@@ -1940,7 +1940,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   })
   const wakeJobs = useMemo<CronJob[]>(
     () => (wakeQuery.data?.jobs || []).filter(
-      (j: CronJob) => wakesCrew(j, editing, editing === defaultAgent)),
+      (j: CronJob) => wakesCrew(j, editing, editing === defaultAgent, editing)),
     [wakeQuery.data, editing, defaultAgent],
   )
 
@@ -2326,6 +2326,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                       modelLabel={editModel === INHERIT_MODEL ? i18nT('pages.kiroCrewAgentsPage.inherited') : editModel}
                       modelInherited={editModel === INHERIT_MODEL}
                       resolvedModel={resolved?.model || ''}
+                      // `editing` for BOTH identities here, which keeps this page's
+                      // attribution exactly as it has always been. This page holds no
+                      // slug for the crew it is editing (the list route does not carry
+                      // `member_id`), so matching on the immutable id is its own change;
+                      // the Crewmates panel, which does have one, passes it.
                       activeSchedules={wakeJobs.filter(j => j.enabled).length}
                       schedulesUnknown={wakeQuery.isError}
                       routingWords={routingWords}
@@ -2513,7 +2518,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                   )}
 
                   {pane === 'schedules' && (
-                    <CrewWakeSection crew={editing} agentTemplate={kiroAgent} isDefaultCrew={editing === defaultAgent} onDraftChange={setSchedDraft} onSavingChange={setSchedSaving} onRequestCancel={requestCancelDraft} />
+                    <CrewWakeSection crew={editing} memberId={editing} agentTemplate={kiroAgent} isDefaultCrew={editing === defaultAgent} onDraftChange={setSchedDraft} onSavingChange={setSchedSaving} onRequestCancel={requestCancelDraft} />
                   )}
 
                   {pane === 'webhook' && <CrewWebhookSection crew={editing} />}

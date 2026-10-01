@@ -1,5 +1,5 @@
 import { memo } from 'react'
-import { Ban, CircleAlert, Info, TriangleAlert } from 'lucide-react'
+import { Ban, CircleAlert, Info, TriangleAlert, type LucideIcon } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
@@ -57,7 +57,19 @@ function srSeverity(tone: NoticeTone): string {
  * while the glyph is 1em of the fixed 13px type, so a px constant would drift
  * under a non-16px root font-size.
  */
-export default memo(function NoticeCard({ content, tone: toneOverride, severity: providerSeverity }: { content: string; tone?: NoticeTone; severity?: unknown }) {
+export default memo(function NoticeCard({
+  content,
+  tone: toneOverride,
+  icon: iconOverride,
+  severity: providerSeverity,
+}: {
+  content: string
+  tone?: NoticeTone
+  /** A caller whose notice names a cause the tone alone does not show (a Stop
+   *  the user pressed) may name the glyph; the tone and its colour are kept. */
+  icon?: LucideIcon
+  severity?: unknown
+}) {
   // Language-generation subscription: this memo() boundary renders i18nT()
   // strings, so a language switch must invalidate it.
   useLanguageGeneration()
@@ -75,7 +87,7 @@ export default memo(function NoticeCard({ content, tone: toneOverride, severity:
     ? providerSeverity === 'warning' ? 'warn' : providerSeverity === 'error' ? 'error' : 'info'
     : toneOverride ?? parsed.tone
   const text = structured ? content : parsed.text
-  const Icon = tone === 'blocked' ? Ban : tone === 'error' ? CircleAlert : tone === 'warn' ? TriangleAlert : Info
+  const Icon = iconOverride ?? (tone === 'blocked' ? Ban : tone === 'error' ? CircleAlert : tone === 'warn' ? TriangleAlert : Info)
   const severity = srSeverity(tone)
   return (
     <div

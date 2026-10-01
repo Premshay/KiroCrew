@@ -1905,7 +1905,7 @@ class Driver:
                 committed,
             )
             # Announce the filed CR so the app can start a watcher session that keeps it
-            # mergable + drives it to passing-all-checks (tasks #21/#24). Opaque to the
+            # mergeable + drives it to passing-all-checks (tasks #21/#24). Opaque to the
             # spine — the backend's on_progress sink decides what to do with it.
             self._progress(
                 cr_filed={

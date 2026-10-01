@@ -326,20 +326,13 @@ class TestCheckpointSlotProjection:
 
         assert slot.session_checkpoint_payload()["next_action"] == ""
 
-    def test_slot_snapshot_exposes_only_the_structured_plan_goal(self) -> None:
+    def test_declared_goal_is_distinct_from_agent_checkpoint(self) -> None:
         slot = _ChatSlot("checkpoint")
-        slot._plan_goal = "Show session intent without transcript summaries."
-        assert slot.to_dict()["plan_goal"] == "Show session intent without transcript summaries."
-
-    def test_declared_goal_is_distinct_from_agent_checkpoint_and_plan_goal(self) -> None:
-        slot = _ChatSlot("checkpoint")
-        slot._plan_goal = "Parsed plan objective."
         slot.set_session_checkpoint(_checkpoint(goal="Agent checkpoint objective."))
 
         assert slot.set_declared_goal("Owner-declared objective.") is True
         snapshot = slot.to_dict()
         assert snapshot["declared_goal"] == "Owner-declared objective."
-        assert snapshot["plan_goal"] == "Parsed plan objective."
         assert snapshot["session_checkpoint"]["goal"] == "Agent checkpoint objective."
         assert (
             slot.session_timeline_payload()[-1]["text"]

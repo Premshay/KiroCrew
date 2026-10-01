@@ -207,6 +207,25 @@ errors retain their separate recovery guidance. At execution, the job's captured
 context reaches the runtime and every worker before provider startup. Continuation
 keeps that member. Ordinary jobs without a member retain their existing V1 behavior.
 
+`member_id` is the only per-crewmate GROUPING key the dashboard has, and it is the
+one the surfaces group by. `GET /api/crons` returns it (`null` for a job with no
+member), and the server offers no member filter or server-side grouping, so every
+per-crewmate list is a client-side filter over the whole payload through one shared
+predicate, `wakesCrew(job, crew, isDefaultCrew, memberId)`: durable `member_id` first -- compared against the crewmate's IMMUTABLE id, since `bind_cron_memory` rewrites the client's value to the canonical one before persisting -- then a
+multi-entry `agent_sequence`, then the template in `agent`, and finally the default
+crew for a job bound to nothing. `script` and `command` jobs are excluded — they run
+a file, not a crew, so no crew attribution exists to report. Two surfaces read that
+predicate through one query key (`crewWakeQueryKey`): the crew editor's Schedules
+pane and the Crewmates panel's Schedules tab, which mount the same component. The
+last fallback is the one place the two differ, and the component takes which it
+wants as one question from its host: the editor asks what the crew will run and so
+takes the fallback, while the panel asks what wakes this crewmate and does not, so
+a job with no `member_id` AND no bound agent or sequence appears on no crewmate's
+tab and stays on `/schedule`; a legacy job attributed by `agent` alone still shows
+on that crewmate's tab, because only the fallback is withheld. See
+[crew-mode](crew-mode.md). Grouping a job under a crewmate never migrates it and
+never grants that crewmate's store.
+
 Member-scoped execution does not require a protected filesystem or memory grant.
 Legacy V1 cron dispatch snapshots its selectors before resolving configuration
 off-loop; supplied canonical execution records require no configuration reread.
@@ -1349,7 +1368,7 @@ A pending tool approval has **two** pieces of state that must stay in lockstep: 
 | Stop / interrupt | `_reject_pending_approvals` marks `"rejected"` |
 | Chat runner's own exits — 2h `wait_for` timeout, Slack delivery-failure auto-reject, task cancellation | the `finally` backstop in `_run_chat` marks with `only_if_pending=True` and broadcasts `approval_resolved`, which retires the card on every window; the Slack delivery failure is decided the moment the post fails, before any further await, so the retirement follows the row's own frame at once (that row's arrival chime is the accepted residual — see `app-notifications.md`, "Sound events"); an answer the dashboard gave while the post was in flight stands over that failure, which then declines nothing and writes no auto-declined notice |
 | Chat runner's no-budget decline (no turn budget left to wait) | decided before the row exists: `_run_chat` pre-checks the remaining-budget bound and appends the `permission` row with `resolved: "rejected"` already in its `cls`, so its one `chat_message` frame carries the decision and the dashboard's approval sound stays silent. A row pre-declined this way is not mirrored to a linked Slack thread: the post is the one cancellable await between the future's registration and the backstop that pops it, and a turn ceiling landing inside the post would leave a future nothing resolves (Board Blocked, Continue 409) for a card the backstop deletes as soon as the post returns. With no await on the path, that `resolved` is the row's final state; the backstop finds the row non-pending and only pushes the slots, so the Board leaves the Blocked lane |
-| State-level approval wait expiry/cancellation (`ApprovalCoordinator.request`'s `finally`, i.e. `request_approval` timing out or being cancelled) | retires before popping: the card is client-injected from the WS `approval` frame, and the `approval_resolved` broadcast marks it resolved. The broadcast uses the requesting slot as its session key whenever one is named, otherwise `"state"`; SEL records the explicit `"expired"` outcome, and the frame is the one `approval_resolved` payload that carries a `decision` (`"expired"`), which the SPA renders with its `"stale"` vocabulary instead of deriving a rejection from `approved: false`. A decided approval's frame stays `{id, approved, slot?}`. The coordinator owns no slot `permission` rows, so it deliberately does not call the marker: bare per-connection ids can collide with rows owned by the chat-runner registry. A future already decided by `resolve()`/`resolve_state()` emits no second retirement broadcast. |
+| State-level approval wait expiry/cancellation (`ApprovalCoordinator.request`'s `finally`, i.e. `request_approval` timing out or being cancelled) | retires before popping: the card is client-injected from the WS `approval` frame, and the `approval_resolved` broadcast marks it resolved. The broadcast uses the requesting slot as its session key whenever one is named, otherwise `"state"`; SEL records the explicit `"expired"` outcome, and the frame is the one `approval_resolved` payload that carries a `decision` (`"expired"`), which the SPA renders with its `"stale"` vocabulary instead of deriving a rejection from `approved: false`. A decided approval's frame stays `{id, approved, slot?}`. The coordinator owns no slot `permission` rows, so it deliberately does not call the marker: bare per-connection ids can collide with rows owned by the chat-runner registry. A future already decided by `resolve()`/`resolve_state()` emits no second retirement broadcast. A wait a same-id request superseded leaves the replacement's record, frame and slot lane alone, but its undecided end is still audited: SEL records `"superseded"` with no broadcast, an outcome distinct from the replacement's own. |
 | Turn-start sweep (repairs orphans from prior turns) | `_sweep_stale_permissions` marks `"stale"` |
 
 **`resolved` field values** (`cls.resolved`): `"approved"`, `"approved_trust_reads"`, `"rejected"`, `"trust"`, `"trust_reads"`, `"yolo"`, `"stale"`. Presence of the key — not its value — is what makes a permission message non-pending; `selectSlotPendingApproval` in the SPA and the `only_if_pending` guard both key off presence alone. The frontend additionally writes `"stale"` locally when a decision 404s, which clears the orphaned card in that tab; it is a display-layer dismissal, not a backend write. Persisted orphans converge via the next turn's sweep.
@@ -1518,9 +1537,13 @@ app, a channel, an entry restored from disk, which carries no provenance) is
 display-redacted. The single decision is `chat_delivery.queued_text_for_display`,
 with a queue entry's origin read by `queue_entry_is_user_origin`: the
 `_directive_user_origin` stamp without `_directive_channel_origin` (a linked
-Slack channel's message carries both). The drain is outside that rule:
-`_start_next_queued_turn` redacts a queued entry before it becomes the next
-turn's input and row, and its `queue_pop` frame carries that same redacted text.
+Slack channel's message carries both). The drain follows that same rule, not an
+exception to it: `_start_next_queued_turn` delivers the owner's own queued entry
+as typed into both the next turn's input and its row, and its `queue_pop` frame
+carries that same as-typed text, so the card and the delivery agree. The rewind
+and edit-resend endpoints route the owner's own edited text (`not request_app`)
+through the same helper. Any non-owner entry -- a peer, an app, a channel, a
+disk-restored entry, or an app-driven edit -- stays fully redacted on delivery.
 Pinned by `test_queued_user_text_display.py`.
 
 **Send identity through the REQUEUE path (#6751).** A steer whose turn dies
@@ -1574,9 +1597,14 @@ Contract:
   non-object body degrades to touch-only rather than failing the keepalive,
   because that half of the route is what stops the watchdog killing the ACP
   subprocess mid-wait.
-- **Reply**: `{"ok": true}`, plus `{"end_wait": "<wait_id>"}` when the user has
-  asked to end *that* sleep. The tool breaks its loop and returns a normal
-  string — deliberately **not** `ToolCancelled`, whose response is suppressed.
+- **Reply**: `{"ok": true}`, plus `{"end_wait": "<wait_id>"}` when an early end
+  of *that* sleep has been requested, either by the user (the End-wait button)
+  or by a session that created this one (`session_end_wait`, via
+  `POST /api/session-control/end-wait`). A session-requested end also carries
+  `{"end_wait_by": "<caller slot key>"}`, which the tool reads only from a reply
+  naming its own `wait_id` and uses to say which session ended the sleep. The
+  tool breaks its loop and returns a normal string — deliberately **not**
+  `ToolCancelled`, whose response is suppressed.
 - **Ping interval** is `mcp_core.WAIT_PING_SECS` (5.0s), not the 60s the
   staleness watchdog alone needs: it is the button's worst-case latency. The
   handler only touches two timestamps, so a 30-minute wait costs ~360 loopback
@@ -1586,6 +1614,11 @@ Contract:
   `slot_not_found`, 409 `wait_not_in_flight` when the id does not match the
   sleep currently tracked — which is how a click on a stale countdown is
   rejected instead of ending a *later* wait. Consumed exactly once.
+  `session_control.end_wait_target` parks the same `_end_wait_request` (plus
+  `_end_wait_by`) for the currently tracked `wait_id`, after the session-control
+  target gate and a creator fence (`not_creator`); a slot with no tracked sleep
+  or with `_wait_contested` set gets an informational `ended: false` reply and
+  parks nothing.
 - **`_ChatSlot`** gains `_wait_state` (`{wait_id, seconds, deadline_ts}`, emitted
   as `wait_state` in `to_dict()`), plus the server-only `_wait_last_ping` and
   `_wait_contested`. `deadline_ts` is absolute and minted **once** on first
@@ -1672,7 +1705,32 @@ fan-out would otherwise spend it on workers and starve the session a person
 follows. A worker's card read answers `unavailable` without queuing work, and its
 team-panel tile shows host state only. Live user/assistant messages, errors, turn completion and pending
 questions enqueue subsequent updates, independently of an attached stream
-reader. Replay, token chunks, GET and polling do not enqueue model work. Card
+reader. Replay, token chunks, GET and polling do not enqueue model work; that
+includes a History resume, whose rebuild replays the window while the slot is
+under construction, and the throwaway slot a `/v1/chat/completions` request
+without an id creates (`_dashboard_card_exempt`). The queue serves a live event
+before a restore seed and the longest-waiting entry first within each, so seeded
+idle sessions cannot hold back the one a person is using (while live sessions
+keep the hourly budget busy, a seeded one waits); a new event on an entry
+already queued sends no frame, because what a reader sees has not changed. The
+evidence window is the newest 32 user/assistant/error/tool-result/inject rows,
+filtered before the slice so tool rows cannot crowd them out; an injected automation
+envelope, and an `inject` breadcrumb (a cron result, a `/note`), reach the model as
+role `automation`, never as the user. Building the
+evidence and checking the returned card run in a worker thread, not on the
+gateway loop. The projection that scan reads ends a comment with the browser's
+endings (`<!-->`, `<!--->`, the first `-->` or `--!>`, else the end), matched inside
+the tokenizer so a `<!--` in an attribute value stays attribute text, rather than by
+the stdlib's own rule, which differs between 3.12 patch releases; CDATA is kept as
+text, since SVG renders it and keeping more text can hide nothing. Tags, bogus
+comments and character references go through `html.parser`, so markup
+cannot split a credential the page shows joined; a parity test pins the projection
+to Chromium's rendered text.
+Scalar data values are bound as their text. Each attempt is recorded
+in the crew log as `background/completed` kind `dynamic_card`. A read before the
+transcript's first flush, or while its lock is contended, answers the queue's own
+status with no card while the entry is queued, generating or waiting on budget,
+and `unavailable` otherwise. Card
 generation events are accepted only from the currently registered slot object.
 Scratch edit/rewind copies sharing the current identity cannot clear its card or
 queue generation. A retired owner's callback clears only a card still owned by
@@ -1768,9 +1826,9 @@ a same-key slot can remount. Owner or binding replacement emits removal before
 installing the new entry; ordinary same-owner, same-binding updates retain valid
 content. Reconnect resets all card queries to cover missed
 removals; only observed cards refetch. Hidden
-frames are unloaded and no card-content polling is added. The existing capped
-inventory polling discovers saved views and repairs missed host events; it does
-not generate the card's content. Answer drafts remain outside the frames.
+frames are unloaded and nothing polls: the inventory frames and a reconnect
+discover saved views and repair missed host events; neither generates the card's
+content. Answer drafts remain outside the frames.
 
 ### Agent Questions (`ask_question`)
 
@@ -1800,7 +1858,7 @@ Returns `200` with an array of cards that can be rehydrated after a reload or we
 
 `ask_id` identifies a parked blocking wait and is answered through the endpoint below. A stateless `card_id` has no blocked caller: its answer is the next ordinary user message, and its status is retired through the dismiss endpoint or that message.
 
-Dynamic Dashboard hosts retain an actively drafted stateless card when polling
+Dynamic Dashboard hosts retain an actively drafted stateless card when a re-read
 retires its server record. The mounted task panel or all-session inbox owns this
 presentation-only retention, keyed by normalized slot and exact `card_id`; text
 and option selections survive section changes and inbox filtering. Clearing the
@@ -2355,8 +2413,9 @@ A legacy claim with neither typed delivery nor an evidence deadline
 deactivates with `completion_evidence_unavailable` while retaining the
 acknowledged fingerprint, so restart cannot duplicate the wake. Completion stops
 on the first exhausted runtime, turn, or token bound (in that precedence), and
-the completed-turn bound is validated against the universal eight-turn ceiling
-when constructed or loaded. Approval-stall completion is terminal and budget exhaustion takes
+the completed-turn bound is skipped when it is zero, its unlimited sentinel, and
+otherwise validated against the universal eight-turn ceiling when constructed or
+loaded. Approval-stall completion is terminal and budget exhaustion takes
 precedence when both apply.
 Claim, budget-stop, completion, and pre-turn dispatch-failure mutations are
 applied to a staged copy; the replacement snapshot is persisted before the live
@@ -2679,7 +2738,7 @@ member-store identities produce a named error and never inherit Global V1. See
 [memory](memory-skills-hooks.md#memory-across-surfaces-and-channels) for canonical
 identity and selected knowledge copying.
 
-**Chat**: POST `/api/chat` (SSE stream, or JSON with `?ws=1` — chunks via WebSocket), `/api/chat/slots` (CRUD, POST accepts optional `agent` field to set agent at creation, plus optional `agent_kind` (`member` | `template`) naming the catalog namespace the agent was picked from — a stated kind is resolved in that namespace only — before the slot is minted, so `409 agent_choice_unavailable` (it does not resolve there) registers no slot — `400 invalid_agent_kind` for any other value; a template kind pins no member memory store; list responses carry the committed `agent_kind`, `""` for a legacy name-first pick or a restored older slot; list responses include `source_links` extracted from slot messages with cached provider/number/state/CI metadata), resume from history, POST `/api/chat/slots/{slot}/generate-title`, POST `/api/chat/slots/{slot}/agent` (switch agent for slot; body `{agent, agent_kind?}` with the same `agent_kind` contract as create, and the response echoes the committed `agent_kind`), POST `/api/chat/slots/{slot}/fork` (fork session — copies visible messages into new slot, body: `{at_message_index?, prompt?}`, returns `{ok, key, title, messages, prompt}`, new slot has `forked_from` metadata), POST `/api/chat/slots/{slot}/edit-resend` (edit a user message and re-run; a real conversation boundary like `rewind` — discards the native ACP conversation, flushes the cleared resume sid, and persists the truncated window before the live slot adopts the edit. Body: `{index?, ts?, content}`. Refusals: 400 `invalid_content` (a present non-string `content`, which would otherwise reach `.strip()` as a 500) / 400 `content_too_long` (over 32768 chars, the same cap `rewind` and `fork` apply, checked before the destructive boundary), 409 `slot_orchestrating` / `slot_subagents_running` (a plan is mid-stage, or sub-agent children are attached to the session the discard would tear down — the same two guards `reset-conversation` applies), 503 `edit_resend_prepare_failed` (discard or sid flush failed), 409 `edit_resend_session_busy` (a channel turn holds the session), 503 `edit_resend_save_failed`, 503 `edit_resend_slot_rebound` (the slot moved to another transcript mid-persistence). App tokens are gated by `_check_slot_app_ownership`, so an app may edit-resend only a slot it owns whose session and transcript are its own — see [session](session.md) → "Edit rewind context boundary"), POST `/api/chat/slots/{slot}/rewind` (edit any past user message and re-run; fork-and-swap — truncates `slot.messages`, removes the slot's ACP session via `SessionManager.remove`, deletes orphaned kiro-cli session JSONL at `~/.kiro/sessions/cli/<id>.json[l]`, then runs the edited prompt against a fresh ACP session under the same slot key/title/folder. Mirrors kiro-cli `/rewind`. Body: `{at_message_index?, ts?, content}`), PATCH `/api/chat/slots/{slot}/mode` (switch session mode between `""` and `"orchestrator"` — `_VALID_MODES`; 404 missing slot, 400 invalid mode, 409 while the session is running)
+**Chat**: POST `/api/chat` (SSE stream, or JSON with `?ws=1` — chunks via WebSocket), `/api/chat/slots` (CRUD, POST accepts optional `agent` field to set agent at creation, plus optional `agent_kind` (`member` | `template`) naming the catalog namespace the agent was picked from — a stated kind is resolved in that namespace only — before the slot is minted, so `409 agent_choice_unavailable` (it does not resolve there) registers no slot — `400 invalid_agent_kind` for any other value; a template kind pins no member memory store; list responses carry the committed `agent_kind`, `""` for a legacy name-first pick or a restored older slot; list responses include `source_links` extracted from slot messages with cached provider/number/state/CI metadata), resume from history, POST `/api/chat/slots/{slot}/generate-title`, POST `/api/chat/slots/{slot}/agent` (switch agent for slot; body `{agent, agent_kind?}` with the same `agent_kind` contract as create, and the response echoes the committed `agent_kind`), POST `/api/chat/slots/{slot}/fork` (fork session — copies visible messages into new slot, body: `{at_message_index?, prompt?}`, returns `{ok, key, title, messages, prompt}`, new slot has `forked_from` metadata), POST `/api/chat/slots/{slot}/edit-resend` (edit a user message and re-run; a real conversation boundary like `rewind` — discards the native ACP conversation, flushes the cleared resume sid, and persists the truncated window before the live slot adopts the edit. Body: `{index?, ts?, content}`. Refusals: 400 `invalid_content` (a present non-string `content`, which would otherwise reach `.strip()` as a 500) / 400 `content_too_long` (over 32768 chars, the same cap `rewind` and `fork` apply, checked before the destructive boundary), 409 `slot_orchestrating` / `slot_subagents_running` (a plan is mid-stage, or sub-agent children are attached to the session the discard would tear down — the same two guards `reset-conversation` applies), 503 `edit_resend_prepare_failed` (discard or sid flush failed), 409 `edit_resend_session_busy` (a channel turn holds the session), 503 `edit_resend_save_failed`, 503 `edit_resend_slot_rebound` (the slot moved to another transcript mid-persistence). App tokens are gated by `_check_slot_app_ownership`, so an app may edit-resend only a slot it owns whose session and transcript are its own — see [session](session.md) → "Edit rewind context boundary"), POST `/api/chat/slots/{slot}/rewind` (edit any past user message and re-run; fork-and-swap — truncates `slot.messages`, removes the slot's ACP session via `SessionManager.remove`, deletes orphaned kiro-cli session JSONL at `~/.kiro/sessions/cli/<id>.json[l]`, then runs the edited prompt against a fresh ACP session under the same slot key/title/folder. Mirrors kiro-cli `/rewind`. Body: `{at_message_index?, ts?, content}`), PATCH `/api/chat/slots/{slot}/mode` (switch session mode — `_VALID_MODES` holds only `""`, and a request naming the retired `"orchestrator"` mode is coerced to `""`; 404 missing slot, 400 invalid mode, 409 while the session is running)
 **Source-link unlink**: DELETE `/api/chat/slots/{slot}/source-links/{identity}` removes one PR/issue/Jira chip from a session's sidebar card. The chips are DERIVED — `SlotProjection.source_links` re-scans the transcript on every revision bump — so nothing is deleted; the endpoint records the chip's identity into the slot's **dismissed set** (`_ChatSlot._dismissed_source_links`, `dismiss_source_link(key)`), which the derivation filters against. Nothing touches a remote provider: this hides a chip, it never closes a pull request or an issue. **Identity, not URL**: `{identity}` is the serialized `SourceRef.identity` that every `source_links` entry carries as `identity` — `source_ref_identity_key()` renders the identity tuple to canonical JSON (fixed member order, no incidental whitespace, `ensure_ascii`) and `is_valid_source_identity_key()` validates an untrusted key against exactly that grammar — so a dismissal suppresses the OBJECT, and a re-mention of the same PR through another URL spelling (trailing slash, sub-path pin) stays gone. aiohttp percent-decodes the path segment once and the handler never `unquote`s again, so two identities that differ only by encoding cannot collapse onto one key. **Permanent by design**: a dismissal has no undo and no re-link, and a later paste of the same object does not resurface the chip; the set only grows within a session and is bounded by `_MAX_DISMISSED_SOURCE_LINKS` = 512, the operative ceiling; an identity is also accepted only when it is currently derived from the transcript or already dismissed (a format-valid but never-mentioned identity is a 404 `source_link_not_found`, so a caller cannot inflate durable state with junk). Refusals: 404 `slot_not_found` (identical to the sibling GET, so the response cannot probe which slots exist); the session-aware app-isolation denial of `_check_slot_app_ownership` (the write lands on the transcript the slot ROUTES to, so an app may unlink only on a slot whose transcript is its own — the same gate `/autocompact`, `/context` and `/note` apply); 400 `invalid_source_identity`; 400 `expected_identity_required` when the required `expect` query param (the session identity `<row_identity>|<created_at>|<linked_session_key>` the chip was rendered under) is absent — it is mandatory so the identity gate always runs; 409 `session_gone` when the slot was deleted or rebound while the request waited, when the transcript's identity cannot be read, when the guarded write declined, or when `expect` does not match the slot's current identity; 409 `dismissed_source_links_full` when the durable set is already at the `_MAX_DISMISSED_SOURCE_LINKS` = 512 ceiling. A repeat of an already-durable dismissal is an idempotent 200 that broadcasts nothing and writes nothing. Success answers `{ok: true, dismissed: true, source_links_total: <n>}`; the client prefers that authoritative `source_links_total` over a local decrement (falling back to `Math.max(0, …-1)` only when an older gateway sends none) and otherwise reconciles from the slots push the endpoint broadcasts. **Persistence**: the set is the slot-owned metadata key `dismissed_source_links` (sorted, deterministic; in `SLOT_OWNED_META_KEYS`, hence in `ROWS_ONLY_DEFERRED_META_KEYS` so a rows-only handover carries the line's own value back verbatim — the key classes are [session](session.md)'s). The endpoint writes it FIELD-SCOPED through `update_metadata_if` under a per-transcript `_source_link_txn_lock` (alias slots of one transcript serialize together), guarded on the transcript's pinned `created_at` so a delete-and-recreate at the same path is declined rather than written into the replacement session, and the written value is the union of every live alias's set with the on-disk line, so a departed alias's committed tombstone is never dropped. Both full-save branches of `_save_slot_to_history` likewise UNION the in-memory set with the on-disk line: a save can add a tombstone but can never shrink the durable set, whatever a slot's in-memory set happens to hold. Two flags make a save carry the on-disk line forward VERBATIM instead: `_dismissed_hydrated is False` (the slot was bound while the transcript's set could not be read — the binding is kept for routing, only the dismissed write is deferred) and `_dismissed_txn_depth > 0` (an unlink holds a tentative in-memory dismissal whose guarded write may still fail and roll back; a periodic flush must not persist it first). On a failed persist the handler rolls the tentative key out of every slot it added it to; a first write that already committed is NOT compensated (there is no cross-process lock spanning the first write and an undo, so undoing it could erase another gateway's acknowledged unlink). Instead it re-reads the transcript identity off-loop and, when that still matches the pin, ACCEPTS the committed grow-only tombstone as durable (disk holds the dismissal, so a 409 would desync); a changed or unreadable identity falls to the 409 rollback, leaving the replacement transcript untouched. **Hydration**: every path that binds a live slot to a transcript and applies its metadata or rows restores the mirror through `_restore_dismissed_source_links` — `_rehydrate_slot_from_history`, `_apply_recent_session`, `surface_channel_session`, `api_chat_slot_resume`, `_bind_cron_slot` (from the off-loop `prefetch_cron_dismissed` read; an unreadable read binds and marks the slot dismissed-unhydrated) and the deleted-job branch of `api_cron_to_chat`. Hydration is authoritative: a transcript with no key CLEARS a reused slot's set (a rebind never carries tombstones into another conversation), and each restored key is re-validated, a tampered entry being dropped rather than aborting the restore — a malformed key can only ever fail to match a real identity. `test_every_metadata_applying_bind_site_restores_dismissals` discovers the bind sites structurally and fails by name on a new one that skips the mirror; because the saves union, a path that forgets the mirror regresses to a stale chip in that slot, not to erasure. **Audit**: every attempt is a permission-class SEL tool invocation named `source_link_unlink` — `allowed` on success (with `already_dismissed`) and `failed` with the `phase` (`lookup`, `ownership`, `expected_identity`, `validate`, `derive`, `reauth`, `identity_pin`, `identity_pin_reauth`, `identity_pin_rebind`, `cap`) on every refusal. **Frontend**: the affordance lives in the session card's existing shared actions menu (`SessionActionsMenu` ⋮), as a **“Hide a PR or Issue chip”** submenu (`SourceLinksSubmenu`, catalog key `source_link_actions`) listing the chips that carry an `identity` (a chip from an older gateway that sent none is not offered); picking one STAGES it (the entry switches to `unlink_source_link_confirm`, “Select again to permanently hide «label»”) and a second select on that staged entry issues the DELETE — a per-item two-step confirmation, since the removal is permanent — hiding the chip optimistically while the mutation is pending (the strip filters pending identities out) and reconciling from the slots push; the submenu is disabled while the gateway is offline, and a failure renders the shared `ErrorNotice` with the localized `unlink_source_link_failed` catalog string, never a raw server or browser message. When a slot carries more links than the serialized preview, the submenu loads the complete list through GET `/api/chat/slots/{slot}/source-links`.
 
 Source-link unlink await boundaries: lock acquisition and the metadata identity
@@ -3388,7 +3447,14 @@ The shared policy is `monitoring.max_runtime_secs` (see [config](config.md)).
 Tools and REST creation/updates use `monitoring.limits`; a budget is checked
 only when it is written, and a persisted budget is left as stored on load.
 Legacy general AutoNudge still allows zero as its pre-existing unbounded value;
-monitor tools and structured monitors require a positive finite budget. Raising
+monitor tools and structured monitors require a positive finite budget for
+`max_runtime_secs`, `max_tokens` and `max_provider_errors`. `max_agent_turns` is
+the one exception and reads zero as unlimited, the same meaning legacy
+`max_cycles` carries: zero is skipped rather than enforced, an explicit positive
+value is bounded by `MAX_MONITOR_AGENT_TURNS`, and MCP schemas, `validation.py`,
+the REST handler, the session directive applier and the dashboard contract all
+publish a minimum of 0 for it alone. Its default stays a positive eight turns.
+Raising
 or lowering the policy never rewrites an existing loop's timestamps, runtime or
 active state; a stored budget above the ceiling runs to its stored deadline.
 
@@ -4176,7 +4242,7 @@ Restart as its sole mutation. Creating a different monitor while terminal eviden
 is retained is disabled until bulk slot cleanup fences every slot before awaiting,
 so an archived slot cannot be repopulated by an in-flight replacement. The form
 enforces the backend bounds: cadence 15–86,400 seconds, runtime 1–604,800 seconds,
-agent turns 1–8, tokens
+agent turns 0–8 where 0 is unlimited, tokens
 1–1,000,000, provider errors 1–20, and at most 1,000 wake-instruction characters.
 Each field exposes the same HTML bound and a localized inline error. Updates
 track dirty fields, reconcile untouched values from same-monitor WebSocket
