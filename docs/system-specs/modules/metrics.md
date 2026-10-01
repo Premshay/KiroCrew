@@ -1197,6 +1197,9 @@ misattribute existing history. The stored slot/session key remains stable across
 the write-side correction and is still the compatibility boundary for this
 reader.
 
+The dedicated `_consolidate` session retains the `consolidation` telemetry
+channel and is grouped under `bg` in Spend, alongside `_bg` background work.
+
 **Two origin columns, deliberately, and they are labelled apart.** The page shows
 the session-origin dimension twice, derived two ways, because the two answer
 different questions. Spend's **Origin** column (`session_category`, from the slot
