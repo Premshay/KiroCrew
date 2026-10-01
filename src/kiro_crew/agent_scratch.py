@@ -664,7 +664,7 @@ def record_tree(key: str, tree: Path) -> None:
     """Remember *tree* as *key*'s work directory. Fail-open, like all scratch.
 
     Only a directory directly under the managed root is recorded. Rows whose
-    directory no longer exists are dropped in the same write, so the index
+    directory is absent are dropped in the same write, so the index
     holds at most the trees the sweep has not reclaimed yet.
     """
     root = scratch_root()

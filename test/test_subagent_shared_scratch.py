@@ -1177,12 +1177,11 @@ class TestBgRuntimeSuccessorInheritsTheTree:
 
 
 class TestAResumedKeyRejoinsItsTree:
-    """A conversation resumed after its process ended (gateway restart, transient
-    exit) used to come back on an EMPTY ``$KIROCREW_SCRATCH``: the new process
-    allocated its own directory and the old tree, now ownerless, was swept an
-    hour later with the session's work in it. The gateway records each key's tree
-    in an index inside the masked root, and a resume hands it back as
-    ``shared_scratch``."""
+    """A resumed conversation rejoins the scratch tree recorded for its key.
+
+    The gateway keeps the index inside the masked root and passes the recorded
+    tree as ``shared_scratch`` when the conversation's process starts.
+    """
 
     def test_the_index_round_trips_and_prunes_reclaimed_trees(self, scratch_root: Path) -> None:
         scratch_root.mkdir(parents=True)
