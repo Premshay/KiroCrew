@@ -14,6 +14,7 @@ import {
   nextPinnedPromptState,
   pinHandoffY,
   pinHandoffBottomY,
+  pinHandoffProgress,
   pinPushTravel,
   type PinnedPromptState,
 } from '../../utils/pinnedPrompt'
@@ -89,26 +90,32 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
     const items = el.querySelectorAll('[data-display-index]')
     const foldY = pinFoldRef.current?.getBoundingClientRect().top
       ?? el.getBoundingClientRect().top
-    // A row stays readable until its bottom crosses a fixed resting band.
+    // A prompt stays readable until its bubble bottom crosses a fixed resting band.
     // Measured card heights vary by prompt and would feed pin selection back
     // into itself, oscillating between consecutive cards without a scroll.
     const handoffY = pinHandoffY(foldY)
     const handoffBottomY = pinHandoffBottomY(foldY)
+    const list = displayItemsRef.current
     let handoffIdx = -1
     let first = true
     for (const item of items) {
       const htmlItem = item as HTMLElement
       const rect = htmlItem.getBoundingClientRect()
-      if (rect.bottom > handoffBottomY) {
+      const index = parseInt(htmlItem.getAttribute('data-display-index') || '0', 10)
+      const entry = list[index]
+      const bubble = entry?.kind === 'single' && entry.msg.role === 'user'
+        ? htmlItem.querySelector('.message-bubble') : null
+      const bottom = bubble?.closest('[data-role="user"]')
+        ? bubble.getBoundingClientRect().bottom + ROW_PAD_Y : rect.bottom
+      if (bottom > handoffBottomY) {
         if (requiresMountedHandoff && first && rect.top > handoffY) { setPinned(null); return }
-        handoffIdx = parseInt(htmlItem.getAttribute('data-display-index') || '0', 10)
+        handoffIdx = index
         break
       }
       first = false
     }
 
     if (!pinEnabledRef.current || handoffIdx < 0) { setPinned(null); return }
-    const list = displayItemsRef.current
     const pinIdx = findPinnedPromptIdx(list, handoffIdx)
     const pinItem = pinIdx >= 0 ? list[pinIdx] : undefined
     if (!pinItem || pinItem.kind !== 'single') { setPinned(null); return }
@@ -300,6 +307,7 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
       liveH,
       maxH,
       stripUncovered,
+      handoffProgress: bubbleBottom == null ? 1 : pinHandoffProgress(handoffBottomY, bubbleBottom),
     }))
   }, [requiresMountedHandoff, scrollerRef])
   // The card grows at rest with no scroll to run the recompute — the hover peek

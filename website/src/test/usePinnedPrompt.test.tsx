@@ -364,6 +364,32 @@ function mountUserRow(row: HTMLElement) {
 }
 
 describe('usePinnedPrompt waits for a readable prompt to leave', () => {
+  it('hands off at the bubble tail, independently of its action strip, in both directions', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    const { bubble } = mountUserRow(g.rows[2])
+    setRect(g.rows[2], -249, 440)
+    setRect(g.rows[3], 191, 40)
+    setRect(g.rows[4], 900, 40)
+    setRect(bubble, -249, 400)
+    wire(h, g)
+    expect(h.result.current.pinned?.idx).not.toBe(2)
+    for (const bottom of [150, 80, 0, 80, 150]) {
+      act(() => {
+        setRect(bubble, bottom - 400, 400)
+        h.result.current.updatePinnedPrompt()
+      })
+      expect(h.result.current.pinned?.idx).toBe(2)
+      expect(h.result.current.pinned?.handoffProgress).toBeGreaterThanOrEqual(0)
+      expect(h.result.current.pinned?.handoffProgress).toBeLessThanOrEqual(1)
+    }
+    act(() => {
+      setRect(bubble, -249, 400)
+      h.result.current.updatePinnedPrompt()
+    })
+    expect(h.result.current.pinned?.idx).not.toBe(2)
+  })
+
   it('keeps a tall prompt visible while its bottom is below the hand-off line', () => {
     const h = renderPin()
     const g = mountGeometry(5)

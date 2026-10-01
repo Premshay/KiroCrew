@@ -54,6 +54,13 @@ export function pinHandoffBottomY(foldY: number): number {
   return pinHandoffY(foldY) + ROW_PAD_Y * 2 + DEFAULT_PINNED_CARD_H
 }
 
+/** Scroll-owned settle: the departing tail meets the card at zero; the normal
+ * preview returns over three resting-card heights. Reversing scroll retraces it. */
+export function pinHandoffProgress(handoffBottom: number, bubbleBottom: number): number {
+  const progress = Math.max(0, Math.min(1, (handoffBottom - bubbleBottom - ROW_PAD_Y) / (3 * DEFAULT_PINNED_CARD_H)))
+  return progress * progress * (3 - 2 * progress)
+}
+
 /**
  * Rows that can take the pin: what the HUMAN typed.
  *
@@ -580,6 +587,8 @@ export interface PinnedPromptState {
    * role alone.
    */
   liveH?: number
+  /** Reversible transition from the departing tail to the resting preview. */
+  handoffProgress?: number
   /**
    * Ceiling on the card's height this frame — the distance from the card's top
    * to the transcript floor (see computePinnedCardMaxH). Both the fold's `liveH`
@@ -613,6 +622,8 @@ export interface PinnedPromptInput {
   bannerH: number
   /** See `PinnedPromptState.liveH`. Recomputed every scroll frame. */
   liveH?: number
+  /** Reversible transition from the departing tail to the resting preview. */
+  handoffProgress?: number
   /** See `PinnedPromptState.maxH`. Recomputed every scroll frame. */
   maxH?: number
   /** See `PinnedPromptState.stripUncovered`. Recomputed every scroll frame. */
@@ -636,16 +647,16 @@ export function nextPinnedPromptState(
   prev: PinnedPromptState | null,
   input: PinnedPromptInput,
 ): PinnedPromptState {
-  const { idx, ts, raw, pastes, push, bannerH, liveH, maxH, stripUncovered } = input
+  const { idx, ts, raw, pastes, push, bannerH, liveH, maxH, stripUncovered, handoffProgress } = input
   const sameMsg = prev !== null && prev.idx === idx && prev.raw === raw && prev.ts === ts
   if (sameMsg && prev.push === push && prev.bannerH === bannerH && prev.liveH === liveH
-    && prev.maxH === maxH && prev.stripUncovered === stripUncovered) return prev
+    && prev.maxH === maxH && prev.stripUncovered === stripUncovered && prev.handoffProgress === handoffProgress) return prev
   // `liveH` DOES move every frame — that is the fold. It is carried on the
   // same-message path for exactly that reason, unlike `push`/`bannerH` which only
   // change when the geometry does. `stripUncovered` flips on a later frame of
   // the same pin (the strip slides under the resting card), so it rides here too,
   // as does `maxH`, which moves when the pane or the dock does.
-  if (sameMsg) return { ...prev, push, bannerH, liveH, maxH, stripUncovered }
+  if (sameMsg) return { ...prev, push, bannerH, liveH, maxH, stripUncovered, handoffProgress }
   const { text, body: full, images } = derivePinnedPromptText(raw, pastes)
   return {
     idx,
@@ -660,6 +671,7 @@ export function nextPinnedPromptState(
     push,
     bannerH,
     liveH,
+    handoffProgress,
     maxH,
     stripUncovered,
   }
