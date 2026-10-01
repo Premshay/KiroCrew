@@ -1204,8 +1204,16 @@ async def test_a_sent_export_streams_its_staged_file_and_removes_it(tmp_path, mo
 
     monkeypatch.setattr(type(staged), "read_bytes", _no_whole_read)
 
+    prepared = asyncio.Event()
+
+    class ObservedExport(se._StagedExport):
+        async def prepare(self, request):
+            writer = await super().prepare(request)
+            prepared.set()
+            return writer
+
     async def _handler(_request):
-        return se._StagedExport(staged, headers={"Content-Type": "application/gzip"})
+        return ObservedExport(staged, headers={"Content-Type": "application/gzip"})
 
     app = web.Application()
     app.router.add_get("/x", _handler)
@@ -1213,6 +1221,8 @@ async def test_a_sent_export_streams_its_staged_file_and_removes_it(tmp_path, mo
         resp = await client.get("/x")
         assert resp.status == 200
         assert json.loads(gzip.decompress(await resp.read())) == document
+        # Receiving the bytes can precede the server's off-loop file cleanup.
+        await asyncio.wait_for(prepared.wait(), timeout=5)
     assert not staged.exists()
 
 
