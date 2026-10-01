@@ -167,6 +167,9 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
+)
+from kiro_crew.acp.types import ACP_CLIENT_CAPABILITIES as ACP_CLIENT_CAPABILITIES  # noqa: F401
+from kiro_crew.acp.types import (
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,

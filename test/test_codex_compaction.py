@@ -915,6 +915,7 @@ def test_native_compaction_state_is_bounded() -> None:
         assert deliver(f"done-{index}", "completed") == "completed"
     assert len(states) == NATIVE_COMPACTION_STATES_MAX
     assert states.evicted == 6
+    assert states.get(long_id) == "started"
     # Settled ids are evicted first, so the in-flight one still dedupes.
     assert deliver(long_id, "completed") == "completed"
     assert deliver(long_id, "completed") is None
