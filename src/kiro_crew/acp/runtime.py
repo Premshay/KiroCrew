@@ -1363,7 +1363,7 @@ class AcpRuntime:
         # believe a consumer exists and park a child request unread.
         self._turn_active_sessions: set[str] = set()
         self._dropped_frames_flushed_at: float = 0.0
-        # Monotonic time of the last frame routed to each registered session.
+        # Monotonic time of the last attributable backend frame observed.
         # The idle sweep reads it (``session_activity_at``) because a session's
         # own clock moves only when a turn is dispatched, while its backend and
         # the children it spawned keep emitting between turns. Per session, not
@@ -5185,11 +5185,12 @@ class AcpRuntime:
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
 
     def session_activity_at(self, session_id: str) -> float | None:
-        """Monotonic time of the last frame this runtime routed to *session_id*.
+        """Monotonic time of the last backend frame attributable to *session_id*.
 
         Counts only frames with an owner: a session-tagged frame, or a child's
-        frame routed to the session that owns the child. An ownerless broadcast
-        says nothing about which tenant is working, so it is not counted.
+        frame observed for the session that owns the child, even if dropped.
+        An ownerless broadcast says nothing about which tenant is working,
+        so it is not counted.
         """
         return self._session_activity_at.get(session_id)
 
