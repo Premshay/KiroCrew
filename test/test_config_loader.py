@@ -6779,6 +6779,8 @@ _DISPATCH_COMPARED = {
     "workspace_dir",
     "memory_store_name",
     "model",
+    # Fork: a crew's pinned effort is applied at spawn, like its model.
+    "reasoning_effort",
 }
 
 # Fields deliberately EXCLUDED from the comparison. Each reason mirrors the
@@ -6813,6 +6815,7 @@ def _dispatch_field_mutations() -> dict[str, object]:
         "workspace_dir": Path("drift-pin-other-workspace"),
         "memory_store_name": "drift-pin-other-store",
         "model": "drift-pin-other-model",
+        "reasoning_effort": "high",
         "resolved_alias": "drift-pin-other-alias",
         "requested_resolved": False,
         "selection_kind": "template",

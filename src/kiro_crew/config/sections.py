@@ -4156,7 +4156,9 @@ class ResolvedBindings:
         fields by hand (the dashboard's slot agent-conflict guard uses this to
         decide whether two different NAMES may share a slot). Compares every
         field that changes what answers a turn — the kiro agent, workspace,
-        memory store, and model — and deliberately not ``resolved_alias``
+        memory store, model, and the crew's pinned reasoning effort (applied at
+        spawn like the model, so two names differing only there run turns at
+        different depth) — and deliberately not ``resolved_alias``
         (two names resolving to one alias's target ARE the same binding) or
         ``selection_kind`` (the namespace is retained separately for later
         resolution; identical current targets may still share a slot) or
@@ -4172,6 +4174,7 @@ class ResolvedBindings:
             and self.workspace_dir == other.workspace_dir
             and self.memory_store_name == other.memory_store_name
             and self.model == other.model
+            and self.reasoning_effort == other.reasoning_effort
         )
 
 
