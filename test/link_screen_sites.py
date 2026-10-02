@@ -121,6 +121,7 @@ DECLARED_SITES = frozenset(
         ("history_projection.py", "SessionMetadataProjection.delete_session"),
         ("hooks.py", "_screen_windows_links"),
         ("image_artifacts.py", "_local_file"),
+        ("ledger_wake.py", "note_wake"),
         ("mcp_gateway/backend_tmp.py", "_discard_owner_marker"),
         ("mcp_gateway/backend_tmp.py", "record_owner"),
         ("mcp_gateway/backend_tmp.py", "sweep_all_backend_tmp"),

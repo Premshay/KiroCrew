@@ -88,6 +88,10 @@ _ANSWERS: dict[str, str] = {
     "timeline": "The ordered moments of the session, and how many were dropped",
     "tools": ("Which tools ran, how often, for how long, how many errored, and what is still open"),
     "approvals": "What was requested, what was decided, and what is still pending",
+    "subagents": (
+        "Which children this session dispatched, and for each one what happened, how "
+        "long it ran and what it cost"
+    ),
     "class": "What KIND of session this log belongs to, over the log's whole life",
     "ledger": (
         "One workstream's goal, phase and next step, what was tried and rejected, and "
@@ -160,8 +164,14 @@ def catalogue() -> dict[str, Any]:
                 # reports a part as the whole.
                 "mode": "session" if name in proj.SESSION_FOLD_NAMES else "slot",
                 "advertised": name not in proj.INTERNAL_PROJECTION_NAMES,
-                # ``None`` means every entry moves this fold.
-                "affects": None if fold.affects is None else sorted(fold.affects),
+                # ``None`` means every entry moves this fold -- whether the registry
+                # leaves ``affects`` unset or spells out the whole vocabulary, which is
+                # how ``status`` and ``class`` declare it.
+                "affects": (
+                    None
+                    if fold.affects is None or fold.affects >= proj.KNOWN_TYPES
+                    else sorted(fold.affects)
+                ),
                 "answers": _ANSWERS[name],
                 "fields": _field_rows(name),
             }

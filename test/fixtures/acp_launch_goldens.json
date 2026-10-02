@@ -25,6 +25,7 @@
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
       "KIROCREW_SCRATCH": "<scratch>",
       "KIROCREW_SPAWNED": "1",
+      "KIROCREW_SPAWN_HOME": "<data-home>",
       "KIROCREW_SPAWN_INSTANCE": "<spawn-instance>",
       "KIRO_CHAT_LOG_FILE": "<scratch-log>",
       "PATH": "<augmented-path>",

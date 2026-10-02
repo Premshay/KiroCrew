@@ -204,8 +204,8 @@ def _state_digest(state: dict[str, Any]) -> str:
 #: so retiring its savepoints costs a cold fold to that fold alone.
 _FOLD_STATE_PINS: dict[str, tuple[str, int]] = {
     "status": ("929af8634f6d6a5f", 4),
-    "usage": ("fca1ed719ebf34fc", 4),
-    "timeline": ("72b9531063943783", 4),
+    "usage": ("d59ec4857f0f69ba", 13),
+    "timeline": ("4f461179faff39a3", 5),
     "tools": ("008b36fed498d32b", 4),
     "approvals": ("c9db629215cc2620", 4),
     "subagents": ("c4930a44d9ee6cc6", 6),

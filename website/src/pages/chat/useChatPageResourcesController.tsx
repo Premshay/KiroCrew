@@ -51,6 +51,7 @@ import type { ResizeInfo } from '../../utils/resizeImage'
 import { errMessage } from '../../utils/thunkError'
 import { fileLandingSlot } from '../../utils/uploadRouting'
 import { usePanelDocumentActions } from '../../hooks/usePanelDocumentActions'
+import { fetchDashboardConfig } from '../../api/dashboardConfigQuery'
 
 type MutableRef<T> = { current: T }
 
@@ -160,11 +161,18 @@ export function useChatPageResourcesController({
   // on each tick. Instead the WS 'slots' push carries the allowlist generation
   // (see useWebSocket), which invalidates this query only when the allowlist
   // actually changes — an edit on disk still propagates, without the churn.
-  const { data: sourceHostCfg } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[] }>({
+  const { data: sourceHostCfg, error: sourceHostError, errorUpdatedAt: sourceHostErrorAt } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[] }>({
     queryKey: ['dashboardConfig'],
-    queryFn: () => api.dashboardConfig(),
+    queryFn: fetchDashboardConfig,
     staleTime: 30_000,
   })
+  // A failed read leaves self-hosted source chips inert, so say so -- once
+  // per failure (keyed on errorUpdatedAt), not on every re-render.
+  useEffect(() => {
+    if (!sourceHostErrorAt || !sourceHostError) return
+    showActionError(i18nT('pages.chatPage.source_hosts_failed_reason', { reason: errMessage(sourceHostError) || i18nT('pages.chatPage.unknown_error') }))
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one notice per failure
+  }, [sourceHostErrorAt])
   const sourceHosts = sourceHostCfg?.gitlab_hosts ?? []
   const jiraSourceHosts = sourceHostCfg?.jira_hosts ?? []
   // Operator link rules (dashboard.link_patterns) are registered into the
@@ -536,7 +544,7 @@ export function useChatPageResourcesController({
       window.dispatchEvent(new CustomEvent('kirocrew-file-open', {
         detail: { path: filePath, before: original, after: modified },
       }))
-    } catch { /* ignore */ }
+    } catch { /* the IDE bridge is optional; the dashboard path below still runs */ }
     if ((window as unknown as { __kirocrewPluginHandlesFiles?: boolean }).__kirocrewPluginHandlesFiles) return
     // Brand-new file (no prior content): a diff would render as one big green
     // all-additions block, which hurts readability. Open the normal readable

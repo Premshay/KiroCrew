@@ -356,7 +356,8 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
     # entirely on any surface where that signal never arrives, and no
     # allowance at all lets a watch go silent while holding half-finished
     # work. Costing one turn per wake is the cheap failure.
-    if monitor.followup_ticks > 0 and not monitor.terminal_pending:
+    pushed = loop.id in (getattr(self, "_pushed_running", None) or ())
+    if monitor.followup_ticks > 0 and not monitor.terminal_pending and not pushed:
         # NOT while a terminal turn is owed. The allowance exists to protect work
         # already in progress, which is why it skips observation -- but a subject
         # with terminal debt is FINISHED, so there is no in-progress work to
@@ -366,11 +367,22 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
         # bypass jumped straight over it and the retried delivery settled a
         # terminal state that had ended. Re-observing costs one probe call on
         # a path that is already firing a turn.
+        #
+        # NOT on a tick a worker's push brought forward either. The allowance is the
+        # loop's own second turn, owed on its cadence; a push landing right after a wake
+        # would otherwise arrive on it and buy a turn without the ledger being read --
+        # a worker's close after its ``done`` report would buy exactly that. Such a tick is
+        # observed like any other and wakes only for an observation the delivered turn
+        # did not already carry; the allowance stays for the next scheduled tick.
         monitor.followup_ticks -= 1
         self._persist_soon()
         logger.debug("AutoNudge: loop %s spending a post-wake follow-up tick", loop.id)
         return False
-    probe = probes.build(monitor.kind)
+    probe = probes.build(
+        monitor.kind,
+        worker_running=self._worker_running,
+        worker_closed=self._worker_closed,
+    )
     if probe is None:
         return False
     # Derive the probe's config from the LOOP'S OWN STRINGS -- its judge brief's
@@ -513,7 +525,18 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
     # the single decision an owner cannot recover by waiting, so it is taken from
     # a typed fact, by the layer that can act on it.
     observation = _pr_observation_of(probe)
-    terminal = observation is not None and observation.is_terminal
+    # Two kinds reach terminal by two channels and BOTH end the watch here. The
+    # gh-pr fetcher exposes its finish as a ``probe.observation`` this reads via
+    # ``_pr_observation_of``; the work-ledger probe exposes none and instead lets
+    # the kernel attribute a ``Severity.TERMINAL`` observation, which surfaces as
+    # ``verdict.outcome is TERMINAL``. Gating on the observation alone left a
+    # settled work-ledger loop with ``terminal`` false forever, so it never
+    # deactivated and polled its own finished ledger on every interval. The
+    # disjunct honours the kernel's typed terminal for the observation-less kind
+    # without disturbing the gh-pr path, whose observation still decides it.
+    terminal = (
+        observation is not None and observation.is_terminal
+    ) or verdict.outcome is irq.Outcome.TERMINAL
     #: Whether the reading published this tick says the same thing as the previous
     #: one. Only the publish below can answer it, and only while the previous
     #: reading is still stored, so it is carried from there rather than recomputed.
@@ -590,6 +613,17 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
         # than out of delivered prose, which would break the first time that
         # wording is edited.
         merged = observation is not None and observation.merged
+        # The probe distinguishes the two, so this reads its KEYS rather than its
+        # prose, which would break the first time that wording is edited. No
+        # key at all (an unusable target) is also not a success. The gh-pr probe
+        # is a FETCHER: its ``observe`` returns ``observations=[]``, so the kernel
+        # never attributes a TERMINAL key on that path and ``verdict.keys`` is
+        # empty for a pull request. ``merged`` is that kind's own success signal
+        # and must stand alongside the keys, or a merged pull request records as
+        # blocked. The disjunct cannot fire spuriously for gh-pr (its key set is
+        # always empty) and cannot fire for a rejected work ledger (``merged`` is
+        # only ever true for a pull request).
+        succeeded = merged or probes.terminal_succeeded(verdict.keys)
         # EVERY field this transition writes has to be in here. The loop's own
         # ``stopped_reason`` is written alongside the monitor's, and leaving it
         # out of the rollback left a live loop tagged as terminated -- which the
@@ -635,7 +669,7 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
         # as finished and refused revival.
         if is_channel_key(loop.slot_key):
             if not monitor.terminal_pending:
-                monitor.terminal_pending = "success" if merged else "blocked"
+                monitor.terminal_pending = "success" if succeeded else "blocked"
                 try:
                     # Same writer as the settlements, for the same reason: a
                     # cancelled ``_persist_locked`` releases ``_lock`` mid-write.
@@ -672,7 +706,7 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
                     loop.id,
                 )
                 return False
-            monitor.outcome = MonitorOutcome.SUCCESS if merged else MonitorOutcome.BLOCKED
+            monitor.outcome = MonitorOutcome.SUCCESS if succeeded else MonitorOutcome.BLOCKED
             monitor.stopped_reason = MONITOR_TERMINAL_REASON
             monitor.stopped_at = time.time()
             loop.stopped_reason = MONITOR_TERMINAL_REASON
@@ -973,7 +1007,11 @@ async def _terminal_still_holds(
     each new piece of per-loop state, so re-asking is the cheaper way to answer.
     """
     target = loop_subject(loop)
-    probe = probes.build(monitor.kind)
+    probe = probes.build(
+        monitor.kind,
+        worker_running=self._worker_running,
+        worker_closed=self._worker_closed,
+    )
     if target is None or probe is None:
         # Cannot re-check, so cannot confirm. Keep the loop alive.
         return False
@@ -984,7 +1022,7 @@ async def _terminal_still_holds(
     # re-read consume the tick's credit for the consecutive-failure backstop.
     identity = f"{loop.id}:{target.host_key}:terminal-recheck"
     try:
-        await asyncio.get_running_loop().run_in_executor(
+        verdict = await asyncio.get_running_loop().run_in_executor(
             None, lambda: irq.poll(identity, target.message, probe)
         )
     except Exception:
@@ -996,7 +1034,29 @@ async def _terminal_still_holds(
         )
         return False
     observation = _pr_observation_of(probe)
-    if observation is None or not observation.is_terminal:
+    if observation is None:
+        # The observation-less kind (work-ledger). Its terminal is NOT a
+        # ``probe.observation`` -- the kernel attributes a ``Severity.TERMINAL``
+        # observation that surfaces as ``verdict.outcome is TERMINAL`` with the
+        # finish classified in ``verdict.keys``. Classifying from the discarded
+        # verdict mirrors the tick's own disjunct (``gate.py`` terminal branch)
+        # and the merged-versus-closed rule, so a settled channel work-ledger
+        # loop confirms its owed terminal here instead of returning False
+        # forever and redelivering the terminal turn every interval.
+        if verdict.outcome is not irq.Outcome.TERMINAL:
+            return False
+        fresh = "success" if probes.terminal_succeeded(verdict.keys) else "blocked"
+        if fresh != monitor.terminal_pending:
+            logger.info(
+                "AutoNudge: loop %s owed a %s settlement but now observes %s -- "
+                "dropping the owed one rather than announcing the wrong ending",
+                loop.id,
+                monitor.terminal_pending,
+                fresh,
+            )
+            return False
+        return True
+    if not observation.is_terminal:
         return False
     fresh = "success" if observation.merged else "blocked"
     if fresh != monitor.terminal_pending:

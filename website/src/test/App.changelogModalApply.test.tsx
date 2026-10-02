@@ -39,12 +39,13 @@ vi.mock('../components/MarkdownRenderer', () => ({ default: ({ content }: { cont
 // `statusOverride` is mutable on purpose: the /api/status fetch lands AFTER mount
 // and writes the same slice the preloaded state seeds, so a fixed fetch payload
 // silently clobbers whatever a test set up and every case would test one shape.
-const { COMMAND, statusOverride, armUpdate, armStatus, setAutoUpdate } = vi.hoisted(() => ({
+const { COMMAND, statusOverride, armUpdate, armStatus, setAutoUpdate, kirocrewConfig } = vi.hoisted(() => ({
   COMMAND: 'python3 -m pip install --upgrade kiro-crew',
   statusOverride: { value: {} as Record<string, unknown> },
   armUpdate: vi.fn(),
   armStatus: vi.fn(),
   setAutoUpdate: vi.fn(),
+  kirocrewConfig: vi.fn(),
 }))
 
 vi.mock('../api/client', () => ({
@@ -70,6 +71,7 @@ vi.mock('../api/client', () => ({
     listInstances: vi.fn().mockResolvedValue({ instances: [], warm_set_cap: 5 }),
     changelog: vi.fn().mockResolvedValue({ content: '## [0.2.0rc9]\n- a new entry\n' }),
     setAutoUpdate,
+    kirocrewConfig,
     armUpdate,
     armStatus,
   },
@@ -128,6 +130,10 @@ describe('changelog modal apply affordance', () => {
     armStatus.mockReset()
     setAutoUpdate.mockReset()
     setAutoUpdate.mockResolvedValue({})
+    // No config by default, so the other cases keep the shell they were written
+    // against; the auto-update seeding case supplies one.
+    kirocrewConfig.mockReset()
+    kirocrewConfig.mockRejectedValue(new Error('no config in this test'))
     armStatus.mockResolvedValue({
       armed: true, expires_in: 590, approve_command: 'kirocrew update approve',
     })
@@ -216,6 +222,44 @@ describe('changelog modal apply affordance', () => {
 
     expect(await screen.findByText('zzq save refused')).toBeInTheDocument()
     expect(toggle).toHaveAttribute('aria-checked', 'true')
+  })
+
+  it('shows the saved auto-update OFF when the modal opens by itself', async () => {
+    // The modal opens on mount (last-seen version differs). The toggle must show
+    // the saved config value, not its `true` starting guess.
+    kirocrewConfig.mockResolvedValue({ auto_update: false })
+    renderWithProviders(<App />, { route: '/chat', preloadedState: wheelState() })
+
+    const toggle = await screen.findByRole('switch', { name: i18nT('app.auto_update_on_restart') })
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'false'))
+    expect(setAutoUpdate).not.toHaveBeenCalled()
+  })
+
+  it('keeps a click made while the saved setting is still being read', async () => {
+    let answer: (v: unknown) => void = () => {}
+    kirocrewConfig.mockImplementation(() => new Promise(resolve => { answer = resolve }))
+    renderWithProviders(<App />, { route: '/chat', preloadedState: wheelState() })
+
+    const toggle = await screen.findByRole('switch', { name: i18nT('app.auto_update_on_restart') })
+    fireEvent.click(toggle)
+    await waitFor(() => expect(setAutoUpdate).toHaveBeenCalledWith(false))
+    answer({ auto_update: true })
+    await waitFor(() => expect(kirocrewConfig).toHaveBeenCalled())
+    await new Promise(r => setTimeout(r, 50))
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it('applies the saved setting that lands after a click whose save failed', async () => {
+    let answer: (v: unknown) => void = () => {}
+    kirocrewConfig.mockImplementation(() => new Promise(resolve => { answer = resolve }))
+    setAutoUpdate.mockRejectedValueOnce(new Error('zzq save refused'))
+    renderWithProviders(<App />, { route: '/chat', preloadedState: wheelState() })
+
+    const toggle = await screen.findByRole('switch', { name: i18nT('app.auto_update_on_restart') })
+    fireEvent.click(toggle)
+    expect(await screen.findByText('zzq save refused')).toBeInTheDocument()
+    answer({ auto_update: false })
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'false'))
   })
 
   it('offers nothing to click when there is no verdict yet', async () => {

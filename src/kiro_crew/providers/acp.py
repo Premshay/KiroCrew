@@ -22,7 +22,7 @@ from kiro_crew.acp.client import (
     advertised_model_ids,
     catalog_row_would_drop,
     model_is_unusable,
-    resolve_pin_spelling,
+    resolve_pin_spelling_on,
     sandbox_init_failure_for_runtime,
 )
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeError
@@ -1451,11 +1451,17 @@ class AcpProvider(LLMProvider):
                     # A literal miss can be a stale `<namespace>::` qualifier on a
                     # model the backend fully serves: resolve to the advertised
                     # spelling and send THAT — same fold the display verdict uses,
-                    # so chip and wire agree. Try the fold FIRST, against the
-                    # snapshot we already have: a qualifier-only miss resolves
-                    # here with no wire traffic and must not pay a throwaway
-                    # session/new on every cold start.
-                    _send_model = resolve_pin_spelling(configured_model, _advertised)
+                    # so chip and wire agree. It can also be a BARE pin on a harness
+                    # that advertises only ``<model>[<effort>]`` rows while its
+                    # ``model`` option takes the bare id, and the backend-aware
+                    # resolver answers that with the model the operator pinned,
+                    # leaving the adapter to own the effort. Try the fold FIRST,
+                    # against the snapshot we already have: a qualifier-only miss
+                    # resolves here with no wire traffic and must not pay a
+                    # throwaway session/new on every cold start.
+                    _send_model = resolve_pin_spelling_on(
+                        configured_model, _advertised, backend=self._client.backend
+                    )
                     if not _send_model:
                         # The fold found nothing, so this looks like a genuine
                         # miss — but the snapshot was captured seconds ago at
@@ -1481,7 +1487,9 @@ class AcpProvider(LLMProvider):
                         except Exception:
                             pass
                         if model_is_unusable(configured_model, _advertised):
-                            _send_model = resolve_pin_spelling(configured_model, _advertised)
+                            _send_model = resolve_pin_spelling_on(
+                                configured_model, _advertised, backend=self._client.backend
+                            )
                         else:
                             _send_model = configured_model
                 if not _send_model and not _foreign_scope:
@@ -2665,12 +2673,13 @@ class AcpProvider(LLMProvider):
             # over by the time anyone reaches this method. claude-agent-acp
             # compacts natively in-prompt; opencode serves ``/compact`` out of
             # its prompt handler
-            # (``test/fixtures/acp_frames/opencode/compact-live.jsonl``). Neither
-            # emits a compaction status, so the queue wait below has nothing to
-            # receive and would spend the whole ``COMPACT_WAIT_TIMEOUT_SECS``
-            # proving it. The set has exactly those two members -- pi and goose
-            # look the same in their own source and are absent for want of a
-            # driven capture, which is recorded on ``ACP_BACKENDS_COMPACT``.
+            # (``test/fixtures/acp_frames/opencode/compact-live.jsonl``), and goose
+            # does the same (``test/fixtures/acp_frames/goose/compact-live.jsonl``).
+            # None of them emits a compaction status, so the queue wait below has
+            # nothing to receive and would spend the whole
+            # ``COMPACT_WAIT_TIMEOUT_SECS`` proving it. pi looks the same in its own
+            # source and is absent for want of a driven capture, which is recorded
+            # on ``ACP_BACKENDS_COMPACT``.
             #
             # HERE rather than in ``compact()``, because this is the one method
             # BOTH routes to a compaction reach. ``compact()`` covers the
@@ -2731,6 +2740,12 @@ class AcpProvider(LLMProvider):
     def has_active_turn(self) -> bool:
         """True if a prompt is in flight (and not yet cancelled) on the client."""
         return bool(self._client) and self._client.has_active_turn()
+
+    def background_launch(self) -> tuple[float, str] | None:
+        """The client's newest background launch, or ``None`` (see base)."""
+        if not self._client:
+            return None
+        return self._client.background_launch()
 
     def has_unfinished_turn(self) -> bool:
         """True if the client reports a native turn that has NOT reached its

@@ -1381,6 +1381,21 @@ async def _steer_policy_notice(
     return True
 
 
+async def _reject_attributed(client: Any, request_id: Any, *, attribution: str) -> None:
+    """Answer a permission request with a rejection whose attribution is stated.
+
+    kiro-cli tells the model "User denied tool execution" for EVERY rejection,
+    which is false for a host deny. Outside the ``_reject_*`` helpers above,
+    every answer site in this module goes through here and must say how the
+    model learns the real cause: ``"steered"`` when a ``_steer_policy_notice``
+    precedes this answer on every path, or ``"exempt: <why>"`` when the generic
+    message is TRUE on the path left unsteered (a provenance-gated steer names
+    the branch it leaves alone). Keyword-only and required, so a new site that
+    omits it is a mypy error; test_refusal_inband_notice.py checks the value.
+    """
+    await client.reject_tool(request_id)
+
+
 async def _reject_hook_blocked(
     client: Any,
     slot: Any,
@@ -3331,8 +3346,13 @@ def _attach_turn_stats(
     cost_usd: float,
     turn_boundary: int = 0,
     model: str = "",
-) -> None:
+    ttft_ms: int = 0,
+) -> bool:
     """Attach per-turn stats to the last assistant message's meta.
+
+    Returns whether a row received them, so a caller can tell a saved row from
+    a turn that had none (a denied tool with no text), whose recovery still has
+    to save it.
 
     Mirrors ``_flush_file_changes``: the meta lands on the in-memory message
     BEFORE ``_save_slot_to_history`` persists it, and reaches the live UI via
@@ -3344,8 +3364,11 @@ def _attach_turn_stats(
     this turn (``read_turn_model``): a concrete id on a pinned session, or the
     bare ``"auto"`` when the turn was handed to Auto and the backend disclosed
     no id for it — Auto's per-turn choice is not on the ACP wire, so ``"auto"``
-    is the whole of what can be said truthfully. Zero/empty fields are omitted
-    so the frontend renders only what the provider actually reported.
+    is the whole of what can be said truthfully. ``ttft_ms`` is the turn's
+    dispatch to first broadcast output latency (``_FirstVisibleClock``; queue
+    wait excluded), stored so it is readable without telemetry on.
+    Zero/empty fields are omitted so the frontend renders only what the
+    provider actually reported.
 
     ``turn_boundary`` is ``len(slot.messages)`` captured at turn start: only
     messages appended DURING this turn are candidates. Without it, an
@@ -3355,7 +3378,7 @@ def _attach_turn_stats(
     message or when there is nothing to show.
     """
     if elapsed_ms <= 0:
-        return
+        return False
     stats: dict[str, Any] = {"elapsed_ms": int(elapsed_ms)}
     if credits > 0:
         stats["credits"] = round(credits, 4)
@@ -3363,11 +3386,14 @@ def _attach_turn_stats(
         stats["cost_usd"] = round(cost_usd, 6)
     if model:
         stats["model"] = model
+    if ttft_ms > 0:
+        stats["ttft_ms"] = int(ttft_ms)
     boundary = max(0, turn_boundary)
     for m in reversed(slot.messages[boundary:]):
         if m.get("role") == "assistant":
             m.setdefault("meta", {})["turn_stats"] = stats
-            break
+            return True
+    return False
 
 
 def _mcp_server_name_is_ambiguous(server_name: str, safe_name: str) -> bool:
@@ -10976,6 +11002,62 @@ async def _finish_queue_cycle(
     summary_task.add_done_callback(state._background_tasks.discard)
 
 
+class _FirstVisibleClock:
+    """Turn dispatch -> first output that actually reaches the wire, in ms.
+
+    Starts where ``kirocrew.chat.first_token.duration`` starts, when
+    ``_run_chat`` begins the turn. A message sent while the slot is busy is
+    dispatched when the queue drains, so its wait in the queue is NOT counted:
+    that wait is set by the length of the turn ahead of it, not by this turn's
+    own path, and the value exists to measure the path.
+
+    Stops on the first NON-EMPTY broadcast, not on chunk receipt: the stream
+    redactors can withhold a whole first chunk until a later chunk or a flush,
+    so the receipt time would understate what the user waited. ``t0`` None
+    (a synthetic or nested prompt) never measures, leaving ``ms`` at 0.
+    ``clock`` must be the same clock ``t0`` was read from.
+    """
+
+    def __init__(self, t0: float | None, clock: Callable[[], float] = time.monotonic) -> None:
+        self._t0 = t0
+        self._clock = clock
+        self.ms = 0
+
+    def mark(self, wire: str) -> None:
+        if wire and self._t0 is not None:
+            self.ms = int((self._clock() - self._t0) * 1000.0)
+            self._t0 = None
+
+
+def _turn_clock(
+    slot: "_ChatSlot", t0: float | None, *, top_level: bool, recovery_turn: bool
+) -> _FirstVisibleClock:
+    """The first-token clock a top-level turn measures with.
+
+    Every top-level turn that does not reuse a clock stores the clock it
+    starts on the slot. A recovery turn of any rung (a replay, a
+    continuation, a requeue of either) skips its stats until one of them
+    saves the row, and it starts no clock of its own. So it reuses the slot's
+    clock object. If that clock already stopped, it keeps its reading. If it
+    never saw output (a tool-only turn), it is still running from the user
+    turn's start and stops at the recovery's first broadcast.
+
+    The stored clock is replaced when the next non-recovery turn starts, and
+    cleared when a top-level turn's stats actually land on a row (a turn with
+    no assistant row keeps it for its recovery). Every recovery turn
+    descends from the last non-recovery turn, so a reused clock always
+    belongs to the episode it is attached to. Nested prompts neither read nor
+    store it.
+    """
+    if not top_level:
+        return _FirstVisibleClock(t0)
+    if recovery_turn and slot._carried_ttft_clock is not None:
+        return slot._carried_ttft_clock
+    clock = _FirstVisibleClock(t0)
+    slot._carried_ttft_clock = clock
+    return clock
+
+
 def _emit_ttft_metric(t0: float, session_key: str, *, is_new: bool, resumed: bool) -> None:
     """Emit the user-message → first-visible-token latency histogram.
 
@@ -11573,6 +11655,22 @@ async def _run_chat(
     # synthetic payloads and nested prompts are runner-authored, and mixing
     # them in would skew the distribution the feature is judged by.
     _ttft_t0 = time.monotonic() if (_prompt_depth == 0 and not _synthetic_payload) else None
+    # Persisted twin of the clock above (same start, so queue wait is excluded),
+    # stopped at the first broadcast rather than at chunk receipt. A recovery
+    # turn may re-send the ORIGINAL payload, so ``_ttft_t0`` is live for the
+    # histogram, but the user message it would time from is the earlier turn's:
+    # it gets no start of its own and either reuses the carried clock or
+    # stores nothing.
+    _ttft_visible = _turn_clock(
+        slot,
+        None if _synthetic_recovery_turn else _ttft_t0,
+        top_level=_prompt_depth == 0,
+        recovery_turn=_synthetic_recovery_turn,
+    )
+    # Set when a steer cut persists text quietly (no frame): that text becomes
+    # visible only with the turn-end ``chat_done`` refresh, so the clock stops
+    # there unless a later broadcast stops it first.
+    _ttft_quiet_text = False
 
     # Inherit Slack link: if this dashboard session mirrors a Slack thread,
     # copy the link so every exit path, including an auth failure, can reply on
@@ -11826,6 +11924,7 @@ async def _run_chat(
         wire = _wsred.flush()
         if not wire:
             return
+        _ttft_visible.mark(wire)
         chunk_seq += 1
         slot._chunk_seq = chunk_seq
         # The window row carries the same seq (and process generation) as the
@@ -11858,6 +11957,7 @@ async def _run_chat(
             return
         wire = _thinkred.flush()
         if wire:
+            _ttft_visible.mark(wire)
             state.broadcast_ws("chat_thinking", {"slot": slot.key, "content": wire})
 
     def _steer_segment_cut() -> None:
@@ -11882,7 +11982,7 @@ async def _run_chat(
         Sync on purpose — the handler and this turn share the event loop, so
         the flush cannot interleave with chunk processing.
         """
-        nonlocal assistant_text, _produced_visible_output
+        nonlocal assistant_text, _produced_visible_output, _ttft_quiet_text
         # Drop the wire redactor's withheld tail instead of emitting it: a
         # chat_chunk broadcast here would arrive AFTER the clients froze their
         # streaming message at the steer boundary, opening a phantom streaming
@@ -11898,6 +11998,10 @@ async def _run_chat(
         # `_flush_thinking_stream`.
         _thinkred.reset()
         if assistant_text.strip():
+            # The persisted row may hold text the redactor never broadcast (a
+            # fully withheld first chunk). It is published quietly, so it is
+            # timed at the turn-end refresh, not here.
+            _ttft_quiet_text = True
             # quiet_persist: the clients already hold this text in their
             # frozen (pre-steer) message; the append's chat_message broadcast
             # would render a duplicate copy below the steer bubble.
@@ -14940,15 +15044,15 @@ async def _run_chat(
         # this path reads is the value the refusal branch already recorded against.
         # Recomputing it here would be the same expression twice.
 
-        # Append-only the session's log: what the request was configured as, what
-        # the gateway put in front of the model, and the body it accepted. All
-        # three name ``_crew_log_turn_no``, the one ordinal every entry of this
-        # turn uses, and all three are written BEFORE the dispatch gates below --
-        # so a refused turn still shows what was asked and what it would have
-        # cost, which is exactly the turn a reader most needs explained.
-        # The accepted input first, then the two facts DERIVED from it. Context is
-        # composed from this message, so a fold that read the composition first
-        # would see a derived fact before its cause.
+        # Append-only the session's log: the body the gateway accepted. This names
+        # ``_crew_log_turn_no``, the one ordinal every entry of this turn uses, and
+        # is written BEFORE the dispatch gates below -- so even a refused turn still
+        # shows what was asked, which is exactly the turn a reader most needs
+        # explained. The two facts DERIVED from this request (``request/configured``
+        # and ``context/composed``) are NOT written here: they are emitted past the
+        # gates (see the block below where ``on_request_configured`` /
+        # ``on_context_composed`` are called), because a refused dispatch assembled a
+        # prompt nothing ever saw and must not publish a composition for it.
         crew_log_emit.on_message_received(
             _crew_log_sid,
             _crew_log_turn_no,
@@ -14957,19 +15061,6 @@ async def _run_chat(
             source=telemetry_channel_of(session_key),
             attachments=_attachments,
         )
-        crew_log_emit.on_request_configured(
-            _crew_log_sid,
-            _crew_log_turn_no,
-            model=_crew_log_model(slot, slot.model or agent_model),
-            provider=provider_name,
-            context_window=read_context_tokens(client)[1],
-        )
-        crew_log_emit.on_context_composed(
-            _crew_log_sid,
-            _crew_log_turn_no,
-            blocks=slot_ctx_blocks,
-        )
-
         # Lease-dispatch race gate: this session's semaphore lease
         # was taken by get_or_create above, but the provider turn only opens on
         # the first stream iteration below. If a gateway restart / Make-Live
@@ -15075,6 +15166,37 @@ async def _run_chat(
         # stop-generation read above and the stream's turn registration below --
         # the emitter hands the write to its own thread and returns -- so the
         # atomic span those two gates rely on is unchanged.
+        #
+        # The two request facts are emitted HERE for the same reason, and not where the
+        # prompt is assembled further up. ``context/composed`` states what the gateway
+        # PUT IN FRONT OF THE MODEL, so a refused dispatch must not write one: the
+        # prompt was built, but nothing ever saw it. Written before the gates, every
+        # refusal left a composition the ``usage`` fold published as a per-turn row, and
+        # the Context chart drew a bar for a turn that never ran -- with no way to
+        # retract it, since ``USAGE_TYPES`` carries no ``turn/refused``. The earlier
+        # expansion gate already states this contract for itself ("the contract on a
+        # refusal is the accepted input plus the refusal, not facts derived from a
+        # request that was never assembled"); these two writes now honour it at the
+        # later gates too. The previous guard was the completion-gated row store, which
+        # only ever wrote a composition for a turn that finished.
+        #
+        # ``request/configured`` stays immediately ahead of ``context/composed``: the
+        # fold reads the configured window from it to stamp each composition row, so the
+        # order between these two is load-bearing even though their order against
+        # ``turn/started`` is not. Neither adds a suspension point, for the reason above.
+        crew_log_emit.on_request_configured(
+            _crew_log_sid,
+            _crew_log_turn_no,
+            model=_crew_log_model(slot, slot.model or agent_model),
+            provider=provider_name,
+            context_window=read_context_tokens(client)[1],
+        )
+        crew_log_emit.on_context_composed(
+            _crew_log_sid,
+            _crew_log_turn_no,
+            blocks=slot_ctx_blocks,
+            phase=slot_ctx_phase,
+        )
         crew_log_emit.on_turn_started(
             _crew_log_sid,
             _crew_log_turn_no,
@@ -15292,6 +15414,7 @@ async def _run_chat(
                 # accumulates the full text for the authoritative final redaction.
                 wire = _wsred.feed(event.text)
                 if wire:
+                    _ttft_visible.mark(wire)
                     chunk_seq += 1
                     slot._chunk_seq = chunk_seq
                     # Same seq and generation on the window row as on the wire
@@ -15319,6 +15442,7 @@ async def _run_chat(
                 # thinking phase ends or the turn completes.
                 wire = _thinkred.feed(event.text)
                 if wire:
+                    _ttft_visible.mark(wire)
                     state.broadcast_ws(
                         "chat_thinking",
                         {"slot": slot.key, "content": wire},
@@ -16654,7 +16778,7 @@ async def _run_chat(
                         await _steer_policy_notice(
                             client, _deny_title, _deny_msg, _refusal_notices, slot, state
                         )
-                        await client.reject_tool(event.request_id)
+                        await _reject_attributed(client, event.request_id, attribution="steered")
                         slot.append(
                             "tool",
                             f"🚫 {_deny_title} — {_deny_msg}",
@@ -17398,7 +17522,7 @@ async def _run_chat(
                             [],
                             cause=DENY_CAUSE_BATCH_CASCADE,
                         )
-                    # deny-notice-exempt: user-originated cascade. When the
+                    # User-originated cascade. When the
                     # person themselves denied the tool that started this
                     # cascade, that refusal covers the group they refused, so
                     # kiro-cli's "User denied tool execution" is the TRUE
@@ -17406,7 +17530,9 @@ async def _run_chat(
                     # host notice would re-attribute the user's own decision.
                     # Host-caused cascades are corrected by the
                     # provenance-gated steer above.
-                    await client.reject_tool(event.request_id)
+                    await _reject_attributed(
+                        client, event.request_id, attribution="exempt: user-originated cascade"
+                    )
                     slot.append(
                         "tool", f"🚫 {_title} (rejected)", "msg msg-tool", meta=_tool_meta(event)
                     )
@@ -18093,7 +18219,7 @@ async def _run_chat(
                             [],
                             cause=_host_deny_cause,
                         )
-                    # deny-notice-exempt: interactive user denial. The person
+                    # Interactive user denial. The person
                     # clicked Reject (or "reject once"), so kiro-cli's "User
                     # denied tool execution" is the true and correct attribution
                     # here — the sharpest case in the class, because steering a
@@ -18103,7 +18229,9 @@ async def _run_chat(
                     # above never fires for it and this exemption stays true for
                     # exactly the branch it covers; the host auto-declines are
                     # that steer's job, not this marker's.
-                    await client.reject_tool(event.request_id)
+                    await _reject_attributed(
+                        client, event.request_id, attribution="exempt: interactive user denial"
+                    )
                     if _safety_reason:
                         _reject_label = f"🚫 {_safe_reject_title} (cancelled — {_safety_reason})"
                     elif outcome == "rejected_once":
@@ -18754,6 +18882,17 @@ async def _run_chat(
                 # write anyway.
                 _provider_name = capabilities_of(client).provider_seam
                 _record_model = slot.model
+                # Occupancy is read ABOVE the billing gate, beside the other locals
+                # the turn closer needs. Two reasons, and either alone decides it:
+                # the closer runs for EVERY completed turn, so a name bound only
+                # inside the gate is unbound on a turn that billed nothing (a fake
+                # backend, an unmetered provider) and the completion path raises;
+                # and occupancy is not a billing quantity -- a turn that costs
+                # nothing still filled the window, so gating the read would drop a
+                # real measurement for the turns least likely to have one recorded
+                # elsewhere. `read_context_tokens` never raises and answers (0, 0)
+                # for a provider without the accessors.
+                _ctx_used, _ctx_window = read_context_tokens(client)
                 if slot._active_fallback_model or slot._refusal_fallback_primary:
                     # Either fallback mechanism active ⇒ the model that SERVED
                     # this turn is the provider's, not the pin; attribute usage
@@ -18794,10 +18933,6 @@ async def _run_chat(
                         if _canonical:
                             slot.model = _canonical
                             _record_model = _canonical
-                    # Read context-window occupancy off the same `client`
-                    # used above (mirrors _context_usage_payload's accessor
-                    # pattern); read_context_tokens never raises.
-                    _ctx_used, _ctx_window = read_context_tokens(client)
                     await persist_token_record_async(
                         slot.key,
                         _record_model,
@@ -18865,6 +19000,12 @@ async def _run_chat(
                     "model": _turn_model or _record_model,
                     "provider": _provider_name,
                     "depth": _prompt_depth,
+                    # The same occupancy reading the row store is given just above,
+                    # so the crew log and the row describe one turn's window
+                    # identically. It is the provider's own figure; the token counts
+                    # beside it are billing, which is a different quantity.
+                    "context_used": _ctx_used,
+                    "context_window": _ctx_window,
                 }
                 _emit_turn_metric(
                     event.usage.duration_ms,
@@ -20245,18 +20386,25 @@ async def _run_chat(
         # consumed credits vanish from the turn record. What it must NOT do is
         # record a
         # success or reset the retry budgets, which stays gated below.
+        if _ttft_quiet_text:
+            # Turn end: the chat_done refresh is what shows a quietly persisted
+            # steer segment. A no-op when a broadcast already stopped the clock.
+            _ttft_visible.mark("quiet")
         if not _retrying_empty:
             # Attach per-turn stats (elapsed / credits) to the last assistant
             # message so the footer can show them (parity with kiro-cli).
             # Scoped to this turn's messages via _turn_msg_boundary.
-            _attach_turn_stats(
+            _stats_attached = _attach_turn_stats(
                 slot,
                 _turn_elapsed_ms,
                 _turn_credits,
                 _turn_cost_usd,
                 turn_boundary=_turn_msg_boundary,
                 model=_turn_model,
+                ttft_ms=_ttft_visible.ms,
             )
+            if _prompt_depth == 0 and _stats_attached:
+                slot._carried_ttft_clock = None
             # Attach accumulated file changes to this turn's assistant row before persist
             _flush_file_changes(
                 slot, turn_boundary=_turn_msg_boundary, turn_start_mid=_turn_start_mid

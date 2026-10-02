@@ -9,6 +9,7 @@ import http.client
 import io
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -482,7 +483,97 @@ def _verified_loopback_gateway_pids(port: int) -> list[int]:
     return [pid]
 
 
-def _stop(cli_port: int | None = None) -> None:
+def _stop_expected_pid(port: int, expect_pid: int) -> None:
+    """SIGTERM ``expect_pid`` only while it is provably this home's gateway on ``port``.
+
+    Three facts are read here, immediately before the signal: ``expect_pid`` is
+    the sole listener on ``port``, it looks like a Kiro Crew gateway, and it is the
+    live holder of this home's ``gateway.lock``. A caller that identified a
+    gateway earlier names it by pid, so a listener that replaced it in between
+    -- another home's gateway, or a fresh one -- is refused instead of stopped.
+
+    The signal is pinned to the process those checks examined, not to its number:
+    a pidfd is opened before the checks and the signal goes through it, so a pid
+    recycled after the checks cannot receive it. Where no pidfd exists (macOS,
+    Windows) the stop refuses. Every refusal signals nothing and exits 1.
+    """
+
+    def refuse(reason: str, message: str) -> NoReturn:
+        sel().log_api_access(
+            caller="cli",
+            operation="gateway_stop",
+            outcome="denied",
+            source="cli",
+            resources=f"port={port} expect_pid={expect_pid} reason={reason}",
+        )
+        print(f"❌ {message} Not signalling anything.")
+        sys.exit(1)
+
+    def check_listener() -> None:
+        listeners = platform_compat.find_listening_pids(port)
+        if listeners != [expect_pid]:
+            shown = ", ".join(str(p) for p in listeners) or "nothing"
+            refuse(
+                "listener_mismatch",
+                f"Port {port} is held by {shown}, not by the expected pid {expect_pid}.",
+            )
+
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if platform_compat.IS_WINDOWS or pidfd_open is None or pidfd_send_signal is None:
+        refuse(
+            "unpinnable_platform",
+            "--expect-pid needs a pidfd (Linux) to pin the process it stops.",
+        )
+    if expect_pid <= 0:
+        refuse("invalid_pid", f"Pid {expect_pid} is not a process id.")
+    try:
+        pidfd = pidfd_open(expect_pid)
+    except ProcessLookupError:
+        refuse("process_already_exited", f"Pid {expect_pid} has already exited.")
+    except OverflowError:
+        refuse("invalid_pid", f"Pid {expect_pid} is not a process id.")
+    except OSError as exc:
+        refuse("identity_unavailable", f"Cannot pin pid {expect_pid} ({exc}).")
+    try:
+        check_listener()
+        if not _is_kirocrew_process(expect_pid):
+            refuse("not_kirocrew", f"Pid {expect_pid} does not look like a Kiro Crew gateway.")
+        try:
+            holder = lock_holder(config_dir())
+        except LockProbeError as exc:
+            refuse("lock_probe_indeterminate", f"{exc}.")
+        if holder.pid != expect_pid or not holder.alive:
+            refuse(
+                "lock_holder_mismatch",
+                f"Pid {expect_pid} does not hold this home's gateway lock.",
+            )
+        check_listener()
+        try:
+            pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            refuse("process_already_exited", f"Pid {expect_pid} has already exited.")
+        except PermissionError:
+            refuse("permission_denied", f"No permission to stop pid {expect_pid}.")
+    finally:
+        os.close(pidfd)
+
+    for _ in range(10):  # up to 1s, so the port is freed
+        time.sleep(0.1)
+        if _pid_exited(expect_pid):
+            break
+    sel().log_api_access(
+        caller="cli",
+        operation="gateway_stop",
+        outcome="allowed",
+        source="cli",
+        resources=f"pids=[{expect_pid}] port={port} via=expect_pid",
+    )
+    print(f"✅ Sent SIGTERM to gateway (pid {expect_pid}).")
+    _stop_mcp_gateway_daemon()
+
+
+def _stop(cli_port: int | None = None, *, expect_pid: int | None = None) -> None:
     """Stop a running KiroCrew gateway.
 
     Accepts the raw CLI ``--port`` value (``None`` when not passed).
@@ -493,7 +584,16 @@ def _stop(cli_port: int | None = None) -> None:
     - ``cli_port is not None``: user explicitly targeted a port, so we
       bypass the service short-circuit and SIGTERM the gateway bound to
       that port directly.
+
+    ``expect_pid`` (CLI ``--expect-pid``, only together with ``--port``) narrows
+    the stop to that one pid; see :func:`_stop_expected_pid`.
     """
+    if expect_pid is not None:
+        if cli_port is None:
+            print("❌ --expect-pid needs --port. Not signalling anything.")
+            sys.exit(2)
+        _stop_expected_pid(resolve_client_port(cli_port), expect_pid)
+        return
     port = resolve_client_port(cli_port)
     if cli_port is None and service_controller.stop_service():
         sel().log_api_access(
@@ -1042,7 +1142,65 @@ def _spawn_detached_gateway(port: int | None = None) -> subprocess.Popen[bytes]:
 
 
 _RESTART_TOKEN_TTL = "20h"
-_RESTART_READY_TIMEOUT = 15  # seconds to wait for gateway to become ready
+_RESTART_TOKEN_WAIT = 15  # seconds to wait for a token after restart
+# Seconds the fork path waits for the replacement gateway to become ready. A
+# loaded install (many agent files and MCP servers to wrap at boot) routinely
+# needs 25-35s, so the default carries margin; KIROCREW_RESTART_READY_TIMEOUT
+# overrides it within the clamp. An early death still returns at once, so the
+# margin costs nothing on a refused startup.
+_RESTART_READY_TIMEOUT_DEFAULT = 60
+_RESTART_READY_TIMEOUT_MIN = 15
+_RESTART_READY_TIMEOUT_MAX = 180
+# Elapsed seconds after which the readiness wait prints one "still starting"
+# line on its next check.
+_RESTART_READY_SOFT_CHECKPOINT = 15
+
+
+def _resolve_restart_ready_timeout() -> int:
+    """Readiness deadline from ``KIROCREW_RESTART_READY_TIMEOUT``, clamped.
+
+    Read each time the fork path runs, not at import. Unset, non-numeric, non-finite,
+    zero or negative values fall back to :data:`_RESTART_READY_TIMEOUT_DEFAULT`;
+    fractional values are rounded UP to whole seconds (so the wait is never
+    shorter than what was asked for), and the result is clamped to
+    ``[_RESTART_READY_TIMEOUT_MIN, _RESTART_READY_TIMEOUT_MAX]`` so a typo
+    cannot make restart fail instantly or hang for an unbounded time.
+    """
+    raw = os.environ.get("KIROCREW_RESTART_READY_TIMEOUT", "")
+    if not raw.strip():
+        return _RESTART_READY_TIMEOUT_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        _warn_restart_ready_override(
+            raw, _RESTART_READY_TIMEOUT_DEFAULT, "is not a positive number"
+        )
+        return _RESTART_READY_TIMEOUT_DEFAULT
+    requested = math.ceil(value)
+    resolved = max(_RESTART_READY_TIMEOUT_MIN, min(_RESTART_READY_TIMEOUT_MAX, requested))
+    if resolved != requested:
+        _warn_restart_ready_override(
+            raw,
+            resolved,
+            f"is outside {_RESTART_READY_TIMEOUT_MIN}..{_RESTART_READY_TIMEOUT_MAX}s",
+        )
+    return resolved
+
+
+def _warn_restart_ready_override(raw: str, used: int, problem: str) -> None:
+    print(
+        f"⚠️  KIROCREW_RESTART_READY_TIMEOUT={raw!r} {problem}; using {used}s.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _print_still_starting(elapsed: float) -> None:
+    print(f"⏳ Still starting ({int(elapsed)}s elapsed), continuing to wait...", flush=True)
+
+
 # Gap between readiness probes while waiting for the replacement gateway. Short
 # enough that a fast boot is reported promptly, long enough not to hammer the
 # starting gateway's event loop while it restores sessions.
@@ -1157,7 +1315,7 @@ def _wait_gateway_ready(
     * **Early death short-circuits the wait.** A replacement refused by the
       ``KIROCREW_HOME`` ownership guard exits within milliseconds; polling the
       port for the full timeout would turn a instantly-knowable failure into a
-      15s stall with a worse message. ``proc.poll()`` is used rather than a pid
+      full-deadline stall with a worse message. ``proc.poll()`` is used rather than a pid
       liveness probe because we are the child's parent, so it both detects the
       exit and yields the status the operator needs. (Same shape as ``pod``'s
       ``_wait_healthy`` bailing out on a dead unit instead of burning the wait.)
@@ -1169,15 +1327,26 @@ def _wait_gateway_ready(
       but not ready", sending the operator to look for a live process that no
       longer exists. The extra poll costs nothing and makes the two verdicts
       mutually exclusive in fact, not just by intention.
+
+    One "still starting" line is printed on the first check after
+    :data:`_RESTART_READY_SOFT_CHECKPOINT` seconds, if the deadline is still
+    ahead, so a slow boot does not look hung.
     """
-    deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    deadline = start + timeout
+    checkpoint = start + _RESTART_READY_SOFT_CHECKPOINT
+    checkpoint_printed = False
     while True:
         status = proc.poll()
         if status is not None:
             return _READY_DIED, status
         if _probe_gateway_ready(port) == 200 and _replacement_is_serving(port, prior_pid):
             return _READY_OK, None
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if not checkpoint_printed and checkpoint <= now < deadline:
+            _print_still_starting(now - start)
+            checkpoint_printed = True
+        if now >= deadline:
             status = proc.poll()
             if status is not None:
                 return _READY_DIED, status
@@ -1187,7 +1356,7 @@ def _wait_gateway_ready(
 
 def _print_token_url(port: int) -> None:
     """Wait for the gateway to come up, then print a fresh token URL."""
-    deadline = time.monotonic() + _RESTART_READY_TIMEOUT
+    deadline = time.monotonic() + _RESTART_TOKEN_WAIT
     while time.monotonic() < deadline:
         try:
             secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
@@ -1509,12 +1678,13 @@ def _restart(cli_port: int | None = None) -> None:
     # ownership guard, crash on a bad config, or hang before it binds — all of
     # which would print the success line below and exit 0 with nothing serving.
     # Report success only once the NEW gateway answers, and audit what happened.
-    verdict, exit_status = _wait_gateway_ready(proc, port, prior_marker_pid, _RESTART_READY_TIMEOUT)
+    ready_timeout = _resolve_restart_ready_timeout()
+    verdict, exit_status = _wait_gateway_ready(proc, port, prior_marker_pid, ready_timeout)
     if verdict != _READY_OK:
         reason = (
             f"replacement_died exit={exit_status}"
             if verdict == _READY_DIED
-            else f"replacement_not_ready_within={int(_RESTART_READY_TIMEOUT)}s"
+            else f"replacement_not_ready_within={ready_timeout}s"
         )
         sel().log_api_access(
             caller="cli",
@@ -1534,7 +1704,7 @@ def _restart(cli_port: int | None = None) -> None:
         else:
             print(
                 f"❌ Replacement gateway (pid {pid}) did not become ready within "
-                f"{int(_RESTART_READY_TIMEOUT)}s. It is still running but not "
+                f"{ready_timeout}s. It is still running but not "
                 f"serving port {port}.\n"
                 f"   It may be slow to start or wedged during startup; nothing is "
                 f"serving the dashboard yet.\n"
@@ -2680,6 +2850,8 @@ async def _run_task(args: argparse.Namespace) -> None:
         sessions=sessions,
         lesson_store=lessons,
         history_idle_secs=cfg.memory.history_idle_hours * 3600,
+        vector_store=vector_memory,
+        migrated=cfg.memory.migrated,
         skills_loader=skills,
         auto_skills_enabled=cfg.skills.auto_create_from_sessions,
         auto_refine_enabled=cfg.skills.auto_refine_on_deviation,

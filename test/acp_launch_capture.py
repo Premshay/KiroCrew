@@ -97,6 +97,9 @@ VOLATILE_ENV = {
     # /proc to tell the root's own descendants from a fresh runtime's. That the
     # runtime's child RECEIVES it is the fact being pinned.
     KIROCREW_SPAWN_INSTANCE_ENV: "<spawn-instance>",
+    # The spawning gateway's data home, so a reclaim can refuse a sibling install's
+    # runtime. That the child RECEIVES it is the fact pinned; the path is the host's.
+    "KIROCREW_SPAWN_HOME": "<data-home>",
     # The runtime's per-process scratch directory, under the capture's temp dir.
     # That the codex child RECEIVES it -- its SQLite home is its own -- is the fact
     # being pinned; the directory is not.

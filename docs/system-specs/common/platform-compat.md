@@ -9,6 +9,18 @@ for the helper, not the stdlib call, even in code you believe only runs on POSIX
 import alone is enough to break a Windows install, and the failure lands at import time
 in a module a Windows user cannot avoid.
 
+`platform_compat` is the import and patch surface for every helper below. Two families
+are defined in their own modules and forwarded from it: the cross-process file locks
+(`file_lock`, `flock_exclusive`, `acquire_lock` / `release_lock`, `try_acquire_lock`,
+`open_lock_file`, `open_create_or_existing`, `probe_file_persistence`) in
+`platform_lock_compat`, and the owner-only access helpers (`current_user_sid`,
+`process_owner_sid`, `local_user_id`, the two writability checks, `restrict_to_owner` /
+`restrict_dir_to_owner`, `make_owner_only_dir`) in `platform_owner_compat`. Import and
+patch them as `platform_compat.<name>`: a patch there lands on the owner. The owners read
+the platform flag, the lock modules, the clock, `ctypes`, the Win32 struct layouts and
+two shared constants from `platform_compat` when they run, so a patch of one of those
+there reaches them too.
+
 This is the contract. The Windows install and runtime story a user follows is
 [windows-install.md](../../guides/windows-install.md).
 
@@ -69,6 +81,7 @@ produces exactly those silent failures, which is why the helper is named per cal
 | READ a file you judged in the same traversal (screen-then-read) | `PinnedDirectory.read_text(name, max_bytes=…)` -- the open itself refuses a link at the name, the descriptor's own `fstat` rejects a non-regular entry, a hardlink and anything over `max_bytes`, and the open is non-blocking so a FIFO cannot stall the read. The size is asked of the OPEN DESCRIPTOR, not of a stat taken before it, and the read itself is bounded too, so a file that grows between the two stops at the cap. The layers under it are private on purpose: reaching for a raw descriptor would be operating outside the pin | screening a name and then reading that name -- the entry is re-resolved in between, and the screen only refuses a link that was PRESENT at check time, so a flip-flop serves a file of the adversary's choosing. Also: a pre-open `stat` for the size, which measures a different file than the one the read then opens |
 | ENUMERATE a directory whose contents an agent writes | `PinnedDirectory.names_bounded(limit)`, which answers None when the directory holds more than *limit* entries | `names()` (or `sorted(os.listdir(...))`) on such a tree: the eager list IS the exhaustion, allocated in full before any budget the caller applies afterwards could refuse it. Returning the first *limit* names instead of None would be worse than either -- the caller acts on a partial directory while believing it saw all of it |
 | Process RSS (live) / peak RSS / CPU | `proc_rss_bytes()` / `proc_peak_rss_bytes()` / `proc_cpu_seconds()` | `resource.getrusage` (`ru_maxrss` is a high-water mark, never a live reading, and its unit is KiB on Linux but bytes on macOS). The peak on Linux is NOT `ru_maxrss`: `execve` seeds it with the pre-exec image's peak, so a gateway started from a large parent would report that parent's number for life; Linux reads its own `/proc/self/status` `VmHWM` instead, monotonic across reads (the kernel folds live RSS into `hiwater_rss` lazily, so raw consecutive readings can dip a few hundred KiB), and an unreadable `/proc` is the documented 0, never the inherited figure. `pdf_extract_child` carries the same `VmHWM` parser rather than importing this module (its imports stay minimal under a capped address space) |
+| Another process's macOS memory footprint | `proc_phys_footprint_bytes_for_pid(pid)` | `proc_pid_rusage(pid, RUSAGE_INFO_V2)` -> `ri_phys_footprint` through `libproc` (no subprocess, no entitlement for a same-uid pid); `None` off macOS or when unreadable. This is the figure jetsam acts on and Activity Monitor's "Memory" column shows: it counts compressed and swapped pages, which `ps` RSS omits, so an idle process that has grown can read a small fraction of its real cost through `ps` (16x measured). `acp/runtime_process_tree` measures each pid of a macOS tree by it, with `ps` RSS as the per-pid fallback, so the runtime ceilings and the Sessions panel read it there |
 | A deadline that survives a host suspend and needs no thread or GIL | `arm_process_alarm(seconds)` (`0` cancels), guarded by `process_alarm_available()`: the kernel's `setitimer(ITIMER_REAL)`, which Linux runs on `CLOCK_MONOTONIC` and macOS on the absolute mach timebase, so a pending deadline keeps its remaining time across a sleep instead of firing on resume; pair it with `faulthandler.register(SIGALRM, ...)` for a GIL-free stack dump, released with `faulthandler.unregister` and registered afresh on every arm (a repeat `register` reinstalls nothing while faulthandler believes it still holds the signal, so a temporary owner that handed `SIGALRM` back with `SIG_DFL` would otherwise leave the next alarm to end the process without a dump). `False` on Windows, which has no such timer — the caller falls back to a mechanism it names for that platform (the loop watchdog uses faulthandler's timer thread there). The timer belongs to the process image that armed it and to no successor: `execve` preserves `ITIMER_REAL` while it resets a caught `SIGALRM` to its default disposition, so `reexec_launcher` / `reexec_python_module` cancel it immediately before `os.execv`, and the gateway entrypoint clears any deadline that still arrived (`loop_watchdog.disarm_inherited_alarm`, only while `SIGALRM` is at its default disposition) | `faulthandler.dump_traceback_later` as a standing deadline (its wait is `CLOCK_REALTIME`-based on every macOS build and on any Linux build without `sem_clockwait`, so a suspend longer than the budget fires it on resume); `signal.setitimer` / `signal.SIGALRM` reached directly (neither exists on Windows); a bare repeat `faulthandler.register` as a way to re-install the handler; an `os.execv` outside the two reexec seams while a deadline is pending (the successor is ended by a signal it never armed) |
 | Now on the suspend-inclusive clock (dating a process start, or measuring a sleep) | `boottime_now()`: `CLOCK_BOOTTIME` on Linux (it counts time the host spent suspended, as `/proc/uptime` and the `starttime` field of `/proc/<pid>/stat` do), `time.time()` on macOS (the clock libproc dates process starts on; it can step, so the liveness oracle pairs it with `acp/liveness.steady_now`), `None` where neither exists — a caller reads `None` as "cannot say", never as a time. The liveness oracle stamps a tool dispatch on it, and the loop watchdog compares its advance against `time.monotonic()` across one poll to name a resume | `time.monotonic()` against a `/proc` process age (`CLOCK_MONOTONIC` stands still through a suspend, so a boot-clock age minus a monotonic stamp places a live child before its own dispatch); `time.clock_gettime(time.CLOCK_BOOTTIME)` outside the compatibility layer (absent on macOS and Windows); importing the reader from `kiro_crew.acp` in application code (the agent-SDK boundary gate refuses the edge) |
 | Available host memory | `host_available_mib()` (0 = unknown, never 0 = no memory) | `/proc/meminfo` directly (Linux-only, so the bound built on it silently vanishes on macOS and Windows) |
@@ -125,6 +138,91 @@ boundaries. It includes resident runtime workers such as
 parent-policy decision. Adding one requires routing it through the helper and adding it
 to that inventory, so a later spawn cannot silently return to the user-site-dependent
 behavior.
+
+## TLS trust bootstrap across an in-app restart
+
+`kiro_crew._ssl_compat._ensure_ssl_certs` runs in the startup prelude of every entry
+point (`__main__`, `cli`, `mcp_gateway.gatewayd`) before any HTTPS client caches an
+SSL context. Its order is the clean-start order: an operator's `SSL_CERT_FILE` wins
+outright (one warning when the file it names cannot be found, nothing else touched);
+Windows exports nothing (`rustls-native-certs` in the kiro-cli child treats
+`SSL_CERT_FILE` as a replacement for the platform store, so a public-roots bundle
+would subtract every private CA); macOS injects Security.framework evaluation for
+this process; then the interpreter's own default cafile (nothing to export), then the
+Linux distribution bundles in `_CA_CANDIDATES`, then certifi's bundle. The found
+bundle is exported as `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` for the children that
+cannot inherit a process-local injection (kiro-cli, Node MCP servers).
+
+The certifi export is **install-pinned**: `certifi.where()` is
+`<prefix>/lib/pythonX.Y/site-packages/certifi/cacert.pem` inside the running install.
+The in-app restart seams hand the successor this process's environment
+(`platform_compat.reexec_launcher` / `reexec_python_module` behind the dashboard's
+update and restart actions, `service.live_target.maybe_reexec` for a live-target
+cutover), so a successor re-enters the prelude holding its predecessor's value.
+Honoured as an operator override, that value keeps the successor pointing at the
+previous install's bundle; once an upgrade or an installer re-run deletes that tree
+every TLS handshake fails until a restart from a clean environment (#15713).
+
+The rule is the one #15607 proposes for the other install-pinned runtime export,
+`LLAMA_CPP_LIB_PATH` (that change is not merged; its names are not cited here): **a value
+the runtime exported is its own transitional value, not an operator's, however it is
+inherited.** Here the export must stay in the environment — the children need it — so the
+runtime publishes its provenance beside it, **one marker per variable it assigns**:
+`KIROCREW_EXPORTED_SSL_CERT_FILE` and `KIROCREW_EXPORTED_REQUESTS_CA_BUNDLE`, each holding
+the value `_export_ca_bundle` wrote into that variable, and each published only when the
+call assigned the variable — `REQUESTS_CA_BUNDLE` is only defaulted, so an operator's
+value found there gets no marker, not even when it equals the bundle this install derives
+(an operator who pinned `REQUESTS_CA_BUNDLE` to `$(python -m certifi)` of this very
+install; one path marker shared by both variables would have vouched for theirs too).
+`_inherited_export_reason` is the one classifier, and it answers yes in exactly one case:
+the variable equals its own marker. A successor inherits a variable and its marker
+together, so it reads its predecessor's export as what it is; an operator sets the
+variable alone, so theirs never matches. **Nothing else is provenance** — not the path's
+shape, and not the directory it lies in, Kiro Crew's own install trees included. An
+operator who set `SSL_CERT_FILE` to a certifi bundle of their own (`$(python -m certifi)`,
+or one they appended a private CA to) holds a working policy while the file exists and a
+fail-closed one once it does not — every handshake fails until they repair the pin, as
+they chose; an operator can place a restricted bundle inside this runtime's own venv, and
+a tree the installers delete takes that pin with it, leaving a fail-closed state that is
+theirs rather than a stale export to re-derive over; and on macOS an explicit bundle is
+also an exclusion (it bypasses the Security.framework injection, so the Keychain's CAs are
+not trusted). Re-deriving over any of these would widen trust past what the operator
+chose, so the prelude infers nothing from a path. It reads no data home and does not load
+the config package or the update engine; the test file pins its import set at `kiro_crew`
+and `kiro_crew._ssl_compat`, the same on every platform.
+
+The one value this leaves unrecognised, by design, is a predecessor's export from **before
+the provenance existed**: it reads as an operator's and is kept. While its file exists it
+works (the managed-venv update engine prunes nothing, so an upgrade leaves the
+predecessor's bundle in place); once that tree is gone the successor fails closed, and the
+existing missing-file `WARNING` names the file and the way out — "if an earlier Kiro Crew
+install exported this value, start it from a clean environment". The producing case is
+narrow and one-time: an installer re-run deletes the retired `<data home>/venv` under a
+running gateway (`cli.sh` retires it without stopping the service), and the operator then
+uses the in-app restart rather than a service restart. One clean start heals the lineage
+for good, because this runtime publishes the provenance and every later restart is
+recognised.
+
+A runtime value in either variable is dropped before the operator check (so a stale
+`REQUESTS_CA_BUNDLE` beside an operator's `SSL_CERT_FILE` does not survive either), the
+inherited provenance is dropped with it, and trust is derived for this install in the
+clean-start order above, so a successor behaves exactly as a fresh start on the same host
+would: the system bundle wins where there is one, the same install re-exports the same
+path with nothing logged, both entry points running the prelude in one process see their
+own export and keep it silently, and an operator's `REQUESTS_CA_BUNDLE` beside the
+runtime's `SSL_CERT_FILE` survives the restart untouched. One `WARNING` line names each
+value that changed and the reason it was judged the runtime's — WARNING rather than the
+INFO #15607 proposes, because this runs in the prelude before logging is configured and
+the last-resort handler drops everything below WARNING. Not on Windows: the prelude
+exports nothing there, so no Kiro Crew process can have left a value behind, and whatever
+is set is an operator's. `test/test_ssl_certs.py::TestInheritedInstallPinnedBundle` pins
+the rule, including the two-bootstrap restart with the first run's environment carried
+into the second against a pruned bundle, a dead pin without provenance kept even inside a
+former install tree (with the clean-environment clause in its warning), an operator's
+`REQUESTS_CA_BUNDLE` at the derived path kept across an upgrade restart while the
+runtime's `SSL_CERT_FILE` beside it is re-derived, the two-module import set of the
+prelude, and the operator's certifi pin on macOS that keeps its exclusion.
+
 ## Confined decision-log append
 
 `platform_log_append.append_line` owns the decision log's filesystem transaction.

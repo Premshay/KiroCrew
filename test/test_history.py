@@ -7087,3 +7087,32 @@ class TestInterruptedTurnPreamble:
         assert out.count("[INTERRUPTED TURN") == 1
         assert out.count("[END INTERRUPTED TURN]") == 1
         assert out.startswith("[INTERRUPTED TURN") and out.endswith("[END INTERRUPTED TURN]")
+
+    def test_only_a_user_opener_is_called_the_users_request(self):
+        # An automated delivery must not be framed as something the user typed.
+        from kiro_crew.context import build_interrupted_turn_preamble
+        from kiro_crew.dashboard.state import TURN_OPENING_INJECT_KINDS
+
+        user = build_interrupted_turn_preamble([{"role": "user", "content": "ship it"}])
+        assert "the user's most recent request" in user
+        assert "Interrupted request:" in user
+
+        cases = [
+            ({"role": "subagent", "content": "review done"}, "a sub-agent completion"),
+            ({"role": "nudge", "content": "cycle 3"}, "a monitor loop cycle"),
+            (
+                {"role": "inject", "content": "rotate", "meta": {"injectKind": "cron"}},
+                "a scheduled job",
+            ),
+            (
+                {"role": "inject", "content": "app ask", "meta": {"injectKind": "mcp_app"}},
+                "an app message",
+            ),
+        ]
+        for row, kind in cases:
+            out = build_interrupted_turn_preamble(
+                [row], opener_inject_kinds=TURN_OPENING_INJECT_KINDS
+            )
+            assert "the user's most recent request" not in out, row
+            assert "not something the user typed" in out and kind in out, row
+            assert "Interrupted automated delivery:" in out, row

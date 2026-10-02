@@ -2867,6 +2867,7 @@ class _ChatSlot:
         "_poisoned_reset_used",
         "_empty_response_retries",
         "_empty_episode_productive",
+        "_carried_ttft_clock",
         "_promise_only_retries",
         "_promise_only_stop_gen",
         "_promise_only_session_stop_gen",
@@ -3768,6 +3769,9 @@ class _ChatSlot:
         self._empty_response_retries: int = 0
         # True once any turn of the CURRENT empty-turn episode was productive.
         self._empty_episode_productive: bool = False
+        # First-token clock of the last top-level turn, reused by its recovery
+        # turns until one saves the row (``chat_runner._turn_clock``).
+        self._carried_ttft_clock: Any = None
         # One bounded synthetic continuation when a turn ended on a promise-only
         # final message (announced an immediate action, then yielded with no tool
         # call). Reset like the other per-turn retry budgets on a landed turn.
@@ -7438,6 +7442,7 @@ class DashboardState:
         update_required: bool = False,
         update_min_version: str = "",
         update_can_arm: bool = False,
+        update_auto_effect: str = "unknown",
         version_display: str = "",
         bundle_id: str = "",
     ) -> dict[str, Any]:
@@ -7529,6 +7534,9 @@ class DashboardState:
             "update_commits_ahead": update_commits_ahead,
             "update_commits_behind": update_commits_behind,
             "update_can_arm": update_can_arm,
+            # What an available update leads to on this install; see
+            # ``update_capability.auto_update_effect``.
+            "update_auto_effect": update_auto_effect,
             "update_last_checked_at": update_last_checked_at,
             "update_check_interval_secs": update_check_interval_secs,
             # Mandatory-update verdict (enterprise governance pin OR the release
@@ -8172,6 +8180,32 @@ class DashboardState:
     def has_slot(self, name: str) -> bool:
         """Check if a slot exists by name."""
         return _registry_for(self).has_slot(self, name)
+
+    def slot_exists(self, name: str) -> bool:
+        """Whether *name* names a session that is open, INCLUDING one still being built.
+
+        The existence question, as opposed to the acquisition one :meth:`get_slot`
+        answers. ``get_slot`` hides an under-construction slot so nobody acquires a
+        half-finished session, and the import path even retracts its slot from
+        ``_slots`` across its async tail while leaving the construction mark set. A
+        caller asking "has this session ENDED" must read both as open: a worker that is
+        rehydrating or resuming has not closed, and treating it as closed would let the
+        work-ledger gate record a permanent "worker gone" for a live worker.
+
+        Two more states are open for the same reason, though no slot object exists for
+        either. A key the last open-tab restore could not READ (``unrestored_slot_keys``)
+        is a session whose metadata read failed transiently, not one proven gone -- the
+        restart-restore snapshot keeps it for exactly that reason. And while a restore is
+        in flight (``restoring_open_slots``), a tab it has not reached yet has no slot, so
+        absence proves nothing about any name until the restore ends.
+        """
+        if _registry_for(self).has_slot(self, name):
+            return True
+        if name in (getattr(self, "_slots_under_construction", None) or ()):
+            return True
+        if name in (getattr(self, "unrestored_slot_keys", None) or ()):
+            return True
+        return bool(getattr(self, "restoring_open_slots", False))
 
     def get_linked_slot(self, session_key: str) -> "_ChatSlot | None":
         """Resolve a Slack link and clean up a stale reverse-index entry."""
@@ -9019,12 +9053,14 @@ class DashboardState:
         self,
         mutate: Callable[[list[dict[str, Any]]], tuple[bool, _T]],
         on_committed: Callable[[], None] | None = None,
+        prepare: Callable[[], Awaitable[None]] | None = None,
     ) -> _T:
         """Serialize a folder mutation and confirm its off-loop persistence.
 
         ``on_committed`` runs under the repository lock only after the write
         is proven, so callers can attach side effects that must not outlive a
-        rolled-back or no-op transaction.
+        rolled-back or no-op transaction. ``prepare`` is awaited under the
+        same lock before *mutate* (see :meth:`FolderRepository.mutate`).
         """
 
         def _mark_committed() -> None:
@@ -9043,6 +9079,7 @@ class DashboardState:
             lambda: config_dir() / self._FOLDERS_FILE,
             self._write_folders_confirmed,
             _mark_committed,
+            prepare,
         )
 
     async def read_folders(self, read: Callable[[list[dict[str, Any]]], _T]) -> _T:

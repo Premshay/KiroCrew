@@ -128,10 +128,13 @@
         "background/completed",
         "compaction/applied",
         "context/composed",
+        "request/configured",
+        "session/opened",
         "step/completed",
         "subagent/completed",
         "subagent/failed",
-        "turn/completed"
+        "turn/completed",
+        "turn/refused"
       ],
       "answers": "Tokens, credits, context, compactions and duration, broken down per model",
       "fields": [
@@ -376,6 +379,44 @@
         {
           "name": "unmatched_decisions",
           "type": "int",
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "subagents",
+      "mode": "session",
+      "advertised": true,
+      "affects": [
+        "subagent/completed",
+        "subagent/failed",
+        "subagent/spawned"
+      ],
+      "answers": "Which children this session dispatched, and for each one what happened, how long it ran and what it cost",
+      "fields": [
+        {
+          "name": "by_id",
+          "type": "dict",
+          "optional": false
+        },
+        {
+          "name": "omitted",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "running",
+          "type": "int",
+          "optional": false
+        },
+        {
+          "name": "running_exact",
+          "type": "bool",
+          "optional": false
+        },
+        {
+          "name": "totals",
+          "type": "dict",
           "optional": false
         }
       ]

@@ -35,6 +35,7 @@ import { selectComposerBusy, selectSlotStreamState } from '../../store/chatSlice
 import { i18nT } from '../../i18n/t'
 import { fmtCompact, fmtElapsed, fmtNumber, fmtPercent, fmtTimeNumeric } from '../../i18n/format'
 import { splitOnPlaceholder } from '../../lib/splitOnPlaceholder'
+import { crewLogProjectionsKey } from '../../hooks/useWebSocket'
 
 /** The six folds, in the order the backend declares them (`PROJECTION_NAMES`). */
 export const CREW_LOG_FOLDS = ['status', 'usage', 'timeline', 'tools', 'approvals', 'subagents'] as const
@@ -46,6 +47,8 @@ export interface CrewLogProjection {
   name?: string
   seq: number
   value: Record<string, unknown>
+  /** Orders this value against a pushed one; absent from an older gateway. */
+  revision?: number
 }
 export type CrewLogBundle = Record<CrewLogFold, CrewLogProjection>
 /** What one read of the batch route answers: the six folds, plus the two things
@@ -57,6 +60,8 @@ const CREW_LOG_DOCS_URL =
 
 export type CrewLogRead = {
   folds: CrewLogBundle
+  /** The unit the folds came from; a pushed frame naming another is not applied. */
+  unit: string
   resolved: boolean
   writesDrained: boolean
   /** False when the gateway reports recording switched off. */
@@ -136,6 +141,18 @@ const count = (v: unknown): string => {
  *  not send the field has not told us a measurement happened either. */
 const measured = (v: unknown, reported: unknown): string =>
   int(reported) === 0 ? '—' : count(v)
+
+/** How many reporters stand behind the session's credit total, across sources.
+ *
+ *  `usage.credits` sums three spenders -- a turn closer, a subagent call, a
+ *  background call -- and `credits_by_source[*].reported` counts them one per
+ *  source. The credits stat gates on this sum, not on `turns.credits_reported`:
+ *  a session billed only by a child or background call has a turn count of zero
+ *  beside a real total, and gating on the turn count dashes a number the fold
+ *  holds. `turns.credits_reported` stays turn-scoped for the per-turn question
+ *  it answers; this answers the session-wide one the credits stat asks. */
+const creditsReportedBySource = (bySource: unknown): number =>
+  Object.values(obj(bySource)).reduce<number>((sum, row) => sum + int(obj(row).reported), 0)
 
 /** Whether a fold reported this field at all -- a number or a non-empty string.
  *
@@ -337,7 +354,7 @@ function UsageBody({ value }: { value: Record<string, unknown> }) {
   return (
     <>
       <div className="grid grid-cols-2 gap-1.5">
-        <Stat value={measured(value.credits, turns.credits_reported)} label={i18nT('pages.chat.crewLog.stat_credits', { turns: fmtNumber(int(turns.credits_reported)) })} />
+        <Stat value={measured(value.credits, creditsReportedBySource(value.credits_by_source))} label={i18nT('pages.chat.crewLog.stat_credits')} />
         <Stat value={measured(tokens.total, turns.tokens_reported)} label={i18nT('pages.chat.crewLog.stat_tokens')} />
         <Stat value={int(turns.duration_reported) === 0 ? '—' : fmtElapsed(int(value.duration_ms))} label={i18nT('pages.chat.crewLog.stat_duration')} />
         <Stat
@@ -808,10 +825,12 @@ function summaryFor(fold: CrewLogFold, value: Record<string, unknown>): string {
   if (fold === 'usage') {
     // The same rule the tiles follow: a total nobody measured is a dash, not a
     // zero. A collapsed header is the ONE line a reader sees without opening the
-    // fold, so "credits: 0" there is the most-read version of the claim.
+    // fold, so "credits: 0" there is the most-read version of the claim. Credits
+    // gate on the session-wide reporter count, since the total spans three
+    // sources; tokens stay turn-scoped, the question that stat answers.
     const turns = obj(value.turns)
     return i18nT('pages.chat.crewLog.summary_usage', {
-      credits: int(turns.credits_reported) === 0
+      credits: creditsReportedBySource(value.credits_by_source) === 0
         ? '—'
         : fmtNumber(num(value.credits) ?? 0, { maximumFractionDigits: 2 }),
       tokens: int(turns.tokens_reported) === 0
@@ -881,7 +900,9 @@ const OPEN_BY_DEFAULT: CrewLogFold[] = ['status', 'usage']
 
 export function CrewLogTab({ slot }: { slot: string }) {
   const { data, isLoading, error, refetch, isFetching } = useQuery<CrewLogRead>({
-    queryKey: ['crew-log-projections', slot],
+    // The key a pushed `session_projection` frame updates, so the panel stays
+    // current between the turn edges below without re-reading.
+    queryKey: crewLogProjectionsKey(slot),
     queryFn: () => api.sessionCrewLogProjections(slot) as Promise<CrewLogRead>,
     enabled: !!slot,
     // The panel's body is unmounted while another tab is shown, so the turn-end

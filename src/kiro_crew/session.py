@@ -133,7 +133,7 @@ from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.backends import model_registry_namespace
-from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
+from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling_on
 from kiro_crew.agent_spec_format import iter_agent_spec_files
 from kiro_crew.config import KiroCrewConfig, live
 from kiro_crew.config.live import ConfigChange
@@ -249,6 +249,7 @@ from kiro_crew.session_pid import (
 )
 from kiro_crew.session_pool import WarmPoolDeps, WarmSessionPool
 from kiro_crew.session_scope_reap import reap_abandoned_agent_scopes
+from kiro_crew.shell_audit_log import rotate_shell_audit_log
 from kiro_crew.stats import Stats
 from kiro_crew.watchdog import CleanupHook, SessionWatchdog
 
@@ -638,7 +639,7 @@ def _load_bg_runtime_types() -> tuple[Any, type[BaseException]]:
 # Heartbeat session key — used by HeartbeatService.  Spawned with the full
 # ``kirocrew`` agent so polled tasks can call read-only MCP tools (CR/ticket
 # status, etc.).  Tool approval at runtime is gated by the
-# ``HEARTBEAT_SAFE_TOOLS`` allowlist in ``slack/gateway.py``.
+# ``HEARTBEAT_SAFE_TOOLS`` allowlist in ``slack/gateway_runtime/tool_policy.py``.
 HEARTBEAT_KEY = "_hb"
 
 # History consolidation session key — runs as ``kirocrew-consolidate`` (its own
@@ -681,20 +682,36 @@ _COMPACT_RESULT_WAIT_MARGIN_SECS = 5.0
 _COMPACT_RESULT_WAIT_FLOOR_SECS = 5.0
 
 
-def _compact_result_wait_secs(elapsed: float) -> float:
+def _compact_result_wait_secs(elapsed: float, budget: float = COMPACT_WAIT_TIMEOUT_SECS) -> float:
     """Inner deadline for the async compaction-status wait.
 
-    The FULL remainder of the shared ``COMPACT_WAIT_TIMEOUT_SECS`` budget
-    after ``elapsed`` seconds — never less, so a compaction completing in the
-    final seconds of the budget is not abandoned early. The outer
-    ``asyncio.wait_for`` carries ``_COMPACT_RESULT_WAIT_MARGIN_SECS`` of
-    headroom on top, keeping this wait's graceful "no result" diagnostic
-    reachable. Clamped to a floor so the wait can never be zero or negative.
+    The FULL remainder of the shared compaction ``budget`` after ``elapsed``
+    seconds — never less, so a compaction completing in the final seconds of
+    the budget is not abandoned early. The outer ``asyncio.wait_for`` carries
+    ``_COMPACT_RESULT_WAIT_MARGIN_SECS`` of headroom on top, keeping this
+    wait's graceful "no result" diagnostic reachable. Clamped to a floor so
+    the wait can never be zero or negative.
+
+    ``budget`` defaults to ``COMPACT_WAIT_TIMEOUT_SECS``; the automatic path
+    passes the effective budget (``_resolve_compact_wait_secs``), so a config
+    key raising the budget raises this inner wait with it rather than leaving
+    it clamped at the built-in default minus elapsed.
     """
     return max(
         _COMPACT_RESULT_WAIT_FLOOR_SECS,
-        COMPACT_WAIT_TIMEOUT_SECS - elapsed,
+        budget - elapsed,
     )
+
+
+def _resolve_compact_wait_secs(configured: float) -> float:
+    """The effective compaction wait budget.
+
+    ``configured`` is ``cfg.session.compact_wait_secs``: a positive value is
+    the operator's chosen budget, and 0 (the default) or any non-positive
+    value falls back to the built-in ``COMPACT_WAIT_TIMEOUT_SECS``. Resolved
+    per compaction so a live config change takes effect on the next one.
+    """
+    return configured if configured > 0 else COMPACT_WAIT_TIMEOUT_SECS
 
 
 # After a failed compact, suppress auto-compaction for this many seconds so a
@@ -895,6 +912,42 @@ def _provider_has_active_turn(provider: LLMProvider) -> bool:
                 pass
         return False
     return res is True
+
+
+def _provider_background_launch(provider: LLMProvider) -> tuple[float, str] | None:
+    """``provider``'s newest background launch as ``(seconds since, description)``.
+
+    ``None`` unless the provider answers with exactly that shape. Same defensive
+    shape as :func:`_provider_has_active_turn`: the probe is optional, a raising
+    one reads as "nothing launched", and an ``AsyncMock``-style double's
+    coroutine is closed. A ``MagicMock`` attribute answers a ``MagicMock``,
+    which is not a tuple, so a double can never hold the watchdog off.
+    """
+    fn = getattr(provider, "background_launch", None)
+    if not callable(fn):
+        return None
+    try:
+        res = fn()
+    except Exception:
+        return None
+    if inspect.isawaitable(res):
+        close = getattr(res, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return None
+    if not (isinstance(res, tuple) and len(res) == 2):
+        return None
+    age, description = res
+    if (
+        isinstance(age, bool)
+        or not isinstance(age, (int, float))
+        or not isinstance(description, str)
+    ):
+        return None
+    return float(age), description
 
 
 def _context_pct_is_unknown(provider: LLMProvider) -> bool:
@@ -1225,7 +1278,11 @@ class SessionManager:
             provider_model_namespace=lambda provider: model_registry_namespace(
                 getattr(getattr(provider, "client", provider), "backend", "") or ""
             ),
-            resolve_pin_spelling=lambda model, advertised: resolve_pin_spelling(model, advertised),
+            resolve_pin_spelling=lambda model, advertised, provider: resolve_pin_spelling_on(
+                model,
+                advertised,
+                getattr(getattr(provider, "client", provider), "backend", "") or "",
+            ),
             to_provider_id=lambda model, provider: model_registry.to_provider_id(model, provider),
             to_acp_id=lambda model: model_registry.to_acp_id(model),
             inc_session_created=lambda: Stats().inc_session_created(),
@@ -1312,6 +1369,10 @@ class SessionManager:
             self.__dict__["_cleanup_state"] = state
         return state
 
+    def runtime_reconciler(self) -> Any:
+        """The retained runtime reconciler, or ``None`` before the first cleanup tick."""
+        return self._cleanup_state_boundary().runtime_reconciler
+
     def _cleanup_deps(self) -> CleanupDeps:
         # Resolved HERE, on the thread that builds the deps, and carried into the
         # sandbox sweep. That sweep runs on the maintenance pool, and a path a pool
@@ -1333,6 +1394,10 @@ class SessionManager:
             ),
             prune_session_pid_mappings=lambda: _prune_stale_session_pid_files(),
             prune_member_pid_bindings=lambda: prune_legacy_member_pid_bindings(),
+            # Same resolved home as the sandbox sweep, for the same reason: the
+            # step runs on the maintenance pool, and the hook's own expansion of
+            # ``${KIROCREW_HOME:-$HOME/.kiro/crew}`` is this path.
+            rotate_shell_audit_log=lambda: rotate_shell_audit_log(data_home),
             prune_pycache=lambda: prune_pycache(),
             collect_active_pids=lambda sessions: _collect_active_pids(
                 cast(dict[Any, Any], sessions)
@@ -1358,6 +1423,7 @@ class SessionManager:
             provider_has_active_turn=lambda provider: _provider_has_active_turn(provider),
             emit_counter=lambda event, dimensions: emit_counter(event, dimensions),
             get_persistent_keys=lambda: _PERSISTENT_KEYS,
+            provider_background_launch=lambda provider: _provider_background_launch(provider),
             get_channel_prefix=lambda: _CHANNEL_PREFIX,
             get_stuck_turn_report_secs=lambda: _STUCK_TURN_REPORT_SECS,
             get_pycache_gc_interval_secs=lambda: PYCACHE_GC_INTERVAL_SECS,
@@ -1954,8 +2020,12 @@ class SessionManager:
                 get_recorder=lambda: get_recorder(),
                 context_pct_is_unknown=lambda provider: _context_pct_is_unknown(provider),
                 unlink_session_queue=lambda session: _unlink_session_queue(session),
-                compact_wait_timeout_secs=lambda: COMPACT_WAIT_TIMEOUT_SECS,
-                compact_result_wait_secs=lambda elapsed: _compact_result_wait_secs(elapsed),
+                compact_wait_timeout_secs=lambda: _resolve_compact_wait_secs(
+                    self._cfg.session.compact_wait_secs
+                ),
+                compact_result_wait_secs=lambda elapsed, budget: _compact_result_wait_secs(
+                    elapsed, budget
+                ),
                 context_warn_margin_pct=CONTEXT_WARN_MARGIN_PCT,
                 compact_result_wait_margin_secs=_COMPACT_RESULT_WAIT_MARGIN_SECS,
                 compact_failure_cooldown_secs=_COMPACT_FAILURE_COOLDOWN_SECS,

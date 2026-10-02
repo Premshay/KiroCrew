@@ -60,6 +60,9 @@ SYSTEM_CHANNELS: dict[str, str] = {
     # agents write for a human decision. Same default priority as
     # system.agent: nothing changes until the user mutes or re-prioritises it.
     "system.monitor": _DEFAULT_PRIORITY,
+    # A dashboard terminal shell that exited with a non-zero code; its tab
+    # closed with it, so the note is where the code is left to read.
+    "system.terminal": _DEFAULT_PRIORITY,
 }
 
 # The channel the gateway's monitor-loop stop/finish notices use. Their legacy

@@ -950,18 +950,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
-    "id": "chat.default-to-autopilot-mode",
-    "label": "Default to Autopilot Mode",
-    "labelKey": "pages.settings.chatPanel.default_to_autopilot_mode",
-    "description": "New sessions start in autopilot mode (plan → approve → execute). You can still toggle individual sessions.",
-    "tab": "chat",
-    "type": "toggle",
-    "occurrence": 1,
-    "params": {
-      "sub": "sessions"
-    }
-  },
-  {
     "id": "chat.describe-your-role",
     "label": "Describe your role",
     "labelKey": "pages.settings.chatPanel.describe_your_role",
@@ -1629,7 +1617,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.decisions-jev",
     "label": "Decisions (Jev)",
     "labelKey": "pages.developer.featurePreviewsTab.decisions",
-    "description": "Jev is a small, fast decision model. With this on, Kiro Crew asks Jev which one of your skills fits the message you just sent — or that none does — and uses Jev's pick for the share of your sessions shown under the switch; the rest keep the word-matching rule this build ships with. If Jev is slow, unreachable or answers with nothing usable, that message falls back to the same rule, so a decision never holds up your reply. Each call is also recorded in a log on the machine that runs Kiro Crew, for diagnostics. This switch is saved on the machine that runs Kiro Crew, not in this browser, so it applies on every device you open it from.",
+    "description": "A small, fast model makes quick calls for Kiro Crew, such as which of your skills fits your message. Pick the model below. If it is slow or does not answer, the built-in rule decides instead, so your reply is never held up.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -1639,6 +1627,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Developer Mode",
     "labelKey": "pages.settings.developerPanel.developer_mode",
     "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.dynamic-dashboard",
+    "label": "Dynamic Dashboard",
+    "labelKey": "pages.developer.featurePreviewsTab.dashboard",
+    "description": "Turns on the in-development Dynamic Dashboard: a status row above the chat composer, a Dashboard view in the side panel and on a crewmate’s page, and an All Dashboards page. Its layout is still being designed, so it is not shown until you turn it on. Also holds the switch for automatic cards.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1

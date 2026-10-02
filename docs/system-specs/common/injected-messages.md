@@ -458,6 +458,33 @@ in the three modules and every funnel call with its verdict, pins the funnel's
 order and required keyword, and drives each deny with a provider double
 recording steer/reject order.
 
+**The task runner steers the same notice.** `task_executor` answers the
+permission requests of every autonomous-project and cron-launched step turn
+through ONE funnel, `_reject_and_log`, whose REQUIRED `cause=` keyword is the
+per-site verdict: a `DENY_CAUSE_*` name steers `llm_helpers._steer_host_deny`
+before the reject, and `None` is the explicit "not a host deny" that stays bare,
+so a site added later has to write one or the other. The SEL row is written
+first at every site. Per site:
+
+- the agent spec's PreToolUse gate blocked the call (a delivered deny, or a gate
+  with no verdict — an unreadable spec, a hook that could not run) — `policy`,
+  with the gate's reason, as the chat runner steers the same `BLOCKED:` strings;
+  the stored hooks' `deny` — `policy`, with the hook's reason.
+- the unattended run refusing a call nothing trusts (no approval handler, no
+  hook auto-approve) — `surface_policy`; the notice says what the surface
+  permits (tools in `hooks.auto_approve_tools`) and offers no remediation.
+- the interactive handler's no (`interactive_rejected`) and the reject that
+  precedes a mid-stream compaction send no notice: the first is the person's
+  verdict, the second tears the turn down to re-run it, so there is no
+  continuing turn for a notice to correct.
+
+`task_planner.decompose` (the decomposition turn) denies inline, audit → steer →
+reject: the stored hooks' `deny` — `policy`; the deny-by-default when the phase
+has no hook store to gate a call — `surface_policy` (the planning phase runs no
+tools). `test_taskrunner_deny_notice.py` enumerates both modules' sites with
+their verdicts, pins the funnel's order and required keyword, and drives each
+deny with a provider double recording steer/reject order.
+
 The recovery classification for the last two rows of the marker table above
 is **structural**: the queue entry
 carries `kind == "synthetic_recovery"` (`SYNTHETIC_RECOVERY_KIND`), set at insert
@@ -656,8 +683,9 @@ text back toward the session, but it **cannot inject a turn**. The path is:
    (truncated to 64 chars), the payload must be a plain object, and the composed
    text is capped. It formats `[UI] <action>: <JSON payload>` (or `[UI] <action>`
    with no payload) and dispatches an internal `mc-widget-send` event.
-3. `ChatPage.tsx` **pre-fills the composer** with that text and records it. It
-   never auto-submits.
+3. `ChatPage.tsx` **pre-fills the composer** with that text and records it
+   (the `mc-widget-send` listener in `useAutoSendIntake`,
+   `website/src/pages/chat/page/launchIntake.ts`). It never auto-submits.
 
 The iframe's own `isTrusted` click check is NOT the trust boundary and must not be
 treated as authoritative: LLM-emitted `<script>` in the same document can

@@ -89,6 +89,9 @@ def register(app: web.Application) -> None:
     # order numbers. Registered BEFORE the "{id}" delete so its literal path is
     # not shadowed by the id parameter.
     app.router.add_post("/api/chat/folders/reorder", chat.api_chat_folder_reorder)
+    # Bulk delete of folders that hold no live session (dry run first). A literal
+    # path, registered before the "{id}" delete for the same reason as reorder.
+    app.router.add_post("/api/chat/folders/cleanup", chat.api_chat_folders_cleanup)
     app.router.add_delete("/api/chat/folders/{id}", chat.api_chat_folder_delete)
     app.router.add_patch("/api/chat/slots/{slot}/folder", chat.api_chat_slot_folder)
     app.router.add_patch("/api/chat/slots/{slot}/pin", chat.api_chat_slot_pin)

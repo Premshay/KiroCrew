@@ -566,6 +566,13 @@ class LLMProvider(ABC):
         of cancel state (drives the shutdown drain). Default False."""
         return False
 
+    def background_launch(self) -> tuple[float, str] | None:
+        """``(seconds since, description)`` of the newest work this session's
+        harness launched to run on after the prompt returned (a backgrounded
+        command, a Workflow), or ``None``. Read by the session watchdog, which
+        cannot otherwise see that work. Default ``None``: nothing launched."""
+        return None
+
     async def wait_turn_done(self, timeout: float) -> str:
         """Wait for the current native turn's done boundary and return its stop
         reason. Default: no turn to wait for — return immediately with ``""``."""

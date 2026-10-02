@@ -291,7 +291,10 @@ package re-export when the caller reads its own defining module, or patching
 `pkg.mod.fn` when the caller did `from pkg.mod import fn` and holds its own binding.
 Either way the real function runs, the assertion passes for the wrong reason, and the
 test pays real time. **Treat an unexpectedly slow "mocked" test as evidence the mock
-missed.**
+missed.** The opposite trap is a patch that is too WIDE: a side effect on a module global
+also fires for every background worker that calls it (the `eventlog-io` legacy fold calls
+`members.read_dm_binding`). Patch the function awaited in the window you mean, and pin
+the order of the calls the test relies on.
 
 Another: **the host is an input, and a "surely-unused" number is not a constant.**
 `999999` reads as an impossible PID and is not — `pid_max` is 4194304, so on a
@@ -382,8 +385,9 @@ spawned without `cwd=`.
 
 At ~56.5k tests, **per-test setup cost dominates any single slow test** — an autouse
 fixture is paid ~56,500 times. Profile, never guess; compare candidates back to back on
-the same host (`git stash`, run, pop, run), because a loaded host makes an absolute
-number meaningless.
+the same host (run the change, then the base in `git worktree add --detach <dir> <base>`;
+never `git stash`: every worktree shares one stash list), because a loaded host makes an
+absolute number meaningless.
 
 The recurring wins, in order of leverage:
 

@@ -548,8 +548,10 @@ Registered so far: `mcp_gateway.forward_declared_env` (False -> True, #4566),
 `instances.warm_set_cap` (5 -> 0, #7248),
 `agent.chat_turn_timeout_secs` (7200 -> 14400, #8949) and
 `agent.subagent_timeout_secs` (1800 -> 10800, #8891), and
-`agent.subagent_max_turns` (100 -> 1000, #12203). **Two** carry `auto_adopt` --
-the agent timeout budgets -- and the other entries are report-only; see below.
+`agent.subagent_max_turns` (100 -> 1000, #12203), and
+`agent.spawn_min_memory_gb` (4.0 -> 2.0, #15890). **Three** carry `auto_adopt` --
+the agent timeout budgets and the spawn memory floor -- and the other entries are
+report-only; see below.
 
 The subagent turn budget follows 1000 automatically when its key is absent,
 including in an existing installation after an update. Every valid stored value
@@ -565,7 +567,10 @@ Reporting is the right answer only while the two readings of a stored value are
 indistinguishable AND holding the old value is survivable. On the two agent timeout
 budgets neither holds: an install carrying `agent.subagent_timeout_secs: 1800` reaps
 every subagent at 30 minutes on a build whose default is 10800, and its operator
-sees timeouts instead of results having never chosen 1800. The existing mechanism's
+sees timeouts instead of results having never chosen 1800. Nor on the spawn
+memory floor: a materialized `agent.spawn_min_memory_gb: 4.0` keeps 4 GB free after
+every start, which a 16 GB laptop rarely has, so its subagents wait in the queue
+and essentially never start. The existing mechanism's
 only answer was a CLI command they have no reason to know exists.
 
 So `SupersededDefault.auto_adopt` opts ONE entry into a one-shot rewrite. What keeps
@@ -579,6 +584,7 @@ supported configuration:
 |---|---|---|
 | `agent.subagent_timeout_secs` | adopts | -- |
 | `agent.chat_turn_timeout_secs` | adopts | -- |
+| `agent.spawn_min_memory_gb` | adopts | -- (the 4.0 inputs in the admission tests set a floor, they do not pin a stored 4.0 as supported; the opt-out is `0`, not the old default) |
 | `session.autocompact_pct` | reports | `test_a_persisted_ceiling_value_is_left_alone` |
 | `dashboard.loop_stall_exit_after_secs` | reports | `test_explicit_desktop_default_is_preserved_for_managed_service` |
 | `stt.streaming` | reports | `test_put_persists_streaming` |
@@ -1832,7 +1838,7 @@ caller, and replays only when it was built with `config=` (a raised
 store keeps its constructor defaults at construction. The other `watch_object`
 owners that copy caller-loaded config before registering (`cron_history.py`,
 `subagent.py`, `history_consolidation.py`, `adaptive/controller.py`,
-`slack/gateway.py`) keep the registration gap; they are out of scope for #10889.
+`slack/gateway_runtime/admission.py`) keep the registration gap; they are out of scope for #10889.
 
 ### The point-of-use read
 
@@ -2932,7 +2938,7 @@ KEEP handling", "KEEP-ALIVE header bug") survives.
 `dashboard.verbosity` describes how the PERSON wants replies to read, so it is
 delivered as session-context chrome — the same class as `[CURRENT DATE]` and
 `[UI LANGUAGE]` — not as a token an agent prompt has to opt into.
-`context.py::_build_response_preferences_section(cfg)` renders the level's
+`context_assembly/sections.py::_build_response_preferences_section(cfg)` renders the level's
 rules (`_reply_style_rules`) inside a `[RESPONSE PREFERENCES — MANDATORY]` …
 `[END RESPONSE PREFERENCES]` frame whose one sentence of preamble states that the
 rules bind every reply, on every surface, for every agent, and outrank any

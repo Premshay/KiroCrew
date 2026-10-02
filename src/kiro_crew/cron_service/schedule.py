@@ -55,6 +55,12 @@ _MAX_SKIP_DATE_LOOKAHEAD = 500_000  # absolute safety ceiling (anti-infinite-loo
 # Jitter bounds (seconds) to spread job execution and avoid traffic spikes
 _JITTER_HOURLY_MAX = 5 * 60  # 0–5 minutes for hourly jobs
 _JITTER_DAILY_MAX = 59 * 60  # 0–59 minutes for daily jobs
+# Longest single sleep inside the jitter wait. The wait ends on a WALL-CLOCK
+# deadline, but asyncio sleeps on time.monotonic(), which on macOS
+# (mach_absolute_time) does not advance while the host is asleep. Slicing the
+# wait bounds how long a resumed host keeps sleeping past a deadline the wall
+# clock already crossed: at most one slice of awake time.
+_JITTER_WALL_SLICE_SECS = 30
 
 
 def cron_expr_matches(expr: str, dt: datetime) -> bool:

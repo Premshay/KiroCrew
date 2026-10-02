@@ -7603,6 +7603,39 @@ async def _await_guarded_history_write(slot: "_ChatSlot", name: str) -> bool:
         await asyncio.wait(pending, timeout=remaining)
 
 
+async def _wake_conductor_for_closed_worker(name: str) -> None:
+    """Pull *name*'s conductor's work-ledger tick forward, if *name* was a bound worker.
+
+    NEVER RAISES. A close is a user action with rollback paths for its own four failure
+    modes; "the conductor was not told early" is not one of them, because the conductor's
+    scheduled tick reads the same ledger a cadence later. So every failure here is a
+    DEBUG line and the close proceeds.
+
+    The import is function-local: ``conductor_wake`` reaches the work-ledger store, and
+    every gateway runs this close path whether or not any conductor has ever opened a
+    ledger.
+
+    WHEN IT IS CALLED. TRIGGER TWO of the crew-log wake, and only from the two exits
+    where the close is COMMITTED: after the archival save succeeds, and after the
+    hand-over exit's tail drain landed. Never between the pop and the save. The
+    conductor's probe answers "is this worker closed" by looking the slot up, and a
+    ``worker_closed`` answer persists a stall observation that no rollback retracts; a
+    tick fired in that window would read the popped slot as gone, and the save's
+    failure arm would then put the slot back under a permanent false "worker gone".
+
+    Awaited rather than detached: the binding read is offloaded inside and ``fire_now``
+    has no suspension point, so this adds one executor hop to a teardown that has
+    already awaited several -- and a detached task would outlive the close and could
+    fire after a same-key recreate.
+    """
+    try:
+        from kiro_crew import conductor_wake
+
+        await conductor_wake.fire_for_worker_slot(name)
+    except Exception:  # noqa: BLE001 - a push must never fail a close
+        logger.debug("conductor wake on close failed for %s", name, exc_info=True)
+
+
 async def close_slot(
     state: DashboardState,
     slot: "_ChatSlot",
@@ -7942,6 +7975,8 @@ async def _close_slot(
         # Otherwise return, do not raise: for the ORIGINAL the close is complete
         # (popped, task cancelled, tail durable), so every caller — the DELETE
         # handler and session-control's close_target — must read this as success.
+        # Committed, so the conductor may be told now and not before.
+        await _wake_conductor_for_closed_worker(name)
         return
     try:
         await save_slot_off_loop(state, slot, closed=True, closed_at=closed_at, best_effort=False)
@@ -8031,6 +8066,8 @@ async def _close_slot(
         # per-slot cards on it can never be pruning a slot that comes back.
         state.push_slot_removed(name)
         discard_closing_failure_scopes()
+        # Committed, so the conductor may be told now and not before.
+        await _wake_conductor_for_closed_worker(name)
     # The app was already told, and compensated if the persist above failed — see
     # the notify block before the pop and the rollback in the except branch.
     # Kill the per-tab session to free resources. Re-check identity ONE more
@@ -11508,21 +11545,91 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
     process re-reads its agent spec and environment and re-initializes MCP
     servers via session/load -- with the conversation preserved.
 
-    Refused with 409 while a turn is in flight (killing an in-flight ACP
-    process orphans the streaming prompt: resume refusals, empty responses)
-    and while sub-agent children are attached (their shared runtime is torn
-    down with the parent session -- see ``SessionManager.reset`` -- so a
-    reload under a working child silently discards its work). The
-    has_active_turn() check is a best-effort fast path; the authoritative
-    guard is the reset's skip_if_busy, which evaluates busyness atomically
-    with the session pop (see _reset_slot_session for why the unblock half of
-    the chokepoint is safe even when the guard declines).
+    The teardown itself is :func:`reload_slot_session`, shared with the
+    session-control ``session_reload`` verb; this handler supplies the
+    dashboard route's own authorization (slot identity and app isolation).
     """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    def _still_ours(_after_reset: bool) -> bool:
+        # Re-authorize after every await: ``name`` can be recreated for a
+        # DIFFERENT app while this request queued on a lock (slot removal +
+        # re-registration under the same name is how a client reconnects), and
+        # the stale ``slot`` object's app-isolation check would then authorize
+        # this teardown against the NEW slot's session -- the same
+        # cross-slot-identity gap the tags/folders/regenerate handlers close
+        # with this exact re-check (e.g. chat_tags.py's ``is not slot`` guard).
+        return not _slot_replaced_while_queued(state, slot, name, request, "chat.slot_reload")
+
+    def _denied(session_key: str) -> web.Response | None:
+        # App isolation, same policy as the cancel routes: reload is a
+        # teardown, so an app token must own both the slot and the session the
+        # teardown lands on, and a denial is indistinguishable from a missing
+        # slot.
+        return _app_cancel_denied(request, slot, "chat.slot_reload", session_key)
+
+    def _busy(session_key: str) -> bool:
+        provider = state.sessions.get_provider(session_key)
+        return provider is not None and provider.has_active_turn()
+
+    return await reload_slot_session(
+        state,
+        slot,
+        name,
+        still_ours=_still_ours,
+        denied=_denied,
+        busy=_busy,
+        notice=_SESSION_RELOAD_NOTICE,
+    )
+
+
+async def reload_slot_session(
+    state: DashboardState,
+    slot: _ChatSlot,
+    name: str,
+    *,
+    still_ours: Callable[[bool], bool],
+    denied: Callable[[str], web.Response | None],
+    busy: Callable[[str], bool],
+    notice: str,
+) -> web.Response:
+    """Tear down *slot*'s agent process and re-arm its resume spawn.
+
+    The one reload teardown, shared by ``api_chat_slot_reload`` (the tab menu)
+    and ``session_control.reload_target`` (the ``session_reload`` MCP verb), so
+    the lock order and the re-checks below cannot drift between the two. The
+    transcript is not touched: only the agent session is reset, and one notice
+    row (*notice*, tagged ``SESSION_RELOAD_KIND``) is appended afterwards.
+
+    The caller supplies its own authorization as three callbacks:
+
+    * ``still_ours(after_reset)`` -- re-run after every await; False answers
+      the byte-identical ``slot_not_found`` 404. ``after_reset`` is True only
+      for the re-check that follows ``_reset_slot_session``, so a caller can
+      tell "refused, nothing was torn down" from "the process is already
+      gone" without inferring the phase from call order. It may also RAISE
+      (the session-control verb re-runs its gate here and lets a pre-reset
+      refusal propagate); the lock stack still unwinds.
+    * ``denied(session_key)`` -- the teardown-target check, run once the
+      session key is resolved inside both locks; a response it returns is
+      returned as-is.
+    * ``busy(session_key)`` -- the fast-path busy probe, refusing with
+      ``turn_in_flight``.
+
+    Refused with 409 while a turn is in flight (killing an in-flight ACP
+    process orphans the streaming prompt: resume refusals, empty responses)
+    and while sub-agent children are attached (their shared runtime is torn
+    down with the parent session -- see ``SessionManager.reset`` -- so a
+    reload under a working child silently discards its work). The ``busy``
+    check is a best-effort fast path; the authoritative guard is the reset's
+    skip_if_busy, which evaluates busyness atomically with the session pop
+    (see _reset_slot_session for why the unblock half of the chokepoint is
+    safe even when the guard declines).
+    """
     # Two locks, in the order documented at _slot_switch_session_lock:
     # slot._lock, then the session lock. The four commit-before-reset switch
     # handlers hold both across their commit-then-reset span, and reload joins
@@ -11535,15 +11642,9 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
     # earlier read could leave this holding the wrong session lock.
     async with contextlib.AsyncExitStack() as _stack:
         await _stack.enter_async_context(slot._lock)
-        # Re-authorize after the await above: ``name`` can be recreated for a
-        # DIFFERENT app while this request queued on the lock (slot removal +
-        # re-registration under the same name is how a client reconnects), and
-        # the stale ``slot`` object's app-isolation check below would then
-        # authorize this teardown against the NEW slot's session -- the same
-        # cross-slot-identity gap the tags/folders/regenerate handlers close
-        # with this exact re-check (e.g. chat_tags.py's ``is not slot`` guard).
-        # A mismatch here is indistinguishable from a missing slot.
-        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_reload"):
+        # Re-authorize after the await above. A mismatch here is
+        # indistinguishable from a missing slot.
+        if not still_ours(False):
             return _slot_not_found()
         # The session the reload will tear down. ``effective_session_key``,
         # never ``_history_key_for``: a channel- or cron-born slot runs its
@@ -11566,7 +11667,7 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
         # above. Without this, the 7396 check would guard only the first
         # await and leave the exact gap it exists to close open on the
         # second.
-        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_reload"):
+        if not still_ours(False):
             return _slot_not_found()
         # Re-derive rather than trust the captured session_key: it names a
         # MUTABLE attribute (slot.linked_session_key), so a cron/channel
@@ -11579,15 +11680,10 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
                 {"error": "slot session was rebound during the switch", "code": "session_rebound"},
                 status=409,
             )
-        # App isolation, same policy as the cancel routes: reload is a
-        # teardown, so an app token must own both the slot and the session the
-        # teardown lands on, and a denial is indistinguishable from a missing
-        # slot.
-        denied = _app_cancel_denied(request, slot, "chat.slot_reload", session_key)
-        if denied is not None:
-            return denied
-        provider = state.sessions.get_provider(session_key)
-        if provider is not None and provider.has_active_turn():
+        refusal = denied(session_key)
+        if refusal is not None:
+            return refusal
+        if busy(session_key):
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
             )
@@ -11605,7 +11701,39 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
             # can observe that the other actor now blocks on the session lock
             # instead of interleaving.
             await _test_interleave("reload:pre_reset")
-        reloaded = await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
+        # Re-authorize once more before the teardown: the children probe (and
+        # the test seam) above are awaits too, and a channel link, mirror or
+        # slot replacement landing during them would otherwise reach
+        # _reset_slot_session on authorization read before that await. This
+        # is the last pre-reset check, so a refusal here still means nothing
+        # was torn down.
+        if not still_ours(False):
+            return _slot_not_found()
+        teardown_incomplete = False
+
+        async def _reset() -> bool:
+            # SessionManager.reset pops the session before its shutdown can
+            # raise, so a raise after the pop means the old process is gone and
+            # the reload has happened with a degraded teardown. Propagating it
+            # would answer 500 with no notice and no respawn for a completed
+            # teardown. Same identity probe as _reset_slot_session_or_warn: the
+            # SAME provider still registered means the raise came before the
+            # pop, nothing was torn down, and the raise propagates.
+            nonlocal teardown_incomplete
+            prior_provider = state.sessions.get_provider(session_key)
+            try:
+                return await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
+            except Exception:
+                if (
+                    prior_provider is not None
+                    and state.sessions.get_provider(session_key) is prior_provider
+                ):
+                    raise
+                logger.exception("Slot %s reload: old session teardown incomplete", name)
+                teardown_incomplete = True
+                return True
+
+        reloaded = await _reset()
         if not reloaded:
             provider = state.sessions.get_provider(session_key)
             if provider is not None and provider.has_active_turn():
@@ -11619,7 +11747,7 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
                 # survives -- the silent failure this endpoint exists to
                 # prevent. Retry once; a second decline means another turn is
                 # genuinely racing, which is the turn-in-flight case.
-                reloaded = await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
+                reloaded = await _reset()
                 if not reloaded:
                     return web.json_response(
                         {"error": "a turn is in flight", "code": "turn_in_flight"},
@@ -11645,7 +11773,7 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
         # cross-slot-identity gap the two earlier checks close, just moved to
         # this last await. Same response as those checks: a mismatch here is
         # indistinguishable from a missing slot.
-        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_reload"):
+        if not still_ours(True):
             return _slot_not_found()
         if effective_session_key(slot) != session_key:
             return web.json_response(
@@ -11661,7 +11789,7 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
     # notice twice.
     slot.append(
         "assistant",
-        _SESSION_RELOAD_NOTICE,
+        notice,
         "msg msg-a",
         meta={"kind": SESSION_RELOAD_KIND},
     )
@@ -11669,6 +11797,8 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
     # process (and its rebuilt toolset) is ready when the user comes back.
     schedule_eager_spawn(state, slot, allow_resume=True)
     state.push_slots_update()
+    if teardown_incomplete:
+        return web.json_response({"ok": True, "warning": _TEARDOWN_INCOMPLETE_WARNING})
     return web.json_response({"ok": True})
 
 
@@ -13019,6 +13149,15 @@ def _hydrate_slot_from_history(
             slot.mode = _mode
     if meta.get("workspace"):
         slot.workspace = meta["workspace"]
+    # The namespace the agent was picked in rides with the pick itself, exactly
+    # as in the two persistence loaders (same position, same two-value guard on
+    # the operator-editable transcript). Restoring the name without it leaves
+    # the dropdown's name-only fallback lighting the same-name MEMBER row for a
+    # template-picked slot, and the next canonical full save -- which rebuilds
+    # meta_line from the live slot -- then omits the empty field and strips the
+    # recorded namespace from disk.
+    if meta.get("agent_kind") in ("member", "template"):
+        slot.agent_kind = meta["agent_kind"]
     if meta.get("project"):
         slot.project = meta["project"]
     if meta.get("channel_folder_filed"):

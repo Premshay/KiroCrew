@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { Activity, Goal, Radar, RotateCw, Square, Trash2, X } from 'lucide-react'
-import { useIsFetching, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError, type MonitorWrite } from '../api/client'
 import {
   deriveAutomationStatus,
@@ -20,6 +20,7 @@ import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { i18nT } from '../i18n/t'
 import MonitorRadar from './MonitorRadar'
 import ErrorNotice from './ErrorNotice'
+import { useQueryIsFetching } from '../hooks/useQueryIsFetching'
 
 interface Props {
   slotKey: string
@@ -126,12 +127,32 @@ function legacyWire(loop: LegacyGoalLoop): AutoNudgeLoop {
     active: loop.active,
     last_fire_ts: loop.lastFireAt,
     next_due_ts: loop.nextDueAt ?? 0,
+    // The goal editor words a paused loop by this field; dropping it rendered
+    // every inactive loop, a fresh pause included, as a bare stop.
+    stopped_reason: loop.stoppedReason,
     ...(loop.stopSentinelPath !== undefined ? { stop_sentinel_path: loop.stopSentinelPath } : {}),
     ...(loop.judge !== undefined ? { judge: loop.judge } : {}),
     ...(loop.judge_last_verdict !== undefined
       ? { judge_last_verdict: loop.judge_last_verdict }
       : {}),
   }
+}
+
+/** A fire landed (`onFired`): arm the due reading on the record the parent
+ *  holds NOW, never on a snapshot. The fire route arms a zero-delay timer and
+ *  writes no deadline, and its answer is the live loop serialized after an
+ *  audit await, so it can already carry the delivery; a parent measured
+ *  against it rolled a delivered cycle back to due for a whole interval.
+ *  `pressed` is pre-request by construction, so a parent record that fired
+ *  since the press leaves nothing to arm. Null too when the parent's record is
+ *  not this loop (the closure outlived it) or is no longer running (another
+ *  writer paused it; `fire_now` refuses an inactive loop). */
+function armedNow(current: AutomationRecord | null, pressed: AutoNudgeLoop, nowTs: number): LegacyGoalLoop | null {
+  if (current?.kind !== 'legacy_goal_loop') return null
+  if (String(current.id) !== String(pressed.id) || current.slotKey !== pressed.slot_key) return null
+  if (!current.active) return null
+  if (current.lastFireAt > (pressed.last_fire_ts || 0)) return null
+  return { ...current, nextDueAt: nowTs }
 }
 
 function boundedInteger(
@@ -213,7 +234,7 @@ export default function SessionAutomationPopover({
   const [confirmClear, setConfirmClear] = useState(false)
   const id = useId()
   const queryClient = useQueryClient()
-  const snapshotFetching = useIsFetching({ queryKey: ['session-automation', slotKey], exact: true }) > 0
+  const snapshotFetching = useQueryIsFetching(['session-automation', slotKey])
   const automationRef = useRef(automation)
   automationRef.current = automation
   const slotKeyRef = useRef(slotKey)
@@ -494,8 +515,22 @@ export default function SessionAutomationPopover({
       open={open}
       onOpenChange={requestOpenChange}
       onChange={loop => {
-        if (automationRef.current !== automation) return
+        // Applied only while the parent still holds the record this press was
+        // rendered against (object identity, as `responseIsCurrent` above). The
+        // record carries no revision, and a response arriving after a frame is a
+        // snapshot the frame may have moved past: a PATCH answered before another
+        // tab's pause but delivered after the pause's frame put the active record
+        // back over the paused one, with nothing to correct it short of a
+        // reconnect. Dropped, and the slot's cold read invalidated instead.
+        if (automationRef.current !== automation) {
+          queryClient.invalidateQueries({ queryKey: ['session-automation', slotKey] })
+          return
+        }
         onChange(loop ? normalizeAutomationRecord(loop) : null)
+      }}
+      onFired={pressed => {
+        const armed = armedNow(automationRef.current, pressed, Date.now() / 1000)
+        if (armed) onChange(armed)
       }}
       onSetUpBoundedMonitor={legacyLoop ? undefined : () => setBoundedModeSlot(slotKey)}
       writeDisabled={sessionModeUnsupported}

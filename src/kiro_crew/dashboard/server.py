@@ -579,6 +579,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/session-control/stop",
         "/api/session-control/end-wait",
         "/api/session-control/set-model",
+        "/api/session-control/reload",
         "/api/session-control/close",
         "/api/session-control/revive",
         "/api/session-control/send",
@@ -1999,6 +2000,10 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post(
         "/api/session-control/set-model",
         _deferred("session_control", "api_session_control_set_model"),
+    )
+    app.router.add_post(
+        "/api/session-control/reload",
+        _deferred("session_control", "api_session_control_reload"),
     )
     app.router.add_post(
         "/api/session-control/close", _deferred("session_control", "api_session_control_close")
@@ -3979,6 +3984,33 @@ def _kick_connections_warm_scavenge(state: DashboardState) -> None:
     task.add_done_callback(state._background_tasks.discard)
 
 
+def _kick_local_decision_model(state: DashboardState) -> None:
+    """Start the local decision model the provider names, post-bind.
+
+    Called by both gateway entrypoints only after ``_start_site`` has returned. The
+    import and the config read happen inside the worker thread, so a gateway with no
+    local model configured pays one thread hop after the listener is serving.
+    """
+
+    def _resume_in_thread() -> str:
+        from kiro_crew.decisions.local_runtime import resume_configured
+
+        return resume_configured()
+
+    async def _resume() -> None:
+        try:
+            preset = await asyncio.to_thread(_resume_in_thread)
+        except Exception:  # noqa: BLE001 - an optional subsystem never fails the gateway
+            logger.warning("local decision model: resume at startup failed", exc_info=True)
+            return
+        if preset:
+            logger.info("local decision model: starting %s", preset)
+
+    task = asyncio.create_task(_resume())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
 def _kick_session_search_index(state: DashboardState) -> None:
     """Keep the session search candidate index caught up, in its OWN process.
 
@@ -5049,6 +5081,19 @@ def _register_stt_hooks(app: web.Application) -> None:
     app.on_startup.append(_stt_startup)
     app.on_cleanup.append(_stt_shutdown)
 
+    # The local decision model the provider names runs for as long as the gateway
+    # does; ``_kick_local_decision_model`` starts it post-bind. Its server also exits
+    # on its own when this process does (it watches the stdin pipe the runtime
+    # holds), so this cleanup is the orderly half only.
+    async def _local_decision_model_shutdown(app_: web.Application) -> None:
+        if "kiro_crew.decisions.local_runtime" not in sys.modules:
+            return
+        from kiro_crew.decisions import local_runtime
+
+        await asyncio.to_thread(local_runtime.get_runtime().deactivate, wait=True)
+
+    app.on_cleanup.append(_local_decision_model_shutdown)
+
 
 def _register_own_host_warm(app: web.Application) -> None:
     """Start reading this machine's own addresses at boot, without waiting on it.
@@ -5302,9 +5347,9 @@ def _register_config_watch(
         await live.watch().stop()
         lifecycle = getattr(state, "_dynamic_cards", None)
         if lifecycle is not None:
-            lifecycle.set_enabled(False)
-            if lifecycle.worker is not None:
-                await asyncio.gather(lifecycle.worker, return_exceptions=True)
+            # One call rather than reaching for a worker attribute: the producer owns two
+            # tasks, the model queue and the number refresher, and both must settle.
+            await lifecycle.shutdown()
 
     app.on_cleanup.append(_config_watch_shutdown)
 
@@ -6525,6 +6570,7 @@ async def start_dashboard(
     _kick_connections_warm_scavenge(state)
     _kick_session_search_index(state)
     _kick_config_watch(app, state)
+    _kick_local_decision_model(state)
     # Same shape for the knowledge store's writer-locked orphan sweep: it left
     # the constructor (which runs pre-bind, on the loop) and runs here on a
     # worker thread once requests are already being served.
@@ -7562,6 +7608,7 @@ async def start_api_server(
     _kick_connections_warm_scavenge(state)
     _kick_session_search_index(state)
     _kick_config_watch(app, state)
+    _kick_local_decision_model(state)
 
     logger.info("API-only server listening on %s:%d", bind_addr, port)
 

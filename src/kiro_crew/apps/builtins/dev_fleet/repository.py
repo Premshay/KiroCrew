@@ -696,7 +696,12 @@ async def _resolve_base_snapshot() -> tuple[str | None, bool, str]:
         # would otherwise flow unseparated into ``git ls-remote --symref {remote} HEAD``
         # and exec a repository-named program. ``origin`` is a fixed literal and always
         # passes; guarding it too costs nothing and keeps one rule for every remote.
-        fallback = "origin" if "origin" in names else (names[0] if len(names) == 1 else "")
+        if "origin" in names:
+            fallback = "origin"
+        elif len(names) == 1:
+            fallback = names[0]
+        else:
+            fallback = ""
         if _plausible_remote_name(fallback):
             remote = fallback
     if remote:

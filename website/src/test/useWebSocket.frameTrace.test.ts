@@ -1379,6 +1379,7 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
 const EXPECTED_LIFECYCLE: Record<string, string[]> = {
   "first connect": [
     'connect ws:/api/ws?caps=slot_patch',
+    'query invalidateQueries ["crew-log-projections"] {"cancelRefetch":false}',
     'action dashboard/sseConnected undefined',
     'query fetchQuery ["automation-seed","legacy"] {"staleTime":0,"retry":false}',
     'query fetchQuery ["automation-seed","structured"] {"staleTime":0,"retry":false}',
@@ -1396,6 +1397,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
   "reconnect catch-up": [
     'action dashboard/sseDisconnected undefined',
     'connect ws:/api/ws?caps=slot_patch',
+    'query invalidateQueries ["crew-log-projections"] {"cancelRefetch":false}',
     'cancel-frame 1',
     'action chat/sseThinkingChunk {"slot":"slot-a","content":"kept"}',
     'cancel-frame 2',
@@ -1430,6 +1432,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
   "reconnect after an update restart reloads": [
     'action dashboard/sseDisconnected undefined',
     'connect ws:/api/ws?caps=slot_patch',
+    'query invalidateQueries ["crew-log-projections"] {"cancelRefetch":false}',
     'reload',
   ],
   "unmount": [
@@ -1446,6 +1449,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
   "forceReconnect": [
     'close',
     'connect ws:/api/ws?caps=slot_patch',
+    'query invalidateQueries ["crew-log-projections"] {"cancelRefetch":false}',
     'action dashboard/sseConnected undefined',
     'action dashboard/fetchSlots/pending',
     'query invalidateQueries ["session-summary"]',
@@ -1478,6 +1482,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'close',
     'action chat/setVoicePlaying false',
     'connect ws:/api/ws?caps=slot_patch',
+    'query invalidateQueries ["crew-log-projections"] {"cancelRefetch":false}',
     'action dashboard/sseConnected undefined',
     'query fetchQuery ["automation-seed","legacy"] {"staleTime":0,"retry":false}',
     'query fetchQuery ["automation-seed","structured"] {"staleTime":0,"retry":false}',

@@ -8,7 +8,26 @@ from types import SimpleNamespace
 
 import pytest
 
+from kiro_crew.crew_main_contract import CARD_FIELDS
 from kiro_crew.dashboard.dynamic_cards import CardBudget, CardPublisher, normalize_card
+
+
+@pytest.fixture(autouse=True)
+def _seeded_session_tree(monkeypatch):
+    """A seeded, empty session tree and a crew log that is on, for every case.
+
+    The root gate refuses an unseeded tree, and no card is generated with the log off,
+    which is this suite's environment default.
+    """
+    from kiro_crew.crew_log import session_tree_projection
+    from kiro_crew.dashboard import card_lifecycle
+
+    monkeypatch.setattr(card_lifecycle, "crew_log_enabled", lambda: True)
+
+    session_tree_projection.reset_for_tests()
+    session_tree_projection.projection().ensure_seeded()
+    yield
+    session_tree_projection.reset_for_tests()
 
 
 def test_layout_can_be_reused_but_first_publication_needs_one():
@@ -324,8 +343,33 @@ async def test_real_slot_events_ignore_replay_and_stream_reader_does_not_hide_ev
 
 @pytest.fixture
 def lifecycle(monkeypatch):
+    """One root slot, with the two process-global reads its card depends on PINNED.
+
+    Every automatic card is now a root session's card, so its numbers are folded from
+    that session's crew log. The fold read is pinned to a small readable board so a case
+    here never depends on what some sibling left in the store, and the session-tree
+    projection is reset because ``_eligible`` refuses a slot the tree calls a worker.
+    """
+    from kiro_crew.crew_log import session_tree_projection
     from kiro_crew.dashboard import card_lifecycle
     from kiro_crew.history import TranscriptWithheld
+
+    session_tree_projection.reset_for_tests()
+    session_tree_projection.projection().ensure_seeded()
+    monkeypatch.setattr(
+        card_lifecycle,
+        "_read_card_folds",
+        lambda key: {
+            "status": {"lifecycle": "open", "turns_completed": 2},
+            "usage": {},
+            "approvals": {},
+            "work": {"items": [{"state": "open", "status": "progress"}], "omitted": 0},
+        },
+    )
+    # The cases here are about publication, redaction and authority, and their model
+    # replies are one-line layouts. Whether a layout binds every fact has its own cases
+    # in the crew-main contract suite, so that one rule is held open here.
+    monkeypatch.setattr(card_lifecycle, "_layout_hides_a_fact", lambda html: False)
 
     class Log:
         allowed = True
@@ -662,7 +706,7 @@ async def test_generation_is_session_scoped_bounded_and_get_is_free(lifecycle, m
 
     async def generate(sessions, prompt, **kwargs):
         calls.append((prompt, kwargs))
-        return '{"html":"<p data-dashboard-field=progress></p>","data":{"progress":"Investigating failing tests"}}'
+        return '{"html":"<p data-dashboard-field=lede></p>","data":{"lede":"Investigating failing tests"}}'
 
     monkeypatch.setattr(card_lifecycle, "run_bg_oneliner", generate)
     service.notify(slot, "error")
@@ -670,7 +714,7 @@ async def test_generation_is_session_scoped_bounded_and_get_is_free(lifecycle, m
     first = await service.read(slot)
     for _ in range(10):
         assert await service.read(slot) == first
-    assert first["card"]["data"]["progress"] == "Investigating failing tests"
+    assert first["card"]["data"]["lede"] == "Investigating failing tests"
     assert len(calls) == 1
     assert calls[0][1]["crew_log_session_key"] == "dashboard:one"
     assert calls[0][1]["max_output_bytes"] == 16384
@@ -696,14 +740,14 @@ async def test_model_input_and_published_output_cross_the_registered_redaction_s
 
     async def generate(sessions, prompt, **kwargs):
         prompts.append(prompt)
-        return json.dumps({"html": f"<p>{evidence}</p>", "data": {"result": evidence}})
+        return json.dumps({"html": f"<p>{evidence}</p>", "data": {"lede": evidence}})
 
     monkeypatch.setattr(card_lifecycle, "run_bg_oneliner", generate)
     service.notify(slot, "done")
     await asyncio.wait_for(service.worker, 2)
     result = await service.read(slot)
     assert result["card"] is not None
-    for boundary in (prompts[0], result["card"]["html"], result["card"]["data"]["result"]):
+    for boundary in (prompts[0], result["card"]["html"], result["card"]["data"]["lede"]):
         assert credential not in boundary
         assert exfil_url not in boundary
         assert "corp-laptop" not in boundary
@@ -726,14 +770,14 @@ async def test_decoded_card_output_is_redacted(lifecycle, monkeypatch, field, se
         if secret == "credential"
         else "https://collect.attacker.example/?token=" + "aB3" * 70 + "&host=corp-laptop"
     )
-    previous = {"html": '<p data-dashboard-field="result"></p>', "data": {"result": "Safe"}}
-    output = {"html": previous["html"], "data": {"result": "Safe"}}
+    previous = {"html": '<p data-dashboard-field="lede"></p>', "data": {"lede": "Safe"}}
+    output = {"html": previous["html"], "data": {"lede": "Safe"}}
     if field == "html":
         output["html"] = f"<p>{sensitive}</p>"
     elif field == "key":
         output["data"] = {sensitive: "Safe"}
     else:
-        output["data"] = {"result": sensitive}
+        output["data"] = {"lede": sensitive}
         if field == "data-only":
             del output["html"]
     encoded = json.dumps(output).replace("ghp_", r"\u0067hp_").replace("https://", r"https:\/\/")
@@ -753,7 +797,8 @@ async def test_decoded_card_output_is_redacted(lifecycle, monkeypatch, field, se
         assert result["card"] == previous
     else:
         assert result["status"] == "published"
-        assert set(result["card"]["data"]) == {"result"}
+        # The model's sentence plus the host's folded numbers, and nothing else.
+        assert set(result["card"]["data"]) == CARD_FIELDS
         if field == "data-only":
             assert result["card"]["html"] == previous["html"]
     assert len(service.publisher.attempts) == 1
@@ -990,31 +1035,42 @@ async def test_maximum_previous_card_leaves_room_for_escaped_recent_evidence(
 
     service, slot, state = lifecycle
     service.publisher.budget = CardBudget(debounce=0, per_session=0)
-    html = '<p data-dashboard-field="result"></p>' + padding * 1000
+    html = '<p data-dashboard-field="lede"></p>' + padding * 1000
     html += " " * (MAX_HTML_BYTES - len(html.encode("utf-8")))
-    previous = {"html": html, "data": {"result": "A" * (MAX_DATA_BYTES - len("result"))}}
+    previous = {"html": html, "data": {"lede": "A" * (MAX_DATA_BYTES - len("lede"))}}
     assert normalize_card(previous) == previous
     prompts = []
 
     async def generate(_sessions, prompt, **kwargs):
         prompts.append(prompt)
         return json.dumps(
-            previous if len(prompts) == 1 else {"data": {"result": "Updated"}}, ensure_ascii=False
+            (
+                {"html": html, "data": {"lede": "Ready"}}
+                if len(prompts) == 1
+                else {"data": {"lede": "Updated"}}
+            ),
+            ensure_ascii=False,
         )
 
     monkeypatch.setattr(card_lifecycle, "run_bg_oneliner", generate)
     service.notify(slot, "done")
     await asyncio.wait_for(service.worker, 2)
-    assert (await service.read(slot))["card"] == previous
+    first = (await service.read(slot))["card"]
+    # A maximum-size layout is kept whole. The sentences are the model's only data now,
+    # so the escape-heavy bulk that must still leave room for evidence is the layout.
+    assert first["html"] == html
+    assert first["data"]["lede"] == "Ready"
     slot.messages = [{"role": "assistant", "content": 'New evidence 界 "\\\n\x01' * 500}]
     service.notify(slot, "completed")
     await asyncio.wait_for(service.worker, 2)
     assert len(prompts) == 2
     assert all(len(prompt) <= MAX_INPUT_CHARS for prompt in prompts)
-    context = json.loads(prompts[1][len(card_lifecycle._PROMPT) :])
+    context = json.loads(prompts[1][len(card_lifecycle._ROOT_PROMPT) :])
     assert "New evidence" in context["recent_messages"][-1]["text"]
-    assert "result" in context["previous"].get("fields", context["previous"].get("data", {}))
-    assert (await service.read(slot))["card"] == {"html": html, "data": {"result": "Updated"}}
+    assert "lede" in context["previous"].get("fields", context["previous"].get("data", {}))
+    updated = (await service.read(slot))["card"]
+    assert updated["html"] == html
+    assert updated["data"]["lede"] == "Updated"
     assert len(service.publisher.attempts) == 2
 
 
@@ -1030,9 +1086,9 @@ async def test_invalid_data_only_result_preserves_publication_and_charges_attemp
     service.publisher.budget = CardBudget(debounce=0, per_session=0)
     responses = iter(
         [
-            {"html": '<p data-dashboard-field="result"></p>', "data": {"result": "Good"}},
+            {"html": '<p data-dashboard-field="lede"></p>', "data": {"lede": "Good"}},
             {"data": {"renamed": "Bad"}},
-            {"data": {"result": "Better"}},
+            {"data": {"lede": "Better"}},
         ]
     )
 
@@ -1053,7 +1109,7 @@ async def test_invalid_data_only_result_preserves_publication_and_charges_attemp
     assert len(service.publisher.attempts) == 2
     service.notify(slot, "done")
     await asyncio.wait_for(service.worker, 2)
-    assert (await service.read(slot))["card"]["data"] == {"result": "Better"}
+    assert (await service.read(slot))["card"]["data"]["lede"] == "Better"
     assert len(service.publisher.attempts) == 3
 
 
@@ -1733,7 +1789,7 @@ async def test_a_long_run_of_tool_rows_does_not_empty_the_evidence_window(lifecy
 
     async def generate(sessions, prompt, **kwargs):
         prompts.append(prompt)
-        return '{"html":"<p data-dashboard-field=s></p>","data":{"s":"ok"}}'
+        return '{"html":"<p data-dashboard-field=lede></p>","data":{"lede":"ok"}}'
 
     monkeypatch.setattr(card_lifecycle, "run_bg_oneliner", generate)
     service.notify(slot, "done")
@@ -1761,7 +1817,7 @@ async def test_card_scanning_runs_off_the_gateway_loop(lifecycle, monkeypatch):
         monkeypatch.setattr(card_lifecycle, name, spy)
 
     async def generate(sessions, prompt, **kwargs):
-        return '{"html":"<p data-dashboard-field=s></p>","data":{"s":"ok"}}'
+        return '{"html":"<p data-dashboard-field=lede></p>","data":{"lede":"ok"}}'
 
     monkeypatch.setattr(card_lifecycle, "run_bg_oneliner", generate)
     service.notify(slot, "done")
@@ -1899,3 +1955,14 @@ def test_cdata_is_kept_as_text_where_the_browser_would_hide_it():
     assert (
         card_lifecycle._html_texts("<math><mi>AKIA<![CDATA[IOSF]]>X</mi></math>")[1] == "AKIAIOSFX"
     )
+
+
+def test_card_prompt_leaves_pending_questions_to_the_host():
+    """The card is a model-written summary; a "Needs you" copy of an ask goes
+    stale on answer and disagrees with the Questions tab, which is the source."""
+    from kiro_crew.dashboard import card_lifecycle
+
+    prompt = " ".join(card_lifecycle._ROOT_PROMPT.split())
+    assert "Do not restate questions, choices or decisions waiting for the user" in prompt
+    assert "Questions tab is the one place they appear" in prompt
+    assert "return replacement html without it" in prompt

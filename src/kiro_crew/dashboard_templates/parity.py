@@ -587,6 +587,19 @@ def html_fields(html: str) -> set[str]:
     return set(scanner.fields)
 
 
+def filled_fields(html: str) -> set[str]:
+    """The fields *html* binds on an element the host's binder fills. Never raises.
+
+    The runtime twin of :func:`html_fields`, for markup a model wrote rather than a page
+    an author is fixing: a binding the binder steps over (``style``, head content, a
+    void, stripped or nested element) is left out instead of refused, so a caller that
+    requires a field reads a blank cell as a missing one. A stray end tag closes nothing
+    here, so an element stays open at least as long as a browser keeps it: a sloppy page
+    can only lose a binding to the nesting rule, never gain one.
+    """
+    return set(_scan(html).fields)
+
+
 def control_tags_used(html: str) -> set[str]:
     """The control tags *html* contains. Empty is the only acceptable answer.
 

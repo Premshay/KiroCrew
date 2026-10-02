@@ -52,6 +52,43 @@ The event, privacy and resource contract is in
 The Needs you inbox precedes cards, and all answer/approval authority stays in
 native controls. Disabling automatic content does not disable those controls.
 
+### The root session's automatic card: numbers from folds, sentences from the model
+
+Only a ROOT session gets an automatic card. Root is
+`card_lifecycle.is_root_session`: an empty `_created_by` (the birth-time edge) AND no
+parent in the crew log's session tree (the edge an adopt or release moves later, the
+same `parent_slot is None` the sidebar reads through `parent_payload`). A worker gets no
+card; the browser's `SessionStatusFrame` mirrors both edges (`created_by` and `parent`)
+and never fetches one for it.
+
+Every number on that card comes from the session's own crew log. `build_crew_main` in
+`kiro_crew.crew_main_contract` folds four renders -- `status`, `work`, `usage`,
+`approvals` -- into `CrewMainDerived`, every value a finished string. Absence is
+three-state in words: a missing key reads `not recorded`, a fold that could not be read
+reads `could not be read`. No value is a percentage, and every count states its
+denominator.
+
+The model still designs the card's layout, as before, but writes no number. It receives
+the folded values under `facts` as read-only text and binds each one by field name with
+`data-dashboard-field`; its own data is exactly `lede`, `you` and `notes`. The publish
+seam (`_root_card_output`) refuses the whole card when the model's part carries a digit
+-- in a sentence, in any text the layout shows, or as a JSON number -- when it writes a
+field it does not own, when its layout binds a name outside the contract, or when its
+layout leaves any fact unbound (`_layout_hides_a_fact`), since a layout of three
+sentences would publish a card with no numbers. Digits in CSS are layout and pass. Only then does `merge_crew_main`, which names every field, put
+the folded values beside the three sentences.
+
+The session folds are read from the crew log UNIT the slot writes now
+(`crew_log.emit.slot_previous_store`), never from the slot's session key: a fold of a
+name no unit carries is an empty record whose counts read as zero. No unit of the slot
+at all reads `not recorded`; units the store cannot rank read `could not be read`.
+
+Numbers follow the log between generations. Each batch the crew-log writer commits
+(`emit.add_growth_listener`) for a slot whose card is already published re-folds and
+re-binds the numbers on a task of its own, with no model
+call, no permit and none of the hourly budget; the layout and the sentences stay as the
+model last returned them. The opt-in and the budget therefore pace the sentences only.
+
 An HTML/widget artifact tagged `task-dashboard` is a model-authored task view,
 not a fixed dashboard schema. The chat's **Dynamic Dashboard** side-panel tab
 (labelled **Dashboard**; the three-tile dock above the composer opens it) and Crew's
@@ -61,6 +98,31 @@ only artifacts whose recorded originating slot is the current slot or a durable
 without impersonating its conductor. The same slug is updated at milestones;
 visible hosts re-read the artifact inventory on each `artifact_update` frame and
 load new revisions.
+
+The side panel's Dashboard view hands its whole **Overview** to that published
+view: the host draws the header (title, help, permission mode), the Overview /
+Questions / Approvals segments with their counts, and the stale / missing-source
+notices, then renders the selected published view and nothing native beside it.
+The automatic card (`SessionStatusFrame`) shows only while no published view
+exists; progress bars, status tiles, blocked and work-item lists are not drawn
+in the panel (the dock above the composer keeps its native tiles). Questions and
+Approvals remain host-rendered `AttentionCard`s — the sandboxed page can name a
+decision but never answer or approve one. The request that asks the agent for a
+page (`commandCenter.prompt.ts`, `REQUEST_PUBLISHED_VIEW`) recommends, without
+enforcing, a layout for that whole-Overview placement: what needs the user first
+with the decision named or linked (answering happens in the Questions tab), one
+line per work item with a status word and details folded, dependencies shown when
+tasks wait on others, cost and technical detail inside the folds, theme CSS
+variables. The artifacts skill repeats the recommendation.
+
+The whole Dynamic Dashboard surface is a developer Feature Preview
+(`PREVIEW_DASHBOARD`, `website/src/utils/previewFlags.ts`), default OFF and
+gating INGRESS only: with the flag off the dock, the + menu entry, a persisted
+Dashboard tab, the Crew chat's Dashboard tab and the Sessions menu's All
+Dashboards item are withheld, while `/session-dashboards` stays routable and
+every API above is unchanged. The **Automatic cards for all sessions** switch
+lives inside that preview's card in Settings > Developer > Feature Previews,
+shown only while the flag is on.
 Session matching strips the dashboard scope and normalizes registered channel
 keys with the history safe-key rules, retaining the channel namespace. Unknown
 prefixes are not folded; missing task roots remain fail-closed.
@@ -1467,7 +1529,8 @@ effect: the host route `/artifacts/:slug` owns the URL, and an in-place
 
 **Composer staging** — "Ask agent to address" routes into the bound session and
 *stages* (never auto-sends) its message through the existing `writePrefill`
-sessionStorage channel ChatPage already consumes on slot activation.
+sessionStorage channel ChatPage already consumes on slot activation (the
+slot-change restore in `website/src/pages/chat/page/composerDrafts.ts`).
 
 ## Roadmap
 

@@ -52,7 +52,11 @@ leaves the process alone and merely counted:
    recycle guard asked HERE, at the decision point, rather than only inside the
    seam. A sandbox shim, an ``mcp start-server`` broker and a sibling install's
    python interpreter all reach this point carrying our inherited marker, and the
-   seam declines every one of them. Asked here, they are withheld by name; asked
+   seam declines every one of them -- a shim for what it WRAPS, not for being a shim:
+   Crew's Linux namespace launcher is the pid a real agent runtime is tracked under, so
+   the gate steps over it and asks the wrapped argv, which answers "harness" for
+   ``kiro-cli`` and "not a harness" for an MCP probe or an app backend. Asked here, they
+   are withheld by name; asked
    only inside the seam, each one first collects an ownership-gate allow and the
    kill attribution that allow writes -- 3151 attribution lines for 181 pids
    against 4 real kills, measured over 6.5 hours on one host;
@@ -115,11 +119,14 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 from kiro_crew import platform_compat, session_pid
+from kiro_crew.config.paths import data_home
 from kiro_crew.mcp_gateway.daemon_control import configured_socket_path
 from kiro_crew.process_identity import audit_kill_decision
 from kiro_crew.runtime_ownership import (
@@ -175,7 +182,10 @@ class ReconcileReading:
     owned_dead: int = 0
     #: Live pids inside our own agent slice that no record claims, EXCEPT those
     #: :meth:`RuntimeReconciler._unowned` excludes: a pid marked as sandboxed tool
-    #: work whose argv0 is not a managed harness. So this is the unclaimed population
+    #: work whose command line does not name a managed harness -- which, for Crew's own
+    #: Linux namespace launcher, is decided by the argv it WRAPS, so a leaked launcher
+    #: around a harness is counted here and one around an MCP probe is not. So this is
+    #: the unclaimed population
     #: this arm can act on, which is what makes it the number to read beside
     #: ``would_kill``. ``resource_status.slice_ownership`` publishes a field of the
     #: same name computed as every unclaimed slice pid, so on a host doing long-lived
@@ -193,6 +203,15 @@ class ReconcileReading:
     would_kill: int = 0
     #: Dead pids whose records were retracted.
     forgotten: int = 0
+    #: Runtimes the untracked-runtime report found (``session_pid``'s report-only
+    #: arm): reparented to init, our marker, in neither pid file. Linux only. No arm
+    #: here acts on them; :meth:`RuntimeReconciler.reclaim_untracked` is the one
+    #: path that may, and only on an explicit user confirm.
+    leaked_untracked: int = 0
+    #: Resident memory of those runtimes, each counted with its descendants.
+    leaked_rss_bytes: int = 0
+    #: ``(pid, tree rss bytes)`` per leaked runtime, lowest pid first.
+    leaked: tuple[tuple[int, int], ...] = ()
 
     def as_counter_fields(self) -> dict[str, str | int | bool | float]:
         """The reading as metric fields, named to match the liveness SLI."""
@@ -203,7 +222,80 @@ class ReconcileReading:
             "killed": self.killed,
             "would_kill": self.would_kill,
             "forgotten": self.forgotten,
+            "leaked_untracked": self.leaked_untracked,
+            "leaked_rss_bytes": self.leaked_rss_bytes,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ReclaimResult:
+    """What one user-confirmed reclaim did. ``supported`` false means it did not look."""
+
+    supported: bool = True
+    reason: str = ""
+    killed: tuple[int, ...] = ()
+    #: ``(pid, why)`` for every leaked runtime left alone.
+    refused: tuple[tuple[int, str], ...] = ()
+
+
+#: Whether the reclaim and the leak reading can run here. Both read ``/proc``
+#: environ and stat, and the report they extend fails closed elsewhere.
+RECLAIM_PLATFORM = sys.platform == "linux"
+
+
+def same_uid_process_table() -> dict[int, tuple[int, int]]:
+    """``{pid: (ppid, rss bytes)}`` for every process this uid owns, from ``/proc/<pid>/stat``."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    uid = os.getuid()
+    table: dict[int, tuple[int, int]] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            table[int(entry.name)] = (int(fields[1]), int(fields[21]) * page)
+        except (OSError, ValueError, IndexError):
+            continue
+    return table
+
+
+def _descends_from(pid: int, root: int, table: dict[int, tuple[int, int]]) -> bool:
+    """Whether *root* is *pid* or one of its ancestors in *table*."""
+    seen: set[int] = set()
+    while pid > 1 and pid not in seen:
+        if pid == root:
+            return True
+        seen.add(pid)
+        pid = table.get(pid, (0, 0))[0]
+    return False
+
+
+def _tree_rss(root: int, table: dict[int, tuple[int, int]]) -> int:
+    return sum(rss for pid, (_pp, rss) in table.items() if _descends_from(pid, root, table))
+
+
+def _own_data_home() -> str:
+    """This gateway's data home, resolved per call (never at import)."""
+    return str(data_home())
+
+
+def _session_leader_alive(pid: int) -> bool:
+    """True when *pid*'s session leader is another live session leader, or unreadable."""
+    sid = session_pid._linux_pid_sid(pid)
+    if sid <= 0:
+        return True
+    return sid != pid and session_pid._linux_pid_sid(sid) == sid
+
+
+def _group_leader_alive(pid: int) -> bool:
+    """True when *pid*'s process-group leader is another live process, or unreadable."""
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return True
+    return pgid != pid and platform_compat.pid_liveness(pgid) != platform_compat.PID_DEAD
 
 
 def _sel_reconcile_kill(pid: int, outcome: str, reason: str) -> None:
@@ -444,7 +536,10 @@ def process_is_a_managed_agent(pid: int) -> bool:
     What asking it HERE changes is who gets recorded. The unowned population is
     dominated by processes that carry our inherited spawn marker and are not
     harnesses at all -- a Playwright chromium tree, an ``mcp start-server`` broker, a
-    sandbox shim, another install's python interpreter. Every one of them satisfies
+    sandbox shim around something that is not a runtime, another install's python
+    interpreter. (A shim around ``kiro-cli`` IS one: the gate steps over Crew's own
+    namespace launcher and asks the wrapped argv, because on Linux that launcher is the
+    pid an agent runtime is tracked under.) Every one of them satisfies
     the other four local conditions, so without this one each would collect an
     ownership-gate allow and have the gate write a kill attribution naming a process
     the seam declines to touch.
@@ -566,7 +661,30 @@ class RuntimeReconciler:
         age_secs: Callable[[int], float] = process_age_secs,
         min_age_secs: float = DEFAULT_MIN_AGE_SECS,
         max_kills: int = DEFAULT_MAX_KILLS,
+        untracked_pids: Callable[[], set[int]] = set,
+        confirm_untracked: Callable[[], set[int]] = set,
+        process_table: Callable[[], dict[int, tuple[int, int]]] = same_uid_process_table,
+        spawn_instance_of: Callable[[int], str | None] = session_pid._env_spawn_instance,
+        spawn_home_of: Callable[[int], str | None] = session_pid._env_spawn_home,
+        own_home: Callable[[], str] = _own_data_home,
+        protected_pids: Callable[[], set[int]] = session_pid._protected_pids,
+        session_leader_alive: Callable[[int], bool] = _session_leader_alive,
+        group_leader_alive: Callable[[int], bool] = _group_leader_alive,
+        reclaim_platform: bool = RECLAIM_PLATFORM,
     ) -> None:
+        self._untracked_pids = untracked_pids
+        self._confirm_untracked = confirm_untracked
+        self._process_table = process_table
+        self._spawn_instance_of = spawn_instance_of
+        self._spawn_home_of = spawn_home_of
+        self._own_home = own_home
+        self._protected_pids = protected_pids
+        self._session_leader_alive = session_leader_alive
+        self._group_leader_alive = group_leader_alive
+        self._reclaim_platform = reclaim_platform
+        #: One pass or one reclaim at a time: both read and signal the same pids.
+        self._lock = threading.Lock()
+        self._last_reading: ReconcileReading | None = None
         self._slice_pids = slice_pids
         self._recorded_pids = recorded_pids
         self._is_alive = is_alive
@@ -639,8 +757,33 @@ class RuntimeReconciler:
         """
         self._max_kills = max(0, budget)
 
+    @property
+    def last_reading(self) -> ReconcileReading | None:
+        """The most recent pass's reading, or ``None`` before the first pass."""
+        return self._last_reading
+
     def run_once(self) -> ReconcileReading:
         """Compare both truths, act on what only one of them knows, and report."""
+        with self._lock:
+            reading = self._run_once()
+        self._last_reading = reading
+        return reading
+
+    def _leak_reading(self) -> tuple[tuple[int, int], ...]:
+        """The untracked-runtime report's current hits, each with its tree RSS."""
+        if not self._reclaim_platform:
+            return ()
+        try:
+            pids = self._untracked_pids()
+            if not pids:
+                return ()
+            table = self._process_table()
+        except Exception:
+            logger.debug("runtime_reconcile: leak reading failed", exc_info=True)
+            return ()
+        return tuple((pid, _tree_rss(pid, table)) for pid in sorted(pids))
+
+    def _run_once(self) -> ReconcileReading:
         try:
             kernel = self._slice_pids()
         except Exception as exc:
@@ -671,6 +814,7 @@ class RuntimeReconciler:
         # previous pass's confirmation and be eligible immediately -- a
         # confirmation about a process that has since gone.
         self._unowned_last_pass = dict(self._identities)
+        leaked = self._leak_reading()
         return ReconcileReading(
             owned_alive=len(recorded) - owned_dead,
             owned_dead=owned_dead,
@@ -678,7 +822,126 @@ class RuntimeReconciler:
             killed=killed,
             would_kill=would_kill,
             forgotten=forgotten,
+            leaked_untracked=len(leaked),
+            leaked_rss_bytes=sum(rss for _pid, rss in leaked),
+            leaked=leaked,
         )
+
+    # -- the user-confirmed reclaim of the untracked-runtime report's hits --
+
+    def reclaim_untracked(self) -> ReclaimResult:
+        """End leaked runtimes once, on an explicit user confirm, through the kill arm's own gates.
+
+        Not scheduled and not default-on: the dashboard's owner-only, confirmed route
+        is its only caller. A candidate must have been reported by a sweep AND be
+        detected again on a fresh, complete read now. Every condition below can only
+        withhold; the start identity is re-read before the gate and pinned into the
+        kill seam, so a match never authorizes and a mismatch or unreadable one vetoes.
+        At most the configured per-pass budget (``session.reconcile_max_kills``, whose
+        ceiling is :data:`DEFAULT_MAX_KILLS`) trees per call, so a budget of 0 refuses
+        every candidate here exactly as it withholds the scheduled arm.
+        """
+        if not self._reclaim_platform:
+            return ReclaimResult(
+                supported=False, reason="reclaim reads /proc and runs on Linux only"
+            )
+        with self._lock:
+            try:
+                reported = self._untracked_pids()
+                candidates = reported & self._confirm_untracked()
+                recorded = self._recorded_pids()
+                protected = self._protected_pids()
+                table = self._process_table()
+            except Exception as exc:
+                return ReclaimResult(supported=False, reason=f"cannot read the records: {exc}")
+            killed: list[int] = []
+            refused = [(pid, "no longer detected") for pid in sorted(reported - candidates)]
+            for pid, why in refused:
+                self._audit(pid, "refused", f"reclaim: {why}")
+            for pid in sorted(candidates):
+                if len(killed) >= min(self._max_kills, DEFAULT_MAX_KILLS):
+                    why = "kill budget spent"
+                else:
+                    identity = self._safe(self._identity_of, pid)
+                    why = self._why_not_reclaimable(pid, recorded | protected, table)
+                    if not why and (
+                        identity is None or self._safe(self._identity_of, pid) != identity
+                    ):
+                        why = "process identity changed or unreadable"
+                    if not why and not self._authorize(
+                        pid, "user-confirmed reclaim of a leaked runtime"
+                    ):
+                        why = "refused by the ownership gate"
+                    if not why:
+                        why = self._reclaim_one(pid, identity)
+                if why:
+                    refused.append((pid, why))
+                    self._audit(pid, "refused", f"reclaim: {why}")
+                else:
+                    killed.append(pid)
+                    self._audit(pid, "killed", "user-confirmed reclaim of a leaked runtime")
+            return ReclaimResult(killed=tuple(killed), refused=tuple(refused))
+
+    @staticmethod
+    def _safe(probe: Callable[[int], str | None], pid: int) -> str | None:
+        try:
+            return probe(pid)
+        except Exception:
+            return None
+
+    def _why_not_reclaimable(
+        self, pid: int, tracked: set[int], table: dict[int, tuple[int, int]]
+    ) -> str:
+        """Empty when every live-owner check passes; any doubt is a refusal."""
+        try:
+            if pid <= 1 or pid == os.getpid() or pid in tracked:
+                return "tracked or protected"
+            if self._leases_on(pid) or self._claims_on(pid):
+                return "leased or claimed"
+            if not self._is_managed(pid):
+                return "not a managed agent process"
+            if not self._is_ours(pid):
+                return "no spawn marker"
+            if self._age_secs(pid) < self._min_age_secs:
+                return "younger than the age floor"
+            if self._spawn_home_of(pid) != self._own_home():
+                # The marker is shared by every install on this uid, and a sibling's
+                # runtime is tracked only in ITS pid files, so it reads as untracked
+                # here. An absent home (a runtime spawned before the stamp) is not ours.
+                return "spawned by another data home, or home unreadable"
+            if self._session_leader_alive(pid):
+                return "its session leader is alive"
+            if self._group_leader_alive(pid):
+                return "its group leader is alive"
+            instance = self._spawn_instance_of(pid)
+            if not instance:
+                return "no readable spawn instance"
+            for other in table:
+                # The stamps are inherited, so a live runtime's descendant carries the
+                # same instance as that runtime. Any holder outside this tree means
+                # the spawn still has a live member, so the candidate may be its child.
+                if other == pid or _descends_from(other, pid, table):
+                    continue
+                if self._spawn_instance_of(other) == instance:
+                    return "another live process shares its spawn instance"
+        except Exception:
+            return "a liveness check could not be read"
+        return ""
+
+    def _reclaim_one(self, pid: int, identity: str | None) -> str:
+        """Signal *pid*'s tree under the tenancy barrier; empty on success, else why not."""
+        epoch = self._epoch_of(pid)
+        if not self._commit_teardown(pid, epoch):
+            return "a tenant claimed the process after the gate allowed it"
+        try:
+            if not self._kill_tree(pid, identity):
+                return "kill signalled nothing"
+        except Exception:
+            logger.debug("runtime_reconcile: reclaim kill failed pid=%s", pid, exc_info=True)
+            return "kill failed"
+        finally:
+            self._release_teardown(pid)
+        return ""
 
     # -- direction one: a record with no process --
 
@@ -1329,4 +1592,6 @@ def build_reconciler(
         notify_dead=notify_dead,
         min_age_secs=min_age_secs,
         max_kills=max_kills,
+        untracked_pids=session_pid.reported_untracked_agent_pids,
+        confirm_untracked=session_pid.confirm_untracked_agent_runtimes,
     )

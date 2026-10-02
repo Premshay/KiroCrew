@@ -25,6 +25,8 @@ import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
 import CommandCenterDock from '../pages/chat/command-center/CommandCenterDock'
+import { usePreviewFlag } from '../hooks/usePreviewFlag'
+import { PREVIEW_DASHBOARD } from '../utils/previewFlags'
 import ChatFooter from '../pages/chat/ChatFooter'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
@@ -51,7 +53,6 @@ import { useAvailableModels } from '../hooks/useAvailableModels'
 import { effortToCarry, filterInteractiveModels, legacyCodexEffort, modelWithoutEffort, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
 import { modelSupportsEffort } from '../lib/effort'
 import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
-import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useKirocrewConfigReader } from '../hooks/useKirocrewConfigReader'
@@ -88,6 +89,7 @@ import { slotApprovalMode } from '../utils/slotApprovalMode'
 
 
 import { i18nT } from '../i18n/t'
+import { fetchDashboardConfig } from '../api/dashboardConfigQuery'
 
 /**
  * ChatPane — one live chat session in the native session grid.
@@ -228,6 +230,9 @@ export default function ChatPane({
   // Same gate the main chat uses: hide a Connections-owned OAuth banner only
   // while the card that owns that flow is reachable.
   const connectionsUiOn = useConnectionsUiEnabled()
+  // The Dynamic Dashboard is a Feature Preview (Settings > Developer): its
+  // dock is offered only to someone who turned it on, whatever the host wired.
+  const dashboardPreview = usePreviewFlag(PREVIEW_DASHBOARD)
   const [input, setInput] = useState('')
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
   // Collapsed paste blocks behind the `[ Paste #N · M lines ]` tokens in
@@ -491,7 +496,7 @@ export default function ChatPane({
   // for the same reason as ChatPage: both would offer the same choices, and
   // only the card can answer the blocked tool call.
   const pendingQuestion = useAppSelector((s) => pendingQuestionFor(s.chat.pendingQuestions, slotKey))
-  const { followUpOptions, followUpIsPlan, followUpSourceKey } = useMemo(
+  const { followUpOptions, followUpSourceKey } = useMemo(
     () => deriveFollowUpOptions(allMessages, busy, !!pendingQuestion),
     [allMessages, busy, pendingQuestion],
   )
@@ -520,26 +525,11 @@ export default function ChatPane({
     followUpInsertedRef.current = null
     setInput(next)
   }, [])
-  // Orchestrator plan dispatch (#5893) — same mutation ChatPage uses,
-  // targeting THIS pane's slot. The hook owns the latch acknowledgement,
-  // keyed on the derived options-row identity passed here; the ref lets the
-  // click handler see the in-flight state, not the render it closed over.
-  const planActionMutation = usePlanActionMutation(slotKey, followUpSourceKey)
-  const planActionMutationRef = useRef(planActionMutation); planActionMutationRef.current = planActionMutation
-  // One spelling for every plan-chip gesture (single-click, double-click,
-  // Send-now). `sourceKeyAtClick` is the row the gesture started on.
-  const dispatchPlanFollowUp = (action: string, sourceKeyAtClick?: string | null): boolean => {
-    if (!(followUpIsPlan && isPlanAction(action))) return false
-    if (!paneSlot) return true
-    if (paneSlot.mode !== 'orchestrator') return false
-    planActionMutationRef.current.mutate({ slot: slotKey, action, clickedSourceKey: sourceKeyAtClick })
-    return true
-  }
   const followUpOptionsKey = followUpOptions.join('\x00')
   useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
   // with the page and no extra request is made for a pane.
-  const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
+  const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: fetchDashboardConfig, staleTime: 30_000 })
   // Whether the split send button may offer `Auto (Jev)`: the fleet ceiling and
   // the owner's consent, both the gateway's answers (see useJevAutoSend).
   const jevAutoConsented = useJevAutoSend()
@@ -1636,6 +1626,7 @@ export default function ChatPane({
                 bodyBeyondPreview={pinnedState.bodyBeyondPreview}
                 pushUp={pinnedState.push}
                 liveH={pinnedState.liveH}
+                maxH={pinnedState.maxH}
                 bannerH={pinnedState.bannerH}
                 expanded={pin.pinExpanded}
                 onToggleExpanded={() => setPinExpanded(p => !p)}
@@ -1764,7 +1755,7 @@ export default function ChatPane({
         <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={scrollToBottom} />
 
         <SubagentProgressBar slot={slotKey} />
-        {onOpenCommandCenter && <CommandCenterDock slot={slotKey} onOpen={onOpenCommandCenter} />}
+        {dashboardPreview && onOpenCommandCenter && <CommandCenterDock slot={slotKey} onOpen={onOpenCommandCenter} />}
 
         <SubagentDeliveryProgress count={systemDeliveryCount} />
         {/* Rendered on server state only. A `steer-only` host never ASKS for a
@@ -2014,21 +2005,7 @@ export default function ChatPane({
           followUpLayout={chatConfig.followUpLayout}
           quickSend={dashCfg?.quick_send}
           followUpSourceKey={followUpSourceKey}
-          followUpPendingOptions={planActionMutation.latchedActions}
-          followUpRefusedOptions={new Set(followUpOptions.filter(planActionMutation.isRefused))}
-          followUpError={planActionMutation.failure}
-          onFollowUpSelect={(o: string, e: React.MouseEvent, sourceKeyAtClick?: string | null) => {
-            // Mirrors ChatPage's wiring, plan branch included (#5893). Plan
-            // options (Go / Go All / Cancel — the only labels the plan
-            // pipeline emits and the only actions the endpoint accepts)
-            // dispatch directly against THIS pane's slot — no input fill:
-            // the same chip must mean the same thing here as in the main
-            // chat. A plan-SHAPED message carrying non-protocol labels keeps
-            // the composer path — dispatching those would 400 server-side
-            // while also skipping the append, leaving a dead chip.
-            // Slot record not yet delivered: dispatchPlanFollowUp no-ops
-            // rather than appending an approval label (the reported bug).
-            if (dispatchPlanFollowUp(o, sourceKeyAtClick)) return
+          onFollowUpSelect={(o: string, e: React.MouseEvent) => {
             // One-click Quick Send takes the same gate as ChatPage: enabled +
             // no shift + not busy + not already in multi-select.
             if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, busy, followUpPickedRef.current.size, (t: string) => doSend(t))) return
@@ -2062,13 +2039,7 @@ export default function ChatPane({
               setFollowUpPicked(next)
             }
           }}
-          onFollowUpSend={(text?: string, sourceKeyAtClick?: string | null) => {
-            // Double-click and Send-now share dispatchPlanFollowUp with
-            // single-click (#6240). `sourceKeyAtClick` is the first-click
-            // row — a straddled double-click on a replaced footer is refused.
-            if (text && dispatchPlanFollowUp(text, sourceKeyAtClick)) return
-            doSend(text)
-          }}
+          onFollowUpSend={(text?: string) => doSend(text)}
           project={paneSlot?.project ?? ''}
           // A crewmate's chat is a DM with one named crewmate, so the composer
           // addresses it by name rather than the product ("Message Kiro Crew…").

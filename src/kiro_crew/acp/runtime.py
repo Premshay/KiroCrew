@@ -125,6 +125,7 @@ from kiro_crew.acp.transport_framing import (
     OversizeLineUnrecoverable,
     _drain_oversize_line,
     response_write_window_secs,
+    settle_drain,
     write_notification_best_effort,
     write_response_frame_bounded,
 )
@@ -158,8 +159,9 @@ from kiro_crew.agent_sdk.tool_search import (
 from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config import live
-from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.constants import (
+    KIROCREW_SPAWN_HOME_ENV,
     KIROCREW_SPAWN_INSTANCE_ENV,
     KIROCREW_SPAWNED_ENV,
     KIROCREW_SPAWNED_VALUE,
@@ -2164,6 +2166,10 @@ class AcpRuntime:
         # /proc/<pid>/environ to prove a process is THIS spawn's descendant once
         # the root itself is gone.
         env[KIROCREW_SPAWN_INSTANCE_ENV] = spawn_instance
+        # Which install spawned it: the leaked-runtime reclaim refuses a runtime
+        # whose home is absent or differs, since the marker above is shared by
+        # every install on this uid.
+        env[KIROCREW_SPAWN_HOME_ENV] = str(data_home())
         # Own browser session per agent process, matching AcpClient._spawn (see
         # browser_session_env). Per PROCESS, not per agent: with session sharing
         # on (the default) an eligible subagent's session is created on the
@@ -2580,9 +2586,13 @@ class AcpRuntime:
         # is the last moment the child's own account of why it could not start
         # is still reachable, and a sandbox refusal is exactly the failure that
         # arrives this way: the child writes its signature and closes stdout
-        # together. Bounded and swallowing (see ``settle_stderr``); this is
-        # already the failure path.
-        await self.settle_stderr()
+        # together. Bounded (see ``settle_stderr``); this is already the failure
+        # path. A cancel of THIS task (loop shutdown) is absorbed here as it is
+        # in the tree scan below, so the kill that follows still runs.
+        try:
+            await self.settle_stderr()
+        except asyncio.CancelledError:
+            pass
         # The group kill below reaches only kiro-cli's own process group, and
         # every stdio MCP server it launches leads a group of its own. A
         # runtime that served a session has those recorded by the descendant
@@ -4422,16 +4432,12 @@ class AcpRuntime:
 
         Bounded and swallowing, because the caller is already on a failure path:
         the worst case of not settling is the generic error it would have produced
-        anyway, and no failure here may become a second failure. The same shape
-        and the same budget as ``AcpClient._read_message``'s own EOF drain.
+        anyway, and no failure here may become a second failure. The same budget
+        as ``AcpClient._read_message``'s own EOF drain, but shielded: this child
+        may still be alive and the drain is still the latches' only writer. A
+        cancel of the caller propagates; see :func:`settle_drain`.
         """
-        task = self._stderr_task
-        if task is None or task.done():
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-        except (Exception, asyncio.CancelledError):
-            pass
+        await settle_drain(self._stderr_task, timeout)
 
     def saw_sandbox_init_failure(self) -> bool:
         """True if an OS sandbox told this runtime's child it could not initialize.
@@ -4823,12 +4829,22 @@ class AcpRuntime:
 
     # ── Protocol Interface (used by AcpSessionHandle) ──
 
-    async def send_request(self, method: str, params: dict[str, Any]) -> int:
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        on_reserved: "Callable[[int], None] | None" = None,
+    ) -> int:
         """Send a JSON-RPC request and return the request id.
 
         The response will be routed to the session's queue (via _routed_requests)
         so AcpSessionHandle can detect turn completion. For requests that need
         an immediate response (init, session/new), use _send_and_await instead.
+
+        ``on_reserved`` is called with the id BEFORE the write, whose ``drain()``
+        can suspend: the response can reach the session queue during that
+        suspension, so a caller that must claim it registers the id by then.
         """
         if not self._process or not self._process.stdin:
             raise AcpRuntimeDead("process not running")
@@ -4845,6 +4861,8 @@ class AcpRuntime:
         session_id = params.get("sessionId")
         if session_id and session_id in self._session_queues:
             self._routed_requests[req_id] = session_id
+        if on_reserved is not None:
+            on_reserved(req_id)
 
         req = JsonRpcRequest(method=method, params=params, id=req_id)
         data = json.dumps(req.to_dict()) + "\n"

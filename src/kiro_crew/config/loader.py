@@ -408,6 +408,8 @@ from kiro_crew.config.validation import (  # noqa: F401
 )
 from kiro_crew.config.validation import validate_config_data as _validate_config_data  # noqa: F401
 from kiro_crew.constants import (
+    DEFAULT_SPAWN_MIN_MEMORY_GB,
+    DEFAULT_SUBAGENT_COST_GB,
     DEFAULT_SUBAGENT_MAX_TURNS,
     SUBAGENT_TIMEOUT_MAX,
     SUBAGENT_TIMEOUT_MIN,
@@ -2444,6 +2446,20 @@ def _subagent_timeout_from(raw: object) -> int:
     return value if value == 0 else max(SUBAGENT_TIMEOUT_MIN, value)
 
 
+def _clamp_compact_wait_secs(raw: object) -> float:
+    """Coerce ``session.compact_wait_secs``, preserving its ``0`` sentinel.
+
+    ``0`` means "use the built-in budget" and the resolver falls back to
+    ``COMPACT_WAIT_TIMEOUT_SECS`` for it, so it must survive coercion. A
+    positive value is lifted to at least ``COMPACT_WAIT_SECS_MIN`` and capped
+    at ``COMPACT_WAIT_SECS_MAX``: ``_safe_float`` with ``lo=0`` collapses a
+    negative to the sentinel, then the floor keeps a hand-edited near-zero
+    value from arming a budget that restarts every compaction.
+    """
+    value = _safe_float(raw, 0.0, lo=0.0, hi=_sections.COMPACT_WAIT_SECS_MAX)
+    return value if value == 0 else max(_sections.COMPACT_WAIT_SECS_MIN, value)
+
+
 _DEFAULT_MEMORY_MODES = frozenset({"persistent", "incognito", "temporary"})
 
 
@@ -2799,7 +2815,9 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         # default back to true. `_safe_bool` here is the final guard for a real
         # bool.
         crew_panel=_safe_bool(agent_data.get("crew_panel", True), True),
-        subagent_cost_gb=_safe_float(agent_data.get("subagent_cost_gb", 0.5), 0.5),
+        subagent_cost_gb=_safe_float(
+            agent_data.get("subagent_cost_gb", DEFAULT_SUBAGENT_COST_GB), DEFAULT_SUBAGENT_COST_GB
+        ),
         subagent_cpu_cost_cores=_safe_float(agent_data.get("subagent_cpu_cost_cores", 1.0), 1.0),
         subagent_auto_max=_safe_int(
             agent_data.get("subagent_auto_max", 32), 32, 3, SUBAGENT_AUTO_MAX_CEILING
@@ -2807,7 +2825,10 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         subagent_spawn_stagger_secs=_safe_float(
             agent_data.get("subagent_spawn_stagger_secs", 0.25), 0.25
         ),
-        spawn_min_memory_gb=_safe_float(agent_data.get("spawn_min_memory_gb", 4.0), 4.0),
+        spawn_min_memory_gb=_safe_float(
+            agent_data.get("spawn_min_memory_gb", DEFAULT_SPAWN_MIN_MEMORY_GB),
+            DEFAULT_SPAWN_MIN_MEMORY_GB,
+        ),
         resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
         resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
         admission_gate=_safe_bool(agent_data.get("admission_gate"), True),
@@ -2956,6 +2977,12 @@ def _build_session_config(session_data: dict) -> SessionConfig:
             lo=AUTOCOMPACT_PCT_MIN,
             hi=AUTOCOMPACT_PCT_MAX,
         ),
+        # Clamped on the read, like the sibling floats: 0 is the sentinel for
+        # "use the built-in budget" and any positive value is the wait, so a
+        # hand-edited negative collapses to 0 (fallback) and an oversized value
+        # is capped. Bounds are referenced via the module handle, not imported:
+        # this module's top-level names are a frozen compatibility facade.
+        compact_wait_secs=_clamp_compact_wait_secs(session_data.get("compact_wait_secs", 0.0)),
         pool_size=_safe_int(
             session_data.get("pool_size", DEFAULT_POOL_SIZE),
             DEFAULT_POOL_SIZE,
@@ -3023,6 +3050,9 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         ),
         restore_sessions=dashboard_data.get("restore_sessions", False),
         crewmate_threads=_safe_bool(dashboard_data.get("crewmate_threads"), False),
+        crewmates_in_agent_picker=_safe_bool(
+            dashboard_data.get("crewmates_in_agent_picker"), False
+        ),
         dynamic_dashboard_cards=_safe_bool(dashboard_data.get("dynamic_dashboard_cards"), False),
         qr_session_until_restart=_safe_bool(dashboard_data.get("qr_session_until_restart"), True),
         qr_session_persist_across_restart=_safe_bool(
@@ -3154,7 +3184,8 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         jira_auth=[
             JiraAuthEntry(
                 host=str(entry.get("host", "")),
-                email=str(entry.get("email", "")),
+                # ``user`` is accepted as an alias; ``email`` wins when both are set.
+                email=str(entry.get("email") or entry.get("user") or ""),
             )
             for entry in (dashboard_data.get("jira_auth") or [])
             if isinstance(entry, dict) and entry.get("host")
@@ -3400,7 +3431,12 @@ class KiroCrewConfig:
     )
     auto_update: bool = field(
         default=True,
-        metadata=_meta("Auto Update", "Enable automatic update checks."),
+        metadata=_meta(
+            "Auto Update",
+            "Where the install can apply updates, true installs them once no work is "
+            "running and restarts; false only notifies. Elsewhere it has no effect. "
+            "On those same installs a policy minimum version applies regardless.",
+        ),
     )
     #: Opt-in for the Connections gallery, which is merged but held for a later
     #: release. A real field rather than an unmodelled top-level key because the

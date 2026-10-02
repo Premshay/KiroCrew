@@ -953,6 +953,23 @@ exception already propagating would discard the very `CancelledError` the
 teardown exists to clean up after — and `gc.collect()` is nested inside its own
 `finally` so a raising shutdown cannot skip it.
 
+Before `provider.start()`, `_chat` runs the bundled audit hook's size sweep once
+(`shell_audit_log.rotate_shell_audit_log` on the resolved data home, via
+`asyncio.to_thread`). The default `postToolUse` hook appends every
+`execute_bash` call to `<data home>/audit.log` from inside kiro-cli, whichever
+process launched it, and the sweep that bounds that file otherwise runs only on
+the gateway's session cleanup loop (see [session.md](session.md), "Shell audit
+log cap") — which this process never starts, so an install that only ever runs
+`kirocrew chat` would never rotate it. Running the sweep at chat start, before
+the backend that will append is spawned, bounds the live file on entry to every
+session; on such an install it overshoots the cap by at most one session's shell
+activity. The sweep never raises by contract, a file under the cap costs one
+`stat` and creates nothing, and the data home is resolved in this process — with
+`data_home()`, the resolve-only helper, since `config_dir()` re-runs
+start-of-process maintenance and is barred from async code (#1057, guarded by
+`test/test_no_config_dir_in_async.py`) — because `KIROCREW_HOME` is what the
+hook's own path expansion reads.
+
 ### Context Tracking
 
 After each message, checks `provider.context_usage_pct()`:
@@ -1271,6 +1288,15 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
 
 `kirocrew stop [--port PORT]` stops a running gateway:
 
+`kirocrew stop --port PORT --expect-pid PID` is a narrower stop for a caller
+that already identified the gateway (the desktop app's stuck-gateway restart).
+It skips the steps below: it opens a pidfd on `PID`, checks that `PID` is the
+sole listener on `PORT`, looks like a Kiro Crew gateway and is the live holder
+of this home's `gateway.lock`, re-checks the listener, then sends SIGTERM
+through the pidfd. Any failed check, and any host without both
+`os.pidfd_open` and `signal.pidfd_send_signal` (macOS, Windows), refuses with
+no signal and exit 1. Without `--expect-pid` the command is unchanged:
+
 1. If a systemd/launchd service is active **and** the caller did not pass
    `--port` explicitly (see Service Management), stop it via the service
    manager and return — without this branch, SIGTERM-by-port would be
@@ -1454,8 +1480,28 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
      tails for foreground gateways). Detach is per-platform: POSIX uses
      `start_new_session=True`; Windows uses `creationflags=DETACHED_PROCESS
      | CREATE_NEW_PROCESS_GROUP` (there is no setsid) — both via
-     `platform_compat`. The shell returns immediately and the user can
-     follow logs via `kirocrew logs -f`.
+     `platform_compat`. The spawn returns immediately, the command then
+     waits for readiness (next bullet), and the user can follow logs via
+     `kirocrew logs -f`.
+   - Report success only once the replacement answers `/api/ready` and its
+     run marker records a pid that differs from the previous gateway's pid
+     when one is known (`_wait_gateway_ready`). Only this fork path verifies
+     readiness before printing success. A replacement that exits prints
+     `Replacement gateway (pid N) died immediately (exit status S)` and exits
+     1 at once. One still running at the deadline prints `Replacement gateway
+     (pid N) did not become ready within Ns. It is still running but not
+     serving port P.` and exits 1. The readiness deadline is read from the
+     environment each time the fork path runs: it defaults to 60 s because a
+     loaded install can take 25-35 s to boot; `KIROCREW_RESTART_READY_TIMEOUT`
+     overrides it, fractional values round up to whole seconds, the result is
+     clamped to 15..180 s, and an unset, non-numeric, non-finite, zero or
+     negative value falls back to the default. A set value that falls back
+     or gets clamped prints one `KIROCREW_RESTART_READY_TIMEOUT='V' ...;
+     using Ns.` line to stderr. When the deadline exceeds
+     15 s, the wait prints one `Still starting (Ns elapsed), continuing to
+     wait...` line on the first check after 15 s. The service path (step 1)
+     does not use this deadline and is unchanged. On both paths, the
+     token-URL wait after a successful restart keeps its fixed 15 s budget.
 3. SEL audit event logged with `via=service` or `via=fork pid=<n>` so
    the audit trail distinguishes the two paths.
 
@@ -1529,8 +1575,17 @@ on crash, and starts on boot. Implemented in `src/kiro_crew/service/`.
     lacks a credential; a fall-back login store, or a stopped unit beside a
     foreground `kirocrew gateway`, both leave the host healthy while the check
     fires.
-  - Boot survival via `WantedBy=multi-user.target` (no linger needed —
-    that's a user-service concept; this is system-level).
+  - Boot survival of the GATEWAY via `WantedBy=multi-user.target` needs no
+    linger — the gateway is a system-level unit, and linger is a user-service
+    concept. The AGENT RUNTIMES are a separate matter: the unit bakes
+    `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` for the service account, so each
+    runtime scope is created under that account's `user@<uid>.service`, which
+    logind stops when the account's last login session ends unless linger is on
+    — killing in-flight scoped runtimes and dropping later spawns to the
+    unscoped path (no cgroup ceilings). `install_service()` therefore prints a
+    non-fatal warning naming `loginctl enable-linger <user>` when it detects
+    linger off for the service account, beside the headless-auth warning above;
+    it is advisory and never changes the install outcome.
   - Crash-loop safety: `StartLimitBurst=3 StartLimitIntervalSec=300`.
   - **A home another gateway already serves is not retried.** `kirocrew
     gateway` takes `<home>/gateway.lock` before it binds anything. One
@@ -1825,6 +1880,29 @@ source checkout within 12 hours of one, where the version-only verdict only did
 so at a release. Requiring both keeps that path firing no more often than
 before. Commit distance without a version bump lights the dashboard badge, and
 `POST /api/update` is the non-destructive way to apply it.
+
+**What `auto_update` does on this install is derived once.**
+`update_capability.auto_update_effect()` answers `install` (with the switch on,
+an available update is installed and the gateway restarts), `notify` (the switch
+cannot install here, so it only notifies), or `mandatory` (a policy floor this
+build is below installs it whatever the switch says). It is read from install
+shape and policy alone, before any check runs: a policy provider owns the update
+and installs only with an `apply_command` it can run; a git checkout installs only
+past the unattended git apply's static gates (a trusted `git`, a primary branch,
+no repository-named exec driver, tracking `origin/<branch>`, the pinned source);
+a managed venv only past the installer's (POSIX, the managed venv itself, a safe
+HTTPS CDN, the pinned source); anything else is updated by its own updater. The
+gateway's update loop branches on that answer, and `notify` never reaches
+`_prepare_auto_update_apply`, so admission is not paused for an update the install
+will not apply (a provider with no `apply_command`, a feature-branch checkout).
+Dynamic conditions stay with the update itself: the git route still requires
+`version_newer`, the installer route a newer build. The status frame carries the
+same answer as `update_auto_effect` (`unknown` until the loop's first
+derivation), re-derived off the loop at most once every five minutes; the
+update loop's first cycle arms that refresh. A policy provider the CHECK
+resolves after the derivation (a live policy refresh) downgrades the cycle to
+notify: a provider owns the update, so no built-in route applies it. `test_every_unattended_apply_consults_the_effect_first`
+pins that every apply branch reads it before pausing admission.
 
 **`POST /api/update` refuses before it moves the tree, and fast-forwards to a
 pinned commit rather than pulling.** In order: a dirty tracked tree is 409

@@ -63,7 +63,7 @@ import aiohttp
 
 from kiro_crew import platform_compat
 from kiro_crew.cloud import ssm as cloud_ssm
-from kiro_crew.cloud.connect import FARGATE_TURN_PATH
+from kiro_crew.cloud.connect import FARGATE_HEALTH_PATH, FARGATE_TURN_PATH
 
 # The local (embedding) gateway's configured port — carried into the minted
 # remote token as the CSP frame-ancestor parent origin so the embedded pane can
@@ -90,6 +90,7 @@ from kiro_crew.instances.constants import (
     DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS as _MODELS_CAPABILITY_PROXY_TIMEOUT,
 )
 from kiro_crew.instances.constants import DEFAULT_PROBE_FAILURE_THRESHOLD as _PROBE_FAILS
+from kiro_crew.instances.constants import DEFAULT_PROBE_HEALTH_TIMEOUT_SECS as _PROBE_HEALTH_TIMEOUT
 from kiro_crew.instances.constants import DEFAULT_PROBE_INTERVAL_SECS as _PROBE_INTERVAL
 from kiro_crew.instances.constants import (
     DEFAULT_PROXY_CONNECT_TIMEOUT_SECS as _PROXY_CONNECT_TIMEOUT,
@@ -769,6 +770,11 @@ class _SshTunnel:
         # down to trigger self-heal; the manager threads the config-tunable value.
         self._probe_fails = probe_failure_threshold
         self._on_exit = on_exit  # Phase 3 seam: called(instance_id) on unexpected exit
+        # Optional seam, assigned by the manager after construction (never a
+        # constructor kwarg, so a tunnel double need not accept it): called
+        # (instance_id) on a proven end-to-end probe success so the manager can
+        # clear the self-heal attempt counter once the forward is verified live.
+        self._on_healthy: Callable[[str], None] | None = None
         self._transport = transport  # "ssh" or "ssm"
         self._ssm_target = ssm_target
         self._aws_profile = aws_profile
@@ -912,14 +918,21 @@ class _SshTunnel:
         return True
 
     async def _probe_loop(self) -> None:
-        """Poll the local forward while CONNECTED; tear down on repeated failure.
+        """Poll the forward end-to-end while CONNECTED; tear down on repeated failure.
 
         Sleeps ``_PROBE_INTERVAL`` between probes (interruptible by ``stop()``).
-        A successful reachability check resets the failure counter; after
-        ``_PROBE_FAILS`` consecutive failures the tunnel is treated as a zombie
-        (alive child, no forwarding) and the child is terminated — the existing
-        ``_monitor`` then fires ``on_exit`` so Stage 2 can rebuild/re-mint.
-        Mirrors ``TunnelManager._probe_loop``.
+        A successful check resets the failure counter and fires ``on_healthy``
+        (so the manager clears the self-heal attempt counter on proven
+        end-to-end health); after ``_PROBE_FAILS`` consecutive failures the
+        tunnel is treated as a zombie (alive child, no forwarding) and the child
+        is terminated — the existing ``_monitor`` then fires ``on_exit`` so
+        Stage 2 can rebuild/re-mint. Mirrors ``TunnelManager._probe_loop``.
+
+        The check is :meth:`_forward_alive`, an end-to-end request through the
+        forward — not :meth:`_port_reachable`. A bare TCP connect proves only
+        that the local listener is bound, which a zombie forward satisfies while
+        relaying nothing to the far end, so a connect-only probe can never
+        observe the very stall it exists to catch.
         """
         try:
             while not self._stopping and self.status.state == TunnelState.CONNECTED:
@@ -930,8 +943,15 @@ class _SshTunnel:
                     pass  # interval elapsed — time to probe
                 if self._stopping or self.status.state != TunnelState.CONNECTED:
                     return
-                if await self._port_reachable():
+                if await self._forward_alive():
                     self._probe_failures = 0
+                    # A proven end-to-end round trip is the signal that clears
+                    # the self-heal attempt counter — not a bind-only rebuild.
+                    # This is what stops one slow probe after a rebuild from
+                    # ratcheting the recovery budget down permanently.
+                    if self._on_healthy is not None:
+                        with contextlib.suppress(Exception):
+                            self._on_healthy(self._id)
                     continue
                 self._probe_failures += 1
                 logger.warning(
@@ -1010,6 +1030,58 @@ class _SshTunnel:
         with contextlib.suppress(Exception):
             await writer.wait_closed()
         return True
+
+    async def _forward_alive(self) -> bool:
+        """Return True only when the far end answers through the forward.
+
+        The steady-state health check, distinct from :meth:`_port_reachable`.
+        A bare TCP connect is answered by whatever holds the local listening
+        socket, which for an SSM forward is ``session-manager-plugin`` on
+        loopback. When that plugin survives a dropped forward as a zombie it
+        keeps the socket bound while relaying nothing, so a connect-only probe
+        passes forever and the tunnel is reported CONNECTED while every request
+        through it stalls — the exact failure this loop exists to catch.
+
+        This issues a ``GET`` at the transport's own unauthenticated liveness
+        path through the forward and treats ANY completed HTTP response — of any
+        status — as alive. A status line is itself proof that bytes traversed to
+        the far end and back, which is what a zombie forward cannot produce: it
+        accepts the connect, then sends zero bytes until the budget expires. The
+        status code is deliberately not inspected. The path is the far end's:
+        a gateway forward answers ``/api/health`` credential-free, while a
+        fargate crew's container serves its own ``FARGATE_HEALTH_PATH``
+        (``turn_url`` is set only for the fargate lane, so it selects the path).
+        Probing the wrong path would still prove liveness, but the fargate
+        container authorises before it routes and would log a ``control`` deny
+        for each probe, so the right path keeps the probe silent in its logs.
+        Only a timeout or a connection error (no response at all) is a failure;
+        the caller's consecutive-failure threshold keeps one slow round trip
+        from tearing down a good tunnel.
+        """
+        if self._local_port <= 0:
+            return False
+        # turn_url is populated only for the fargate lane; its container serves a
+        # dedicated liveness path and refuses (audited) every other one.
+        health_path = FARGATE_HEALTH_PATH if self.status.turn_url else "/api/health"
+        url = f"http://{_LOOPBACK}:{self._local_port}{health_path}"
+        try:
+            timeout = aiohttp.ClientTimeout(total=_PROBE_HEALTH_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, allow_redirects=False) as resp:
+                    # Any status line is proof the far end sent bytes back. A
+                    # zombie forward never reaches here; it stalls until the
+                    # timeout arm below fires.
+                    _ = resp.status
+                    return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(
+                "Tunnel forward liveness probe on port %d failed (%s)",
+                self._local_port,
+                type(e).__name__,
+            )
+            return False
 
     async def _monitor(self) -> None:
         """Await the child's exit; on unexpected exit mark ERROR and notify."""
@@ -3473,6 +3545,7 @@ class SshTunnelManager:
             self._tunnels[instance_id] = tunnel
             self._tunnel_epoch[instance_id] = self._tunnel_epoch.get(instance_id, 0) + 1
             tunnel.status.turn_url = params.turn_url(local_port)
+            tunnel._on_healthy = self._on_tunnel_healthy
             ok = await tunnel.start()
             if not ok:
                 self._last_error[instance_id] = tunnel.status.error or "tunnel failed to start"
@@ -3881,6 +3954,25 @@ class SshTunnelManager:
             return  # not lent, or the credential it protected has already died
         self._hop_guard.hold(port, until)
 
+    def _on_tunnel_healthy(self, instance_id: str) -> None:
+        """Sync seam invoked by a tunnel's probe loop on a proven live forward.
+
+        A successful end-to-end probe is the only signal that clears the
+        self-heal attempt counter. A rebuild's ``start()`` confirms only the
+        LOCAL bind, so resetting the counter there would let a forward whose far
+        end is dead rebuild "successfully" forever without ever reaching the
+        recovery cap; and gating that reset on a single post-rebuild probe would
+        instead ratchet the counter UP permanently whenever one 4s probe missed
+        a still-booting far end. Clearing it here — on any interval whose probe
+        traverses to the far end and back — makes the counter reflect observed
+        end-to-end health: it climbs only while the forward stays dead across
+        rebuilds (so ``_recover`` reaches ``_MAX_RECOVERY`` and hands off to
+        diagnosis) and returns to zero the moment the forward answers again.
+        Idempotent: dropping an absent key is a no-op, so a healthy tunnel that
+        never needed recovery costs nothing.
+        """
+        self._recover_attempts.pop(instance_id, None)
+
     def _on_tunnel_exit(self, instance_id: str) -> None:
         """Sync seam invoked by a tunnel's monitor on unexpected exit.
 
@@ -4000,6 +4092,7 @@ class SshTunnelManager:
             **params.tunnel_kwargs(),
         )
         tunnel.status.turn_url = params.turn_url(local_port)
+        tunnel._on_healthy = self._on_tunnel_healthy
         async with self._lock:
             if self._tunnel_epoch.get(inst.id, 0) != expected_epoch:
                 raise _RecoverySuperseded(inst.id)
@@ -4070,7 +4163,10 @@ class SshTunnelManager:
         displacing path stops the tunnel it displaces, so *mine* is already
         down and untracked.
 
-        Reset the attempt counter and persist the hints, under lock, iff tracked.
+        Persist the forwarder identity hints, under lock, iff still tracked.
+        The attempt counter is NOT reset here — a bind-only rebuild does not
+        prove the forward reaches its far end; the reset lives on a proven
+        end-to-end probe success (see :meth:`_probe_loop`).
 
         A rebuild replaced the tunnel child, so the recorded forwarder
         identity (``forwarder_pid`` + ``forwarder_start`` + the
@@ -4101,6 +4197,15 @@ class SshTunnelManager:
         bare ``to_thread`` await would NOT stop the already-running thread, so
         its write could land after the lock released and break the ordering.
         """
+        # A rebuild's start() waits only for the LOCAL forward to bind, so it
+        # reports success even when the far end never answers. The attempt
+        # counter is therefore NOT reset here: only a proven end-to-end probe
+        # success clears it (see _probe_loop -> _on_tunnel_healthy). A rebuild
+        # whose far end stays dead leaves the counter climbing, so _recover
+        # reaches _MAX_RECOVERY and hands off to _schedule_diagnosis instead of
+        # respawning a healthy-looking forward every interval; a rebuild whose
+        # forward IS alive has its counter cleared by the next successful probe,
+        # so a single slow probe cannot ratchet the budget down permanently.
         async with self._lock:
             tunnel = self._tunnels.get(instance_id)
             if tunnel is None:
@@ -4108,7 +4213,6 @@ class SshTunnelManager:
             if tunnel is not mine or self._tunnel_epoch.get(instance_id, 0) != expected_epoch:
                 logger.info("Discarding a superseded self-heal rebuild for %s", instance_id)
                 return
-            self._recover_attempts[instance_id] = 0
             await self._persist_hint(
                 self._registry.update,
                 instance_id,
@@ -4125,9 +4229,11 @@ class SshTunnelManager:
         A CHAINED crew is minted for BEFORE tier 1, because only the mint reply
         names the port the parent's forward to this crew listens on, and tier 1's
         rebuild has to dial it; its tier 2 is therefore a second rebuild too.
-        Capped at ``_MAX_RECOVERY`` consecutive attempts (reset on success) so a
-        persistently-broken host can't churn forever. No-ops if the instance was
-        disconnected/removed or has already recovered while we waited for the lock.
+        Capped at ``_MAX_RECOVERY`` consecutive attempts (reset when a rebuilt
+        forward answers the end-to-end probe, via :meth:`_on_tunnel_healthy` — a
+        bind-only rebuild does not zero it) so a persistently-broken host can't
+        churn forever. No-ops if the instance was disconnected/removed or has
+        already recovered while we waited for the lock.
 
         The slow remote I/O (mint; rebuild) runs **without** the manager lock —
         mirroring ``_refresh_token_once`` — so self-heal can't stall concurrent

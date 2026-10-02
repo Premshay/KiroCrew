@@ -49,7 +49,7 @@
         "session_sharing": true,
         "max_subagents": 0,
         "max_stop_hook_nudges": 100,
-        "spawn_min_memory_gb": 4.0,
+        "spawn_min_memory_gb": 2.0,
         "resource_pressure_gb": 4.0,
         "resource_critical_gb": 2.0,
         "admission_gate": true,
@@ -717,10 +717,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Spawn Min Memory GB",
-      "help": "Minimum available memory (GB) required to spawn a subagent. 0 disables the check.",
+      "help": "Available memory (GB) that must remain after admitting a subagent start. A dedicated-process start is priced at what such a runtime settles at (about 1 GB until runs of that agent have been measured, then their learned size capped at 2 GB, never below subagent_cost_gb); one that shares its parent's runtime at about 0.35 GB less. A spawn that does not fit waits in the durable queue (one with no durable queue is refused). 0 disables the check.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 4.0
+      "defaultValue": 2.0
     },
     {
       "path": "agent.resource_pressure_gb",
@@ -1206,7 +1206,7 @@
       "sensitive": false,
       "tags": [],
       "label": "SubAgent Memory Cost (GB)",
-      "help": "Free memory (GB) each sub-agent start must find on top of the admission floor; also the per-agent fallback used to auto-size the cap until a learned value accumulates. Raise it on hosts whose runtimes settle heavier.",
+      "help": "The least a dedicated sub-agent start is priced at when admission reserves its memory (the measured or learned settled size applies when higher); also the per-agent fallback used to auto-size the cap until a learned value accumulates.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0.5
@@ -1248,7 +1248,7 @@
       "sensitive": false,
       "tags": [],
       "label": "SubAgent Spawn Stagger (seconds)",
-      "help": "Delay between successive subagent spawns (initial fill and queued drain) to bound cold-start CPU/memory spikes. Starts stay serialized; the interval only decides how fast a wide fan-out fills. Raise it if this host or the model provider is the bottleneck -- a spawn still has to clear spawn_min_memory_gb and the host budget, and the adaptive controller cuts the cap on real pressure, so this is a smoothing interval rather than the memory guard.",
+      "help": "Delay between successive subagent spawns (initial fill and queued drain) to bound cold-start CPU/memory spikes. Starts stay serialized; the interval only decides how fast a wide fan-out fills. Raise it if this host or the model provider is the bottleneck -- a spawn still has to leave spawn_min_memory_gb free after its start and clear the host budget, and the adaptive controller cuts the cap on real pressure, so this is a smoothing interval rather than the memory guard.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0.25
@@ -1452,6 +1452,7 @@
         "empty_response_auto_continue": true,
         "empty_response_max_continues": 1,
         "autocompact_pct": 70.0,
+        "compact_wait_secs": 0.0,
         "pool_size": 0,
         "pool_agent": "",
         "pool_ttl_secs": 1800,
@@ -1516,6 +1517,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 70.0
+    },
+    {
+      "path": "session.compact_wait_secs",
+      "kind": "core",
+      "type": "number",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Compaction Wait Budget",
+      "help": "Seconds the automatic-compaction coordinator waits for a compaction to finish before giving up and restarting the session. 0 (the default) uses the built-in budget. A positive value below 60 is raised to 60 and a value above 3600 is capped. Raise it on a host where automatic compaction on a large context window regularly needs longer than the built-in budget.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0.0
     },
     {
       "path": "session.pool_size",
@@ -4076,7 +4091,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Max Recovery Attempts",
-      "help": "Consecutive self-heal attempts before a dropped tunnel is left disconnected. With the capped-exponential backoff, the default 8 spans a ~2 min recovery window, enough to outlast a transient drop (screen lock, proxy warmup) before giving up.",
+      "help": "Consecutive self-heal attempts before a dropped tunnel is left disconnected. A rebuild that fails outright spans a ~2 min window under the capped-exponential backoff (enough to outlast a transient drop such as a screen lock or proxy warmup); a forward that re-binds but whose far end stays dead additionally spends one probe window per attempt (probe_failure_threshold x probe_interval), so handoff to diagnosis takes roughly attempts x (90s + backoff) ~= 16 min at the default 8. Size this against the longer window.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 8
@@ -7011,6 +7026,7 @@
         "restore_sessions": false,
         "dynamic_dashboard_cards": false,
         "crewmate_threads": false,
+        "crewmates_in_agent_picker": false,
         "qr_session_until_restart": true,
         "qr_session_persist_across_restart": false,
         "restore_window_minutes": 30,
@@ -7251,6 +7267,20 @@
       "tags": [],
       "label": "Reply threads on crewmate chat messages",
       "help": "Let any message in a crewmate's chat carry its own reply thread, opened in the side panel while the main chat stays visible. Off by default: the thread routes answer not-found, no thread frame is sent, and the dashboard draws no Reply in thread control. Takes effect on the next request; no restart.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "dashboard.crewmates_in_agent_picker",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Crewmates in the chat agent picker",
+      "help": "List crewmates in the chat composer's agent picker, beside the agent templates, so a chat can be switched onto a crewmate (and its own workspace and memory) without opening it from the Crew page. Off by default: the picker lists templates plus any crewmate no listed template already covers. Takes effect when the dashboard is reloaded; no gateway restart.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
@@ -8963,7 +8993,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Auto Update",
-      "help": "Enable automatic update checks.",
+      "help": "Where the install can apply updates, true installs them once no work is running and restarts; false only notifies. Elsewhere it has no effect. On those same installs a policy minimum version applies regardless.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true

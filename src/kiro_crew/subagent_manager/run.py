@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
     from ..subagent import (
         _CANCEL_RESUME_PREFIX,
+        _DEDICATED_TOPUP_POLL_SECS,
+        _DEDICATED_TOPUP_WAIT_SECS,
         _ON_DONE_TIMEOUT,
         _RECOVERY_SLOT_WAIT_SECS,
         _RESET_TIMEOUT,
@@ -53,10 +55,17 @@ if TYPE_CHECKING:
         Stats,
         SubagentInfo,
         _context_groups_of,
+        _cost_bucket,
+        _dedicated_start_price_gb,
         _describe_exception,
+        _host_available_gb_off_loop,
         _redact,
         _resolved_model_of,
         _RunCreditAccounting,
+        _selection_kind,
+        _SharingPlan,
+        _spawn_memory_floor_and_cost,
+        _startup_memory_reserve_gb,
         _subagent_default_effort,
         _subagent_default_model,
         _timeout_context,
@@ -1170,6 +1179,7 @@ class RunEventCoordinator(ManagerComponent):
         # an arbitrary spawn-approval wait). Must be the first statement.
         info._exec_started = time.time()
         info._first_stream_started = None
+        info._first_stream_mono = None
         info._startup_cotenant_frames = 0
         # The durable row stays ``starting`` until this run's OWN turn produces
         # its first stream event addressed to its session
@@ -1331,7 +1341,7 @@ class RunEventCoordinator(ManagerComponent):
             ),
         )
         agent = info.agent or execution.template_id
-        kind = "template" if info.agent else execution.selection_kind
+        kind = _selection_kind(info)
         if info.crew or execution.member_id or (not info.agent and agent):
             policy_agent = info.crew or (execution.selection_name if kind == "member" else agent)
             denial = await asyncio.to_thread(
@@ -1371,17 +1381,18 @@ class RunEventCoordinator(ManagerComponent):
         # configured sub-agent role model (agent.role_models['subagent']). When
         # that role is unpinned the helper returns "" so we omit the kwarg and
         # keep deferring to the provider's configured default, exactly as before.
-        eff_model = info.model or _subagent_default_model()
-        # A spawn that names no model may be routed to a configured tier of the
-        # seat's vendor by ``spawn.route`` (off without consent; ``None`` is every
-        # refusal). A per-spawn pin is the parent's answer and is never asked
-        # about; the role pin is the owner's, and is asked about only so the
-        # decision is RECORDED -- it is applied only when the owner configured
-        # ``decisions.spawn_route`` tiers, which is what makes the answer usable.
+        # The one sharing decision (``_sharing_plan``), which admission also read
+        # to price this start: template execution, not ``keep``, the eligibility
+        # predicate, and no model / reasoning-effort pin.
+        plan = self._manager._sharing_plan(info)
+        eff_model = plan.eff_model
         if not info.model:
             routed = await self._route_spawn_model(info, agent)
             if routed:
-                eff_model = routed["model"]
+                # MERGE-REVIEW: a routed pin requires a dedicated runtime; the
+                # existing top-up gate must price it before the process starts.
+                plan = plan._replace(eff_model=routed["model"], shared=False)
+                eff_model = plan.eff_model
                 info.route_reason = routed["line"]
         # Record the EFFECTIVE pin (per-spawn OR the role_models['subagent']
         # config pin, via ``_subagent_default_model()``) as the requested side of
@@ -1396,7 +1407,7 @@ class RunEventCoordinator(ManagerComponent):
         # Sub-agent reasoning effort (per-call override -> role_efforts['subagent']
         # -> chat default). Passed as an override so it wins over the factory's
         # agent-derived default; "" leaves it to that default.
-        eff_effort = info.reasoning_effort or _subagent_default_effort()
+        eff_effort = plan.eff_effort
         if eff_effort:
             extra_kwargs["reasoning_effort_override"] = eff_effort
         if info.bare:
@@ -1445,17 +1456,7 @@ class RunEventCoordinator(ManagerComponent):
         if info.keep:
             self._manager._sessions.mark_continuable(session_key)
             self._manager._conversations[session_key] = time.time()
-        use_session_sharing = (
-            kind == "template" and not info.keep and self._manager._should_use_session_sharing(info)
-        )
-        # A per-spawn or per-role model / reasoning-effort override cannot be
-        # applied to the parent's already-started shared runtime (it was spawned
-        # with the parent's model and cannot switch model per session). Force the
-        # dedicated process path so the override in extra_kwargs actually reaches
-        # get_or_create -> the provider factory; otherwise a configured sub-agent
-        # model/effort would silently no-op on the default (session-sharing) path.
-        if eff_model or eff_effort:
-            use_session_sharing = False
+        use_session_sharing = plan.shared
         if use_session_sharing:
             # Local import: run.py's ``*_impl`` bodies resolve globals through
             # ``kiro_crew.subagent``, which does not export this name.
@@ -1500,6 +1501,9 @@ class RunEventCoordinator(ManagerComponent):
                 info._session_sharing = False
                 info._shared_provider = None
                 use_session_sharing = False
+                # Admitted at the shared price; the process this launches was
+                # never reserved. Top up (and re-check the floor) first.
+                await self._manager._ensure_dedicated_start_priced(info)
 
                 def _fallback_claim():
                     return self._manager._sessions.get_or_create(
@@ -1543,6 +1547,16 @@ class RunEventCoordinator(ManagerComponent):
             # A kept KAS session whose registered batch auto-approves what a
             # PreToolUse hook now covers is reset first, so the claim re-projects.
             await invalidate_stale_kas_session(self._manager._sessions, session_key, agent)
+            # Admission may have priced this start shared and the decision
+            # turned dedicated since (parent gone, sharing off, a role pin set
+            # while it waited): reserve the process before launching it.
+            await self._manager._ensure_dedicated_start_priced(info)
+            # This arm owns its process: a flag an earlier shared attempt of the
+            # run left (a cancel-recovery respawn) would hand this process's
+            # teardown to the shared arm. The old attempt's teardown, which read
+            # it, has finished before this one runs.
+            info._session_sharing = False
+            info._shared_provider = None
 
             def _claim():
                 return self._manager._sessions.get_or_create(
@@ -1842,6 +1856,8 @@ class RunEventCoordinator(ManagerComponent):
         # On such a backend PreToolUse hooks gate each permission request below;
         # the KAS projection turns every call they cover into one.
         _spec = await turn_spec_hooks(client, agent)
+        # Set when the stream ends on a generate failure after real output.
+        _kept_after_generate_failure = False
 
         async def _stream_with_transient_retry():
             """Yield stream events, retrying transient backend errors.
@@ -1978,6 +1994,19 @@ class RunEventCoordinator(ManagerComponent):
                     # re-run it (duplicate writes/messages). Only a turn with
                     # zero observed activity resends the original prompt.
                     _had_activity = bool(result_text) or turns > 0 or info.tool_count > 0
+                    # The one continue is spent and the backend still fails to
+                    # generate after real output: end the stream and keep that
+                    # output (flagged below) instead of failing a run that answered.
+                    if (
+                        post_activity_attempts >= 1
+                        # A bare [OPTIONS: ...] tag is stripped later, leaving nothing.
+                        and extract_options(result_text)[0].strip()
+                        and "failed to generate a response" in str(exc).lower()
+                    ):
+                        nonlocal _kept_after_generate_failure
+                        _kept_after_generate_failure = True
+                        logger.warning("Subagent %s: kept output after a transient error", info.id)
+                        return
                     # A failure an adapter recognises as a DEPENDENCY condition
                     # (provider throttle, 5xx, connection loss: taskq.dependency)
                     # is not retried here: the run reports it to the per-scope
@@ -2704,6 +2733,16 @@ class RunEventCoordinator(ManagerComponent):
             self._manager._completion_keep,
             self._manager._completion_keep_chars,
         )
+        if _kept_after_generate_failure:
+            # Added AFTER the keep cap, so no keep mode can cut it off.
+            _warn = (
+                "_Warning: the backend failed to generate a final response; "
+                "this is the output streamed before that._"
+            )
+            info.result = f"{_warn}\n\n{info.result}"
+            info.partial = True
+            # result.txt is what spawn_status / spawn_run read for a done run.
+            write_result_chunk(info.id, f"\n\n{_warn}\n")
         evict_completed_agents(self._manager._agents)
 
         # ── Per-turn usage row: attribute subagent spend. ──
@@ -3359,6 +3398,137 @@ class RunEventCoordinator(ManagerComponent):
         if not info.parent_session_key:
             return False
         return self._manager._sessions.is_session_sharing_eligible(info.parent_session_key)
+
+    def _sharing_plan_impl(self, info: SubagentInfo, *, cfg: Any = None) -> _SharingPlan:
+        """Decide how *info* will start: the ONE decision behind both callers.
+
+        ``_run_inner`` takes the shared-runtime arm exactly when ``shared`` is
+        True, and the admission gate prices the start from the same answer, so
+        the price can never follow a copy of the rule that drifted. Shared needs
+        template execution, no ``keep`` (a kept or continued run owns its
+        process), :meth:`_should_use_session_sharing_impl`, and no per-spawn or
+        per-role model / reasoning-effort pin: a pin cannot be applied to the
+        parent's already-started runtime, so it forces the dedicated process
+        where the override reaches the provider factory. Eligibility is the
+        backend's opt-in membership (``is_session_sharing_eligible``); nothing
+        here names a harness. *cfg* is a config the caller already loaded.
+        """
+        kind = _selection_kind(info)
+        eff_model = info.model or _subagent_default_model(cfg)
+        eff_effort = info.reasoning_effort or _subagent_default_effort(cfg)
+        # Not coerced: the eligibility answer is passed through as the run has
+        # always read it, and admission prices a start shared only on a real
+        # ``True``, so an answer it cannot trust is priced dedicated.
+        shared = (
+            kind == "template"
+            and not info.keep
+            and not (eff_model or eff_effort)
+            and self._manager._should_use_session_sharing(info)
+        )
+        return _SharingPlan(eff_model, eff_effort, shared)
+
+    async def _ensure_dedicated_start_priced_impl(self, info: SubagentInfo) -> None:
+        """Reserve a dedicated process for a start admitted at the shared price.
+
+        Admission reserved the shared price (:func:`_shared_start_price_gb`) for
+        a start predicted to share its parent's runtime. When the start takes the
+        dedicated arm instead -- the shared runtime was unavailable, or the
+        decision changed while the row waited -- the process it is about to
+        launch costs the dedicated projection, which nobody reserved. Raise the
+        row's price first, so every later admission charges it, then re-check
+        the floor with this row at that price. Below the floor the start waits
+        here with its start clock frozen (it holds its slot, so it is still
+        counted), one such start at a time so waiters do not each count the
+        others and all hold, for at most ``_DEDICATED_TOPUP_WAIT_SECS``; past
+        that it starts anyway and says so. A capacity verdict never fails a run
+        that was admitted. A row not admitted at the shared price returns at once;
+        the flag that marks it clears only once the check passed or the wait ran
+        out, so a cancel during the wait leaves the respawn to re-check.
+        """
+        if not info._start_priced_shared:
+            return
+        floor, cost = _spawn_memory_floor_and_cost()
+        settled = self._manager._learned_settled_gb
+        info._start_price_gb = _dedicated_start_price_gb(
+            cost, settled, _cost_bucket(info.agent, info.execution_context)
+        )
+        if floor <= 0:
+            info._start_priced_shared = False
+            return
+        started = time.monotonic()
+        deadline = started + _DEDICATED_TOPUP_WAIT_SECS
+        self._manager._gate_wait_mark(info)()
+        lock = self._manager._dedicated_topup_lock
+        held = False
+        try:
+            info._topup_waiting = True
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=_DEDICATED_TOPUP_WAIT_SECS)
+                held = True
+            except asyncio.TimeoutError:
+                pass
+            info._topup_waiting = False
+
+            def _need() -> float:
+                # Rows still waiting for their turn have launched nothing; each
+                # is counted once it holds the turn, against what went first.
+                rows = list(self._manager._agents.values())
+                queued_behind = sum(a._topup_waiting and not a._slot_released for a in rows)
+                return floor + _startup_memory_reserve_gb(
+                    [a for a in rows if not a._topup_waiting],
+                    running_count=self._manager._running_count - queued_behind,
+                    cost_gb=cost,
+                    next_start_gb=0.0,
+                    settled_gb=settled,
+                    claim_prices=[price for price, _ in self._manager._claim_prices.values()],
+                )
+
+            while True:
+                asked = _need()
+                avail = await _host_available_gb_off_loop(asked)
+                # Decided here, on the loop, against what the reserve owes NOW:
+                # other rows may have started or settled while the read ran.
+                need = max(asked, _need())
+                if avail < 0 or avail >= need:
+                    # -1 is the reader's "unmeasurable": fail open, as the gate does.
+                    info._start_priced_shared = False
+                    break
+                if time.monotonic() >= deadline:
+                    waited = time.monotonic() - started
+                    logger.warning(
+                        "Subagent %s: starting a dedicated process with %.2f GB available, "
+                        "below the %.2f GB its start needs; waited %.0fs",
+                        info.id,
+                        avail,
+                        need,
+                        waited,
+                    )
+                    sel().log_tool_invocation(
+                        session_key=info.parent_session_key or "",
+                        source="subagent",
+                        tool_name="spawn_run",
+                        outcome="dedicated_start_below_floor",
+                        metadata={
+                            "available_gb": avail,
+                            "min_gb": need,
+                            "start_price_gb": info._start_price_gb,
+                            "waited_secs": round(waited, 1),
+                            "subagent_id": info.id,
+                        },
+                    )
+                    info._start_priced_shared = False
+                    break
+                await asyncio.sleep(
+                    min(_DEDICATED_TOPUP_POLL_SECS, max(0.0, deadline - time.monotonic()))
+                )
+        finally:
+            info._topup_waiting = False
+            if held:
+                lock.release()
+            # Restart the start clock: the wait was admission's cost, not this
+            # start's -- including a cancel that lands mid-wait, so a respawn
+            # never inherits a frozen clock.
+            self._manager._gate_exit_reset(info)(0.0)
 
     def _gate_exit_reset_impl(self, info: SubagentInfo) -> "Callable[[float], None]":
         """The ``on_gate_acquired`` callback for *info*'s ``session/new``.

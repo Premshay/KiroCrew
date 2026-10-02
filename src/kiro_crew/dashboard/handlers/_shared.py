@@ -1119,7 +1119,7 @@ def _admitted_chat_route_methods(path: str) -> frozenset[str] | None:
         # own folders.
         return _MEMBER_CHAT_FOLDER_REORDER_METHODS
     id_part = _single_id_segment(path, "/api/chat/folders/")
-    if id_part is not None and id_part != "reorder":
+    if id_part is not None and id_part not in ("reorder", "cleanup"):
         return _MEMBER_CHAT_FOLDER_ID_METHODS
     slot = _single_id_segment(path, "/api/chat/slots/", suffix="/folder")
     if slot is not None:

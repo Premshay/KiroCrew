@@ -38,6 +38,29 @@ if TYPE_CHECKING:
 #: Caller name on this module's kill-decision audit rows.
 _SWEEP = "session_cleanup sweep"
 
+#: How long after a session's harness launched work that outlives the prompt
+#: the RSS recycle and the idle sweep still treat that session as busy. Claude
+#: Code runs a backgrounded command or a Workflow in the session's own process
+#: tree after the prompt returns, and reports the launch on the launching tool
+#: call; it reports nothing a client can read while that work runs, nor when it
+#: ends. So the hold is bounded by time: long enough for an ordinary workflow,
+#: short enough that a launch cannot exempt a runaway tree from the memory
+#: ceiling for the rest of the session's life.
+HARNESS_BACKGROUND_WORK_HOLD_SECS = 3600.0
+
+#: Hard ceiling multiplier on ``rss_max_mb`` that the hold cannot override.
+#: The hold's clock restarts on every launch, so an agent that keeps launching
+#: background work -- possibly steered to by injected content -- renews it
+#: forever and the time bound alone does not bound memory. Inside the hold
+#: the RSS recycle therefore still proceeds once the tree exceeds this multiple
+#: of the configured ceiling, and the notice names the launched work that may
+#: have been stopped (only this recycle does: one let through past the hold
+#: presumed the work finished, so its notice stays plain).
+#: Why 2x: the reported workflow trees read 2398-2641 MB against
+#: the 1536 MB default ceiling, so the hold must survive an ordinary workflow
+#: at ~1.6-1.7x while still cutting off a runaway before it grows unbounded.
+HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR = 2
+
 
 class ShutdownSignal(Protocol):
     """The subset of ``asyncio.Event`` used by the cleanup loop."""
@@ -148,6 +171,11 @@ def _last_activity(session: SessionEntry) -> float:
     return session.last_used
 
 
+def _no_background_launch(provider: LLMProvider) -> tuple[float, str] | None:
+    """Default background-launch probe: no provider reports a launch."""
+    return None
+
+
 @dataclass(slots=True)
 class CleanupState:
     """Mutable state exclusively owned by :class:`SessionCleanup`."""
@@ -225,6 +253,9 @@ class CleanupDeps:
     cleanup_stale_sandbox_profiles: Callable[[], int]
     prune_session_pid_mappings: Callable[[], int]
     prune_member_pid_bindings: Callable[[], int]
+    # Rotates the bundled shell-audit hook's ``audit.log`` once it reaches its
+    # cap; answers whether this call moved it aside. See ``shell_audit_log``.
+    rotate_shell_audit_log: Callable[[], bool]
     prune_pycache: Callable[[], tuple[int, int]]
     collect_active_pids: ActivePidCollector
     periodic_pid_sweep: PeriodicPidSweep
@@ -266,6 +297,14 @@ class CleanupDeps:
     # and defaults to "nothing injecting" so a manager without a gateway keeps
     # its existing behaviour.
     has_pending_injection: Callable[[str], bool] = _no_pending_injection
+    # ``(seconds since, description)`` of the newest work the session's harness
+    # launched to keep running after the prompt returned, or ``None``. A free
+    # semaphore only proves Kiro Crew's own prompt returned, and this is the only
+    # witness to that work. Synchronous -- it reads one record -- and defaults
+    # to "nothing launched" so a manager without ACP providers is unchanged.
+    provider_background_launch: Callable[[LLMProvider], tuple[float, str] | None] = (
+        _no_background_launch
+    )
 
 
 class SessionCleanup:
@@ -808,6 +847,33 @@ class SessionCleanup:
                         key,
                     )
                     continue
+                # The harness's own background work, which neither the
+                # semaphore nor the sub-agent probe can see: Claude Code keeps a
+                # backgrounded command or Workflow running in this tree after
+                # the prompt returned. A launch inside the hold keeps the
+                # session; an older one recycles with the plain memory-limit
+                # notice (letting it through presumes the work finished).
+                # The hold yields to the hard ceiling: every new launch
+                # refreshes the hold's clock, so without a memory bound of its
+                # own, a session that keeps launching work would keep this
+                # check off forever while its tree grows without limit.
+                # Synchronous, so the no-suspend window to ``reset`` holds.
+                launch = self._harness_background_launch(session)
+                if (
+                    launch is not None
+                    and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS
+                    and rss <= self.state.rss_max_mb * HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR
+                ):
+                    self._deps.logger.info(
+                        "RSS recycle: session %s tree rss=%dMB exceeds %dMB but its "
+                        "harness launched background work %.0fs ago (%s); skipping",
+                        key,
+                        rss,
+                        self.state.rss_max_mb,
+                        launch[0],
+                        launch[1],
+                    )
+                    continue
                 # reset revalidates both object identity and the busy semaphore
                 # under its own lock after the unlocked RSS measurement, and
                 # ``skip_if_injecting`` puts the counter read under that same
@@ -830,13 +896,40 @@ class SessionCleanup:
                     self.state.rss_max_mb,
                 )
                 self._deps.stats_factory().inc_session_cleaned()
-                await self._owner._fire_recycle_callback(
-                    key,
-                    reason=f"memory limit ({rss}MB)",
-                )
+                reason = f"memory limit ({rss}MB)"
+                # Name the launched work only while the launch is still inside
+                # the hold — in practice, a hard-ceiling recycle. A recycle let
+                # through PAST the hold just presumed that work finished (that
+                # is what ending the hold means), and the record is never
+                # cleared while the process lives, so warning "may have been
+                # stopped" about a launch from hours ago would be permanent
+                # noise on every later recycle.
+                if launch is not None and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS:
+                    reason += (
+                        "; background work its agent started earlier may have been "
+                        f"stopped: {launch[1]}"
+                    )
+                await self._owner._fire_recycle_callback(key, reason=reason)
             except Exception:
                 # One victim cannot suppress the rest of this tick.
                 self._deps.logger.exception("RSS recycle failed for session %s", key)
+
+    def _harness_background_launch(self, session: SessionEntry) -> tuple[float, str] | None:
+        """*session*'s newest background launch as ``(seconds since, description)``.
+
+        ``None`` means its harness launched nothing, or the provider cannot say.
+        Not fail-closed, unlike the two probes below: no launch is the normal
+        answer for every session that started no background work, and an
+        unreadable one must not hold the memory ceiling off.
+        """
+        provider = getattr(session, "provider", None)
+        if provider is None:
+            return None
+        try:
+            return self._deps.provider_background_launch(provider)
+        except Exception:
+            self._deps.logger.debug("Background-launch probe failed", exc_info=True)
+            return None
 
     def _injection_pending(self, key: str) -> bool:
         """Fail-closed read of "is a completion injection in flight for *key*?".
@@ -1083,6 +1176,7 @@ class SessionCleanup:
             await self._sweep_sandbox_artifacts()
             await self._sweep_session_pid_mappings()
             await self._sweep_member_pid_bindings()
+            await self._sweep_shell_audit_log()
             await self._maybe_prune_pycache()
             await self._sweep_periodic_pids()
             await self._sweep_untracked_mcps()
@@ -1198,6 +1292,35 @@ class SessionCleanup:
         except Exception as exc:
             self._deps.logger.debug(
                 "member-memory pid binding sweep failed: %s",
+                type(exc).__name__,
+            )
+
+    async def _sweep_shell_audit_log(self) -> None:
+        """Bound the bundled shell-audit hook's ``audit.log``.
+
+        The hook in ``config/defaults.json`` is one shell append with no size
+        check, so nothing on the writing side ever bounds the file. The bound is
+        ``shell_audit_log.rotate_shell_audit_log`` (one ``.1`` generation at a
+        named cap, try-locked, never raises); it needs a caller on a bounded
+        cadence, which is what this tick is -- the same cadence that retracts
+        session-pid mappings, capped by :data:`MAX_TICK_INTERVAL_SECS`, so the
+        live file can overshoot the cap by at most one tick's worth of shell
+        activity. On the maintenance executor for the same reason as its
+        siblings: the data home is same-uid agent-writable, and a stat plus a
+        rename over such a path is filesystem work the event loop must not do.
+        """
+        try:
+            rotated = await asyncio.get_running_loop().run_in_executor(
+                self._deps.get_maintenance_executor(),
+                self._deps.rotate_shell_audit_log,
+            )
+            if rotated:
+                self._deps.logger.info(
+                    "Periodic sweep: rotated the shell audit log; one previous generation kept"
+                )
+        except Exception as exc:
+            self._deps.logger.debug(
+                "shell audit log sweep failed: %s",
                 type(exc).__name__,
             )
 
@@ -1588,6 +1711,23 @@ class SessionCleanup:
                 self._deps.logger.info(
                     "Idle sweep: %s began a turn mid-sweep - left running",
                     key,
+                )
+                continue
+            # Then the harness, on BOTH axes, for the reason the RSS recycle
+            # asks it: a free semaphore and no attached sub-agent do not mean
+            # the harness stopped working for this session. Work it launched to
+            # run after the prompt keeps going with no turn and no tab, which is
+            # what makes it look idle to ``last_used`` and abandoned to the
+            # orphan axis. Synchronous, like every read from here to ``reset``.
+            launch = self._harness_background_launch(scanned)
+            if launch is not None and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS:
+                self._deps.logger.info(
+                    "Idle sweep: %s looks %s but its harness launched background "
+                    "work %.0fs ago (%s) - left running",
+                    key,
+                    "orphaned" if is_orphan else "idle",
+                    launch[0],
+                    launch[1],
                 )
                 continue
             # Then the clock, on the idle axis only. A turn that started AND

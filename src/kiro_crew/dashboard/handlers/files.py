@@ -4052,7 +4052,16 @@ async def api_file_raw(request: web.Request) -> web.Response:
         _log("denied", path)
         return web.json_response({"error": "file content is not a recognized format"}, status=403)
     _log("success", path)
-    headers = {"Content-Type": content_type, "X-Content-Type-Options": "nosniff"}
+    # inline (not attachment) keeps the PDF/image rendering in the viewer's
+    # <iframe>/<img>, while naming the file so the browser's native Download /
+    # Save-as saves under the real name instead of "file-raw" -- the last
+    # segment of this endpoint's URL. Sibling parity with api_file_stream.
+    safe_name = urllib.parse.quote(os.path.basename(path), safe="")
+    headers = {
+        "Content-Type": content_type,
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": f"inline; filename*=UTF-8''{safe_name}",
+    }
     if content_type == "image/svg+xml":
         headers["Content-Security-Policy"] = "script-src 'none'; style-src 'unsafe-inline'"
     return web.Response(body=data, headers=headers)
@@ -4347,6 +4356,13 @@ async def api_file_stream(request: web.Request) -> web.StreamResponse:
         resp.content_length = end - start + 1
         resp.headers["Accept-Ranges"] = "bytes"
         resp.headers["X-Content-Type-Options"] = "nosniff"
+        # inline (not attachment) keeps playback in the <video>/<audio> element,
+        # while naming the file so a player-initiated download (the native media
+        # controls' Download) saves under the real name instead of "file-stream"
+        # -- the last segment of this endpoint's URL, which the browser would
+        # otherwise use. Sibling parity with api_file_download's Content-Disposition.
+        safe_name = urllib.parse.quote(os.path.basename(path), safe="")
+        resp.headers["Content-Disposition"] = f"inline; filename*=UTF-8''{safe_name}"
         if status == 206:
             resp.headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         # SEL: record the ALLOW decision before any bytes move. prepare() and
@@ -7361,8 +7377,16 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
     # Same shape, same reason: the Decisions feature-preview card is drawn only when
     # the ceiling permits the seam, and this endpoint is the only place the dashboard
     # can learn that. Presentation, not the control -- the consent PUT and the gate's
-    # own consent read are the two chokepoints (``decisions/capability.py``).
-    decisions_denied = await asyncio.to_thread(is_decisions_denied)
+    # own consent read are the two chokepoints (``decisions/capability.py``). The card
+    # is drawn while EITHER row permits: a fleet that withdraws hosted Jev but allows
+    # a local model (``capabilities.decisions_local``) still needs the card to pick one.
+    # Both rows evaluated in one hop, never short-circuited: each evaluation writes
+    # its own governance_decision row, and which rows appear must not depend on
+    # the other row's answer.
+    hosted_denied, local_denied = await asyncio.to_thread(
+        lambda: (is_decisions_denied(), is_decisions_denied(local=True))
+    )
+    decisions_denied = hosted_denied and local_denied
     return web.json_response(
         {
             "restore_sessions": cfg.dashboard.restore_sessions,

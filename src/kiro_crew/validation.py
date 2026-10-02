@@ -1607,6 +1607,25 @@ def _validate_monitor_runtime(args: dict[str, Any]) -> None:
             raise ValidationError("max_runtime_secs", str(exc)) from exc
 
 
+#: The one value ``watch`` accepts, as a LITERAL. Spelled here rather than imported from
+#: :mod:`kiro_crew.probes` for the reason that package spells its own kinds as literals:
+#: this module is imported by every MCP surface and ``probes`` pulls in a probe
+#: implementation, so the schema must not drag the observation layer along to validate a
+#: string. ``test_both_monitor_schemas_accept_the_work_ledger_watch`` pins it equal to
+#: ``probes.WORK_LEDGER``.
+#:
+#: CLOSED to one value on purpose. ``watch`` exists for the one subject an instruction
+#: cannot name -- a session's own key is not in its own prose -- and ``gh-pr`` is already
+#: inferred from the message, so accepting it here would offer a second spelling of the
+#: default. A caller naming anything else is refused rather than given an ordinary timer.
+_WATCH_WORK_LEDGER = "work-ledger"
+
+#: Shared by both monitor schemas, so the arm and the revision cannot drift on what the
+#: field accepts. Optional: absent means "infer the subject from the message", which is
+#: every caller written before this field existed.
+_MONITOR_WATCH_FIELD = FieldSpec("watch", str, allowed=frozenset({_WATCH_WORK_LEDGER}))
+
+
 MONITOR_WATCH_SCHEMA = ToolSchema(
     tool_name="monitor_watch",
     custom_validator=_validate_monitor_runtime,
@@ -1670,6 +1689,10 @@ MONITOR_START_SCHEMA = ToolSchema(
         # that names no brief is screened under the default, so refusing the judge
         # needs a spelling of its own. Only ``false`` survives validate_judge_spec.
         FieldSpec("judge", (dict, bool)),
+        # The SUBJECT, for the one subject a message cannot name. Accepted because
+        # the whole chain carries it: the payload, the applier and the authz forward
+        # all pass it through, so a request naming it is never silently discarded.
+        _MONITOR_WATCH_FIELD,
     ],
 )
 
@@ -1791,6 +1814,12 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         # false`` is what takes the judge off a live loop; an empty object only drops
         # the owner's own criteria, and a gated loop then runs under the default.
         FieldSpec("judge", (dict, bool)),
+        # Same field as the arm side, for the reason the comment at the top of this
+        # schema gives: a loop must not be updatable into a state monitor_start would
+        # have refused. On this side it also ARMS a watch on a loop that has none, which
+        # is the only way a conductor that armed a plain timer reaches the gate without
+        # tearing its loop down and losing its cycle count.
+        _MONITOR_WATCH_FIELD,
     ],
 )
 
@@ -3944,6 +3973,13 @@ SESSION_SET_MODEL_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_RELOAD_SCHEMA = ToolSchema(
+    tool_name="session_reload",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
 SESSION_CLOSE_SCHEMA = ToolSchema(
     tool_name="session_close",
     fields=[
@@ -4306,6 +4342,7 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_stop": SESSION_STOP_SCHEMA,
     "session_end_wait": SESSION_END_WAIT_SCHEMA,
     "session_set_model": SESSION_SET_MODEL_SCHEMA,
+    "session_reload": SESSION_RELOAD_SCHEMA,
     "session_close": SESSION_CLOSE_SCHEMA,
     "session_revive": SESSION_REVIVE_SCHEMA,
     "session_send": SESSION_SEND_SCHEMA,
@@ -4532,7 +4569,22 @@ WORK_REPORT_SCHEMA = ToolSchema(
     custom_validator=lambda cleaned: _validate_work_artifacts(cleaned.get("artifacts")),
 )
 
-WORK_LEDGER_READ_SCHEMA = ToolSchema(tool_name="work_ledger_read")
+#: Every parameter of ``work_ledger_read`` narrows or shapes the read; none is
+#: required, and with none the whole board comes back as it always has. The
+#: ``events`` ceiling restates the route's own tail cap (``_MAX_EVENT_TAIL`` in
+#: ``dashboard/handlers/work_ledger.py``), pinned together by its tests.
+WORK_LEDGER_READ_SCHEMA = ToolSchema(
+    tool_name="work_ledger_read",
+    fields=[
+        FieldSpec("events", int, min_val=0, max_val=20),
+        FieldSpec("item_id", str, max_len=16, pattern=re.compile(r"^it_[0-9a-f]{8}$")),
+        FieldSpec("state", str, allowed=_WORK_ITEM_STATES),
+        # Long enough for an offset-carrying ISO-8601 stamp with microseconds;
+        # whether it PARSES is the route's check, with the store's own reader.
+        FieldSpec("since", str, max_len=40),
+        FieldSpec("compact", bool),
+    ],
+)
 WORK_LEDGER_REBUILD_SCHEMA = ToolSchema(tool_name="work_ledger_rebuild")
 
 WORK_LEDGER_RECORD_SCHEMA = ToolSchema(

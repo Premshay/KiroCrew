@@ -4539,15 +4539,19 @@ def _hook_subprocess_env(hook: "ScriptHook", context: str) -> dict[str, str]:
     command (see ``_HOOK_BASE_ENV_KEYS``). The metadata variables are set LAST so
     a same-named ambient variable can never shadow them.
 
-    ``KIROCREW_HOOK_CONTEXT`` is capped for a Stop event only: the env var is
-    bounded by ARG_MAX (~32K on Windows), and a multi-KB Stop segment there can
-    fail subprocess creation. The full context still reaches the hook via the
-    stdin JSON payload (``Stop -> hook_event["assistant_text"]``) and drove
-    matcher evaluation, so the cap loses nothing the hook cannot recover.
+    ``KIROCREW_HOOK_CONTEXT`` is capped at 500 chars on every event: the env
+    var is bounded by ARG_MAX, and a large UserPromptSubmit prompt (pasted
+    docs) fails subprocess creation the same way a multi-KB Stop segment does.
+    For the events that echo their context onto stdin — UserPromptSubmit (the
+    ``prompt`` key) and Stop (``assistant_text``) — the full text still reaches
+    the hook there and drove matcher evaluation, so a hook reading stdin loses
+    nothing. Other events (e.g. AgentSpawn) carry no dedicated context key on
+    stdin, so for them this cap bounds what the env var conveys; their in-repo
+    callers pass a short context (a session key), well under the cap.
     """
     env = {k: v for k, v in os.environ.items() if k in _HOOK_BASE_ENV_KEYS}
     env["KIROCREW_HOOK_EVENT"] = hook.event
-    env["KIROCREW_HOOK_CONTEXT"] = context[:500] if hook.event == HOOK_EVENT_STOP else context
+    env["KIROCREW_HOOK_CONTEXT"] = context[:500]
     return env
 
 

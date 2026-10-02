@@ -67,7 +67,7 @@ BASE_SURFACE: dict[str, str] = {
     "_CONDUCTOR_AGENT_FILENAME": "value str 923f5ca0627d569f",
     "_CONDUCTOR_CORE_GRANTS": "value tuple 9ef89fe81974156e",
     "_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 0b859d2b54e84503",
-    "_CONDUCTOR_SYSTEM_PROMPT": "value str 34c8df9885581875",
+    "_CONDUCTOR_SYSTEM_PROMPT": "value str d81489d16ba34dcd",
     "_CREW_ONLY_HOOK_EVENTS": "value frozenset 9d900cfb866f983a",
     "_DEFAULT_KIRO_HOOKS_DIR": "value host",
     "_DEFAULT_SPEC_OBSERVATION_ATTEMPTS": "value int 4e07408562bedb8b",
@@ -939,3 +939,4 @@ def test_no_conductor_is_granted_a_fleet_write_or_a_model_switch() -> None:
             assert f"@kirocrew-dashboard/{verb}" not in grants
     every = conductor_tuples + (agent._MEMBER_DASHBOARD_GRANTS, agent._MEMBER_PANEL_GRANTS)
     assert all("@kirocrew-dashboard/session_set_model" not in grants for grants in every)
+    assert all("@kirocrew-dashboard/session_reload" not in grants for grants in every)

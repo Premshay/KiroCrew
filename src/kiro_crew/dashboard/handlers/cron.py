@@ -11,9 +11,9 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from aiohttp import web
 
@@ -110,6 +110,8 @@ from ._shared import (
 
 if TYPE_CHECKING:
     from kiro_crew.learn import Lesson, LessonStore
+
+_T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
 
@@ -663,20 +665,50 @@ def _resolve_chat_folder_id(
     if not folder_id:
         return "", None
     if not chat_folder_exists(state, folder_id):
-        # Shown verbatim under the Schedule form's Save button, so it names the
-        # next step rather than only the fact: the reader picked a folder that
-        # has since been deleted, and the list they picked from is stale.
-        return "", web.json_response(
-            {
-                "error": (
-                    "That chat folder does not exist. Retry the folder list and pick "
-                    "another, or choose not to file runs."
-                ),
-                "code": "unknown_chat_folder",
-            },
-            status=400,
-        )
+        return "", _unknown_chat_folder_response()
     return folder_id, None
+
+
+def _unknown_chat_folder_response() -> web.Response:
+    # Shown verbatim under the Schedule form's Save button, so it names the
+    # next step rather than only the fact: the reader picked a folder that
+    # has since been deleted, and the list they picked from is stale.
+    return web.json_response(
+        {
+            "error": (
+                "That chat folder does not exist. Retry the folder list and pick "
+                "another, or choose not to file runs."
+            ),
+            "code": "unknown_chat_folder",
+        },
+        status=400,
+    )
+
+
+class _ChatFolderGone(Exception):
+    """The job's chat folder was deleted before the save could commit."""
+
+
+async def _persist_holding_folder(
+    state: DashboardState, folder_id: str, persist: Callable[[], Awaitable[_T]]
+) -> _T:
+    """Run *persist* (a job write) while the folder-store lock is held.
+
+    A job that names a chat folder is checked and written inside one hold of
+    that lock, the lock the folder cleanup also takes to read saved jobs and
+    delete. So either this save commits first and the cleanup sees the job, or
+    the cleanup deletes first and the re-check here refuses the save. Without a
+    folder there is nothing to exclude and the write runs as before.
+    """
+    if not folder_id:
+        return await persist()
+
+    async def _section(folders: list[dict[str, Any]]) -> _T:
+        if not any(str(f.get("id")) == folder_id for f in folders):
+            raise _ChatFolderGone()
+        return await persist()
+
+    return await state.hold_folders(_section)
 
 
 def _app_caller(request: web.Request) -> str:
@@ -946,7 +978,13 @@ async def api_crons_create(request: web.Request) -> web.Response:
             status=400,
         )
     try:
-        job = await state.crons.add_job_async(name, message, **schedule_kwargs, **add_kwargs)
+        job = await _persist_holding_folder(
+            state,
+            chat_folder_id,
+            lambda: state.crons.add_job_async(name, message, **schedule_kwargs, **add_kwargs),
+        )
+    except _ChatFolderGone:
+        return _unknown_chat_folder_response()
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
     except CronStoreUnreadable as exc:
@@ -1196,7 +1234,13 @@ async def api_cron_update(request: web.Request) -> web.Response:
     if not kwargs:
         return web.json_response({"error": "no fields to update"}, status=400)
     try:
-        job = await state.crons.update_job_async(job_id, **kwargs)
+        job = await _persist_holding_folder(
+            state,
+            str(kwargs.get("chat_folder_id") or ""),
+            lambda: state.crons.update_job_async(job_id, **kwargs),
+        )
+    except _ChatFolderGone:
+        return _unknown_chat_folder_response()
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
     except CronStoreUnreadable as exc:

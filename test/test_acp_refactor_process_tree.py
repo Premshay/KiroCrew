@@ -84,6 +84,9 @@ def _as_darwin(check_output) -> Iterator[list[list[str]]]:
         patched.setattr(sys, "platform", "darwin")
         patched.setattr(platform_compat, "IS_WINDOWS", False)
         patched.setattr(platform_compat, "trusted_system_bin", lambda name: f"/bin/{name}")
+        # The ps path is under test; on a real Mac the footprint reader would
+        # answer first for a same-uid pid the fake output names.
+        patched.setattr(platform_compat, "proc_phys_footprint_bytes_for_pid", lambda pid: None)
         patched.setattr(subprocess, "check_output", _recording)
         yield calls
 

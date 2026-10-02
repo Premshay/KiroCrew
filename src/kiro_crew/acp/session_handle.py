@@ -903,7 +903,13 @@ class AcpRuntimeProtocol(Protocol):
         """
         ...
 
-    async def send_request(self, method: str, params: dict[str, Any]) -> int: ...
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        on_reserved: Callable[[int], None] | None = None,
+    ) -> int: ...
 
     async def probe_advertised_models(
         self, *, force: bool = False, not_before: float = 0.0
@@ -2428,7 +2434,9 @@ class AcpSessionHandle:
         This is the shared-runtime SUBSTITUTE path (background one-liners, tips,
         contradiction sweep, and any caller that did not pre-guard an explicit
         user pick). ``resolve_usable_model`` maps the request to what the account
-        can run: a served id is sent; ``"auto"`` is sent only when the backend
+        can run: a served id is sent; a bare pin a pair-id harness serves only as
+        the model half of its advertised ``<model>[<effort>]`` rows is sent as
+        that bare id; ``"auto"`` is sent only when the backend
         advertises it; and anything else — ``"auto"`` on a partition that doesn't
         serve it, or an unentitled concrete id — resolves to ``""``,
         meaning **inherit the session's backend default** (the served model
@@ -2437,7 +2445,16 @@ class AcpSessionHandle:
         reset-to-default. Explicit user picks raise instead, upstream in
         ``AcpSessionProvider.set_model`` / ``AcpClient.set_model``.
         """
-        resolved = resolve_usable_model(model_id, self._advertised_model_ids())
+        # Backend-aware: on a ``<model>[<effort>]`` pair-id harness the advertised
+        # list is the picker's vocabulary while the ``model`` config option's is
+        # the BARE id, so a bare pin misses the list yet is exactly what the wire
+        # takes. Without the backend this layer answers the provider's already
+        # resolved pin with a SECOND withhold, and the pin is dropped after all.
+        resolved = resolve_usable_model(
+            model_id,
+            self._advertised_model_ids(),
+            backend=self._runtime.acp_backend,
+        )
         if not resolved:
             # Inherit the backend default — nothing to send. For the ephemeral
             # _bg session the current model IS session/new's served default.
@@ -3058,7 +3075,7 @@ class AcpSessionHandle:
             }
         else:
             payload = {"sessionId": self._session_id, "command": command}
-        req_id = await self._runtime.send_request(METHOD_COMMANDS_EXECUTE, payload)
+        req_id = await self._send_awaited(METHOD_COMMANDS_EXECUTE, payload)
         try:
             msg = await self._wait_for_response(req_id, timeout=60.0)
             result = msg.result or {}
@@ -3083,11 +3100,32 @@ class AcpSessionHandle:
 
         Sends session/set_config_option JSON-RPC request.
         """
-        req_id = await self._runtime.send_request(
+        req_id = await self._send_awaited(
             METHOD_SET_CONFIG_OPTION,
             {"sessionId": self._session_id, "configId": config_id, "value": value},
         )
         await self._wait_for_response(req_id, timeout=10.0)
+
+    async def _send_awaited(self, method: str, params: dict[str, Any]) -> int:
+        """Send a request whose response a following _wait_for_response claims.
+
+        The id joins _awaited_responses before the write: a response that lands
+        on the queue while the write drains would otherwise read as owed to
+        nobody and be dropped. _wait_for_response's finally removes it; a failed
+        send removes it here.
+        """
+        reserved: list[int] = []
+
+        def _reserve(req_id: int) -> None:
+            reserved.append(req_id)
+            self._awaited_responses.add(req_id)
+
+        try:
+            return await self._runtime.send_request(method, params, on_reserved=_reserve)
+        except BaseException:
+            for req_id in reserved:
+                self._awaited_responses.discard(req_id)
+            raise
 
     async def apply_session_permission_routing(self) -> None:
         """Make a ``SESSION_CONFIG`` harness actually ask, or refuse to run it.

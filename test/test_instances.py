@@ -4664,7 +4664,84 @@ class TestSelfHealRefreshRestart:
         mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
         await mgr._recover("cd-1")
         assert mgr.status("cd-1").state == TunnelState.CONNECTED
+        # The rebuild only re-binds the local port, so it leaves the attempt
+        # counter at the value this recovery raised it to (1). The counter is
+        # cleared later by a proven end-to-end probe, which
+        # test_rebuild_does_not_reset_the_counter_until_a_probe_proves_the_forward_live
+        # pins directly.
+        assert mgr._recover_attempts.get("cd-1", 0) == 1
+
+    @pytest.mark.asyncio
+    async def test_rebuild_does_not_reset_the_counter_until_a_probe_proves_the_forward_live(
+        self, tmp_path
+    ):
+        """A rebuild's start() waits only for the LOCAL bind, so it is not proof
+        the far end answers — the attempt counter is NOT reset by the rebuild.
+        Only a proven end-to-end probe success (the _on_tunnel_healthy seam the
+        probe loop fires) clears it. This keeps a forward whose remote gateway
+        is down from resetting its budget every rebuild and churning forever,
+        while a single slow post-rebuild probe cannot ratchet the budget down
+        permanently — the next good probe clears it."""
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+        mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
+        mgr._recover_attempts["cd-1"] = 2
+
+        await mgr._recover("cd-1")
+        # start() reported success (local bind), so the tunnel is CONNECTED...
+        assert mgr.status("cd-1").state == TunnelState.CONNECTED
+        # ...but the rebuild alone did NOT reset the counter (it climbed by one).
+        assert mgr._recover_attempts.get("cd-1", 0) == 3
+
+        # A proven end-to-end probe success — what the probe loop fires — clears it.
+        mgr._on_tunnel_healthy("cd-1")
         assert mgr._recover_attempts.get("cd-1", 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_on_tunnel_healthy_clears_the_attempt_counter_idempotently(self, tmp_path):
+        """The probe-success seam is idempotent: clearing an absent key is a
+        no-op, so a healthy tunnel that never needed recovery costs nothing."""
+        reg, mgr = self._mgr(tmp_path)
+        mgr._recover_attempts["cd-1"] = 5
+        mgr._on_tunnel_healthy("cd-1")
+        assert "cd-1" not in mgr._recover_attempts
+        mgr._on_tunnel_healthy("cd-1")  # absent key -> no-op, no raise
+        assert "cd-1" not in mgr._recover_attempts
+
+    @pytest.mark.asyncio
+    async def test_probe_loop_fires_on_healthy_on_a_successful_probe(self, tmp_path):
+        """Wiring guard: a successful _forward_alive in the probe loop must fire
+        the _on_healthy seam so the manager can clear the attempt counter."""
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState, _SshTunnel
+
+        stm_interval = stm._PROBE_INTERVAL
+        healthy: list[str] = []
+        t = _SshTunnel("cd-1", "h", 7778, 7777)
+        t.status.state = TunnelState.CONNECTED
+        t._on_healthy = healthy.append
+
+        async def _alive():
+            # Answer once, then stop the loop so the test does not spin.
+            t._stopping = True
+            return True
+
+        t._forward_alive = _alive  # type: ignore[assignment]
+
+        async def main():
+            import asyncio as _aio
+
+            stm._PROBE_INTERVAL = 0.01
+            try:
+                await _aio.wait_for(t._probe_loop(), timeout=2)
+            finally:
+                stm._PROBE_INTERVAL = stm_interval
+
+        await main()
+        assert healthy == ["cd-1"]
 
     def test_recover_releases_lock_during_io(self, tmp_path):
         from kiro_crew.instances.ssh_tunnel_manager import TunnelState
@@ -4693,7 +4770,9 @@ class TestSelfHealRefreshRestart:
             release.set()
             await asyncio.wait_for(task, timeout=2)
             assert mgr.status("cd-1").state == TunnelState.CONNECTED
-            assert mgr._recover_attempts.get("cd-1", 0) == 0
+            # The rebuild only re-binds locally, so the counter stands at the
+            # value this recovery raised it to (1), not reset by the rebuild.
+            assert mgr._recover_attempts.get("cd-1", 0) == 1
 
         asyncio.run(main())
 
@@ -5009,7 +5088,43 @@ class TestSelfHealRefreshRestart:
 
         assert mgr.status("cd-1").state == TunnelState.CONNECTED
         assert mgr.get_token("cd-1") not in (None, first_token)  # re-mint stored
-        assert mgr._recover_attempts.get("cd-1", 0) == 0  # marked recovered
+        # The rebuild only re-binds locally, so the counter stands at the value
+        # this recovery raised it to (1); a proven probe clears it later.
+        assert mgr._recover_attempts.get("cd-1", 0) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_tier2_recovery_resets_the_counter_only_on_a_proven_probe(self, tmp_path):
+        """Pin the counter-reset invariant at the tier-2 site, through the
+        production path. A tier-2 recovery (tier 1 fails, tier 2 re-mints and
+        rebuilds) raises the attempt counter and leaves it raised — the rebuild
+        is a local bind, not proof the far end answers. The recovery wires the
+        rebuilt tunnel's `_on_healthy` seam to the manager's `_on_tunnel_healthy`
+        (what the probe loop fires on a proven end-to-end round trip); firing it
+        is the ONLY thing that clears the counter. Asserting the reset after that
+        seam runs — not after a manual pop — pins the real production reset: were
+        the reset deleted from `_on_tunnel_healthy`, the final assert reds."""
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr, _arm, _started, _release, fail_next = self._tier2_rig(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        await mgr.connect("cd-1")
+
+        mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
+        fail_next["n"] = 1  # tier 1 fails, tier 2's own rebuild succeeds
+        await mgr._recover("cd-1")
+
+        assert mgr.status("cd-1").state == TunnelState.CONNECTED
+        # Tier 2 rebuilt the forward but has not proven the far end answers, so
+        # the counter stands at the value this recovery raised it to.
+        assert mgr._recover_attempts.get("cd-1", 0) == 1
+        # The recovery wired the rebuilt tunnel's probe-success seam to the
+        # manager's reset (production wiring, not a test hook).
+        rebuilt = mgr._tunnels["cd-1"]
+        assert rebuilt._on_healthy == mgr._on_tunnel_healthy
+        # Fire it exactly as the probe loop does on a proven end-to-end probe —
+        # this runs the real _on_tunnel_healthy reset, clearing the counter.
+        rebuilt._on_healthy(rebuilt.status.instance_id)
+        assert mgr._recover_attempts.get("cd-1", 0) == 0
 
     @pytest.mark.asyncio
     async def test_a_disconnect_during_tier1_rebuild_is_not_overwritten(self, tmp_path):
@@ -5372,7 +5487,7 @@ class TestSelfHealRefreshRestart:
             async def _unreachable():
                 return False
 
-            t._port_reachable = _unreachable
+            t._forward_alive = _unreachable
             await asyncio.wait_for(t._probe_loop(), timeout=2)
             await asyncio.sleep(0.05)
             assert t._probe_failed is True

@@ -39,7 +39,8 @@ with the unsent message available to copy and never sends to a fallback. A route
 chat waits for that exact target before using the message; an embedded chat never
 consumes the dashboard intent.
 `window.__mc_chat_launch` is claimed once: the session controller owns explicit
-targets and fresh drafts; `ChatPage` owns untargeted automatic sends. Unclaimed
+targets and fresh drafts; `ChatPage` owns untargeted automatic sends
+(`useAppLaunchIntake`, `website/src/pages/chat/page/launchIntake.ts`). Unclaimed
 intents expire after ten seconds. A newer intent supersedes a pending target
 by ref identity, so its later completion cannot release the older message.
 `autoSend: false` seeds
@@ -411,7 +412,9 @@ prevent.
 
 Two conditions displace the cached `_bg_runtime`: a **backend switch** and
 **staleness** (`AcpRuntime._is_stale()` → `"age"` past 6h, or `"rss"` past
-500 MiB across the descendant tree). The displacement policy has ONE
+500 MiB across the descendant tree; on macOS each pid of that tree is measured
+by its `phys_footprint`, falling back to its `ps` RSS, because `ps` RSS omits the
+compressed and swapped pages an idle grown runtime mostly consists of). The displacement policy has ONE
 implementation, `_detach_bg_runtime_locked(runtime, cause, *, park_only=False)`:
 the runtime is
 killed if idle, and **parked on `_draining_bg_runtimes` if it has live or
@@ -877,14 +880,14 @@ against sweep completeness, and are torn down at `close_all`.
   and one-shot gates remain unchanged; trusted or global auto-approve sessions
   retain the existing notice-only downgrade.
 - **Context compaction**: at ≥ configured threshold (`session.autocompact_pct`, default 70%, valid 5–90), compacts **in place** on a member of
-  `ACP_BACKENDS_COMPACT` — kiro-cli, claude, codex and opencode. They divide by WHERE
+  `ACP_BACKENDS_COMPACT` — kiro-cli, claude, codex, opencode and goose. They divide by WHERE
   the
   done signal lands, which is `ACP_BACKENDS_INLINE_COMPACTION`: kiro-cli sends a
   `/compact` **prompt** (`session/prompt` + `_kiro.dev/compaction/status` watch —
   never the string form of `_kiro.dev/commands/execute`, which kiro-cli 2.14.0
-  exits rc=0 on) and its result arrives afterwards, while claude, codex and opencode
-  finish the whole compaction inside the prompt turn. claude and opencode emit no
-  status at all; codex reports the compaction as a `tool_call` pair marked
+  exits rc=0 on) and its result arrives afterwards, while claude, codex, opencode and
+  goose finish the whole compaction inside the prompt turn. claude and opencode emit no
+  status at all, and goose emits only a `Compaction complete` chunk; codex reports the compaction as a `tool_call` pair marked
   `_meta.contextCompaction` (translated by
   `_dispatch.parse_codex_compaction_update`) that arrives before the prompt
   response, so its terminal is read from the stream like kiro-cli's.
@@ -893,7 +896,9 @@ against sweep completeness, and are torn down at `close_all`.
   rather than from the queue — but only when the turn reached its own end
   boundary uncancelled, since a cancelled turn compacted nothing and a false
   `completed` resets the meter AND arms the cooldown. Awaiting the queue for an
-  inline member instead spends the full `COMPACT_WAIT_TIMEOUT_SECS` and then
+  inline member instead spends the full compaction wait budget
+  (`COMPACT_WAIT_TIMEOUT_SECS`, raised per host by `session.compact_wait_secs`)
+  and then
   recycles a session that had just compacted correctly. That answer lives on the
   WAIT, because both routes to a compaction reach it — the manual entry points
   through `provider.compact()`, the autocompact through
@@ -921,9 +926,9 @@ against sweep completeness, and are torn down at `close_all`.
   - A backend in none of the three is **declined and logged at WARNING**, naming
     the missing membership. Declining is the safe action, since the alternative
     ends a conversation and no harness earns that by never having been
-    classified, but it is not a settled condition and the log says so. pi and goose
-    are that case today: both look inline in SOURCE but have no driven capture,
-    which is the bar `ACP_BACKENDS_COMPACT` holds its members to.
+    classified, but it is not a settled condition and the log says so. pi is that
+    case today: it looks inline in SOURCE but has no driven capture, which is the
+    bar `ACP_BACKENDS_COMPACT` holds its members to.
 
   Every surface that refuses a manual `/compact` picks among three sentences via
   `messaging.commands.compact_refusal_arm`, so a surface supplies wording only and
@@ -1196,8 +1201,8 @@ against sweep completeness, and are torn down at `close_all`.
   monkeypatch seams remain observable: `idle_expiry`, `orphan_mcp`,
   `reap_agent_scopes`, `rss_threshold`, `stuck_turn`, and `bg_drain_reap`.
   `SessionCleanup._cleanup_loop` then directly coordinates the session-root,
-  sandbox-artifact, session-pid-mapping, bytecode-cache, periodic tracked-PID,
-  and untracked-MCP sweeps.
+  sandbox-artifact, session-pid-mapping, member-pid-binding, shell-audit-log,
+  bytecode-cache, periodic tracked-PID, and untracked-MCP sweeps.
 - **Runtime reconciler** (`runtime_reconcile.py`): its kill arm is bounded by
   `session.reconcile_max_kills`, re-read from the live config on every tick. The
   field's ceiling equals its default, so it can only lower the shipped budget and
@@ -1334,6 +1339,43 @@ against sweep completeness, and are torn down at `close_all`.
   backward scan skips it). Idle/orphan sweeps do NOT fire the recycle
   callback. Linux-only measurement (`get_session_rss_mb` returns 0 elsewhere),
   so the feature is inert off-Linux.
+- **Harness background work** (`CleanupDeps.provider_background_launch`,
+  `HARNESS_BACKGROUND_WORK_HOLD_SECS` = 3600 s,
+  `HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR` = 2): a free semaphore only proves Kiro
+  Crew's own prompt returned. Claude Code runs a backgrounded Bash command or a
+  Workflow in the session's process tree after the prompt answers `end_turn`,
+  and neither the semaphore nor the sub-agent probe can see it. claude-agent-acp
+  reports the launch on the launching call's PostToolUse `tool_call_update`, as
+  `_meta.claudeCode.toolResponse` carrying `backgroundTaskId` (Bash) or
+  `status: "async_launched"` with a `taskId` (Workflow);
+  `_dispatch.parse_background_launch` reads exactly those structured fields, and
+  skips an `Agent`/`Task` launch because the adapter holds the prompt open until
+  such a sub-agent settles. Only `AcpClient` — the transport that serves claude,
+  the one harness whose adapter stamps the marker — keeps a per-session
+  `BackgroundLaunchRecord` today (the `AcpSessionHandle` runtime serves only
+  backends that never stamp `_meta.claudeCode`), never reset per turn, exposed as
+  `background_launch()` -> `(seconds since, description)` through the provider
+  chain. Nothing the adapter sends a client without its AIR extension marks the
+  END of that work: a live capture shows a quiet run sends nothing between
+  `end_turn` and the model waking to report it. So the hold is bounded by time.
+  The RSS recycle, as its last synchronous read before `reset`, and the idle
+  sweep, as a post-await re-judge on both axes, keep a session whose newest
+  launch is inside the hold. Past it the ceiling applies again and the recycle
+  notice stays the plain memory-limit reason: letting the recycle through past
+  the hold presumes the launched work finished, and the record is never cleared
+  while the process lives, so naming a launch from hours ago would be permanent
+  noise. The record IS cleared by `AcpClient._reset_state` — the work dies with
+  the process whose harness started it, so a respawn on the same client must
+  not inherit the dead tree's hold. The hold cannot
+  override memory without bound: every launch refreshes its clock, so a session
+  that keeps launching work would renew it forever. Inside the hold the RSS
+  recycle therefore still proceeds when the tree exceeds
+  `rss_max_mb * HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR` (2x — observed
+  real workflow trees ran 2398-2641 MB against the 1536 MB default ceiling, so
+  the hold must survive those while still cutting off a runaway), and the
+  notice still names the work. The idle sweep is not memory-driven, so its hold
+  has no such ceiling. The probe is not fail-closed: a missing or unreadable
+  answer is "nothing launched".
 
 ## APIs
 
@@ -3715,6 +3757,55 @@ a trust root on its own; publication therefore also writes a
   each pass is capped at `_LEGACY_PID_BINDING_PRUNE_BUDGET` (2000) so a
   six-figure backlog drains over passes instead of monopolising one maintenance
   task.
+- **Shell audit log cap** (`SessionCleanup._sweep_shell_audit_log` →
+  `shell_audit_log.rotate_shell_audit_log`): the bundled `postToolUse` hook in
+  `config/defaults.json` records every `execute_bash` call by appending a stamp
+  line, the hook-event JSON kiro-cli hands it on stdin (the tool call — its
+  command and, on this event, its result) and a blank line to
+  `<data home>/audit.log`, and the command bounds nothing — measured at 4.4 MB
+  over about five weeks on a default install, one file, no sibling generation.
+  The bound is applied from the gateway side, not the hook: the shipped command
+  stays byte-identical (no portable in-shell `stat` dance, no Python start per
+  shell tool call through a helper the hook would have to find, no change for a
+  user who authored their own hook), and the sweep reuses
+  `jsonl_util.rotate_jsonl_at` — rename to ONE `.1` generation replacing any
+  older one, a non-blocking try-lock so two rotators cannot both rotate, a
+  rename rather than a truncate so the hook's `>>` keeps working and no record is
+  cut mid-write, never raises. An over-cap file that stays over the cap after the
+  attempt — the `.1` slot blocked by a planted directory, a sharing violation
+  that never clears — is logged at WARNING, since the primitive
+  swallows its own failure by contract and nothing else would tell a stuck bound
+  from a file under the cap; the line is throttled to one per
+  `shell_audit_log.SHELL_AUDIT_LOG_WARN_INTERVAL_SECS` (an hour) per data home,
+  not one per attempt, because the tick retries for the gateway's whole life and
+  a blocked slot does not clear itself, and it names the usual causes rather than
+  a determined one (the primitive reports no reason, only that the file is still
+  over the cap). The cap is `shell_audit_log.SHELL_AUDIT_LOG_MAX_BYTES`
+  (8 MiB: about nine and a half weeks of the measured rate before the first
+  rotation, roughly four months of history on disk with the kept generation).
+  The steady-state bound on disk is that cap plus at most one tick interval of
+  shell activity of overshoot on the live file, times two generations; the first
+  rotation on an install that already carries an oversized file moves that whole
+  file aside as `.1`, whatever its size, and the next rotation replaces it, so the
+  bound holds from the second rotation on. This is the retention change the issue
+  asked for: a default install's shell audit trail becomes finite — the live file
+  plus one previous generation — where it was unbounded, and history older than
+  the kept generation is discarded at each rotation. The step runs on every
+  cleanup tick, under the same `MAX_TICK_INTERVAL_SECS` ceiling as the sweeps
+  above, so an oversized file is bounded by the first tick after the loop starts;
+  there is no separate start-of-loop pass, since one would gain at most one tick
+  interval inside the overshoot the design already accepts. It runs on the
+  maintenance executor for the same `no-blocking-call-on-event-loop` reason (the
+  data home is same-uid agent-writable). A file under the cap costs one `stat`
+  and creates nothing — the primitive's lock file appears only when a rotation
+  is actually attempted — so a fresh data home gains no files from this sweep.
+  The cleanup loop is not the file's only guardian: the hook runs inside
+  kiro-cli whichever process launched it, and standalone `kirocrew chat` spawns
+  the same agent with no cleanup loop, so `cli_chat._chat` runs the same sweep
+  once at every chat start, before the backend is spawned (see
+  [cli.md](cli.md), "Interactive Mode"); an install that never runs a gateway is
+  bounded by its next chat start, overshooting by at most one session's shell
+  activity. Not an LLM-facing capability: no MCP tool and no CLI command expose it.
 - **Member execution routing**: the ordinary session/run owner record carries
   the immutable member/store snapshot. Strict MCP caller identity still uses
   the existing transport token and signed `session_pid` publication. No separate
@@ -3821,6 +3912,103 @@ a shape that does not exist. An adapter shipping as a Python entry script adds i
 interpreter there with its own review. The rest of argv is excluded because arguments are
 chosen by whoever started the process and say nothing about what it is; accepting them let
 `node build.js --agent goose` authorize a SIGKILL.
+
+Both positions are taken on the WRAPPED argv when the command line is Crew's own Linux
+sandbox launcher. Where the namespace backend is in use — `sandbox.detect_backend() ==
+"namespace"`, which is what the shipped `auto` resolves to on any Linux host whose kernel
+permits an unprivileged user namespace (stock Ubuntu 23.10+ is the notable exception; see
+[security](security.md) on `kernel.apparmor_restrict_unprivileged_userns`) — the pid the
+gateway tracks is not the harness at all. `sandbox.namespace_argv` wraps the spawn as
+`<interpreter> -I -S <run dir>/kirocrew_sandbox_<pid>_<rand>.py <harness argv…>`, and the
+launcher's PARENT never execs: it writes the child's uid/gid maps and then blocks in
+`waitpid` for the life of the session (`sandbox_launcher.main`). So the gate's `argv[0]`
+is the interpreter and the harness sits past the script, where the two positional rules
+above were not looking, and every sandboxed agent root answered "not managed". The cost
+was not a spared process: the settled-token arm RETAINS an entry the argv gate does not
+recognise — never killed, never pruned, because dropping the record would make the process
+unfindable by every sweep — and the scope reaper skips its scope too, since gate (i) of
+[§Reaping abandoned agent scopes](#reaping-abandoned-agent-scopes) refuses any scope holding
+a tracked pid. So an unrecognised root holds its whole `kiro-cli` runtime, several hundred
+MB, for as long as the OWNING GATEWAY lives. `cleanup_orphaned_session_roots` applies the
+same gate, so a restart does not clear it either; what ends it is the launcher REPARENTING
+when its gateway dies, which moves it into the orphan-MCP sweep's population. Recognition,
+not disposal, is therefore what had to change.
+
+`_sandbox_launcher_wrapped_argv` names that ONE shape positively, and the conjunction is
+what keeps an ordinary Python process off a kill path: `argv[0]`'s basename is a CPython
+spelling, the launcher's interpreter flags occupy the next positions exactly and in order,
+that token's basename carries both the prefix and the suffix `sandbox.py` generates its
+launcher tempfile with, its DIRECTORY is `sandbox.namespace_launcher_script_dir()`, and at
+least one token follows. A plain `python foo.py kiro-cli` fails three of the five. The
+suffix is carried because the `.sb` seatbelt profile is written beside the launcher under
+the same prefix.
+
+The directory comparison is EXACT and lexical in both directions, and the normalization
+that makes that sound happens on the WRITER's side:
+`sandbox.namespace_launcher_script_dir()` returns `normpath(abspath(<config_dir>/run))`
+and `namespace_argv` hands that same value to `mkstemp`, so a data home spelled with `..`
+or a trailing separator is already collapsed by the time the path reaches `/proc`.
+Normalizing the token instead would widen what a kill path accepts — to `run/../run` and
+to a relative spelling resolved against the SWEEPING gateway's cwd, which is a path the
+target process never named. The directory is `os.fsencode`d, not `str.encode`d, so a data
+home that is not valid UTF-8 still matches the bytes `/proc` holds.
+
+ONLY the preferred run directory is accepted. `_ensure_run_dir` degrades to the system
+tmpdir when the crew `run/` cannot be created or chmod'd, and that directory is shared with
+every other user of the host: accepting it on a kill path would let a path anyone can write
+decide which process trees are reclaimable. RESIDUAL, stated rather than closed: on such a
+host a sandboxed root is not recognised and its entry is retained, exactly as before this
+gate learned the shape. Closing it needs identity a shared path cannot supply.
+
+Every one of those values is read from the `sandbox` module rather than spelled again:
+`_LAUNCHER_INTERPRETER_FLAGS`, `_SANDBOX_ARTIFACT_PREFIX` and `_LAUNCHER_SCRIPT_SUFFIX`
+through `session_pid._namespace_launcher_shape` (which reads them off the module object at
+call time, so a test can repoint any of them), and the directory through
+`sandbox.namespace_launcher_script_dir()`. `clone_setup._LAUNCHER_TRACEBACK_RE` reads the
+same two name constants, and both `mkstemp` calls in `sandbox.py` now take their prefix and
+suffix from them too — so adding a launcher flag, moving the run directory or renaming the
+artifact moves the recogniser's idea of the script slot with the builder's instead of
+silently handing it a flag token. Pinned end to end against a real `namespace_argv` result.
+
+The directory is the one part that is a FUNCTION rather than a constant, and the gate asks
+for it LAST, because `namespace_launcher_script_dir()` resolves `config_dir()`, which
+creates the data home and can raise, and the gate runs once per tracked entry on every
+sweep — so an ordinary unwrapped `kiro-cli` argv answers without reaching it at all. And
+the gate NEVER raises: an unreadable shape returns "not the launcher", which costs one
+missed reclaim, where propagating would abort the sweep for every remaining entry
+(`cleanup_orphaned_session_roots`'s caller swallows the error with no per-entry guard, so
+one unreadable home would silently stop reclaiming anything).
+
+Exactly one unwrap, and the reason is the OS, not a convention: the launcher's own
+seccomp-BPF filter denies `unshare` (with `mount`, `umount2`, `setns`, `pivot_root`) for
+everything in the sandboxed tree, and refuses the spawn outright where that filter cannot
+be installed, so a second launcher inside the first cannot reach a namespace at all. An
+in-sandbox `wrap_argv` detecting the marker and passing through is the layer above that.
+Accepting the nested shape would be authority granted for one the OS already makes
+impossible. The inner positional rules are unchanged,
+so a wrapped `/usr/bin/make` or a wrapped editor opened on a file called `kiro-cli` still
+answers "not a harness" — the sandbox wraps MCP probes and app backends too, and the
+launcher being Crew's proves only that Crew started the process, not that it is an agent
+runtime.
+
+`_is_untracked_managed_agent_orphan` deliberately does NOT use this gate, and keeps its
+own argv0 test. It answers a different question — "is this a runtime no reaper can reach"
+— and an orphaned launcher IS reached: its command line carries the sandbox artifact
+prefix, so `_is_orphan_mcp` accepts it and the orphan-MCP sweep kills it on the same pass.
+Teaching it the launcher shape would make that arm log "leaked agent runtime, not
+terminated" about a pid that is already a kill candidate and inflate `leaked_untracked`
+with it. The asymmetry is pinned by a test, so it is not quietly "fixed" later.
+
+RESIDUAL — the zombie launcher. `_kill_pid_tree` signals the children and then re-checks
+the root. A launcher that has already reaped its child and exited is a zombie whose
+`/proc/<pid>/cmdline` is EMPTY, so the gate declines and the root kill is skipped for that
+pass; the settled-token arm retains the entry (the pid still probes alive), the next pass
+finds it DEAD and prunes it. One extra pass, not a lost process — and retaining rather than
+pruning on an empty cmdline is what makes it self-healing.
+
+Nothing equivalent is needed on macOS. The seatbelt wrap is `env … /usr/bin/sandbox-exec
+-f <profile> <argv…>`, and both of those exec through, so the tracked pid ends up carrying
+the harness's own argv.
 
 The script slot accepts two spellings, because the resolver produces two, and they are
 matched by two different KINDS of identity. The bin shim is `node /opt/n/bin/codex-acp`,

@@ -10,12 +10,25 @@ import { sendTurn } from '../../../chat-core/transport/sendTurn'
 import { Btn } from '../../../components/ui'
 import QuestionCard from '../../../components/QuestionCard'
 import ErrorNotice from '../../../components/ErrorNotice'
-import { APPROVAL_MODE_KEYS, approvalTitle, type AttentionItem } from './model'
+import { APPROVAL_MODE_KEYS, approvalTitle, questionText, type AttentionItem } from './model'
 import { toApiDecision } from '../../../utils/approvalDecision'
 import { ApiError, isTerminalApprovalRefusal } from '../../../api/apiError'
 
 /** Kept mounted while other inbox items are selected, preserving each answer draft. */
-export default function AttentionCard({ item, title, context, onDraftChange }: { item: AttentionItem; title: string; context?: string; onDraftChange?: (active: boolean) => void }) {
+export default function AttentionCard({ item, title, context, onDraftChange, onOpenSession }: {
+  item: AttentionItem
+  title: string
+  context?: string
+  onDraftChange?: (active: boolean) => void
+  /** How to leave for this item's session, when the HOST must be asked first.
+   *  Open session sits in this card's own header, one line above the composer
+   *  holding the unsent answer, so it is the likeliest way to lose one -- and a
+   *  bare `<Link>` reaches no leave guard (`NavigationLeaveGuard`: coverage is
+   *  opt-in per navigation surface). A host that can unmount this subtree passes
+   *  its guarded exit here; with none the link is an ordinary one, which is
+   *  right where the route change does not take the draft with it. */
+  onOpenSession?: (slot: string) => void
+}) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const dispatch = useAppDispatch()
@@ -23,6 +36,11 @@ export default function AttentionCard({ item, title, context, onDraftChange }: {
   const busy = useAppSelector(state => selectComposerBusy(state, item.slot)
     || state.dashboard.slots.some(slot => slot.key === item.slot && slot.running))
   const locked = useRef(false)
+  // QuestionCard drops a draft whenever its payload changes, so a follow-up's
+  // heading is translated once per mount: a language switch must not erase a
+  // pick in progress. New labels change the item id, which remounts the card.
+  const [followUpQuestions] = useState(() => item.question?.followUp
+    ? item.question.questions.map((q, i) => ({ ...q, question: questionText(item.question!, i) })) : null)
   const [delivered, setDelivered] = useState(false)
   const mutation = useMutation({
     retry: false,
@@ -36,7 +54,12 @@ export default function AttentionCard({ item, title, context, onDraftChange }: {
           await api.answerQuestion(q.ask_id, action.answers)
           dispatch(resolveQuestionCard({ ask_id: q.ask_id }))
         } else {
-          const receipt = await sendTurn({ slot: item.slot, message: Object.entries(action.answers).map(([question, answer]) => `${question}: ${answer}`).join('\n'), ...(q.native && busy ? { steer: true } : {}) })
+          // A follow-up choice is sent bare, as the composer chips send it: the
+          // card's question text is ours, not the agent's, so prefixing it would
+          // put words in the user's mouth.
+          const message = q.followUp ? Object.values(action.answers).join('\n')
+            : Object.entries(action.answers).map(([question, answer]) => `${question}: ${answer}`).join('\n')
+          const receipt = await sendTurn({ slot: item.slot, message, ...(q.native && busy ? { steer: true } : {}) })
           if (receipt.status !== 'dispatched' && receipt.status !== 'queued') {
             throw new Error(receipt.status === 'refused' ? receipt.reason || t('commandCenter.send_refused') : t('commandCenter.send_unknown'))
           }
@@ -75,7 +98,9 @@ export default function AttentionCard({ item, title, context, onDraftChange }: {
   return <section className="rounded-lg border border-border bg-card p-3 space-y-3">
     <div className="flex items-center gap-2 min-w-0">
       <h3 className="text-sm font-semibold break-words min-w-0 flex-1">{item.approval && <ShieldCheck size={15} className="lucide-inline" />}{approvalHeading || title}</h3>
-      <Link to={`/chat?sid=${encodeURIComponent(item.slot)}`} className="text-accent text-[12px] inline-flex items-center gap-1 shrink-0">{t('commandCenter.open_session')}<ArrowUpRight size={13} /></Link>
+      {onOpenSession
+        ? <button type="button" onClick={() => onOpenSession(item.slot)} className="text-accent text-[12px] inline-flex items-center gap-1 shrink-0">{t('commandCenter.open_session')}<ArrowUpRight size={13} /></button>
+        : <Link to={`/chat?sid=${encodeURIComponent(item.slot)}`} className="text-accent text-[12px] inline-flex items-center gap-1 shrink-0">{t('commandCenter.open_session')}<ArrowUpRight size={13} /></Link>}
     </div>
     {item.approval && <p className="text-[12px] text-muted break-words">{t('commandCenter.from_session', { name: title })}</p>}
     {context && <p className="text-sm text-muted break-words">{context}</p>}
@@ -85,7 +110,7 @@ export default function AttentionCard({ item, title, context, onDraftChange }: {
     {/* No hand-off: QuestionCard holds this session's unsent answer draft. */}
     <ErrorNotice message={expired ? t('components.approvalCard.approval_no_longer_pending') : mutation.error?.message} />
     {delivered ? <p role="status" className="text-sm text-ok flex items-center gap-2"><Check size={15} />{t('commandCenter.recorded')}</p>
-      : item.question ? <QuestionCard questions={item.question.questions} submitLabel={t('commandCenter.send_answer')} busy={mutation.isPending} onDraftChange={onDraftChange} onSubmit={answers => submit({ answers })} />
+      : item.question ? <QuestionCard questions={followUpQuestions || item.question.questions} submitLabel={t('commandCenter.send_answer')} busy={mutation.isPending} onDraftChange={onDraftChange} onSubmit={answers => submit({ answers })} />
       : item.approval ? <>
         <p className="text-sm break-words">{item.approval.tool_purpose?.trim() || t('commandCenter.purpose_missing')}</p>
         {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- keyboard users must be able to scroll the exact command without splitting its tokens. */}

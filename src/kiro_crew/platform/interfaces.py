@@ -89,6 +89,14 @@ class ProviderRegistry(Protocol):
         """
         ...
 
+    def agent_runtime_policy(self, engine_identity: str) -> dict[str, Any] | None:
+        """Return advisory catalog metadata, or None in the public edition.
+
+        The key is the member's ``kiro_agent``, falling back to its roster alias
+        when empty. Only owner-visible member rows request this metadata.
+        """
+        ...
+
     def register_acp_backends(self) -> None:
         """Register any extra ACP backends (no-op in the public edition).
 
@@ -318,7 +326,7 @@ class SlackEnterpriseGate(Protocol):
     def heartbeat_safe_tools(self) -> "frozenset[str]":
         """Extra tool names an edition allows during unattended heartbeat polling.
 
-        WIRED: ``slack/gateway.py::_is_heartbeat_safe_tool`` checks this set after
+        WIRED: ``slack/gateway_runtime/tool_policy.py::_is_heartbeat_safe_tool`` checks this set after
         the core ``HEARTBEAT_SAFE_TOOLS`` exact-name match. The public default is
         ``frozenset()`` (no additions — the heartbeat allowlist is byte-identical
         to today). A companion returns its own read-only tool names so its

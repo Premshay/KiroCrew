@@ -5891,7 +5891,7 @@ class TestAcpSessionHandleCommands:
         sent_payloads = []
         req_counter = [100]
 
-        async def capture_send(method, params):
+        async def capture_send(method, params, **_kw):
             sent_payloads.append((method, params))
             req_id = req_counter[0]
             req_counter[0] += 1
@@ -5917,7 +5917,7 @@ class TestAcpSessionHandleCommands:
         sent_payloads = []
         req_counter = [200]
 
-        async def capture_send(method, params):
+        async def capture_send(method, params, **_kw):
             sent_payloads.append((method, params))
             req_id = req_counter[0]
             req_counter[0] += 1
@@ -5943,7 +5943,7 @@ class TestAcpSessionHandleCommands:
         sent_payloads = []
         req_counter = [300]
 
-        async def capture_send(method, params):
+        async def capture_send(method, params, **_kw):
             sent_payloads.append((method, params))
             req_id = req_counter[0]
             req_counter[0] += 1
@@ -8049,7 +8049,7 @@ async def test_send_command_redacts_output(monkeypatch):
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
 
-    async def _fake_send_request(method, params):
+    async def _fake_send_request(method, params, **_kw):
         return 1
 
     rt.send_request = _fake_send_request  # type: ignore[method-assign]

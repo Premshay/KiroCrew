@@ -93,6 +93,7 @@ legacy metadata do not override a canonical execution.
 | `slack/transport.py` | Slack reference `MessagingTransport` (`SlackTransport`) over `SlackClientOps` |
 | `slack/renderer.py` | Slack reference `Renderer` (`SlackRenderer`) + `SlackApprovalDecider` + `build_approval_blocks` |
 | `slack/transport_dispatch.py` | `handle_message_transport()` — full new-path dispatch wiring the three layers together |
+| `telegram/transport_dispatch.py` + `telegram/dispatch/` | `TelegramDispatcher` and the owners it is composed from — see [Telegram's dispatcher composition](#telegrams-dispatcher-composition) |
 
 ## Layer 1 — `MessagingTransport` (`transport.py`)
 
@@ -1692,8 +1693,9 @@ abstraction Slack uses, so one bot serves many parallel, topic-scoped sessions
 A message that arrives while a turn is still generating is not a new turn: the
 session semaphore is held, so running it directly would either block or open a
 second conversation against the same key. Three channels carry the full
-steer/queue/drain machinery — `telegram/transport_dispatch.py`,
-`discord/transport_dispatch.py` and `teams/transport_dispatch.py`; all read the
+steer/queue/drain machinery — `telegram/transport_dispatch.py` (its steer-or-queue arm
+in `telegram/dispatch/midturn.py`), `discord/transport_dispatch.py` and
+`teams/transport_dispatch.py`; all read the
 same `messaging.queue_mode` (`config/loader.py`, `"steer"` | `"queue"`, anything
 else normalized to `steer`) and all implement the same three primitives
 (`_handle_busy`, `_enqueue_with_receipt` + `_drain_queue`, `_handle_stop`).
@@ -1960,7 +1962,7 @@ grouping on sender and place ALONE:
 
 - Teams (`teams/transport_dispatch.py`, `_QueuedOrigin`) excludes the per-message
   activity id.
-- Telegram (`telegram/transport_dispatch.py`, `_QueuedOrigin`) records user, chat,
+- Telegram (`telegram/dispatch/origin.py`, `_QueuedOrigin`) records user, chat,
   Topic, chat type and the sender's `@handle`, and excludes the handle: it is a
   mutable label for a sender `user_id` already pins, so a rename between two
   messages would split one person's burst.
@@ -3003,8 +3005,11 @@ lacking them should close the finding, not file it:
 ## Cron output delivery: one run, one surface
 
 An unattended cron run has no inbound message to answer, so its output is
-delivered proactively, and `slack/gateway.py` chooses ONE surface instead of
-broadcasting to every one it can reach. The choice is that a job belongs to the
+delivered proactively, and the Slack gateway chooses ONE surface instead of
+broadcasting to every one it can reach. The cron callback, `_deliver_cron_response`,
+`_deliver_channel_reply` and the failure alerts in `slack/gateway.py` choose and
+redact each leg; the origin and channel-conversation helpers they call are
+`slack/gateway_runtime/delivery.py`. The choice is that a job belongs to the
 conversation that scheduled it: `job.session_key` records the creating session's
 key, and `_cron_origin_key(parent_key)` recovers it from the run's
 `cron:{job_id}` / `cron:{job_id}:{run_id}` key, which carries no channel namespace
@@ -3618,6 +3623,48 @@ re-link carrying a refreshed admission is left in place.
 The channel's transport, forum routing and mid-turn machinery are described in
 the sections above; what follows is what is specific to its rendering and its
 Bot API surface.
+
+### Telegram's dispatcher composition
+
+`TelegramDispatcher` is one class composed from owners. `telegram/transport_dispatch.py`
+keeps the dispatcher's state and live config, the inbound front door (`handle_message`:
+governance, admission, activation, resume routing, the command ladder, the busy check,
+rotation and the turn-path privacy apply) and the turn engine it hands an admitted
+message to (`_run_turn`). It also keeps the queue drain (`_drain_queue`, `_pump_queue`),
+the receipt wrappers (`_receipt_surface`, `_enqueue_with_receipt`,
+`_receipt_flip_locked`), `/stop`, `/title`, `_persist_turn`, the restriction predicates,
+the conversation-identity helpers (route, session key, `_rotated_session_key`, agent,
+origin mirror) and `_user_safe_failure_reason`. Repository guards read those constructs
+in this file by path: the tool-gate splat, the turn ceiling and its mute-aware refusal,
+the crew-log opener, the persist-then-pin order, the failure charge, `_drain_queue`, the
+receipt flip calls, the single rotation site, the title writes, `/stop`'s owner and the
+"Telegram failure reason" redaction sink.
+
+Every other responsibility is an owner under `telegram/dispatch/`, and new work of that
+kind goes to it:
+
+| Owner | Holds |
+|---|---|
+| `origin.py` | `_QueuedOrigin`, its sender key, owner token and queue-entry spelling, `_CHANNEL` |
+| `addressing.py` | forum activation (`_activation_outcome`, `_addresses_this_bot`) and `_reply_target` |
+| `midturn.py` | `_handle_busy`: steer or queue a mid-turn message, with its privacy reservation |
+| `pickers.py` | the `/model` and `/agent` keyboards, the `_Picker` record, prune and consume, and their apply (the tables stay on the dispatcher) |
+| `callbacks.py` | `on_callback`: every inline-button prefix |
+| `spawn_approval.py` | `deliver_spawn_approval` and its destination checks |
+| `commands.py` | `/kirocrew dashboard`, `/yolo`, `/cron`, `/spawn`, `/task`, `/link`, `/unlink`, `/compact`, `_require_direct_chat`, `_reply_markdown` |
+| `voice.py` | `/voice`, `_voice_enabled`, `_speak_reply` |
+
+A new command's handler goes to `commands.py`; its dispatch stays in `handle_message`.
+An owner's function whose first parameter is `self` is bound as the `TelegramDispatcher`
+attribute of the same name, so instance and class patches, `inspect.getsource` and every
+`self.<name>(...)` call reach it as they reach a method defined in the class body; the
+state stays on the dispatcher. A name tests rebind on the facade (`sel`,
+`TelegramApprovalDecider`, `list_agents`, `channel_inbound_permitted`, ...) is read
+through `kiro_crew.telegram.transport_dispatch` at call time and never bound in an
+owner. Owners log under the facade's logger name, and the facade imports every owner when
+it loads. `test/test_telegram_transport_dispatch_composition_contract.py` pins the
+surface, the patch reach (the rebound set is derived from the tests) and these placement
+rules.
 
 ### Telegram session resume
 

@@ -279,8 +279,10 @@ def _kill_escaped_children(child_pids: dict[int, int | None] | dict[int, ChildRe
 def _get_rss_mb(pid: int) -> float | None:
     """Get resident set size (RSS) of a process in MiB, or None if unavailable.
 
-    Linux: reads /proc/<pid>/status. macOS (no /proc): shells out to
-    ``ps -o rss= -p <pid>`` (ps reports RSS in KiB on both platforms).
+    Linux: reads /proc/<pid>/status. macOS (no /proc): the process's
+    ``phys_footprint`` through libproc, falling back to ``ps -o rss= -p <pid>``
+    (KiB) when the footprint cannot be read; the footprint is the macOS figure
+    that counts compressed and swapped pages.
     Windows: WorkingSetSize through the ``platform_compat`` shim, since no
     ``ps`` is resolvable there. Returns None on any failure (missing /proc,
     permission error, process gone, ps not found) so callers can treat
@@ -312,8 +314,14 @@ def _get_rss_mb(pid: int) -> float | None:
         rss = platform_compat.proc_rss_bytes_for_pid(pid)
         return None if rss is None else rss / (1024.0 * 1024.0)
 
-    # macOS / other: no /proc, fall back to ps (mirrors the sysctl/ps pattern
-    # used elsewhere in this codebase for darwin system info).
+    # macOS: the footprint, which counts the compressed and swapped pages that
+    # ps RSS leaves out (see platform_compat.proc_phys_footprint_bytes_for_pid).
+    footprint = platform_compat.proc_phys_footprint_bytes_for_pid(pid)
+    if footprint is not None:
+        return footprint / (1024.0 * 1024.0)
+
+    # macOS without a readable footprint / other: no /proc, fall back to ps
+    # (mirrors the sysctl/ps pattern used elsewhere for darwin system info).
     ps_bin = platform_compat.trusted_system_bin("ps")
     if ps_bin is None:
         return None
@@ -564,16 +572,23 @@ def _get_rss_tree_mb(
         # producing a phantom-low tree attached to a recycled root.
         return platform_compat.proc_rss_tree_mb_for_pid(pid)
 
-    # macOS / other: sum the descendant subtree rooted at pid off a SHARED
+    # macOS / other: walk the descendant subtree rooted at pid off a SHARED
     # whole-machine snapshot (ps reports RSS in KiB). The snapshot is memoized in
     # _ps_process_table, so sampling N pids costs one process-table walk, not N.
+    #
+    # Each pid is then measured by its macOS FOOTPRINT, with its ps RSS only as
+    # the fallback when the footprint cannot be read. ps RSS omits compressed
+    # and swapped pages, which is most of what an idle runtime that has grown
+    # consists of, so summing RSS left the background runtime's ceiling blind:
+    # 124 MB of RSS against 1983 MB of footprint was measured on one Mac. The
+    # footprint read is one in-process libproc call per pid, no subprocess.
     table = _ps_process_table()
     if table is None:
         return _get_rss_mb(pid)
     children, rss_kib = table
     if pid not in rss_kib:
         return None
-    total_kib = 0
+    total_bytes = 0
     visited: set[int] = set()
     queue: list[tuple[int, int]] = [(pid, 0)]
     while queue:
@@ -581,8 +596,9 @@ def _get_rss_tree_mb(
         if p in visited:
             continue
         visited.add(p)
-        total_kib += rss_kib.get(p, 0)
+        footprint = platform_compat.proc_phys_footprint_bytes_for_pid(p)
+        total_bytes += footprint if footprint is not None else rss_kib.get(p, 0) * 1024
         if max_depth is not None and depth >= max_depth:
             continue
         queue.extend((c, depth + 1) for c in children.get(p, []))
-    return total_kib / 1024.0
+    return total_bytes / (1024.0 * 1024.0)

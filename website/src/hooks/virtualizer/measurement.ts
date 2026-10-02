@@ -12,6 +12,7 @@ import { useCallback, useLayoutEffect, useMemo, useRef, useSyncExternalStore, ty
 import { isRailSettling } from '../useRailWidth'
 import { inPlaceDeltaAbove, resizedInPlaceBelow } from './inPlaceResize'
 import { HeightIndex } from './HeightIndex'
+import { boundWidthFamilyFor } from '../../utils/widthFamilyGc'
 import { repriceAboveFoldDelta } from './FollowController'
 import type { WindowRange } from './WindowCalculator'
 import { composerExplainsViewportChange } from '../../utils/composerResize'
@@ -135,6 +136,20 @@ export function useHeightOwner<T>(ctx: {
         const it = itemsRef.current[i]
         return it ? getKeyRef.current(it, i) : null
       },
+      // Bound this slot's per-width family on the FIRST persist of this width's
+      // blob -- NOT here at construction. A brand-new width has no blob when its
+      // HeightIndex is constructed (construction only loads; the write happens
+      // later, when a measured row flushes), so binding at construction would
+      // skip every fresh width a reader drags the pane through and only ever
+      // fire on a remount or warm return to a width already written. The first
+      // flush that creates the blob (absent -> present) is the one moment a new
+      // width joins the family, so that is when the bound runs. It spares the
+      // scope just written (the current width, and the warm return a reader
+      // oscillates back to), reclaims only the least-recently-used OTHER widths,
+      // operates only on persisted derived caches -- never this live owner, a
+      // draft, or config -- and never caps the measurable width. No-op for a
+      // scope with no `:w<bucket>` suffix (a caller that did not width-scope).
+      onFirstPersist: () => boundWidthFamilyFor(heightScope),
     })
   } else {
     // Transcripts grow while mounted; keep the cap in step with the row count.

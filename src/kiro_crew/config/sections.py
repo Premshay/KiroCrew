@@ -100,6 +100,8 @@ from kiro_crew.config.service_sections import (  # noqa: F401
     TaskRunnerConfig,
     WatchdogConfig,
 )
+from kiro_crew.constants import DEFAULT_SPAWN_MIN_MEMORY_GB as _DEFAULT_SPAWN_MIN_MEMORY_GB
+from kiro_crew.constants import DEFAULT_SUBAGENT_COST_GB as _DEFAULT_SUBAGENT_COST_GB
 from kiro_crew.constants import DEFAULT_SUBAGENT_MAX_TURNS as _DEFAULT_SUBAGENT_MAX_TURNS
 from kiro_crew.constants import SUBAGENT_TIMEOUT_MAX as _SUBAGENT_TIMEOUT_MAX
 from kiro_crew.constants import SUBAGENT_TIMEOUT_MIN as _SUBAGENT_TIMEOUT_MIN
@@ -1224,10 +1226,16 @@ class AgentConfig:
         ),
     )
     spawn_min_memory_gb: float = field(
-        default=4.0,
+        default=_DEFAULT_SPAWN_MIN_MEMORY_GB,
         metadata=_meta(
             "Spawn Min Memory GB",
-            "Minimum available memory (GB) required to spawn a subagent. 0 disables the check.",
+            "Available memory (GB) that must remain after admitting a subagent start. A "
+            "dedicated-process start is priced at what such a runtime settles at (about 1 GB "
+            "until runs of that agent have been measured, then their learned size capped at "
+            "2 GB, never below subagent_cost_gb); one that shares its parent's runtime at "
+            "about 0.35 GB "
+            "less. A spawn that does not fit waits in the durable queue (one with no "
+            "durable queue is refused). 0 disables the check.",
         ),
     )
     resource_pressure_gb: float = field(
@@ -1618,13 +1626,13 @@ class AgentConfig:
         ),
     )
     subagent_cost_gb: float = field(
-        default=0.5,
+        default=_DEFAULT_SUBAGENT_COST_GB,
         metadata=_meta(
             "SubAgent Memory Cost (GB)",
-            "Free memory (GB) each sub-agent start must find on top of the "
-            "admission floor; also the per-agent fallback used to auto-size the "
-            "cap until a learned value accumulates. Raise it on hosts whose "
-            "runtimes settle heavier.",
+            "The least a dedicated sub-agent start is priced at when admission "
+            "reserves its memory (the measured or learned settled size applies "
+            "when higher); also the per-agent fallback used to auto-size the cap "
+            "until a learned value accumulates.",
         ),
     )
     subagent_cpu_cost_cores: float = field(
@@ -1658,7 +1666,8 @@ class AgentConfig:
             "serialized; the interval only decides how fast a wide fan-out "
             "fills. Raise it if this "
             "host or the model provider is the bottleneck -- a spawn still has "
-            "to clear spawn_min_memory_gb and the host budget, and the adaptive "
+            "to leave spawn_min_memory_gb free after its start and clear the host "
+            "budget, and the adaptive "
             "controller cuts the cap on real pressure, so this is a smoothing "
             "interval rather than the memory guard.",
         ),
@@ -1840,6 +1849,18 @@ class SessionConfig:
         metadata=_meta(
             "Auto-Compact Threshold",
             "Context usage percentage at which auto-compaction triggers (5-90).",
+        ),
+    )
+    compact_wait_secs: float = field(
+        default=0.0,
+        metadata=_meta(
+            "Compaction Wait Budget",
+            "Seconds the automatic-compaction coordinator waits for a "
+            "compaction to finish before giving up and restarting the "
+            "session. 0 (the default) uses the built-in budget. A positive "
+            "value below 60 is raised to 60 and a value above 3600 is capped. "
+            "Raise it on a host where automatic compaction on a large context "
+            "window regularly needs longer than the built-in budget.",
         ),
     )
     pool_size: int = field(
@@ -2458,6 +2479,18 @@ class DashboardConfig:
             "default: the thread routes answer not-found, no thread frame is sent, "
             "and the dashboard draws no Reply in thread control. Takes effect on "
             "the next request; no restart.",
+        ),
+    )
+    crewmates_in_agent_picker: bool = field(
+        default=False,
+        metadata=_meta(
+            "Crewmates in the chat agent picker",
+            "List crewmates in the chat composer's agent picker, beside the agent "
+            "templates, so a chat can be switched onto a crewmate (and its own "
+            "workspace and memory) without opening it from the Crew page. Off by "
+            "default: the picker lists templates plus any crewmate no listed "
+            "template already covers. Takes effect when the dashboard is reloaded; "
+            "no gateway restart.",
         ),
     )
     qr_session_until_restart: bool = field(
@@ -3567,6 +3600,16 @@ MAX_SUBAGENTS_FIXED_FLOOR = 3
 # read instead.
 AUTOCOMPACT_PCT_MIN = 5.0
 AUTOCOMPACT_PCT_MAX = 90.0
+
+# ``session.compact_wait_secs``: 0 is the sentinel for "use the built-in
+# budget"; any positive value is lifted to at least ``COMPACT_WAIT_SECS_MIN``
+# and capped at ``COMPACT_WAIT_SECS_MAX`` so a hand-edited typo cannot arm a
+# near-zero budget (which would restart every compaction) or an unbounded
+# wait. The load path applies the sentinel-preserving floor
+# (``value if value == 0 else max(value, MIN)``); the resolver treats <= 0 as
+# unset and falls back to the built-in default.
+COMPACT_WAIT_SECS_MIN = 60.0
+COMPACT_WAIT_SECS_MAX = 3600.0
 
 # ── Load/write bound parity ────────────────────────────────────────────────────
 # Ranges for bounded numeric fields the LOAD path clamps, while `_EDITABLE_CONFIG`

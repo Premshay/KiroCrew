@@ -73,6 +73,7 @@ async def add(
     # if that PR is already merged, deactivates it before its first turn.
     gate: bool = False,
     judge: dict | None = None,
+    watch: str = "",
     replace_existing: bool = True,
     replace_stopped: bool = False,
     self_armed: bool = False,
@@ -103,6 +104,7 @@ async def add(
             admission_check=admission_check,
             gate=gate,
             judge=judge,
+            watch=watch,
             replace_existing=replace_existing,
             replace_stopped=replace_stopped,
             self_armed=self_armed,
@@ -153,6 +155,7 @@ async def _add_locked(
     admission_check: Callable[[], bool] | None = None,
     gate: bool = False,
     judge: dict | None = None,
+    watch: str = "",
     replace_existing: bool = True,
     replace_stopped: bool = False,
     self_armed: bool = False,
@@ -171,6 +174,7 @@ async def _add_locked(
             admission_check=admission_check,
             gate=gate,
             judge=judge,
+            watch=watch,
             replace_existing=replace_existing,
             replace_stopped=replace_stopped,
             self_armed=self_armed,
@@ -192,6 +196,7 @@ async def _add_unserialized(
     admission_check: Callable[[], bool] | None = None,
     gate: bool = False,
     judge: dict | None = None,
+    watch: str = "",
     replace_existing: bool = True,
     replace_stopped: bool = False,
     self_armed: bool = False,
@@ -324,11 +329,29 @@ async def _add_unserialized(
             # subject; keying that only on the wording of the instruction made a
             # cadence contract depend on prose.
             monitor=(
-                infer_monitor(message, now, creation_surface=creation_surface, judge=stored_judge)
-                if gate
+                infer_monitor(
+                    message,
+                    now,
+                    creation_surface=creation_surface,
+                    judge=stored_judge,
+                    watch=watch,
+                    slot_key=slot_key,
+                )
+                # An explicit ``watch`` gates on its own, without ``gate``. This
+                # path defaults to UNGATED for the reason above, so requiring
+                # both would make the field work from monitor_start and do
+                # nothing here -- and no caller means "observe this subject, and
+                # ignore it". ``slot_key`` is what makes a work-ledger watch
+                # possible at all: its subject is the session being armed, which
+                # no amount of reading the message can recover.
+                if (gate or watch)
                 else None
             ),
-            gate=gate,
+            # ``watch`` is folded in here as well as above, because the tick path
+            # reads the STORED flag and refuses to poll a loop whose ``gate`` is
+            # False even when it carries a monitor. Leaving the two to disagree is
+            # what makes a watch that looks armed and never observes anything.
+            gate=bool(gate or watch),
             banner=banner,
             self_armed=self_armed,
         )
@@ -369,10 +392,12 @@ async def update(
     idle_secs: int | None = None,
     max_cycles: int | None = None,
     active: bool | None = None,
+    fresh_run: bool = False,
     max_runtime_secs: int | None = None,
     stopped_reason: str | None = None,
     banner: str | None = None,
     judge: dict | None = None,
+    watch: str | None = None,
     expected_generation: int | None = None,
     expect_fingerprint: str | None = None,
     precondition: Callable[[NudgeLoop], bool] | None = None,
@@ -383,7 +408,10 @@ async def update(
     A refused precondition changes nothing and returns ``None``, the same
     "not applied" answer as a missing row; only the stale-wake stop passes one.
     ``on_absent`` is called inside the same hold when the row is missing, so
-    that caller can tell a deleted row from a replaced one.
+    that caller can tell a deleted row from a replaced one. ``fresh_run`` marks
+    a revival as the user's own resume, which runs on a fresh budget; without
+    it a revival keeps the loop's count and clock (the reconciler re-arms and a
+    ``monitor_update`` bound raise, where a fresh allowance is not what was asked).
     """
     # CANCELLATION SAFETY: same contract as add(). The mutate+persist runs
     # as a SHIELDED, supervised task so a caller cancelled mid-write cannot
@@ -397,10 +425,12 @@ async def update(
             idle_secs=idle_secs,
             max_cycles=max_cycles,
             active=active,
+            fresh_run=fresh_run,
             max_runtime_secs=max_runtime_secs,
             stopped_reason=stopped_reason,
             banner=banner,
             judge=judge,
+            watch=watch,
             expected_generation=expected_generation,
             expect_fingerprint=expect_fingerprint,
             precondition=precondition,
@@ -432,10 +462,12 @@ async def _update_locked(
     idle_secs: int | None = None,
     max_cycles: int | None = None,
     active: bool | None = None,
+    fresh_run: bool = False,
     max_runtime_secs: int | None = None,
     stopped_reason: str | None = None,
     banner: str | None = None,
     judge: dict | None = None,
+    watch: str | None = None,
     expected_generation: int | None = None,
     expect_fingerprint: str | None = None,
     precondition: Callable[[NudgeLoop], bool] | None = None,
@@ -451,10 +483,12 @@ async def _update_locked(
             idle_secs=idle_secs,
             max_cycles=max_cycles,
             active=active,
+            fresh_run=fresh_run,
             max_runtime_secs=max_runtime_secs,
             stopped_reason=stopped_reason,
             banner=banner,
             judge=judge,
+            watch=watch,
             expected_generation=expected_generation,
             expect_fingerprint=expect_fingerprint,
             precondition=precondition,
@@ -472,10 +506,12 @@ async def _update_unserialized(
     idle_secs: int | None = None,
     max_cycles: int | None = None,
     active: bool | None = None,
+    fresh_run: bool = False,
     max_runtime_secs: int | None = None,
     stopped_reason: str | None = None,
     banner: str | None = None,
     judge: dict | None = None,
+    watch: str | None = None,
     expected_generation: int | None = None,
     expect_fingerprint: str | None = None,
     precondition: Callable[[NudgeLoop], bool] | None = None,
@@ -636,12 +672,45 @@ async def _update_unserialized(
             # Only for a gated loop: a structured monitor is refused far above, and
             # an ungated loop has no judge to read.
             rebind_monitor = rebind_monitor or loop.gate
+        requested_watch = str(watch or "").strip()
+        if requested_watch:
+            # ARM a subject on a live loop. This is the one subject a message edit cannot
+            # reach: a work-ledger watch observes the session's OWN key, which no wording
+            # contains, so without this field a conductor that armed a plain timer has to
+            # tear its loop down -- losing the cycle count the revision path exists to
+            # keep -- in order to start gating.
+            #
+            # ``gate`` is set with it, the same fold the arm path applies for the same
+            # reason: the tick path reads the STORED flag and refuses to poll a loop whose
+            # gate is False even when it carries a monitor, so leaving the two to disagree
+            # produces a loop that looks armed and observes nothing.
+            loop.gate = True
+            rebind_monitor = True
         # ONE place resolves the subject, from the two strings this loop now holds.
         # Reached by a changed instruction and by a replaced brief alike, because
         # either can name a different pull request and only the pair says which.
         if rebind_monitor:
+            # The loop's OWN kind, fed back into every derivation below. A
+            # work-ledger watch's subject is this session, which no message
+            # names, so re-inferring from text alone would answer "this
+            # instruction names nothing observable" and CLEAR the monitor --
+            # turning the documented way to reword an instruction into a
+            # silent way to disarm the watch. For gh-pr it changes nothing.
+            # A watch REQUESTED by this update wins over the loop's current kind, and has
+            # to: on a loop with no monitor the stored kind is "", which re-infers from
+            # text alone, answers "this instruction names nothing observable", and leaves
+            # the monitor None -- so the field would validate, reach here, and do nothing.
+            watch_kind = requested_watch or (loop.monitor.kind if loop.monitor is not None else "")
             inferred = (
-                infer_monitor(loop.message, time.time(), judge=loop.judge) if loop.gate else None
+                infer_monitor(
+                    loop.message,
+                    time.time(),
+                    judge=loop.judge,
+                    watch=watch_kind,
+                    slot_key=loop.slot_key,
+                )
+                if loop.gate
+                else None
             )
             current = loop.monitor
             # The stored spelling is a canonical shorthand and cannot
@@ -650,8 +719,18 @@ async def _update_unserialized(
             # "unchanged" and keep polling the wrong server. This is the
             # third of the three places that comparison had to reach; the
             # other two are the post-poll binding and the dedupe identity.
-            old_probe = infer_subject(str(previous.get("message") or ""), previous.get("judge"))
-            new_probe = infer_subject(loop.message, loop.judge)
+            old_probe = infer_subject(
+                str(previous.get("message") or ""),
+                previous.get("judge"),
+                watch=watch_kind,
+                slot_key=loop.slot_key,
+            )
+            new_probe = infer_subject(
+                loop.message,
+                loop.judge,
+                watch=watch_kind,
+                slot_key=loop.slot_key,
+            )
             same_host = (old_probe.host_key if old_probe else None) == (
                 new_probe.host_key if new_probe else None
             )
@@ -758,9 +837,8 @@ async def _update_unserialized(
             # budget-revivable against an explicit pause. Both transitions
             # serialize on _lock, so re-checking here closes the race: the
             # bound's deactivation degrades to a no-op when the loop is
-            # already inactive. The reverse order is already safe — a
-            # manual pause overwriting a bound tag only ever NARROWS
-            # revivability ("manual" never auto-revives).
+            # already inactive. The reverse order -- a reasonless pause
+            # arriving after the bound -- is closed two branches down.
             elif (
                 not active
                 and stopped_reason is None
@@ -775,6 +853,22 @@ async def _update_unserialized(
                     "AutoNudge: loop %s retains its source stop reason on "
                     "reasonless inactive update",
                     loop.id,
+                )
+            elif (
+                not active
+                and stopped_reason is None
+                and not loop.active
+                and loop.stopped_reason in _TERMINAL_BOUND_REASONS
+            ):
+                # The MIRROR of the race above: the bound landed first and a
+                # reasonless pause (the goal popover's, pressed off a stale
+                # running reading) arrives second. A repeat of an inactive state
+                # is not a new stop, and "manual" over the bound would lose why
+                # the loop ended.
+                logger.info(
+                    "AutoNudge: loop %s keeps its %s stop on reasonless inactive update",
+                    loop.id,
+                    loop.stopped_reason,
                 )
             elif stopped_reason in _TERMINAL_BOUND_REASONS and not active and not loop.active:
                 logger.info(
@@ -807,6 +901,21 @@ async def _update_unserialized(
                         # Same rule, same reason: the streak is evidence
                         # about a PAST run, and a revival starts a fresh one.
                         loop.consecutive_start_failures = 0
+                        # The user's resume runs a FRESH budget (Hermes ``/goal
+                        # resume`` resets the turn counter): without this the
+                        # timer's cap and budget checks re-stop a bound-stopped
+                        # loop on its first tick unless the bound was raised
+                        # first. ``created_ts`` IS the budget clock -- every
+                        # reader of the runtime left measures from it -- so it
+                        # moves too. Opt-in rather than a property of every
+                        # revival: the Research Lab and Issue Radar reconcilers
+                        # re-arm ANY inactive loop of a live campaign or crew
+                        # every few seconds, and a ``monitor_update`` bound raise
+                        # asks for its increment -- on those paths a reset would
+                        # turn the user's cap into a per-run allowance.
+                        if fresh_run:
+                            loop.cycle_count = 0
+                            loop.created_ts = time.time()
                 else:
                     loop.stopped_reason = stopped_reason or MANUAL_STOP_REASON
         revived = loop.active and not was_active
@@ -908,6 +1017,14 @@ def remove_sync(
     self._rearm_fail_count.pop(loop_id, None)
     self._start_failure_deferred.pop(loop_id, None)
     self._rearm_pending.discard(loop_id)
+    # Beside the line above, and for its reason: a claim released in one set and
+    # forgotten in another outlives its loop, and an id reused by a later loop would
+    # inherit a pull-forward nobody asked for.
+    self._pulled_forward.discard(loop_id)
+    self._pushed_ticks.discard(loop_id)
+    self._pushed_running.discard(loop_id)
+    self._pull_forward_counts.pop(loop_id, None)
+    self._pull_forward_capped = {pair for pair in self._pull_forward_capped if pair[0] != loop_id}
     self._accepted_monitor_turns.pop(loop_id, None)
     if persist:
         self._save()

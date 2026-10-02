@@ -5,7 +5,7 @@ import { useCallback, type Dispatch, type SetStateAction, useRef, useEffect } fr
 import type { DragStartEvent, DragEndEvent, DragOverEvent } from '@dnd-kit/core'
 import type { QueryClient } from '@tanstack/react-query'
 import type { ChatFolder } from '../../../types'
-import { computeSiblingReorder } from '../../../utils/reorderFolders'
+import { computeSiblingReorder, siblingReorderContainer } from '../../../utils/reorderFolders'
 import { haptic } from '../../../lib/haptic'
 import { api } from '../../../api/client'
 import { errMessage } from '../../../utils/thunkError'
@@ -49,6 +49,13 @@ export function useFolderDropOps({ folderReorderable, queryClient, setFolderActi
     // Past every refusal above: rows really renumber, so the drop seats here
     // and not in the caller, which cannot see which releases this helper drops.
     haptic('light')
+    // The container this renumber was computed against, stated to the endpoint
+    // as its precondition: a concurrent re-parent landing between this read and
+    // the write refuses the whole batch (409) instead of persisting an index
+    // computed for a container a row has left. The failure lands in the same
+    // catch below, whose rollback + invalidate is exactly the resync a stale
+    // tree needs.
+    const expectedParent = siblingReorderContainer(current, activeId)
     // Snapshot the pre-drag order of exactly the rows this drag renumbers, so a
     // rejected write can be rolled back field-scoped rather than by restoring a
     // whole-list snapshot (which would clobber a concurrent rename/move).
@@ -68,7 +75,7 @@ export function useFolderDropOps({ folderReorderable, queryClient, setFolderActi
     // per-row PATCH loop is wrong here. On failure, roll back only the rows
     // this drag set, and only where the cache still holds its optimistic
     // value, then re-sync from the server.
-    api.reorderChatFolders(changes).catch((e) => {
+    api.reorderChatFolders(changes, expectedParent).catch((e) => {
       setFolderActionError((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong')))
       queryClient.setQueryData<ChatFolder[]>(['chat-folders'], old =>
         (old ?? []).map(f => {

@@ -509,7 +509,13 @@ class _ReachedModule:
 
 
 _POSIX = SimpleNamespace(IS_WINDOWS=False)
-_POSIX_PS = SimpleNamespace(IS_WINDOWS=False, trusted_system_bin=lambda _name: "/bin/ps")
+# ``proc_phys_footprint_bytes_for_pid`` answers None so the macOS RSS helpers
+# reach their ``ps`` fallback, the branch these rows steer onto.
+_POSIX_PS = SimpleNamespace(
+    IS_WINDOWS=False,
+    trusted_system_bin=lambda _name: "/bin/ps",
+    proc_phys_footprint_bytes_for_pid=lambda _pid: None,
+)
 _LINUX = SimpleNamespace(platform="linux")
 _DARWIN = SimpleNamespace(platform="darwin")
 

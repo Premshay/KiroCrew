@@ -29,6 +29,7 @@ from kiro_crew.config.loader import (  # noqa: F401
     config_dir,
     resolve_agent_bindings,
 )
+from kiro_crew.dashboard.chat_folder_cleanup import api_chat_folders_cleanup  # noqa: F401
 from kiro_crew.dashboard.chat_folder_scaffold import (  # noqa: F401
     api_chat_folders_scaffold,
     api_chat_folders_scan,

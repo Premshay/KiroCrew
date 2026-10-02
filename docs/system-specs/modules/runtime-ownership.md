@@ -188,6 +188,7 @@ than blurred:
 | `subagent_manager.monitoring._reconcile_orphans_impl` | convention |
 | `subagent_manager.terminal._sigkill_session_impl` | convention |
 | `runtime_reconcile._default_authorize` | convention |
+| `runtime_reconcile.RuntimeReconciler.reclaim_untracked` (through the same `_authorize` seam) | convention |
 
 A convention site that drops its gate call is not caught: the primitive call it
 still makes stays counted, so `BYPASS_BASELINE` does not move and the suite stays
@@ -309,6 +310,12 @@ reading that cannot be taken, and a registry that cannot be read, each refuse th
 entire pass rather than acting on the half that answered. An incomplete active-pid
 union does the same.
 
+### Leaked untracked runtimes: read every pass, reclaimed only on a user confirm
+
+`session_pid`'s report-only arm finds a managed runtime reparented to init with our marker and in neither pid file. Every pass copies its current hits into the reading as `leaked_untracked`, `leaked_rss_bytes` (each root counted with its descendants) and `leaked`, Linux only. No scheduled arm acts on them.
+
+`RuntimeReconciler.reclaim_untracked` is the one path that may, and its only caller is the owner-only `POST /api/system/leaked-runtimes/reclaim` with `{"confirm": true}`. A candidate must have been reported by a sweep and be detected again on a complete tracked snapshot. Each condition can only withhold: tracked, protected, leased or claimed; not a managed harness; no spawn marker; younger than the age floor; a `KIROCREW_SPAWN_HOME` that is absent or names another data home (the marker is shared by every install on this uid, and a sibling's runtime is tracked only in its own pid files); a live session leader or group leader other than itself; no readable `KIROCREW_SPAWN_INSTANCE`; or any live process outside its own tree carrying the same instance. The last one is what keeps a live runtime's descendant safe: the stamps are inherited, so that runtime itself holds the instance. The start identity is re-read before `authorize_runtime_kill` and pinned into `_kill_pid_tree`, under the tenancy barrier, at most `DEFAULT_MAX_KILLS` trees per call.
+
 ### Why an unowned process is counted before it is killed
 
 Absence from the record is evidence that something is unclaimed, not evidence that
@@ -352,7 +359,12 @@ merely counted (`RuntimeReconciler._why_not_yet`, `_reconcile_unowned`):
    guard asked here at the decision point). Most of the unowned population carries
    the inherited spawn marker and is not a harness — a Playwright chromium tree, an
    `mcp start-server` broker, a sandbox shim, another install's interpreter — and
-   the seam declines every one. Asked here they are withheld by name; asked only
+   the seam declines every one. A sandbox shim is declined for what it WRAPS, not
+   for being a shim: on Linux the namespace launcher is the pid a real agent runtime
+   is tracked under, so the gate steps over the launcher and asks its positional
+   rules of the wrapped argv (see [session.md](session.md) §Reclaim identity) — a
+   launcher around an MCP probe or an app backend still answers "not a harness", and
+   one around `kiro-cli` answers that it is. Asked here they are withheld by name; asked only
    inside the seam, each first collects a gate allow and the attribution that allow
    writes. The seam still re-applies it last, because a pid can change hands
    between the two answers;
