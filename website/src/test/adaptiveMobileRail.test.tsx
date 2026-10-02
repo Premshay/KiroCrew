@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { render, screen, within } from '@testing-library/react'
-import { APPS_FLOOR_PX, AdaptiveMobileRail, shouldFoldSecondary } from '../shell/nav/adaptiveMobileRail'
+import { APPS_FLOOR_PX, AdaptiveMobileRail, shouldFoldSecondary, stableRailHeight } from '../shell/nav/adaptiveMobileRail'
 
 describe('shouldFoldSecondary', () => {
   it('keeps the pins while the Apps list still gets its floor', () => {
@@ -13,6 +13,26 @@ describe('shouldFoldSecondary', () => {
   })
   it('keeps the shipped pinned layout before the rail is measured', () => {
     expect(shouldFoldSecondary(0, 300, 240, 120)).toBe(false)
+  })
+})
+
+describe('stableRailHeight', () => {
+  it('ignores a shrink at the same width (keyboard, browser toolbar)', () => {
+    const tall = stableRailHeight(null, 72, 1000)
+    expect(stableRailHeight(tall, 72, 640)).toEqual({ width: 72, height: 1000 })
+  })
+  it('adopts growth at the same width', () => {
+    expect(stableRailHeight({ width: 72, height: 700 }, 72, 900)).toEqual({ width: 72, height: 900 })
+  })
+  it('re-decides from scratch when the width changes (rotation)', () => {
+    expect(stableRailHeight({ width: 72, height: 1000 }, 80, 500)).toEqual({ width: 80, height: 500 })
+  })
+  it('keeps pinned tiles pinned when the keyboard shrinks a tall rail below the floor', () => {
+    const sizes = [300, 240, 120]
+    const open = stableRailHeight(stableRailHeight(null, 72, 1000), 72, 640)
+    expect(shouldFoldSecondary(1000, ...sizes as [number, number, number])).toBe(false)
+    expect(shouldFoldSecondary(640, ...sizes as [number, number, number])).toBe(true)
+    expect(shouldFoldSecondary(open.height, ...sizes as [number, number, number])).toBe(false)
   })
 })
 

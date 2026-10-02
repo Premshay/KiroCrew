@@ -18,6 +18,21 @@ export function shouldFoldSecondary(
   return railPx - topPx - secondaryPx - bottomPx < APPS_FLOOR_PX
 }
 
+/** The rail height the fold decides from: the tallest seen at this width.
+ *
+ * Only a change in the WINDOW width (rotation, split screen) resets it. A height that shrinks
+ * at the same width is the on-screen keyboard (the app uses
+ * `interactive-widget=resizes-content`) or the browser toolbar, both
+ * transient, so the tiles must not move for them -- otherwise focusing the
+ * drawer's session filter on a borderline-height phone would yank four tiles
+ * into the Apps list and back. Growth is real room and is adopted at once. */
+export function stableRailHeight(
+  prev: { width: number; height: number } | null, width: number, height: number,
+): { width: number; height: number } {
+  if (!prev || prev.width !== width) return { width, height }
+  return { width, height: Math.max(prev.height, height) }
+}
+
 /**
  * The phone rail's body, split into four regions so each scrolls one way:
  *
@@ -30,7 +45,9 @@ export function shouldFoldSecondary(
  *   with no nested scroll and no control to learn.
  *
  * The decision cannot feed back on itself: the blocks keep their heights wherever
- * the secondary tiles sit, and the rail's height comes from the viewport.
+ * the secondary tiles sit, and the rail's height comes from the viewport. It
+ * decides from `stableRailHeight`, so the keyboard and browser chrome never
+ * move a tile; only rotation or a taller rail re-decides.
  */
 export function AdaptiveMobileRail({ top, apps, secondary, bottom, className, ...navProps }: {
   top: ReactNode
@@ -48,16 +65,22 @@ export function AdaptiveMobileRail({ top, apps, secondary, bottom, className, ..
   useLayoutEffect(() => {
     const nav = navRef.current
     if (!nav) return
+    let stable: { width: number; height: number } | null = null
     const measure = () => {
       const h = (el: HTMLElement | null) => el?.getBoundingClientRect().height ?? 0
-      setFold(shouldFoldSecondary(nav.clientHeight, h(topRef.current), h(secondaryRef.current), h(bottomRef.current)))
+      // The WINDOW width, not the rail's: the rail is a fixed 72px, so its own
+      // width never changes on rotation.
+      stable = stableRailHeight(stable, window.innerWidth, nav.clientHeight)
+      setFold(shouldFoldSecondary(stable.height, h(topRef.current), h(secondaryRef.current), h(bottomRef.current)))
     }
     measure()
     if (typeof ResizeObserver === 'undefined') return
     const ro = new ResizeObserver(measure)
     ro.observe(nav)
     for (const el of [topRef.current, secondaryRef.current, bottomRef.current]) if (el) ro.observe(el)
-    return () => ro.disconnect()
+    // A width-only change (split screen) resizes nothing the observer watches.
+    window.addEventListener('resize', measure)
+    return () => { ro.disconnect(); window.removeEventListener('resize', measure) }
   }, [])
 
   const block = 'w-full flex flex-col items-center gap-1 shrink-0'
