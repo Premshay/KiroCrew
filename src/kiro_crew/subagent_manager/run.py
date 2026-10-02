@@ -1386,6 +1386,12 @@ class RunEventCoordinator(ManagerComponent):
         # predicate, and no model / reasoning-effort pin.
         plan = self._manager._sharing_plan(info)
         eff_model = plan.eff_model
+        # A spawn that names no model may be routed to a configured tier of the
+        # seat's vendor by ``spawn.route`` (off without consent; ``None`` is every
+        # refusal). A per-spawn pin is the parent's answer and is never asked
+        # about; the role pin is the owner's, and is asked about only so the
+        # decision is RECORDED -- it is applied only when the owner configured
+        # ``decisions.spawn_route`` tiers, which is what makes the answer usable.
         if not info.model:
             routed = await self._route_spawn_model(info, agent)
             if routed:

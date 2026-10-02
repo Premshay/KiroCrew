@@ -1274,6 +1274,8 @@ def main():
         sys.exit("sandbox_launcher: no command given")
 
     # A child must enter its own mount namespace before binding Crew ceilings.
+    # A child must have a separate mount namespace before it mounts Crew ceilings;
+    # otherwise a bind mount can conceal or overwrite the gateway's live state.
     _host_mount_namespace = os.stat("/proc/self/ns/mnt").st_ino
 
     # Export this launcher's HOST pid before any fork/namespace work. The

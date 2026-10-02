@@ -71,6 +71,10 @@ export function useFollowUpChips({
   // context and re-renders every atom under it.
   const composerRootChange = useCallback((v: string) => { clearFollowUpOwnership(); setInput(v) }, [clearFollowUpOwnership, setInput])
   const prefillEditedRef = useRef(prefillEdited); prefillEditedRef.current = prefillEdited
+  // Typing is the user taking the composer back (fork): exit the hands-free loop
+  // and discard any capture in flight so nothing they are editing gets
+  // auto-sent. ChatInput-only -- dictation writes through `composerRootChange`,
+  // which must not end the loop.
   const composerUserEdit = useCallback((v: string) => {
     const handsFree = composerRef.current?.voice()?.handsFree
     if (handsFree?.armed) handsFree.exit('discard')

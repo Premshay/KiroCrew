@@ -74,10 +74,6 @@ class DefaultProviderRegistry:
         # point this hook opens on its own.
         return None
 
-    def agent_runtime_policy(self, agent_name: str) -> dict[str, Any] | None:
-        """Public Kiro-ACP has no companion-specific runtime policy."""
-        return None
-
     def agent_client_binding(self, agent_name: str) -> dict[str, Any] | None:
         """Public Kiro-ACP binds every agent to the native kiro-cli path."""
         return None

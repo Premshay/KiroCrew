@@ -18949,8 +18949,6 @@ async def _run_chat(
                         app=getattr(slot, "_app", "") or "",
                         context_used=_ctx_used,
                         context_window=_ctx_window,
-                        ctx_blocks=slot_ctx_blocks,
-                        phase=slot_ctx_phase,
                         # Same wall clock the turn-duration histogram below is
                         # given, so the row store and the histogram can never
                         # disagree about one turn. acp reports 0 here.
