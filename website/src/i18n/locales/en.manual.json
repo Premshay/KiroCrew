@@ -1,4 +1,16 @@
 {
+  "preference_advisor": {
+    "timeout": "Preference advice timed out. Continue without advice or try again.",
+    "loading": "Checking your task preferences…",
+    "recommend": "Suggested for this task: {{model}}",
+    "reason": "Based on {{examples}} similar reviewed preferences. This is advice, not a capability guarantee.",
+    "use": "Use suggested",
+    "keep": "Keep current",
+    "choose": "Choose another",
+    "draft": "Your draft is kept. After choosing, press Send to start.",
+    "skip": "Continue without advice",
+    "saved": "Preference saved. Press Send when ready."
+  },
   "commandCenter": {
     "automatic_cards": "Automatic cards for all sessions",
     "card_limits": "Off by default. Uses the background model, one call at a time. At most one attempt per session every {{minutes}} minutes and {{hourly}} attempts per hour shared by all sessions, including failures. Live status and decisions do not use the model.",

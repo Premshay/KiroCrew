@@ -1,0 +1,276 @@
+import asyncio
+import json
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from aiohttp import web
+
+from kiro_crew.dashboard.handlers import preference_advisor as handler
+
+
+@pytest.fixture
+def setup(monkeypatch):
+    slot = SimpleNamespace(
+        key="s",
+        memory_mode="persistent",
+        is_remote=False,
+        total_messages=0,
+        _task=None,
+        _model_pick_gen=0,
+        model="current",
+        agent="test-agent",
+        project="",
+        workspace="",
+    )
+    app = {
+        "state": SimpleNamespace(
+            _slots={"s": slot},
+            conversation_log=SimpleNamespace(publication_hold=lambda _: nullcontext()),
+        )
+    }
+    body = {"slot": "s", "task": "classify", "models": ["small"]}
+    monkeypatch.setattr(handler, "_deny_non_owner", AsyncMock(return_value=None))
+    from kiro_crew.dashboard import chat_utils
+
+    monkeypatch.setattr(chat_utils, "effective_session_key", lambda _: "dashboard:s")
+
+    async def read(_):
+        return body, None
+
+    monkeypatch.setattr(handler, "read_bounded_json", read)
+    monkeypatch.setattr(
+        handler,
+        "_compute",
+        lambda *args: {
+            "model": "small",
+            "budget": "fast",
+            "reason": "similar_preferences",
+            "examples": ["a", "b"],
+        },
+    )
+    return SimpleNamespace(app=app), slot, body
+
+
+class TestPreferenceAdvisor:
+    @pytest.mark.parametrize(
+        "contents,enabled",
+        [
+            (None, False),
+            ('{"enabled":false}', False),
+            ('{"enabled":true}', True),
+            ("{", False),
+        ],
+    )
+    def test_enablement_requires_valid_explicit_configuration(
+        self, tmp_path, monkeypatch, contents, enabled
+    ):
+        from kiro_crew.config import paths
+
+        monkeypatch.setattr(paths, "config_dir", lambda: tmp_path)
+        if contents is not None:
+            (tmp_path / "routing-preferences.json").write_text(contents)
+        assert handler.preference_advisor_enabled() is enabled
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("memory_mode", "incognito"),
+            ("memory_mode", "temporary"),
+            ("_pending_memory_mode", "incognito"),
+            ("total_messages", 1),
+            ("_model_pick_gen", 1),
+            ("is_remote", True),
+        ],
+    )
+    async def test_restricted_or_continuing_sessions_never_score(
+        self, setup, monkeypatch, field, value
+    ):
+        request, slot, _ = setup
+        setattr(slot, field, value)
+
+        def forbidden(*args):
+            pytest.fail("must not read examples or encode")
+
+        monkeypatch.setattr(handler, "_compute", forbidden)
+        response = await handler.api_preference_advice(request)
+        assert json.loads(response.body)["reason"] == "keep_current"
+
+    @pytest.mark.asyncio
+    async def test_non_owner_cannot_read_or_write(self, setup, monkeypatch):
+        request, _, _ = setup
+        monkeypatch.setattr(
+            handler, "_deny_non_owner", AsyncMock(return_value=web.Response(status=403))
+        )
+        assert (await handler.api_preference_advice(request)).status == 403
+        assert (await handler.api_preference_feedback(request)).status == 403
+
+    @pytest.mark.asyncio
+    async def test_feedback_requires_successful_model_pick_and_is_idempotent(
+        self, setup, monkeypatch
+    ):
+        from kiro_crew.dashboard import chat_utils
+        from kiro_crew.decisions import log
+
+        request, slot, body = setup
+        rows = []
+        monkeypatch.setattr(log, "append", lambda row: rows.append(row) or True)
+        monkeypatch.setattr(chat_utils, "effective_session_key", lambda _: "dashboard:s")
+        advice = json.loads((await handler.api_preference_advice(request)).body)
+        assert slot.model == "current"
+        assert rows == []
+        body.clear()
+        body.update(id=advice["id"], choice="use", model="small")
+        assert (await handler.api_preference_feedback(request)).status == 409
+        slot.model = "small"
+        assert (await handler.api_preference_feedback(request)).status == 200
+        assert (await handler.api_preference_feedback(request)).status == 200
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "preference_feedback"
+        assert "classify" not in json.dumps(rows)
+
+    @pytest.mark.asyncio
+    async def test_feedback_after_privacy_change_is_not_written(self, setup):
+        request, slot, body = setup
+        advice = json.loads((await handler.api_preference_advice(request)).body)
+        slot.memory_mode = "incognito"
+        body.clear()
+        body.update(id=advice["id"], choice="keep", model="current")
+        assert (await handler.api_preference_feedback(request)).status == 409
+
+    @pytest.mark.asyncio
+    async def test_persisted_privacy_restriction_blocks_feedback(self, setup, monkeypatch):
+        from kiro_crew.decisions import log
+        from kiro_crew.history import TranscriptWithheld
+
+        request, _, body = setup
+        advice = json.loads((await handler.api_preference_advice(request)).body)
+
+        def refused(_):
+            raise TranscriptWithheld("restricted")
+
+        request.app["state"].conversation_log.publication_hold = refused
+
+        def forbidden(_):
+            pytest.fail("restricted feedback must not reach the log")
+
+        monkeypatch.setattr(log, "append", forbidden)
+        body.clear()
+        body.update(id=advice["id"], choice="keep", model="current")
+        assert (await handler.api_preference_feedback(request)).status == 409
+
+    def test_missing_config_is_off(self, tmp_path, monkeypatch):
+        from kiro_crew.config import paths
+
+        monkeypatch.setattr(paths, "config_dir", lambda: tmp_path)
+        assert handler._compute("task", ["small"]) == {"reason": "not_configured"}
+
+    def test_only_reviewed_examples_reach_local_encoder(self, tmp_path, monkeypatch):
+        from kiro_crew import decisions, embeddings
+        from kiro_crew.config import paths
+
+        monkeypatch.setattr(paths, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(decisions, "is_enabled", lambda *a, **kw: False)
+        calls = []
+
+        class LocalEncoder:
+            def embed(self, text):
+                calls.append(text)
+                return [1, 0]
+
+        monkeypatch.setattr(embeddings, "LlamaCppEmbedder", LocalEncoder)
+        monkeypatch.setattr(embeddings, "get_shared_embedder", LocalEncoder)
+        rows = [
+            {
+                "id": str(i),
+                "group": str(i),
+                "task": f"reviewed {i}",
+                "role": "parent",
+                "budget": "balanced",
+                "reviewed": True,
+            }
+            for i in range(2)
+        ]
+        rows.append({"task": "unreviewed private example", "reviewed": False})
+        (tmp_path / "routing-preferences.json").write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "models": {"balanced": "small"},
+                    "examples": rows,
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = handler._compute("new task", ["small"])
+        assert result["model"] == "small"
+        assert calls == ["new task", "reviewed 0", "reviewed 1"]
+        assert result["evidence"] == ["reviewed 0", "reviewed 1"]
+        monkeypatch.setattr(decisions, "is_enabled", lambda *a, **kw: True)
+        assert (
+            handler._compute("new task", ["small"], routing_armed=True)["reason"]
+            == "automatic_routing_active"
+        )
+        assert len(calls) == 3
+        assert handler._compute("new task", ["small"], routing_armed=False)["model"] == "small"
+        assert len(calls) == 6
+        with pytest.raises(TimeoutError):
+            handler._compute("new task", ["small"], deadline=0)
+        assert len(calls) == 6
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model,flag,expected",
+        [("auto", False, True), ("current", True, True), ("current", False, False)],
+    )
+    async def test_passes_actual_slot_routing_state(
+        self, setup, monkeypatch, model, flag, expected
+    ):
+        request, slot, _ = setup
+        slot.model, slot.jev_route = model, flag
+        seen = []
+        monkeypatch.setattr(handler, "_compute", lambda *args: seen.append(args[3]) or {})
+        await handler.api_preference_advice(request)
+        assert seen == [expected]
+
+    @pytest.mark.asyncio
+    async def test_slow_scoring_is_bounded_without_holding_feedback_lock(self, setup, monkeypatch):
+        request, slot, body = setup
+        advice = json.loads((await handler.api_preference_advice(request)).body)
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = asyncio.to_thread
+
+        async def blocked(function, *args):
+            if function is handler._compute:
+                entered.set()
+                await release.wait()
+                return {"model": "small"}
+            return await original(function, *args)
+
+        monkeypatch.setattr(handler.asyncio, "to_thread", blocked)
+        monkeypatch.setattr(handler, "_COMPUTE_SECONDS", 0.02)
+        pending = asyncio.create_task(handler.api_preference_advice(request))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            assert (
+                json.loads((await handler.api_preference_advice(request)).body)["reason"]
+                == "advice_busy"
+            )
+            from kiro_crew.decisions import log
+
+            monkeypatch.setattr(log, "append", lambda row: True)
+            body.clear()
+            body.update(id=advice["id"], choice="keep", model="current")
+            assert (
+                await asyncio.wait_for(handler.api_preference_feedback(request), 1)
+            ).status == 200
+            assert (
+                json.loads((await asyncio.wait_for(pending, 1)).body)["reason"] == "advice_timeout"
+            )
+            assert not request.app[handler._WORK].done()
+        finally:
+            release.set()
+            await asyncio.wait_for(request.app[handler._WORK], 1)
+            await pending

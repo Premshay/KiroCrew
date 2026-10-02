@@ -1067,6 +1067,10 @@ from kiro_crew.dashboard.handlers.decisions import (  # noqa: E402, F401
     api_decisions_provider_get,
     api_decisions_provider_put,
 )
+from kiro_crew.dashboard.handlers.preference_advisor import (  # noqa: E402, F401
+    api_preference_advice,
+    api_preference_feedback,
+)
 
 # Flagged-file delivery consent — owner-gated, and the ONLY writer of
 # ``file_delivery_consent.json``. Recording is arm (owner POST) + approve

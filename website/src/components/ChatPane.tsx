@@ -11,6 +11,7 @@ import type { ThreadHooks } from '../app-sdk/messageRenderers'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
+import { usePreferenceAdvisor } from '../pages/chat/usePreferenceAdvisor'
 import { filterCrewmateChat } from './chat/crewmateBubbles'
 import type { CrewmateIdentity } from '../pages/chat/CrewmateMessage'
 import ErrorNotice from './ErrorNotice'
@@ -529,7 +530,7 @@ export default function ChatPane({
   useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
   // with the page and no extra request is made for a pane.
-  const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: fetchDashboardConfig, staleTime: 30_000 })
+  const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean; preference_advisor_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: fetchDashboardConfig, staleTime: 30_000 })
   // Whether the split send button may offer `Auto (Jev)`: the fleet ceiling and
   // the owner's consent, both the gateway's answers (see useJevAutoSend).
   const jevAutoConsented = useJevAutoSend()
@@ -658,6 +659,16 @@ export default function ChatPane({
     [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model, jevRouteOn, jevRouteLabel, codexPairModels],
   )
   const modelDD = useFilteredDropdown(modelPickerModels)
+  const preferenceAdvisor = usePreferenceAdvisor({
+    enabled: dashCfg?.preference_advisor_enabled === true,
+    slot: slotKey,
+    model: paneSlot?.model || '',
+    eligible: !!paneSlot && !paneSlot.messages && !paneSlot.running && !paneRemoteCrew.isRemote && (paneSlot.memory_mode ?? 'persistent') === 'persistent',
+    models: modelPickerModels.map(model => model.name),
+    readDraft: () => input,
+    applyModel: model => switchModel(model, true),
+    openModelPicker: trigger => { anchorModelBtn(trigger.getBoundingClientRect(), trigger); modelDD.setOpen(true) },
+  })
   const [attachModelList, modelListEdges, remeasureModelList] = useScrollEdgesY<HTMLDivElement>()
   // The filter box narrows `modelDD.filtered` without a scroll or a box
   // resize once the list sits at its max height, so re-measure on every
@@ -779,8 +790,10 @@ export default function ChatPane({
       setSwitchError(msg)
     }
   }, [dispatch, slotKey])
-  const switchModel = useCallback(async (name: string) => {
+  const switchModel = useCallback(async (name: string, adviser = false) => {
     setSwitchError('')
+    const finishAdvicePick = adviser ? undefined : preferenceAdvisor.beginModelPick(name)
+    let appliedModel: string | undefined
     try {
       // A staged slider pick or a legacy pair level is carried; an effort
       // write already on the wire is waited for, not re-sent, and its
@@ -822,14 +835,21 @@ export default function ChatPane({
           // `model`: the gateway resolves the sentinel to `auto`, so the stored
           // model cannot tell a routed pick from a plain Auto one. Written on
           // every pick, because picking a concrete model is what clears it.
-          (value) => dispatch(updateSlot({
+          (value) => {
+            appliedModel = value
+            dispatch(updateSlot({
             key: slotKey,
             model: value,
             jev_route: name === JEV_ROUTE_MODEL,
-          })))
+          }))
+          })
       }, () => inFlightSlotSwitchOutcome('reasoning_effort', slotKey))
       queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', slotKey] })
+      finishAdvicePick?.(appliedModel)
+      return appliedModel
     } catch (e) {
+      finishAdvicePick?.()
+      if (adviser) throw e
       // Same failure surface as switchAgent above: the shared notice toast,
       // plus the in-pane notice (the toast alone would be the only report of
       // a write that did not persist).
@@ -840,7 +860,7 @@ export default function ChatPane({
       // eslint-disable-next-line no-console
       console.error('[ChatPane] switchModel failed', e)
     }
-  }, [codexPairModels, dispatch, paneSlot?.model, paneSlot?.reasoning_effort, queryClient, slotKey])
+  }, [codexPairModels, dispatch, paneSlot?.model, paneSlot?.reasoning_effort, queryClient, slotKey, preferenceAdvisor.beginModelPick])
 
   // Roving-focus keyboard nav for the pickers (mirrors ChatPage / StyledSelect):
   // ArrowUp/Down across options, Enter/Space select, Escape/Tab close + return
@@ -1012,7 +1032,7 @@ export default function ChatPane({
     }))
   }, [dispatch, slotKey])
 
-  const doSend = useCallback((optionText?: string, steerNow?: boolean) => {
+  const doSend = useCallback(async (optionText?: string, steerNow?: boolean, origin: 'manual' | 'voice' = 'manual') => {
     // `optionText` mirrors ChatPage.send's first parameter: the follow-up
     // bar's direct-send gesture (double-click / split button) hands the option
     // label here so it bypasses the setInput race, superseding any composer
@@ -1035,6 +1055,12 @@ export default function ChatPane({
     // no capture: the server retires it when this send's user row lands and
     // announces it with `question_card_resolved`.
     const askAtSend = capturePendingAskId(store.getState().chat.pendingQuestions, slotKey)
+    if (origin === 'manual' && !optionText && !pendingFiles.length && !pasteBlocks.length) {
+      const advice = preferenceAdvisor.beforeSend(text)
+      if (!(typeof advice === 'boolean' ? advice : await advice)) return
+      if (slotKeyRef.current !== slotKey || inputRef.current.trim() !== text ||
+        pendingFilesRef.current !== pendingFiles || pasteBlocksRef.current !== pasteBlocks) return
+    }
     // Staged text and files belong to the COMPOSER, so only a send that
     // consumes the composer may clear or carry them. An `optionText` send (the
     // follow-up bar's direct-send gesture) supplies its own text and leaves the
@@ -1201,7 +1227,7 @@ export default function ChatPane({
   }, [input, pendingFiles, pasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure, scrollToBottom])
   // The endpointer auto-submit (handed to the Voice atom above) reads the
   // latest send through this ref.
-  doSendRef.current = doSend
+  doSendRef.current = text => { void doSend(text, undefined, 'voice') }
 
   // Mid-turn steer: inject the composer content into the RUNNING turn instead
   // of queueing behind it. The pane's counterpart to ChatPage.steer, on the
@@ -1946,6 +1972,7 @@ export default function ChatPane({
             shape as ChatPage's inputAreaRef). */}
         {quoteFlight && <FlyingQuote text={quoteFlight.text} from={quoteFlight.from} targetRef={inputAreaRef} onComplete={endQuoteFlight} />}
         <div ref={inputAreaRef} className="relative z-10">
+        {preferenceAdvisor.card}
         <Composer
           ref={composerRef}
           slotKey={slotKey}

@@ -1,4 +1,16 @@
 {
+  "preference_advisor": {
+    "timeout": "Tempo scaduto per il consiglio. Continua senza consiglio o riprova.",
+    "loading": "Verifica delle preferenze per l’attività…",
+    "recommend": "Suggerimento per questa attività: {{model}}",
+    "reason": "Basato su {{examples}} preferenze simili verificate. È un consiglio, non una garanzia di capacità.",
+    "use": "Usa suggerimento",
+    "keep": "Mantieni attuale",
+    "choose": "Scegli un altro",
+    "draft": "La bozza viene conservata. Dopo la scelta, premi Invia per iniziare.",
+    "skip": "Continua senza consiglio",
+    "saved": "Preferenza salvata. Premi Invia quando sei pronto."
+  },
   "commandCenter": {
     "automatic_cards": "Schede automatiche per tutte le sessioni",
     "card_limits": "Disattivate per impostazione predefinita. Il modello in background esegue una chiamata alla volta. Al massimo un tentativo per sessione ogni {{minutes}} minuti e {{hourly}} tentativi all’ora condivisi tra tutte le sessioni, inclusi quelli falliti. Stato in tempo reale e decisioni non usano il modello.",

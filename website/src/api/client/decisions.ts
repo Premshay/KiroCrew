@@ -85,6 +85,16 @@ export type DecisionFeedbackSide = 'jev' | 'baseline'
 /** A reader's verdict on one side. `null` retracts an earlier one. */
 export type DecisionVerdictValue = 'right' | 'wrong' | null
 
+export interface PreferenceAdvice {
+  id?: string
+  model?: string | null
+  current?: string
+  budget?: 'fast' | 'balanced' | 'frontier'
+  reason: string
+  examples?: string[]
+  evidence?: string[]
+}
+
 /** One local System One model the card offers (`decisions/local_models.py`). */
 export interface DecisionsLocalModel {
   id: string
@@ -142,7 +152,7 @@ export interface DecisionsProviderData {
   runtime?: DecisionsRuntimeStatus
 }
 
-export function createDecisionsEndpoints({ get, post, put, del, j }: ClientTransport) {
+export function createDecisionsEndpoints({ get, post, put, del, j, withJournaledDeadline, sessionKeyHeader }: ClientTransport) {
   const consentRead = {
     // Decision-seam consent (Settings > Developer > Feature Previews). The switch
     // is a KEYSTONE, not a config path: see decisionsPreview.ts. The PUT returns
@@ -157,6 +167,22 @@ export function createDecisionsEndpoints({ get, post, put, del, j }: ClientTrans
   }
 
   const scopesAndFeedback = {
+    getPreferenceAdvice: (slot: string, task: string, models: string[], signal?: AbortSignal) =>
+      withJournaledDeadline(5000, signal, '/api/decisions/preference', bounded =>
+        fetch('/api/decisions/preference', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...sessionKeyHeader },
+          body: JSON.stringify({ slot, task, models }),
+          signal: bounded,
+        }).then(j)) as Promise<PreferenceAdvice>,
+    sendPreferenceFeedback: (id: string, choice: 'use' | 'keep' | 'choose', model: string, signal?: AbortSignal) =>
+      withJournaledDeadline(5000, signal, '/api/decisions/preference/feedback', bounded =>
+        fetch('/api/decisions/preference/feedback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...sessionKeyHeader },
+          body: JSON.stringify({ id, choice, model }),
+          signal: bounded,
+        }).then(j)) as Promise<{ ok: boolean }>,
     // A SCOPE on its own, with `enabled` deliberately OMITTED and no endpoint echo.
     // A per-point scope switch is not a review of an address, so it must not restate
     // consent to one; the gateway preserves the recorded switch and endpoint for an

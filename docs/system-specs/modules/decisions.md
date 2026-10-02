@@ -220,6 +220,96 @@ The reader is `readSteerRecord` in `website/src/pages/chat/decisionRecord.ts`, a
 `choice` IS the claim and is held against the two shipped paths: unlike a skill key or a difficulty tier, a third value would name a code path that does not exist, so the line draws nothing rather than printing it. An absent or unknown `point` is not read as this record either -- an absent one is the older producer's shape and belongs to `readDecisionStrip`. `baseline` is on the record because the record IS the log row and the day-file fold reads it, and the READER ignores it: it is `steer` on every row -- the one arm a refusal keeps -- so a line printing it would print one word forever, which this document's own rule about a count that never changes excludes. There is no `error` field, and its absence is the producer's contract: a failed decision takes the steer path and stamps nothing. `latency_ms` floors to 0, which prints no latency, and a `p` outside 0..1 prints no score.
 
 Tests: the two arms, the fallback on every refusal, the transcript walk (its stop at the running turn's request, the excluded `thinking` rows, the shared budget's split, the bounded read, the redaction of both halves) and the row's shape (`test_decisions_message_steer.py`); which path a `steer: "auto"` send takes, that a MANUAL steer or queue is never decided, that an app send is never decided, that a refused row stamps no receipt, that a request cannot supply a receipt through either door, and that a turn ending inside the decision discards the answer (`test_decisions_message_steer_apply.py`); the reader, the line, the user row's absent-field path and the third mode's availability (`website/src/test/SteerDecisionLine.test.tsx`), with the fenced record above held against the reader in `website/src/test/decisionStripContract.test.ts`.
+## Task-start preference adviser (`model.preference`)
+
+The preference adviser recommends a task budget from reviewed examples of the
+owner's choices. It does not classify intrinsic difficulty or switch models on
+continuation turns. Its reusable core is `kiro_crew.preference_routing`: callers
+supply task text, role, reviewed examples and a synchronous local encoder.
+Parent and worker examples never vote on each other. Retrieval keeps at most
+five neighbors, one per source-session group, requires two supporting groups,
+and abstains below similarity 0.65 or vote-share margin 0.2. These are initial
+heuristics, not calibrated probabilities or demonstrated quality guarantees.
+
+The dashboard preview intercepts the first plain-text Send in an existing empty,
+local, persistent slot. It leaves the draft intact and displays a conversation
+card: **Use suggested**, **Keep current**, or **Choose another**, which opens the
+existing combined model-and-effort picker. A successful model choice records
+feedback; the user then presses Send to begin. Silence records nothing. Attachments,
+collapsed pastes, programmatic sends, remote slots, ongoing conversations,
+incognito and temporary modes bypass this preview. Explicit picker changes take
+precedence. A changed draft or slot invalidates the pending interaction.
+VS Code, other harness adapters, child dispatch and task boundaries within an
+existing conversation are not integrated yet; the core's role boundary supports
+those future callers without importing dashboard code.
+
+`POST /api/decisions/preference` and `/api/decisions/preference/feedback` are
+dashboard-owner-only. Advice takes a bounded draft (4,000 characters), slot key
+and the current picker's model IDs. A non-owner denial bypasses advice without
+blocking ordinary Send; authentication and service failures remain visible.
+These IDs constrain a suggestion, never grant
+permission to apply one. Suggested and alternative model choices use each
+surface's existing model-and-effort transaction, including staged or inherited
+effort and outstanding effort writes, before the slot-model route. Feedback verifies the actual
+slot model, expires after 15 minutes and is idempotent for an identical response.
+Only explicit responses enter the existing decision log, as
+`kind=preference_feedback`, with model, budget, recommendation ID and task hash;
+the draft and example text are not copied into that log. A gateway restart
+invalidates unanswered cards. Failed feedback remains visible and retryable.
+After applying a model, a retry writes only feedback; it does not reapply the
+model. The owner can explicitly skip failed feedback before sending.
+Advice and feedback requests have a five-second browser deadline and can be
+bypassed while loading or recording. Bypassed or invalidated attempts cannot
+reopen a card or show a saved notice with a late result. Alternative picker
+operations bind to their originating interaction before the first write, so a
+websocket update arriving before the HTTP response does not discard feedback.
+Server scoring has a three-second budget, checked between embedding calls, and
+runs outside the feedback lock. One in-flight scorer per application remains
+accounted for even if a native embedding call outlives the HTTP deadline; further
+requests abstain while it is busy rather than accumulating worker threads.
+
+Configuration is operator-owned `routing-preferences.json` in the crew data home:
+`enabled` must be exactly `true`; `models` maps `fast`, `balanced`, `frontier` to
+catalog IDs; `examples` contains `id`, `group` (source-session deduplication key),
+`task` (model-name-free task/context summary), `role`, `budget`, optional `weight`
+in (0, 1], and exact `reviewed: true`. Private transcripts do not ship in source.
+Absent configuration leaves ordinary Send unchanged. Unreviewed historical
+weak labels are never promoted automatically. Model mapping misses abstain.
+The picker must advertise a concrete matching ID before advice can appear. A
+cold advertised-selection backend may expose only `auto` until an ACP session
+publishes its choices. An unloaded local embedder also causes abstention; its
+first load is asynchronous. Neither condition is evidence against a task budget.
+The adapter uses only the in-process `LlamaCppEmbedder`; a registered substitute
+encoder is refused rather than assuming it is local. No Jev request is made and
+no consent ceiling is edited. This preview abstains only when the slot is armed
+for automatic routing and scoped `model.route` is enabled; a globally enabled
+preview does not suppress advice on an unarmed concrete-model slot.
+
+Evaluate agreement and overrides on held-out source-session groups, then track
+completion time, rework and frontier usage. Feedback expresses a preference,
+not task success; it needs review before entering the example set.
+
+Verification (2026-10-02): 34 focused backend tests and 21 UI tests pass.
+The adviser, both composer voice suites and split attachment suite pass 61
+tests together. Semantic voice endpoints bypass advice; manual Send disarms
+streaming capture before retrieval. A staging change during retrieval cancels
+that Send without consuming the draft or its attachments. The dashboard config
+exposes read-only enablement, so absent or disabled advice makes no draft request.
+Disabled and ineligible advice also preserves synchronous Send entry. Question
+and folder-card generations are captured before advice, so a later card is not
+dismissed or aged by the earlier Send. API contract and disabled-Send regression
+suites pass 1,036 tests; French and Russian changed-value style gates pass.
+The backend and dashboard-config suites pass 40 tests together.
+TypeScript checking and the production build pass; the conversation card was
+also checked in Chromium at 390 px and 320 px viewport widths.
+An isolated gateway exercised real local embeddings, explicit model selection,
+feedback persistence and a completed first turn through the Codex subscription
+backend. The persisted turn identified the selected model. The test pod needed
+an 8 GiB memory ceiling; its default 4 GiB ceiling paused adaptive dispatch while
+the embedding runtime was loaded. These checks verify the interaction, not the
+adequacy of a historical preference corpus. Personal examples remain private
+and require role-specific review before activation.
+
 ## 11. Model routing (`model.route`)
 
 An enabled, sampled session that names NO model asks Jev to put each chat turn in one of three difficulty tiers and runs that turn on the model `decisions.model_route` maps the tier to. A refusal leaves the session on the model it was already on, which is exactly what every unconsented install does.

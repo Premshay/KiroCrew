@@ -6908,7 +6908,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         # PUT body. Drop them here instead of listing them in _allowed -- they
         # stay unwritable, but a round-tripped read-only field must not 400 an
         # unrelated toggle save.
-        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts", "social_share_enabled", "decisions_enabled", "model_picker_hidden_models", "model_picker_configured"}
+        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts", "social_share_enabled", "decisions_enabled", "preference_advisor_enabled", "model_picker_hidden_models", "model_picker_configured"}
         body = {
             k: v
             for k, v in body.items()
@@ -7387,6 +7387,9 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         lambda: (is_decisions_denied(), is_decisions_denied(local=True))
     )
     decisions_denied = hosted_denied and local_denied
+    from kiro_crew.dashboard.handlers.preference_advisor import preference_advisor_enabled
+
+    preference_enabled = await asyncio.to_thread(preference_advisor_enabled)
     return web.json_response(
         {
             "restore_sessions": cfg.dashboard.restore_sessions,
@@ -7422,6 +7425,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             # the Decisions (Jev) feature-preview card; the owner's own switch is
             # the keystone behind `/api/decisions/consent`, never a field here.
             "decisions_enabled": not decisions_denied,
+            "preference_advisor_enabled": preference_enabled,
             # Read-write (unlike the host allowlists above): a rule only changes
             # how this dashboard RENDERS text -- it grants no fetch and no CLI
             # any authority -- so the settings editor may manage it.

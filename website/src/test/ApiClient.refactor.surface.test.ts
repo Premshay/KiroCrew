@@ -175,7 +175,7 @@ const API_KEY_ORDER = [
   'reopenComment', 'deleteArtifactComment', 'editArtifactComment', 'getBrowserInstall',
   'setBrowserToken', 'installBrowserCli', 'installBrowserEngine', 'getBrowserView',
   'startBrowserView', 'openInBrowser', 'getComputerUseConfig', 'saveComputerUseConfig',
-  'getDecisionsConsent', 'getDecisionsProvider', 'getDecisionsLocalRuntime', 'saveDecisionsConsent', 'saveDecisionsScope',
+  'getDecisionsConsent', 'getDecisionsProvider', 'getDecisionsLocalRuntime', 'saveDecisionsConsent', 'getPreferenceAdvice', 'sendPreferenceFeedback', 'saveDecisionsScope',
   'saveDecisionsHistoryBudget', 'sendDecisionsFeedback', 'saveDecisionsProvider', 'removeDecisionsLocalModel', 'getSlackConfig', 'getSlackManifest', 'saveSlackConfig',
   'getDiscordConfig', 'saveDiscordConfig', 'getTelegramConfig', 'saveTelegramConfig',
   'getWeComConfig', 'getFeishuConfig', 'saveFeishuConfig', 'saveWeComConfig',

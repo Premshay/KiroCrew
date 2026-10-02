@@ -192,6 +192,8 @@ def register(app: web.Application) -> None:
     # strip's tooltip reads. Browser-called by the chat surface, like the consent
     # pair above.
     app.router.add_post("/api/decisions/feedback", handlers.api_decisions_feedback)
+    app.router.add_post("/api/decisions/preference", handlers.api_preference_advice)
+    app.router.add_post("/api/decisions/preference/feedback", handlers.api_preference_feedback)
     # Flagged-file delivery consent. Owner-gated in the handler; deliberately NOT
     # on the strict-internal list in server.py, because unlike the file_send legs
     # its only legitimate caller IS the owner's browser.
