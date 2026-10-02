@@ -140,6 +140,7 @@ import { useNavTip } from './shell/nav/navTip'
 import { isChatRoute, useRouteActiveModel } from './shell/nav/routeActive'
 import { useDeveloperMode } from './shell/nav/developerMode'
 import { RailHeaderGlyph, RailBrandToggle, RailCommunityLinks } from './shell/nav/railChrome'
+import { AdaptiveMobileRail } from './shell/nav/adaptiveMobileRail'
 
 // Lazy on purpose: the update-found popup (its policy module, Trans runtime
 // wiring, and mutation plumbing) is dead weight for every session without an
@@ -1480,118 +1481,106 @@ export default function App() {
         ? i18nT('app.open_command_bar')
         : i18nT('app.search_sessions_files_and_commands')
       return (
-        <nav
+        <AdaptiveMobileRail
           data-testid="mobile-nav-rail"
           role="navigation"
           aria-label={i18nT('app.main_navigation')}
           className="w-[72px] shrink-0 h-full flex flex-col items-center gap-1 pt-1.5 pb-2.5 border-r border-border bg-bg-accent overflow-y-auto overflow-x-hidden overscroll-y-contain scrollbar-none"
           style={{ scrollbarWidth: 'none' }}
-        >
-          <button
-            type="button"
-            data-testid="mobile-nav-rail-home"
-            onClick={() => { onActivate(); if (!(activePath === '/chat' || activePath === '/')) navigate('/chat', { replace: true }) }}
-            className="w-11 h-11 mb-1 flex items-center justify-center shrink-0 rounded-xl bg-transparent border-none cursor-pointer"
-            // Named for what it DOES (home = the chat root), not for the brand
-            // it shows: an icon-only control announced as the product name told
-            // a screen-reader user nothing about where the tap goes.
-            aria-label={i18nT('nav.home')}
-          >
-            <RailHeaderGlyph avatar={avatar} boxClass={branding?.logoClass ?? 'w-7 h-7'} iconSize={18} />
-          </button>
-          {advertisedNavItems.filter(n => n.group === 'Main').map(railRow)}
-          {/* Fork: no Discover / Library tiles. Both are setup surfaces visited
-              once per app, not daily drivers like the app tiles below, and on a
-              phone each costs a ~60px row the Apps list needs. Both stay reachable
-              through Search and the nav drawer on every other page. */}
-          {/* Apps list: scrolls in its OWN frame when many apps are installed --
-              the brand mark, the Main rows and Discover above it, and
-              Capabilities / Settings / Search below it stay pinned, exactly as
-              the desktop rail does. The scroller has no gap of its own so a
-              short list sits flush under Discover.
-              It keeps at least two tiles of height: the pinned tiles alone
-              (~60px each) fill a short phone, and a frame allowed to shrink to
-              zero hid every app with nothing to scroll. When the pinned set
-              plus that floor does not fit, the rail itself scrolls instead, so
-              every tile stays reachable. */}
-          <div
-            data-testid="mobile-nav-rail-apps"
-            className="flex-1 min-h-[7.5rem] w-full flex flex-col items-center gap-1 overflow-y-auto overflow-x-hidden overscroll-y-none scrollbar-none"
-            style={{ scrollbarWidth: 'none' }}
-          >
-            {sortedAppGroup.map(railRow)}
-            {/* Fork: Developer / Terminal / Customize / Kiro Account ride the
-                Apps scroller, after the apps. Pinned, they took ~240px of a
-                phone's height from the app tiles, the rail's most-used rows;
-                Settings and Search stay pinned below. */}
-            {devMode && (
+          top={<>
+              <button
+                type="button"
+                data-testid="mobile-nav-rail-home"
+                onClick={() => { onActivate(); if (!(activePath === '/chat' || activePath === '/')) navigate('/chat', { replace: true }) }}
+                className="w-11 h-11 mb-1 flex items-center justify-center shrink-0 rounded-xl bg-transparent border-none cursor-pointer"
+                // Named for what it DOES (home = the chat root), not for the brand
+                // it shows: an icon-only control announced as the product name told
+                // a screen-reader user nothing about where the tap goes.
+                aria-label={i18nT('nav.home')}
+              >
+                <RailHeaderGlyph avatar={avatar} boxClass={branding?.logoClass ?? 'w-7 h-7'} iconSize={18} />
+              </button>
+              {advertisedNavItems.filter(n => n.group === 'Main').map(railRow)}
+              {/* Fork: no Discover / Library tiles. Both are setup surfaces visited
+                  once per app, not daily drivers like the app tiles, and on a
+                  phone each costs a ~60px row the Apps list needs. Both stay
+                  reachable through Search and the nav drawer on other pages. */}
+          </>}
+          apps={sortedAppGroup.map(railRow)}
+          // Pinned above Settings while the rail has room; folded into the Apps
+          // scroller (behind a divider) on screens where pinning them would leave
+          // the app tiles less than four rows (shell/nav/adaptiveMobileRail.tsx).
+          secondary={<>
+              {devMode && (
+                <NavItem
+                  navId="developer"
+                  path="/developer"
+                  label={i18nT('app.developer')}
+                  icon={<Code size={16} />}
+                  active={activePath === '/developer'}
+                  collapsed
+                  touch
+                  replace
+                  onClickOverride={activePath === '/developer' ? onActivate : undefined}
+                />
+              )}
+              {terminalEnabled && (
+                <NavItem
+                  navId="terminal"
+                  path="#"
+                  label={i18nT('app.terminal')}
+                  icon={<SquareTerminal size={16} />}
+                  active={bottomTerminalOpen || terminalPoppedOut}
+                  pressed={bottomTerminalOpen || terminalPoppedOut}
+                  collapsed
+                  touch
+                  onClickOverride={() => { onActivate(); if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
+                />
+              )}
+              {railRow(capabilitiesSurface)}
+              {/* The account modal (balance, sign-in state): the desktop opens it
+                  from the readout capsule, which the phone does not render, so the
+                  rail carries it -- on exactly the readings the desktop segment
+                  shows (`kiroAccountEntry`). Toggles a surface, so `pressed`. */}
+              {kiroAccountEntry && (
+                <NavItem
+                  navId="account"
+                  path="#"
+                  label={i18nT('components.kiroAccountModal.kiro_account')}
+                  icon={<Coins size={16} />}
+                  active={kiroUsageOpen}
+                  pressed={kiroUsageOpen}
+                  collapsed
+                  touch
+                  onClickOverride={() => { onActivate(); setKiroUsageOpen(true) }}
+                />
+              )}
+          </>}
+          bottom={<>
               <NavItem
-                navId="developer"
-                path="/developer"
-                label={i18nT('app.developer')}
-                icon={<Code size={16} />}
-                active={activePath === '/developer'}
+                path={settingsSurface.path}
+                label={surfaceLabel(settingsSurface)}
+                icon={settingsSurface.icon}
+                active={navRowActive(settingsSurface.path)}
                 collapsed
                 touch
                 replace
-                onClickOverride={activePath === '/developer' ? onActivate : undefined}
+                onClickOverride={navRowActive(settingsSurface.path) ? onActivate : undefined}
+                badge={updateAvailable ? <span title={i18nT('app.update_available')} role="status" aria-label={i18nT('app.update_available_2')} className="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full z-10" /> : undefined}
               />
-            )}
-            {terminalEnabled && (
-              <NavItem
-                navId="terminal"
-                path="#"
-                label={i18nT('app.terminal')}
-                icon={<SquareTerminal size={16} />}
-                active={bottomTerminalOpen || terminalPoppedOut}
-                pressed={bottomTerminalOpen || terminalPoppedOut}
-                collapsed
-                touch
-                onClickOverride={() => { onActivate(); if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
-              />
-            )}
-            {railRow(capabilitiesSurface)}
-            {/* The account modal (balance, sign-in state): the desktop opens it
-                from the readout capsule, which the phone does not render, so the
-                rail carries it -- on exactly the readings the desktop segment
-                shows (`kiroAccountEntry`). Toggles a surface, so `pressed`. */}
-            {kiroAccountEntry && (
-              <NavItem
-                navId="account"
-                path="#"
-                label={i18nT('components.kiroAccountModal.kiro_account')}
-                icon={<Coins size={16} />}
-                active={kiroUsageOpen}
-                pressed={kiroUsageOpen}
-                collapsed
-                touch
-                onClickOverride={() => { onActivate(); setKiroUsageOpen(true) }}
-              />
-            )}
-          </div>
-          <NavItem
-            path={settingsSurface.path}
-            label={surfaceLabel(settingsSurface)}
-            icon={settingsSurface.icon}
-            active={navRowActive(settingsSurface.path)}
-            collapsed
-            touch
-            replace
-            onClickOverride={navRowActive(settingsSurface.path) ? onActivate : undefined}
-            badge={updateAvailable ? <span title={i18nT('app.update_available')} role="status" aria-label={i18nT('app.update_available_2')} className="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full z-10" /> : undefined}
-          />
-          <button
-            type="button"
-            data-testid="mobile-nav-rail-search"
-            onClick={() => { onActivate(); commandPalette.openPalette() }}
-            className="mt-1 w-16 h-14 px-0.5 rounded-xl border border-border bg-card text-text flex flex-col items-center justify-center gap-0.5 cursor-pointer shrink-0"
-            aria-label={searchLabel}
-            title={searchLabel}
-          >
-            <SearchIcon size={18} />
-            <span aria-hidden="true" className="max-w-full whitespace-normal text-center text-[10px] leading-[1.1] font-medium tracking-tight line-clamp-2">{i18nT('nav.search_short')}</span>
-          </button>
-        </nav>
+              <button
+                type="button"
+                data-testid="mobile-nav-rail-search"
+                onClick={() => { onActivate(); commandPalette.openPalette() }}
+                className="mt-1 w-16 h-14 px-0.5 rounded-xl border border-border bg-card text-text flex flex-col items-center justify-center gap-0.5 cursor-pointer shrink-0"
+                aria-label={searchLabel}
+                title={searchLabel}
+              >
+                <SearchIcon size={18} />
+                <span aria-hidden="true" className="max-w-full whitespace-normal text-center text-[10px] leading-[1.1] font-medium tracking-tight line-clamp-2">{i18nT('nav.search_short')}</span>
+              </button>
+          </>}
+        />
       )
     }
     : null
