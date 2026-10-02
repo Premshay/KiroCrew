@@ -2020,6 +2020,8 @@ describe('every api method issues one well-formed /api request', () => {
   // contract for these methods. Keep this list narrow: every other dispatched
   // signal must still be the exact one supplied by the caller.
   const DEADLINE_WRAPPED_METHODS = new Set([
+    'getPreferenceAdvice',
+    'sendPreferenceFeedback',
     'fileSearch',
     'browseFiles',
     'browseDirs',
@@ -2035,6 +2037,8 @@ describe('every api method issues one well-formed /api request', () => {
   // each one names the minimal shape its URL is read from. Signal-bearing methods
   // also receive a real signal so the probe can assert their dispatch contract.
   const ARGS: Record<string, unknown[]> = {
+    getPreferenceAdvice: ['slot', 'task', ['model'], CALLER_SIGNAL],
+    sendPreferenceFeedback: ['id', 'keep', 'model', CALLER_SIGNAL],
     // Memory reads take typed objects; positional strings do not satisfy the
     // query/record contract and would manufacture undefined URL parameters.
     memoryRecords: ['member-reviewer', { q: 'contact', kind: 'fact' }, 0, 50],

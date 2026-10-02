@@ -1,4 +1,16 @@
 {
+  "preference_advisor": {
+    "timeout": "Zeitüberschreitung bei der Empfehlung. Ohne Empfehlung fortfahren oder erneut versuchen.",
+    "loading": "Aufgabenpräferenzen werden geprüft…",
+    "recommend": "Vorschlag für diese Aufgabe: {{model}}",
+    "reason": "Basierend auf {{examples}} ähnlichen geprüften Präferenzen. Dies ist ein Rat, keine Leistungsgarantie.",
+    "use": "Vorschlag verwenden",
+    "keep": "Aktuelles beibehalten",
+    "choose": "Anderes wählen",
+    "draft": "Dein Entwurf bleibt erhalten. Nach der Auswahl auf Senden klicken, um zu starten.",
+    "skip": "Ohne Empfehlung fortfahren",
+    "saved": "Präferenz gespeichert. Klicke auf Senden, wenn du bereit bist."
+  },
   "commandCenter": {
     "automatic_cards": "Automatische Karten für alle Sitzungen",
     "card_limits": "Standardmäßig aus. Das Hintergrundmodell verarbeitet jeweils einen Aufruf. Höchstens ein Versuch pro Sitzung alle {{minutes}} Minuten und insgesamt {{hourly}} Versuche pro Stunde für alle Sitzungen, auch bei Fehlern. Live-Status und Entscheidungen brauchen kein Modell.",

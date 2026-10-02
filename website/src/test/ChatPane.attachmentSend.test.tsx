@@ -1,6 +1,8 @@
 import type { ReactNode } from 'react'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import type { RootState } from '../store'
+import { store as liveStore } from '../store'
+import { setQuestionCard, clearQuestionCard } from '../store/chatSlice'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { configureStore } from '@reduxjs/toolkit'
@@ -41,6 +43,9 @@ vi.mock('../api/client', () => ({
     screenshot: vi.fn().mockResolvedValue({ path: null }),
     fileSearch: vi.fn().mockResolvedValue({ root: '/repo', results: [] }),
     chatSlotAgent: vi.fn().mockResolvedValue(undefined),
+    dashboardConfig: vi.fn().mockResolvedValue({ preference_advisor_enabled: true }),
+    getPreferenceAdvice: vi.fn().mockResolvedValue({ reason: 'not_configured' }),
+    answerQuestion: vi.fn().mockResolvedValue({ ok: true }),
   },
   SEARCH_MIN_CHARS: 2,
   ApiError: class ApiError extends Error {
@@ -127,6 +132,41 @@ beforeEach(() => {
 })
 
 describe('ChatPane send — attachment serialization (parity with ChatPage)', () => {
+  it('does not dismiss a question arriving during advice', async () => {
+    let resolve!: (value: { reason: string }) => void
+    liveStore.dispatch(clearQuestionCard('pane-question'))
+    vi.mocked(api.getPreferenceAdvice).mockImplementationOnce(() => new Promise(r => { resolve = r }))
+    renderPane('pane-question')
+    await waitFor(() => expect(api.dashboardConfig).toHaveBeenCalled())
+    await sendText('draft task')
+    await waitFor(() => expect(resolve).toBeDefined())
+    liveStore.dispatch(setQuestionCard({ slot: 'pane-question', ask_id: 'new-unseen', questions: [{ question: 'New?', options: [] }] }))
+    resolve({ reason: 'keep_current' })
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalled())
+    expect(api.answerQuestion).not.toHaveBeenCalledWith('new-unseen')
+    liveStore.dispatch(clearQuestionCard('pane-question'))
+  })
+
+  it('retains an upload completed during advice instead of consuming a stale draft', async () => {
+    let resolve!: (value: { reason: string }) => void
+    vi.mocked(api.getPreferenceAdvice).mockImplementationOnce(() => new Promise(r => { resolve = r }))
+    vi.mocked(api.uploadFiles).mockResolvedValueOnce({ paths: ['/uploads/late.txt'] })
+    const { container } = renderPane('pane-advice-upload')
+    await waitFor(() => expect(api.dashboardConfig).toHaveBeenCalled())
+    await sendText('draft task')
+    await waitFor(() => expect(resolve).toBeDefined())
+    await stageUpload(container, 'late.txt', 'text/plain')
+    await screen.findByText('late.txt')
+    resolve({ reason: 'not_configured' })
+    await waitFor(() => expect(screen.queryByText('Checking reviewed preferences…')).not.toBeInTheDocument())
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Message input')).toHaveValue('draft task')
+    expect(screen.getByText('late.txt')).toBeInTheDocument()
+    await sendText('')
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
+    expect(lastSend().meta?.files).toEqual(['/uploads/late.txt'])
+  })
+
   it('ships an attached image as its markdown line on the wire AND in the bubble, not on meta.files', async () => {
     ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ paths: ['/home/u/.kiro/crew/uploads/shot.png'] })
     const { store, container } = renderPane('pane-img')
