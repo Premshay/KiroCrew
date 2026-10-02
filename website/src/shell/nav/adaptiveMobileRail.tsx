@@ -80,7 +80,9 @@ export function AdaptiveMobileRail({ top, apps, secondary, bottom, className, ..
         {apps}
         {fold && (
           <>
-            <div role="separator" aria-hidden="true" className="w-10 shrink-0 border-t border-border my-1.5" />
+            {/* The muted TEXT colour, not `border`: on the dark themes `border`
+                is within a few shades of the rail background and the line vanished. */}
+            <div role="separator" aria-hidden="true" className="w-10 h-0.5 shrink-0 rounded-full bg-muted/40 my-1.5" />
             {secondaryBlock}
           </>
         )}
