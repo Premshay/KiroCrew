@@ -152,13 +152,16 @@ describe('phone chat page: one top bar', () => {
     // The rail is the last row-set before Search; nothing in it is a text label
     // (icon-only, 56px wide), so every row must be named.
     for (const row of within(rail).getAllByRole('button')) expect(row).toHaveAccessibleName()
-    // Only the Apps list scrolls (its own frame, like the desktop rail); the
-    // brand mark above and Customize / Settings / Search below stay pinned,
-    // so 14 installed apps cannot push Settings off the bottom of the screen.
-    expect(rail).toHaveClass('overflow-hidden')
-    expect(rail).not.toHaveClass('overflow-y-auto')
+    // The Apps list scrolls in its own frame (like the desktop rail), so 14
+    // installed apps cannot push Settings off the bottom of a tall screen. The
+    // frame keeps a two-tile floor, and the rail itself scrolls when the pinned
+    // tiles plus that floor overflow a short phone: a zero-height frame hid
+    // every app there with nothing to scroll.
+    expect(rail).toHaveClass('overflow-y-auto')
+    expect(rail).not.toHaveClass('overflow-hidden')
     const apps = within(rail).getByTestId('mobile-nav-rail-apps')
-    expect(apps).toHaveClass('overflow-y-auto', 'flex-1', 'min-h-0')
+    expect(apps).toHaveClass('overflow-y-auto', 'flex-1', 'min-h-[7.5rem]')
+    expect(apps).not.toHaveClass('min-h-0')
     expect(apps).not.toContainElement(within(rail).getByTestId('mobile-nav-rail-home'))
     expect(apps).not.toContainElement(within(rail).getByTestId('mobile-nav-rail-search'))
     expect(apps).not.toContainElement(within(rail).getByRole('button', { name: 'Settings' }))

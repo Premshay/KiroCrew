@@ -1484,7 +1484,8 @@ export default function App() {
           data-testid="mobile-nav-rail"
           role="navigation"
           aria-label={i18nT('app.main_navigation')}
-          className="w-[72px] shrink-0 h-full flex flex-col items-center gap-1 pt-1.5 pb-2.5 border-r border-border bg-bg-accent overflow-hidden"
+          className="w-[72px] shrink-0 h-full flex flex-col items-center gap-1 pt-1.5 pb-2.5 border-r border-border bg-bg-accent overflow-y-auto overflow-x-hidden overscroll-y-contain scrollbar-none"
+          style={{ scrollbarWidth: 'none' }}
         >
           <button
             type="button"
@@ -1526,10 +1527,15 @@ export default function App() {
               the brand mark, the Main rows and Discover above it, and
               Capabilities / Settings / Search below it stay pinned, exactly as
               the desktop rail does. The scroller has no gap of its own so a
-              short list sits flush under Discover. */}
+              short list sits flush under Discover.
+              It keeps at least two tiles of height: the pinned tiles alone
+              (~60px each) fill a short phone, and a frame allowed to shrink to
+              zero hid every app with nothing to scroll. When the pinned set
+              plus that floor does not fit, the rail itself scrolls instead, so
+              every tile stays reachable. */}
           <div
             data-testid="mobile-nav-rail-apps"
-            className="flex-1 min-h-0 w-full flex flex-col items-center gap-1 overflow-y-auto overflow-x-hidden overscroll-y-none scrollbar-none"
+            className="flex-1 min-h-[7.5rem] w-full flex flex-col items-center gap-1 overflow-y-auto overflow-x-hidden overscroll-y-none scrollbar-none"
             style={{ scrollbarWidth: 'none' }}
           >
             {sortedAppGroup.map(railRow)}
