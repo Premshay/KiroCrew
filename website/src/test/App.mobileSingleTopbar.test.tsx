@@ -168,13 +168,17 @@ describe('phone chat page: one top bar', () => {
     expect(apps).not.toContainElement(customize)
   })
 
-  it('carries Library, Developer and Terminal on the rail, and leaves out Connect-your-phone', async () => {
+  it('carries Developer and Terminal on the rail, and leaves out Discover, Library and Connect-your-phone', async () => {
     localStorage.setItem('mc-onboarded', '1')
     localStorage.setItem('mc-dev-mode', '1')
     try {
       renderWithProviders(<App />, { route: '/chat' })
       const rail = await screen.findByTestId('mobile-nav-rail')
-      expect(within(rail).getByRole('button', { name: 'Library' })).toBeInTheDocument()
+      // Fork: Discover and Library are setup surfaces, not daily drivers; the
+      // phone rail spends its rows on the app tiles. Search and the nav drawer
+      // still reach both.
+      expect(within(rail).queryByRole('button', { name: 'Library' })).toBeNull()
+      expect(within(rail).queryByRole('button', { name: 'Discover' })).toBeNull()
       expect(within(rail).getByRole('button', { name: 'Developer' })).toBeInTheDocument()
       // Terminal toggles the docked panel from the chat page itself, without a
       // detour through another page's nav drawer. Pinned below the scrolling

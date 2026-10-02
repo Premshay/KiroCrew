@@ -1500,29 +1500,10 @@ export default function App() {
             <RailHeaderGlyph avatar={avatar} boxClass={branding?.logoClass ?? 'w-7 h-7'} iconSize={18} />
           </button>
           {advertisedNavItems.filter(n => n.group === 'Main').map(railRow)}
-          <NavItem
-            navId="apps"
-            path="/apps"
-            label={i18nT('nav.discover')}
-            icon={<Compass size={16} />}
-            active={discoverNavActive}
-            collapsed
-            touch
-            replace
-            onClickOverride={discoverNavActive ? onActivate : undefined}
-            badge={<NavBadge navId="apps" collapsed appBadges={discoverBadges} />}
-          />
-          <NavItem
-            navId="apps-library"
-            path="/apps/library"
-            label={i18nT('nav.library')}
-            icon={<LayoutGrid size={16} />}
-            active={libraryNavActive}
-            collapsed
-            touch
-            replace
-            onClickOverride={libraryNavActive ? onActivate : undefined}
-          />
+          {/* Fork: no Discover / Library tiles. Both are setup surfaces visited
+              once per app, not daily drivers like the app tiles below, and on a
+              phone each costs a ~60px row the Apps list needs. Both stay reachable
+              through Search and the nav drawer on every other page. */}
           {/* Apps list: scrolls in its OWN frame when many apps are installed --
               the brand mark, the Main rows and Discover above it, and
               Capabilities / Settings / Search below it stay pinned, exactly as
