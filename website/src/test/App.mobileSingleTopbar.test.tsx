@@ -165,7 +165,9 @@ describe('phone chat page: one top bar', () => {
     expect(apps).not.toContainElement(within(rail).getByTestId('mobile-nav-rail-home'))
     expect(apps).not.toContainElement(within(rail).getByTestId('mobile-nav-rail-search'))
     expect(apps).not.toContainElement(within(rail).getByRole('button', { name: 'Settings' }))
-    expect(apps).not.toContainElement(customize)
+    // Fork: Customize rides the Apps scroller after the apps; Settings and
+    // Search stay pinned.
+    expect(apps).toContainElement(customize)
   })
 
   it('carries Developer and Terminal on the rail, and leaves out Discover, Library and Connect-your-phone', async () => {
@@ -181,13 +183,13 @@ describe('phone chat page: one top bar', () => {
       expect(within(rail).queryByRole('button', { name: 'Discover' })).toBeNull()
       expect(within(rail).getByRole('button', { name: 'Developer' })).toBeInTheDocument()
       // Terminal toggles the docked panel from the chat page itself, without a
-      // detour through another page's nav drawer. Pinned below the scrolling
-      // Apps frame, like Capabilities / Settings.
+      // detour through another page's nav drawer. Fork: inside the scrolling
+      // Apps frame, after the apps (Settings and Search stay pinned).
       const terminal = within(rail).getByRole('button', { name: 'Terminal' })
       expect(terminal).toHaveAttribute('aria-pressed', 'false')
       expect(within(rail).queryByRole('button', { name: /connect your phone/i })).toBeNull()
       const apps = within(rail).getByTestId('mobile-nav-rail-apps')
-      expect(apps).not.toContainElement(terminal)
+      expect(apps).toContainElement(terminal)
     } finally {
       localStorage.removeItem('mc-dev-mode')
     }
@@ -288,8 +290,8 @@ describe('phone chat page: one top bar', () => {
       const { unmount } = renderWithProviders(<App />, { route: '/chat' })
       const rail = await screen.findByTestId('mobile-nav-rail')
       const tile = await within(rail).findByRole('button', { name: 'Kiro Account' })
-      // Between Capabilities and Settings, pinned with them (not in the Apps scroller).
-      expect(within(rail).getByTestId('mobile-nav-rail-apps')).not.toContainElement(tile)
+      // Fork: after Customize, inside the Apps scroller; Settings stays pinned.
+      expect(within(rail).getByTestId('mobile-nav-rail-apps')).toContainElement(tile)
       expect(tile).toHaveAttribute('aria-pressed', 'false')
       fireEvent.click(tile)
       expect(await screen.findByRole('dialog', { name: 'Kiro Account' })).toBeInTheDocument()

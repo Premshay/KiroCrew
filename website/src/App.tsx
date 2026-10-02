@@ -1520,51 +1520,55 @@ export default function App() {
             style={{ scrollbarWidth: 'none' }}
           >
             {sortedAppGroup.map(railRow)}
+            {/* Fork: Developer / Terminal / Customize / Kiro Account ride the
+                Apps scroller, after the apps. Pinned, they took ~240px of a
+                phone's height from the app tiles, the rail's most-used rows;
+                Settings and Search stay pinned below. */}
+            {devMode && (
+              <NavItem
+                navId="developer"
+                path="/developer"
+                label={i18nT('app.developer')}
+                icon={<Code size={16} />}
+                active={activePath === '/developer'}
+                collapsed
+                touch
+                replace
+                onClickOverride={activePath === '/developer' ? onActivate : undefined}
+              />
+            )}
+            {terminalEnabled && (
+              <NavItem
+                navId="terminal"
+                path="#"
+                label={i18nT('app.terminal')}
+                icon={<SquareTerminal size={16} />}
+                active={bottomTerminalOpen || terminalPoppedOut}
+                pressed={bottomTerminalOpen || terminalPoppedOut}
+                collapsed
+                touch
+                onClickOverride={() => { onActivate(); if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
+              />
+            )}
+            {railRow(capabilitiesSurface)}
+            {/* The account modal (balance, sign-in state): the desktop opens it
+                from the readout capsule, which the phone does not render, so the
+                rail carries it -- on exactly the readings the desktop segment
+                shows (`kiroAccountEntry`). Toggles a surface, so `pressed`. */}
+            {kiroAccountEntry && (
+              <NavItem
+                navId="account"
+                path="#"
+                label={i18nT('components.kiroAccountModal.kiro_account')}
+                icon={<Coins size={16} />}
+                active={kiroUsageOpen}
+                pressed={kiroUsageOpen}
+                collapsed
+                touch
+                onClickOverride={() => { onActivate(); setKiroUsageOpen(true) }}
+              />
+            )}
           </div>
-          {devMode && (
-            <NavItem
-              navId="developer"
-              path="/developer"
-              label={i18nT('app.developer')}
-              icon={<Code size={16} />}
-              active={activePath === '/developer'}
-              collapsed
-              touch
-              replace
-              onClickOverride={activePath === '/developer' ? onActivate : undefined}
-            />
-          )}
-          {terminalEnabled && (
-            <NavItem
-              navId="terminal"
-              path="#"
-              label={i18nT('app.terminal')}
-              icon={<SquareTerminal size={16} />}
-              active={bottomTerminalOpen || terminalPoppedOut}
-              pressed={bottomTerminalOpen || terminalPoppedOut}
-              collapsed
-              touch
-              onClickOverride={() => { onActivate(); if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
-            />
-          )}
-          {railRow(capabilitiesSurface)}
-          {/* The account modal (balance, sign-in state): the desktop opens it
-              from the readout capsule, which the phone does not render, so the
-              rail carries it -- on exactly the readings the desktop segment
-              shows (`kiroAccountEntry`). Toggles a surface, so `pressed`. */}
-          {kiroAccountEntry && (
-            <NavItem
-              navId="account"
-              path="#"
-              label={i18nT('components.kiroAccountModal.kiro_account')}
-              icon={<Coins size={16} />}
-              active={kiroUsageOpen}
-              pressed={kiroUsageOpen}
-              collapsed
-              touch
-              onClickOverride={() => { onActivate(); setKiroUsageOpen(true) }}
-            />
-          )}
           <NavItem
             path={settingsSurface.path}
             label={surfaceLabel(settingsSurface)}
