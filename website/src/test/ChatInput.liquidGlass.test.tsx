@@ -135,7 +135,9 @@ describe('composer liquid glass', () => {
     // against them instead of the dock wrapper (Design, round 1).
     expect(CHAT_INPUT_SRC).toMatch(/className=\{`input-area px-4 pb-1 \$\{hasApproval \? 'pt-0' : 'pt-1'\} mx-auto w-full flex flex-col`\}/)
     expect(CHAT_INPUT_SRC).not.toMatch(/className=\{`input-area [^`]*\b(relative|absolute|fixed|sticky)\b/)
-    expect(CHAT_INPUT_SRC).toMatch(/data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0" style=\{\{ \['--glass-shelf-h' as string\]: `\$\{shelfHeight\}px` \}\}/)
+    // Fork: the shelf also scrolls horizontally (overflow-x-auto) so every chip
+    // stays reachable on a phone.
+    expect(CHAT_INPUT_SRC).toMatch(/data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0 overflow-x-auto overflow-y-hidden" style=\{\{ \['--glass-shelf-h' as string\]: `\$\{shelfHeight\}px` \}\}/)
   })
 
   it('lets the follow-up chips keep their top and bottom hairline', () => {

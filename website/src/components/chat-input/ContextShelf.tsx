@@ -160,7 +160,7 @@ export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agen
 }) {
   return (
     <button
-      className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
+      className={`inline-flex items-center gap-1.5 h-7 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
       onClick={e => onAgentClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
       disabled={isRunning}
       // Inherited default: explain what the ` . default` marker means, on
@@ -441,7 +441,9 @@ export function ModelChip({ modelName, modelIsJevRouted, modelIsInheritedDefault
     title={modelChipLabel}
     aria-label={modelChipLabel}
   >
-    <span className="truncate max-w-[180px]">
+    {/* Fork: the cap follows the shelf, so a long model id cannot squeeze the
+        chips beside it on a phone. */}
+    <span className={`truncate ${shelfCompact ? 'max-w-[96px]' : 'max-w-[180px]'}`}>
       {modelIsJevRouted ? i18nT('components.modelDropdownList.auto_jev') : modelName}
     </span>
     {/* Outside the truncating span: a long provider-prefixed id must

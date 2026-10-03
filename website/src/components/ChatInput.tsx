@@ -960,7 +960,10 @@ function ChatInput({
 
         {/* Bottom icon row */}
         <div className="flex items-center justify-between px-2.5 pb-2 pt-0.5">
-          <div className="flex items-center gap-0.5 min-w-0">
+          {/* Fork: `flex-1` gives the scrolling control row the space left beside
+              the fixed voice/send group; without it the group sizes to its
+              content and its controls paint under that group on a phone. */}
+          <div className="flex flex-1 items-center gap-0.5 min-w-0">
             <AttachMenu plus={plus} onUploadFiles={onUploadFiles} uploading={uploading} onCancelUpload={onCancelUpload} directFilePicker={directFilePicker} collapsible={collapsible} fileInputId={fileInputId} openPicker={openPicker} isMac={isMac} isMobile={isMobile} onScreenshot={onScreenshot} collapseMenuRow={collapseMenuRow} typedCommandMenus={typedCommandMenus} onFileSelect={onFileSelect} />
             {directFilePicker && collapsible && (
               /* The repo's own overflow mechanism, not a second spelling of it.
@@ -1040,7 +1043,7 @@ function ChatInput({
                 also owns the flex sizing so the scroller keeps filling the
                 row. */}
             <div className="relative min-w-0 flex-1">
-              <div ref={attachControlRow} data-testid="composer-control-row" className="flex items-center gap-0.5 overflow-x-auto">
+              <div ref={attachControlRow} data-testid="composer-control-row" data-fade-left={controlRowEdges.left ? 'true' : undefined} data-fade-right={controlRowEdges.right ? 'true' : undefined} className="edge-fade-x flex items-center gap-0.5 overflow-x-auto">
 
               {onAutomationClick && (
                 <Suspense fallback={null}>
@@ -1064,22 +1067,11 @@ function ChatInput({
                 <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
               )}
               </div>
-              {/* Edge cues, same treatment as the sibling strips that already
-                  ship it (FollowUpBar's scroll row, SidePanelLayout's tab
-                  strip): at narrow widths the loop chip and approval picker
-                  clip silently, and the overlay scrollbar on macOS/iOS leaves
-                  no idle trace. from-bg-elevated matches the composer surface.
-                  Deliberately NO z-index: positioned elements already paint
-                  above the row's in-flow buttons, and an explicit z-10 would
-                  win the tree-order tiebreak against the optimizing dim
-                  overlay (also z-10, earlier in the tree), punching an
-                  undimmed wedge through it. */}
-              {controlRowEdges.left && (
-                <div aria-hidden="true" data-testid="control-row-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 bg-gradient-to-r from-bg-elevated to-transparent" />
-              )}
-              {controlRowEdges.right && (
-                <div aria-hidden="true" data-testid="control-row-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 bg-gradient-to-l from-bg-elevated to-transparent" />
-              )}
+              {/* Edge cues: the row itself fades out at a clipped edge (`edge-fade-x`,
+                  driven by data-fade-left/right). Fork: it used a painted
+                  from-bg-elevated gradient, which drew an opaque block over the
+                  glass composer; a mask fades the buttons instead and works on
+                  any surface. */}
             </div>
             {isMobile && approvalMode && (
               <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
@@ -1216,7 +1208,13 @@ function ChatInput({
           // this the chip is silently invisible whenever no other pill happens
           // to be present — the control is declared, mounted and unreachable.
           !!sessionControls?.length) && (
-        <div ref={shelfRef} data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0" style={{ ['--glass-shelf-h' as string]: `${shelfHeight}px` }}>
+        /* Fork: one line, never a second row: the labels shed first (shelfCompact)
+           and `overflow-x-auto` backstops the rest, so every chip stays tappable on
+           a phone instead of the row clipping the model chip off its right edge.
+           The native scrollbar stays visible: it is the cue that the row scrolls.
+           The glass layer is positioned against the composer, not this row, so
+           the scroller does not clip it. */
+        <div ref={shelfRef} data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0 overflow-x-auto overflow-y-hidden" style={{ ['--glass-shelf-h' as string]: `${shelfHeight}px` }}>
           {/* App-contributed session controls live in their OWN group, not
               beside the agent/project chips. `max-two-buttons-per-row`
               (AUTOSDE.yaml, blocking) caps a horizontal group at 2 action
