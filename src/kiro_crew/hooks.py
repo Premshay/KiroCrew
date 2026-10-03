@@ -1275,6 +1275,17 @@ class HookManager:
         governance_mcp_ref = mcp_identity_ref(mcp_server_name, mcp_tool_name)
         if command:
             deny_targets.append(command)
+        # A shell call the event did not classify as shell still carries its
+        # command in the raw params. The DeepSeek Harness streams its ``bash``
+        # tool as ``kind: "other"``, so ``command`` above is None and the deny
+        # floor only ever saw the title: ``git push origin main`` ran from a
+        # DeepSeek seat although this floor denies it. Deny-only, like every
+        # target here; the shell-only exemptions stay keyed on ``is_shell``.
+        elif isinstance(raw_params, dict):
+            for key in ("command", "cmd"):
+                value = raw_params.get(key)
+                if isinstance(value, str) and value.strip() and value not in deny_targets:
+                    deny_targets.append(value)
         for target in deny_targets:
             reason = authority.is_denied(
                 target,
