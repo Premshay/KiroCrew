@@ -25,6 +25,8 @@ New here? Start with [guides/install.md](guides/install.md), then
 | [reference/](reference/README.md) | A mirror of upstream kiro-cli documentation, with named local exceptions. |
 | [task-specs/](task-specs/README.md) | Archived per-task specs. Not current context. |
 
+Unsubmitted upstream issue draft: [Claude member capabilities](request-for-change/member-capabilities-claude-issue.md).
+
 ## The rule for changing docs
 
 A code change that alters documented behavior MUST update the docs **in the same

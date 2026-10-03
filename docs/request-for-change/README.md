@@ -7,6 +7,8 @@ that, read the code, or the `status` field described below.
 
 ## Index
 
+Unsubmitted upstream issue draft: [Claude member capabilities](member-capabilities-claude-issue.md).
+
 Every status below is verified against the code — definitions *and* callers — and
 against merged PR history, never taken from the document's own claims. Rows are
 re-audited in waves rather than all at once, so each document's own
