@@ -930,7 +930,9 @@ class WorkflowService:
             try:
                 await memory_scope.prepare(self._context_builder, key)
                 provider, author_is_new, _resumed = await self._sessions.get_or_create(
-                    key, agent=author_agent or "kirocrew-lite", model=author_model or None,
+                    key,
+                    agent=author_agent or "kirocrew-lite",
+                    model=author_model or None,
                     start_priority=start_priority,
                 )
             except Exception as exc:

@@ -2224,7 +2224,6 @@ class HistoryConsolidator:
                 # commits its own prefix and leaves the durable offset ready
                 # for the next one; stamping ``total`` would silently declare
                 # the untouched tail consolidated.
-                processed_offset = old_offset + len(chunk)
                 await asyncio.to_thread(
                     self._log.mark_consolidated,
                     key,

@@ -90,7 +90,7 @@ class ClaudeHarness(MembershipHarness):
             session_meta={"claudeCode": {"options": {}}},
         )
 
-    def apply_spawn_env(self, env: dict[str, str]) -> None:
+    def apply_spawn_env(self, env: dict[str, str], *, spawned_binary: str | None = None) -> None:
         """Strip kiro-cli's API key and point the adapter at a ``claude`` binary.
 
         The key goes because a foreign adapter must never receive it. The

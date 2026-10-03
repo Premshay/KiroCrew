@@ -29,6 +29,10 @@ error chains and tracebacks still name the path callers import it from.
 harness executable resolution, `finish_suspended_spawn` and the model-push ladder
 (`_push_model_via_effort_split`, `_is_config_value_rejection`) in `acp/client.py`.
 
+Every harness accepts the runtime's optional `spawned_binary` keyword when
+preparing the child environment. Claude and DeepSeek accept the hint while
+retaining their existing executable selection and environment policy.
+
 New module-level code goes to the owner whose row above names its
 responsibility, not to `acp/client.py` or `acp/runtime.py`: stdio framing and
 write bounds to `acp/transport_framing.py`; an `AcpError` subclass, or a

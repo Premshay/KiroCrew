@@ -1979,8 +1979,6 @@ def _container_cgroup_available_gb() -> float:
     return available
 
 
-
-
 def _agents_slice_available_gb() -> float:
     """Headroom (GB) under the agents slice's own ceiling, or -1.0 if none applies.
 

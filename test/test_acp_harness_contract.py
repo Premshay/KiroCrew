@@ -432,6 +432,19 @@ def test_kiro_injects_the_api_key_and_kas_strips_it(monkeypatch):
     assert calls == ["inject", "strip"]
 
 
+@pytest.mark.parametrize("adapter", [ClaudeHarness(), DeepseekHarness()])
+def test_foreign_spawn_env_accepts_the_runtime_binary_hint(adapter, monkeypatch):
+    from kiro_crew.config import loader as loader_mod
+
+    monkeypatch.setattr(
+        loader_mod, "strip_kiro_cli_api_key", lambda env: env.pop("KIRO_API_KEY", None)
+    )
+    env = {"KIRO_API_KEY": "test-key", "CLAUDE_CODE_EXECUTABLE": "claude"}
+    adapter.apply_spawn_env(env, spawned_binary="/adapter/binary")
+    assert "KIRO_API_KEY" not in env
+    assert env["CLAUDE_CODE_EXECUTABLE"] == "claude"
+
+
 # ── Seam 2: initialize ──
 
 

@@ -212,7 +212,8 @@ async def test_author_selection_reaches_isolated_session(monkeypatch, background
     from kiro_crew.start_priority import StartPriority
 
     assert sessions.acquired[0][1] == {
-        "agent": "selected-agent", "model": "selected-model",
+        "agent": "selected-agent",
+        "model": "selected-model",
         "start_priority": StartPriority.BACKGROUND,
     }
     assert sessions.destroyed == [sessions.acquired[0][0]]

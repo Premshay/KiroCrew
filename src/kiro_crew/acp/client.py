@@ -5024,7 +5024,6 @@ class AcpClient:
             f"Backend {self.backend!r} cannot enforce a tool whitelist before execution"
         )
 
-
     def _session_mcp_servers(self) -> list[dict[str, Any]]:
         """Build one deduplicated MCP roster for an ACP session bind.
 
@@ -6362,7 +6361,6 @@ class AcpClient:
                 ],
             }
         }
-
 
     def _claude_session_excludes_local(self) -> bool:
         """Whether this session's array was delivered under the exclusion."""

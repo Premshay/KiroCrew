@@ -1169,10 +1169,10 @@ def session_capability_servers(session_key: str | None = None) -> list[dict]:
     # Owned by agent_materialization since the module split; this module only
     # re-exports it lazily, and a bare name inside a function does not reach
     # the module-level __getattr__ that serves those re-exports.
-    from kiro_crew.agent_materialization.managed_mcp import _managed_mcp_env
+    from kiro_crew.agent_materialization.managed_mcp import _managed_mcp_env as managed_mcp_env
 
     command, args = _kirocrew_mcp_invocation("mcp-core")
-    env = _managed_mcp_env()
+    env = managed_mcp_env()
     if session_key:
         env["KIROCREW_SESSION_KEY"] = session_key
     return [

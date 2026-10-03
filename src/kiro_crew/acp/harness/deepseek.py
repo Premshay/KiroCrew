@@ -110,7 +110,7 @@ class DeepseekHarness(MembershipHarness):
             session_model=ctx.model or None,
         )
 
-    def apply_spawn_env(self, env: dict[str, str]) -> None:
+    def apply_spawn_env(self, env: dict[str, str], *, spawned_binary: str | None = None) -> None:
         """Take kiro-cli's API key OUT, and pin the harness's own sandbox mode.
 
         A foreign host must never receive kiro-cli's key, and removing it is the
