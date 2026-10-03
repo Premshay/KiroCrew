@@ -926,8 +926,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const preferenceAdvisor = usePreferenceAdvisor({
     enabled: jevDashCfgQ.data?.preference_advisor_enabled === true,
     slot: activeSlot,
-    model: adviceSlot?.model || '',
-    eligible: !!adviceSlot && !adviceSlot.messages && !adviceSlot.running && !remoteCrew.isRemote && (adviceSlot.memory_mode ?? 'persistent') === 'persistent',
+    model: adviceSlot?.model || pendingModel || '',
+    scope: adviceSlot?.agent || pendingAgent || defaultAgent || '',
+    eligible: !remoteCrew.isRemote && (adviceSlot
+      ? !adviceSlot.messages && !adviceSlot.running && (adviceSlot.memory_mode ?? 'persistent') === 'persistent'
+      : !activeSlot && !mode),
     models: modelPickerModels.map(model => model.name),
     readDraft: composerDraft.get,
     subscribeDraft: composerDraft.subscribe,
@@ -2556,7 +2559,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (!activeSlot) {
       if (modelName === JEV_ROUTE_MODEL) { setPendingModel(''); return }
       setPendingModel(modelName)
-      return
+      return modelName
     }
     const finishAdvicePick = adviser ? undefined : preferenceAdvisor.beginModelPick(modelName)
     let appliedModel: string | undefined

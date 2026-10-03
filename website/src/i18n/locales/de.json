@@ -1,5 +1,8 @@
 {
   "preference_advisor": {
+    "budget_fast": "Schnelles Modell",
+    "budget_balanced": "Ausgewogenes Modell",
+    "budget_frontier": "Spitzenmodell",
     "timeout": "Zeitüberschreitung bei der Empfehlung. Ohne Empfehlung fortfahren oder erneut versuchen.",
     "loading": "Aufgabenpräferenzen werden geprüft…",
     "recommend": "Vorschlag für diese Aufgabe: {{model}}",

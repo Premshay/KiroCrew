@@ -30,6 +30,8 @@ Call Kiro Crew MCP tools as tools, never via bash. Tool Search hides their specs
 - Reuse runs: `spawn_continue` resumes FINISHED conversations (best-effort ~1h; `keep=true` extends retention, `spawn_release` ends it); `spawn_steer` corrects RUNNING work (`mode='follow_up'` queues until the turn ends). `spawn_status` reads the finished transcript instead of re-running. Errors: `conversation_busy` = running, `conversation_gone` = expired (re-spawn with summary), `not_found` = queued.
 - `resource_status`: BEFORE full tests, large builds or wide spawn waves, check memory/CPU headroom and live cap. Advisory, no reservation; take the lighter path on `tight` or `critical`.
 
+- `preference_advice`: advisory model preferences at task boundaries throughout a conversation. When choosing how to handle a new task, start another session, delegate, or author workflow workers, consult it with a concise task/context summary, role (`parent` or `worker`), and the target agent's advertised model IDs. Respect explicit user choices and actual seat/capability limits. Do not switch an ongoing task silently. Abstention, disabled advice, or unavailable tools leave ordinary work unblocked; do not call it on every continuation or treat silence as approval.
+
 ### Subagent Orchestration
 
 **Do the task yourself by default.** One task is faster done here than handed off, even a multi-step one: a lookup, an investigation, a coherent bug fix, then filing one ticket. Spawn only when at least one of these holds:

@@ -14,14 +14,16 @@ type Options = {
   model: string
   eligible: boolean
   models: string[]
+  scope?: string
   readDraft: () => string
   subscribeDraft?: (listener: () => void) => () => void
   openModelPicker: (trigger: HTMLButtonElement) => void
   applyModel: (model: string) => Promise<string | undefined>
 }
-type Pending = { slot: string; task: string; advice: PreferenceAdvice }
+type Pending = { slot: string | null; scope?: string; task: string; advice: PreferenceAdvice }
 type Response = { choice: 'use' | 'keep' | 'choose'; model: string }
 const noSubscription = () => () => {}
+const taskKey = (slot: string | null, scope: string | undefined, task: string) => JSON.stringify([slot, scope, task])
 
 export function usePreferenceAdvisor(options: Options) {
   const { t } = useTranslation()
@@ -61,7 +63,7 @@ export function usePreferenceAdvisor(options: Options) {
     mutationFn: async (response: Response) => {
       const { choice, model } = response
       const attempt = generation.current
-      if (!pending?.advice.id || latest.current.slot !== pending.slot) return
+      if (!pending || latest.current.slot !== pending.slot) return
       if (!matches(pending, applied.current !== null)) {
         setPending(null)
         return
@@ -79,6 +81,12 @@ export function usePreferenceAdvisor(options: Options) {
       }
       if (attempt !== generation.current || !matches(pending, applied.current !== null)) return
       const selected = applied.current ?? response
+      if (pending.advice.preview) {
+        allowed.current = taskKey(pending.slot, pending.scope, pending.task)
+        setPending(null)
+        return
+      }
+      if (!pending.advice.id) return
       feedbackController.current = new AbortController()
       setRecording(true)
       try {
@@ -87,7 +95,7 @@ export function usePreferenceAdvisor(options: Options) {
         if (attempt === generation.current) setRecording(false)
       }
       if (attempt !== generation.current || !matches(pending, applied.current !== null)) return
-      allowed.current = `${pending.slot}\n${pending.task}`
+      allowed.current = taskKey(pending.slot, pending.scope, pending.task)
       setPending(null)
       setNotice(pending.slot)
     },
@@ -96,7 +104,7 @@ export function usePreferenceAdvisor(options: Options) {
   const matches = useCallback((value: Pending, appliedOnWire = false) => {
     const current = latest.current
     if (applied.current && current.model === applied.current.model) appliedObserved.current = true
-    return current.enabled && current.slot === value.slot && current.eligible && current.readDraft().trim() === value.task &&
+    return current.enabled && current.slot === value.slot && current.scope === value.scope && current.eligible && current.readDraft().trim() === value.task &&
       (appliedOnWire || current.model === (applied.current?.model ?? value.advice.current) ||
         (applied.current !== null && !appliedObserved.current && current.model === value.advice.current) ||
         applying.current !== null || pickerPending.current)
@@ -104,8 +112,8 @@ export function usePreferenceAdvisor(options: Options) {
 
   useEffect(() => {
     if (pending && (!draftMatches || !matches(pending))) {
-      if (options.slot === pending.slot && options.readDraft().trim() === pending.task && options.eligible) {
-        allowed.current = `${pending.slot}\n${pending.task}`
+      if (options.slot === pending.slot && options.scope === pending.scope && options.readDraft().trim() === pending.task && options.eligible) {
+        allowed.current = taskKey(pending.slot, pending.scope, pending.task)
       }
       setPending(null)
       generation.current++
@@ -126,7 +134,7 @@ export function usePreferenceAdvisor(options: Options) {
   pickRef.current = target => {
     if (!pending || !matches(pending)) return () => {}
     if (!choosing.current) {
-      allowed.current = `${pending.slot}\n${pending.task}`
+      allowed.current = taskKey(pending.slot, pending.scope, pending.task)
       setPending(null)
       generation.current++
       return () => {}
@@ -154,7 +162,7 @@ export function usePreferenceAdvisor(options: Options) {
     feedbackController.current?.abort()
     setRecording(false)
     inFlight.current = false
-    allowed.current = `${latest.current.slot}\n${latest.current.readDraft().trim()}`
+    allowed.current = taskKey(latest.current.slot, latest.current.scope, latest.current.readDraft().trim())
     choosing.current = false
     pickerPending.current = false
     setPicking(false)
@@ -167,8 +175,8 @@ export function usePreferenceAdvisor(options: Options) {
 
   async function beforeSend(task: string): Promise<boolean> {
     const current = latest.current
-    if (!current.enabled || !current.slot || !current.eligible || task.length > 4000 || task.startsWith('/')) return true
-    const key = `${current.slot}\n${task}`
+    if (!current.enabled || !current.eligible || task.length > 4000 || task.startsWith('/')) return true
+    const key = taskKey(current.slot, current.scope, task)
     if (allowed.current === key) return true
     if (inFlight.current || feedback.isPending || pickerPending.current) return false
     if (pending && matches(pending)) return false
@@ -183,12 +191,12 @@ export function usePreferenceAdvisor(options: Options) {
     choosing.current = false
     feedback.reset()
     try {
-      const result = await advice.mutateAsync({ slot: current.slot, task, models: current.models, signal: controller.current.signal })
+      const result = await advice.mutateAsync({ slot: current.slot ?? '', task, models: current.models, signal: controller.current.signal })
       if (attempt !== generation.current) return false
-      if (latest.current.slot !== current.slot || latest.current.model !== current.model) return false
+      if (latest.current.slot !== current.slot || latest.current.model !== current.model || latest.current.scope !== current.scope) return false
       if (latest.current.readDraft().trim() !== task) return false
-      if (!result.id || !result.model) return true
-      setPending({ slot: current.slot, task, advice: result })
+      if ((!result.id && !result.preview) || !(result.model || result.budget) || (result.model && result.model === current.model)) return true
+      setPending({ slot: current.slot, scope: current.scope, task, advice: { ...result, current: current.model } })
       return false
     } catch {
       return false
@@ -203,20 +211,20 @@ export function usePreferenceAdvisor(options: Options) {
     latest.current.enabled && latest.current.eligible ? sendRef.current(task) : true, [])
 
   const visible = pending && matches(pending) ? pending : null
-  const ownsAttempt = attempted.current.startsWith(`${options.slot}\n`)
+  const ownsAttempt = attempted.current === taskKey(options.slot, options.scope, options.readDraft().trim())
   const error = ownsAttempt ? advice.error || feedback.error : null
-  const saved = notice === options.slot && options.eligible
+  const saved = notice !== null && notice === options.slot && options.eligible
   const loading = ownsAttempt && advice.isPending
   const card = visible || error || saved || loading ? (
     <div className="mx-auto w-full px-4 pb-2 text-sm text-text" style={{ maxWidth: 'var(--mc-content-width, 900px)' }} aria-live="polite">
       {loading && <p>{t('preference_advisor.loading')}</p>}
       {visible && <div className="rounded-lg border border-border bg-card p-3 space-y-2">
-        <p>{t('preference_advisor.recommend', { model: visible.advice.model })}</p>
+        <p>{t('preference_advisor.recommend', { model: visible.advice.model || t(`preference_advisor.budget_${visible.advice.budget}`) })}</p>
         <p className="text-muted">{t('preference_advisor.reason', { examples: visible.advice.examples?.length ?? 0 })}</p>
         {visible.advice.evidence?.length ? <ul className="list-disc pl-5 text-muted">{visible.advice.evidence.map((example, index) => <li key={index}>{example}</li>)}</ul> : null}
         <div className="flex flex-wrap gap-2">
           {applied.current ? <Btn disabled={feedback.isPending || picking} onClick={() => feedback.mutate(applied.current!)}>{t('components.chatPane.retry')}</Btn> : <>
-            <Btn primary disabled={feedback.isPending || picking} onClick={() => feedback.mutate({ choice: 'use', model: visible.advice.model! })}>{t('preference_advisor.use')}</Btn>
+            {visible.advice.model && <Btn primary disabled={feedback.isPending || picking} onClick={() => feedback.mutate({ choice: 'use', model: visible.advice.model! })}>{t('preference_advisor.use')}</Btn>}
             <Btn disabled={feedback.isPending || picking} onClick={() => feedback.mutate({ choice: 'keep', model: visible.advice.current ?? '' })}>{t('preference_advisor.keep')}</Btn>
           </>}
         </div>

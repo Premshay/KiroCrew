@@ -1,5 +1,8 @@
 {
   "preference_advisor": {
+    "budget_fast": "高速モデル",
+    "budget_balanced": "バランス型モデル",
+    "budget_frontier": "最上位モデル",
     "timeout": "推奨の取得がタイムアウトしました。推奨なしで続行するか、再試行してください。",
     "loading": "タスクの設定を確認中…",
     "recommend": "このタスクの推奨モデル：{{model}}",

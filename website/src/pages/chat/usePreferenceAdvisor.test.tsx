@@ -21,6 +21,39 @@ const options = { enabled: true, slot: 'test-advice', model: 'current', eligible
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
 
 describe('task-start preference adviser', () => {
+  it('previews before slot creation and stages a choice without claiming saved feedback', async () => {
+    const get = vi.spyOn(api, 'getPreferenceAdvice').mockResolvedValue({ ...suggestion, id: undefined, preview: true })
+    const feedback = vi.spyOn(api, 'sendPreferenceFeedback')
+    const apply = vi.fn(async (model: string) => model)
+    let current: ReturnType<typeof usePreferenceAdvisor>
+    function Harness() {
+      current = usePreferenceAdvisor({ ...options, slot: null, applyModel: apply })
+      return current.card
+    }
+    render(<Harness />, { wrapper: Wrapper })
+    expect(screen.queryByText('Preference saved. Press Send when ready.')).not.toBeInTheDocument()
+    await act(async () => { expect(await current.beforeSend('classify rules')).toBe(false) })
+    expect(get).toHaveBeenCalledWith('', 'classify rules', options.models, expect.any(AbortSignal))
+    fireEvent.click(screen.getByRole('button', { name: 'Use suggested' }))
+    await waitFor(() => expect(apply).toHaveBeenCalledWith('smaller'))
+    await waitFor(() => expect(screen.queryByText('Suggested for this task: smaller')).not.toBeInTheDocument())
+    expect(feedback).not.toHaveBeenCalled()
+    expect(await current!.beforeSend('classify rules')).toBe(true)
+  })
+
+  it('discards a slotless preview if the target agent changes during scoring', async () => {
+    let resolve!: (value: typeof suggestion & { preview: boolean }) => void
+    vi.spyOn(api, 'getPreferenceAdvice').mockImplementation(() => new Promise(r => { resolve = r }))
+    const { result, rerender } = renderHook(({ scope }) => usePreferenceAdvisor({ ...options, slot: null, scope }),
+      { wrapper: Wrapper, initialProps: { scope: 'agent-a' } })
+    let request!: Promise<boolean>
+    act(() => { request = result.current.beforeSend('classify rules') })
+    await waitFor(() => expect(resolve).toBeDefined())
+    rerender({ scope: 'agent-b' })
+    await act(async () => { resolve({ ...suggestion, preview: true }); expect(await request).toBe(false) })
+    expect(result.current.card).toBeNull()
+  })
+
   it('does not query advice without explicit enablement', async () => {
     const get = vi.spyOn(api, 'getPreferenceAdvice')
     const { result } = renderHook(() => usePreferenceAdvisor({ ...options, enabled: false }), { wrapper: Wrapper })

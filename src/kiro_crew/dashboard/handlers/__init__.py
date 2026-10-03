@@ -1069,6 +1069,7 @@ from kiro_crew.dashboard.handlers.decisions import (  # noqa: E402, F401
 )
 from kiro_crew.dashboard.handlers.preference_advisor import (  # noqa: E402, F401
     api_preference_advice,
+    api_preference_consult,
     api_preference_feedback,
 )
 

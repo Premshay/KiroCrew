@@ -27,6 +27,12 @@ own gate model is [computer-use](../system-specs/modules/computer-use.md).
 
 ## Config file hierarchy
 
+`preference_advice` is a stateless planning read. Its strict caller identity is
+passed to `/api/preference-consult`; the gateway rejects restricted modes and
+scores only reviewed examples of the requested role with local embeddings.
+It works during ongoing sessions, including planning other sessions, subagents
+and workflow workers, without dispatching or changing any model or seat.
+
 | File | Owner | Purpose | Read by |
 |------|-------|---------|---------|
 | `~/.kiro/agents/kirocrew.json` | Kiro Crew gateway (`agent.rebuild_agent_config`) | The rendered Kiro agent: model + tools + merged `mcpServers` | kiro-cli, when spawned as the `kirocrew` agent |

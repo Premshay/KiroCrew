@@ -1,5 +1,8 @@
 {
   "preference_advisor": {
+    "budget_fast": "Modello veloce",
+    "budget_balanced": "Modello bilanciato",
+    "budget_frontier": "Modello di punta",
     "timeout": "Tempo scaduto per il consiglio. Continua senza consiglio o riprova.",
     "loading": "Verifica delle preferenze per l’attività…",
     "recommend": "Suggerimento per questa attività: {{model}}",

@@ -1,5 +1,8 @@
 {
   "preference_advisor": {
+    "budget_fast": "Modelo rápido",
+    "budget_balanced": "Modelo equilibrado",
+    "budget_frontier": "Modelo de ponta",
     "timeout": "O tempo da recomendação esgotou. Continue sem recomendação ou tente novamente.",
     "loading": "Verificando suas preferências de tarefa…",
     "recommend": "Sugestão para esta tarefa: {{model}}",

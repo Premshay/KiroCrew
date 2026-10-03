@@ -1,5 +1,10 @@
 # Context Management
 
+The base agent prompt directs `preference_advice` consultation at new task and
+allocation boundaries throughout a session. Agents provide task context and
+the target's advertised models, respect explicit choices, and continue normally
+when advice abstains or is unavailable. It is not a per-turn switching rule.
+
 What Kiro Crew puts in front of the model, in what order, and where each piece
 comes from. Six questions, one section each: a fresh main chat session, the
 per-turn additions, a sub-agent, the default agent versus any other agent, a

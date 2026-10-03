@@ -1,5 +1,8 @@
 {
   "preference_advisor": {
+    "budget_fast": "快速模型",
+    "budget_balanced": "均衡模型",
+    "budget_frontier": "最强模型",
     "timeout": "偏好建议请求超时。请不使用建议继续，或重试。",
     "loading": "正在检查任务偏好…",
     "recommend": "此任务建议使用：{{model}}",

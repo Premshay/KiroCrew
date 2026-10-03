@@ -21,6 +21,7 @@ vi.mock('react-virtuoso', () => ({ Virtuoso: ({ data, itemContent }: { data?: un
 vi.mock('../api/client', () => ({
   api: {
     chatSlots: vi.fn().mockResolvedValue([]),
+    chatSlotCreate: vi.fn(),
     chatSlotDetail: vi.fn().mockResolvedValue({ messages: [{ role: 'assistant', content: 'hi', cls: '' }], running: false, has_more: false, total: 1 }),
     sendChat: vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) }),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
@@ -121,7 +122,7 @@ import { api } from '../api/client'
 import { savePttConfig } from '../lib/pushToTalk'
 import { DRAFTS_KEY } from '../utils/chatDrafts'
 
-function makeStore(activeSlot: string, slots: { key: string; mode?: string }[], running = false, messages = 1) {
+function makeStore(activeSlot: string | null, slots: { key: string; mode?: string }[], running = false, messages = 1) {
   return configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
     preloadedState: {
@@ -172,6 +173,21 @@ beforeEach(() => {
   localStorage.clear()
   vi.mocked(api.sendChat).mockClear()
   vi.mocked(api.getPreferenceAdvice).mockClear()
+})
+
+it('shows budget advice on the first send even when the model catalog has no matching ID', async () => {
+  vi.mocked(api.getPreferenceAdvice).mockResolvedValueOnce({ id: 'advice', model: null, budget: 'frontier', reason: 'similar_preferences' })
+  const store = makeStore('test', [{ key: 'test' }], false, 0)
+  await renderAndWaitForInput(store)
+  const input = screen.getByLabelText('Message input')
+  fireEvent.change(input, { target: { value: 'Coordinate the implementation program' } })
+  fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' })
+  await waitFor(() => expect(api.getPreferenceAdvice).toHaveBeenCalledWith('test', 'Coordinate the implementation program', expect.any(Array), expect.any(AbortSignal)))
+  await waitFor(() => expect(screen.getByText('Suggested for this task: Frontier model')).toBeInTheDocument())
+  expect(screen.queryByRole('button', { name: 'Use suggested' })).not.toBeInTheDocument()
+  expect(api.sendChat).not.toHaveBeenCalled()
+  expect(api.chatSlotCreate).not.toHaveBeenCalled()
+  expect(input).toHaveValue('Coordinate the implementation program')
 })
 
 describe('ChatPage — sending while dictating', () => {

@@ -70,6 +70,8 @@ def _compute(
     session_key: str | None = None,
     routing_armed: bool = False,
     deadline: float | None = None,
+    role: str = "parent",
+    require_mapping: bool = True,
 ) -> dict:
     from kiro_crew.preference_routing import PreferenceExample, advise, resolve_budget_model
 
@@ -86,7 +88,7 @@ def _compute(
         raise ValueError("invalid preference configuration")
     if not all(isinstance(value, str) and len(value) <= 200 for value in mapping.values()):
         raise ValueError("invalid model mapping")
-    if not any(
+    if require_mapping and not any(
         model in advertised and model not in ("auto", "auto:jev") for model in mapping.values()
     ):
         return {"reason": "no_advertised_mapping"}
@@ -111,7 +113,7 @@ def _compute(
                 float(row.get("weight", 1.0)),
             )
         )
-    if not any(e.role == "parent" for e in examples):
+    if not any(e.role == role for e in examples):
         return {"reason": "no_examples"}
     from kiro_crew.embeddings import LlamaCppEmbedder, get_shared_embedder
 
@@ -128,10 +130,97 @@ def _compute(
             raise TimeoutError("preference scoring budget exhausted")
         return vector
 
-    advice = advise(task, "parent", examples, encode)
+    advice = advise(task, role, examples, encode)
     model = resolve_budget_model(advice, mapping, advertised)
     evidence = [e.task[:240] for e in examples if e.id in advice.examples][:2]
     return {**asdict(advice), "model": model, "evidence": evidence}
+
+
+async def _score(
+    request: web.Request,
+    task: str,
+    advertised: list[str],
+    session_key: str | None = None,
+    routing_armed: bool = False,
+    role: str = "parent",
+    require_mapping: bool = True,
+) -> dict:
+    work = request.app.get(_WORK)
+    if work is not None and not work.done():
+        return {"reason": "advice_busy"}
+    # Native inference can outlive cancellation; retain its task until it really finishes.
+    work = asyncio.create_task(
+        asyncio.to_thread(
+            _compute,
+            task,
+            advertised,
+            session_key,
+            routing_armed,
+            time.monotonic() + _COMPUTE_SECONDS,
+            role,
+            require_mapping,
+        )
+    )
+    request.app[_WORK] = work
+    work.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    try:
+        return await asyncio.wait_for(asyncio.shield(work), _COMPUTE_SECONDS)
+    except TimeoutError:
+        logger.info("Preference advice exceeded its scoring budget")
+        return {"reason": "advice_timeout"}
+    except (OSError, ValueError, TypeError):
+        logger.warning("Could not read routing preferences", exc_info=True)
+        return {"reason": "preference_unavailable"}
+
+
+async def api_preference_consult(request: web.Request) -> web.Response:
+    """Read-only task-boundary advice for a verified persistent session."""
+    from kiro_crew.dashboard.handlers._shared import _is_restricted_session
+    from kiro_crew.dashboard.handlers.cron import _recognize_session
+    from kiro_crew.history import is_incognito_transcript
+
+    if request.get("app"):
+        return web.json_response(
+            {"error": "owner session required", "code": "dashboard_owner_required"}, status=403
+        )
+    state = request.app["state"]
+    session_key = request.headers.get("X-Session-Key", "")
+    refusal = await _recognize_session(
+        state, session_key, "preference_advice", blocks_persisted_mode=is_incognito_transcript
+    )
+    if refusal is not None:
+        return refusal
+    if _is_restricted_session(state, request):
+        return web.json_response({"reason": "restricted_session"}, status=403)
+    body, error = await read_bounded_json(request)
+    if error is not None:
+        return error
+    assert body is not None
+    task, models, role = body.get("task"), body.get("models"), body.get("role")
+    if (
+        not isinstance(task, str)
+        or not task.strip()
+        or len(task) > _MAX_TASK
+        or role not in ("parent", "worker")
+        or not isinstance(models, list)
+        or len(models) > 200
+        or not all(isinstance(model, str) and len(model) <= 200 for model in models)
+    ):
+        return web.json_response(
+            {"error": "invalid advice request", "code": "preference_invalid"}, status=400
+        )
+    result = await _score(
+        request, task, models, session_key=session_key, role=role, require_mapping=False
+    )
+    refusal = await _recognize_session(
+        state, session_key, "preference_advice", blocks_persisted_mode=is_incognito_transcript
+    )
+    if refusal is not None:
+        return refusal
+    if _is_restricted_session(state, request):
+        return web.json_response({"reason": "restricted_session"}, status=403)
+    result.pop("evidence", None)
+    return web.json_response({**result, "advisory": True, "role": role})
 
 
 async def api_preference_advice(request: web.Request) -> web.Response:
@@ -157,6 +246,14 @@ async def api_preference_advice(request: web.Request) -> web.Response:
         )
     state = request.app["state"]
     slot = state._slots.get(name)
+    if name == "":
+        result = await _score(request, task, advertised, require_mapping=False)
+        if result.get("reason") == "preference_unavailable":
+            return web.json_response(
+                {"error": "routing preferences unavailable", "code": "preference_unavailable"},
+                status=503,
+            )
+        return web.json_response({**result, "preview": True})
     if not _eligible(slot) or slot._model_pick_gen:
         return web.json_response({"reason": "keep_current"})
     scope = _scope(slot)
@@ -171,37 +268,24 @@ async def api_preference_advice(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.chat_runner import _jev_route_armed
     from kiro_crew.dashboard.chat_utils import effective_session_key
 
-    work = request.app.get(_WORK)
-    if work is not None and not work.done():
-        return web.json_response({"reason": "advice_busy"})
-    # A native encoder cannot be interrupted; keep its one worker accounted for
-    # after the HTTP deadline so repeated requests cannot pile up threads.
-    work = asyncio.create_task(
-        asyncio.to_thread(
-            _compute,
-            task,
-            advertised,
-            effective_session_key(slot),
-            _jev_route_armed(slot),
-            time.monotonic() + _COMPUTE_SECONDS,
-        )
+    result = await _score(
+        request,
+        task,
+        advertised,
+        effective_session_key(slot),
+        _jev_route_armed(slot),
+        require_mapping=False,
     )
-    request.app[_WORK] = work
-    work.add_done_callback(lambda done: None if done.cancelled() else done.exception())
-    try:
-        result = await asyncio.wait_for(asyncio.shield(work), _COMPUTE_SECONDS)
-    except TimeoutError:
-        logger.info("Preference advice exceeded its scoring budget")
-        return web.json_response({"reason": "advice_timeout"})
-    except (OSError, ValueError, TypeError):
-        logger.warning("Could not read routing preferences", exc_info=True)
+    if result.get("reason") == "preference_unavailable":
         return web.json_response(
             {"error": "routing preferences unavailable", "code": "preference_unavailable"},
             status=503,
         )
     if state._slots.get(name) is not slot or not _eligible(slot) or _scope(slot) != scope:
         return web.json_response({"reason": "keep_current"})
-    if not result.get("model") or result["model"] == slot.model:
+    if not (result.get("model") or result.get("budget")) or (
+        result.get("model") and result["model"] == slot.model
+    ):
         return web.json_response({**result, "model": None})
     if _lock.locked():
         return web.json_response({"reason": "advice_busy"})

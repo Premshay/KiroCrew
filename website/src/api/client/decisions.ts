@@ -86,6 +86,7 @@ export type DecisionFeedbackSide = 'jev' | 'baseline'
 export type DecisionVerdictValue = 'right' | 'wrong' | null
 
 export interface PreferenceAdvice {
+  preview?: boolean
   id?: string
   model?: string | null
   current?: string

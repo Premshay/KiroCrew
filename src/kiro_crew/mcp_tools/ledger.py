@@ -27,6 +27,34 @@ def schemas() -> list[dict[str, Any]]:
     terminal = ", ".join(sorted(TERMINAL_PHASES))
     return [
         {
+            "name": "preference_advice",
+            "description": (
+                "Consult reviewed owner preferences at a task boundary, including midway "
+                "through an ongoing conversation before choosing a new session, subagent, "
+                "or workflow worker. Supply a concise task/context summary and the target "
+                "agent's actual advertised model IDs. Use role=parent for a coordinator "
+                "or main task, worker for delegated work. Advice only: never blocks or "
+                "dispatches work, changes a model, or approves a seat. Respect explicit "
+                "user choices, provider capabilities and seat availability. Abstention "
+                "or a budget without a matching model leaves selection to your judgment. "
+                "Do not retry until it recommends something."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    "role": {"type": "string", "enum": ["parent", "worker"]},
+                    "models": {
+                        "type": "array",
+                        "maxItems": 200,
+                        "items": {"type": "string", "maxLength": 200},
+                    },
+                },
+                "required": ["task", "role", "models"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "session_ledger_read",
             "description": (
                 "Read THIS session's durable work ledger: the state record "
@@ -207,7 +235,23 @@ def session_ledger_record(name: str, args: dict[str, Any]) -> str:
     return line
 
 
+def preference_advice(name: str, args: dict[str, Any]) -> str:
+    sk, err = mcp_core.require_strict_session_key(
+        "Error: preference advice requires a verified persistent session identity."
+    )
+    if err:
+        return err
+    result = mcp_core._post(
+        "/api/preference-consult",
+        {key: args.get(key) for key in ("task", "role", "models")},
+        session_key=sk,
+        timeout=5,
+    )
+    return json.dumps(result)
+
+
 HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
+    "preference_advice": preference_advice,
     "session_ledger_read": session_ledger_read,
     "session_ledger_record": session_ledger_record,
 }

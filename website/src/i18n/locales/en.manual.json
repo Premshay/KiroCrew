@@ -1,5 +1,8 @@
 {
   "preference_advisor": {
+    "budget_fast": "Fast model",
+    "budget_balanced": "Balanced model",
+    "budget_frontier": "Frontier model",
     "timeout": "Preference advice timed out. Continue without advice or try again.",
     "loading": "Checking your task preferences…",
     "recommend": "Suggested for this task: {{model}}",

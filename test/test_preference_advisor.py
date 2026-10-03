@@ -50,10 +50,115 @@ def setup(monkeypatch):
             "examples": ["a", "b"],
         },
     )
-    return SimpleNamespace(app=app), slot, body
+    return SimpleNamespace(app=app, get=lambda key: None), slot, body
 
 
 class TestPreferenceAdvisor:
+    def test_consult_tool_uses_verified_identity_and_bounded_transport(self, monkeypatch):
+        from unittest.mock import Mock
+        from kiro_crew import mcp_core
+        from kiro_crew.mcp_tools.ledger import preference_advice
+
+        post = Mock(return_value={"reason": "no_examples", "advisory": True})
+        monkeypatch.setattr(mcp_core, "_post", post)
+        monkeypatch.setattr(mcp_core, "require_strict_session_key", lambda _: ("", "unverified"))
+        assert preference_advice("preference_advice", {}) == "unverified"
+        post.assert_not_called()
+        monkeypatch.setattr(mcp_core, "require_strict_session_key", lambda _: ("dashboard:s", ""))
+        args = {"task": "triage findings", "role": "worker", "models": ["small"]}
+        assert json.loads(preference_advice("preference_advice", args))["advisory"] is True
+        post.assert_called_once_with(
+            "/api/preference-consult", args, session_key="dashboard:s", timeout=5
+        )
+
+    @pytest.mark.asyncio
+    async def test_slotless_preview_does_not_create_slot_or_feedback_token(self, setup):
+        request, _, body = setup
+        body["slot"] = ""
+        before = dict(request.app["state"]._slots)
+        result = json.loads((await handler.api_preference_advice(request)).body)
+        assert result["preview"] is True
+        assert result["model"] == "small"
+        assert "id" not in result
+        assert request.app["state"]._slots == before
+        assert handler._KEY not in request.app
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", ["parent", "worker"])
+    async def test_consult_during_ongoing_task_is_read_only(self, setup, monkeypatch, role):
+        from kiro_crew.dashboard.handlers import _shared, cron
+
+        request, slot, body = setup
+        slot.total_messages = 50
+        request.headers = {"X-Session-Key": "dashboard:s"}
+        body["role"] = role
+        recognize = AsyncMock(return_value=None)
+        monkeypatch.setattr(cron, "_recognize_session", recognize)
+        monkeypatch.setattr(_shared, "_is_restricted_session", lambda *_: False)
+        score = AsyncMock(return_value={"model": "small", "evidence": ["private task"]})
+        monkeypatch.setattr(handler, "_score", score)
+        result = json.loads((await handler.api_preference_consult(request)).body)
+        assert result == {"model": "small", "advisory": True, "role": role}
+        assert score.call_args.kwargs["role"] == role
+        assert score.call_args.kwargs["session_key"] == "dashboard:s"
+        assert slot.model == "current"
+        assert slot.total_messages == 50
+        assert handler._KEY not in request.app
+
+    @pytest.mark.asyncio
+    async def test_restricted_consult_never_scores(self, setup, monkeypatch):
+        from kiro_crew.dashboard.handlers import _shared, cron
+
+        request, _, body = setup
+        request.headers = {"X-Session-Key": "dashboard:s"}
+        body["role"] = "worker"
+        monkeypatch.setattr(cron, "_recognize_session", AsyncMock(return_value=None))
+        monkeypatch.setattr(_shared, "_is_restricted_session", lambda *_: True)
+        score = AsyncMock()
+        monkeypatch.setattr(handler, "_score", score)
+        assert (await handler.api_preference_consult(request)).status == 403
+        score.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_consult_refuses_app_before_scoring(self, setup, monkeypatch):
+        request, _, _ = setup
+        request.get = lambda key: "app-principal" if key == "app" else None
+        score = AsyncMock()
+        monkeypatch.setattr(handler, "_score", score)
+        assert (await handler.api_preference_consult(request)).status == 403
+        score.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_consult_refuses_unrecognized_session(self, setup, monkeypatch):
+        from kiro_crew.dashboard.handlers import cron
+
+        request, _, _ = setup
+        request.headers = {"X-Session-Key": "dashboard:unknown"}
+        monkeypatch.setattr(
+            cron, "_recognize_session", AsyncMock(return_value=web.Response(status=400))
+        )
+        score = AsyncMock()
+        monkeypatch.setattr(handler, "_score", score)
+        assert (await handler.api_preference_consult(request)).status == 400
+        score.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_consult_withholds_result_after_privacy_change(self, setup, monkeypatch):
+        from kiro_crew.dashboard.handlers import _shared, cron
+
+        request, _, body = setup
+        request.headers = {"X-Session-Key": "dashboard:s"}
+        body["role"] = "parent"
+        monkeypatch.setattr(cron, "_recognize_session", AsyncMock(return_value=None))
+        restricted = iter([False, True])
+        monkeypatch.setattr(_shared, "_is_restricted_session", lambda *_: next(restricted))
+        score = AsyncMock(return_value={"model": "small", "budget": "fast"})
+        monkeypatch.setattr(handler, "_score", score)
+        result = await handler.api_preference_consult(request)
+        assert result.status == 403
+        assert "budget" not in json.loads(result.body)
+        score.assert_awaited_once()
+
     @pytest.mark.parametrize(
         "contents,enabled",
         [
@@ -208,6 +313,8 @@ class TestPreferenceAdvisor:
         assert result["model"] == "small"
         assert calls == ["new task", "reviewed 0", "reviewed 1"]
         assert result["evidence"] == ["reviewed 0", "reviewed 1"]
+        assert handler._compute("worker task", ["small"], role="worker")["reason"] == "no_examples"
+        assert len(calls) == 3
         monkeypatch.setattr(decisions, "is_enabled", lambda *a, **kw: True)
         assert (
             handler._compute("new task", ["small"], routing_armed=True)["reason"]
@@ -216,9 +323,12 @@ class TestPreferenceAdvisor:
         assert len(calls) == 3
         assert handler._compute("new task", ["small"], routing_armed=False)["model"] == "small"
         assert len(calls) == 6
+        unmapped = handler._compute("new task", ["another-provider-model"], require_mapping=False)
+        assert unmapped["budget"] == "balanced"
+        assert unmapped["model"] is None
         with pytest.raises(TimeoutError):
             handler._compute("new task", ["small"], deadline=0)
-        assert len(calls) == 6
+        assert len(calls) == 9
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

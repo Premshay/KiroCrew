@@ -1,5 +1,8 @@
 {
   "preference_advisor": {
+    "budget_fast": "빠른 모델",
+    "budget_balanced": "균형 잡힌 모델",
+    "budget_frontier": "최상위 모델",
     "timeout": "추천 요청 시간이 초과되었습니다. 추천 없이 계속하거나 다시 시도하세요.",
     "loading": "작업 선호도를 확인하는 중…",
     "recommend": "이 작업의 추천 모델: {{model}}",

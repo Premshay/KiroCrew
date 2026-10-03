@@ -231,17 +231,30 @@ five neighbors, one per source-session group, requires two supporting groups,
 and abstains below similarity 0.65 or vote-share margin 0.2. These are initial
 heuristics, not calibrated probabilities or demonstrated quality guarantees.
 
-The dashboard preview intercepts the first plain-text Send in an existing empty,
-local, persistent slot. It leaves the draft intact and displays a conversation
+The dashboard preview intercepts the first plain-text Send before creating a new
+chat, or in an existing empty local persistent slot. It leaves the draft intact and displays a conversation
 card: **Use suggested**, **Keep current**, or **Choose another**, which opens the
 existing combined model-and-effort picker. A successful model choice records
 feedback; the user then presses Send to begin. Silence records nothing. Attachments,
 collapsed pastes, programmatic sends, remote slots, ongoing conversations,
 incognito and temporary modes bypass this preview. Explicit picker changes take
 precedence. A changed draft or slot invalidates the pending interaction.
-VS Code, other harness adapters, child dispatch and task boundaries within an
-existing conversation are not integrated yet; the core's role boundary supports
-those future callers without importing dashboard code.
+Before slot creation, recommendations are previews without feedback tokens:
+an explicit choice stages the model for the eventual session, and is not claimed
+as saved feedback. Changing the target agent invalidates pending advice.
+
+The `preference_advice` MCP tool supports task boundaries within ongoing
+conversations. The agent supplies a bounded task/context summary, target model
+IDs and `parent` or `worker` role before choosing a new session, subagent or
+workflow worker. `POST /api/preference-consult` requires strict recognized session
+identity and excludes restricted modes. It shares the dashboard's bounded local
+scorer, returns advice without source task text, and never dispatches, switches a
+model, changes a seat, writes feedback or blocks ordinary work. The agent prompt
+directs consultation at allocation decisions, not every continuation. Explicit
+user choices and execution eligibility take precedence; missing role examples
+abstain. A supported budget can still be returned when the configured model is
+absent from the target provider: `model` is then null and the planner uses the
+target's actual capabilities. This is planning advice, not an execution gate.
 
 `POST /api/decisions/preference` and `/api/decisions/preference/feedback` are
 dashboard-owner-only. Advice takes a bounded draft (4,000 characters), slot key
@@ -275,7 +288,9 @@ catalog IDs; `examples` contains `id`, `group` (source-session deduplication key
 in (0, 1], and exact `reviewed: true`. Private transcripts do not ship in source.
 Absent configuration leaves ordinary Send unchanged. Unreviewed historical
 weak labels are never promoted automatically. Model mapping misses abstain.
-The picker must advertise a concrete matching ID before advice can appear. A
+The picker must advertise a concrete matching ID before **Use suggested** can
+apply a model. Otherwise supported advice still appears as a budget, with
+**Keep current** and **Choose another**; it does not invent a runnable ID. A
 cold advertised-selection backend may expose only `auto` until an ACP session
 publishes its choices. An unloaded local embedder also causes abstention; its
 first load is asynchronous. Neither condition is evidence against a task budget.

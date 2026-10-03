@@ -5,6 +5,8 @@ description: Author, run, inspect, or resume multi-phase agent workflows with th
 
 # Dynamic workflows
 
+Before selecting an author or workers, including mid-session replanning, consult `preference_advice` if available with the task summary, role (`parent` for the coordinator, `worker` for delegated work), and target's advertised model IDs; advice is optional, respects explicit user choices and seat limits, and never blocks work when unavailable or abstaining.
+
 Check `workflow_library_list` for a reusable definition. Use `workflow_run(intent=...)`
 to author and launch, or `workflow_author` to inspect the script first. Read
 `workflow_result` before claiming success; a failed authoring phase means no workers ran.
