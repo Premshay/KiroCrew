@@ -844,6 +844,7 @@ class SessionMcpProjection(NamedTuple):
     #: host consumes the spec, so the caller re-verifies THIS after ``session/new`` /
     #: ``session/load`` -- one snapshot per consumed load.
     derived_spec_snapshot: Any = None
+    agent_spec: dict[str, Any] | None = None
 
 
 def session_mcp_projection(
@@ -887,6 +888,7 @@ def session_mcp_projection(
         disabled_servers=session_mcp_disabled_servers(spec, settings),
         allowlist=_tools_allowlist(spec),
         derived_spec_snapshot=snapshot,
+        agent_spec=spec,
     )
 
 

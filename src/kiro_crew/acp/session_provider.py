@@ -44,6 +44,7 @@ from kiro_crew.acp.runtime import (
 )
 from kiro_crew.acp.session_handle import WatchdogSettings
 from kiro_crew.acp.types import (
+    ACP_BACKEND_KIRO,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
 )
@@ -841,13 +842,13 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def member_capabilities_supported(self) -> bool:
-        """Full saved member-spec loading is opt-in (harness-parity H6)."""
+        """Saved member-spec loading or projection is opt-in (harness-parity H6)."""
         return self._runtime.acp_backend in ACP_BACKENDS_MEMBER_CAPABILITIES
 
     @property
     def loaded_capability_template(self) -> str:
         if (
-            self.member_capabilities_supported
+            self._runtime.acp_backend == ACP_BACKEND_KIRO
             and self._owns_runtime
             and self._runtime.is_alive()
             and self._handle.active_agent == self._runtime._agent

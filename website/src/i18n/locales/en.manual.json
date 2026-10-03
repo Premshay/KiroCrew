@@ -167,7 +167,7 @@
     "runtime_applied": "The server reports this version loaded.",
     "runtime_failed": "Runtime loading failed. The saved version remains.",
     "runtime_unverified": "Runtime use has not been verified.",
-    "newRuntime": "Supported on the Kiro backend only. Saving leaves active sessions unchanged. A new runtime loads the saved version.",
+    "newRuntime": "Supported on the Kiro and Claude backends. Saving leaves active sessions unchanged. A new runtime loads the saved version. Unsupported Claude spec fields remain unverified.",
     "parentMissing": "The parent template is missing or unverified, so saving is blocked.",
     "enroll": "Follow the parent template",
     "connection": "Add configured MCP connection",
