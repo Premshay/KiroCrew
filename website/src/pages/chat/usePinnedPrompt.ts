@@ -106,21 +106,15 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
     // below what the reader can see. With a top-edge rule that shows up as the
     // FIRST mounted row already sitting below the line — every contiguous case has
     // a mounted row above the boundary.
-    //
-    // Fork override: a row hands over only once its BOTTOM has cleared the card's
-    // resting bottom, so a prompt taller than the viewport scrolls natively as a
-    // real bubble all the way through instead of being replaced by a folding card
-    // drawn over the transcript (whose text never scrolled and whose touch was
-    // forwarded, leaving long prompts unreadable on a phone). With this line the
-    // fold below never engages: by hand-off the bubble already fits the clamp.
-    const handoffBottomY = handoffY + ROW_PAD_Y * 2 + pinCollapsedHRef.current
+    // MERGE-REVIEW: upstream's bubble-bottom guard below preserves native
+    // scrolling for tall prompts while allowing their action strip to stay visible.
     let handoffIdx = -1
     let first = true
     for (const item of items) {
       const htmlItem = item as HTMLElement
       const rect = htmlItem.getBoundingClientRect()
-      if (rect.bottom > handoffBottomY) {
-        if (requiresMountedHandoff && first && rect.top > handoffY) { setPinned(null); return }
+      if (rect.top > handoffY) {
+        if (requiresMountedHandoff && first) { setPinned(null); return }
         handoffIdx = parseInt(htmlItem.getAttribute('data-display-index') || '0', 10)
         break
       }
@@ -215,6 +209,17 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
     // The threshold lives here because this is where the resting height lives;
     // duplicating it in the card would let the two disagree about "at rest".
     const restingH = pinCollapsedHRef.current
+    // A prompt taller than the resting card is NOT pinned while any of it is
+    // still below the card's resting bottom. Pinning it there hid the real,
+    // scrollable bubble and grew the card over the page with a plain-text copy
+    // clipped to the prompt's FIRST lines, so the reader scrolled and the
+    // middle of a long message was unreachable. The real bubble stays in the
+    // transcript until it has scrolled behind the band; only then does the
+    // one-line card take over. No pin means the row stays visible.
+    if (bubbleBottom != null && bubbleBottom - foldY - ROW_PAD_Y > restingH + 0.5) {
+      setPinned(null)
+      return
+    }
     // The transcript FLOOR: the scroller's bottom edge minus its bottom padding.
     // That padding is each host's own statement of where readable content stops
     // — the main chat sets it to the floating composer dock's height plus a

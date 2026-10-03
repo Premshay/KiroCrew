@@ -30,6 +30,7 @@ from typing import Any, Optional
 from aiohttp import web
 
 from kiro_crew.dashboard.handlers._shared import internal_memory_scope, read_bounded_json
+from kiro_crew.dashboard.request_priority import owner_start_priority
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import MAX_SHORT_STRING
@@ -457,7 +458,13 @@ async def api_workflow_author(request: web.Request) -> web.Response:
             {"error": "author_agent and author_model must be strings"}, status=400
         )
     out = await svc.author(
-        intent, author=author, expected_store=request.get("workflow_expected_store"), **selection
+        intent,
+        author=author,
+        expected_store=request.get("workflow_expected_store"),
+        # The dashboard owner waits on the Create-draft spinner; an app token or an
+        # agent's internal call does not (kiro_crew.start_priority).
+        start_priority=owner_start_priority(request),
+        **selection,
     )
     return web.json_response(_redact_obj(out))
 

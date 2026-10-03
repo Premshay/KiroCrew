@@ -143,20 +143,18 @@ class TestAScriptCronNamingTheBundle:
 
 
 class TestACommandCronRunningBundleCode:
-    @pytest.fixture(autouse=True)
-    def _command_crons_run_here(self):
-        """A host with no POSIX shell refuses every command cron before it spawns.
-
-        Windows is that host by design (``_no_command_shell_message``): nothing reaches
-        ``wrap_argv``, so there is no mask to check. Gate on the product's own probe,
-        not on the platform name, so a host that does run command crons is still held
-        to the pin.
-        """
-        if cron_script._resolve_command_shell() is None:
-            pytest.skip("this host refuses command crons: no POSIX shell to run them")
-
     def test_the_call_site_leaves_the_bundle_readable(self, bundle, monkeypatch):
         seen = _record_spawns(monkeypatch)
+        # A host with no POSIX shell refuses every command cron before it spawns
+        # (``_no_command_shell_message``; Windows by design), so there is no mask to
+        # check. The probe runs AFTER the recorder is in place: unpatched, it spawns
+        # through the real ``wrap_argv``, which raises on a POSIX host with no sandbox
+        # backend and would read that host as shell-less -- the very host this case
+        # is written for. A cached verdict from an earlier probe is cleared first.
+        monkeypatch.setattr(cron_script, "_POSIX_STRICT_CACHE", {})
+        if cron_script._resolve_command_shell() is None:
+            pytest.skip("this host refuses command crons: no POSIX shell to run them")
+        seen.clear()
 
         result = run_command_sandboxed(_command(bundle), timeout=60, job_id="job-sibling")
 
@@ -170,6 +168,10 @@ class TestACommandCronRunningBundleCode:
 
     @_NO_BACKEND
     def test_the_real_sandbox_runs_it(self, bundle):
+        # Nothing is patched here, so the real probe answers: a host whose shell fails
+        # it refuses command crons, and there is no run to check.
+        if cron_script._resolve_command_shell() is None:
+            pytest.skip("this host refuses command crons: no POSIX shell to run them")
         result = run_command_sandboxed(_command(bundle), timeout=120, job_id="job-sibling")
 
         assert result["status"] == "ok", result

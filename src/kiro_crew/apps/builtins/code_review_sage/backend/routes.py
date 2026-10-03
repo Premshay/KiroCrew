@@ -46,6 +46,7 @@ from aiohttp import web
 from kiro_crew import hooks
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.loop_lock import LoopBoundLock
 
 logger = logging.getLogger("kirocrew.app.code-review-sage")
@@ -679,6 +680,9 @@ async def _handle_review(request: web.Request) -> web.Response:
 
     Body: ``{"links": "<pasted CR links>"}`` or ``{"changes": ["CR-1", ...]}``.
     Returns immediately with a ``run_id``; poll ``/runs`` for status."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.review")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -859,6 +863,9 @@ async def _handle_review_repo(request: web.Request) -> web.Response:
     Body: ``{"repo": "<github repo url>", "force": bool}``. By default only PRs
     NOT yet reviewed at their current head SHA are queued; ``force=true`` reviews
     ALL open PRs regardless of the dedup index."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.review_repo")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -1051,6 +1058,9 @@ async def _handle_run_cancel(request: web.Request) -> web.Response:
     started are dropped, but a change already mid-review finishes, because its
     worker session owns an in-flight model turn that cannot be torn down without
     corrupting the shared pool. The UI must not promise an instant stop."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_cancel")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     async with _LOCK:
         run = _find_run(run_id)
@@ -1078,6 +1088,9 @@ async def _handle_run_cancel(request: web.Request) -> web.Response:
 
 async def _handle_run_delete(request: web.Request) -> web.Response:
     """DELETE .../runs/{run_id} — dismiss a finished thread and delete its data."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_delete")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     async with _LOCK:
         run = _find_run(run_id)
@@ -1244,6 +1257,9 @@ async def _handle_run_post(request: web.Request) -> web.Response:
     still going, when its records have been cleared, or when it already posted —
     a duplicate post is not undoable from here.
     """
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_post")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     force = request.query.get("force", "").lower() in ("1", "true", "yes")
     try:
@@ -1447,6 +1463,9 @@ async def _handle_run_archive(request: web.Request) -> web.Response:
     Reports are archived automatically when a run finishes; this is the retry /
     share path for a run whose archive failed (or one archived before the artifact
     was pruned). The report itself lives in the run dir either way."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_archive")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     async with _LOCK:
         run = _find_run(run_id)
@@ -1625,6 +1644,9 @@ async def _handle_repos(request: web.Request) -> web.Response:
     if request.method == "GET":
         repos = await asyncio.to_thread(discovery.read_repos)
         return web.json_response({"repos": repos})
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.repos_write")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -1891,6 +1913,9 @@ async def _handle_settings(request: web.Request) -> web.Response:
 
         return web.json_response(await asyncio.to_thread(_build_settings_response))
     # PUT
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.settings_write")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -1982,6 +2007,10 @@ async def _handle_namespaces(request: web.Request) -> web.Response:
             logger.warning("namespace list failed: %s", exc, exc_info=True)
             return web.json_response({"namespaces": [], "active": ["default"]})
 
+    owner_denied = await require_owner_dashboard_request(
+        request, "code_review_sage.namespaces_write")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -2333,6 +2362,9 @@ async def _consolidate_bg(
 
 async def _handle_consolidate(request: web.Request) -> web.Response:
     """POST .../learnings/consolidate — queue a durable, human-confirmed proposal."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.consolidate")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -2733,6 +2765,9 @@ async def _handle_followup_start(request: web.Request) -> web.Response:
     resume itself is already armed when this returns, so the slot's first turn
     loads the reviewer's transcript.
     """
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.followup_start")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:

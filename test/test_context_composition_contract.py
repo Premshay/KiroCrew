@@ -251,8 +251,8 @@ _STABLE_TEXT = {
 
 _STABLE_TEXT_SHA256 = {
     "context_scope_all_withheld": "98ed04f8fca6f805d76f7fd3f518c63f221d5af6da6636fd30b28dc217207a0a",
-    "critical_rules": "ec1f111419a124d44052c87bae636bfd4c52733a10db05b3bcd2ff09f73ef201",
-    "critical_rules_channel": "6df8721b47d6fbddf143feb00450e51855c639f7cedc5ecd969e469d0cf20fdb",
+    "critical_rules": "06ea61438802e0538dbf1f107e2e6b07cf2416348734f330e0cf0ec3ef52e899",
+    "critical_rules_channel": "7e0dc53a1e4db382d51bb8ead062cd94ed5752dbb30b40149b6d9728ba734742",
     "docs_section": "971b6008afbd9ff048c498c06cffecc6dafc7a58b0df75ff9db0b15cf9e26c09",
     "member_how_you_work": "a815570887d9b4d15feb491fb49de2db00d5d7ca765f1762000dc0e9898bc248",
     "member_how_you_work_unavailable": "0c77e7625768a1a10f8a5ea309f85a10137457e94699a9ac22ac0f08c1676d25",
@@ -1239,7 +1239,7 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
     ),
     "build_message": (
         "method",
-        "(self, text: 'str', is_new_session: 'bool', session_key: 'str | None' = None, channel_id: 'str | None' = None, interactive: 'bool' = True, agent: 'str | None' = None, resumed: 'bool' = False, thread_ts: 'str | None' = None, workspace: 'str | None' = None, project: 'str | None' = None, memory_store: 'str | None' = None, user_display_name: 'str | None' = None, compressed_history: 'str | None' = None, mode: 'str' = '', blocks_reads: 'bool' = False, action_context: 'str | None' = None, thread_parent_text: 'str | None' = None, thread_meta: 'str | None' = None, provider_type: 'str' = 'acp', minimal_context: 'bool' = False, *, runtime_source: 'str | None' = None, request_prefix_context: 'str | None' = None, exclude_last_n: 'int' = 0, folder_path: 'str | None' = None, model_window: 'int | None' = None, board_tags: 'list[tuple[str, str]] | None' = None, user_text_range: 'tuple[int, int] | None' = None, user_span_out: 'list[int] | None' = None, needs_reinjection: 'bool' = False, context_groups: 'frozenset[str] | None' = None, member: 'str' = '', execution_context: 'Any' = None, context_provider: \"'ContextPromptProvider | None'\" = None, steering_dirs: 'tuple[str, ...]' = ()) -> 'tuple[str, HookResult]'",
+        "(self, text: 'str', is_new_session: 'bool', session_key: 'str | None' = None, channel_id: 'str | None' = None, interactive: 'bool' = True, agent: 'str | None' = None, resumed: 'bool' = False, thread_ts: 'str | None' = None, workspace: 'str | None' = None, project: 'str | None' = None, memory_store: 'str | None' = None, user_display_name: 'str | None' = None, compressed_history: 'str | None' = None, mode: 'str' = '', blocks_reads: 'bool' = False, action_context: 'str | None' = None, thread_parent_text: 'str | None' = None, thread_meta: 'str | None' = None, provider_type: 'str' = 'acp', minimal_context: 'bool' = False, *, runtime_source: 'str | None' = None, request_prefix_context: 'str | None' = None, exclude_last_n: 'int' = 0, thread_replies_text: 'str | None' = None, folder_path: 'str | None' = None, model_window: 'int | None' = None, board_tags: 'list[tuple[str, str]] | None' = None, user_text_range: 'tuple[int, int] | None' = None, user_span_out: 'list[int] | None' = None, needs_reinjection: 'bool' = False, context_groups: 'frozenset[str] | None' = None, member: 'str' = '', execution_context: 'Any' = None, context_provider: \"'ContextPromptProvider | None'\" = None, steering_dirs: 'tuple[str, ...]' = ()) -> 'tuple[str, HookResult]'",
     ),
     "build_session_context": (
         "method",

@@ -47,9 +47,7 @@ class TestConsolidateAgent:
 
         src = inspect.getsource(history_consolidation)
         assert 'consolidation_agent: str = "kirocrew-consolidate"' in src
-        assert "agent=self._consolidation_agent" in inspect.getsource(
-            HistoryConsolidator._call_llm
-        )
+        assert "agent=self._consolidation_agent" in inspect.getsource(HistoryConsolidator._call_llm)
 
     def test_consolidation_uses_its_own_session_key(self) -> None:
         """Pin the dedicated session key: under the shared BACKGROUND_KEY the
@@ -90,9 +88,7 @@ class TestConsolidateAgent:
         # the resume decision is made in ``_get_or_create_impl``.
         from kiro_crew.session_allocation import SessionAllocationService
 
-        assert "_get_or_create_impl(" in inspect.getsource(
-            SessionAllocationService.get_or_create
-        )
+        assert "_get_or_create_impl(" in inspect.getsource(SessionAllocationService.get_or_create)
         assert "constants.consolidate_key" in inspect.getsource(
             SessionAllocationService._get_or_create_impl
         )

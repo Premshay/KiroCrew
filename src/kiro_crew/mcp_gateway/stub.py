@@ -34,7 +34,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, NoReturn, Optional
+from typing import Any, Callable, Mapping, NoReturn, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.executors import configure_default_executor, subprocess_executor
@@ -44,6 +44,7 @@ from kiro_crew.mcp_caller import (
     CallerContext,
     _parent_pid,
 )
+from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.mcp_gateway.hashing import (
@@ -535,23 +536,52 @@ def _binary_version(command: str) -> str:
 #: folded in for exactly these, and only these: a third-party MCP binary is
 #: what its bytes say it is, and re-partitioning its pool on every Kiro Crew
 #: commit would cold-start it for no reason.
+#:
+#: Spelled out rather than imported from ``mcp_discovery``, whose module-level
+#: cost the stub's timed cold-start path must not pay; a ratchet test pins this
+#: set equal to ``mcp_discovery._MANAGED_SERVER_SUBCOMMANDS``'s values. The set
+#: also decides which stubs run the daemon-generation check in
+#: :func:`handshake`, so a managed server missing here keeps attaching to a
+#: pre-fingerprint daemon after an upgrade -- and the caller-aware ones then
+#: refuse every call as ``identity_unattested``.
 _KIROCREW_MCP_SUBCOMMANDS = frozenset(
-    {"mcp-core", "mcp-cron", "mcp-work", "mcp-computer", "mcp-dashboard", "mcp-crew-log"}
+    {
+        "mcp-core",
+        "mcp-cron",
+        "mcp-work",
+        "mcp-computer",
+        "mcp-dashboard",
+        "mcp-crew-log",
+        "mcp-debug",
+        "mcp-panel",
+    }
 )
+
+
+def _pool_binary_identity(command: str, target_args: list[str]) -> tuple[str, str]:
+    """Return ``(pool version, argv-selected Crew generation)`` for one target.
+
+    The second value is empty unless the target argv names a managed Crew
+    subcommand. :func:`build_register_payload` separately validates ``--server``
+    before putting that value on the wire; the pool version deliberately keeps
+    its existing argv-based identity.
+    """
+    base = _binary_version(command)
+    if not any(a in _KIROCREW_MCP_SUBCOMMANDS for a in target_args):
+        return base, ""
+    # Imported here, not at module top: the stub's cold-start path is timed
+    # and this module is only needed on the Kiro Crew branch.
+    from kiro_crew.code_fingerprint import code_fingerprint
+
+    generation = code_fingerprint()
+    return f"{base}+{generation}", generation
 
 
 def pool_binary_version(command: str, target_args: list[str]) -> str:
     """The ``binary_version`` a stub registers: the binary's hash, plus the Kiro
     Crew code fingerprint when the target is one of Kiro Crew's own servers.
     """
-    base = _binary_version(command)
-    if not any(a in _KIROCREW_MCP_SUBCOMMANDS for a in target_args):
-        return base
-    # Imported here, not at module top: the stub's cold-start path is timed
-    # and this module is only needed on the Kiro Crew branch.
-    from kiro_crew.code_fingerprint import code_fingerprint
-
-    return f"{base}+{code_fingerprint()}"
+    return _pool_binary_identity(command, target_args)[0]
 
 
 def binary_fingerprint(command: str) -> str:
@@ -638,6 +668,7 @@ def build_register_payload(args: argparse.Namespace) -> dict:
     The result is accepted verbatim by :meth:`PoolKey.from_register` —
     callers do not post-process."""
     target_args = _resolve_target_args(args)
+    binary_version, stub_code_fingerprint = _pool_binary_identity(args.target_command, target_args)
     # Prefer --env-json when present (commas/equals round-trip intact);
     # fall back to the legacy --env CSV for overlay files written by a
     # pre-JSON rewriter that may still be on disk during the transition.
@@ -671,7 +702,7 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         "command_args_hash": hash_command(args.target_command, target_args),
         "effective_env_hash": hash_effective_env(env_pairs, identity_keys=identity_keys),
         "work_dir": work_dir,
-        "binary_version": pool_binary_version(args.target_command, target_args),
+        "binary_version": binary_version,
         # Not os.getuid(): that attribute does not exist on Windows, where an
         # AttributeError here would abort the Register frame and send every
         # session to per-session exec -- pooling would appear enabled and
@@ -719,6 +750,13 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         "session_type": caller["session_type"],
         "principal_id": caller["principal_id"],
     }
+    if stub_code_fingerprint and args.server in KIROCREW_BIN_MCP_SERVERS:
+        # Compatibility attestation, not a PoolKey dimension. The daemon answers
+        # with its own fingerprint in ``registered``; an absent or different
+        # value means an adopted pre-upgrade daemon cannot safely carry this
+        # control plane's current per-session protocol, so handshake requests the
+        # existing direct-exec fallback instead of serving subtly stale frames.
+        payload["stub_code_fingerprint"] = stub_code_fingerprint
     if session_token:
         # Sibling field, deliberately NOT a PoolKey dimension: a per-connection
         # value in the key would give every session its own backend and pooling
@@ -861,6 +899,18 @@ class FallbackRequestedError(Exception):
         self.reason = reason
 
 
+class StaleGenerationError(FallbackRequestedError):
+    """The daemon answered the Register with no code fingerprint, or another one.
+
+    A :class:`FallbackRequestedError`, so the cold-start caller degrades to its
+    per-session ``fallback_exec`` exactly as for any other handshake failure.
+    Distinguished so the reconnect path can tell it from an outage: a daemon that
+    is absent or still starting is retried, but one that is UP and of a different
+    generation will answer the next attempt the same way, so retrying it only
+    spends the whole reconnect budget on registers the stub then closes.
+    """
+
+
 async def handshake(
     socket_path: str, payload: dict
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str, dict]:
@@ -898,6 +948,19 @@ async def handshake(
 
     msg_type = resp.get("type")
     if msg_type == "registered":
+        expected_generation = payload.get("stub_code_fingerprint")
+        if isinstance(expected_generation, str) and expected_generation:
+            daemon_generation = resp.get("fingerprint")
+            if not isinstance(daemon_generation, str) or not daemon_generation:
+                await _safe_close(writer)
+                raise StaleGenerationError(
+                    "gateway did not report its code fingerprint; using direct execution"
+                )
+            if daemon_generation != expected_generation:
+                await _safe_close(writer)
+                raise StaleGenerationError(
+                    "gateway code fingerprint does not match this stub; using direct execution"
+                )
         return reader, writer, payload["stub_uuid"], resp
     await _safe_close(writer)
     if msg_type == "rejected":
@@ -2069,6 +2132,25 @@ async def _reconnect(
             reader, writer, _uuid, registered = await asyncio.wait_for(
                 handshake(socket_path, payload), timeout=_HANDSHAKE_TIMEOUT_SECS
             )
+        except StaleGenerationError as exc:
+            # Caught BEFORE the transient arm below, which it would otherwise
+            # match as a plain FallbackRequestedError. The daemon that answered
+            # is up and of another code generation -- the endpoint a reconnect
+            # binds to need not be the one this stub first registered with --
+            # and it will answer every later attempt the same way, so this is
+            # the refusal the docstring names, not an outage. Cold start
+            # degrades to a per-session exec; here ``initialize`` is long
+            # consumed, so the honest move is the terminal exit, exactly as for
+            # the two capability refusals below. ``handshake`` already closed
+            # the connection.
+            logger.warning(
+                "stub reconnect: handshake refused the new gateway generation "
+                "(%s); terminal, not retried -- a daemon of another generation "
+                "keeps answering that way pool=%s",
+                exc.reason,
+                pool_label,
+            )
+            return None
         except (asyncio.TimeoutError, FallbackRequestedError) as exc:
             now = _reconnect_now()
             logger.info(
@@ -2557,6 +2639,104 @@ def _fallback_spawn_child(argv: list[str], exec_env: dict[str, str]) -> NoReturn
     os._exit(_child_exit_status(rc))
 
 
+def _fallback_target_is_own_control_plane(
+    args: argparse.Namespace, target_args: list[str], exec_env: Mapping[str, str]
+) -> bool:
+    """Whether the process this fallback is about to exec is Kiro Crew's own control plane.
+
+    Delegates to the check gatewayd runs before it hands a pooled backend the
+    session token (``_spawns_own_control_plane``): the server name must be a
+    control plane, the binary must be the managed invocation's by real path, the
+    args must match exactly, the child env must carry no loader or ``PYTHON*``
+    overlay, and no import root may shadow ``kiro_crew``. The server NAME alone is
+    never trusted.
+
+    The env it judges is the one the child really gets, with exactly one
+    allowance: Kiro Crew's own UTF-8 pinning (``platform_compat._UTF8_PROCESS_ENV``)
+    is dropped when its value is the pinned one. The runtime sets those two
+    ``PYTHON*`` keys on every process it starts, so they reach this stub from
+    kiro-cli, and gatewayd likewise applies them only after its verdict. Any
+    other value for those keys still counts. The cwd judged is this process's,
+    because ``exec`` inherits it.
+
+    Fails closed: any error means "not ours", which is the behaviour before this
+    check existed.
+
+    A refusal leaves a record here, on the stub's own stderr: a reserved name
+    that loses the token presents later only as every policy-reading tool
+    answering ``identity_unattested``, and the vetting's own log line lands in
+    the daemon's logger wording ("spawned ... will answer 403"), which does not
+    name this fallback. A third-party target is the ordinary answer and stays
+    silent. Neither line ever carries the token or an env value.
+
+    The name is tested FIRST, against the leaf ``KIROCREW_BIN_MCP_SERVERS`` the
+    daemon's own ``CONTROL_PLANE_BACKENDS`` is built from, and only a Crew name
+    reaches the import below. The fallback runs for EVERY stubbed server while
+    gatewayd is down, and the token is always in a stub's env, so importing
+    gatewayd here unconditionally would pull its whole module graph (and run its
+    module-level SSL setup) into every third-party fallback that the vetting
+    then refuses on its first line anyway.
+    """
+    server_name = str(getattr(args, "server", "") or "")
+    if server_name not in KIROCREW_BIN_MCP_SERVERS:
+        return False
+    try:
+        # circular import: gatewayd imports this stub; defer its heavy daemon
+        # dependencies to the rare fallback path, off the timed cold start.
+        from kiro_crew.mcp_gateway.gatewayd import _spawns_own_control_plane
+        from kiro_crew.platform_compat import _UTF8_PROCESS_ENV
+
+        verdict_env = {
+            key: value
+            for key, value in exec_env.items()
+            if key != STUB_SESSION_TOKEN_ENV and _UTF8_PROCESS_ENV.get(key) != value
+        }
+        denial: list[str] = []
+        ours = bool(
+            _spawns_own_control_plane(
+                server_name,
+                str(getattr(args, "target_command", "") or ""),
+                list(target_args),
+                env=verdict_env,
+                work_dir=os.getcwd(),
+                denial=denial,
+            )
+        )
+    except Exception:
+        # The vetting itself broke (an import, a signature, a config read), which
+        # is not a verdict: say so above DEBUG, or a drift here silently returns
+        # every control-plane fallback to the tokenless behaviour this fixed.
+        logger.warning(
+            "fallback: control-plane vetting of %r raised; dropping the session token",
+            server_name,
+            exc_info=True,
+        )
+        return False
+    if not ours:
+        # Only a Crew name reaches here, so a False verdict is a refusal of a
+        # reserved name, never the ordinary third-party answer.
+        logger.warning(
+            "fallback: %r is a control-plane name but gatewayd's vetting refused it, so "
+            "the direct backend runs without the session token (%s); every tool that "
+            "reads the session's policy will answer identity_unattested",
+            server_name,
+            "; ".join(denial) or "no reason recorded",
+        )
+    return ours
+
+
+def _fallback_user_site_holds_our_package() -> bool:
+    """gatewayd's user-site probe, failing toward disabling user-site."""
+    try:
+        # circular import: gatewayd imports this stub; defer its heavy daemon
+        # dependencies to the rare fallback path, off the timed cold start.
+        from kiro_crew.mcp_gateway.gatewayd import _user_site_holds_our_package
+
+        return bool(_user_site_holds_our_package())
+    except Exception:
+        return False
+
+
 def fallback_exec(args: argparse.Namespace) -> None:
     """Replace the current process with the real MCP backend. ``execvpe``
     never returns on success; a return raises so the caller surfaces a
@@ -2570,16 +2750,25 @@ def fallback_exec(args: argparse.Namespace) -> None:
     # otherwise reads only for PoolKey hashing. On this fallback path we exec
     # the real backend directly, so it must run with its declared env to match
     # the non-pooled baseline — the daemon's own environment lacks it.
+    session_token = os.environ.get(STUB_SESSION_TOKEN_ENV, "")
     exec_env = dict(os.environ)
-    # Never hand the backend this session's stub token. It is a bearer name for
-    # the session's identity at gatewayd, and the process about to replace this
-    # one is the operator's third-party server binary — which on a later gateway
-    # start could register with it and be answered as this session. Its own
-    # declared env is restored below; this one value was never part of it. The
-    # non-fallback path is unaffected: gatewayd spawns backends from its OWN
-    # environment, so the token has never reached one there.
-    exec_env.pop(STUB_SESSION_TOKEN_ENV, None)
     exec_env.update(_parse_env_file(getattr(args, "env_file", "") or ""))
+    # The token is a bearer name for this session's identity. A third-party
+    # server binary must never inherit it: on a later gateway start it could
+    # register with it and be answered as this session. Kiro Crew's OWN control
+    # plane is the opposite case: the token exists for it, and without it every
+    # tool call that reads the session's policy is refused identity_unattested
+    # wherever the kernel peer check cannot name the session (a runtime hosting
+    # several sessions, or a TCP connection). So keep it only when the target
+    # passes the same vetting gatewayd applies before it hands a pooled backend
+    # the token, and drop it for anything else.
+    exec_env.pop(STUB_SESSION_TOKEN_ENV, None)
+    if session_token and _fallback_target_is_own_control_plane(args, target_args, exec_env):
+        exec_env[STUB_SESSION_TOKEN_ENV] = session_token
+        # Same defense in depth gatewayd applies to an accepted control plane.
+        exec_env["PYTHONSAFEPATH"] = "1"
+        if not _fallback_user_site_holds_our_package():
+            exec_env["PYTHONNOUSERSITE"] = "1"
     if platform_compat.IS_WINDOWS:
         _fallback_spawn_child(argv, exec_env)
     # exec IS this fallback stub's whole purpose: when the gateway is

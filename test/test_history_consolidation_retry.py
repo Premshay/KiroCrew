@@ -423,7 +423,7 @@ async def test_a_refused_hold_after_the_first_commit_marks_the_span(
         from kiro_crew import history_consolidation
 
         rows = log.read_messages(KEY)
-        limit = sum(len(history_consolidation._fmt_message(row)) for row in rows[:2])
+        limit = len("\n".join(history_consolidation._fmt_message(row) for row in rows[:2]))
         monkeypatch.setattr(history_consolidation, "_CONSOLIDATION_CHUNK_MAX_CHARS", limit)
     processed = 2 if chunked else 3
     c = _make_consolidator(log)
@@ -1038,7 +1038,7 @@ def member_receipt_case(tmp_path, monkeypatch, request):
             history_consolidation, "_CONSOLIDATION_OVERSIZED_MESSAGE_MAX_CHARS", 120
         )
         rendered = history_consolidation._consolidation_chunk(log.read_messages(KEY))
-        limit = sum(len(history_consolidation._fmt_message(row)) for row in rendered[:2])
+        limit = len("\n".join(history_consolidation._fmt_message(row) for row in rendered[:2]))
         monkeypatch.setattr(history_consolidation, "_CONSOLIDATION_CHUNK_MAX_CHARS", limit)
         c = _make_consolidator(log, vector_store=vectors)
         monkeypatch.setattr(execution_context, "read_session_execution", lambda key: execution)
@@ -1144,18 +1144,25 @@ async def test_member_receipt_reports_rejected_acknowledgement(member_receipt_ca
 
 
 def _span(
-    log: ConversationLog, total: int | None = None, key: str = KEY
+    log: ConversationLog,
+    total: int | None = None,
+    key: str = KEY,
+    prompted: int | None = None,
 ) -> history_mod.AttemptedSpan:
     """The span identity a turn over the CURRENT transcript would attempt.
 
     Mirrors what ``_consolidate`` freezes from its pre-turn snapshot, so a test
     charging a failure by hand stamps the same identity production would.
+    *prompted* defaults to the whole tail — the unsplit case, where one prompt
+    carried every unconsolidated message.
     """
     meta = log.get_metadata(key)
+    extent = _total(log, key) if total is None else total
     return history_mod.AttemptedSpan(
-        total=_total(log, key) if total is None else total,
+        total=extent,
         generation=int(meta.get("rotation_generation", 0) or 0),
         offset=int(meta.get("last_consolidated", 0) or 0),
+        prompted=extent if prompted is None else prompted,
     )
 
 
@@ -2026,10 +2033,20 @@ class TestRotationReleasesTheBudgetForNewContent:
             c.retry_eligible(KEY) is True
         ), "a rotation left the session permanently unable to consolidate"
 
+        # Each of these rows is megabytes wide, so the prompt budget puts one
+        # message in front of the model per pass. Drive the passes to a fixed
+        # point rather than asserting on one: what the rotation released is that
+        # the tail CAN be consolidated, and a bounded pass reaches that over
+        # successive turns. The pass cap is what proves it terminates.
+        passes = 0
         with patch.object(
             c, "_call_llm", AsyncMock(return_value={"history_entry": "after rotation"})
         ):
-            await c._consolidate(KEY, include_history=True)
+            while log.unconsolidated_count(KEY) and passes < 20:
+                before = log.unconsolidated_count(KEY)
+                await c._consolidate(KEY, include_history=True)
+                assert log.unconsolidated_count(KEY) < before, "a pass consolidated nothing"
+                passes += 1
 
         assert log.unconsolidated_count(KEY) == 0, "post-rotation content never consolidated"
         assert "consolidation_attempts" not in log.get_metadata(KEY)

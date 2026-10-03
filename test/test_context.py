@@ -2025,7 +2025,8 @@ class TestMemoryGetContextQueryWiring:
             get_episodic_context=lambda query_text, cap: "",
             get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda query_text="", cap=0: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None, recall_query=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            startup_lesson_query=lambda query_text: None,
             has_any_lesson=lambda: True,
         )
         builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
@@ -2046,7 +2047,8 @@ class TestMemoryGetContextQueryWiring:
             get_episodic_context=lambda query_text, cap: "",
             get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda query_text="", cap=0: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None, recall_query=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            startup_lesson_query=lambda query_text: None,
             has_any_lesson=lambda: False,
         )
         builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
@@ -2091,7 +2093,8 @@ class TestMemoryGetContextQueryWiring:
             get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
             get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda query_text="", cap=0: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None, recall_query=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            startup_lesson_query=lambda query_text: None,
             has_any_lesson=lambda: True,
         )
         msg, _ = builder.build_message("q", True, "s1")
@@ -2116,7 +2119,8 @@ class TestMemoryGetContextQueryWiring:
             get_episodic_context=_episodic,
             get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda query_text="", cap=0: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None, recall_query=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            startup_lesson_query=lambda query_text: None,
             has_any_lesson=lambda: True,
         )
         builder.build_message("find my tokyo notes", True, "s2")
@@ -2135,7 +2139,8 @@ class TestMemoryGetContextQueryWiring:
             get_episodic_context=lambda query_text, cap: "",
             get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda query_text="", cap=0: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None, recall_query=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            startup_lesson_query=lambda query_text: None,
             has_any_lesson=lambda: True,
         )
         huge = "ACTIVITY-FILLER " * 10_000
@@ -2306,7 +2311,8 @@ class TestDurableModelVersionLessonContext:
             get_episodic_context=lambda query_text, cap: "",
             get_semantic_context=lambda query_text, cap, facts_only=False: "",
             get_preferences_context=lambda query_text="", cap=0: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None, recall_query=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            startup_lesson_query=lambda query_text: None,
             has_any_lesson=lambda: False,
         )
         assert builder.lessons.save(Lesson(ts="t", rule=self.RULE, category="tool")) == "inserted"
@@ -2446,3 +2452,12 @@ class TestKeepVisibleMarkerRule:
         clause = "Prefer restructuring the turn so the deliverable IS its last message"
         assert clause in _CRITICAL_RULES
         assert clause not in _CRITICAL_RULES_CHANNEL
+
+
+def test_critical_rules_forbid_assuming_a_persons_gender():
+    """A named person whose pronouns were never given is not called "he"."""
+    from kiro_crew.context import _CRITICAL_RULES, _CRITICAL_RULES_CHANNEL
+
+    rule = "Do not assume anyone's gender."
+    assert rule in _CRITICAL_RULES
+    assert rule in _CRITICAL_RULES_CHANNEL

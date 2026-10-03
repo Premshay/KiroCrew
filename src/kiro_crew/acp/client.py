@@ -2,7 +2,8 @@
 
 Protocol (ACP JSON-RPC 2.0):
   initialize → session/new → session/set_mode → session/set_model → session/prompt
-  (claude backend: skips set_mode and uses session/set_config_option for model)
+  (claude backend: no agent activation via set_mode -- its modes are permission
+  modes, not agents -- and session/set_config_option for model)
 
 Agent selection: ``session/set_mode`` with ``modeId`` activates the agent
 config (prompt, tools, resources).  MCP servers are passed explicitly
@@ -144,11 +145,13 @@ from kiro_crew.acp.transport_errors import (
     sandbox_init_failure,
 )
 from kiro_crew.acp.transport_framing import (
-    _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
     _STDOUT_BUFFER_LIMIT,
+    RequestWriteResult,
+    _stall_window_phrase,
     response_write_window_secs,
     settle_drain,
     write_notification_best_effort,
+    write_request_frame_bounded,
     write_response_frame_bounded,
 )
 from kiro_crew.acp.types import (
@@ -2370,8 +2373,9 @@ def _claude_settings_usable(path: Path) -> bool:
     ``work_dir`` is routinely a checked-out project, so this path is attacker-
     influenced: a repository can ship
     ``.claude/settings.local.json -> ~/.aws/credentials`` (or a ``.claude``
-    directory that is itself a link). Crew never reads or rewrites an existing
-    file here, so the exposure is the CREATE: a dangling link is absent to
+    directory that is itself a link). Crew never rewrites an existing file here,
+    and reads one only for its deny rules without following a link, so the
+    exposure is the CREATE: a dangling link is absent to
     ``exists()`` yet writing it materializes Crew's settings at the link's target,
     and a ``.claude`` directory that is itself a link puts the whole write
     somewhere the project does not own.
@@ -2401,6 +2405,183 @@ def _claude_settings_usable(path: Path) -> bool:
         # directory is one ``ln -s`` away from.
         return False
     return not is_sensitive_path(str(real))
+
+
+#: The only filesystem setting source a claude session loads when the project owns
+#: its own ``settings.local.json``. Sent as ``_meta.claudeCode.options.settingSources``,
+#: which claude-agent-acp spreads over its own ``["user", "project", "local"]``
+#: default. Neither project tier loads: not ``local`` (the project's own file) and
+#: not ``project`` (a checked-in ``.claude/settings.json``), so no rule a repository
+#: carries can pre-approve a Crew tool.
+_CLAUDE_CREW_GOVERNED_SETTING_SOURCES: tuple[str, ...] = ("user",)
+
+#: The permission mode Crew pins on such a session before its first prompt. It asks
+#: the host about every call Crew's own settings do not deny.
+_CLAUDE_PINNED_MODE = "default"
+
+#: Starting modes that APPROVE Crew's MCP calls without asking the host, and so are
+#: pinned away. ``bypassPermissions`` skips every prompt; ``auto`` lets Claude's own
+#: classifier approve them. Every other mode is left as the session started it:
+#: ``plan`` is stricter than ``default``, ``acceptEdits`` auto-approves only file
+#: edits, never an MCP call, and ``dontAsk`` refuses every call that is not
+#: pre-approved (the SDK's own contract: "deny if not pre-approved"), so it runs
+#: nothing ``default`` would not.
+_CLAUDE_GATE_ESCAPING_MODES = frozenset({"bypassPermissions", "auto"})
+
+#: The project settings files whose ``permissions.deny`` the exclusion carries
+#: inline: the project's own ``settings.local.json`` and a checked-in
+#: ``settings.json``, both under ``<work dir>/.claude``. Leaving their tiers out
+#: must drop their allows, not their denies.
+_CLAUDE_PROJECT_SETTINGS_FILES: tuple[str, ...] = ("settings.local.json", "settings.json")
+
+#: The oldest claude-agent-acp verified to honour ``_meta.claudeCode.options``
+#: ``settingSources``: 0.84.0 spreads those options over its own
+#: ``["user", "project", "local"]`` default (``dist/acp-agent.js``). Below it, or
+#: when the adapter reports no ``agentInfo.version``, a project-owned file is NOT
+#: left out: the adapter could load its ``permissions.allow`` anyway, so the session
+#: keeps the array withheld.
+CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION = (0, 84, 0)
+
+
+def _claude_adapter_honours_setting_sources(agent_version: str) -> bool:
+    """Whether *agent_version* is at or above the ``settingSources`` floor."""
+    # Bounded digit runs: the version is adapter-reported, and ``int()`` refuses a
+    # run past the interpreter's digit limit with ``ValueError``.
+    match = re.match(r"(\d{1,9})\.(\d{1,9})\.(\d{1,9})(?!\d)", agent_version or "")
+    if not match:
+        return False
+    found = tuple(int(part) for part in match.groups())
+    return found >= CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION
+
+
+def _claude_adapter_installed_version(argv: list[str]) -> str:
+    """The ``version`` in the package.json of the claude-agent-acp *argv* runs, or ``""``.
+
+    Read before spawn so the settings writer can apply the ``settingSources``
+    floor before the session's MCP array is first resolved, rather than after
+    the handshake. Only a manifest named :data:`CLAUDE_ACP_NPM_PKG` counts; a
+    wrapper or an override that names something else answers ``""``, which the
+    floor reads as below it. Blocking (small file reads); callers run it off the
+    loop. The handshake's ``agentInfo.version`` is still checked before the first
+    prompt.
+    """
+    for element in argv:
+        try:
+            here = Path(os.path.realpath(element))
+        except (OSError, ValueError):
+            continue
+        if not here.is_file():
+            continue
+        shim_roots = [here.parent / "node_modules"]
+        if here.parent.name == ".bin":
+            shim_roots.append(here.parent.parent)
+        candidates = [root / CLAUDE_ACP_NPM_PKG / "package.json" for root in shim_roots]
+        candidates += [d / "package.json" for d in list(here.parents)[:4]]
+        for manifest in candidates:
+            try:
+                if manifest.stat().st_size > 1 << 20:
+                    continue
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError, RecursionError):
+                continue
+            if isinstance(data, dict) and data.get("name") == CLAUDE_ACP_NPM_PKG:
+                version = data.get("version")
+                return version.strip() if isinstance(version, str) else ""
+    return ""
+
+
+#: Project settings keys that RESTRICT a session but cannot be carried inline:
+#: a ``PreToolUse`` hook can also return ``allow``, and ``sandbox`` carries
+#: ``autoAllowBashIfSandboxed``, so either would reopen a pre-approval channel.
+#: A project file that sets one keeps its tiers loaded and the array withheld.
+_CLAUDE_PROJECT_UNCARRIED_GUARD_KEYS: tuple[str, ...] = ("hooks", "sandbox")
+
+#: The ``permissions`` lists of a project settings file that RESTRICT a session and
+#: so ride inline when its tier is left out: ``deny`` refuses a call, ``ask``
+#: forces a prompt even where an allow would pre-approve it. Merging either into
+#: Crew's inline settings can only narrow what runs.
+_CLAUDE_CARRIED_PERMISSION_KEYS: tuple[str, ...] = ("deny", "ask")
+
+#: Ceiling on a project settings file read only to collect its deny rules.
+_CLAUDE_PROJECT_SETTINGS_MAX_BYTES = 1 << 20
+
+
+def _project_settings_restrictions(path: Path) -> list[tuple[str, str]] | None:
+    """The ``(kind, rule)`` pairs a project settings file restricts with.
+
+    ``kind`` is a key of :data:`_CLAUDE_CARRIED_PERMISSION_KEYS`: a
+    ``permissions.deny`` rule refuses a call, a ``permissions.ask`` rule forces
+    a prompt even where an allow would pre-approve it.
+
+    Read only so the exclusion can carry them inline; nothing else in the file is
+    used, and the file is never written. ``[]`` for an absent file, one with no
+    such rules, or one whose content claude itself could not take rules from
+    (not JSON, not an object, a ``permissions``, ``deny`` or ``ask`` of the
+    wrong type): carrying nothing from it drops nothing the CLI would have enforced.
+    ``None`` -- the caller then withholds the array -- when the bytes cannot be
+    examined at all (a link, a non-regular or oversized file, a read error, or
+    JSON nested too deeply for this parser), or when the file sets a key in
+    :data:`_CLAUDE_PROJECT_UNCARRIED_GUARD_KEYS`, whose restriction leaving the
+    tier out would drop.
+
+    Bounded and non-blocking like :meth:`AcpClient._settings_path_holds`: the
+    path is attacker-influenced, so ``O_NOFOLLOW`` and ``O_NONBLOCK`` on the open
+    and a size ceiling on the read. A file that changes after this read can only
+    have GAINED a rule Crew did not carry; it can never add an allow, because the
+    tier still does not load.
+    """
+    try:
+        if path.is_symlink():
+            return None
+    except OSError:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _CLAUDE_PROJECT_SETTINGS_MAX_BYTES:
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        while total <= _CLAUDE_PROJECT_SETTINGS_MAX_BYTES:
+            chunk = os.read(fd, _CLAUDE_PROJECT_SETTINGS_MAX_BYTES + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > _CLAUDE_PROJECT_SETTINGS_MAX_BYTES:
+            return None
+        raw = b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return []
+    except RecursionError:
+        # Valid JSON nested past Python's parser depth: claude's own parser may
+        # still take deny rules from it, so it cannot be read as having none.
+        return None
+    if isinstance(data, dict) and any(
+        data.get(key) for key in _CLAUDE_PROJECT_UNCARRIED_GUARD_KEYS
+    ):
+        return None
+    permissions = data.get("permissions") if isinstance(data, dict) else None
+    if not isinstance(permissions, dict):
+        return []
+    found: list[tuple[str, str]] = []
+    for kind in _CLAUDE_CARRIED_PERMISSION_KEYS:
+        rules = permissions.get(kind)
+        if isinstance(rules, list):
+            found.extend((kind, rule) for rule in rules if isinstance(rule, str))
+    return found
 
 
 def _resolve_ssh_auth_sock(env: dict[str, str]) -> None:
@@ -3588,6 +3769,11 @@ class AcpClient:
         # apart from _claude_settings_authored on purpose: this session did not write
         # the file and must never delete it. Only _permission_surface_governed reads it.
         self._claude_settings_governed = False
+        # True while the project owns settings.local.json and this session leaves
+        # that file out of its setting sources, carrying Crew's settings inline in
+        # ``_claude_inline_settings`` instead -- see _exclude_foreign_local_settings.
+        self._claude_local_settings_excluded = False
+        self._claude_inline_settings: dict[str, Any] | None = None
         # The exact bytes this session last wrote to that path, held as the str
         # whose utf-8 encoding IS those bytes -- the writer emits binary so no
         # newline translation can come between the two on any platform. Creating
@@ -3845,6 +4031,9 @@ class AcpClient:
         # messageId -> (text streamed so far, number of deltas seen); see
         # _is_replayed_message. Cleared per connection alongside _turn_done.
         self._streamed_by_message_id: OrderedDict[str, tuple[str, int]] = OrderedDict()
+        # Whether ``_agent_version`` has been read off a handshake at all, so an
+        # adapter that reported NO version is told apart from one not yet asked.
+        self._agent_version_read = False
         # Models advertised by the backend in the session/new (or session/load)
         # response. claude-agent-acp returns the real versioned Claude list
         # (Opus 4.8/4.7, Sonnet 4.6, …); kiro-cli returns its own. Captured so
@@ -3974,6 +4163,12 @@ class AcpClient:
         self._jsonl_pos: int = 0  # track read position in session JSONL for tool results
         self._stderr_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._last_activity: float = time.monotonic()
+        # Set when a request write stalls (``_write_request_bounded``): the child
+        # stopped reading stdin and may still read a buffered frame. The client
+        # then reads as neither responsive nor mid-turn, and the next
+        # ``ensure_ready`` kills it before spawning a replacement, so no new
+        # prompt is ever appended behind the stalled one.
+        self._stdin_stalled = False
         # Idle == done. An idle client (spawned, no prompt sent yet) must read
         # as NOT in a turn: has_active_turn() is the 409 turn_in_flight gate
         # on set-model / set-agent, so an unset Event on a live warm process
@@ -4299,6 +4494,14 @@ class AcpClient:
         # so ``owned`` is always False there, and reading it as a refusal would
         # strip every tool from every session on those hosts.
         self._session_mcp_withheld = self._seeds_local_settings and not owned
+        # Recorded BEFORE the projection reads the governed flag, and beside the
+        # array it authorizes: the session/new envelope reads this record, so an
+        # array delivered under the exclusion always ships with it.
+        excludes_local = bool(getattr(self, "_claude_local_settings_excluded", False))
+        self._session_mcp_excludes_local = excludes_local
+        self._session_mcp_inline_settings = (
+            getattr(self, "_claude_inline_settings", None) if excludes_local else None
+        )
         # The STRUCTURED face rather than the wire one, for every mirror alike: two
         # things can come out of the one spec parse and only one of them is wire
         # data -- the array, and a per-tool deny set this client enforces at the
@@ -4821,54 +5024,6 @@ class AcpClient:
             f"Backend {self.backend!r} cannot enforce a tool whitelist before execution"
         )
 
-    def _claude_session_meta(self) -> dict[str, Any]:
-        """Return the adapter extension requested on every Claude session bind."""
-        options: dict[str, Any] = {}
-        if self._allowed_tools is not None:
-            # SDK `tools` removes built-ins before execution; `allowedTools`
-            # only pre-approves them and cannot constrain bypassPermissions.
-            options.update(
-                tools=list(self._allowed_tools),
-                strictMcpConfig=True,
-                disallowedTools=["mcp__*"],
-            )
-        # Asks for the roster the adapter will actually be handed, which is the
-        # thing this decision is about. The former test read the TRANSLATION twice
-        # -- ``_claude_session_mcp_servers`` returns exactly what
-        # ``_translated_session_mcp_servers`` does -- so it missed every session
-        # whose profile arrives as pooled stubs or the capability server with
-        # nothing surviving translation. Those sessions DO receive a complete Crew
-        # profile, and they were the ones left discovering the user's registry on
-        # top of it: the browser/filesystem/research fleet this exists to prevent.
-        # An empty roster still leaves the key unset, so a session Crew withheld
-        # tools from keeps the adapter's own sources -- the disclosed fallback.
-        if self._session_mcp_servers():
-            # The explicit ACP list above is the complete KiroCrew profile. Do
-            # not also discover the user's interactive MCP registry, or every
-            # dashboard worker recreates its browser/filesystem/research fleet.
-            # Project/local settings remain available for task-owned policy.
-            options["settingSources"] = ["project", "local"]
-        return {
-            "claudeCode": {
-                "options": options,
-                "emitRawSDKMessages": [
-                    *(
-                        {"type": "user", "origin": origin}
-                        for origin in sorted(_CLAUDE_AUTONOMOUS_ORIGINS)
-                    ),
-                    {"type": "assistant"},
-                    # Every result, not only autonomous ones: the end of a
-                    # between-turn stretch is what flushes its closing prose.
-                    {"type": "result"},
-                    # The background-task lifecycle, so the idle sweep can tell
-                    # a session waiting on its own task from an abandoned one.
-                    *(
-                        {"type": "system", "subtype": subtype}
-                        for subtype in sorted(_CLAUDE_TASK_LIFECYCLE_SUBTYPES)
-                    ),
-                ],
-            }
-        }
 
     def _session_mcp_servers(self) -> list[dict[str, Any]]:
         """Build one deduplicated MCP roster for an ACP session bind.
@@ -5764,11 +5919,18 @@ class AcpClient:
         a file already observed to be someone else's, never that Crew governs it.
         ``getattr`` on both governed flags because tests build clients without
         ``__init__``.
+
+        A third shape governs without the file: the project owns it, and this
+        session leaves it out of its setting sources
+        (``_claude_local_settings_excluded``, see
+        :meth:`_exclude_foreign_local_settings`). Its ``permissions.allow`` then
+        never loads, so it cannot pre-approve a tool either.
         """
         return (
             getattr(self, "_claude_settings_authored", False)
             or getattr(self, "_permission_surface_share_validated", False)
             or getattr(self, "_claude_settings_governed", False)
+            or getattr(self, "_claude_local_settings_excluded", False)
         )
 
     def _invalidate_session_mcp_projection(self) -> None:
@@ -6011,6 +6173,309 @@ class AcpClient:
                 pinned_fs.unlink_verified_by_name(local_settings.parent, taken[0].name, taken[1])
         self._restore_aside_without_clobber(reseed_aside[0], local_settings, reseed_aside[1])
 
+    def _exclude_foreign_local_settings(self, local_settings: Path, payload: str) -> bool:
+        """Leave a project-owned ``settings.local.json`` out of this session.
+
+        The project's file stays exactly as it is: never written, and read only
+        for its ``permissions.deny`` and ``permissions.ask`` rules (below), never
+        for its mode. The
+        session loads only the ``user`` setting source and carries Crew's
+        payload inline as ``options.settings`` (the flag tier). Neither the
+        project's ``settings.local.json`` nor a checked-in
+        ``.claude/settings.json`` reaches the CLI, so no ``permissions.allow`` a
+        repository carries can pre-approve a call before Crew's gate sees it.
+        That is what lets the session carry Crew's tools.
+
+        One thing a file still decides: claude-agent-acp picks the STARTING
+        permission mode from every settings file itself, and a file can change
+        between any check here and ``session/new``. So nothing here trusts the
+        file's mode. :meth:`_pin_claude_starting_mode` reads back the mode the
+        session actually started in and pins :data:`_CLAUDE_PINNED_MODE` before
+        the first prompt, or stops the session.
+
+        Leaving the project tiers out must not drop what they REFUSE. So the
+        ``permissions.deny`` and ``permissions.ask`` rules of both project files
+        are read (bounded, never
+        through a link, see :func:`_project_settings_restrictions`) and carried inline
+        beside Crew's own. A file that changes after that read can only have
+        gained a restriction; its allows never load either way. Project ``hooks`` and
+        ``sandbox`` settings cannot be carried without reopening an approval
+        channel, so a project file that sets either refuses the exclusion.
+
+        Refused, keeping the array withheld, when this session asked for a
+        permission mode of its own (the pin sets only the asking mode), when
+        a project file cannot be examined or sets ``hooks`` or ``sandbox``, or
+        when the adapter that
+        answered the handshake is below
+        :data:`CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION` or reported no version.
+        Before the handshake the floor is read from the installed package's own
+        version, so the decision is made before the MCP array is first resolved;
+        :meth:`_pin_claude_starting_mode` checks the handshake's version too.
+
+        Returns whether the exclusion was taken.
+        """
+        if self._claude_adapter_below_setting_sources_floor():
+            self._log_claude_adapter_below_floor(local_settings)
+            return False
+        if getattr(self, "_permission_mode", None):
+            logger.warning(
+                "%s belongs to the project and this session requested permission mode "
+                "%r, which cannot be pinned without that file; the session runs without "
+                "Crew's MCP tools.",
+                local_settings,
+                self._permission_mode,
+            )
+            return False
+        try:
+            inline = json.loads(payload)
+        except ValueError:
+            return False
+        if not isinstance(inline, dict):
+            return False
+        project_rules: list[tuple[str, str]] = []
+        for name in _CLAUDE_PROJECT_SETTINGS_FILES:
+            found = _project_settings_restrictions(local_settings.parent / name)
+            if found is None:
+                logger.warning(
+                    "%s belongs to the project and %s could not be examined, or sets "
+                    "hooks or sandbox settings, so leaving the project tiers out could "
+                    "drop a restriction; the session runs without Crew's MCP tools.",
+                    local_settings,
+                    local_settings.parent / name,
+                )
+                return False
+            project_rules.extend(found)
+        if project_rules:
+            permissions = inline.setdefault("permissions", {})
+            if not isinstance(permissions, dict):
+                return False
+            for kind in _CLAUDE_CARRIED_PERMISSION_KEYS:
+                current = permissions.get(kind)
+                merged = list(current) if isinstance(current, list) else []
+                merged.extend(r for k, r in project_rules if k == kind and r not in merged)
+                if merged:
+                    permissions[kind] = merged
+        self._claude_inline_settings = inline
+        self._claude_local_settings_excluded = True
+        logger.warning(
+            "%s belongs to the project; leaving it untouched and out of this session's "
+            "setting sources, with Crew's settings and the project's %d deny/ask rule(s) "
+            "carried inline instead. The project tiers do not load otherwise, so this "
+            "session runs without the repository's env, plugins and CLAUDE.md.",
+            local_settings,
+            len(project_rules),
+        )
+        return True
+
+    def _claude_adapter_below_setting_sources_floor(self) -> bool:
+        """Whether the adapter may ignore ``settingSources``.
+
+        After a handshake, judged on the ``agentInfo.version`` it reported. Before
+        one, on the installed package's own version, read by the claude spawn arm
+        before the settings writer runs (``_claude_adapter_disk_version``). Unknown
+        reads as below the floor, so the exclusion is never taken on a guess.
+        """
+        if getattr(self, "_agent_version_read", False):
+            version = getattr(self, "_agent_version", "")
+        else:
+            version = getattr(self, "_claude_adapter_disk_version", "")
+        return not _claude_adapter_honours_setting_sources(version)
+
+    def _log_claude_adapter_below_floor(self, local_settings: Path) -> None:
+        floor = ".".join(str(part) for part in CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION)
+        logger.warning(
+            "%s belongs to the project and claude-agent-acp reported version %r, not "
+            "verified to honour settingSources (needs %s or newer), so the file cannot "
+            "be left out; the session runs without Crew's MCP tools. Upgrade with "
+            "'npm i -g %s'.",
+            local_settings,
+            _scrub_observed(getattr(self, "_agent_version", "")),
+            floor,
+            CLAUDE_ACP_NPM_PKG,
+        )
+
+    def _claude_session_meta(self) -> dict[str, Any]:
+        """The ``_meta`` envelope for a claude ``session/new`` or ``session/load``.
+
+        An explicit Crew roster loads only governed project and local settings.
+        When a project-owned ``settings.local.json`` is excluded, no setting
+        sources load; Crew's payload rides ``settings``, and ``allowDangerouslySkipPermissions``
+        is off so no settings file can start the session in
+        ``bypassPermissions``. The exclusion is read from the
+        projection's record as well as the live flag, so an array delivered
+        under it always ships beside it; excluding the tier is never the
+        widening direction.
+        """
+        options: dict[str, Any] = {}
+        if self._allowed_tools is not None:
+            # SDK `tools` removes built-ins before execution; `allowedTools`
+            # only pre-approves them and cannot constrain bypassPermissions.
+            options.update(
+                tools=list(self._allowed_tools),
+                strictMcpConfig=True,
+                disallowedTools=["mcp__*"],
+            )
+        excluded = getattr(self, "_claude_local_settings_excluded", False) or getattr(
+            self, "_session_mcp_excludes_local", False
+        )
+        if excluded:
+            options["settingSources"] = list(_CLAUDE_CREW_GOVERNED_SETTING_SOURCES)
+            options["allowDangerouslySkipPermissions"] = False
+            inline = getattr(self, "_claude_inline_settings", None)
+            if not isinstance(inline, dict):
+                inline = getattr(self, "_session_mcp_inline_settings", None)
+            if isinstance(inline, dict) and inline:
+                options["settings"] = dict(inline)
+        if self._session_mcp_servers():
+            # MERGE-REVIEW: an explicit Crew roster excludes the user's MCP
+            # registry; inline exclusion also omits both project setting tiers.
+            options["settingSources"] = [] if excluded else ["project", "local"]
+        # What this envelope ships, recorded as it is built: the session freezes
+        # these deny and ask rules at creation, and a later re-seed (``_reseed_after_capture``)
+        # moves the live inline settings without reaching the session.
+        settings = options.get("settings")
+        permissions = settings.get("permissions") if isinstance(settings, dict) else None
+        shipped: set[tuple[str, str]] = set()
+        for kind in _CLAUDE_CARRIED_PERMISSION_KEYS:
+            rules = permissions.get(kind) if isinstance(permissions, dict) else None
+            if isinstance(rules, list):
+                shipped.update((kind, rule) for rule in rules if isinstance(rule, str))
+        self._claude_shipped_restrictions = frozenset(shipped)
+        return {
+            "claudeCode": {
+                "options": options,
+                "emitRawSDKMessages": [
+                    *(
+                        {"type": "user", "origin": origin}
+                        for origin in sorted(_CLAUDE_AUTONOMOUS_ORIGINS)
+                    ),
+                    {"type": "assistant"},
+                    # Every result, not only autonomous ones: the end of a
+                    # between-turn stretch is what flushes its closing prose.
+                    {"type": "result"},
+                    # The background-task lifecycle, so the idle sweep can tell
+                    # a session waiting on its own task from an abandoned one.
+                    *(
+                        {"type": "system", "subtype": subtype}
+                        for subtype in sorted(_CLAUDE_TASK_LIFECYCLE_SUBTYPES)
+                    ),
+                ],
+            }
+        }
+
+
+    def _claude_session_excludes_local(self) -> bool:
+        """Whether this session's array was delivered under the exclusion."""
+        return bool(
+            getattr(self, "_claude_local_settings_excluded", False)
+            or getattr(self, "_session_mcp_excludes_local", False)
+        )
+
+    async def _verify_claude_project_denies_unchanged(self) -> None:
+        """Stop a session whose project files gained a restriction after it was read.
+
+        The deny and ask rules the exclusion carried were read by the writer, before
+        ``session/new``; the session froze them into its inline settings when it
+        was created. Re-reading both project files now, before the first prompt,
+        closes that window: every deny or ask rule either file holds must be among the ones
+        the envelope shipped (recorded by :meth:`_claude_session_meta` as it was
+        built, not re-derived: a re-seed since then never reached the session).
+        A file that gained one, or that cannot be examined now, stops the
+        harness. A change after this point is the residual the spec names: the
+        session's settings are fixed at creation, and the next session reads
+        the file again.
+        """
+        carried: frozenset[tuple[str, str]] = getattr(
+            self, "_claude_shipped_restrictions", frozenset()
+        )
+        directory = self._claude_local_settings_path().parent
+
+        def _gained() -> bool:
+            for name in _CLAUDE_PROJECT_SETTINGS_FILES:
+                found = _project_settings_restrictions(directory / name)
+                if found is None or not set(found) <= carried:
+                    return True
+            return False
+
+        if not await asyncio.to_thread(_gained):
+            return
+        await self._kill_process(force=True)
+        raise AcpError(
+            "a project .claude settings file gained deny or ask rules (or became unreadable) "
+            "while a claude session that leaves it out was starting; the session was "
+            "stopped so that no deny it carries goes unenforced"
+        )
+
+    async def _pin_claude_starting_mode(self, resp: dict) -> None:
+        """Hold a claude session that carries Crew's tools to the asking mode.
+
+        The mode is read back from the response, never from the file: the
+        ``modes.currentModeId`` claude-agent-acp returns is the mode the session
+        really started in, whatever the file held at any earlier moment. Only a
+        mode in :data:`_CLAUDE_GATE_ESCAPING_MODES`, or a response that names no
+        mode, is pinned: ``session/set_mode`` moves it to
+        :data:`_CLAUDE_PINNED_MODE`, and the call must succeed. A stricter or
+        narrower mode the operator chose (``plan``, ``acceptEdits``) is kept,
+        never widened. No prompt has run yet, so no tool call can happen in
+        between. A pin that fails stops the harness: the session never runs with
+        Crew's tools under a mode that approves on its own.
+
+        Runs only on the exclusion path (:meth:`_claude_session_excludes_local`),
+        the one shape this change opens. A session whose settings file Crew
+        wrote is not pinned: a user ``~/.claude`` mode reaching it is the
+        inherited-config gap the spec names, not something this path adds. The
+        exclusion is never taken when Crew requested a mode of its own, or when
+        the installed adapter is below :data:`CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION`;
+        if the adapter that answered the handshake reports a version below it
+        anyway, the session is stopped here. A session without the exclusion
+        gains no call (harness-parity H13).
+
+        Observed on claude-agent-acp 0.84.0
+        (``test/fixtures/claude_mode_pin/``): ``session/new`` and
+        ``session/load`` report ``modes.currentModeId`` (a project ``plan``
+        starts in ``plan``; a project ``auto`` is filtered and starts in
+        ``default``), and ``session/set_mode`` ``default`` answers ``{}`` from
+        ``auto``.
+
+        On the exclusion path the project files' deny and ask rules are first
+        re-read (:meth:`_verify_claude_project_denies_unchanged`), closing the
+        window between the writer's read and the session's creation.
+        """
+        if not self._claude_session_excludes_local():
+            return
+        if self._claude_adapter_below_setting_sources_floor():
+            # The installed package passed the floor, but the adapter that answered
+            # the handshake did not: it may have loaded the project tiers anyway.
+            await self._kill_process(force=True)
+            raise AcpError(
+                "the claude-agent-acp that answered the handshake is not verified to "
+                "honour settingSources, so a session that leaves the project's settings "
+                "out was stopped before its first prompt"
+            )
+        await self._verify_claude_project_denies_unchanged()
+        session_id = resp.get("sessionId") or self._session_id
+        modes = resp.get("modes")
+        current = modes.get("currentModeId") if isinstance(modes, dict) else None
+        if isinstance(current, str) and current not in _CLAUDE_GATE_ESCAPING_MODES:
+            return
+        logger.warning(
+            "claude session started in mode %r while carrying Crew's tools; "
+            "pinning %r before the first prompt",
+            _scrub_observed(current if isinstance(current, str) else ""),
+            _CLAUDE_PINNED_MODE,
+        )
+        try:
+            req_id = await self._send_request(
+                METHOD_SET_MODE, {"sessionId": session_id, "modeId": _CLAUDE_PINNED_MODE}
+            )
+            await self._wait_for_response(req_id, timeout=_INIT_TIMEOUT, method=METHOD_SET_MODE)
+        except (AcpError, AcpTimeoutError) as exc:
+            await self._kill_process(force=True)
+            raise AcpError(
+                "could not pin the asking permission mode on a claude session that "
+                "carries Crew's tools; the session was stopped"
+            ) from exc
+
     def _log_declined_share(self, local_settings: Path) -> None:
         """Log that an existing settings file was left authoritative."""
         logger.info(
@@ -6161,6 +6626,9 @@ class AcpClient:
         # Re-derived by every run, never carried: the file a re-seed finds may no
         # longer be the sibling seed the last run matched against.
         self._claude_settings_governed = False
+        # Re-decided on every run; only the foreign-file branch below sets it.
+        self._claude_local_settings_excluded = False
+        self._claude_inline_settings = None
         if not _claude_settings_usable(local_settings):
             # A symlink, or a sensitive resolved target: creating the file would
             # follow the link and write Crew's settings through it. Left entirely
@@ -6297,11 +6765,15 @@ class AcpClient:
                 # Not byte-identical, but the permissions block may still be this
                 # session's: govern without writing, claiming, or ever removing it
                 # (see _seed_document_governs). Teardown never reads this flag.
+                # MERGE-REVIEW: retain validated fork permission-block sharing before
+                # upstream's inline exclusion, preserving project settings without a write.
                 if self._adopt_permission_block_governance(local_settings, payload):
                     return
-                # Crew authors none of the rest, so it touches none of them and
-                # reports that this session runs without Crew's seeded settings.
-                self._log_declined_share(local_settings)
+                # Crew authors none of the rest, so it touches none of them. The
+                # session can still carry Crew's settings inline and leave the
+                # file out; when it cannot, it runs without them and says so.
+                if not self._exclude_foreign_local_settings(local_settings, payload):
+                    self._log_declined_share(local_settings)
                 return
 
         # An adoption already holds the path's live slot, because ``claim`` above
@@ -6720,7 +7192,7 @@ class AcpClient:
 
     def is_responsive(self, stale_threshold: float = 600.0) -> bool:
         """True if process is alive AND has had I/O activity within threshold seconds."""
-        if not self._is_process_alive():
+        if not self._is_process_alive() or getattr(self, "_stdin_stalled", False):
             return False
         return (time.monotonic() - self._last_activity) < stale_threshold
 
@@ -7208,20 +7680,12 @@ class AcpClient:
         if probe_sid:
             policy = harness_for(self.backend).teardown
             try:
-                if policy.notification:
-                    frame = {
-                        "jsonrpc": "2.0",
-                        "method": policy.method,
-                        "params": {"sessionId": probe_sid},
-                    }
-                    process = self._process
-                    if process is not None and process.stdin is not None:
-                        async with self._stdin_write_lock():
-                            process.stdin.write((json.dumps(frame) + "\n").encode())
-                            await process.stdin.drain()
-                else:
-                    teardown_id = await self._send_request(policy.method, {"sessionId": probe_sid})
-                    await self._wait_for_response(teardown_id, timeout=_TERMINATE_TIMEOUT)
+                # Every harness this probe runs on tears a session down with an
+                # awaited request (``TeardownPolicy.notification`` is False for
+                # kiro, KAS and codex; test_deny_bounded_write pins it), so the
+                # request is the only path here.
+                teardown_id = await self._send_request(policy.method, {"sessionId": probe_sid})
+                await self._wait_for_response(teardown_id, timeout=_TERMINATE_TIMEOUT)
             except Exception:
                 logger.debug("direct-client probe session teardown failed", exc_info=True)
         return fresh, answered_at
@@ -8097,6 +8561,35 @@ class AcpClient:
             self._model = model_registry.resolve_wire_model_id(
                 self._model, self._model_registry_namespace
             )
+            global _claude_acp_argv_cache  # noqa: PLW0603
+            cached_claude_resolution: tuple[list[str] | None, str] | object = _claude_acp_argv_cache
+            if cached_claude_resolution is _UNRESOLVED:
+                # Fenced on the resolution generation -- see ``_resolution_generation``.
+                epoch = _resolution_epoch(ACP_BACKEND_CLAUDE)
+                cached_claude_resolution = await asyncio.to_thread(_resolve_claude_acp_bin)
+                if _resolution_epoch(ACP_BACKEND_CLAUDE) == epoch:
+                    _claude_acp_argv_cache = cached_claude_resolution
+            claude_argv, acp_search_path = (
+                cached_claude_resolution
+                if isinstance(cached_claude_resolution, tuple)
+                else (None, "")
+            )
+            if not isinstance(claude_argv, list) or not claude_argv:
+                raise AcpError(
+                    f"{CLAUDE_ACP_BIN} not found "
+                    f"({describe_search_path(acp_search_path)}). Install it with "
+                    f"'npm i -g {CLAUDE_ACP_NPM_PKG}' (or add it as a project "
+                    f"dependency), or set CLAUDE_AGENT_ACP_BIN to its entry script."
+                )
+            argv: list[str] = claude_argv
+            # The installed adapter's own version, read BEFORE the seed: the writer
+            # applies the settingSources floor with it, so the exclusion is decided
+            # before the MCP array below is first resolved and nothing has to be
+            # re-resolved on the loop after the handshake. Off-loop: it reads files.
+            self._agent_version_read = False
+            self._claude_adapter_disk_version = await asyncio.to_thread(
+                _claude_adapter_installed_version, argv
+            )
             # Per-session settings seed (permissions.defaultMode + the
             # availableModels allowlist that unlocks the 1M-token window). It MUST
             # run on the PRIMARY spawn path — not only the rare model-substitution
@@ -8123,27 +8616,6 @@ class AcpClient:
             # set (not this branch) is what decides whether the array is populated
             # at all; the warm is what keeps the read off the loop.
             self._session_mcp_cache = await asyncio.to_thread(self._resolve_session_mcp_servers)
-            global _claude_acp_argv_cache  # noqa: PLW0603
-            cached_claude_resolution: tuple[list[str] | None, str] | object = _claude_acp_argv_cache
-            if cached_claude_resolution is _UNRESOLVED:
-                # Fenced on the resolution generation -- see ``_resolution_generation``.
-                epoch = _resolution_epoch(ACP_BACKEND_CLAUDE)
-                cached_claude_resolution = await asyncio.to_thread(_resolve_claude_acp_bin)
-                if _resolution_epoch(ACP_BACKEND_CLAUDE) == epoch:
-                    _claude_acp_argv_cache = cached_claude_resolution
-            claude_argv, acp_search_path = (
-                cached_claude_resolution
-                if isinstance(cached_claude_resolution, tuple)
-                else (None, "")
-            )
-            if not isinstance(claude_argv, list) or not claude_argv:
-                raise AcpError(
-                    f"{CLAUDE_ACP_BIN} not found "
-                    f"({describe_search_path(acp_search_path)}). Install it with "
-                    f"'npm i -g {CLAUDE_ACP_NPM_PKG}' (or add it as a project "
-                    f"dependency), or set CLAUDE_AGENT_ACP_BIN to its entry script."
-                )
-            argv: list[str] = claude_argv
             spawn_label = _adapter_spawn_label(
                 argv,
                 CLAUDE_ACP_BIN,
@@ -9743,6 +10215,7 @@ class AcpClient:
         saved_child_pids = self._child_pids
         self._process = None
         self._pid = None
+        self._stdin_stalled = False
         self._spawn_start_token = None
         # The instance id names the process that just ended; a replacement spawn
         # mints its own, so nothing may keep answering with this one in between.
@@ -9973,6 +10446,10 @@ class AcpClient:
                 *(self._goose_session_mcp_servers() if self._is_goose else []),
                 *(await asyncio.to_thread(self._pooled_mcp_servers)),
             ]
+            # Rebuilt AFTER the array, from the same re-seed: the envelope carries
+            # the setting sources the array was authorized under and the inline
+            # settings naming the substitute model.
+            new_params["_meta"] = self._claude_session_meta()
             self._begin_session_report(new_params.get("mcpServers"))
             self._guard_unresolved_mcp_refs(new_params.get("mcpServers"))
             self._last_substitution_model = None
@@ -10027,6 +10504,7 @@ class AcpClient:
         _prompt_caps = capabilities.get("promptCapabilities")
         self._prompt_capabilities = dict(_prompt_caps) if isinstance(_prompt_caps, dict) else {}
         self._agent_version = agent_version_from_init(init_resp)
+        self._agent_version_read = True
         self._note_pi_adapter_version()
         self._note_goose_version()
 
@@ -10186,6 +10664,8 @@ class AcpClient:
                     # own read-back on the response that replaces this one.
                     if self._is_goose and self._resumed:
                         self._verify_goose_routing(load_resp)
+                    if self._is_claude and self._resumed:
+                        await self._pin_claude_starting_mode(load_resp)
             else:
                 logger.info("Session file missing for %s, skipping load", resume_sid)
 
@@ -10244,6 +10724,8 @@ class AcpClient:
             _model_log, _ = redact_exfiltration_urls(str(self._model))
             _model_log, _ = redact_credentials(_model_log)
             logger.info("ACP session created: %s (model=%s)", self._session_id, _model_log)
+            if self._is_claude:
+                await self._pin_claude_starting_mode(session_resp)
         self._last_activity = time.monotonic()
 
         # Seek to end of JSONL so we only read new tool results.
@@ -10272,7 +10754,10 @@ class AcpClient:
         except DerivedSpecStale as exc:
             raise AcpError(str(exc)) from exc
 
-        # 4. Activate agent via set_mode (claude-agent-acp does not support set_mode — skip).
+        # 4. Activate agent via set_mode -- kiro only. claude-agent-acp does handle
+        #    session/set_mode, but its modeIds are permission modes (default,
+        #    acceptEdits, plan, ...), never an agent name, so there is no agent to
+        #    activate there. _pin_claude_starting_mode uses it for the permission mode.
         #    Guard (A): fire only when the backend advertised this agent, or
         #    advertised no modes at all (older kiro-cli / fake → attempt,
         #    backward-compatible). If modes ARE advertised but this agent is
@@ -10334,8 +10819,22 @@ class AcpClient:
                 self._process.returncode is not None
                 or getattr(self, "_windows_tree_cleanup_failed", False) is True
             )
-        ):
+        ) or getattr(self, "_stdin_stalled", False):
+            # A stalled child stopped reading stdin with a frame possibly
+            # buffered: it is killed BEFORE a replacement starts, so it cannot
+            # act on that frame while the new turn runs.
             await self._kill_process(force=True)
+            if (
+                getattr(self, "_stdin_stalled", False)
+                and self._process is not None
+                and self._process.returncode is None
+            ):
+                # Not confirmed dead: stay stalled, so the next ensure_ready
+                # retries the kill rather than spawning beside the old child.
+                raise AcpProcessDied(
+                    "the stalled ACP child could not be confirmed dead; "
+                    "not starting a replacement beside it"
+                )
             try:
                 await self._discard_claude_settings_seed()
             finally:
@@ -10662,16 +11161,78 @@ class AcpClient:
         req = JsonRpcRequest(method=method, params=params, id=req_id)
         data = json.dumps(req.to_dict()) + "\n"
         try:
-            # Under the write lock so a response frame waiting behind this
-            # (caller-sized, deliberately unbounded) frame measures the
-            # reader's progress exactly; see await_under_no_progress_bound.
-            async with self._stdin_write_lock():
-                self._process.stdin.write(data.encode())
-                await self._process.stdin.drain()
+            # Bounded on the reader's PROGRESS, not held across a raw drain: a
+            # request write that parks while the backend is flow-control-paused
+            # must not hold the write lock (acute on the shared runtime, where a
+            # co-tenant waits behind the lock, but a single session can self-wedge
+            # too). A stall raises AcpProcessDied, the same recovery a closed pipe
+            # already gets.
+            await self._write_request_bounded(data.encode(), req_id, method)
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
         self._last_activity = time.monotonic()
         return req_id
+
+    async def _write_request_bounded(self, data: bytes, request_id: int, method: str) -> None:
+        """Write a REQUEST frame under the write lock and the same no-progress bound.
+
+        The request twin of :meth:`_write_response_bounded`. A request frame is
+        caller-sized (a prompt may carry any number of image blocks), which is
+        why the bound is on the reader's PROGRESS rather than on elapsed time: a
+        reader still consuming keeps the wait alive, and only a writer whose
+        buffer has not shrunk for ``_RESPONSE_WRITE_BOUND_SECS`` is the
+        reader-gone stall. Holding the write lock across an unbounded ``drain()``
+        here would let a flow-control-paused backend park it forever WITH the
+        lock held; on the shared runtime that wedges every co-tenant session
+        behind the lock at 0 CPU. A stall is mapped to
+        ``AcpProcessDied`` so the caller takes the existing session-reset +
+        bounded-requeue recovery.
+
+        A DRAIN_STALL can leave the frame buffered in a backend that resumes
+        reading, but the kill-and-reap that would try to make delivery impossible
+        is NOT done here: it cannot be guaranteed (a close/EOF keeps flushing the
+        buffered bytes, and a wedged child is exactly the one that fails to exit
+        within the grace, so death is not confirmed before the raise), and on the
+        shared runtime it would bypass the ownership authorization and terminate
+        sibling sessions. Instead a DRAIN_STALL raises ``AcpProcessDied`` with
+        ``ambiguous_delivery`` set, which ``build_recovery_requeue`` reads to
+        resume from restored state rather than replay a prompt the backend may
+        have consumed; a LOCK_STALL wrote no byte, so it is not ambiguous and its
+        replay is safe. The phase appears only in the log. Either phase marks
+        the client stalled, so nothing reuses it: the next
+        ``ensure_ready`` kills the child before spawning its replacement.
+        """
+        assert self._process is not None and self._process.stdin is not None
+        result = await write_request_frame_bounded(
+            self._process.stdin,
+            self._stdin_write_lock(),
+            data,
+            bound_secs=transport_framing._RESPONSE_WRITE_BOUND_SECS,
+        )
+        if result is RequestWriteResult.OK:
+            return
+        safe_id = _loggable_request_id(request_id)
+        window = response_write_window_secs(
+            self._process.stdin, transport_framing._RESPONSE_WRITE_BOUND_SECS
+        )
+        logger.warning(
+            "ACP stdin stalled: %s while sending request method=%s req=%s; "
+            "treating the backend as dead (%s)",
+            _stall_window_phrase(self._process.stdin, window),
+            _loggable_request_id(method),
+            safe_id,
+            (
+                "frame never written"
+                if result is RequestWriteResult.LOCK_STALL
+                else "frame already buffered"
+            ),
+        )
+        self._stdin_stalled = True
+        raise AcpProcessDied(
+            f"ACP stdin stalled: no write progress for {window:g}s while "
+            f"sending request req={safe_id}",
+            ambiguous_delivery=result is RequestWriteResult.DRAIN_STALL,
+        )
 
     def _stdin_write_lock(self) -> asyncio.Lock:
         """The one lock every stdin write on this client takes (see
@@ -10708,10 +11269,9 @@ class AcpClient:
             self._process.stdin, transport_framing._RESPONSE_WRITE_BOUND_SECS
         )
         logger.warning(
-            "ACP stdin stalled: no write progress for %gs (floor %d bytes/window) while "
+            "ACP stdin stalled: %s while "
             "delivering response to req=%s; treating the backend as dead",
-            window,
-            _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
+            _stall_window_phrase(self._process.stdin, window),
             safe_id,
         )
         raise AcpProcessDied(
@@ -13122,7 +13682,12 @@ class AcpClient:
         before the agent acknowledges the cancel. Callers that need to force
         a kill regardless of cancel state should skip this check.
         """
-        return not self._cancelled and not self._turn_done.is_set() and self._is_process_alive()
+        return (
+            not self._cancelled
+            and not self._turn_done.is_set()
+            and self._is_process_alive()
+            and not getattr(self, "_stdin_stalled", False)
+        )
 
     def has_unfinished_turn(self) -> bool:
         """True if the native turn has NOT reached its done boundary and the
@@ -15314,7 +15879,17 @@ class AcpClient:
                     self._track_metadata(msg)
                     if s_type == "completed":
                         await self._drain_post_compaction_metadata()
-                    return {"type": s_type, "summary": params.get("summary", "")}
+                    # Redact the backend-echoed summary before it reaches callers
+                    # (compact() surfaces this to the dashboard and channel
+                    # mirrors). Mirrors AcpSessionHandle.wait_for_compaction.
+                    summary = redact_text(str(params.get("summary", "") or ""))
+                    if s_type == "failed" and not summary:
+                        # kiro-cli leaves `summary` empty on failure, so the
+                        # manual /compact notice would say nothing — carry the
+                        # notification's own reason, read by the same extractor
+                        # the dispatch loop uses for the streaming notice.
+                        summary = compaction_failure_detail(params)
+                    return {"type": s_type, "summary": summary}
             elif msg.is_method(METHOD_METADATA):
                 self._track_metadata(msg)
             else:
@@ -15391,6 +15966,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "OversizeLineUnrecoverable",
         "_drain_oversize_line",
         "_RESPONSE_WRITE_BOUND_SECS",
+        "_RESPONSE_WRITE_MIN_PROGRESS_BYTES",
         "_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS",
         "_is_proactor_loop",
         "_level_is_progress_signal",
@@ -15433,6 +16009,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "_RE_GENERATE_FAILED",
         "_RE_PROCESS_FAILED",
         "_RE_MALFORMED_REQUEST",
+        "_RE_CONTEXT_WINDOW_OVERFLOW",
         "_RE_IMAGE_FORMAT_UNSUPPORTED",
         "_PROMPT_BUSY_RE",
         "_RE_STREAM_ENVELOPE",
@@ -15594,6 +16171,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         _RE_AUTH,
         _RE_AUTH_STATUS,
         _RE_CONNECTION,
+        _RE_CONTEXT_WINDOW_OVERFLOW,
         _RE_GENERATE_FAILED,
         _RE_IMAGE_FORMAT_UNSUPPORTED,
         _RE_INVALID_BEARER,
@@ -15649,6 +16227,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
     from kiro_crew.acp.transport_framing import (  # noqa: F401
         _OVERSIZE_DRAIN_MAX_BYTES,
         _RESPONSE_WRITE_BOUND_SECS,
+        _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
         _RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS,
         OversizeLineUnrecoverable,
         _drain_oversize_line,

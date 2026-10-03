@@ -792,6 +792,41 @@ is gone falls back the same way, under the existing swap notice. The page's copy
 says crewmate / Crewmates and "Built from"; the crew record, its API and its
 identifiers are unchanged.
 
+The roster lists a row unasked when EITHER its Crewmates-page DM thread already
+holds a message (any origin) OR it was created on the dashboard (`source` is
+`kirocrew` AND the record carries a `member_id`, which covers a greeting that
+never landed) OR the user starred it; the default crew (whichever crew the top-level `default_agent` names) is
+always listed. Every other row (an app's own source stamp, with or without a
+member id, a sync-generated row, a legacy `kirocrew` row without a member id,
+none of them chatted with) is hidden and appears when the search text matches
+it. The star, origin and status filters narrow the rows the roster shows, so
+choosing an origin does not reach a hidden row; the search is the one door
+within the roster list. A team's view (`?team=`) and the team dialog are built
+from the whole roster, so they still list every crewmate the user put on that
+team -- placing a crewmate on a team is itself a choice to use it -- and a team
+whose crewmates are all hidden keeps its (empty) roster header. The crewmate
+open in the thread stays listed while open, and a remembered crewmate is
+restored even when the rule hides it; with nothing but the default crew
+listed while hidden crewmates exist, the landing opens the most recently used
+hidden one (listed while open); where nothing auto-opens (below md) and every
+row is hidden, the roster says so and names the search. If
+the default-crew lookup fails, every row is listed and an error notice says why. `GET /api/members` carries the two facts as booleans, `dashboard_created`
+and `has_dm_message` (`ConversationLog.has_messages` on the bound thread, which
+stops at the first non-metadata row, or rows held by the live slot; an
+unreadable transcript counts as a message); the member id itself is not on the
+wire. The client also treats a non-empty live `last_message` as a message, so a
+row the user just chatted with stays listed before the next roster read. A row
+from an older gateway carrying neither field is listed. The header count and
+the filter tallies count the listed rows plus any hidden row the search
+reaches. The landing fallback opens a remembered crewmate first (even a
+hidden one, which is then listed while open), then the most recently used listed
+crewmate, then the most recently used hidden one when only the default crew is
+listed.
+
+Deleting a crewmate is not on this page: it lives in the crewmate's settings
+on the Customize page's Crewmates tab (the editor's Danger pane), which also
+reaches rows this page hides.
+
 Reopening a running Member DM, including a turn awaiting tool approval,
 reuses its captured execution record. The canonical session key, selected
 member, live slot store and execution record must agree. This read does
@@ -1373,6 +1408,16 @@ resolver. The spawn gate applies the same rule to the one input that is not a
 record: a slot's inherited `("member", name)` selection whose row is gone keeps
 its template on the shared store, and refuses on any other store.
 
+Because the decoder adopts while the stored bytes still say `member`, a
+compare-and-set must compare like with like. `bind_session_execution`'s two
+CAS predicates (the persistent admission and the restricted privacy
+tightening) decode the stored carrier the same way before comparing it with
+the decoded record they read (`_carrier_still`). Comparing the decoded
+record's `to_record()` with the stored bytes reads the adoption itself as a
+concurrent change, and refuses the first send of every such chat with
+`session changed during admission`. A carrier another writer changed between
+the read and the CAS still decodes to something else and is still refused.
+
 Any future pass that deletes `config.agents` rows must either preserve this
 invariant or rewrite the records first. `test_crewmate_prune_migration.py`
 pins it (`test_records_bound_to_a_removed_row_stay_executable`: every row the
@@ -1643,7 +1688,7 @@ name, and it resolves an empty crew too so the concrete template stays inside
 
 | Test | What it holds |
 |---|---|
-| `test/test_pruned_crewmate_records.py` | Records bound to a pruned synced crewmate decode as their template for every reader (chat resume, subagent continuation and inheritance, prompt builder); owned members still refuse |
+| `test/test_pruned_crewmate_records.py` | Records bound to a pruned synced crewmate decode as their template for every reader (chat resume, subagent continuation and inheritance, prompt builder); owned members still refuse; the first send of a resumed pruned chat is admitted by the session CAS while a real concurrent change is still refused |
 | `test/test_agent_execution_catalog.py` | Read-only catalog, same-name member/template choices, requesting-project isolation, private-template exclusion and explicit discovery failure |
 | `test/test_agent_templates_endpoint.py` | Templates roster marks editability (a row with no spec file beneath the agents directory — empty, foreign or absent `filename` — is read-only for the runtime's reason) and references (crews, default, schedules by what they dispatch — sequence over dormant `agent_id`, the captured execution's template over a stale or empty `agent_id`, script jobs over neither — chat-folder pins, webhook pins, private copies) and masks package-controlled strings like the sibling rosters (the delete refusal's references too); a row whose filename is absolute, traversing or nested names nothing to delete (404, file intact); create writes a minimal runnable spec or a lineage-free copy (re-read inside the spec lock, where the source name is re-resolved and must reach exactly the probed file — a second claimant or a replacement refuses, nothing written) and refuses taken, bound (in the base or only in the overlay), reserved, ambiguous and malformed names; delete refuses read-only and referenced templates (listing the references), a name two files reach — a crossover or a same-name twin the roster would collapse (neither unlinked), a row whose file does not answer to the requested name, a second claimant that lands after the probe (ambiguity re-checked under the lock) and a row that calls a package file plain (the file re-read and classified under the lock), checks and unlinks inside one folder-store hold rather than from a snapshot, counts a binding that lives only in `config.local.json`, does not count a template that merely shares the default crew's alias, holds the schedule store's own lock from the reference walk through the rename (probed on both sides) and answers 503 `schedule_store_busy` with the file intact when another holder keeps it past the bounded wait, names a schedule written past the lock (warning + SEL row), fails closed on an unreadable cron store before the unlink (503, file intact) and only warns after it, retires the file as a one-deep tombstone (renamed before the older grave goes, so a refused rename keeps both; same-second graves stay distinct; the sweep spares a live template whose name looks like a grave), runs both mutations through the drained seam, and removes an unreferenced one; create re-scans by declared name under the lock; a successful create and delete emit operation-labelled SEL events; a create publishes its name to the dispatch snapshot before scheduling the rescan and a delete awaits the rescan before answering (a refusal touches neither); the detail PATCH writes the definition keys on an owned template, refuses them on a package one, refuses every key on an ambiguous name (neither file touched) and a claimant landing after the scan (re-checked under the write lock), classifies the targeted file rather than its name, and validates their shape |
 | `website/src/test/AgentTemplatesTab.test.tsx` | Grouping by origin, the two-control action row with its overflow menu (enroll hint, Delete vs Duplicate-to-edit by editability), the definition save through the detail PATCH (changed keys only — a prompt-only save never resends the model), the dirty-draft guard on row switch, on a background refetch, on Discard (asks; declined keeps the draft) and on New custom agent (a create never inherits the previous draft), a saved skill list written into the detail cache before the refetch lands, the saved confirmation in the bar's slot and the visible Add tool label, a delete naming the deleted template over the next row and, on a narrow viewport, returning to the list, every in-app link routed through the shell's leave gate with its target, `beforeunload` armed only while dirty, a rejected detail read rendering its error rather than Loading, a refused save reported inside the save bar beside Save and cleared by Discard, resources as plain rows, string-only MCP fields from a hand-edited spec, one Skills heading, the referenced-delete dialog (opened directly from the row's own holders with no confirm or request, and from the server's refusal when a holder landed later; including a chat-folder row and a private-copy row that links to its crew), a private copy's Open crewmate, the usage line naming folder and webhook holders with each holder linked to where it is held, blank vs `from` create with the created row selected after the roster refetch, and chat-with in the template namespace (enabled while dirty, behind the discard confirm) |

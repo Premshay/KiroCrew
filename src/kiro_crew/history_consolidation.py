@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from kiro_crew.config import live
@@ -54,6 +54,7 @@ from kiro_crew.vector_memory_constants import (
     _MAX_EPISODIC_PER_CONSOLIDATION,
     _MAX_LESSONS_PER_CONSOLIDATION,
     _MAX_SEMANTIC_PER_CONSOLIDATION,
+    _SEMANTIC_PROMPT_CAP_PER_CONSOLIDATION,
 )
 
 if TYPE_CHECKING:
@@ -95,6 +96,22 @@ _CONSOLIDATION_MAX_ATTEMPTS = 5
 _CONSOLIDATION_BACKOFF_BASE_SECS = 900.0
 _CONSOLIDATION_BACKOFF_MAX_SECS = 86400.0
 _SKILL_DETECTION_WINDOW = 200
+# Rendered CHARACTERS of transcript one history consolidation prompt may carry.
+# The unconsolidated tail is otherwise unbounded: a session that goes a long time
+# between passes — or whose consolidation kept failing — renders every message
+# since the marker into one prompt, and past some length no provider accepts it.
+# The span that most needs extracting is then the one that can never be
+# extracted.
+#
+# Characters, not bytes: the ceiling exists to keep a prompt inside a context
+# window, and a context window is measured in tokens. Code points track tokens
+# far more evenly across scripts than UTF-8 bytes do — a CJK transcript is
+# roughly one token per character but three bytes per character, so a byte
+# budget would cut it to a third of the span it gives a Latin one for no reason
+# the provider cares about. 65_536 characters leaves room beside the transcript
+# for the instructions and the current memory blocks in every context window
+# Kiro Crew dispatches to.
+_CONSOLIDATION_PROMPT_BUDGET_CHARS = 64 * 1024
 
 #: Wall-clock ceiling on the memory writes of ONE consolidation pass that embed
 #: inline. A pass writes up to ``_MAX_SEMANTIC_PER_CONSOLIDATION`` +
@@ -106,6 +123,144 @@ _SKILL_DETECTION_WINDOW = 200
 #: Deferred rows are filled in by the standing repair sweep
 #: (``backfill_missing_embeddings``), which is what makes deferral lossless.
 _EMBED_BUDGET_SECS_PER_PASS = 60.0
+
+#: The one line under a bounded ``## Current Semantic Memory`` table. The prompt
+#: tells the model to update or delete the keys it can see, so a table that lost
+#: rows silently would read as "those facts do not exist" and invite a deletion
+#: of nothing or a near-duplicate of a dropped key. Same vocabulary as the chat
+#: path's startup omission notice, so a reader learns one shape.
+_SEMANTIC_OMISSION_NOTICE = (
+    "[Context budget: omitted {count} of {total} semantic rows above the "
+    "{limit}-character consolidation budget; the least recently updated rows were "
+    "left out. The table above is PARTIAL: a key you do not see may still exist, "
+    "so update or delete only keys listed above and treat a missing key as "
+    "unknown, not absent.]"
+)
+
+
+class _BoundedTable(NamedTuple):
+    """A rendered semantic table, how many rows it left out, and the keys it shows."""
+
+    text: str
+    omitted: int
+    visible_keys: frozenset[str]
+
+
+def _recency(updated_at: object) -> tuple[int, float]:
+    """Rank an ``updated_at`` for the newest-first cut.
+
+    Stamps are parsed, not compared as text: the store writes ISO 8601 with an
+    offset, while imported or older rows can carry a naive stamp, a space
+    separator or an epoch, and as text those shapes rank by their separator
+    before their instant. A stamp that parses ranks by instant; one that does
+    not ranks after every one that does.
+    """
+    if isinstance(updated_at, (int, float)) and math.isfinite(updated_at):
+        return 1, float(updated_at)
+    if not isinstance(updated_at, str):
+        return 0, 0.0
+    text = updated_at.strip()
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            return 1, float(text)
+        except ValueError:
+            return 0, 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return 1, parsed.timestamp()
+
+
+def _bounded_semantic_table(rows: list[dict], entries: list[dict], cap: int) -> _BoundedTable:
+    """Render ``entries`` as the prompt's semantic table within ``cap`` characters.
+
+    ``rows`` are the store rows (in the store's key order) that ``entries`` were
+    rendered from, one to one. A table that fits renders whole and byte-identical
+    to the uncapped form. Over the cap, the most recently updated rows are kept
+    -- the order the chat path's ``semantic_cap`` reads without a query -- and
+    rendered in the same key order, so the block keeps its shape and only loses
+    its oldest rows. Returns the block, the number of rows left out, and the keys
+    the block shows, which is what the writers may update or delete.
+
+    The fit is found by bisection on the row count with the real renderer rather
+    than by an estimate per row, so the bound is exact for whatever ``indent``
+    and escaping produce, at the cost of O(log n) serialisations. A row is kept
+    whole or not at all: when even the newest row alone is over the cap the
+    table is ``[]`` and every row counts as omitted, because a value cut short
+    would read as the fact itself.
+    """
+    whole = json.dumps(entries, indent=1) if entries else "[]"
+    if len(whole) <= cap:
+        return _BoundedTable(whole, 0, frozenset(str(r.get("key", "")) for r in rows))
+    # Newest first; key as the tiebreak so rows written in the same second keep
+    # one order across runs (a stable sort on top of the key order given).
+    by_recency = sorted(range(len(rows)), key=lambda i: str(rows[i].get("key", "")))
+    by_recency.sort(key=lambda i: _recency(rows[i].get("updated_at")), reverse=True)
+
+    def _render(count: int) -> str:
+        kept = sorted(by_recency[:count])
+        return json.dumps([entries[i] for i in kept], indent=1) if kept else "[]"
+
+    fits, overflows = 0, len(rows)
+    rendered = "[]"
+    while overflows - fits > 1:
+        middle = (fits + overflows) // 2
+        candidate = _render(middle)
+        if len(candidate) <= cap:
+            fits, rendered = middle, candidate
+        else:
+            overflows = middle
+    visible = frozenset(str(rows[i].get("key", "")) for i in by_recency[:fits])
+    return _BoundedTable(rendered, len(rows) - fits, visible)
+
+
+def _withhold_unseen_deletes(
+    result: dict, visible_keys: frozenset[str] | None, logger: logging.Logger
+) -> tuple[dict, int]:
+    """Drop every ``delete`` naming a key the bounded semantic table never showed.
+
+    Keys are guessable (``user.work_email``, ``project.*``), so a model reading a
+    partial table can name a row it never read, and the omission notice alone
+    does not stop it. A delete has nothing behind it to arbitrate, so it is
+    withheld here, on the model's answer, before either write path reads it --
+    ``_write_structured_memory`` and the member store's ``apply_consolidation``
+    share this one fence so they cannot drift. An update is NOT withheld: the
+    new value's authority is the transcript, not the rendered table, and the
+    store arbitrates the old one (``_write_semantic`` skips a consolidation
+    overwrite of a user-stated row; the member store turns a conflicting update
+    into an owner proposal). Refusing it would also refuse a user's genuine
+    correction for a key the cap cut from the table, and the span is marked
+    consolidated either way, so that correction would be gone for good. ``None``
+    means no bounded table was rendered and nothing is withheld.
+
+    Returns the result (a shallow copy when anything was dropped) and how many
+    distinct keys were withheld; each is logged once, however often it is named.
+    """
+    items = result.get("semantic")
+    if visible_keys is None or not isinstance(items, list):
+        return result, 0
+    kept: list = []
+    withheld: set[str] = set()
+    for item in items:
+        if (
+            isinstance(item, dict)
+            and item.get("delete")
+            and isinstance(item.get("key"), str)
+            and item["key"] not in visible_keys
+        ):
+            if item["key"] not in withheld:
+                withheld.add(item["key"])
+                logger.warning(
+                    "Semantic consolidation refused delete of %r: key not in the rendered table"
+                    " (omitted above the prompt budget), so the model never saw its value",
+                    item["key"],
+                )
+            continue
+        kept.append(item)
+    if not withheld:
+        return result, 0
+    return {**result, "semantic": kept}, len(withheld)
 
 
 class _EmbedBudget:
@@ -187,6 +342,7 @@ _CONSOLIDATION_META_KEYS: frozenset[str] = frozenset(
         "consolidation_attempts_generation",
         "consolidation_attempts_offset",
         "consolidation_attempts_count",
+        "consolidation_attempts_prompted",
     }
 )
 
@@ -226,11 +382,27 @@ class _LessonDeleteDecision(NamedTuple):
 
 
 class AttemptedSpan(NamedTuple):
-    """Identity of the transcript span a billed consolidation turn covered."""
+    """Identity of the transcript span a billed consolidation turn covered.
+
+    ``total`` and ``prompted`` answer different questions and must not be
+    collapsed. ``total`` is how far the TRANSCRIPT reached when the turn was
+    charged. ``prompted`` is how far the PROMPT reached, and is the only offset
+    the abandon path may write to the durable marker — the tail past it was
+    never sent to any provider, so marking it consolidated would drop it from
+    memory unread.
+
+    The retry accounting stamps BOTH, and needs both: ``total`` is what a later
+    transcript is compared against to tell new content from the same content,
+    and ``prompted`` is what says whether that comparison means anything. An
+    attempt that stopped short of ``total`` covered a prefix, and a prefix does
+    not change when messages are appended behind it (see
+    :meth:`ConversationLog._attempts_describe_current_span`).
+    """
 
     total: int
     generation: int
     offset: int
+    prompted: int
 
 
 class _ConsolidationNotDispatched(Exception):
@@ -401,6 +573,9 @@ def _consolidation_chunk(messages: list[dict]) -> list[dict]:
     chunk: list[dict] = []
     size = 0
     for message in messages:
+        if message.get("role") in DISPLAY_ONLY_ROLES:
+            chunk.append(message)
+            continue
         rendered_size = len(_fmt_message(message))
         if rendered_size > _CONSOLIDATION_OVERSIZED_MESSAGE_MAX_CHARS:
             truncated = dict(message)
@@ -413,10 +588,13 @@ def _consolidation_chunk(messages: list[dict]) -> list[dict]:
             truncated["content"] = content[:content_limit] + marker
             message = truncated
             rendered_size = len(_fmt_message(message))
-        if chunk and size + rendered_size > _CONSOLIDATION_CHUNK_MAX_CHARS:
+        separator = 1 if size else 0
+        if size and size + separator + rendered_size > min(
+            _CONSOLIDATION_CHUNK_MAX_CHARS, _CONSOLIDATION_PROMPT_BUDGET_CHARS
+        ):
             break
         chunk.append(message)
-        size += rendered_size
+        size += separator + rendered_size
     return chunk
 
 
@@ -901,9 +1079,13 @@ class HistoryConsolidator:
         indefinitely.
 
         *span* is the pre-turn snapshot identity (see :class:`AttemptedSpan`), used
-        both to stamp the charge and to place the abandon marker — the same values
-        for both, so the marker cannot be written for a span other than the one the
-        cap was reached on.
+        both to stamp the charge and to place the abandon marker, so the marker
+        cannot be written for a span other than the one the cap was reached on.
+        The abandon marker lands at ``span.prompted``, NOT ``span.total``: only
+        the prompted prefix was ever put in front of a provider, and marking the
+        tail behind it would retire messages no model has read. That tail is left
+        unconsolidated and is picked up by the next pass, which charges its own
+        attempts against it.
         """
         try:
             attempts, retry_at = await asyncio.to_thread(
@@ -941,10 +1123,12 @@ class HistoryConsolidator:
             key,
             attempts,
             reason,
-            span.total,
+            span.prompted - span.offset,
         )
         try:
-            await asyncio.to_thread(self._log.mark_consolidated, key, span.total, span.generation)
+            await asyncio.to_thread(
+                self._log.mark_consolidated, key, span.prompted, span.generation
+            )
         except Exception:
             # The count stays at the cap, so retry_eligible() keeps refusing —
             # the span stops spending even though the marker is missing.
@@ -1182,26 +1366,58 @@ class HistoryConsolidator:
         ACTUALLY consolidated — the durable offset it moved from and to, and
         whether the pass was partial — instead of printing success for a span
         that was refused, skipped as sensitive, or failed at the provider.
+        Passes repeat until the tail is drained. One pass renders at most
+        :data:`_CONSOLIDATION_PROMPT_BUDGET_CHARS` (see
+        :func:`_consolidation_chunk`), and the CLI process exits when this
+        returns — there is no idle sweep behind it to pick up a remainder the
+        way there is for every in-gateway entry point. A single pass would
+        therefore report a tail larger than the budget as fully consolidated
+        while most of it was never read.
 
-        Safety: defense-in-depth — the consolidation retry backoff is also
-        checked inside _consolidate(), and _run_skill_detection() re-checks
-        the sensitive-session guard over its own window.
+        The loop stops on the first pass that consolidates nothing, not only on
+        an empty tail: a refusal, an unreadable transcript, or a span that the
+        marker cannot advance over all leave the count where it was, and
+        repeating them is an infinite loop rather than progress.
+
+        A later failure keeps its typed outcome and durable offset. The sensitive
+        guard runs before every pass and inside history consolidation, so a
+        live append cannot move a sensitive row into a later extraction prompt.
         """
         old_offset = int(self._log.get_metadata(key).get("last_consolidated", 0) or 0)
-        if self._log.unconsolidated_count(key) < 1:
+        remaining = self._log.unconsolidated_count(key)
+        if remaining < 1:
             return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
-        messages = self._log._read_messages(key)
-        if _session_touched_sensitive(messages):
-            self._logger.info("consolidate_now skipped for %s: sensitive session", key)
-            return ConsolidationOutcome(
-                "skipped", detail="sensitive session", old_offset=old_offset, new_offset=old_offset
-            )
-        result = await self._consolidate(key, include_history=True)
-        if isinstance(result, _ConsolidationRefusedSentinel):
-            return ConsolidationOutcome(
-                "skipped", detail="session memory policy refuses consolidation"
-            )
-        return result
+        last_offset = old_offset
+        # MERGE-REVIEW: drain upstream's bounded passes while retaining the fork's
+        # typed failure outcome; a later failed pass must not read as success.
+        while remaining > 0:
+            messages = await asyncio.to_thread(self._log._read_messages, key)
+            if _session_touched_sensitive(messages):
+                return ConsolidationOutcome(
+                    "skipped", detail="sensitive session", old_offset=old_offset,
+                    new_offset=last_offset, complete=False,
+                )
+            outcome = await self._consolidate(key, include_history=True)
+            if isinstance(outcome, _ConsolidationRefusedSentinel):
+                return ConsolidationOutcome(
+                    "skipped", detail="session memory policy refuses consolidation",
+                    old_offset=old_offset, new_offset=last_offset, complete=False,
+                )
+            if not outcome.completed:
+                return outcome
+            last_offset = outcome.new_offset
+            after = self._log.unconsolidated_count(key)
+            if after >= remaining:
+                self._logger.warning(
+                    "consolidate_now made no progress on %s: %d message(s) remain", key, after
+                )
+                return ConsolidationOutcome(
+                    "consolidated", old_offset=old_offset, new_offset=last_offset, complete=False
+                )
+            remaining = after
+        return ConsolidationOutcome(
+            "consolidated", old_offset=old_offset, new_offset=last_offset
+        )
 
     async def _consolidate(
         self, key: str, include_history: bool = True
@@ -1228,7 +1444,7 @@ class HistoryConsolidator:
         # circular import: kiro_crew.history re-exports this module
         from kiro_crew.history import TranscriptWithheld, is_incognito_transcript
 
-        attempted = AttemptedSpan(0, 0, 0)
+        attempted = AttemptedSpan(0, 0, 0, 0)
         commit_state = _RunCommitState()
         # The output being published, named in the warning when a later hold is
         # refused after an earlier output committed (see the Withheld arm below).
@@ -1341,26 +1557,28 @@ class HistoryConsolidator:
             # the same lock hold — no second read that a concurrent rotation could
             # land between. A failure charge stamped with these values describes
             # what the turn attempted even if the file changed underneath it.
+            offset = total - len(unconsolidated)
+            # Bound what this pass prompts, and mark exactly that. History
+            # consolidation owns a durable marker, so a bounded prompt is only
+            # safe if the marker follows the prompt rather than the snapshot:
+            # advancing to `total` after prompting a prefix is the same silent
+            # loss the bound exists to prevent, just moved.
+            #
+            # Prefs-only passes keep the whole tail. Their window is tracked by
+            # an in-memory offset that `maybe_consolidate`'s done-callback
+            # advances to the count it scheduled against, with no channel back
+            # from here — so bounding this prompt without also making that
+            # offset follow it would drop the remainder from preference and
+            # project extraction outright. Unbounded is the lesser fault while
+            # that offset is a scheduling artifact rather than a durable marker.
+            chunk = _consolidation_chunk(unconsolidated) if include_history else unconsolidated
             attempted = AttemptedSpan(
                 total=total,
                 generation=generation_at_snapshot,
-                offset=total - len(unconsolidated),
+                offset=offset,
+                prompted=offset + len(chunk),
             )
             old_offset = attempted.offset
-            if include_history:
-                chunk = _consolidation_chunk(unconsolidated)
-                if not chunk:
-                    await self._note_environment_failure(
-                        key, "one transcript message exceeds the automatic consolidation window"
-                    )
-                    return ConsolidationOutcome(
-                        "failed",
-                        detail="one transcript message exceeds the automatic consolidation window",
-                        old_offset=old_offset,
-                        new_offset=old_offset,
-                    )
-            else:
-                chunk = unconsolidated
             complete = len(chunk) == len(unconsolidated)
 
             # The sensitive guard belongs HERE, not only on the entry points.
@@ -1547,29 +1765,42 @@ class HistoryConsolidator:
                     current_semantic = await run_in_embed_pool(
                         vector_store.with_record_metadata, current_semantic
                     )
-                semantic_json = (
-                    json.dumps(
-                        [
+                semantic_entries = [
+                    {
+                        "key": e["key"],
+                        "value_json": _prompt_value(e),
+                        "confidence": e["confidence"],
+                        **(
                             {
-                                "key": e["key"],
-                                "value_json": _prompt_value(e),
-                                "confidence": e["confidence"],
-                                **(
-                                    {
-                                        "record_revision": e.get("record_revision", 0),
-                                        "metadata": e.get("record_metadata", {}),
-                                    }
-                                    if private_policy
-                                    else {}
-                                ),
+                                "record_revision": e.get("record_revision", 0),
+                                "metadata": e.get("record_metadata", {}),
                             }
-                            for e in current_semantic
-                        ],
-                        indent=1,
-                    )
-                    if current_semantic
-                    else "[]"
+                            if private_policy
+                            else {}
+                        ),
+                    }
+                    for e in current_semantic
+                ]
+                # The PROMPT's copy of the table is bounded; ``current_semantic``
+                # itself stays whole, because the writers below read it as the
+                # snapshot that decides update-versus-create and the revision a
+                # correction is checked against. The keys the bounded copy shows
+                # travel with it: a row the model never read is not its to
+                # delete. Offloaded like the fetch: the fit is
+                # found by re-serialising a table that can run to megabytes,
+                # and this coroutine is on the gateway event loop.
+                semantic_json, semantic_omitted, semantic_visible = await asyncio.to_thread(
+                    _bounded_semantic_table,
+                    current_semantic,
+                    semantic_entries,
+                    _SEMANTIC_PROMPT_CAP_PER_CONSOLIDATION,
                 )
+                if semantic_omitted:
+                    semantic_json += "\n" + _SEMANTIC_OMISSION_NOTICE.format(
+                        count=semantic_omitted,
+                        total=len(current_semantic),
+                        limit=_SEMANTIC_PROMPT_CAP_PER_CONSOLIDATION,
+                    )
                 semantic_fields = (
                     '"delete": false, "metadata": {"category": "contact", "subject": "user", '
                     '"predicate": "work_email", "scope": "", "source_ref": "brief evidence", '
@@ -1772,18 +2003,27 @@ class HistoryConsolidator:
                 stage = "member memory"
                 if vector_store is None:
                     raise RuntimeError("Member memory database is unavailable")
+                # The receipt must describe the span the model READ, not the
+                # snapshot: the replay path above marks consolidated up to
+                # ``committed["source_total"]`` once it recognises the digest,
+                # so a receipt covering the whole tail advances the durable
+                # marker past messages no model has seen.
                 # Bound here because a nested def does not inherit the enclosing
                 # scope's narrowing: the closure would see the un-narrowed
                 # ``VectorMemoryStore | None`` and ``dict | None``.
                 store = vector_store
-                consolidation: dict = result
+                # The member store arbitrates the model's updates itself (a
+                # conflicting one becomes an owner proposal); a delete of a row
+                # the model never read is withheld here, the same fence the V1
+                # writer applies, so the two paths cannot drift.
+                consolidation, _ = _withhold_unseen_deletes(result, semantic_visible, self._logger)
 
                 def _apply_member_consolidation() -> dict:
                     with self._publication_hold_checked(key, commit_state) as publication:
                         applied = store.apply_consolidation(
                             source_id=source_id,
                             session_key=key,
-                            source_total=old_offset + len(chunk),
+                            source_total=attempted.prompted,
                             result=consolidation,
                             snapshot={row["key"]: row for row in current_semantic},
                             messages=chunk,
@@ -1808,7 +2048,12 @@ class HistoryConsolidator:
                         publication.mark_committed()
 
                 await run_in_embed_pool(_append_history_under_hold)
-                self._logger.info("Consolidated %d messages for %s", len(chunk), key)
+                self._logger.info(
+                    "Consolidated %d of %d unconsolidated messages for %s",
+                    len(chunk),
+                    len(unconsolidated),
+                    key,
+                )
 
             # Structured memory writes (Phase 2/3). Offloaded to a worker thread:
             # _write_structured_memory embeds each item via a blocking urllib call
@@ -1824,6 +2069,7 @@ class HistoryConsolidator:
                     vector_store,
                     facets=facets,
                     snapshot={row["key"]: row for row in current_semantic},
+                    visible_keys=semantic_visible,
                     messages=chunk,
                     commit_state=commit_state,
                 )
@@ -1960,6 +2206,13 @@ class HistoryConsolidator:
 
             # Only advance the consolidated offset for history consolidation.
             # Prefs-only consolidation uses a separate in-memory offset.
+            #
+            # The marker lands at the end of the PROMPTED prefix, not at the
+            # snapshot total: when the budget split the tail, everything past
+            # the prefix is still unread and the next pass starts there. A
+            # session whose tail outgrew one prompt therefore drains over
+            # successive passes instead of losing the remainder in one write.
+            #
             # mark_consolidated does a synchronous, fsync-backed rewrite of the
             # whole transcript (up to a couple of MB) behind the per-file lock.
             # _consolidate runs on the gateway event loop (fired via
@@ -1975,7 +2228,7 @@ class HistoryConsolidator:
                 await asyncio.to_thread(
                     self._log.mark_consolidated,
                     key,
-                    processed_offset,
+                    attempted.prompted,
                     generation_at_snapshot,
                 )
 
@@ -2008,10 +2261,12 @@ class HistoryConsolidator:
             )
             if include_history:
                 try:
+                    # The prompted prefix, not the snapshot: the messages past
+                    # it were never read, and the next pass prompts them.
                     await asyncio.to_thread(
                         self._log.mark_consolidated,
                         key,
-                        old_offset + len(chunk),
+                        attempted.prompted,
                         generation_at_snapshot,
                     )
                 except Exception:
@@ -2474,6 +2729,7 @@ class HistoryConsolidator:
         *,
         facets: "MemoryFacets | None" = None,
         snapshot: dict | None = None,
+        visible_keys: frozenset[str] | None = None,
         messages: list[dict] | None = None,
         commit_state: _RunCommitState | None = None,
     ) -> None:
@@ -2483,6 +2739,11 @@ class HistoryConsolidator:
         global handle, which is what the workspace and default arms want; an
         explicit ``None`` means the silo has no vector store and the tier is
         skipped, the same distinction :meth:`_save_lessons` draws.
+
+        *visible_keys* is the set of keys the prompt's bounded semantic table
+        showed the model; a ``delete`` of a key outside it is withheld before the
+        loop (``_withhold_unseen_deletes`` says why an update is not). ``None``
+        means the caller rendered no bounded table and nothing is withheld.
         """
         if isinstance(vector_store, _InheritGlobal):
             vector_store = self._vector_store
@@ -2493,6 +2754,8 @@ class HistoryConsolidator:
         # Shared by both tiers below: each embeds inline, so both charge the same
         # pass and either can arm the latch for the other.
         budget = _EmbedBudget(_EMBED_BUDGET_SECS_PER_PASS, self._logger)
+
+        result, withheld = _withhold_unseen_deletes(result, visible_keys, self._logger)
 
         # Semantic entries
         semantic_items = result.get("semantic")
@@ -2688,11 +2951,13 @@ class HistoryConsolidator:
                 or absent
                 or unreadable
                 or stale_skipped
+                or withheld
             ):
                 self._logger.info(
                     "Semantic consolidation: %d written, %d deleted, %d skipped (no value), "
                     "%d refused, %d protected (standing rule), %d absent, %d unreadable, "
-                    "%d stale-skipped (compare-and-delete no-op)",
+                    "%d stale-skipped (compare-and-delete no-op), "
+                    "%d withheld (delete of a key not in the rendered table)",
                     written,
                     deleted,
                     skipped,
@@ -2701,6 +2966,7 @@ class HistoryConsolidator:
                     absent,
                     unreadable,
                     stale_skipped,
+                    withheld,
                 )
 
         # Episodic entries

@@ -73,9 +73,7 @@ def _text_frame(text: str) -> JsonRpcMessage:
 class TestClientSignals:
     def test_the_task_lifecycle_is_requested_from_the_adapter(self, tmp_path):
         """Without the subscription the adapter never forwards these frames."""
-        filters = _client(tmp_path)._claude_session_meta()["claudeCode"][
-            "emitRawSDKMessages"
-        ]
+        filters = _client(tmp_path)._claude_session_meta()["claudeCode"]["emitRawSDKMessages"]
         subtypes = {f.get("subtype") for f in filters if f.get("type") == "system"}
         assert subtypes == {"task_started", "task_notification", "task_updated"}
 
@@ -90,16 +88,12 @@ class TestClientSignals:
         assert client.has_background_work is False
 
     @pytest.mark.asyncio
-    async def test_a_terminal_patch_settles_a_task_without_a_notification(
-        self, tmp_path
-    ):
+    async def test_a_terminal_patch_settles_a_task_without_a_notification(self, tmp_path):
         """The adapter guarantees only the patch per transition."""
         client = _client(tmp_path)
         await client._route_claude_frame(_task("task_started"))
 
-        await client._route_claude_frame(
-            _task("task_updated", patch={"status": "killed"})
-        )
+        await client._route_claude_frame(_task("task_updated", patch={"status": "killed"}))
 
         assert client.has_background_work is False
 
@@ -107,9 +101,7 @@ class TestClientSignals:
     async def test_a_running_patch_revives_a_resumed_task(self, tmp_path):
         client = _client(tmp_path)
 
-        await client._route_claude_frame(
-            _task("task_updated", patch={"status": "running"})
-        )
+        await client._route_claude_frame(_task("task_updated", patch={"status": "running"}))
 
         assert client.has_background_work is True
 
@@ -135,10 +127,7 @@ class TestClaudeActivityClock:
 
     def test_a_client_without_the_reader_reports_nothing(self, tmp_path):
         """DeepSeek and friends on this transport are not read between turns."""
-        assert (
-            AcpClient(work_dir=tmp_path, acp_backend="deepseek").session_activity_at
-            is None
-        )
+        assert AcpClient(work_dir=tmp_path, acp_backend="deepseek").session_activity_at is None
 
 
 def _runtime(tmp_path: Path) -> tuple[AcpRuntime, asyncio.StreamReader]:
@@ -204,9 +193,7 @@ class TestRuntimeActivityClock:
         assert rt.session_activity_at("sB") is None
 
     @pytest.mark.asyncio
-    async def test_a_child_frame_dropped_between_turns_still_stamps_its_owner(
-        self, tmp_path
-    ):
+    async def test_a_child_frame_dropped_between_turns_still_stamps_its_owner(self, tmp_path):
         """The between-turn child frame is discarded, but the child IS working."""
         rt, reader = _runtime(tmp_path)
         rt._session_queues["owner"] = asyncio.Queue()
@@ -292,9 +279,7 @@ async def _stale_session(mgr: SessionManager) -> None:
 
 class TestIdleSweep:
     @pytest.mark.asyncio
-    async def test_recent_backend_activity_keeps_a_stale_session(
-        self, manager, providers, caplog
-    ):
+    async def test_recent_backend_activity_keeps_a_stale_session(self, manager, providers, caplog):
         """The chat-1918 regression: working at 09:31, expired at 09:43.
 
         The scan itself must not elect it: the post-probe re-check reads the
@@ -321,9 +306,7 @@ class TestIdleSweep:
         await manager.close_all()
 
     @pytest.mark.asyncio
-    async def test_a_non_number_leaves_the_turn_clock_in_charge(
-        self, manager, providers
-    ):
+    async def test_a_non_number_leaves_the_turn_clock_in_charge(self, manager, providers):
         """A provider double's auto-attribute must not pin a session."""
         await _stale_session(manager)
         providers[0].session_activity_at = MagicMock()
@@ -369,9 +352,7 @@ class TestPendingWorkGuard:
         """The waiter launched at 09:31 emits nothing until it settles."""
         await _stale_session(manager)
         state = _guard_state(_claude_provider(background_work=True))
-        manager.set_idle_expiry_guard(
-            lambda key: DashboardState._has_pending_work(state, key)
-        )
+        manager.set_idle_expiry_guard(lambda key: DashboardState._has_pending_work(state, key))
 
         await manager._expire_idle(timeout_secs=1)
 

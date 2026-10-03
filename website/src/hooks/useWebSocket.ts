@@ -88,6 +88,7 @@ export {
 } from './websocket/slotProjection'
 
 export { ROW_STALL_MS, ROW_STALL_TICK_MS } from './websocket/rowDeliveryWatchdog'
+
 /** A socket that has delivered nothing for this long while the page is visible
  *  is treated as dead, even when its `readyState` still reads OPEN. The gateway
  *  pushes a `dashboard` status frame on every socket every 5s

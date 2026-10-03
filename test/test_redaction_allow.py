@@ -127,12 +127,26 @@ def test_a_variant_shows_an_allowed_link_like_its_row() -> None:
 def test_what_is_saved_never_depends_on_the_allow_list() -> None:
     """Saving and reloading redact every blocked link with its record whatever
     the reader allowed, so a list that has not loaded yet cannot lose a link."""
+    import importlib
     import inspect
+    import pkgutil
 
-    from kiro_crew.dashboard import chat_persistence, chat_runner
+    from kiro_crew.dashboard import chat_persistence, chat_runner, chat_turn, slot_persistence
 
+    # The save-side row projection is composed into chat_persistence from these,
+    # and the runner's turn helpers into chat_runner from the chat_turn owners.
+    packages = (slot_persistence, chat_turn)
+    owners = [
+        importlib.import_module(f"{package.__name__}.{info.name}")
+        for package in packages
+        for info in pkgutil.iter_modules(package.__path__)
+    ]
+    assert owners, "the owner scan found no module, so it is measuring nothing"
+    assert {owner.__name__.rpartition(".")[0] for owner in owners} == {
+        package.__name__ for package in packages
+    }
     redaction_allow.allow_host("ws1", "reviews.corp.example")
-    for module in (chat_persistence, chat_runner):
+    for module in (chat_persistence, chat_runner, *owners):
         src = inspect.getsource(module)
         assert "allowed_hosts_for" not in src
         assert "scoped_exempt_hosts" not in src
