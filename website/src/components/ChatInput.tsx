@@ -960,7 +960,10 @@ function ChatInput({
 
         {/* Bottom icon row */}
         <div className="flex items-center justify-between px-2.5 pb-2 pt-0.5">
-          <div className="flex items-center gap-0.5 min-w-0">
+          {/* Fork: `flex-1` gives the scrolling control row the space left beside
+              the fixed voice/send group; without it the group sizes to its
+              content and its controls paint under that group on a phone. */}
+          <div className="flex flex-1 items-center gap-0.5 min-w-0">
             <AttachMenu plus={plus} onUploadFiles={onUploadFiles} uploading={uploading} onCancelUpload={onCancelUpload} directFilePicker={directFilePicker} collapsible={collapsible} fileInputId={fileInputId} openPicker={openPicker} isMac={isMac} isMobile={isMobile} onScreenshot={onScreenshot} collapseMenuRow={collapseMenuRow} typedCommandMenus={typedCommandMenus} onFileSelect={onFileSelect} />
             {directFilePicker && collapsible && (
               /* The repo's own overflow mechanism, not a second spelling of it.
@@ -1216,7 +1219,12 @@ function ChatInput({
           // this the chip is silently invisible whenever no other pill happens
           // to be present — the control is declared, mounted and unreachable.
           !!sessionControls?.length) && (
-        <div ref={shelfRef} data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0" style={{ ['--glass-shelf-h' as string]: `${shelfHeight}px` }}>
+        /* Fork: one line, never a second row: the labels shed first (shelfCompact)
+           and `overflow-x-auto` backstops the rest, so every chip stays tappable on
+           a phone instead of the row clipping the model chip off its right edge.
+           The glass layer is positioned against the composer, not this row, so
+           the scroller does not clip it. */
+        <div ref={shelfRef} data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0 overflow-x-auto overflow-y-hidden scrollbar-none" style={{ ['--glass-shelf-h' as string]: `${shelfHeight}px`, scrollbarWidth: 'none' }}>
           {/* App-contributed session controls live in their OWN group, not
               beside the agent/project chips. `max-two-buttons-per-row`
               (AUTOSDE.yaml, blocking) caps a horizontal group at 2 action
