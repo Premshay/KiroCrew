@@ -134,7 +134,7 @@ describe('composer liquid glass', () => {
     expect(CHAT_INPUT_SRC).not.toMatch(/className=\{`input-area [^`]*\b(relative|absolute|fixed|sticky)\b/)
     // Fork: the shelf also scrolls horizontally (overflow-x-auto) so every chip
     // stays reachable on a phone.
-    expect(CHAT_INPUT_SRC).toMatch(/data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0 overflow-x-auto overflow-y-hidden scrollbar-none" style=\{\{ \['--glass-shelf-h' as string\]: `\$\{shelfHeight\}px`, scrollbarWidth: 'none' \}\}/)
+    expect(CHAT_INPUT_SRC).toMatch(/data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0 overflow-x-auto overflow-y-hidden" style=\{\{ \['--glass-shelf-h' as string\]: `\$\{shelfHeight\}px` \}\}/)
   })
 
   it('lets the follow-up chips keep their top and bottom hairline', () => {

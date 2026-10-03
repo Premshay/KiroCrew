@@ -1222,9 +1222,10 @@ function ChatInput({
         /* Fork: one line, never a second row: the labels shed first (shelfCompact)
            and `overflow-x-auto` backstops the rest, so every chip stays tappable on
            a phone instead of the row clipping the model chip off its right edge.
+           The native scrollbar stays visible: it is the cue that the row scrolls.
            The glass layer is positioned against the composer, not this row, so
            the scroller does not clip it. */
-        <div ref={shelfRef} data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0 overflow-x-auto overflow-y-hidden scrollbar-none" style={{ ['--glass-shelf-h' as string]: `${shelfHeight}px`, scrollbarWidth: 'none' }}>
+        <div ref={shelfRef} data-testid="composer-context-shelf" className="glass-shelf pt-1 flex items-center gap-2 min-w-0 overflow-x-auto overflow-y-hidden" style={{ ['--glass-shelf-h' as string]: `${shelfHeight}px` }}>
           {/* App-contributed session controls live in their OWN group, not
               beside the agent/project chips. `max-two-buttons-per-row`
               (AUTOSDE.yaml, blocking) caps a horizontal group at 2 action
