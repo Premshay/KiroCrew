@@ -3828,6 +3828,10 @@ class AcpClient:
         # ``session/load`` response instead, against this snapshot. Resolved and
         # cleared together with the array, for the same per-spawn freshness reason.
         self._session_mcp_snapshot: DerivedSpecSnapshot | None = None
+        self._session_agent_spec: dict[str, Any] | None = None
+        self.member_context = False
+        self._loaded_capability_template = ""
+        self._capability_projection_gaps: tuple[str, ...] = ()
         # This session's agent spec, snapshotted once per spawn for the
         # unresolved-ref guard alone (see _guard_unresolved_mcp_refs). Held for
         # the same reason as the array above and read at the same kind of site:
@@ -4531,6 +4535,7 @@ class AcpClient:
         # Kept beside the array it describes, so the post-consume check judges the
         # generation these elements were built from and not a later read of the file.
         self._session_mcp_snapshot = projection.derived_spec_snapshot
+        self._session_agent_spec = projection.agent_spec
         servers = projection.params.get("mcpServers") or []
         out = list(servers) if isinstance(servers, list) else []
         # The restriction half of the projection's withhold set, from the SAME parse the
@@ -5936,6 +5941,9 @@ class AcpClient:
         """Drop the MCP array and the spec snapshot that authorized it."""
         self._session_mcp_cache = None
         self._session_mcp_snapshot = None
+        self._session_agent_spec = None
+        self._loaded_capability_template = ""
+        self._capability_projection_gaps = ()
 
     def _withdraw_shared_reader_lease(self, path: Path, owner: str) -> bool:
         """Withdraw the durable reader lease before clearing its lease flag."""
@@ -7141,6 +7149,57 @@ class AcpClient:
         # teardown's ordinary settle transaction hands it back from here.
         self._claude_settings_claim_unrevoked = False
         self._invalidate_session_mcp_projection()
+
+    def _confirm_member_projection(self, spec: dict[str, Any] | None) -> None:
+        """Confirm the consumed projection, never a spec re-read after startup."""
+        if not self.member_context:
+            return
+        from kiro_crew import agent_state
+        from kiro_crew.agent_capabilities import _digest
+
+        try:
+            intent = agent_state.get_capabilities(self._agent)
+        except (OSError, ValueError) as exc:
+            raise AcpError("capability_state_unreadable: cannot verify saved spec") from exc
+        if intent is None:
+            return
+        if (
+            not self._permission_surface_governed
+            or spec is None
+            or _digest(spec) != intent.get("materialized")
+        ):
+            raise AcpError(
+                "capability_runtime_unverified: saved spec projection was withheld or changed"
+            )
+        gaps = []
+        for field in ("hooks", "toolsSettings", "excludedTools"):
+            if spec.get(field):
+                gaps.append(field)
+        tools = spec.get("tools", [])
+        if tools != "*" and (not isinstance(tools, list) or "*" not in tools):
+            gaps.append("native_tools")
+        if isinstance(tools, list) and any(
+            isinstance(ref, str) and ref.startswith("@") and "/" in ref for ref in tools
+        ):
+            gaps.append("per_tool_mounts")
+        if spec.get("allowedTools") or any(
+            isinstance(server, dict) and server.get("autoApprove")
+            for server in spec.get("mcpServers", {}).values()
+        ):
+            gaps.append("auto_approval")
+        self._capability_projection_gaps = tuple(gaps)
+        self._loaded_capability_template = self._agent
+
+    @property
+    def loaded_capability_template(self) -> str:
+        """Saved template whose projection was consumed by this live Claude session."""
+        if self._is_claude and self.is_ready and self._is_process_alive():
+            return self._loaded_capability_template
+        return ""
+
+    @property
+    def capability_projection_gaps(self) -> tuple[str, ...]:
+        return self._capability_projection_gaps
 
     @property
     def is_ready(self) -> bool:
@@ -10198,6 +10257,9 @@ class AcpClient:
         self._session_mcp_cache = None
         self._session_mcp_withheld = True
         self._session_mcp_snapshot = None
+        self._session_agent_spec = None
+        self._loaded_capability_template = ""
+        self._capability_projection_gaps = ()
         # Same per-spawn freshness rule as the array above: an edited spec must be
         # what the next session's guard judges, not this one's.
         self._mcp_ref_spec = None
@@ -10550,6 +10612,7 @@ class AcpClient:
         resume_sid = self._resume_session_id
         self._resume_session_id = None  # consume — no retry loop
         sent_snapshot: DerivedSpecSnapshot | None = None
+        sent_spec: dict[str, Any] | None = None
 
         if resume_sid and self._can_load_session:
             # Only attempt session/load when the prior session transcript
@@ -10636,6 +10699,7 @@ class AcpClient:
                         self._resumed = True
                         self._capture_available_models(load_resp)
                         sent_snapshot = self._session_mcp_snapshot
+                        sent_spec = self._session_agent_spec
                         if self._uses_advertised_model_selection:
                             await self._persist_advertised_models_if_changed()
                             await self._reseed_after_capture()
@@ -10679,6 +10743,7 @@ class AcpClient:
             model_before = self._model
             session_resp = await self._new_session_following_substitution()
             sent_snapshot = self._session_mcp_snapshot
+            sent_spec = self._session_agent_spec
             self._session_id = session_resp.get("sessionId")
             self._capture_available_models(session_resp)
             if self._uses_advertised_model_selection:
@@ -10799,6 +10864,8 @@ class AcpClient:
 
         # Drain MCP server init notifications
         await self._drain_notifications()
+        if self._is_claude:
+            await asyncio.to_thread(self._confirm_member_projection, sent_spec)
 
     async def ensure_ready(self) -> None:
         """Ensure process is spawned and session is initialized.

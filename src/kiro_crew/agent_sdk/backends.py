@@ -832,12 +832,13 @@ def resolve_selected_backend(value: object) -> str:
 # reach is recorded here rather than claimed.
 ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
 
-# Backends that can load an enrolled member's full saved agent spec at spawn.
+# Backends that can verify an enrolled member's saved spec at spawn.
 # Separate from session sharing and per-session dispatch (harness-parity H6):
-# support for either does not establish full-spec loading. Only kiro-cli has
-# demonstrated it; the provider still requires a live dedicated runtime and a
-# confirmed active template before reporting that the saved spec is loaded.
-ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset({ACP_BACKEND_KIRO})
+# support for either does not establish saved-spec loading. Only kiro-cli has
+# demonstrated native loading. Claude proves consumption of its saved projection;
+# unrepresented fields keep its runtime view unverified. Both require a live
+# dedicated runtime before reporting a saved template.
+ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE})
 
 # Backends that can mount a DIFFERENT MCP tool set on one session than the
 # on-disk agent template declares — the capability crew-member dispatch rides

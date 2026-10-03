@@ -895,14 +895,20 @@ class AcpProvider(LLMProvider):
 
     @property
     def member_capabilities_supported(self) -> bool:
-        """Full saved member-spec loading is opt-in (harness-parity H6)."""
+        """Saved member-spec loading or projection is opt-in (harness-parity H6)."""
         return self._client.backend in ACP_BACKENDS_MEMBER_CAPABILITIES
 
     @property
     def loaded_capability_template(self) -> str:
         if isinstance(self._client, AcpSessionProvider):
             return self._client.loaded_capability_template
-        return ""
+        return self._client.loaded_capability_template
+
+    @property
+    def capability_projection_gaps(self) -> tuple[str, ...]:
+        if isinstance(self._client, AcpSessionProvider):
+            return ()
+        return self._client.capability_projection_gaps
 
     @property
     def mcp_config_hot_reload(self) -> bool:
@@ -2255,7 +2261,8 @@ class AcpProvider(LLMProvider):
             # sessions (session sharing).
             await self._start_kiro_runtime()
         else:
-            # ── CC path: legacy AcpClient (unchanged) ──
+            # ── CC path: legacy AcpClient ──
+            self._client.member_context = self.member_context
             await self._client.ensure_ready()
 
         await self._apply_initial_effort()
