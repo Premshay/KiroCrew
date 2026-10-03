@@ -3700,7 +3700,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // (`statusStackOccupied`, measured by `useComposerDockMetrics`). The scroller
   // geometry reads one name: `dockReserved`.
   const jumpPillVisible = !isAtBottom && messages.length > 0
-  const dockReserved = statusStackOccupied || jumpPillVisible
+  // Fork: only the status bars reserve the dock. The pill is a glass chip that
+  // reads over text the way the composer does; reserving for it ended the
+  // scroller above the composer too, so the composer's glass sat over bare page
+  // and turned solid every time the reader scrolled up.
+  const dockReserved = statusStackOccupied
   // Mirror the virtualizer's follow API into the refs the early effects/handlers
   // (declared above) read. Done in a layout effect rather than the render body
   // so a concurrent render React throws away can't write stale callbacks into

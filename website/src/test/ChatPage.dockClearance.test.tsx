@@ -63,7 +63,10 @@ describe('composer dock clearance', () => {
     // child presence (CommandCenterDock and QueueStack keep a zero-height wrapper
     // mounted while idle, so a presence test would reserve the band in every chat).
     expect(CHAT_PAGE).toMatch(/dockReserved\s*\?\s*\{ marginBottom: dockH, paddingBottom: DOCK_CLEARANCE_PX \}/)
-    expect(CHAT_PAGE).toMatch(/const jumpPillVisible = !isAtBottom && messages\.length > 0\s*const dockReserved = statusStackOccupied \|\| jumpPillVisible/)
+    // Fork: only the status bars reserve; the glass pill does not, so the
+    // composer keeps text behind its glass while the reader is scrolled up.
+    expect(CHAT_PAGE).toMatch(/const jumpPillVisible = !isAtBottom && messages\.length > 0/)
+    expect(CHAT_PAGE).toMatch(/const dockReserved = statusStackOccupied\n/)
     expect(DOCK).toMatch(/const band = el\.querySelector<HTMLElement>\('\[data-testid="composer-status-stack"\]'\)\s*setStatusStackOccupied\(!!band && Array\.from\(band\.children\)\.some\(c => \(c as HTMLElement\)\.offsetHeight > 0\)\)/)
     expect(DOCK).not.toMatch(/setStatusStackOccupied\(!!band\?\.firstElementChild\)/)
     expect(DOCK).toMatch(/if \(!el\) \{ setDockH\(0\); setDockGutter\(0\); setStatusStackOccupied\(false\); return \}/)
