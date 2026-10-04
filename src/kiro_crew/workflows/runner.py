@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
+from kiro_crew.llm_helpers import ToolCallLimitExceeded
 from kiro_crew.metrics.events import WORKFLOW_RUNS, emit_counter
 
 from . import BudgetExceeded, WorkflowEvent
@@ -374,6 +375,7 @@ class _RunContext:
         self._concurrency = concurrency
         self._current_phase = ""
         self._busy_sessions: set[str] = set()
+        self._tool_limit_error: Optional[ToolCallLimitExceeded] = None
         self._events: list[WorkflowEvent] = []
         self._on_event = on_event
         # Resume / restart-subtree: cached agent results from a prior run,
@@ -438,6 +440,8 @@ class _RunContext:
         if self.budget.would_exceed():
             raise BudgetExceeded("budget exhausted before agent call")
 
+        if self._tool_limit_error is not None:
+            raise self._tool_limit_error
         if session is not None and session in self._busy_sessions:
             raise _WorkflowSessionBusy(_SESSION_BUSY_ERROR)
         call_index = self._counter.count - 1
@@ -500,6 +504,8 @@ class _RunContext:
         except Exception as exc:  # noqa: BLE001 - record before propagating a busy session
             result, ok = None, False
             error = describe_agent_error(exc)
+            if isinstance(exc, ToolCallLimitExceeded):
+                self._tool_limit_error = exc
             if session is not None and (
                 isinstance(exc, _PROMPT_BUSY_ERRORS)
                 or (
@@ -545,6 +551,8 @@ class _RunContext:
                 "error": error,
             },
         )
+        if self._tool_limit_error is not None:
+            raise self._tool_limit_error
         if session is not None and session in self._busy_sessions:
             raise _WorkflowSessionBusy(_SESSION_BUSY_ERROR)
         return result
@@ -1027,7 +1035,7 @@ class WorkflowRunner:
                 agent_errors=dict(ctx.agent_errors),
                 source=source,
             )
-        except _WorkflowSessionBusy as exc:
+        except (_WorkflowSessionBusy, ToolCallLimitExceeded) as exc:
             await _pre_terminal()
             emit(stream.run_failed(now, error=str(exc), where="exec"))
             return RunResult(
@@ -1035,7 +1043,9 @@ class WorkflowRunner:
                 ok=False,
                 result={
                     "status": "incomplete",
-                    "reason": "session_busy",
+                    "reason": (
+                        "tool_limit" if isinstance(exc, ToolCallLimitExceeded) else "session_busy"
+                    ),
                     "child_status": "unknown",
                 },
                 events=events,
@@ -1073,16 +1083,20 @@ class WorkflowRunner:
                 agent_errors=dict(ctx.agent_errors),
                 source=source,
             )
-        if ctx._busy_sessions or task_is_incomplete(result):
+        if ctx._tool_limit_error or ctx._busy_sessions or task_is_incomplete(result):
             error = (
-                _SESSION_BUSY_ERROR
-                if ctx._busy_sessions
-                else "Workflow ended with an incomplete task result. Inspect the result before resuming."
+                str(ctx._tool_limit_error)
+                if ctx._tool_limit_error
+                else (
+                    _SESSION_BUSY_ERROR
+                    if ctx._busy_sessions
+                    else "Workflow ended with an incomplete task result. Inspect the result before resuming."
+                )
             )
-            if ctx._busy_sessions:
+            if ctx._tool_limit_error or ctx._busy_sessions:
                 result = {
                     "status": "incomplete",
-                    "reason": "session_busy",
+                    "reason": "tool_limit" if ctx._tool_limit_error else "session_busy",
                     "child_status": "unknown",
                 }
             emit(stream.run_failed(now, error=error, where="exec"))

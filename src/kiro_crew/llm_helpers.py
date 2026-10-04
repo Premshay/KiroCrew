@@ -2378,6 +2378,10 @@ async def background_turn(
                 logger.debug("background recycle failed task=%s", task, exc_info=True)
 
 
+class ToolCallLimitExceeded(RuntimeError):
+    """Collection stopped at its tool ceiling; provider completion is unverified."""
+
+
 async def stream_and_collect(
     provider: LLMProvider,
     message: str,
@@ -2391,6 +2395,7 @@ async def stream_and_collect(
     on_tool_gate: Callable[[str, bool, bool], None] | None = None,
     retry_transient: bool = True,
     max_turns: int | None = None,
+    raise_on_tool_limit: bool = False,
     session_key: str = "",
     agent: str = "",
     app: str = "",
@@ -2442,6 +2447,9 @@ async def stream_and_collect(
         max_turns: Optional cap on tool-call iterations per prompt. When reached,
             the event loop breaks and returns whatever text has been collected.
             None (default) means no limit.
+        raise_on_tool_limit: Raise ToolCallLimitExceeded instead of returning
+            partial text at the ceiling. Does not establish provider completion
+            or cancel its outstanding prompt.
         session_key: Calling surface's session key, forwarded to the PreToolUse
             gate. Empty (default) preserves every existing caller's behavior.
         agent: Calling agent name, forwarded to the gate alongside *session_key*.
@@ -2569,6 +2577,11 @@ async def stream_and_collect(
                             outcome="denied_max_turns",
                             metadata={"max_turns": max_turns, "count": tool_call_count},
                         )
+                        if raise_on_tool_limit:
+                            raise ToolCallLimitExceeded(
+                                f"Tool-call limit {max_turns} exceeded; task incomplete; "
+                                "team state unknown. Reconcile the outstanding prompt before resuming."
+                            )
                         break
                     # Fire PreToolUse hooks for auto-approved tools (informational only)
                     _sel().log_tool_invocation(
