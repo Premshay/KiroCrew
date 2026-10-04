@@ -712,7 +712,10 @@ async def test_owner_reselection_cannot_promote_existing_template_context_to_mem
         response = await client.post(
             "/api/chat/slots/template-chat/agent", json={"agent": TEMPLATE}
         )
-        assert response.status == 503, await response.text()
+        # A refusal by policy, not a store fault: the conversation already has
+        # template context, so choosing member memory needs a new conversation.
+        assert response.status == 409, await response.text()
+        assert (await response.json())["code"] == "member_memory_requires_new_conversation"
     assert read_session_execution(key) == previous
     assert session_agent_selection_kind(key, TEMPLATE) == "template"
     assert read_private_session_store(key) is None
