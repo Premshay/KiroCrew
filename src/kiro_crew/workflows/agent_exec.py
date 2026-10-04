@@ -33,7 +33,12 @@ import logging
 import time
 from typing import Any, Callable, Optional
 
-from kiro_crew.llm_helpers import ToolApprovalPolicy, provider_last_turn_usage, stream_and_collect
+from kiro_crew.llm_helpers import (
+    ToolApprovalPolicy,
+    ToolCallLimitExceeded,
+    provider_last_turn_usage,
+    stream_and_collect,
+)
 from kiro_crew.security import redact
 
 logger = logging.getLogger(__name__)
@@ -185,6 +190,7 @@ def build_agent_fn(
         # duration_ms is a literal 0. Started after get_or_create so session
         # setup is not charged to the turn.
         _turn_t0 = time.monotonic()
+        tool_limit_reached = False
         try:
             from kiro_crew.messaging.identity import publish_turn_identity
 
@@ -268,14 +274,20 @@ def build_agent_fn(
             if memory_scope is not None:
                 await memory_scope.validate()
             return text
+        except ToolCallLimitExceeded:
+            tool_limit_reached = True
+            raise
         finally:
             # Every successful acquire owns a lease, including stateful calls.
             # Returning it without cleanup keeps the named provider and history.
             try:
                 sessions.release(key, cleanup=ephemeral)
-                if ephemeral and memory_scope is not None:
+            except Exception as exc:  # noqa: BLE001 - cleanup must not mask the result
+                logger.warning("workflow session lease release failed: %s", type(exc).__name__)
+            if tool_limit_reached or (ephemeral and memory_scope is not None):
+                try:
                     await sessions.destroy(key)
-            except Exception:  # noqa: BLE001 - cleanup must not mask the result
-                logger.warning("workflow session lease release failed", exc_info=True)
+                except Exception as exc:  # noqa: BLE001 - preserve the tool-limit failure
+                    logger.warning("workflow session teardown failed: %s", type(exc).__name__)
 
     return agent_fn

@@ -132,7 +132,12 @@ Reconcile the outstanding prompt before starting a recovery run.
 Workflow steps also raise on the 200-tool collection ceiling instead of returning
 partial text to schema validation. The run records `reason: tool_limit` and
 `child_status: unknown`; schema re-asks and continuation retries stop. This ceiling
-does not establish provider or teammate completion and does not cancel them.
+does not establish provider or teammate completion. On this failure, both
+execution adapters retire the affected session through SessionManager teardown,
+including named sessions; pooled workers are evicted on the exception. Teardown
+closes its approval transport instead of retaining unanswered child requests.
+Saved workspace files remain. The result keeps team state unknown because a
+cleanup attempt is not evidence of teammate completion.
 
 A normal script return with top-level `status: incomplete` also ends as
 unsuccessful, preserving the returned result. Terminal snapshots expose

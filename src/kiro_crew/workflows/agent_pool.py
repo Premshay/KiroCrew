@@ -36,7 +36,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from kiro_crew.acp.worker_pool import WorkerPool
-from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
+from kiro_crew.llm_helpers import ToolApprovalPolicy, ToolCallLimitExceeded, stream_and_collect
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.security import redact
 from kiro_crew.taskq.adapters.runner import (
@@ -373,6 +373,7 @@ def build_pooled_agent_fn(
             cwd=opts.get("cwd") or cwd,
             extra_env=extra_env,
         )
+        tool_limit_reached = False
         try:
             # Same identity publication as the pooled worker (see
             # _WorkflowSessionWorker.send_message): a named ``session=`` chain
@@ -394,6 +395,9 @@ def build_pooled_agent_fn(
             if memory_scope is not None:
                 await memory_scope.validate()
             return result
+        except ToolCallLimitExceeded:
+            tool_limit_reached = True
+            raise
         finally:
             # Best-effort teardown. An exception raised from this ``finally``
             # would REPLACE the step's real outcome: a successful ``result``
@@ -411,7 +415,7 @@ def build_pooled_agent_fn(
                     sessions.release(key, cleanup=False)
                 except Exception as exc:
                     _log_unpooled_teardown_failure("release", exc)
-            else:
+            if named is None or tool_limit_reached:
                 try:
                     await sessions.destroy(key)
                 except Exception as exc:

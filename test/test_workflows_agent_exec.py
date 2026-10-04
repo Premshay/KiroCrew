@@ -99,6 +99,31 @@ async def test_named_session_is_reused_and_lease_released() -> None:
     assert sessions.released == ["chain-A"]
 
 
+@pytest.mark.parametrize("named", [None, "chain-A"])
+@pytest.mark.parametrize("release_fails", [False, True])
+async def test_tool_limit_retires_session_before_returning_failure(
+    monkeypatch, named, release_fails
+) -> None:
+    sessions = FakeSessions()
+    sessions.destroy = AsyncMock()
+    if release_fails:
+        sessions.release = MagicMock(side_effect=RuntimeError("lease failure"))
+
+    async def limited_stream(*args, **kwargs):
+        raise agent_exec.ToolCallLimitExceeded("tool limit")
+
+    monkeypatch.setattr(agent_exec, "stream_and_collect", limited_stream)
+    fn = build_agent_fn(sessions, run_id="wf_limit")
+    with pytest.raises(agent_exec.ToolCallLimitExceeded):
+        await fn("audit", {"session": named})
+    key = sessions.created[0][0]
+    if release_fails:
+        sessions.release.assert_called_once_with(key, cleanup=named is None)
+    else:
+        assert sessions.released == [key]
+    sessions.destroy.assert_awaited_once_with(key)
+
+
 async def test_two_default_calls_get_distinct_sessions() -> None:
     sessions = FakeSessions()
     fn = build_agent_fn(sessions, run_id="wf_y")

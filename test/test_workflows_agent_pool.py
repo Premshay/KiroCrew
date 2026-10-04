@@ -15,6 +15,7 @@ import asyncio
 import pytest
 from overload_fakes import settle_dependency_park, settle_store_writes
 
+from kiro_crew.llm_helpers import ToolCallLimitExceeded
 from kiro_crew.workflows.agent_pool import _WorkflowSessionWorker, build_pooled_agent_fn
 
 
@@ -103,6 +104,25 @@ def _patch_stream(monkeypatch):
     monkeypatch.setattr("kiro_crew.workflows.agent_pool.stream_and_collect", _fake_stream)
     # redaction is a no-op passthrough for these tests
     monkeypatch.setattr("kiro_crew.workflows.agent_pool.redact", lambda t: t)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named", [None, "chain-A"])
+async def test_tool_limit_retires_pooled_and_named_sessions(monkeypatch, named):
+    sessions = _FakeSessions()
+
+    async def limited_stream(*args, **kwargs):
+        raise ToolCallLimitExceeded("tool limit")
+
+    monkeypatch.setattr("kiro_crew.workflows.agent_pool.stream_and_collect", limited_stream)
+    fn, pool = build_pooled_agent_fn(sessions, run_id="wf_limit")
+    try:
+        with pytest.raises(ToolCallLimitExceeded):
+            await fn("audit", {"session": named})
+        assert not sessions.live
+        assert sessions.destroys == 1
+    finally:
+        await pool.shutdown()
 
 
 @pytest.mark.asyncio
