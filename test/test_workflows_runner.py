@@ -35,6 +35,106 @@ def _types(res: RunResult) -> list[str]:
     return [e.type for e in res.events]
 
 
+async def test_incomplete_return_is_unsuccessful_and_preserved() -> None:
+    script = (
+        'META = {"name": "incomplete"}\n'
+        "async def workflow(ctx):\n"
+        "    return {'status': 'incomplete', 'stage': 'audit', 'result': None}\n"
+    )
+    res = await _runner().run(script, run_id="wf_incomplete", now=NOW)
+    assert not res.ok
+    assert res.result == {"status": "incomplete", "stage": "audit", "result": None}
+    assert res.events[-1].type == "run_failed"
+    assert "incomplete" in res.error
+
+
+async def test_busy_named_session_stops_continuation_loop() -> None:
+    from kiro_crew.acp.transport_errors import AcpError
+
+    calls = []
+
+    async def busy(prompt, opts):
+        calls.append(opts["session"])
+        raise AcpError("a prompt is already in flight for this session", code=-32602)
+
+    script = (
+        'META = {"name": "busy"}\n'
+        "async def workflow(ctx):\n"
+        "    for turn in range(6):\n"
+        "        await ctx.agent('continue', session='retained-team')\n"
+        "    return {'done': True}\n"
+    )
+    res = await _runner(agent_fn=busy).run(script, run_id="wf_busy", now=NOW)
+    assert calls == ["retained-team"]
+    assert not res.ok
+    assert res.result == {
+        "status": "incomplete",
+        "reason": "session_busy",
+        "child_status": "unknown",
+    }
+    assert len(res.agent_errors) == 1
+    assert res.events[-1].type == "run_failed"
+    assert "Reconcile" in res.error
+
+
+async def test_invalid_params_without_busy_message_keeps_per_call_semantics() -> None:
+    from kiro_crew.acp.transport_errors import AcpError
+
+    async def invalid(prompt, opts):
+        raise AcpError("Invalid params", code=-32602)
+
+    script = (
+        'META = {"name": "invalid"}\n'
+        "async def workflow(ctx):\n"
+        "    await ctx.agent('go', session='named')\n"
+        "    return {'handled': True}\n"
+    )
+    res = await _runner(agent_fn=invalid).run(script, run_id="wf_invalid", now=NOW)
+    assert res.ok
+    assert res.result == {"handled": True}
+    assert len(res.agent_errors) == 1
+
+
+async def test_parallel_busy_failure_cannot_be_returned_as_success() -> None:
+    from kiro_crew.acp.transport_errors import AcpError
+
+    calls = []
+
+    async def busy(prompt, opts):
+        calls.append(prompt)
+        raise AcpError("a prompt is already in flight for this session", code=-32602)
+
+    script = (
+        'META = {"name": "parallel busy"}\n'
+        "async def workflow(ctx):\n"
+        "    await ctx.parallel([lambda: ctx.agent('go', session='team')])\n"
+        "    return {'done': True}\n"
+    )
+    res = await _runner(agent_fn=busy).run(script, run_id="wf_parallel_busy", now=NOW)
+    assert calls == ["go"]
+    assert not res.ok
+    assert res.result["reason"] == "session_busy"
+    assert res.result["child_status"] == "unknown"
+
+
+async def test_typed_busy_refusal_without_code_stops_named_session() -> None:
+    from kiro_crew.acp.transport_errors import AcpPromptBusy
+
+    async def busy(prompt, opts):
+        raise AcpPromptBusy("A prompt is already in progress")
+
+    script = (
+        'META = {"name": "typed busy"}\n'
+        "async def workflow(ctx):\n"
+        "    await ctx.agent('go', session='team')\n"
+        "    return {'done': True}\n"
+    )
+    res = await _runner(agent_fn=busy).run(script, run_id="wf_typed_busy", now=NOW)
+    assert not res.ok
+    assert res.result["reason"] == "session_busy"
+    assert len(res.agent_errors) == 1
+
+
 # --------------------------------------------------------------------------- #
 # A7 — end-to-end event stream
 # --------------------------------------------------------------------------- #
@@ -296,9 +396,7 @@ async def test_author_in_run_failure_becomes_run_failed() -> None:
     async def _bad_author(intent: str, *, on_progress=None):
         return {"ok": False, "errors": ["no META", "no workflow()"]}
 
-    res = await _runner().run(
-        "", run_id="wf_a2", now=NOW, intent="nonsense", author_fn=_bad_author
-    )
+    res = await _runner().run("", run_id="wf_a2", now=NOW, intent="nonsense", author_fn=_bad_author)
     assert not res.ok
     failed = [e for e in res.events if e.type == "run_failed"]
     assert failed and failed[-1].data["where"] == "author"
@@ -310,9 +408,7 @@ async def test_author_in_run_exception_is_captured() -> None:
     async def _explode(intent: str, *, on_progress=None):
         raise RuntimeError("model down")
 
-    res = await _runner().run(
-        "", run_id="wf_a3", now=NOW, intent="x", author_fn=_explode
-    )
+    res = await _runner().run("", run_id="wf_a3", now=NOW, intent="x", author_fn=_explode)
     assert not res.ok
     assert "model down" in (res.error or "")
     assert any(e.type == "run_failed" for e in res.events)
@@ -344,7 +440,11 @@ async def test_author_in_run_publishes_source_before_execution() -> None:
     runner = WorkflowRunner(agent_fn=_blocking_agent)
     task = asyncio.ensure_future(
         runner.run(
-            "", run_id="wf_src", now=NOW, intent="x", author_fn=_author_fn,
+            "",
+            run_id="wf_src",
+            now=NOW,
+            intent="x",
+            author_fn=_author_fn,
             on_source=published.append,
         )
     )

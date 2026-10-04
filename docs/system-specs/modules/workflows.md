@@ -121,6 +121,20 @@ run_id`.
 
 ### Agent execution
 
+A named-session `AcpPromptBusy` rejection, or a legacy ACP rejection with code
+`-32602` and the prompt-in-flight message, ends the workflow as unsuccessful
+after recording the rejected call.
+The runner does not send continuation retries to that session within the run.
+Its result declares `status: incomplete`, `reason: session_busy`, and
+`child_status: unknown`: rejection does not prove that the team stopped.
+Reconcile the outstanding prompt before starting a recovery run.
+
+A normal script return with top-level `status: incomplete` also ends as
+unsuccessful, preserving the returned result. Terminal snapshots expose
+`execution_status: ended` and `task_outcome: incomplete`; older persisted
+`finished` records with that result are presented as `failed` without rewriting
+their stored journal. Other return values retain their existing semantics.
+
 ```python
 async def agent(
     self, prompt: str, *, label=None, phase=None, schema=None, model=None,
@@ -143,8 +157,8 @@ Semantics, from `runner._RunContext.agent`:
 - `label` defaults to `prompt[:40]`.
 - With `schema=`, the call goes through `schema.run_with_schema` and resolves to a
   **validated** value, or `None` after bounded re-asks.
-- **`BudgetExceeded` is the only exception `agent()` raises.** Every other failure
-  is caught per call and resolves to `None`, with a bounded, redacted reason
+- **`BudgetExceeded` and a named-session prompt-in-flight refusal stop the run.** Other failures
+  are caught per call and resolve to `None`, with a bounded, redacted reason
   recorded in `agent_errors[call_index]` and on the `agent_finished` event's
   `error` field. A dead agent therefore does not fail the run
   (`test_workflows_runner.py::test_failed_agent_resolves_to_none_not_run_failure`).
