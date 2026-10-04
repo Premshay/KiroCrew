@@ -41,7 +41,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 from kiro_crew.llm_helpers import ToolCallLimitExceeded
 from kiro_crew.metrics.events import WORKFLOW_RUNS, emit_counter
 
-from . import BudgetExceeded, WorkflowEvent
+from . import _DEFAULT_TOOL_CALL_LIMIT, _MAX_TOOL_CALL_LIMIT, BudgetExceeded, WorkflowEvent
 from .context import DEFAULT_MAX_AGENTS_PER_RUN, AgentCounter, Budget, build_safe_globals
 from .dsl import parallel as _parallel
 from .dsl import pipeline as _pipeline
@@ -430,6 +430,7 @@ class _RunContext:
         cwd: Optional[str] = None,
         session: Optional[str] = None,
         nudge: Optional[dict] = None,
+        max_tool_calls: int = _DEFAULT_TOOL_CALL_LIMIT,
     ) -> Any:
         # B6 cap + A4 ceiling are checked BEFORE the call so a script cannot run
         # past either limit. would_exceed lets us stop at the boundary cleanly.
@@ -466,9 +467,14 @@ class _RunContext:
             "cwd": cwd,
             "session": session,
             "nudge": nudge,
+            "max_tool_calls": max_tool_calls,
         }
         error = ""
         try:
+            if type(max_tool_calls) is not int or not 1 <= max_tool_calls <= _MAX_TOOL_CALL_LIMIT:
+                raise ValueError(
+                    f"max_tool_calls must be an integer from 1 to {_MAX_TOOL_CALL_LIMIT}"
+                )
             if call_index < self._replay_before and call_index in self._replay_results:
                 # Resume: replay the cached result from the prior run instead
                 # of re-calling the model. Determinism (no time/random + stable

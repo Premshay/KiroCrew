@@ -48,6 +48,42 @@ async def test_incomplete_return_is_unsuccessful_and_preserved() -> None:
     assert "incomplete" in res.error
 
 
+async def test_tool_allowance_reaches_agent_adapter():
+    limits = []
+
+    async def capture(prompt, opts):
+        limits.append(opts["max_tool_calls"])
+        return "done"
+
+    script = (
+        'META = {"name": "allowance"}\n'
+        "async def workflow(ctx):\n"
+        "    await ctx.agent('ordinary')\n"
+        "    return await ctx.agent('team', max_tool_calls=1000)\n"
+    )
+    res = await _runner(agent_fn=capture).run(script, run_id="wf_allowance", now=NOW)
+    assert res.ok
+    assert limits == [200, 1000]
+
+
+@pytest.mark.parametrize("limit", ["0", "2001", "True", "None", "200.5"])
+async def test_invalid_tool_allowance_never_calls_adapter(limit):
+    calls = []
+
+    async def capture(prompt, opts):
+        calls.append(opts)
+        return "done"
+
+    script = (
+        'META = {"name": "bad-allowance"}\n'
+        "async def workflow(ctx):\n"
+        f"    return await ctx.agent('team', max_tool_calls={limit})\n"
+    )
+    res = await _runner(agent_fn=capture).run(script, run_id="wf_bad_allowance", now=NOW)
+    assert not calls
+    assert "max_tool_calls" in res.agent_errors[0]
+
+
 async def test_busy_named_session_stops_continuation_loop() -> None:
     from kiro_crew.acp.transport_errors import AcpError
 

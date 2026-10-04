@@ -226,6 +226,24 @@ async def test_tool_ceiling_can_fail_without_returning_partial_text():
     provider.shutdown.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [200, 1000])
+async def test_team_allowance_counts_lead_and_delegated_calls(limit):
+    events = [LLMEvent(kind=EVENT_TOOL_CALL, tool_call_id=f"lead-{i}") for i in range(23)]
+    events += [
+        LLMEvent(kind=EVENT_TOOL_CALL, tool_call_id=f"child-team-{i}") for i in range(183)
+    ]
+    events.append(LLMEvent(kind=EVENT_TEXT_CHUNK, text="audit complete"))
+    provider = _make_provider(events=events)
+    if limit == 200:
+        with pytest.raises(ToolCallLimitExceeded):
+            await stream_and_collect(provider, "audit", max_turns=limit, raise_on_tool_limit=True)
+    else:
+        assert await stream_and_collect(
+            provider, "audit", max_turns=limit, raise_on_tool_limit=True
+        ) == "audit complete"
+
+
 class TestStreamAndCollectPromptBusy:
     @pytest.mark.asyncio
     async def test_retries_on_prompt_busy_then_succeeds(self) -> None:

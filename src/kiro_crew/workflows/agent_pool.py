@@ -55,6 +55,7 @@ from kiro_crew.taskq.model import KIND_WORKFLOW_AGENT, SIDE_EFFECT_UNKNOWN
 from kiro_crew.workflows.agent_exec import (
     _MAX_TURNS_PER_STEP,
     WorkflowSpawnRefused,
+    _step_tool_limit,
     vet_step_spawn,
 )
 
@@ -75,12 +76,18 @@ def _log_unpooled_teardown_failure(action: str, exc: BaseException) -> None:
     )
 
 
-async def _run_step(provider: Any, prompt: str, *, timeout: Optional[float] = None) -> str:
+async def _run_step(
+    provider: Any,
+    prompt: str,
+    *,
+    timeout: Optional[float] = None,
+    max_tool_calls: int = _MAX_TURNS_PER_STEP,
+) -> str:
     """Stream one workflow agent step through ``provider`` and redact its output.
 
     Single source of truth for the per-step contract shared by the pooled worker
     and the ``session=`` bypass path: AUTO_APPROVE policy, the shared
-    ``_MAX_TURNS_PER_STEP`` tool-call ceiling, an optional per-task ``timeout``
+    tool-call allowance (default ``_MAX_TURNS_PER_STEP``), an optional per-task ``timeout``
     (via ``asyncio.wait_for`` — the pool passes its per-task bound here so a
     wedged turn is terminated instead of holding a permit until the run ceiling),
     and canonical output redaction (parity with ``agent_exec`` — prevents
@@ -91,7 +98,7 @@ async def _run_step(provider: Any, prompt: str, *, timeout: Optional[float] = No
         provider,
         prompt,
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
-        max_turns=_MAX_TURNS_PER_STEP,
+        max_turns=max_tool_calls,
         raise_on_tool_limit=True,
     )
     text = await (asyncio.wait_for(coro, timeout) if timeout is not None else coro)
@@ -391,7 +398,7 @@ def build_pooled_agent_fn(
                     agent=opts.get("agent") or default_agent,
                     cwd=opts.get("cwd") or cwd,
                 )
-            result = await _run_step(provider, prompt)
+            result = await _run_step(provider, prompt, max_tool_calls=_step_tool_limit(opts))
             if memory_scope is not None:
                 await memory_scope.validate()
             return result
@@ -422,6 +429,7 @@ def build_pooled_agent_fn(
                     _log_unpooled_teardown_failure("destroy", exc)
 
     async def agent_fn(prompt: str, opts: dict) -> Any:
+        tool_limit = _step_tool_limit(opts)
         if memory_scope is not None:
             await memory_scope.validate()
         # The same two gates the cold path runs, at the single entry: the pooled
@@ -436,7 +444,7 @@ def build_pooled_agent_fn(
             # Launch in the RESOLVED directory and key the warm sub-pool on it, so
             # a worker is never built for an unresolved spelling of a path.
             opts = {**opts, "cwd": step_cwd}
-        if opts.get("session") is not None:
+        if opts.get("session") is not None or tool_limit != _MAX_TURNS_PER_STEP:
             return await _run_unpooled(prompt, opts)
         target = _pool_for(opts.get("agent"), opts.get("model"), opts.get("cwd"))
         if target is None:

@@ -129,7 +129,7 @@ Its result declares `status: incomplete`, `reason: session_busy`, and
 `child_status: unknown`: rejection does not prove that the team stopped.
 Reconcile the outstanding prompt before starting a recovery run.
 
-Workflow steps also raise on the 200-tool collection ceiling instead of returning
+Workflow steps also raise on the tool-call collection ceiling instead of returning
 partial text to schema validation. The run records `reason: tool_limit` and
 `child_status: unknown`; schema re-asks and continuation retries stop. This ceiling
 does not establish provider or teammate completion. On this failure, both
@@ -138,6 +138,12 @@ including named sessions; pooled workers are evicted on the exception. Teardown
 closes its approval transport instead of retaining unanswered child requests.
 Saved workspace files remain. The result keeps team state unknown because a
 cleanup attempt is not evidence of teammate completion.
+
+Set `ctx.agent(..., max_tool_calls=1000)` for a long team audit. The default is
+200; accepted values are integers from 1 to 2000. The allowance includes lead
+and teammate calls. Non-default allowances use dedicated sessions, keeping warm
+pool limits unchanged. Invalid values fail before provider allocation. Token
+and time budgets, approvals, teardown and incomplete-result handling still apply.
 
 A normal script return with top-level `status: incomplete` also ends as
 unsuccessful, preserving the returned result. Terminal snapshots expose
@@ -148,7 +154,7 @@ their stored journal. Other return values retain their existing semantics.
 ```python
 async def agent(
     self, prompt: str, *, label=None, phase=None, schema=None, model=None,
-    agent=None, effort=None, cwd=None, session=None, nudge=None,
+    agent=None, effort=None, cwd=None, session=None, nudge=None, max_tool_calls=200,
 ) -> AgentResult
 ```
 
@@ -179,8 +185,8 @@ Semantics, from `runner._RunContext.agent`:
   `MAX_AGENT_ERROR_CHARS` = 500, no traceback).
 
 `label`, `phase`, `schema`, `model`, `agent`, `effort`, `cwd`, `session` and
-`nudge` are all passed to the injected `agent_fn` in one `opts` dict. The shipped
-adapters read `session`, `agent`, `model` and `cwd`; `label` and `phase` are
+`nudge` and `max_tool_calls` are all passed to the injected `agent_fn` in one `opts` dict. The shipped
+adapters read `session`, `agent`, `model`, `cwd` and `max_tool_calls`; `label` and `phase` are
 consumed by the runner for the event stream; `schema` is consumed by the runner.
 
 > Open question: `effort` and the per-call `nudge` dict are part of the frozen
@@ -570,7 +576,7 @@ None-guard, and `validate` rejects the inline unguarded dereference.
 | Wall clock per run | `runner.DEFAULT_RUN_TIMEOUT_SECS` | 3600s | `run_failed`, `where="ceiling"`, `error="timeout"` |
 | Wall-clock bounds | `MIN_RUN_TIMEOUT_SECS` / `MAX_RUN_TIMEOUT_SECS` | 60s / 21600s (6h) | a caller value is clamped into the range |
 | Agent calls per run | `context.DEFAULT_MAX_AGENTS_PER_RUN` | 1000 | `BudgetExceeded` -> `run_failed`, `where="ceiling"` |
-| Tool calls per agent step | `agent_exec._MAX_TURNS_PER_STEP` | 200 | `stream_and_collect` stops the step; prevents an infinite tool loop from prompt injection |
+| Tool calls per agent step | `ctx.agent(max_tool_calls=...)` | 200 default; 1–2000 | Includes delegated calls; stops and tears down the step at the allowance |
 | Token budget | `budget_total` per run | caller-set, `None` = unbounded | `BudgetExceeded` -> `run_failed`, `where="ceiling"` |
 | Script size | `validate.MAX_SCRIPT_BYTES` | 262144 | validation error |
 | Schema re-asks | `schema.DEFAULT_SCHEMA_RETRIES` | 2 | result is `None` |

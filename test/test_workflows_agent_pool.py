@@ -11,6 +11,7 @@ SessionManager — no kiro-cli spawns.
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 from overload_fakes import settle_dependency_park, settle_store_writes
@@ -121,6 +122,39 @@ async def test_tool_limit_retires_pooled_and_named_sessions(monkeypatch, named):
             await fn("audit", {"session": named})
         assert not sessions.live
         assert sessions.destroys == 1
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named", [None, "chain-A"])
+async def test_custom_allowance_uses_dedicated_session(monkeypatch, named):
+    sessions = _FakeSessions()
+    collector = AsyncMock(return_value="done")
+    monkeypatch.setattr("kiro_crew.workflows.agent_pool.stream_and_collect", collector)
+    fn, pool = build_pooled_agent_fn(sessions, run_id="wf_allowance")
+    try:
+        assert await fn("audit", {"session": named, "max_tool_calls": 1000}) == "done"
+        assert collector.await_args.kwargs["max_turns"] == 1000
+        assert collector.await_args.kwargs["raise_on_tool_limit"] is True
+        assert all(not key.startswith("wf-pool:") for key in sessions.keys_seen)
+        if named is None:
+            assert not sessions.live
+    finally:
+        if named is not None:
+            await sessions.destroy(named)
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 2001, True, None])
+async def test_invalid_allowance_cannot_start_pooled_worker(limit):
+    sessions = _FakeSessions()
+    fn, pool = build_pooled_agent_fn(sessions, run_id="wf_invalid_allowance")
+    try:
+        with pytest.raises(ValueError, match="max_tool_calls"):
+            await fn("audit", {"max_tool_calls": limit})
+        assert sessions.cold_starts == 0
     finally:
         await pool.shutdown()
 

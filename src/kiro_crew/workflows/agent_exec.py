@@ -40,15 +40,22 @@ from kiro_crew.llm_helpers import (
     stream_and_collect,
 )
 from kiro_crew.security import redact
+from kiro_crew.workflows import _DEFAULT_TOOL_CALL_LIMIT, _MAX_TOOL_CALL_LIMIT
 
 logger = logging.getLogger(__name__)
 
 # Signature the runner expects: async (prompt, opts) -> result.
 AgentFn = Callable[[str, dict], Any]
 
-# Per-step tool-call ceiling. Generous enough for any realistic agent step,
-# but prevents infinite tool loops from prompt injection.
-_MAX_TURNS_PER_STEP = 200
+# Delegated calls share the step's tool allowance.
+_MAX_TURNS_PER_STEP = _DEFAULT_TOOL_CALL_LIMIT
+
+
+def _step_tool_limit(opts: dict) -> int:
+    limit = opts.get("max_tool_calls", _DEFAULT_TOOL_CALL_LIMIT)
+    if type(limit) is not int or not 1 <= limit <= _MAX_TOOL_CALL_LIMIT:
+        raise ValueError(f"max_tool_calls must be an integer from 1 to {_MAX_TOOL_CALL_LIMIT}")
+    return limit
 
 
 class WorkflowSpawnRefused(Exception):
@@ -161,6 +168,7 @@ def build_agent_fn(
     counter = itertools.count()
 
     async def agent_fn(prompt: str, opts: dict) -> Any:
+        tool_limit = _step_tool_limit(opts)
         # Spawn gates FIRST: a refused step must allocate no session, touch no
         # memory scope and consume no session index.
         step_cwd = await vet_step_spawn(
@@ -210,7 +218,7 @@ def build_agent_fn(
                 provider,
                 prompt,
                 approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
-                max_turns=_MAX_TURNS_PER_STEP,
+                max_turns=tool_limit,
                 raise_on_tool_limit=True,
             )
             # ── Per-turn usage row: attribute workflow spend. ──

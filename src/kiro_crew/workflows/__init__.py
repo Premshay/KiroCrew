@@ -41,6 +41,9 @@ Thunk = Callable[[], Any]
 # What ctx.agent() resolves to: validated dict (schema=), free text, or None.
 AgentResult = Union[str, dict, None]
 
+_DEFAULT_TOOL_CALL_LIMIT = 200
+_MAX_TOOL_CALL_LIMIT = 2000
+
 
 class BudgetExceeded(Exception):  # noqa: N818 (frozen-contract name; see module spec)
     """Raised by ``ctx.agent()`` once cumulative token cost reaches ``budget.total``.
@@ -140,6 +143,7 @@ class WorkflowContext(Protocol):
         cwd: Optional[str] = None,
         session: Optional[str] = None,
         nudge: Optional[dict] = None,
+        max_tool_calls: int = _DEFAULT_TOOL_CALL_LIMIT,
     ) -> AgentResult:
         """Run one agent. Subagent by default; ``session=`` for in-session.
 

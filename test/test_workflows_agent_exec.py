@@ -59,6 +59,26 @@ def _patch_stream(monkeypatch):
     monkeypatch.setattr(agent_exec, "stream_and_collect", fake_stream)
 
 
+@pytest.mark.parametrize("limit", [1, 200, 1000, 2000])
+async def test_step_tool_allowance_reaches_collector(monkeypatch, limit):
+    collector = AsyncMock(return_value="done")
+    monkeypatch.setattr(agent_exec, "stream_and_collect", collector)
+    sessions = FakeSessions()
+    fn = build_agent_fn(sessions, run_id="wf_allowance")
+    assert await fn("audit", {"max_tool_calls": limit}) == "done"
+    assert collector.await_args.kwargs["max_turns"] == limit
+    assert collector.await_args.kwargs["raise_on_tool_limit"] is True
+
+
+@pytest.mark.parametrize("limit", [0, -1, 2001, True, None, 200.5, "1000"])
+async def test_invalid_tool_allowance_allocates_no_session(limit):
+    sessions = FakeSessions()
+    fn = build_agent_fn(sessions, run_id="wf_invalid_allowance")
+    with pytest.raises(ValueError, match="max_tool_calls"):
+        await fn("audit", {"max_tool_calls": limit})
+    assert not sessions.created
+
+
 async def test_default_uses_fresh_ephemeral_session_and_releases() -> None:
     sessions = FakeSessions()
     fn = build_agent_fn(sessions, run_id="wf_x")
