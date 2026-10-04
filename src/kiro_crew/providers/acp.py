@@ -906,8 +906,6 @@ class AcpProvider(LLMProvider):
 
     @property
     def capability_projection_gaps(self) -> tuple[str, ...]:
-        if isinstance(self._client, AcpSessionProvider):
-            return ()
         return self._client.capability_projection_gaps
 
     @property
@@ -1572,6 +1570,10 @@ class AcpProvider(LLMProvider):
             # requests are fail-closed instead of shown as a card.
             if self._child_fidelity_aware:
                 provider.child_fidelity_aware = True
+            # Inside the guard: a member session whose saved spec did not reach the
+            # process must not keep the runtime it was refused on.
+            if self.member_context:
+                await asyncio.to_thread(provider.confirm_member_projection)
             self._client = provider  # type: ignore[assignment]
             # The tree this session ACTUALLY has, read off the live process:
             # the runtime drops an inherited window that was swept and falls

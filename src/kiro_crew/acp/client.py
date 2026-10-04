@@ -7213,7 +7213,7 @@ class AcpClient:
         if not self.member_context:
             return
         from kiro_crew import agent_state
-        from kiro_crew.agent_capabilities import _digest
+        from kiro_crew.agent_capabilities import consumed_spec_matches, projection_gaps
 
         try:
             intent = agent_state.get_capabilities(self._agent)
@@ -7224,29 +7224,13 @@ class AcpClient:
         if (
             self._session_mcp_withheld
             or (self._seeds_local_settings and not self._permission_surface_governed)
-            or spec is None
-            or _digest(spec) != intent.get("materialized")
+            or not consumed_spec_matches(spec, intent)
         ):
             raise AcpError(
                 "capability_runtime_unverified: saved spec projection was withheld or changed"
             )
-        gaps = []
-        for field in ("hooks", "toolsSettings", "excludedTools"):
-            if spec.get(field):
-                gaps.append(field)
-        tools = spec.get("tools", [])
-        if tools != "*" and (not isinstance(tools, list) or "*" not in tools):
-            gaps.append("native_tools")
-        if isinstance(tools, list) and any(
-            isinstance(ref, str) and ref.startswith("@") and "/" in ref for ref in tools
-        ):
-            gaps.append("per_tool_mounts")
-        if spec.get("allowedTools") or any(
-            isinstance(server, dict) and server.get("autoApprove")
-            for server in spec.get("mcpServers", {}).values()
-        ):
-            gaps.append("auto_approval")
-        self._capability_projection_gaps = tuple(gaps)
+        assert spec is not None
+        self._capability_projection_gaps = projection_gaps(spec)
         self._loaded_capability_template = self._agent
 
     @property
