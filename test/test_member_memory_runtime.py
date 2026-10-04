@@ -649,6 +649,35 @@ async def test_owner_agent_pick_pin_failure_rolls_the_switch_back(tmp_path, memb
 
 
 @pytest.mark.asyncio
+async def test_member_pick_on_a_conversation_with_history_names_the_boundary(
+    tmp_path, member_stores
+):
+    """A member's private store cannot adopt an existing conversation in place, so
+    the answer names that boundary (409) instead of masquerading as an unavailable
+    memory store (503), which read as an infrastructure fault."""
+    from aiohttp.test_utils import TestClient, TestServer
+    from chat_test_helpers import _make_app_with_agent_routes, _make_state
+    from dashboard_owner_helpers import as_owner
+
+    writer, _ = member_stores
+    state = _make_state(tmp_path)
+    state.sessions.reset = AsyncMock(return_value=True)
+    slot = state.get_or_create_slot("history-pick", agent="default")
+    slot.messages.append({"role": "user", "content": "already talking"})
+    with patch("kiro_crew.dashboard.chat_handlers.schedule_eager_spawn"):
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
+            response = await client.post(
+                "/api/chat/slots/history-pick/agent", json={"agent": "writer"}
+            )
+            assert response.status == 409, await response.text()
+            body = await response.json()
+            assert body["code"] == "member_memory_requires_new_conversation"
+            assert body["error"] == "Open a new conversation to choose member memory."
+    assert slot.agent == "default"
+    assert slot.memory_store != writer
+
+
+@pytest.mark.asyncio
 async def test_owner_second_member_pick_on_pinned_empty_chat_is_refused(tmp_path, member_stores):
     from aiohttp.test_utils import TestClient, TestServer
     from chat_test_helpers import _make_app_with_agent_routes, _make_state
