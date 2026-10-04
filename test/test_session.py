@@ -5283,6 +5283,41 @@ class TestProviderOwnedSessionMapping:
         await mgr.close_all()
 
     @pytest.mark.asyncio
+    async def test_seat_switch_on_same_label_starts_fresh_with_replay(self, cfg):
+        """Two seats on one backend share a provider label, so only the seat-switch
+        mark stops the old seat's native conversation (and its model) resuming."""
+        provider = AsyncMock()
+        provider.start = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.is_process_alive = lambda: True
+        provider.context_usage_pct = lambda: 0.0
+        provider.session_id = ""
+        provider.session_provider_label = "external-test"
+        provider.session_resumed = False
+        provider.cwd = "/tmp/workspace"
+        provider.set_resume_session_id = MagicMock()
+
+        mgr = SessionManager(cfg, provider_factory=lambda *args, **kwargs: provider)
+        mgr._session_map.set(
+            "dashboard:slot0",
+            "conversation-1",
+            provider="external-test",
+            cwd="/tmp/workspace",
+        )
+        assert mgr._session_map.mark_seat_switch("dashboard:slot0") is True
+
+        _, is_new, resumed = await mgr.get_or_create("dashboard:slot0")
+
+        assert is_new is True
+        assert resumed is False
+        provider.set_resume_session_id.assert_not_called()
+        assert mgr.provider_switch_replay_pending("dashboard:slot0") is True
+        assert mgr._session_map.get_discarded_sid("dashboard:slot0") == "conversation-1"
+        assert mgr._session_map.consume_seat_switch("dashboard:slot0") is False
+        mgr.release("dashboard:slot0")
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
     async def test_first_streamed_native_id_is_durably_mapped(self, cfg):
         provider = AsyncMock()
         provider.start = AsyncMock()

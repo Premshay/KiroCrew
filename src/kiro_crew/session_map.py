@@ -1329,6 +1329,34 @@ class SessionMap:
             return True
         return False
 
+    @_guarded
+    def mark_seat_switch(self, key: str) -> bool:
+        """Record that *key*'s next allocation runs on a different execution seat.
+
+        The provider label cannot see this: two seats on one backend (a flash
+        and a pro DeepSeek seat, or two Claude-adapter seats) share a label, so
+        the stored sid would be resumed and the native conversation would keep
+        the old seat's model and launch environment. Allocation consumes the
+        mark and handles it exactly like a provider switch -- fresh session,
+        history replay. Only marked when a sid exists, since without one there
+        is nothing to resume. Returns whether the mark was written.
+        """
+        entry = self._data.get(canonical_key(key))
+        if not entry or not entry.get("sid"):
+            return False
+        entry["seat_switch"] = True
+        self._save()
+        return True
+
+    @_guarded
+    def consume_seat_switch(self, key: str) -> bool:
+        """Pop the mark :meth:`mark_seat_switch` wrote. True if it was set."""
+        entry = self._data.get(canonical_key(key))
+        if not entry or not entry.pop("seat_switch", False):
+            return False
+        self._save()
+        return True
+
     def get_discarded_sid(self, key: str) -> str:
         """Return the last sid dropped from *key* by any path, or ''.
 
