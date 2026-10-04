@@ -31,16 +31,21 @@ export default function RuntimeSelector({ slot, value, running, remote = false }
   if (remote || !slot) return null
   if (choices.error) return <ErrorNotice message={choices.error instanceof Error ? choices.error.message : String(choices.error)} />
   const runtimeChoices = choices.data?.choices ?? []
+  // An unset runtime_agent is not "no backend": the conversation still runs on
+  // the seat its agent is configured for. Showing that seat is what couples the
+  // picker to the identity in the view; clearing back to it stays one action.
+  const selected = value || choices.data?.effective_runtime_agent || ''
   return <div className="flex items-center gap-1.5 text-[12px] text-muted" data-testid="runtime-selector">
     <span>{i18nT('components.webAppArtifactCard.backend')}</span>
     <SimpleSelect
-      className="h-6 w-auto max-w-48 rounded-full border-transparent bg-transparent px-2 py-0 text-[12px]"
+      className="h-6 w-auto max-w-[13rem] rounded-full border-transparent bg-transparent px-2 py-0 text-[12px]"
+      contentClassName="w-60 max-w-[22rem]"
       aria-label={i18nT('components.webAppArtifactCard.backend')}
       clearLabel={i18nT('components.modelDropdownList.auto_default')}
       options={runtimeChoices.map(choice => choice.name)}
       optionLabels={runtimeChoices.map(choice => choice.supported ? choice.label : `${choice.label} — ${choice.reason}`)}
       optionDisabled={runtimeChoices.map(choice => !choice.supported)}
-      value={value || ''}
+      value={selected}
       disabled={running || change.isPending || runtimeChoices.length === 0}
       onChange={name => change.mutate(name)}
     />

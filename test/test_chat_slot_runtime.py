@@ -31,6 +31,7 @@ def runtime_state(monkeypatch):
     cfg = KiroCrewConfig.load()
     cfg.agents = {
         "vernier": KiroCrewAgentConfig(kiro_agent="saved-member", member_id="vernier"),
+        "claude": KiroCrewAgentConfig(kiro_agent="claude-engine"),
         "codex": KiroCrewAgentConfig(kiro_agent="codex-engine"),
         "deepseek": KiroCrewAgentConfig(kiro_agent="deepseek-engine"),
     }
@@ -41,7 +42,14 @@ def runtime_state(monkeypatch):
             providers=SimpleNamespace(
                 agent_runtime_policy=lambda name: {
                     "engine": name,
-                    "backend": "codex" if name == "codex-engine" else "deepseek",
+                    "backend": (
+                        "claude"
+                        if name == "claude-engine"
+                        else "codex"
+                        if name == "codex-engine"
+                        else "deepseek"
+                    ),
+                    "priority": 0 if name == "claude-engine" else 1,
                 }
             )
         ),
@@ -76,7 +84,7 @@ async def test_runtime_switch_preserves_member_store_history_and_project(runtime
     )
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.post(
-            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "codex"}
+            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "claude"}
         )
         assert response.status == 200, await response.text()
     assert (
@@ -86,15 +94,19 @@ async def test_runtime_switch_preserves_member_store_history_and_project(runtime
         slot.project,
         effective_session_key(slot),
     ) == before
-    assert slot.runtime_agent == "codex"
+    assert slot.runtime_agent == "claude"
     assert (slot.model, slot.reasoning_effort) == ("", "")
     assert slot._dirty
     reset.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("selected", ["unknown", "deepseek"])
+@pytest.mark.parametrize("selected", ["unknown", "deepseek", "codex"])
 async def test_unverified_member_runtime_is_refused_without_mutation(runtime_state, selected):
+    # codex is here deliberately: it runs on the shared AcpRuntime path, which
+    # does not yet confirm a member projection, so it must be refused the same
+    # way an unknown or non-member backend is -- not offered and then killed on
+    # the first prompt with capability_runtime_unverified.
     state, slot, reset = runtime_state
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.post(
@@ -113,7 +125,7 @@ async def test_busy_member_refuses_switch(runtime_state):
     slot.task.done.return_value = False
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.post(
-            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "codex"}
+            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "claude"}
         )
         assert response.status == 409
     assert slot.runtime_agent == ""
@@ -121,19 +133,59 @@ async def test_busy_member_refuses_switch(runtime_state):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [False, RuntimeError("pre-pop reset failure")])
-async def test_reset_failure_rolls_back_selection(runtime_state, failure):
+async def test_reset_failure_rolls_back_selection(runtime_state):
+    """A pre-pop raise leaves the old session alive on the old bindings, so the
+    answer is a 500 and the committed selection rolls back. A False verdict is NOT
+    a failure -- see the declined-reset tests below: it means nothing was torn
+    down, and the next message cold-starts on the new seat."""
     state, slot, reset = runtime_state
-    if isinstance(failure, Exception):
-        reset.side_effect = failure
-    else:
-        reset.return_value = failure
+    reset.side_effect = RuntimeError("pre-pop reset failure")
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.post(
-            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "codex"}
+            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "claude"}
         )
-        assert response.status == (500 if isinstance(failure, Exception) else 409)
+        assert response.status == 500
     assert (slot.runtime_agent, slot.model, slot.reasoning_effort) == ("", "original-model", "high")
+
+
+@pytest.mark.asyncio
+async def test_declined_reset_with_no_live_session_still_switches(runtime_state):
+    """A False reset verdict with no registered provider means there was nothing to
+    tear down, not a busy decline: the next message cold-starts on the selected
+    seat. Treating it as a 409 is what made every switch on a fresh conversation
+    answer 'session changed during execution switch'."""
+    state, slot, reset = runtime_state
+    reset.return_value = False
+    state.sessions.get_provider.return_value = None
+    async with TestClient(TestServer(runtime_app(state))) as client:
+        response = await client.post(
+            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "claude"}
+        )
+        assert response.status == 200, await response.text()
+    assert slot.runtime_agent == "claude"
+    reset.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_declined_reset_with_idle_live_session_retries_then_refuses(runtime_state):
+    """A live provider that is idle declined for a non-busy reason; tearing down an
+    idle session is safe, so the handler retries once. A second decline is a turn
+    genuinely racing the switch, answered with the same 409 the fast path gives."""
+    from kiro_crew.providers.base import LLMProvider
+
+    state, slot, reset = runtime_state
+    live = MagicMock(spec=LLMProvider)
+    live.has_active_turn.return_value = False
+    state.sessions.get_provider.return_value = live
+    reset.return_value = False
+    async with TestClient(TestServer(runtime_app(state))) as client:
+        response = await client.post(
+            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "claude"}
+        )
+        assert response.status == 409, await response.text()
+        assert (await response.json())["code"] == "turn_in_flight"
+    assert reset.await_count == 2
+    assert slot.runtime_agent == ""
 
 
 @pytest.mark.asyncio
@@ -142,9 +194,8 @@ async def test_choices_show_projection_gap(runtime_state):
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.get(f"/api/chat/slots/{slot.key}/runtime")
         choices = (await response.json())["choices"]
-    assert [choice["name"] for choice in choices] == ["codex", "deepseek"]
-    assert choices[0]["supported"]
-    assert not choices[1]["supported"]
+    assert [choice["name"] for choice in choices] == ["claude", "codex", "deepseek"]
+    assert [choice["supported"] for choice in choices] == [True, False, False]
 
 
 @pytest.mark.asyncio
@@ -158,10 +209,10 @@ async def test_linked_views_receive_same_selection(runtime_state):
     assert effective_session_key(twin) == effective_session_key(slot)
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.post(
-            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "codex"}
+            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "claude"}
         )
         assert response.status == 200, await response.text()
-    assert twin.runtime_agent == slot.runtime_agent == "codex"
+    assert twin.runtime_agent == slot.runtime_agent == "claude"
     assert twin._dirty
 
 
@@ -189,10 +240,10 @@ async def test_cold_model_controls_use_execution_backend(runtime_state):
 @pytest.mark.asyncio
 async def test_same_runtime_does_not_clear_current_model(runtime_state):
     state, slot, reset = runtime_state
-    slot.runtime_agent = "codex"
+    slot.runtime_agent = "claude"
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.post(
-            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "codex"}
+            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "claude"}
         )
         assert response.status == 200
         assert (await response.json())["model"] == "original-model"
@@ -206,7 +257,7 @@ async def test_app_token_cannot_switch_runtime(runtime_state):
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.post(
             f"/api/chat/slots/{slot.key}/runtime",
-            json={"runtime_agent": "codex"},
+            json={"runtime_agent": "claude"},
             headers={"X-Test-App": "plugin"},
         )
         assert response.status == 403
@@ -223,7 +274,7 @@ async def test_active_children_prevent_runtime_switch(runtime_state, monkeypatch
     )
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.post(
-            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "codex"}
+            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "claude"}
         )
         assert response.status == 409
     reset.assert_not_awaited()
@@ -251,12 +302,12 @@ async def test_cancellation_keeps_selection_consistent_with_session(
     monkeypatch.setattr(
         chat_handlers,
         "read_bounded_json",
-        AsyncMock(return_value=({"runtime_agent": "codex"}, None)),
+        AsyncMock(return_value=({"runtime_agent": "claude"}, None)),
     )
     request = owner_claims(MagicMock(spec=web.Request))
     request.app = {"state": state}
     request.match_info = {"slot": slot.key}
     with pytest.raises(asyncio.CancelledError):
         await chat_handlers.api_chat_slot_runtime(request)
-    assert slot.runtime_agent == ("codex" if popped else "")
+    assert slot.runtime_agent == ("claude" if popped else "")
     assert slot._active_fallback_model == ("" if popped else "old-fallback")
