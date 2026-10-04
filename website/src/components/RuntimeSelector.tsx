@@ -28,18 +28,20 @@ export default function RuntimeSelector({ slot, value, running, remote = false }
       await cache.invalidateQueries({ queryKey: ['slot-selection-capabilities', slot] })
     },
   })
-  if (remote) return null
+  if (remote || !slot) return null
   if (choices.error) return <ErrorNotice message={choices.error instanceof Error ? choices.error.message : String(choices.error)} />
-  if (!choices.data?.choices.length) return null
-  return <div className="mx-4 mt-2">
+  const runtimeChoices = choices.data?.choices ?? []
+  return <div className="flex items-center gap-1.5 text-[12px] text-muted" data-testid="runtime-selector">
+    <span>{i18nT('components.webAppArtifactCard.backend')}</span>
     <SimpleSelect
+      className="h-6 w-auto max-w-48 rounded-full border-transparent bg-transparent px-2 py-0 text-[12px]"
       aria-label={i18nT('components.webAppArtifactCard.backend')}
       clearLabel={i18nT('components.modelDropdownList.auto_default')}
-      options={choices.data.choices.map(choice => choice.name)}
-      optionLabels={choices.data.choices.map(choice => choice.supported ? choice.label : `${choice.label} — ${choice.reason}`)}
-      optionDisabled={choices.data.choices.map(choice => !choice.supported)}
+      options={runtimeChoices.map(choice => choice.name)}
+      optionLabels={runtimeChoices.map(choice => choice.supported ? choice.label : `${choice.label} — ${choice.reason}`)}
+      optionDisabled={runtimeChoices.map(choice => !choice.supported)}
       value={value || ''}
-      disabled={running || change.isPending}
+      disabled={running || change.isPending || runtimeChoices.length === 0}
       onChange={name => change.mutate(name)}
     />
     {change.data?.warning && <p role="status">{change.data.warning}</p>}

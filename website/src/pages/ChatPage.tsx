@@ -6312,7 +6312,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   <MemoryModeChip memoryMode={currentSlot?.memory_mode ?? 'persistent'} onSwitchMode={switchMemoryMode} />
                 </div>
               )}
-              <RuntimeSelector slot={activeSlot || ''} value={currentSlot?.runtime_agent} running={!!slotRunning} remote={activeSlotRemoteBound} />
               <Composer
                 ref={composerRef}
                 slotKey={activeSlot}
@@ -6382,6 +6381,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onDragOver={dropTargetProps.onDragOver}
               onDragLeave={dropTargetProps.onDragLeave}
               agentName={activeAgentName}
+              backendControl={<RuntimeSelector slot={activeSlot || ''} value={currentSlot?.runtime_agent} running={!!slotRunning} remote={activeSlotRemoteBound} />}
               // The chip shows the inherited-default marker; `agentName` stays
               // the raw resolved alias for the skills query and switch title.
               // Uses the SLOT's stored agent (not `activeAgentName`, which has

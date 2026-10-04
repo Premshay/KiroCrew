@@ -1914,7 +1914,6 @@ export default function ChatPane({
         />
 
         {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
-        <RuntimeSelector slot={slotKey} value={paneSlot?.runtime_agent} running={running} remote={paneRemoteCrew.isRemote} />
         {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
         <ErrorNotice
           className="mx-4 mt-2 mb-0 animate-rise"
@@ -2005,6 +2004,7 @@ export default function ChatPane({
           busyMode={busyMode}
           autoFocusKey={slotKey}
           agentName={paneAgentName}
+          backendControl={<RuntimeSelector slot={slotKey} value={paneSlot?.runtime_agent} running={running} remote={paneRemoteCrew.isRemote} />}
           // The chip shows the inherited-default marker; `agentName` stays the
           // raw resolved alias for the skills query and switch title. Uses the
           // SLOT's stored agent (not `paneAgentName`, which has already

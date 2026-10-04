@@ -29,6 +29,7 @@ describe('RuntimeSelector', () => {
     const runtime = vi.spyOn(api, 'chatSlotRuntime').mockResolvedValue({ ok: true, runtime_agent: 'codex', model: '', reasoning_effort: '' })
     const identity = vi.spyOn(api, 'chatSlotAgent')
     mount()
+    await waitFor(() => expect(screen.getByRole('combobox')).not.toBeDisabled())
     fireEvent.click(await screen.findByRole('combobox'))
     expect(await screen.findByRole('option', { name: 'DeepSeek — Capabilities unverified' })).toHaveAttribute('aria-disabled', 'true')
     fireEvent.click(await screen.findByRole('option', { name: 'Codex' }))
@@ -46,5 +47,12 @@ describe('RuntimeSelector', () => {
     vi.spyOn(api, 'chatSlotRuntimes').mockRejectedValue(new Error('Runtime catalog unavailable'))
     mount()
     expect(await screen.findByRole('alert')).toHaveTextContent('Runtime catalog unavailable')
+  })
+
+  it('keeps a labelled disabled control visible when the catalog is empty', async () => {
+    vi.spyOn(api, 'chatSlotRuntimes').mockResolvedValue({ ...choices, choices: [] })
+    mount()
+    expect(await screen.findByRole('combobox', { name: 'Backend' })).toBeDisabled()
+    expect(screen.getByText('Backend')).toBeVisible()
   })
 })
