@@ -55,6 +55,13 @@ describe('ChatInput — session control chips', () => {
     expect(screen.queryByRole('button', { name: 'Scope' })).toBeNull()
   })
 
+  it('places backend selection in the context shelf without other controls', () => {
+    renderWithProviders(<ChatInput {...props()} backendControl={<button>Backend</button>} />)
+    const control = screen.getByRole('button', { name: 'Backend' })
+    expect(control).toBeVisible()
+    expect(screen.getByTestId('composer-context-shelf')).toContainElement(control)
+  })
+
   it('tints the chip with --ok when the app reports ok', () => {
     // This is what makes a bound scope visible without opening the popover.
     renderWithProviders(

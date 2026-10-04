@@ -135,6 +135,7 @@ function ChatInput({
   onDragOver,
   onDragLeave,
   agentName,
+  backendControl,
   agentLabel,
   agentIsInheritedDefault,
   modelIsInheritedDefault,
@@ -1283,6 +1284,7 @@ function ChatInput({
       {!showGhost &&
         !composerCollapsed &&
         (onProjectClick ||
+          backendControl ||
           (onModelClick && modelName) ||
           // An app-contributed chip is reason enough to draw the shelf. Without
           // this the chip is silently invisible whenever no other pill happens
@@ -1307,6 +1309,7 @@ function ChatInput({
           {!!sessionControls?.length && (
             <SessionControlChips sessionControls={sessionControls} shelfCompact={shelfCompact} onSessionControlClick={onSessionControlClick} />
           )}
+          {backendControl && <div className="shrink-0 border-r border-border pr-2" data-testid="composer-backend-control">{backendControl}</div>}
           <div className="flex items-center gap-2 flex-1">
           {onAgentClick && agentName && (
             <AgentChip agentName={agentName} agentLabel={agentLabel} agentIsInheritedDefault={agentIsInheritedDefault} agentSource={agentSource} isRunning={isRunning} shelfCompact={shelfCompact} onAgentClick={onAgentClick} />

@@ -106,6 +106,7 @@ export interface ChatInputProps {
    */
   /** Chat-level controls in input bar */
   agentName?: string
+  backendControl?: React.ReactNode
   /**
    * Display label for the agent chip when it must differ from the raw alias.
    * The chip shows this; everything else keyed on the agent (the skills query,
