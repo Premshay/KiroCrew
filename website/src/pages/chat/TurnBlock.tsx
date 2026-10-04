@@ -167,25 +167,23 @@ type Seg =
 
 /**
  * Split items into ordered segments: contiguous "collapsed" runs interleaved
- * with items that must render in place (widgets/images, hand-backs, crew
- * replies, mcp_oauth/error rows, workflow_run / spawn_run / completion cards,
+ * with items that must render in place (assistant replies, widgets/images,
+ * hand-backs, crew replies, mcp_oauth/error rows, workflow_run / spawn_run / completion cards,
  * MCP-App tool rows, diff cards — see isVisibleInline).
  *
  * ONE definition, shared by the collapseAll split and the interim-fan-out fold,
  * so "what may never be hidden behind a toggle" cannot drift between them.
  * `idx` is the item's index in the caller's list, offset by `offset` when the
  * caller passes a slice.
+ *
+ * Assistant replies always render in place: a reply the user already read must
+ * not be reclassified as reasoning by a later tool call or a later synthesis.
  */
-function splitSegments(
-  items: TurnItem[],
-  appToolCallIds: ReadonlySet<string>,
-  offset = 0,
-  showAssistantReplies = false,
-): Seg[] {
+function splitSegments(items: TurnItem[], appToolCallIds: ReadonlySet<string>, offset = 0): Seg[] {
   const segs: Seg[] = []
   for (let i = 0; i < items.length; i++) {
     const it = items[i]
-    if ((showAssistantReplies && isAssistantReply(it)) || isVisibleInline(it, appToolCallIds)) {
+    if (isAssistantReply(it) || isVisibleInline(it, appToolCallIds)) {
       segs.push({ type: 'visible', it, idx: offset + i })
     } else {
       const last = segs[segs.length - 1]
@@ -402,7 +400,7 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
     // Only the non-visible-inline pre-conclusion items are actually collapsed.
     return beforeItems.some(it =>
       !isVisibleInline(it, appToolCallIds) &&
-      !(collapseAll && !turn.interim && isAssistantReply(it)) &&
+      !isAssistantReply(it) &&
       msgIdxs(it).includes(currentMessageIdx),
     )
   }, [items, term, currentMessageIdx, collapseAll, appToolCallIds, turn.interim])
@@ -423,11 +421,9 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
 
   // Interim fan-out region: everything the agent emitted between the user's
   // prompt and the synthesis turn that restates it (see `interim` in types.ts).
-  // Folded in BOTH modes and with no conclusion carve-out — the region's last
-  // assistant message is a per-completion summary, which is exactly the row the
-  // conclusion rule would have kept visible. `isVisibleInline` still holds, so
-  // the spawn_run card, the completion cards and any error stay in place: the
-  // reader keeps the record that a wave ran, without the prose.
+  // Its working steps fold in BOTH modes, with no conclusion carve-out. Assistant
+  // replies stay in place (see splitSegments), as do the spawn_run card, the
+  // completion cards and any error.
   if (turn.interim) {
     const segs = splitSegments(items, appToolCallIds)
     const stepCount = countCollapsedSteps(segs)
@@ -472,7 +468,7 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
     // Split pre-conclusion items into ordered segments (see splitSegments):
     // visible items render in place; collapsed runs hide behind the reasoning
     // toggle.
-    const segs = splitSegments(beforeItems, appToolCallIds, 0, true)
+    const segs = splitSegments(beforeItems, appToolCallIds)
     const stepCount = countCollapsedSteps(segs)
 
     if (!turn.complete || stepCount === 0) {

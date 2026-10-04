@@ -13,10 +13,11 @@ describe('TurnBlock — interim fan-out fold', () => {
       {it.kind === 'single' ? it.msg.content : 'group'}
     </div>
   )
-  /** The interim region of a fan-out: a per-completion summary plus an error. */
+  /** The interim region of a fan-out: a per-completion summary, an error and a tool step. */
   const interimItems = (): TurnItem[] => [
     { kind: 'single', msg: { role: 'assistant', content: 'Two of three agents are in…', ts: '1' }, idx: 0 },
     { kind: 'single', msg: { role: 'error', content: 'a spawn failed', ts: '2' }, idx: 1 },
+    { kind: 'single', msg: { role: 'tool', content: '🔧 Running: gh pr view', ts: '3' }, idx: 2 },
   ]
   /** The element CollapsibleSection wraps its children in. */
   const collapsed = (c: HTMLElement) => c.querySelector('[style*="overflow: hidden"]')
@@ -24,9 +25,22 @@ describe('TurnBlock — interim fan-out fold', () => {
   it('folds the region behind one toggle in DEFAULT mode, where nothing folded before', () => {
     const turn = { ...makeTurn(interimItems()), interim: true }
     const { container } = render(<TurnBlock turn={turn} renderItem={renderItem} />)
-    // The interim summary is inside the collapsible; the toggle is its control.
+    // The tool step is inside the collapsible; the toggle is its control.
     expect(container.querySelector('button')).toBeInTheDocument()
-    expect(collapsed(container)).toContainElement(screen.getByTestId('item-0'))
+    expect(collapsed(container)).toContainElement(screen.getByTestId('item-2'))
+  })
+
+  it('leaves an assistant reply outside the fold', () => {
+    const turn = { ...makeTurn(interimItems()), interim: true }
+    const { container } = render(<TurnBlock turn={turn} renderItem={renderItem} />)
+    expect(collapsed(container)).not.toContainElement(screen.getByTestId('item-0'))
+  })
+
+  it('leaves an assistant reply outside the fold in collapse-all mode', () => {
+    const turn = { ...makeTurn(interimItems()), interim: true }
+    const { container } = render(<TurnBlock turn={turn} renderItem={renderItem} collapseAll />)
+    expect(collapsed(container)).toContainElement(screen.getByTestId('item-2'))
+    expect(collapsed(container)).not.toContainElement(screen.getByTestId('item-0'))
   })
 
   it('leaves an error row outside the fold', () => {
@@ -43,7 +57,7 @@ describe('TurnBlock — interim fan-out fold', () => {
   })
 
   it('an identical turn without the interim flag is untouched in default mode', () => {
-    const turn = makeTurn(interimItems())
+    const turn = makeTurn(interimItems().slice(0, 2))
     const { container } = render(<TurnBlock turn={turn} renderItem={renderItem} />)
     expect(container.querySelector('button')).toBeNull()
     expect(screen.getByTestId('item-0')).toBeInTheDocument()

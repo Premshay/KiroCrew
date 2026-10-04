@@ -20,11 +20,11 @@ const renderItem = (it: TurnItem, i: number) => (
   <div data-testid={`item-${i}`}>{it.kind === 'single' ? it.msg.content : 'group'}</div>
 )
 
-/** An interim fan-out region: folded in both modes, so one toggle is rendered. */
+/** An interim fan-out region: its tool step folds in both modes, so one toggle is rendered. */
 const foldedTurn = () => ({
   ...makeTurn([
     { kind: 'single', msg: { role: 'assistant', content: 'Two of three agents are in…', ts: '1' }, idx: 0 },
-    { kind: 'single', msg: { role: 'assistant', content: 'and the third just landed', ts: '2' }, idx: 1 },
+    { kind: 'single', msg: { role: 'tool', content: '🔧 Running: gh pr view', ts: '2' }, idx: 1 },
   ]),
   interim: true,
 })
