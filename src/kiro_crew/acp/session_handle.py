@@ -1249,6 +1249,9 @@ class AcpSessionHandle:
         # so the permission event can rebuild mcp__<server>__<tool> for per-tool
         # governance in the app-own-server auto-approve.
         self._tool_call_tool_name: dict[str, str] = {}
+        # toolCallId -> the tool's own name its tool_call frame stated, for the
+        # permission event's harness_tool_id (see _dispatch.harness_tool_name).
+        self._tool_call_harness_tool_name: dict[str, str] = {}
         # Parent-scoped cache keys populated by tagged native-child tool calls.
         # Cleared per turn beside the sibling per-call caches below.
         self._native_child_tool_call_ids: set[str] = set()
@@ -1670,6 +1673,7 @@ class AcpSessionHandle:
         self._tool_call_diff_path.clear()
         self._tool_call_mcp_server.clear()
         self._tool_call_tool_name.clear()
+        self._tool_call_harness_tool_name.clear()
         self._native_child_tool_call_ids.clear()
         self._permission_options.clear()
         self._permission_gate_events.clear()
@@ -5076,6 +5080,7 @@ class AcpSessionHandle:
                             diff_path_cache=self._tool_call_diff_path,
                             mcp_server_name_cache=self._tool_call_mcp_server,
                             tool_name_cache=self._tool_call_tool_name,
+                            harness_tool_name_cache=self._tool_call_harness_tool_name,
                             cache_scope=ssid,
                         )
                     tcid = str(upd.get("toolCallId") or "")
@@ -6009,12 +6014,14 @@ class AcpSessionHandle:
             diff_path_cache=self._tool_call_diff_path,
             mcp_server_name_cache=self._tool_call_mcp_server,
             tool_name_cache=self._tool_call_tool_name,
+            harness_tool_name_cache=self._tool_call_harness_tool_name,
             # ORIGIN-BOUND provenance: cache entries are keyed by the
             # emitting frame's sessionId, so a child cannot replay a consumed
             # parent toolCallId to inherit trusted params for a different
             # operation, while same-origin repeat frames still resolve.
             cache_scope=str(_perm_params.get("sessionId") or self._session_id),
             kas_consent_meta=self._runtime.acp_backend == ACP_BACKEND_KAS,
+            harness_backend=self._runtime.acp_backend,
         )
         if event is None:
             return None
@@ -6389,6 +6396,7 @@ class AcpSessionHandle:
                 diff_path_cache=self._tool_call_diff_path,
                 mcp_server_name_cache=self._tool_call_mcp_server,
                 tool_name_cache=self._tool_call_tool_name,
+                harness_tool_name_cache=self._tool_call_harness_tool_name,
                 cache_scope=frame_sid,
             )
             out: list[AcpEvent] = []
@@ -6503,6 +6511,7 @@ class AcpSessionHandle:
                         diff_path_cache=self._tool_call_diff_path,
                         mcp_server_name_cache=self._tool_call_mcp_server,
                         tool_name_cache=self._tool_call_tool_name,
+                        harness_tool_name_cache=self._tool_call_harness_tool_name,
                         cache_scope=self._session_id,
                     )
                     return _child_prefix
@@ -6526,6 +6535,7 @@ class AcpSessionHandle:
             diff_path_cache=self._tool_call_diff_path,
             mcp_server_name_cache=self._tool_call_mcp_server,
             tool_name_cache=self._tool_call_tool_name,
+            harness_tool_name_cache=self._tool_call_harness_tool_name,
             cache_scope=self._session_id,
         )
         filtered_events: list[AcpEvent] = []

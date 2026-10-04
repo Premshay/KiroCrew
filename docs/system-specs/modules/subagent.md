@@ -324,6 +324,149 @@ running work: a settled child that runs builds or tests can still push the host
 below it. And a start admitted shared whose runtime then dies may, after its
 bounded wait, launch a dedicated process below the floor rather than fail.
 
+**macOS: the kernel memory-pressure hold.** The macOS reading of the floor has
+a second input: the kernel's `kern.memorystatus_vm_pressure_level`, read fresh
+on every check through `resource_status.read_memory_pressure_level()`
+(`platform_compat.memory_pressure_level()`, a `sysctlbyname` on the cached libc
+handle; it says once per process, at WARNING, when macOS cannot answer it). This
+section is the one statement of the hold's rules; the code points here.
+
+The hold applies (`_memory_pressure_hold`) while all of these are true:
+
+- the floor is on (`spawn_min_memory_gb > 0`);
+- the level is WARN or CRITICAL;
+- a dedicated runtime of this gateway is running or warming
+  (`_owns_dedicated_runtime`): a live row admitted at the dedicated price and
+  not confirmed shared, or a claim admitted at the dedicated price
+  (`_claim_prices`) and not registered yet. A row with no process does not
+  count: one parked at the spawn approval (`_parked_at_spawn_approval`) or one
+  approved and waiting for the pump to release it (`_start_release`). Neither
+  do shared-priced starts: their end returns little memory, and counting them
+  would hold a shared wave behind its own first member.
+
+It keeps a start (`_memory_pressure_holds`) when, in addition:
+
+- the start is a root (not nested, `taskq_parent_id_for` / `entry_is_child`);
+  a child's parent is a live runtime of ours waiting on it, so holding the
+  child would hold the parent on an episode only the child can end;
+- it is not a claim re-entry (`_dispatch_now`), which already holds its slot;
+- the start's own wait has not run out. A row's wait is clocked from the first
+  time it is held, and past `_PRESSURE_HOLD_MAX_WAIT_SECS` it never proceeds
+  into the pressure it waited on: it is ended, never started
+  (`MEMORY_PRESSURE_NEVER_STARTED`, which OPENS with its verdict because a
+  surface grouping terminal runs would otherwise read it as a success; its row
+  failed, its parent's depth recounted and the terminal record registered so a
+  read by id answers the outcome rather than a 404; the run card headlines a
+  wave whose every member ended this way as "N agents never started", and a
+  settled wave where only some did as "M of N agents ran", matching
+  the error's opening words through `NEVER_STARTED_PREFIX`, which lives in
+  `website/src/lib/backendPhrases.json` because it is backend prose the UI
+  matches rather than copy it renders; the error itself opens with the owner's
+  wording, "never started: waiting for memory", and names both ways out, the
+  level easing and a running agent finishing, which the card states whenever any member
+  ended this way, as an inline `ErrorNotice` directly under the card's button
+  (never inside it), counted ("1 never started — ...") and naming the panel's
+  Retry failed control,
+  so a mixed wave's "finished" header cannot hide it and the retry is not read
+  as automatic), with a WARNING and
+  a `never_started_memory_pressure` SEL row
+  (`_pressure_hold_expired`) whose `expired_by` says which bound ended it:
+  `wait` (its own wait ran out) or `episode` (the spent episode ended it at
+  once, so `waited_secs` is near 0 and `episode_secs` carries the episode's
+  length). The bound is a named constant carrying the
+  planned default of the queued-spawn maximum wait, a config key main does not
+  have yet. An approval-released start past its bound ends the same way. The
+  pump's pick only classifies an expired row (it is picked); the gate's
+  re-check is what ends it and writes the record, so a row whose level eased
+  in between starts with no "never started" audit. The clock survives a pause
+  in the hold, such as our last runtime ending between two of a wave's
+  starts, so a wave released one runtime at a time still meets the bound; only
+  a clock older than `_PRESSURE_HOLD_PRUNE_SECS` (a row that left with no
+  registration or refusal) is dropped.
+
+**Foreign pressure with a runtime of ours alive, weighed.** The hold cannot
+tell its own load from foreign load (a browser, a build). So with one
+long-lived dedicated subagent of ours running (a `keep` conversation, say) on a
+Mac held at WARN by other apps, every new root start waits, up to its bound,
+even though ending our runtime might not end the episode. That is the chosen
+side: a new runtime under WARN slows the whole machine, not just Kiro Crew, and
+the per-row bound caps the wait at `_PRESSURE_HOLD_MAX_WAIT_SECS` (30 minutes),
+after which the start is ended rather than launched into the pressure. A
+chronic episode does not make every new start wait that long in turn: once the
+hold has applied without a break for `_PRESSURE_HOLD_MAX_WAIT_SECS`
+(`_pressure_episode_since`, from the first read at which it applied; a read at
+which it does not apply, because the level eased or nothing of ours runs, ends
+the episode, and so does a gap between reads longer than
+`_PRESSURE_EPISODE_MAX_GAP_SECS`, a break nobody observed), the episode is spent (`_pressure_episode_spent`, one WARNING) and
+every start the hold would keep is ended at once, never started, until the hold
+stops applying.
+With no runtime of ours the hold never applies, so foreign pressure alone never
+delays or ends a start. `spawn_min_memory_gb = 0` turns it off. The
+shared-to-dedicated top-up is not a held start: it is an admitted run already
+starting, so past its own bound it starts and says so
+(`dedicated_start_under_memory_pressure`), as it does below the floor.
+
+The memory-figure exits run first: below the floor a start is deferred as
+`low_memory`, and a critical posture defers it as `posture_critical` with its
+figure, which wins over this hold. Agent validation runs before both, so an
+unknown agent is refused `agent_not_found` instead of waiting.
+
+The level is the kernel's own verdict, and it lags. A 16 GB Mac has read NORMAL
+with 4.9 GB in the compressor and 4.8 of 6.0 GB of swap in use, so the level is
+no measure of free memory and does not replace the figure. It is a backstop
+beside the floor: when the kernel does say WARN, the host is short whatever the
+page counters add up to. A start the floor priced shared is held too: it skips
+the kiro-cli process but still launches a fresh copy of the agent's MCP servers
+(~0.45-0.6 GiB with the default roster, see *Prices* above).
+
+A held start waits like a capacity wait, not a store deferral. It joins the
+in-memory window (`_queue`) exactly as a `concurrency_limit` row does, durable
+or restricted alike, labelled `QUEUED_REASON_MEMORY_PRESSURE` with the
+figure-free detail `MEMORY_PRESSURE_DETAIL`, and the pump's pick passes over
+held roots (`pick_window_index(root_held=...)`) the way the child reserve does.
+Every slot release and pump pass re-checks it, and while the hold applies one
+timer (`_pressure_recheck_handle`, cancelled at shutdown) pumps every
+`MEMORY_PRESSURE_RECHECK_SECS`, so a level that eases with nothing finishing is
+noticed. The label is the binding reason: a start the hold keeps is labelled
+`memory_pressure` even when a full cap or the stagger would also have queued
+it, except under an adaptive cap of 0, which keeps `adaptive_cap_zero` because
+nothing starts before the controller's probe recovers. A row first held at the
+pump's pick (queued earlier for capacity) is relabelled there. When the hold
+stops applying, a parent still labelled `memory_pressure` is relabelled
+`concurrency_limit`, or `adaptive_cap_zero` while the cap is 0. Because the row never leaves the window
+machinery, its crew-log pin, its parent's teardown and the continuation checks
+see it as they see any capacity wait. The same rule is re-checked where a start
+could otherwise pass it later: an approval-released start
+(`_release_admitted_start_impl`, so an approval answered after the hold began
+waits too; it is decided per entry, so a held root is passed over rather than
+blocking the nested starts released behind it) and a shared start turning
+dedicated (`_ensure_dedicated_start_priced`, under that wait's own
+`_DEDICATED_TOPUP_WAIT_SECS` bound).
+
+What a held start reports: `deferred_memory_pressure` in SEL on its first hold
+(with the floor's `available_gb`, null when that figure was unreadable, and
+absent when the hold was decided at the pump, which reads none), no GB figures in its
+label, detail or event (the figure cleared the floor, so any "N GB free, needs
+M GB" pair would contradict the verdict), and WARNING once per level
+(`_pressure_hold_level`), DEBUG for every later row. When the hold stops
+applying, the WARNING latch resets, so the next episode warns again; each row
+keeps its wait clock (see the bound above) unless it is older than
+`_PRESSURE_HOLD_PRUNE_SECS`.
+
+An unreadable figure on macOS is reported like Linux's: a WARNING and a
+`memory_check_unavailable` SEL row, and the start proceeds on the fail-open
+contract.
+
+The level never rewrites the figure and never moves the posture, which stays
+figure-based. It is reported beside them: `summary_lines` (the
+`resource_status` tool, whose guidance then names the pressure instead of
+"heavy work is fine"), the `[RESOURCES]` context line, and the diagnostics
+bundle. The eager-spawn admission (`chat_runner._pressure_hold_blocks_prewarm`)
+admits no new speculative pre-warm while the hold applies, and leaves the idle
+ones already live to the host bands; the re-probe after a
+pre-warm registered does not read it. The cron, runner and adaptive-controller
+gates do not act on the level (the probe they share reports it).
+
 The adaptive growth bound is the user's ceiling itself (`user_max_concurrent`),
 with no static host prediction under it: the controller climbs on live pressure
 signals and this spawn-time reservation queues what the host cannot absorb yet.
@@ -564,12 +707,21 @@ Admission order (`subagent_manager/admission/gate.py::spawn_impl`):
 2. For persistent work, **persist** the row in the task store (write-before-ack; see § Durable task
    queue). A store write failure is a refusal with
    `error_code="task_store_unavailable"`; the id is never handed out as accepted.
-3. Memory floor (`spawn_min_memory_gb`, what must remain after the start's price; see *Memory guard*) and posture gate (`admission_gate`,
+3. Agent name validation (a failure marks the row `failed`, refused
+   `agent_not_found` before any wait). The event-loop callers (`spawn_async`
+   and the coroutine pump's dispatch) take both agent-directory scans, app
+   ownership and `_validate_agent`, on a worker thread and hand the gate the
+   answer (`AgentCheck`, keyed by the agent, the cwd it runs in and the app the
+   gate settles on, the captured execution's app winning over the caller's); a
+   synchronous caller validates inline.
+4. Memory floor (`spawn_min_memory_gb`, what must remain after the start's price;
+   see *Memory guard*) and posture gate (`admission_gate`,
    `cached_admission_check`): with a persistent row, **defer** (row stays `queued`,
    `next_run_at = now + admit_wait_secs`, pump wake-up armed, caller gets a
    `queued` id); without one, refuse as before.
-4. Capacity / stagger gate: queue (persistent window/store-only or restricted memory-only) or proceed.
-5. Agent name validation (a failure marks the row `failed`), then the **atomic
+5. Capacity / stagger gate, with the child reserve and the macOS kernel
+   memory-pressure hold (see *Memory guard*): queue (persistent window/store-only
+   or restricted memory-only) or proceed. Then the **atomic
    claim** for persistent work (`admitted`, generation++). A row cancelled while it waited fails the
    claim here and is never started. A boundary-owned claim then revalidates its
    generation and cancellation authority. If that post-claim store step is
@@ -578,20 +730,23 @@ Admission order (`subagent_manager/admission/gate.py::spawn_impl`):
    Registration consumes the reservation; a durable refusal releases it.
 6. Register, take the slot, `starting`; then the approval branch below.
 
-**Every wait is labelled with the verdict that caused it.** Steps 3 and 4 set
+**Every wait is labelled with the verdict that caused it.** Steps 4 and 5 set
 `SubagentInfo.queued_reason` on the `queued` record they return — one of the
 kinds defined in the leaf module `kiro_crew.subagent_wait_reasons` (re-exported by
 `kiro_crew.subagent`; the channel command layer reads them from the leaf so it never
-imports `kiro_crew.subagent` at runtime): `QUEUED_REASON_LOW_MEMORY` / `QUEUED_REASON_POSTURE_CRITICAL` (step 3, with
-`queued_reason_detail` = the gate's own sentence, the same text the task store's
-`deferred` event records), `QUEUED_REASON_ADAPTIVE_CAP_ZERO` (step 4 when the
-effective cap is 0) or `QUEUED_REASON_CONCURRENCY_LIMIT` (step 4 otherwise: a
-taken slot or the stagger tick). The label is a report of a decision already
+imports `kiro_crew.subagent` at runtime): `QUEUED_REASON_LOW_MEMORY` /
+`QUEUED_REASON_POSTURE_CRITICAL` (step 4, with `queued_reason_detail` = the
+gate's own sentence, the same text the task store's `deferred` event records),
+`QUEUED_REASON_MEMORY_PRESSURE` (step 5 while the kernel pressure hold keeps the
+start, with its figure-free detail), `QUEUED_REASON_ADAPTIVE_CAP_ZERO` (step 5
+when the effective cap is 0) or `QUEUED_REASON_CONCURRENCY_LIMIT` (step 5
+otherwise: a taken slot or the stagger tick). The label is a report of a decision already
 made; no gate reads it back. Two consumers:
 
 - The advisory `subagent_queued` lifecycle event (`_emit_queue_depth`) carries
-  `reason` and, for the memory kinds, `available_gb` / `required_gb` beside
-  `queued`. The label is remembered per parent (`_queue_wait`) so the drain's,
+  `reason` and, for the low-memory and posture kinds, `available_gb` /
+  `required_gb` beside `queued`; the memory-pressure kind carries no figures.
+  The label is remembered per parent (`_queue_wait`) so the drain's,
   the claim path's, the cancel paths' and the terminal reports' requests —
   which carry no verdict of their own — keep it. A frame at depth 0 is the
   bare `{"queued": 0}`, and a 0 read no request overlapped forgets the label.
@@ -603,8 +758,11 @@ made; no gate reads it back. Two consumers:
   not it changed at every point a wave settles: every terminal report of a
   run that started, every queued-stop report (the record of a waiting row
   stopped before it started, whichever path removed the row — so that
-  terminal adds no request of its own), and every `cancel_for_parent` (Stop
-  all) and `cancel_for_boundary` (the stage's Cancel) that stopped nothing. A
+  terminal adds no request of its own), every granted resume (`_resume_publish`:
+  the resume entry was never counted, but the wait that ended — a dependency, a
+  permission answer, an input — has no terminal of its own), and every
+  `cancel_for_parent` (Stop all) and `cancel_for_boundary` (the stage's Cancel)
+  that stopped nothing. A
   frame the client missed or received out of order therefore cannot leave "N
   waiting to start" on the card once the wave has settled.
   **The emit is coalesced per parent into a burst.** At most one read is in
@@ -638,7 +796,17 @@ made; no gate reads it back. Two consumers:
   until the gate has queued it (`_admitting_waiting`, marked by that call as
   the gate returns the queued record and before it awaits anything): the
   refill must never claim it, but once it is deferred or behind the cap it is
-  waiting, and its own labelled request counts it. The count answers how
+  waiting, and its own labelled request counts it. A `recovering` row is not
+  counted either, on disk (`count_pending(include_recovering=False)`) or
+  hydrated into the window (`WINDOW_ENTRY_RECOVERING`, set from the row's
+  state; it is also `spawn`'s keyword, so a gate that re-queues the drained,
+  still-unclaimed row puts the mark back on the entry it appends, pinned by
+  `test_a_restart_survivor_the_gate_requeues_stays_off_the_card`): it is a
+  run that had started before its owner was lost (a gateway restart) and is
+  being rebuilt, which the queued
+  listing names "waiting to resume", and counting it would put "N waiting to
+  start" on the card after every restart. The pending-work guards keep counting it:
+  it is still work the parent is owed. The count answers how
   many spawns wait to START; the lanes API's census of what each lane holds
   counts a resident run's resume entry as that lane's waiting work, a
   different question. **A store that cannot be read publishes nothing** and
@@ -657,7 +825,7 @@ made; no gate reads it back. Two consumers:
   does exist for that parent.
   An event without `reason` (nothing labelled, or an older gateway) leaves the
   dashboard on its default "queued behind the concurrency limit" text; the
-  memory and adaptive kinds render their own sentence
+  memory, memory-pressure and adaptive kinds render their own sentence
   (`website/src/pages/chat/subagentQueuedReason.ts`), visibly on the run card
   and the composer chip as well as in their tooltips, and with a figure-less
   sentence when the event names the kind but not the numbers. The dashboard
@@ -666,7 +834,7 @@ made; no gate reads it back. Two consumers:
   `sseSubagentQueued` reducer (`website/src/store/chat/subagents.ts`), which
   rewrites or clears both on every frame, so a count never sits under a stale
   reason.
-- `POST /api/spawn` answers the three DEFERRED kinds (`DEFERRED_QUEUED_REASONS`)
+- `POST /api/spawn` answers the DEFERRED kinds (`DEFERRED_QUEUED_REASONS`)
   with `status: "queued"`, `reason` and `reason_detail` under the same `id`;
   every reader of that answer relays it: `spawn_run` prints a
   `Queued N subagent(s). Not started yet: <detail> …` group apart from the
@@ -676,7 +844,9 @@ made; no gate reads it back. Two consumers:
   `{"status": "queued", ...}` record for a member that had not started when its
   wait ended (and reports it only there, never also as an error), `kirocrew spawn run` prints `Queued subagent <id> …`, and the
   channel `spawn <task>` keyword (`messaging/commands.py`) replies
-  `⏳ Queued subagent …` with the reason instead of `🚀 Spawned subagent …`. A
+  `⏳ Queued subagent …` with the reason instead of `🚀 Spawned subagent …`, and
+  `⚠️ Subagent … was not started: <error>` for a refusal (a terminal record, not
+  None). A
   `concurrency_limit` wait keeps `status: "spawned"`: it is the ordinary wave
   shape and clears within seconds. Neither the admission verdicts nor the memory
   pricing (`_startup_memory_reserve_gb`) are touched by the label.
@@ -946,7 +1116,13 @@ hold as the pop that retires the key. Every await after that point is a window i
 which a cold start can register a SUCCESSOR under the same key, so an answer
 computed later can name the successor's runs. Returns the live and the queued runs
 both — a queued run's stagger timer would otherwise start work for a parent that
-is gone.
+is gone. Beside the selection it opens the snapshot's FENCE (`note_teardown_snapshot`,
+kept per key at the latest snapshot in `_teardown_store_fences`): from then on every
+row the store accepts for this key is recorded in it, by `taskq_accept_record` before
+the row is written. The cancel takes it (`take_teardown_snapshot`) to sweep the rows no
+selection can name, and it keeps recording (`_teardown_store_sweeps`) until that
+cancel returns. A recycle takes no snapshot, so it opens no fence and its children's
+rows are left to the resumed conversation.
 
 What it MARKS is wider than what it returns, and the two questions are different:
 the return value is what to cancel, the mark is whose delivery to drop. A run that is
@@ -1003,6 +1179,34 @@ goes through `taskq_cancel_queued_async`, which is `taskq_cancel_queued` handed 
 thread, and the race-safety argument (the state test and the cancel sharing one
 `only_from` under the generation the read returned) is the same code rather than the same
 intent restated.
+
+**After the snapshot's ids, the store rows accepted before the snapshot.** A row held
+only by the store — a memory-deferred spawn, or one waiting past the window — is in
+neither the queue nor `_agents`, so no snapshot names it, and left alone it would stay
+queued for a conversation that has ended: it would count on the card ("1 waiting") under
+a key that has moved on, and start into whatever the key serves next. So the cancel then
+reads this parent's waiting rows through `taskq_pending_ids_for_async(…, include_window=True)`
+and stops each one through the same per-id path (marked first, `allow_admitted=False`,
+a queued-stop report with no injection), every one except the rows the snapshot's fence
+recorded. So a row a successor under the same key queued after the snapshot is never
+swept, even one accepted while the cancel runs, and a row the refill hydrated into the
+window after the snapshot is swept like one on disk (the window's own rows are kept in
+the read, since the teardown's `_unqueue` drops a window entry with its row). The fence
+orders by ACCEPT, never by `created_at`: a wall clock stepped back during the teardown
+stamps the successor's row earlier than the retired conversation's, and a time cutoff
+would sweep it. It runs after the
+named runs are stopped, so it never delays a live reap behind a store read, and it logs
+one `parent-end teardown: … store_rows=… store_ids=…` WARNING when it finds any. A store
+it cannot read sweeps nothing (the snapshot's ids are already stopped). Pinned by
+`test_queue_depth_reconcile.py::test_after_each_exit_the_published_depth_equals_the_store_count`
+(`parent_end`, `session_reset`),
+`test_a_parent_end_stops_its_store_rows_without_reporting_them_home`, for a row the
+refill windows between the snapshot and the sweep,
+`test_a_parent_end_sweeps_a_row_the_refill_windowed_after_its_snapshot`, for a clock
+stepped back mid-teardown,
+`test_a_wall_clock_stepped_back_mid_teardown_never_sweeps_the_successors_row`, and for a
+successor spawn during the cancel,
+`test_a_successor_row_accepted_while_the_teardown_cancel_runs_is_spared`.
 
 The mark is what separates this from `cancel_for_parent`. A user pressing Stop all
 wants the outcome reported back into a conversation they are still looking at, and
@@ -1066,9 +1270,14 @@ of the same window:
 - **Admitted late may start.** A spawn between its row write and its registration is in
   neither the queue nor `_agents` — `spawn_async` persists the row and then re-enters
   `spawn` to register — so no selection can name it, and it starts into whatever the key
-  serves next. A durable row that has spilled out of the in-memory window is outside the
-  snapshot for the same reason: the store keeps more than the window holds, and a restart
-  repopulates the store without repopulating the window.
+  serves next. A durable row held only by the store is outside this half when its
+  `taskq_accept_record` ran before the snapshot: the snapshot's fence never recorded it,
+  so the cancel's sweep stops it. A row is spared exactly when `taskq_accept_record`
+  runs after `note_teardown_snapshot`, and that includes an accept from the RETIRED
+  conversation still in flight at the snapshot (a `spawn_async` row write queued on the
+  store's writer thread behind it), which the fence cannot tell from a successor's and
+  spares. So is a row a `spawn_async` caller is still admitting. No clock is read, so a
+  wall clock stepped back cannot make the sweep take a successor's row.
 - **Reporting late may deliver.** A report that has already passed the delivery gate and
   is suspended inside `_on_done` is not stopped by marking its id afterwards. The injector
   resolves the parent through `get_or_create`, which CREATES a session when none is live,
@@ -1081,9 +1290,12 @@ report already past the gate is not reached by marking it later.
 
 Neither half is closed by another recheck at one end. Selecting more, or re-testing before
 injecting, both need an await, and an await here cannot tell work belonging to the retired
-conversation from work a successor under the same key has just started: a spilled row of
-the conversation that ended looks exactly like one the successor queued, and a report
-resolving its parent looks the same whichever conversation it belongs to. The answer is one
+conversation from work a successor under the same key has just started: a run registered
+after the snapshot looks exactly like one the successor started, and a report resolving
+its parent looks the same whichever conversation it belongs to. A durable row is the one
+exception, because every accept is recorded against the snapshot's fence as it happens
+and every conversation that held the key before the snapshot had ended by it; that record
+is the whole of the store sweep's fence. The answer is one
 identity every path can test, not a recheck per path — a conversation-incarnation counter
 that does not exist today. Tracked in #12069, which carries both halves.
 
@@ -1596,11 +1808,13 @@ On timeout (inner or outer):
 
 **Reconnect recovery**: `subscribe_subagents` in `ws.py` restores both managed and native subagent cards. Managed subagents are authoritative in `SubagentManager` while the gateway that ran them is alive: running records replay as `subagent_snapshot`, and recently completed records replay as `subagent_done`, including terminal `elapsed` and cumulative `credits`. Managed results remain disk-backed and are not copied into inline Redux card payloads.
 
-A replacement gateway process has neither, so the replay has a second, durable source for managed runs the live manager does not know: `subagent_persistence.read_panel_records` reads the run folders and maps them to `subagent_done` frames, which join the same replay list and therefore pass the same ownership filter, per-socket scope gate and `subagent_snapshot_batch` packaging as the live frames. `GET /api/spawn` consults the same reader, so the list endpoint and the reconnect replay agree. Live state wins whole: a folder is admitted only for an id the live manager does not hold, and no fields are merged. Native cards have no durable record -- `create_agent_folder` is reached only from the manager's admission pump -- so they are not recovered across a restart, and a run whose memory mode is not `persistent` writes no folder and cannot appear.
+A replacement gateway process has neither, so the replay has a second, durable source for managed runs the live manager does not know, and that source is the CREW LOG: `ws.read_fold_subagent_records` folds each live slot's session for the `subagents` and `class` projections in one pass and maps the closed rows to `subagent_done` frames, which join the same replay list and therefore pass the same ownership filter, per-socket scope gate and `subagent_snapshot_batch` packaging as the live frames. The log is the record, so a card's outcome, duration and cost are a fold of it rather than a store kept in step with it by hand -- which is also what lets the frames carry the per-child `credits` and `model` the folder reader never held. Live state wins whole: a row is admitted only for an id the live manager does not hold, and no fields are merged. Only a CLOSED row is replayed: a row with no outcome is a child still in flight that this process is not tracking, so a card drawn from it would wear a running pill nothing will ever advance, and the fold's own `running` count is what states those instead. Native cards are not in the session's log -- nothing on the native path emits `subagent/spawned` -- so they are still not recovered across a restart. A log the operator turned off (`KIROCREW_CREW_LOG` falsy) folds nothing, and the replay falls back to `subagent_persistence.read_panel_records` over the run folders on the same bounds and through the same gates: the opt-out is about the RECORD, not about the panel, so it costs the rebuild its per-child `credits` and `model` rather than the rebuild itself. That branch is also the only path on which the replay reads folders, which is what keeps exactly one dismissal record authoritative at a time.
 
-The rebuild is bounded by `PERSISTED_SUBAGENT_REPLAY_KEEP` (50 newest records, capping the burst one connect delivers) and `PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS` (one day, capping how far back it reaches). The age bound is separate from the native terminal TTL because it answers after the process is replaced, which is routinely more than an hour later. What actually survives to be replayed is decided by `prune_stale_tombstones`, not by this bound: abnormal endings keep their folder for `max_age_days` (a week), while a `delivered` folder is reclaimed after `agent.subagent_result_ttl_secs` (an hour by default). So a restart rebuilds the interrupted runs plus whatever was delivered recently, and older successes have aged off disk by design. A folder with NO ending recorded is not given one: `classify_persisted_ending` answers an empty outcome and the record is skipped until the reconciler has written an ending, because a card claiming `completed` would contradict the orphan notice injected for that same run. Every string a record retains is either clamped to a named cap or, for the three equality keys (`id`, `app`, `parent_session`), refused when oversized, since clamping a key would make it compare unequal while still reading as a value. What the row cap cut is COUNTED and returned with the records, and each consumer says it once per rebuild as a WARNING naming the cap and the count, because a truncated tail otherwise reads exactly like a population that never held those runs. The scan's candidate window is a SECOND bound, and it closes on mtime before validity and admission run, so a window filled entirely by records that are then rejected leaves admissible older folders uninspected at a count of zero. Its saturation is therefore reported on its own rather than only alongside a nonzero count. The report is addressed to the operator, not to the client: no panel acts on the number, and a field no consumer reads is a field that silently rots. It is a WARNING and nothing else: a truncation refuses nobody, so it is not a permission decision and is kept out of the SEL deny stream, which carries the ownership and scope refusals an operator reads that stream to find. The count is computed over the CALLER'S OWN admissible set, because the caller's visibility filter runs before the cap: filtering afterwards would let a record the caller may not see occupy a slot its own runs need, and would make the number disclose how many foreign runs exist.
+`GET /api/spawn` keeps reading the run folders through `subagent_persistence.read_panel_records`, and that is not a second record of the same state. What the folders hold that the log does not is the run's own OUTPUT TEXT: `result.txt`, which that endpoint returns and the log deliberately never carries. The state facts stay off it -- outcome, timing and cost are read from the fold by the surface that draws them -- so the folder reader is a body store the endpoint consults for a body, not a parallel answer to "what happened to this child".
 
-Ownership of a replayed record is decided by `ws_event_scope.persisted_replay_denial_reason`, not by the per-frame scope gate alone. It answers `""` for an admitted record, `"slot_missing"` when the slot is absent or still under construction, and `"persisted_owner_mismatch"` when the run's recorded app differs from the slot's present owner, so a slot that has not hydrated yet is not recorded as an ownership breach. `_subagent_visible` admits on the slot's **current** `_app`, which is the right question for a live run and the wrong one for a record read back off disk: slot keys are caller-supplied and are not namespaced by app, so the key an app's run was recorded under can later be created by a different app, and the gate would then hand the old run to the new owner. The predicate therefore requires the run's own recorded app to equal the slot's present owner and fails closed both ways, so a run no app owns matches only a slot no app owns. Any future change to slot-key allocation has to preserve that equality. The predicate is evaluated ON THE EVENT LOOP, twice, and never from the worker thread. Once before the off-loop scan, as `ws_event_scope.persisted_precap_readings` (which pairs `slot_owner_snapshot` with `visible_subagent_slot_keys`) fed to `persisted_precap_denial_reason`, whose answer sizes the row cap over the records this caller may see; and once again on each surviving record with `persisted_replay_denial_reason` before its frame is kept, which is the authoritative decision. A slot's owner can be reclaimed while the scan runs, so a decision taken inside the worker thread would be read from state the caller no longer describes. Both halves answer the SAME reason shape, because they are two halves of one decision and withholding a record IS the permission decision: a bool on the snapshot half would force a caller to drop a record with no record of why, which is the normal case, since the two apply the same equality and most refusals never reach the loop half. The two sets are disjoint, so nothing is audited twice. Each refusal emits a SEL event through the same `_audit_deny` chokepoint the per-frame gate uses, under its own reason so an ownership refusal and a scope refusal are not read for one another; and an ADMISSION emits `_audit_allow`, because a stream carrying only refusals can show what was blocked and never what was released. `GET /api/spawn` shares the loop-taken ownership half and the same audit chokepoint, but NOT the pre-cap pair: it consults `persisted_snapshot_denial_reason`, which answers on ownership alone, where the replay's `persisted_precap_denial_reason` adds the visibility half (`persisted_not_visible`). The replay needs that half because a socket subscribes to declared event types; the REST caller declares none, so there is no declaration for a record to fall outside of.
+The rebuild is bounded by `PERSISTED_SUBAGENT_REPLAY_KEEP` (50 newest rows, capping the burst one connect delivers) and `PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS` (one day, capping how far back it reaches). The age bound is separate from the native terminal TTL because it answers after the process is replaced, which is routinely more than an hour later. Both are measured on each row's `started_ms`, the `subagent/spawned` entry's own envelope stamp, which is also what orders the cap newest-first -- `seq_spawned` orders rows inside one log and says nothing across two, so a cap applied over several sessions needs the stamp. What actually survives to be replayed is decided by the log's own retention plus the fold's `OPEN_RETAIN_LIMIT`, not by this bound: a session that dispatched past the cap keeps its totals exact and reports the shortfall as `omitted`, which the panel section draws. A row with NO outcome is not given one: it is skipped until a closer lands, because a card claiming `completed` would contradict the orphan notice injected for that same run; a row whose closer recorded an outcome outside the three a card can draw becomes `failed` with the orphan wording, which is the same answer `classify_persisted_ending` gave an unreadable ending, and never `done` -- the client's terminal precedence falls through to success for a value it does not recognise. What the row cap cut is COUNTED and returned with the rows, and the consumer says it once per rebuild as a WARNING naming the cap and the count, because a truncated tail otherwise reads exactly like a population that never held those runs. There is no second scan-window bound to report: the fold read enumerates the live slots rather than walking a directory, so the count is exact over what the folds hold. The report is addressed to the operator, not to the client: no panel acts on the number, and a field no consumer reads is a field that silently rots. It is a WARNING and nothing else: a truncation refuses nobody, so it is not a permission decision and is kept out of the SEL deny stream, which carries the ownership and scope refusals an operator reads that stream to find. The count is computed over the CALLER'S OWN admissible set, because the caller's visibility filter runs before the cap: filtering afterwards would let a record the caller may not see occupy a slot its own runs need, and would make the number disclose how many foreign runs exist.
+
+Ownership of a replayed record is decided by `ws_event_scope.persisted_replay_denial_reason`, not by the per-frame scope gate alone. It answers `""` for an admitted record, `"slot_missing"` when the slot is absent or still under construction, and `"persisted_owner_mismatch"` when the run's recorded app differs from the slot's present owner, so a slot that has not hydrated yet is not recorded as an ownership breach. `_subagent_visible` admits on the slot's **current** `_app`, which is the right question for a live run and the wrong one for a record read back off disk: slot keys are caller-supplied and are not namespaced by app, so the key an app's run was recorded under can later be created by a different app, and the gate would then hand the old run to the new owner. The predicate therefore requires the run's own recorded app to equal the slot's present owner and fails closed both ways, so a run no app owns matches only a slot no app owns. On the folded path that recorded app is the `class` fold's `app`, which holds the FIRST owner the session ever had and never moves off it -- a log that was an app's stays an app's, which is exactly the property the equality needs, and it is read from the same one-pass fold the rows come from. Any future change to slot-key allocation has to preserve that equality. The predicate is evaluated ON THE EVENT LOOP, twice, and never from the worker thread. Once before the off-loop scan, as `ws_event_scope.persisted_precap_readings` (which pairs `slot_owner_snapshot` with `visible_subagent_slot_keys`) fed to `persisted_precap_denial_reason`, whose answer sizes the row cap over the records this caller may see; and once again on each surviving record with `persisted_replay_denial_reason` before its frame is kept, which is the authoritative decision. A slot's owner can be reclaimed while the scan runs, so a decision taken inside the worker thread would be read from state the caller no longer describes. Both halves answer the SAME reason shape, because they are two halves of one decision and withholding a record IS the permission decision: a bool on the snapshot half would force a caller to drop a record with no record of why, which is the normal case, since the two apply the same equality and most refusals never reach the loop half. The two sets are disjoint, so nothing is audited twice. Each refusal emits a SEL event through the same `_audit_deny` chokepoint the per-frame gate uses, under its own reason so an ownership refusal and a scope refusal are not read for one another; and an ADMISSION emits `_audit_allow`, because a stream carrying only refusals can show what was blocked and never what was released. `GET /api/spawn` shares the loop-taken ownership half and the same audit chokepoint, but NOT the pre-cap pair: it consults `persisted_snapshot_denial_reason`, which answers on ownership alone, where the replay's `persisted_precap_denial_reason` adds the visibility half (`persisted_not_visible`). The replay needs that half because a socket subscribes to declared event types; the REST caller declares none, so there is no declaration for a record to fall outside of.
 
 The pre-cap decision carries TWO independent bounds, ownership and VISIBILITY, and both are needed before the cap: a record may name a slot the caller owns while carrying an event the caller never declared, and may be visible under a declaration while belonging to another app. Sizing the cap on ownership alone lets a burst of records this client cannot see spend the slots its own visible runs need, and the cut count is then computed over records that were never its to receive. Visibility is reported first because it is the broader refusal — a declaration gap must not enter the stream as a cross-app breach. Using it before the cap is safe despite the answer being time-varying, because of which way it moves: `app_events_revoked` reports NOT revoked on a cold cache and schedules the refresh, so the cold answer is the OPEN one and warming can only narrow it, and pre-cap open then post-cap closed costs a cap slot the authoritative gate reclaims. The losing direction needs an app re-enabled mid-scan, which costs one run one replay that the next reconnect carries.
 
@@ -1614,7 +1828,7 @@ That carry-forward adds a disk READ to a function that already wrote, so it shar
 
 The REST listing's app bound gates on the presence of the caller's app CLAIM, never on a transport flag. `derive_caller_app` states that app-ownership checks read `request["app"]`, and publication is narrowing-only: every arm sets the claim only for a positively resolved app and leaves it absent for the dashboard user, which is the same fact the middleware inverts into `is_dashboard_user`. A flag answers which credential arrived, and four arms publish an app claim while only the internal-secret arm sets `internal_auth`, so a bound keyed to that flag is absent on exactly the cookie and token transports an installed app normally arrives over.
 
-**Dismissal**: because this reader answers from folders, dropping a run from the manager is only half of a dismissal, and on its own it lasted exactly as long as the process — `settle_before_delete` pops the run and leaves its folder, so the next rebuild found that folder and sent the card again. A dismissal therefore leaves a durable record of its own, `subagent_persistence.record_panel_dismissal`, and `read_panel_records` skips a recorded id on the same terms as a live one. It is skipped in the directory walk, before the candidate heap, so a dismissed folder cannot spend a slot a visible run needs. The record is written at the pop rather than in the route, so the two halves cannot come apart, and `DELETE /api/spawn/{id}` writes it directly for an id that exists only on disk — which after a restart is every finished run, and which the route previously refused with a 404 that made those cards undismissable. That arm is the dashboard owner's alone, exactly as wide as what the owner can already see, since an app token holding a reach over runs it cannot list would be a new capability; an absent app claim is refused rather than trusted, and an id with no folder keeps its 404 because nothing durable can rebuild that card. Both arms are audited under `spawn.dismiss`.
+**Dismissal**: because a durable reader answers from something that outlives the process, dropping a run from the manager is only half of a dismissal, and on its own it lasted exactly as long as the process — `settle_before_delete` pops the run and leaves the durable trace, so the next rebuild found it and sent the card again. The PANEL's half of a dismissal is therefore an entry in the owning session's crew log, `subagent/dismissed`, written by the dismiss route: the panel's durable half is a fold of that log, the `subagents` fold adds the type to `affects` and marks the row dismissed, and its render stops offering the row while leaving every total where it was. Keeping it anywhere else is a second record of a fact about the session, and this is not hypothetical — it lived in `subagent_persistence.record_panel_dismissal`, a registry keyed on the run's FOLDER at both ends: the write refused without one, and `prune_orphan_panel_dismissals` dropped a record whose folder had gone. A `delivered` folder is reclaimed within the hour while the log keeps the child for the replay's whole day-long window, so a dismissed card came back. The owning session is resolved cheapest-first, from the emitter's own in-process spawn pin and then from the live slots' logs, because the case that matters has neither a manager entry nor a pin: both died with the gateway that wrote them. That registry is NOT removed, because `GET /api/spawn` still reads the folders and `read_panel_records` still skips a recorded id there. A dismissal recorded before this entry type existed is corrected INTO the log rather than read around: on each panel replay `ws.backfill_legacy_panel_dismissals` appends the missing `subagent/dismissed` for a child the registry marks dismissed and the log does not, and excludes the ids it corrected from that same read, because the append is queued and the fold that follows may not carry it yet. It is idempotent through the fold's own behaviour: the render stops offering a dismissed row, so a corrected child is not among the rows a later pass walks, and the registry is read at most once per child and never written from that path. The record is written at the pop rather than in the route, so the two halves cannot come apart, and `DELETE /api/spawn/{id}` writes it directly for an id that exists only on disk — which after a restart is every finished run, and which the route previously refused with a 404 that made those cards undismissable. The route now answers 404 only when NEITHER record can be written, since a log that records the child is enough to keep the card gone whether or not a folder survives. Each crew-log append is WAITED on until it commits, bounded, because the queue returns as soon as the entry is handed over and once the folder is reclaimed that entry is the only record of the dismissal -- publishing on the handover reports a dismissal the next reconnect undoes, with nothing left to explain it and nothing for a retry to act on. A half that was owed and did not land answers the retryable 503 whichever half it was. That arm is the dashboard owner's alone, exactly as wide as what the owner can already see, since an app token holding a reach over runs it cannot list would be a new capability; an absent app claim is refused rather than trusted, and an id with no folder keeps its 404 only when no unit holds it either, because then nothing durable can rebuild that card. A run a unit DOES hold is not an unknown id: if its append does not commit the route answers the retryable 503, not 404. Both arms are audited under `spawn.dismiss`.
 
 The record lives in its own top-level `panel-dismissals/` leaf of the data home, OUTSIDE the run folder, and deliberately NOT under `trust/`. A dismissal is an OWNER decision about what the panel hides, which makes it the same class of record as `crew-panels`, `crew-teams` and `tag-grants` — and each of those is its own top-level leaf precisely because `trust/` is a declared sandbox READ-WRITE exception (in-sandbox `verify_session_pid` reads `trust/sel_hmac.key` and the in-sandbox MCP servers append to the audit log). A record under `trust/` stays writable by a sandboxed command that builds the path at runtime, which command matching cannot catch because it has no literal path to match; the cleanup identities that do live there predate that rule rather than justifying it. So the leaf is registered in four places, and because nothing in the code fails when one is missing, each is pinned by name in `TestTheDismissalStoreIsRegisteredEverywhereItMustBe`: `paths._CREW_SECRET_LEAVES` for the file gate, `sandbox._CREW_HIDDEN_LEAVES` for the bind mask, `_CREW_PRECREATE_HIDDEN_DIR_LEAVES` because the directory is created on the first dismissal and the mask loop SKIPS a name that does not exist, and `_CREW_NO_ALIAS_LEAVES` because a symlink would attach the mask to the target and leave the name writable. `state.json` and `tombstone.json`, by contrast, are agent-writable, so a marker kept in there would let a run hide its own card from every later rebuild. The write goes through `atomic_write(..., restrict_to_owner=True)` so the lockdown lands on the temp file before the payload and before the rename. The run FOLDER is deliberately left in place rather than deleted — `spawn_continue` reseeds its session map from that folder's `state.json`, so removing it to hide a card would also destroy a conversation the user can still continue, and would take the result text and the prune bookkeeping with it. The reader fails OPEN: an unreadable record yields no id, so a filesystem fault resurrects a dismissed card, which the user can dismiss again, rather than hiding a run nobody dismissed. Records are reclaimed with their folder at both removal sites (`delete_agent_folder` and `prune_stale_tombstones`), and `prune_orphan_panel_dismissals` sweeps once per prune cycle for a folder that left by some other route.
 
@@ -1843,7 +2057,15 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   trusting the row (`test_taskq_admission_integration.py::test_a_row_on_disk_carrying_auto_approval_faces_the_spawn_gate`
   drains a row that still holds the grant and asserts the approval callback ran).
   The value stays recorded in `scope_ref`, which the schema defines as references
-  rather than grants and which no start path reads.
+  rather than grants and which no start path reads. One in-process exception: the
+  process that ACCEPTED a durable row keeps its `approval_mode` in
+  `_held_approval_modes` (keyed by the freshly minted run id) for as long as the
+  row waits, and its window refill (`_refill_apply`) puts it back on that row's
+  entry. That is the same request's consent, which an entry that never left the
+  in-memory window carries anyway; without it a held or deferred App Kit spawn
+  would drain into a prompt nobody can answer. It is dropped when the row
+  registers, is refused or is stopped (`_forget_pending_start`), and a restart
+  replays the row without it, as above.
 - **A run id is 16 hex characters, minted at one site**
   (`SubagentManager._mint_agent_id`, `_RUN_ID_HEX_CHARS`; the gate, the
   continuation coordinator and the wave digest all call it and none of them
@@ -1908,11 +2130,12 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   across the boundary. `queued_count_for` /
   `has_pending_work_for` / `batch_members_pending` / the stuck-wave and
   digest-hold sweeps /
-  `cancel_for_parent` all add the store-only rows (`taskq_overflow`,
-  `taskq_batch_pending`, `taskq_pending_ids_for`). An event-loop caller takes the
+  `cancel_for_parent` / `cancel_for_teardown` all add the store-only rows
+  (`taskq_overflow`, `taskq_batch_pending`, `taskq_pending_ids_for`; the teardown
+  fences its read with the ids the snapshot's fence recorded as accepted after it). An event-loop caller takes the
   `*_async` sibling instead — `queued_count_for_async` /
   `has_pending_work_for_async` over `taskq_overflow_async`,
-  `taskq_pending_ids_for_async` for `cancel_for_parent`, and
+  `taskq_pending_ids_for_async` for `cancel_for_parent` and `cancel_for_teardown`, and
   `batch_members_pending_async` / `_sweep_stuck_waves_async` /
   `_sweep_digest_holds_async` over `taskq_batch_pending_async` (the reaper and
   the gateway's completion consumer are the coroutines that hold them) — each of
@@ -2023,9 +2246,10 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   (tests, tools) pumps as soon as it can. The first refused pass logs one debug
   line naming the queue depth and store state, so a hold that is never released
   is visible instead of presenting as rows accepted but never claimed.
-- **Memory pressure defers.** See admission order step 3. SEL outcomes:
+- **Memory pressure defers.** See admission order step 4. SEL outcomes:
   `deferred_low_memory` / `deferred_memory_critical` (store) vs the legacy
-  `refused_low_memory` / `refused_memory_critical`.
+  `refused_low_memory` / `refused_memory_critical`. The macOS kernel pressure
+  hold is a capacity-style wait (step 5), audited `deferred_memory_pressure`.
 - **Nested tree.** `taskq_accept` sets `parent_id` (and inherits `root_id`)
   when the spawning session is `subagent:<id>` and that id has a row, so the
   store holds the S → A → B links a restart rebuilds from.
@@ -2107,6 +2331,44 @@ The dispatcher's order is not global FIFO. The store side is in
   queued row the refill refetches in FIFO order. Pinned end to end by
   `test_fairness_lanes.py::test_reserve_pulls_a_child_into_a_window_holding_one_entry_per_lane`
   and directly by `::test_eviction_frees_one_lane_head_per_call_and_never_a_resume`.
+- **An id stays pending wherever the row waits (`is_queued`).** A spawn the
+  cap queued, or the memory / posture guard deferred, already returned its id
+  but has no `_agents` row, and the eviction above moves a windowed row back to
+  store-only. The app SDK's serial-lock done-probe (`spawn_sdk.build_done_probe`)
+  reads an untracked id as done UNLESS `SubagentManager.is_queued` names it, so
+  every such place must answer: a missed one releases the caller's guard and lets
+  a duplicate of not-yet-run work be queued (#15668). `is_queued` is False for
+  an id with a live `_agents` row, then True when any of three holds:
+  - **`_queue`** names it (a fresh entry; a `_resume_id` entry is a resident
+    run and never counts). The window add / pop and the eviction move it in and
+    out.
+  - **`_dispatch_window_ids`** names it. The pump adds the id when it pops a row
+    (beside `_dispatching_ids`, the depth exclusion). It drops it when that one
+    attempt ends: a refused or re-queued `spawn`, a claim that did not proceed,
+    or the inner or outer `_unmark_dispatching`. A RETAINED claim is the
+    exception and keeps it until `retry_retained_claims` settles the row.
+    `_dispatching_ids` is dropped at every attempt end, retained or not. For a
+    non-durable row (`incognito` / `temporary`, or no store at all) this set is
+    the only record between pop and registration.
+  - **`TaskStore.is_unstarted`** names it, for every durable row. The store
+    keeps an in-memory index of the ids in a claimable or `admitted` state (the
+    `_SQL_UNSTARTED` set `count_pending(include_admitted=True)` reads). It loads
+    the index at `open` and updates it after the commit of every state write
+    that can cross that set: `accept`, `insert_if_absent`, `transition` (and so
+    `finish` / `advance` / `enter_wait`), `cancel`, `wake_wait`. A `claim` stays
+    inside it (claimable to `admitted`). So the cap's store-only
+    branch, a pressure deferral at accept (sync `spawn` or `spawn_async`) or at
+    drain time (`park_defer`), the eviction and a retained claim all stay named
+    without a manager-side add. Every terminal write unnames the row: settle,
+    queued cancel, boundary cancel, `cancel_tree`, wait expiry. The manager
+    keeps no set of its own for this, so a new path that moves a row on disk
+    needs no extra bookkeeping. The read is a set lookup under a lock that no
+    I/O is ever done under, never SQLite, because the probe runs on the gateway
+    loop. A write by another connection on the same file is not seen until the
+    next `open`.
+
+  Pinned by `test_taskq_admission_integration.py::test_is_queued_*` and
+  `test_taskq_store.py::test_unstarted_index_*`.
 - **`CapacityView` (`capacity_view()`).** One reading per decision:
   `cap_total` = `_max_concurrent`, lifted to `min(user_max_concurrent,
   adaptive_floor + child_reserve)` ONLY while a parent is in

@@ -82,8 +82,10 @@ from kiro_crew.agent_sdk.spec_hooks import (
     refuse_stale_switch,
     reproject_claimed_session,
     session_agent,
+    spec_project_dir,
 )
 from kiro_crew.agent_sdk.tool_search import resume_takes_tool_search_replay
+from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
 from kiro_crew.autonudge import get_instance
 from kiro_crew.autonudge_authz import normalize_banner
 from kiro_crew.browser_cli import install as browser_cli_install
@@ -691,6 +693,59 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402, F401
 _CONTEXT_WINDOW_RECOVERY_PREFIX = "[KiroCrew context-window recovery]"
 
 
+def unavailable_agent_message(agent_name: str) -> str:
+    """What a resumed conversation whose agent does not resolve tells its user.
+
+    A recorded skill-view name the projection cannot map back is not a Crew
+    Member the user can restore: nothing records which agent it was built
+    from, and none can be recovered (the view name is a one-way digest). The
+    remedy that works is to pick the agent again or start a new chat, so that
+    is what it says, rather than naming a generated file as a missing member.
+    """
+    if agent_name.startswith(NATIVE_SKILL_ALIAS_PREFIX):
+        return (
+            "This chat was recorded under a generated skill view from an earlier "
+            f"version ('{agent_name}'), and the agent it was built from is not "
+            "recorded. Pick the agent for this chat again, or start a new chat."
+        )
+    return f"Crew Member '{agent_name}' is unavailable; restore it or choose a member"
+
+
+def _slot_member_slug(slot_key: str) -> str:
+    """The slug a member DM slot key encodes, or ``""`` for a non-member key.
+
+    A member with a persisted identity gets an id-based slug, so its DM slot key
+    (``member-<member_id>``) carries that immutable id directly -- the one
+    identity source that survives BOTH a restart AND the removal of the original
+    member. The ``dm.json`` binding cannot serve this: ``read_dm_binding``
+    reports it absent whenever the encoded id fails to resolve in config (exactly
+    the reassignment case that matters). The transcript line is not consulted
+    either -- it is the operator-editable JSONL the pin must never re-derive
+    identity from. A legacy member's key carries a name-derived slug that equals
+    no member's id, so a caller comparing this against a resolved ``member_id``
+    only ever sees a divergence for a genuine stable-identity thread.
+    """
+    from kiro_crew import members as members_mod
+
+    return members_mod.slug_from_dm_slot_key(slot_key) or ""
+
+
+def _dm_member_binding_changed(bound_member_id: str, slot_key: str) -> bool:
+    """Whether a DM member thread's encoded id differs from the resolved alias.
+
+    The slot KEY is the one un-plantable identity a restored session carries
+    (the session's address, not the agent-writable metadata line). A DM slot
+    key encodes the member_id; when the alias resolves to a member whose id
+    differs, the thread belongs to a member the alias does not name, so the
+    carrier-less re-selection must refuse. Returns ``False`` when the slot key
+    encodes no id (an ordinary ``chat-N`` slot) -- there is nothing to compare,
+    and the leak this guards is specific to a DM thread whose alias has been
+    reassigned to a different member.
+    """
+    slot_member_slug = _slot_member_slug(slot_key)
+    return bool(bound_member_id) and bool(slot_member_slug) and bound_member_id != slot_member_slug
+
+
 def _require_session_memory_assignment(session_key: str, memory_store: str | None) -> None:
     """A captured execution outranks a later mutable member declaration."""
     from kiro_crew.execution_context import read_session_execution  # noqa: F811
@@ -1045,7 +1100,9 @@ async def _prepare_spec_hooks(
         logger.warning("no agent is known for this KAS session; tool calls are blocked")
         return [], True, work_dir
     try:
-        hooks, lost, unconfirmable = await asyncio.to_thread(crew_fired_spec_hooks, agent)
+        hooks, lost, unconfirmable = await asyncio.to_thread(
+            crew_fired_spec_hooks, agent, spec_project_dir(client)
+        )
     except Exception:  # noqa: BLE001 - the caller fails PreToolUse closed
         logger.warning(
             "agent spec hooks for %r could not be read; tool calls are blocked",
@@ -5489,6 +5546,26 @@ def _prewarm_allowance() -> int:
     return resource_status.prewarm_allowance()
 
 
+def _pressure_hold_blocks_prewarm(state: "DashboardState") -> bool:
+    """Whether the subagent gate's macOS kernel memory-pressure hold applies now.
+
+    Read at a pre-warm's ADMISSION only, never on the re-probe after one
+    registered: a speculative runtime must not take the memory held user starts
+    wait for, but one that already finished its handshake is not evicted for a
+    level that crossed WARN meanwhile. On the loop: the manager's state is
+    loop-owned, and the read is a sysctl (plus a cached config read only while
+    the level is held).
+    """
+    subagents = getattr(state, "subagents", None)
+    if subagents is None:
+        return False
+    try:
+        return subagents.memory_pressure_hold_active() is True
+    except Exception:
+        logger.debug("Eager spawn: pressure-hold read failed", exc_info=True)
+        return False
+
+
 async def _evict_prefetches_beyond(
     sessions: Any,
     limit: int,
@@ -6078,6 +6155,16 @@ async def _eager_spawn(
             # is made first (oldest unclaimed evicted) so the population never
             # overshoots during the handshake. Off the loop: it reads procfs.
             allowance = await asyncio.to_thread(_prewarm_allowance)
+            if allowance > 0 and _pressure_hold_blocks_prewarm(state):
+                # No new speculative runtime, but the idle ones already live are
+                # not evicted: they hold no more memory than they did, and the
+                # host bands below, not the hold, decide when those must go.
+                logger.info(
+                    "Eager spawn: the subagent memory-pressure hold applies; leaving "
+                    "slot %s to first turn",
+                    slot.key,
+                )
+                return
             if not await _admit_prefetch(
                 sessions, session_key, allowance, signal_generation=signal_generation
             ):
@@ -9463,9 +9550,7 @@ async def _run_chat(
             if slot.agent and not slot._app and not bindings.requested_resolved:
                 from kiro_crew.memory_stores import UnknownMemoryStore
 
-                raise UnknownMemoryStore(
-                    f"Crew Member '{slot.agent}' is unavailable; restore it or choose a member"
-                )
+                raise UnknownMemoryStore(unavailable_agent_message(slot.agent))
         except Exception as exc:
             logger.warning("Failed to resolve agent bindings in _run_chat", exc_info=True)
             from kiro_crew.memory_stores import UnknownMemoryStore
@@ -9517,6 +9602,40 @@ async def _run_chat(
                     app=slot._app or "",
                     validate_memory_files=False,
                 )
+                # A RESTRICTED session (incognito/temporary) persists no durable
+                # execution carrier -- its line names no ``execution_context`` and
+                # no ``memory_store`` -- so ``previous_execution`` is None and this
+                # branch re-selects the member from the ALIAS the restored slot
+                # carries. The alias is mutable: a member removed and a new one
+                # created under the same name reassigns it to a DIFFERENT immutable
+                # id, and an incognito session READS memory, so a bare alias
+                # re-selection would bind the new member's PRIVATE store and
+                # surface memory this chat never ran as.
+                #
+                # Binding that private store is sound only when a durable identity
+                # the session itself carries -- one that is NOT the agent-writable
+                # metadata line, which the pin must never re-derive identity from
+                # -- confirms the alias still names the same member. The sole such
+                # identity is the slot KEY (the session's address, not an editable
+                # payload): a DM slot key encodes the member_id (id-based for a
+                # member with a persisted identity, durable across the original
+                # member's removal). An ordinary ``chat-N`` slot's key encodes NO
+                # id, so there is nothing un-plantable to confirm the re-selection
+                # -- but the leak this guards is specific to a DM thread whose
+                # alias has been reassigned to a different member, so only that
+                # case refuses:
+                #  * DM slot whose encoded id DIFFERS from the resolved member's
+                #    (the alias was reassigned): the thread belongs to a specific
+                #    member and the alias now names another. Refuse fail-closed --
+                #    the same "open a new conversation" answer the durable-carrier
+                #    path above gives on a store mismatch, leaving the member's
+                #    memory intact to bind cleanly in a new conversation.
+                bound_member_id = execution_context.member_id or ""
+                if _dm_member_binding_changed(bound_member_id, slot.key):
+                    raise _MemoryUnavailable(
+                        "memory_unavailable: this conversation's member "
+                        "binding changed; open a new conversation"
+                    )
             else:
                 execution_context = ExecutionContext(
                     None,
@@ -11210,7 +11329,7 @@ async def _run_chat(
                 depth=_prompt_depth,
             )
             try:
-                state.broadcast_ws("chat_done", chat_done_payload(state, slot))
+                state.broadcast_ws("chat_done", await chat_done_payload(state, slot))
             except Exception:  # pragma: no cover - unblock is best-effort
                 logger.debug("chat_done broadcast failed for aborted replay", exc_info=True)
             return
@@ -17336,7 +17455,10 @@ async def _run_chat(
             )
             needs_session_reset = True  # checked in finally block
             _persist_partial_reply()
-            if _should_suppress_requeue(slot):
+            # A Stop that already resolved to idle is invisible to the suppress
+            # check; the replay snapshots below are post-Stop, so only this gate
+            # can see it.
+            if _should_suppress_requeue(slot) or _stop_pressed():
                 pass
             elif _prompt_depth == 0 and not slot._session_not_found_retry_used:
                 slot._session_not_found_retry_used = True

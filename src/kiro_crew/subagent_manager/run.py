@@ -15,6 +15,7 @@ from ..subagent_persistence import (
     write_run_agent,
 )
 from ._component import ManagerComponent
+from .admission.types import WINDOW_ENTRY_RECOVERING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -100,6 +101,7 @@ if TYPE_CHECKING:
         mark_result_complete,
         name_grant,
         permission_pre_tool_block,
+        platform_compat,
         process_survived_async,
         provider_fallback_active,
         read_tombstone,
@@ -466,6 +468,47 @@ class RunEventCoordinator(ManagerComponent):
     def get_impl(self, agent_id: str) -> SubagentInfo | None:
         """Get agent info by ID."""
         return self._manager._agents.get(agent_id)
+
+    def is_queued_impl(self, agent_id: str) -> bool:
+        """Whether *agent_id* names a spawn accepted but not yet started.
+
+        A spawn admitted behind the concurrency / adaptive cap -- or deferred by
+        the memory or posture guard, at accept or at drain time -- returns its
+        real id to the caller but has no ``_agents`` entry until it starts. A
+        serial-lock done-probe that read such an id as finished (``_agents``
+        miss) would release the caller's guard and let a duplicate of
+        not-yet-run work be queued. Three places can hold it:
+
+        * the in-memory ``_queue`` (a params dict), while it is windowed;
+        * ``_dispatch_window_ids``, across the pump's pop-to-claim /
+          retained-claim window -- the only record of a popped row that has no
+          durable one (``incognito`` / ``temporary``, or no store at all);
+        * the durable task store, for every durable row: the store's own
+          unstarted-row index (``TaskStore.is_unstarted``), written through by
+          the same commit that moves the row, so every path that leaves a row
+          waiting on disk (the cap's store-only branch, a pressure deferral, a
+          drain-time deferral, the window eviction, a retained claim) is named,
+          and every path that ends one (settle, cancel, boundary, cancel-tree,
+          wait expiry) unnames it, with no bookkeeping of the manager's own to
+          miss a path. The index is in memory: NEVER a SQLite read here, since a
+          done-probe runs on the gateway loop.
+
+        A ``_resume_id`` entry reuses an existing ``_agents`` row, so it is not a
+        fresh queued spawn; an id-less entry has no handle; and an id with a
+        live ``_agents`` row is a run, not a queued spawn, even while its row is
+        claimable on disk (a woken wait lands in ``retry_wait``).
+        """
+        if not agent_id or agent_id in self._manager._agents:
+            return False
+        for params in self._manager._queue:
+            if params.get("_resume_id"):
+                continue
+            if params.get("_preassigned_id", "") == agent_id:
+                return True
+        if agent_id in self._manager._dispatch_window_ids:
+            return True
+        store = getattr(self._manager, "_taskq", None)
+        return store is not None and bool(store.is_unstarted(agent_id))
 
     async def _teardown_run_session_impl(self, info: SubagentInfo, session_key: str) -> None:
         """Release and reset the run's own session (skipped when reaped).
@@ -1008,7 +1051,7 @@ class RunEventCoordinator(ManagerComponent):
         # must see them.
         return in_window + self._manager._admission.taskq_overflow(parent_session_key)
 
-    def _window_depth(self, parent_session_key: str) -> int:
+    def _window_depth(self, parent_session_key: str, *, include_recovering: bool = True) -> int:
         """Unstarted spawns *parent_session_key* holds in the in-memory window.
 
         A ``_resume_id`` entry is not one: it is a RESIDENT run asking for its
@@ -1018,12 +1061,19 @@ class RunEventCoordinator(ManagerComponent):
         leave "1 waiting to start" on the card for work that has started. An
         approval-released start (``_startup_release``) has not started its run
         yet, so it is still waiting and still counts.
+
+        *include_recovering* False is the chip's reading: it also leaves out an
+        entry hydrated from a ``recovering`` row (``WINDOW_ENTRY_RECOVERING``),
+        a run being rebuilt after a restart, exactly as its store half does.
+        The reset-deferral guards keep it: it is still work this parent is owed.
         """
         resident = self._manager._admission.entry_is_resident_resume
         return sum(
             1
             for q in self._manager._queue
-            if q.get("parent_session_key", "") == parent_session_key and not resident(q)
+            if q.get("parent_session_key", "") == parent_session_key
+            and not resident(q)
+            and (include_recovering or not q.get(WINDOW_ENTRY_RECOVERING))
         )
 
     async def _queued_depth_async_impl(self, parent_session_key: str) -> int:
@@ -1152,7 +1202,7 @@ class RunEventCoordinator(ManagerComponent):
 
         *wait* is the gate's label for WHY the rows wait (a ``QUEUED_REASON_*``
         ``reason``, plus ``available_gb`` / ``required_gb`` for the memory
-        kinds). It is recorded per parent with the request and rides on every
+        kinds; ``memory_pressure`` carries no figures). It is recorded per parent with the request and rides on every
         later non-zero frame for that parent until a depth-0 read that no
         request overlapped forgets it; an overlapped 0 read is published bare
         and keeps the label, since the overlapping request may have written it.
@@ -1314,7 +1364,7 @@ class RunEventCoordinator(ManagerComponent):
         (in the store: the snapshot did not exclude it) and one the pump pops
         is counted once (in the window half).
         """
-        in_window = self._window_depth(parent_session_key)
+        in_window = self._window_depth(parent_session_key, include_recovering=False)
         overflow = await self._manager._admission.taskq_chip_overflow_async(parent_session_key)
         return None if overflow is None else in_window + overflow
 
@@ -3786,8 +3836,12 @@ class RunEventCoordinator(ManagerComponent):
         here with its start clock frozen (it holds its slot, so it is still
         counted), one such start at a time so waiters do not each count the
         others and all hold, for at most ``_DEDICATED_TOPUP_WAIT_SECS``; past
-        that it starts anyway and says so. A capacity verdict never fails a run
-        that was admitted. A row not admitted at the shared price returns at once;
+        that it starts anyway and says so. A root start also waits here while the
+        macOS kernel memory-pressure hold applies (subagent.md, *macOS: the
+        kernel memory-pressure hold*), under the same bound: it is an admitted
+        run already starting, not a held start, so it is not ended. A capacity verdict
+        never fails a run that was admitted. A row not admitted at the shared
+        price returns at once;
         the flag that marks it clears only once the check passed or the wait ran
         out, so a cancel during the wait leaves the respawn to re-check.
         """
@@ -3829,14 +3883,44 @@ class RunEventCoordinator(ManagerComponent):
                     claim_prices=[price for price, _ in self._manager._claim_prices.values()],
                 )
 
+            # A nested child is never held by the kernel pressure hold; this row
+            # itself does not count as a runtime of ours while it waits, since it
+            # is still flagged shared-priced.
+            root = not self._manager._admission.entry_is_child(
+                {"parent_session_key": info.parent_session_key}
+            )
             while True:
                 asked = _need()
                 avail = await _host_available_gb_off_loop(asked)
                 # Decided here, on the loop, against what the reserve owes NOW:
                 # other rows may have started or settled while the read ran.
                 need = max(asked, _need())
-                if avail < 0 or avail >= need:
-                    # -1 is the reader's "unmeasurable": fail open, as the gate does.
+                pressure = self._manager._memory_pressure_hold(floor_gb=floor) if root else None
+                # -1 is the reader's "unmeasurable": fail open, as the gate does.
+                fits = avail < 0 or avail >= need
+                if fits and pressure is None:
+                    info._start_priced_shared = False
+                    break
+                if time.monotonic() >= deadline and fits:
+                    waited = time.monotonic() - started
+                    logger.warning(
+                        "Subagent %s: starting a dedicated process under macOS memory "
+                        "pressure (%s); waited %.0fs",
+                        info.id,
+                        platform_compat.memory_pressure_name(pressure),
+                        waited,
+                    )
+                    sel().log_tool_invocation(
+                        session_key=info.parent_session_key or "",
+                        source="subagent",
+                        tool_name="spawn_run",
+                        outcome="dedicated_start_under_memory_pressure",
+                        metadata={
+                            "memory_pressure_level": pressure,
+                            "waited_secs": round(waited, 1),
+                            "subagent_id": info.id,
+                        },
+                    )
                     info._start_priced_shared = False
                     break
                 if time.monotonic() >= deadline:

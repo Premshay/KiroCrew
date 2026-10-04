@@ -1039,6 +1039,7 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     api_stt_prewarm,
     api_stt_status,
     api_stt_transcribe,
+    api_stt_vocabularies,
     api_theme_boot,
     api_theme_config,
     api_token_local,

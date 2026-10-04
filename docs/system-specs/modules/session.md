@@ -234,7 +234,13 @@ the line, a store name would read back as the legacy owner claim the identity
 backfill refuses for a restricted mode, and the restart would refuse the chat.
 Left out, the restart reads the session as unbound and the first turn re-selects
 the member from `agent` under the retained mode -- the same live-only carrier the
-session ran under before the restart. `agent_kind` stays on the line: it is a
+session ran under before the restart. Because `agent` is a mutable alias, a DM
+re-selection must prove the chat still runs as the member it ran before: a DM
+slot KEY encodes the member's immutable id (the metadata line is agent-writable
+and is never an identity source), so a DM re-selection whose resolved id differs
+from that encoded id is refused -- the thread belongs to a specific member and
+the alias now names another; the member's memory stays intact and a new
+conversation binds it cleanly. `agent_kind` stays on the line: it is a
 display fact, not an owner claim.
 
 Tab close and idle archival snapshot the live restricted identity before yielding;
@@ -356,6 +362,10 @@ if needed — no compaction, since background tasks are stateless:
   `recycle_background()` counts the turn itself (`check_context_usage` is a
   chat-turn hook and never advances `_bg`), and the log names the backstop rather
   than the percentage that did not trigger it.
+- Process-tree RSS at or over `session.watchdog_rss_max_mb` → recycle. When
+  that knob is 0 (its default, which turns the chat-session sweep off) the
+  ceiling is `BACKGROUND_RSS_FALLBACK_MB` (1536 MiB), so this runtime stays
+  bounded either way.
 - Below thresholds → no-op (session stays warm)
 
 Callers: heartbeat callback, taskrunner lesson extraction.
@@ -1305,7 +1315,7 @@ against sweep completeness, and are torn down at `close_all`.
   path — is recorded in
   `../../architecture/design-notes/tool-stall-watchdog-placement.md`.
 - **RSS-threshold recycle** (`_rss_threshold_check`, config
-  `session.watchdog_rss_max_mb`, default 1536 MiB via
+  `session.watchdog_rss_max_mb`, default 0 via
   `DEFAULT_WATCHDOG_RSS_MAX_MB`; 0 disables): recycles non-busy
   sessions whose `/proc` process-tree RSS (MiB) exceeds the ceiling. Skips
   persistent (`_PERSISTENT_KEYS`) and `channel:`-prefixed keys — the same
@@ -1377,7 +1387,7 @@ against sweep completeness, and are torn down at `close_all`.
   that keeps launching work would renew it forever. Inside the hold the RSS
   recycle therefore still proceeds when the tree exceeds
   `rss_max_mb * HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR` (2x — observed
-  real workflow trees ran 2398-2641 MB against the 1536 MB default ceiling, so
+  real workflow trees ran 2398-2641 MB against a 1536 MB ceiling, so
   the hold must survive those while still cutting off a runaway), and the
   notice still names the work. The idle sweep is not memory-driven, so its hold
   has no such ceiling. The probe is not fail-closed: a missing or unreadable

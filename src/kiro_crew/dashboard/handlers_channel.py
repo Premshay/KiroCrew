@@ -17,7 +17,7 @@ from kiro_crew.channel import (
     _shell_base_binary,
     run_channel_agent,
 )
-from kiro_crew.config.loader import config_path
+from kiro_crew.config.loader import config_path, read_config_text
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.state import PEER_CHANNEL_REQUEST_KIND, PEER_CHANNEL_REQUEST_PREFIX
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -158,7 +158,7 @@ def _load_presets() -> object:
         return cached[1]
     config: dict = {}
     try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
+        parsed = json.loads(read_config_text(path))
         if isinstance(parsed, dict):
             config = parsed
     except (OSError, json.JSONDecodeError):

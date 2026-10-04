@@ -95,6 +95,9 @@ whose app could be disabled by the time the row starts, and `approval_mode`, who
 `"auto"` skips the spawn gate AND pre-approves the run's tools. A recovered row
 faces the gate its caller faced. `scope_ref` still RECORDS both, which is why the
 schema calls that column references rather than grants: no start path reads it.
+The one in-process exception is the accepting process's own `approval_mode` for a
+row still waiting, restored on its window refill (subagent.md,
+`_held_approval_modes`); a restart never sees it.
 Pinned by
 `test_taskq_admission_integration.py::test_an_ad_hoc_auto_approval_is_never_persisted_on_the_row`,
 and the legacy importer drops a persisted `auto_approve` for the same reason
@@ -788,7 +791,12 @@ loop is deliberately not added (the reaper sweep is `LEASE_SECS`).
 
 ## Bounded dispatch window
 
-The store keeps no dispatch state in memory. The adapter's in-memory queue
+The store keeps no dispatch state in memory. Its one in-memory fact is an
+index, not a decision: the ids of rows in a claimable or `admitted` state
+(`TaskStore.is_unstarted`). It is loaded at `open`, written through after the
+commit of every state write, and readable on the event loop without SQLite. The
+subagent done-probe's `is_queued` reads it ([subagent](subagent.md) § Fairness
+lanes). The adapter's in-memory queue
 (`SubagentManager._queue`) is a FIFO window of at most `TaskStore.window`
 (`agent.task_dispatch_window`, default 64) entries:
 
@@ -813,8 +821,21 @@ The store keeps no dispatch state in memory. The adapter's in-memory queue
   listing (`list_pending(include_admitted=True, app=…)`) shares. When the
   dashboard chip asks, a row the pump has popped and not yet claimed is left
   out (a row a `spawn_async` caller is still admitting does count once the
-  gate has queued it). Wave accounting consults `fetch_pending_by_batch` the
-  same way.
+  gate has queued it), and so is a `recovering` row, in the store
+  (`count_pending(include_recovering=False)`) and in the window (the refill
+  marks its entry `WINDOW_ENTRY_RECOVERING`, and a gate re-queue of the
+  still-unclaimed entry keeps it): claimable, but a run that had
+  started and lost its owner, not one waiting for its first start. Every count
+  of work still owed keeps it. Wave accounting consults `fetch_pending_by_batch`
+  the same way.
+- A parent-end teardown stops the parent's waiting rows the store accepted
+  before its snapshot (`taskq_pending_ids_for_async(…, include_window=True)`,
+  window rows included, live runs and rows a `spawn_async` caller is still
+  admitting left out, less the ids the snapshot's fence recorded as accepted
+  after it, by accept order rather than `created_at`, which a stepped-back
+  wall clock would misorder), so a row held only by the store does not
+  outlive the conversation that queued it, and a row a successor under the
+  same key queued after the snapshot is never swept. See [subagent.md](subagent.md) § `cancel_for_teardown`.
 - When a pass finds nothing and the window is empty, the pump arms one
   `call_later` at `next_eligible_at`: the earliest moment a row held only by
   time (deferred by `next_run_at`, or leased by `lease_expires_at`) becomes
@@ -882,7 +903,10 @@ subagent adapter calls it — instead of refusing — when
 caller receives a `queued` id. Only when there is no store (the feature is
 off, or the row is a legacy in-memory entry the store never saw) does pressure
 still refuse, exactly as before. `agent.admission_gate=false` still turns the
-posture tier off entirely.
+posture tier off entirely. The macOS kernel memory-pressure hold is not a deferral: it
+is a capacity-style wait in the window (subagent.md), and the runner lane,
+cron and workflow `ctx.agent` gates deliberately do not read the kernel level;
+only the subagent gate acts on it.
 
 ## Journal mode and network filesystems
 

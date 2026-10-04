@@ -40,6 +40,7 @@ from kiro_crew.config.loader import (
     TELEGRAM_ACTIVATIONS,
     KiroCrewConfig,
     config_path,
+    read_config_text,
 )
 from kiro_crew.constants import CHANNEL_SEND_NAMESPACES, SUBAGENT_COMPLETION_META_KEY
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
@@ -951,12 +952,13 @@ async def api_spawn(request: web.Request) -> web.Response:
         "status": "spawned",
         "parent_work_supported": can_work,
     }
-    # A row the gate DEFERRED (memory floor, critical posture, adaptive cap at
-    # 0) is accepted and keyed like any other -- same ``id``, counted in its
-    # wave -- but it is not running and may not run for a long time: the pump
-    # re-checks it every admit wait for as long as the host stays below the
-    # bar. Saying ``spawned`` for it left the caller waiting on a completion
-    # event that was not coming. ``queued`` names the wait; ``reason`` is the
+    # A row the gate DEFERRED or HELD (memory floor, critical posture, adaptive
+    # cap at 0, macOS kernel memory pressure) is accepted and keyed like any
+    # other -- same ``id``, counted in its wave -- but it is not running and may
+    # not run for a long time: the pump re-checks it until the condition clears
+    # (the pressure hold within its own bound). Saying ``spawned`` for it left
+    # the caller waiting on a completion event that was not coming. ``queued``
+    # names the wait; ``reason`` is the
     # kind, ``reason_detail`` the gate's own sentence. A row waiting only for a
     # slot or the stagger tick (``concurrency_limit``) keeps ``spawned``: that
     # wait is the ordinary wave shape and clears within seconds.
@@ -1550,11 +1552,12 @@ def _awaiting_spawn_approval(info: object) -> bool:
     pair, because the two handlers build their payloads independently and a
     drift between them is invisible to a behavioural test.
 
-    ``subagent_manager/terminal.py`` computes the same pair for the reap message.
-    Deliberately not extracted onto ``SubagentInfo``: that read is a plain
-    attribute read on a live run inside the manager package, whereas this one
-    must survive the info doubles the handlers are tested with (below). The
-    duplication is two lines and both sites name each other.
+    The manager package has its own copy, ``subagent._parked_at_spawn_approval``,
+    read by ``subagent_manager/terminal.py`` (the reap message),
+    ``subagent_manager/cancellation.py`` (the parent-end paths) and the kernel
+    memory-pressure hold. Deliberately not imported from there: this handler
+    layer does not reach into the manager's private helpers. The duplication is
+    two lines and both sites name each other.
 
     ``getattr`` with a strict ``is True`` / ``is None``: these handlers are
     exercised with lightweight info doubles (SimpleNamespace / MagicMock) that
@@ -1971,6 +1974,118 @@ async def _retry_failed_run(state: "DashboardState", agent_id: str, old: Any) ->
     return web.json_response({"id": info.id, "retried_from": agent_id, "status": "spawned"})
 
 
+#: No unit holds the child, so no crew-log record was owed or written.
+DISMISSAL_LOG_ABSENT = "absent"
+#: A unit holds the child and the append COMMITTED.
+DISMISSAL_LOG_COMMITTED = "committed"
+#: A unit holds the child and the append did not commit inside the bound. The run
+#: exists, so this is not an unknown id; the dismissal simply did not happen.
+DISMISSAL_LOG_FAILED = "failed"
+
+
+async def _log_panel_dismissal(state: DashboardState, agent_id: str) -> str:
+    """Record a panel dismissal in the owning session's crew log.
+
+    Answers one of :data:`DISMISSAL_LOG_ABSENT`,
+    :data:`DISMISSAL_LOG_COMMITTED` or :data:`DISMISSAL_LOG_FAILED`. The last two
+    are the distinction a boolean could not carry: both mean a unit holds this
+    child, so the run exists and an unknown-id answer would be wrong, while only
+    one of them means the card is actually cleared.
+
+    This is the record the PANEL reads. Its durable half is a fold of the session's
+    crew log, so the dismissal belongs there: kept anywhere else it is a second
+    record of a fact about the session, reclaimed on its own schedule. The folder
+    registry below this is the case in point -- it is keyed on the run's folder at
+    both ends, so it forgets a dismissal when that folder is pruned, while the fold
+    still draws the child the log kept.
+
+    The owning UNIT is resolved in two steps, cheapest first.
+    :func:`crew_log.emit.dismiss_child` answers from the emitter's own spawn pin,
+    which is the unit the child's ``subagent/spawned`` was written to; the terminal
+    report releases that pin, so it answers only for a child still running, and a
+    gateway restart clears it entirely. Then the LOG is searched, over the units
+    each live slot has run under -- which is the same question the panel's own read
+    answers, and the only one that cannot name the wrong unit: a slot owns one ACP
+    session id at a time, so a child dispatched before a reset sits in a retired
+    unit that the slot's current id does not name.
+
+    ``ABSENT`` when no unit holds the child, which is not a failure: there is then
+    no folded card to clear, and the caller's folder record still answers for a
+    pre-existing one. ``ABSENT`` also when the crew log is switched off, where an
+    install that opted out of the record has no record to write to.
+
+    Each append is waited on until it COMMITS, because the caller publishes a
+    dismissal to the user on the strength of this answer, and once the run's folder
+    has been reclaimed this entry is the only record of it.
+    """
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+        from kiro_crew.crew_log.resolve import UnitSearchFailed, unit_holding_child
+
+        if not crew_log_emit.enabled():
+            return DISMISSAL_LOG_ABSENT
+
+        loop_wait = crew_log_emit.awaiting_commit
+
+        async def _committed(emit_one) -> bool:
+            return await loop_wait(emit_one, what=f"the panel dismissal for {agent_id}")
+
+        pinned = False
+
+        def _via_pin(on_settled) -> None:
+            nonlocal pinned
+            pinned = bool(crew_log_emit.dismiss_child(agent_id, on_settled=on_settled))
+            if not pinned:
+                # No pin, so nothing was queued and nothing will settle. Resolved
+                # here rather than left to the timeout, which would spend the whole
+                # bound before the unit search that is the real answer.
+                on_settled(False)
+
+        if await _committed(_via_pin):
+            return DISMISSAL_LOG_COMMITTED
+        if pinned:
+            # The pin named the unit, so the run exists, and its append did not
+            # commit. Searching the units would only queue a second entry into the
+            # same wedged writer; the caller's retry is what should decide.
+            return DISMISSAL_LOG_FAILED
+
+        slots = [
+            subagent_event_slot(effective_session_key(slot))
+            for slot in list(getattr(state, "_slots", {}).values())
+        ]
+        for slot_key in slots:
+            try:
+                unit = await asyncio.to_thread(unit_holding_child, slot_key, agent_id)
+            except UnitSearchFailed:
+                # The store would not say whether this slot holds the child. Reading
+                # that as "this slot does not" would let the loop finish and answer
+                # ABSENT, which the caller turns into a 404 or a success -- an
+                # obligation reported discharged that was never looked for.
+                logger.debug(
+                    "crew log: the unit search for %s under %s failed",
+                    agent_id,
+                    slot_key,
+                    exc_info=True,
+                )
+                return DISMISSAL_LOG_FAILED
+            if unit:
+                landed = await _committed(
+                    lambda on_settled, _unit=unit: crew_log_emit.on_subagent_dismissed(
+                        _unit, agent_id=agent_id, on_settled=on_settled
+                    )
+                )
+                return DISMISSAL_LOG_COMMITTED if landed else DISMISSAL_LOG_FAILED
+        return DISMISSAL_LOG_ABSENT
+    except Exception:
+        # FAILED, not ABSENT. Everything that reaches here is a store or emitter
+        # fault, and the caller turns ABSENT into a 404 or a plain success -- an
+        # obligation reported discharged that was never looked for. The one case
+        # that genuinely owes no record, a switched-off emitter, returns above
+        # before anything here can fail.
+        logger.debug("crew log: recording a panel dismissal failed", exc_info=True)
+        return DISMISSAL_LOG_FAILED
+
+
 async def api_spawn_delete(request: web.Request) -> web.Response:
     """DELETE /api/spawn/{agent_id} — cancel a running subagent or remove a finished one."""
     state: DashboardState = request.app["state"]
@@ -2065,15 +2180,25 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
                 {"error": "app token not allowed", "code": "app_token_forbidden"}, status=403
             )
         outcome = await asyncio.to_thread(record_panel_dismissal_outcome, agent_id)
-        if outcome == DISMISSAL_NO_FOLDER:
-            # No folder, so nothing durable can rebuild this card and there is no
-            # run here to speak of. Same answer as before for a truly unknown id.
+        # The dismissal the PANEL reads: an entry in the owning session's crew log.
+        # The panel's durable half is a fold of that log, so this is the record that
+        # keeps the card cleared; the folder registry above is kept because
+        # ``GET /api/spawn`` still reads the folders, and because a dismissal made
+        # before this entry type existed lives only there.
+        logged = await _log_panel_dismissal(state, agent_id)
+        if outcome == DISMISSAL_NO_FOLDER and logged == DISMISSAL_LOG_ABSENT:
+            # Nothing durable can rebuild this card -- no folder, and no log that
+            # records the child -- so there is no run here to speak of. Same answer
+            # as before for a truly unknown id.
             return web.json_response({"error": "not found"}, status=404)
-        if outcome == DISMISSAL_FAILED:
-            # The store is unwritable, so this card returns on the next rebuild.
-            # Answering 404 would say the run does not exist, and answering ok
-            # would claim a dismissal that did not happen; both leave the user
-            # watching a dismissed card come back with nothing to explain it.
+        if outcome == DISMISSAL_FAILED or logged == DISMISSAL_LOG_FAILED:
+            # One of the two records was owed and did not land, so the dismissal is
+            # at best partial and the card comes back on a reader that still holds
+            # its own record. The folder half feeds ``GET /api/spawn``; the log half
+            # feeds the panel, and once the run's folder is reclaimed it is the only
+            # record there is. Answering ok would claim a dismissal a reader goes on
+            # contradicting, with nothing anywhere saying which half failed, so the
+            # caller cannot retry the one that did not land.
             _sel().log_api_access(
                 caller="internal",
                 operation="spawn.dismiss",
@@ -5359,7 +5484,7 @@ def _clean_id_list(raw: object, is_valid: Callable[[str], bool], label: str) -> 
     return out
 
 
-async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
+async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bool = False) -> None:
     """Run the blocking ``.env`` write on a worker, drained under the config lock.
 
     Every caller holds ``_get_config_lock()`` across this, and a thread cannot be
@@ -5378,6 +5503,17 @@ async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
     All six channel saves go through here. The offload itself is already in
     place on every one of them; the bare offload is what leaves the hole, so
     covering a subset would leave the same window open in the rest.
+
+    A ``.env`` saved as UTF-16 or UTF-32 is refused before anything is written
+    (:func:`_write_env_updates_locked` never overwrites a file it cannot
+    parse). That refusal is raised here as a 409 carrying the fix, so every
+    channel save answers it the same way instead of with an opaque 500. A
+    caller that rolls its config write back on a failed ``.env`` write (Slack,
+    Teams, Webex, WeCom and Feishu) still does, because it catches every
+    exception; Discord and Telegram commit config before this call and keep it,
+    so their 409 leaves the config change in place and only the ``.env`` part
+    unsaved, which a retry after the UTF-8 re-save completes. Those two callers
+    pass ``config_kept=True`` so the 409 says their other settings were saved.
     """
     fut = asyncio.ensure_future(asyncio.to_thread(_write_env_updates, updates))
     try:
@@ -5385,6 +5521,29 @@ async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
     except asyncio.CancelledError:
         await asyncio.wait([fut])
         raise
+    except _loader.EnvFileWideEncodingError as exc:
+        raise _wide_env_refusal(exc, config_kept=config_kept) from exc
+
+
+def _wide_env_refusal(
+    exc: _loader.EnvFileWideEncodingError, *, config_kept: bool = False
+) -> web.HTTPConflict:
+    """The response for a channel save refused because ``.env`` is wide-encoded.
+
+    ``config_kept`` is set by a caller whose config write stays in place when
+    the ``.env`` write is refused, so the message does not imply the whole save
+    was discarded.
+    """
+    outcome = "The .env was not changed"
+    outcome += "; your other settings were saved." if config_kept else "."
+    message = (
+        f"{_loader.env_path()} is saved as {exc.wide_encoding}, which Kiro Crew "
+        f"cannot read. Re-save it as UTF-8 and save again. {outcome}"
+    )
+    return web.HTTPConflict(
+        text=json.dumps({"error": message}),
+        content_type="application/json",
+    )
 
 
 def _write_env_updates(updates: dict[str, str | None]) -> None:
@@ -5449,7 +5608,7 @@ def _write_env_updates_locked(ep: "Path", updates: dict[str, str | None]) -> Non
     """The read-modify-atomic-rewrite of .env, run under the .env lock held by
     the caller (:func:`_write_env_updates`)."""
 
-    lines = ep.read_text(encoding="utf-8").splitlines() if ep.exists() else []
+    lines = _loader.read_env_text(ep, encoding="utf-8").splitlines() if ep.exists() else []
     seen: set[str] = set()
     out: list[str] = []
     for line in lines:
@@ -5468,7 +5627,12 @@ def _write_env_updates_locked(ep: "Path", updates: dict[str, str | None]) -> Non
         if k not in seen and new_val:
             out.append(f"{k}={new_val}")
     content = "\n".join(out) + ("\n" if out else "")
-    atomic_write(ep, content, restrict_to_owner=True, restrict_on_error="warn")
+    atomic_write(
+        ep,
+        _loader.env_bom_prefix(ep) + content,
+        restrict_to_owner=True,
+        restrict_on_error="warn",
+    )
 
 
 async def api_slack_manifest(request: web.Request) -> web.Response:
@@ -5747,7 +5911,9 @@ async def _slack_config_save_locked(request: web.Request) -> web.Response:
     # Config → config.json under "slack" (staged, applied only after Phase 1).
     path = config_path()
     try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data = json.loads(read_config_text(path)) if path.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError("config.json is not a JSON object")
     except Exception:
         return _deny("config.json is corrupt", status=500)
     if not isinstance(data.get("slack"), dict):
@@ -6108,7 +6274,9 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
     # Config → config.json under "discord" (staged, applied only after Phase 1).
     path = config_path()
     try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data = json.loads(read_config_text(path)) if path.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError("config.json is not a JSON object")
     except Exception:
         return _deny("config.json is corrupt", status=500)
     if not isinstance(data.get("discord"), dict):
@@ -6289,7 +6457,7 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
     if env_updates:
         # Off-loop: the .env write is blocking file IO (lock, temp write,
         # owner-only lockdown, replace) and must not block the event loop.
-        await _write_env_off_loop(env_updates)
+        await _write_env_off_loop(env_updates, config_kept=True)
         # Keep the live process environment in sync with the new .env state
         # (load_credentials() lets os.environ win over .env — see the Slack
         # save handler for the full rationale).
@@ -6499,7 +6667,10 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
     path = config_path()
 
     def _read_config() -> dict:
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data = json.loads(read_config_text(path)) if path.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError("config.json is not a JSON object")
+        return data
 
     try:
         data = await asyncio.to_thread(_read_config)
@@ -6692,7 +6863,7 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
     if env_updates:
         # Off-loop: the .env write is blocking file IO (lock, temp write,
         # owner-only lockdown, replace) and must not block the event loop.
-        await _write_env_off_loop(env_updates)
+        await _write_env_off_loop(env_updates, config_kept=True)
         # Keep the live process environment in sync with the new .env state
         # (load_credentials() lets os.environ win over .env — see the Slack
         # save handler for the full rationale).
@@ -7173,7 +7344,10 @@ async def _teams_config_save(request: web.Request) -> web.Response:
             # Offload read_text + json.loads to a thread so a slow filesystem
             # cannot stall the async event loop.
             def _read_config_15() -> dict:
-                return json.loads(_p15_cfg.read_text(encoding="utf-8")) if _p15_cfg.exists() else {}
+                data = json.loads(read_config_text(_p15_cfg)) if _p15_cfg.exists() else {}
+                if not isinstance(data, dict):
+                    raise ValueError("config.json is not a JSON object")
+                return data
 
             _rd15 = await asyncio.to_thread(_read_config_15)
             # Guard against a malformed config.json where "teams" is not a dict
@@ -7227,7 +7401,9 @@ async def _teams_config_save(request: web.Request) -> web.Response:
     async with _get_config_lock():
         path = config_path()
         try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            data = json.loads(read_config_text(path)) if path.exists() else {}
+            if not isinstance(data, dict):
+                raise ValueError("config.json is not a JSON object")
         except Exception:
             return _deny("config.json is corrupt", status=500)
         if not isinstance(data.get("teams"), dict):
@@ -7658,7 +7834,9 @@ async def _webex_config_save(request: web.Request) -> web.Response:
     async with _get_config_lock():
         path = config_path()
         try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            data = json.loads(read_config_text(path)) if path.exists() else {}
+            if not isinstance(data, dict):
+                raise ValueError("config.json is not a JSON object")
         except Exception:
             return _deny("config.json is corrupt", status=500)
         if not isinstance(data.get("webex"), dict):
@@ -8283,7 +8461,10 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
     path = config_path()
 
     def _read_config() -> dict:
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data = json.loads(read_config_text(path)) if path.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError("config.json is not a JSON object")
+        return data
 
     try:
         data = await asyncio.to_thread(_read_config)
@@ -8718,7 +8899,10 @@ async def _feishu_config_save_locked(request: web.Request) -> web.Response:
     path = config_path()
 
     def _read_config() -> dict:
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data = json.loads(read_config_text(path)) if path.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError("config.json is not a JSON object")
+        return data
 
     def _corrupt_config() -> web.Response:
         message = "config.json is corrupt"

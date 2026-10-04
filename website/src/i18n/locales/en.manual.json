@@ -1842,7 +1842,10 @@
       "categoryRail": {
         "all_apps": "All apps",
         "curated_reviewed_by_the_kiro_crew_team": "Reviewed by the {{productName}} team",
-        "community_listed_not_vetted_by_the_kiro_crew_team": "Community-listed, not vetted by the {{productName}} team"
+        "community_listed_not_vetted_by_the_kiro_crew_team": "Community-listed, not vetted by the {{productName}} team",
+        "install_state": "INSTALL STATE",
+        "all_install_states": "All",
+        "installed": "Installed"
       },
       "installedAppCard": {
         "app_cannot_be_opened_kirocrew_is_running_in_a_he": "App cannot be opened — {{productName}} is running in a headless environment.",
@@ -1969,6 +1972,10 @@
       "maximum_terminals": "Maximum {{n}} terminals",
       "terminal": "Terminal"
     },
+    "runInTerminalConfirm": {
+      "body_default_multi": "No workspace selected. The {{lines}} lines below will run in a new terminal tab, using the terminal’s starting directory.",
+      "body_default_single": "No workspace selected. The command below will run in a new terminal tab, using the terminal’s starting directory."
+    },
     "chatInput": {
       "cancel_upload": "Cancel upload",
       "auto_jev": "Auto (Jev)",
@@ -1989,6 +1996,7 @@
       "branch": "Branch: {{branch}}",
       "detached_head_at": "Detached HEAD at {{branch}}",
       "message_placeholder": "Message {{bot}}… (/command · @file · $skill)",
+      "message_placeholder_terminal": "Message {{bot}}… (/command · @file · $skill · ! shell command)",
       "approve": "Approve",
       "approve_all": "Approve all",
       "could_not_submit_that_decision_see_the_console_f": "Could not submit that decision — see the console for details.",
@@ -2044,6 +2052,22 @@
       "session_control_needs_attention": "Needs attention",
       "session_control_ready": "Ready",
       "session_control_chip_label": "{{label}} — {{detail}}",
+      "terminal_hint": "Terminal panel · {{workspace}}",
+      "terminal_panel": "Terminal panel",
+      "terminal_review_at_capacity": "Review the command. Run opens the terminal panel; if it is still full, close an unused tab and try again. Nothing is queued.",
+      "terminal_default_directory": "Terminal starting directory",
+      "terminal_failed": "Command not sent. Your draft is kept; see the terminal panel.",
+      "terminal_unavailable": "Terminal is turned off. Enable dashboard.terminal.enabled in the server configuration. Remove the leading ! to return to chat.",
+      "terminal_limit": "Terminal limit reached. Close an unused terminal tab, then try again.",
+      "terminal_main_window": "Open this session in the main window to run terminal commands.",
+      "terminal_remote": "Terminal commands are unavailable for sessions on another server. Remove the leading ! to return to chat.",
+      "terminal_attachments": "Remove attachments before running a terminal command.",
+      "terminal_folder_attachments": "Remove folder attachments before running. Removing a folder also removes its {{folderRef}} reference from the command.",
+      "terminal_empty": "Type a command after !. You'll review it before it runs.",
+      "terminal_review": "Review and run in terminal",
+      "terminal_run_review": "Review terminal command",
+      "terminal_force_stop": "Stop agent",
+      "terminal_pending": "Wait for session details to load, or select another session.",
       "handsfree_interrupt_hint": "Tap the mic to interrupt",
       "handsfree_listening": "Listening, pause to send",
       "handsfree_off": "Hands-free voice: off",
@@ -2073,6 +2097,7 @@
       "disconnected_message": "Terminal disconnected",
       "displaced_message": "Another window took over this terminal",
       "failed_retry": "Failed — retry",
+      "invalid_cwd_message": "The terminal working directory “{{cwd}}” is unavailable. Restore it and reconnect, or use the terminal’s starting directory.",
       "reconnect": "Reconnect",
       "reconnecting": "Reconnecting…",
       "redaction_failed_retry": "Redaction failed — retry",
@@ -2081,7 +2106,9 @@
       "sending": "Sending…",
       "touch_select_anchor": "First point set — tap the other end",
       "touch_select_done": "Range selected — tap Copy",
-      "use_here": "Use terminal here"
+      "use_here": "Use terminal here",
+      "use_starting_directory": "Use terminal starting directory",
+      "use_starting_directory_hint": "Opens a new shell in the server's configured terminal directory (dashboard.terminal.cwd, otherwise the server's home directory). The failed command is not sent again."
     },
     "codeBlock": {
       "copied": "Copied!",
@@ -3874,7 +3901,7 @@
       "walk_back_mru_history": "Walk back MRU history",
       "stop_speaking": "Stop speaking",
       "toggle_focus_mode": "Toggle focus mode",
-      "jump_to_chat_letters": "Jump to chat 10 and beyond (letters follow the badge shown on each row)",
+      "jump_to_chat_letters": "Jump to chat 10 and beyond (hold the modifier to see each chat’s letter; on macOS, not while a text field is focused)",
       "toggle_left_sidebar": "Toggle left sidebar",
       "toggle_session_panel": "Toggle session panel",
       "toggle_side_panel": "Toggle side panel",
@@ -4665,6 +4692,12 @@
         "agent_finished_other": "{{count}} agents finished",
         "agent_launched_one": "{{count}} agent launched",
         "agent_launched_other": "{{count}} agents launched",
+        "agent_never_started_one": "{{count}} agent never started",
+        "agent_never_started_other": "{{count}} agents never started",
+        "agent_ran_of_total_one": "{{count}} of {{total}} agents ran",
+        "agent_ran_of_total_other": "{{count}} of {{total}} agents ran",
+        "never_started_memory_pressure_one": "{{count}} never started — macOS memory pressure did not ease in time; once it eases (Activity Monitor’s Memory tab shows it) or a running agent finishes, use “Retry failed” in the Subagents panel",
+        "never_started_memory_pressure_other": "{{count}} never started — macOS memory pressure did not ease in time; once it eases (Activity Monitor’s Memory tab shows it) or a running agent finishes, use “Retry failed” in the Subagents panel",
         "agent_one": "{{count}} agent",
         "agent_other": "{{count}} agents",
         "agent_queued_one": "{{count}} agent queued",
@@ -5117,6 +5150,7 @@
       "new": "New",
       "new_chat": "New chat",
       "new_chat_on_crew": "New chat on crew",
+      "creating_on_crew": "Starting chat on {{name}}…",
       "no_inactive_sessions_to_archive": "No inactive sessions to archive.",
       "older": "Older",
       "show": "Show",
@@ -7274,6 +7308,15 @@
         "config_load_failed": "Could not load the skills settings. The switches show defaults, not what is stored."
       },
       "sttSettings": {
+        "transcribe_vocabulary": "Custom vocabulary",
+        "transcribe_vocabulary_hint": "Names and terms you uploaded to Amazon Transcribe so dictation spells them right. Listed from the AWS profile and region above.",
+        "transcribe_vocabulary_none": "None",
+        "transcribe_vocabulary_loading": "Loading vocabularies…",
+        "transcribe_vocabulary_option": "{{name}} ({{language}})",
+        "transcribe_vocabulary_language_mismatch": "This vocabulary is for {{vocabularyLanguage}}, but dictation is set to {{dictationLanguage}}. Amazon Transcribe refuses a vocabulary in another language, so dictation will fail until you choose another one or None.",
+        "transcribe_vocabulary_unavailable": "Amazon Transcribe has no ready vocabulary named {{name}} in {{region}}. Dictation will fail until you choose another one or None.",
+        "transcribe_vocabulary_access_denied": "These AWS credentials are not allowed to list custom vocabularies. Grant {{permission}} to see them here.",
+        "transcribe_vocabulary_list_failed": "Your custom vocabularies could not be loaded from AWS.",
         "language_auto": "Detect language automatically",
         "failed_to_save_stt_config": "Failed to save STT config",
         "microphone_2": "Microphone {{n}}",
@@ -8219,7 +8262,8 @@
       "stream_error_decode_failed": "Speech recognition could not finish this transcript. Dictate it again.",
       "stream_error_max_duration": "Dictation reached its length limit. Start a new recording to continue.",
       "stream_error_model_missing": "The speech model is not ready yet. Download it in the speech-to-text settings, then try again.",
-      "stream_error_session_failed": "The dictation session failed. Try recording again."
+      "stream_error_session_failed": "The dictation session failed. Try recording again.",
+      "stream_error_vocabulary_rejected": "Amazon Transcribe could not use your custom vocabulary. Choose another one, or None, in the speech-to-text settings, then try again."
     },
     "templateSource": {
       "built_in": "Built-in",

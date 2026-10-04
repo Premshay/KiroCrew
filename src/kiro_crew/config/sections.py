@@ -158,12 +158,12 @@ CONTEXT_WARN_MARGIN_PCT = 10.0
 # invisible on disk — this constant is the only place the value is written.
 DEFAULT_POOL_SIZE = 0
 # Per-session process-tree RSS ceiling (MiB) the cleanup watchdog recycles an
-# idle session at. Non-zero by default so a runaway session tree is bounded
-# out of the box: fleet gateways were observed at several hundred MB with
-# nothing bounding them. 1536 leaves a healthy kiro-cli plus its MCP servers
-# (typically 300-600 MiB) a wide margin while still catching a leak before
-# it takes the host with it. 0 disables.
-DEFAULT_WATCHDOG_RSS_MAX_MB = 1536
+# idle session at. 0 disables, and that is the default: a fixed ceiling cannot
+# tell a leak from a healthy session that loads many MCP servers. An agent with
+# six MCP servers measured ~1.4 GB of tree RSS thirteen seconds after start, so
+# the old 1536 default recycled ordinary sessions after one heavy turn. An
+# operator who wants a bound sets one sized to their own agents.
+DEFAULT_WATCHDOG_RSS_MAX_MB = 0
 # session.reconcile_max_kills — root candidates the runtime reconciler may signal
 # the tree of in one pass. Defaults to the budget the arm already ships with, so an
 # unconfigured host behaves exactly as before; the field's ceiling equals that same
@@ -1235,7 +1235,9 @@ class AgentConfig:
             "2 GB, never below subagent_cost_gb); one that shares its parent's runtime at "
             "about 0.35 GB "
             "less. A spawn that does not fit waits in the durable queue (one with no "
-            "durable queue is refused). 0 disables the check.",
+            "durable queue is refused). On macOS a start also waits while the kernel "
+            "reports memory pressure and one of this gateway's dedicated subagents is "
+            "running. 0 disables the check, that wait included.",
         ),
     )
     resource_pressure_gb: float = field(
@@ -1245,9 +1247,11 @@ class AgentConfig:
             "Available memory (GB) at or below which the agent is told host memory "
             "is 'tight' via a compact [RESOURCES] context line, so it can prefer "
             "the lighter path for heavy work (targeted tests, smaller sub-agent "
-            "waves). Advisory only — not enforced. 0 disables the context line. "
-            "Lower this on small-memory hosts / memory-limited containers (e.g. a "
-            "2-4 GB pod) so the advisory only fires under genuine pressure.",
+            "waves). On macOS the line also fires while the kernel reports memory "
+            "pressure. Advisory only — not enforced. 0 disables the context line, "
+            "that macOS case included. Lower this on small-memory hosts / "
+            "memory-limited containers (e.g. a 2-4 GB pod) so the advisory only fires "
+            "under genuine pressure.",
         ),
     )
     resource_critical_gb: float = field(
@@ -1915,7 +1919,8 @@ class SessionConfig:
         metadata=_meta(
             "Watchdog RSS Limit (MiB)",
             "Recycle a session when its process tree resident memory exceeds "
-            "this many MiB (default 1536). 0 disables. Busy sessions (turn in "
+            "this many MiB. 0 disables (the default); the internal background "
+            "runtime still recycles at 1536 MiB. Busy sessions (turn in "
             "flight) are never recycled.",
         ),
     )
@@ -3898,6 +3903,65 @@ def _validated_stt_model(value: object) -> str:
     return _resolve_stt_model(value).name
 
 
+#: Amazon Transcribe's own limit on a custom vocabulary name
+#: (``StartStreamTranscription``'s ``VocabularyName``). The name travels as a
+#: request header on every stream, so a value outside this shape can only ever
+#: fail the request it rides on.
+TRANSCRIBE_VOCABULARY_NAME_MAX = 200
+_TRANSCRIBE_VOCABULARY_NOTICE_VALUE_MAX = 120
+_TRANSCRIBE_VOCABULARY_NAME_RE = _re.compile(r"[0-9A-Za-z._-]+")
+_LAST_WARNED_TRANSCRIBE_VOCABULARY: str | None = None
+
+
+def transcribe_vocabulary_name(value: object) -> str | None:
+    """The custom vocabulary *value* names: ``""`` for none, None when unusable.
+
+    Only surrounding whitespace is dropped. AWS compares vocabulary names
+    case-sensitively, so folding case would select a different vocabulary, or
+    none at all.
+
+    The one rule both writers apply: ``PUT /api/config/stt`` stores only a value
+    this accepts, and the loader keeps only what this accepts, so the name a user
+    reads back is the name every Transcribe request carries.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name:
+        return ""
+    if len(name) > TRANSCRIBE_VOCABULARY_NAME_MAX:
+        return None
+    return name if _TRANSCRIBE_VOCABULARY_NAME_RE.fullmatch(name) else None
+
+
+def _validated_transcribe_vocabulary(value: object) -> str:
+    """:func:`transcribe_vocabulary_name` for a stored value: degrades to none, logs once.
+
+    Degrades rather than failing the load, like the provider and model above. A
+    ``null`` is the absent key and says nothing. An unusable name is dropped rather
+    than sent, because Amazon Transcribe would refuse every stream that carried it:
+    dictation keeps working without the vocabulary, and the notice says why.
+    """
+    global _LAST_WARNED_TRANSCRIBE_VOCABULARY
+
+    if value is None:
+        return ""
+    name = transcribe_vocabulary_name(value)
+    if name is not None:
+        return name
+    seen = repr(value)[:_TRANSCRIBE_VOCABULARY_NOTICE_VALUE_MAX]
+    if seen != _LAST_WARNED_TRANSCRIBE_VOCABULARY:
+        _LAST_WARNED_TRANSCRIBE_VOCABULARY = seen
+        logger.warning(
+            "Unusable stt.transcribe_vocabulary %s; dictation runs without a custom "
+            "vocabulary. Amazon Transcribe names are 1-%d letters, digits, '.', '_' or "
+            "'-'. Choose one in Settings -> Voice, or fix the value in config.json.",
+            seen,
+            TRANSCRIBE_VOCABULARY_NAME_MAX,
+        )
+    return ""
+
+
 _VALID_COMPLETION_KEEP = ("head", "tail", "both")
 
 
@@ -4314,6 +4378,16 @@ class SttConfig:
     transcribe_profile: str = field(
         default="",
         metadata=_meta("Transcribe Profile", "AWS profile for Transcribe API."),
+    )
+    transcribe_vocabulary: str = field(
+        default="",
+        metadata=_meta(
+            "Transcribe Vocabulary",
+            "Name of a custom vocabulary you created in Amazon Transcribe, in the same "
+            "region, so names and terms it would mishear are recognised (`transcribe` "
+            "provider only). Its language must match the dictation language, or "
+            "Amazon Transcribe refuses it and dictation fails. Empty uses none.",
+        ),
     )
 
     def __post_init__(self) -> None:

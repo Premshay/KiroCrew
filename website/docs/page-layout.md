@@ -340,7 +340,12 @@ scrolls the prompt instead of clipping it. A host that moves its floor (a dock
 that grows a status bar) only has to keep its `padding-bottom` honest. A prompt
 whose part still below the band is taller than the resting card is not pinned
 at all: the real bubble stays in the transcript, so a long prompt reads and
-scrolls as itself, and the card takes over only once what remains fits it.
+scrolls as itself, and the card takes over only once what remains fits it. The
+resting height belongs to one prompt's card (an image-only card is two lines
+tall, a text card one), so it falls back to the default whenever the pin
+candidate changes, until the card reports it for that prompt — the host hands
+the card the candidate's identity as `promptKey`, so a card that stays mounted
+across the change re-measures and reports too.
 
 | What moves the scroller | Owner (`website/src/hooks/virtualizer/`) |
 |---|---|

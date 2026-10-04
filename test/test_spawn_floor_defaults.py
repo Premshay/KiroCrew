@@ -23,7 +23,7 @@ import threading
 from unittest.mock import MagicMock
 
 import pytest
-from overload_fakes import mock_ctx, mock_sessions
+from overload_fakes import mock_ctx, mock_sessions, wait_taskq_open
 
 import kiro_crew.resource_status as rs
 import kiro_crew.subagent as subagent_mod
@@ -92,7 +92,7 @@ async def _manager(monkeypatch, *, eligible: bool):
     monkeypatch.setattr(subagent_mod, "Stats", MagicMock())
     monkeypatch.setattr(subagent_mod, "sel", MagicMock())
     mgr = SubagentManager(sessions=sessions, ctx_builder=mock_ctx(), max_concurrent=4)
-    await asyncio.wait_for(mgr.wait_taskq_ready(), _WAIT_SECS)
+    await wait_taskq_open(mgr)
     mgr._spawn_stagger_secs = 0.0
     mgr._last_spawn_ts = 0.0
     mgr._taskq_admit_wait_secs = 3600.0  # no re-check pass inside a scenario
@@ -442,6 +442,47 @@ async def test_a_start_admitted_shared_is_repriced_dedicated_before_its_process(
         assert info._start_price_gb == pytest.approx(DEDICATED)
         # The re-check charges this row at the dedicated price, no next start.
         assert host.gated() == [pytest.approx(FLOOR + DEDICATED)]
+    finally:
+        await _teardown(mgr)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize(
+    ("parent", "outcomes"),
+    [
+        pytest.param(
+            PARENT, ["dedicated_start_under_memory_pressure"], id="root-held-then-bounded"
+        ),
+        pytest.param("subagent:busy", [], id="nested-child-never-held"),
+    ],
+)
+async def test_the_top_up_waits_on_the_kernel_pressure_hold(
+    monkeypatch, tmp_path, parent: str, outcomes: list[str]
+) -> None:
+    """A shared start turning dedicated meets the pressure hold too, under the
+    top-up's own bound; the figure clears the floor here, so only the hold waits."""
+    from kiro_crew import platform_compat
+
+    _Host(monkeypatch, tmp_path, 16.0)
+    mgr, _ = await _manager(monkeypatch, eligible=True)
+    monkeypatch.setattr(subagent_mod, "_DEDICATED_TOPUP_WAIT_SECS", 0.2)
+    monkeypatch.setattr(subagent_mod, "_DEDICATED_TOPUP_POLL_SECS", 0.05)
+    monkeypatch.setattr(platform_compat, "memory_pressure_level", lambda: 2)
+    audit = MagicMock()
+    monkeypatch.setattr(subagent_mod, "sel", audit)
+    busy = _row(id="busy")  # a dedicated runtime of ours
+    mgr._agents[busy.id] = busy
+    info = _row(
+        id="b3", _start_price_gb=SHARED, _start_priced_shared=True, parent_session_key=parent
+    )
+    mgr._agents[info.id] = info
+    mgr._running_count = 2
+    try:
+        await asyncio.wait_for(mgr._ensure_dedicated_start_priced(info), _WAIT_SECS)
+        seen = [c.kwargs["outcome"] for c in audit.return_value.log_tool_invocation.mock_calls]
+        assert seen == outcomes
+        assert info._start_priced_shared is False
     finally:
         await _teardown(mgr)
 

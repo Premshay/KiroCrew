@@ -19,6 +19,8 @@ export interface ChatInputProps {
   value?: string
   onChange: (v: string) => void
   onSend: () => void
+  /** Keep identified sessions pending until their local/remote metadata is available. */
+  terminalCommands?: 'local' | 'remote' | 'pending'
   /** Rendered inside the composer's own width wrapper, directly above the
    * bordered input box. Children here share the EXACT box geometry of the
    * composer (same padding container, same resolved max-width), so band
@@ -192,6 +194,11 @@ export interface ChatInputProps {
     state?: 'ok' | 'warn' | 'none'
     /** Replaces the tooltip when the app explains its state. */
     statusTooltip?: string
+    /**
+     * App-reported per-session name, shown after `label` on the chip. `label`
+     * stays the manifest label, so a detail cannot relabel the control.
+     */
+    detail?: string
   }[]
   onSessionControlClick?: (key: string, rect: DOMRect, trigger?: HTMLElement) => void
   contextPct?: number

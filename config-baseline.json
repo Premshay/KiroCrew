@@ -717,7 +717,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Spawn Min Memory GB",
-      "help": "Available memory (GB) that must remain after admitting a subagent start. A dedicated-process start is priced at what such a runtime settles at (about 1 GB until runs of that agent have been measured, then their learned size capped at 2 GB, never below subagent_cost_gb); one that shares its parent's runtime at about 0.35 GB less. A spawn that does not fit waits in the durable queue (one with no durable queue is refused). 0 disables the check.",
+      "help": "Available memory (GB) that must remain after admitting a subagent start. A dedicated-process start is priced at what such a runtime settles at (about 1 GB until runs of that agent have been measured, then their learned size capped at 2 GB, never below subagent_cost_gb); one that shares its parent's runtime at about 0.35 GB less. A spawn that does not fit waits in the durable queue (one with no durable queue is refused). On macOS a start also waits while the kernel reports memory pressure and one of this gateway's dedicated subagents is running. 0 disables the check, that wait included.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 2.0
@@ -731,7 +731,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Resource Pressure Threshold (GB)",
-      "help": "Available memory (GB) at or below which the agent is told host memory is 'tight' via a compact [RESOURCES] context line, so it can prefer the lighter path for heavy work (targeted tests, smaller sub-agent waves). Advisory only — not enforced. 0 disables the context line. Lower this on small-memory hosts / memory-limited containers (e.g. a 2-4 GB pod) so the advisory only fires under genuine pressure.",
+      "help": "Available memory (GB) at or below which the agent is told host memory is 'tight' via a compact [RESOURCES] context line, so it can prefer the lighter path for heavy work (targeted tests, smaller sub-agent waves). On macOS the line also fires while the kernel reports memory pressure. Advisory only — not enforced. 0 disables the context line, that macOS case included. Lower this on small-memory hosts / memory-limited containers (e.g. a 2-4 GB pod) so the advisory only fires under genuine pressure.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 4.0
@@ -1458,7 +1458,7 @@
         "pool_ttl_secs": 1800,
         "eager_spawn": true,
         "archive_retention_days": 30,
-        "watchdog_rss_max_mb": 1536,
+        "watchdog_rss_max_mb": 0,
         "reconcile_max_kills": 5
       }
     },
@@ -1612,10 +1612,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Watchdog RSS Limit (MiB)",
-      "help": "Recycle a session when its process tree resident memory exceeds this many MiB (default 1536). 0 disables. Busy sessions (turn in flight) are never recycled.",
+      "help": "Recycle a session when its process tree resident memory exceeds this many MiB. 0 disables (the default); the internal background runtime still recycles at 1536 MiB. Busy sessions (turn in flight) are never recycled.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 1536
+      "defaultValue": 0
     },
     {
       "path": "session.reconcile_max_kills",
@@ -3144,7 +3144,8 @@
         "dictation_panel": true,
         "timeout_secs": 300,
         "transcribe_region": "us-east-1",
-        "transcribe_profile": ""
+        "transcribe_profile": "",
+        "transcribe_vocabulary": ""
       }
     },
     {
@@ -3349,6 +3350,20 @@
       "tags": [],
       "label": "Transcribe Profile",
       "help": "AWS profile for Transcribe API.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "stt.transcribe_vocabulary",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Transcribe Vocabulary",
+      "help": "Name of a custom vocabulary you created in Amazon Transcribe, in the same region, so names and terms it would mishear are recognised (`transcribe` provider only). Its language must match the dictation language, or Amazon Transcribe refuses it and dictation fails. Empty uses none.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""

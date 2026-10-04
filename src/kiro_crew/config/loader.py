@@ -12,10 +12,12 @@ dashboard URL via the config file. (The dashboard *port* is set with the
 from __future__ import annotations
 
 import asyncio
+import codecs as _codecs
 import contextlib
 import copy
 import hashlib as _hashlib
 import json
+import locale as _locale
 import logging
 import math  # noqa: F401 - historical loader namespace compatibility
 import os
@@ -100,6 +102,7 @@ from kiro_crew.config.paths import (  # noqa: F401, kiro_agents_dir
     data_home,
     ensure_data_home,
     kiro_agents_dir,
+    project_agents_dir,
 )
 from kiro_crew.config.resolution import (  # noqa: F401
     _KNOWN_CONFIG_SECTIONS,
@@ -528,20 +531,169 @@ def env_path() -> Path:
     return config_dir() / ".env"
 
 
+# ``.env`` paths already warned about as undecodable. The set exists because
+# the gateway re-reads ``.env`` from many call sites over its whole life
+# (every ``read_env_file_credential``), and one bad file must not log on each
+# read. A path leaves the set when :func:`read_env_file` next decodes it:
+# without that, the first warning would mute the path for the rest of the
+# process, and an operator who fixes the file and later breaks it again (a
+# second editor save in UTF-16) would get no warning at all while every
+# credential silently reads as unset.
+_warned_undecodable_env: set[str] = set()
+
+
+class EnvFileWideEncodingError(UnicodeDecodeError):
+    """A ``.env`` starts with a UTF-16 or UTF-32 byte-order mark.
+
+    Readers catch exactly this to treat the file as unset. Any other decode
+    error (a BOM-less file invalid in the chosen encoding) propagates as it
+    always has, so the BOM handling cannot hide an unrelated bad file.
+
+    ``encoding`` is the codec the mark declares (``"utf-32-le"`` and so on)
+    and ``object`` holds only the mark itself, never the credentials after
+    it. :attr:`wide_encoding` names the family for a message.
+    """
+
+    @property
+    def wide_encoding(self) -> str:
+        """``"UTF-16"`` or ``"UTF-32"``."""
+        return _wide_family(self.encoding)
+
+    def __str__(self) -> str:
+        # The base class would say "'utf-16-le' codec can't decode bytes in
+        # position 0-1", which reads as a decoding bug rather than a file
+        # saved in the wrong encoding.
+        return f"the .env is saved as {self.wide_encoding}; re-save it as UTF-8"
+
+
+# Longest mark first: a UTF-32LE mark (FF FE 00 00) begins with the UTF-16LE
+# one (FF FE), so it must be matched before it.
+_WIDE_BOMS = (
+    (_codecs.BOM_UTF32_LE, "utf-32-le"),
+    (_codecs.BOM_UTF32_BE, "utf-32-be"),
+    (_codecs.BOM_UTF16_LE, "utf-16-le"),
+    (_codecs.BOM_UTF16_BE, "utf-16-be"),
+)
+
+
+def _wide_family(codec: str) -> str:
+    return "UTF-32" if codec.startswith("utf-32") else "UTF-16"
+
+
+def _wide_bom(head: bytes) -> tuple[bytes, str] | None:
+    """The wide byte-order mark *head* starts with and the codec it declares."""
+    for bom, codec in _WIDE_BOMS:
+        if head.startswith(bom):
+            return bom, codec
+    return None
+
+
+def env_bom_prefix(ep: Path) -> str:
+    """The UTF-8 byte-order mark to put back when rewriting *ep*, or ``""``.
+
+    :func:`read_env_text` drops a UTF-8 BOM, and an in-place rewriter that
+    wrote the text back without it would change how the file decodes: with
+    the BOM it is UTF-8, without it a bare read falls back to the locale, so
+    a non-ASCII byte that loaded before the save would fail or turn to
+    mojibake after it. Each rewriter prefixes this to the text it writes.
+    Reads only the first three bytes; ``""`` when the file is absent or
+    unreadable.
+    """
+    try:
+        with ep.open("rb") as fh:
+            head = fh.read(len(_codecs.BOM_UTF8))
+    except OSError:
+        return ""
+    return "\ufeff" if head == _codecs.BOM_UTF8 else ""
+
+
+def decode_env_bytes(raw: bytes, encoding: str | None = None, errors: str = "strict") -> str:
+    """Decode the bytes of a ``.env`` file, honouring a byte-order mark.
+
+    A UTF-8 BOM (what PowerShell 5.1's ``Out-File -Encoding utf8`` writes) says
+    the file is UTF-8, so the rest is decoded as UTF-8 and the BOM is dropped:
+    left in, it becomes part of the first key and that credential silently
+    never matches. A UTF-16 BOM (PowerShell's default ``>`` / ``Out-File``) or
+    a UTF-32 one raises :class:`EnvFileWideEncodingError`, a
+    :class:`UnicodeDecodeError` readers can tell apart: a wide-encoded
+    credential file is not a supported format, and decoding it as UTF-8 or the
+    locale would either fail with an unrelated error or, under a single-byte
+    code page such as cp1252, silently yield NUL-riddled keys. Without a BOM
+    the bytes are decoded exactly as before: with *encoding*, or the locale
+    default that a bare ``read_text()`` uses when *encoding* is ``None``.
+    """
+    if raw.startswith(_codecs.BOM_UTF8):
+        return raw[len(_codecs.BOM_UTF8) :].decode("utf-8", errors)
+    wide = _wide_bom(raw)
+    if wide is not None:
+        bom, codec = wide
+        # Carry only the BOM bytes: ``.object`` is shown by repr() and by a
+        # traceback that captures locals, and the rest of the file is secrets.
+        reason = f"{_wide_family(codec)} byte-order mark"
+        raise EnvFileWideEncodingError(codec, bom, 0, len(bom), reason)
+    return raw.decode(encoding or _locale.getpreferredencoding(False), errors)
+
+
+def read_env_file(
+    ep: Path, encoding: str | None = None, errors: str = "strict"
+) -> tuple[bytes, str]:
+    """Read a ``.env`` file once; return its raw bytes and decoded text.
+
+    Every reader and in-place rewriter of the data home's ``.env`` decodes it
+    here, or through :func:`read_env_text`, so they agree on what the first
+    key is: if only the readers stripped a BOM, a dashboard clear could not
+    match the key the gateway loads, and the cleared credential would survive.
+    The bytes are for a rewriter that must compare against or restore exactly
+    what it parsed (the secrets migration); they come from the same read as
+    the text. Raises :class:`OSError` or :class:`UnicodeDecodeError`; a
+    rewriter lets the decode error propagate so it never overwrites a file it
+    could not parse. A successful decode re-arms :func:`warn_undecodable_env`
+    for *ep*.
+    """
+    raw = ep.read_bytes()
+    text = decode_env_bytes(raw, encoding, errors)
+    _warned_undecodable_env.discard(str(ep))
+    return raw, text
+
+
+def read_env_text(ep: Path, encoding: str | None = None) -> str:
+    """The decoded text of a ``.env`` file; see :func:`read_env_file`."""
+    return read_env_file(ep, encoding)[1]
+
+
+def warn_undecodable_env(ep: Path, exc: UnicodeDecodeError) -> None:
+    """Log that *ep* could not be decoded and is treated as unset.
+
+    Once per path until :func:`read_env_file` next decodes it.
+    """
+    key = str(ep)
+    if key in _warned_undecodable_env:
+        return
+    _warned_undecodable_env.add(key)
+    logger.warning(
+        "Cannot decode %s (%s); treating it as empty. Save it as UTF-8.",
+        ep,
+        exc.reason,
+    )
+
+
 def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
     """Best-effort read of one ``KEY=VALUE`` entry from the data home's ``.env``.
 
     Same line format :meth:`KiroCrewConfig.load_credentials` parses (one pair
     per line, ``#`` comments, no quotes required, last occurrence wins).
-    Returns ``""`` when the file is absent or unreadable — callers treat the
-    credential as unset rather than failing.
+    Returns ``""`` when the file is absent, unreadable or UTF-16/UTF-32 encoded —
+    callers treat the credential as unset rather than failing.
 
     Blocking file IO: call via ``asyncio.to_thread`` from async paths.
     """
     ep = env_file if env_file is not None else env_path()
     try:
-        text = ep.read_text()
+        text = read_env_text(ep)
     except OSError:
+        return ""
+    except EnvFileWideEncodingError as exc:
+        warn_undecodable_env(ep, exc)
         return ""
     value = ""
     for line in text.splitlines():
@@ -718,10 +870,11 @@ def read_config_text(path: Path) -> str:
     U+FEFF in front that ``json.loads`` refuses. The mark is dropped by
     :func:`kiro_crew.user_json.strip_utf8_bom`, the one place that already does it
     for the other user-owned JSON files. Writers keep emitting plain UTF-8, so a
-    locked write removes the mark. Every reader in this module comes through here,
-    as do the consumers that must agree with the loader about what the files say:
-    the hot-reload tear probe, doctor's drift and overlay reads, and the
-    app-trust gates. Other readers of these files are not yet converted.
+    locked write removes the mark. Every in-tree reader of the live files comes
+    through here (``test_config_json_bom.test_every_config_reader_tolerates_a_bom``
+    pins it); readers of COPIES of them -- the pod seed and export bundles -- and
+    ``agent._load_json`` strip the same mark with
+    :func:`~kiro_crew.user_json.strip_utf8_bom` directly.
     """
     return strip_utf8_bom(path.read_text(encoding="utf-8"))
 
@@ -5098,7 +5251,12 @@ class KiroCrewConfig:
                     ep.chmod(0o600)
             except OSError:
                 logger.warning("Cannot enforce permissions on %s", ep)
-            for line in ep.read_text().splitlines():
+            try:
+                env_text = read_env_text(ep)
+            except EnvFileWideEncodingError as exc:
+                warn_undecodable_env(ep, exc)
+                env_text = ""
+            for line in env_text.splitlines():
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
@@ -5460,6 +5618,11 @@ _MATERIALIZED_AGENTS: frozenset[str] = frozenset()
 # residue witness compares a dict by identity. See :func:`dispatch_kiro_agent`.
 _MATERIALIZED_STEMS: dict[str, str] = {}
 _MATERIALIZED_AGENTS_READY = False
+# Whether the snapshot now installed came from a scan that read every spec.
+# Published with the snapshot, under the same lock, because the healer reads the
+# INSTALLED snapshot, which a later partial scan may have replaced since the
+# refresh that called it scanned (see :func:`reset_dangling_default_agent`).
+_MATERIALIZED_COMPLETE = False
 # Every name a landed snapshot or a publish has let a binding dispatch in this
 # process: declared names and the file names mapped to one. Updated in place,
 # never rebound. A name in it that the current snapshot does not declare was
@@ -5544,6 +5707,15 @@ def _remember_seen(names: Iterable[str]) -> None:
     _report_dropped("removal-evidence name(s)", dropped)
 
 
+# Whether the last :func:`_scan_materialized_index` on THIS thread read every
+# candidate spec. Thread-local, not returned: the scan's ``(names, stems)``
+# contract has other callers, and each refresh runs its scan and reads this on
+# one thread. A scan that skipped an unreadable or unparseable spec leaves that
+# agent's name out of the snapshot although its file is still there, so its
+# absence is not evidence of a removal (see :func:`refresh_materialized_agents`).
+_SCAN_STATE = threading.local()
+
+
 def _scan_materialized_agents(agents_dir: Path) -> frozenset[str]:
     """Every agent name declared by the kiro agent configs in *agents_dir*.
 
@@ -5579,9 +5751,11 @@ def _scan_materialized_index(agents_dir: Path) -> tuple[frozenset[str], dict[str
     # fail-closed, rather than falling back to an unguarded read.
     from kiro_crew.hooks import safe_read_file
 
+    _SCAN_STATE.complete = True
     try:
         candidates = iter_agent_spec_files(agents_dir)
     except OSError:
+        _SCAN_STATE.complete = False
         return frozenset(), {}
     for af in candidates:
         try:
@@ -5593,6 +5767,8 @@ def _scan_materialized_index(agents_dir: Path) -> tuple[frozenset[str], dict[str
             # refused entry is skipped by the same handler as an unreadable one.
             data = parse_agent_spec_text(safe_read_file(str(af)), af)
         except (ValueError, OSError):
+            # Its agent may be one this scan now leaves out; the scan is partial.
+            _SCAN_STATE.complete = False
             continue
         # Skip stray non-object JSON a user may have dropped in the dir. The
         # filename stem is only trusted AFTER the file parses as an agent config:
@@ -5660,7 +5836,9 @@ def refresh_materialized_agents(*, heal_default: bool = False) -> None:
     inside a caller's own locked config write (the default-agent PUT reaches
     :func:`dispatch_kiro_agent` from its mutate), where the reset's write would
     wait on the lock that caller holds. A refresh that does not heal still
-    records what it saw removed, for the next one that does.
+    records what it saw removed, for the next one that does. A scan that could
+    not read or parse every spec never heals: the agent of a skipped file is
+    missing from that snapshot while its file is still on disk.
 
     Consequence worth stating plainly: editing an existing config IN PLACE — say
     renaming its ``name`` field by hand — refreshes nothing, so that new name
@@ -5670,14 +5848,16 @@ def refresh_materialized_agents(*, heal_default: bool = False) -> None:
     rather than papered over with a per-file stat.
     """
     global _MATERIALIZED_AGENTS, _MATERIALIZED_AGENTS_READY, _MATERIALIZED_REFRESH_ISSUED
-    global _MATERIALIZED_REFRESH_APPLIED
+    global _MATERIALIZED_REFRESH_APPLIED, _MATERIALIZED_COMPLETE
     with _MATERIALIZED_AGENTS_LOCK:
         generation_at_start = _MATERIALIZED_AGENTS_GENERATION
         _MATERIALIZED_REFRESH_ISSUED += 1
         my_ticket = _MATERIALIZED_REFRESH_ISSUED
     try:
         agents_dir = kiro_agents_dir()
+        _SCAN_STATE.complete = True
         snapshot, stems = _scan_materialized_index(agents_dir)
+        scan_complete = bool(getattr(_SCAN_STATE, "complete", True))
     except Exception:  # noqa: BLE001 — a refresh failure only costs a fallback
         logger.debug("Failed to refresh materialized agent names", exc_info=True)
         return
@@ -5706,6 +5886,7 @@ def refresh_materialized_agents(*, heal_default: bool = False) -> None:
         # One call per landed snapshot, so its eviction and its report happen
         # once for the whole of what it declares.
         _remember_seen([*snapshot, *stems])
+        _MATERIALIZED_COMPLETE = scan_complete
         _MATERIALIZED_AGENTS_READY = True
         _MATERIALIZED_REFRESH_APPLIED = my_ticket
     # An app install/upgrade that rewrote agent JSON just landed in the snapshot;
@@ -5718,8 +5899,25 @@ def refresh_materialized_agents(*, heal_default: bool = False) -> None:
         invalidate_include_crew_context_cache()
     except Exception:  # noqa: BLE001 — best-effort; a stale flag is not fatal
         logger.debug("Failed to invalidate includeCrewContext cache", exc_info=True)
-    if heal_default:
+    # Only a scan that read every spec may heal: one that skipped a file it could
+    # not read or parse is missing that file's agent while the file is still
+    # there, and the reset it would make is durable.
+    if heal_default and scan_complete:
         reset_dangling_default_agent()
+
+
+def _removal_evidence() -> tuple[frozenset[str] | None, frozenset[str], bool]:
+    """``(installed names, removed names, scan complete)``, read in one lock hold.
+
+    ``None`` names while no snapshot has landed. Read together so the removals
+    and the completeness flag describe the same installed snapshot.
+    """
+    with _MATERIALIZED_AGENTS_LOCK:
+        names = _MATERIALIZED_AGENTS if _MATERIALIZED_AGENTS_READY else None
+        removed = frozenset(
+            _MATERIALIZED_SEEN.keys() - _MATERIALIZED_AGENTS - _MATERIALIZED_STEMS.keys()
+        )
+        return names, removed, _MATERIALIZED_COMPLETE
 
 
 def reset_dangling_default_agent() -> bool:
@@ -5755,12 +5953,8 @@ def reset_dangling_default_agent() -> bool:
     and takes the config lock); :func:`refresh_materialized_agents` is its
     caller. Never raises. Returns ``True`` when the default was reset.
     """
-    with _MATERIALIZED_AGENTS_LOCK:
-        names = _MATERIALIZED_AGENTS if _MATERIALIZED_AGENTS_READY else None
-        removed = frozenset(
-            _MATERIALIZED_SEEN.keys() - _MATERIALIZED_AGENTS - _MATERIALIZED_STEMS.keys()
-        )
-    if not names or not removed:
+    names, removed, complete = _removal_evidence()
+    if not names or not removed or not complete:
         return False
     try:
         cfg = KiroCrewConfig.load()
@@ -5776,6 +5970,9 @@ def reset_dangling_default_agent() -> bool:
     template = _dangling_template(row.kiro_agent, names)
     if template is None or template not in removed or template in _edition_agent_names():
         return False
+    workspace_dir = _alias_workspace_dir(cfg.workspaces, row.workspace, cfg.default_workspace)
+    if _workspace_declares(template, workspace_dir):
+        return False
     reset = False
 
     def _reset(data: dict) -> dict | None:
@@ -5786,7 +5983,17 @@ def reset_dangling_default_agent() -> bool:
         row = agents.get(current)
         if "default" not in agents or not isinstance(row, dict):
             return None
-        if _dangling_template(row.get("kiro_agent"), _MATERIALIZED_AGENTS) != template:
+        # Re-derived from the snapshot installed NOW: another refresh may have
+        # replaced the one read above, and if its scan was partial its absences
+        # are not evidence.
+        names_now, removed_now, complete_now = _removal_evidence()
+        if names_now is None or not complete_now or template not in removed_now:
+            return None
+        if _dangling_template(row.get("kiro_agent"), names_now) != template:
+            return None
+        # The workspace checked above must still be the one this row places in;
+        # a row repointed at another workspace in the window was not checked.
+        if _locked_workspace_dir(data, row) != workspace_dir:
             return None
         data["default_agent"] = "default"
         reset = True
@@ -5808,6 +6015,75 @@ def reset_dangling_default_agent() -> bool:
     )
     _log_default_agent_reset(current, template)
     return True
+
+
+def _alias_workspace_dir(
+    workspaces: Mapping[str, WorkspaceConfig], name: str, default_name: str
+) -> Path:
+    """The directory an alias's ``workspace`` places it in, as dispatch does.
+
+    The named entry, else the ``default_workspace`` entry, through
+    :func:`workspace_dir_from_entry`, the one placement rule.
+    """
+    return workspace_dir_from_entry(workspaces.get(name) or workspaces.get(default_name))
+
+
+def _locked_workspace_dir(data: dict, row: dict) -> Path | None:
+    """:func:`_alias_workspace_dir` for a raw ``config.json`` document and row.
+
+    ``None`` when the document's ``workspaces`` section is not the plain
+    name -> ``{"dir": ...}`` shape, so a caller comparing it declines.
+    """
+    raw = data.get("workspaces", {})
+    if not isinstance(raw, dict):
+        return None
+    entries: dict[str, WorkspaceConfig] = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("dir", ""), str):
+            return None
+        entries[name] = WorkspaceConfig(dir=entry.get("dir", ""))
+    name = row.get("workspace") or KiroCrewAgentConfig.__dataclass_fields__["workspace"].default
+    default_name = (
+        data.get("default_workspace")
+        or KiroCrewConfig.__dataclass_fields__["default_workspace"].default
+    )
+    if not isinstance(name, str) or not isinstance(default_name, str):
+        return None
+    return _alias_workspace_dir(entries, name, default_name)
+
+
+def _workspace_declares(template: str, workspace_dir: Path) -> bool:
+    """Whether the checkout at *workspace_dir* still declares *template*.
+
+    The removal evidence comes from the user-level agents directory only, but
+    kiro-cli resolves ``--agent`` against the session's project directory first,
+    so a global spec uninstalled while the alias's workspace still declares a
+    same-named spec leaves the default dispatching there. Read with the same
+    scan the user-level snapshot uses, over ``<workspace>/.kiro/agents`` (the
+    only project location the backend activates, both spec forms), so its
+    completeness is known. Answers ``True`` -- do not reset -- whenever it cannot
+    be sure: a sensitive workspace directory (never read), a listing that fails,
+    or a scan that skipped a spec it could not read or parse. A workspace with
+    no ``.kiro/agents`` directory, or none at all, declares nothing.
+    """
+    from kiro_crew.security import is_sensitive_path  # circular import
+
+    try:
+        if is_sensitive_path(str(workspace_dir)):
+            return True
+        agents_dir = project_agents_dir(workspace_dir)
+        if not agents_dir.exists():
+            return False
+        previous = getattr(_SCAN_STATE, "complete", True)
+        try:
+            names, _stems = _scan_materialized_index(agents_dir)
+            complete = bool(getattr(_SCAN_STATE, "complete", True))
+        finally:
+            _SCAN_STATE.complete = previous
+    except Exception:  # noqa: BLE001 — an unreadable checkout is not evidence of removal
+        logger.debug("default agent check: workspace agents unreadable", exc_info=True)
+        return True
+    return not complete or template in names
 
 
 def _edition_agent_names() -> frozenset[str]:
