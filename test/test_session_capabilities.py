@@ -1188,6 +1188,37 @@ def test_codex_member_template_not_reported_from_dead_runtime(monkeypatch):
     assert provider.loaded_capability_template == ""
 
 
+def test_deepseek_member_confirms_on_the_spec_its_array_was_built_from(
+    tmp_path, monkeypatch
+):
+    """deepseek confirms on the AcpClient path like claude. The mirror must hand back
+    the spec it parsed: a projection that drops it leaves nothing to confirm, and every
+    deepseek member session would be refused."""
+    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.agent_capabilities import _digest
+    from kiro_crew.providers.mirrors.registry import mirror_for
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    spec = {"name": "saved-member", "tools": ["*"], "mcpServers": {}}
+    (agents / "saved-member.json").write_text(json.dumps(spec), encoding="utf-8")
+    monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: agents, raising=False)
+    monkeypatch.setenv("KIRO_AGENTS_DIR", str(agents))
+    projection = mirror_for(ACP_BACKEND_DEEPSEEK).session_projection(
+        "saved-member", work_dir=tmp_path
+    )
+    consumed = projection.agent_spec
+    assert consumed is not None
+    monkeypatch.setattr(
+        agent_state, "get_capabilities", lambda _: {"materialized": _digest(consumed)}
+    )
+    client = AcpClient(work_dir=tmp_path, agent="saved-member", acp_backend=ACP_BACKEND_DEEPSEEK)
+    client._session_mcp_withheld = False
+    client.member_context = True
+    client._confirm_member_projection(consumed)
+    assert client.capability_projection_gaps == ()
+
+
 def test_deepseek_member_spec_reaches_its_session_array():
     """deepseek confirms on the AcpClient path like claude, which needs a mirror that
     carries the spec it parsed; without one there is nothing to confirm."""
