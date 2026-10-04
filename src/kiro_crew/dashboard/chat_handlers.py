@@ -5635,6 +5635,16 @@ def _switch_target_busy(
     )
 
 
+class _MemberMemoryRequiresNewConversation(ValueError):
+    """A member pick that would rebind an existing conversation's memory.
+
+    Subclasses ValueError so every existing catch still treats it as the
+    selection failure it is; named so the handler can answer it as the
+    conversation-boundary refusal it means, instead of wrapping it in the
+    store-unavailable 503 the generic except produces.
+    """
+
+
 async def api_chat_slot_agent(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/agent — set agent for a chat slot."""
     state: DashboardState = request.app["state"]
@@ -6375,7 +6385,9 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     and changed_member
                 ):
                     if slot.messages:
-                        raise ValueError("Open a new conversation to choose member memory.")
+                        raise _MemberMemoryRequiresNewConversation(
+                            "Open a new conversation to choose member memory."
+                        )
                     await release_prewarmed_session(state, session_key, agent_name, cfg)
                     await pin_private_agent_store(
                         state,
@@ -6412,6 +6424,17 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             ):
                 await _rollback_owner_selection()
                 if selection_error is not None:
+                    if isinstance(selection_error, _MemberMemoryRequiresNewConversation):
+                        # Not a store fault: this conversation already has history,
+                        # so its memory binding cannot move to a member's private
+                        # store in place. Name the boundary the user can act on.
+                        return web.json_response(
+                            {
+                                "error": str(selection_error),
+                                "code": "member_memory_requires_new_conversation",
+                            },
+                            status=409,
+                        )
                     from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
 
                     return _store_unavailable_response(slot.memory_store, selection_error)
