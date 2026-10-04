@@ -835,10 +835,12 @@ ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
 # Backends that can verify an enrolled member's saved spec at spawn.
 # Separate from session sharing and per-session dispatch (harness-parity H6):
 # support for either does not establish saved-spec loading. Only kiro-cli has
-# demonstrated native loading. Claude proves consumption of its saved projection;
-# unrepresented fields keep its runtime view unverified. Both require a live
+# demonstrated native loading. Claude and Codex prove consumption of their saved
+# projections; unrepresented fields keep their runtime views unverified. They require a live
 # dedicated runtime before reporting a saved template.
-ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE})
+ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset(
+    {ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX}
+)
 
 # Backends that can mount a DIFFERENT MCP tool set on one session than the
 # on-disk agent template declares — the capability crew-member dispatch rides

@@ -200,6 +200,7 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "title",
         "agent",
         "model",
+        "runtime_agent",
         "reasoning_effort",
         "autocompact_pct",
         # Source-link dismissals: the slot save is authoritative (it rebuilds the

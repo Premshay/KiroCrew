@@ -16,6 +16,15 @@ export const SLASH_COMMANDS_TIMEOUT_MS = 15_000
 
 export function createChatSlotSettingsEndpoints({ post, j }: ClientTransport) {
   const selection = {
+    chatSlotRuntimes: (slot: string) =>
+      fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/runtime').then(j) as Promise<{
+        runtime_agent: string
+        choices: { name: string; label: string; supported: boolean; reason: string }[]
+      }>,
+    chatSlotRuntime: (slot: string, runtime_agent: string) =>
+      post('/api/chat/slots/' + encodeURIComponent(slot) + '/runtime', { runtime_agent }).then(j) as Promise<{
+        ok: boolean; runtime_agent: string; model: string; reasoning_effort: string; served_model?: string; warning?: string
+      }>,
     models: () => fetch('/api/models').then(j),
     chatSlotSelectionCapabilities: (slot: string) =>
       fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/selection-capabilities').then(j) as Promise<{

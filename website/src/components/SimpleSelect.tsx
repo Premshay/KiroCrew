@@ -42,6 +42,7 @@ export interface SimpleSelectProps {
   options: string[]
   /** Optional display labels for each option (same order as options). Falls back to the option value. */
   optionLabels?: string[]
+  optionDisabled?: boolean[]
   /** Decorative identity icons in option order. Text labels remain the accessible
    * names and typeahead values. Touch keeps the native list plus the selected icon. */
   optionIcons?: React.ReactNode[]
@@ -95,7 +96,7 @@ export interface SimpleSelectProps {
   title?: string
 }
 
-export default function SimpleSelect({ options, optionLabels, optionIcons, value, onChange, action, clearLabel, triggerFallback, labelsInListOnly, optionBadges, disabled, style, id, className, contentClassName, 'aria-label': ariaLabel, 'aria-describedby': ariaDescribedBy, title }: SimpleSelectProps) {
+export default function SimpleSelect({ options, optionLabels, optionDisabled, optionIcons, value, onChange, action, clearLabel, triggerFallback, labelsInListOnly, optionBadges, disabled, style, id, className, contentClassName, 'aria-label': ariaLabel, 'aria-describedby': ariaDescribedBy, title }: SimpleSelectProps) {
   const isTouch = useIsTouchDevice()
   const toRadix = (v: string) => (v === '' ? EMPTY_VALUE_SENTINEL : v)
   const fromRadix = (v: string) => (v === EMPTY_VALUE_SENTINEL ? '' : v)
@@ -155,7 +156,7 @@ export default function SimpleSelect({ options, optionLabels, optionIcons, value
           <NativeSelectOption value={EMPTY_VALUE_SENTINEL}>{clearLabel}</NativeSelectOption>
         )}
         {options.map((opt, i) => (
-          <NativeSelectOption key={opt} value={toRadix(opt)}>{label(opt, i)}</NativeSelectOption>
+          <NativeSelectOption key={opt} value={toRadix(opt)} disabled={optionDisabled?.[i]}>{label(opt, i)}</NativeSelectOption>
         ))}
       </NativeSelect>
     )
@@ -195,7 +196,7 @@ export default function SimpleSelect({ options, optionLabels, optionIcons, value
             const badge = opt === '' ? undefined : optionBadges?.[i]
             const icon = optionIcons?.[i]
             return (
-              <SelectItem key={opt} value={toRadix(opt)} textValue={label(opt, i)}>
+              <SelectItem key={opt} value={toRadix(opt)} textValue={label(opt, i)} disabled={optionDisabled?.[i]}>
                 {badge ? (
                   <span className="inline-flex items-center gap-1.5">
                     {opt}

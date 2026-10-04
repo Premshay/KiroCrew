@@ -296,12 +296,23 @@ so the id sent and the id recorded are one value. An empty stamp means the
 allocation resolved nothing, or that a registration site which resolves no models
 made the session.
 
-Enrolled allocations bypass warm and shared processes. Full-spec loading is
-supported by the dedicated Kiro backend; other harnesses refuse explicitly rather
-than falling back to the default agent. A successful mode handshake, fresh process
+Enrolled allocations bypass warm and shared processes. The dedicated Kiro backend
+loads the full spec; Claude and Codex verify the consumed saved projection and
+report unsupported fields as gaps. Other harnesses refuse explicitly rather than
+falling back to the default agent. A successful activation or projection handshake, fresh process
 instance, live session id, and post-start saved-byte/ownership/governance checks
 are all required before `_Session.loaded_capabilities` is stamped. MCP hot reload
 is not evidence that prompt, resources and the rest of the spec were loaded.
+
+A dashboard owner may select `runtime_agent` independently of the member identity
+through the slot runtime endpoint. Runtime policies come from the provider registry.
+The selected generic execution seat is persisted with the slot and changes engine
+lookup, while the original member spec, memory store, workspace and transcript stay
+bound. Member conversations admit only runtimes with saved-projection support.
+Switches refuse active turns or attached children, synchronize linked slot views,
+reset model/effort/fallback state and bypass warm allocation. The target runtime
+supplies its own default model; allocation and restore must not inherit the member's
+prior provider model. No automatic vendor fallback is introduced.
 The applied view also checks that each enabled MCP connection in that saved
 version has reported ready through the provider's own MCP report. Missing reports
 remain unverified, authentication requests remain pending, and initialization

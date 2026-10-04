@@ -370,6 +370,7 @@ def merge_empty_window(
             "color_theme": slot.color_theme or "",
             "memory_mode": _mode,
             "model": slot.model,
+            "runtime_agent": getattr(slot, "runtime_agent", ""),
             # CLEARABLE: the queued prompts a restore hands back. Written
             # even when empty, so a drain that emptied the queue is not
             # left with the pre-drain set on disk (the merge cannot
@@ -679,6 +680,7 @@ def build_full_line(
     if slot.agent:
         meta_line["agent"] = slot.agent
     meta_line["model"] = slot.model
+    meta_line["runtime_agent"] = getattr(slot, "runtime_agent", "")
     if slot.reasoning_effort:
         cp._remember_reasoning_effort_for_restore(slot.reasoning_effort)
         meta_line["reasoning_effort"] = slot.reasoning_effort

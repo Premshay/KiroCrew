@@ -2406,7 +2406,7 @@ class SessionAllocationService:
 
         # Reconciliation can publish a new template model. Resolve only after
         # that boundary, while retaining an explicit caller model unchanged.
-        if model is None:
+        if model is None and not extra_factory_kwargs.get("runtime_agent"):
 
             def resolve_model() -> str | None:
                 cfg = self._deps.load_config() if preparation.revision else owner._cfg
@@ -2433,6 +2433,8 @@ class SessionAllocationService:
             pool_decision = "disabled"
         elif preparation.revision:
             pool_decision = "bypass_member_capabilities"
+        elif extra_factory_kwargs.get("runtime_agent"):
+            pool_decision = "bypass_runtime_agent"
         elif resume_sid:
             pool_decision = "bypass_resume"
         elif is_stateless:

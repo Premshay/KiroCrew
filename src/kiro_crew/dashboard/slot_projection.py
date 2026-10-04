@@ -381,6 +381,7 @@ class SlotProjection:
             "agent_kind": getattr(slot, "agent_kind", ""),
             "effective_agent": resolve_effective_agent(slot.agent, slot.project or None),
             "model": slot.model,
+            "runtime_agent": getattr(slot, "runtime_agent", ""),
             # Whether this session's turns ask Jev which model tier to run on
             # (the picker's "Auto (Jev)" entry). Shipped on every slot, not only
             # the routed ones, so the picker branches on a field that is always

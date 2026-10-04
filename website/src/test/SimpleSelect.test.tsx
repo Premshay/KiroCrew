@@ -9,6 +9,15 @@ import SimpleSelect from '../components/SimpleSelect'
  * jsdom (unlike DropdownMenu), so no mock is needed here.
  */
 describe('SimpleSelect', () => {
+  it('shows unsupported choices without permitting selection', async () => {
+    const onChange = vi.fn()
+    render(<SimpleSelect options={['claude', 'deepseek']} optionDisabled={[false, true]} value="claude" onChange={onChange} aria-label="Backend" />)
+    fireEvent.click(screen.getByRole('combobox', { name: 'Backend' }))
+    const unsupported = await screen.findByRole('option', { name: 'deepseek' })
+    expect(unsupported).toHaveAttribute('aria-disabled', 'true')
+    fireEvent.click(unsupported)
+    expect(onChange).not.toHaveBeenCalled()
+  })
   it('keeps identity icons in the selected value and options without changing their text names', async () => {
     const onChange = vi.fn()
     render(<SimpleSelect options={['reviewer', 'writer']} optionLabels={['Code review', 'Writing']} optionIcons={[<img key="reviewer" src="/reviewer.png" alt="" />, <img key="writer" src="/writer.png" alt="" />]} value="reviewer" onChange={onChange} aria-label="Member" />)

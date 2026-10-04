@@ -174,6 +174,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_LOAD_WITHOUT_MODES,
+    ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MEMBER_PANEL,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
@@ -7221,7 +7222,8 @@ class AcpClient:
         if intent is None:
             return
         if (
-            not self._permission_surface_governed
+            self._session_mcp_withheld
+            or (self._seeds_local_settings and not self._permission_surface_governed)
             or spec is None
             or _digest(spec) != intent.get("materialized")
         ):
@@ -7249,8 +7251,12 @@ class AcpClient:
 
     @property
     def loaded_capability_template(self) -> str:
-        """Saved template whose projection was consumed by this live Claude session."""
-        if self._is_claude and self.is_ready and self._is_process_alive():
+        """Saved template whose projection was consumed by this live session."""
+        if (
+            self.backend in ACP_BACKENDS_MEMBER_CAPABILITIES
+            and self.is_ready
+            and self._is_process_alive()
+        ):
             return self._loaded_capability_template
         return ""
 
@@ -10921,7 +10927,10 @@ class AcpClient:
 
         # Drain MCP server init notifications
         await self._drain_notifications()
-        if self._is_claude:
+        if (
+            self.backend in ACP_BACKENDS_MEMBER_CAPABILITIES
+            and self.backend in ACP_BACKENDS_SESSION_MCP_ARRAY
+        ):
             await asyncio.to_thread(self._confirm_member_projection, sent_spec)
 
     async def ensure_ready(self) -> None:

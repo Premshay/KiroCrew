@@ -71,7 +71,8 @@ export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigge
   }, [dispatch])
   const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(effectiveAgents)
   const filteredAgents = filteredAgentsByName
-  const modelPickerAgentName = slots.find(s => s.key === activeSlot)?.agent || pendingAgent || defaultAgent
+  const modelPickerSlot = slots.find(s => s.key === activeSlot)
+  const modelPickerAgentName = modelPickerSlot?.runtime_agent || modelPickerSlot?.agent || pendingAgent || defaultAgent
   const modelPickerAgent = installedAgents.find(agent => agent.name === modelPickerAgentName)
   const localModelCatalog = useAvailableModelsQuery({ agent: modelPickerAgent })
   const localModels = localModelCatalog.data

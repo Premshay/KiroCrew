@@ -16,6 +16,7 @@ import { filterCrewmateChat } from './chat/crewmateBubbles'
 import type { CrewmateIdentity } from '../pages/chat/CrewmateMessage'
 import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
+import RuntimeSelector from './RuntimeSelector'
 import ChatDropOverlay, { useChatFileDrop } from './ChatDropOverlay'
 import PaneDim from './PaneDim'
 
@@ -609,7 +610,7 @@ export default function ChatPane({
   // The pop-up lists the full catalog (a same-name member and template are
   // two rows); every other reader of the roster keeps the name-folded list.
   const agentDD = useFilteredDropdown(agentChoices)
-  const modelPickerAgent = installedAgents.find((agent) => agent.name === paneAgentName)
+  const modelPickerAgent = installedAgents.find((agent) => agent.name === (paneSlot?.runtime_agent || paneAgentName))
   const localModels = useAvailableModels({ agent: modelPickerAgent })
   const effectiveModels = useMemo<ModelInfo[]>(() => {
     if (!paneRemoteCrew.isRemote) return localModels
@@ -620,7 +621,7 @@ export default function ChatPane({
     }))
   }, [paneRemoteCrew.isRemote, paneRemoteCrew.capabilities, localModels])
   const selectionCapabilitiesQ = useQuery({
-    queryKey: ['slot-selection-capabilities', slotKey],
+    queryKey: ['slot-selection-capabilities', slotKey, paneSlot?.runtime_agent || ''],
     queryFn: () => api.chatSlotSelectionCapabilities(slotKey),
     enabled: !!paneSlot && typeof api.chatSlotSelectionCapabilities === 'function',
     refetchInterval: query => query.state.data?.known || query.state.dataUpdateCount + query.state.errorUpdateCount >= 5 ? 30_000 : 2_000,
@@ -1912,6 +1913,8 @@ export default function ChatPane({
           }}
         />
 
+        {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
+        <RuntimeSelector slot={slotKey} value={paneSlot?.runtime_agent} running={running} remote={paneRemoteCrew.isRemote} />
         {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
         <ErrorNotice
           className="mx-4 mt-2 mb-0 animate-rise"

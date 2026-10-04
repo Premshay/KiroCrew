@@ -186,6 +186,8 @@ _BASE_ROUTES = (
     ("POST", "/api/chat/slots/cleanup", "api_chat_slots_cleanup"),
     ("POST", "/api/chat/slots/model", "api_chat_slots_model"),
     ("POST", "/api/chat/slots/{slot}/agent", "api_chat_slot_agent"),
+    ("GET", "/api/chat/slots/{slot}/runtime", "api_chat_slot_runtime"),
+    ("POST", "/api/chat/slots/{slot}/runtime", "api_chat_slot_runtime"),
     ("POST", "/api/chat/slots/{slot}/approve", "api_chat_slot_approve"),
     ("POST", "/api/chat/slots/{slot}/autocompact", "api_chat_slot_autocompact"),
     ("POST", "/api/chat/slots/{slot}/context", "api_chat_slot_context"),

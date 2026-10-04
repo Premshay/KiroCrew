@@ -19,6 +19,12 @@ allocation. `member_context` controls native instruction deduplication; it is no
 a security capability and does not choose a database. Memory access uses the
 Gateway's captured execution record and ordinary authenticated transport.
 
+Enrolled Claude and Codex members verify the saved spec against the projection
+consumed by their fresh session. A withheld or changed projection refuses startup;
+fields the harness cannot enforce remain explicitly unverified. Codex records the
+spec from the same parse that built its session MCP array, rather than re-reading
+the file after the session has started.
+
 Retention mode is established before provider startup. Restricted sessions bypass
 resumable warm providers, suppress Crew raw frame recording and discard known
 native transcript files on teardown, including a declined late startup. A shared

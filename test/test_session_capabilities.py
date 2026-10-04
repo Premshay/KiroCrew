@@ -1013,28 +1013,56 @@ def test_capability_runtime_facade_projects_owned_state_without_exporting_it():
 
 
 @pytest.mark.asyncio
+async def test_execution_override_reaches_allocation_without_member_model(world):
+    service, cfg, factory, _, project, stores, _ = world
+    save(service, enroll=True)
+    cfg = KiroCrewConfig.load()
+    cfg.agents["A"].model = "claude-opus-4.8"
+    cfg.save()
+    captured = []
+
+    def recording_factory(key, **kwargs):
+        captured.append(kwargs)
+        return factory(key, **kwargs)
+
+    manager = SessionManager(cfg, provider_factory=recording_factory)
+    try:
+        provider, _, _ = await manager.get_or_create(
+            "dashboard:A", agent="A", runtime_agent="codex", cwd=str(project)
+        )
+        assert captured[0]["runtime_agent"] == "codex"
+        assert captured[0]["model_override"] is None
+        assert provider.template == captured[0]["agent"]
+        assert read_private_session_store("dashboard:A") == stores["A"]
+        view = manager.capability_runtime_view("A", service.get("A")["revision"])
+        assert view["sessions"][0]["session_key"] == "dashboard:A"
+    finally:
+        await manager.close_all(drain_timeout=0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["claude", "codex"])
 @pytest.mark.parametrize("resume", [False, True])
 @pytest.mark.parametrize("fault", [None, "withheld", "changed", "wire", "state"])
-async def test_claude_saved_projection_requires_consumed_matching_spec(
-    world, monkeypatch, resume, fault
+async def test_saved_projection_requires_consumed_matching_spec(
+    world, monkeypatch, resume, fault, backend
 ):
     from kiro_crew.acp.client import AcpError
-    from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
     from kiro_crew.providers.acp import AcpProvider
     from kiro_crew.session_capabilities import loaded_stamp, prepare_runtime, verify_saved
 
     service, cfg, _, _, project, _, _ = world
     await asyncio.to_thread(save, service, enroll=True)
     prepared = await asyncio.to_thread(prepare_runtime, "A", "A", str(project))
-    provider = AcpProvider(
-        work_dir=project, agent=prepared.template, acp_backend=ACP_BACKEND_CLAUDE
-    )
+    provider = AcpProvider(work_dir=project, agent=prepared.template, acp_backend=backend)
     client = provider.client
     client.member_context = True
     client._process = MagicMock(returncode=None)
     client._process_instance = "claude-incarnation"
     client._claude_settings_authored = fault != "withheld"
     client._session_mcp_cache = await asyncio.to_thread(client._resolve_session_mcp_servers)
+    if fault == "withheld":
+        client._session_mcp_withheld = True
     if fault == "changed":
         client._session_agent_spec = {**client._session_agent_spec, "prompt": "not saved"}
     if resume:
@@ -1051,7 +1079,17 @@ async def test_claude_saved_projection_requires_consumed_matching_spec(
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
         if fault == "wire":
             raise AcpError("session creation refused")
-        return {"sessionId": "claude-history", "modes": {"currentModeId": "default"}}
+        return {
+            "sessionId": "claude-history",
+            "modes": {"currentModeId": "default"},
+            "configOptions": [
+                {
+                    "id": "mode",
+                    "currentValue": "read-only",
+                    "options": [{"value": "read-only", "name": "Read only"}],
+                }
+            ],
+        }
 
     monkeypatch.setattr(client, "_send_request", send)
     monkeypatch.setattr(client, "_wait_for_response", answer)
@@ -1129,6 +1167,7 @@ def test_claude_projection_gaps_are_explicit(tmp_path, monkeypatch, field):
     monkeypatch.setattr(agent_state, "get_capabilities", lambda _: {"materialized": _digest(spec)})
     client = AcpClient(work_dir=tmp_path, agent="saved-member", acp_backend=ACP_BACKEND_CLAUDE)
     client._claude_settings_authored = True
+    client._session_mcp_withheld = False
     client.member_context = True
     client._confirm_member_projection(spec)
     expected = "auto_approval" if field == "allowedTools" else field

@@ -229,6 +229,7 @@ import InboundLinkChip from '../components/InboundLinkChip'
 import ModelEffortDropdown from '../components/ModelEffortDropdown'
 
 import ChatInput from '../components/ChatInput'
+import RuntimeSelector from '../components/RuntimeSelector'
 import { usePreferenceAdvisor } from './chat/usePreferenceAdvisor'
 import { useStableCallbackProps } from './chat/useStableCallbackProps'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
@@ -855,7 +856,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     effectiveModels, localModelCatalog,
   } = useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, slots, dispatch, pendingAgent })
   const selectionCapabilitiesQ = useQuery({
-    queryKey: ['slot-selection-capabilities', activeSlot],
+    queryKey: ['slot-selection-capabilities', activeSlot, slots.find(s => s.key === activeSlot)?.runtime_agent],
     queryFn: () => api.chatSlotSelectionCapabilities(activeSlot!),
     enabled: !!activeSlot && typeof api.chatSlotSelectionCapabilities === 'function',
     // A new ACP session may not exist when its slot first appears. Recheck
@@ -6311,6 +6312,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   <MemoryModeChip memoryMode={currentSlot?.memory_mode ?? 'persistent'} onSwitchMode={switchMemoryMode} />
                 </div>
               )}
+              <RuntimeSelector slot={activeSlot || ''} value={currentSlot?.runtime_agent} running={!!slotRunning} remote={activeSlotRemoteBound} />
               <Composer
                 ref={composerRef}
                 slotKey={activeSlot}

@@ -400,10 +400,17 @@ def _restore_model_fields(slot: Any, meta: dict, *, cfg: Any, effort_marker: boo
     key (no-op for other providers); it is read only when a model is set.
     *effort_marker* is the off-loop ``_has_validated_effort_marker`` read for
     this effort value.
-    Returns True when the metadata carried a model, so a caller can fall
-    back to the agent's default model when it did not.
+    Returns True when the metadata owns the model selection, including an
+    execution seat's default, so callers do not restore the member's old model.
     """
     raw_model = meta.get("model")
+    runtime_agent = meta.get("runtime_agent", "")
+    runtime_binding = (
+        cfg.agents.get(runtime_agent) if cfg and isinstance(runtime_agent, str) else None
+    )
+    slot.runtime_agent = (
+        runtime_agent if runtime_binding is not None and not runtime_binding.member_id else ""
+    )
     # Metadata is agent-writable: a non-string model is dropped, not hashed.
     has_model = isinstance(raw_model, str) and bool(raw_model)
     if has_model and isinstance(raw_model, str):
@@ -415,7 +422,7 @@ def _restore_model_fields(slot: Any, meta: dict, *, cfg: Any, effort_marker: boo
         slot.reasoning_effort = _validate_reasoning_effort(
             meta["reasoning_effort"], persisted_marker=effort_marker
         )
-    return has_model
+    return has_model or bool(slot.runtime_agent)
 
 
 #: Retired session modes. A slot persisted under one of these comes back as a

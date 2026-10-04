@@ -2726,6 +2726,7 @@ class _ChatSlot:
         "title",
         "agent",
         "agent_kind",
+        "runtime_agent",
         "model",
         "jev_route",
         "_model_withheld",
@@ -3074,6 +3075,7 @@ class _ChatSlot:
         # inheriting rather than pinning. "" = unknown. Written through
         # `record_served_model`.
         self.served_model: str = ""
+        self.runtime_agent: str = ""
         # Reasoning effort: "" = provider default, else one of low/medium/high/max.
         # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
         self.reasoning_effort: str = ""
