@@ -75,6 +75,35 @@ async def test_background_run_finishes_and_captures_result() -> None:
     assert snap["author"] == "a-contributor"
 
 
+async def test_background_incomplete_result_is_failed_with_execution_outcome() -> None:
+    reg = RunRegistry()
+    runner = WorkflowRunner(agent_fn=_echo, audit=lambda *a, **k: None)
+    script = (
+        'META = {"name": "audit"}\n'
+        "async def workflow(ctx):\n"
+        "    return {'status': 'incomplete', 'stage': 'audit', 'result': None}\n"
+    )
+    await runner.run_background(script, registry=reg, run_id="wf_incomplete", now=NOW)
+    snap = await _wait_terminal(reg, "wf_incomplete")
+    assert snap["status"] == "failed"
+    assert snap["task_outcome"] == "incomplete"
+    assert snap["execution_status"] == "ended"
+    assert snap["result"]["stage"] == "audit"
+
+
+async def test_old_finished_incomplete_snapshot_never_claims_success() -> None:
+    handle = RunHandle(run_id="wf_old", name="audit", status=STATUS_FINISHED)
+    handle.result = {"status": "incomplete", "stage": "audit", "result": None}
+    snap = handle.snapshot(include_result=False)
+    assert snap["status"] == "failed"
+    assert snap["task_outcome"] == "incomplete"
+    assert snap["execution_status"] == "ended"
+    assert "incomplete" in snap["error"]
+    assert "result" not in snap
+    assert handle.status == STATUS_FINISHED
+    assert snap["child_status"] == "unknown"
+
+
 async def test_events_stream_into_handle_live() -> None:
     reg = RunRegistry()
     seen: list[str] = []

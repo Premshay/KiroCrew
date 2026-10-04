@@ -15,6 +15,24 @@ from kiro_crew.dashboard.workflow_inject import (
 )
 
 
+def test_incomplete_summary_preserves_payload_and_warns_about_team_liveness():
+    body = _summarize(
+        {
+            "run_id": "wf_busy",
+            "name": "audit",
+            "status": "failed",
+            "task_outcome": "incomplete",
+            "execution_status": "ended",
+            "child_status": "unknown",
+            "result": {"status": "incomplete", "reason": "session_busy"},
+        }
+    )
+    assert "**failed**" in body
+    assert "Execution ended; task incomplete" in body
+    assert "Team state: unknown" in body
+    assert '"reason": "session_busy"' in body
+
+
 # --- lightweight fakes for routing tests --------------------------------------
 class _FakeSlot:
     def __init__(self, key: str) -> None:

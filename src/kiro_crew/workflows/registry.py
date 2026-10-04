@@ -46,6 +46,10 @@ OnDoneFn = Callable[[str, dict], None]
 OnEventFn = Callable[[str, dict], None]
 
 
+def task_is_incomplete(result: Any) -> bool:
+    return isinstance(result, dict) and result.get("status") == "incomplete"
+
+
 async def _await_owned(task: "asyncio.Task[Any]") -> Any:
     """Drain owned work even under repeated cancellation, then propagate it."""
     cancelled = False
@@ -182,6 +186,15 @@ class RunHandle:
         }
         if self._persistence_error and not self.error:
             snap["error_code"] = "workflow_checkpoint_failed"
+        if self.status not in ACTIVE_STATUSES and task_is_incomplete(self.result):
+            snap["task_outcome"] = "incomplete"
+            snap["execution_status"] = "ended"
+            snap["child_status"] = "unknown"
+            # Older persisted runs labelled a normal incomplete return finished.
+            # Keep their result, but never present that task as successful.
+            if self.status == STATUS_FINISHED:
+                snap["status"] = STATUS_FAILED
+                snap["error"] = snap["error"] or "Workflow ended with an incomplete task result."
         if include_result:
             snap["result"] = self.result
         # Work that outlived a run which ENDED WITHOUT a usable return value

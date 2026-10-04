@@ -50,9 +50,17 @@ from .registry import (
     STATUS_FAILED,
     STATUS_FINISHED,
     start_background_run,
+    task_is_incomplete,
 )
 from .schema import run_with_schema
 from .validate import CORE_CTX_SURFACE, check_ctx_surface, validate
+
+try:
+    from kiro_crew.acp.transport_errors import AcpPromptBusy
+except ImportError:  # pragma: no cover - standalone engine without the ACP adapter
+    _PROMPT_BUSY_ERRORS: tuple[type[Exception], ...] = ()
+else:
+    _PROMPT_BUSY_ERRORS = (AcpPromptBusy,)
 
 # Optional dependency (gate F1): the SEL security event log lives in the app
 # layer, and the workflows engine must stay importable as a standalone unit
@@ -133,6 +141,16 @@ def clamp_run_timeout(value: Optional[int], *, default: int = DEFAULT_RUN_TIMEOU
     if secs <= 0:
         return default
     return max(MIN_RUN_TIMEOUT_SECS, min(secs, MAX_RUN_TIMEOUT_SECS))
+
+
+class _WorkflowSessionBusy(Exception):
+    pass
+
+
+_SESSION_BUSY_ERROR = (
+    "A named agent session has a prompt in flight. Task incomplete; team state unknown. "
+    "Reconcile the outstanding prompt before resuming."
+)
 
 
 def describe_agent_error(exc: BaseException) -> str:
@@ -355,6 +373,7 @@ class _RunContext:
         self._agent_fn = agent_fn
         self._concurrency = concurrency
         self._current_phase = ""
+        self._busy_sessions: set[str] = set()
         self._events: list[WorkflowEvent] = []
         self._on_event = on_event
         # Resume / restart-subtree: cached agent results from a prior run,
@@ -419,6 +438,8 @@ class _RunContext:
         if self.budget.would_exceed():
             raise BudgetExceeded("budget exhausted before agent call")
 
+        if session is not None and session in self._busy_sessions:
+            raise _WorkflowSessionBusy(_SESSION_BUSY_ERROR)
         call_index = self._counter.count - 1
         agent_id = f"a{call_index}"
         use_phase = phase or self._current_phase
@@ -476,9 +497,17 @@ class _RunContext:
                     error = "agent returned no result"
         except BudgetExceeded:
             raise
-        except Exception as exc:  # noqa: BLE001 - captured per call, never fails the run
+        except Exception as exc:  # noqa: BLE001 - record before propagating a busy session
             result, ok = None, False
             error = describe_agent_error(exc)
+            if session is not None and (
+                isinstance(exc, _PROMPT_BUSY_ERRORS)
+                or (
+                    getattr(exc, "code", None) == -32602
+                    and "a prompt is already in flight for this session" in str(exc)
+                )
+            ):
+                self._busy_sessions.add(session)
         # Record this call's result so a future resume can replay the prefix.
         self.agent_results[call_index] = result
         if error:
@@ -516,6 +545,8 @@ class _RunContext:
                 "error": error,
             },
         )
+        if session is not None and session in self._busy_sessions:
+            raise _WorkflowSessionBusy(_SESSION_BUSY_ERROR)
         return result
 
     # --- scheduling (delegate to the dsl combinators with the run's cap) ---
@@ -996,6 +1027,23 @@ class WorkflowRunner:
                 agent_errors=dict(ctx.agent_errors),
                 source=source,
             )
+        except _WorkflowSessionBusy as exc:
+            await _pre_terminal()
+            emit(stream.run_failed(now, error=str(exc), where="exec"))
+            return RunResult(
+                run_id,
+                ok=False,
+                result={
+                    "status": "incomplete",
+                    "reason": "session_busy",
+                    "child_status": "unknown",
+                },
+                events=events,
+                error=str(exc),
+                agent_results=dict(ctx.agent_results),
+                agent_errors=dict(ctx.agent_errors),
+                source=source,
+            )
         except Exception as exc:  # script raised — captured, not propagated
             await _pre_terminal()
             emit(stream.run_failed(now, error=repr(exc), where="exec"))
@@ -1021,6 +1069,29 @@ class WorkflowRunner:
                 result=None,
                 events=events,
                 error="cancelled",
+                agent_results=dict(ctx.agent_results),
+                agent_errors=dict(ctx.agent_errors),
+                source=source,
+            )
+        if ctx._busy_sessions or task_is_incomplete(result):
+            error = (
+                _SESSION_BUSY_ERROR
+                if ctx._busy_sessions
+                else "Workflow ended with an incomplete task result. Inspect the result before resuming."
+            )
+            if ctx._busy_sessions:
+                result = {
+                    "status": "incomplete",
+                    "reason": "session_busy",
+                    "child_status": "unknown",
+                }
+            emit(stream.run_failed(now, error=error, where="exec"))
+            return RunResult(
+                run_id,
+                ok=False,
+                result=result,
+                events=events,
+                error=error,
                 agent_results=dict(ctx.agent_results),
                 agent_errors=dict(ctx.agent_errors),
                 source=source,

@@ -59,7 +59,13 @@ def _summarize(snapshot: dict) -> str:
     status = snapshot.get("status", "")
     run_id = snapshot.get("run_id", "")
     lines = ["[Workflow completion event]", f"Workflow `{name}` ({run_id}) → **{status}**"]
-    if status == "finished":
+    if snapshot.get("task_outcome") == "incomplete":
+        lines.append(
+            "Execution ended; task incomplete. This does not establish that the team stopped."
+        )
+    if snapshot.get("child_status") == "unknown":
+        lines.append("Team state: unknown. Check child liveness before recovery.")
+    if status == "finished" or snapshot.get("task_outcome") == "incomplete":
         result = snapshot.get("result")
         try:
             body = json.dumps(result, indent=2, default=str)
