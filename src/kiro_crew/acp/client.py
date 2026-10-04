@@ -3435,6 +3435,25 @@ def _is_config_value_rejection(exc: AcpError, config_id: str, backend: str = "")
     )
 
 
+def _route_pairs_for(model_id: str, advertised: Collection[str]) -> list[str]:
+    """Advertised ``["provider","model"]`` pairs whose model half is *model_id*."""
+    out = []
+    for value in advertised:
+        if not value.startswith("["):
+            continue
+        try:
+            pair = json.loads(value)
+        except ValueError:
+            continue
+        if (
+            isinstance(pair, list)
+            and len(pair) == 2
+            and all(isinstance(part, str) for part in pair)
+            and pair[1] == model_id
+        ):
+            out.append(value)
+    return out
+
 async def _push_model_via_effort_split(driver: Any, backend: str, model_id: str) -> str:
     """Apply a ``<model>[<effort>]`` id as two config-option writes.
 
@@ -7843,7 +7862,16 @@ class AcpClient:
         # Each push describes only itself; the split below sets it again.
         self.model_pin_partial = ""
         last_exc: AcpError | None = None
-        for cand in self._model_config_candidates(model_id):
+        candidates = self._model_config_candidates(model_id)
+        # A harness that advertises ["provider","model"] route pairs (DeepSeek)
+        # takes only the pair; a bare id naming one pair's model half -- a seat
+        # default or a spawn pin -- is that pair, not a different model.
+        candidates += [
+            pair
+            for pair in _route_pairs_for(model_id, self._advertised_model_ids())
+            if pair not in candidates
+        ]
+        for cand in candidates:
             try:
                 await self.set_config_option("model", cand)
             except AcpError as exc:

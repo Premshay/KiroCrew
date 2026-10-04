@@ -214,7 +214,8 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
         )}
         {(resolvedModel || requestedModel) && (() => {
           const resolvedKnown = !!resolvedModel
-          const displayModel = resolvedModel || requestedModel
+          // modelLabel: a DeepSeek ["provider","model"] pair must not reach the chip.
+          const displayModel = modelLabel(resolvedModel || requestedModel)
           // Requested-only (model not yet resolved): render a muted chip only
           // for the 'auto' sentinel. For a concrete pinned id, render nothing —
           // the chip appears once the model resolves. See ActivityViewer.tsx for

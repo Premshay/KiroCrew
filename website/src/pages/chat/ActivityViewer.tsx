@@ -263,7 +263,8 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
         {identity && <code className="text-[11px] text-muted/50 bg-bg-hover px-1.5 py-0.5 rounded shrink-[3] min-w-0 max-w-[6.5rem] truncate inline-block align-middle" title={identity}>{identity}</code>}
         {(() => {
           const resolvedKnown = !!a.model
-          const display = a.model || a.requestedModel || ''
+          // modelLabel: a DeepSeek ["provider","model"] pair must not reach the chip.
+          const display = modelLabel(a.model || a.requestedModel || '')
           if (!display) return null
           const liveDowngrade = resolvedKnown && isModelDowngrade(a.requestedModel ?? '', a.model!)
           // Requested-only (model not yet resolved): render a muted chip only

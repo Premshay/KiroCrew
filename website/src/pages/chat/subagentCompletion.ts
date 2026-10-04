@@ -23,7 +23,7 @@
  * markdown renderer) into a pure module.
  */
 import type { ChatMessage } from '../../types'
-import { normalizeModelKey } from '../../lib/model'
+import { modelLabel, normalizeModelKey } from '../../lib/model'
 import { canonicalKey } from '../../providers/modelRegistry'
 
 const SINGLE_PREFIX = '[Subagent completion event]'
@@ -109,8 +109,10 @@ const OUTCOME_BY_GLYPH: Record<string, SubagentOutcome> = {
  * served an unregistered id (or vice versa) is a genuine difference and flags.
  */
 export function isModelDowngrade(requestedModel: string, resolvedModel: string): boolean {
-  const req = requestedModel.trim()
-  const res = resolvedModel.trim()
+  // A pair-spelled served id (["deepseek-official","deepseek-v4-pro"]) names the
+  // same model as the bare id it was requested by; compare the model halves.
+  const req = modelLabel(requestedModel).trim()
+  const res = modelLabel(resolvedModel).trim()
   if (!req || !res) return false
   const reqKey = normalizeModelKey(req)
   // `normalizeModelKey` folds `auto`/`default` to `"auto"` — no pin, so nothing

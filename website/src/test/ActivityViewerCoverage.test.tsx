@@ -880,6 +880,25 @@ describe('ActivityViewer — panel behaviour', () => {
 // Live model-downgrade flag (#5326)
 // ---------------------------------------------------------------------------
 describe('ActivityViewer — live model downgrade flag (#5326)', () => {
+  it('names a DeepSeek route pair by its model, not the raw pair', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: '["deepseek-official","deepseek-v4-pro"]',
+            requestedModel: 'deepseek-v4-pro',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.textContent).toBe('deepseek-v4-pro')
+    expect(chip.className).not.toContain('text-warn')
+  })
+
   it('shows normal accent chip when requested model matches resolved', () => {
     renderPanel(
       <ActivityViewer
