@@ -134,6 +134,39 @@ async def test_unverified_member_runtime_is_refused_without_mutation(runtime_sta
 
 
 @pytest.mark.asyncio
+async def test_seat_declaring_member_capabilities_is_offered_and_accepted(
+    runtime_state, monkeypatch
+):
+    """A companion seat outside the ACP backends may declare member support; it is
+    then held to loaded_stamp at allocation like any other member backend."""
+    state, slot, reset = runtime_state
+    from kiro_crew.platform import context as platform_context
+
+    base_policy = platform_context.current_context().providers.agent_runtime_policy
+
+    def policy(name):
+        row = base_policy(name)
+        if name == "antigravity-engine":
+            row["member_capabilities"] = True
+        return row
+
+    monkeypatch.setattr(
+        "kiro_crew.platform.context.current_context",
+        lambda: SimpleNamespace(providers=SimpleNamespace(agent_runtime_policy=policy)),
+    )
+    async with TestClient(TestServer(runtime_app(state))) as client:
+        listed = await (await client.get(f"/api/chat/slots/{slot.key}/runtime")).json()
+        row = next(c for c in listed["choices"] if c["name"] == "antigravity")
+        assert (row["supported"], row["member_capable"]) == (True, True)
+        response = await client.post(
+            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "antigravity"}
+        )
+        assert response.status == 200, await response.text()
+    assert slot.runtime_agent == "antigravity"
+    reset.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_busy_member_refuses_switch(runtime_state):
     state, slot, reset = runtime_state
     slot.task = MagicMock()
