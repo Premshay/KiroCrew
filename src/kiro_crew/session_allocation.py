@@ -2658,6 +2658,16 @@ class SessionAllocationService:
             if memory_mode != "persistent":
                 resume_sid = None
             provider_switched = False
+            # Consumed unconditionally so a mark left by a switch that never
+            # reached a resumable allocation cannot fire on a later one.
+            seat_switched = owner._session_map.consume_seat_switch(key)
+            if resume_sid and seat_switched:
+                # Same backend label, different seat: resuming would keep the
+                # previous seat's model and launch environment.
+                self._deps.logger.info("Execution seat switch detected for %s", key)
+                resume_sid = None
+                provider_switched = True
+                owner._session_map.clear_sid(key)
             if resume_sid:
                 is_claude_now = self._deps.is_claude_provider(
                     provider

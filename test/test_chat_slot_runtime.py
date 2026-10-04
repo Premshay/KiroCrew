@@ -101,6 +101,19 @@ async def test_runtime_switch_preserves_member_store_history_and_project(runtime
     assert (slot.model, slot.reasoning_effort) == ("", "")
     assert slot._dirty
     reset.assert_awaited_once()
+    state.sessions._session_map.mark_seat_switch.assert_called_once_with(before[4])
+
+
+@pytest.mark.asyncio
+async def test_refused_switch_leaves_no_seat_switch_mark(runtime_state):
+    state, slot, reset = runtime_state
+    reset.side_effect = RuntimeError("pre-pop reset failure")
+    async with TestClient(TestServer(runtime_app(state))) as client:
+        response = await client.post(
+            f"/api/chat/slots/{slot.key}/runtime", json={"runtime_agent": "claude"}
+        )
+        assert response.status == 500
+    state.sessions._session_map.mark_seat_switch.assert_not_called()
 
 
 @pytest.mark.asyncio

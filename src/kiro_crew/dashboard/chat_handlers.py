@@ -5662,6 +5662,9 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "session changed during execution switch"}, status=409
             )
+        # The teardown alone resumes the stored conversation when the new seat
+        # shares the old one's backend label; mark it so allocation starts fresh.
+        state.sessions._session_map.mark_seat_switch(session_key)
         state.push_slots_update()
         response = {
             "ok": True,
