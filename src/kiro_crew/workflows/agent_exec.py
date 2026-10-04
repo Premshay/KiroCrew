@@ -205,6 +205,7 @@ def build_agent_fn(
                 prompt,
                 approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
                 max_turns=_MAX_TURNS_PER_STEP,
+                raise_on_tool_limit=True,
             )
             # ── Per-turn usage row: attribute workflow spend. ──
             # Best-effort analytics that must never break the workflow run — but

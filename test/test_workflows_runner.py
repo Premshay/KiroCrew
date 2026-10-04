@@ -77,6 +77,32 @@ async def test_busy_named_session_stops_continuation_loop() -> None:
     assert "Reconcile" in res.error
 
 
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_tool_limit_stops_schema_reasks_and_continuations(parallel) -> None:
+    from kiro_crew.llm_helpers import ToolCallLimitExceeded
+
+    calls = []
+
+    async def limited(prompt, opts):
+        calls.append(prompt)
+        raise ToolCallLimitExceeded("Tool-call limit exceeded; team state unknown")
+
+    call = "ctx.agent('go', session='team', schema={'type': 'object'})"
+    step = f"ctx.parallel([lambda: {call}])" if parallel else call
+    script = (
+        'META = {"name": "tool limit"}\n'
+        "async def workflow(ctx):\n"
+        f"    await {step}\n"
+        "    return {'done': True}\n"
+    )
+    res = await _runner(agent_fn=limited).run(script, run_id="wf_limited", now=NOW)
+    assert len(calls) == 1
+    assert not res.ok
+    assert res.result["reason"] == "tool_limit"
+    assert res.result["child_status"] == "unknown"
+    assert len(res.agent_errors) == 1
+
+
 async def test_invalid_params_without_busy_message_keeps_per_call_semantics() -> None:
     from kiro_crew.acp.transport_errors import AcpError
 

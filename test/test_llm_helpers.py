@@ -14,6 +14,7 @@ from kiro_crew.llm_helpers import (
     FallbackState,
     PromptBusyExhaustedError,
     ToolApprovalPolicy,
+    ToolCallLimitExceeded,
     first_advertised_fallback,
     next_fallback_candidate,
     parse_llm_json,
@@ -208,6 +209,21 @@ def _make_provider(events=None, error=None):
 
     provider.stream = _stream
     return provider
+
+
+@pytest.mark.asyncio
+async def test_tool_ceiling_can_fail_without_returning_partial_text():
+    provider = _make_provider(
+        events=[
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="still working"),
+            LLMEvent(kind=EVENT_TOOL_CALL, tool_call_id="one"),
+            LLMEvent(kind=EVENT_TOOL_CALL, tool_call_id="two"),
+        ]
+    )
+    with pytest.raises(ToolCallLimitExceeded, match="team state unknown"):
+        await stream_and_collect(provider, "go", max_turns=1, raise_on_tool_limit=True)
+    provider.cancel.assert_not_awaited()
+    provider.shutdown.assert_not_awaited()
 
 
 class TestStreamAndCollectPromptBusy:

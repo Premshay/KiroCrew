@@ -129,6 +129,11 @@ Its result declares `status: incomplete`, `reason: session_busy`, and
 `child_status: unknown`: rejection does not prove that the team stopped.
 Reconcile the outstanding prompt before starting a recovery run.
 
+Workflow steps also raise on the 200-tool collection ceiling instead of returning
+partial text to schema validation. The run records `reason: tool_limit` and
+`child_status: unknown`; schema re-asks and continuation retries stop. This ceiling
+does not establish provider or teammate completion and does not cancel them.
+
 A normal script return with top-level `status: incomplete` also ends as
 unsuccessful, preserving the returned result. Terminal snapshots expose
 `execution_status: ended` and `task_outcome: incomplete`; older persisted

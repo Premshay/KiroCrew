@@ -92,6 +92,7 @@ async def _run_step(provider: Any, prompt: str, *, timeout: Optional[float] = No
         prompt,
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         max_turns=_MAX_TURNS_PER_STEP,
+        raise_on_tool_limit=True,
     )
     text = await (asyncio.wait_for(coro, timeout) if timeout is not None else coro)
     return redact(text)
