@@ -34,6 +34,7 @@ def runtime_state(monkeypatch):
         "claude": KiroCrewAgentConfig(kiro_agent="claude-engine"),
         "codex": KiroCrewAgentConfig(kiro_agent="codex-engine"),
         "deepseek": KiroCrewAgentConfig(kiro_agent="deepseek-engine"),
+        "antigravity": KiroCrewAgentConfig(kiro_agent="antigravity-engine"),
     }
     monkeypatch.setattr(KiroCrewConfig, "load", lambda: cfg)
     monkeypatch.setattr(
@@ -48,6 +49,8 @@ def runtime_state(monkeypatch):
                         else "codex"
                         if name == "codex-engine"
                         else "deepseek"
+                        if name == "deepseek-engine"
+                        else "antigravity_headless"
                     ),
                     "priority": 0 if name == "claude-engine" else 1,
                 }
@@ -101,12 +104,11 @@ async def test_runtime_switch_preserves_member_store_history_and_project(runtime
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("selected", ["unknown", "deepseek", "codex"])
+@pytest.mark.parametrize("selected", ["unknown", "antigravity"])
 async def test_unverified_member_runtime_is_refused_without_mutation(runtime_state, selected):
-    # codex is here deliberately: it runs on the shared AcpRuntime path, which
-    # does not yet confirm a member projection, so it must be refused the same
-    # way an unknown or non-member backend is -- not offered and then killed on
-    # the first prompt with capability_runtime_unverified.
+    # antigravity is here deliberately: it has no way to confirm a member's saved
+    # spec, so it must be refused the same way an unknown backend is -- not offered
+    # and then killed on the first prompt with capability_runtime_unverified.
     state, slot, reset = runtime_state
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.post(
@@ -194,8 +196,8 @@ async def test_choices_show_projection_gap(runtime_state):
     async with TestClient(TestServer(runtime_app(state))) as client:
         response = await client.get(f"/api/chat/slots/{slot.key}/runtime")
         choices = (await response.json())["choices"]
-    assert [choice["name"] for choice in choices] == ["claude", "codex", "deepseek"]
-    assert [choice["supported"] for choice in choices] == [True, False, False]
+    assert [choice["name"] for choice in choices] == ["claude", "codex", "deepseek", "antigravity"]
+    assert [choice["supported"] for choice in choices] == [True, True, True, False]
 
 
 @pytest.mark.asyncio

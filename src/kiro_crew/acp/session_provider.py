@@ -103,6 +103,10 @@ class AcpSessionProvider(LLMProvider):
         # When True, shutdown() kills the runtime (parent session owns it).
         # When False, shutdown() only destroys the session handle (subagent).
         self._owns_runtime = owns_runtime
+        # Set only by confirm_member_projection, for a projecting (mirrored) backend.
+        # kiro-cli loads its member natively and answers from the handle instead.
+        self._confirmed_projection_template = ""
+        self._capability_projection_gaps: tuple[str, ...] = ()
         # This provider's LEASE on the runtime, or None when it holds none.
         #
         # The durable form of ``_owns_runtime``: that flag says "I may kill this
@@ -853,14 +857,46 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def loaded_capability_template(self) -> str:
-        if (
-            self._runtime.acp_backend == ACP_BACKEND_KIRO
-            and self._owns_runtime
-            and self._runtime.is_alive()
-            and self._handle.active_agent == self._runtime._agent
-        ):
-            return self._handle.active_agent
-        return ""
+        if not (self._owns_runtime and self._runtime.is_alive()):
+            return ""
+        if self._runtime.acp_backend == ACP_BACKEND_KIRO:
+            if self._handle.active_agent == self._runtime._agent:
+                return self._handle.active_agent
+            return ""
+        return self._confirmed_projection_template
+
+    @property
+    def capability_projection_gaps(self) -> tuple[str, ...]:
+        return self._capability_projection_gaps
+
+    def confirm_member_projection(self) -> None:
+        """Confirm a projecting backend consumed the member's saved spec. Blocking.
+
+        The shared-runtime counterpart of ``AcpClient._confirm_member_projection``:
+        judged on the spec the session's array was built from (recorded on the
+        handle by the runtime), never on a re-read of the file after startup. kiro-cli
+        loads its member natively, so it needs no confirmation here.
+        """
+        if self._runtime.acp_backend == ACP_BACKEND_KIRO:
+            return
+        from kiro_crew import agent_state
+        from kiro_crew.agent_capabilities import consumed_spec_matches, projection_gaps
+
+        template = self._runtime._agent
+        try:
+            intent = agent_state.get_capabilities(template)
+        except (OSError, ValueError) as exc:
+            raise AcpError("capability_state_unreadable: cannot verify saved spec") from exc
+        if intent is None:
+            return
+        spec = self._handle.consumed_agent_spec
+        if not consumed_spec_matches(spec, intent):
+            raise AcpError(
+                "capability_runtime_unverified: saved spec projection was withheld or changed"
+            )
+        assert spec is not None
+        self._capability_projection_gaps = projection_gaps(spec)
+        self._confirmed_projection_template = template
 
     @property
     def exit_code(self) -> int | None:

@@ -20,6 +20,7 @@ from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     EVENT_MCP_OAUTH_REQUEST,
@@ -1132,17 +1133,68 @@ async def test_saved_projection_requires_consumed_matching_spec(
     assert provider.loaded_capability_template == ""
 
 
-@pytest.mark.asyncio
-async def test_codex_member_capabilities_not_advertised_without_runtime_confirmation():
-    """Codex runs on the shared AcpRuntime path, whose AcpSessionProvider reports a
-    loaded template only for kiro-cli and performs no member-projection confirmation,
-    so an enrolled member session on it dies in loaded_stamp() with
-    capability_runtime_unverified. Until that path is ported, codex must stay out of
-    the advertised member-capable set: the dashboard greys it out instead of offering
-    a seat that starts and then fails on its first prompt. The one-process-per-session
-    AcpClient path (claude) is exercised by the test above and does confirm."""
-    assert ACP_BACKEND_CLAUDE in ACP_BACKENDS_MEMBER_CAPABILITIES
-    assert ACP_BACKEND_CODEX not in ACP_BACKENDS_MEMBER_CAPABILITIES
+def _codex_session_provider(template: str, consumed_spec, *, alive: bool = True):
+    """An AcpSessionProvider on a codex runtime, with the spec its array consumed."""
+    from kiro_crew.acp.session_provider import AcpSessionProvider
+
+    runtime = MagicMock()
+    runtime.acp_backend = ACP_BACKEND_CODEX
+    runtime._agent = template
+    runtime.is_alive.return_value = alive
+    handle = MagicMock()
+    handle.consumed_agent_spec = consumed_spec
+    return AcpSessionProvider(handle, runtime, owns_runtime=True)
+
+
+def test_codex_member_loaded_only_after_consumed_spec_confirms(monkeypatch):
+    """Codex runs on the shared AcpRuntime path. Its member session reports a loaded
+    template only once the spec its session array was built from matches the saved
+    intent; before confirmation it reports none, so loaded_stamp() refuses."""
+    from kiro_crew.agent_capabilities import _digest
+
+    spec = {"name": "saved-member", "tools": ["*"], "hooks": {"x": 1}}
+    monkeypatch.setattr(agent_state, "get_capabilities", lambda _: {"materialized": _digest(spec)})
+    provider = _codex_session_provider("saved-member", spec)
+    assert ACP_BACKEND_CODEX in ACP_BACKENDS_MEMBER_CAPABILITIES
+    assert provider.loaded_capability_template == ""
+    provider.confirm_member_projection()
+    assert provider.loaded_capability_template == "saved-member"
+    assert provider.capability_projection_gaps == ("hooks",)
+
+
+@pytest.mark.parametrize("consumed", [None, {"name": "saved-member", "tools": []}])
+def test_codex_member_refused_when_consumed_spec_differs(monkeypatch, consumed):
+    """No consumed spec (array not built from a mirror) or a different one (the file
+    changed after the intent was saved) both refuse: the session never reports the
+    saved template, so the member cannot be claimed as running on codex."""
+    from kiro_crew.acp.client import AcpError
+    from kiro_crew.agent_capabilities import _digest
+
+    saved = {"name": "saved-member", "tools": ["*"]}
+    monkeypatch.setattr(agent_state, "get_capabilities", lambda _: {"materialized": _digest(saved)})
+    provider = _codex_session_provider("saved-member", consumed)
+    with pytest.raises(AcpError, match="capability_runtime_unverified"):
+        provider.confirm_member_projection()
+    assert provider.loaded_capability_template == ""
+
+
+def test_codex_member_template_not_reported_from_dead_runtime(monkeypatch):
+    from kiro_crew.agent_capabilities import _digest
+
+    spec = {"name": "saved-member", "tools": ["*"]}
+    monkeypatch.setattr(agent_state, "get_capabilities", lambda _: {"materialized": _digest(spec)})
+    provider = _codex_session_provider("saved-member", spec, alive=False)
+    provider.confirm_member_projection()
+    assert provider.loaded_capability_template == ""
+
+
+def test_deepseek_member_spec_reaches_its_session_array():
+    """deepseek confirms on the AcpClient path like claude, which needs a mirror that
+    carries the spec it parsed; without one there is nothing to confirm."""
+    from kiro_crew.providers.mirrors.registry import has_mirror
+
+    assert has_mirror(ACP_BACKEND_DEEPSEEK)
+    assert ACP_BACKEND_DEEPSEEK in ACP_BACKENDS_MEMBER_CAPABILITIES
 
 
 @pytest.mark.asyncio

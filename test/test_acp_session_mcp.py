@@ -739,10 +739,10 @@ class TestClientSeam:
         assert "foo" in _by_name(client._session_mcp_servers())
 
     def test_a_broker_only_backend_is_not_withheld(self, tmp_path, agents_dir, monkeypatch):
-        """``no mirror`` is not ``refused``: a BROKER_ONLY backend still gets Crew's servers.
+        """``no mirror`` is not ``refused``: a session-array backend still gets Crew's servers.
 
-        deepseek declares a real channel and no spec translation, so the withheld
-        verdict must not drop the shared broker append. Dropping it left every
+        deepseek was BROKER_ONLY when this was written (it is mirrored now), so the
+        withheld verdict must not drop Crew's servers. Dropping it left every
         deepseek session with none of Crew's tools, observed live 2026-09-17: no
         broker stub process under the harness and no Crew tool on the session.
         """
@@ -760,20 +760,19 @@ class TestClientSeam:
         assert "foo" not in names
 
     @pytest.mark.parametrize("pooled", [False, True])
-    def test_broker_only_backend_prefers_broker_over_direct_capabilities(
-        self, tmp_path, agents_dir, monkeypatch, pooled
-    ):
+    def test_deepseek_mirror_keeps_crew_servers(self, tmp_path, agents_dir, monkeypatch, pooled):
+        """deepseek is MIRRORED now, so the mirror places Crew's servers itself, as it
+        does for goose and opencode, rather than the BROKER_ONLY shared append. What
+        must survive the move is that a deepseek session still carries them."""
         _write_spec(agents_dir, servers={}, tools=[])
         client = AcpClient(
             work_dir=tmp_path, agent="crew-deepseek", acp_backend=ACP_BACKEND_DEEPSEEK
         )
         names = ("kirocrew-core", "kirocrew-cron")
-        direct = [{"name": name, "command": "/direct"} for name in names]
         broker = [{"name": name, "command": "/broker"} for name in names]
         monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: broker if pooled else [])
-        monkeypatch.setattr(client, "_session_capability_mcp_servers", lambda: direct)
 
-        assert client._session_mcp_servers() == (broker if pooled else direct)
+        assert set(names) <= set(_by_name(client._session_mcp_servers()))
 
     def test_the_seam_hands_down_the_pooled_stub_names(self, tmp_path, agents_dir, monkeypatch):
         # The client owns the overlay, so it is the only layer that can answer

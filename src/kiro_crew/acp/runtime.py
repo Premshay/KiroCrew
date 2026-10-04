@@ -949,6 +949,9 @@ class _MirroredSessionMcp(NamedTuple):
     it costs session start no scheduling point of its own (H13). ``None`` when the
     spec is unreadable, which the guard treats as nothing to say.
     """
+    agent_spec: Any = None
+    """The parsed spec the array was built from. A member session's loaded-check
+    compares THIS, never a later read of the file, against its saved intent."""
 
 
 def _point_private_state_at_scratch(
@@ -6571,6 +6574,7 @@ class AcpRuntime:
             stub_token=stub_token,
             derived_spec_snapshot=projection.derived_spec_snapshot,
             ref_spec=ref_spec,
+            agent_spec=projection.agent_spec,
         )
 
     def _mirrored_spec_check_needed(self, snapshot: Any) -> bool:
@@ -6810,6 +6814,7 @@ class AcpRuntime:
         session_work_dir = await self._session_work_dir(cwd)
         denied_tools: frozenset[tuple[str, str]] = frozenset()
         mirrored_snapshot: Any = None
+        consumed_spec: Any = None
         ref_spec: Any = None
         if mcp_servers is None:
             # A mirrored host takes its whole array from the mirror; every other host
@@ -6831,6 +6836,7 @@ class AcpRuntime:
                 stub_token = mirrored.stub_token
                 denied_tools = mirrored.denied_tools
                 mirrored_snapshot = mirrored.derived_spec_snapshot
+                consumed_spec = mirrored.agent_spec
                 ref_spec = mirrored.ref_spec
             else:
                 pooled, ref_spec = await asyncio.to_thread(
@@ -7047,6 +7053,7 @@ class AcpRuntime:
                 stub_token=stub_token,
                 denied_tools=denied_tools,
                 mirrored_snapshot=mirrored_snapshot,
+                consumed_spec=consumed_spec,
                 ref_spec=ref_spec,
                 active_agent=active_agent,
                 session_work_dir=session_work_dir,
@@ -7079,6 +7086,7 @@ class AcpRuntime:
             stub_token=stub_token,
             denied_tools=denied_tools,
             mirrored_snapshot=mirrored_snapshot,
+            consumed_spec=consumed_spec,
             ref_spec=ref_spec,
             active_agent=active_agent,
             session_work_dir=session_work_dir,
@@ -7100,6 +7108,7 @@ class AcpRuntime:
         stub_token: str,
         denied_tools: frozenset[tuple[str, str]],
         mirrored_snapshot: Any,
+        consumed_spec: Any,
         ref_spec: Any,
         active_agent: str,
         session_work_dir: str | Path,
@@ -7184,6 +7193,7 @@ class AcpRuntime:
                     stub_token=stub_token,
                     denied_tools=denied_tools,
                     mirrored_snapshot=mirrored_snapshot,
+                    consumed_spec=consumed_spec,
                     ref_spec=ref_spec,
                     active_agent=active_agent,
                     session_work_dir=session_work_dir,
@@ -7280,6 +7290,7 @@ class AcpRuntime:
         stub_token: str,
         denied_tools: frozenset[tuple[str, str]],
         mirrored_snapshot: Any,
+        consumed_spec: Any,
         ref_spec: Any,
         active_agent: str,
         session_work_dir: str | Path,
@@ -7324,6 +7335,8 @@ class AcpRuntime:
         # session's permission requests. Empty for a host with no mirror and for a
         # caller-supplied array, and the handle's check is a no-op on empty.
         handle.spec_denied_tools = denied_tools
+        # The spec the array was built from, for a member session's loaded-check.
+        handle.consumed_agent_spec = consumed_spec
         # What the registered agent batch grants, recorded by the harness that
         # registered one; a host that took its agent at spawn time records nothing.
         self._harness.record_session_projection(handle, kas_agents, active_agent)
@@ -7705,6 +7718,7 @@ class AcpRuntime:
         session_work_dir = str(await self._session_work_dir(cwd))
         denied_tools: frozenset[tuple[str, str]] = frozenset()
         mirrored_snapshot: Any = None
+        consumed_spec: Any = None
         ref_spec: Any = None
         # A mirrored host re-declares the array its projection built, not the raw
         # pooled one: session/load re-initializes the session's servers, so an
@@ -7729,6 +7743,7 @@ class AcpRuntime:
             stub_token = mirrored.stub_token
             denied_tools = mirrored.denied_tools
             mirrored_snapshot = mirrored.derived_spec_snapshot
+            consumed_spec = mirrored.agent_spec
             ref_spec = mirrored.ref_spec
         else:
             pooled, ref_spec = await asyncio.to_thread(
@@ -7921,6 +7936,7 @@ class AcpRuntime:
         # Mirrors create_session: the resumed session re-declares the array, so it
         # re-derives the deny set that array came with and re-checks the generation.
         handle.spec_denied_tools = denied_tools
+        handle.consumed_agent_spec = consumed_spec
         # Mirrors create_session: the re-registered batch is what this session now
         # runs.
         self._harness.record_session_projection(handle, kas_agents, active_agent)

@@ -1293,6 +1293,10 @@ class AcpSessionHandle:
         # ``_deny_spec_disabled_tool`` a single falsy read on those sessions.
         # Mirrors ``AcpClient._spec_denied_tools``.
         self.spec_denied_tools: frozenset[tuple[str, str]] = frozenset()
+        # The parsed agent spec this session's mirrored array was built from, set by
+        # the runtime from the same projection. None on a host with no mirror. A
+        # member session's loaded-check reads this, never a re-read of the file.
+        self.consumed_agent_spec: dict[str, Any] | None = None
         # The capabilities the agent batch this session registered auto-approves
         # (see ``kas_agents.projected_auto_approved``); None when no batch was sent.
         self.kas_auto_approved: frozenset[str] | None = None
