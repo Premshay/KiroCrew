@@ -18,6 +18,8 @@ from dashboard_owner_helpers import as_owner
 from kiro_crew import agent, agent_discovery, agent_state
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     EVENT_MCP_OAUTH_REQUEST,
@@ -1041,11 +1043,10 @@ async def test_execution_override_reaches_allocation_without_member_model(world)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("backend", ["claude", "codex"])
 @pytest.mark.parametrize("resume", [False, True])
 @pytest.mark.parametrize("fault", [None, "withheld", "changed", "wire", "state"])
 async def test_saved_projection_requires_consumed_matching_spec(
-    world, monkeypatch, resume, fault, backend
+    world, monkeypatch, resume, fault
 ):
     from kiro_crew.acp.client import AcpError
     from kiro_crew.providers.acp import AcpProvider
@@ -1054,7 +1055,7 @@ async def test_saved_projection_requires_consumed_matching_spec(
     service, cfg, _, _, project, _, _ = world
     await asyncio.to_thread(save, service, enroll=True)
     prepared = await asyncio.to_thread(prepare_runtime, "A", "A", str(project))
-    provider = AcpProvider(work_dir=project, agent=prepared.template, acp_backend=backend)
+    provider = AcpProvider(work_dir=project, agent=prepared.template, acp_backend=ACP_BACKEND_CLAUDE)
     client = provider.client
     client.member_context = True
     client._process = MagicMock(returncode=None)
@@ -1129,6 +1130,19 @@ async def test_saved_projection_requires_consumed_matching_spec(
     client._process.returncode = None
     client._invalidate_session_mcp_projection()
     assert provider.loaded_capability_template == ""
+
+
+@pytest.mark.asyncio
+async def test_codex_member_capabilities_not_advertised_without_runtime_confirmation():
+    """Codex runs on the shared AcpRuntime path, whose AcpSessionProvider reports a
+    loaded template only for kiro-cli and performs no member-projection confirmation,
+    so an enrolled member session on it dies in loaded_stamp() with
+    capability_runtime_unverified. Until that path is ported, codex must stay out of
+    the advertised member-capable set: the dashboard greys it out instead of offering
+    a seat that starts and then fails on its first prompt. The one-process-per-session
+    AcpClient path (claude) is exercised by the test above and does confirm."""
+    assert ACP_BACKEND_CLAUDE in ACP_BACKENDS_MEMBER_CAPABILITIES
+    assert ACP_BACKEND_CODEX not in ACP_BACKENDS_MEMBER_CAPABILITIES
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,9 @@ export function createChatSlotSettingsEndpoints({ post, j }: ClientTransport) {
     chatSlotRuntimes: (slot: string) =>
       fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/runtime').then(j) as Promise<{
         runtime_agent: string
+        /** The seat the conversation already runs on when `runtime_agent` is
+         *  unset, so the picker shows the backend in force instead of "Default". */
+        effective_runtime_agent: string
         choices: { name: string; label: string; supported: boolean; reason: string }[]
       }>,
     chatSlotRuntime: (slot: string, runtime_agent: string) =>

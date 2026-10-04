@@ -835,12 +835,20 @@ ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
 # Backends that can verify an enrolled member's saved spec at spawn.
 # Separate from session sharing and per-session dispatch (harness-parity H6):
 # support for either does not establish saved-spec loading. Only kiro-cli has
-# demonstrated native loading. Claude and Codex prove consumption of their saved
-# projections; unrepresented fields keep their runtime views unverified. They require a live
-# dedicated runtime before reporting a saved template.
-ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset(
-    {ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX}
-)
+# demonstrated native loading. Claude proves consumption of its saved projection
+# on the one-process-per-session AcpClient path; unrepresented fields keep its
+# runtime view unverified, and it requires a live dedicated runtime before
+# reporting a saved template.
+#
+# Codex is deliberately NOT here yet. Codex runs on the shared AcpRuntime path
+# (ACP_BACKENDS_ACP_RUNTIME), whose AcpSessionProvider reports a loaded template
+# only for kiro-cli and performs no projection confirmation at all, so a codex
+# member session fails loaded_stamp() with capability_runtime_unverified. The
+# mirror already builds the projected array (codex_projection carries agent_spec
+# for it), so the missing piece is the confirmation and the loaded-template
+# report on the runtime path -- not the delivery. Advertising it before that
+# lands offered a seat that started and then died on its first prompt.
+ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE})
 
 # Backends that can mount a DIFFERENT MCP tool set on one session than the
 # on-disk agent template declares — the capability crew-member dispatch rides

@@ -5462,6 +5462,14 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
         for alias, binding in cfg.agents.items():
             if binding.member_id:
                 continue
+            # Internal roles are not operator execution seats: kirocrew-* are the
+            # gateway's own background agents, code-review-sage-reviewer is the
+            # review pool's identity, and mochi* are app seats. Listing them let
+            # a task-specific engine (the knowledge-extraction Codex seat) be
+            # chosen and labelled as the vendor, so the picker offered a seat
+            # whose model was never the operator's intent.
+            if alias.startswith(("kirocrew-", "mochi")) or alias == "code-review-sage-reviewer":
+                continue
             policy = getter(binding.kiro_agent or alias)
             if not isinstance(policy, dict) or not policy.get("engine"):
                 continue
@@ -5476,19 +5484,39 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
                 {
                     "name": alias,
                     "label": policy.get("runtime") or engine,
+                    "engine": engine,
                     "supported": supported,
                     "priority": policy.get("priority", 5),
                     "backend": policy.get("backend"),
-                    "reason": (
-                        ""
-                        if supported
-                        else "Saved member capabilities are not verified on this runtime"
-                    ),
+                    "reason": "" if supported else "member capabilities not verified here",
                 }
             )
     choices.sort(key=lambda row: row["priority"])
+    # The seat the conversation already runs on, so an unset runtime_agent reads
+    # as the backend in force rather than a bare "Default". Resolved through the
+    # same policy getter as the choices above, so a private engine copy inherits
+    # its parent's engine exactly as allocation does.
+    effective_runtime_agent = ""
+    if callable(getter) and slot.agent:
+        slot_binding = cfg.agents.get(slot.agent)
+        for lookup in (slot.agent, getattr(slot_binding, "kiro_agent", "") or ""):
+            if not lookup:
+                continue
+            policy = getter(lookup)
+            if isinstance(policy, dict) and policy.get("engine"):
+                for row in choices:
+                    if row["engine"] == policy["engine"]:
+                        effective_runtime_agent = row["name"]
+                        break
+                break
     if request.method == "GET":
-        return web.json_response({"runtime_agent": slot.runtime_agent, "choices": choices})
+        return web.json_response(
+            {
+                "runtime_agent": slot.runtime_agent,
+                "effective_runtime_agent": effective_runtime_agent,
+                "choices": choices,
+            }
+        )
     body, error = await read_bounded_json(request)
     if error is not None:
         return error
@@ -5579,20 +5607,57 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
         for other in siblings:
             for field, value in updates.items():
                 setattr(other, field, value.copy() if isinstance(value, list) else value)
-        try:
-            reset = await _reset_slot_session_or_warn(
-                state, slot, session_key, switch_kind="runtime"
-            )
-        except asyncio.CancelledError:
-            if provider is not None and state.sessions.get_provider(session_key) is provider:
+        async def attempt_teardown() -> bool | None:
+            """One teardown attempt, sharing the raise handling with the retry."""
+            try:
+                return await _reset_slot_session_or_warn(
+                    state, slot, session_key, switch_kind="runtime"
+                )
+            except asyncio.CancelledError:
+                if provider is not None and state.sessions.get_provider(session_key) is provider:
+                    rollback()
+                else:
+                    state.push_slots_update()
+                raise
+            except Exception:
                 rollback()
-            else:
-                state.push_slots_update()
-            raise
-        except Exception:
-            rollback()
-            raise
-        if reset is False or effective_session_key(slot) != session_key:
+                raise
+
+        teardown_incomplete = False
+        reset = await attempt_teardown()
+        if reset is None:
+            # Teardown raised after the session pop: the switch is committed, so
+            # answer the committed state with an advisory warning.
+            teardown_incomplete = True
+        elif not reset:
+            # A False verdict is ambiguous: a turn slipped into the window
+            # between the fast-path probe and the atomic pop, or there was no
+            # live session to tear down at all. Disambiguate fail-closed on the
+            # live provider, exactly as the model/effort switch handlers do --
+            # with no registered provider the next message cold-starts on the
+            # selected seat, which is what the reset would have arranged.
+            busy_provider = state.sessions.get_provider(session_key)
+            if isinstance(busy_provider, LLMProvider):
+                if busy_provider.has_active_turn():
+                    rollback()
+                    return web.json_response(
+                        {"error": "a turn is in flight", "code": "turn_in_flight"},
+                        status=409,
+                    )
+                # A live IDLE session declined (its turn ended before this
+                # re-read). Tearing down an idle session is safe -- history
+                # lives on the slot, not the process -- so retry once; a
+                # second decline means a turn is genuinely racing.
+                reset = await attempt_teardown()
+                if reset is None:
+                    teardown_incomplete = True
+                elif not reset:
+                    rollback()
+                    return web.json_response(
+                        {"error": "a turn is in flight", "code": "turn_in_flight"},
+                        status=409,
+                    )
+        if effective_session_key(slot) != session_key:
             rollback()
             return web.json_response(
                 {"error": "session changed during execution switch"}, status=409
@@ -5605,7 +5670,7 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
             "reasoning_effort": "",
             "served_model": "",
         }
-        if reset is None:
+        if teardown_incomplete:
             response["warning"] = _TEARDOWN_INCOMPLETE_WARNING
         return web.json_response(response)
 

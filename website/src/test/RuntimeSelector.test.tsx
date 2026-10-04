@@ -17,6 +17,7 @@ function mount(running = false) {
 
 const choices = {
   runtime_agent: '',
+  effective_runtime_agent: '',
   choices: [
     { name: 'codex', label: 'Codex', supported: true, reason: '' },
     { name: 'deepseek', label: 'DeepSeek', supported: false, reason: 'Capabilities unverified' },
@@ -35,6 +36,14 @@ describe('RuntimeSelector', () => {
     fireEvent.click(await screen.findByRole('option', { name: 'Codex' }))
     await waitFor(() => expect(runtime).toHaveBeenCalledWith('vernier', 'codex'))
     expect(identity).not.toHaveBeenCalled()
+  })
+
+  it('shows the backend already in force instead of a bare Default', async () => {
+    // An unset runtime_agent is not "no backend": the conversation runs on the
+    // seat its agent is configured for, and the picker must say which.
+    vi.spyOn(api, 'chatSlotRuntimes').mockResolvedValue({ ...choices, effective_runtime_agent: 'codex' })
+    mount()
+    await waitFor(() => expect(screen.getByRole('combobox')).toHaveTextContent('Codex'))
   })
 
   it('disables switching during a turn', async () => {
