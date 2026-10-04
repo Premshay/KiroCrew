@@ -468,6 +468,56 @@ async def test_startup_failure_never_applies_and_real_retry_works(world, fault):
         await manager.close_all(drain_timeout=0)
 
 
+class PerTurnProvider(FakeProvider):
+    """A per-turn harness: no native session at start, one learned on the first turn."""
+
+    async def start(self):
+        await super().start()
+        self.sid = ""
+
+    @property
+    def capability_binds_to_instance(self):
+        return True
+
+
+@pytest.mark.asyncio
+async def test_per_turn_provider_stamp_binds_to_instance_not_session(world):
+    service, cfg, factory, _, project, _, _ = world
+    await asyncio.to_thread(save, service, enroll=True)
+
+    def per_turn_factory(key, **kwargs):
+        provider = factory(key, **kwargs)
+        provider.__class__ = PerTurnProvider
+        return provider
+
+    manager = SessionManager(cfg, provider_factory=per_turn_factory)
+    try:
+        provider, _, _ = await manager.get_or_create("dashboard:A", agent="A", cwd=str(project))
+        prepared = await asyncio.to_thread(prepare_member_capabilities, "A", project)
+        stamp = manager._sessions["dashboard:A"].loaded_capabilities
+        assert stamp is not None and stamp.session_id == provider.incarnation
+        assert manager.capability_runtime_view("A", prepared["revision"])["status"] == "applied"
+        # The conversation id arrives with the first turn; the stamp still holds.
+        provider.sid = "conversation-from-first-turn"
+        assert manager.capability_runtime_view("A", prepared["revision"])["status"] == "applied"
+        # A new instance token is a different runtime.
+        provider.incarnation = "replacement-instance"
+        assert manager.capability_runtime_view("A", prepared["revision"])["status"] == "unverified"
+        manager.release("dashboard:A")
+    finally:
+        await manager.close_all(drain_timeout=0)
+
+
+def test_session_bound_provider_without_session_id_is_unverified(world):
+    from kiro_crew.session_capabilities import loaded_stamp
+
+    provider = FakeProvider("dashboard:A", "t", "/w", None)
+    provider.active, provider.incarnation, provider.sid = "t", "proc", ""
+    prepared = SimpleNamespace(template="t", governance_generation=None)
+    with pytest.raises(CapabilityStartupError, match="capability_runtime_unverified"):
+        loaded_stamp(provider, prepared)
+
+
 @pytest.mark.asyncio
 async def test_runtime_status_tracks_process_and_handle_identity(world):
     service, cfg, factory, made, project, _, _ = world

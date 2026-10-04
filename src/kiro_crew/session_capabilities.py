@@ -103,6 +103,18 @@ def verify_saved(prepared: CapabilityPreparation, cwd: str) -> None:
         raise CapabilityStartupError("capability_startup_raced")
 
 
+def _capability_session(provider: Any) -> str:
+    """The session identity a capability stamp binds to.
+
+    The native session id, except for a provider that declares its stamp binds to
+    the provider instance (``capability_binds_to_instance``): a per-turn process has
+    no session id at verification time, so its per-instance token stands in.
+    """
+    if provider.capability_binds_to_instance is True:
+        return provider.process_instance
+    return provider.session_id
+
+
 def loaded_stamp(provider: Any, prepared: CapabilityPreparation) -> LoadedCapabilities:
     """Require native activation or a verified projection on a fresh process."""
 
@@ -110,7 +122,7 @@ def loaded_stamp(provider: Any, prepared: CapabilityPreparation) -> LoadedCapabi
         provider.member_capabilities_supported is not True
         or provider.loaded_capability_template != prepared.template
         or not provider.process_instance
-        or not provider.session_id
+        or not _capability_session(provider)
         or not provider.is_process_alive()
         or governance_answer_generation() != prepared.governance_generation
     ):
@@ -120,7 +132,7 @@ def loaded_stamp(provider: Any, prepared: CapabilityPreparation) -> LoadedCapabi
         prepared.template,
         prepared.revision,
         provider.process_instance,
-        provider.session_id,
+        _capability_session(provider),
         prepared.governance_generation,
         prepared.mcp_servers,
     )
@@ -142,7 +154,7 @@ def runtime_view(state: SessionRegistryState, member: str, saved_revision: str) 
             if (
                 provider.is_process_alive()
                 and provider.process_instance == stamp.process_instance
-                and provider.session_id == stamp.session_id
+                and _capability_session(provider) == stamp.session_id
                 and provider.loaded_capability_template == stamp.template
                 and governance_answer_generation() == stamp.governance_generation
             ):

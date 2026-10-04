@@ -414,6 +414,20 @@ class LLMProvider(ABC):
         return ""
 
     @property
+    def capability_binds_to_instance(self) -> bool:
+        """Whether a capability stamp binds to this provider rather than a native session.
+
+        False for every provider that holds a live process and a native session from
+        start(). True only for a provider that starts a process per turn and learns
+        its conversation id from the first turn: it has no session id at verification
+        time, and the id it learns later would read as a different session. Such a
+        provider confirms the spec once in start() for the overlay every turn reuses,
+        and mints a per-instance ``process_instance`` token there; the stamp binds to
+        that token in place of the session id.
+        """
+        return False
+
+    @property
     def capability_projection_gaps(self) -> tuple[str, ...]:
         """Saved fields this runtime cannot demonstrate applying."""
         return ()

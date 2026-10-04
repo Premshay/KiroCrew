@@ -5477,9 +5477,13 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
             if engine in seen:
                 continue
             seen.add(engine)
-            supported = (
-                not member_bound or policy.get("backend") in ACP_BACKENDS_MEMBER_CAPABILITIES
+            # A seat outside the ACP backends (a companion provider) declares its
+            # own support; it is held to the same loaded_stamp at allocation.
+            member_capable = (
+                policy.get("backend") in ACP_BACKENDS_MEMBER_CAPABILITIES
+                or policy.get("member_capabilities") is True
             )
+            supported = not member_bound or member_capable
             choices.append(
                 {
                     "name": alias,
@@ -5488,6 +5492,7 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
                     "supported": supported,
                     "priority": policy.get("priority", 5),
                     "backend": policy.get("backend"),
+                    "member_capable": member_capable,
                     "reason": "" if supported else "member capabilities not verified here",
                 }
             )
@@ -5538,7 +5543,7 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
         member = cfg.agents.get(slot.agent)
         if selected and (slot.mode == members_mod.DM_SLOT_MODE or (member and member.member_id)):
             selected_row = next(row for row in choices if row["name"] == selected)
-            if selected_row["backend"] not in ACP_BACKENDS_MEMBER_CAPABILITIES:
+            if not selected_row["member_capable"]:
                 return web.json_response(
                     {"error": "Saved member capabilities are not verified on this runtime"},
                     status=409,
