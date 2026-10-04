@@ -2505,6 +2505,32 @@ class TestAModelPiCannotSelectLeavesTheSessionOnItsDefault:
             asyncio.run(client._push_model_config_option("ollama/gone-model", strict=False))
         assert not isinstance(raised.value, acp_client.AcpModelUnavailable)
 
+    def test_a_bare_id_applies_as_its_advertised_route_pair(self, tmp_path, monkeypatch):
+        """DeepSeek takes only ["provider","model"]; a bare seat or spawn pin naming a
+        pair's model half is that pair, not a refused model left on the default."""
+        client = acp_client.AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_DEEPSEEK)
+        client._session_id = "dsh-sess"
+        flash = '["deepseek-official","deepseek-flash"]'
+        pro = '["deepseek-official","deepseek-v4-pro"]'
+        client._acp_config_options = [
+            {"id": "model", "options": [{"value": flash}, {"value": pro}]}
+        ]
+        sent: list[str] = []
+
+        async def only_pairs(config_id: str, value: str) -> None:
+            sent.append(value)
+            if value not in (flash, pro):
+                raise acp_client.AcpError("Invalid params", code=-32602)
+
+        monkeypatch.setattr(client, "set_config_option", only_pairs)
+
+        assert asyncio.run(client._push_model_config_option("deepseek-v4-pro", strict=True)) == pro
+        assert sent == ["deepseek-v4-pro", pro]
+        sent.clear()
+        # A bare id no pair carries is still refused, never folded onto another model.
+        assert asyncio.run(client._push_model_config_option("deepseek-v9", strict=False)) == ""
+        assert pro not in sent and flash not in sent
+
     def test_the_phrase_is_read_only_for_the_model_option(self):
         exc = acp_client.AcpError(_PI_MODEL_NOT_FOUND, code=-32603)
 

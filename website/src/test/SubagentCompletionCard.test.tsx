@@ -609,6 +609,12 @@ describe('model provenance on the completion card (#3582)', () => {
 })
 
 describe('isModelDowngrade / normalizeModelId (GPT review on #3582)', () => {
+  it('reads a DeepSeek route pair by its model half', () => {
+    // dsh serves ["provider","model"]; the bare id it was requested by is the same model.
+    expect(isModelDowngrade('deepseek-v4-pro', '["deepseek-official","deepseek-v4-pro"]')).toBe(false)
+    expect(isModelDowngrade('deepseek-v4-pro', '["deepseek-official","deepseek-flash"]')).toBe(true)
+  })
+
   it('does not flag a pin vs its provider-prefixed canonical served id', () => {
     // The false positive the reviews caught: a config pin (dotted
     // `claude-opus-4.8`) and the id the adapter serves for the SAME registry
