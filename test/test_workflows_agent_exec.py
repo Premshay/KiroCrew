@@ -22,6 +22,7 @@ import pytest
 
 import kiro_crew.workflows.agent_exec as agent_exec
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.llm_helpers import ToolCallLimitExceeded, TurnNotCompleted
 from kiro_crew.workflows.agent_exec import build_agent_fn
 
 pytestmark = pytest.mark.asyncio
@@ -68,6 +69,7 @@ async def test_step_tool_allowance_reaches_collector(monkeypatch, limit):
     assert await fn("audit", {"max_tool_calls": limit}) == "done"
     assert collector.await_args.kwargs["max_turns"] == limit
     assert collector.await_args.kwargs["raise_on_tool_limit"] is True
+    assert collector.await_args.kwargs["raise_on_incomplete"] is True
 
 
 @pytest.mark.parametrize("limit", [0, -1, 2001, True, None, 200.5, "1000"])
@@ -121,8 +123,13 @@ async def test_named_session_is_reused_and_lease_released() -> None:
 
 @pytest.mark.parametrize("named", [None, "chain-A"])
 @pytest.mark.parametrize("release_fails", [False, True])
-async def test_tool_limit_retires_session_before_returning_failure(
-    monkeypatch, named, release_fails
+@pytest.mark.parametrize(
+    "failure",
+    [ToolCallLimitExceeded("tool limit"), TurnNotCompleted("cancelled", "")],
+    ids=["tool_limit", "turn_not_completed"],
+)
+async def test_incomplete_step_retires_session_before_returning_failure(
+    monkeypatch, named, release_fails, failure
 ) -> None:
     sessions = FakeSessions()
     sessions.destroy = AsyncMock()
@@ -130,11 +137,11 @@ async def test_tool_limit_retires_session_before_returning_failure(
         sessions.release = MagicMock(side_effect=RuntimeError("lease failure"))
 
     async def limited_stream(*args, **kwargs):
-        raise agent_exec.ToolCallLimitExceeded("tool limit")
+        raise failure
 
     monkeypatch.setattr(agent_exec, "stream_and_collect", limited_stream)
     fn = build_agent_fn(sessions, run_id="wf_limit")
-    with pytest.raises(agent_exec.ToolCallLimitExceeded):
+    with pytest.raises(type(failure)):
         await fn("audit", {"session": named})
     key = sessions.created[0][0]
     if release_fails:

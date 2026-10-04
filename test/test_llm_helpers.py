@@ -15,6 +15,7 @@ from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
     ToolApprovalPolicy,
     ToolCallLimitExceeded,
+    TurnNotCompleted,
     first_advertised_fallback,
     next_fallback_candidate,
     parse_llm_json,
@@ -224,6 +225,52 @@ async def test_tool_ceiling_can_fail_without_returning_partial_text():
         await stream_and_collect(provider, "go", max_turns=1, raise_on_tool_limit=True)
     provider.cancel.assert_not_awaited()
     provider.shutdown.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ending",
+    [
+        [],
+        [LLMEvent(kind=EVENT_COMPLETE, stop_reason="cancelled")],
+        [LLMEvent(kind=EVENT_COMPLETE, stop_reason="error: tool stall")],
+    ],
+    ids=["no-completion", "cancelled", "stalled"],
+)
+async def test_interrupted_turn_raises_with_partial_text(ending):
+    provider = _make_provider(
+        events=[LLMEvent(kind=EVENT_TEXT_CHUNK, text="waiting for teammates"), *ending]
+    )
+    with pytest.raises(TurnNotCompleted, match="team state unknown") as caught:
+        await stream_and_collect(provider, "go", raise_on_incomplete=True)
+    assert caught.value.partial_text == "waiting for teammates"
+    assert caught.value.reason == "turn_not_completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raise_on_incomplete", [False, True])
+async def test_completed_turn_returns_text(raise_on_incomplete):
+    provider = _make_provider(
+        events=[
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="audit complete"),
+            LLMEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+        ]
+    )
+    assert (
+        await stream_and_collect(provider, "go", raise_on_incomplete=raise_on_incomplete)
+        == "audit complete"
+    )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_returns_partial_text_by_default():
+    provider = _make_provider(
+        events=[
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="partial"),
+            LLMEvent(kind=EVENT_COMPLETE, stop_reason="cancelled"),
+        ]
+    )
+    assert await stream_and_collect(provider, "go") == "partial"
 
 
 @pytest.mark.asyncio

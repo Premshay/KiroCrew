@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 import pytest
 from overload_fakes import settle_dependency_park, settle_store_writes
 
-from kiro_crew.llm_helpers import ToolCallLimitExceeded
+from kiro_crew.llm_helpers import ToolCallLimitExceeded, TurnNotCompleted
 from kiro_crew.workflows.agent_pool import _WorkflowSessionWorker, build_pooled_agent_fn
 
 
@@ -109,16 +109,21 @@ def _patch_stream(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("named", [None, "chain-A"])
-async def test_tool_limit_retires_pooled_and_named_sessions(monkeypatch, named):
+@pytest.mark.parametrize(
+    "failure",
+    [ToolCallLimitExceeded("tool limit"), TurnNotCompleted("cancelled", "")],
+    ids=["tool_limit", "turn_not_completed"],
+)
+async def test_incomplete_step_retires_pooled_and_named_sessions(monkeypatch, named, failure):
     sessions = _FakeSessions()
 
     async def limited_stream(*args, **kwargs):
-        raise ToolCallLimitExceeded("tool limit")
+        raise failure
 
     monkeypatch.setattr("kiro_crew.workflows.agent_pool.stream_and_collect", limited_stream)
     fn, pool = build_pooled_agent_fn(sessions, run_id="wf_limit")
     try:
-        with pytest.raises(ToolCallLimitExceeded):
+        with pytest.raises(type(failure)):
             await fn("audit", {"session": named})
         assert not sessions.live
         assert sessions.destroys == 1
@@ -137,6 +142,7 @@ async def test_custom_allowance_uses_dedicated_session(monkeypatch, named):
         assert await fn("audit", {"session": named, "max_tool_calls": 1000}) == "done"
         assert collector.await_args.kwargs["max_turns"] == 1000
         assert collector.await_args.kwargs["raise_on_tool_limit"] is True
+        assert collector.await_args.kwargs["raise_on_incomplete"] is True
         assert all(not key.startswith("wf-pool:") for key in sessions.keys_seen)
         if named is None:
             assert not sessions.live

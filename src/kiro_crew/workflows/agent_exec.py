@@ -35,7 +35,7 @@ from typing import Any, Callable, Optional
 
 from kiro_crew.llm_helpers import (
     ToolApprovalPolicy,
-    ToolCallLimitExceeded,
+    StepIncomplete,
     provider_last_turn_usage,
     stream_and_collect,
 )
@@ -198,7 +198,7 @@ def build_agent_fn(
         # duration_ms is a literal 0. Started after get_or_create so session
         # setup is not charged to the turn.
         _turn_t0 = time.monotonic()
-        tool_limit_reached = False
+        step_incomplete = False
         try:
             from kiro_crew.messaging.identity import publish_turn_identity
 
@@ -220,6 +220,7 @@ def build_agent_fn(
                 approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
                 max_turns=tool_limit,
                 raise_on_tool_limit=True,
+                raise_on_incomplete=True,
             )
             # ── Per-turn usage row: attribute workflow spend. ──
             # Best-effort analytics that must never break the workflow run — but
@@ -282,8 +283,8 @@ def build_agent_fn(
             if memory_scope is not None:
                 await memory_scope.validate()
             return text
-        except ToolCallLimitExceeded:
-            tool_limit_reached = True
+        except StepIncomplete:
+            step_incomplete = True
             raise
         finally:
             # Every successful acquire owns a lease, including stateful calls.
@@ -292,10 +293,10 @@ def build_agent_fn(
                 sessions.release(key, cleanup=ephemeral)
             except Exception as exc:  # noqa: BLE001 - cleanup must not mask the result
                 logger.warning("workflow session lease release failed: %s", type(exc).__name__)
-            if tool_limit_reached or (ephemeral and memory_scope is not None):
+            if step_incomplete or (ephemeral and memory_scope is not None):
                 try:
                     await sessions.destroy(key)
-                except Exception as exc:  # noqa: BLE001 - preserve the tool-limit failure
+                except Exception as exc:  # noqa: BLE001 - preserve the incomplete-step failure
                     logger.warning("workflow session teardown failed: %s", type(exc).__name__)
 
     return agent_fn

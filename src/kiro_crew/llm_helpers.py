@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew import name_grant, permission_floor
 from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
-from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
+from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage, classify_stop_reason
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling_on
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.constants import (
@@ -2378,8 +2378,34 @@ async def background_turn(
                 logger.debug("background recycle failed task=%s", task, exc_info=True)
 
 
-class ToolCallLimitExceeded(RuntimeError):
+class StepIncomplete(RuntimeError):
+    """A collected turn did not finish its task; ``reason`` names why."""
+
+    reason = "incomplete"
+
+
+class ToolCallLimitExceeded(StepIncomplete):
     """Collection stopped at its tool ceiling; provider completion is unverified."""
+
+    reason = "tool_limit"
+
+
+class TurnNotCompleted(StepIncomplete):
+    """The stream ended without a successful completion (cancel, death, stall).
+
+    ``partial_text`` keeps what streamed before the turn stopped.
+    """
+
+    reason = "turn_not_completed"
+
+    def __init__(self, stop_reason: str, partial_text: str) -> None:
+        self.stop_reason = stop_reason
+        self.partial_text = partial_text
+        ended = f"stop_reason={stop_reason!r}" if stop_reason else "no completion event"
+        super().__init__(
+            f"Turn did not complete ({ended}); task incomplete; team state unknown. "
+            "Reconcile the outstanding prompt before resuming."
+        )
 
 
 async def stream_and_collect(
@@ -2396,6 +2422,7 @@ async def stream_and_collect(
     retry_transient: bool = True,
     max_turns: int | None = None,
     raise_on_tool_limit: bool = False,
+    raise_on_incomplete: bool = False,
     session_key: str = "",
     agent: str = "",
     app: str = "",
@@ -2450,6 +2477,9 @@ async def stream_and_collect(
         raise_on_tool_limit: Raise ToolCallLimitExceeded instead of returning
             partial text at the ceiling. Does not establish provider completion
             or cancel its outstanding prompt.
+        raise_on_incomplete: Raise TurnNotCompleted instead of returning partial
+            text when the stream ends without ``EVENT_COMPLETE`` or on a stop
+            reason ``classify_stop_reason`` does not count as success.
         session_key: Calling surface's session key, forwarded to the PreToolUse
             gate. Empty (default) preserves every existing caller's behavior.
         agent: Calling agent name, forwarded to the gate alongside *session_key*.
@@ -2518,6 +2548,7 @@ async def stream_and_collect(
         # ``tool_call_id`` is what lets a caller see that work happened.
         gate_decided_ids: set[str] = set()
         executed_calls: list[tuple[str, str]] = []
+        complete_event: LLMEvent | None = None
         retrying = False
         # Billing accrued on THIS attempt is measured against the stats object as
         # it stands now: a retry installs a fresh one, so without a per-attempt
@@ -2599,12 +2630,19 @@ async def stream_and_collect(
                 elif event.kind == EVENT_STEER_CONSUMED:
                     consumed_this_attempt.append(event.text or "")
                 elif event.kind == EVENT_COMPLETE:
+                    complete_event = event
                     if on_complete:
                         try:
                             on_complete(event)
                         except Exception:
                             logger.debug("on_complete callback failed", exc_info=True)
                     break
+            if raise_on_incomplete:
+                if complete_event is None:
+                    raise TurnNotCompleted("", result_text)
+                stop = classify_stop_reason(complete_event.stop_reason)
+                if not stop.is_success:
+                    raise TurnNotCompleted(stop.stop_reason, result_text)
             return result_text
         except AcpError as exc:
             msg = str(exc)

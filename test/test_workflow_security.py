@@ -43,6 +43,8 @@ class FakeEvent:
     # Mirrors LLMEvent's diff-content-block path (default ""): the edit gate
     # reads it on every permission frame, not only behind an edit tool_kind.
     diff_path: str = ""
+    # Mirrors LLMEvent.stop_reason: workflow collection classifies EVENT_COMPLETE.
+    stop_reason: str = ""
 
 
 class FakeProvider:

@@ -139,6 +139,12 @@ closes its approval transport instead of retaining unanswered child requests.
 Saved workspace files remain. The result keeps team state unknown because a
 cleanup attempt is not evidence of teammate completion.
 
+A step whose turn ends without a successful completion follows the same path
+with `reason: turn_not_completed`. That covers a stream that ends with no
+completion event, and a stop reason that `classify_stop_reason` does not count
+as success: a cancel, such as session teardown during a gateway restart, a
+stall or an error. The partial text is not returned as the step's result.
+
 Set `ctx.agent(..., max_tool_calls=1000)` for a long team audit. The default is
 200; accepted values are integers from 1 to 2000. The allowance includes lead
 and teammate calls. Non-default allowances use dedicated sessions, keeping warm

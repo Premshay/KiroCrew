@@ -114,14 +114,17 @@ async def test_busy_named_session_stops_continuation_loop() -> None:
 
 
 @pytest.mark.parametrize("parallel", [False, True])
-async def test_tool_limit_stops_schema_reasks_and_continuations(parallel) -> None:
-    from kiro_crew.llm_helpers import ToolCallLimitExceeded
+@pytest.mark.parametrize("failure", ["tool_limit", "turn_not_completed"])
+async def test_incomplete_step_stops_schema_reasks_and_continuations(parallel, failure) -> None:
+    from kiro_crew.llm_helpers import ToolCallLimitExceeded, TurnNotCompleted
 
     calls = []
 
     async def limited(prompt, opts):
         calls.append(prompt)
-        raise ToolCallLimitExceeded("Tool-call limit exceeded; team state unknown")
+        if failure == "tool_limit":
+            raise ToolCallLimitExceeded("Tool-call limit exceeded; team state unknown")
+        raise TurnNotCompleted("cancelled", "waiting for teammates")
 
     call = "ctx.agent('go', session='team', schema={'type': 'object'})"
     step = f"ctx.parallel([lambda: {call}])" if parallel else call
@@ -134,9 +137,27 @@ async def test_tool_limit_stops_schema_reasks_and_continuations(parallel) -> Non
     res = await _runner(agent_fn=limited).run(script, run_id="wf_limited", now=NOW)
     assert len(calls) == 1
     assert not res.ok
-    assert res.result["reason"] == "tool_limit"
+    assert res.result["reason"] == failure
     assert res.result["child_status"] == "unknown"
     assert len(res.agent_errors) == 1
+
+
+async def test_interrupted_step_fails_a_run_whose_script_returns() -> None:
+    from kiro_crew.llm_helpers import TurnNotCompleted
+
+    async def interrupted(prompt, opts):
+        raise TurnNotCompleted("cancelled", "waiting for teammates")
+
+    script = (
+        'META = {"name": "interrupted"}\n'
+        "async def workflow(ctx):\n"
+        "    result = await ctx.agent('go')\n"
+        "    return {'status': 'returned_for_parent_verification', 'result': result}\n"
+    )
+    res = await _runner(agent_fn=interrupted).run(script, run_id="wf_interrupted", now=NOW)
+    assert not res.ok
+    assert res.result["reason"] == "turn_not_completed"
+    assert res.events[-1].type == "run_failed"
 
 
 async def test_invalid_params_without_busy_message_keeps_per_call_semantics() -> None:

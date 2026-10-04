@@ -36,7 +36,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from kiro_crew.acp.worker_pool import WorkerPool
-from kiro_crew.llm_helpers import ToolApprovalPolicy, ToolCallLimitExceeded, stream_and_collect
+from kiro_crew.llm_helpers import ToolApprovalPolicy, StepIncomplete, stream_and_collect
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.security import redact
 from kiro_crew.taskq.adapters.runner import (
@@ -100,6 +100,7 @@ async def _run_step(
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         max_turns=max_tool_calls,
         raise_on_tool_limit=True,
+        raise_on_incomplete=True,
     )
     text = await (asyncio.wait_for(coro, timeout) if timeout is not None else coro)
     return redact(text)
@@ -380,7 +381,7 @@ def build_pooled_agent_fn(
             cwd=opts.get("cwd") or cwd,
             extra_env=extra_env,
         )
-        tool_limit_reached = False
+        step_incomplete = False
         try:
             # Same identity publication as the pooled worker (see
             # _WorkflowSessionWorker.send_message): a named ``session=`` chain
@@ -402,8 +403,8 @@ def build_pooled_agent_fn(
             if memory_scope is not None:
                 await memory_scope.validate()
             return result
-        except ToolCallLimitExceeded:
-            tool_limit_reached = True
+        except StepIncomplete:
+            step_incomplete = True
             raise
         finally:
             # Best-effort teardown. An exception raised from this ``finally``
@@ -422,7 +423,7 @@ def build_pooled_agent_fn(
                     sessions.release(key, cleanup=False)
                 except Exception as exc:
                     _log_unpooled_teardown_failure("release", exc)
-            if named is None or tool_limit_reached:
+            if named is None or step_incomplete:
                 try:
                     await sessions.destroy(key)
                 except Exception as exc:
