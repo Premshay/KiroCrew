@@ -1114,6 +1114,31 @@ class _RunCreditAccounting:
 
 
 _TURN_LIMIT = DEFAULT_SUBAGENT_MAX_TURNS
+
+#: dsh-acp forwards a team member's approval on its Lead's own ACP session and
+#: namespaces the call id as ``child-<first 8 of the member's session id>-<id>``
+#: (``childCallId`` in @deepseek-ai/dsh-acp). The request carries no
+#: sub-session id, so this prefix is the only mark of a member's call.
+_DSH_TEAM_CHILD_CALL = re.compile(r"child-([0-9A-Za-z]{1,8})-")
+#: Aggregate bound on child-origin approvals for one run, in parent turn
+#: budgets: dsh's default team cap is 16 members (``maxMembers``), each of
+#: which gets the per-child bound of one parent budget.
+_CHILD_BUDGETS_PER_RUN = 16
+
+
+def _child_origin(event: Any) -> str:
+    """The child a permission request came from, or ``""`` for the parent's own.
+
+    A runtime-routed child carries ``sub_session_id``; a dsh team member is
+    recognised by its namespaced call id. Read only for turn accounting: the
+    event itself is not re-tagged, so approval fidelity rules are unchanged.
+    """
+    if event.sub_session_id:
+        return event.sub_session_id
+    match = _DSH_TEAM_CHILD_CALL.match(event.tool_call_id or "")
+    return f"dsh-member:{match.group(1)}" if match else ""
+
+
 # Successor-claim markers: a retry start in flight, and a start that raised
 # after it may have accepted its durable row (the successor's id is unknown).
 SUCCESSOR_PENDING = "(starting)"

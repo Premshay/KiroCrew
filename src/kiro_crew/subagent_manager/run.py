@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
     from ..subagent import (
         _CANCEL_RESUME_PREFIX,
+        _CHILD_BUDGETS_PER_RUN,
         _DEDICATED_TOPUP_POLL_SECS,
         _DEDICATED_TOPUP_WAIT_SECS,
         _HEADLESS_DENY_REASON,
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
         Path,
         Stats,
         SubagentInfo,
+        _child_origin,
         _context_groups_of,
         _cost_bucket,
         _dedicated_start_price_gb,
@@ -2037,7 +2039,10 @@ class RunEventCoordinator(ManagerComponent):
         # they are exempt from the parent's turn budget (see the
         # EVENT_PERMISSION_REQUEST branch) but must not be unbounded.
         child_escalations = 0
-        child_escalation_limit = max(turn_limit * 3, 60)
+        child_escalation_limit = max(turn_limit * _CHILD_BUDGETS_PER_RUN, 60)
+        # Each child is bounded on its own as well, at one parent budget, so a
+        # single chatty child cannot spend the whole run's allowance.
+        child_escalations_by_origin: dict[str, int] = {}
         # Reports inherited agent (not just info.agent) so telemetry shows
         # the actual agent used for this subagent session.
         #
@@ -2527,7 +2532,8 @@ class RunEventCoordinator(ManagerComponent):
                 # child could generate unbounded approval prompts until the
                 # wall-clock reaper fires. Generous multiple of the parent's
                 # limit: legitimate crews fan many small child tool calls.
-                if not event.sub_session_id:
+                _origin = _child_origin(event)
+                if not _origin:
                     turns += 1
                     info.turns = turns
                 else:
@@ -2538,7 +2544,13 @@ class RunEventCoordinator(ManagerComponent):
                     # run's replay budget (tool_count gates prompt replay
                     # and cancel-respawn).
                     child_escalations += 1
-                    if child_escalations > child_escalation_limit:
+                    child_escalations_by_origin[_origin] = (
+                        child_escalations_by_origin.get(_origin, 0) + 1
+                    )
+                    if (
+                        child_escalations > child_escalation_limit
+                        or child_escalations_by_origin[_origin] > turn_limit
+                    ):
                         # Answer the triggering request BEFORE bailing: this
                         # event is already dequeued, so returning without a
                         # response would strand the child's oneshot — under
@@ -2561,14 +2573,21 @@ class RunEventCoordinator(ManagerComponent):
                             )
                         except Exception:
                             logger.exception("failed to reject escalation-limit trigger request")
+                        # Name the bound that tripped: one child's, or the run's.
+                        _bound = (
+                            turn_limit
+                            if child_escalations <= child_escalation_limit
+                            else child_escalation_limit
+                        )
                         info.result = result_text or "_Partial output._"
-                        info.error = f"child_escalation_limit:{child_escalation_limit}"
+                        info.error = f"child_escalation_limit:{_bound}"
                         info.done = True
                         Stats().inc_subagent_failed()
                         logger.warning(
-                            "Subagent %s hit child escalation limit (%d)",
+                            "Subagent %s hit child escalation limit (%d, child %s)",
                             info.id,
-                            child_escalation_limit,
+                            _bound,
+                            _origin,
                         )
                         usage.settle()
                         self._manager._write_tombstone(info, "child_escalation_limit")
@@ -3537,7 +3556,11 @@ class RunEventCoordinator(ManagerComponent):
         as it was).
         """
         from kiro_crew.dashboard.state import build_infra_retry_prompt
-        from kiro_crew.recovery.ladder import CLASS_CAPACITY, L1_TOOL_CALL, default_ladder
+        from kiro_crew.recovery.ladder import (
+            CLASS_CAPACITY,
+            L1_TOOL_CALL,
+            default_ladder,
+        )
         from kiro_crew.taskq.dependency import (
             KIND_CONCURRENCY_EXCEEDED,
             KIND_DEPENDENCY_UNAVAILABLE,
@@ -3980,7 +4003,10 @@ class RunEventCoordinator(ManagerComponent):
         no watchdog bounds still ends.
         """
         # Imported here: a rebound ``_impl`` resolves globals in ``kiro_crew.subagent``.
-        from kiro_crew.start_priority import START_QUEUE_LOG_MIN_MS, START_QUEUE_SESSION_NEW
+        from kiro_crew.start_priority import (
+            START_QUEUE_LOG_MIN_MS,
+            START_QUEUE_SESSION_NEW,
+        )
 
         def _on_gate_acquired(queue_wait_ms: float, queue: str = START_QUEUE_SESSION_NEW) -> None:
             now = time.time()

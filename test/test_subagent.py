@@ -2953,13 +2953,15 @@ class TestChildEscalationLimit:
         provider = sessions.get_or_create.return_value[0]
 
         async def _stream(*_a, **_kw):
-            # Limit floor is 60: the 61st child escalation trips the bail.
+            # Run-wide floor is 60: the 61st child escalation trips the bail.
+            # One child per request, so the per-child bound (one parent budget,
+            # here 1) is never what trips.
             for i in range(61):
                 yield LLMEvent(
                     kind=EVENT_PERMISSION_REQUEST,
                     title=f"child tool {i}",
                     request_id=1000 + i,
-                    sub_session_id="child-a",
+                    sub_session_id=f"child-{i}",
                 )
 
         provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream())
@@ -3001,6 +3003,92 @@ class TestChildEscalationLimit:
         answered = {c.args[0] for c in provider.reject_tool.await_args_list}
         assert 1000 + 60 in answered, "triggering request was not answered"
         assert len(answered) == 61
+
+    async def _run_permission_stream(self, events, *, turn_limit):
+        """Run one subagent over *events* with every request auto-approved."""
+        from kiro_crew.hooks import TOOL_AUTO_APPROVE, ToolHookResult
+        from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+        sessions = _mock_sessions()
+        sessions.get_approval_policy = MagicMock(return_value="")
+        provider = sessions.get_or_create.return_value[0]
+
+        async def _stream(*_a, **_kw):
+            for event in events:
+                yield event
+
+        provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream())
+        provider.reject_tool = AsyncMock()
+        provider.approve_tool = AsyncMock()
+        ctx = MagicMock()
+        ctx.build_message = MagicMock(return_value=("msg", None))
+        ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult(action=TOOL_AUTO_APPROVE))
+        ctx.hooks.auto_approve_subagent_spawn = True
+        manager = SubagentManager(
+            sessions=sessions, ctx_builder=ctx, default_turn_limit=turn_limit
+        )
+        info = SubagentInfo(
+            execution_context=execution_for_store(""),
+            id="team01",
+            task="t",
+            parent_session_key="dashboard:default",
+        )
+        manager._log_spawned(info)
+        manager._agents["team01"] = info
+        manager._write_tombstone = MagicMock()  # type: ignore[method-assign]
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent.update_state"),
+            patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True),
+        ):
+            await manager._run_inner(info, "subagent:team01")
+        return info
+
+    @pytest.mark.asyncio
+    async def test_dsh_team_member_calls_do_not_spend_the_lead_turns(self) -> None:
+        """dsh forwards a member's approval on the Lead's session with a namespaced
+        ``child-<8>-`` call id and no sub-session id. Those must not count as the
+        Lead's turns, or a team's combined tool calls trip the Lead's limit."""
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+        events = [
+            LLMEvent(
+                kind=EVENT_PERMISSION_REQUEST,
+                title=f"member {m} tool {i}",
+                request_id=f"{m}-{i}",
+                tool_call_id=f"child-{m}abcdef0-call_00_{i}",
+            )
+            for m in "12"
+            for i in range(3)
+        ] + [
+            LLMEvent(
+                kind=EVENT_PERMISSION_REQUEST,
+                title=f"lead tool {i}",
+                request_id=f"lead-{i}",
+                tool_call_id=f"call_00_lead{i}",
+            )
+            for i in range(3)
+        ]
+        info = await self._run_permission_stream(events, turn_limit=3)
+        assert not (info.error or "").startswith(("turn_limit", "child_escalation_limit"))
+        assert info.turns == 3
+
+    @pytest.mark.asyncio
+    async def test_one_child_is_bounded_at_one_parent_budget(self) -> None:
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+        events = [
+            LLMEvent(
+                kind=EVENT_PERMISSION_REQUEST,
+                title=f"member tool {i}",
+                request_id=f"m-{i}",
+                tool_call_id=f"child-1abcdef0-call_00_{i}",
+            )
+            for i in range(4)
+        ]
+        info = await self._run_permission_stream(events, turn_limit=3)
+        assert info.error == "child_escalation_limit:3"
 
 
 class TestSpawnMemoryModeSnapshot:
