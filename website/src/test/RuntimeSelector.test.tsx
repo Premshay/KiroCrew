@@ -9,10 +9,12 @@ import { api } from '../api/client'
 
 afterEach(() => vi.restoreAllMocks())
 
-function mount(running = false) {
+function mount(running = false, slot = 'vernier') {
   const store = configureStore({ reducer: { dashboard: dashboardReducer } })
   const cache = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  render(<Provider store={store}><QueryClientProvider client={cache}><RuntimeSelector slot="vernier" running={running} /></QueryClientProvider></Provider>)
+  const view = (key: string) => <Provider store={store}><QueryClientProvider client={cache}><RuntimeSelector slot={key} running={running} /></QueryClientProvider></Provider>
+  const { rerender } = render(view(slot))
+  return (next: string) => rerender(view(next))
 }
 
 const choices = {
@@ -50,6 +52,21 @@ describe('RuntimeSelector', () => {
     vi.spyOn(api, 'chatSlotRuntimes').mockResolvedValue(choices)
     mount(true)
     expect(await screen.findByRole('combobox')).toBeDisabled()
+  })
+
+  it('keeps a failed switch on its own conversation', async () => {
+    // One selector stays mounted while the active conversation changes; the
+    // error from one conversation's refused switch must not follow the user.
+    vi.spyOn(api, 'chatSlotRuntimes').mockResolvedValue(choices)
+    vi.spyOn(api, 'chatSlotRuntime').mockRejectedValue(new Error('session changed during execution switch'))
+    const show = mount()
+    await waitFor(() => expect(screen.getByRole('combobox')).not.toBeDisabled())
+    fireEvent.click(await screen.findByRole('combobox'))
+    fireEvent.click(await screen.findByRole('option', { name: 'Codex' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('session changed during execution switch')
+    show('derrick')
+    await waitFor(() => expect(screen.getByRole('combobox')).not.toBeDisabled())
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 
   it('reports runtime discovery failures', async () => {

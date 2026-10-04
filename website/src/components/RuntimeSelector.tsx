@@ -6,12 +6,23 @@ import { updateSlot } from '../store/dashboardSlice'
 import ErrorNotice from './ErrorNotice'
 import SimpleSelect from './SimpleSelect'
 
-export default function RuntimeSelector({ slot, value, running, remote = false }: {
+type RuntimeSelectorProps = {
   slot: string
   value?: string
   running: boolean
   remote?: boolean
-}) {
+}
+
+// Both call sites keep one selector mounted while the active conversation
+// changes, so an unkeyed mutation carried one conversation's failed switch
+// (and its pending state) onto every conversation opened after it, and its
+// late onSuccess would update whichever slot was showing. Keying by slot gives
+// each conversation its own switch state.
+export default function RuntimeSelector(props: RuntimeSelectorProps) {
+  return <SlotRuntimeSelector key={props.slot} {...props} />
+}
+
+function SlotRuntimeSelector({ slot, value, running, remote = false }: RuntimeSelectorProps) {
   const dispatch = useAppDispatch()
   const cache = useQueryClient()
   const choices = useQuery({
