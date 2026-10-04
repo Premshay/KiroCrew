@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ChatMessage } from '../types'
 import type { DisplayItem } from '../pages/chat/types'
 import { pinCandidateKey, usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
-import { DEFAULT_PINNED_CARD_H } from '../utils/pinnedPrompt'
+import { DEFAULT_PINNED_CARD_H, ROW_PAD_Y, pinHandoffBottomY, pinHandoffProgress } from '../utils/pinnedPrompt'
 
 /**
  * chat-core P5-d: the pinned-prompt geometry extracted from the main chat's
@@ -818,5 +818,90 @@ describe('pinCandidateKey (the identity the reset and the card\'s promptKey shar
   it('changes with the ts alone, so a prompt replaced in place at one index is a new identity', () => {
     expect(pinCandidateKey(4, 'a')).not.toBe(pinCandidateKey(4, 'b'))
     expect(pinCandidateKey(4, 'a')).toBe(pinCandidateKey(4, 'a'))
+  })
+})
+
+describe('usePinnedPrompt waits for a readable prompt to leave', () => {
+  it('hands off at the bubble tail, independently of its action strip, in both directions', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    const { bubble } = mountUserRow(g.rows[2])
+    setRect(g.rows[2], -249, 440)
+    setRect(g.rows[3], 191, 40)
+    setRect(g.rows[4], 900, 40)
+    setRect(bubble, -235, 400)
+    wire(h, g)
+    expect(h.result.current.pinned?.idx).not.toBe(2)
+    for (const bottom of [150, 80, 0, 80, 150]) {
+      act(() => {
+        setRect(bubble, bottom - 400, 400)
+        h.result.current.updatePinnedPrompt()
+      })
+      expect(h.result.current.pinned?.idx).toBe(2)
+      expect(h.result.current.pinned?.handoffProgress).toBeGreaterThanOrEqual(0)
+      expect(h.result.current.pinned?.handoffProgress).toBeLessThanOrEqual(1)
+      expect(h.result.current.pinned?.handoffProgress).toBeCloseTo(
+        pinHandoffProgress(pinHandoffBottomY(100), bottom + ROW_PAD_Y),
+      )
+    }
+    act(() => {
+      setRect(bubble, -235, 400)
+      h.result.current.updatePinnedPrompt()
+    })
+    expect(h.result.current.pinned?.idx).not.toBe(2)
+  })
+
+  it('keeps a tall prompt visible while its bottom is below the hand-off line', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    setRect(g.rows[2], 60, 400)
+    setRect(g.rows[3], 460, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    expect(h.result.current.pinned).toBeNull()
+  })
+
+  it('pins at resting size after the whole prompt has cleared the line', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    setRect(g.rows[2], -250, 400)
+    setRect(g.rows[3], 160, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2 })
+    expect(h.result.current.pinned?.liveH).toBeUndefined()
+  })
+
+  it('keeps the same pin when consecutive cards report different resting heights', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    setRect(g.rows[2], 90, 40)
+    setRect(g.rows[3], 160, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    for (const height of [92, 40, 92, 40]) {
+      act(() => {
+        h.result.current.onPinCollapsedHeight(height)
+        h.result.current.updatePinnedPrompt()
+      })
+      expect(h.result.current.pinned?.idx).toBe(2)
+    }
+  })
+
+  it('ignores editing and action markers inside message content', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    const { root, bubble, strip } = mountUserRow(g.rows[2])
+    setRect(strip, 120, 20)
+    const forged = document.createElement('div')
+    forged.setAttribute('data-message-editing', '')
+    forged.setAttribute('data-message-actions', '')
+    setRect(forged, 200, 20)
+    bubble.append(forged)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: false })
+    root.setAttribute('data-message-editing', '')
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned).toBeNull()
   })
 })

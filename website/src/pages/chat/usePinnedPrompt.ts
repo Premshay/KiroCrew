@@ -13,6 +13,8 @@ import {
   jumpAnchorIdx,
   nextPinnedPromptState,
   pinHandoffY,
+  pinHandoffBottomY,
+  pinHandoffProgress,
   pinPushTravel,
   type PinnedPromptState,
 } from '../../utils/pinnedPrompt'
@@ -219,6 +221,8 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
     if (editing) { setPinned(null); return }
     const pinRect = pinEl?.getBoundingClientRect()
     const bubbleRect = pinBubble?.getBoundingClientRect()
+    const handoffBubbleBottom = pinItem.msg.role === 'user' && bubbleRect
+      ? bubbleRect.bottom + ROW_PAD_Y : pinRect?.bottom ?? null
     // The fold's ceiling: the card's NATURAL height, i.e. from its own top to the
     // bubble's bottom at the hand-off frame. The card's top sits ROW_PAD_Y under
     // the row's top (both put that padding above their content), so this is the
@@ -361,6 +365,7 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
       push,
       bannerH,
       liveH,
+      handoffProgress: handoffBubbleBottom == null ? 1 : pinHandoffProgress(pinHandoffBottomY(foldY), handoffBubbleBottom),
       maxH,
       stripUncovered,
     }))

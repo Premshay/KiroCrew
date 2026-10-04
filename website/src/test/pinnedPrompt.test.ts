@@ -8,6 +8,8 @@ import {
   promptBody,
   pinnedImageUrl,
   pinHandoffY,
+  pinHandoffBottomY,
+  pinHandoffProgress,
   pinPushTravel,
   computeLiveCardH,
   computePinnedCardMaxH,
@@ -455,5 +457,24 @@ describe('computePinnedCardMaxH', () => {
 
   it('never goes negative when the fold itself is below the floor', () => {
     expect(computePinnedCardMaxH(500, 400)).toBe(0)
+  })
+})
+
+describe('pinHandoffProgress', () => {
+  it('preserves the tail at hand-off and retraces the settle when scrolling back', () => {
+    const bottom = pinHandoffBottomY(100)
+    const positions = [0, 0.25, 0.5, 0.75, 1]
+    const progress = positions.map(p => pinHandoffProgress(bottom, bottom - ROW_PAD_Y - p * 3 * DEFAULT_PINNED_CARD_H))
+    expect(progress).toEqual([0, 0.15625, 0.5, 0.84375, 1])
+    expect(positions.toReversed().map(p => pinHandoffProgress(bottom, bottom - ROW_PAD_Y - p * 3 * DEFAULT_PINNED_CARD_H))).toEqual(progress.toReversed())
+    expect(pinHandoffProgress(bottom, bottom + 500)).toBe(0)
+    expect(pinHandoffProgress(bottom, bottom - 1000)).toBe(1)
+  })
+})
+
+describe('pinHandoffBottomY', () => {
+  it('uses a fixed resting band for bottom-edge hand-off', () => {
+    expect(pinHandoffBottomY(100)).toBe(154.75)
+    expect(pinHandoffBottomY(200) - pinHandoffBottomY(100)).toBe(100)
   })
 })
