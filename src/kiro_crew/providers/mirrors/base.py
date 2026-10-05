@@ -140,6 +140,9 @@ class SessionProjection:
     that keeps a narrowed server MOUNTED because its transport honours the restriction
     another way -- claude re-expresses it as ``permissions.deny`` rules.
     """
+    agent_spec: dict[str, Any] | None = None
+    """The exact parsed spec this projection consumed; absent when withheld."""
+
     derived_spec_snapshot: Any = None
     """The ``agent.DerivedSpecSnapshot`` the ``mcpServers`` array was built from.
 

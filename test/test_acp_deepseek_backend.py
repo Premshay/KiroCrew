@@ -2985,3 +2985,29 @@ def test_a_blank_signed_out_signature_is_refused() -> None:
     declaration = host_auth.declaration_for(ACP_BACKEND_DEEPSEEK)
     with pytest.raises(ValueError, match="blank signed-out signature"):
         dataclasses.replace(declaration, signed_out_signature="  ")
+
+
+def test_deepseek_gets_its_own_mcp_array_at_every_session_call_site() -> None:
+    """deepseek is in ``MIRRORS``, so ``_pooled_mcp_servers`` hands it ``[]``: without a
+    splice of its own a session carries none of Crew's tools and no member spec, and an
+    enrolled member's confirmation sees no consumed spec. Same pin as goose's."""
+    import ast
+    import textwrap
+
+    splices = 0
+    for method in (
+        AcpClient._new_session_following_substitution,
+        AcpClient._initialize_session,
+    ):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+        splices += sum(
+            1
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_deepseek_session_mcp_servers"
+        )
+    assert splices == 3, (
+        "deepseek's array must be spliced into the initial session/new, the "
+        f"substitution retry, and session/load; found {splices}"
+    )

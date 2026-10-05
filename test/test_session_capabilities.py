@@ -18,7 +18,13 @@ from dashboard_owner_helpers import as_owner
 from kiro_crew import agent, agent_discovery, agent_state
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
     ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_MEMBER_CAPABILITIES,
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
@@ -592,11 +598,10 @@ async def test_governance_change_during_startup_is_not_applied(world):
 
 @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
 def test_real_provider_support_is_explicit_and_unstarted_is_unverified(tmp_path, backend):
-    from kiro_crew.acp.types import ACP_BACKEND_KIRO
     from kiro_crew.providers.acp import AcpProvider
 
     provider = AcpProvider(work_dir=tmp_path, acp_backend=backend)
-    assert provider.member_capabilities_supported is (backend == ACP_BACKEND_KIRO)
+    assert provider.member_capabilities_supported is (backend in ACP_BACKENDS_MEMBER_CAPABILITIES)
     assert provider.loaded_capability_template == ""
 
 
@@ -605,12 +610,11 @@ def test_real_session_provider_member_support_is_explicit(tmp_path, backend):
     from kiro_crew.acp.runtime import AcpRuntime
     from kiro_crew.acp.session_handle import AcpSessionHandle, WatchdogSettings
     from kiro_crew.acp.session_provider import AcpSessionProvider
-    from kiro_crew.acp.types import ACP_BACKEND_KIRO
 
     runtime = AcpRuntime(work_dir=tmp_path, acp_backend=backend)
     handle = AcpSessionHandle("member", asyncio.Queue(), runtime, watchdog=WatchdogSettings())
     provider = AcpSessionProvider(handle, runtime, owns_runtime=True)
-    assert provider.member_capabilities_supported is (backend == ACP_BACKEND_KIRO)
+    assert provider.member_capabilities_supported is (backend in ACP_BACKENDS_MEMBER_CAPABILITIES)
     assert provider.loaded_capability_template == ""
 
 
@@ -1011,3 +1015,438 @@ def test_capability_runtime_facade_projects_owned_state_without_exporting_it():
     assert set(state.sessions) == {"live"}
     assert manager.capability_runtime_view("absent", "")["status"] == "unverified"
     assert manager.capability_runtime_view("absent", "saved")["status"] == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("fault", [None, "withheld", "changed", "wire", "state"])
+async def test_claude_saved_projection_requires_consumed_matching_spec(
+    world, monkeypatch, resume, fault
+):
+    from kiro_crew.acp.client import AcpError
+    from kiro_crew.providers.acp import AcpProvider
+    from kiro_crew.session_capabilities import loaded_stamp, prepare_runtime, verify_saved
+
+    service, _, _, _, project, _, _ = world
+    await asyncio.to_thread(save, service, enroll=True)
+    prepared = await asyncio.to_thread(prepare_runtime, "A", "A", str(project))
+    provider = AcpProvider(
+        work_dir=project, agent=prepared.template, acp_backend=ACP_BACKEND_CLAUDE
+    )
+    client = provider.client
+    client.member_context = True
+    client._process = MagicMock(returncode=None)
+    client._process_instance = "claude-incarnation"
+    client._claude_settings_authored = fault != "withheld"
+    client._session_mcp_cache = await asyncio.to_thread(client._resolve_session_mcp_servers)
+    if fault == "changed":
+        client._session_agent_spec = {**client._session_agent_spec, "prompt": "not saved"}
+    if resume:
+        client._resume_session_id = "claude-history"
+    sent = []
+
+    async def send(method, params):
+        sent.append((method, params))
+        return len(sent)
+
+    async def answer(request_id, **kwargs):
+        method = sent[request_id - 1][0]
+        if method == "initialize":
+            return {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
+        if fault == "wire":
+            raise AcpError("session creation refused")
+        return {"sessionId": "claude-history", "modes": {"currentModeId": "default"}}
+
+    monkeypatch.setattr(client, "_send_request", send)
+    monkeypatch.setattr(client, "_wait_for_response", answer)
+    for method in (
+        "_persist_advertised_models_if_changed",
+        "_apply_startup_model",
+        "_pin_claude_starting_mode",
+        "_drain_notifications",
+    ):
+        monkeypatch.setattr(client, method, AsyncMock())
+
+    async def reseed():
+        client._invalidate_session_mcp_projection()
+
+    monkeypatch.setattr(client, "_reseed_after_capture", reseed)
+    if fault == "state":
+        monkeypatch.setattr(
+            agent_state, "get_capabilities", MagicMock(side_effect=ValueError("unreadable state"))
+        )
+    assert provider.loaded_capability_template == ""
+    if fault:
+        with pytest.raises(AcpError):
+            await asyncio.wait_for(client._initialize_session(), 5)
+        assert provider.loaded_capability_template == ""
+        with pytest.raises(CapabilityStartupError, match="unverified"):
+            loaded_stamp(provider, prepared)
+        return
+    await asyncio.wait_for(client._initialize_session(), 5)
+    assert sent[1][0] == ("session/load" if resume else "session/new")
+    assert "mcpServers" in sent[1][1]
+    assert provider.loaded_capability_template == prepared.template
+    await asyncio.to_thread(verify_saved, prepared, str(project))
+    assert loaded_stamp(provider, prepared).revision == prepared.revision
+    assert provider.capability_projection_gaps == ("native_tools",)
+    client._process.returncode = 0
+    assert provider.loaded_capability_template == ""
+    client._process.returncode = None
+    client._invalidate_session_mcp_projection()
+    assert provider.loaded_capability_template == ""
+
+
+def _codex_session_provider(template: str, consumed_spec, *, alive: bool = True):
+    """An AcpSessionProvider on a codex runtime, with the spec its array consumed.
+
+    The handle carries the runtime's confirmation result fields with their
+    defaults, the way a fresh ``AcpSessionHandle`` does before the mirrored arm
+    confirms anything.
+    """
+    from kiro_crew.acp.session_provider import AcpSessionProvider
+
+    runtime = MagicMock()
+    runtime.acp_backend = ACP_BACKEND_CODEX
+    runtime._agent = template
+    runtime.is_alive.return_value = alive
+    handle = MagicMock(
+        consumed_agent_spec=consumed_spec,
+        confirmed_projection_template="",
+        capability_projection_gaps=(),
+    )
+    return AcpSessionProvider(handle, runtime, owns_runtime=True)
+
+
+def _codex_runtime():
+    """An AcpRuntime shaped like a member's codex runtime, without spawning it."""
+    from kiro_crew.acp.runtime import AcpRuntime
+
+    runtime = AcpRuntime.__new__(AcpRuntime)
+    runtime._member_context = True
+    runtime._agent = "saved-member"
+    return runtime
+
+
+def _codex_handle(consumed_spec):
+    """A handle shaped like a fresh codex session, before any confirmation."""
+    return MagicMock(
+        session_id="codex-session",
+        consumed_agent_spec=consumed_spec,
+        confirmed_projection_template="",
+        capability_projection_gaps=(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_member_confirms_on_the_shared_runtime(monkeypatch):
+    """Codex runs on the shared AcpRuntime path. The runtime confirms the member's
+    consumed spec on the mirrored arm, and records the saved template and its
+    projection gaps on the session handle; before confirmation the handle reports
+    none, so loaded_stamp() refuses."""
+    from kiro_crew.agent_capabilities import _digest
+
+    spec = {"name": "saved-member", "tools": ["*"], "hooks": {"x": 1}}
+    monkeypatch.setattr(agent_state, "get_capabilities", lambda _: {"materialized": _digest(spec)})
+    assert ACP_BACKEND_CODEX in ACP_BACKENDS_MEMBER_CAPABILITIES
+    handle = _codex_handle(spec)
+    await _codex_runtime()._confirm_member_projection(handle)
+    assert handle.confirmed_projection_template == "saved-member"
+    assert handle.capability_projection_gaps == ("hooks",)
+
+
+def test_codex_provider_reports_the_handle_confirmation(monkeypatch):
+    """The provider answers the Capabilities pane from the handle the runtime
+    confirmed, so the confirmation belongs to the session it checked: a warm
+    worker's fresh conversation, built from a spec edited in between, does not
+    inherit the old session's result."""
+    from kiro_crew.agent_capabilities import _digest
+
+    spec = {"name": "saved-member", "tools": ["*"], "hooks": {"x": 1}}
+    monkeypatch.setattr(agent_state, "get_capabilities", lambda _: {"materialized": _digest(spec)})
+    provider = _codex_session_provider("saved-member", spec)
+    assert provider.loaded_capability_template == ""
+    provider._handle.confirmed_projection_template = "saved-member"
+    provider._handle.capability_projection_gaps = ("hooks",)
+    assert provider.loaded_capability_template == "saved-member"
+    assert provider.capability_projection_gaps == ("hooks",)
+
+
+def test_kiro_member_start_takes_no_projection_step():
+    """Member confirmation belongs behind the existing adapter-only routing gate (H13)."""
+    import inspect
+
+    from kiro_crew.acp.runtime import AcpRuntime
+    from kiro_crew.acp.session_handle import AcpSessionHandle
+    from kiro_crew.providers.acp import AcpProvider
+
+    for method in (
+        AcpProvider._start_kiro_runtime_impl,
+        AcpRuntime.create_session,
+        AcpRuntime._finish_create_session,
+        AcpRuntime.load_session,
+    ):
+        source = inspect.getsource(method)
+        assert "_confirm_member_projection" not in source
+        assert "_member_projection_needs_confirmation" not in source
+    routing = inspect.getsource(AcpSessionHandle.apply_session_permission_routing)
+    assert routing.index("return") < routing.index("_confirm_member_projection")
+    assert "self.mirror_used" in routing
+
+
+def test_acp_client_confirms_inside_the_existing_consumed_spec_check():
+    """On AcpClient the member check rides the off-loop step every path already
+    takes, so the kiro construction path gains no call, await or branch (H13)."""
+    import inspect
+
+    from kiro_crew.acp.client import AcpClient
+
+    init = inspect.getsource(AcpClient._initialize_session)
+    assert "_confirm_member_projection" not in init
+    assert "ACP_BACKENDS_MEMBER_CAPABILITIES" not in init
+    assert init.count("_check_consumed_session_spec") == 1
+
+
+@pytest.mark.parametrize(
+    "backend, confirms",
+    [(ACP_BACKEND_KIRO, False), (ACP_BACKEND_CLAUDE, True), (ACP_BACKEND_DEEPSEEK, True)],
+)
+def test_consumed_spec_check_confirms_only_projecting_backends(tmp_path, backend, confirms):
+    from kiro_crew.acp.client import AcpClient
+
+    client = AcpClient(work_dir=tmp_path, acp_backend=backend)
+    client._confirm_member_projection = MagicMock()
+    client._check_consumed_session_spec(None, {"name": "saved-member"})
+    assert client._confirm_member_projection.called is confirms
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CODEX, ACP_BACKEND_KIRO, ACP_BACKEND_KAS])
+@pytest.mark.parametrize("mirror_used", [False, True])
+@pytest.mark.parametrize("member_context", [False, True])
+async def test_member_confirmation_uses_adapter_routing_seam(
+    monkeypatch, backend, mirror_used, member_context
+):
+    from kiro_crew import acp_tool_gate
+    from kiro_crew.acp.session_handle import AcpSessionHandle
+
+    runtime = _codex_runtime()
+    runtime._acp_backend = backend
+    runtime._member_context = member_context
+    runtime._confirm_member_projection = AsyncMock()
+    handle = _codex_handle(None)
+    handle._runtime = runtime
+    handle.mirror_used = mirror_used
+    handle.set_config_option = AsyncMock()
+    monkeypatch.setattr(acp_tool_gate, "session_config_issue", lambda *_: None)
+
+    await AcpSessionHandle.apply_session_permission_routing(handle)
+
+    if backend == ACP_BACKEND_CODEX and mirror_used and member_context:
+        runtime._confirm_member_projection.assert_awaited_once_with(handle)
+    else:
+        runtime._confirm_member_projection.assert_not_awaited()
+
+
+def test_member_confirmation_gate_follows_the_mirrored_array():
+    """The gate asks whether a MIRROR built this session's array and whether the
+    session is a member's -- never whether the array carried a derived spec."""
+    runtime = _codex_runtime()
+    assert runtime._member_projection_needs_confirmation(True) is True
+    assert runtime._member_projection_needs_confirmation(False) is False
+    runtime._member_context = False
+    assert runtime._member_projection_needs_confirmation(True) is False
+
+
+@pytest.mark.asyncio
+async def test_non_derived_member_is_confirmed_and_starts(world):
+    """A member's own template is not derived, so ``require_fresh_derived_spec``
+    answers None for it while the mirror still builds that session's array from the
+    template. The confirmation follows the ARRAY's origin, so this member is
+    confirmed and its start stamps cleanly; gating it on the derived snapshot left
+    ``confirmed_projection_template`` empty and ``loaded_stamp`` refused the start."""
+    from kiro_crew.agent import require_fresh_derived_spec
+    from kiro_crew.providers.mirrors.registry import mirror_for
+    from kiro_crew.session_capabilities import loaded_stamp, prepare_runtime
+
+    service, _, _, _, project, _, _ = world
+    await asyncio.to_thread(save, service, enroll=True)
+    prepared = await asyncio.to_thread(prepare_runtime, "A", "A", str(project))
+    assert prepared.template
+    snapshot = await asyncio.to_thread(require_fresh_derived_spec, prepared.template, str(project))
+    assert snapshot is None, "the member template is derived -- this defect needs a non-derived one"
+    projection = await asyncio.to_thread(
+        mirror_for(ACP_BACKEND_CODEX).session_projection, prepared.template, work_dir=project
+    )
+    consumed = projection.agent_spec
+    assert consumed is not None
+    assert projection.derived_spec_snapshot is None
+
+    provider = _codex_session_provider(prepared.template, consumed)
+    runtime = _codex_runtime()
+    runtime._agent = prepared.template
+    # The bracket this bug came from: the derived-spec gate answers "nothing to
+    # check" for this session, which is why the confirmation skipped it.
+    assert runtime._mirrored_spec_check_needed(projection.derived_spec_snapshot) is False
+
+    # Before confirmation the session stands exactly where the finding left it.
+    with pytest.raises(CapabilityStartupError, match="unverified"):
+        loaded_stamp(provider, prepared)
+
+    assert runtime._member_projection_needs_confirmation(True) is True
+    await runtime._confirm_member_projection(provider._handle)
+    assert provider.loaded_capability_template == prepared.template
+    assert loaded_stamp(provider, prepared).revision == prepared.revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumed", [None, {"name": "saved-member", "tools": []}])
+async def test_codex_member_refused_when_consumed_spec_differs(monkeypatch, consumed):
+    """No consumed spec (array not built from a mirror) or a different one (the file
+    changed after the intent was saved) both refuse: the session never reports the
+    saved template, so the member cannot be claimed as running on codex."""
+    from kiro_crew.acp.client import AcpError
+    from kiro_crew.agent_capabilities import _digest
+
+    saved = {"name": "saved-member", "tools": ["*"]}
+    monkeypatch.setattr(agent_state, "get_capabilities", lambda _: {"materialized": _digest(saved)})
+    runtime = _codex_runtime()
+    runtime.terminate_session = AsyncMock()
+    handle = _codex_handle(consumed)
+    with pytest.raises(AcpError, match="capability_runtime_unverified"):
+        await runtime._confirm_member_projection(handle)
+    runtime.terminate_session.assert_awaited_once_with("codex-session")
+    assert handle.confirmed_projection_template == ""
+
+
+def test_codex_member_template_not_reported_from_dead_runtime(monkeypatch):
+    from kiro_crew.agent_capabilities import _digest
+
+    spec = {"name": "saved-member", "tools": ["*"]}
+    monkeypatch.setattr(agent_state, "get_capabilities", lambda _: {"materialized": _digest(spec)})
+    provider = _codex_session_provider("saved-member", spec, alive=False)
+    provider._handle.confirmed_projection_template = "saved-member"
+    assert provider.loaded_capability_template == ""
+
+
+def test_deepseek_member_confirms_on_the_spec_its_array_was_built_from(tmp_path, monkeypatch):
+    """deepseek confirms on the AcpClient path like claude. The mirror must hand back
+    the spec it parsed: a projection that drops it leaves nothing to confirm, and every
+    deepseek member session would be refused."""
+    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.agent_capabilities import _digest
+    from kiro_crew.providers.mirrors.registry import mirror_for
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    spec = {"name": "saved-member", "tools": ["*"], "mcpServers": {}}
+    (agents / "saved-member.json").write_text(json.dumps(spec), encoding="utf-8")
+    monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: agents, raising=False)
+    monkeypatch.setenv("KIRO_AGENTS_DIR", str(agents))
+    projection = mirror_for(ACP_BACKEND_DEEPSEEK).session_projection(
+        "saved-member", work_dir=tmp_path
+    )
+    consumed = projection.agent_spec
+    assert consumed is not None
+    monkeypatch.setattr(
+        agent_state, "get_capabilities", lambda _: {"materialized": _digest(consumed)}
+    )
+    client = AcpClient(work_dir=tmp_path, agent="saved-member", acp_backend=ACP_BACKEND_DEEPSEEK)
+    client._session_mcp_withheld = False
+    client.member_context = True
+    client._confirm_member_projection(consumed)
+    assert client.capability_projection_gaps == ()
+
+
+def test_deepseek_member_spec_reaches_its_session_array():
+    """deepseek confirms on the AcpClient path like claude, which needs a mirror that
+    carries the spec it parsed; without one there is nothing to confirm."""
+    from kiro_crew.providers.mirrors.registry import has_mirror
+
+    assert has_mirror(ACP_BACKEND_DEEPSEEK)
+    assert ACP_BACKEND_DEEPSEEK in ACP_BACKENDS_MEMBER_CAPABILITIES
+
+
+@pytest.mark.asyncio
+async def test_projection_gaps_keep_saved_runtime_unverified(world, monkeypatch):
+    service, cfg, factory, _, project, _, _ = world
+    await asyncio.to_thread(save, service, enroll=True)
+    manager = SessionManager(cfg, provider_factory=factory)
+    try:
+        await manager.get_or_create("dashboard:A", agent="A", cwd=str(project))
+        prepared = await asyncio.to_thread(prepare_member_capabilities, "A", project)
+        assert manager.capability_runtime_view("A", prepared["revision"])["status"] == "applied"
+        monkeypatch.setattr(
+            FakeProvider, "capability_projection_gaps", property(lambda _: ("hooks",))
+        )
+        view = manager.capability_runtime_view("A", prepared["revision"])
+        assert view["status"] == "unverified"
+        assert view["sessions"][0]["status"] == "unverified"
+        manager.release("dashboard:A")
+    finally:
+        await manager.close_all(drain_timeout=0)
+
+
+@pytest.mark.parametrize(
+    "field", [None, "hooks", "toolsSettings", "excludedTools", "allowedTools", "per_tool_mounts"]
+)
+def test_claude_projection_gaps_are_explicit(tmp_path, monkeypatch, field):
+    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.agent_capabilities import _digest
+
+    spec = {"name": "saved-member", "tools": ["*"]}
+    if field == "per_tool_mounts":
+        spec["tools"] = ["*", "@docs/search"]
+    elif field:
+        spec[field] = {"entry": "value"}
+    monkeypatch.setattr(agent_state, "get_capabilities", lambda _: {"materialized": _digest(spec)})
+    client = AcpClient(work_dir=tmp_path, agent="saved-member", acp_backend=ACP_BACKEND_CLAUDE)
+    client._claude_settings_authored = True
+    client.member_context = True
+    client._confirm_member_projection(spec)
+    expected = "auto_approval" if field == "allowedTools" else field
+    assert client.capability_projection_gaps == ((expected,) if expected else ())
+    assert client.loaded_capability_template == ""
+
+
+@pytest.mark.asyncio
+async def test_saved_claude_member_uses_existing_essentials_path(world, monkeypatch):
+    from kiro_crew.member_essential_context import documents_for_member
+
+    service, _, _, _, project, _, _ = world
+    # A file:// resource must sit under the home directory; keep the project
+    # inside it wherever the test's temporary tree happens to be.
+    monkeypatch.setenv("HOME", str(project.parent))
+    resource = project / "member-guide.md"
+    resource.write_text("SAVED_MEMBER_RESOURCE", encoding="utf-8")
+    uri = "file://" + str(resource)
+    request = {
+        "revision": service.get("A")["revision"],
+        "enroll": True,
+        "operations": [
+            {"section": "prompt", "id": "prompt", "action": "set", "value": "SAVED_MEMBER_PROMPT"},
+            {"section": "resources", "id": uri, "action": "set", "value": uri},
+        ],
+    }
+    preview = await asyncio.to_thread(service.preview, "A", request)
+    await asyncio.to_thread(
+        service.put, "A", {**request, "preview_token": preview["preview_token"]}
+    )
+    prepared = await asyncio.to_thread(prepare_member_capabilities, "A", project)
+    documents = await asyncio.to_thread(
+        documents_for_member, prepared["template"], str(project), inherits_default_resources=False
+    )
+    bodies = "\n".join(body for _, body in documents)
+    assert "SAVED_MEMBER_PROMPT" in bodies
+    assert "SAVED_MEMBER_RESOURCE" in bodies
+
+
+def test_nonmember_claude_does_not_read_member_capability_state(tmp_path, monkeypatch):
+    from kiro_crew.acp.client import AcpClient
+
+    read = MagicMock(side_effect=ValueError("unreadable member state"))
+    monkeypatch.setattr(agent_state, "get_capabilities", read)
+    client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+    client._confirm_member_projection(None)
+    read.assert_not_called()
+    assert client.loaded_capability_template == ""

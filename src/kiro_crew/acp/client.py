@@ -165,6 +165,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_LOAD_WITHOUT_MODES,
+    ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MEMBER_PANEL,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
@@ -3664,6 +3665,10 @@ class AcpClient:
         # ``session/load`` response instead, against this snapshot. Resolved and
         # cleared together with the array, for the same per-spawn freshness reason.
         self._session_mcp_snapshot: DerivedSpecSnapshot | None = None
+        self._session_agent_spec: dict[str, Any] | None = None
+        self.member_context = False
+        self._loaded_capability_template = ""
+        self._capability_projection_gaps: tuple[str, ...] = ()
         # This session's agent spec, snapshotted once per spawn for the
         # unresolved-ref guard alone (see _guard_unresolved_mcp_refs). Held for
         # the same reason as the array above and read at the same kind of site:
@@ -4332,6 +4337,7 @@ class AcpClient:
         # Kept beside the array it describes, so the post-consume check judges the
         # generation these elements were built from and not a later read of the file.
         self._session_mcp_snapshot = projection.derived_spec_snapshot
+        self._session_agent_spec = projection.agent_spec
         servers = projection.params.get("mcpServers") or []
         out = list(servers) if isinstance(servers, list) else []
         # The restriction half of the projection's withhold set, from the SAME parse the
@@ -4866,6 +4872,22 @@ class AcpClient:
             self._session_id,
         )
         return servers
+
+    def _deepseek_session_mcp_servers(self) -> list:
+        """MCP server array passed to a deepseek ``session/new`` / ``session/load``.
+
+        The deepseek twin of :meth:`_goose_session_mcp_servers`: ``dsh --profile acp``
+        reads no ``~/.kiro/agents/<name>.json``, and once deepseek is in ``MIRRORS``
+        :meth:`_pooled_mcp_servers` answers ``[]`` for it, so this array is the only
+        route for Crew's own tools as well as the spec's servers. An element whose
+        command cannot start fails ``session/new`` whole on this harness
+        (``test/fixtures/acp_frames/deepseek/mcp-stdio-rollback-live.jsonl``).
+
+        In-memory only. The spawn path warms ``_session_mcp_cache`` off the loop, so
+        this accessor adds no scheduling or failure point to a call site shared with
+        kiro-cli (harness-parity H13).
+        """
+        return self._session_mcp_servers()
 
     def _claude_local_settings_path(self) -> Path:
         return self._work_dir / ".claude" / "settings.local.json"
@@ -5455,6 +5477,9 @@ class AcpClient:
         """Drop the MCP array and the spec snapshot that authorized it."""
         self._session_mcp_cache = None
         self._session_mcp_snapshot = None
+        self._session_agent_spec = None
+        self._loaded_capability_template = ""
+        self._capability_projection_gaps = ()
 
     def _withdraw_shared_reader_lease(self, path: Path, owner: str) -> bool:
         """Withdraw the durable reader lease before clearing its lease flag."""
@@ -6614,6 +6639,57 @@ class AcpClient:
         # teardown's ordinary settle transaction hands it back from here.
         self._claude_settings_claim_unrevoked = False
         self._invalidate_session_mcp_projection()
+
+    def _check_consumed_session_spec(
+        self, snapshot: DerivedSpecSnapshot | None, spec: dict[str, Any] | None
+    ) -> None:
+        """Check what the host consumed once the session exists. Blocking.
+
+        The derived spec must be unchanged since the array was built, and a member on
+        a projecting backend must have consumed its saved spec. A host that sends no
+        array (kiro-cli) passes ``None`` and is not a projecting backend, so both
+        checks are no-ops for it.
+        """
+        require_unchanged_derived_spec(snapshot)
+        if (
+            self.backend in ACP_BACKENDS_MEMBER_CAPABILITIES
+            and self.backend in ACP_BACKENDS_SESSION_MCP_ARRAY
+        ):
+            self._confirm_member_projection(spec)
+
+    def _confirm_member_projection(self, spec: dict[str, Any] | None) -> None:
+        """Confirm the consumed projection, never a spec re-read after startup."""
+        if not self.member_context:
+            return
+        from kiro_crew.agent_capabilities import CapabilityError, confirm_consumed_projection
+
+        try:
+            gaps = confirm_consumed_projection(
+                self._agent,
+                spec,
+                withheld=self._seeds_local_settings and not self._permission_surface_governed,
+            )
+        except CapabilityError as exc:
+            raise AcpError(f"{exc.code}: saved spec projection could not be confirmed") from exc
+        if gaps is None:
+            return
+        self._capability_projection_gaps = gaps
+        self._loaded_capability_template = self._agent
+
+    @property
+    def loaded_capability_template(self) -> str:
+        """Saved template whose projection was consumed by this live session."""
+        if (
+            self.backend in ACP_BACKENDS_MEMBER_CAPABILITIES
+            and self.is_ready
+            and self._is_process_alive()
+        ):
+            return self._loaded_capability_template
+        return ""
+
+    @property
+    def capability_projection_gaps(self) -> tuple[str, ...]:
+        return self._capability_projection_gaps
 
     @property
     def is_ready(self) -> bool:
@@ -8258,13 +8334,12 @@ class AcpClient:
             _deepseek_bin, argv, spawn_label, stderr_label = (
                 await self._resolve_self_served_launch()
             )
-            # No spec translation is warmed here, and its absence is the declared
-            # state rather than an omission: this harness has no mirror, so
-            # ``_resolve_session_mcp_servers`` would answer with an empty list, and
-            # warming it would buy a disk read and a thread hop for that answer. What
-            # DOES reach the session is the shared broker append, which stays on the
-            # composition path for every mirror-less backend. See
-            # ``providers/mirrors/registry`` for the projection this harness declares.
+            # Translate the agent spec into this session's MCP array HERE, on this
+            # harness's own arm, for the reason the goose arm gives: the translation
+            # reads disk, and doing it at the shared session/new call site would put
+            # an executor hop on every backend's construction path, kiro-cli included
+            # (harness-parity H13). The mirror places Crew's broker stubs itself.
+            self._session_mcp_cache = await asyncio.to_thread(self._resolve_session_mcp_servers)
             #
             # The refuse-then-mask preflight every ENFORCED harness takes, and FIRST
             # for the reason the pi arm gives: the read-back below starts a child of
@@ -9578,6 +9653,9 @@ class AcpClient:
         # a replacement process must not inherit this one's snapshot.
         self._session_mcp_cache = None
         self._session_mcp_snapshot = None
+        self._session_agent_spec = None
+        self._loaded_capability_template = ""
+        self._capability_projection_gaps = ()
         # Same per-spawn freshness rule as the array above: an edited spec must be
         # what the next session's guard judges, not this one's.
         self._mcp_ref_spec = None
@@ -9755,6 +9833,7 @@ class AcpClient:
                 *(self._claude_session_mcp_servers() if self._is_claude else []),
                 *(self._opencode_session_mcp_servers() if self._is_opencode else []),
                 *(self._goose_session_mcp_servers() if self._is_goose else []),
+                *(self._deepseek_session_mcp_servers() if self._is_deepseek else []),
                 *(await asyncio.to_thread(self._pooled_mcp_servers)),
             ],
         }
@@ -9823,6 +9902,7 @@ class AcpClient:
                 *(self._claude_session_mcp_servers() if self._is_claude else []),
                 *(self._opencode_session_mcp_servers() if self._is_opencode else []),
                 *(self._goose_session_mcp_servers() if self._is_goose else []),
+                *(self._deepseek_session_mcp_servers() if self._is_deepseek else []),
                 *(await asyncio.to_thread(self._pooled_mcp_servers)),
             ]
             # Rebuilt AFTER the array, from the same re-seed: the envelope carries
@@ -9919,6 +9999,7 @@ class AcpClient:
         resume_sid = self._resume_session_id
         self._resume_session_id = None  # consume — no retry loop
         sent_snapshot: DerivedSpecSnapshot | None = None
+        sent_spec: dict[str, Any] | None = None
 
         if resume_sid and self._can_load_session:
             # Only attempt session/load when the prior session transcript
@@ -9976,6 +10057,7 @@ class AcpClient:
                             *(self._claude_session_mcp_servers() if self._is_claude else []),
                             *(self._opencode_session_mcp_servers() if self._is_opencode else []),
                             *(self._goose_session_mcp_servers() if self._is_goose else []),
+                            *(self._deepseek_session_mcp_servers() if self._is_deepseek else []),
                             *(await asyncio.to_thread(self._pooled_mcp_servers)),
                         ],
                     }
@@ -10010,6 +10092,7 @@ class AcpClient:
                         self._resumed = True
                         self._capture_available_models(load_resp)
                         sent_snapshot = self._session_mcp_snapshot
+                        sent_spec = self._session_agent_spec
                         if self._uses_advertised_model_selection:
                             await self._persist_advertised_models_if_changed()
                             await self._reseed_after_capture()
@@ -10053,6 +10136,7 @@ class AcpClient:
             model_before = self._model
             session_resp = await self._new_session_following_substitution()
             sent_snapshot = self._session_mcp_snapshot
+            sent_spec = self._session_agent_spec
             self._session_id = session_resp.get("sessionId")
             self._capture_available_models(session_resp)
             if self._uses_advertised_model_selection:
@@ -10121,8 +10205,10 @@ class AcpClient:
         # to ``AcpError`` for the reason the two checks above are: that is the type
         # ``ensure_ready`` handles, and its handler is what ends the child and drops
         # the half-registered session state.
+        # The same off-loop step also confirms a member's consumed projection, so the
+        # kiro construction path gains no call, await or branch of its own (H13).
         try:
-            await asyncio.to_thread(require_unchanged_derived_spec, sent_snapshot)
+            await asyncio.to_thread(self._check_consumed_session_spec, sent_snapshot, sent_spec)
         except DerivedSpecStale as exc:
             raise AcpError(str(exc)) from exc
 

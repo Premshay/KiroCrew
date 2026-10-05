@@ -346,6 +346,9 @@ def opencode_projection(
         restricted_servers=projection.restricted | narrowed_plane,
         derived_spec_snapshot=projection.derived_spec_snapshot,
         zero_tools=projection.zero_tools,
+        # The parse the array came from, for a member session's loaded-check (the
+        # deepseek mirror delegates here; codex and claude carry theirs the same way).
+        agent_spec=projection.agent_spec,
     )
 
 
