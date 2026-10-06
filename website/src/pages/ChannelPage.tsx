@@ -34,6 +34,7 @@ import { AnimatePresence } from 'framer-motion'
 import DetailPanel from '../components/DetailPanel'
 
 import { i18nT } from '../i18n/t'
+import { isChatPageSurface } from '../utils/channelOrigin'
 import { useListDetailView } from '../hooks/useListDetailView'
 import { useAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 import ListDetailBack from '../components/ListDetailBack'
@@ -107,7 +108,15 @@ interface DashboardSlot {
   key: string
   title?: string
   agent?: string
+  mode?: string
+  surface?: string
 }
+
+/** Only sessions the sidebar shows; a crewmate's own chat is its desk and stays out of channels. */
+const isAttachableSlot = (slot: DashboardSlot) => isChatPageSurface(slot.surface ?? slot.mode)
+
+const attachableSlotLabel = (slot: DashboardSlot) =>
+  `${slot.title || slot.key}${slot.agent ? ` · ${slot.agent}` : ''}`
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mapMsg = (m: any): ChannelMessage => ({
   id: m.id,
@@ -959,7 +968,8 @@ function AttachSessionForm({
     staleTime: 0,
   })
   const attachable = slots.filter(
-    (slot) => slot.key && !attachedSessionKeys.has(`dashboard:${slot.key}`),
+    (slot) =>
+      slot.key && isAttachableSlot(slot) && !attachedSessionKeys.has(`dashboard:${slot.key}`),
   )
   const [selected, setSelected] = useState('')
 
@@ -976,9 +986,7 @@ function AttachSessionForm({
         id="channel-session-picker"
         aria-label={i18nT('pages.chatSidebar.sessions')}
         options={attachable.map((slot) => slot.key)}
-        optionLabels={attachable.map(
-          (slot) => `${slot.title || slot.key}${slot.agent ? ` · ${slot.agent}` : ''}`,
-        )}
+        optionLabels={attachable.map(attachableSlotLabel)}
         value={selected}
         onChange={setSelected}
         className="w-full"

@@ -53,6 +53,19 @@ describe('ChannelPage — attach live dashboard session', () => {
     expect(picker).not.toHaveTextContent('Codex Multiplex')
   })
 
+  it('offers only sessions the sidebar shows, not crewmate chats', async () => {
+    vi.mocked(api).chatSlots = vi.fn().mockResolvedValue([
+      { key: 'member-grain.memory-member-grain-1', title: 'Hello', agent: 'grain', mode: 'member' },
+      { key: 'chat-hidden', title: 'Dashboard tab', agent: 'crew-claude', surface: 'dashboard' },
+      { key: 'chat-work', title: 'Grain work', agent: 'grain' },
+    ])
+    await openSessionPicker()
+    const picker = await screen.findByRole('combobox', { name: 'Sessions' })
+    expect(picker).toHaveTextContent('Grain work · grain')
+    expect(picker).not.toHaveTextContent('Hello')
+    expect(picker).not.toHaveTextContent('Dashboard tab')
+  })
+
   it('attaches the selected dashboard slot then refreshes the channel', async () => {
     const user = await openSessionPicker()
     await user.click(screen.getByRole('button', { name: 'Add' }))
