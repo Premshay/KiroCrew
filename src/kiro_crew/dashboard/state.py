@@ -4795,6 +4795,9 @@ class _ChatSlot:
         self._checkpoint_covered_generation = min(covered, self._checkpoint_activity_generation)
 
     def checkpoint_reminder_due(self) -> bool:
+        # A crewmate's own chat keeps its briefing instead of a Multiplex card.
+        if self.mode == "member":
+            return False
         return (
             self._checkpoint_activity_generation > self._checkpoint_covered_generation
             and self._checkpoint_reminder_generation < self._checkpoint_activity_generation

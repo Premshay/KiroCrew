@@ -4504,6 +4504,15 @@ async def api_session_checkpoint(request: web.Request) -> web.Response:
             status=404,
         )
     slot = slots[0]
+    if slot.mode == "member":
+        return web.json_response(
+            {
+                "error": "a crewmate's own chat keeps its briefing instead of a checkpoint; "
+                "work sessions it opens publish checkpoints",
+                "code": "checkpoint_not_for_member_chat",
+            },
+            status=409,
+        )
     try:
         slot.set_session_checkpoint(checkpoint)
         from kiro_crew.dashboard.chat_persistence import save_slot_off_loop

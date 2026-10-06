@@ -222,6 +222,14 @@ class TestCheckpointDirectiveDispatch:
 
 
 class TestCheckpointSlotProjection:
+    def test_crewmate_chat_gets_no_checkpoint_reminder(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot.mode = "member"
+
+        slot.mark_checkpoint_activity()
+
+        assert slot.checkpoint_reminder_due() is False
+
     def test_checkpoint_freshness_tracks_meaningful_changes_until_covered(self) -> None:
         slot = _ChatSlot("checkpoint")
 
@@ -527,6 +535,22 @@ class TestCheckpointInternalEndpoint:
         assert json.loads(response.text)["code"] == "checkpoint_persistence_failed"
         assert slot.session_checkpoint_payload() is not None
         assert slot._dirty is True
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_crewmate_chat(self, tmp_path) -> None:
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("consumer")
+        slot.mode = "member"
+        request = MagicMock()
+        request.app = {"state": state}
+        request.headers = {"X-Session-Key": "dashboard:consumer"}
+        request.json = AsyncMock(return_value=_checkpoint())
+
+        response = await api_session_checkpoint(request)
+
+        assert response.status == 409
+        assert json.loads(response.text)["code"] == "checkpoint_not_for_member_chat"
+        assert slot.session_checkpoint_payload() is None
 
     @pytest.mark.asyncio
     async def test_rejects_a_session_without_its_own_live_slot(self, tmp_path) -> None:
