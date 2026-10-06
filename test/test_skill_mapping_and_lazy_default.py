@@ -375,6 +375,7 @@ class TestScopedDiscovery:
         page = await call(action="list", limit=2)
         assert [row["key"] for row in page["matches"]] == ["team/s0", "team/s1"]
         assert page["next_offset"] == 2
+        assert page["scoped"] is True
         tail = await call(action="list", limit=2, offset=2)
         assert [row["key"] for row in tail["matches"]] == ["team/s2"]
         assert tail["next_offset"] is None
@@ -383,8 +384,55 @@ class TestScopedDiscovery:
         # Clearing the custom mapping must not widen any discovery surface.
         paths.clear()
         assert (await call(action="list"))["matches"] == []
-        assert (await call(action="search", q="outside"))["matches"] == []
+        cleared = await call(action="search", q="outside")
+        assert cleared["matches"] == []
+        assert cleared["scoped"] is True
         assert (await call(action="read", key="outside"))["matches"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_wildcard_mapping_flags_a_scoped_miss_without_a_glob_count(
+        self, tmp_path, monkeypatch, opened
+    ):
+        import json
+        from types import SimpleNamespace
+        from urllib.parse import urlencode
+
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        from kiro_crew.dashboard.handlers import prompts
+
+        root = tmp_path / "skills"
+        for n in range(3):
+            _skill(root, f"team/s{n}")
+        globs: list[list[str] | None] = [[str(root / "team" / "*" / "SKILL.md")]]
+        loader = _loader(tmp_path, opened=opened)
+        monkeypatch.setattr(prompts, "_read_session_key", lambda request: "dashboard:scoped")
+        monkeypatch.setattr(prompts, "_deny_foreign_app_skill_slot", lambda *args: None)
+        monkeypatch.setattr(prompts, "_get_skills", lambda state: loader)
+        monkeypatch.setattr(prompts, "requesting_slot_project", lambda *args: None)
+        monkeypatch.setattr(prompts, "_named_slot", lambda *args: SimpleNamespace(agent="custom"))
+        monkeypatch.setattr(prompts, "session_skill_globs", lambda *args, **kw: globs[0])
+        app = web.Application()
+        app["state"] = SimpleNamespace(sessions=None)
+
+        async def call(**query):
+            request = make_mocked_request(
+                "GET", "/api/skills?" + urlencode({"q": "", **query}), app=app
+            )
+            return json.loads((await prompts.api_skills(request)).body)
+
+        # One glob maps three skills: the response must not report a size taken
+        # from the mapping, which would say one skill where three are in scope.
+        assert len((await call(action="list"))["matches"]) == 3
+        miss = await call(action="search", q="babysit")
+        assert miss["matches"] == []
+        assert miss["scoped"] is True
+        assert "scope_size" not in miss
+        globs[0] = None
+        unscoped = await call(action="search", q="babysit")
+        assert unscoped["matches"] == []
+        assert unscoped["scoped"] is False
 
     def test_mapping_bounds_every_surface_and_keeps_the_tail_loadable(self, tmp_path, opened):
         root = tmp_path / "skills"

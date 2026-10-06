@@ -4068,6 +4068,10 @@ term frequency, metadata coverage, usage and stable full key. This prevents comm
 metadata words from burying a result carrying multiple query words in its body.
 Search/list have stable-key results and offset pagination; search does not record
 usage. Exact reads share the resolved mapping and the bounded file reader.
+A search miss under a resolved mapping says the search covered only the agent's
+`skill://` resources and points at `action='list'`, so it does not read as the
+skill being uninstalled. The gateway marks it with a `scoped` flag, not a count:
+one glob can admit any number of skills.
 One exact read delivers at most `SKILL_READ_CAPACITY` (99,000 UTF-8 bytes): a tool
 response is cut at `MAX_RESPONSE_LEN` characters and the cut takes the tail, so a
 body that does not fit under that ceiling with its framing would lose its closing
