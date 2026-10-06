@@ -59,6 +59,7 @@ from kiro_crew.dashboard.handlers._shared import (
     SESSION_SEARCH_TEXT_FIELDS,
     guard_owner_surface_routes,
     internal_memory_scope,
+    member_scope_denied_refusal,
 )
 from kiro_crew.dashboard.kiro_readiness import (
     _POLL_GATE_MAX_AGE_SECS,
@@ -5488,13 +5489,37 @@ async def api_session_archive_read(request: web.Request) -> web.Response:
     return web.Response(text=redacted, content_type="application/x-ndjson")
 
 
+async def _member_channel_report_guard(request: web.Request) -> web.Response | None:
+    """Let a member read and post in its own channels, never change membership."""
+    scope, refusal = await internal_memory_scope(request, "api_session_channel")
+    if refusal is not None or scope is None:
+        return refusal
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return None  # the handler reports the malformed body
+    if isinstance(body, dict) and body.get("action") in {"status", "post"}:
+        return None
+    return await member_scope_denied_refusal("api_session_channel")
+
+
 # Every ``api_session*`` handler is an owner surface, so a private member's
-# internal call is refused before it runs (audit label = handler name). These
-# three verify and scope their own caller instead.
+# internal call is refused before it runs (audit label = handler name). The
+# member-scoped ones act only on the caller's own slot and verify it
+# themselves; the channel route admits a member to its own channels for status
+# and post only. Maintenance stays owner-only: its status lists every busy
+# session.
 guard_owner_surface_routes(
     globals(),
     prefix="api_session",
     member_scoped=frozenset(
-        {"api_session_directive", "api_session_keepalive", "api_session_tool_policy"}
+        {
+            "api_session_checkpoint",
+            "api_session_directive",
+            "api_session_keepalive",
+            "api_session_restart_continuation",
+            "api_session_tool_policy",
+        }
     ),
+    resource_scoped={"api_session_channel": _member_channel_report_guard},
 )
