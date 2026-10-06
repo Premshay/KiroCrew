@@ -38,6 +38,7 @@ const catalog = [
 ]
 
 const COVERED_HIDDEN = [
+  ['member', 'reviewer'],
   ['template', 'reviewer'],
   // The built-in default crew is covered by the listed `kirocrew` template, but
   // it is the default agent, so it stays: a chat must be able to switch back to it.
@@ -66,7 +67,7 @@ describe('useAgents keeps covered crewmates out of the picker unless the config 
     configApi.mockResolvedValue(cfg as never)
     const { result } = renderHookWithProviders(() => useAgents(0))
     await waitFor(() => expect(configApi).toHaveBeenCalled())
-    await waitFor(() => expect(result.current.choices).toHaveLength(6))
+    await waitFor(() => expect(result.current.choices).toHaveLength(7))
 
     expect(result.current.choices.map(c => [c.selection_kind, c.name])).toEqual(COVERED_HIDDEN)
   })
@@ -89,23 +90,32 @@ describe('useAgents keeps covered crewmates out of the picker unless the config 
     )
   })
 
-  it('withholds a same-name crewmate and an identity-less one on a listed template', () => {
-    // `reviewer` shares its name with a template; `default` has no memory of its
-    // own and runs the listed `kirocrew` template -- both are the same binding.
-    // With some other agent named as the default, both are withheld.
+  it('withholds an identity-less crewmate on a listed template', () => {
     const rows = withoutCoveredCrewmates(catalog as never, 'tuned')
     const members = rows.filter(r => r.selection_kind === 'member').map(r => r.name)
-    expect(members).not.toContain('reviewer')
     expect(members).not.toContain('default')
   })
 
   it('keeps the covered crewmate that is the default agent', () => {
-    // The same catalog with `default` named as the default: it is still the same
-    // binding as the `kirocrew` template, and it stays anyway (#18239).
     const rows = withoutCoveredCrewmates(catalog as never, 'default')
     const members = rows.filter(r => r.selection_kind === 'member').map(r => r.name)
     expect(members).toContain('default')
-    expect(members).not.toContain('reviewer')
+    expect(members).toContain('reviewer')
+  })
+
+  it.each(['tuned', 'reviewer'])('keeps a same-name crewmate that has its own memory (default=%s)', (defaultAgent) => {
+    // A template pick binds the shared `default` store, so the `reviewer`
+    // template does not reach the `reviewer` crewmate's own memory.
+    const rows = withoutCoveredCrewmates(catalog as never, defaultAgent)
+    expect(rows.filter(r => r.name === 'reviewer').map(r => r.selection_kind)).toEqual(['member', 'template'])
+  })
+
+  it.each(['', 'shared'])('withholds a same-name crewmate with no memory of its own (default=%s)', (defaultAgent) => {
+    const rows = withoutCoveredCrewmates([
+      { name: 'shared', kiro_agent: 'shared', memory_store: 'default', selection_kind: 'member' },
+      { name: 'shared', kiro_agent: 'shared', memory_store: 'default', selection_kind: 'template' },
+    ] as never, defaultAgent)
+    expect(rows.map(r => r.selection_kind)).toEqual(['template'])
   })
 
   it('keeps a crewmate whose own-memory binding is not a template pick', () => {
