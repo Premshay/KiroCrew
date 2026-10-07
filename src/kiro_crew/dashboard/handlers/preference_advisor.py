@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import threading
 import time
 import uuid
 from dataclasses import asdict
@@ -22,6 +23,10 @@ _KEY = web.AppKey("preference_advice", dict)
 _MAX_TASK = 4000
 _COMPUTE_SECONDS = 3.0
 _WORK = web.AppKey("preference_work", asyncio.Task)
+# Reviewed examples change only when the preference file does, so their vectors
+# are kept per embedding model; a request then embeds just its own task.
+_example_vectors: dict[tuple[str, str], list[float]] = {}
+_example_vectors_lock = threading.Lock()
 
 
 def _eligible(slot) -> bool:
@@ -122,15 +127,33 @@ def _compute(
     if type(backend) is not LlamaCppEmbedder:
         return {"reason": "local_embedding_required"}
 
+    example_texts = {e.task for e in examples}
+    model_id = backend.model_id
+
     def encode(text: str):
+        key = (model_id, text)
+        if text in example_texts:
+            with _example_vectors_lock:
+                cached = _example_vectors.get(key)
+            if cached is not None:
+                return cached
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("preference scoring budget exhausted")
         vector = backend.embed(text)
+        if vector and text in example_texts:
+            with _example_vectors_lock:
+                # Bounded by the configuration's 500-example cap per model.
+                _example_vectors[key] = list(vector)
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("preference scoring budget exhausted")
         return vector
 
-    advice = advise(task, role, examples, encode)
+    try:
+        advice = advise(task, role, examples, encode)
+    except TimeoutError:
+        # The request already answered advice_timeout; raising here would surface
+        # from the shielded task as an unhandled asyncio error.
+        return {"reason": "advice_timeout"}
     model = resolve_budget_model(advice, mapping, advertised)
     evidence = [e.task[:240] for e in examples if e.id in advice.examples][:2]
     return {**asdict(advice), "model": model, "evidence": evidence}

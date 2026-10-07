@@ -277,7 +277,9 @@ reopen a card or show a saved notice with a late result. Alternative picker
 operations bind to their originating interaction before the first write, so a
 websocket update arriving before the HTTP response does not discard feedback.
 Server scoring has a three-second budget, checked between embedding calls, and
-runs outside the feedback lock. One in-flight scorer per application remains
+runs outside the feedback lock. Reviewed example vectors are kept per embedding
+model, so a request embeds only its own task; an exhausted budget returns
+`advice_timeout` from the worker instead of raising out of the shielded task. One in-flight scorer per application remains
 accounted for even if a native embedding call outlives the HTTP deadline; further
 requests abstain while it is busy rather than accumulating worker threads.
 

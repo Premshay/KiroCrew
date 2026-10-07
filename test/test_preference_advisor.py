@@ -281,10 +281,13 @@ class TestPreferenceAdvisor:
         calls = []
 
         class LocalEncoder:
+            model_id = "local-model"
+
             def embed(self, text):
                 calls.append(text)
                 return [1, 0]
 
+        monkeypatch.setattr(handler, "_example_vectors", {})
         monkeypatch.setattr(embeddings, "LlamaCppEmbedder", LocalEncoder)
         monkeypatch.setattr(embeddings, "get_shared_embedder", LocalEncoder)
         rows = [
@@ -321,14 +324,20 @@ class TestPreferenceAdvisor:
             == "automatic_routing_active"
         )
         assert len(calls) == 3
+        # Reviewed examples are embedded once per model; later requests embed
+        # only their own task.
         assert handler._compute("new task", ["small"], routing_armed=False)["model"] == "small"
-        assert len(calls) == 6
+        assert len(calls) == 4
         unmapped = handler._compute("new task", ["another-provider-model"], require_mapping=False)
         assert unmapped["budget"] == "balanced"
         assert unmapped["model"] is None
-        with pytest.raises(TimeoutError):
-            handler._compute("new task", ["small"], deadline=0)
-        assert len(calls) == 9
+        assert len(calls) == 5
+        # An exhausted budget is an answer, not an exception escaping the worker.
+        assert handler._compute("new task", ["small"], deadline=0) == {"reason": "advice_timeout"}
+        assert len(calls) == 5
+        LocalEncoder.model_id = "another-model"
+        handler._compute("new task", ["small"])
+        assert calls[-3:] == ["new task", "reviewed 0", "reviewed 1"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
