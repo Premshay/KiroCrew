@@ -48,12 +48,11 @@ override with `EXPLAIN_FOR_EVAL_CLI`.
 
 ## Adding a case
 
-Append to the `cases` array, with the next unused `id` (`--check` rejects a
-duplicate; the example uses 18):
+Append to the `cases` array:
 
 ```json
 {
-  "id": 18,
+  "id": 13,
   "name": "explain-oauth-partner",
   "prompt": "Explain this to my wife: why login broke on her phone",
   "audience": "Partner",

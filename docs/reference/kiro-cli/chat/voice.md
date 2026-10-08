@@ -176,8 +176,8 @@ you can interrupt at any time by typing or speaking your next message.
 
 ### Manual Replay
 
-Open the **More actions** menu on any non-blank assistant reply and choose
-**Read aloud** to hear it. This works independently of auto-speak.
+Hover over any assistant message (≥50 chars) and click the **Speak** button
+to hear it read aloud. This works independently of auto-speak.
 
 For Pocket, replay is an on-demand Ogg Opus stream. Piper and Polly retain the
 existing synthesis path for manual replay.

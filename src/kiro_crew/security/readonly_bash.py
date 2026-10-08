@@ -51,15 +51,6 @@ _READ_ONLY_BASH_PREFIXES: tuple[str, ...] = (
     "realpath",
     "basename",
     "dirname",
-    # Stdout-only filters: no flag writes a file or runs a program. Kept off: `rg`
-    # (`--pre` runs a program), `printf` (`-v` assigns a variable), `jq` (evaluates a
-    # program) and `xxd` (`-r` writes a file).
-    "tr",
-    "nl",
-    "rev",
-    "comm",
-    "od",
-    "column",
     "git status",
     "git log",
     "git diff",
@@ -86,8 +77,7 @@ _READ_ONLY_BASH_PREFIXES: tuple[str, ...] = (
 )
 
 _READ_ONLY_PIPE_RE = re.compile(
-    r"^\s*(grep|egrep|fgrep|head|tail|wc|sort|uniq|cut|less|more|cat"
-    r"|tr|nl|rev|comm|od|column)\b"
+    r"^\s*(grep|egrep|fgrep|head|tail|wc|sort|uniq|cut|less|more|cat)\b"
 )
 
 # Reject redirections and command substitutions, conservatively.
@@ -96,16 +86,7 @@ _READ_ONLY_PIPE_RE = re.compile(
 # TOKEN ELISION rather than command execution, and they are handled per verb in
 # `_side_effect_reason` instead: see `_ELISION_SENSITIVE` for why a global refusal
 # was the wrong place for them.
-#
-# `$[...]` and an `=` after `${` (`${X:=v}`, `${X=v}`, a subscript `${a[X=0]}`)
-# ASSIGN a variable for every later segment: `echo $[PATH=0]; ls` runs `ls` from
-# `./0`. Any `=` after a `${`, to the end of the whole command: the expansion's
-# end cannot be found by stopping at `}` (an inner one closes first) or at `|` / a
-# newline (arithmetic and quoting carry both). A later `=` costs only a prompt.
-# That check is a substring test in `_classify_bash`: as a regex it backtracks
-# quadratically on a long command, on the event loop.
-_UNSAFE_SHELL_RE = re.compile(r">|`|\$\(|<\(|(?<!&)&(?!&)|\$\[")
-
+_UNSAFE_SHELL_RE = re.compile(r">|`|\$\(|<\(|(?<!&)&(?!&)")
 
 # Discard-only redirect idioms that are read-only despite containing '>'/'&':
 # `2>/dev/null`, `>/dev/null`, `&>/dev/null`, `2>>/dev/null`, and `2>&1`.
@@ -1402,12 +1383,8 @@ def _classify_bash(cmd: str) -> str:
     # Strip discard-only redirects (output sinks / stderr-merge) before the
     # unsafe-shell check; they are read-only but contain '>' / '&'.
     scrubbed = _DEVNULL_REDIR_RE.sub(" ", cmd)
-    expansion_at = scrubbed.find("${")
-    if _UNSAFE_SHELL_RE.search(scrubbed) or (expansion_at >= 0 and "=" in scrubbed[expansion_at:]):
-        return (
-            "unsafe shell pattern (redirect, command/process substitution, "
-            "backgrounding, or a variable-assigning expansion)"
-        )
+    if _UNSAFE_SHELL_RE.search(scrubbed):
+        return "unsafe shell pattern (redirect, command/process substitution, or backgrounding)"
     parts = re.split(r"\s*(?:&&|\|\||;|\n)\s*", cmd.strip())
     for part in parts:
         if not part.strip():

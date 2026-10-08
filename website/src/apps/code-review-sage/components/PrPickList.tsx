@@ -481,7 +481,8 @@ export default function PrPickList({ source }: { source?: PrSource }) {
             const inputId = `sage-pr-${pr.number}`
             return (
               // The checkbox BATCHES; clicking the row OPENS the PR and its
-              // review, so a PR can be looked at without queueing it.
+              // review. These were one <label> before, which meant there was no
+              // way to look at a PR without also queueing it.
               <div
                 key={pr.url}
                 className={`flex items-start gap-2 rounded-lg border px-2.5 py-2 transition-colors ${

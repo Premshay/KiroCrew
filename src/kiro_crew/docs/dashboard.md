@@ -32,8 +32,7 @@ Multi-session parallel chat with full Markdown rendering, syntax-highlighted cod
 - **Resume**: click a history item to restore the full conversation.
 - **Notifications**: click a notification to view it in the main pane.
 - **Auto-titles**: sessions get auto-generated titles after a few turns.
-- **Rename a session**: choose **Rename** from a sidebar row's `⋮` menu (or right-click the row), double-click the bold title in the row, or click the title in the session header. A name you set is kept: background title refreshes skip it, and only the **Auto-title** button replaces it.
-- **Edit & resend**: edit and resend previous user messages with history preserved. From an empty composer, ⌘↑ (macOS) or Ctrl+↑ opens the last user message for editing.
+- **Edit & resend**: edit and resend previous user messages with history preserved.
 - **Fork session**: fork a session into a new tab with full context carried over.
 - **Regenerate replies**: regenerate assistant replies with variant history navigation.
 - **Prompt history**: ↑/↓ arrow keys navigate through previous prompts.
@@ -55,7 +54,7 @@ Multi-session parallel chat with full Markdown rendering, syntax-highlighted cod
 
 ### Settings (`/settings/*`)
 
-Settings uses tabbed panels for Overview, Imports, Agent Harness, Chat, Display, Voice, Notifications, Shortcuts, Skills, Channels, Browser, Computer Use, Webhooks, Remote Crew, Privacy, Security, Connections, Secrets, Developer, Releases, and About. `/overview` redirects to `/settings/overview`.
+Settings uses tabbed panels for Overview, Imports, Chat, Display, Voice, Notifications, Shortcuts, Skills, Channels, Browser, Computer Use, Webhooks, Instances, Privacy, Security, Connections, Secrets, Developer, Releases, and About. `/overview` redirects to `/settings/overview`.
 
 ### Customize (`/capabilities`)
 
@@ -67,7 +66,7 @@ Create and manage cron jobs, organize them in folders, and switch between list, 
 
 ### Developer (`/developer`)
 
-Tabbed developer views for logs, system metrics, telemetry, storage, MCP pooling, memory, configuration, debug tools, and the session archive. The former standalone `/system` page is the System tab here. The agent backend lives in **Settings → Agent Harness**; an old `/developer?tab=agent-backend` link forwards there.
+Tabbed developer views for logs, system metrics, telemetry, storage, MCP pooling, memory, configuration, the agent backend, debug tools, and the session archive. The former standalone `/system` page is now the System tab here.
 
 ### Logs (`/logs`)
 

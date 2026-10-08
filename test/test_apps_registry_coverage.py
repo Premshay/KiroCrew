@@ -2164,10 +2164,6 @@ class TestKillProcessGroup:
         class _Stubborn(_FakeProc):
             def __init__(self) -> None:
                 super().__init__(returncode=0)
-                # A child that ignores SIGTERM has NOT exited yet, so asyncio
-                # has recorded no exit code; it is set only once ``wait()``
-                # finally returns.
-                self.returncode = None
                 self._reaped = False
 
             async def wait(self) -> int:
@@ -2175,7 +2171,6 @@ class TestKillProcessGroup:
                 if not self._reaped:
                     self._reaped = True
                     await asyncio.sleep(5)
-                self.returncode = 0
                 return 0
 
         proc = _Stubborn()
@@ -2200,10 +2195,6 @@ class TestKillProcessGroup:
         class _Stubborn(_FakeProc):
             def __init__(self) -> None:
                 super().__init__(returncode=0)
-                # A child that ignores SIGTERM has NOT exited yet, so asyncio
-                # has recorded no exit code; it is set only once ``wait()``
-                # finally returns.
-                self.returncode = None
                 self._reaped = False
 
             async def wait(self) -> int:
@@ -2211,7 +2202,6 @@ class TestKillProcessGroup:
                 if not self._reaped:
                     self._reaped = True
                     await asyncio.sleep(5)
-                self.returncode = 0
                 return 0
 
         proc = _Stubborn()
@@ -4686,8 +4676,7 @@ class TestGitFetchAndPullFailClosed:
         monkeypatch.setattr(registry, "_clone_origin_url", _origin)
         monkeypatch.setattr(registry, "_read_clone_branch", lambda path: "main")
         spawned = self._spawns(
-            monkeypatch,
-            [(("git", "-c"), lambda a, k: self._Proc(returncode=1, output=b"no"))],
+            monkeypatch, [(("git", "pull"), lambda a, k: self._Proc(returncode=1, output=b"no"))]
         )
         log: list[str] = []
         result = await registry._git_clone_or_pull(url, "main", dest, log)
@@ -4695,9 +4684,7 @@ class TestGitFetchAndPullFailClosed:
             "ok": False,
             "error": "git pull failed (exit 1); not installing stale code",
         }
-        # The hooks/fsmonitor neutralizer is spliced in right after ``git``.
-        hooks = ("-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false")
-        assert spawned == [("git", *hooks, "pull", "--ff-only", url, "main")]
+        assert spawned == [("git", "pull", "--ff-only", url, "main")]
         assert log[-1] == "git pull failed (exit 1) — aborting"
         assert (dest / ".git").is_dir(), "a failed pull leaves the checkout in place"
 

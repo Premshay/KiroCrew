@@ -85,7 +85,7 @@ const memoryQuery = (q: MemoryCarveQuery): string => {
   return s ? `?${s}` : ''
 }
 
-export function createMemoryEndpoints({ get, post, put, del, j, jfetch: fetch }: ClientTransport) {
+export function createMemoryEndpoints({ get, post, put, del, j }: ClientTransport) {
   const memoryAndVectors = {
     // Memory
     //

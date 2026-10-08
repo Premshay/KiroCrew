@@ -25,7 +25,6 @@ import json
 import logging
 import os
 import pathlib
-import socket
 import time
 from pathlib import Path
 
@@ -118,17 +117,26 @@ async def _no_cookie_header(_pid, _url, _name):
 
 
 def _fake_base_port() -> int:
-    """Worker-local fake band for cases that do not bind real hop sockets.
+    """A fake tunnel base port this process does not share with a sibling worker.
 
-    Keep the band below the platform ephemeral ranges. Real ownership cases use
-    a kernel-selected port hint in ``_mgr(real_hop_guard=True)``.
+    Several cases here install a REAL ``HopPortGuard`` and let it take OS ownership of
+    the first port the allocator hands out. One fixed base would make that port a
+    shared resource between parallel test processes, and the loser of the race reports
+    "no hold was taken" -- a real-looking failure with an unrelated cause. Bands are
+    40 wide, which is far more than the two or three ports any one case allocates.
+
+    The bands sit BELOW every platform's ephemeral range (Linux hands out 32768-60999,
+    macOS and Windows 49152-65535): a sibling worker that binds port 0 -- a dozen
+    test files do -- is handed a port from that range by the kernel, and a band
+    inside it is a port the sibling can be given at the very moment the guard here
+    goes to take it, which the guard then reports as the port already bound.
     """
     worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
     index = int(worker[2:]) if worker.startswith("gw") and worker[2:].isdigit() else 0
     return 23700 + index * 40
 
 
-def _mgr(tmp_path, monkeypatch, *, mint=None, real_hop_guard=False):
+def _mgr(tmp_path, monkeypatch, *, mint=None):
     """A manager over a fresh registry, with a fake forwarder and a fake mint."""
     _free_ports(monkeypatch)
     from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager
@@ -147,24 +155,24 @@ def _mgr(tmp_path, monkeypatch, *, mint=None, real_hop_guard=False):
     ):
         return f"SSH_TOKEN_FOR_{host}_epp{embed_parent_port}"
 
-    base_port = _fake_base_port()
-    if real_hop_guard:
-        # Real ownership cases use a kernel-selected hint, never a fixed worker band.
-        # The guard must still acquire it through the production transition under test.
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            base_port = probe.getsockname()[1]
-
     mgr = SshTunnelManager(
         reg,
-        base_port=base_port,
+        base_port=_fake_base_port(),
         mint_token=mint or ok_mint,
         tunnel_factory=_FakeTunnel,
         parent_port=4242,
     )
-    # Fake-port cases bind nothing; real ownership cases keep the manager's real guard.
-    if not real_hop_guard:
-        mgr._hop_guard = _InertGuard()
+    # These cases run a FAKE forwarder on a fixed fake base port, so nothing here ever
+    # really binds one. A real HopPortGuard would: every teardown of a lent hop would
+    # take OS ownership of that fake port and keep it, because only `shutdown` releases
+    # it -- so the sockets would accumulate across cases and the next manager would
+    # collide with a hold left by an earlier one on the same fixed port.
+    #
+    # Inert here, therefore, and exercised for real in exactly two places, neither of
+    # which is skipped: `test_hop_port_guard.py` pins the mechanism against a separate
+    # process, and `test_a_torn_down_lent_hop_is_owned_not_merely_skipped` swaps a real
+    # guard back in to pin that teardown actually arms it.
+    mgr._hop_guard = _InertGuard()
     return reg, mgr
 
 
@@ -2545,7 +2553,10 @@ class TestTheHopOwnershipInvariantHolds:
 
     def _lent(self, tmp_path, monkeypatch):
         """A crew connected, its hop lent, and a REAL guard installed."""
-        reg, mgr = _mgr(tmp_path, monkeypatch, real_hop_guard=True)
+        from kiro_crew.instances.ssh_tunnel_manager import HopPortGuard
+
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        mgr._hop_guard = HopPortGuard()
         reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
         asyncio.run(mgr.connect("c"))
         hop = mgr.status("c").local_port
@@ -2810,9 +2821,10 @@ class TestLentHopReservation:
         freed while the credential naming it stayed valid -- the exposure itself, reached
         without any orphan, reclaim or restart.
         """
-        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+        from kiro_crew.instances.ssh_tunnel_manager import HopPortGuard, TunnelState
 
-        reg, mgr = _mgr(tmp_path, monkeypatch, real_hop_guard=True)
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        mgr._hop_guard = HopPortGuard()
         reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
         asyncio.run(mgr.connect("c"))
         hop = mgr.status("c").local_port
@@ -3151,9 +3163,10 @@ class TestLentHopReservation:
         valid. Asserted on the GUARD, because the cache surviving proves nothing about who
         owns the port.
         """
-        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+        from kiro_crew.instances.ssh_tunnel_manager import HopPortGuard, TunnelState
 
-        reg, mgr = _mgr(tmp_path, monkeypatch, real_hop_guard=True)
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        mgr._hop_guard = HopPortGuard()
         reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
         asyncio.run(mgr.connect("c"))
 
@@ -3192,9 +3205,10 @@ class TestLentHopReservation:
         in-memory cache, and this case proves it by making every registry read raise: if
         the seam consults the record at all, it fails here.
         """
-        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+        from kiro_crew.instances.ssh_tunnel_manager import HopPortGuard, TunnelState
 
-        reg, mgr = _mgr(tmp_path, monkeypatch, real_hop_guard=True)
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        mgr._hop_guard = HopPortGuard()
         reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
         asyncio.run(mgr.connect("c"))
         hop = mgr.status("c").local_port
@@ -3226,9 +3240,10 @@ class TestLentHopReservation:
         ``_hold_lent_port_now`` directly, so deleting the call from the seam leaves them
         all green. This drives the real entry point the monitor uses.
         """
-        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+        from kiro_crew.instances.ssh_tunnel_manager import HopPortGuard, TunnelState
 
-        reg, mgr = _mgr(tmp_path, monkeypatch, real_hop_guard=True)
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        mgr._hop_guard = HopPortGuard()
         reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
         asyncio.run(mgr.connect("c"))
         hop = mgr.status("c").local_port
@@ -3259,9 +3274,10 @@ class TestLentHopReservation:
         all -- the port would stay free for the rest of the lease with no later pass to
         notice. It pins the hold as the seam's FIRST act rather than one of its outcomes.
         """
-        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+        from kiro_crew.instances.ssh_tunnel_manager import HopPortGuard, TunnelState
 
-        reg, mgr = _mgr(tmp_path, monkeypatch, real_hop_guard=True)
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        mgr._hop_guard = HopPortGuard()
         reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
         asyncio.run(mgr.connect("c"))
         hop = mgr.status("c").local_port
@@ -3280,9 +3296,10 @@ class TestLentHopReservation:
 
     def test_a_lapsed_cache_entry_is_not_held(self, tmp_path, monkeypatch):
         """The cache mirrors a deadline, so it must not resurrect a dead credential."""
-        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+        from kiro_crew.instances.ssh_tunnel_manager import HopPortGuard, TunnelState
 
-        reg, mgr = _mgr(tmp_path, monkeypatch, real_hop_guard=True)
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        mgr._hop_guard = HopPortGuard()
         reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
         asyncio.run(mgr.connect("c"))
         hop = mgr.status("c").local_port
@@ -3302,21 +3319,18 @@ class TestLentHopReservation:
 
     def test_a_settle_reseeds_the_cache_from_the_registry(self, tmp_path, monkeypatch):
         """The record is the source of truth, so memory never outlives it."""
-        reg, mgr = _mgr(tmp_path, monkeypatch, real_hop_guard=True)
+        from kiro_crew.instances.ssh_tunnel_manager import HopPortGuard
+
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        mgr._hop_guard = HopPortGuard()
         reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
         asyncio.run(mgr.connect("c"))
         assert asyncio.run(mgr.mint_embed_token("c", 9191))[0] is True
 
         try:
-            live_ports = reg.live_hop_leases()
-            cache_only_port = next(
-                port for port in range(1, len(live_ports) + 2) if port not in live_ports
-            )
-            mgr._lent_hops[cache_only_port] = time.time() + 999
+            mgr._lent_hops[65000] = time.time() + 999  # never in the record
             mgr._apply_hop_holds(reg.live_hop_lease_deadlines())
-            assert (
-                cache_only_port not in mgr._lent_hops
-            ), "a cache entry the registry never had survived"
+            assert 65000 not in mgr._lent_hops, "a cache entry the registry never had survived"
             assert set(mgr._lent_hops) == set(reg.live_hop_leases())
         finally:
             mgr._hop_guard.close_all()
@@ -3412,7 +3426,12 @@ class TestLentHopReservation:
         import subprocess
         import sys
 
-        reg, mgr = _mgr(tmp_path, monkeypatch, real_hop_guard=True)
+        from kiro_crew.instances.hop_port_guard import HopPortGuard
+
+        reg, mgr = _mgr(tmp_path, monkeypatch)
+        # The fixture installs an inert guard so fake-port cases do not leak listening
+        # sockets; this case is precisely about the real one, so put it back.
+        mgr._hop_guard = HopPortGuard()
         reg.add(name="C", ssh_host="c-host", instance_id="c", ttl="2h")
         asyncio.run(mgr.connect("c"))
         hop = mgr.status("c").local_port

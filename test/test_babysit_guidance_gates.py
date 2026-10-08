@@ -39,7 +39,7 @@ PR_STATUS_SCRIPT = (
     / "kiro_crew"
     / "builtin_skills"
     / "kirocrew-dev"
-    / "kirocrew-prepare-pr"
+    / "prepare-pr"
     / "scripts"
     / "pr_status.py"
 )

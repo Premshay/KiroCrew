@@ -26,11 +26,11 @@ import { SOFT_STOP_DEBOUNCE_MS } from '../pages/chat/types'
 import { mergePreservedPastes } from '../utils/pasteTokens'
 import { initialState, type ChatState } from './chat/state'
 import { filterMessages, isUnsafeKey, safeKey } from './chat/wire'
-import { ensureMsgId, finalizeTrailingStreaming, floorForGen, isRedeliveredMessage, mintMsgId, reconcileOptimisticEcho } from './chat/transcript'
+import { ensureMsgId, finalizeTrailingStreaming, floorForGen, isBetweenTurnWork, isRedeliveredMessage, mintMsgId, reconcileOptimisticEcho } from './chat/transcript'
 import { OLDER_PAGE_LIMIT, OLDER_WALK_PAGE_LIMIT, claimOlderFetchAbort, isSupersededPagingRejection, releaseOlderFetchAbort } from './chat/paging'
 import { reinsertThinkingOrphans } from './chat/thinking'
 import { bumpRunEpoch, runStateReducers, setRunState, syncOriginRun } from './chat/runState'
-import { setPagingCursor, slotCacheReducers, writeSlotPage } from './chat/slotCache'
+import { setPagingCursor, slotCacheReducers } from './chat/slotCache'
 import { composerCardReducers } from './chat/composerCards'
 import { messageReducers } from './chat/messages'
 import { queueReducers } from './chat/queue'
@@ -244,11 +244,7 @@ function applyNonActiveFrame(
   }
   if (role === '_done') {
     setRunState(run, 'idle')
-    // The replay floor survives `_done`: seqs never restart within a gateway
-    // generation, so a chunk redelivered after the turn ends sits at or below
-    // it and is dropped instead of opening a second bubble. A turn-starting
-    // `user`/`inject` frame clears it, which covers a slot whose server
-    // counter did restart (rebuilt slot, gen-less gateway).
+    run.lastChunkSeq = undefined
     syncOriginRun(state, slot, 'idle')
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === 'streaming') { msgs[i].role = 'assistant'; msgs[i].rawText = msgs[i].content; break }
@@ -276,15 +272,13 @@ function applyNonActiveFrame(
   // placed after the redelivery guard so a replayed frame cannot clear a
   // live card (see dropStaleStatelessQuestion).
   dropStaleStatelessQuestion(state, slot, role)
+  if (isBetweenTurnWork(effectiveMeta)) finalizeTrailingStreaming(msgs)
   // An inject row (cron, continue, auto-nudge) starts a turn like a user
   // message does — count it (see `ChatState.runEpoch`). A `/note` is also an
   // inject row but is PASSIVE: it starts no turn, so counting it would make a
   // Stop settlement captured a moment earlier read as stale and leave the pane
   // falsely busy (GPT round 10).
-  if (role === 'inject' && !isNoteRow({ cls, meta })) {
-    bumpRunEpoch(state, slot)
-    if (run.state === 'idle') run.lastChunkSeq = undefined
-  }
+  if (role === 'inject' && !isNoteRow({ cls, meta })) bumpRunEpoch(state, slot)
   if (role === 'tool') {
     if (run.state === 'idle') bumpRunEpoch(state, slot)
     setRunState(run, 'tool_running')
@@ -301,7 +295,7 @@ function applyNonActiveFrame(
   if (role === 'assistant') {
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === 'streaming') {
-        msgs[i].role = 'assistant'; msgs[i].content = content; msgs[i].rawText = content; if (ts) msgs[i].ts = ts
+        msgs[i].role = 'assistant'; msgs[i].content = content; if (ts) msgs[i].ts = ts
         // Carry the frame's meta — crucially `mid`, this row's server identity.
         // The row was minted client-side by the first `chunk` and has none until
         // now; without it a later redelivery of THIS frame is unrecognisable and
@@ -316,7 +310,6 @@ function applyNonActiveFrame(
     // cleanup so the approval bar remains visible and answerable (#1667).
     if (!meta?.steer) {
       bumpRunEpoch(state, slot)
-      if (run.state === 'idle') run.lastChunkSeq = undefined
       sa.toolLog = []
       for (const m of msgs) {
         if (m.role === 'permission' && !m.meta?.resolved) { if (m.meta) m.meta.resolved = 'rejected'; else m.meta = { resolved: 'rejected' } }
@@ -429,7 +422,7 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   if (role === '_done') {
     countLiveFrame(state)
     state.slotState = 'idle'
-    // Floor kept on purpose; see the background `_done` branch.
+    state.lastChunkSeq = undefined
     for (let i = state.messages.length - 1; i >= 0; i--) {
       if (state.messages[i].role === 'streaming') {
         const msg = state.messages[i]
@@ -484,12 +477,10 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   // placed after the redelivery guard so a replayed frame cannot clear a
   // live card (see dropStaleStatelessQuestion).
   dropStaleStatelessQuestion(state, slot, role)
+  if (isBetweenTurnWork(effectiveMeta)) finalizeTrailingStreaming(state.messages)
   // An inject row starts a turn like a user message does (see runEpoch);
   // a passive `/note` does not (GPT round 10).
-  if (role === 'inject' && !isNoteRow({ cls, meta })) {
-    bumpRunEpoch(state, slot)
-    if (state.slotState === 'idle') state.lastChunkSeq = undefined
-  }
+  if (role === 'inject' && !isNoteRow({ cls, meta })) bumpRunEpoch(state, slot)
   // Tool call — update state, insert before streaming message
   if (role === 'tool') {
     if (state.slotState === 'idle') bumpRunEpoch(state, slot)
@@ -513,7 +504,7 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   if (role === 'assistant') {
     for (let i = state.messages.length - 1; i >= 0; i--) {
       if (state.messages[i].role === 'streaming') {
-        state.messages[i].role = 'assistant'; state.messages[i].content = content; state.messages[i].rawText = content; if (ts) state.messages[i].ts = ts
+        state.messages[i].role = 'assistant'; state.messages[i].content = content; if (ts) state.messages[i].ts = ts
         // Carry the frame's meta — crucially `mid`, this row's server
         // identity. The row was minted client-side by the first `chunk` and
         // has none until now; without it a later redelivery of THIS frame is
@@ -529,7 +520,6 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
     // cleanup so the approval bar remains visible and answerable (#1667).
     if (!meta?.steer) {
       bumpRunEpoch(state, slot)
-      if (state.slotState === 'idle') state.lastChunkSeq = undefined
       state.toolLog = []
       // Auto-resolve any stale permissions from previous turn so they don't block the new turn
       for (const m of state.messages) {
@@ -717,40 +707,6 @@ export const loadOlderMessages = createAsyncThunk(
   },
 )
 
-/** One older page for a BACKGROUND pane (a crewmate DM, a split pane), paged
- *  from that pane's own cursor (`slotPaneNextBefore`). `loadOlderMessages` only
- *  walks the active slot, and the Members page never makes a DM active, so its
- *  pane had no way back past the page it opened with.
- *
- *  Not the full page's walk: no scroll-quiet buffer and no shared abort handle,
- *  because neither guards anything here -- the pane's bar is a click, and the
- *  single shared handle belongs to the active slot's walk, which a pane fetch
- *  must not cancel. The cursor read at dispatch is the page's identity: a write
- *  that re-described the head while the fetch flew moves it, and the page then
- *  addresses rows that are no longer the head, so it is dropped. */
-export const loadOlderSlotMessages = createAsyncThunk(
-  'chat/loadOlderSlot',
-  async (slot: string, { getState, rejectWithValue }) => {
-    const state = (getState() as { chat: ChatState }).chat
-    const before = state.slotPaneNextBefore?.[safeKey(slot)] ?? 0
-    try {
-      const d = await api.chatSlotDetail(slot, OLDER_PAGE_LIMIT, before)
-      return { slot, before, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), hasMore: d.has_more || false }
-    } catch {
-      return rejectWithValue({ slot })
-    }
-  },
-  {
-    condition: (slot, { getState }) => {
-      const state = (getState() as { chat: ChatState }).chat
-      if (isUnsafeKey(slot) || slot === state.activeSlot) return false
-      const k = safeKey(slot)
-      if (state.slotPaneLoadingOlder?.[k]) return false
-      return state.slotPaneHasMore?.[k] === true && (state.slotPaneNextBefore?.[k] ?? 0) > 0
-    },
-  },
-)
-
 /** Shape of the `/stop` reply this thunk reads. `info` is set only on the
  *  backend's no-op branch (`not running` / `stop already in progress`); a real
  *  stop answers a bare `{ok: true}`. */
@@ -818,10 +774,6 @@ const chatSlice = createSlice({
     ...mcpAppReducers,
     ...historyNoticeReducers,
     setPendingInput(state, action: PayloadAction<string | null>) { state.pendingInput = action.payload },
-    /** Stage Side Chat text for the main composer of a specific slot. The host
-     *  showing that slot appends it to the live draft; passing null clears the
-     *  field after it is consumed. */
-    stageToMainComposer(state, action: PayloadAction<{ slot: string; text: string } | null>) { state.mainComposerAppend = action.payload },
     setAgentSwitchNotice(state, action: PayloadAction<string | null>) {
       // Always create a fresh value so repeating the same refusal restarts the
       // App shell's expiry effect instead of inheriting the previous timer.
@@ -903,43 +855,14 @@ const chatSlice = createSlice({
         const failed = action.payload as { slot?: string } | undefined
         if (failed?.slot === state.activeSlot) state.slotOlderError = true
       })
-      .addCase(loadOlderSlotMessages.pending, (state, action) => {
-        const k = safeKey(action.meta.arg)
-        ;(state.slotPaneLoadingOlder ??= {})[k] = true
-        delete state.slotPaneOlderError?.[k]
-      })
-      .addCase(loadOlderSlotMessages.fulfilled, (state, action) => {
-        const { slot, before, nextBefore, messages, hasMore } = action.payload
-        const k = safeKey(slot)
-        delete state.slotPaneLoadingOlder?.[k]
-        // Became active mid-fetch: the switch owns the transcript and its cursor.
-        if (slot === state.activeSlot) return
-        if ((state.slotPaneNextBefore?.[k] ?? 0) !== before) return
-        const cur = state.slotMessages[k] ?? []
-        // Identity is meta.mid only, as for the active walk: an overlapping
-        // page must not reach the list as a duplicate row key.
-        const fresh = messages.filter(m => !isRedeliveredMessage(cur, m.meta))
-        // The bounded length indexes this array, so it shifts with the prepend.
-        const boundedLen = state.slotPaneBounded?.[k]
-        writeSlotPage(state, slot, [...fresh, ...cur], hasMore,
-          boundedLen === undefined ? undefined : boundedLen + fresh.length, nextBefore)
-      })
-      .addCase(loadOlderSlotMessages.rejected, (state, action) => {
-        // A refused dispatch never set the flag, and must not clear one a
-        // fetch already in flight owns.
-        if (action.meta.condition) return
-        const k = safeKey(action.meta.arg)
-        delete state.slotPaneLoadingOlder?.[k]
-        if (action.payload) (state.slotPaneOlderError ??= {})[k] = true
-      })
   },
 })
 
 export const {
-  setActiveSlot, clearSlotState, setPendingInput, stageToMainComposer, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
+  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
   removeThinking, confirmOptimisticSend, markSendUnconfirmed, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
-  sseContextUsage, setVoicePlaying, setVoiceBusy, setVoiceAudio,
-  toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued, reconcileSubagentQueuedFromSlots,
+  sseContextUsage, setVoicePlaying, setVoiceBusy, setVoiceAudio, startRemoteTurn,
+  toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,
   setAutomations, sseAutomation, removeAutomation,
   sseSubagentSnapshot, sseToolActivity, sseToolResult, sseActivityEvent,
@@ -948,7 +871,7 @@ export const {
   sseSideResult, sseSideQueue, sideReleaseConsumed, sideClose, sideOptimisticAppend, sideOptimisticRollback,
 } = chatSlice.actions
 
-export { clampToolOutput, TOOL_OUTPUT_MAX_CHARS, queueEntryAttachments, queueEntryQuote, type QueueEntryAttachments } from './chat/wire'
+export { clampToolOutput, TOOL_OUTPUT_MAX_CHARS, queueEntryAttachments, type QueueEntryAttachments } from './chat/wire'
 export { floorForGen, hasUnidentifiedDurableRow, raiseChunkSeq, snapshotChunkGen, snapshotChunkSeq, transcriptTsMs } from './chat/transcript'
 export {
   OLDER_PAGE_LIMIT, OLDER_WALK_PAGE_LIMIT, SLOT_DETAIL_MAX_LIMIT, PANE_HYDRATE_LIMIT, REFRESH_LIMIT_CEILING,
@@ -959,7 +882,7 @@ export type { FollowupItem, SideMessage, SideQueueEntry, SideState, SlotState, S
 export { FOLDER_SUGGESTION_MAX_TURNS, capturePendingAskId, pendingQuestionFor, shouldResolveAskOnSend } from './chat/composerCards'
 export { mcpAppKey } from './chat/mcpApps'
 export {
-  isAwaitingSpawnApproval, selectSidebarApprovalCounts, selectSidebarStartedSubagentCounts, selectSidebarSubagentCounts, selectSlotPendingSpawnApprovals,
+  isAwaitingSpawnApproval, selectSidebarApprovalCounts, selectSidebarSubagentCounts, selectSlotPendingSpawnApprovals,
   selectSlotSubagents, selectSlotSubagentsActive, selectSubagentActivityCount,
 } from './chat/subagents'
 export { WORKFLOW_TERMINAL_STATUSES, isTerminalWorkflowStatus, selectSidebarWorkflowActive, selectSidebarWorkflowActiveKeys } from './chat/workflows'

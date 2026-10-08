@@ -639,7 +639,8 @@ def schemas() -> list[dict[str, Any]]:
                             "this changes only what is stored and displayed. Set "
                             "it whenever `message` is long: a multi-KB "
                             "instruction is otherwise re-stored and re-broadcast "
-                            "as a transcript row on every single cycle. "
+                            "as a transcript row on every single cycle, which "
+                            "measured 51.8% of one long-running session's file. "
                             'Something like "watching PR #123 for CI" is '
                             "enough. Omit it for a short message, and omit it on "
                             "a channel-bound loop (`slack:`/`discord:`/`webex:`) "
@@ -778,10 +779,7 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "target": {
                         "type": "string",
-                        "description": (
-                            "New canonical PR/MR URL of the same provider kind "
-                            "as the structured monitor"
-                        ),
+                        "description": "New GitHub PR URL for a structured monitor",
                     },
                     "objective": {"type": "string", "enum": sorted(publicly_armable_objectives())},
                     "max_agent_turns": {
@@ -1026,8 +1024,7 @@ def schemas() -> list[dict[str, Any]]:
                 "Offer the user up to 3 follow-up items as a card below the chat "
                 "composer in the CURRENT dashboard session. Each item shows a title "
                 "and description with three buttons: 'Start in new worktree' (creates "
-                "a git worktree off origin/HEAD, or the project's current HEAD when "
-                "that does not resolve, opens a new chat "
+                "a git worktree off the project's default branch, opens a new chat "
                 "session scoped to it, and pre-fills the composer with your prompt), "
                 "'Add to this session' (pre-fills this session's composer with your "
                 "prompt), and 'Skip'. Both non-skip buttons PRE-FILL the composer — "
@@ -1547,10 +1544,6 @@ def register_hook(name: str, args: dict[str, Any]) -> str:
         f"Auth: Authorization: Bearer <webhook token>. Tokens are created in the\n"
         f"dashboard under Webhooks (each one is shown once, then stored hashed);\n"
         f"with no token configured the endpoint refuses every call with 401.\n"
-        f"A token that requires signatures (the dashboard default) also needs\n"
-        f"X-KiroCrew-Timestamp (unix seconds, within 300s of now) and\n"
-        f"X-KiroCrew-Signature: sha256=<hex HMAC of '<timestamp>.<raw body>' keyed\n"
-        f"by the token's signing secret>; see the bundled inbound-webhooks.md doc.\n"
         f"The call returns 200 immediately and the agent's answer arrives via\n"
         f"notifications, not in the HTTP response.\n"
         f"Context summary saved for session resume (injected verbatim within 1h,\n"
@@ -1793,25 +1786,13 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # subject resolvable at all -- a session's key is not in its own prose -- and it is
     # the BINDING key, the same one the applier passes, so the ack names the subject the
     # loop will actually carry rather than a second derivation of it.
-    #
-    # ``session_texts`` is the session log a bare ``PR <number>`` resolves against. The
-    # MCP server's run of this handler is off the gateway's loop, so it reads it there.
-    # The gateway's directive replay runs this handler ON its event loop and discards
-    # the ack, so that run skips the read: the applier reads the log off-loop itself.
-    binding_key = str(mcp_core._autonudge_binding_key(sk) or "")
-    session_texts = (
-        None
-        if mcp_core.directive_capture_active()
-        else autonudge.read_session_texts(stored_message, binding_key, watch)
-    )
     gated = (
         autonudge.infer_monitor(
             stored_message,
             time.time(),
             judge=autonudge.scrubbed_judge_spec(judge_spec) if judge_spec else None,
             watch=watch,
-            slot_key=binding_key,
-            session_texts=session_texts,
+            slot_key=str(mcp_core._autonudge_binding_key(sk) or ""),
         )
         if (gate or watch)
         else None
@@ -2279,9 +2260,7 @@ def monitor_update(name: str, args: dict[str, Any]) -> str:
         )
         return (
             "monitor_update: nothing to change — pass at least one of "
-            "message, interval_secs, max_cycles, max_runtime_secs, target, "
-            "objective, max_agent_turns, max_tokens, max_provider_errors, "
-            "wake_instructions, banner, judge, watch."
+            "message, interval_secs, max_cycles, max_runtime_secs, judge, watch."
         )
     # AFTER the empty-patch no-op so that more specific answer still wins. A
     # retained stop cannot be updated either: ``update_monitor`` answers "not found

@@ -4,8 +4,7 @@
  *
  * Given a base URL and a list of routes, visit each and save a full-page PNG,
  * then the critic fs_reads each shot. Prefers Playwright (full-page + networkidle
- * + animation settle). Playwright is REQUIRED: without it the script exits 3
- * rather than render unguarded (see main()).
+ * + animation settle); falls back to headless Chrome (viewport shot only).
  *
  * Usage:
  *   node capture-site.mjs --base=http://localhost:3000 \

@@ -42,9 +42,8 @@ the job can see at run time. See SKILL.md for what each one costs.
 Stdlib only, Python 3.9+.
 
 Usage:
-  cron_cost_scan.py --input payload.json [--min-runs N] [--json]
-      payload.json is the cron_list json=true document, saved to a file
-  cron_cost_scan.py [--min-runs N] [--json] < payload.json
+  cron_list json=true | cron_cost_scan.py [--min-runs N] [--json]
+  cron_cost_scan.py --input payload.json      # a saved payload, for testing
 """
 
 from __future__ import annotations
@@ -280,10 +279,7 @@ def load_payload(text: str) -> dict[str, Any]:
     """
     stripped = text.strip()
     if not stripped:
-        raise LookupError(
-            "the input is empty; save the `cron_list json=true` document to a file "
-            "and pass it with --input"
-        )
+        raise LookupError("no input on stdin; pipe `cron_list json=true` into this script")
     if not stripped.startswith("{"):
         raise LookupError(f"cron_list did not return JSON, it said: {stripped[:400]}")
     try:
@@ -593,7 +589,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--input",
-        help="Read the cron_list json=true payload from this file instead of stdin.",
+        help="Read the payload from this file instead of stdin. For testing.",
     )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     args = parser.parse_args(argv)

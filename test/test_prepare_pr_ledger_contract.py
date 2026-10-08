@@ -1,4 +1,4 @@
-"""Pin the server-side facts kirocrew-prepare-pr's disposition guidance relies on.
+"""Pin the server-side facts prepare-pr's disposition guidance relies on.
 
 SKILL.md tells the agent to write a disposition's rationale in ``> `` lines,
 at class level, and to argue not-a-defect (never merely disproportional) for a
@@ -25,13 +25,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL = (
-    REPO_ROOT
-    / "src"
-    / "kiro_crew"
-    / "builtin_skills"
-    / "kirocrew-dev"
-    / "kirocrew-prepare-pr"
-    / "SKILL.md"
+    REPO_ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr" / "SKILL.md"
 )
 CODEX = REPO_ROOT / ".github" / "workflows" / "codex-review.yml"
 CONVERGENCE = REPO_ROOT / ".github" / "review-prompts" / "gpt-round-convergence.md"
@@ -90,7 +84,7 @@ CONTRACT = (
     / "kiro_crew"
     / "builtin_skills"
     / "kirocrew-dev"
-    / "kirocrew-prepare-pr"
+    / "prepare-pr"
     / "scripts"
     / "_review_contract.py"
 )

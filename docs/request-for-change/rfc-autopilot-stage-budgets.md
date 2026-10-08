@@ -36,9 +36,7 @@ proposal below is retained as historical context, not as current direction.
 - Measured against `main` at `7f1f4fb1d` on 2026-09-26.
 - Incident evidence: [sanitized timeout evidence](assets/autopilot-stage-timeout-evidence.md).
 - Tracking issue: [#14058](https://github.com/kirodotdev/KiroCrew/issues/14058).
-- Existing contracts: `docs/system-specs/modules/autopilot.md` as of
-  `7f1f4fb1d` ([pinned copy](https://github.com/kirodotdev/KiroCrew/blob/7f1f4fb1d77cd426365bbb89cfede5ba115c497f/docs/system-specs/modules/autopilot.md);
-  absent from current `main`),
+- Existing contracts: `docs/system-specs/modules/autopilot.md`,
   `docs/system-specs/modules/session.md`, and
   `docs/system-specs/modules/acp-client.md`.
 
@@ -97,7 +95,7 @@ The visible signature was consistent across the incidents:
 - ordinary user messages queued behind the preserved stage boundary;
 - the native turn could continue after the dashboard had stopped observing it.
 
-### Behavior at `7f1f4fb1d`
+### Current behavior on `main`
 
 At `7f1f4fb1d`:
 

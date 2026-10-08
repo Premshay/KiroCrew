@@ -185,7 +185,7 @@ describe('sourceProviderMeta', () => {
     expect([gitlab.displayName, gitlab.refLabel(5), gitlab.numberLabel(5), gitlab.logo])
       .toEqual(['GitLab', 'MR !5', '!5', 'gitlab'])
     expect(gitlab.capabilities)
-      .toEqual({ checks: true, mergeState: true, resolveThreads: true, comment: true })
+      .toEqual({ checks: true, mergeState: true, resolveThreads: false, comment: false })
   })
 
   it('takes a registered provider label, name and capabilities', () => {

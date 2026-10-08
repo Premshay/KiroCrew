@@ -39,10 +39,7 @@ from kiro_crew.messaging.commands import (
     COMPACT_TIMED_OUT_REPLY_ZH,
     compact_unsupported_backend,
     compact_unsupported_reply_zh,
-    context_recycle_warning_zh,
     note_user_stop,
-    recycle_backend,
-    recycle_warning_should_send,
 )
 from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
@@ -538,12 +535,6 @@ class WeComDispatcher:
         userid = inbound.userid
         pct = self.sessions.check_context_usage(session_key, provider)
         soft, hard = self._thresholds()
-        if recycle_backend(provider):
-            # Crew restarts this backend's session at the threshold; warn once
-            # before it, offering a fresh start instead of a compaction.
-            if recycle_warning_should_send(self.sessions, self._conv, userid, session_key, pct):
-                await self._notice_bubble(inbound, context_recycle_warning_zh())
-            return
         if pct >= soft:
             # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
@@ -558,9 +549,7 @@ class WeComDispatcher:
                 await provider.compact()
                 # A failed or timed-out compaction is a RETURNED result, not an
                 # exception, so the notice is posted only for a completed one.
-                cr = await provider.wait_for_compaction(
-                    timeout=self.sessions.compact_wait_budget_secs()
-                )
+                cr = await provider.wait_for_compaction()
                 if cr["type"] == "completed":
                     await self._notice_bubble(inbound, "🗜️ 上下文接近上限，已自动压缩。")
                 else:
@@ -828,9 +817,7 @@ class WeComDispatcher:
             await provider.compact()
             # Failure and timeout come back as the result's ``type``, not as an
             # exception, so the receipt is read off it rather than assumed.
-            cr = await provider.wait_for_compaction(
-                timeout=self.sessions.compact_wait_budget_secs()
-            )
+            cr = await provider.wait_for_compaction()
             if cr["type"] == "completed":
                 await self.client.say(inbound, "🗜️ 已压缩上下文。")
             elif cr["type"] == "failed":

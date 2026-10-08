@@ -32,7 +32,6 @@ import { api } from '../api/client'
 
 beforeEach(() => {
   vi.spyOn(api, 'recentProjects').mockResolvedValue({ dirs: ['/home/u/projA'] })
-  vi.spyOn(api, 'favoriteProjects').mockResolvedValue({ dirs: [] })
   vi.spyOn(api, 'browseDirs').mockResolvedValue({ path: '/home/u', parent: '/home', dirs: [] })
 })
 

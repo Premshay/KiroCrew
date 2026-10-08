@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from chat_test_helpers import _make_state
@@ -20,9 +20,7 @@ from kiro_crew.dashboard import chat_handlers
 from kiro_crew.dashboard import session_control as sc
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.handlers import session_control as handlers_sc
-from kiro_crew.mcp_dashboard import TABLE
-from kiro_crew.mcp_tools.dashboard_client import DashboardRequest, InMemoryDashboardClient
-from kiro_crew.mcp_tools.table import Caller, ToolContext
+from kiro_crew.mcp_dashboard import _call_tool_inner
 
 
 @pytest.fixture(autouse=True)
@@ -187,7 +185,7 @@ def test_a_remote_crew_target_is_refused(tmp_path, eager):
     state, caller, target = _world(tmp_path)
     target.executor = "remote"
 
-    assert _refused(state, caller).code == "relay_archive_read_only"
+    assert _refused(state, caller).code == "remote_target_unsupported"
     state.sessions.reset.assert_not_awaited()
 
 
@@ -521,33 +519,30 @@ def test_the_route_is_in_the_strict_internal_set():
 _VERIFIED = "dashboard:chat-verified"
 
 
-def _tool(name: str, args: dict, route: str, reply: dict) -> tuple[str, list[DashboardRequest]]:
-    """One frame of ``name`` as the verified caller, against one dashboard route."""
-    dash = InMemoryDashboardClient({route: reply})
-    out = TABLE.call(name, args, ToolContext(dash, Caller.strict(_VERIFIED)))
-    return out, dash.requests
-
-
 def test_tool_carries_the_verified_key_and_reports_the_reload():
-    out, (post,) = _tool(
-        "session_reload",
-        {"target": "chat-2"},
-        "POST /api/session-control/reload",
-        {"ok": True, "target": "chat-2"},
-    )
-    assert post.path == "/api/session-control/reload"
-    assert post.body == {"target": "chat-2"}
-    assert post.session_key == _VERIFIED
+    with (
+        patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=_VERIFIED),
+        patch(
+            "kiro_crew.mcp_dashboard._post",
+            return_value={"ok": True, "target": "chat-2"},
+        ) as post,
+    ):
+        out = _call_tool_inner("session_reload", {"target": "chat-2"})
+    assert post.call_args.args[0] == "/api/session-control/reload"
+    assert post.call_args.args[1] == {"target": "chat-2"}
+    assert post.call_args.kwargs["session_key"] == _VERIFIED
     assert "`chat-2` is relaunching its agent process" in out
 
 
 def test_tool_reports_a_busy_refusal_as_an_error():
-    out, _ = _tool(
-        "session_reload",
-        {"target": "chat-2"},
-        "POST /api/session-control/reload",
-        {"error": "session busy, not reloaded"},
-    )
+    with (
+        patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=_VERIFIED),
+        patch(
+            "kiro_crew.mcp_dashboard._post",
+            return_value={"error": "session busy, not reloaded"},
+        ),
+    ):
+        out = _call_tool_inner("session_reload", {"target": "chat-2"})
     assert out.startswith("Error:")
     assert "session busy, not reloaded" in out
 
@@ -555,44 +550,34 @@ def test_tool_reports_a_busy_refusal_as_an_error():
 def test_tool_reports_a_changed_target_as_reset_not_refused():
     """Mutation guard: the generic error branch tells the agent the reload
     did not happen for a process that was already torn down."""
-    out, _ = _tool(
-        "session_reload",
-        {"target": "chat-2"},
-        "POST /api/session-control/reload",
-        {
-            "error": "session changed during the reload",
-            "code": "target_changed_during_reload",
-        },
-    )
+    with (
+        patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=_VERIFIED),
+        patch(
+            "kiro_crew.mcp_dashboard._post",
+            return_value={
+                "error": "session changed during the reload",
+                "code": "target_changed_during_reload",
+            },
+        ),
+    ):
+        out = _call_tool_inner("session_reload", {"target": "chat-2"})
     assert "could not reload" not in out
     assert "was reset" in out
 
 
-def test_tool_reads_the_changed_target_code_before_any_error():
-    """The code decides even on a reply with no ``error`` beside it.
-
-    Mutation guard: checking the error first answers this as a plain reload.
-    """
-    out, _ = _tool(
-        "session_reload",
-        {"target": "chat-2"},
-        "POST /api/session-control/reload",
-        {"ok": True, "code": "target_changed_during_reload"},
-    )
-    assert "was reset" in out and "is relaunching" not in out
-
-
 def test_tool_reports_a_degraded_teardown_as_a_completed_reload():
-    out, _ = _tool(
-        "session_reload",
-        {"target": "chat-2"},
-        "POST /api/session-control/reload",
-        {
-            "ok": True,
-            "target": "chat-2",
-            "warning": "old session teardown incomplete",
-        },
-    )
+    with (
+        patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=_VERIFIED),
+        patch(
+            "kiro_crew.mcp_dashboard._post",
+            return_value={
+                "ok": True,
+                "target": "chat-2",
+                "warning": "old session teardown incomplete",
+            },
+        ),
+    ):
+        out = _call_tool_inner("session_reload", {"target": "chat-2"})
     assert "is relaunching" in out
     assert "old session teardown incomplete" in out
 

@@ -774,15 +774,14 @@ describe('ActivityViewer — queued subagents', () => {
     expect(text).not.toContain('concurrency limit')
   })
 
-  it('renders an older gateway\'s paused-cap label as the default text', () => {
-    // The execution cap is never paused any more, so the kind is not one the
-    // chip knows; it falls back to the text an unlabelled wait shows.
+  it('says a paused cap is about memory or load, in user words, not the concurrency limit', () => {
     render(<ActivityViewer {...baseProps} view="subagents" />, {
       wrapper: queuedWrapper(2, { reason: 'adaptive_cap_zero' }),
     })
     const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
-    expect(text).toContain('2 waiting to start')
-    expect(text).not.toContain('low on memory or overloaded')
+    expect(text).toContain('low on memory or overloaded')
+    expect(text).not.toContain('controller')
+    expect(text).not.toContain('concurrency limit')
   })
 
   it('names macOS memory pressure without GB figures, even if an event carries them', () => {
@@ -793,7 +792,7 @@ describe('ActivityViewer — queued subagents', () => {
     })
     const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
     expect(text).toBe(
-      '1 waiting to start — macOS reports memory pressure; the starts resume on their own once it eases or the running agents finish; starts give up once the pressure outlasts the wait limit',
+      '1 waiting to start — macOS reports memory pressure; the starts resume on their own once it eases or the running agents finish; starts give up once the pressure has lasted 30 minutes',
     )
     expect(text).not.toMatch(/GB/)
   })
@@ -814,12 +813,13 @@ describe('ActivityViewer — queued subagents', () => {
     expect(text).not.toMatch(/needs .* of free memory/)
   })
 
-  it('keeps the default text for the posture label an older gateway sent', () => {
+  it('drops to the figure-less critical sentence when the posture event carries no number', () => {
     render(<ActivityViewer {...baseProps} view="subagents" />, {
       wrapper: queuedWrapper(1, { reason: 'posture_critical' }),
     })
-    expect(screen.getByTestId('subagent-queued-banner').textContent)
-      .toBe('1 waiting to start — queued behind the concurrency limit')
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toContain('critically low; free up memory')
+    expect(text).not.toContain('(')
   })
 
   it('keeps the concurrency text for the concurrency kind itself', () => {

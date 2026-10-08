@@ -1358,7 +1358,6 @@ class TestDenyOnce:
 
         async def _call(action: str):
             request = MagicMock()
-            request.get = {}.get  # the dashboard user: no app claim
             request.app = {"state": state}
             request.match_info = {"id": "req-9", "action": action}
             return await api_approval_resolve(request)

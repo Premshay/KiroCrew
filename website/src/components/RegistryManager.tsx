@@ -153,10 +153,7 @@ export default function RegistryManager({ bare = false }: { bare?: boolean } = {
   ])
 
   const mutation = useMutation({
-    // Only the row's own coordinates go back: `trust` in the GET is the tier in
-    // force (possibly an operator grant), which a config row never stores.
-    mutationFn: (regs: Registry[]) =>
-      api.updateRegistries(regs.map(({ name, repo, branch }) => ({ name, repo, branch }))),
+    mutationFn: (regs: Registry[]) => api.updateRegistries(regs),
     onSuccess: (res: { newlyTrustedHosts?: string[] }) => {
       queryClient.invalidateQueries({ queryKey: ['registries'] })
       queryClient.invalidateQueries({ queryKey: ['registry'] })

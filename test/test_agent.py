@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import codecs
 import contextlib
 import json
 import logging
@@ -153,19 +152,6 @@ class TestInstallAgent:
         config = json.loads(path.read_text(encoding="utf-8"))
         assert config["model"] == "claude-default"
         assert "ReadFile" in config["tools"]
-
-    def test_fresh_install_applies_bom_saved_user_overrides(self, tmp_path: Path):
-        """An agent.json saved with a UTF-8 byte-order mark still overrides."""
-        cfg_dir = _bundled_defaults(tmp_path)
-        user_home = tmp_path / "kirocrew_home"
-        user_home.mkdir()
-        (user_home / "agent.json").write_bytes(
-            codecs.BOM_UTF8 + json.dumps({"model": "user-pick"}).encode("utf-8")
-        )
-
-        path = _run_install(tmp_path, cfg_dir)
-
-        assert json.loads(path.read_text(encoding="utf-8"))["model"] == "user-pick"
 
     def test_fresh_install_preserves_safe_managed_server_overrides(self, tmp_path: Path):
         """A clean rebuild keeps preferences without ceding invocation ownership."""
@@ -1139,15 +1125,9 @@ class TestInstallAgent:
 
 
 class TestAtomicJsonWrite:
-    """_atomic_json_write is owner-only on POSIX and handles new files.
+    """Test 1.3: _atomic_json_write preserves permissions and handles new files."""
 
-    Agent specs carry the vault's projected secrets (a pre-registered
-    ``oauth.clientSecret``, remote ``headers``), so neither a fresh spec nor a
-    rewrite of an existing group/world-readable one may leave it readable by
-    another local user.
-    """
-
-    def test_existing_file_keeps_owner_bits_and_drops_group_other(self, tmp_path: Path):
+    def test_preserves_existing_permissions(self, tmp_path: Path):
         from kiro_crew.agent import _atomic_json_write
 
         target = tmp_path / "test.json"
@@ -1162,24 +1142,10 @@ class TestAtomicJsonWrite:
         if sys.platform != "win32":
             # Windows has no POSIX mode bits; the content contract below is
             # what this writer guarantees there.
-            assert stat.S_IMODE(target.stat().st_mode) == 0o600
+            assert stat.S_IMODE(target.stat().st_mode) == 0o664
         assert json.loads(target.read_text(encoding="utf-8")) == {"key": "value"}
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
-    def test_existing_owner_only_mode_is_preserved(self, tmp_path: Path):
-        from kiro_crew.agent import _atomic_json_write
-
-        target = tmp_path / "test.json"
-        target.write_text("{}")
-        target.chmod(0o700)
-
-        _atomic_json_write(target, {"key": "value"})
-
-        import stat
-
-        assert stat.S_IMODE(target.stat().st_mode) == 0o700
-
-    def test_new_file_is_owner_only(self, tmp_path: Path):
+    def test_new_file_gets_0o644(self, tmp_path: Path):
         from kiro_crew.agent import _atomic_json_write
 
         target = tmp_path / "new.json"
@@ -1188,32 +1154,8 @@ class TestAtomicJsonWrite:
         import stat
 
         if sys.platform != "win32":
-            assert stat.S_IMODE(target.stat().st_mode) == 0o600
+            assert stat.S_IMODE(target.stat().st_mode) == 0o644
         assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
-
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
-    def test_a_projected_client_secret_is_not_world_readable(self, tmp_path: Path):
-        """A default spec already on disk at 0o644 is
-        rewritten with a pre-registered client secret projected into it."""
-        from kiro_crew.agent import _atomic_json_write
-
-        target = tmp_path / "kirocrew.json"
-        target.write_text("{}")
-        target.chmod(0o644)
-        spec = {
-            "mcpServers": {
-                "github": {
-                    "url": "https://api.githubcopilot.com/mcp/",
-                    "oauth": {"clientId": "cid", "clientSecret": "s3cret"},
-                }
-            }
-        }
-
-        _atomic_json_write(target, spec)
-
-        import stat
-
-        assert stat.S_IMODE(target.stat().st_mode) & 0o077 == 0
 
     def test_a_contended_rename_is_retried_on_windows(self, tmp_path: Path, monkeypatch):
         """The rename this writer ends on is the one Windows can refuse.
@@ -2596,17 +2538,7 @@ class TestKiroHooksFiltering:
             (kiro_dir / filename).write_text(json.dumps(broken_config))
 
         _hooks_sanitized_mtimes.clear()
-        with (
-            patch("kiro_crew.agent.KIRO_AGENTS_DIR", kiro_dir),
-            patch(
-                "kiro_crew.agent_materialization.worker_agent."
-                "_foreign_dashboard_author_spec_reason",
-                return_value=None,
-            ),
-        ):
-            # The dashboard-author file is repaired only when its content marks confirm it as
-            # ours (the same attribution that guards the install); the other owned specs were
-            # never user-creatable and are swept unconditionally.
+        with patch("kiro_crew.agent.KIRO_AGENTS_DIR", kiro_dir):
             _sanitize_agent_hooks()
 
         for filename in OWNED_KIRO_AGENT_FILES:
@@ -2614,25 +2546,6 @@ class TestKiroHooksFiltering:
             assert "auto_approve_tools" not in repaired["hooks"]
             assert "postToolUse" in repaired["hooks"]
             assert "futureHookEvent" in repaired["hooks"]
-
-    def test_sanitize_agent_hooks_repairs_a_bom_saved_owned_file(self, tmp_path: Path):
-        """A hand-saved owned spec with a byte-order mark is repaired, not skipped."""
-        from kiro_crew.agent import _hooks_sanitized_mtimes, _sanitize_agent_hooks
-        from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
-
-        kiro_dir = tmp_path / "agents"
-        kiro_dir.mkdir()
-        spec = {"name": "kirocrew", "hooks": {"auto_approve_tools": ["x"], "stop": []}}
-        target = kiro_dir / sorted(OWNED_KIRO_AGENT_FILES)[0]
-        target.write_bytes(codecs.BOM_UTF8 + json.dumps(spec).encode("utf-8"))
-
-        _hooks_sanitized_mtimes.clear()
-        with patch("kiro_crew.agent.KIRO_AGENTS_DIR", kiro_dir):
-            _sanitize_agent_hooks()
-
-        raw = target.read_bytes()
-        assert not raw.startswith(codecs.BOM_UTF8)
-        assert json.loads(raw)["hooks"] == {"stop": []}
 
     @pytest.mark.parametrize(
         "filename", ["other-tool.json", "kirocrew-custom.json", "sample-app--worker.json"]
@@ -3060,7 +2973,7 @@ class TestToolBloatFixes:
         monkeypatch.setattr(
             agent_mod,
             "_app_owned_mcp_keys",
-            lambda: {"deadapp:srv": False, "liveapp:srv": True},
+            lambda: ({"deadapp:srv": False, "liveapp:srv": True}, True),
         )
 
         config = json.loads(
@@ -3683,14 +3596,17 @@ class TestToolBloatFixes:
         # A targeted removal, not a sweep.
         assert "fs_read" in config["tools"]
 
-    def test_a_server_no_read_claims_keeps_its_mount_but_not_its_grant(
+    def test_a_claim_unread_at_the_start_is_not_rescued_by_a_whole_final_read(
         self, tmp_path: Path, monkeypatch
     ):
-        """An app server neither ownership read claims loses its auto-approval.
+        """Both reads must have seen every claim, not just the last one.
 
-        The carried-over config still declares it and its command does not
-        resolve, so nothing vouches for the grant. The mount stays: dropping a
-        `tools` ref is not recoverable for a name nothing re-adds.
+        This is the composition that makes the start snapshot's own completeness
+        matter: the claim goes unread at the start, the app is uninstalled before
+        the end, and the final read is then perfectly whole precisely because there
+        is nothing left to read. The base was never recorded by either read, so the
+        name looks unowned while its owner simply was never visible, and exempting
+        it leaves an auto-approval behind.
         """
         from kiro_crew import agent as agent_mod
 
@@ -3704,8 +3620,11 @@ class TestToolBloatFixes:
         }
         (kiro_dir / "kirocrew.json").write_text(json.dumps(existing))
 
-        reads = iter([{}, {}])
-        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: next(reads, {}))
+        # Start: claims nothing and says so. End: claims nothing and is whole,
+        # because the app is gone. A reader that trusts only the final read is
+        # satisfied here and must not be.
+        reads = iter([({}, False), ({}, True)])
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: next(reads, ({}, True)))
 
         config = json.loads(
             _run_install(
@@ -3716,9 +3635,95 @@ class TestToolBloatFixes:
         )
 
         assert "@ghosted:srv" not in config["allowedTools"]
-        # The MOUNT stays; only the grant goes.
+        # The MOUNT stays: a claim unread at the start is doubt, and the grant above
+        # is the side where that doubt could leave an auto-approval behind.
         assert "@ghosted:srv" in config["tools"]
         assert "fs_read" in config["tools"]
+
+    def test_a_dangling_app_root_link_still_counts_as_an_app_on_disk(self, tmp_path, monkeypatch):
+        """`list_apps` skips a root entry that is not a readable directory, so this must not.
+
+        An app root replaced by a dangling junction or symlink is not a dir, is not
+        listed, and its record is unreachable, so every resolving predicate agrees
+        the app is absent. It is not: something occupies that name, and the claim it
+        stood for went unread.
+
+        The plain `notes.txt` is the other half on the same input. It inspects
+        cleanly as a file and is NOT counted, because an ordinary non-app file in
+        this directory is indistinguishable from an overwritten app root, and
+        counting every one would leave ownership permanently incomplete.
+        """
+        from kiro_crew import agent as agent_mod
+        from kiro_crew.apps import manager as apps_manager
+
+        fake_apps = tmp_path / "fake_apps"
+        fake_apps.mkdir()
+        (fake_apps / "vanished").symlink_to(tmp_path / "no-such-app-dir")
+        (fake_apps / "notes.txt").write_text("not an app")
+
+        monkeypatch.setattr(apps_manager, "apps_dir", lambda: fake_apps)
+        monkeypatch.setattr(apps_manager, "list_apps", lambda: [])
+        monkeypatch.setattr(apps_manager, "app_enabled_state", lambda name: False)
+        monkeypatch.setattr(apps_manager, "get_app_manifest", lambda name: None)
+
+        owned, fully_read = agent_mod._app_owned_mcp_keys()
+
+        assert owned == {}
+        assert fully_read is False
+
+    def test_a_plain_file_in_the_app_root_is_not_an_unread_claim(self, tmp_path, monkeypatch):
+        """An ordinary file beside the app directories must not narrow every rebuild.
+
+        Paired with the test above: there the entry could not be inspected as what
+        it claimed to be, here it inspects cleanly and is simply not an app. If this
+        counted, a single stray file would hold ownership permanently incomplete and
+        narrow the exemption for every unclaimed name.
+        """
+        from kiro_crew import agent as agent_mod
+        from kiro_crew.apps import manager as apps_manager
+
+        fake_apps = tmp_path / "fake_apps"
+        fake_apps.mkdir()
+        (fake_apps / "notes.txt").write_text("not an app")
+
+        monkeypatch.setattr(apps_manager, "apps_dir", lambda: fake_apps)
+        monkeypatch.setattr(apps_manager, "list_apps", lambda: [])
+        monkeypatch.setattr(apps_manager, "app_enabled_state", lambda name: False)
+        monkeypatch.setattr(apps_manager, "get_app_manifest", lambda name: None)
+
+        owned, fully_read = agent_mod._app_owned_mcp_keys()
+
+        assert owned == {}
+        assert fully_read is True
+
+    def test_a_dangling_record_link_still_counts_as_an_app_on_disk(self, tmp_path, monkeypatch):
+        """A record path that cannot be resolved is not the same as no record.
+
+        `Path.exists` follows a symlink, so a dangling `installed.json` link reads
+        absent -- while `list_apps` still drops that app, because reading it fails.
+        Taken together the two answers claim there is no such app while the app is
+        sitting on disk, and its carried-forward server then looks unowned. The
+        presence test therefore does not resolve the path.
+        """
+        from kiro_crew import agent as agent_mod
+        from kiro_crew.apps import manager as apps_manager
+
+        fake_apps = tmp_path / "fake_apps"
+        (fake_apps / "linked").mkdir(parents=True)
+        # Points at nothing, so `exists()` is False while something IS there.
+        (fake_apps / "linked" / apps_manager.INSTALLED_META_FILENAME).symlink_to(
+            tmp_path / "no-such-target.json"
+        )
+
+        monkeypatch.setattr(apps_manager, "apps_dir", lambda: fake_apps)
+        monkeypatch.setattr(apps_manager, "list_apps", lambda: [])
+        monkeypatch.setattr(apps_manager, "app_enabled_state", lambda name: False)
+        monkeypatch.setattr(apps_manager, "get_app_manifest", lambda name: None)
+
+        owned, fully_read = agent_mod._app_owned_mcp_keys()
+
+        assert owned == {}
+        assert fully_read is False
 
     def test_an_unreadable_enablement_claims_nothing_rather_than_disabled(self, monkeypatch):
         """None from `app_enabled_state` is "could not read", never "switched off".
@@ -3741,8 +3746,11 @@ class TestToolBloatFixes:
         monkeypatch.setattr(apps_manager, "get_app_manifest", lambda name: _Manifest())
         monkeypatch.setattr(apps_manager, "apps_dir", lambda: Path("/nonexistent-apps-root"))
 
-        # No claim is recorded.
-        assert agent_mod._app_owned_mcp_keys() == {}
+        owned, fully_read = agent_mod._app_owned_mcp_keys()
+
+        # No claim is recorded, and the read reports it was not whole.
+        assert owned == {}
+        assert fully_read is False
 
     def test_a_closed_gate_does_not_vouch_for_a_disabled_app_claim(
         self, tmp_path: Path, monkeypatch
@@ -3827,8 +3835,8 @@ class TestToolBloatFixes:
         monkeypatch.setattr(agent_mod, "_gated_off_servers", lambda: frozenset({"gated-claimed"}))
         # Claimed (and enabled) at the start read, gone by the final one: the
         # uninstall lands between them. Both reads saw every claim.
-        reads = iter([{"gated-claimed": True}, {}])
-        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: next(reads, {}))
+        reads = iter([({"gated-claimed": True}, True), ({}, True)])
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: next(reads, ({}, True)))
 
         config = json.loads(_run_install(tmp_path, cfg_dir).read_text(encoding="utf-8"))
 
@@ -3971,8 +3979,8 @@ class TestToolBloatFixes:
         # Owned and enabled on the first read, gone by the second: the uninstall
         # lands between them. Both reads saw every claim, so the absence at the end
         # is a confirmed removal rather than an unread claim.
-        reads = iter([{"doomed:srv": True}, {}])
-        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: next(reads, {}))
+        reads = iter([({"doomed:srv": True}, True), ({}, True)])
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: next(reads, ({}, True)))
 
         config = json.loads(
             _run_install(
@@ -4025,9 +4033,10 @@ class TestToolBloatFixes:
         }
         (kiro_dir / "kirocrew.json").write_text(json.dumps(existing))
 
-        # Owned and enabled at the start; the second read claims nothing.
-        reads = iter([{"live:srv": True}, {}])
-        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: next(reads, {}))
+        # Owned and enabled at the start; the second read claims nothing AND
+        # reports it could not read every claim.
+        reads = iter([({"live:srv": True}, True), ({}, False)])
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: next(reads, ({}, False)))
 
         config = json.loads(
             _run_install(
@@ -4061,7 +4070,7 @@ class TestToolBloatFixes:
             },
         }
         (kiro_dir / "kirocrew.json").write_text(json.dumps(existing))
-        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: {})
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: ({}, True))
         events: list[dict] = []
 
         class _Sel:
@@ -4117,7 +4126,7 @@ class TestToolBloatFixes:
             },
         }
         (kiro_dir / "kirocrew.json").write_text(json.dumps(existing))
-        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: {})
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: ({}, True))
         events: list[dict] = []
 
         class _Sel:
@@ -4175,7 +4184,7 @@ class TestToolBloatFixes:
             },
         }
         (kiro_dir / "kirocrew.json").write_text(json.dumps(existing))
-        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: {})
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: ({}, True))
         events: list[dict] = []
 
         class _Sel:
@@ -4221,7 +4230,7 @@ class TestToolBloatFixes:
             },
         }
         (kiro_dir / "kirocrew.json").write_text(json.dumps(existing))
-        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: {})
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: ({}, True))
         events: list[dict] = []
 
         class _Sel:
@@ -6943,19 +6952,6 @@ class TestKiroHooksAutoimport:
         assert any("rejected" in rec.message.lower() for rec in caplog.records)
 
 
-class TestRefreshDynamicFieldsLegacyMcpJsonAlias:
-    """kiro-cli reads ``useLegacyMcpJson`` as an alias of ``includeMcpJson``,
-    so a refreshed config that keeps both is refused as a duplicate field."""
-
-    def test_alias_dropped_when_include_mcp_json_written(self):
-        from kiro_crew.agent import _refresh_dynamic_fields
-
-        config = {"useLegacyMcpJson": True}
-        _refresh_dynamic_fields(config)
-        assert config["includeMcpJson"] is False
-        assert "useLegacyMcpJson" not in config
-
-
 class TestRefreshDynamicFieldsStripsStaleUrl:
     """Managed servers are stdio-only; a stale url from an old build must be
     removed on refresh so it can't propagate into the CC config."""
@@ -7084,153 +7080,6 @@ class TestRefreshDynamicFieldsStripsStaleUrl:
         _refresh_dynamic_fields(config)
         assert "deniedCommands" not in config["toolsSettings"]["execute_bash"]
         assert config["toolsSettings"]["execute_bash"]["allowedCommands"] == ["ls", "cat"]
-
-
-class TestMigrateRelocatedSkillUris:
-    """An agent spec mapping a relocated builtin skill's old path follows the move."""
-
-    OLD = "kirocrew-dev/prepare-pr"
-    NEW = "kirocrew-dev/kirocrew-prepare-pr"
-
-    @pytest.fixture
-    def env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        home = tmp_path / "home"
-        skills = home / ".kiro" / "crew" / "skills"
-        (skills / self.NEW).mkdir(parents=True)
-        (skills / self.NEW / "SKILL.md").write_text("---\nname: kirocrew-prepare-pr\n---\n")
-        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-        monkeypatch.setattr("kiro_crew.skills.skills_dir", lambda: skills)
-        agents = tmp_path / "kiro_agents"
-        agents.mkdir()
-        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents)
-        return skills, agents
-
-    def _write(self, agents: Path, resources: list) -> Path:
-        spec = agents / "a.json"
-        spec.write_text(json.dumps({"name": "alpha", "resources": resources}))
-        return spec
-
-    def test_rewrites_home_and_absolute_forms_in_place(self, env) -> None:
-        from kiro_crew.agent import migrate_relocated_skill_uris
-
-        skills, agents = env
-        spec = self._write(
-            agents,
-            [
-                "file://AGENTS.md",
-                f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md",
-                "skill://~/.kiro/crew/skills/babysit-other/SKILL.md",
-            ],
-        )
-        assert migrate_relocated_skill_uris() == 1
-        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [
-            "file://AGENTS.md",
-            f"skill://~/.kiro/crew/skills/{self.NEW}/SKILL.md",
-            "skill://~/.kiro/crew/skills/babysit-other/SKILL.md",
-        ]
-
-        spec = self._write(agents, [f"skill://{(skills / self.OLD / 'SKILL.md').as_posix()}"])
-        assert migrate_relocated_skill_uris() == 1
-        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [
-            f"skill://{(skills / self.NEW / 'SKILL.md').as_posix()}"
-        ]
-
-    def test_drops_the_old_entry_when_the_new_path_is_already_mapped(self, env) -> None:
-        from kiro_crew.agent import migrate_relocated_skill_uris
-
-        _skills, agents = env
-        new = f"skill://~/.kiro/crew/skills/{self.NEW}/SKILL.md"
-        spec = self._write(agents, [new, f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"])
-        assert migrate_relocated_skill_uris() == 1
-        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [new]
-
-    def test_is_idempotent(self, env) -> None:
-        from kiro_crew.agent import migrate_relocated_skill_uris
-
-        _skills, agents = env
-        self._write(agents, [f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"])
-        assert migrate_relocated_skill_uris() == 1
-        assert migrate_relocated_skill_uris() == 0
-
-    def test_leaves_a_mapping_whose_old_skill_still_loads(self, env) -> None:
-        from kiro_crew.agent import migrate_relocated_skill_uris
-
-        skills, agents = env
-        (skills / self.OLD).mkdir(parents=True)
-        (skills / self.OLD / "SKILL.md").write_text("---\nname: prepare-pr\n---\n")
-        old = f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"
-        spec = self._write(agents, [old])
-        assert migrate_relocated_skill_uris() == 0
-        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [old]
-
-    def test_reads_and_writes_inside_the_spec_lock(self, env, monkeypatch) -> None:
-        # A concurrent template PATCH holds the same lock; reading before it
-        # would write a stale snapshot back over the user's saved edit.
-        import kiro_crew.agent as agent_mod
-
-        _skills, agents = env
-        self._write(agents, [f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"])
-        held: list[bool] = [False]
-        seen: list[tuple[str, bool]] = []
-
-        @contextlib.contextmanager
-        def recording_lock(agents_dir):
-            held[0] = True
-            try:
-                yield
-            finally:
-                held[0] = False
-
-        real_read = agent_mod._read_agent_spec
-        real_write = agent_mod._atomic_json_write
-
-        def read(*args, **kwargs):
-            seen.append(("read", held[0]))
-            return real_read(*args, **kwargs)
-
-        def write(*args, **kwargs):
-            seen.append(("write", held[0]))
-            return real_write(*args, **kwargs)
-
-        monkeypatch.setattr(agent_mod, "agents_spec_lock", recording_lock)
-        monkeypatch.setattr(agent_mod, "_read_agent_spec", read)
-        monkeypatch.setattr(agent_mod, "_atomic_json_write", write)
-
-        assert agent_mod.migrate_relocated_skill_uris() == 1
-        assert seen == [("read", True), ("write", True)]
-
-    def test_leaves_an_enrolled_members_saved_generation_alone(self, env, monkeypatch) -> None:
-        # An enrolled member's spec carries a digest its capability intent
-        # records; an in-place rewrite would make reconcile refuse sessions.
-        from kiro_crew.agent import migrate_relocated_skill_uris
-
-        _skills, agents = env
-        old = f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"
-        spec = self._write(agents, [old])
-
-        monkeypatch.setattr(
-            "kiro_crew.agent_state.get_capabilities",
-            lambda name: {"status": "saved"} if name == "alpha" else None,
-        )
-        assert migrate_relocated_skill_uris() == 0
-        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [old]
-
-        def unreadable(name):
-            raise ValueError("capability_state_invalid")
-
-        monkeypatch.setattr("kiro_crew.agent_state.get_capabilities", unreadable)
-        assert migrate_relocated_skill_uris() == 0
-        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [old]
-
-    def test_leaves_workspace_relative_and_wildcard_uris_alone(self, env) -> None:
-        from kiro_crew.agent import migrate_relocated_skill_uris
-
-        _skills, agents = env
-        kept = [f".kiro/skills/{self.OLD}/SKILL.md", "skill://~/.kiro/crew/skills/*/SKILL.md"]
-        kept = [f"skill://{kept[0]}", kept[1]]
-        spec = self._write(agents, kept)
-        assert migrate_relocated_skill_uris() == 0
-        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == kept
 
 
 class TestMigrateAgentSpecs:
@@ -9217,33 +9066,3 @@ class TestForkPromptRefreshGuard:
         inline = {"prompt": "You are a helpful crew."}
         _refresh_dynamic_fields(inline, fork=True)
         assert inline["prompt"] == "You are a helpful crew."
-
-
-class TestRefreshDynamicFieldsWrongTypedAgentSection:
-    """The spec builder reads the config ``agent`` section as a dict. A ``None``
-    or missing section means inherit; a truthy non-dict value (a list or a
-    string from a hand-edited config.json) also degrades to inherit rather than
-    reaching ``.get`` on a non-dict, matching the validated loader."""
-
-    @pytest.mark.parametrize("bad_agent", [["x"], "oops", 123, 1.5])
-    def test_a_truthy_non_dict_agent_section_does_not_raise(self, tmp_path, bad_agent):
-        from kiro_crew.agent import _refresh_dynamic_fields
-
-        mc = tmp_path / "config.json"
-        mc.write_text(json.dumps({"agent": bad_agent}), encoding="utf-8")
-        config = {"name": "kirocrew", "model": "sentinel"}
-        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
-            _refresh_dynamic_fields(config)
-        # No model was pulled from the malformed section, so the sentinel the
-        # builder started with is not overwritten by a config-derived pick.
-        assert config["model"] == "sentinel"
-
-    def test_a_valid_agent_model_is_still_applied(self, tmp_path):
-        from kiro_crew.agent import _refresh_dynamic_fields
-
-        mc = tmp_path / "config.json"
-        mc.write_text(json.dumps({"agent": {"model": "claude-chosen"}}), encoding="utf-8")
-        config = {"name": "kirocrew", "model": "sentinel"}
-        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
-            _refresh_dynamic_fields(config)
-        assert config["model"] == "claude-chosen"

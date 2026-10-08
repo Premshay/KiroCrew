@@ -1291,7 +1291,6 @@ class TestOnLoopCallersOffload:
         )
 
         request = MagicMock()
-        request.get = {}.get  # the dashboard user: no app claim
         request.app = {"state": state}
         request.match_info = {"key": "gone"}
 

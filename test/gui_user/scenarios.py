@@ -57,7 +57,7 @@ FEATURES: dict[str, str] = {
     "topbar": "Top bar",
     "search": "Search everywhere & command palette",
     "members": "Crew Members",
-    "capabilities": "Customize (crews, templates, skills, prompts, steering, hooks, workflows)",
+    "capabilities": "Agent capabilities (crews, templates, skills, prompts, steering, hooks, workflows)",
     "connections": "Connections (MCP servers & services)",
     "memory": "Memory, lessons & usage",
     "knowledge": "Knowledge library",

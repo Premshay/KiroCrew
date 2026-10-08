@@ -40,8 +40,7 @@ def schemas() -> list[dict[str, Any]]:
             "description": (
                 "Search installed skills across names, descriptions and bodies. "
                 "Search, paginated list and exact full-key read use this agent's mapped scope. Returns "
-                "skill keys with a read-by-key hint, or a confined project skill's "
-                "instructions inline; "
+                "global file paths or safely loaded confined project instructions; "
                 "$skillname explicitly loads a skill. A body too large for one read is "
                 "read in pages with offset/limit (lines). Use when the compact startup "
                 "discovery entry does not name what you need."
@@ -365,12 +364,6 @@ def _refused_read(key: str, refusal: dict[str, Any] | None, offset: int) -> str:
     """
     reason = str((refusal or {}).get("reason") or "")
     capacity = int((refusal or {}).get("capacity") or 0)
-    if reason == "outside_scope" and (refusal or {}).get("incomplete"):
-        return (
-            f"Error: the exact key `{key}` was not found, but that is not conclusive yet: "
-            "this scope's skill catalog is still building, and a project skill becomes "
-            "readable only once it finishes. Retry the same key shortly."
-        )
     if reason == "outside_scope":
         return (
             f"Error: the exact key `{key}` is outside this agent's scope: no skill here "
@@ -396,8 +389,7 @@ def _refused_read(key: str, refusal: dict[str, Any] | None, offset: int) -> str:
             return (
                 f"Error: line {refusal['line']} of skill `{key}` is {int(size or 0):,} bytes "
                 f"on its own, more than the {capacity:,}-byte capacity of one read, so no "
-                f"page can hold it; continue with offset={int(refusal['line']) + 1} to read "
-                "past it."
+                "page can hold it."
             )
         if size is None:
             return (

@@ -155,7 +155,6 @@
       "native-theme.js",
       "zoom.js",
       "instance-guard.js",
-      "singleton-lock.js",
       "context-menu.js",
       "find-bin.js",
       "gateway-env.js",

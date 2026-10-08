@@ -23,8 +23,6 @@ mixin over :class:`ManagerComponent` with no state of its own:
   and its refill, and the single owner of off-loop store writes
   (``_post_store_write`` / ``track_store_task``).
 * :mod:`.fairness` -- lanes, the child reserve, the capacity view.
-* :mod:`.memory_wake` -- the starts waiting for memory: their record, the
-  event wake and sampler that re-check them, and each lane's memory share.
 * :mod:`.waits` -- yielding the lane slot, resuming through admission, child
   registration and wait deadlines.
 
@@ -47,20 +45,16 @@ from types import FunctionType
 from .._component import ManagerComponent
 from .fairness import _FairnessMixin
 from .gate import _GateMixin
-from .memory_wake import _MemoryWakeMixin
 from .pump import _PumpMixin
 from .taskq_bridge import _TaskqBridgeMixin
 from .types import (
     FAIRNESS_SETTINGS_TTL_SECS,
-    MEMORY_CAUSE_LANE_SHARE,
-    MEMORY_WAIT_UNTIL_KEY,
     TASK_STORE_UNAVAILABLE_CODE,
     WINDOW_ENTRY_RECOVERING,
     CapacityView,
     ClaimPoint,
     DeferPoint,
     FairnessSettings,
-    MemoryReadPoint,
     PreparedSpawn,
     QueuedReadUnavailable,
     QueuedRun,
@@ -70,13 +64,7 @@ from .waits import _WaitsMixin
 
 
 class SpawnAdmissionCoordinator(
-    _GateMixin,
-    _PumpMixin,
-    _TaskqBridgeMixin,
-    _FairnessMixin,
-    _MemoryWakeMixin,
-    _WaitsMixin,
-    ManagerComponent,
+    _GateMixin, _PumpMixin, _TaskqBridgeMixin, _FairnessMixin, _WaitsMixin, ManagerComponent
 ):
     #: Whether the pump runs as a coroutine on a running loop (its store reads
     #: on the writer thread). Production keeps it on. Deterministic harnesses
@@ -98,8 +86,6 @@ class SpawnAdmissionCoordinator(
     #: package's globals are not in scope.
     TASK_STORE_UNAVAILABLE_CODE = TASK_STORE_UNAVAILABLE_CODE
     WINDOW_ENTRY_RECOVERING = WINDOW_ENTRY_RECOVERING
-    MEMORY_WAIT_UNTIL_KEY = MEMORY_WAIT_UNTIL_KEY
-    MEMORY_CAUSE_LANE_SHARE = MEMORY_CAUSE_LANE_SHARE
 
 
 def _hoist_impls(cls: type) -> None:
@@ -119,15 +105,12 @@ _hoist_impls(SpawnAdmissionCoordinator)
 
 __all__ = [
     "FAIRNESS_SETTINGS_TTL_SECS",
-    "MEMORY_CAUSE_LANE_SHARE",
-    "MEMORY_WAIT_UNTIL_KEY",
     "TASK_STORE_UNAVAILABLE_CODE",
     "WINDOW_ENTRY_RECOVERING",
     "CapacityView",
     "ClaimPoint",
     "DeferPoint",
     "FairnessSettings",
-    "MemoryReadPoint",
     "PreparedSpawn",
     "QueuedReadUnavailable",
     "QueuedRun",

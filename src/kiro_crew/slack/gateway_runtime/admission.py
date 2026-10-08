@@ -134,12 +134,7 @@ def _start_adaptive_controller(
         except Exception:
             return None
 
-    from kiro_crew.mcp_gateway.admission import derive_spawn_gate_ceiling
-    from kiro_crew.subagent import subagent_count_ceiling
-
-    if cfg is None:
-        return
-    cfg_gw = cfg.mcp_gateway
+    cfg_gw = cfg.mcp_gateway  # type: ignore[union-attr]  # narrowed above
     try:
         controller = AdaptiveController(
             self.subagent_mgr,
@@ -149,12 +144,7 @@ def _start_adaptive_controller(
             read_runner_lane=_runner_lane_stats,
             gate_initial=int(getattr(cfg_gw, "spawn_concurrency_initial", 4)),
             gate_floor=int(getattr(cfg_gw, "spawn_concurrency_min", 1)),
-            # Derived from config exactly as mcp_broker launches the daemon, so
-            # the policy's target and the daemon's clamp agree.
-            gate_ceiling=derive_spawn_gate_ceiling(
-                int(getattr(cfg_gw, "spawn_concurrency_max", 8)),
-                subagent_count_ceiling(cfg),
-            ),
+            gate_ceiling=int(getattr(cfg_gw, "spawn_concurrency_max", 8)),
         )
         controller.start()
     except Exception:
@@ -189,16 +179,12 @@ def _wire_overload_health(self: GatewayOrchestrator, controller: AdaptiveControl
         state = controller.state()
         if not state.get("enabled"):
             return None
-        # The pause and its probe are the spawn gate's: the execution cap is
-        # never paused (adaptive-concurrency.md).
         return {
             "effective": state.get("spawn_gate_capacity"),
             "applied": state.get("applied_gate_cap"),
             "pending": state.get("gate_pending"),
             "floor": state.get("gate_floor"),
             "ceiling": state.get("gate_ceiling"),
-            "paused": bool(state.get("paused")),
-            "probing": bool(state.get("probing")),
         }
 
     def _exec_cap() -> dict | None:
@@ -208,11 +194,11 @@ def _wire_overload_health(self: GatewayOrchestrator, controller: AdaptiveControl
         return {
             "adaptive": state.get("effective_exec_cap"),
             "ceiling": state.get("exec_ceiling"),
+            "paused": bool(state.get("paused")),
+            "probing": bool(state.get("probing")),
         }
 
     def _degrade_reason() -> str | None:
-        # Pause and probe are the SPAWN GATE's (the execution cap is never
-        # paused), so their catalog copy names backend starts, not runs.
         state = controller.state()
         if state.get("paused"):
             return "adaptive_pause"

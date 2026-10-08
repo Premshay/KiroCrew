@@ -215,10 +215,6 @@ export const SHORTCUT_REGISTRY: readonly ShortcutEntry[] = [
   { id: 'agent-monitor', group: 'actions', dispatch: 'code', defaults: both({ key: 'g', ctrl: true }) },
   // Bare Escape, handled by a capture-phase listener; listed for the reference.
   { id: 'stop-speaking', group: 'actions', dispatch: 'code', defaults: both({ key: 'Escape' }) },
-  // Bare Up/Down, handled by NotificationFeed while one of its rows has focus
-  // (inbox page and bell sheet); listed for the reference.
-  { id: 'notification-prev', group: 'actions', dispatch: 'code', defaults: both({ key: 'ArrowUp' }) },
-  { id: 'notification-next', group: 'actions', dispatch: 'code', defaults: both({ key: 'ArrowDown' }) },
   // ---- Remote instances (useInstanceShortcuts, Electron only) ---------------
   // 1 = Local, 2..6 = the 1st..5th remote instance, matching the InstanceTabBar
   // left-to-right order.
@@ -342,11 +338,9 @@ export function resolveShortcuts(overrides: ShortcutOverrides, platform: Shortcu
  * AltGr) the physical US-QWERTY key still works, matching how every chord in
  * `useKeyboardShortcuts` has always been matched. Not mapped: `NumpadEnter`
  * (the handler has always compared `code === 'Enter'`, so the numpad key is not
- * the same chord) and the numpad digits. Shared with the panel-toggle /
- * quick-search recorder (`quickSearchShortcut.eventKeyToken`) so both chord
- * families read punctuation the same way.
+ * the same chord) and the numpad digits.
  */
-export const CODE_TOKENS: Readonly<Record<string, string>> = {
+const CODE_TOKENS: Readonly<Record<string, string>> = {
   Comma: ',', Period: '.', Slash: '/', Backslash: '\\', BracketLeft: '[', BracketRight: ']',
   Backquote: '`', Minus: '-', Equal: '=', Semicolon: ';', Quote: "'",
 }

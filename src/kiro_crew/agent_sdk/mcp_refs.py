@@ -1,4 +1,4 @@
-"""Which of an agent spec's ``@server`` tool refs name nothing in Crew's projection.
+"""Which of an agent spec's ``@server`` tool refs name nothing a session gets.
 
 One defect class has shipped three times, on three different harnesses, and each
 time it was diagnosed from scratch by someone who did not know it had happened

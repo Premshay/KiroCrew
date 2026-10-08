@@ -278,7 +278,7 @@ const FRAME_CASES: Array<[string, Frame[], Frame[]]> = [
     type: 'slots', data: SLOTS, yolo: true, channelTrusted: false,
     folders: [{ id: 'f1', name: 'F' }], foldersGeneration: 3, gitlabHostsGeneration: 4, governanceGeneration: 5,
   }]],
-  ['slots repeated frame only reconciles the queued depth', [{ type: 'slots', data: SLOTS, foldersGeneration: 3 }], [{ type: 'slots', data: SLOTS, foldersGeneration: 3 }]],
+  ['slots repeated frame is skipped', [{ type: 'slots', data: SLOTS, foldersGeneration: 3 }], [{ type: 'slots', data: SLOTS, foldersGeneration: 3 }]],
   ['slots unchanged generations', [{ type: 'slots', data: SLOTS, foldersGeneration: 3, gitlabHostsGeneration: 4 }], [{ type: 'slots', data: [...SLOTS].reverse(), foldersGeneration: 3, gitlabHostsGeneration: 4 }]],
   ['credential_redaction_changed', [], [{ type: 'credential_redaction_changed', data: { enabled: true, changed_at: TS } }]],
   ['credential_redaction_changed without a boolean', [], [{ type: 'credential_redaction_changed', data: { enabled: 'yes', changed_at: 3 } }]],
@@ -331,12 +331,6 @@ const FRAME_CASES: Array<[string, Frame[], Frame[]]> = [
   ]],
   ['members_subscribed truncating a torn tail', [{ type: 'member_projection', data: { slug: 'ada', key: 'roster', seq: 9, value: 1 } }], [{ type: 'members_subscribed', data: { lastSeqs: { ada: 3 } } }]],
   ['members_subscribed with nothing to drop', [], [{ type: 'members_subscribed', data: { lastSeqs: { ada: 3 } } }]],
-  // A crewmate filled one of its own dashboard fields. Metadata only, so the only
-  // effect is the tab's re-read; a frame with no slug must do nothing at all.
-  ['dashboard_value_written', [], [
-    { type: 'dashboard_value_written', data: { slug: 'ada' } },
-    { type: 'dashboard_value_written', data: {} },
-  ]],
   ['chat_message user row in the active slot', [], [{ type: 'chat_message', data: { slot: ACTIVE, role: 'user', content: 'hi', ts: TS } }]],
   ['chat_message assistant row in a background slot', [], [{ type: 'chat_message', data: { slot: BACKGROUND, role: 'assistant', content: 'done', ts: TS } }]],
   ['chat_message permission row in a background slot', [], [{ type: 'chat_message', data: { slot: BACKGROUND, role: 'permission', content: '[agent] shell', ts: TS } }]],
@@ -893,7 +887,6 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'reload',
   ],
   "slots first frame of a connection": [
-    'action chat/reconcileSubagentQueuedFromSlots [{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"}]',
     'action dashboard/sseSlots [{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"}]',
     'action dashboard/sseYolo true',
     'action dashboard/setChannelTrusted false',
@@ -902,11 +895,8 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'query invalidateQueries ["dashboardConfig"]',
     'event mc:app:slots',
   ],
-  "slots repeated frame only reconciles the queued depth": [
-    'action chat/reconcileSubagentQueuedFromSlots [{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"}]',
-  ],
+  "slots repeated frame is skipped": [],
   "slots unchanged generations": [
-    'action chat/reconcileSubagentQueuedFromSlots [{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"}]',
     'action dashboard/sseSlots [{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"}]',
     'event mc:app:slots',
   ],
@@ -1065,20 +1055,12 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
   "slot_agent_switch": [
     'action dashboard/fetchSlots/pending',
   ],
-  // Two frames, two invalidations: a fold advancing is what makes a crewmate's open
-  // Dashboard tab stale, and the store apply is silent (it is not a query).
-  "member_projection": [
-    "query invalidateQueries [\"member-dashboard\",\"ada\"]",
-    "query invalidateQueries [\"member-dashboard\",\"ada\"]",
-  ],
+  "member_projection": [],
   "members_subscribed truncating a torn tail": [
     'query resetQueries ["kirocrew-agents","members-roster"]',
     'query resetQueries ["kirocrew-agents","member-projections"]',
   ],
   "members_subscribed with nothing to drop": [],
-  "dashboard_value_written": [
-    "query invalidateQueries [\"member-dashboard\",\"ada\"]",
-  ],
   "chat_message user row in the active slot": [
     'action chat/sseChatMessage {"slot":"slot-a","role":"user","content":"hi","ts":"2026-09-01T00:00:00.000Z"}',
     'send {"type":"slot_read","slot":"slot-a","read_ts":"2026-09-01T00:00:00.000Z"}',
@@ -1283,7 +1265,6 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'action chat/refreshSlot/pending',
     'query refetchQueries ["pull-request-source"] {"type":"active"}',
     'query invalidateQueries ["pull-request-statuses"] {"refetchType":"active"}',
-    'query invalidateQueries ["session-control-status","dashboard:slot-a"] {"refetchType":"active"}',
   ],
   "chat_done in a background slot": [
     'action chat/sseChatMessage {"slot":"slot-b","ts":"2026-09-01T00:00:00.000Z","role":"_done"}',
@@ -1293,7 +1274,6 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'action chat/setSlotStatusDetail {"slot":"slot-b","kind":"idle","ts":"<clock>"}',
     'action chat/refreshSlot/pending',
     'query invalidateQueries ["pull-request-statuses"] {"refetchType":"none"}',
-    'query invalidateQueries ["session-control-status","dashboard:slot-b"] {"refetchType":"none"}',
   ],
   "chat_done needing input": [
     'action chat/sseChatMessage {"slot":"slot-b","ts":"2026-09-01T00:00:00.000Z","needs_input":true,"continuing":false,"role":"_done"}',
@@ -1303,7 +1283,6 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'action chat/setSlotStatusDetail {"slot":"slot-b","kind":"idle","ts":"<clock>"}',
     'action chat/refreshSlot/pending',
     'query invalidateQueries ["pull-request-statuses"] {"refetchType":"none"}',
-    'query invalidateQueries ["session-control-status","dashboard:slot-b"] {"refetchType":"none"}',
   ],
   "chat_done still continuing": [
     'action chat/sseChatMessage {"slot":"slot-b","ts":"2026-09-01T00:00:00.000Z","continuing":true,"role":"_done"}',
@@ -1312,7 +1291,6 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'action chat/setSlotStatusDetail {"slot":"slot-b","kind":"idle","ts":"<clock>"}',
     'action chat/refreshSlot/pending',
     'query invalidateQueries ["pull-request-statuses"] {"refetchType":"none"}',
-    'query invalidateQueries ["session-control-status","dashboard:slot-b"] {"refetchType":"none"}',
   ],
   "autonudge_state update and removal": [
     'query invalidateQueries ["autonudge-loops"]',
@@ -1436,7 +1414,6 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'query invalidateQueries ["global-approvals"]',
     'query invalidateQueries ["artifacts"]',
     'query invalidateQueries ["artifact-folders"]',
-    'query invalidateQueries ["kirocrewConfig"]',
     'query fetchQuery ["credential-redaction"] {"staleTime":0}',
     'query invalidateQueries ["chat-thread"]',
     'query invalidateQueries ["chat-threads"]',
@@ -1485,7 +1462,6 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'query invalidateQueries ["global-approvals"]',
     'query invalidateQueries ["artifacts"]',
     'query invalidateQueries ["artifact-folders"]',
-    'query invalidateQueries ["kirocrewConfig"]',
     'query fetchQuery ["credential-redaction"] {"staleTime":0}',
     'query invalidateQueries ["chat-thread"]',
     'query invalidateQueries ["chat-threads"]',
@@ -1573,7 +1549,6 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'action chat/setSlotStatusDetail {"slot":"slot-b","kind":"idle","ts":"<clock>"}',
     'action chat/refreshSlot/pending',
     'query invalidateQueries ["pull-request-statuses"] {"refetchType":"none"}',
-    'query invalidateQueries ["session-control-status","dashboard:slot-b"] {"refetchType":"none"}',
   ],
   "an overflowing chunk lands its status before the flush; reasoning after it": [
     'action chat/setSlotStatusDetail {"slot":"slot-a","kind":"streaming","ts":"<clock>"}',

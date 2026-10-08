@@ -39,7 +39,6 @@ vi.mock('../api/client', async (importOriginal) => {
       createChatTag: vi.fn().mockResolvedValue({ ok: true }),
       chatFolders: vi.fn().mockResolvedValue([]),
       recentProjects: vi.fn().mockResolvedValue({ dirs: [] }),
-      favoriteProjects: vi.fn().mockResolvedValue({ dirs: [] }),
       browseDirs: vi.fn().mockResolvedValue({ path: '/home/u', parent: '/home', dirs: [] }),
     },
   }
@@ -162,7 +161,6 @@ describe('ProjectPicker path input — rule 2: gate the Enter path only', () => 
   beforeEach(() => {
     vi.useFakeTimers()
     vi.mocked(api.recentProjects).mockResolvedValue({ dirs: [] })
-    vi.mocked(api.favoriteProjects).mockResolvedValue({ dirs: [] })
     vi.mocked(api.browseDirs).mockResolvedValue({
       path: '/home/u',
       parent: '/home',

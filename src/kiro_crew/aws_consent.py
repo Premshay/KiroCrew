@@ -399,15 +399,7 @@ def revoke_for_profile(profile: str) -> list[str]:
     return revoked
 
 
-#: Default for :func:`is_granted`'s ``grant`` argument. A sentinel rather than
-#: ``None`` because ``None`` is a real answer there: "the caller read the store and
-#: found no grant".
-_READ_GRANT: Any = object()
-
-
-def is_granted(
-    service: str, *, profile: str, region: str, grant: Grant | None = _READ_GRANT
-) -> tuple[bool, str]:
+def is_granted(service: str, *, profile: str, region: str) -> tuple[bool, str]:
     """Whether a grant exists matching this profile+region. LOCAL only.
 
     Returns ``(granted, reason)``. ``reason`` is an operator-facing sentence for
@@ -417,13 +409,8 @@ def is_granted(
     This is the first of two checks. It does NOT verify the live account -- see
     :func:`authorize`, which is what call sites use. Kept separate because the
     local half is what the dashboard reports and what the tests pin.
-
-    ``grant`` is the record to check, for a caller that also checks the grant's
-    account and so has already read it: both checks then judge the same record.
-    Omitted, the grant is read here.
     """
-    if grant is _READ_GRANT:
-        grant = read_grant(service)
+    grant = read_grant(service)
     label = SERVICE_LABELS.get(service, service)
     if grant is None:
         return False, (

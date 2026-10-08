@@ -93,7 +93,7 @@ Publishing refuses, with the reason on stderr and nothing written:
 ## Verify
 
 ```bash
-python3 scripts/feature-videos/verify.py dist/feature-videos/<release>
+python3 scripts/feature-videos/verify.py dist/feature-videos/0.8.0
 ```
 
 Recomputes every hash from the bytes on disk, verifies the signature against the
@@ -106,10 +106,10 @@ signed with another key.
 Publishing prints the commands and stops. Run them yourself:
 
 ```bash
-aws s3 sync --dryrun dist/feature-videos/<release>/ s3://BUCKET/feature-videos/<release>/
-aws s3 sync dist/feature-videos/<release>/ s3://BUCKET/feature-videos/<release>/
+aws s3 sync --dryrun dist/feature-videos/0.8.0/ s3://BUCKET/feature-videos/0.8.0/
+aws s3 sync dist/feature-videos/0.8.0/ s3://BUCKET/feature-videos/0.8.0/
 aws cloudfront create-invalidation --distribution-id DISTRIBUTION \
-  --paths '/feature-videos/<release>/*'
+  --paths '/feature-videos/0.8.0/*'
 ```
 
 The tool enforces immutability on the folder it signs; the bucket side is yours.

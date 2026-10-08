@@ -118,7 +118,8 @@ class TestEmittedResultPointersAreReadable:
             SubagentManager._notify_orphan(
                 stub,
                 agent_id,
-                {"task": "summarize the diff", "parent_session": "", "result_complete": True},
+                {"task": "summarize the diff", "parent_session": ""},
+                recovery="undeliverable",
                 has_result=True,
             )
         )

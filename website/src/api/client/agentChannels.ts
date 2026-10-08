@@ -7,7 +7,7 @@
 
 import type { ClientTransport } from './transport'
 
-export function createAgentChannelsEndpoints({ post, del, patch, j, jfetch: fetch }: ClientTransport) {
+export function createAgentChannelsEndpoints({ post, del, patch, j }: ClientTransport) {
   const channels = {
     // Channels
     channelsList: () => fetch('/api/channels').then(j),

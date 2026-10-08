@@ -27,14 +27,20 @@ from kiro_crew.mcp_gateway.pool import BackendPool, PoolAtCapacity, PoolKey
 pytestmark = pytest.mark.xdist_group("mcp_gateway")
 
 
-def _make_pool_key(server: str = "srv") -> PoolKey:
+def _make_pool_key(server: str = "srv", agent: str = "agent") -> PoolKey:
     return PoolKey(
         server_name=server,
+        agent_name=agent,
         command_args_hash="abc123",
         effective_env_hash="def456",
         work_dir="/tmp/test",
         binary_version="1.0",
         os_uid=1000,
+        sandbox_mode="none",
+        autoapprove_set_hash="ghi789",
+        approval_mode="reads",
+        trust_all_tools=False,
+        config_snapshot_hash="jkl012",
     )
 
 
@@ -478,7 +484,7 @@ class _HandlerBackend:
     def __init__(self) -> None:
         self._pending_requests: dict = {}
 
-    async def attach_stub(self, _uuid: str, *, agent: str = "") -> "asyncio.Queue[bytes]":
+    async def attach_stub(self, _uuid: str) -> "asyncio.Queue[bytes]":
         return asyncio.Queue()
 
     async def detach_stub(self, _uuid: str) -> int:

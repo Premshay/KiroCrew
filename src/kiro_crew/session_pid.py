@@ -34,7 +34,6 @@ from kiro_crew.constants import (
     KIROCREW_SPAWNED_VALUE,
 )
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
-from kiro_crew.owner_only_files import ensure_directory, owner_only_opener_for
 from kiro_crew.runtime_ownership import (
     PidRefcount,
     authorize_runtime_kill,
@@ -63,8 +62,8 @@ def _pid_age_seconds(pid: int, proc_root: str = "/proc") -> float | None:
     """Return the process age in seconds, or None if it cannot be determined.
 
     On Linux, reads /proc/<pid>/stat field 22 (starttime in clock ticks since
-    boot) through ``platform_compat.read_proc_stat`` and dates it against
-    ``<proc_root>/uptime`` with ``platform_compat.process_age_secs``.
+    boot). The comm field (field 2) can contain spaces and parentheses — split
+    on the substring AFTER the LAST ')' in the line.
 
     On macOS (and other POSIX without /proc): derived from
     ``platform_compat.get_process_start_id``, whose darwin value is the process
@@ -87,14 +86,27 @@ def _pid_age_seconds(pid: int, proc_root: str = "/proc") -> float | None:
             return max(0.0, time.time() - float(start_id))
         except ValueError:
             return None
-    stat = platform_compat.read_proc_stat(pid, proc_root=Path(proc_root))
-    if stat is None or stat.start_ticks is None:
-        return None
     try:
+        stat_data = Path(f"{proc_root}/{pid}/stat").read_text()
+        # Field 22 is starttime. Fields before it: pid (1), comm (2, in parens,
+        # may contain spaces), state (3), ... The reliable parse is to find the
+        # LAST ')' — everything after is space-separated fields starting at
+        # field 3 (state).
+        close_paren = stat_data.rfind(")")
+        if close_paren < 0:
+            return None
+        fields_after_comm = stat_data[close_paren + 2 :].split()
+        # starttime is field 22 overall. After comm (field 2), state is field 3
+        # which is index 0 of fields_after_comm. So field 22 = index 19.
+        starttime_ticks = int(fields_after_comm[19])
+        clk_tck = os.sysconf("SC_CLK_TCK")
         uptime = float(Path(f"{proc_root}/uptime").read_text().split()[0])
+        now = time.time()
+        boot_time = now - uptime
+        start_seconds = boot_time + (starttime_ticks / clk_tck)
+        return now - start_seconds
     except (OSError, ValueError, IndexError):
         return None
-    return platform_compat.process_age_secs(stat.start_ticks, now=uptime)
 
 
 def _pid_in_spawn_grace(pid: int) -> bool:
@@ -163,7 +175,7 @@ def _session_pid_file_path() -> Path:
 def _session_pid_file_lock():  # type: ignore[no-untyped-def]
     """Exclusive file lock for session PID file operations."""
     lock_path = _session_pid_file_path().with_suffix(".lock")
-    ensure_directory(lock_path.parent)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     # Open non-truncating; see ``platform_compat.open_lock_file`` for why ``"w"``
     # loses the lock on Windows (GH-9248). The helper does the create-or-open in
     # one syscall; the parent mkdir above stays because it does not.
@@ -216,9 +228,9 @@ def _track_session_pid(pid: int, start_token: str | None = None) -> None:
     entry = f"{prefix}:{token}" if token else prefix
     with _session_pid_file_lock():
         path = _session_pid_file_path()
-        ensure_directory(path.parent)
+        path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
-            lines = _read_pid_file_text(path).splitlines()
+            lines = path.read_text(encoding="utf-8").splitlines()
             kept: list[str] = []
             already_present = False
             stale_predecessor = False
@@ -258,7 +270,7 @@ def _track_session_pid(pid: int, start_token: str | None = None) -> None:
                 if not _rewrite_pid_file(path, "\n".join(kept) + "\n"):
                     raise OSError(f"could not record root PID {pid} in {path}")
                 return
-        with open(path, "a", encoding="utf-8", opener=owner_only_opener_for(path)) as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(f"{entry}\n")
 
 
@@ -266,26 +278,13 @@ def _track_session_pid(pid: int, start_token: str | None = None) -> None:
 def _pid_file_lock():  # type: ignore[no-untyped-def]
     """Exclusive file lock for all PID file read-modify-write operations."""
     lock_path = _pid_file_path().with_suffix(".lock")
-    ensure_directory(lock_path.parent)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     # Open non-truncating; see ``platform_compat.open_lock_file`` for why ``"w"``
     # loses the lock on Windows (GH-9248). The helper does the create-or-open in
     # one syscall; the parent mkdir above stays because it does not.
     with platform_compat.open_lock_file(lock_path) as lock_fd:
         with platform_compat.file_lock(lock_fd, exclusive=True):
             yield
-
-
-def _read_pid_file_text(path: Path) -> str:
-    """A PID tracking file's text; raises ``OSError`` exactly as ``read_text`` does.
-
-    The files hold ASCII digits and colons, so a byte that is not UTF-8 is
-    damage, and a strict decode would raise ``UnicodeDecodeError`` -- which no
-    ``except OSError`` around these reads catches -- out of every reader,
-    including the boot sweep. Undecodable bytes become U+FFFD instead, so the
-    field they sit in fails its ``int()`` parse and each reader's
-    malformed-entry rule applies to it exactly as to an ASCII-garbled one.
-    """
-    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def _rewrite_pid_file(path: Path, content: str) -> bool:
@@ -496,10 +495,9 @@ def _sandbox_launcher_wrapped_argv(tokens: list[bytes]) -> list[bytes] | None:
         ``<interpreter> -I -S <run dir>/kirocrew_sandbox_<pid>_<rand>.py <harness argv…>``
 
     and the launcher's parent never execs: it writes the child's uid/gid maps and then
-    blocks in ``waitpid`` for the life of the session
-    (``sandbox_launcher_program.main``). So the gate's ``argv[0]`` is the interpreter and
-    the harness sits past the script, out of reach of :func:`_harness_naming_tokens`'s two
-    positions.
+    blocks in ``waitpid`` for the life of the session (``sandbox_launcher.main``). So the
+    gate's ``argv[0]`` is the interpreter and the harness sits past the script, out of
+    reach of :func:`_harness_naming_tokens`'s two positions.
 
     Recognising it is not optional, because an unrecognised agent root is UNRECLAIMABLE
     rather than spared: :func:`_sweep_pid_entries` RETAINS a settled-token entry the argv
@@ -1128,7 +1126,7 @@ def _write_back_pid_file(killed_or_dead: set[str]) -> None:
     with _session_pid_file_lock():
         path = _session_pid_file_path()
         if path.exists():
-            current = _read_pid_file_text(path).splitlines()
+            current = path.read_text(encoding="utf-8").splitlines()
             keep = [
                 entry
                 for entry in current
@@ -1307,7 +1305,7 @@ def _periodic_pid_sweep(my_gw_pid: int, active_pids: set[int]) -> tuple[set[str]
     if not path.exists():
         return set(), []
     lock_path = path.with_suffix(".lock")
-    ensure_directory(lock_path.parent)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         # Non-truncating, for the reason spelled out in `_session_pid_file_lock`.
         # This site is the likeliest of the three to feel it: the sweep runs on a
@@ -1316,7 +1314,7 @@ def _periodic_pid_sweep(my_gw_pid: int, active_pids: set[int]) -> tuple[set[str]
         # Kept inline rather than routed through `platform_compat.open_lock_file`:
         # this fd is held across the try/finally below, not a `with` block, so a
         # with-scoped opener that closes the fd at block exit does not fit.
-        lock_path.touch(mode=0o600, exist_ok=True)
+        lock_path.touch(exist_ok=True)
         lock_fd = open(lock_path, "r+")
     except OSError:
         return set(), []
@@ -1329,7 +1327,7 @@ def _periodic_pid_sweep(my_gw_pid: int, active_pids: set[int]) -> tuple[set[str]
         if not platform_compat.try_acquire_lock(lock_fd.fileno(), exclusive=False):
             return set(), []
         try:
-            lines = _read_pid_file_text(path).splitlines() if path.exists() else []
+            lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
         finally:
             platform_compat.release_lock(lock_fd.fileno())
     finally:
@@ -1369,7 +1367,7 @@ def _session_pid_entry_index(my_gw_pid: int) -> dict[int, tuple[str, str | None]
         with _session_pid_file_lock():
             if not path.exists():
                 return index
-            lines = _read_pid_file_text(path).splitlines()
+            lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         logger.warning("Could not read %s for the kill phase", path, exc_info=True)
         return index
@@ -1401,17 +1399,13 @@ def retained_gateway_pids() -> frozenset[int]:
     could confirm dead or kill and removed those entries, so a gateway pid that
     still has one may have something alive and its run directories are kept. A
     ledger that cannot be read raises ``OSError`` rather than answering "nothing
-    retained": the callers decide a deletion on this answer and fail closed. A
-    byte that is not UTF-8 gets the malformed-entry rule an ASCII-garbled one
-    does: a gateway-pid field it lands in fails its parse and the line is skipped,
-    as the boot sweep has already pruned it.
+    retained": the callers decide a deletion on this answer and fail closed.
     """
     path = _session_pid_file_path()
     with _session_pid_file_lock():
         if not path.exists():
             return frozenset()
-        text = _read_pid_file_text(path)
-    lines = text.splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     retained: set[int] = set()
     for line in lines:
         parts = line.strip().split(":")
@@ -1838,14 +1832,20 @@ def _pid_exited_but_unreaped(pid: int) -> bool:
         return bool(zombie) if zombie is not None else False
     if sys.platform != "linux":
         return not platform_compat.pid_exists(pid)
-    zombie = platform_compat.pid_is_zombie(pid)
-    if zombie is None:
-        # Gone, or present but unreadable: only a pid that has gone has exited.
-        return not platform_compat.pid_exists(pid)
-    return zombie
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return True  # already gone
+    except OSError:
+        return False  # unreadable -- do not claim it exited
+    rparen = stat.rfind(")")
+    if rparen < 0:
+        return False
+    fields = stat[rparen + 2 :].split()
+    return bool(fields) and fields[0] == "Z"
 
 
-def _pgroup_has_member_besides(pgid: int, root_pid: int, *, proc_root: Path | None = None) -> bool:
+def _pgroup_has_member_besides(pgid: int, root_pid: int) -> bool:
     """True when some process other than *root_pid* is still in group *pgid*.
 
     ``pgroup_exists`` cannot answer this: a retained zombie leader is itself a
@@ -1853,9 +1853,9 @@ def _pgroup_has_member_besides(pgid: int, root_pid: int, *, proc_root: Path | No
     has died (measured). Without this distinction, holding the zombie for pgid
     safety would cost every teardown its full SIGTERM grace.
 
-    One ``/proc`` pass through ``platform_compat.linux_pgroup_members``, which
-    reads every stat as bytes. Callers gate it behind the cheap probes, so the
-    common path runs it once. *proc_root* substitutes a fixture process table.
+    One ``/proc`` pass reading each stat's pgrp (field 5, the third field after
+    the last ``)``, the same parse :func:`_pid_parent_and_token` uses). Callers
+    gate it behind the cheap probes, so the common path runs it once.
 
     Conservative on a scan failure: returns True, i.e. "assume the group still
     holds something", so the caller escalates rather than declaring the tree
@@ -1873,11 +1873,32 @@ def _pgroup_has_member_besides(pgid: int, root_pid: int, *, proc_root: Path | No
         return any(m.pid != root_pid and not m.zombie for m in members)
     if sys.platform != "linux":
         return platform_compat.pgroup_exists(pgid)
-    group = platform_compat.linux_pgroup_members(pgid, proc_root=proc_root)
-    if group is None:
-        logger.debug("_sync_kill_provider: /proc scan failed for pgid %d", pgid)
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        logger.debug("_sync_kill_provider: /proc scan failed for pgid %d", pgid, exc_info=True)
         return True
-    return any(member != root_pid for member in group)
+    for entry in entries:
+        name = entry.name
+        if not name.isdigit():
+            continue
+        member = int(name)
+        if member == root_pid:
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except (OSError, ValueError):
+            continue  # exited mid-scan; it is not holding the group open
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            continue
+        fields = stat[rparen + 2 :].split()
+        try:
+            if int(fields[2]) == pgid and fields[0] != "Z":
+                return True
+        except (IndexError, ValueError):
+            continue
+    return False
 
 
 def group_vouching_available() -> bool:
@@ -1898,7 +1919,6 @@ def _marked_group_members(
     instance: str,
     *,
     require_runtime_identity: bool = True,
-    proc_root: Path | None = None,
 ) -> dict[int, str | None]:
     """Live members of process group *pgid* spawned as incarnation *instance*.
 
@@ -1924,11 +1944,6 @@ def _marked_group_members(
     inherited the marker is excluded by the argv identity check, the same pair
     the tracked sweep's systemd arm requires.
 
-    The start id is the one ``platform_compat.linux_pgroup_members`` read
-    alongside the group and state, so it names the process that was admitted;
-    a member whose start cannot be read is left out. *proc_root* substitutes a
-    fixture process table.
-
     Linux only. The environ read is Linux-only and fail-closed everywhere else,
     so the answer is ``{}`` on macOS and Windows and the caller signals nothing
     -- a missed reap there, never a wrong kill. Zombies are skipped: they hold
@@ -1950,19 +1965,35 @@ def _marked_group_members(
     """
     if not group_vouching_available() or pgid <= 1 or not instance:
         return {}
-    group = platform_compat.linux_pgroup_members(pgid, proc_root=proc_root)
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return {}
     members: dict[int, str | None] = {}
-    for member, start_ticks in (group or {}).items():
-        # The start id comes from the read that admitted the member: one read
-        # later, the pid may already name another process.
-        if start_ticks is None:
+    for entry in entries:
+        name = entry.name
+        if not name.isdigit():
+            continue
+        member = int(name)
+        try:
+            stat = (entry / "stat").read_text()
+        except (OSError, ValueError):
+            continue
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            continue
+        fields = stat[rparen + 2 :].split()
+        try:
+            if int(fields[2]) != pgid or fields[0] == "Z":
+                continue
+        except (IndexError, ValueError):
             continue
         if (
-            _env_spawn_instance(member, proc_root) == instance
-            and _env_has_kirocrew_marker(member, proc_root)
+            _env_spawn_instance(member) == instance
+            and _env_has_kirocrew_marker(member)
             and (not require_runtime_identity or _tracked_child_has_runtime_identity(member))
         ):
-            members[member] = str(start_ticks)
+            members[member] = _pid_start_token(member)
     return members
 
 
@@ -2662,7 +2693,7 @@ def _cleanup_orphaned_mcp_servers() -> int:
     # read and our kill decision.  os.kill is non-blocking so lock duration is
     # negligible.
     with _pid_file_lock():
-        lines = _read_pid_file_text(path).splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
         killed = 0
         lines_to_remove: set[str] = set()
         # Lazily computed on the first orphan-kill decision: the /proc scan is
@@ -2796,7 +2827,7 @@ def cleanup_orphaned_sessions(*, narrow_with_leaders: bool = True) -> None:
     # Step 1: Read file under lock (fast I/O only)
     with _session_pid_file_lock():
         path = _session_pid_file_path()
-        lines: list[str] = _read_pid_file_text(path).splitlines() if path.exists() else []
+        lines: list[str] = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
     # Step 2: Process outside lock (slow: os.kill, _get_child_pids, SIGKILL)
     def _skip_tagged(gw_pid: int, _pid: int) -> bool:
@@ -3021,7 +3052,7 @@ def cleanup_orphaned_session_roots() -> int:
         return killed
 
     with _session_pid_file_lock():
-        lines = _read_pid_file_text(path).splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
 
     if not lines:
         return killed
@@ -3183,8 +3214,8 @@ def _track_pid(pid: int) -> None:
     """Append a PID to the tracking file."""
     with _pid_file_lock():
         path = _pid_file_path()
-        ensure_directory(path.parent)
-        with open(path, "a", encoding="utf-8", opener=owner_only_opener_for(path)) as f:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
             f.write(f"{pid}\n")
 
 
@@ -3201,9 +3232,9 @@ def _track_child_pids(pids: Mapping[int, object], parent_pid: int = 0) -> None:
         return
     with _pid_file_lock():
         path = _pid_file_path()
-        ensure_directory(path.parent)
-        existing = set(_read_pid_file_text(path).splitlines()) if path.exists() else set()
-        with open(path, "a", encoding="utf-8", opener=owner_only_opener_for(path)) as f:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = set(path.read_text(encoding="utf-8").splitlines()) if path.exists() else set()
+        with open(path, "a", encoding="utf-8") as f:
             for pid in pids:
                 key = f"{pid}:{parent_pid}"
                 if any(e == key or e.startswith(key + ":") for e in existing):
@@ -3280,8 +3311,8 @@ def _replace_child_pids(
         return True
     with _pid_file_lock():
         path = _pid_file_path()
-        ensure_directory(path.parent)
-        lines = _read_pid_file_text(path).splitlines() if path.exists() else []
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
         kept: list[str] = []
         for raw in lines:
             entry = raw.strip()
@@ -3307,7 +3338,7 @@ def _untrack_child_pids(pids: Mapping[int, object]) -> None:
         path = _pid_file_path()
         if not path.exists():
             return
-        lines = _read_pid_file_text(path).splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
         lines = [
             ln for ln in lines if ":" not in ln.strip() or ln.strip().split(":")[0] not in to_remove
         ]
@@ -3320,7 +3351,7 @@ def _untrack_pid(pid: int) -> bool:
         path = _pid_file_path()
         if not path.exists():
             return True
-        lines = _read_pid_file_text(path).splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
         lines = [ln for ln in lines if ln.strip() != str(pid)]
         return _rewrite_pid_file(path, "\n".join(lines) + "\n" if lines else "")
 
@@ -3337,7 +3368,7 @@ def _untrack_session_pid(pid: int) -> bool:
         path = _session_pid_file_path()
         if not path.exists():
             return True
-        lines = _read_pid_file_text(path).splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
         # Match both the legacy ``gw:pid`` form and the token-bearing
         # ``gw:pid:token`` form (see _track_session_pid).
         lines = [
@@ -3376,7 +3407,7 @@ def _untrack_pid_if_dead(pid: int) -> bool:
             return True
         if platform_compat.pid_exists(pid):
             return True
-        lines = _read_pid_file_text(path).splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
         lines = [ln for ln in lines if ln.strip() != str(pid)]
         return _rewrite_pid_file(path, "\n".join(lines) + "\n" if lines else "")
 
@@ -3428,7 +3459,7 @@ def _untrack_root_by_identity(pid: int, start_token: str | None) -> bool:
         session_path = _session_pid_file_path()
         if not session_path.exists():
             return False
-        lines = _read_pid_file_text(session_path).splitlines()
+        lines = session_path.read_text(encoding="utf-8").splitlines()
         kept = [ln for ln in lines if ln.strip() != ours]
         if len(kept) == len(lines):
             return False
@@ -3785,10 +3816,10 @@ def _browser_session_owner_alive(
             continue
         except OSError:
             return True
-        if _linux_pid_sid(other, root) == pid:
+        if _linux_pid_sid(other, proc_root) == pid:
             continue  # the daemon's own detached tree, not an owner
         try:
-            owner_session = _env_value(other, _BROWSER_SESSION_ENV, root)
+            owner_session = _env_value(other, _BROWSER_SESSION_ENV, proc_root)
             if owner_session == session:
                 logger.debug(
                     "browser_session_owner_probe daemon_pid=%s candidate_pid=%s "
@@ -3953,9 +3984,8 @@ def _accepted_subreaper_pids() -> set[int]:
             try:
                 if entry.stat().st_uid != my_uid:
                     continue
-                # Detect systemd --user (user-session subreaper). Compared as
-                # bytes: a name is whatever bytes its process chose.
-                if (entry / "comm").read_bytes().strip() == b"systemd":
+                # Detect systemd --user (user-session subreaper)
+                if (entry / "comm").read_text().strip() == "systemd":
                     accepted.add(int(entry.name))
             except (OSError, ValueError):
                 continue
@@ -3983,19 +4013,23 @@ def _our_orphan_pids() -> list[int]:
     try:
         if sys.platform == "linux":
             result: list[int] = []
-            proc = Path("/proc")
-            for entry in proc.iterdir():
+            for entry in Path("/proc").iterdir():
                 if not entry.name.isdigit():
                     continue
                 try:
                     if entry.stat().st_uid != my_uid:
                         continue
-                except OSError:
-                    continue
-                pid = int(entry.name)
-                stat = platform_compat.read_proc_stat(pid, proc_root=proc)
-                if stat is not None and stat.ppid in accepted_ppids:
-                    result.append(pid)
+                    pid = int(entry.name)
+                    for ln in (entry / "status").read_text().splitlines():
+                        if ln.startswith("PPid:"):
+                            parts = ln.split(maxsplit=1)
+                            if len(parts) < 2:
+                                break
+                            if int(parts[1]) in accepted_ppids:
+                                result.append(pid)
+                            break
+                except (OSError, ValueError, IndexError):
+                    pass
             return result
         else:
             result = []
@@ -4548,25 +4582,19 @@ def _read_tracked_agent_pids() -> tuple[set[int], bool]:
     go through :func:`_rewrite_pid_file` (temp file + rename, so a reader sees
     either the whole old or the whole new content) and tracking appends are
     single short lines. ``complete`` is false whenever a potential PID could
-    have been dropped -- a reapable field that does not parse, a byte that was
-    not UTF-8 in it included; a missing file is a complete empty contribution.
+    have been dropped; a missing file is a complete empty contribution.
     """
     tracked: set[int] = set()
     complete = True
     paths = (_session_pid_file_path(), _pid_file_path())
     for path, (_label, reapable_index) in zip(paths, _REAPABLE_PID_FIELD):
         try:
-            # Bytes no writer produces are damage: they fail the per-line int()
-            # below and mark the snapshot incomplete instead of raising out of
-            # every reaper that reads it.
-            raw = _read_pid_file_text(path)
+            raw = path.read_text(encoding="utf-8")
         except OSError as exc:
             if exc.errno != errno.ENOENT:
                 complete = False
             continue
         for line in raw.split():
-            # A damaged byte gets the malformed-entry rule: in the reapable field
-            # it fails the int() below; elsewhere the pid still counts as tracked.
             fields = line.split(":")
             index = 0 if len(fields) == 1 else reapable_index
             if index >= len(fields):
@@ -4619,7 +4647,7 @@ def tracked_agent_pid_owners() -> dict[int, int]:
     paths = (_session_pid_file_path(), _pid_file_path())
     for path, (_label, reapable_index) in zip(paths, _REAPABLE_PID_FIELD):
         try:
-            raw = _read_pid_file_text(path)
+            raw = path.read_text(encoding="utf-8")
         except OSError:
             continue
         owner_index = 1 - reapable_index
@@ -4721,7 +4749,7 @@ def confirm_untracked_agent_runtimes() -> set[int]:
     return found
 
 
-def _work_orphan_session_leader_alive(pid: int, proc_root: Path | None = None) -> bool:
+def _work_orphan_session_leader_alive(pid: int) -> bool:
     """True when *pid*'s session LEADER still exists as a session leader.
 
     The SID of an agent-spawned work process is the PID of the kiro-cli
@@ -4737,7 +4765,7 @@ def _work_orphan_session_leader_alive(pid: int, proc_root: Path | None = None) -
     alive"), so the work path never kills without positively verifying the
     owning session ended.
     """
-    sid = _linux_pid_sid(pid, proc_root)
+    sid = _linux_pid_sid(pid)
     if sid <= 0:
         return True  # unreadable — assume the owner is alive, do not sweep
     if sid == pid:
@@ -4746,24 +4774,8 @@ def _work_orphan_session_leader_alive(pid: int, proc_root: Path | None = None) -
         # already restricts this path to test runners, and a coordinator that
         # setsid'd itself is not distinguishable from an owned one.
         return True
-    return _linux_session_leader_alive(sid, proc_root)
-
-
-def _linux_session_leader_alive(sid: int, proc_root: Path | None = None) -> bool:
-    """True unless *sid* has provably stopped leading session *sid*.
-
-    It has when its ``/proc`` entry is gone, or when it reads a different
-    session (a recycled pid that is not a leader does not resurrect
-    ownership; a kernel thread reads session 0, which is such a reading). A
-    leader that is present but whose stat cannot be read is assumed alive:
-    only a pid whose entry is absent counts as gone. Shared by the orphan-work
-    sweep and ``runtime_reconcile._session_leader_alive``.
-    """
-    leader_sid = _linux_pid_sid(sid, proc_root)
-    if leader_sid >= 0:
-        return leader_sid == sid
-    root = proc_root if proc_root is not None else Path("/proc")
-    return (root / str(sid)).exists()
+    leader_sid = _linux_pid_sid(sid)
+    return leader_sid == sid  # alive AND still a session leader
 
 
 def find_orphan_mcp_candidates(active_pids: set[int]) -> list[int]:
@@ -4780,6 +4792,7 @@ def find_orphan_mcp_candidates(active_pids: set[int]) -> list[int]:
     """
     candidates: list[int] = []
     my_pid = os.getpid()
+    now = time.time()
 
     orphan_pids = _our_orphan_pids()
     # Read once per scan, not per PID: the files are small but the scan is not.
@@ -4796,7 +4809,7 @@ def find_orphan_mcp_candidates(active_pids: set[int]) -> list[int]:
                 cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
                 # Use /proc/pid/stat field 22 (starttime in clock ticks) for
                 # canonical process age — immune to /proc mtime heuristic issues.
-                pid_age = _linux_pid_age(pid)
+                pid_age = _linux_pid_age(pid, now)
             else:
                 # Single ps call fetches both age and command (two -o flags
                 # avoid the BSD header-label comma ambiguity). etime is
@@ -4864,7 +4877,7 @@ def find_orphan_mcp_candidates(active_pids: set[int]) -> list[int]:
 
 
 def _linux_pid_sid(pid: int, proc_root: Path | None = None) -> int:
-    """Session id (SID): field 6 of /proc/<pid>/stat, via ``read_proc_stat``.
+    """Session id (SID) from /proc/pid/stat (field 6, index 3 after state).
 
     The SID of an agent-spawned work process points at the kiro-cli session
     leader that (transitively) spawned it — kiro-cli is started with
@@ -4873,21 +4886,31 @@ def _linux_pid_sid(pid: int, proc_root: Path | None = None) -> int:
     -1 when unreadable (caller must fail closed). *proc_root* is a test seam
     for fixture-owned process tables.
     """
-    stat = platform_compat.read_proc_stat(pid, proc_root=proc_root)
-    if stat is None or stat.session is None:
+    root = proc_root if proc_root is not None else Path("/proc")
+    try:
+        stat_data = (root / str(pid) / "stat").read_text()
+        close_paren = stat_data.rfind(")")
+        fields = stat_data[close_paren + 2 :].split()
+        return int(fields[3])  # field 6 (session) = index 3 after state
+    except (OSError, ValueError, IndexError):
         return -1
-    return stat.session
 
 
-def _linux_pid_age(pid: int, proc_root: Path | None = None) -> float:
-    """Process age in seconds from /proc/<pid>/stat starttime (canonical).
-
-    ``0.0`` when it cannot be read, which the min-age guard reads as too young.
-    *proc_root* is a test seam for fixture-owned process tables, which carry
-    their own ``uptime``.
-    """
-    age = _pid_age_seconds(pid, str(proc_root) if proc_root is not None else "/proc")
-    return 0.0 if age is None else age
+def _linux_pid_age(pid: int, now: float) -> float:
+    """Process age in seconds using /proc/pid/stat starttime (canonical)."""
+    try:
+        stat_data = Path(f"/proc/{pid}/stat").read_text()
+        # Field 22 is starttime (after comm which may contain spaces/parens)
+        close_paren = stat_data.rfind(")")
+        fields = stat_data[close_paren + 2 :].split()
+        starttime_ticks = int(fields[19])  # field 22 is index 19 after state
+        clk_tck = os.sysconf("SC_CLK_TCK")
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        boot_time = now - uptime
+        start_seconds = boot_time + (starttime_ticks / clk_tck)
+        return now - start_seconds
+    except (OSError, ValueError, IndexError):
+        return 0.0  # Cannot determine age — min-age guard will skip
 
 
 def _parse_etime(etime: str) -> float:
@@ -5068,14 +5091,14 @@ def kill_orphan_mcps(pids: list[int]) -> int:
             # gatewayd that has not bound its socket yet, and without the
             # floor that pre-bind daemon would read as "socket absent" and
             # be TERMed. TERM-first so the daemon drains its own backends.
-            gw_age = _linux_pid_age(pid) if sys.platform == "linux" else 0.0
+            gw_age = _linux_pid_age(pid, time.time()) if sys.platform == "linux" else 0.0
             if gw_age >= _ORPHAN_MIN_AGE_SECONDS and _is_sweepable_orphan_gatewayd(cmdline):
                 killed += _kill_orphan_gatewayd(pid, cmdline)
                 continue
             # Work-class orphan (KIROCREW_SPAWNED marker, no launcher shape).
             # Re-verify the full identity — including the age floor — right
             # before the kill; _is_sweepable_orphan_work fails closed off Linux.
-            work_age = _linux_pid_age(pid) if sys.platform == "linux" else 0.0
+            work_age = _linux_pid_age(pid, time.time()) if sys.platform == "linux" else 0.0
             if _is_sweepable_orphan_work(pid, cmdline, work_age):
                 killed += _kill_orphan_work_tree(
                     pid, cmdline, work_age, budget=_ORPHAN_SWEEP_MAX_KILLS - killed
@@ -5085,7 +5108,7 @@ def kill_orphan_mcps(pids: list[int]) -> int:
             # shape, exec-time environ, live-owner probe and the age floor —
             # immediately before signalling, so a PID recycled since the find
             # phase cannot inherit the verdict.
-            daemon_age = _linux_pid_age(pid) if sys.platform == "linux" else 0.0
+            daemon_age = _linux_pid_age(pid, time.time()) if sys.platform == "linux" else 0.0
             if _is_sweepable_orphan_browser_daemon(pid, cmdline, daemon_age):
                 live_token = _pid_start_token(pid)
                 if root_token is None or live_token is None or live_token != root_token:
@@ -5177,7 +5200,7 @@ def _pid_cmdline(pid: int, proc_root: Path | None = None) -> bytes:
         return b""
 
 
-def _pid_parent_and_token(pid: int, proc_root: Path | None = None) -> tuple[int | None, str | None]:
+def _pid_parent_and_token(pid: int) -> tuple[int | None, str | None]:
     """``(ppid, start_token)`` for *pid* from ONE ``/proc/<pid>/stat`` read.
 
     Both values must come from the SAME read. Reading the parent edge and the
@@ -5186,20 +5209,26 @@ def _pid_parent_and_token(pid: int, proc_root: Path | None = None) -> tuple[int 
     parent edge -- and that token then matches at kill time, which is precisely
     how a live worker gets SIGKILLed.
 
-    ``platform_compat.get_process_start_identity`` is that one read, and its
-    start id is the token :func:`_pid_start_token` compares at kill time.
+    ``stat`` field 4 is PPid and field 22 is starttime; ``comm`` (field 2) can
+    contain spaces and parentheses, so both are read after the LAST ``)``, the
+    same way :func:`_build_child_map` and
+    ``platform_compat.get_process_start_id`` parse it.
 
     ``(None, None)`` on any failure, and off Linux -- where the whole subtree
     reap is already a no-op because :func:`_env_has_kirocrew_marker` is
     fail-closed. Callers must treat ``None`` as unproven, never as a mismatch.
-    *proc_root* substitutes a fixture process table.
     """
     if sys.platform != "linux":
         return (None, None)
-    identity = platform_compat.get_process_start_identity(pid, proc_root=proc_root)
-    if identity is None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            return (None, None)
+        fields = stat[rparen + 2 :].split()
+        return (int(fields[1]), fields[19])
+    except (OSError, ValueError, IndexError):
         return (None, None)  # exited mid-read or unreadable — fail closed
-    return (identity.ppid, identity.start_id)
 
 
 def _prune_from_orphan_walk(pid: int) -> bool:
@@ -5519,55 +5548,49 @@ def _read_rss_pages(pid: int, proc_root: Path | None = None) -> int:
 def _build_child_map(proc_root: Path | None = None) -> dict[int, list[int]]:
     """Parent-PID -> direct-children map from one pass over ``/proc/<pid>/stat``.
 
-    ``platform_compat.proc_child_map``, with "cannot list ``/proc``" (which it
-    logs) and "not Linux" both answered as an empty map: the RSS watchdog then
-    measures each root alone. Windows never comes here -- ``get_session_rss_mb``
-    routes it through ``platform_compat.proc_rss_tree_mb_for_pid``, which
-    validates every parent->child edge. *proc_root* overrides the ``/proc``
-    mount (test seam only).
+    Reads the ``PPid`` (4th) field of every process's ``stat`` file. This is
+    authoritative and complete for all live processes regardless of kernel
+    config, and deliberately replaces the earlier
+    ``/proc/<pid>/task/*/children`` walk, which requires
+    ``CONFIG_CHECKPOINT_RESTORE``/``CONFIG_PROC_CHILDREN`` and is documented as
+    reliable only for frozen/stopped tasks — for a live task it could return an
+    incomplete child set, silently dropping whole descendant subtrees from the
+    RSS sum (so the memory-protection feature could no-op with no signal).
+
+    A failure to scan ``/proc`` is logged at debug rather than swallowed
+    silently, so a degraded reading is diagnosable.
+
+    Windows deliberately has NO branch here and returns an empty map: Toolhelp's
+    ``th32ParentProcessID`` is never cleared when a parent exits and Windows
+    recycles PIDs aggressively, so a raw parent->child walk can attach an
+    unrelated subtree to a recycled PID -- which would let the watchdog recycle a
+    healthy session. ``get_session_rss_mb`` routes Windows through
+    ``platform_compat.proc_rss_tree_mb_for_pid``, which validates every
+    parent->child edge against creation/exit times, instead of coming here.
+
+    *proc_root* overrides the ``/proc`` mount (test seam only).
     """
-    child_map = platform_compat.proc_child_map(proc_root=proc_root)
-    return {} if child_map is None else child_map
-
-
-_rss_ceiling_inert_warned = False
-
-
-def _warn_rss_ceiling_inert_once(reason: str) -> None:
-    """Say once per process that the session RSS ceiling cannot measure here.
-
-    Without it an unsupported host reads every tree as 0 MiB and silently never
-    recycles a session, however large it grows.
-    """
-    global _rss_ceiling_inert_warned
-    if _rss_ceiling_inert_warned:
-        return
-    _rss_ceiling_inert_warned = True
-    logger.warning(
-        "session RSS ceiling cannot measure on this host (%s): every tree reads 0 MiB "
-        "and no session is recycled for memory",
-        reason,
-    )
-
-
-def _off_linux_tree_mb(pid: int, exclude_pids: set[int]) -> int:
-    """Tree reading (MiB) where there is no ``/proc``: macOS walks libproc.
-
-    It does not reuse the runtime watchdog's ``acp.runtime._get_rss_tree_mb``:
-    this module sits outside the agent-SDK boundary, and
-    ``scripts/check_agent_sdk_boundary.py`` refuses new ACP-layer imports here.
-
-    Any other host, or a Mac whose libproc does not load, cannot measure; it
-    answers 0 and warns once. Windows never comes here (see ``get_session_rss_mb``).
-    """
-    if sys.platform != "darwin":
-        _warn_rss_ceiling_inert_once(f"platform {sys.platform}")
-        return 0
-    if not platform_compat.darwin_libproc_available():
-        _warn_rss_ceiling_inert_once("libproc unavailable")
-        return 0
-    tree_mb = platform_compat.darwin_footprint_tree_mb(pid, exclude_pids)
-    return 0 if tree_mb is None else int(tree_mb)
+    root = proc_root if proc_root is not None else Path("/proc")
+    child_map: dict[int, list[int]] = {}
+    try:
+        for entry in root.iterdir():
+            name = entry.name
+            if not name.isdigit():
+                continue
+            try:
+                # Format: "pid (comm) state ppid ...". comm can contain spaces
+                # and parentheses, so locate the LAST ')' and read ppid after
+                # it rather than naively splitting on whitespace.
+                stat = (entry / "stat").read_text()
+                rparen = stat.rfind(")")
+                ppid = int(stat[rparen + 2 :].split()[1])
+            except (FileNotFoundError, ProcessLookupError, ValueError, IndexError, OSError):
+                # Process exited mid-scan or stat unreadable — skip this PID.
+                continue
+            child_map.setdefault(ppid, []).append(int(name))
+    except (FileNotFoundError, OSError):
+        logger.debug("RSS watchdog: /proc scan for child map failed", exc_info=True)
+    return child_map
 
 
 def _rss_mb_from_tree(
@@ -5585,13 +5608,7 @@ def _rss_mb_from_tree(
     across sequential/threaded calls. Any PID in *exclude_pids* is skipped along
     with its subtree. Resident pages are summed across the tree and converted to
     MiB once at the end.
-
-    Off Linux (no *proc_root*) the map is not used: macOS sums each process's
-    footprint over libproc's live child lists instead (``_off_linux_tree_mb``),
-    honouring *exclude_pids* the same way.
     """
-    if proc_root is None and sys.platform != "linux":
-        return _off_linux_tree_mb(pid, exclude_pids)
     total_pages = 0
     seen: set[int] = set()
     frontier = [pid]
@@ -5629,18 +5646,17 @@ def get_session_rss_mb(
     walk (see ``_build_child_map``), so it delegates to
     ``platform_compat.proc_rss_tree_mb_for_pid``, which sums only
     lineage-validated descendants; without that the ceiling measured every tree
-    as 0 MiB there and no session was ever recycled. macOS has no ``/proc``
-    either; it sums footprints over libproc (``_off_linux_tree_mb``). Any other
-    host returns 0 and logs one warning that the ceiling cannot measure.
+    as 0 MiB there and no session was ever recycled. macOS has no ctypes-only
+    per-pid RSS path, so it returns 0 and the ceiling stays inert.
 
-    *exclude_pids* is honoured on the ``/proc`` and macOS routes. The Windows
-    route derives its own validated descendant set, so a caller that needs a
-    subtree barrier there must exclude the pid before calling.
+    *exclude_pids* is honoured on the ``/proc`` route. The Windows route derives
+    its own validated descendant set, so a caller that needs a subtree barrier
+    there must exclude the pid before calling.
     """
     if platform_compat.IS_WINDOWS and proc_root is None:
         tree_mb = platform_compat.proc_rss_tree_mb_for_pid(pid)
         return 0 if tree_mb is None else int(tree_mb)
-    if proc_root is None and sys.platform != "linux":
-        return _off_linux_tree_mb(pid, exclude_pids)
+    if sys.platform != "linux":
+        return 0
     child_map = _build_child_map(proc_root)
     return _rss_mb_from_tree(pid, child_map, exclude_pids, proc_root)

@@ -270,9 +270,7 @@ class LocalMemoryFiles:
         it is not a refusal.
         """
         self._require_link_free_roots()
-        from kiro_crew.owner_only_files import ensure_directory
-
-        ensure_directory(path)  # 0700 when the memory tree is in the data home
+        path.mkdir(parents=True, exist_ok=True)
 
     def remove(self, path: Path) -> None:
         """See ``MemoryFiles.remove``.

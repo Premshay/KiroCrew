@@ -13,7 +13,6 @@ into the testable engine modules (:mod:`cloud.ec2`, :mod:`cloud.iam`,
 from __future__ import annotations
 
 import dataclasses
-import os
 import secrets
 import threading
 import time
@@ -330,22 +329,6 @@ class _ExistingLaunch:
     saved: bool = False
 
 
-def _credential_source(profile: str) -> str:
-    """Name where the aws CLI takes this launch's credentials from.
-
-    Env-var keys are scrubbed from the child env (see ``aws.run_aws``), so the
-    source is always a profile: ``--profile``, else ``AWS_PROFILE`` /
-    ``AWS_DEFAULT_PROFILE``, else the default profile.
-    """
-    if profile:
-        return f"profile {profile}"
-    for var in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE"):
-        value = os.environ.get(var, "").strip()
-        if value:
-            return f"profile {value} from {var}"
-    return "the default profile"
-
-
 def _new_tag() -> str:
     """A short, unique discovery tag: ``kc-<6 hex>``."""
     return f"kc-{secrets.token_hex(3)}"
@@ -438,8 +421,6 @@ def launch(
         return 1
     who = reach["account"]
     ui.ok(f"account {who} · {region} · reachable")
-    if reach.get("arn"):
-        ui.detail(f"Signed in as {reach['arn']} ({_credential_source(profile)})")
     if not (
         reach["ec2_reachable"] and reach["cloudformation_reachable"] and reach["ssm_reachable"]
     ):
@@ -500,17 +481,8 @@ def launch(
             f"~${sizes.monthly_estimate(tier):.0f}/mo if left running (approx)"
         )
 
-        # The stack is created in whatever account the aws CLI resolves, which
-        # can be a different account than the user expects (a shell left
-        # federated into another account). Name it and ask before the first
-        # deploy, `--size` included; only `--yes` skips the question.
-        if not assume_yes:
-            if not ui.confirm(
-                f"Create the Kiro Crew stack in AWS account {who} "
-                f"({_credential_source(profile)}) and launch a {tier.label} "
-                f"instance in {region}?",
-                default=True,
-            ):
+        if not assume_yes and not size_key:
+            if not ui.confirm(f"Launch a {tier.label} instance in {region}?", default=True):
                 ui.info("Aborted — nothing was created.")
                 return 0
     else:

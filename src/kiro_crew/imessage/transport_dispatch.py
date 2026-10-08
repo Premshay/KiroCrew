@@ -38,9 +38,6 @@ from kiro_crew.imessage.transport import IMESSAGE_CAPABILITIES
 from kiro_crew.messaging.commands import (
     compact_refusal_plain_text,
     compact_unsupported_backend,
-    context_recycle_warning,
-    recycle_backend,
-    recycle_warning_should_send,
 )
 from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
@@ -399,12 +396,6 @@ class IMessageDispatcher:
         handle = inbound.handle
         pct = self.sessions.check_context_usage(session_key, provider)
         soft, hard = self._thresholds()
-        if recycle_backend(provider):
-            # Crew restarts this backend's session at the threshold; warn once
-            # before it, offering a fresh start instead of a compaction.
-            if recycle_warning_should_send(self.sessions, self._conv, handle, session_key, pct):
-                await self._notify(handle, context_recycle_warning())
-            return
         if pct >= soft:
             # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
@@ -419,9 +410,7 @@ class IMessageDispatcher:
                 await provider.compact()
                 # A failed or timed-out compaction is a RETURNED result, not an
                 # exception, so the notice is posted only for a completed one.
-                cr = await provider.wait_for_compaction(
-                    timeout=self.sessions.compact_wait_budget_secs()
-                )
+                cr = await provider.wait_for_compaction()
                 if cr["type"] == "completed":
                     await self._notify(
                         handle,
@@ -474,9 +463,7 @@ class IMessageDispatcher:
             await provider.compact()
             # Failure and timeout come back as the result's ``type``, not as an
             # exception, so the receipt is read off it rather than assumed.
-            cr = await provider.wait_for_compaction(
-                timeout=self.sessions.compact_wait_budget_secs()
-            )
+            cr = await provider.wait_for_compaction()
             if cr["type"] == "completed":
                 await self._notify(handle, "🗜️ Context compacted.")
             elif cr["type"] == "failed":

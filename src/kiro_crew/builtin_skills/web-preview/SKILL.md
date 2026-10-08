@@ -19,10 +19,7 @@ Emit exactly this, on its own line, once the server is confirmed listening:
 <!-- kirocrew:preview url="http://127.0.0.1:PORT" -->
 ```
 
-- It's an **HTML comment**, so the user never sees it in the **dashboard** chat.
-  Only the dashboard has a Browser panel: in a Slack, Discord or other channel
-  conversation the marker is not stripped and reaches the user as literal text,
-  so do not emit it there — give the URL in prose instead.
+- It's an **HTML comment**, so the user never sees it in the rendered message.
   The dashboard opens the Browser tab and shows a **Load preview** card for that
   URL, contextual to the current session. Nothing is fetched until the user
   clicks Load, so tell them to click it rather than saying the preview is
@@ -72,6 +69,6 @@ hand over a preview and call the change verified.
 
 After starting a static server:
 
-> The server is up and serving HTTP 200.
+> Preview is live and serving HTTP 200.
 > <!-- kirocrew:preview url="http://127.0.0.1:8080" -->
-> Click **Load preview** in the **Browser** tab of the right panel to view it.
+> Open the **Browser** tab in the right panel to view it.

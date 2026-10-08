@@ -37,10 +37,9 @@ _PROACTOR_CONNECTION_LOST_CALLBACK = "_ProactorBasePipeTransport._call_connectio
 def _crash_log_path() -> Path:
     """Resolve the crash log path — always under ``<config_dir>/logs/``."""
     from kiro_crew.config.paths import config_dir
-    from kiro_crew.owner_only_files import mkdirs_owner_only
 
     logs_dir = config_dir() / "logs"
-    mkdirs_owner_only(logs_dir)
+    logs_dir.mkdir(parents=True, exist_ok=True)
     return logs_dir / "crash.log"
 
 
@@ -54,11 +53,7 @@ def _write_crash(header: str, exc_info: tuple | None = None) -> None:
         # mid-record, and the except below swallows it, so the record is lost or
         # truncated exactly where the cause would be named. backslashreplace
         # keeps even an unencodable surrogate from ending the last-resort writer.
-        from kiro_crew.owner_only_files import owner_only_opener
-
-        with open(
-            path, "a", encoding="utf-8", errors="backslashreplace", opener=owner_only_opener
-        ) as f:
+        with open(path, "a", encoding="utf-8", errors="backslashreplace") as f:
             f.write(f"\n{'=' * 72}\n")
             f.write(f"{header}\n")
             f.write(f"Time: {datetime.now(timezone.utc).isoformat()}\n")

@@ -8,7 +8,6 @@ import os
 import shutil
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -148,20 +147,10 @@ def test_credential_dirs_are_refused() -> None:
     assert not routes._is_sensitive_dir(Path("/Users/x/Developer/myapp"))
 
 
-_OWNER = "owner-user"
-
-
-class _Req(dict):
-    """Minimal stand-in for an owner's dashboard request.
-
-    Carries the signed claims the owner gate reads (``user``, an empty ``app``)
-    and the ``state.owner_id`` it compares them to, plus the one method the
-    handler awaits.
-    """
+class _Req:
+    """Minimal stand-in exposing the one method the handler awaits."""
 
     def __init__(self, payload: object) -> None:
-        super().__init__(user=_OWNER, app="")
-        self.app = {"state": SimpleNamespace(owner_id=_OWNER)}
         self._payload = payload
 
     async def json(self) -> object:

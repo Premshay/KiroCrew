@@ -59,7 +59,6 @@ from typing import Iterable, NamedTuple, Sequence
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.memory_recall import recall_terms
-from kiro_crew.owner_only_files import mkdirs_owner_only, prepare_owner_only_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -359,8 +358,7 @@ class SkillSearchIndex:
                     _rollback_quietly(self._conn)
                 return self._conn
             try:
-                mkdirs_owner_only(self._path.parent)
-                prepare_owner_only_sqlite(self._path)
+                self._path.parent.mkdir(parents=True, exist_ok=True)
                 conn = sqlite3.connect(
                     str(self._path), timeout=_BUSY_TIMEOUT_SECS, check_same_thread=False
                 )

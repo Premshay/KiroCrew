@@ -8,18 +8,9 @@ import { useRef, useEffect, type KeyboardEvent, type FocusEvent } from 'react'
  */
 const POST_COMPOSITION_MS = 50
 
-/**
- * Hangul syllables, Jamo and compatibility Jamo. Korean has no candidate step:
- * the Enter that follows a Hangul commit is the user's own Enter, so it must
- * not fall inside the post-composition window. Hanja conversion commits Han
- * characters, which do not match, so that candidate Enter stays guarded.
- */
-const HANGUL = /[\uAC00-\uD7A3\u1100-\u11FF\u3130-\u318F]$/
-
 export interface ImeLatch {
   onCompositionStart: () => void
-  /** `data` is the committed text; a Hangul commit opens no window. */
-  onCompositionEnd: (data?: string) => void
+  onCompositionEnd: () => void
   /** True while a composition is live or inside the post-composition window. */
   isLatched: () => boolean
   /** Clear the latch and any pending timer (stale-latch recovery). */
@@ -87,8 +78,7 @@ export function createImeLatch(): ImeLatch {
       clearTimeout(timer)
       latched = true
     },
-    onCompositionEnd(data?: string) {
-      if (data && HANGUL.test(data)) { clearTimeout(timer); latched = false; return }
+    onCompositionEnd() {
       latched = true
       timer = setTimeout(() => { latched = false }, POST_COMPOSITION_MS)
     },
@@ -229,7 +219,7 @@ export function useImeGuard() {
   const reset = () => latch.reset()
 
   const onCompositionStart = () => latch.onCompositionStart()
-  const onCompositionEnd = (e?: { data: string }) => latch.onCompositionEnd(e?.data)
+  const onCompositionEnd = () => latch.onCompositionEnd()
   const isComposing = (e: KeyboardEvent) =>
     latch.isLatched() || e.nativeEvent.isComposing || e.keyCode === 229
 

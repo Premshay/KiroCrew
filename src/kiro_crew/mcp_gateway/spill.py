@@ -23,7 +23,6 @@ from pathlib import Path
 
 from kiro_crew import platform_compat
 from kiro_crew.config.paths import config_dir
-from kiro_crew.json_line import parse_json_object_line
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +100,13 @@ def maybe_spill_response(
     if len(line) <= threshold_bytes:
         return line
 
-    msg = parse_json_object_line(line)
-    if msg is None:
-        return line  # not a JSON object — pass through
+    try:
+        msg = json.loads(line.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return line  # not JSON — pass through
+
+    if not isinstance(msg, dict):
+        return line
 
     # Only spill tool/call results (has result.content list with text items)
     result = msg.get("result")

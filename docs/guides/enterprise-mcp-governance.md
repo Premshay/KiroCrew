@@ -73,9 +73,7 @@ distinguishes a governed account from an ungoverned one. Leave the setting
 are the ones dropped.
 
 Verify with `kirocrew doctor`, which grows an `MCP Governance (enterprise)`
-section when the local identity is one an administrator's registry can govern
-(an IAM Identity Center or API-key sign-in), when `agent.mcp_registry_mode` is
-set, or when registry-marked entries are present.
+section whenever the local identity came from Identity Center.
 
 ### 2. Have the administrator allow-list the servers
 
@@ -105,7 +103,7 @@ that `uvx` uses:
     {
       "name": "kirocrew-core",
       "description": "Kiro Crew orchestration: subagents, memory, artifacts, monitoring",
-      "version": "<fleet version>",
+      "version": "0.8.0",
       "packages": [
         {
           "registryType": "pypi",
@@ -118,7 +116,7 @@ that `uvx` uses:
     {
       "name": "kirocrew-cron",
       "description": "Kiro Crew scheduled jobs",
-      "version": "<fleet version>",
+      "version": "0.8.0",
       "packages": [
         {
           "registryType": "pypi",
@@ -131,7 +129,7 @@ that `uvx` uses:
     {
       "name": "kirocrew-computer",
       "description": "Kiro Crew desktop automation (macOS/Windows, opt-in)",
-      "version": "<fleet version>",
+      "version": "0.8.0",
       "packages": [
         {
           "registryType": "pypi",
@@ -458,7 +456,7 @@ host runs under whatever local policy it has, which may be none.
 One document governing every host is the widest blast radius in this model, so
 plan the retraction before the first rollout.
 
-Recovery from a bad central push is by re-publishing a good document at the source: no local document outranks the fleet ceiling. See [Loading + precedence](../system-specs/modules/governance.md#loading--precedence) in the governance spec.
+A time-boxed local override (a dated `break_glass` grant an authority document could issue to a lower tier) was designed for this change and **withdrawn before merge**: a channel by which a local document outranks the fleet ceiling is the override this ladder exists to remove, and the reviewed design carried its own expiry-handling and cache-trust defects. Recovery from a bad central push is by re-publishing a good document at the source. The override is tracked as the follow-up issue [#9106](https://github.com/kirodotdev/KiroCrew/issues/9106), not shipped here.
 
 A running fleet is better protected than a restarting one, and the difference
 matters when you plan:

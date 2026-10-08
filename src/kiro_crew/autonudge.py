@@ -89,7 +89,6 @@ from kiro_crew.autonudge_service.maintenance import (  # noqa: F401 -- re-export
 )
 from kiro_crew.autonudge_service.model import (  # noqa: F401 -- re-exported
     _CHANNEL_KEY_PREFIXES,
-    _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
     _MAX_IDLE_SECS,
     _MIN_IDLE_SECS,
     _REPLACEABLE_LOOP_STOP_REASONS,
@@ -98,16 +97,13 @@ from kiro_crew.autonudge_service.model import (  # noqa: F401 -- re-exported
     _TERMINAL_BOUND_REASONS,
     APPROVAL_STALL_REASON,
     AUTONUDGE_STOP_REASON,
-    CONSECUTIVE_FAILURE_REASON,
     CYCLE_CAP_REASON,
-    FINISHED_LOOP_REASONS,
     MANUAL_STOP_REASON,
     MONITOR_TERMINAL_REASON,
     NUDGE_RENEW_DUE_SHARE,
     RUNTIME_BUDGET_REASON,
     SENTINEL_DROPPED_REASON,
     SESSION_START_FAILURE_REASON,
-    STOP_SENTINEL_REASON,
     STRUCTURAL_TERMINAL_REASON,
     AutoNudgeStaleBaseline,
     AutoNudgeStoreUnvetted,
@@ -120,7 +116,6 @@ from kiro_crew.autonudge_service.model import (  # noqa: F401 -- re-exported
     is_structured_monitor_loop,
     new_goal_token,
     nudge_cycle_header,
-    reason_in,
     runtime_budget_exceeded,
     terminal_notification_delivery_matches,
 )
@@ -143,7 +138,6 @@ from kiro_crew.autonudge_service.subject import (  # noqa: F401 -- re-exported
     infer_monitor,
     infer_subject,
     loop_subject,
-    read_session_texts,
 )
 from kiro_crew.autonudge_service.timers import (  # noqa: F401 -- re-exported
     _MONITOR_RETRY_BACKOFF_SECS,
@@ -673,23 +667,6 @@ def get_instance() -> "AutoNudgeService | None":
     return _INSTANCE
 
 
-def release_approval_hold_for(slot_key: str | None, *, why: str) -> None:
-    """End *slot_key*'s approval hold, if its loop has one. Best-effort.
-
-    The one call the approval paths make once a person answers a prompt. It
-    schedules ``AutoNudgeService.release_approval_hold`` (which awaits its own
-    durable write) and returns at once. A monitoring convenience must never change
-    how that answer is applied, so a missing service, an empty key or a fault here
-    is swallowed.
-    """
-    try:
-        svc = _INSTANCE
-        if svc is not None and slot_key:
-            _timers._schedule_release(svc, slot_key, why=why)
-    except Exception:
-        logger.debug("autonudge.release_approval_hold failed", exc_info=True)
-
-
 def _is_torn_deactivation(loop: NudgeLoop) -> bool:
     """Whether a persisted row is inactive without any stop having been recorded.
 
@@ -1087,12 +1064,6 @@ class AutoNudgeService:
                         redact_store_value(loop_values["self_armed"]),
                     )
                     loop_values["self_armed"] = False
-                # ``default_patrol`` only ever WIDENS what an arm on the same slot may
-                # displace, so an unreadable value resolves to the narrower False.
-                if "default_patrol" in loop_values and not isinstance(
-                    loop_values["default_patrol"], bool
-                ):
-                    loop_values["default_patrol"] = False
                 # ``config_generation`` is agent-writable persisted data and is
                 # used in arithmetic (``+= 1``) and an equality fence. A stored
                 # ``null``, string or negative would raise mid-mutation (a partial
@@ -1343,14 +1314,7 @@ class AutoNudgeService:
                 loop.created_ts, created_repaired = _repair_number(
                     loop.created_ts, lo=0.0, fallback=0.0
                 )
-                # ``consecutive_failed_cycles`` is compared with ``>=`` on every
-                # wake too, for the same agent-writable-store reason, so it is
-                # normalised at the boundary alongside its siblings above.
-                failed_num, failed_repaired = _repair_number(
-                    loop.consecutive_failed_cycles, lo=0.0, fallback=0.0
-                )
-                loop.consecutive_failed_cycles = int(failed_num)
-                if count_repaired or created_repaired or failed_repaired:
+                if count_repaired or created_repaired:
                     self._store_dirty = True
                 if (
                     loop.monitor is not None
@@ -1613,7 +1577,7 @@ class AutoNudgeService:
 
     async def start(self) -> None:
         if not enabled():
-            logger.info("AutoNudge disabled (KIROCREW_AUTONUDGE is 0/false/no)")
+            logger.info("AutoNudge disabled (KIROCREW_AUTONUDGE not set)")
             return
         # This lock spans load, repair, timer arming and singleton publication.
         # Disabled-mode maintenance that got here first finishes its whole
@@ -1901,9 +1865,7 @@ class AutoNudgeService:
     _deactivate_and_wait_unserialized = _maintenance._deactivate_and_wait_unserialized
     # autonudge_service.timers
     notify_approval_stalled = _timers.notify_approval_stalled
-    release_approval_hold = _timers.release_approval_hold
     notify_cycle_start_failed = _timers.notify_cycle_start_failed
-    notify_cycle_failed = _timers.notify_cycle_failed
     notify_cycle_landed = _timers.notify_cycle_landed
     notify_turn_complete = _timers.notify_turn_complete
     notify_user_input = _timers.notify_user_input
@@ -1928,7 +1890,6 @@ class AutoNudgeService:
     _persist_judge_state = _judge_tick._persist_judge_state
     # autonudge_service.firing
     _timer = _firing._timer
-    _extend_for_open_ledger = _firing._extend_for_open_ledger
     _run_fire_cycle = _firing._run_fire_cycle
     fire_now = _firing.fire_now
     # autonudge_service.mutations

@@ -40,7 +40,7 @@ function tickFailureDetail(e: unknown): string | null {
       return i18nT('pages.chat.taskProgressBar.fail_task_gone')
     case 'caller_unattributable':
       return i18nT('pages.chat.taskProgressBar.fail_session_gone')
-    case 'relay_archive_read_only':
+    case 'remote_action_unsupported':
       return i18nT('pages.chat.taskProgressBar.fail_remote')
     default:
       return null

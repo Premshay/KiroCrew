@@ -44,9 +44,7 @@ APP_NAME = "design-critique"
 # but then silently redirect to chat, shipping a dead nav entry.
 ROUTE_GUARD_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._~-]*$")
 
-# The six automation scripts the skill ships and the docs it depends on.
-# ssrf-guard.mjs is imported by capture-build.mjs and capture-site.mjs, so a
-# package without it ships captures that fail at import time.
+# The five automation scripts the skill ships and the docs it depends on.
 _SKILL_REQUIRED_FILES = (
     "SKILL.md",
     "frameworks/main-checklist.md",
@@ -55,7 +53,6 @@ _SKILL_REQUIRED_FILES = (
     "scripts/discover-routes.mjs",
     "scripts/ensure-playwright.mjs",
     "scripts/render.mjs",
-    "scripts/ssrf-guard.mjs",
 )
 
 # The asset URLs declared in app.json, keyed by manifest field name.

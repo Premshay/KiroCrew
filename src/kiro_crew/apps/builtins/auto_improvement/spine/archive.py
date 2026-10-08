@@ -31,11 +31,6 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from kiro_crew.atomic_write import read_json_or
-from kiro_crew.owner_only_files import (
-    ensure_directory,
-    owner_only_opener_for,
-    write_text_owner_only_in_home,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -109,12 +104,12 @@ class Archive:
         self.drift_dir = self.root / "drift"
         self.meta_path = self.root / "run.meta.json"
         for d in (self.root, self.candidates_dir, self.anchors_dir, self.drift_dir):
-            ensure_directory(d)
+            d.mkdir(parents=True, exist_ok=True)
         self._ensure_tsv()
 
     def _ensure_tsv(self) -> None:
         if not self.tsv.exists():
-            write_text_owner_only_in_home(self.tsv, "\t".join(CONTROL_COLUMNS) + "\n")
+            self.tsv.write_text("\t".join(CONTROL_COLUMNS) + "\n", encoding="utf-8")
             return
 
         raw = self.tsv.read_bytes()
@@ -148,7 +143,7 @@ class Archive:
     # ── run metadata ────────────────────────────────────────────────────
 
     def write_meta(self, meta: dict) -> None:
-        write_text_owner_only_in_home(self.meta_path, json.dumps(_jsonable(meta), indent=2))
+        self.meta_path.write_text(json.dumps(_jsonable(meta), indent=2), encoding="utf-8")
 
     def read_meta(self) -> dict:
         if not self.meta_path.exists():
@@ -162,18 +157,17 @@ class Archive:
         ref recorded in the TSV row."""
         diff_path = self.candidates_dir / f"{cand_id}.diff"
         json_path = self.candidates_dir / f"{cand_id}.json"
-        # The run archive is intentionally local plaintext under the app's data
-        # directory (``store.results_dir()``, owner-only inside the data home), not a
-        # credential store — it IS the
+        # The run archive is intentionally local plaintext under the app's scratch
+        # directory (`~/.autoimprove-scratch`), not a credential store — it IS the
         # evidence an operator inspects to judge a candidate, so an encrypted or elided
         # copy would defeat its only purpose. Nothing here is served raw: the read side
         # (`backend/routes.py:_redact_for_display`) credential-scans before the diff
         # reaches a browser, and every push path scans before anything leaves the host.
-        write_text_owner_only_in_home(
-            diff_path, diff or ""
+        diff_path.write_text(
+            diff or "", encoding="utf-8"
         )  # lgtm[py/clear-text-storage-sensitive-data]
-        write_text_owner_only_in_home(  # lgtm[py/clear-text-storage-sensitive-data]
-            json_path, json.dumps(_jsonable(detail), indent=2)
+        json_path.write_text(  # lgtm[py/clear-text-storage-sensitive-data]
+            json.dumps(_jsonable(detail), indent=2), encoding="utf-8"
         )
         return diff_path.name
 
@@ -201,9 +195,9 @@ class Archive:
             return text.replace("\t", " ").replace("\r", " ").replace("\n", " ")
 
         line = "\t".join(_cell(c) for c in CONTROL_COLUMNS)
-        with open(self.tsv, "a", encoding="utf-8", opener=owner_only_opener_for(self.tsv)) as f:
+        with self.tsv.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
-        with open(self.jsonl, "a", encoding="utf-8", opener=owner_only_opener_for(self.jsonl)) as f:
+        with self.jsonl.open("a", encoding="utf-8") as f:
             # Local plaintext archive row — same reasoning as `save_candidate` above.
             f.write(json.dumps(_jsonable(row)) + "\n")  # lgtm[py/clear-text-storage-sensitive-data]
 
@@ -249,7 +243,7 @@ class Archive:
         return [r for r, _ in scored[:k]]
 
     def write_drift(self, cycle: int, payload: dict) -> None:
-        write_text_owner_only_in_home(
-            self.drift_dir / f"rebest-{cycle}.json",
+        (self.drift_dir / f"rebest-{cycle}.json").write_text(
             json.dumps(_jsonable({"cycle": cycle, "ts": time.time(), **payload}), indent=2),
+            encoding="utf-8",
         )

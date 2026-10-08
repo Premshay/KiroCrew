@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Review driver — code-enforced single-pass review per pull request.
+"""Review driver — code-enforced two-stage review loop.
 
-The clean-session-per-change guarantee is not left to the LLM. This
-deterministic driver owns the dispatch:
+Neither the clean-session-per-change guarantee NOR the Phase 1 -> Phase 2 switch
+is left to the LLM. This deterministic driver owns both:
 
-  Review     — one isolated session per pull request reviews every changed file
-               in a single pass (design reasoning is one dimension of it, not a
-               separate gate) and writes the complete result record.
-  Follow-up  — only when that record reports ``coverage_complete=false``, the
-               driver dispatches AT MOST ONE coverage follow-up session that
-               reviews the still-uncovered files and appends net-new findings.
+  Stage 1 (gate)  — spawn an isolated Phase-1-ONLY session per change; it writes
+                    a gate-only result record (phase1 + blast_radius).
+  Phase switch    — the driver READS the recorded gate_verdict. Every usable
+                    verdict (PASS, CONCERNS, BLOCK) proceeds to Phase 2: a design
+                    BLOCK informs the ship decision but does NOT skip the code
+                    review, so the author sees all issues in one pass.
+  Stage 2 (deep)  — for any usable verdict: spawn a second isolated session that
+                    runs the Phase 2 dimensions and augments the record with
+                    findings.
 
-Every session runs on a **reusable worker pool** (``sage_lib/review_pool.py``): a bounded
+Both stages run on a **reusable worker pool** (``sage_lib/review_pool.py``): a bounded
 set of long-lived ``AcpClient`` sessions, NOT a fresh ``/api/spawn`` sub-agent
 per change. The driver hands each task to the pool via an injected ``dispatch``
 callable and the call returns when that task's session finishes its turn (i.e.
@@ -25,7 +28,7 @@ The driver then builds the Focus Report deterministically. The orchestrating
 session cannot review inline because the driver owns the dispatch. The per-change
 *judgment* (the gate verdict and the findings) still runs in each isolated worker
 session using the code-review-sage ruleset — Python enforces the structure and
-the follow-up bound, not the verdict itself.
+the phase switch, not the verdict itself.
 
 Usage:
     python3 sage_lib/review_driver.py run --changes "<pr-url>[,<pr-url>...]" [--concurrency 3]
@@ -1343,11 +1346,12 @@ def run_review(
     preflight=None,
     rule_resolutions: dict[str, dict] | None = None,
 ) -> dict:
-    """One single-pass review task per change (bounded concurrency), plus at most
-    one coverage follow-up task when the review reports incomplete coverage.
+    """Two-stage per change (bounded concurrency): a Phase-1 gate task, then a
+    Phase-2 deep-review task for every usable verdict (PASS / CONCERNS / BLOCK).
     Each task is dispatched to the reusable worker pool (``dispatch``) and the
-    call returns when that task's session finishes its turn. The driver then
-    builds the Focus Report. Returns a deterministic summary.
+    call returns when that task's session finishes its turn. The driver reads
+    the gate verdict; a BLOCK does not skip Phase 2 (it only informs the ship
+    decision), then builds the Focus Report. Returns a deterministic summary.
 
     ``dispatch`` is an injected ``(task, timeout) -> {ok, output, error}`` callable
     (the app backend wires ``review_pool.make_sync_dispatch``; tests inject a fake).
@@ -1876,9 +1880,7 @@ def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Code Review Sage review driver")
     sub = ap.add_subparsers(dest="cmd", required=True)
     rp = sub.add_parser("run", help="Review each change on the reusable worker pool")
-    rp.add_argument(
-        "--changes", required=True, help="newline/comma-separated GitHub pull request links"
-    )
+    rp.add_argument("--changes", required=True, help="newline/comma-separated links or CR ids")
     rp.add_argument(
         "--concurrency",
         type=int,

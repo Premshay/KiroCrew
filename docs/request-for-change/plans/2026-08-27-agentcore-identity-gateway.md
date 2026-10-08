@@ -1,10 +1,10 @@
 # AgentCore Identity and Gateway Implementation Plan
 
-> **Partial implementation on main.** 4 of 30 checklist steps are done: the
-> Task 1 documentation steps. At `e281ecaf33`, `platform/agentcore_schema.py`
-> and the AWS-free `AgentIdentityProvider` core seam ship; the AWS adapter,
-> IAM helpers, Gateway attachment, consent flow, and Settings surfaces do not.
-> Its spec is
+> **Partial implementation on main.** 11 of 29 checklist steps are marked done,
+> but the checkboxes include work not present in this snapshot. At `80bd0a81f`,
+> `platform/agentcore_schema.py` and the AWS-free `AgentIdentityProvider` core
+> seam ship; the AWS adapter, IAM helpers, Gateway attachment, consent flow,
+> and Settings surfaces do not. Its spec is
 > [`../rfc-agentcore-identity-gateway.md`](../rfc-agentcore-identity-gateway.md).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
@@ -419,9 +419,6 @@ local header-proxy MCP. Do not implement both.
 
 ### Task 5: PR 5 — Gateway attach and inbound injection
 
-Not on `main`: no Gateway injection path or `test_agentcore_gateway_inject.py`
-exists.
-
 **Files (sidecar path, if Phase 0 said yes):**
 
 - Modify: `src/kiro_crew/mcp_gateway/` rewriter / session spawn
@@ -439,7 +436,7 @@ exists.
 
 **Either path:**
 
-- [ ] **Step 1: Write failing tests.**
+- [x] **Step 1: Write failing tests.**
 
   - `enabled() is False` → no Gateway server in the rebuilt agent config.
   - `enabled() is True` / posture `login` but `vend_gateway_inbound_token`
@@ -453,12 +450,12 @@ exists.
     (unpooled).
   - Token bytes never appear in a captured log / SEL fixture.
 
-- [ ] **Step 2: Implement the Phase 0-chosen path only.**
+- [x] **Step 2: Implement the Phase 0-chosen path only.**
 
   Gate contribution on `capabilities.agentcore` (fail closed when the
   capability is off, even if the companion `enabled()` is True).
 
-- [ ] **Step 3: Commit.**
+- [x] **Step 3: Commit.**
 
   ```
   feat: inject per-session AgentCore Gateway inbound tokens
@@ -467,9 +464,6 @@ exists.
 ---
 
 ### Task 6: PR 6 — consent surface and unattended policy
-
-Not on `main`: no consent allowlist, unattended policy, or AgentCore consent
-tests exist.
 
 **Files:**
 
@@ -486,20 +480,20 @@ tests exist.
 - Modify: `docs/system-specs/modules/security.md`
 - Test: `test/test_agentcore_consent.py`, `test/test_agentcore_unattended.py`
 
-- [ ] **Step 1: Write failing tests for unknown consent host, injected
+- [x] **Step 1: Write failing tests for unknown consent host, injected
   envelope, and cron-without-JWT.**
 
-- [ ] **Step 2: Implement allowlist + fail-closed unattended policy.**
+- [x] **Step 2: Implement allowlist + fail-closed unattended policy.**
 
   User-facing copy is cataloged. Backend errors include `code`.
   No model-visible "click this URL" injection.
 
-- [ ] **Step 3: Verify dashboard strings and the unattended path.**
+- [x] **Step 3: Verify dashboard strings and the unattended path.**
 
   `cd website && npm run test` for the new modal/copy.
   Backend: `python -m pytest test/test_agentcore_consent.py test/test_agentcore_unattended.py -n0 -q`
 
-- [ ] **Step 4: Commit.**
+- [x] **Step 4: Commit.**
 
   ```
   feat: gate AgentCore 3LO consent and unattended vending
@@ -507,13 +501,10 @@ tests exist.
 
 ---
 
-### Task 7: In-repo extra + IaC (this repository) — planned, not on main
+### Task 7: In-repo extra + IaC (this repository)
 
-Planned as an opt-in extra in Kiro Crew, not a `kirocrew.plugins`
-companion, so a launched box that opts into AgentCore actually vends. None of
-it is on `main`: there is no `agentcore` extra, `platform/agentcore_aws.py`,
-`platform/agentcore_sigv4.py`, `platform/agentcore_inspect.py`, or
-`/api/agentcore` route.
+Landed in Kiro Crew as an opt-in extra, not a `kirocrew.plugins`
+companion. A launched box that opted into AgentCore actually vends.
 
 - Extra: `kirocrew[agentcore]` = `boto3>=1.34,<2` (`setup.cfg`)
 - Adapter: `platform/agentcore_aws.py` `AwsAgentIdentityProvider`

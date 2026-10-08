@@ -200,18 +200,14 @@ def workspace_dir() -> Path:
     ruler, results, PR queue, profiles, and ledger move here so a repo/branch
     switch swaps the whole set atomically.
     """
-    from kiro_crew.owner_only_files import ensure_directory
-
     path = data_dir() / "repos" / workspace_key()
-    ensure_directory(path)  # 0700 levels in the data home
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def _sub(name: str) -> Path:
-    from kiro_crew.owner_only_files import ensure_directory
-
     path = workspace_dir() / name
-    ensure_directory(path)  # 0700 levels in the data home
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -239,10 +235,8 @@ def sessions_dir() -> Path:
     its own subject id and may reference any repo, so it is not scoped to the
     active one.
     """
-    from kiro_crew.owner_only_files import ensure_directory
-
     path = data_dir() / "sessions"
-    ensure_directory(path)  # 0700 in the data home
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 

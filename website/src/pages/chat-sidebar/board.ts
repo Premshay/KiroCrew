@@ -149,14 +149,12 @@ export function useColumnPopover() {
 }
 
 /** Column writes and the state-lane seeding. */
-export function useBoardColumnMutations({ queryClient, setBoardError, orderedColumns, rawColumns, paintedWidthRef, widenForBoard, setSeedError }: {
+export function useBoardColumnMutations({ queryClient, setBoardError, orderedColumns, rawColumns, sidebarWidthRef, widenForBoard, setSeedError }: {
   queryClient: QueryClient
   setBoardError: Dispatch<SetStateAction<string>>
   orderedColumns: TagColumn[]
   rawColumns: TagColumn[]
-  /** The width the sidebar is painted at, which a window narrower than the
-   *  saved width holds below it (see sidebarPaintWidth). */
-  paintedWidthRef: MutableRefObject<number>
+  sidebarWidthRef: MutableRefObject<number>
   widenForBoard: (next: number) => void
   setSeedError: Dispatch<SetStateAction<string>>
 }) {
@@ -263,14 +261,9 @@ export function useBoardColumnMutations({ queryClient, setBoardError, orderedCol
       // A board is a horizontal strip inside a 260px-default sidebar, so lanes
       // that do not fit are reachable only by discovering the resize handle.
       // Widen once to fit them; never shrink, so a width the user chose stands.
-      // Compare against the painted width, what the lanes actually get: a
-      // saved width wider than this window allows is clipped on screen, so it
-      // says nothing about whether the lanes fit.
-      const painted = paintedWidthRef.current
-      const next = boardSidebarWidth(columnCount, painted, window.innerWidth)
-      // Remembering what the user had (the saved width, not the painted one)
-      // is the width owner's job (widenForBoard).
-      if (next !== painted) widenForBoard(next)
+      const next = boardSidebarWidth(columnCount, sidebarWidthRef.current, window.innerWidth)
+      // Remembering what the user had is the width owner's job (widenForBoard).
+      if (next !== sidebarWidthRef.current) widenForBoard(next)
     },
     onError: (err) => {
       // Without this the toggle has already flipped to board view and nothing
@@ -290,10 +283,8 @@ export function useBoardColumnMutations({ queryClient, setBoardError, orderedCol
 export type BoardColumnMutations = ReturnType<typeof useBoardColumnMutations>
 
 /** Whether a slot belongs in a column. */
-export function useColumnMatches({ subagentStartedCounts, subagentApprovalCounts, workflowActiveSet, automationRunningSet }: {
-  /** STARTED children only (`selectSidebarStartedSubagentCounts`): a queued
-   *  child is not work, so it must never be what files a session as Working. */
-  subagentStartedCounts: Record<string, number>
+export function useColumnMatches({ subagentCounts, subagentApprovalCounts, workflowActiveSet, automationRunningSet }: {
+  subagentCounts: Record<string, number>
   subagentApprovalCounts: Record<string, number>
   workflowActiveSet: Set<string>
   automationRunningSet: Set<string>
@@ -308,7 +299,7 @@ export function useColumnMatches({ subagentStartedCounts, subagentApprovalCounts
       // Clamped against the running count exactly as the row status chain does:
       // an approval count above the live agent count is stale, and unclamped it
       // would pin an otherwise-idle session to Needs Approval indefinitely.
-      const running = subagentStartedCounts[slot.key] || 0
+      const running = subagentCounts[slot.key] || 0
       // `slot` here is the raw payload, whose `running` covers only the slot's
       // own turn. A dynamic workflow and a goal loop are both live work that
       // outlive that flag, and the row status chain already reads them from the
@@ -329,7 +320,7 @@ export function useColumnMatches({ subagentStartedCounts, subagentApprovalCounts
     if (col.mode === 'all') return col.tag_ids.every(t => set.has(t))
     if (col.mode === 'none') return !col.tag_ids.some(t => set.has(t))
     return col.tag_ids.some(t => set.has(t))  // 'any'
-  }, [subagentApprovalCounts, subagentStartedCounts, automationRunningSet, workflowActiveSet])
+  }, [subagentApprovalCounts, subagentCounts, automationRunningSet, workflowActiveSet])
   return { columnMatches }
 }
 

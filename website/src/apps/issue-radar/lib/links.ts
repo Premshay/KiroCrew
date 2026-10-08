@@ -130,12 +130,6 @@ export interface ProviderTerms {
   providerName: string
   /** The CLI that owns the credentials: `gh` / `glab` / `az`. */
   cli: string
-  /** The command that signs that CLI in, shown verbatim in a code span.
-   *
-   * A whole literal rather than `cli` plus a catalog fragment: a command is typed
-   * as written, so no part of it is translatable, and `az` signs in with `login`
-   * rather than `auth login`. */
-  loginCommand: string
 }
 
 /** URL grammar per provider id.
@@ -384,7 +378,6 @@ export function providerTerms(ref?: Pick<RepoRef, 'provider'>): ProviderTerms {
       trackedItemPluralTitleKey: 'apps.issueRadar.lib.links.tracked_items_work_items',
       providerName: 'Azure DevOps',
       cli: 'az',
-      loginCommand: 'az login',
     }
   }
   return isGitlab(ref)
@@ -400,7 +393,6 @@ export function providerTerms(ref?: Pick<RepoRef, 'provider'>): ProviderTerms {
         trackedItemPluralTitleKey: 'apps.issueRadar.lib.links.tracked_items_issues',
         providerName: 'GitLab',
         cli: 'glab',
-        loginCommand: 'glab auth login',
       }
     : {
         changeRequest: 'pull request',
@@ -414,7 +406,6 @@ export function providerTerms(ref?: Pick<RepoRef, 'provider'>): ProviderTerms {
         trackedItemPluralTitleKey: 'apps.issueRadar.lib.links.tracked_items_issues',
         providerName: 'GitHub',
         cli: 'gh',
-        loginCommand: 'gh auth login',
       }
 }
 

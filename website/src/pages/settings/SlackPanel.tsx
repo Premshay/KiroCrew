@@ -27,8 +27,6 @@ type Draft = {
   session_folder_on: boolean
   /** Folder name, kept while the toggle is off so turning it back on restores it. */
   session_folder: string
-  /** Open a Slack thread in the owner's bot DM for every new dashboard session on its first message. */
-  auto_link_sessions: boolean
 }
 
 function draftFrom(c: SlackConfigData): Draft {
@@ -42,7 +40,6 @@ function draftFrom(c: SlackConfigData): Draft {
     // means off, so the toggle is derived rather than separately persisted.
     session_folder_on: !!c.session_folder,
     session_folder: c.session_folder ?? '',
-    auto_link_sessions: !!c.auto_link_sessions,
   }
 }
 
@@ -260,7 +257,6 @@ export function SlackPanel() {
       // Off sends "" (the field's off-state); on with a blank name falls back
       // to "Slack", which is what the toggle's description promises.
       session_folder: draft.session_folder_on ? (draft.session_folder.trim() || CHANNEL_NAME) : '',
-      auto_link_sessions: draft.auto_link_sessions,
     }
     if (botClear) payload.bot_token_clear = true
     else if (botToken.trim()) payload.bot_token = botToken.trim()
@@ -438,19 +434,6 @@ export function SlackPanel() {
             onChange={v => upd({ show_thinking: v })}
             disabled={ro}
           />
-          {/* Optional auto-connect of every new dashboard session, always into
-              the owner's bot DM. Off by default: the thread carries the
-              session's title and first prompt into Slack. */}
-          <div className="border-t border-border mt-4 pt-4">
-            <SettingsToggle
-              label={i18nT('pages.settings.slackPanel.auto_link_sessions')}
-              description={i18nT('pages.settings.slackPanel.auto_link_sessions_desc')}
-              checked={draft.auto_link_sessions}
-              onChange={v => upd({ auto_link_sessions: v })}
-              disabled={ro}
-              configKey="slack.auto_link_sessions"
-            />
-          </div>
           {/* Optional per-channel session filing. Off by default: Slack
               conversations stay unfiled in the sidebar, as before. */}
           <div className="border-t border-border mt-4 pt-4">

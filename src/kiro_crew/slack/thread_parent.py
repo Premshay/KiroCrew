@@ -148,10 +148,7 @@ def parent_prompt_text(parent: ThreadParent) -> str:
     """The parent as ``build_message``'s ``thread_parent_text``."""
     text = parent.text
     if len(text) > PARENT_TEXT_CAP:
-        text = text[:PARENT_TEXT_CAP] + (
-            "\n[truncated — use the Slack MCP server's thread-reading tool "
-            "(e.g. get_thread) for full text]"
-        )
+        text = text[:PARENT_TEXT_CAP] + "\n[truncated — use batch_get_thread_replies for full text]"
     return text
 
 

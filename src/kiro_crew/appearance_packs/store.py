@@ -608,8 +608,7 @@ class AppearanceStore:
             if backup is not None:
                 shutil.rmtree(backup, ignore_errors=True)
             return True
-        except (OSError, ValueError) as exc:
-            # ValueError covers content UTF-8 cannot encode (a lone surrogate).
+        except OSError as exc:
             logger.warning("appearance-packs: pack save failed: %s", exc)
             try:
                 if staging.exists():

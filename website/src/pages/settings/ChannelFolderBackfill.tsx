@@ -11,7 +11,6 @@ import {
 import { Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { i18nT } from '../../i18n/t'
-import { invalidateFoldersWhenIdle } from '../../api/chatFoldersWrite'
 
 /** The report `POST /api/channel-folders/backfill` answers with.
  *
@@ -112,8 +111,7 @@ export function ChannelFolderBackfill(props: {
         // the live sidebar moves on its own. These two cover what that push does
         // not: a conversation with no open tab (it only exists in History), and a
         // folder that was hidden and becomes visible now that it holds something.
-        // Through the idle gate: a sidebar folder write may still be pending.
-        invalidateFoldersWhenIdle(qc)
+        void qc.invalidateQueries({ queryKey: ['chat-folders'] })
         // No slots invalidation here, deliberately. `['slots']` and
         // `['chat-slots']` are both DEAD keys: nothing in the dashboard registers
         // a query on either, so `invalidateQueries` traverses an empty match set

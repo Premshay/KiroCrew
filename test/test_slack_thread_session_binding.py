@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -29,6 +31,9 @@ from kiro_crew.messaging.link import ChannelLink, canonical_key
 from kiro_crew.session_map import SessionMap
 from kiro_crew.slack import transport_dispatch
 
+_test_dir = Path(__file__).parent
+if str(_test_dir) not in sys.path:  # pragma: no cover
+    sys.path.insert(0, str(_test_dir))
 _golden = importlib.import_module("test_slack_golden_transcript")
 
 FakeSessions = _golden.FakeSessions

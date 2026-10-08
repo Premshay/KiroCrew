@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from kiro_crew.config.fields import _meta, field_default
+from kiro_crew.config.fields import _meta
 from kiro_crew.effort import EFFORT_LEVELS
 
 logger = logging.getLogger("kiro_crew.config.loader")
@@ -228,7 +228,8 @@ class MemoryConfig:
             "writes (lessons, consolidation extraction, task-runner lessons) "
             "and no stored memory/lessons injected into new sessions; "
             "within-conversation context is unaffected. Explicit dashboard "
-            "edits and deletions stay available.",
+            "edits and deletions stay available. An installed app's own "
+            "ingestion sweep is out of scope and still writes app-scoped rows.",
         ),
     )
     inject_memory: bool = field(
@@ -289,13 +290,12 @@ DEFAULT_AUTO_INGEST_ARTIFACT_KINDS = ["markdown", "text", "html", "json"]
 def _coerce_embedding_provider(raw: str) -> str:
     """Normalize legacy or unknown embedding_provider values.
 
-    Embeddings are always-on: every value coerces to the field's default,
-    ``"llama_cpp"``, the one provider. Old configs may carry ``"ollama"`` (a retired
-    runtime) or ``"none"`` (the disabled setting); both are transparently upgraded.
-    Unknown values also coerce so a config file from a newer/older version never
-    crashes.
+    Embeddings are always-on: every value coerces to ``"llama_cpp"``. Old configs
+    may carry ``"ollama"`` (a retired runtime) or ``"none"`` (the disabled setting);
+    both are transparently upgraded. Unknown values also coerce so a config file
+    from a newer/older version never crashes.
     """
-    return field_default(MemoryConfig, "embedding_provider")
+    return "llama_cpp"
 
 
 @dataclass
@@ -344,9 +344,10 @@ class KnowledgeConfig:
         default=10.0,
         metadata=_meta(
             "Embed Timeout (seconds)",
-            "Retained for config compatibility; it bounds no call. The "
-            "Knowledge-Library embedder runs in-process (llama.cpp), so there is "
-            "no per-request timeout for this value to apply to.",
+            "Per-request timeout for the Knowledge-Library embedder. Raise it "
+            "when a large chunk times out on a cold Ollama model load (the embed "
+            "then never completes and the item is retried every maintenance "
+            "pass). 0 or unset keeps the built-in 10s default.",
         ),
     )
     embed_content_budget: int = field(
@@ -581,13 +582,13 @@ def _read_auto_add_documents(knowledge_data: dict) -> bool:
     Canonical spelling is ``auto_add_documents``, which is what ``save()`` writes,
     so a save/load round-trip settles on it.
 
-    Absent both keys it reads the field's default, OFF: auto-ingest is opt-in, so a
-    config that never mentioned it must not start adding documents.
+    Absent both keys the feature is OFF: auto-ingest is opt-in, so a config that
+    never mentioned it must not start adding documents.
     """
     for key in ("auto_add_documents", "auto_ingest_doc_links"):
         if key in knowledge_data:
             return bool(knowledge_data.get(key))
-    return field_default(KnowledgeConfig, "auto_add_documents")
+    return False
 
 
 @dataclass
@@ -696,9 +697,8 @@ class SkillsConfig:
             "Auto Similarity Threshold",
             "Skip creation when an existing skill's description has keyword overlap "
             "≥ this fraction with the synthesized description (0.0-1.0). Prevents "
-            "near-duplicate skills. Used as the lexical fallback when the dedupe "
-            "judge is unavailable, and as a safety net after the judge returns a "
-            "NEW verdict.",
+            "near-duplicate skills. Used as the lexical fallback when the Haiku "
+            "dedupe judge is unavailable.",
         ),
     )
     # ── Staged approval + lifecycle (v2) ──
@@ -794,13 +794,11 @@ class SkillsConfig:
             logger.warning("auto_min_tool_calls %d < 2, using 2", self.auto_min_tool_calls)
             object.__setattr__(self, "auto_min_tool_calls", 2)
         if not 0.0 <= self.auto_similarity_threshold <= 1.0:
-            threshold = field_default(SkillsConfig, "auto_similarity_threshold")
             logger.warning(
-                "auto_similarity_threshold %.2f out of range [0.0, 1.0], using %.2f",
+                "auto_similarity_threshold %.2f out of range [0.0, 1.0], using 0.85",
                 self.auto_similarity_threshold,
-                threshold,
             )
-            object.__setattr__(self, "auto_similarity_threshold", threshold)
+            object.__setattr__(self, "auto_similarity_threshold", 0.85)
         if self.auto_refine_on_deviation and not self.auto_create_from_sessions:
             logger.warning(
                 "auto_refine_on_deviation requires auto_create_from_sessions; "
@@ -892,10 +890,9 @@ class SessionSummaryConfig:
         metadata=_meta(
             "Assistant Excerpt Size",
             "Characters kept from each end of an assistant message when building "
-            "the summarization input (>=80). Each user message is capped at its "
-            "first 4,000 characters, and kept whole up to that cap unless the whole "
-            "input exceeds the fixed 40,000-character summary input limit -- user "
-            "messages carry intent and are small -- while assistant output is "
+            "the summarization input (>=80). User messages are included in full "
+            "unless the whole input exceeds the fixed 40,000-character summary input "
+            "limit -- they carry intent and are small -- while assistant output is "
             "excerpted because it holds the progress detail but dominates the "
             "transcript. Past that limit, middle turns are dropped and any turn is "
             "cut to about 5,000 characters per end, so larger values stop helping.",

@@ -18,6 +18,7 @@ import html
 import itertools
 import random
 import re
+import time
 
 import pytest
 
@@ -404,22 +405,20 @@ class TestBalancedLinkReadings:
         assert redact_for_display(payload, _default_redactor) == (payload, False)
 
     @pytest.mark.parametrize(
-        "build_pump",
+        "payload",
         [
-            pytest.param(lambda n: "[a](" * n, id="openers"),
-            pytest.param(lambda n: "[a](" + "(" * n + ")" * n + ")", id="nested-parentheses"),
-            pytest.param(lambda n: "[" * n, id="brackets"),
-            pytest.param(lambda n: "[a](" * n + ")" * n, id="openers-then-closers"),
-            pytest.param(lambda n: "](<" * n, id="angle-closers"),
+            "[a](" * 5_000,
+            "[a](" + "(" * 3_000 + ")" * 3_000 + ")",
+            "[" * 5_000,
+            "[a](" * 400 + ")" * 400,
+            "](<" * 3_000,
         ],
     )
-    def test_each_reading_stays_linear(self, build_pump):
-        """Every screen reading handles a pump of openers in linear CPU time.
-
-        Ramped on thread CPU by ``assert_rejected_without_backtracking``: a single
-        wall-clock sample would charge this reading for the time the worker spends
-        descheduled behind its siblings."""
-        assert_rejected_without_backtracking(_screen_readings, build_pump, budget_seconds=1.0)
+    def test_each_reading_stays_linear(self, payload):
+        started = time.perf_counter()
+        _screen_readings(payload)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 1.0, elapsed
 
 
 class TestRendererLinkGrammarDoesNotWiden:
@@ -975,10 +974,15 @@ class TestRendererLabelsAreNoWiderThanTheScreens:
         every opener: quadratic in the length of attacker-supplied text."""
         pattern = _RENDERER_LINK_PATTERNS[renderer]
 
-        def reject(text: str) -> None:
-            assert pattern.sub("", text) == text, renderer
+        def elapsed(repeats: int) -> float:
+            text = "[b" * repeats
+            started = time.perf_counter()
+            assert pattern.sub("", text) == text
+            return time.perf_counter() - started
 
-        assert_rejected_without_backtracking(reject, lambda n: "[b" * n, budget_seconds=0.5)
+        small, large = elapsed(5_000), elapsed(20_000)
+        assert large < 0.5, (renderer, large)
+        assert large <= max(8 * small, 0.05), (renderer, small, large)
 
 
 #: The link patterns outside chat that read a destination with ``md_link_destination``:
@@ -1003,10 +1007,15 @@ class TestLinkPatternsOutsideChatStayLinear:
     def test_a_run_of_openers_stays_fast(self, site, opener):
         pattern = _OUTSIDE_CHAT_LINK_PATTERNS[site]
 
-        def reject(text: str) -> None:
-            assert pattern.sub("", text) == text, (site, opener)
+        def elapsed(repeats: int) -> float:
+            text = opener * repeats
+            started = time.perf_counter()
+            assert pattern.sub("", text) == text
+            return time.perf_counter() - started
 
-        assert_rejected_without_backtracking(reject, lambda n: opener * n, budget_seconds=0.5)
+        small, large = elapsed(5_000), elapsed(20_000)
+        assert large < 0.5, (site, opener, large)
+        assert large <= max(8 * small, 0.05), (site, opener, small, large)
 
     @pytest.mark.parametrize("site", sorted(_OUTSIDE_CHAT_LINK_PATTERNS))
     def test_a_hard_wrapped_label_is_still_a_link(self, site):

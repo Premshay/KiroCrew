@@ -19,7 +19,6 @@ import { issueRadarApi, type RefSummary, type RepoRef as RepoIdentity } from '..
 import { repoScopeKey } from '../lib/links'
 import type { RepoRef } from '../lib/refLinks'
 import ShimmerLine from './ShimmerLine'
-import { useTouchReplay } from '../../../hooks/useTouchReplay'
 
 import { i18nT } from '../../../i18n/t'
 import { fmtDateTimeNumeric } from '../../../i18n/format'
@@ -134,13 +133,7 @@ export default function RefLink({
   }
   useEffect(() => clearTimer, [])
 
-  // A tap's replayed mouseenter/focus must not schedule the card: the 320ms
-  // timer is inside iOS's content-change window, so the card would cost the
-  // tap its click (see useTouchReplay).
-  const { fromTouch, pointerProps } = useTouchReplay()
-
   const scheduleOpen = useCallback(() => {
-    if (fromTouch()) return
     clearTimer()
     openTimer.current = window.setTimeout(() => {
       openTimer.current = null
@@ -150,7 +143,7 @@ export default function RefLink({
       setBox(clampBox(el))
       setRect(el.getBoundingClientRect())
     }, HOVER_OPEN_MS)
-  }, [fromTouch])
+  }, [])
 
   const close = useCallback(() => {
     clearTimer()
@@ -203,7 +196,6 @@ export default function RefLink({
         rel="noopener noreferrer"
         aria-describedby={rect ? cardId : undefined}
         onClick={onClick}
-        {...pointerProps}
         onMouseEnter={scheduleOpen}
         onMouseLeave={close}
         onFocus={scheduleOpen}

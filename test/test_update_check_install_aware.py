@@ -21,7 +21,6 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -1387,8 +1386,6 @@ class TestAutoApplyGuard:
             "update_available": True,
             "can_apply": False,
             "managed_by": "kirocrew",
-            "channel": "stable",
-            "latest_version": "9.9.9",
             "remediation": {
                 "kind": "command",
                 "message": "Re-run the installer to upgrade.",
@@ -1406,61 +1403,17 @@ class TestAutoApplyGuard:
                 effect=AutoUpdateEffect("install", "wheel"),
             )
         orch._auto_apply_update.assert_not_awaited()
-        orch._auto_apply_wheel_update.assert_awaited_once_with("stable", "9.9.9")
-        # The new tree builds beside the live one with admission open; only the
-        # restart into it (inside the apply) pauses admission.
-        orch.sessions.pause_turn_admission_for_update.assert_not_awaited()
-
-    _MANAGED_UPDATE = {
-        "update_available": True,
-        "can_apply": False,
-        "managed_by": "kirocrew",
-        "remediation": {
-            "kind": "command",
-            "message": "Re-run the installer to upgrade.",
-            "command": "curl -fsSL … | sh",
-        },
-    }
-
-    def test_no_apply_starts_once_shutdown_is_signalled(self):
-        # The first coordinator cycle runs while boot is still inside the MCP
-        # probe, so a SIGTERM there reaches it before ``_shutdown`` does. An
-        # installer admitted now would be stopped mid-write moments later.
-        with patch("kiro_crew.slack.gateway.shutdown_event", SimpleNamespace(is_set=lambda: True)):
-            orch = self._run(dict(self._MANAGED_UPDATE), auto_update=True, managed_venv=True)
-        orch._auto_apply_wheel_update.assert_not_awaited()
-        orch.sessions.pause_turn_admission_for_update.assert_not_awaited()
-
-    def test_a_busy_retry_after_shutdown_is_signalled_starts_nothing(self):
-        orch = self._orchestrator()
-        orch._pending_update_respawn = MagicMock()
-        orch._restart_after_update = AsyncMock()
-        orch._finish_auto_update_apply = AsyncMock()
-        with patch("kiro_crew.slack.gateway.shutdown_event", SimpleNamespace(is_set=lambda: True)):
-            asyncio.run(orch._retry_pending_update_restart())
-        orch._restart_after_update.assert_not_awaited()
-        orch.sessions.pause_turn_admission_for_update.assert_not_awaited()
-
-    def test_finishing_while_the_pause_is_kept_schedules_no_replay(self):
-        # During a shutdown the resume keeps the pause and reports it; a replay
-        # then would tell senders to resend while the gateway is stopping.
-        orch = self._orchestrator()
-        orch.sessions.resume_turn_admission_after_update = AsyncMock(return_value=False)
-
-        asyncio.run(orch._finish_auto_update_apply())
-
+        orch._auto_apply_wheel_update.assert_awaited_once()
+        orch.sessions.pause_turn_admission_for_update.assert_awaited_once()
         orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
-        orch._schedule_inbound_replay.assert_not_called()
+        orch._schedule_inbound_replay.assert_called_once()
 
-    def test_busy_managed_install_still_builds_with_admission_open(self):
-        """In-flight turns delay only the restart, never the build."""
+    def test_busy_managed_install_defers_and_keeps_update_pending(self):
         orch = self._run(
             {
                 "update_available": True,
                 "can_apply": False,
                 "managed_by": "kirocrew",
-                "channel": "stable",
-                "latest_version": "9.9.9",
                 "remediation": {
                     "kind": "command",
                     "message": "Re-run the installer to upgrade.",
@@ -1472,8 +1425,12 @@ class TestAutoApplyGuard:
             busy=1,
             effect=AutoUpdateEffect("install", "wheel"),
         )
-        orch._auto_apply_wheel_update.assert_awaited_once_with("stable", "9.9.9")
-        orch.sessions.pause_turn_admission_for_update.assert_not_awaited()
+        orch._auto_apply_wheel_update.assert_not_awaited()
+        assert orch._update_apply_deferred is True
+        orch.sessions.pause_turn_admission_for_update.assert_awaited_once()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        orch._schedule_inbound_replay.assert_called_once()
+        orch.dashboard_state.push_refresh.assert_called_with("update_available")
 
     def test_mandatory_busy_update_keeps_deferring_after_the_grace_limit(self):
         orch = self._orchestrator()
@@ -1537,7 +1494,7 @@ class TestAutoApplyGuard:
         assert orch._mandatory_update_deferred_at is not None
         assert orch._mandatory_update_deferred_key == "new-floor:2.0.0"
 
-    def test_foreign_environment_never_takes_the_shadow_apply(self):
+    def test_foreign_environment_never_runs_the_managed_installer(self):
         orch = self._run(
             {
                 "update_available": True,
@@ -1801,6 +1758,7 @@ async def callback(job):
             "sessions.inbound_callback_count",
             "inbound_spool.pending_refusal_write_count()",
             'getattr(slot, "task", None)',
+            'getattr(slot, "_in_stage_execution", False)',
             'getattr(owner, "_handler_tasks", None)',
             'getattr(self, "_channel_handles", {})',
         ):
@@ -2026,21 +1984,14 @@ async def callback(job):
             for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-
-        def attrs_of(name: str) -> set[str]:
-            return {
+        for name in ("_auto_apply_update", "_auto_apply_wheel_update"):
+            attrs = {
                 node.func.attr
                 for node in ast.walk(methods[name])
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             }
-
-        # The managed-venv apply builds with admission open and reaches the fence
-        # through the restart bracket, which pauses admission first.
-        assert "_retry_pending_update_restart" in attrs_of("_auto_apply_wheel_update")
-        for name in ("_auto_apply_update", "_retry_pending_update_restart"):
-            assert "_restart_after_update" in attrs_of(name)
-        for name in ("_auto_apply_update", "_auto_apply_wheel_update"):
-            assert "reexec_python_module" not in attrs_of(name)
+            assert "_restart_after_update" in attrs
+            assert "reexec_python_module" not in attrs
 
         prepare_attrs = {
             node.func.attr
@@ -2049,7 +2000,7 @@ async def callback(job):
         }
         assert "drain_active_turns" not in prepare_attrs
 
-        restart = methods["_restart_after_update_claimed"]
+        restart = methods["_restart_after_update"]
         calls: dict[str, list[int]] = {}
         for node in ast.walk(restart):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
@@ -2250,7 +2201,7 @@ _SHAPES = [
         {"managed_by": "kirocrew", "platform": "win32"}, "notify", None, id="managed-on-windows"
     ),
     pytest.param(
-        {"managed_by": "kirocrew", "shell": False}, "notify", None, id="managed-without-openssl"
+        {"managed_by": "kirocrew", "shell": False}, "notify", None, id="managed-without-a-shell"
     ),
     pytest.param(
         {"managed_by": "kirocrew", "blocked": "pinned"}, "notify", None, id="managed-pinned-away"
@@ -2357,12 +2308,7 @@ class TestAutoUpdateEffect:
                 # Notify really notifies: the provider's verdict reaches the badge.
                 assert published["update_available"] is True
         else:
-            if route == "wheel":
-                # The shadow apply builds with admission open and pauses it only
-                # for its own restart, inside the apply.
-                orch._prepare_auto_update_apply.assert_not_awaited()
-            else:
-                orch._prepare_auto_update_apply.assert_awaited_once()
+            orch._prepare_auto_update_apply.assert_awaited_once()
             assert applied[route] == 1
             assert sum(applied.values()) == 1
 
@@ -2563,8 +2509,6 @@ _DYNAMIC_GATES = {
     "running_from_managed_venv": "read by the route; the apply trusts the route",
     "min_version": "the floor's value, already folded into the effect",
     "update_required": "the floor verdict, already folded into the effect",
-    "check_release_version": "reads the version this cycle's check reported, never the install",
-    "WheelUpdateError": "the exception class a refusal raises, not a gate",
 }
 
 _APPLY_ROUTES = [("_auto_apply_update", "_git_route"), ("_auto_apply_wheel_update", "_wheel_route")]
@@ -2604,17 +2548,11 @@ def test_the_derivation_reads_every_static_gate_its_apply_path_reads(apply_name,
             if isinstance(node, (ast.Attribute, ast.Name))
         }
 
-    # platform_compat's two update gates: a trusted git, and a trusted system
-    # binary. Named rather than derived, because that module's surface is every
-    # POSIX call the product makes.
+    # platform_compat's two update gates: a trusted git, and a trusted shell
+    # for the installer. Named rather than derived, because that module's
+    # surface is every POSIX call the product makes.
     helpers = _gate_helper_names() | {"trusted_git_bin", "trusted_system_bin"}
-    applied = _names(gateway, apply_name)
-    if "preflight_bases" in applied:
-        # The managed-venv apply runs its gates through the shared preflight.
-        from kiro_crew.platform import wheel_apply
-
-        applied |= _names(wheel_apply, "preflight_bases")
-    static_gates = (applied & helpers) - set(_DYNAMIC_GATES)
+    static_gates = (_names(gateway, apply_name) & helpers) - set(_DYNAMIC_GATES)
     assert static_gates, "no gate helper found in the apply path — is the parse right?"
     missing = static_gates - _names(update_capability, route_name)
     assert not missing, (

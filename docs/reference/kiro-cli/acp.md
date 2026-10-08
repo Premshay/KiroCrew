@@ -8,9 +8,6 @@ Source: https://kiro.dev/docs/cli/acp/ (fetched 2026-09-06)
 > counterpart in upstream's method table; they are measured here and describe Kiro
 > Crew's claude-agent-acp path. A re-fetch must preserve them. Upstream's own
 > table now carries `_session/terminate`, so that row is no longer local-only.
-> Two wire names are corrected locally against what Kiro Crew sends and reads:
-> session updates arrive as the `session/update` notification, and
-> `session/prompt` carries its content blocks in `params.prompt`.
 
 ACP is an open standard for agent-editor communication (like LSP for language servers). Kiro CLI implements ACP, enabling use in JetBrains IDEs, Zed, and other compatible editors.
 
@@ -80,7 +77,7 @@ Advertised during initialization:
 - `loadSession: true` — supports loading existing sessions
 - `promptCapabilities.image: true` — supports image content
 
-### Session update types (via `session/update`)
+### Session update types (via `session/notification`)
 
 | Type | Description |
 |------|-------------|
@@ -172,7 +169,7 @@ Custom methods prefixed with `_kiro.dev/` (optional, safe to ignore).
   "method": "session/prompt",
   "params": {
     "sessionId": "sess_abc123",
-    "prompt": [{ "type": "text", "text": "Explain this codebase" }]
+    "content": [{ "type": "text", "text": "Explain this codebase" }]
   }
 }
 ```

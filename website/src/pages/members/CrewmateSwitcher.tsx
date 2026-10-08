@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import type { MemberRosterRow } from '../../api/client'
 import { crewDisplayName } from '../../components/AgentSelector'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
+import { Glass } from '../../components/Glass'
 import { Popover, PopoverContent, PopoverTrigger } from '../../components/ui/popover'
 import { fmtList } from '../../i18n/format'
 import { cn } from '../../lib/utils'
@@ -127,12 +128,13 @@ export default function CrewmateSwitcher({
       }}
     >
       <PopoverTrigger asChild>
-        {/* A plain header button, not a second Glass pill: two pills of
-            different heights side by side read as a mismatched pair. */}
-        <button
+        <Glass
+          as="button"
           type="button"
+          variant="chip"
+          radius={999}
           className={cn(
-            'group flex items-center gap-1.5 h-[42px] pl-2.5 pr-3 rounded-full text-text hover:bg-bg-hover data-[state=open]:bg-bg-hover transition-colors cursor-pointer focus-ring shrink-0',
+            'glass-shadow flex items-center gap-1.5 pl-1.5 pr-2.5 py-1 cursor-pointer focus-ring shrink-0',
             className,
           )}
           aria-label={chipLabel}
@@ -149,7 +151,7 @@ export default function CrewmateSwitcher({
             {stack.map((m, i) => (
               <span
                 key={m.name}
-                className={cn('rounded-full ring-2 ring-bg group-hover:ring-bg-hover group-data-[state=open]:ring-bg-hover transition-colors', i > 0 && '-ml-2')}
+                className={cn('rounded-full ring-2 ring-bg-elevated', i > 0 && '-ml-2')}
                 style={{ zIndex: STACK_FACES - i }}
               >
                 <CrewStateAvatar seed={m.name} avatar={m.avatar} slotKey={m.slot_key} running={signals(m).running} size={22} working="subtle" />
@@ -157,14 +159,14 @@ export default function CrewmateSwitcher({
             ))}
             {othersNeedYou && (
               <span
-                className="absolute -right-0.5 -top-0.5 z-10 w-2.5 h-2.5 rounded-full border-2 border-bg group-hover:border-bg-hover group-data-[state=open]:border-bg-hover bg-warn"
+                className="absolute -right-0.5 -top-0.5 z-10 w-2.5 h-2.5 rounded-full border-2 border-bg-elevated bg-warn"
                 data-testid="crewmate-switcher-needs-you"
               />
             )}
           </span>
           <span className="text-[12.5px] font-semibold tabular-nums" data-testid="crewmate-switcher-count">{members.length}</span>
           <ChevronDown size={13} className={cn('text-muted transition-transform', open && 'rotate-180')} aria-hidden="true" />
-        </button>
+        </Glass>
       </PopoverTrigger>
       <PopoverContent
         align="start"

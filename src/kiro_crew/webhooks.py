@@ -254,7 +254,7 @@ def sanitize_label(label: str) -> str:
 
 def hash_token(raw: str) -> str:
     """Return the sha256 hex digest persisted for *raw*."""
-    return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ── Token store ──
@@ -564,10 +564,9 @@ class WebhookTokenStore:
         """
         if not candidate:
             return None
-        digest = hash_token(candidate).encode("ascii")
+        digest = hash_token(candidate)
         for entry in self._load():
-            stored_digest = str(entry.get("token_hash", "")).encode("utf-8", "surrogatepass")
-            if hmac.compare_digest(stored_digest, digest):
+            if hmac.compare_digest(str(entry.get("token_hash", "")), digest):
                 token_id = str(entry.get("id", ""))
                 if stamp_used:
                     try:
@@ -577,10 +576,7 @@ class WebhookTokenStore:
                             "webhook token last_used_at stamp failed", exc_info=True
                         )
                 return token_id
-        if legacy_token and hmac.compare_digest(
-            candidate.encode("utf-8", "surrogatepass"),
-            legacy_token.encode("utf-8", "surrogatepass"),
-        ):
+        if legacy_token and hmac.compare_digest(candidate, legacy_token):
             return LEGACY_TOKEN_ID
         return None
 

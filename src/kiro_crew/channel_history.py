@@ -227,10 +227,8 @@ class ChannelHistory:
         path = self._observe_path(channel_id)
         if path is None:
             return
-        from kiro_crew.owner_only_files import ensure_directory, owner_only_opener_for
-
         try:
-            ensure_directory(path.parent)  # 0700 inside the data home
+            path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(
                 {
                     "user": entry.user,
@@ -241,10 +239,7 @@ class ChannelHistory:
                 },
                 ensure_ascii=False,
             )
-            # Channel messages: 0600 from creation inside the data home (an
-            # existing file keeps its mode; the startup sweep tightens one an
-            # older version left). A history_dir outside the home is unchanged.
-            with open(path, "a", encoding="utf-8", opener=owner_only_opener_for(path)) as f:
+            with path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except OSError:
             logger.warning("Failed to append to history file %s", path, exc_info=True)

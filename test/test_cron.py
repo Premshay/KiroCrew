@@ -1014,7 +1014,7 @@ class TestCancelAgainstFinishedTask:
         stale = asyncio.get_running_loop().create_task(_died_before_cleanup())
         await asyncio.gather(stale, return_exceptions=True)
         assert stale.done()
-        stale_claim = svc._claims[job.id] = _RunClaim(
+        svc._claims[job.id] = _RunClaim(
             trigger="scheduled",
             claimed_at=time.time() - 3600,
             started_monotonic=time.monotonic() - 3600,
@@ -1025,8 +1025,9 @@ class TestCancelAgainstFinishedTask:
         with patch("kiro_crew.sel.sel"):
             cancelled = await svc.cancel(job.id)
 
-        assert not stale_claim.cancelled, (
-            "cancel() against a finished task flagged a run that had already ended as cancelled"
+        assert not svc._runs.cancelled._marks, (
+            "cancel() against a finished task left the cancel markers set; the job's "
+            "next real run will be treated as cancelled and its result dropped"
         )
         assert cancelled is False, "cancel() reported a cancellation with nothing running"
         # The leftovers are released, so the next Run and the next due-scan see

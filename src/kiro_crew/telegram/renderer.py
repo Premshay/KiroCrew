@@ -33,6 +33,7 @@ import html
 import logging
 import os
 import re
+import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -69,7 +70,6 @@ from kiro_crew.messaging.renderer import (
     apply_options_cap,
     count_redaction_tags,
     new_approval_nonce,
-    nonce_eq,
     redaction_notice,
     repaired_after_a_sent_tail,
     session_provenance_tag,
@@ -1143,7 +1143,7 @@ class TelegramApprovalDecider:
         expected = cls._NONCES.get(key)
         if not expected or not nonce:
             return False
-        return nonce_eq(expected, nonce)
+        return secrets.compare_digest(nonce, expected)
 
     @classmethod
     def is_pending(cls, key: str, nonce: str = "") -> bool:

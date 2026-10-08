@@ -1,7 +1,6 @@
 /** Shared file-token utilities used by send() and renderUserContent(). */
 
 import { decodeLocalPath } from './urlTransform'
-import { WINDOWS_SHAPED_PATH_RE } from './pathBasename'
 
 export const IMG_EXT = /\.(png|jpe?g|gif|webp|bmp|svg)$/i
 
@@ -422,7 +421,7 @@ export interface SendPayload {
  *  host-naming UNC shape. A UNC upload is emitted as `//host/share/…`, which
  *  reaches the renderer as a scheme-less relative URL and is validated against
  *  the gateway's trusted attachment roots server-side. */
-const WIN_PRODUCER_PATH_RE = WINDOWS_SHAPED_PATH_RE
+const WIN_PRODUCER_PATH_RE = /^(?:[A-Za-z]:|\\\\[^\\/]+)[\\/]/
 
 /** Forward-slash form of a Windows-shaped absolute path (drive letter / UNC).
  *  A path that is not Windows-shaped is returned untouched: on POSIX `\` is a

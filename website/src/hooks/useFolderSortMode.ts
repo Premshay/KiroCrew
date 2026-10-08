@@ -4,7 +4,6 @@ import { api } from '../api/client'
 import { i18nT } from '../i18n/t'
 import { errMessage } from '../utils/thunkError'
 import { readFolderSortMode, type FolderSortMode } from '../utils/folderTree'
-import { failedWithNoData } from '../api/queryState'
 
 export interface FolderSortModeRead {
   /**
@@ -71,7 +70,7 @@ export function useFolderSortRead(q: {
   const known = q.data !== undefined
   // Failed on record: no body has ever arrived, and a fetch has errored. Holds
   // through every retry's pending phase, for every observer, latch or no latch.
-  const failedOnRecord = failedWithNoData(q)
+  const failedOnRecord = !known && q.errorUpdatedAt > 0
   const liveFailure = q.status === 'error' && !known
     ? (errMessage(q.error) || i18nT('components.errorBoundary.something_went_wrong'))
     : null

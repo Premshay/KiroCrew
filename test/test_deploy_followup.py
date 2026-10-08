@@ -39,10 +39,7 @@ class TestFU1ReaperRemediation:
 
     def test_both_409_sites_attach_remediation(self):
         src = Path(h.__file__).read_text(encoding="utf-8")
-        # Base missing gets the base-then-reaper command; reaper missing gets
-        # the reaper command alone.
-        assert src.count('"remediation": _base_remediation(profile, region)') == 1
-        assert src.count('"remediation": _reaper_remediation(profile, region)') == 1
+        assert src.count('"remediation": _reaper_remediation(profile, region)') == 2
 
 
 class TestFU3EmptyCostHint:

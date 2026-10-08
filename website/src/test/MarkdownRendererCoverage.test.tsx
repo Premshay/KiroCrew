@@ -544,23 +544,12 @@ describe('Lightbox download', () => {
     window.dispatchEvent(new CustomEvent('lightbox', { detail: { images: [{ src, alt }], index: 0 } }))
   }
 
-  // The vitest harness provides a full Clipboard API, so Copy is offered and
-  // Download lives in the toolbar's overflow menu (the two-button cap, after
-  // Copy joined the row). Open the menu, then select Download — Radix opens and
-  // selects on the pointer gesture, not a bare click, in jsdom.
-  function clickDownload(container: HTMLElement) {
-    const trigger = container.querySelector('[data-testid="lightbox-actions-menu"]') as HTMLElement
-    act(() => { fireEvent.pointerDown(trigger, { button: 0 }); fireEvent.pointerUp(trigger); fireEvent.click(trigger) })
-    const item = document.body.querySelector('[data-testid="lightbox-download-image"]') as HTMLElement
-    act(() => { fireEvent.pointerDown(item, { button: 0 }); fireEvent.pointerUp(item); fireEvent.click(item) })
-  }
-
   it('downloads the served bytes, naming the file from the ?path= query', async () => {
     vi.useFakeTimers()
     try {
-      const { container } = render(<Lightbox />)
+      const { getByLabelText } = render(<Lightbox />)
       act(() => open('/api/file-raw?path=%2Ftmp%2Fshots%2Fpanel.png', 'panel'))
-      clickDownload(container)
+      act(() => { fireEvent.click(getByLabelText('Download image')) })
       await vi.waitFor(() => expect(clicks).toHaveLength(1))
       expect(clicks[0]).toEqual({ download: 'panel.png', href: 'blob:shot' })
       expect(fetchMock).toHaveBeenCalledWith('/api/file-raw?path=%2Ftmp%2Fshots%2Fpanel.png')
@@ -574,36 +563,36 @@ describe('Lightbox download', () => {
   })
 
   it('names a remote image from its URL basename', async () => {
-    const { container } = render(<Lightbox />)
+    const { getByLabelText } = render(<Lightbox />)
     act(() => open('https://example.invalid/media/diagram.svg', 'diagram'))
-    clickDownload(container)
+    act(() => { fireEvent.click(getByLabelText('Download image')) })
     await waitFor(() => expect(clicks).toHaveLength(1))
     expect(clicks[0].download).toBe('diagram.svg')
   })
 
   it('falls back to the alt text when the source carries no filename', async () => {
-    const { container } = render(<Lightbox />)
+    const { getByLabelText } = render(<Lightbox />)
     act(() => open('data:image/png;base64,iVBORw0KGgo=', 'Kiro Crew banner'))
-    clickDownload(container)
+    act(() => { fireEvent.click(getByLabelText('Download image')) })
     await waitFor(() => expect(clicks).toHaveLength(1))
     expect(clicks[0].download).toBe('Kiro_Crew_banner')
   })
 
   it('opens the image in a new tab when the fetch is refused', async () => {
     fetchMock.mockResolvedValue({ ok: false, status: 403 } as unknown as Response)
-    const { container } = render(<Lightbox />)
+    const { getByLabelText } = render(<Lightbox />)
     act(() => open('https://example.invalid/blocked.png', 'blocked'))
-    clickDownload(container)
+    act(() => { fireEvent.click(getByLabelText('Download image')) })
     await waitFor(() => expect(openMock).toHaveBeenCalled())
     expect(openMock).toHaveBeenCalledWith('https://example.invalid/blocked.png', '_blank', 'noopener,noreferrer')
     expect(clicks).toHaveLength(0)
   })
 
   it('downloads the current image on the "d" shortcut', async () => {
-    render(<Lightbox />)
+    const { getByLabelText } = render(<Lightbox />)
     act(() => open('/api/file-raw?path=%2Ftmp%2Fshot.png', 'shot'))
-    // The toolbar's download control now lives in the overflow menu; this path
-    // is the keyboard shortcut, which is unchanged and needs no open menu.
+    // The toolbar button is present, but this path is the keyboard one.
+    expect(getByLabelText('Download image')).not.toBeNull()
     act(() => { fireEvent.keyDown(window, { key: 'd' }) })
     await waitFor(() => expect(clicks).toHaveLength(1))
     expect(clicks[0].download).toBe('shot.png')

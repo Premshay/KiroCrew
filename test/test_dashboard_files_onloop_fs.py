@@ -46,7 +46,6 @@ from aiohttp.test_utils import make_mocked_request
 
 import kiro_crew.dashboard.handlers as _HANDLERS_PKG
 from kiro_crew import executors
-from kiro_crew.dashboard import file_api
 from kiro_crew.dashboard.handlers import files as f
 
 #: The shared open-and-check prefix resolves the validator through the
@@ -135,22 +134,9 @@ _BLOCKING_HELPERS = frozenset(
 )
 
 
-def _owner_files() -> list[Path]:
-    """The ``file_api`` owners composed into the handlers module."""
-    return sorted(Path(inspect.getsourcefile(file_api)).parent.glob("[!_]*.py"))
-
-
 def _module_tree() -> ast.Module:
-    """The handlers module and its ``file_api`` owners, read as one module.
-
-    The endpoints' bodies live in the owners, and ``files`` is their import path
-    and patch surface, so the ratchet reads every one of those files.
-    """
     src = Path(inspect.getsourcefile(f)).read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    for path in _owner_files():
-        tree.body.extend(ast.parse(path.read_text(encoding="utf-8")).body)
-    return tree
+    return ast.parse(src)
 
 
 def _is_to_thread(fn: ast.expr) -> bool:
@@ -220,15 +206,6 @@ class TestStaticRatchet:
             "the prefix scan found only "
             f"{sorted(guarded)} -- a rename likely moved the handlers out of the "
             "guarded families, which would silently empty this ratchet"
-        )
-        served = {
-            name
-            for name, value in vars(f).items()
-            if name.startswith(_GUARDED_PREFIXES) and inspect.iscoroutinefunction(value)
-        }
-        assert served <= set(guarded), (
-            "these endpoints are served from a file the scan does not read: "
-            f"{sorted(served - set(guarded))}"
         )
         violations: list[str] = []
         for node in guarded.values():

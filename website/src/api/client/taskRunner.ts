@@ -20,7 +20,7 @@ export interface PlanStepInput {
   [key: string]: unknown
 }
 
-export function createTaskRunnerEndpoints({ get, post, put, del, j, jfetch: fetch }: ClientTransport) {
+export function createTaskRunnerEndpoints({ get, post, put, del, j }: ClientTransport) {
   const runs = {
     // Task runner
     taskRunnerStatus: () => fetch('/api/taskrunner').then(j),

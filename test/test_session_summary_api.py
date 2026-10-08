@@ -269,7 +269,6 @@ class TestSummaryAppIsolation:
     ):
         mock_sel = MagicMock()
         monkeypatch.setattr(chat_handlers, "sel", lambda: mock_sel)
-        monkeypatch.setattr("kiro_crew.dashboard.slot_ownership.sel", lambda: mock_sel)
         _pin_flag(monkeypatch, True)
         state = _make_state(tmp_path)
         slot = _ChatSlot("s1")
@@ -452,7 +451,6 @@ class TestSummaryGenerateEndpoint:
         be the laxer of the two (App Kit §5.2)."""
         mock_sel = MagicMock()
         monkeypatch.setattr(chat_handlers, "sel", lambda: mock_sel)
-        monkeypatch.setattr("kiro_crew.dashboard.slot_ownership.sel", lambda: mock_sel)
         _pin_flag(monkeypatch, True)
         called = _stub_generation(monkeypatch)
         state = _make_state(tmp_path)

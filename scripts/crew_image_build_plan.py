@@ -89,10 +89,12 @@ def logical_instructions(text: str) -> list[str]:
     The Dockerfile parser strips whole-line comments even inside a
     backslash-continued instruction, so that is mirrored before joining.
 
-    This is the single Dockerfile instruction reader in the repository.
-    ``test/test_docker_wheel_layer_contract.py`` reads recipes for its own
-    ratchet by calling this through a thin per-file wrapper (``_instructions``),
-    so the two gates cannot classify the same recipe differently.
+    ``test/test_docker_wheel_layer_contract.py`` reads recipes the same way for
+    its own ratchet, against one hard-coded path rather than a caller's text.
+    The two are held byte-equal by a parity test in
+    ``test/test_crew_image_build_plan.py``, so this reader is a deliberate copy
+    and a divergence fails a test rather than silently classifying a recipe one
+    way here and another way there.
     """
     logical: list[str] = []
     pending = ""

@@ -1,12 +1,12 @@
 ---
 title: An owner-written MCP autoApprove is respected
-status: implemented
+status: accepted
 author: Bolin Chen
 created: 2026-09-27
-last-audited: 2026-10-06
-audited-at: 9348a25a34
+last-audited: 2026-09-27
+audited-at: 94bcda2f75
 doc-pr: null
-implementation-prs: [14394]
+implementation-prs: []
 tracking-issues: []
 supersedes: []
 superseded-by: []
@@ -14,7 +14,6 @@ superseded-by: []
 
 # RFC: An owner-written MCP autoApprove is respected
 
-- Status: implemented in #14394. `mcp.honour_auto_approve` defaults to on.
 - Changed default: `mcp.honour_auto_approve` goes from off to ON.
 - The enterprise governance ceiling is unchanged and still wins.
 

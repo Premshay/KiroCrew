@@ -1331,6 +1331,11 @@ class TestLauncherAdvisoryIsNotARefusal:
         # /tmp names the wrong cause.
         assert str(excinfo.value) == self._FATAL
 
+    @pytest.mark.skipif(
+        not hasattr(os, "getuid"),
+        reason="the namespace launcher is POSIX-only: _build_launcher_script reads "
+        "os.getuid(), which Windows has not got",
+    )
     def test_the_launcher_emits_no_severity_the_classifier_does_not_know(self):
         """Ratchet the coupling: `_WARNING` above is a hand-typed copy of the real text.
 
@@ -1343,24 +1348,13 @@ class TestLauncherAdvisoryIsNotARefusal:
 
         Pinned as the SET of severities the launcher can emit, so adding one is a
         deliberate edit here plus a decision about which side of the prefix it falls
-        on -- rather than a silent reclassification. Read from every string literal
-        of the launcher program's source (an f-string by its literal head), which is
-        the text the renderer emits, so a line no test triggers is still counted.
+        on -- rather than a silent reclassification.
         """
-        from kiro_crew import sandbox_launcher
+        from kiro_crew.sandbox import _build_launcher_script
 
-        literals: list[str] = []
-        for node in ast.walk(ast.parse(sandbox_launcher.launcher_program_source())):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                literals.append(node.value)
-            elif isinstance(node, ast.JoinedStr) and node.values:
-                head = node.values[0]
-                if isinstance(head, ast.Constant) and isinstance(head.value, str):
-                    literals.append(head.value)
         severities = {
             token.split()[0]
-            for literal in literals
-            for token in re.findall(r"sandbox: ([^'\"%\\\n]+)", literal)
+            for token in re.findall(r"sandbox: ([^'\"%\\\n]+)", _build_launcher_script("strict"))
         }
 
         assert severities == {

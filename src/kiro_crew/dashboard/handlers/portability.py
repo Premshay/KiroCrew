@@ -40,10 +40,6 @@ _MAX_IMPORT_BYTES = 2 * 1024**3
 #: Export response header naming the agent templates the bundle does not carry.
 UNBUNDLED_TEMPLATES_HEADER = "X-Kirocrew-Unbundled-Templates"
 
-#: Export response header: how many chats were left out so the archive stays within
-#: what import accepts (`portability._export_sessions`). A bare non-negative integer.
-SESSIONS_SKIPPED_SIZE_HEADER = "X-Kirocrew-Sessions-Skipped-Size"
-
 
 def _sel():
     return _sel_fn()
@@ -84,9 +80,6 @@ async def api_portability_export(request: web.Request) -> web.Response:
     subject that is not the owner (an allow-listed messaging user holding a
     ``!dashboard`` token, say) must not be able to pull it. This aggregate export
     requires owner permission independently of member memory visibility.
-
-    ``?include_sessions=true`` adds the persistent dashboard chats
-    (`portability._export_sessions`); without it the archive carries none.
     """
     if "user" not in request or not request["user"]:
         return web.json_response(
@@ -96,12 +89,8 @@ async def api_portability_export(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     caller = request["user"]
-    # Opt-in per export: chats ride only when this request asks for them.
-    include_sessions = request.query.get("include_sessions", "").lower() in ("1", "true")
     try:
-        zip_bytes, manifest = await asyncio.to_thread(
-            create_export_zip, include_sessions=include_sessions
-        )
+        zip_bytes, manifest = await asyncio.to_thread(create_export_zip)
     except Exception as e:
         logger.exception("Export failed")
         _sel().log_api_access(
@@ -115,20 +104,11 @@ async def api_portability_export(request: web.Request) -> web.Response:
     ts = manifest.get("created_at", "unknown").replace(":", "").replace("-", "")
     filename = f"kirocrew-export-{ts}.zip"
 
-    contents = manifest.get("contents", {})
-    skipped_size = contents.get("sessions_skipped_size", 0)
-    if not isinstance(skipped_size, int) or isinstance(skipped_size, bool) or skipped_size < 0:
-        skipped_size = 0
     _sel().log_api_access(
         caller=caller,
         operation="portability.export",
         outcome="ok",
-        resources=f"size={len(zip_bytes)}"
-        + (
-            f",sessions={contents.get('session_count', 0)},sessions_skipped_size={skipped_size}"
-            if include_sessions
-            else ""
-        ),
+        resources=f"size={len(zip_bytes)}",
     )
 
     headers = {
@@ -143,8 +123,6 @@ async def api_portability_export(request: web.Request) -> web.Response:
     unbundled, more = await asyncio.to_thread(unbundled_agent_templates)
     if unbundled:
         headers[UNBUNDLED_TEMPLATES_HEADER] = json.dumps(unbundled + ([f"+{more}"] if more else []))
-    if include_sessions:
-        headers[SESSIONS_SKIPPED_SIZE_HEADER] = str(skipped_size)
     return web.Response(body=zip_bytes, content_type="application/zip", headers=headers)
 
 
@@ -152,8 +130,7 @@ async def api_portability_import(request: web.Request) -> web.Response:
     """POST /api/portability/import — upload and apply a Kiro Crew export zip.
 
     Owner-only, like the export: an import rewrites the install's memory -- every named
-    store's included -- and its config. Merge (the default) never overwrites a settings
-    document this install has; see `portability._merge_settings`.
+    store's included -- and its config.
     """
     if "user" not in request or not request["user"]:
         return web.json_response(
@@ -188,12 +165,7 @@ async def api_portability_import(request: web.Request) -> web.Response:
                 {"ok": False, "error": error, "code": "import_archive_invalid"}, status=400
             )
 
-        # The running gateway's notification-settings store, so restored mutes apply at
-        # once instead of being written back over by its in-memory copy.
-        channel_settings = getattr(request.app.get("state"), "notification_channel_settings", None)
-        summary = await asyncio.to_thread(
-            apply_import_zip, zip_path, mode, channel_settings=channel_settings
-        )
+        summary = await asyncio.to_thread(apply_import_zip, zip_path, mode)
 
         # `staging` is recorded here, not only returned. Nothing renders it, and
         # whether an import was pinned, mixed or unpinned is a security property of the

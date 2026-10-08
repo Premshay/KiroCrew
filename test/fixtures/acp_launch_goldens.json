@@ -108,7 +108,6 @@
       "KIROCREW_SESSION_KEY": "golden-session",
       "KIROCREW_SPAWNED": "1",
       "KIROCREW_STUB_SESSION_TOKEN": "<session-token>",
-      "KIRO_CLI_CLIENT_APPLICATION": "kirocrew",
       "PATH": "<augmented-path>"
     },
     "spawn_label": "kiro-cli acp",

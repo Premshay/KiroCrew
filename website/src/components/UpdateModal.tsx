@@ -27,11 +27,7 @@ function getUpdateApi(): UpdateAPI | undefined {
   return window.updateAPI
 }
 
-/**
- * `held`: another update dialog (What's new) is on screen, whose app switch
- * can itself start a download. The prompt waits for it to close.
- */
-export default function UpdateModal({ held = false }: { held?: boolean } = {}) {
+export default function UpdateModal() {
   const { data: update } = useQuery<UpdateState | null>({
     queryKey: ['update-state'],
     queryFn: () => null,
@@ -79,7 +75,7 @@ export default function UpdateModal({ held = false }: { held?: boolean } = {}) {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reset identity is stable; keying on state transition
   }, [state, stateVersion, installFor, installMutation.isSuccess])
 
-  const open = !!update && update.state === 'downloaded' && !update.replayed && !dismissed && !held
+  const open = !!update && update.state === 'downloaded' && !update.replayed && !dismissed
 
   // Escape dismisses the modal (unless an install is in flight), matching the
   // backdrop-click affordance and keeping the overlay keyboard-accessible.

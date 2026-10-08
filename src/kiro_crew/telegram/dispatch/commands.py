@@ -499,9 +499,7 @@ async def _handle_compact(
             # branch is unreachable and a slow-but-healthy session gets
             # destroyed by the outer TimeoutError.
             await asyncio.wait_for(provider.compact(), timeout=120)
-            cr = await provider.wait_for_compaction(
-                timeout=self.sessions.compact_wait_budget_secs()
-            )
+            cr = await provider.wait_for_compaction()
             if cr["type"] == "completed":
                 # ``summary`` is model-facing compacted context, not a
                 # user-facing receipt. Never publish its orchestration text.

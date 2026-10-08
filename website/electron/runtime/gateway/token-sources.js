@@ -2,13 +2,7 @@
 
 const { getRemoteHostConfig } = require("../../host-config");
 const { validateRemoteSettings } = require("../../validation");
-const { findSshBin } = require("../../find-bin");
-const {
-  buildRemoteTokenCommand,
-  buildRemoteTokenSshArgs,
-  describeSshFailure,
-  parseTokenFromStdout,
-} = require("../../remote-token");
+const { buildRemoteTokenCommand, parseTokenFromStdout } = require("../../remote-token");
 const { defaultedPort } = require("../../gateway-auth-hint");
 const { mintLocalToken: mintTokenFromHome } = require("../../local-token");
 const { resolveHome } = require("../../home-dir");
@@ -34,7 +28,6 @@ function createTokenSources({
   fs,
   path,
   http,
-  isWindows,
   log: glog,
   sendStatus,
   snapshotGatewayPortPids,
@@ -60,30 +53,20 @@ function createTokenSources({
       port: effectivePort,
       remotePath: remotePath || undefined,
     });
-    const timeoutMs = Math.max(store.get("sshTimeoutMs") || 20000, 5000);
-    const sshArgs = buildRemoteTokenSshArgs(remoteHost, remoteCommand, { timeoutMs });
-    const sshBin = findSshBin(fs, path, isWindows);
-    if (!sshBin) {
-      const error = "ssh client not found: the Windows system directory did not resolve.";
-      console.error(`Refusing SSH token fetch: ${error}`);
-      return Promise.resolve({ token: "", error });
-    }
+    const sshArgs = ["-o", "ConnectTimeout=10", remoteHost, remoteCommand];
 
     return new Promise((resolve) => {
       sendStatus("Fetching token from remote dev desktop…");
-      glog(`SSH token fetch: ${sshBin} ${remoteHost} for port ${effectivePort}`);
+      glog(`SSH token fetch: ssh ${remoteHost} for port ${effectivePort}`);
       execFile(
-        sshBin,
+        "/usr/bin/ssh",
         sshArgs,
-        { timeout: timeoutMs },
+        { timeout: Math.max(store.get("sshTimeoutMs") || 20000, 5000) },
         (error, stdout, stderr) => {
           if (error) {
             console.error("SSH token fetch failed:", error.message);
             if (stderr) console.error("SSH stderr:", stderr.trim().slice(0, 500));
-            resolve({
-              token: "",
-              error: describeSshFailure(error, stderr, { sshBin, remoteHost, timeoutMs }),
-            });
+            resolve({ token: "", error: stderr?.trim() || error.message });
             return;
           }
           resolve({ token: parseTokenFromStdout(stdout), error: null });
@@ -179,8 +162,7 @@ function createTokenSources({
       return "";
     }
     // Re-resolve the home at call time so a KIROCREW_HOME change after Electron
-    // starts is honored. The mint dials the configured loopback origin exactly
-    // as written; `mintTokenFromHome` never rewrites it to a literal address.
+    // starts is honored. Mint only against the literal loopback endpoint.
     return mintTokenFromHome({
       backendUrl: targetBackendUrl,
       resolveHome,

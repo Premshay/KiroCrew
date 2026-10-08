@@ -176,7 +176,8 @@ async def test_user_echo_reaches_only_authorized_ws_clients(
 
 
 @pytest.mark.asyncio
-async def test_in_band_send_keeps_its_existing_stream_contract(echo_state, monkeypatch):
+@pytest.mark.parametrize("relay", [False, True])
+async def test_in_band_send_keeps_its_existing_stream_contract(echo_state, monkeypatch, relay):
     published = []
     original_broadcast = echo_state.broadcast_ws
 
@@ -189,7 +190,7 @@ async def test_in_band_send_keeps_its_existing_stream_contract(echo_state, monke
     app.middlewares.insert(0, token_auth.token_auth_middleware())
     async with TestClient(TestServer(app)) as client:
         response = await client.post(
-            "/api/chat",
+            "/api/chat?relay=1" if relay else "/api/chat",
             params={"token": token_auth.generate_token("local-app")},
             json={"slot": _SLOT, "message": "in-band message", "meta": {"sendId": "s-in-band"}},
         )
@@ -202,7 +203,10 @@ async def test_in_band_send_keeps_its_existing_stream_contract(echo_state, monke
         ]
         assert [row["type"] for row in rows] == ["assistant"]
         assert rows[0]["content"] == "reply"
-        assert "meta" not in rows[0]
+        if relay:
+            assert rows[0]["meta"]["mid"]
+        else:
+            assert "meta" not in rows[0]
         users = [row for row in echo_state.get_slot(_SLOT).messages if row["role"] == "user"]
         assert len(users) == 1
         assert users[0]["content"] == "in-band message"

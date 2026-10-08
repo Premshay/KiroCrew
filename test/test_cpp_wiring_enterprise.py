@@ -16,12 +16,9 @@ the suite is self-contained.
 from __future__ import annotations
 
 import dataclasses
-import os
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pytest
-from test_sandbox_launcher_program import rendered_payload
 
 from kiro_crew import agent, sandbox
 from kiro_crew.config.loader import KiroCrewConfig
@@ -147,13 +144,13 @@ def test_seatbelt_profile_hides_sso(enterprise_ctx) -> None:
 
 
 def test_launcher_script_hides_sso(enterprise_ctx, monkeypatch) -> None:
-    """The wired ``_build_launcher_script`` carries ``~/.sso`` in its mask list."""
+    """The wired ``_build_launcher_script`` embeds ``.sso`` in SENSITIVE_DIRS."""
     # The script builder asks the host's ``ssh -V`` for the accept-new flag (once per
     # process, cached). The flag is not what this asserts, so the probe is pinned:
     # no host binary, and no dependence on which test in the worker ran first.
     monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
-    masked = rendered_payload(sandbox._build_launcher_script("strict"))["sensitive_dirs"]
-    assert os.path.join(str(Path.home()), ".sso") in masked
+    script = sandbox._build_launcher_script("strict")
+    assert ".sso" in script
 
 
 # ── Task 3: security deny floor extended (via the hooks caller) ──

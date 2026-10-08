@@ -322,9 +322,6 @@ def _stub_restricted(monkeypatch):
     monkeypatch.setattr(art_handlers, "_is_restricted_session", _stub)
 
 
-_OWNER = "U_OWNER"
-
-
 def _request(
     *,
     body: dict | None = None,
@@ -337,15 +334,9 @@ def _request(
     req.query = {}
     encoded = json.dumps(body).encode() if body is not None else b""
     req.read = AsyncMock(return_value=encoded)
-    state = state if state is not None else MagicMock()
-    # The dashboard owner: the artifact write routes refuse any other subject.
-    state.owner_id = _OWNER
-    req.app = {"state": state, "_restricted_session": False}
-    # Dashboard-origin claims (no app token) for the signed-in owner.
-    claims = {"user": _OWNER, "app": ""}
-    req.get = MagicMock(side_effect=lambda key, default=None: claims.get(key, default))
-    req.__contains__ = MagicMock(side_effect=claims.__contains__)
-    req.__getitem__ = MagicMock(side_effect=claims.__getitem__)
+    req.app = {"state": state if state is not None else MagicMock(), "_restricted_session": False}
+    # request.get("app", "") — dashboard-origin (no app token)
+    req.get = MagicMock(return_value="")
     return req
 
 

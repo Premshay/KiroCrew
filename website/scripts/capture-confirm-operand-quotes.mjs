@@ -19,8 +19,7 @@
  *   “Everything” starts completely fresh. / Delete “Everything” and all of
  *   its files? — and fails on the bare string.
  *   --before mode inverts those two assertions (run it against base
- *   catalogs, e.g. after `git checkout <base> -- <locale files>`) and expects
- *   them BARE.
+ *   catalogs, e.g. with the locale changes stashed) and expects them BARE.
  *
  * Usage:
  *   npx vite --host 127.0.0.1 --port 6823 --strictPort   # in another shell

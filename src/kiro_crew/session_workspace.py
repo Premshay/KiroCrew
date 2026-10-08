@@ -8,7 +8,6 @@ import shutil
 from pathlib import Path
 
 from kiro_crew.config.paths import config_dir
-from kiro_crew.owner_only_files import mkdirs_owner_only, owner_only_opener, write_text_owner_only
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,7 @@ def is_valid_id(value: str) -> bool:
 def workspace_dir(session_id: str) -> Path:
     """Return ~/.kiro/crew/sessions/{session_id}/, creating if needed."""
     d = config_dir() / _SESSIONS_DIR / _validate_id(session_id, "session_id")
-    mkdirs_owner_only(d)  # transcripts and sub-agent results: 0700
+    d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -58,7 +57,7 @@ def history_path(session_id: str) -> Path:
 def append_history(session_id: str, entry: dict) -> None:
     """Append a JSONL entry to the session's history.jsonl."""
     p = history_path(session_id)
-    with open(p, "a", encoding="utf-8", opener=owner_only_opener) as f:
+    with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
@@ -86,14 +85,14 @@ def result_path(session_id: str, agent_id: str) -> Path:
 def write_result(session_id: str, agent_id: str, content: str) -> Path:
     """Write sub-agent result to agent-{id}.md. Returns path."""
     p = result_path(session_id, agent_id)
-    write_text_owner_only(p, content)
+    p.write_text(content, encoding="utf-8")
     return p
 
 
 def append_result(session_id: str, agent_id: str, chunk: str) -> Path:
     """Append a chunk to a sub-agent result file (streaming). Returns path."""
     p = result_path(session_id, agent_id)
-    with open(p, "a", encoding="utf-8", opener=owner_only_opener) as f:
+    with p.open("a", encoding="utf-8") as f:
         f.write(chunk)
     return p
 

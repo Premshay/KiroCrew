@@ -1,4 +1,4 @@
-"""Tests for the agent sync prune logic, ``_do_agents_sync`` in dashboard/agent_admin/installed_agents.py."""
+"""Tests for agent sync prune logic in dashboard/handlers/agents.py."""
 
 from __future__ import annotations
 

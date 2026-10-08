@@ -46,7 +46,6 @@ from typing import Any
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.owner_only_files import ensure_directory, owner_only_opener_for
 from kiro_crew.platform_compat import is_link_or_junction
 from kiro_crew.sel import sel
 
@@ -91,7 +90,7 @@ def _audit(operation: str, resource: str, *, outcome: str) -> None:
 def data_dir(root: Path | None = None) -> Path:
     """Return the app's data dir, creating it if missing."""
     data = root if root is not None else app_data_dir(k.APP_NAME)
-    ensure_directory(data)
+    data.mkdir(parents=True, exist_ok=True)
     return data
 
 
@@ -125,7 +124,7 @@ def ensure_data_dirs(root: Path | None = None) -> Path:
     """
     data = data_dir(root)
     for name in k.DATA_SUBDIRS:
-        ensure_directory(data / name)  # meeting notes: 0700 in the data home
+        (data / name).mkdir(parents=True, exist_ok=True)
     dictionary = data / k.DICTIONARY_FILE
     if not dictionary.exists():
         atomic_write(dictionary, SEED_DICTIONARY)
@@ -227,7 +226,7 @@ def _read_json(path: Path, default: Any) -> Any:
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    ensure_directory(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, json.dumps(payload, indent=2))
 
 
@@ -534,9 +533,8 @@ def append_transcript(
         payload = separator + encoded
         if current_size + len(payload) > k.MAX_TRANSCRIPT_BYTES:
             return None
-        ensure_directory(path.parent)
-        # 0600 from creation inside the data home; a root outside it is unchanged.
-        with open(path, "ab", opener=owner_only_opener_for(path)) as transcript:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("ab") as transcript:
             transcript.write(payload)
             transcript.flush()
             os.fsync(transcript.fileno())
@@ -756,7 +754,7 @@ def ensure_agent_files(
         fpath = agent_output_path(meeting_id, fname, root)
         if fpath.exists():
             continue
-        ensure_directory(fpath.parent)
+        fpath.parent.mkdir(parents=True, exist_ok=True)
         seed = f"# {title}\n\n" if agent_def.get("widget_type") != "html" else ""
         atomic_write(fpath, seed)
         created.append(fname)
@@ -791,7 +789,7 @@ def write_agent_output(
     if not fname:
         return
     path = agent_output_path(meeting_id, fname, root)
-    ensure_directory(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, content)
 
 
@@ -955,7 +953,7 @@ def write_agent_edit(
         raise MeetingsPathError(
             "this agent has no output file to edit", status=409, code="agent_has_no_output"
         )
-    ensure_directory(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
     # ``newline=""`` — the byte-for-byte promise again: the default translation
     # rewrites ``\n`` to ``\r\n`` on Windows, and a document that is read back,
     # edited and saved would accumulate carriage returns on every round trip.

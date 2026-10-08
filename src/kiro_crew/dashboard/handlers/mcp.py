@@ -69,7 +69,6 @@ from kiro_crew.mcp_utils import (
     INTERNAL_SCOPES_KEY,
     apply_kiro_oauth_hints,
     mcp_server_alias,
-    without_mcp_refs,
 )
 from kiro_crew.platform.governance import may_skip_gate_now
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -414,13 +413,10 @@ def _sync_mcp_to_agent_unlocked(name: str, enabled: bool, *, remove: bool = Fals
                 changed = True
         if "allowedTools" not in keys:
             stale = cfg.get("allowedTools")
-            if isinstance(stale, list):
-                # A grant written before the ceiling arrived must not survive it,
-                # in either spelling.
-                kept = without_mcp_refs(stale, (alias,))
-                if len(kept) != len(stale):
-                    stale[:] = kept
-                    changed = True
+            if isinstance(stale, list) and tool_ref in stale:
+                # A grant written before the ceiling arrived must not survive it.
+                stale.remove(tool_ref)
+                changed = True
         if not changed:
             return
         if "allowedTools" not in keys:
@@ -446,12 +442,10 @@ def _sync_mcp_to_agent_unlocked(name: str, enabled: bool, *, remove: bool = Fals
             )
     # On disable/remove, clean up any @server-name refs the user may have added
     if not enabled or remove:
-        stale_servers = (alias, name)
+        stale_refs = {f"@{alias}", f"@{name}"}
         tool_ref = f"@{alias}"
-        cfg["tools"] = without_mcp_refs(cfg.get("tools", []), stale_servers, per_tool=False)
-        # Per-tool grants go too: ``@server/tool`` in allowedTools auto-approves
-        # that tool just as the bare ref does for the whole server.
-        cfg["allowedTools"] = without_mcp_refs(cfg.get("allowedTools", []), stale_servers)
+        cfg["tools"] = [t for t in cfg.get("tools", []) if t not in stale_refs]
+        cfg["allowedTools"] = [t for t in cfg.get("allowedTools", []) if t not in stale_refs]
         sel().log_api_access(
             caller="system",
             operation="mcp_tools_removed",
@@ -569,11 +563,9 @@ def _sync_mcp_to_agent_batch_unlocked(names: list[str], enabled: bool) -> None:
                     changed = True
             if "allowedTools" not in keys:
                 stale = cfg.get("allowedTools")
-                if isinstance(stale, list):
-                    kept = without_mcp_refs(stale, (alias,))
-                    if len(kept) != len(stale):
-                        stale[:] = kept
-                        changed = True
+                if isinstance(stale, list) and tool_ref in stale:
+                    stale.remove(tool_ref)
+                    changed = True
         if changed:
             if granted_refs:
                 sel().log_api_access(
@@ -602,12 +594,13 @@ def _sync_mcp_to_agent_batch_unlocked(names: list[str], enabled: bool) -> None:
         refs_to_remove = {f"@{name}" for name in names} | {
             f"@{mcp_server_alias(name)}" for name in names
         }
-        servers_to_remove = tuple(names) + tuple(mcp_server_alias(name) for name in names)
-        cfg["tools"] = without_mcp_refs(cfg.get("tools", []), servers_to_remove, per_tool=False)
-        cfg["allowedTools"] = without_mcp_refs(cfg.get("allowedTools", []), servers_to_remove)
+        cfg["tools"] = [t for t in cfg.get("tools", []) if t not in refs_to_remove]
+        cfg["allowedTools"] = [t for t in cfg.get("allowedTools", []) if t not in refs_to_remove]
         # Mark the entries too — a dropped ref alone does not stop a server that
         # a live session is already running (see the single-server path).
-        _mark_agent_entries_disabled(cfg, servers_to_remove)
+        _mark_agent_entries_disabled(
+            cfg, tuple(names) + tuple(mcp_server_alias(name) for name in names)
+        )
         changed = True
         sel().log_api_access(
             caller="system",
@@ -3819,7 +3812,7 @@ def _collect_server_rows() -> dict[str, dict[str, Any]]:
                     # measurement belongs to one execution identity, and the probe
                     # only ever runs the definition that won the merge, so a second
                     # distinct launch here means the row covers something nobody
-                    # measured. Hashing opens no file the launch names.
+                    # measured. Hashing is pure -- no file is opened.
                     "launch_ids": set(),
                 }
                 rows[name] = row

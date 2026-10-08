@@ -18,23 +18,9 @@ from typing import Any
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
-from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew.apps.builtins.mochi import hooks
 from kiro_crew.apps.builtins.mochi.backend import routes
-
-
-def _owner_request(*args, **kwargs):
-    """A mocked request that reads as the dashboard owner.
-
-    The mutating routes are owner-gated, and the gate reads
-    ``request.app["state"]`` plus the claims the token middleware sets.
-    """
-    req = make_mocked_request(*args, **kwargs)
-    req.app["state"] = NoConfiguredOwner()
-    req["user"] = "local-app"
-    req["app"] = ""
-    return req
 
 
 class _Ctx:
@@ -71,7 +57,7 @@ async def _live_runtime(tmp_path):
 
 
 def _post(body: dict | None):
-    req = _owner_request(
+    req = make_mocked_request(
         "POST", "/api/apps/mochi/pet-event", headers={"Content-Type": "application/json"}
     )
 

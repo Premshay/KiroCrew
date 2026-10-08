@@ -23,11 +23,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 
 const runnerScript = `
-import { extractAll, generateAgentRegistryJson, generateRegistrySource, panelRoots } from './scripts/settingsExtract'
+import { extractAll, generateAgentRegistryJson, generateRegistrySource } from './scripts/settingsExtract'
 import * as path from 'path'
 import * as fs from 'fs'
 
-const { entries, skipped } = extractAll(panelRoots(path.resolve(${JSON.stringify(ROOT)}, 'src')))
+const settingsDir = path.resolve(${JSON.stringify(ROOT)}, 'src/pages/settings')
+const { entries, skipped } = extractAll(settingsDir)
 
 // Minimum-count floor. The extractor matches JSX by regex, so a change to how labels
 // are written (e.g. the i18n conversion swapping \`label="X"\` for

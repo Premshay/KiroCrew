@@ -530,8 +530,6 @@ export interface BackupRunResult {
  * Result of `POST /backup/{account}/restore`. Nothing is hot-swapped: the
  * archive is downloaded to a local staging folder and `path` is where it landed.
  * `origin` and `install` echo whose archive was restored, resolved from the key.
- * `recovered` is true when something else had written over the key and the
- * bytes handed back are the version this install recorded uploading.
  */
 export interface BackupRestoreResult {
   downloaded: true
@@ -539,7 +537,6 @@ export interface BackupRestoreResult {
   bytes: number
   origin: BackupOrigin
   install: string
-  recovered: boolean
 }
 
 /** Payload of `GET /iam-policy` — the exact permissions to paste, as JSON text. */

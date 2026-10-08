@@ -150,7 +150,6 @@ def _stub(backend: str = GOOSE) -> AcpClient:
     client._modes_advertised = False
     client._session_key = ""
     client._agent = ""
-    client._spec_zero_tools = False
     return client
 
 

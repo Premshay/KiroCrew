@@ -922,10 +922,7 @@ def validate_refresh_token(token: str) -> tuple[bool, str, str, str, str, float]
     except (ValueError, TypeError):
         return False, "", "malformed token", "", "", 0.0
     expected = _sign(payload_bytes)
-    # Compared as BYTES: the signature comes off a request cookie, and
-    # ``hmac.compare_digest`` raises TypeError on a str holding a non-ASCII
-    # character, which turned a forged cookie into a 500 instead of a denial.
-    if not hmac.compare_digest(expected.encode(), sig.encode("utf-8", "surrogatepass")):
+    if not hmac.compare_digest(sig, expected):
         return False, "", "bad signature", "", "", 0.0
     try:
         payload = json.loads(payload_bytes)

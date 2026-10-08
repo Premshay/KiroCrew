@@ -5,7 +5,7 @@ import { sseTodoUpdate, sseMcpReportUpdate, sseSlotTitle, triggerRefresh, fetchS
 import { addNotification, ackNotificationByTs, unackNotificationByTs, clearAllNotifications } from '../store/notificationsSlice'
 import { dispatchMcNotification, dispatchLiveNotification } from './notificationEvent'
 import {
-  fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, refreshSlot, sseContextUsage, clearMessages, clearSlotCache, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, sseMcpAppRender, sseSideQueue, queueEntryAttachments, isTerminalWorkflowStatus,
+  fetchHistory, startRemoteTurn, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, refreshSlot, sseContextUsage, clearMessages, clearSlotCache, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, sseMcpAppRender, sseSideQueue, queueEntryAttachments, isTerminalWorkflowStatus,
 } from '../store/chatSlice'
 import { store } from '../store'
 import { TAB_ID } from '../api/tabId'
@@ -17,11 +17,6 @@ import {
   readSessionProjectionFrame,
   refetchSessionProjections,
 } from './websocket/sessionProjection'
-import {
-  onUsageFrame,
-  rereadAllContextTraces,
-  resetContextTraceRefresh,
-} from './websocket/contextTraceRefresh'
 import {
   fetchingAnyFoldQuery,
   invalidateBelowFloor,
@@ -44,7 +39,6 @@ import { useBundleReload, handleUpdateProgress } from './websocket/bundleReload'
 import {
   handleArtifactUpdate,
   handleCredentialRedactionChanged,
-  handleDashboardMoved,
   handleMemberProjection,
   handleMembersSubscribed,
   handleSourceStatus,
@@ -68,11 +62,6 @@ import { runFirstConnect, runReconnectCatchUp } from './websocket/reconnectCatch
    constants and thaw grace test/test_ws_status_cadence_contract.py reads
    from this file. Every export below keeps its original import path. */
 export { __resetRedactionHealForTests, healRedactionSwitchAfterReconnect } from './websocket/serverState'
-// The crewmate dashboard's cache prefix and its frame handler, reached through
-// this facade like every other owner binding. Both are named so a caller can
-// invalidate the same key the handler invalidates: a second spelling of that
-// prefix would let a refresh reach a different cache entry from the frame.
-export { MEMBER_DASHBOARD_QUERY_PREFIX, handleDashboardMoved } from './websocket/serverState'
 export { identityOf, askIdsOf, reconcileQuestions, staleAskIds } from './websocket/composerCards'
 export { resolvedSince } from './websocket/retiredIds'
 export { UPDATE_RESTART_LATCH_KEY, UPDATE_RESTART_LATCH_TTL_MS, consumeUpdateRestartLatch } from './websocket/bundleReload'
@@ -87,13 +76,6 @@ export {
   readSessionProjectionFrame,
   refetchSessionProjections,
 } from './websocket/sessionProjection'
-export {
-  COALESCE_MS as CONTEXT_TRACE_COALESCE_MS,
-  contextTraceKey,
-  onUsageFrame,
-  rereadAllContextTraces,
-  resetContextTraceRefresh,
-} from './websocket/contextTraceRefresh'
 export {
   baselineOrHeld,
   fetchingAnyFoldQuery,
@@ -183,8 +165,6 @@ export function useWebSocket() {
       // which a restarted gateway's frames would all fall below. One re-read per
       // connection re-bases it on the process now serving.
       void queryClient.invalidateQueries({ queryKey: ['crew-log-projections'] }, { cancelRefetch: false })
-      // The Context tab's usage revisions belong to the previous process too.
-      resetContextTraceRefresh()
       // Cache auto-speak preference
       voice.refreshAutoSpeak()
       const catchUp = {
@@ -198,9 +178,6 @@ export function useWebSocket() {
         syncWorkflowRuns,
       }
       if (socket.wasConnectedRef.current) {
-        // No frame could arrive while the socket was down (a gateway restart is
-        // one), so the Context tab's trace may have moved unseen: read it once.
-        rereadAllContextTraces(queryClient)
         runReconnectCatchUp(ws, catchUp)
         return
       }
@@ -332,12 +309,6 @@ export function useWebSocket() {
             }
             break
           }
-          case 'dashboard_value_written':
-            // A crewmate wrote one of its own dashboard fields mid-turn. The frame
-            // carries only {slug}; the tab's refetch re-asks the server, which
-            // re-composes the page and re-checks ownership.
-            handleDashboardMoved(queryClient, data)
-            break
           case 'notification_ack':
             dispatch(ackNotificationByTs(data.ts))
             break
@@ -421,10 +392,6 @@ export function useWebSocket() {
           }
           case 'member_projection':
             handleMemberProjection(data)
-            // A fold advanced. Every number on a crewmate's dashboard but its own
-            // agentic writes comes from a fold, so this is the other half of the
-            // tab's liveness -- see `handleDashboardMoved`.
-            handleDashboardMoved(queryClient, data)
             break
           case 'members_subscribed':
             handleMembersSubscribed(queryClient, data)
@@ -543,7 +510,7 @@ export function useWebSocket() {
             break
           }
           case 'subagent_spawn':
-            dispatch(sseSubagentSpawn(data as { slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string; batch_id?: string }))
+            dispatch(sseSubagentSpawn(data as { slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string; controllable?: boolean }))
             break
           case 'subagent_queued':
             // The count plus the gate's optional `reason` label (absent from an
@@ -573,7 +540,7 @@ export function useWebSocket() {
             // Flush any buffered chunks before the done event, so the final
             // streaming text is visible before the agent transitions to done.
             buffers.flushSubagentChunks()
-            dispatch(sseSubagentDone(data as { slot: string; id: string; elapsed: number; credits?: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; requested_model?: string; batch_id?: string; result?: string }))
+            dispatch(sseSubagentDone(data as { slot: string; id: string; elapsed: number; credits?: number; error?: string; stopped?: boolean; reported?: boolean; controllable?: boolean; outcome?: 'completed' | 'failed' | 'stopped' | 'reported'; task?: string; agent?: string; model?: string; requested_model?: string; result?: string }))
             break
           case 'app_reload':
             emitAppReload(data as { app: string })
@@ -581,7 +548,7 @@ export function useWebSocket() {
           case 'subagent_snapshot': {
             // Clear any buffered chunks for this agent — the snapshot's streaming
             // field is authoritative and already includes any in-flight text.
-            const snapData = data as { id: string; slot: string; task: string; agent: string; model?: string; requested_model?: string; batch_id?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean }
+            const snapData = data as { id: string; slot: string; task: string; agent: string; model?: string; requested_model?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean; controllable?: boolean }
             buffers.dropSubagentKey(snapData.slot, snapData.id)
             dispatch(sseSubagentSnapshot(snapData))
             break
@@ -638,10 +605,6 @@ export function useWebSocket() {
             if (applySessionProjection(queryClient, frame) === 'refetch') {
               refetchSessionProjections(queryClient, frame.slot)
             }
-            // A `usage` frame also means the Context tab's trace moved. The frame
-            // is one unit's fold and the trace joins the slot's units, so it is a
-            // signal to re-read, not a value to apply.
-            onUsageFrame(queryClient, frame)
             break
           }
           case 'slot_projection/subscribed':
@@ -747,7 +710,20 @@ export function useWebSocket() {
           }
           case 'chat_status':
             if (data.slot && data.status) {
+              // Emitted only after the server admitted this turn, so it ends the
+              // optimistic pre-send window (see `startRemoteTurn`).
+              dispatch(startRemoteTurn(data.slot))
               dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', label: data.status, ts: Date.now() }))
+            }
+            // `queue_pop` is normally the event that retires this card. A
+            // reconnect can miss that short-lived frame while still receiving
+            // the successor turn's status and chunks, leaving a card visible
+            // for text already running. The runner repeats the consumed IDs on
+            // this immediate status frame, so repair only those exact cards.
+            if (data.slot && Array.isArray((data as { queue_ids?: unknown }).queue_ids)) {
+              for (const queueId of (data as { queue_ids: unknown[] }).queue_ids) {
+                if (typeof queueId === 'string') dispatch(removeQueuedMessage({ slot: data.slot, queue_id: queueId }))
+              }
             }
             break
           case 'chat_variant_switch':
@@ -901,6 +877,8 @@ export function useWebSocket() {
       document.removeEventListener('visibilitychange', onVisibility)
     }
   }, [socket, forceReconnect])
+
+
 
   useEffect(() => {
     socket.resume()

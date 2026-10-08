@@ -17,15 +17,14 @@ from kiro_crew.dashboard.chat_title import (
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE, _ChatSlot
 
 
-def _fake_state(*slots):
+def _fake_state():
     state = MagicMock()
     # conversation_log must be truthy for _persist_title to attempt a write.
     state.conversation_log = MagicMock()
     # A restricted slot's title write looks up ``state._slots`` for a live
     # same-key replacement to pre-tighten; a bare MagicMock there would pose
-    # as one at every key. The background titler only writes for the slot
-    # that still holds its key, so a titled slot is registered here.
-    state._slots = {s.key: s for s in slots}
+    # as one at every key. No slot is registered in these tests.
+    state._slots = {}
     return state
 
 
@@ -216,8 +215,8 @@ class TestAutoTitleInFlightGuard:
         from kiro_crew.dashboard import chat_title
 
         async def _scenario():
+            state = _fake_state()
             slot = _ChatSlot("chat-4-1783603256")
-            state = _fake_state(slot)
             slot.messages.append({"role": "user", "content": "debug my flaky test"})
             first_started = asyncio.Event()
             release_first = asyncio.Event()
@@ -309,7 +308,7 @@ class TestSkipFallbackBranch:
 
         from kiro_crew.dashboard import chat_title
 
-        state = _fake_state(slot)
+        state = _fake_state()
 
         async def _skip(*_a, **_k):
             return ""  # simulate SKIP/empty
@@ -360,7 +359,7 @@ class TestAutoTitleRunsForEveryMemoryMode:
 
         from kiro_crew.dashboard import chat_title
 
-        state = _fake_state(slot)
+        state = _fake_state()
         attempts = []
 
         async def _generate(_state, messages, *, session_key: str = ""):

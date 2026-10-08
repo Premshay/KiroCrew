@@ -26,19 +26,16 @@ from __future__ import annotations
 import sys
 
 import pytest
-from test_sandbox_launcher_program import launch
 
 import kiro_crew.sandbox as sb
-from kiro_crew import sandbox_launcher_program as program
-from kiro_crew.sandbox_plan import namespace_payload
 
 
 @pytest.fixture(autouse=True)
 def _no_host_ssh_probe(monkeypatch):
-    """The namespace plan asks the HOST's ``ssh -V`` for accept-new support.
+    """``_build_launcher_script`` asks the HOST's ``ssh -V`` for accept-new support.
 
-    The env scrub lists the plan hands the launcher do not depend on that answer, and
-    a real ssh spawned from the test process is a host dependency this module is not
+    The env scrub lists read out of the launcher do not depend on that answer, and a
+    real ssh spawned from the test process is a host dependency this module is not
     about (it tests the SOCKET forward, never the client). Pinned so no binary runs.
     """
     monkeypatch.setattr(sb, "_ssh_supports_accept_new", lambda: True)
@@ -153,63 +150,42 @@ def test_seatbelt_scrub_keys_on_omits_socket_only(monkeypatch):
     assert "AWS_SECRET_ACCESS_KEY" in keys
 
 
-# --- Site 1: Linux namespace launcher (POSIX-only) ---
+# --- Site 1: Linux namespace launcher script (POSIX-only) ---
 
-# The namespace plan reads os.getuid(), which does not exist on Windows; the launcher
-# never runs there.
+# _build_launcher_script builds the Linux user-namespace launcher and calls
+# os.getuid(), which does not exist on Windows; the launcher never runs there.
 _linux_only = pytest.mark.skipif(
     sys.platform == "win32", reason="Linux namespace launcher is POSIX-only (os.getuid)"
 )
 
 
-def _launcher_child_env(tmp_path, **kwargs) -> tuple[tuple[str, ...], dict[str, str]]:
-    """The plan's scrub list, and the environment the launcher child execs the agent with.
-
-    The plan is built the way ``_build_launcher_script`` builds it, then its payload
-    drives the program's own ``scrub_env`` stage over an environment carrying the
-    socket and a credential.
-    """
-    plan = sb._spawn_plan("namespace", "strict", **kwargs)
-    run = launch(tmp_path, namespace_payload(plan), environ=_env_with_socket())
-    program.scrub_env(run)
-    return plan.env_scrub_prefixes, run.environ
-
-
 @_linux_only
-def test_launcher_off_scrubs_socket(tmp_path):
+def test_launcher_off_scrubs_socket():
     """forward=False (default): the launcher lists SSH_AUTH_SOCK to delete."""
-    prefixes, child_env = _launcher_child_env(tmp_path, strip_python_env=True)
-    # Negative + control: the socket prefix AND another credential prefix are both in
-    # the launcher's scrub list, and both keys are gone from the child's environment.
-    assert "SSH_AUTH_SOCK" in prefixes
-    assert "AWS_SECRET" in prefixes
-    assert "SSH_AUTH_SOCK" not in child_env
-    assert "AWS_SECRET_ACCESS_KEY" not in child_env
-    assert child_env["PATH"] == "/usr/bin"
+    script = sb._build_launcher_script("strict", strip_python_env=True)
+    # Negative + control in one string: the socket prefix AND another credential
+    # prefix both appear in the launcher's ENV_PREFIXES payload.
+    assert "SSH_AUTH_SOCK" in script
+    assert "AWS_SECRET" in script
 
 
 @_linux_only
-def test_launcher_on_keeps_socket_only(tmp_path):
+def test_launcher_on_keeps_socket_only():
     """forward=True: the launcher omits SSH_AUTH_SOCK from its scrub, but still lists
     the other credential prefixes."""
-    prefixes, child_env = _launcher_child_env(
-        tmp_path, strip_python_env=True, forward_ssh_auth_sock=True
-    )
-    # Positive: socket prefix dropped from the delete set, so the child keeps the
-    # socket with its exact value.
-    assert "SSH_AUTH_SOCK" not in prefixes
-    assert child_env["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
-    # Control (same launch): a real credential prefix is STILL in the delete set,
+    script = sb._build_launcher_script("strict", strip_python_env=True, forward_ssh_auth_sock=True)
+    # Positive: socket prefix dropped from the delete set.
+    assert '"SSH_AUTH_SOCK"' not in script
+    # Control (same script): a real credential prefix is STILL in the delete set,
     # proving the launcher scrub itself is intact.
-    assert "AWS_SECRET" in prefixes
-    assert "AWS_SECRET_ACCESS_KEY" not in child_env
+    assert "AWS_SECRET" in script
 
 
 # --- Scope: the forward is agent-only; generic launchers keep scrubbing ---
 
 
 @_linux_only
-def test_generic_launcher_default_never_forwards_socket(tmp_path):
+def test_generic_launcher_default_never_forwards_socket():
     """A generic (non-agent) launcher build defaults forward_ssh_auth_sock=False,
     so an app openCommand / sandboxed_spawn_argv spawn through the same builder
     keeps scrubbing the socket even if an operator opted in for AGENT spawns.
@@ -218,9 +194,8 @@ def test_generic_launcher_default_never_forwards_socket(tmp_path):
     only, never read from config inside the generic builder.
     """
     # No forward_ssh_auth_sock argument == the generic caller's default.
-    prefixes, child_env = _launcher_child_env(tmp_path, strip_python_env=True)
-    assert "SSH_AUTH_SOCK" in prefixes  # socket still scrubbed for generic callers
-    assert "SSH_AUTH_SOCK" not in child_env
+    script = sb._build_launcher_script("strict", strip_python_env=True)
+    assert "SSH_AUTH_SOCK" in script  # socket still scrubbed for generic callers
 
 
 # --- Platform gate: the forward is a no-op where the socket concept is absent ---

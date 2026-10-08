@@ -377,9 +377,7 @@ def open_lock_file(path: "str | os.PathLike[str]") -> Iterator[int]:
     :func:`flock_exclusive`. The lock file's CONTENT is never meaningful to
     the lock itself; this exists so contenders cannot watch it flicker empty.
     """
-    # 0o600: a lock file is Kiro Crew's own and nobody else's to open; inside
-    # the data home every file is owner-only (kiro_crew.owner_only_files).
-    fd = open_create_or_existing(path, os.O_RDWR, 0o600)
+    fd = open_create_or_existing(path, os.O_RDWR, 0o644)
     try:
         yield fd
     finally:
@@ -389,7 +387,7 @@ def open_lock_file(path: "str | os.PathLike[str]") -> Iterator[int]:
 def open_create_or_existing(
     path: "str | os.PathLike[str]",
     flags: int,
-    mode: int = 0o600,
+    mode: int = 0o644,
     *,
     dir_fd: int | None = None,
 ) -> int:
@@ -482,23 +480,6 @@ def try_acquire_lock(fd: int, *, exclusive: bool = False) -> bool:
 
     POSIX: ``fcntl.flock(... | LOCK_NB)``. Windows: ``msvcrt.locking`` with the
     non-blocking codes. On success, the caller must :func:`release_lock` the fd.
-    Every failure, including a filesystem that cannot lock, reads as ``False``;
-    :func:`try_acquire_lock_or_raise` tells the two apart.
-    """
-    try:
-        return try_acquire_lock_or_raise(fd, exclusive=exclusive)
-    except OSError:
-        return False
-
-
-def try_acquire_lock_or_raise(fd: int, *, exclusive: bool = False) -> bool:
-    """Like :func:`try_acquire_lock`, but only "held by someone else" is ``False``.
-
-    :func:`try_acquire_lock` folds every failure into ``False``, which reads a
-    filesystem that cannot lock at all (``ENOLCK``, ``EINVAL`` on some network
-    mounts) as permanently busy. A caller that retries on busy would retry
-    forever; this one raises that ``OSError`` instead. POSIX busy is
-    ``EWOULDBLOCK``/``EAGAIN``; Windows busy is ``EACCES``/``EDEADLOCK``.
     """
     from kiro_crew.platform_compat import IS_POSIX
 
@@ -509,12 +490,8 @@ def try_acquire_lock_or_raise(fd: int, *, exclusive: bool = False) -> bool:
         try:
             fcntl.flock(fd, mode)
             return True
-        except BlockingIOError:
+        except (BlockingIOError, OSError):
             return False
-        except OSError as exc:
-            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                return False
-            raise
     # msvcrt has no shared lock; LK_NBLCK is a non-blocking exclusive lock.
     try:
         os.lseek(fd, 0, os.SEEK_SET)
@@ -522,10 +499,8 @@ def try_acquire_lock_or_raise(fd: int, *, exclusive: bool = False) -> bool:
 
         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
         return True
-    except OSError as exc:
-        if exc.errno in (errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK)):
-            return False
-        raise
+    except OSError:
+        return False
 
 
 def probe_file_persistence(directory: Path) -> str | None:

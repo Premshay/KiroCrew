@@ -204,18 +204,15 @@ export const selectSubagentActivityCount = createSelector(
 
 /** Per-slot subagent counts for sidebar. Reuses shared counting helpers above. */
 
-/** STARTED sub-agents per slot (running + tool + pending), never the queued
- *  count. This is the reading for anything that says a session is working: a
- *  child that has not started holds no process and makes no progress, so a
- *  queued-only parent whose own turn has ended is waiting, not working (the
- *  board's Working lane, and the row's "live work" checks). */
-export const selectSidebarStartedSubagentCounts = createSelector(
+/** Total active subagents per slot (running + tool + pending). */
+export const selectSidebarSubagentCounts = createSelector(
   [
     (state: RootState) => state.chat.activeSlot,
     (state: RootState) => state.chat.subagents,
     (state: RootState) => state.chat.slotActivity,
+    (state: RootState) => state.chat.subagentQueued,
   ],
-  (activeSlot, activeSubs, slotActivity) => {
+  (activeSlot, activeSubs, slotActivity, queued) => {
     const counts: Record<string, number> = {}
     if (activeSlot) {
       const n = countActiveSubagents(activeSubs)
@@ -227,20 +224,7 @@ export const selectSidebarStartedSubagentCounts = createSelector(
       const n = countActiveSubagents(act.subagents)
       if (n > 0) counts[slot] = n
     }
-    return counts
-  },
-)
-
-/** Every sub-agent a slot has in flight: started (above) plus accepted-but-
- *  queued. The reading for "does this session still own sub-agent work" — the
- *  row's count label, the turn-done chime, stale collapse — never for Working. */
-export const selectSidebarSubagentCounts = createSelector(
-  [
-    selectSidebarStartedSubagentCounts,
-    (state: RootState) => state.chat.subagentQueued,
-  ],
-  (started, queued) => {
-    const counts: Record<string, number> = { ...started }
+    // Fold in queued counts.
     for (const [slot, q] of Object.entries(queued ?? {})) {
       if (q > 0) counts[slot] = (counts[slot] || 0) + q
     }
@@ -319,29 +303,6 @@ export const subagentReducers = {
     if (reason) state.subagentQueuedReason[key] = reason
     else delete state.subagentQueuedReason[key]
   },
-  /** Reconcile the queued counts with a `slots` push. Each row carries the
-   *  depth the gateway last published for its session (`subagents_queued`), so
-   *  a count a missed or misapplied `subagent_queued` frame left behind is
-   *  corrected by the next push, for every slot in the list and not only the
-   *  one on screen. A row without the field (a `slot_patch`, an older gateway)
-   *  leaves its count alone. The wait label is kept while rows still wait: the
-   *  push carries the count, and the label stays the one the frames gave it. */
-  reconcileSubagentQueuedFromSlots(state: ChatState, action: PayloadAction<ReadonlyArray<{ key: string; subagents_queued?: unknown }>>) {
-    state.subagentQueued ??= {}
-    state.subagentQueuedReason ??= {}
-    for (const row of action.payload) {
-      const published = row.subagents_queued
-      if (typeof published !== 'number' || !Number.isFinite(published) || isUnsafeKey(row.key)) continue
-      const key = safeKey(row.key)
-      const n = Math.max(0, Math.floor(published))
-      if (n === 0) {
-        delete state.subagentQueued[key]
-        delete state.subagentQueuedReason[key]
-      } else if (state.subagentQueued[key] !== n) {
-        state.subagentQueued[key] = n
-      }
-    }
-  },
   sseSubagentPending(state: ChatState, action: PayloadAction<{ slot: string; id: string; task: string; approval_id: string }>) {
     if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
     const entry: SubagentActivity = {
@@ -365,7 +326,7 @@ export const subagentReducers = {
       if (b) { b.approving = action.payload.approving; return }
     }
   },
-  sseSubagentSpawn(state: ChatState, action: PayloadAction<{ slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; batch_id?: string }>) {
+  sseSubagentSpawn(state: ChatState, action: PayloadAction<{ slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; controllable?: boolean }>) {
     if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
     const subs = action.payload.slot !== state.activeSlot
       ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).subagents
@@ -380,13 +341,11 @@ export const subagentReducers = {
       // Same guard for requestedModel: only set when the frame carries a value.
       if (action.payload.requested_model) existing.requestedModel = action.payload.requested_model
       if (action.payload.child_session) existing.childSession = action.payload.child_session
-      // Same guard for the wave id: only set when the frame names a wave, so a
-      // later frame that omits it cannot blank a known batch.
-      if (action.payload.batch_id) existing.batchId = action.payload.batch_id
       // The spawn event carries the authoritative task text (the pending
       // card's task is derived from the approval title, which may be empty
       // or just "spawn_run") — always prefer the spawn payload's task.
       if (action.payload.task) existing.task = action.payload.task
+      if (action.payload.controllable !== undefined) existing.controllable = action.payload.controllable
       return
     }
     subs[safeKey(action.payload.id)] = {
@@ -394,7 +353,6 @@ export const subagentReducers = {
       model: action.payload.model || '',
       requestedModel: action.payload.requested_model || existing?.requestedModel || undefined,
       childSession: action.payload.child_session || undefined,
-      batchId: action.payload.batch_id || existing?.batchId || undefined,
       status: 'running', streaming: existing?.streaming || '', lastTool: '', startedAt: existing?.startedAt || Date.now(), elapsed: 0,
       // Reusing an entry's start time inherits whether that time was ASSUMED.
       // Rebuilding the entry without this would silently promote an assumption
@@ -402,6 +360,7 @@ export const subagentReducers = {
       // -- `Date.now()` is only genuine for an entry being created here.
       startedAtAssumed: existing?.startedAt ? existing.startedAtAssumed : undefined,
       toolCount: 0, stalled: false,
+      controllable: action.payload.controllable ?? existing?.controllable ?? true,
     }
   },
   sseSubagentTool(state: ChatState, action: PayloadAction<{ slot: string; id: string; tool: string; turns?: number; tool_count?: number }>) {
@@ -492,10 +451,10 @@ export const subagentReducers = {
     if (!subs) return
     for (const id of Object.keys(subs)) {
       const st = subs[id]?.status
-      if (st === 'done' || st === 'error' || st === 'stopped') delete subs[id]
+      if (st === 'done' || st === 'error' || st === 'stopped' || st === 'reported') delete subs[id]
     }
   },
-  sseSubagentDone(state: ChatState, action: PayloadAction<{ slot: string; id: string; elapsed: number; credits?: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; requested_model?: string; child_session?: string; batch_id?: string; result?: string }>) {
+  sseSubagentDone(state: ChatState, action: PayloadAction<{ slot: string; id: string; elapsed: number; credits?: number; error?: string; stopped?: boolean; reported?: boolean; controllable?: boolean; outcome?: 'completed' | 'failed' | 'stopped' | 'reported'; task?: string; agent?: string; model?: string; requested_model?: string; child_session?: string; result?: string }>) {
     if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
     const subs = action.payload.slot !== state.activeSlot
       ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).subagents
@@ -518,8 +477,9 @@ export const subagentReducers = {
     // (spec: docs/system-specs/modules/subagent.md). `stopped`/`error`
     // derivation is kept ONLY as a fallback for old payloads that predate
     // the field (reconnect replays from a pre-upgrade gateway).
-    const doneStatus: 'stopped' | 'error' | 'done' =
-      action.payload.outcome === 'stopped' ? 'stopped'
+    const doneStatus: 'stopped' | 'error' | 'done' | 'reported' =
+      action.payload.outcome === 'reported' ? 'reported'
+        : action.payload.outcome === 'stopped' ? 'stopped'
         : action.payload.outcome === 'failed' ? 'error'
           : action.payload.outcome === 'completed' ? 'done'
             : action.payload.stopped ? 'stopped' : (action.payload.error ? 'error' : 'done')
@@ -536,14 +496,12 @@ export const subagentReducers = {
       // has resolved it by completion). Prefer a known value, but never
       // clobber a prior known id back to '' if this frame omits it.
       if (action.payload.model) a.model = action.payload.model
+      if (action.payload.controllable !== undefined) a.controllable = action.payload.controllable
       // Carry the requested pin so a reconnect that rebuilds a completed card
       // (clearSubagentsForSnapshot drops it, then subagent_done rehydrates it)
       // keeps the live-downgrade amber chip. Never clobber a known value to ''.
       if (action.payload.requested_model) a.requestedModel = action.payload.requested_model
       if (action.payload.child_session && !a.childSession) a.childSession = action.payload.child_session
-      // Carry the wave id so a reconnect that rehydrates a completed card keeps
-      // its batch chip. Never clobber a known value to ''.
-      if (action.payload.batch_id && !a.batchId) a.batchId = action.payload.batch_id
       if (isNative && action.payload.result !== undefined) a.result = action.payload.result
       // A done frame carries authoritative `elapsed`, which reconstructs the
       // real start for an entry whose start was only ASSUMED -- the same
@@ -563,7 +521,6 @@ export const subagentReducers = {
         model: action.payload.model || '',
         requestedModel: action.payload.requested_model || undefined,
         childSession: action.payload.child_session || undefined,
-        batchId: action.payload.batch_id || undefined,
         status: doneStatus,
         streaming: '',
         lastTool: '',
@@ -572,10 +529,11 @@ export const subagentReducers = {
         credits,
         error: doneStatus === 'stopped' ? undefined : action.payload.error,
         result: isNative ? action.payload.result : undefined,
+        controllable: action.payload.controllable ?? true,
       }
     }
   },
-  sseSubagentSnapshot(state: ChatState, action: PayloadAction<{ id: string; slot: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; batch_id?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean; idle_secs?: number }>) {
+  sseSubagentSnapshot(state: ChatState, action: PayloadAction<{ id: string; slot: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean; idle_secs?: number; controllable?: boolean }>) {
     const d = action.payload
     // A snapshot without an owning slot is an orphan, not evidence that it
     // belongs to whichever chat this browser happens to show. Popout windows
@@ -590,7 +548,7 @@ export const subagentReducers = {
     const existing = subs[d.id]
     // Live events can interleave with replay because subscription starts before
     // snapshots are sent. Never let a stale running snapshot demote a terminal card.
-    if (existing?.status === 'done' || existing?.status === 'error') return
+    if (existing?.status === 'done' || existing?.status === 'error' || existing?.status === 'stopped' || existing?.status === 'reported') return
     const stalled = d.stalled ?? false
     subs[safeKey(d.id)] = {
       id: d.id, task: d.task, agent: d.agent || 'kirocrew',
@@ -600,7 +558,6 @@ export const subagentReducers = {
       // Same guard for requestedModel: prefer frame value, fall back to existing.
       requestedModel: d.requested_model || existing?.requestedModel || undefined,
       childSession: d.child_session || existing?.childSession || undefined,
-      batchId: d.batch_id || existing?.batchId || undefined,
       status: d.last_tool ? 'tool' : 'running', streaming: d.streaming, lastTool: d.last_tool,
       startedAt: d.started * 1000, elapsed: 0,
       toolCount: d.tool_count ?? 0, stalled,
@@ -621,6 +578,7 @@ export const subagentReducers = {
       // preserves what a live frame already set.
       retrying: existing?.retrying,
       approval_id: existing?.approval_id, approving: existing?.approving,
+      controllable: d.controllable ?? existing?.controllable ?? true,
     }
   },
 }
