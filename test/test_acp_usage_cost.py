@@ -248,6 +248,15 @@ class TestToTurnUsage:
         assert stats.to_turn_usage() == TurnUsage()
 
 
+class TestCompanionTurnUsageFields:
+    def test_accepts_the_fields_antigravity_fills(self):
+        # kirocrew_nexus_companion's Antigravity seam builds TurnUsage with
+        # thinking_tokens and total_tokens; without them every completed turn
+        # raises TypeError and loses its usage record.
+        u = TurnUsage(thinking_tokens=7, total_tokens=42)
+        assert (u.thinking_tokens, u.total_tokens) == (7, 42)
+
+
 # ── AcpClient tracking (no process spawn) ────────────────────────────────
 
 
