@@ -143,6 +143,44 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_delete("/api/lessons", handlers.api_lessons_delete)
     app.router.add_get("/api/session-ledger", handlers.api_session_ledger_get)
     app.router.add_post("/api/session-ledger/record", handlers.api_session_ledger_record)
+    app.router.add_get("/api/work-items", handlers.api_work_items_list)
+    app.router.add_post("/api/work-items/cycle/open", handlers.api_work_cycle_open)
+    app.router.add_post("/api/work-items/cycle/close", handlers.api_work_cycle_close)
+    app.router.add_post("/api/work-items/items", handlers.api_work_item_create)
+    app.router.add_post("/api/work-items/items/evaluate", handlers.api_work_item_evaluate)
+    app.router.add_get("/api/work-items/items/{item_id}", handlers.api_work_item_read)
+    app.router.add_post("/api/work-items/items/{item_id}/update", handlers.api_work_item_update)
+    app.router.add_post(
+        "/api/work-items/items/{item_id}/transition", handlers.api_work_item_transition
+    )
+    app.router.add_get("/api/work-items/archive", handlers.api_work_cycle_archive_list)
+    app.router.add_get(
+        "/api/work-items/archive/{cycle_id}", handlers.api_work_cycle_archive_read
+    )
+    app.router.add_get(
+        "/api/work-items/launch/candidates", handlers.api_work_item_launch_candidates
+    )
+    app.router.add_post(
+        "/api/work-items/items/{item_id}/launch", handlers.api_work_item_launch
+    )
+    app.router.add_post(
+        "/api/work-items/items/{item_id}/dispatch-retry",
+        handlers.api_work_item_dispatch_retry,
+    )
+    app.router.add_post(
+        "/api/work-items/items/{item_id}/revoke-assignment",
+        handlers.api_work_item_revoke_assignment,
+    )
+    app.router.add_get("/api/work-items/assigned", handlers.api_work_item_assigned_list)
+    app.router.add_get(
+        "/api/work-items/assigned/{item_id}", handlers.api_work_item_assigned_read
+    )
+    app.router.add_post(
+        "/api/work-items/assigned/{item_id}/progress", handlers.api_work_item_report_progress
+    )
+    app.router.add_post(
+        "/api/work-items/assigned/{item_id}/handoff", handlers.api_work_item_submit_handoff
+    )
     app.router.add_get("/api/work-ledger", _deferred_work_ledger("api_work_ledger_get"))
     app.router.add_post("/api/work-ledger/record", _deferred_work_ledger("api_work_ledger_record"))
     app.router.add_get("/api/work-ledger/brief", _deferred_work_ledger("api_work_brief"))
