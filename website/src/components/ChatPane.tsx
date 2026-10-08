@@ -11,6 +11,7 @@ import type { ThreadHooks } from '../app-sdk/messageRenderers'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
+import RuntimeSelector from './RuntimeSelector'
 import { busySteerFlag } from './chat-input/busySend'
 import { filterCrewmateChat } from './chat/crewmateBubbles'
 import type { CrewmateIdentity } from '../pages/chat/CrewmateMessage'
@@ -2054,6 +2055,7 @@ export default function ChatPane({
           busyMode={busyMode}
           autoFocusKey={slotKey}
           agentName={paneAgentName}
+          backendControl={<RuntimeSelector slot={slotKey} value={paneSlot?.runtime_agent} running={running} remote={paneRemoteCrew.isRemote} />}
           // The chip shows the inherited-default marker; `agentName` stays the
           // raw resolved alias for the skills query and switch title. Uses the
           // SLOT's stored agent (not `paneAgentName`, which has already

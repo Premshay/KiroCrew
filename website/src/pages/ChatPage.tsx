@@ -235,6 +235,7 @@ import InboundLinkChip from '../components/InboundLinkChip'
 import ModelEffortDropdown from '../components/ModelEffortDropdown'
 
 import ChatInput from '../components/ChatInput'
+import RuntimeSelector from '../components/RuntimeSelector'
 import { useStableCallbackProps } from './chat/useStableCallbackProps'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { promptHistoryFromMessages, samePromptHistory, type PromptHistoryItem } from '../components/composerPromptHistory'
@@ -6434,6 +6435,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onDragOver={dropTargetProps.onDragOver}
               onDragLeave={dropTargetProps.onDragLeave}
               agentName={activeAgentName}
+              backendControl={<RuntimeSelector slot={activeSlot || ''} value={currentSlot?.runtime_agent} running={!!slotRunning} remote={activeSlotRemoteBound} />}
               // The chip shows the inherited-default marker; `agentName` stays
               // the raw resolved alias for the skills query and switch title.
               // Uses the SLOT's stored agent (not `activeAgentName`, which has
