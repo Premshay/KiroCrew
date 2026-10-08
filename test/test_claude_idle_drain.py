@@ -258,6 +258,25 @@ class TestStretchTail:
         assert client._claude_autonomous_origin is None
         assert client._claude_inbox.qsize() == 2
 
+    @pytest.mark.asyncio
+    async def test_text_after_a_folded_notification_opens_a_new_paragraph(self, tmp_path):
+        """A notification folded into the live turn starts a new Claude message, but
+        its text streams into the same reply row; without a break the two messages
+        weld into one sentence ("...ending the turn.The spec agent...")."""
+        client = _client(tmp_path)
+        _sink(client)
+        client._claude_dispatch_depth = 1
+        notification = JsonRpcMessage(
+            method="_claude/sdkMessage",
+            params={"sessionId": "sess-1",
+                    "message": {"type": "user", "origin": {"kind": "task-notification"}}},
+        )
+
+        assert client._extract_text_chunk(_text_frame("Ending the turn."))[0] == "Ending the turn."
+        await client._route_claude_frame(notification)
+        assert client._extract_text_chunk(_text_frame("The spec"))[0] == "\n\nThe spec"
+        assert client._extract_text_chunk(_text_frame(" agent"))[0] == " agent"
+
     def test_every_result_is_requested_from_the_adapter(self, tmp_path):
         client = _client(tmp_path)
         requested = client._claude_session_meta()["claudeCode"]["emitRawSDKMessages"]
