@@ -14,6 +14,7 @@ if TYPE_CHECKING:
         KiroCrewAgentConfig,
         KiroCrewConfig,
         _avatar_stem,
+        _cached_agent_advertised_ids,
         _carries_mask,
         _carry_motions_through_motionless_save,
         _carry_pack_through_faceless_save,
@@ -190,6 +191,7 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "name": name})
     if "model" in body:
         pending_model = normalize_agent_model(body["model"])
+        target_advertised_ids = _cached_agent_advertised_ids(request, name)
     # Rejected before the config is even loaded: the check is pure, and every
     # validation must land before the first field assignment below so a bad value
     # cannot leave the in-memory record half-updated.
@@ -237,6 +239,7 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 pending_model,
                 request,
                 cfg.agent.provider,
+                advertised_ids=target_advertised_ids,
                 backend=_pin_entitlement_backend(cfg),
             )
             if model_reason:
