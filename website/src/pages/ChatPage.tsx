@@ -877,6 +877,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // client must not OFFER regenerate, edit-resend, rewind or continue either —
   // same predicate and same `executor` keying `selectContinuable` uses for Resume.
   const activeSlotRemoteBound = slotIsRemoteBound(slots.find(s => s.key === activeSlot))
+  const [pendingAgent, _setPendingAgent] = useState('')  // agent for next new slot
+  const pendingAgentRef = useRef('')
+  // The namespace the pending agent was picked from, kept beside the name so
+  // the create carries both: a pending "reviewer" template must not become the
+  // "reviewer" member on send. Cleared with the name.
+  const pendingAgentKindRef = useRef<'member' | 'template' | undefined>(undefined)
+  const setPendingAgent = useCallback((v: string, kind?: 'member' | 'template') => {
+    pendingAgentRef.current = v
+    pendingAgentKindRef.current = v ? kind : undefined
+    _setPendingAgent(v)
+  }, [])
+  const [pendingModel, _setPendingModel] = useState('')  // model for next new slot
+  const pendingModelRef = useRef('')
+  const setPendingModel = useCallback((v: string) => { pendingModelRef.current = v; _setPendingModel(v) }, [])
+  const pendingProjectRef = useRef('')
+  const setPendingProject = useCallback((v: string) => { pendingProjectRef.current = v }, [])
   // The agent and model rosters the pickers offer.
   const {
     installedAgents, sidebarAgents, defaultAgent, effectiveAgents,
@@ -970,23 +986,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     onEnterSingleMatch: () => { pickModel(filteredModels[0].name) },
     closeToTrigger: () => setModelDropdown(false),
   })
-  const [pendingAgent, _setPendingAgent] = useState('')  // agent for next new slot
-  const pendingAgentRef = useRef('')
-  // The namespace the pending agent was picked from, kept beside the name so
-  // the create carries both: a pending "reviewer" template must not become the
-  // "reviewer" member on send. Cleared with the name.
-  const pendingAgentKindRef = useRef<'member' | 'template' | undefined>(undefined)
-  const setPendingAgent = useCallback((v: string, kind?: 'member' | 'template') => {
-    pendingAgentRef.current = v
-    pendingAgentKindRef.current = v ? kind : undefined
-    _setPendingAgent(v)
-  }, [])
-  const [pendingModel, _setPendingModel] = useState('')  // model for next new slot
-  const pendingModelRef = useRef('')
-  const setPendingModel = useCallback((v: string) => { pendingModelRef.current = v; _setPendingModel(v) }, [])
-  const pendingProjectRef = useRef('')
-  const setPendingProject = useCallback((v: string) => { pendingProjectRef.current = v }, [])
-
   // pendingModel is the model for the NEXT new slot, and it is deliberately
   // left EMPTY unless the user explicitly picks one (switchModel below).
   //
