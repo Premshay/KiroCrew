@@ -48,8 +48,11 @@ function SlotRuntimeSelector({ slot, value, running, remote = false }: RuntimeSe
   const selected = value || choices.data?.effective_runtime_agent || ''
   return <div className="flex items-center gap-1.5 text-[12px] text-muted" data-testid="runtime-selector">
     <span>{i18nT('components.webAppArtifactCard.backend')}</span>
+    {/* On touch the control is a native <select>, which sizes to its WIDEST
+        option ("Label — reason" rows included), not the selected one; the
+        field-sizing rule fits it to the selected value instead. */}
     <SimpleSelect
-      className="h-6 w-auto max-w-[13rem] rounded-full border-transparent bg-transparent px-2 py-0 text-[12px]"
+      className="h-6 w-auto max-w-[13rem] field-sizing-content rounded-full border-transparent bg-transparent px-2 py-0 text-[12px]"
       contentClassName="w-60 max-w-[22rem]"
       aria-label={i18nT('components.webAppArtifactCard.backend')}
       clearLabel={i18nT('components.modelDropdownList.auto_default')}
