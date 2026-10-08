@@ -33,6 +33,7 @@ from kiro_crew.dashboard.handlers._shared import internal_memory_scope, read_bou
 from kiro_crew.dashboard.request_priority import owner_start_priority
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.validation import MAX_SHORT_STRING
 from kiro_crew.workflows.preview import plan_from_source
 
 logger = logging.getLogger(__name__)
@@ -451,6 +452,11 @@ async def api_workflow_author(request: web.Request) -> web.Response:
     refusal = await _private_memory_refusal(request, "workflow.author")
     if refusal is not None:
         return refusal
+    selection = _author_selection(body)
+    if selection is None:
+        return web.json_response(
+            {"error": "author_agent and author_model must be strings"}, status=400
+        )
     try:
         out = await svc.author(
             intent,
@@ -459,11 +465,23 @@ async def api_workflow_author(request: web.Request) -> web.Response:
             # The dashboard owner waits on the Create-draft spinner; an app token or an
             # agent's internal call does not (kiro_crew.start_priority).
             start_priority=owner_start_priority(request),
+            **selection,
         )
     except Exception:
         logger.exception("workflow author failed")
         return _error("could not author workflow", "workflow_author_failed", 500)
     return web.json_response(_redact_obj(out))
+
+
+def _author_selection(body: dict) -> Optional[dict[str, str]]:
+    selection = {}
+    for field in ("author_agent", "author_model"):
+        value = body.get(field, "")
+        if not isinstance(value, str) or len(value) > MAX_SHORT_STRING:
+            return None
+        if value.strip():
+            selection[field] = value.strip()
+    return selection
 
 
 def _opt_int(value: Any) -> Optional[int]:
@@ -568,6 +586,11 @@ async def api_workflow_run_intent(request: web.Request) -> web.Response:
     refusal = await _private_memory_refusal(request, "workflow.run_intent")
     if refusal is not None:
         return refusal
+    selection = _author_selection(body)
+    if selection is None:
+        return web.json_response(
+            {"error": "author_agent and author_model must be strings"}, status=400
+        )
     try:
         out = await svc.start_from_intent(
             intent,
@@ -578,6 +601,7 @@ async def api_workflow_run_intent(request: web.Request) -> web.Response:
             expected_store=request.get("workflow_expected_store"),
             budget_total=budget_total,
             timeout_secs=_opt_int(body.get("timeout_secs")),
+            **selection,
         )
     except Exception:
         logger.exception("workflow run_intent failed")
