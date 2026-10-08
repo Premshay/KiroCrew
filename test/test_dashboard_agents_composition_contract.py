@@ -248,11 +248,14 @@ _FACADE_DEFS = (
     "api_models",
     "api_kirocrew_agent_models",
     "api_effort_levels",
+    "_menu_description",
+    "_advertised_commands",
     "api_slash_commands",
     "api_kirocrew_agents",
     "_get_config_lock",
     "_pin_entitlement_backend",
     "_revalidate_crew_pin",
+    "_cached_agent_advertised_ids",
     "_model_pin_rejected",
     "api_kirocrew_agent_avatar_get",
 )
@@ -544,7 +547,7 @@ def test_every_base_definition_is_in_exactly_one_place() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
     assert defined == set(_FACADE_DEFS)
-    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 125
+    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 128
 
 
 def test_the_owners_log_as_the_facade() -> None:
