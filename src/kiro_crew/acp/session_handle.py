@@ -3659,6 +3659,18 @@ class AcpSessionHandle:
             isinstance(opt, dict) and opt.get("id") == config_id for opt in self._config_options
         )
 
+    def effort_config_option_id(self) -> str | None:
+        """Return this shared session's advertised reasoning-effort selector."""
+        option_id = effort_config_option_id(self._runtime.acp_backend)
+        return (
+            option_id
+            if any(
+                isinstance(option, dict) and option.get("id") == option_id
+                for option in self._config_options
+            )
+            else None
+        )
+
     def get_valid_effort_levels(self) -> list[str]:
         """Return valid effort levels from config options, preserving order.
 

@@ -1351,6 +1351,10 @@ class AcpSessionProvider(LLMProvider):
         """Valid effort levels from config options."""
         return self._handle.get_valid_effort_levels()
 
+    def effort_config_option_id(self) -> str | None:
+        """Reasoning-effort selector advertised by this shared session."""
+        return self._handle.effort_config_option_id()
+
     def supports_config_option(self, config_id: str) -> bool:
         """Whether the session advertised a config option with this id."""
         return self._handle.supports_config_option(config_id)
