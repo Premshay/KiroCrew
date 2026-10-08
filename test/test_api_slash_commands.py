@@ -25,7 +25,7 @@ from kiro_crew.dashboard.chat_utils import (
 
 
 def _fake_config(provider: str):
-    return SimpleNamespace(agent=SimpleNamespace(provider=provider))
+    return SimpleNamespace(agent=SimpleNamespace(provider=provider, acp_backend=""))
 
 
 def _make_app() -> web.Application:
