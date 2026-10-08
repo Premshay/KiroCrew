@@ -120,35 +120,16 @@ function matchesSearch(m: RosterRowLike, needle: string): boolean {
   return m.name.toLowerCase().includes(needle) || rowLabel(m).toLowerCase().includes(needle)
 }
 
-/** Whether the roster lists a row WITHOUT being asked for it: only a crew the
- *  user has actually chatted with (`last_chat_ts`, recorded server-side when
- *  the person sends it a message in its DM or in a normal chat), or one the
- *  user starred. A crew that only ran in the background -- a cron, a wake, a
- *  sub-agent, a dispatched worker -- or that an app drove is hidden until the
- *  search reaches it, the default crew included.
- *
- *  A row from an older gateway carries no `last_chat_ts`, and keeps that
- *  gateway's rule (DM thread holds a message, created on the dashboard, the
- *  default crew): hiding on an absent field would blank the roster on a
- *  mixed-version deploy. `defaultAgent === null` (the lookup failed) lists
- *  every such row, since that rule cannot tell which row it must never hide. */
+/** Every registered crew belongs in the Crew Members roster. The source and
+ * activity controls narrow it only when the person explicitly asks them to. */
 export function listedByDefault(m: RosterRowLike, defaultAgent: string | null): boolean {
-  if (m.starred === true) return true
-  if (typeof m.last_chat_ts === 'number') return m.last_chat_ts > 0
-  if (defaultAgent === null) return true
-  if (defaultAgent !== '' && m.name === defaultAgent) return true
-  if (m.dashboard_created === undefined && m.has_dm_message === undefined) return true
-  return (
-    m.has_dm_message === true ||
-    m.dashboard_created === true ||
-    (typeof m.last_message === 'string' && m.last_message.trim() !== '')
-  )
+  void m
+  void defaultAgent
+  return true
 }
 
 /** Whether the roster shows this row for `query`, before the star / origin /
- *  status filters: listed by default, or reached by a typed search. With a
- *  search typed the search decides alone — a hidden row it reaches shows, a
- *  listed row it misses does not. */
+ * status filters. A search narrows the complete roster. */
 export function rosterShows(
   m: RosterRowLike,
   query: Pick<RosterQuery, 'search' | 'defaultAgent' | 'chosen'>,
@@ -158,12 +139,7 @@ export function rosterShows(
   return listedByDefault(m, query.defaultAgent) || (!!query.chosen && m.name === query.chosen)
 }
 
-/** The rows the roster is ABOUT for `query`: every row listed by default plus
- *  any hidden row the typed search reaches. This is the population the header
- *  count, the "N of M" and the filter menu's tallies read, so a count never
- *  includes a row the user cannot get to -- and, as before, the search itself
- *  never SHRINKS the count (it is transient, not a filter), it can only add the
- *  hidden rows it surfaces. */
+/** The complete roster used for the header count and filter menu tallies. */
 export function rosterPopulation<M extends RosterRowLike>(
   members: readonly M[],
   query: Pick<RosterQuery, 'search' | 'defaultAgent' | 'chosen'>,
