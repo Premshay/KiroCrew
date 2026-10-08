@@ -4394,6 +4394,83 @@ class TestGovernanceTurnsOnThePermissionBlockAlone:
         assert pinned._claude_settings_governed is True
         assert pinned._permission_surface_governed is True
 
+    def test_project_settings_with_hooks_keeps_member_permission_surface(self, tmp_path):
+        """Project hooks prevent inline exclusion, so matching local permissions must govern."""
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (path.parent / "settings.json").write_text(
+            '{"hooks": {"PreToolUse": []}}\n', encoding="utf-8"
+        )
+        client = _client(tmp_path)
+        own = json.loads(client._render_claude_settings_payload())
+        project_settings = {
+            "availableModels": ["legacy-model"],
+            "model": "legacy-model",
+            "enabledMcpjsonServers": [],
+        }
+        if "permissions" in own:
+            project_settings["permissions"] = own["permissions"]
+        path.write_text(json.dumps(project_settings) + "\n", encoding="utf-8")
+        before = path.read_bytes()
+
+        client._write_claude_local_settings()
+
+        assert client._claude_settings_governed is True
+        assert client._permission_surface_governed is True
+        assert client._claude_local_settings_excluded is False
+        assert client._claude_settings_authored is False
+        assert path.read_bytes() == before
+
+    def test_replaced_seed_with_stale_record_keeps_project_permission_surface(self, tmp_path):
+        """The live project file can differ from an old Crew record after a user edit."""
+        seeded = _client(tmp_path)
+        seeded._write_claude_local_settings()
+        path = _settings(tmp_path)
+        assert sp.recorded_durable(path) is not None
+        assert sp.release(path, seeded._seed_owner)
+        (path.parent / "settings.json").write_text(
+            '{"hooks": {"PreToolUse": []}}\n', encoding="utf-8"
+        )
+        replacement = {
+            "availableModels": ["legacy-model"],
+            "model": "legacy-model",
+            "enabledMcpjsonServers": [],
+        }
+        own = json.loads(seeded._render_claude_settings_payload())
+        if "permissions" in own:
+            replacement["permissions"] = own["permissions"]
+        path.write_text(json.dumps(replacement) + "\n", encoding="utf-8")
+        client = _client(tmp_path)
+
+        client._write_claude_local_settings()
+
+        assert client._permission_surface_governed is True
+        assert client._claude_settings_authored is False
+        assert json.loads(path.read_text(encoding="utf-8")) == replacement
+
+    def test_unshareable_crew_seed_cannot_be_adopted_without_a_lease(self, tmp_path, monkeypatch):
+        """A live owner could delete its seed, so a failed share may not bypass its lease."""
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        live = _client(tmp_path, permission_mode="default", model=_SERVED[0])
+        live._write_claude_local_settings()
+        later = _client(tmp_path, permission_mode="default", model="unlisted-model")
+
+        later._write_claude_local_settings()
+
+        assert later._permission_surface_governed is False
+
+    def test_unavailable_provenance_does_not_look_like_a_project_file(self, tmp_path, monkeypatch):
+        """An unreadable record cannot authorize an unleased permission surface."""
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"model": "other"}\n', encoding="utf-8")
+        monkeypatch.setattr(sp, "recorded_durable_checked", lambda _path: (False, None))
+        client = _client(tmp_path)
+
+        client._write_claude_local_settings()
+
+        assert client._claude_settings_governed is False
+
     def test_a_file_carrying_a_permissions_allow_is_still_refused(self, tmp_path, monkeypatch):
         """The hazard the mirror names, unchanged.
 

@@ -445,13 +445,25 @@ the session can do:
   The file is left exactly as it is.
 - An inherited `bypassPermissions` in such a file is **not** stripped: stripping
   would require rewriting the user's file, which is exactly the machinery this rule
-  removes. Such a file is left out of the session instead (see
-  below): whatever starting mode the adapter picks from it is read back and pinned.
+  removes. If the file is excluded (see below), its starting mode is absent;
+  if it is retained, the adapter's starting mode is read back and checked.
 
 #### A project-owned settings file
 
-The project's file is left out of the session instead of being rewritten.
-`_exclude_foreign_local_settings` takes that path, and `_claude_session_meta`
+When a regular project-owned `settings.local.json` has the same `permissions`
+block as this session's rendered seed, `_adopt_project_permission_governance`
+keeps the project setting sources in the session without writing or claiming the
+file. This applies even when model metadata differs and a checked-in
+`settings.json` has hooks, which prevents the exclusion path below. A durable
+Crew record may remain after the project replaces the file; the bounded read's
+fingerprint must then differ from that record and no live Crew owner may hold the
+path. A still-matching Crew seed requires a validated reader lease: matching
+permissions alone cannot keep its owner from removing the file. A different
+permission block, including `permissions.allow`, never qualifies.
+
+Otherwise, `_exclude_foreign_local_settings` attempts to leave the project's
+file out of the session instead of rewriting it. If exclusion is safe,
+`_claude_session_meta`
 puts it on the wire for `session/new` and `session/load`:
 
 | `_meta.claudeCode.options` key | Value |
@@ -598,7 +610,8 @@ overridden — so a user whose global settings pre-approve a tool family gets th
 calls auto-approved by Claude's own engine, which never calls `canUseTool` and so
 never reaches Crew's gate. A project's own `settings.local.json` is not part of
 this gap: a session that carries Crew's tools either governs a Crew seed (authored or
-shared) or excludes the project tier from its setting sources. Its checked-in `.claude/settings.json` is part of the
+shared), verifies the project file's matching permission block, or excludes the
+project tier from its setting sources. Its checked-in `.claude/settings.json` is part of the
 gap only for a session whose file Crew authored. Both are the same hazard the "no gate on pre-approved calls"
 section above describes, arriving through inherited config. Closing it means an
 isolated config root, which is a separate change: it has to carry credentials

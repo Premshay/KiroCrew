@@ -1370,7 +1370,7 @@ function ChatInput({
             <SessionControlChips sessionControls={sessionControls} shelfCompact={shelfCompact} onSessionControlClick={onSessionControlClick} />
           )}
           {backendControl && <div className="shrink-0 border-r border-border pr-2" data-testid="composer-backend-control">{backendControl}</div>}
-          <div className="flex items-center gap-2 min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-1">
           {onAgentClick && agentName && (
             <AgentChip agentName={agentName} agentLabel={agentLabel} agentIsInheritedDefault={agentIsInheritedDefault} agentSource={agentSource} isRunning={isRunning} shelfCompact={shelfCompact} onAgentClick={onAgentClick} />
           )}
@@ -1379,26 +1379,26 @@ function ChatInput({
              the folder segment opens the project picker and the branch segment
              copies. A <button> inside a <button> is invalid HTML and browsers
              collapse it, so the pill is a plain container and each segment owns
-             its own click target and hover state. */
-          <div className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted">
+             its own click target and hover state. Do not put min-w-0 on this pill
+             or its folder button: the icon otherwise paints over the Git badge
+             when the shelf is narrower than its controls. */
+          <div className="inline-flex items-center gap-1.5 h-7 text-[12px] text-muted">
           <button
-            className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
+            className="inline-flex items-center gap-1.5 h-7 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
             onClick={e => onProjectClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
             disabled={isRunning}
             title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
             aria-label={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
           >
             <FolderOpen size={13} className="shrink-0 opacity-70" />
-            {/* Budget favours the branch: the folder name is also in the tooltip
-                and the picker, whereas a clipped branch ("feat/pro…") is exactly
-                the ambiguity this label exists to remove. The enclosing shelf
-                group is flex-1/min-w-0, so both segments still shrink below
-                these caps on a narrow window. */}
+            {/* The folder name is also in the picker, so compact shelves keep the branch. */}
             {!shelfCompact && <span className="truncate max-w-[160px]">{project ? (project.split('/').filter(Boolean).pop() || project) : i18nT('components.chatInput.project')}</span>}
           </button>
+          {!shelfCompact && !!projectBranch && (
+            <span className="opacity-40 shrink-0" aria-hidden="true">·</span>
+          )}
           {!!projectBranch && (
             <>
-              <span className="opacity-40 shrink-0" aria-hidden="true">·</span>
               {/* Copying stays enabled while a response is running — unlike
                   switching project, reading the branch name is harmless. A git
                   ref IS code, so it sets `font-mono` itself (the pill container
@@ -1412,10 +1412,10 @@ function ChatInput({
           )}
           </div>
           )}
-          </div>
           {!!projectBranch && !!gitBadgeTitle && (
             <GitTreeBadge title={gitBadgeTitle} dirty={projectGitDirty} truncated={projectGitDirtyTruncated} ahead={projectGitAhead} behind={projectGitBehind} />
           )}
+          </div>
           <div className="flex items-center shrink-0">
           {contextPct != null && (
             <ContextUsageControl contextPct={contextPct} contextUsedTokens={contextUsedTokens} contextWindowTokens={contextWindowTokens} showContextPct={showContextPct} showContextTokens={showContextTokens} shelfCompact={shelfCompact} modelName={modelName} ctxPopoverOpen={ctxPopoverOpen} setCtxPopoverOpen={setCtxPopoverOpen} ctxPopoverRect={ctxPopoverRect} setCtxPopoverRect={setCtxPopoverRect} ctxWrapRef={ctxWrapRef} ctxPanelRef={ctxPanelRef} autoCompactThreshold={autoCompactThreshold} />

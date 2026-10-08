@@ -660,6 +660,27 @@ def recorded_durable(path: Path | str) -> tuple[int, str] | None:
     return size, sha
 
 
+def recorded_durable_checked(path: Path | str) -> tuple[bool, tuple[int, str] | None]:
+    """Distinguish an absent record from a failed durable lookup.
+
+    A foreign-file governance decision may accept an absent or mismatched
+    record, so a lock failure must not masquerade as absence.
+    """
+    key = _key(path)
+    try:
+        with _cross_process_lock():
+            entry = _read_disk_seeds().get(key)
+    except OSError:
+        logger.debug("seed-provenance lock unavailable for %s", path, exc_info=True)
+        return False, None
+    if entry is None:
+        return True, None
+    size, sha = entry.get("size"), entry.get("sha256")
+    if not isinstance(size, int) or not isinstance(sha, str) or not sha:
+        return False, None
+    return True, (size, sha)
+
+
 def has_sharers(path: Path | str) -> bool:
     """Whether any live shared reader is registered in this or another process.
 

@@ -3589,32 +3589,44 @@ class AcpClient:
     @staticmethod
     def _settings_path_document(path: Path) -> tuple[bool, dict[str, Any] | None]:
         """Read a bounded regular JSON settings document without following links."""
+        readable, document, _fingerprint = AcpClient._settings_path_document_fingerprint(path)
+        return readable, document
+
+    @staticmethod
+    def _settings_path_document_fingerprint(
+        path: Path,
+    ) -> tuple[bool, dict[str, Any] | None, tuple[int, str] | None]:
+        """Read one settings snapshot and its fingerprint from the same file handle."""
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
             fd = os.open(path, flags)
         except OSError:
-            return False, None
+            return False, None, None
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode) or st.st_size > _SETTINGS_READ_CAP_BYTES:
-                return False, None
+                return False, None, None
             raw = os.read(fd, _SETTINGS_READ_CAP_BYTES)
+            if len(raw) != st.st_size:
+                return False, None, None
         except OSError:
-            return False, None
+            return False, None, None
         finally:
             os.close(fd)
         try:
             data = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            return False, None
-        return (True, data) if isinstance(data, dict) else (False, None)
+            return False, None, None
+        if not isinstance(data, dict):
+            return False, None, None
+        return True, data, (len(raw), hashlib.sha256(raw).hexdigest())
 
     @property
     def _permission_surface_governed(self) -> bool:
         """Whether Crew controls this session's native permission surface.
 
-        The precondition for delivering the ``mcpServers`` array, in either of
-        its two shapes: this client authored ``settings.local.json`` itself
+        The precondition for delivering the ``mcpServers`` array includes a
+        ``settings.local.json`` this client authored
         (``_claude_settings_authored``), or the file's CURRENT on-disk bytes
         passed the sibling-seed validation
         (``_permission_surface_share_validated``). The durable reader lease is
@@ -3626,11 +3638,11 @@ class AcpClient:
         ``getattr`` on both governed flags because tests build clients without
         ``__init__``.
 
-        A third shape governs without the file: the project owns it, and this
-        session leaves it out of its setting sources
-        (``_claude_local_settings_excluded``, see
-        :meth:`_exclude_foreign_local_settings`). Its ``permissions.allow`` then
-        never loads, so it cannot pre-approve a tool either.
+        A project-owned file can govern when its permission block matches this
+        session's seed (``_claude_settings_governed``). Otherwise, the project
+        file may be left out of this session's setting sources
+        (``_claude_local_settings_excluded``); its ``permissions.allow`` then
+        cannot pre-approve a tool either.
         """
         return (
             getattr(self, "_claude_settings_authored", False)
@@ -3827,6 +3839,34 @@ class AcpClient:
         if shared:
             self._claude_settings_governed = True
         return shared
+
+    def _adopt_project_permission_governance(self, local_settings: Path, payload: str) -> bool:
+        """Use a project-owned file when its permission block matches this session's."""
+        readable, document, fingerprint = self._settings_path_document_fingerprint(local_settings)
+        if not readable or document is None or fingerprint is None:
+            return False
+        # A Crew-owned file needs a reader lease. A stale record whose digest
+        # differs from this snapshot describes a file the project has replaced.
+        known, recorded = seed_provenance.recorded_durable_checked(local_settings)
+        if (
+            not known
+            or recorded == fingerprint
+            or seed_provenance.held_by_another(local_settings, self._seed_owner)
+        ):
+            return False
+        try:
+            ours = json.loads(payload)
+        except ValueError:
+            return False
+        if not isinstance(ours, dict) or document.get("permissions") != ours.get("permissions"):
+            return False
+        self._claude_settings_governed = True
+        logger.info(
+            "%s is project-owned and its permissions match this session's; "
+            "using it without writing or claiming the file.",
+            local_settings,
+        )
+        return True
 
     @staticmethod
     def _rename_aside_noreplace(aside: Path, path: Path) -> bool:
@@ -4387,21 +4427,16 @@ class AcpClient:
         digest lets it be re-seeded (or removed on reset) while a genuinely
         user-authored file is still left exactly as it was.
 
-        That is what keeps this seam out of a user's project state: nothing here
-        reads, merges into, rewrites or deletes a file Crew did not author, so
-        there is no snapshot to take, no ownership to arbitrate between two
-        sessions sharing a ``work_dir``, and no restore write on the teardown
-        path.
+        A foreign regular file is read only to compare its permission block
+        and fingerprint with this session's seed and Crew's durable record.
+        It is never merged into, rewritten or deleted, so teardown needs no
+        restore write into the project.
 
-        The cost is stated rather than hidden: a project that already carries its
-        own ``settings.local.json`` gets NO seed, so that session runs without the
-        ``availableModels`` allowlist and without the ``permissions.deny`` rules
-        derived from ``disabledTools``, and an inherited ``bypassPermissions``
-        there is not stripped. Those tool calls still reach the host gate unless
-        the user's own file pre-approves them, which is the same disclosed
-        boundary the inherited-``~/.claude`` gap already documents. Preserving
-        such a file and restoring it afterwards is tracked separately; doing it
-        here means reading and rewriting a path a checked-out repository controls.
+        A project-owned file gets no seed. When its permission block does not
+        match and the file cannot be excluded, the session runs without Crew's
+        model allowlist and derived deny rules. An inherited
+        ``bypassPermissions`` is not stripped, and project pre-approval can
+        bypass the host gate; the Claude provider spec documents this boundary.
 
         Blocking (writes a file); callers run it off the loop.
         """
@@ -4542,6 +4577,8 @@ class AcpClient:
                 shared = self._share_sibling_settings_seed(local_settings, payload)
                 self._invalidate_session_mcp_projection()
                 if shared:
+                    return
+                if self._adopt_project_permission_governance(local_settings, payload):
                     return
                 # Crew authors none of the rest, so it touches none of them. The
                 # session can still carry Crew's settings inline and leave the

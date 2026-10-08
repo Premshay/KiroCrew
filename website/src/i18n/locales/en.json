@@ -9258,6 +9258,7 @@
         "streaming": "Streaming",
         "ffmpeg_is_missing_voice_recordings_from_the_brow": "ffmpeg is missing — voice recordings from the browser cannot be transcribed until it is installed.",
         "the_bundled_audio_decoder_is_missing_or_damaged": "The bundled audio decoder is missing or damaged. Reinstall the {{productName}} desktop app; do not install FFmpeg separately.",
+        "desktop_app_ships_no_decoder_homebrew_hint": "This version of the {{productName}} desktop app doesn't include FFmpeg. To install it with Homebrew, copy the command below and paste it into Terminal. If you don't have Homebrew yet, get it from <0>brew.sh</0> first.",
         "then_restart_the_gateway_so_it_can_import_the_ne": "Then restart the gateway so it can import the new packages.",
         "the_desktop_app_can_t_add_transcribe_support_ins": "The desktop app can't add Transcribe support — its bundled Python can't install extra packages. Install {{productName}} with pip and run the gateway from that environment instead.",
         "this_gateway_s_python_can_t_install_extra_packag": "This gateway's Python can't install extra packages, so Transcribe can't be enabled here. Run the gateway from a Python environment where pip can install boto3 + amazon-transcribe.",
