@@ -373,12 +373,19 @@ def _restore_model_fields(slot: Any, meta: dict, *, cfg: Any, effort_marker: boo
     *effort_marker* is the off-loop ``_has_validated_effort_marker`` read for
     this effort value. The effort allowlist is process state that stays on
     ``chat_persistence``, so the check is made there.
-    Returns True when the metadata carried a model, so a caller can fall
-    back to the agent's default model when it did not.
+    Returns True when the metadata owns model selection, including an execution
+    seat's default, so callers do not restore the member's old model.
     """
     from kiro_crew.dashboard import chat_persistence as cp  # circular import: facade imports owners
 
     raw_model = meta.get("model")
+    runtime_agent = meta.get("runtime_agent", "")
+    runtime_binding = (
+        cfg.agents.get(runtime_agent) if cfg and isinstance(runtime_agent, str) else None
+    )
+    slot.runtime_agent = (
+        runtime_agent if runtime_binding is not None and not runtime_binding.member_id else ""
+    )
     # Metadata is agent-writable: a non-string model is dropped, not hashed.
     has_model = isinstance(raw_model, str) and bool(raw_model)
     if has_model and isinstance(raw_model, str):
@@ -390,7 +397,7 @@ def _restore_model_fields(slot: Any, meta: dict, *, cfg: Any, effort_marker: boo
         slot.reasoning_effort = cp._validate_reasoning_effort(
             meta["reasoning_effort"], persisted_marker=effort_marker
         )
-    return has_model
+    return has_model or bool(slot.runtime_agent)
 
 
 # ── The table ─────────────────────────────────────────────────────────────────
@@ -1049,6 +1056,13 @@ FIELDS: tuple[Field, ...] = (
         read=_read_agent_kind,
     ),
     Field(
+        "runtime_agent",
+        _ALL,
+        attr="runtime_agent",
+        line=_truthy(lambda s: s.runtime_agent),
+        merge=_always(lambda s: s.runtime_agent),
+    ),
+    Field(
         "project",
         _ALL,
         attr="project",
@@ -1446,6 +1460,7 @@ LINE_ORDER: tuple[str, ...] = (
     "workspace",
     "memory_store",
     "agent_kind",
+    "runtime_agent",
     "project",
     "executor",
     "instance_id",
@@ -1505,6 +1520,7 @@ MERGE_ORDER: tuple[str, ...] = (
     "workspace",
     "memory_store",
     "agent_kind",
+    "runtime_agent",
     "project",
     "app",
     "declared_goal",

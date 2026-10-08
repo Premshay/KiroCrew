@@ -2,6 +2,12 @@
 
 ## Overview
 
+The dashboard's Backend picker reads and writes
+`/api/chat/slots/{slot}/runtime`. It preserves the conversation's member and
+memory while changing its execution seat. The selected seat is persisted,
+restored on resume, and passed through both eager and regular session startup.
+Switching refuses active turns and unsupported member capability bindings.
+
 Maps thread keys to LLMProvider instances (`session.py`). Each thread gets
 its own kiro-cli session with idle expiry, context compaction, circuit
 breaker, per-session semaphore, and persistent background session.

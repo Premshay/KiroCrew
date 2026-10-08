@@ -377,6 +377,7 @@ class SlotProjection:
             "title": redact(slot.display_title),
             "agent": slot.agent,
             "agent_kind": getattr(slot, "agent_kind", ""),
+            "runtime_agent": slot.runtime_agent,
             "effective_agent": resolve_effective_agent(slot.agent, slot.project or None),
             "model": slot.model,
             # Whether this session's turns ask Jev which model tier to run on

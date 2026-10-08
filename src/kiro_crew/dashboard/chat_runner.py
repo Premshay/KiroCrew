@@ -6307,7 +6307,9 @@ async def _spawn_admitted_prefetch(
         # which case the speculative session/load runs here and the
         # resumed=True observation is armed for the real turn. See
         # get_or_create's docstring.
-        _requested_model = slot.model or agent_model or default_model or ""
+        _requested_model = slot.model or (
+            "" if slot.runtime_agent else agent_model or default_model or ""
+        )
         try:
             _, is_new, resumed = await sessions.get_or_create(
                 session_key,
@@ -6318,6 +6320,7 @@ async def _spawn_admitted_prefetch(
                 # cross-namespace name match. "" is authoritative: no
                 # alias applied, so no override applies.
                 crew_agent=crew_alias,
+                **({"runtime_agent": slot.runtime_agent} if slot.runtime_agent else {}),
                 model=_requested_model or None,
                 cwd=slot.project or None,
                 speculative=True,
@@ -10589,13 +10592,16 @@ async def _run_chat(
         # local because two consumers must not diverge: the provider call below,
         # which decides whether to send it, and the crew log's `session/opened`,
         # which records the choice.
-        _requested_model = slot.model or agent_model or default_model or ""
+        _requested_model = slot.model or (
+            "" if slot.runtime_agent else agent_model or default_model or ""
+        )
         _allocation_kwargs: dict[str, Any] = dict(
             agent=kiro_agent or slot.agent or None,
             # Same canonical crew identity as the eager-spawn path — the two
             # must agree or an eager session and its real first turn would
             # carry different watchdog windows.
             crew_agent=crew_alias,
+            **({"runtime_agent": slot.runtime_agent} if slot.runtime_agent else {}),
             model=_requested_model or None,
             cwd=slot.project or None,
             # The persisted channel stays separate from the dashboard-owned key
