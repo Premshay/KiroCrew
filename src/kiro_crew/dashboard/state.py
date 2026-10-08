@@ -512,10 +512,18 @@ def _attach_slot_parents(
     through ``session_create``: the sidebar already receives the slots broadcast, so
     the edge rides a frame it gets anyway rather than a route it would have to poll.
 
-    The SHAPE is byte-identical to the Sessions table's ``parent`` -- same two keys,
-    same meaning, same ``key: None`` for a creator that is not running or sits on a
-    cycle -- because one moved ``nestsUnder`` serves both views and a second shape
-    would be a second way to nest the same gateway. What differs, necessarily, is the
+    The SHAPE is byte-identical to the Sessions table's ``parent`` -- same keys, same
+    meaning, same ``key: None`` for a creator that is not running under a chain with
+    nothing open in it, or one that sits on a cycle -- because one moved ``nestsUnder``
+    serves both views and a second shape would be a second way to nest the same
+    gateway. A third key, ``ancestor``, rides the one case where ``key`` and ``slot``
+    name different sessions: the creator in ``slot`` has CLOSED and ``key`` is the
+    nearest session above it still open, so the row nests where the run is owned and
+    still cites a creator that is gone (see
+    :func:`~kiro_crew.crew_log.session_tree.parent_payload`). It is omitted, never
+    ``False``, so an ordinary edge is the payload it has always been.
+
+    What differs between the two views, necessarily, is the
     KEY SPACE: ``key`` names the creator's row IN THIS PAYLOAD, so here it is the bare
     slot key and on the memory payload it is the full ``dashboard:`` session key.
     ``nestsUnder`` resolves ``parent.key`` against its own payload's keys, so that is
@@ -10821,11 +10829,19 @@ class DashboardState:
         """Publish that slot *key* left the registry without re-sending the list.
 
         Patch-capable sockets receive ``{"slots": [...], "removed": [key]}``.
-        The ``slots`` rows re-state the ``parent`` of every row whose creator is
-        not live, because a removed conductor turns its workers' ``parent.key``
-        to ``None`` in the full frame; carrying those rows keeps the sidebar's
-        nesting identical to what a full list would have produced. Everyone else
-        gets the full list, as with :meth:`push_slot_patch`.
+        The ``slots`` rows re-state the ``parent`` of every row the removal MOVED,
+        because a removed conductor changes its workers' ``parent`` in the full
+        frame; carrying those rows keeps the sidebar's nesting identical to what a
+        full list would have produced. Everyone else gets the full list, as with
+        :meth:`push_slot_patch`.
+
+        Two shapes qualify, and the second is why the test is not ``key is None``.
+        A worker with no open ancestor loses its key outright. A worker that HAS one
+        is re-parented onto it and carries ``ancestor``, so its key is a live string
+        -- the lead's -- and a null test would leave the client holding the closed
+        conductor's key, a row the same frame just removed. Every one of those
+        workers would then render top-level with the orphan glyph until a full frame
+        happened along, which is the behaviour this method exists to prevent.
 
         A key that is registered again (a same-name replacement landed while the
         close was tearing down) is not removed: the full push describes it. The
@@ -10864,14 +10880,14 @@ class DashboardState:
         if self._has_slot_patch_clients():
             rows = self._lineage_rows()
             _attach_slot_parents(rows, getattr(self, "spend_slot_by_session", None))
-            orphans = [
+            restated = [
                 {"key": row["key"], "parent": row["parent"]}
                 for row in rows
                 if isinstance(row.get("parent"), dict)
-                and row["parent"].get("key") is None
+                and (row["parent"].get("key") is None or row["parent"].get("ancestor") is True)
                 and not row.get("lineage_pending")
             ]
-            self._send_slot_patch({"slots": orphans, "removed": [key]})
+            self._send_slot_patch({"slots": restated, "removed": [key]})
         self._emit_member_slot_transitions()
 
     def _has_slot_patch_clients(self) -> bool:

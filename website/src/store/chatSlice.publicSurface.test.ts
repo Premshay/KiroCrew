@@ -40,7 +40,7 @@ const ACTION_CREATORS = [
   'removeAutomation', 'removeByApprovalId', 'removeQueuedMessage', 'removeThinking',
   'reorderQueuedMessages', 'replaceMessages', 'requestFolderReveal', 'requestSlotReveal',
   'resolveByApprovalId', 'resolveOptimisticSteer', 'resolveQuestionCard', 'selectSubagent',
-  'setActiveSlot', 'setAgentSwitchNotice', 'setAutomations', 'setFolderSuggestion',
+  'setActiveSlot', 'setAgentSwitchNotice', 'setAutomations', 'setCloseRefused', 'setFolderSuggestion',
   'setFollowupCard', 'setPendingInput', 'setQuestionCard', 'setQuestionDraft', 'setSlotRunning',
   'setSlotState', 'setSlotStatusDetail', 'setSlotStopping', 'setStopPressedAt', 'stageToMainComposer', 'setVoiceAudio',
   'setVoiceBusy', 'setVoicePlaying', 'settleStopNotRunning', 'sideClose', 'sideOptimisticAppend',
@@ -117,6 +117,7 @@ const INITIAL_STATE = {
   slotHistory: [], slotsSnapshotSeen: false, pendingQuestions: {}, followups: {},
   folderSuggestions: {}, stopPressedAt: {}, runEpoch: {}, activeRunEpochAtEntry: 0,
   pendingTurnSlot: null,
+  closeRefused: null,
 }
 
 const surface = chatSlice as unknown as Record<string, unknown>

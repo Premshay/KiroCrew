@@ -102,8 +102,13 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, jCre
          * own crew log records it; null for a session nobody created. `key` is the
          * creator's live session key when it is running (the edge the table nests
          * on) and null when it is not, so the citation outlives the creator.
+         *
+         * `ancestor` is true when `key` is the nearest OPEN ancestor instead of the
+         * creator in `slot`, which happens once the creator itself closes: the row
+         * nests under the session that owns the run and the citation still names the
+         * creator that is gone.
          */
-        parent: { slot: string; key: string | null } | null
+        parent: { slot: string; key: string | null; ancestor?: boolean } | null
       }[]
       tasks: {
         id: string; task: string; agent: string; parent: string
