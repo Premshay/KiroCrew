@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { renderHook, act, waitFor } from '@testing-library/react'
+import { renderHook, act } from '@testing-library/react'
 import { createElement } from 'react'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { api } from '../api/client'
-import chatReducer, { PANE_HYDRATE_LIMIT, refreshSlot, setActiveSlot, sseChatMessage, sseSubagentSpawn, sseSubagentPending, sseSubagentDone } from '../store/chatSlice'
-import { store, type RootState } from '../store'
+import chatReducer, { PANE_HYDRATE_LIMIT, refreshSlot, sseSubagentSpawn, sseSubagentPending, sseSubagentDone } from '../store/chatSlice'
+import type { RootState } from '../store'
 import { setViewedThreadSlot, _resetViewedThreadForTests } from '../lib/viewedThread'
 
 // Track markSlotUnread dispatches (normalized to the slot key: the payload

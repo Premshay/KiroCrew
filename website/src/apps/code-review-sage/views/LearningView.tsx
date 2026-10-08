@@ -4,7 +4,7 @@
 // untouched until the operator explicitly confirms a fresh preview's apply.
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Brain, Check, FileText, Loader2, Sparkles } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { SageApiError, sageApi } from '../api'
 import { useSage } from '../context'
@@ -399,7 +399,10 @@ export default function LearningView() {
   const isActive = !!ns && activeList.includes(ns)
   const patterns = learningsQuery.data?.patterns ?? []
   const candidate = learningsQuery.data?.candidate ?? []
-  const candidateIds = candidate.map((item) => item.id)
+  const candidateIds = useMemo(
+    () => (learningsQuery.data?.candidate ?? []).map((item) => item.id),
+    [learningsQuery.data?.candidate],
+  )
   const activePreviewId = previewId ?? previewsQuery.data?.previews[0]?.preview_id ?? null
 
   useEffect(() => {
@@ -410,7 +413,7 @@ export default function LearningView() {
   }, [ns])
   useEffect(() => {
     setSelectedIds((current) => current.filter((id) => candidateIds.includes(id)))
-  }, [candidateIds.join('|')])
+  }, [candidateIds])
   useEffect(() => {
     const previews = previewsQuery.data?.previews ?? []
     if (!awaitingPreview) return

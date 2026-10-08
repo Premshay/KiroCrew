@@ -877,6 +877,7 @@ export default function ChatPane({
       modelDD.setOpen(true)
     },
   })
+  const { beforeSend: checkPreferenceBeforeSend } = preferenceAdvisor
 
   // Roving-focus keyboard nav for the pickers (mirrors ChatPage / StyledSelect):
   // ArrowUp/Down across options, Enter/Space select, Escape/Tab close + return
@@ -1101,7 +1102,7 @@ export default function ChatPane({
     // announces it with `question_card_resolved`.
     const askAtSend = capturePendingAskId(store.getState().chat.pendingQuestions, slotKey)
     if (origin === 'manual' && !optionText && !pendingFiles.length && !pasteBlocks.length) {
-      const advice = preferenceAdvisor.beforeSend(text)
+      const advice = checkPreferenceBeforeSend(text)
       if (!(typeof advice === 'boolean' ? advice : await advice)) return
       if (slotKeyRef.current !== slotKey || inputRef.current.trim() !== text ||
         pendingFilesRef.current !== pendingFiles || readPastes() !== pasteBlocks) return
@@ -1250,7 +1251,7 @@ export default function ChatPane({
       if (!askAtSend) return
       void resolveAskAfterSend(receipt.body, askAtSend, dispatch)
     })
-  }, [input, pendingFiles, pasteBlocks, setPasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure, scrollToBottom, consumeQuote, recoverQuoteInto, preferenceAdvisor.beforeSend, readPastes])
+  }, [input, pendingFiles, pasteBlocks, setPasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure, scrollToBottom, consumeQuote, recoverQuoteInto, checkPreferenceBeforeSend, readPastes])
 
   // Mid-turn steer: inject the composer content into the RUNNING turn instead
   // of queueing behind it. The pane's counterpart to ChatPage.steer, on the
