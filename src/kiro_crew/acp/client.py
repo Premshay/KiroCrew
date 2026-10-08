@@ -2220,6 +2220,10 @@ class AcpClient:
         self._claude_autonomous_handler_owner = ""
         self._pending_claude_autonomous_turns: deque[ClaudeAutonomousTurn] = deque()
         self._claude_dispatch_depth = 0
+        # Set when Claude folds an autonomous message into the live turn; the
+        # next reply text then opens a new paragraph instead of continuing the
+        # sentence the previous message ended on.
+        self._claude_folded_message_break = False
         self._claude_idle_handler: Callable[[AcpEvent], Awaitable[None]] | None = None
         self._claude_idle_text: list[str] = []
         self._claude_live_background_tasks: set[str] = set()
@@ -6346,6 +6350,7 @@ class AcpClient:
         origin = origin_data.get("kind") if isinstance(origin_data, dict) else None
         if kind == "user" and origin in _CLAUDE_AUTONOMOUS_ORIGINS:
             if self._claude_dispatch_depth > 0:
+                self._claude_folded_message_break = True
                 return
             if self._claude_autonomous_origin is not None:
                 logger.error(
@@ -9560,6 +9565,7 @@ class AcpClient:
                     parked_total += max(0.0, time.monotonic() - _parked_since)
         finally:
             self._claude_dispatch_depth = max(0, self._claude_dispatch_depth - 1)
+            self._claude_folded_message_break = False
             self._turn_lock.release()
             # Release any cooperative-stop waiter regardless of how the loop
             # ends. The callers set the precise stop reason on the clean
@@ -11493,6 +11499,9 @@ class AcpClient:
             if not is_thinking and isinstance(text, str) and text:
                 if self._is_replayed_message(update.get("messageId"), text):
                     return None, False
+                if self._claude_folded_message_break:
+                    self._claude_folded_message_break = False
+                    text = "\n\n" + text
             return text, is_thinking
         if kind == UPDATE_AGENT_THOUGHT_CHUNK:
             content = update.get("content", {})
