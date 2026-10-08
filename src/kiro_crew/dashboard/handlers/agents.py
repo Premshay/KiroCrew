@@ -1832,8 +1832,24 @@ async def _revalidate_crew_pin(model: str, request: web.Request) -> str | None:
     )
 
 
+def _cached_agent_advertised_ids(request: web.Request, name: str) -> list[str] | None:
+    """Return a fresh target-agent discovery result, when available."""
+    state: DashboardState | None = request.app.get("state")
+    if state is None:
+        return None
+    cached = _model_discovery_cache.get((id(state.sessions), name))
+    if cached is None or time.monotonic() - cached[0] >= _MODEL_DISCOVERY_CACHE_TTL_SECS:
+        return None
+    return advertised_model_ids(cached[1].get("models", []))
+
+
 def _model_pin_rejected(
-    model: str, request: web.Request, provider: str, *, backend: str | None = None
+    model: str,
+    request: web.Request,
+    provider: str,
+    *,
+    advertised_ids: list[str] | None = None,
+    backend: str | None = None,
 ) -> str | None:
     """Reason a crew's model pin is unusable, or ``None`` to allow it.
 
@@ -1887,9 +1903,19 @@ def _model_pin_rejected(
         )
     # circular import: handlers.core resolves _get_config_lock from this module,
     # so importing it at module scope would close the cycle.
+    from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
     from kiro_crew.dashboard.handlers.core import _validate_role_model
 
-    return _validate_role_model(model, request, provider=provider, backend=backend)
+    if advertised_ids is None:
+        return _validate_role_model(model, request, provider=provider, backend=backend)
+
+    reason = _model_rejected_reason(model, provider=provider)
+    if reason:
+        return reason
+    if model_is_unusable(model, advertised_ids):
+        usable = ", ".join(advertised_ids[:8]) or "auto"
+        return f"{model!r} is not available on this agent; choose one of: {usable}, or 'auto'."
+    return None
 
 
 # ── Per-crew uploaded avatars ────────────────────────────────────────
