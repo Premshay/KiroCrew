@@ -8649,8 +8649,8 @@ async def _run_chat(
     _steer_possibly_delivered: bool = False,
     _directive_user_origin: bool = False,
     _post_restart_continuation: bool = False,
-    _drained_queue_ids: tuple[str, ...] = (),
     _peer_channel_request_refs: tuple[tuple[str, str], ...] = (),
+    _drained_queue_ids: tuple[str, ...] = (),
     # This turn was drained from a queue entry a PREVIOUS process accepted
     # (`slot_queue_repository.RESTORED_QUEUE_KEY`). Its provenance therefore
     # rests on an ordinary writable file rather than on anything this process
