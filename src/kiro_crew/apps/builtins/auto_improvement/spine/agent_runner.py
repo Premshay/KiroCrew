@@ -54,6 +54,7 @@ from kiro_crew.hooks import (
     hook_gate_kwargs,
     hooks_config_from_config_dict,
 )
+from kiro_crew.json_line import parse_json_object_line
 from kiro_crew.llm_helpers import _steer_host_deny
 from kiro_crew.permission_floor import (
     OUTCOME_PENDING_APPROVAL,
@@ -64,7 +65,7 @@ from kiro_crew.platform_compat import SIGKILL, kill_process_tree
 from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
-from .git_safety import GIT_SAFE_CONFIG, require_pinned
+from .git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned
 
 logger = logging.getLogger(__name__)
 
@@ -575,7 +576,9 @@ def _governance_denial(
         # caller that most needs it. Raised by the GPT review.
         manager = HookManager(hooks_config_from_config_dict(getattr(cfg, "hooks", {}) or {}))
         if tool_kind is None:
-            tool_kind = getattr(ev, "tool_kind", "") or getattr(ev, "tool_purpose", "")
+            # ``tool_purpose`` is the agent's own prose about the call (display text
+            # only), so it never stands in for the tool's identity.
+            tool_kind = getattr(ev, "tool_kind", "") or ""
         command = _requested_command(ev)
         result = manager.on_tool_call(
             (getattr(ev, "title", "") or tool_kind or "").strip(),
@@ -1069,12 +1072,8 @@ class AgentRunner:
                         error=f"timeout after {timeout_s}s",
                         duration_s=time.monotonic() - t0,
                     )
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
+                obj = parse_json_object_line(line)
+                if obj is None:
                     continue
                 act = _summarize_stream_event(obj)
                 if act:
@@ -1328,7 +1327,7 @@ class SessionAgentRunner:
                 dest_dir,
                 self.agent_name,
                 operation="auto_improvement.register_agent",
-                source=__name__,
+                source="auto_improvement_loop",
             )
             if registered is not None and not dest.exists():
                 # The app bridge injects its MCP map into the namespaced copy.
@@ -1579,10 +1578,13 @@ class SessionAgentRunner:
                     # approval landed out-of-order relative to the read loop, the agent never
                     # saw its tool result, and the run hung to the timeout. Inline await is
                     # the proven pattern and completes the turn.
-                    tool = (
-                        getattr(ev, "tool_kind", "")
-                        or announced_tool_kind.get(getattr(ev, "tool_call_id", ""), "")
-                        or getattr(ev, "tool_purpose", "")
+                    # Identity comes from the provider's ``kind`` only, never from
+                    # ``tool_purpose``: that is agent-written display text, and the
+                    # allowlist below substring-matches it, so a purpose such as
+                    # "Read the module" would pass a ``["Read"]`` allowlist for a
+                    # write. An unnamed request stays unnamed and is refused.
+                    tool = getattr(ev, "tool_kind", "") or announced_tool_kind.get(
+                        getattr(ev, "tool_call_id", ""), ""
                     )
                     rid = getattr(ev, "request_id", "")
                     # ENFORCE the caller's allowlist. `allowed_tools` was accepted by `run`
@@ -2054,7 +2056,7 @@ def author_bug_fix(
     require_pinned(worktree)
     where = str(Path(worktree).absolute())
     st = subprocess.run(
-        ["git", "-C", where, *_GIT_SAFE_CONFIG, "status", "--porcelain"],
+        ["git", "-C", where, *_GIT_SAFE_CONFIG, *hook_off_args(where), "status", "--porcelain"],
         capture_output=True,
         cwd=where,
         **UTF8_TEXT,
@@ -2213,7 +2215,7 @@ def author_perf_fix(
     # directory must be the worktree, not whatever the gateway inherited.
     where = str(Path(worktree).absolute())
     st = subprocess.run(
-        ["git", "-C", where, *_GIT_SAFE_CONFIG, "status", "--porcelain"],
+        ["git", "-C", where, *_GIT_SAFE_CONFIG, *hook_off_args(where), "status", "--porcelain"],
         capture_output=True,
         cwd=where,
         **UTF8_TEXT,

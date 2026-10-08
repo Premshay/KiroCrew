@@ -131,6 +131,16 @@ class LLMProvider(ABC):
         """Exact documents supplied at native startup, empty without evidence."""
         return {}
 
+    @property
+    def member_dispatch_mounted(self) -> bool | None:
+        """Whether this session holds the member session-control tools.
+
+        ``None`` means no evidence: context assembly falls back to the configured
+        member backend's capability. A provider that composes a session's MCP
+        array answers from that composition.
+        """
+        return None
+
     def restrict_tools(self, allowed_tools: list[str]) -> None:
         """Restrict tools before startup, or refuse if enforcement is unavailable.
 
@@ -148,8 +158,11 @@ class LLMProvider(ABC):
         """Gracefully shut down."""
 
     @abstractmethod
-    async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
-        """Send a message and yield events."""
+    async def stream(self, message: str, *, allow_image: bool = True) -> AsyncIterator[LLMEvent]:
+        """Send a message and yield events.
+
+        ``allow_image=False`` keeps path-like text from becoming image blocks.
+        """
         yield LLMEvent(kind=EVENT_COMPLETE)  # pragma: no cover
 
     @abstractmethod

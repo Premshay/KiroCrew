@@ -14,10 +14,7 @@ import os
 import shutil
 import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
-
-if TYPE_CHECKING:
-    from kiro_crew.providers.acp import AcpProvider
+from typing import Any, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.agent_sdk.backends import (
@@ -27,6 +24,7 @@ from kiro_crew.agent_sdk.backends import (
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_sdk import build_acp_provider, is_acp_timeout
 from kiro_crew.config import live
 from kiro_crew.config.loader import read_config_text
 from kiro_crew.config.paths import config_dir
@@ -43,10 +41,9 @@ from kiro_crew.sandbox import (
 )
 
 try:
-    from kiro_crew.acp.client import AcpClient, AcpTimeoutError
+    from kiro_crew.acp.client import AcpClient
 except ImportError:
     AcpClient = None  # type: ignore[assignment,misc]
-    AcpTimeoutError = ()  # type: ignore[assignment,misc]
 
 # Sweep-protection shield for AcpClient-backed workers. These are direct,
 # long-lived AcpClient sessions (not SessionMap sessions / warm-pool providers),
@@ -414,7 +411,7 @@ class AcpWorker(Worker):
         effort: Optional[str] = None,
     ) -> None:
         self._client: Optional[AcpClient] = None
-        self._provider: Optional[AcpProvider] = None
+        self._provider: Optional[Any] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
         self._sandbox_mode = sandbox_mode
@@ -465,9 +462,7 @@ class AcpWorker(Worker):
             sorted(binding) or "none",
         )
         if binding.get("acp_backend") in ACP_BACKENDS_ACP_RUNTIME:
-            from kiro_crew.providers.acp import AcpProvider
-
-            self._provider = AcpProvider(
+            self._provider = build_acp_provider(
                 agent=AGENT_NAME,
                 sandbox_mode=sandbox_mode,
                 **binding,
@@ -857,6 +852,7 @@ class LLMPool:
         effort_key: Optional[str] = None,
         fallback_effort: str = "",
         config_pool_size_key: Optional[str] = None,
+        use_config_pool_size: Optional[bool] = None,
     ):
         self._pool_size = pool_size
         self._effort = _normalize_effort(effort)
@@ -867,11 +863,20 @@ class LLMPool:
         # override for tests / pure construction.
         self._effort_key = effort_key
         self._fallback_effort = fallback_effort
-        # Config keys override ``pool_size`` ONLY for the workload that owns
-        # them: extraction binds ``config_pool_size_key="extraction_pool_size"``
-        # while the fetch pool passes nothing, so knowledge.extraction_pool_size
-        # cannot silently resize it (or the auto_research pool).
-        self._config_pool_size_key = config_pool_size_key
+        # A default-width pool retains the former config-driven behavior, while
+        # an explicit non-default width stays fixed unless it binds a config key.
+        # This keeps the compatibility flag from resizing the one-worker fetch
+        # and auto-research pools that predate ``config_pool_size_key``.
+        self._use_config_pool_size = (
+            pool_size == DEFAULT_POOL_SIZE or config_pool_size_key is not None
+            if use_config_pool_size is None
+            else use_config_pool_size
+        )
+        self._config_pool_size_key = (
+            config_pool_size_key
+            if config_pool_size_key is not None
+            else ("extraction_pool_size" if self._use_config_pool_size else None)
+        )
         self._semaphore = asyncio.Semaphore(pool_size)
         self._workers: list[Worker] = []
         self._available: asyncio.Queue[int] = asyncio.Queue()
@@ -1006,8 +1011,7 @@ class LLMPool:
             self._timeout_floor = _get_timeout_floor(config, bound=bool(binding))
             if self._timeout_floor:
                 logger.info(
-                    "LLMPool: bound to an edition engine — prompt timeouts "
-                    "floored at %.0fs",
+                    "LLMPool: bound to an edition engine — prompt timeouts " "floored at %.0fs",
                     self._timeout_floor,
                 )
             try:
@@ -1211,9 +1215,7 @@ class LLMPool:
         idx, worker = await self.acquire()
         try:
             # After acquire: start() has run, so the bound floor is resolved.
-            return await worker.send_message(
-                prompt, timeout=max(timeout, self._timeout_floor)
-            )
+            return await worker.send_message(prompt, timeout=max(timeout, self._timeout_floor))
         finally:
             try:
                 await self._maybe_recycle(idx, worker)
@@ -1292,7 +1294,7 @@ class LLMPool:
                     prompt, timeout=max(timeout, self._timeout_floor)
                 )
             except Exception as e:
-                if self._timeout_floor > 0 and isinstance(e, AcpTimeoutError):
+                if self._timeout_floor > 0 and is_acp_timeout(e):
                     if not floor_hit:
                         floor_hit.append(e)
                         logger.warning(

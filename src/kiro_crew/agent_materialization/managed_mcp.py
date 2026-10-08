@@ -262,8 +262,8 @@ def _mcp_server_emission_eligible(
       shut, so the rebuild actively withholds it rather than merely skipping it.
 
     Both spec writers consult this, and so does the dashboard PUT's merge-on-write
-    host set (``handlers/agents.py::_app_or_host_owned``). That co-tenancy is the
-    whole point of the helper rather than a convenience: the merge preserves an
+    host set (``dashboard/agent_admin/app_mcp_ownership.py::_app_or_host_owned``). That
+    co-tenancy is the whole point of the helper rather than a convenience: the merge preserves an
     absent managed entry *because* a rebuild would re-add it, so if the two ever
     disagreed the merge would resurrect entries the rebuild withholds — an
     ``opt_in`` grant the user revoked through the only surface that can revoke it,
@@ -297,10 +297,11 @@ def emission_eligible_mcp_servers() -> frozenset[str]:
     here for the same reason a managed one is. Today they carry neither, so this
     is every extra plus the always-emitted managed entries.
 
-    Exported (no leading underscore) because ``handlers/agents.py``'s
-    merge-on-write is a legitimate out-of-module consumer: it must preserve
-    exactly the set a rebuild would re-add, and computing that itself is what let
-    the two drift. Read live rather than cached — a keystone flip between two PUTs
+    Exported (no leading underscore) because
+    ``dashboard/agent_admin/app_mcp_ownership.py``'s merge-on-write is a legitimate
+    out-of-module consumer: it must preserve exactly the set a rebuild would re-add,
+    and computing that itself is what let the two drift. Read live rather than
+    cached — a keystone flip between two PUTs
     must change the answer.
     """
     return frozenset(

@@ -41,13 +41,14 @@ from kiro_crew.dashboard.chat_title import (
 from kiro_crew.dashboard.state import _ChatSlot
 
 
-def _fake_state():
+def _fake_state(*slots):
     state = MagicMock()
     # conversation_log must be truthy for _persist_title to attempt a write.
     state.conversation_log = MagicMock()
     # The title write looks up ``state._slots`` for the live holder of the key; a
-    # bare MagicMock there poses as a slot at every key. No slot is registered here.
-    state._slots = {}
+    # bare MagicMock there poses as a slot at every key. The background titler
+    # only writes for the slot that still holds its key, so pass that slot here.
+    state._slots = {s.key: s for s in slots}
     return state
 
 
@@ -83,7 +84,7 @@ class TestRefreshGating:
     async def test_not_due_before_first_milestone(self, monkeypatch):
         calls = _patch_generator(monkeypatch, "New Title")
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0] - 1)
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == []
         assert slot.title == "Initial auto title"
 
@@ -91,7 +92,7 @@ class TestRefreshGating:
     async def test_due_at_first_milestone(self, monkeypatch):
         calls = _patch_generator(monkeypatch, "New Title")
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == ["Initial auto title"]
         assert slot.title == "New Title"
 
@@ -136,7 +137,7 @@ class TestRefreshGating:
     async def test_user_origin_is_never_refreshed(self, monkeypatch):
         calls = _patch_generator(monkeypatch, "New Title")
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[1], origin=_TITLE_ORIGIN_USER)
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == []
         assert slot.title == "Initial auto title"
 
@@ -146,7 +147,7 @@ class TestRefreshGating:
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
         slot._titled = False
         slot._title_origin = ""
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == []
 
     @pytest.mark.asyncio
@@ -154,7 +155,7 @@ class TestRefreshGating:
         calls = _patch_generator(monkeypatch, "New Title")
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
         slot._title_in_flight = True
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == []
 
     @pytest.mark.asyncio
@@ -164,7 +165,7 @@ class TestRefreshGating:
         calls = _patch_generator(monkeypatch, "New Title")
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0] + 1)
         slot._title_refresh_mark = _TITLE_REFRESH_MILESTONES[0]
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == [], "first milestone already consumed pre-restart"
 
 
@@ -192,7 +193,7 @@ class TestRefreshOutcomes:
     async def test_new_title_is_applied_pushed_and_stays_auto(self, monkeypatch):
         _patch_generator(monkeypatch, "Debug flaky auth test")
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
-        state = _fake_state()
+        state = _fake_state(slot)
         await maybe_refresh_title(state, slot)
         assert slot.title == "Debug flaky auth test"
         assert slot._title_origin == _TITLE_ORIGIN_AUTO, "stays refreshable"
@@ -344,6 +345,7 @@ class TestManualRegenerateWindow:
         state = _fake_state()
         state._slots = {slot.key: slot}
         request = MagicMock()
+        request.get.return_value = ""
         request.app = {"state": state}
         request.match_info = {"slot": slot.key}
 
@@ -391,6 +393,7 @@ class TestManualRegenerateRaceGuard:
         state._slots = {slot.key: slot}
         epoch_after_rename = slot._title_epoch + 1
         request = MagicMock()
+        request.get.return_value = ""
         request.app = {"state": state}
         request.match_info = {"slot": slot.key}
 
@@ -434,6 +437,7 @@ class TestManualRegenerateRaceGuard:
         state = _fake_state()
         state._slots = {slot.key: slot}
         request = MagicMock()
+        request.get.return_value = ""
         request.app = {"state": state}
         request.match_info = {"slot": slot.key}
 
@@ -468,6 +472,7 @@ class TestManualRegenerateRaceGuard:
         state._slots = {slot.key: slot}
         epoch_before = slot._title_epoch
         request = MagicMock()
+        request.get.return_value = ""
         request.app = {"state": state}
         request.match_info = {"slot": slot.key}
 
@@ -498,7 +503,7 @@ class TestOriginRecording:
         monkeypatch.setattr(chat_title, "maybe_suggest_folder", _noop)
         slot = _ChatSlot("chat-1-1")
         slot.messages = [{"role": "user", "content": "hello world task"}]
-        await chat_title._maybe_auto_title(_fake_state(), slot)
+        await chat_title._maybe_auto_title(_fake_state(slot), slot)
         assert slot._titled is True
         assert slot._title_origin == _TITLE_ORIGIN_AUTO
 
@@ -518,7 +523,7 @@ class TestOriginRecording:
             {"role": "user", "content": "hello world task"},
             {"role": "assistant", "content": "done"},
         ]
-        await chat_title._maybe_auto_title(_fake_state(), slot)
+        await chat_title._maybe_auto_title(_fake_state(slot), slot)
         assert slot._titled is True
         assert slot._title_origin == _TITLE_ORIGIN_AUTO, (
             "the truncated fallback is auto-generated, so the refresh may "
@@ -565,7 +570,7 @@ class TestRevealIsCosmetic:
     async def test_reveal_stops_when_epoch_moves(self, monkeypatch):
         monkeypatch.setattr(chat_title, "_TITLE_REVEAL_STEP_SECS", 0)
         slot = _ChatSlot("chat-1-1")
-        state = _fake_state()
+        state = _fake_state(slot)
 
         def _bump_epoch(*_a, **_kw):
             slot._title_epoch += 1
@@ -942,6 +947,7 @@ class TestRenameIsFinal:
         state = _fake_state()
         state._slots = {"chat-1-1": slot}
         request = MagicMock()
+        request.get.return_value = ""
         request.app = {"state": state}
         request.match_info = {"slot": "chat-1-1"}
 
@@ -1065,7 +1071,7 @@ class TestRefreshCadence:
             return 10
 
         monkeypatch.setattr(chat_title, "_title_refresh_every", _read_while_something_lands)
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == []
         assert slot._title_refresh_mark == 0
         if landing == "refresh":
@@ -1088,7 +1094,7 @@ class TestRefreshCadence:
 
         monkeypatch.setattr(chat_title, "_title_refresh_every", _hold_both_in_the_hop)
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
-        state = _fake_state()
+        state = _fake_state(slot)
         await asyncio.gather(maybe_refresh_title(state, slot), maybe_refresh_title(state, slot))
         assert calls == ["Initial auto title"]
         assert slot._title_refresh_mark == _TITLE_REFRESH_MILESTONES[0]
@@ -1333,7 +1339,7 @@ class TestRefreshErrorPathPersistsBudget:
 
         monkeypatch.setattr(chat_title, "_persist_title", _spy_persist)
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert persisted == [_TITLE_REFRESH_MILESTONES[0]]
 
 
@@ -1398,9 +1404,287 @@ class TestSlotCreatePinIsFinal:
         slot.messages = [
             {"role": "user", "content": f"m{i}"} for i in range(_TITLE_REFRESH_MILESTONES[0])
         ]
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == []
         assert slot.title == "Pinned by caller"
+
+
+class TestScriptCronSlotCreateTitles:
+    _CRON_KEY = "cron:nightly-dispatcher"
+
+    @staticmethod
+    def _make_route(tmp_path, monkeypatch, *, cron: bool):
+        from unittest.mock import AsyncMock
+
+        from aiohttp import web
+        from chat_test_helpers import _make_ready_kiro_prerequisite
+
+        from kiro_crew.dashboard import chat_handlers
+        from kiro_crew.dashboard.chat import api_chat_slot_create
+        from kiro_crew.dashboard.state import DashboardState
+        from kiro_crew.history import ConversationLog
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        sessions = MagicMock(count=0)
+        sessions.remove = AsyncMock()
+        sessions.recycle_background = AsyncMock()
+        sessions.get_pid = MagicMock(return_value=None)
+        state = DashboardState(
+            sessions=sessions,
+            crons=MagicMock(
+                list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})
+            ),
+            lessons=MagicMock(load_all=MagicMock(return_value=[])),
+            start_time=0.0,
+            conversation_log=ConversationLog(base_dir=tmp_path),
+        )
+        state.kiro_prerequisite_service = _make_ready_kiro_prerequisite()
+        if cron:
+
+            async def _cron_creator(_request):
+                return TestScriptCronSlotCreateTitles._CRON_KEY
+
+            monkeypatch.setattr(chat_handlers, "cron_slot_creator", _cron_creator)
+
+        app = web.Application()
+        app["state"] = state
+        app.router.add_post("/api/chat/slots", api_chat_slot_create)
+        return state, app
+
+    @pytest.mark.asyncio
+    async def test_a_cron_reopen_keeps_a_user_renamed_title(self, tmp_path, monkeypatch):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        state, app = self._make_route(tmp_path, monkeypatch, cron=True)
+        slot = state.get_or_create_slot("nightly-dispatch")
+        slot.title = "User renamed title"
+        slot._titled = True
+        slot._title_origin = _TITLE_ORIGIN_USER
+        slot._title_epoch = 4
+        slot._created_by = self._CRON_KEY
+
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/api/chat/slots",
+                json={"name": "nightly-dispatch", "title": "Nightly dispatch"},
+            )
+
+        assert response.status == 200
+        assert slot.title == "User renamed title"
+        assert slot._title_origin == _TITLE_ORIGIN_USER
+        assert slot._title_epoch == 4
+
+    @pytest.mark.asyncio
+    async def test_a_cron_reopens_a_closed_session_with_its_saved_title(
+        self, tmp_path, monkeypatch
+    ):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.chat_api.slot_lifecycle import close_slot
+
+        state, app = self._make_route(tmp_path, monkeypatch, cron=True)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/api/chat/slots",
+                json={"name": "nightly-dispatch", "title": "Nightly dispatch"},
+            )
+            assert response.status == 200
+
+            slot = state._slots["nightly-dispatch"]
+            slot.append("user", "Keep this saved session")
+            slot.title = "User renamed title"
+            slot._titled = True
+            slot._title_origin = _TITLE_ORIGIN_USER
+            slot._title_epoch = 4
+            slot.created_at = "2000-01-01T00:00:00+00:00"
+            await close_slot(state, slot, slot.key)
+            assert "nightly-dispatch" not in state._slots
+            persisted = state.conversation_log.get_metadata("dashboard:nightly-dispatch")
+            assert persisted["title"] == "User renamed title"
+            assert persisted["title_origin"] == _TITLE_ORIGIN_USER
+            assert persisted["created_by"] == self._CRON_KEY
+            saved_created_at = persisted["created_at"]
+
+            response = await client.post(
+                "/api/chat/slots",
+                json={"name": "nightly-dispatch", "title": "Nightly dispatch"},
+            )
+
+        assert response.status == 200
+        reopened = state._slots["nightly-dispatch"]
+        assert reopened.title == "User renamed title"
+        assert reopened._title_origin == _TITLE_ORIGIN_USER
+        assert reopened._titled is True
+        assert reopened.created_at != saved_created_at
+
+        calls = _patch_generator(monkeypatch, "Model replacement")
+        reopened.messages = [
+            {"role": "user", "content": f"message {index}"}
+            for index in range(_TITLE_REFRESH_MILESTONES[0])
+        ]
+        await maybe_refresh_title(_fake_state(reopened), reopened)
+        assert calls == []
+        assert reopened.title == "User renamed title"
+
+        persisted = state.conversation_log.get_metadata("dashboard:nightly-dispatch")
+        assert persisted["title"] == "User renamed title"
+        assert persisted["title_origin"] == _TITLE_ORIGIN_USER
+
+    @pytest.mark.asyncio
+    async def test_a_closed_cron_reopen_rebases_the_auto_title_mark(self, tmp_path, monkeypatch):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.chat_api.slot_lifecycle import close_slot
+
+        state, app = self._make_route(tmp_path, monkeypatch, cron=True)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/api/chat/slots",
+                json={"name": "nightly-dispatch", "title": "Nightly dispatch"},
+            )
+            assert response.status == 200
+
+            slot = state._slots["nightly-dispatch"]
+            for index in range(30):
+                slot.append("user", f"saved message {index}")
+            slot.title = "Saved automatic title"
+            slot._titled = True
+            slot._title_origin = _TITLE_ORIGIN_AUTO
+            slot._title_refresh_mark = 30
+            slot._created_by = self._CRON_KEY
+            await close_slot(state, slot, slot.key)
+
+            response = await client.post(
+                "/api/chat/slots",
+                json={"name": "nightly-dispatch", "title": "Nightly dispatch"},
+            )
+
+        assert response.status == 200
+        reopened = state._slots["nightly-dispatch"]
+        assert reopened.messages == []
+        assert reopened.title == "Saved automatic title"
+        assert reopened._title_origin == _TITLE_ORIGIN_AUTO
+        assert reopened._title_refresh_mark == _rehydrated_refresh_mark(30, 0)
+
+        calls = _patch_generator(monkeypatch, "Refreshed automatic title")
+        monkeypatch.setattr(chat_title, "_title_refresh_every", lambda: 10)
+        reopened.messages = [
+            {"role": "user", "content": f"new message {index}"} for index in range(30)
+        ]
+        await maybe_refresh_title(_fake_state(reopened), reopened)
+        assert calls == ["Saved automatic title"]
+        assert reopened.title == "Refreshed automatic title"
+
+    @pytest.mark.asyncio
+    async def test_a_closed_cron_reopen_runs_the_new_slot_steps(self, tmp_path, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard import chat_handlers
+        from kiro_crew.dashboard.chat_api.slot_lifecycle import close_slot
+
+        state, app = self._make_route(tmp_path, monkeypatch, cron=True)
+        slot = state.get_or_create_slot("nightly-dispatch")
+        slot.append("user", "Keep this saved session")
+        slot.title = "User renamed title"
+        slot._titled = True
+        slot._title_origin = _TITLE_ORIGIN_USER
+        slot._created_by = self._CRON_KEY
+        slot.created_at = "2000-01-01T00:00:00+00:00"
+        await close_slot(state, slot, slot.key)
+
+        folder_id = "folder-1"
+        state._folders = [
+            {
+                "id": folder_id,
+                "name": "Reports",
+                "parent_id": None,
+                "hidden": False,
+                "tags": ["tag-1"],
+            }
+        ]
+        state._tags = [{"id": "tag-1", "name": "Report", "color": "#6b7280", "order": 0}]
+        state._tags_authoritative = True
+
+        pin_store = AsyncMock(return_value="")
+        record_selection = AsyncMock(return_value=None)
+        cfg = SimpleNamespace(
+            default_agent="",
+            dashboard=SimpleNamespace(default_project=""),
+        )
+        monkeypatch.setattr(chat_handlers, "pin_private_agent_store", pin_store)
+        monkeypatch.setattr(chat_handlers, "_record_explicit_agent_selection", record_selection)
+        monkeypatch.setattr(
+            chat_handlers,
+            "resolve_agent_bindings",
+            lambda *_args, **_kwargs: SimpleNamespace(selection_kind=""),
+        )
+        monkeypatch.setattr(chat_handlers.KiroCrewConfig, "load", staticmethod(lambda: cfg))
+        monkeypatch.setattr(chat_handlers, "is_owner_dashboard_request", lambda _request: True)
+        monkeypatch.setattr(chat_handlers, "default_project_dir", lambda _workspace: "")
+        monkeypatch.setattr(chat_handlers, "schedule_eager_spawn", lambda *_args, **_kwargs: None)
+
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/api/chat/slots",
+                json={
+                    "name": "nightly-dispatch",
+                    "title": "Nightly dispatch",
+                    "folder_id": folder_id,
+                },
+                headers={"X-Internal-Secret": "test"},
+            )
+
+        assert response.status == 200
+        reopened = state._slots["nightly-dispatch"]
+        assert reopened.title == "User renamed title"
+        assert reopened._title_origin == _TITLE_ORIGIN_USER
+        assert reopened._created_by == self._CRON_KEY
+        assert reopened.created_at != "2000-01-01T00:00:00+00:00"
+        assert reopened.folder_id == folder_id
+        assert reopened.tags == ["tag-1"]
+        pin_store.assert_awaited_once()
+        record_selection.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_cron_new_slot_gets_the_pinned_title(self, tmp_path, monkeypatch):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        state, app = self._make_route(tmp_path, monkeypatch, cron=True)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/api/chat/slots",
+                json={"name": "nightly-dispatch", "title": "Nightly dispatch"},
+            )
+
+        assert response.status == 200
+        slot = state._slots["nightly-dispatch"]
+        assert slot.title == "Nightly dispatch"
+        assert slot._titled is True
+        assert slot._title_origin == _TITLE_ORIGIN_USER
+
+    @pytest.mark.asyncio
+    async def test_a_non_cron_reopen_still_replaces_the_title(self, tmp_path, monkeypatch):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        state, app = self._make_route(tmp_path, monkeypatch, cron=False)
+        slot = state.get_or_create_slot("manual-session")
+        slot.title = "Current title"
+        slot._titled = True
+        slot._title_origin = _TITLE_ORIGIN_USER
+        slot._title_epoch = 2
+
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/api/chat/slots",
+                json={"name": "manual-session", "title": "Replacement title"},
+            )
+
+        assert response.status == 200
+        assert slot.title == "Replacement title"
+        assert slot._title_origin == _TITLE_ORIGIN_USER
+        assert slot._title_epoch == 3
 
 
 # ── server-review regressions: resume hydration, pin persistence, cancel path ─
@@ -1529,7 +1813,7 @@ class TestRefreshCancelSafety:
         monkeypatch.setattr(chat_title, "_generate_refreshed_title", _cancelled_generation)
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
         with pytest.raises(asyncio.CancelledError):
-            await maybe_refresh_title(_fake_state(), slot)
+            await maybe_refresh_title(_fake_state(slot), slot)
         assert order[0] == f"persist:{_TITLE_REFRESH_MILESTONES[0]}"
         assert order[1] == "generate"
         assert slot._title_in_flight is False
@@ -1698,7 +1982,7 @@ class TestRefreshPushGuard:
         slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
         persist_calls = {"n": 0}
 
-        async def _persist_with_rename(_state, s):
+        async def _persist_with_rename(_state, s, **_kw):
             persist_calls["n"] += 1
             if persist_calls["n"] == 2:
                 # The FINAL persist (after the refresh assigned its title):
@@ -1710,12 +1994,161 @@ class TestRefreshPushGuard:
 
         _patch_generator(monkeypatch, "Refreshed title")
         monkeypatch.setattr(chat_title, "_persist_title", _persist_with_rename)
-        state = _fake_state()
+        state = _fake_state(slot)
         await maybe_refresh_title(state, slot)
         assert slot.title == "User chosen name"
         state.push_slot_title.assert_not_called(), (
             "stale refresh title must not be broadcast over the rename's push"
         )
+
+
+class TestSuccessorSlotIsNotTitled:
+    """A session closed and reopened under the same key while a background
+    title is in flight gets a NEW slot with its own epoch. The old slot's title
+    must not be written for, or pushed to, the successor."""
+
+    @staticmethod
+    def _successor(state, slot) -> _ChatSlot:
+        successor = _ChatSlot(slot.key)
+        successor.title = "Successor title"
+        state._slots[slot.key] = successor
+        return successor
+
+    @staticmethod
+    def _spy_persist(monkeypatch, on_call=None):
+        calls: list[tuple[str, bool | None]] = []
+
+        async def _persist(_state, s, *, still_current=None):
+            if on_call is not None:
+                on_call(len(calls))
+            calls.append((s.title, None if still_current is None else still_current()))
+            return True
+
+        monkeypatch.setattr(chat_title, "_persist_title", _persist)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_refresh_swap_during_generation_writes_nothing(self, monkeypatch):
+        slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
+        state = _fake_state(slot)
+        holder = {}
+
+        async def _generate(_state, _messages, _current, *, session_key: str = ""):
+            holder["successor"] = self._successor(state, slot)
+            return "Old session title"
+
+        monkeypatch.setattr(chat_title, "_generate_refreshed_title", _generate)
+        calls = self._spy_persist(monkeypatch)
+        await maybe_refresh_title(state, slot)
+        assert calls == [("Initial auto title", None)], "only the pre-spend mark write"
+        assert slot.title == "Initial auto title"
+        assert holder["successor"].title == "Successor title"
+        state.push_slot_title.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refresh_of_a_replaced_slot_spends_nothing(self, monkeypatch):
+        slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
+        state = _fake_state(slot)
+        successor = self._successor(state, slot)
+        calls = _patch_generator(monkeypatch, "Old session title")
+        persists = self._spy_persist(monkeypatch)
+        await chat_title.title_then_refresh(state, slot)
+        assert calls == [] and persists == [], "no LLM call and no mark write"
+        assert successor.title == "Successor title"
+        state.push_slot_title.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refresh_swap_during_persist_is_refused_and_not_pushed(self, monkeypatch):
+        slot = _titled_slot(_TITLE_REFRESH_MILESTONES[0])
+        state = _fake_state(slot)
+        _patch_generator(monkeypatch, "Old session title")
+
+        def _swap_on_final_write(n):
+            if n == 1:
+                self._successor(state, slot)
+
+        calls = self._spy_persist(monkeypatch, _swap_on_final_write)
+        await maybe_refresh_title(state, slot)
+        assert calls[1] == ("Old session title", False), "the write must be refused"
+        state.push_slot_title.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_auto_title_swap_during_generation_writes_nothing(self, monkeypatch):
+        monkeypatch.setattr(chat_title, "_TITLE_REVEAL_STEP_SECS", 0)
+        slot = _ChatSlot("chat-1-1")
+        slot.messages = [{"role": "user", "content": "debug my flaky test"}]
+        state = _fake_state(slot)
+        holder = {}
+
+        async def _generate(_state, _messages, *, session_key: str = ""):
+            holder["successor"] = self._successor(state, slot)
+            return "Old session title"
+
+        monkeypatch.setattr(chat_title, "_generate_title_via_kiro", _generate)
+        calls = self._spy_persist(monkeypatch)
+        await chat_title._maybe_auto_title(state, slot)
+        assert calls == []
+        assert slot._titled is False
+        assert holder["successor"].title == "Successor title"
+        state.push_slot_title.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_auto_title_swap_during_reveal_stops_painting(self, monkeypatch):
+        monkeypatch.setattr(chat_title, "_TITLE_REVEAL_STEP_SECS", 0)
+        slot = _ChatSlot("chat-1-1")
+        slot.messages = [{"role": "user", "content": "debug my flaky test"}]
+        state = _fake_state(slot)
+
+        async def _generate(_state, _messages, *, session_key: str = ""):
+            return "one two three four five"
+
+        state.push_slot_title.side_effect = lambda *_a, **_kw: self._successor(state, slot)
+        monkeypatch.setattr(chat_title, "_generate_title_via_kiro", _generate)
+        calls = self._spy_persist(monkeypatch)
+        await chat_title._maybe_auto_title(state, slot)
+        assert state.push_slot_title.call_count == 1, "no frame after the swap"
+        assert calls == []
+        assert slot._titled is False
+
+    @pytest.mark.asyncio
+    async def test_auto_title_swap_during_persist_is_refused(self, monkeypatch):
+        monkeypatch.setattr(chat_title, "_TITLE_REVEAL_STEP_SECS", 0)
+        slot = _ChatSlot("chat-1-1")
+        slot.messages = [{"role": "user", "content": "debug my flaky test"}]
+        state = _fake_state(slot)
+        suggested = []
+
+        async def _generate(_state, _messages, *, session_key: str = ""):
+            return "Old session title"
+
+        async def _suggest(_state, s):
+            suggested.append(s)
+
+        monkeypatch.setattr(chat_title, "_generate_title_via_kiro", _generate)
+        monkeypatch.setattr(chat_title, "maybe_suggest_folder", _suggest)
+        calls = self._spy_persist(monkeypatch, lambda _n: self._successor(state, slot))
+        await chat_title._maybe_auto_title(state, slot)
+        assert calls == [("Old session title", False)], "the write must be refused"
+        assert all(c.kwargs.get("full") is False for c in state.push_slot_title.mock_calls)
+        assert suggested == [], "no folder card for a slot that lost its key"
+
+    @pytest.mark.asyncio
+    async def test_auto_title_fallback_swap_during_persist_is_refused(self, monkeypatch):
+        slot = _ChatSlot("chat-1-1")
+        slot.messages = [
+            {"role": "user", "content": "something vague"},
+            {"role": "assistant", "content": "some reply"},
+        ]
+        state = _fake_state(slot)
+
+        async def _skip(*_a, **_kw):
+            return ""
+
+        monkeypatch.setattr(chat_title, "_generate_title_via_kiro", _skip)
+        calls = self._spy_persist(monkeypatch, lambda _n: self._successor(state, slot))
+        await chat_title._maybe_auto_title(state, slot)
+        assert calls == [("something vague", False)], "the write must be refused"
+        state.push_slot_title.assert_not_called()
 
 
 class TestResumeCorruptedTitleMetadata:
@@ -1785,7 +2218,7 @@ class TestEarlyRefreshGating:
         calls = _patch_generator(monkeypatch, "S3 bucket policy violation triage")
         slot = _titled_slot(1)
         slot._title_low_signal = True
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == ["Initial auto title"]
         assert slot.title == "S3 bucket policy violation triage"
 
@@ -1794,7 +2227,7 @@ class TestEarlyRefreshGating:
         calls = _patch_generator(monkeypatch, "New Title")
         slot = _titled_slot(1)
         assert slot._title_low_signal is False
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == []
         assert slot.title == "Initial auto title"
 
@@ -1830,7 +2263,7 @@ class TestEarlyRefreshGating:
         calls = _patch_generator(monkeypatch, "New Title")
         slot = _titled_slot(1, origin=_TITLE_ORIGIN_USER)
         slot._title_low_signal = True
-        await maybe_refresh_title(_fake_state(), slot)
+        await maybe_refresh_title(_fake_state(slot), slot)
         assert calls == []
         assert slot.title == "Initial auto title"
 
@@ -1852,7 +2285,7 @@ class TestLowSignalLockSites:
         slot.messages = [
             {"role": "user", "content": "https://tickets.example.com/T8412000027 investigate"}
         ]
-        await chat_title._maybe_auto_title(_fake_state(), slot)
+        await chat_title._maybe_auto_title(_fake_state(slot), slot)
         assert slot._titled is True
         assert slot._title_low_signal is True
 
@@ -1870,7 +2303,7 @@ class TestLowSignalLockSites:
         monkeypatch.setattr(chat_title, "maybe_suggest_folder", _noop)
         slot = _ChatSlot("chat-1-1")
         slot.messages = [{"role": "user", "content": "the login page times out on submit"}]
-        await chat_title._maybe_auto_title(_fake_state(), slot)
+        await chat_title._maybe_auto_title(_fake_state(slot), slot)
         assert slot._titled is True
         assert slot._title_low_signal is False
 
@@ -1890,7 +2323,7 @@ class TestLowSignalLockSites:
             {"role": "user", "content": "please look into the flaky build on main"},
             {"role": "assistant", "content": "done"},
         ]
-        await chat_title._maybe_auto_title(_fake_state(), slot)
+        await chat_title._maybe_auto_title(_fake_state(slot), slot)
         assert slot._titled is True
         assert slot._title_low_signal is True, "a fallback is an echo of the opener"
 
@@ -1918,6 +2351,7 @@ class TestLowSignalLockSites:
 
         state = _fake_state()
         request = MagicMock()
+        request.get.return_value = ""
         request.app = {"state": state}
         request.match_info = {"slot": "chat-1-1"}
         state._slots = {"chat-1-1": slot}
@@ -2008,7 +2442,7 @@ class TestChainedTriggerWaitsForOnSendAttempt:
         refresh_calls = _patch_generator(monkeypatch, "S3 bucket policy triage")
 
         slot = self._one_message_url_slot()
-        state = _fake_state()
+        state = _fake_state(slot)
         # The on-send attempt is still awaiting its LLM call at chat_done.
         slot._title_task = asyncio.create_task(chat_title._maybe_auto_title(state, slot))
         await asyncio.sleep(0)  # let it take the in-flight guard
@@ -2034,7 +2468,7 @@ class TestChainedTriggerWaitsForOnSendAttempt:
 
         slot = self._one_message_url_slot()
         assert slot._title_task is None
-        await chat_title.title_then_refresh(_fake_state(), slot)
+        await chat_title.title_then_refresh(_fake_state(slot), slot)
         assert refresh_calls == ["Research ticket T8412000027"]
         assert slot.title == "S3 bucket policy triage"
 
@@ -2050,7 +2484,7 @@ class TestChainedTriggerWaitsForOnSendAttempt:
         refresh_calls = _patch_generator(monkeypatch, "S3 bucket policy triage")
 
         slot = self._one_message_url_slot()
-        state = _fake_state()
+        state = _fake_state(slot)
         slot._title_task = asyncio.create_task(chat_title._maybe_auto_title(state, slot))
         await asyncio.sleep(0)
         slot._title_task.cancel()
@@ -2077,7 +2511,7 @@ class TestChainedTriggerWaitsForOnSendAttempt:
         """
         gate = asyncio.Event()
 
-        async def _slow_persist(_state, _slot):
+        async def _slow_persist(_state, _slot, **_kw):
             await gate.wait()
             return True  # honor the bool contract — the durable-mark gate reads it
 
@@ -2089,7 +2523,7 @@ class TestChainedTriggerWaitsForOnSendAttempt:
         refresh_calls = _patch_generator(monkeypatch, "S3 bucket policy triage")
 
         slot = self._one_message_url_slot()
-        state = _fake_state()
+        state = _fake_state(slot)
         slot._title_task = asyncio.create_task(chat_title._maybe_auto_title(state, slot))
         await asyncio.sleep(0)  # generate returns; attempt now awaits persist
         await asyncio.sleep(0)

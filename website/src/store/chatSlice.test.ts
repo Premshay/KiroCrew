@@ -360,6 +360,25 @@ describe('queue entries carry their attachment lists onto the queued row', () =>
     expect(row().meta).toEqual({ queueId: 'q1' })
   })
 
+  it('editQueuedMessage drops the row quote once the edit takes its block off the head of the text', () => {
+    const quote = { role: 'assistant' as const, text: 'older reply', ts: 't0' }
+    const block = '> older reply\n> — quoting an earlier message from the assistant'
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(appendQueuedMessage({ slot: 'active', content: `${block}\n\nwhy?`, ts: 't', queue_id: 'q1', meta: { quote } }))
+    const row = () => store.getState().chat.messages.find((m) => m.role === 'queued')!
+    // The text under an intact block changes: the record stays.
+    store.dispatch(editQueuedMessage({ slot: 'active', queue_id: 'q1', content: `${block}\n\nwhy not?` }))
+    expect(row().meta).toEqual({ queueId: 'q1', quote })
+    // The block itself is edited away: the record goes with it, on the
+    // optimistic edit and on the server frame alike.
+    store.dispatch(editQueuedMessage({ slot: 'active', queue_id: 'q1', content: 'why not?' }))
+    expect(row().meta).toEqual({ queueId: 'q1' })
+    store.dispatch(appendQueuedMessage({ slot: 'active', content: `${block}\n\nagain`, ts: 't', queue_id: 'q2', meta: { quote } }))
+    store.dispatch(editQueuedMessage({ slot: 'active', queue_id: 'q2', content: 'again', attachments: {} }))
+    expect(store.getState().chat.messages.find((m) => m.meta?.queueId === 'q2')!.meta).toEqual({ queueId: 'q2' })
+  })
+
   it('queueEntryAttachments drops anything but a non-empty list of strings', () => {
     expect(queueEntryAttachments(undefined)).toEqual({})
     expect(queueEntryAttachments({ files: [] })).toEqual({})
@@ -836,5 +855,108 @@ describe('sseSubagentSnapshot — requestedModel threading (#5326)', () => {
       streaming: 'x', last_tool: '', started: 1000, tool_count: 1,
     }))
     expect(store.getState().chat.subagents['snap2'].requestedModel).toBe('claude-opus-4.8')
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// batchId threading — wave membership on the card (#759 item 4)
+//
+// The gateway's _subagent_event stamps `batch_id` onto every spawn/done/snapshot
+// frame when the run is part of a wave. The reducers must fold it onto the row
+// (as `batchId`) so the Subagents panel can show which agents launched
+// together: queued members get fresh ids that never appear in the launch text,
+// so this is the only on-wire tie to their siblings.
+// ---------------------------------------------------------------------------
+describe('sseSubagentSpawn — batchId threading (#759)', () => {
+  function makeStore() {
+    return configureStore({
+      reducer: { chat: chatReducer },
+      middleware: (getDefault) => getDefault({ serializableCheck: false, immutableCheck: false }),
+    })
+  }
+
+  it('threads batch_id from the spawn frame into the new row', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseSubagentSpawn({ slot: 'active', id: 'b1', task: 't', agent: 'a', batch_id: 'wave-1' }))
+    expect(store.getState().chat.subagents['b1'].batchId).toBe('wave-1')
+  })
+
+  it('leaves batchId undefined for a solo spawn', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseSubagentSpawn({ slot: 'active', id: 'b2', task: 't', agent: 'a' }))
+    expect(store.getState().chat.subagents['b2'].batchId).toBeUndefined()
+  })
+
+  it('sets batchId on a pending→running transition', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseSubagentPending({ slot: 'active', id: 'b3', task: 'old', approval_id: 'ap-1' }))
+    store.dispatch(sseSubagentSpawn({ slot: 'active', id: 'b3', task: 'new', agent: 'kirocrew', batch_id: 'wave-2' }))
+    expect(store.getState().chat.subagents['b3'].batchId).toBe('wave-2')
+  })
+
+  it('does not clobber a known batchId when a later frame omits it', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseSubagentSpawn({ slot: 'active', id: 'b4', task: 't', agent: 'a', batch_id: 'wave-3' }))
+    store.dispatch(sseSubagentSpawn({ slot: 'active', id: 'b4', task: 't', agent: 'a' }))
+    expect(store.getState().chat.subagents['b4'].batchId).toBe('wave-3')
+  })
+})
+
+describe('sseSubagentDone — batchId threading (#759)', () => {
+  function makeStore() {
+    return configureStore({ reducer: { chat: chatReducer } })
+  }
+
+  it('rehydrates batchId when a completed card is rebuilt from subagent_done alone', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseSubagentDone({ slot: 'active', id: 'bd1', elapsed: 9, outcome: 'completed', batch_id: 'wave-4' }))
+    expect(store.getState().chat.subagents['bd1'].batchId).toBe('wave-4')
+  })
+
+  it('does not clobber a known batchId when the done frame omits it', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseSubagentSpawn({ slot: 'active', id: 'bd2', task: 't', agent: 'a', batch_id: 'wave-5' }))
+    store.dispatch(sseSubagentDone({ slot: 'active', id: 'bd2', elapsed: 5, outcome: 'completed' }))
+    expect(store.getState().chat.subagents['bd2'].batchId).toBe('wave-5')
+  })
+})
+
+describe('sseSubagentSnapshot — batchId threading (#759)', () => {
+  function makeStore() {
+    return configureStore({
+      reducer: { chat: chatReducer },
+      middleware: (getDefault) => getDefault({ serializableCheck: false, immutableCheck: false }),
+    })
+  }
+
+  it('threads batch_id from the snapshot frame into the row', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseSubagentSnapshot({
+      slot: 'active', id: 'bs1', task: 't', agent: 'a', batch_id: 'wave-6',
+      streaming: '', last_tool: '', started: 1000, tool_count: 0,
+    }))
+    expect(store.getState().chat.subagents['bs1'].batchId).toBe('wave-6')
+  })
+
+  it('preserves a known batchId when a later snapshot omits it (reconnect parity)', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseSubagentSnapshot({
+      slot: 'active', id: 'bs2', task: 't', agent: 'a', batch_id: 'wave-7',
+      streaming: '', last_tool: '', started: 1000, tool_count: 0,
+    }))
+    store.dispatch(sseSubagentSnapshot({
+      slot: 'active', id: 'bs2', task: 't', agent: 'a',
+      streaming: 'x', last_tool: '', started: 1000, tool_count: 1,
+    }))
+    expect(store.getState().chat.subagents['bs2'].batchId).toBe('wave-7')
   })
 })

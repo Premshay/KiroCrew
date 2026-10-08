@@ -377,7 +377,7 @@ class TestProjectionLockstep:
     until a full refetch. The vocabulary lives in FOUR places kept in
     lockstep: the two `_CONFIG_FIELDS` tuples (eventlog_hooks,
     members_projections) and the `_ev_before`/`_ev_after` snapshot dicts in
-    handlers/agents.py.
+    the crew PUT handler, `api_kirocrew_agent_update`.
     """
 
     def test_config_fields_tuples_match_and_carry_display_name(self):
@@ -400,7 +400,7 @@ class TestProjectionLockstep:
         from kiro_crew import eventlog_hooks
         from kiro_crew.dashboard.handlers import agents as agents_mod
 
-        source = inspect.getsource(agents_mod)
+        source = inspect.getsource(agents_mod.api_kirocrew_agent_update)
         before_at = source.index("_ev_before = {")
         after_at = source.index("_ev_after = {")
         before_block = source[before_at : source.index("}", before_at)]

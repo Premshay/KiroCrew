@@ -289,6 +289,22 @@ def acp_error_is_session_not_found(exc: BaseException) -> bool:
     return isinstance(exc, AcpError) and "session not found" in str(exc).lower()
 
 
+TOOL_ACTIVITY_ATTR = "turn_tool_activity"
+
+
+def acp_error_after_tool_activity(exc: BaseException) -> bool:
+    """Return whether a failed turn had already emitted a tool call."""
+    return getattr(exc, TOOL_ACTIVITY_ATTR, False) is True
+
+
+SESSION_NOT_FOUND_RETRY_NOTICE = "⟳ The agent lost its session — reconnecting…"
+SESSION_NOT_FOUND_GIVE_UP_TEXT = "Could not reconnect the agent's session."
+SESSION_NOT_FOUND_NOT_REPLAYED_TEXT = (
+    "The agent lost its session after it had started working. It reconnects on the "
+    "next message; this one was not re-run, so its tools do not run twice."
+)
+
+
 def transient_retry_delay(attempt: int) -> float:
     """Backoff delay (seconds) for the *attempt*-th (1-based) transient retry.
 

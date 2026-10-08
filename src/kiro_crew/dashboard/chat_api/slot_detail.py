@@ -25,13 +25,13 @@ if TYPE_CHECKING:
         _attach_variants,
         _ChatSlot,
         _collapse_wire_rows,
-        _deny_cross_app_slot_access,
         _live_child_instance,
         _prepare_messages,
         _redact_for_display,
         _redact_meta_for_role,
         _slots_serialization_note,
         carry_provenance,
+        deny_app_slot_access,
         effective_session_key,
         history_corpus_unreadable,
         logger,
@@ -40,6 +40,7 @@ if TYPE_CHECKING:
         redact_credentials,
         redact_exfiltration_urls,
         slot_history_key,
+        slot_not_found,
     )
 
 
@@ -160,13 +161,9 @@ def _context_reading(pct: Any, used: Any, window: Any, *, stale: bool) -> dict[s
     fields: dict[str, Any] = {"context_pct": pct_num, "context_stale": stale}
     if window_num:
         fields["context_window_tokens"] = int(window_num)
-    if used_num and not stale:
-        fields["context_used_tokens"] = int(used_num)
-    if (
-        not pct_num
-        and "context_window_tokens" not in fields
-        and "context_used_tokens" not in fields
-    ):
+        if used_num and not stale:
+            fields["context_used_tokens"] = int(used_num)
+    if not pct_num and "context_window_tokens" not in fields:
         return {}
     return fields
 
@@ -729,8 +726,8 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:
-        return web.json_response({"error": "not found"}, status=404)
-    denied = _deny_cross_app_slot_access(request, slot, name, "slot_detail")
+        return slot_not_found()
+    denied = deny_app_slot_access(request.get("app", ""), slot, name, "slot_detail")
     if denied is not None:
         return denied
 
@@ -980,87 +977,108 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         # A memory-only gateway (no conversation log) has no durable rows to
         # index; the fallback below already serves it from the resident window.
         if state.conversation_log and not requires_full_reader:
-            for _attempt in range(_FLUSH_SNAPSHOT_RETRIES):
-                tail_snapshot = _snapshot_slot_window(slot)
-                durable_prefix_count = _durable_prefix_counter(slot)
-                version = (
-                    getattr(slot, "_dirty_gen", 0),
-                    slot._disk_older_count,
-                    durable_prefix_count,
-                )
+            # Imported here, not at module scope: this function runs on the
+            # handlers module's globals (``chat_api.compose``).
+            from kiro_crew.dashboard.transcript_snapshot import (
+                PAGE,
+                SNAPSHOT_ATTEMPTS,
+                RetryRead,
+                SlotView,
+                SnapshotUnstable,
+                read_consistent_transcript,
+            )
+
+            # A local the closure can close over as non-optional: mypy does not
+            # carry the ``if not slot`` narrowing above into a nested function.
+            paged_slot = slot
+
+            async def _read_page(view: SlotView) -> tuple[list[dict], int, bool, int]:
+                tail_snapshot = _snapshot_slot_window(paged_slot)
                 try:
-                    candidate = await asyncio.to_thread(
+                    return await asyncio.to_thread(
                         _bounded_slot_page,
                         state.conversation_log,
-                        slot,
+                        paged_slot,
                         history_key,
                         limit=limit,
                         before=before,
                         snapshot=tail_snapshot,
-                        durable_prefix_count=durable_prefix_count,
+                        # The count the PAGE witness holds, so the read is measured
+                        # against the observation it is checked against.
+                        durable_prefix_count=view.durable_older,
                     )
-                except UnicodeDecodeError:
-                    # Same posture as the full reader's strict text-mode read:
-                    # undecodable transcript bytes are not a page to serve.
-                    logger.warning(
-                        "bounded slot history is not valid UTF-8 for %s", history_key, exc_info=True
-                    )
-                    return history_corpus_unreadable()
-                except RecursionError:
-                    # A row nested past the parser's depth is a corrupt corpus,
-                    # not a page: the unlimited path answers the same 503 for it.
-                    logger.warning(
-                        "bounded slot history row exceeds JSON depth for %s",
-                        history_key,
-                        exc_info=True,
-                    )
-                    return history_corpus_unreadable()
-                except ValueError:
-                    # ``json.loads`` refusing a row for a reason other than
-                    # malformed JSON (an integer literal past the interpreter's
-                    # digit limit). Deterministic for the revision, and the full
-                    # reader raises the same error, so answer the 503 it would
-                    # answer instead of retrying toward it.
-                    logger.warning(
-                        "bounded slot history row is not decodable for %s",
-                        history_key,
-                        exc_info=True,
-                    )
-                    return history_corpus_unreadable()
-                except (OversizedRecord, SplitlinesBoundaryRecord):
-                    # Deterministic: the same row is over the cap, or holds a
-                    # boundary only the full reader's splitlines() honours, on
-                    # every attempt. Go straight to the authoritative full reader.
-                    logger.debug("bounded slot history hit an unframeable row for %s", history_key)
-                    break
-                except _DurablePrefixMismatch:
-                    # Deterministic for this snapshot: the raw and durable prefix
-                    # counters disagree (mid-flush bookkeeping). The full reader
-                    # below reconciles against the complete corpus.
-                    logger.debug("bounded slot history prefix counters differ for %s", history_key)
-                    break
-                except (TranscriptRevisionChanged, OSError):
+                except (
+                    ValueError,
+                    RecursionError,
+                    OversizedRecord,
+                    SplitlinesBoundaryRecord,
+                    _DurablePrefixMismatch,
+                ):
+                    # The caller's to answer, below -- and checked first, so an
+                    # exception that is also an OSError (``io.UnsupportedOperation``)
+                    # meets the arm it would meet in one ordered chain.
+                    raise
+                except (TranscriptRevisionChanged, OSError) as exc:
                     # Retryable: a concurrent write moved the revision or a
-                    # transient read failure. Anything else is a bug and propagates.
-                    last = _attempt + 1 == _FLUSH_SNAPSHOT_RETRIES
+                    # transient read failure. A bug propagates.
+                    last = view.attempt == SNAPSHOT_ATTEMPTS
                     logger.log(
                         logging.WARNING if last else logging.DEBUG,
                         "bounded slot history read failed for %s (attempt %d/%d)%s",
                         history_key,
-                        _attempt + 1,
-                        _FLUSH_SNAPSHOT_RETRIES,
+                        view.attempt,
+                        SNAPSHOT_ATTEMPTS,
                         "; falling back to the full reader" if last else "; retrying",
                         exc_info=True,
                     )
-                    continue
-                current_version = (
-                    getattr(slot, "_dirty_gen", 0),
-                    slot._disk_older_count,
-                    _durable_prefix_counter(slot),
+                    raise RetryRead from exc
+
+            try:
+                bounded_page = (
+                    await read_consistent_transcript(state, slot, PAGE, _read_page)
+                ).result
+            except SnapshotUnstable:
+                # The slot kept moving inside every attempt: the full reader below
+                # serves the request instead.
+                pass
+            except UnicodeDecodeError:
+                # Same posture as the full reader's strict text-mode read:
+                # undecodable transcript bytes are not a page to serve.
+                logger.warning(
+                    "bounded slot history is not valid UTF-8 for %s", history_key, exc_info=True
                 )
-                if current_version == version:
-                    bounded_page = candidate
-                    break
+                return history_corpus_unreadable()
+            except RecursionError:
+                # A row nested past the parser's depth is a corrupt corpus,
+                # not a page: the unlimited path answers the same 503 for it.
+                logger.warning(
+                    "bounded slot history row exceeds JSON depth for %s",
+                    history_key,
+                    exc_info=True,
+                )
+                return history_corpus_unreadable()
+            except ValueError:
+                # ``json.loads`` refusing a row for a reason other than
+                # malformed JSON (an integer literal past the interpreter's
+                # digit limit). Deterministic for the revision, and the full
+                # reader raises the same error, so answer the 503 it would
+                # answer instead of retrying toward it.
+                logger.warning(
+                    "bounded slot history row is not decodable for %s",
+                    history_key,
+                    exc_info=True,
+                )
+                return history_corpus_unreadable()
+            except (OversizedRecord, SplitlinesBoundaryRecord):
+                # Deterministic: the same row is over the cap, or holds a
+                # boundary only the full reader's splitlines() honours, on
+                # every attempt. Go straight to the authoritative full reader.
+                logger.debug("bounded slot history hit an unframeable row for %s", history_key)
+            except _DurablePrefixMismatch:
+                # Deterministic for this snapshot: the raw and durable prefix
+                # counters disagree (mid-flush bookkeeping). The full reader
+                # below reconciles against the complete corpus.
+                logger.debug("bounded slot history prefix counters differ for %s", history_key)
 
         if bounded_page is not None and state.conversation_log:
             # The bounded reader walks only the live tab chain. A size rotation

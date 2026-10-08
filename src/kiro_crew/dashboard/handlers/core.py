@@ -6,7 +6,6 @@ import asyncio
 import copy
 import difflib
 import functools
-import hmac
 import json
 import logging
 import math
@@ -25,7 +24,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
 import kiro_crew.config.resolution as _resolution
-from kiro_crew import aws_consent, beacon, platform_compat, serving_checkout, stt
+from kiro_crew import aws_consent, beacon, platform_compat, stt
 from kiro_crew.acp_backends import selectable_backend_values
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES_LIMIT
@@ -55,8 +54,12 @@ from kiro_crew.config.loader import (
     SUBAGENT_AUTO_MAX_CEILING,
     SUBAGENT_MAX_TURNS_CEILING,
     SWEEP_CHUNK_BUDGET_MAX,
+    ConfigReadError,
+    ConfigWriteRefused,
     KiroCrewConfig,
+    coerce_dict_section,
     config_path,
+    update_config_locked,
 )
 from kiro_crew.config.sections import (
     DECISION_BUCKET_MAX,
@@ -68,7 +71,7 @@ from kiro_crew.config.sections import (
     transcribe_vocabulary_name,
 )
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
-from kiro_crew.dashboard.chat_utils import drained_to_thread
+from kiro_crew.dashboard.chat_utils import drained_to_thread, run_config_write
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
     guard_owner_surface_routes,
@@ -81,6 +84,7 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.stt_stream import _STREAMING_PROVIDERS, PROVIDER_LOCAL
 from kiro_crew.dashboard.token_auth import (
     MAX_SESSION_TTL_SECS,
+    _ct_eq,
     _unix_request_socket,
     generate_token,
     parse_duration,
@@ -116,7 +120,6 @@ from kiro_crew.transcribe import (
     batch_duration_cap_secs,
     ensure_ffmpeg_in_path,
     ffmpeg_source,
-    is_available,
     list_custom_vocabularies,
 )
 
@@ -499,12 +502,6 @@ async def _liveness_payload(request: web.Request) -> dict[str, object]:
                 "gateway_id": await asyncio.to_thread(gateway_id),
             }
         )
-        # A checkout that moved under this process is the same class of
-        # direct-local fact as the version above: a later import may already be
-        # reading a revision this process never loaded.
-        drift = serving_checkout.current()
-        if drift is not None:
-            payload["code_drift"] = drift.to_payload()
     return payload
 
 
@@ -653,7 +650,18 @@ async def api_theme_config(request: web.Request) -> web.Response:
 
     GET returns the current config. PUT accepts
     {mode?, color?, language?, onboarded?, import_onboarded?, privacy_acked?,
-    crewmates_onboarded?} and persists to the workspace config file.
+    crewmates_onboarded?} and persists ONLY those ``dashboard.*`` keys.
+
+    The PUT is a locked delta read-modify-write, never a whole-document
+    ``KiroCrewConfig.save()``. A momentarily unreadable ``config.json`` (a torn
+    read, a sharing violation, an empty file) makes ``load()`` answer
+    pure defaults, and the SPA fires this PUT on its own at boot (the legacy
+    theme migration, triggered by the ``onboarded=false`` such a load reports),
+    so publishing the loaded snapshot erased every setting in the file. Even a
+    healthy snapshot carried load-time coercions back to disk and lost a
+    concurrent CLI write. Writing only the requested keys under both config
+    locks leaves the rest of the file as it was, and an unreadable file is
+    refused (500 ``config_unreadable``) with its bytes untouched.
     """
     if request.method == "GET":
         cfg = KiroCrewConfig.load()
@@ -666,79 +674,73 @@ async def api_theme_config(request: web.Request) -> web.Response:
     body = await request.json()
     if not isinstance(body, dict):
         raise web.HTTPBadRequest(text="request body must be an object")
-    from kiro_crew.config.loader import ConfigReadError  # noqa: F811
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock
 
-    async with _get_config_lock():
-        cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        changed = False
-        if "mode" in body:
-            mode = body["mode"]
-            if mode not in ("", "dark", "light", "system"):
-                raise web.HTTPBadRequest(text="mode must be '', 'dark', 'light', or 'system'")
-            if cfg.dashboard.theme_mode != mode:
-                cfg.dashboard.theme_mode = mode
-                changed = True
-        if "color" in body:
-            color = body["color"]
-            if not isinstance(color, str) or len(color) > 64:
-                raise web.HTTPBadRequest(text="color must be a string (max 64 chars)")
-            if cfg.dashboard.theme_color != color:
-                cfg.dashboard.theme_color = color
-                changed = True
-        if "language" in body:
-            language = body["language"]
-            # "" is the explicit "follow the browser" sentinel, so it must stay
-            # writable — a user returning to Auto has to be able to clear the
-            # stored choice.
-            if not isinstance(language, str):
-                raise web.HTTPBadRequest(text="language must be a string")
-            if language and not _LANGUAGE_TAG_RE.match(language):
-                raise web.HTTPBadRequest(
-                    text="language must be '' or a BCP-47 tag (e.g. 'en', 'zh-CN')"
-                )
-            if cfg.dashboard.language != language:
-                cfg.dashboard.language = language
-                changed = True
-        if "onboarded" in body:
-            onboarded = bool(body["onboarded"])
-            if cfg.dashboard.onboarded != onboarded:
-                cfg.dashboard.onboarded = onboarded
-                changed = True
-        if "import_onboarded" in body:
-            import_onboarded = body["import_onboarded"]
-            if not isinstance(import_onboarded, bool):
-                raise web.HTTPBadRequest(text="import_onboarded must be a boolean")
-            if cfg.dashboard.import_onboarded != import_onboarded:
-                cfg.dashboard.import_onboarded = import_onboarded
-                changed = True
-        if "privacy_acked" in body:
-            privacy_acked = body["privacy_acked"]
-            if not isinstance(privacy_acked, bool):
-                raise web.HTTPBadRequest(text="privacy_acked must be a boolean")
-            if cfg.dashboard.privacy_acked != privacy_acked:
-                cfg.dashboard.privacy_acked = privacy_acked
-                changed = True
-        if "crewmates_onboarded" in body:
-            crewmates_onboarded = body["crewmates_onboarded"]
-            if not isinstance(crewmates_onboarded, bool):
-                raise web.HTTPBadRequest(text="crewmates_onboarded must be a boolean")
-            if cfg.dashboard.crewmates_onboarded != crewmates_onboarded:
-                cfg.dashboard.crewmates_onboarded = crewmates_onboarded
-                changed = True
+    # Validate the WHOLE body before anything is written, so a 400 is a no-op.
+    updates: dict[str, object] = {}
+    if "mode" in body:
+        mode = body["mode"]
+        if mode not in ("", "dark", "light", "system"):
+            raise web.HTTPBadRequest(text="mode must be '', 'dark', 'light', or 'system'")
+        updates["theme_mode"] = mode
+    if "color" in body:
+        color = body["color"]
+        if not isinstance(color, str) or len(color) > 64:
+            raise web.HTTPBadRequest(text="color must be a string (max 64 chars)")
+        updates["theme_color"] = color
+    if "language" in body:
+        language = body["language"]
+        # "" is the explicit "follow the browser" sentinel, so it must stay
+        # writable — a user returning to Auto has to be able to clear the
+        # stored choice.
+        if not isinstance(language, str):
+            raise web.HTTPBadRequest(text="language must be a string")
+        if language and not _LANGUAGE_TAG_RE.match(language):
+            raise web.HTTPBadRequest(
+                text="language must be '' or a BCP-47 tag (e.g. 'en', 'zh-CN')"
+            )
+        updates["language"] = language
+    # A real bool only: ``bool("false")`` is True, so a string here is a client bug
+    # this endpoint must answer 400, not persist inverted.
+    for flag in ("onboarded", "import_onboarded", "privacy_acked", "crewmates_onboarded"):
+        if flag in body:
+            if not isinstance(body[flag], bool):
+                raise web.HTTPBadRequest(text=f"{flag} must be a boolean")
+            updates[flag] = body[flag]
 
-        if changed:
-            try:
-                await asyncio.to_thread(cfg.save)
-            except ConfigReadError:
-                # The load above fell back to defaults for this file, so saving
-                # would have replaced the user's whole config with them.
-                logger.warning("Theme config PUT: config.json is unparseable", exc_info=True)
-                return web.json_response(
-                    {"error": "failed to read config file", "code": "config_unreadable"},
-                    status=500,
-                )
+    if updates:
 
+        def _apply_theme(doc: dict) -> dict | None:
+            dashboard = coerce_dict_section(doc, "dashboard")
+            changed = False
+            for key, value in updates.items():
+                current = dashboard.get(key)
+                # ``type`` too: ``1 == True``, and a hand-written 1 is not the
+                # bool the loader reads back.
+                if key in dashboard and current == value and type(current) is type(value):
+                    continue
+                dashboard[key] = value
+                changed = True
+            return doc if changed else None
+
+        try:
+            await run_config_write(update_config_locked, config_path(), mutate=_apply_theme)
+        except ConfigReadError:
+            logger.warning("theme config PUT: config.json is unreadable", exc_info=True)
+            return web.json_response(
+                {"error": "failed to read config file", "code": "config_unreadable"}, status=500
+            )
+        except ConfigWriteRefused as exc:
+            return web.json_response(
+                {"error": str(exc), "code": "config_write_refused"}, status=400
+            )
+        except OSError:
+            logger.warning("theme config PUT: config.json write failed", exc_info=True)
+            return web.json_response(
+                {"error": "failed to write config file", "code": "config_write_failed"},
+                status=500,
+            )
+
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
     return web.json_response(_theme_payload(cfg))
 
 
@@ -796,7 +798,6 @@ _STT_LANGUAGE_CODES: tuple[str, ...] = (
     "es-US",
     "it-IT",
     "pt-BR",
-    "he-IL",
     "ja-JP",
     "ko-KR",
     "zh-CN",
@@ -1017,7 +1018,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
     # set outside the thread that exists to hold the lighter ones. Windows was
     # where this first showed up, as "event-loop heartbeat: lag".
 
-    def _prereqs_and_probes() -> tuple[list[str], bool, bool, bool, bool]:
+    def _prereqs_and_probes() -> tuple[list[str], bool, bool, bool, bool, str]:
         cmds = _stt_prereq_commands(provider)
         ensure_ffmpeg_in_path()
         # `_find_ffmpeg`, not a bare `which`: the settings panel must report on the
@@ -1028,7 +1029,11 @@ async def api_stt_config(request: web.Request) -> web.Response:
         # user guidance (no Python environment of the user's own to fix), so
         # the UI needs to distinguish it from the pip-less/PEP 668 causes.
         bundled = platform_compat.is_bundled_interpreter()
-        return cmds, no_ffmpeg, unsupported, bundled, is_available(cfg.stt)
+        # Derive both `available` and `code` from the SAME detail (the same probe
+        # api_stt_status uses) so the two fields cannot disagree, and the chat
+        # modal can render the precise per-code reason from this one query.
+        detail = availability_detail(cfg.stt)
+        return cmds, no_ffmpeg, unsupported, bundled, detail.ok, detail.code
 
     (
         prereqs,
@@ -1036,6 +1041,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
         transcribe_unsupported,
         bundled_app,
         available,
+        availability_code,
     ) = await asyncio.to_thread(_prereqs_and_probes)
     return web.json_response(
         {
@@ -1043,6 +1049,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
             "provider": provider,
             "model": cfg.stt.model,
             "available": available,
+            "code": availability_code,
             "streaming": cfg.stt.streaming,
             "endpointing": cfg.stt.endpointing,
             "dictation_panel": cfg.stt.dictation_panel,
@@ -1848,16 +1855,16 @@ def _ffmpeg_install_commands() -> list[str]:
 def _stt_prereq_commands(provider: str = "local") -> list[str]:
     """Shell commands the user has to run themselves (they need sudo, a GUI, or a shell).
 
-    Deliberately short, and there is no install button behind it any more. Desktop
-    releases already include both runtime pieces. A source install may need the
-    optional ``voice`` extra plus system ffmpeg for batch WebM/voice-memo input,
-    while ``local`` fetches its own model.
+    Returns the actionable commands the UI surfaces (Settings -> Voice and the
+    microphone modal): the ``pip`` command for the missing ``voice``/``voice-aws``
+    extra when that extra is absent and a pip channel into this interpreter
+    exists, plus the system ffmpeg install command(s) for batch WebM/voice-memo
+    input. The extra to name depends on the provider, because an extra resolves
+    atomically and advising the full local set to a cloud-only user can fail the
+    whole install.
 
-    Desktop builds bundle the extra and must never suggest installing a system
-    dependency. A source install using Apple's OS recogniser can still use a
-    system ffmpeg as a fallback when it did not install the voice extra.
-
-    An empty list means "nothing to do", which is the steady state.
+    Desktop builds bundle both runtime pieces and run on a frozen interpreter, so
+    they return an empty list -- the steady state, meaning "nothing to do".
     """
     cmds: list[str] = []
     # Which extra to name depends on the provider, because the two halves are
@@ -2321,24 +2328,6 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
                     return None
                 agent["max_subagents"] = val
                 applied.append("max_subagents")
-
-            if "subagent_max_per_parent" in agent_settings:
-                val = agent_settings["subagent_max_per_parent"]
-                if (
-                    isinstance(val, bool)
-                    or not isinstance(val, int)
-                    or not 0 <= val <= persisted_hard_cap
-                ):
-                    _validation_error.append(
-                        (
-                            "subagent_max_per_parent must be 0 (unbounded) or an integer "
-                            f"between 1 and {persisted_hard_cap}",
-                            400,
-                        )
-                    )
-                    return None
-                agent["subagent_max_per_parent"] = val
-                applied.append("subagent_max_per_parent")
 
             if not applied:
                 _validation_error.append(("no recognized settings provided", 400))
@@ -2983,10 +2972,11 @@ _EDITABLE_CONFIG: dict[str, dict] = {
 # on its own" -- the point validates it against what the provider advertises to
 # this account and keeps the session's model when it is not there -- whereas the
 # endpoint chooses WHERE collected state is sent and `api_key` is schema-sensitive,
-# so the masked GET returns a sentinel for it. Same grammar and the same
-# entitlement validation as the `agent.role_models.*` pins next to it, because the
-# vocabulary is identically unknowable up front: `""` INHERITS (the turn keeps its
-# session's model) and no concrete id is named here.
+# so the masked GET returns a sentinel for it. The same entitlement validation as
+# the `agent.role_models.*` pins next to it, because the vocabulary is identically
+# unknowable up front: `""` INHERITS (the turn keeps its session's model) and no
+# concrete id is named here. The grammar is wider: a tier also accepts
+# `provider/model` ids, while a role_models pin stays one segment.
 for _tier in DECISION_MODEL_ROUTE_TIERS:
     _EDITABLE_CONFIG[f"decisions.model_route.{_tier}"] = {
         "type": "str",
@@ -3506,7 +3496,7 @@ async def api_token_local(request: web.Request) -> web.Response:
     if not expected:
         return web.json_response({"error": "not available"}, status=503)
     provided = request.headers.get("X-Local-Secret", "")
-    if not provided or not hmac.compare_digest(expected, provided):
+    if not provided or not _ct_eq(expected, provided):
         _sel().log_api_access(
             caller=request.remote or "unknown",
             operation="token.local",
@@ -3715,7 +3705,7 @@ async def api_logout(request: web.Request) -> web.Response:
 
     expected = request.app.get("local_secret", "")
     provided = request.headers.get("X-Local-Secret", "")
-    if not expected or not provided or not hmac.compare_digest(expected, provided):
+    if not expected or not provided or not _ct_eq(expected, provided):
         _sel().log_api_access(
             caller=request.remote or "unknown",
             operation="logout",
@@ -3787,7 +3777,7 @@ async def api_shutdown(request: web.Request) -> web.Response:
 
     expected = request.app.get("local_secret", "")
     provided = request.headers.get("X-Local-Secret", "")
-    if not expected or not provided or not hmac.compare_digest(expected, provided):
+    if not expected or not provided or not _ct_eq(expected, provided):
         _sel().log_api_access(
             caller=request.remote or "unknown",
             operation="shutdown",

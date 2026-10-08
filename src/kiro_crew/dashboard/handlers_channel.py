@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from kiro_crew.acp.client import AcpError
+from kiro_crew.agent_sdk import is_acp_error
 from kiro_crew.channel import (
     ApprovalPolicy,
     ChannelManager,
@@ -17,7 +17,7 @@ from kiro_crew.channel import (
     _shell_base_binary,
     run_channel_agent,
 )
-from kiro_crew.config.loader import config_path, read_config_text
+from kiro_crew.config.loader import coerce_config_field, config_path, read_config_text
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.state import PEER_CHANNEL_REQUEST_KIND, PEER_CHANNEL_REQUEST_PREFIX
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -164,7 +164,7 @@ def _load_presets() -> object:
     except (OSError, json.JSONDecodeError):
         # Malformed config — fall through to defaults
         pass
-    presets = config.get("channel_presets", _DEFAULT_PRESETS)
+    presets = coerce_config_field(config, "channel_presets", list, _DEFAULT_PRESETS)
     _presets_cache = (key, presets)
     return presets
 
@@ -211,11 +211,6 @@ async def api_channel_create(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "topic required", "code": "channel_topic_required"}, status=400
         )
-    session_only = body.get("session_only", False)
-    if not isinstance(session_only, bool):
-        return web.json_response(
-            {"error": "session_only must be a boolean", "code": "invalid_session_only"}, status=400
-        )
 
     agents_def = body.get("agents", [])
     if not isinstance(agents_def, list):
@@ -223,19 +218,6 @@ async def api_channel_create(request: web.Request) -> web.Response:
             {"error": "agents must be an array", "code": "channel_agents_type_invalid"},
             status=400,
         )
-    if session_only and agents_def:
-        return web.json_response(
-            {
-                "error": "session-only channels cannot include channel-owned agents",
-                "code": "invalid_session_only",
-            },
-            status=400,
-        )
-    # Local import mirrors the sibling agent-mutation handlers below; the
-    # module-level import was narrowed when channel agents moved out of the
-    # import surface.
-    from kiro_crew.channel import ApprovalPolicy
-
     valid_policies = {policy.value for policy in ApprovalPolicy}
     for agent_def in agents_def:
         if not isinstance(agent_def, dict):
@@ -287,7 +269,7 @@ async def api_channel_create(request: web.Request) -> web.Response:
 
     # Spawn agents from preset
     has_orchestrator = any(a.get("is_orchestrator") for a in agents_def)
-    if agents_def and not has_orchestrator:
+    if not has_orchestrator:
         agents_def = [
             {"role": "Orchestrator", "is_orchestrator": True, "task": topic},
             *agents_def,
@@ -314,44 +296,7 @@ async def api_channel_close(request: web.Request) -> web.Response:
     return web.json_response({"ok": ok})
 
 
-async def api_channel_attach_session(request: web.Request) -> web.Response:
-    """Attach one live dashboard session to an existing channel."""
-    ch, body = await _get_channel_body(request)
-    slot_name = body.get("slot")
-    if not isinstance(slot_name, str):
-        return web.json_response({"error": "slot required", "code": "slot_required"}, status=400)
-    state: DashboardState = request.app["state"]
-    slot = state._slots.get(slot_name)
-    if slot is None:
-        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
-    request_app = request.get("app", "")
-    if request_app and request_app != slot._app:
-        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
-    session_key = effective_session_key(slot)
-    if not session_key.startswith("dashboard:"):
-        return web.json_response(
-            {"error": "slot is not a dashboard session", "code": "unsupported_session"}, status=409
-        )
-    role = body.get("role")
-    if not isinstance(role, str) or not role.strip():
-        role = slot.title or slot.key
-    listen_mode = body.get("listen", "all")
-    if listen_mode not in {"all", "mention", "silent"}:
-        return web.json_response(
-            {"error": "invalid listen mode", "code": "invalid_listen_mode"}, status=400
-        )
-    member = ch.attach_session(
-        session_key,
-        role=role.strip()[:100],
-        agent_name=(slot.agent or "")[:100],
-        listen_mode=listen_mode,
-    )
-    if member is None:
-        return web.json_response(
-            {"error": "session is already attached or channel is full", "code": "attach_rejected"},
-            status=409,
-        )
-    return web.json_response({"ok": True, "agent": member.to_dict()})
+# ── Messages ──
 
 
 def _peer_interrupt_text(channel, message, content: str) -> str:
@@ -407,10 +352,7 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
     )
     if inbox_outcome != "queued":
         return inbox_outcome
-
     if message.msg_type == "mention":
-        # A peer request can change the recipient's work, but its text is not
-        # adopted as a checkpoint. Mark only the freshness boundary.
         slot.mark_checkpoint_activity()
 
     from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
@@ -422,20 +364,17 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
             client = slot._acp_client
             if client is not None and getattr(client, "supports_steer", False):
                 interrupt_text = _peer_interrupt_text(channel, message, content)
-                # Register before awaiting the steer RPC. The runner's finally
-                # requeues an unconsumed steer at the head, so a failed turn
-                # cannot silently discard this already-persisted peer report.
                 slot._pending_steers.append(interrupt_text)
                 try:
                     steered = await client.steer(interrupt_text)
-                except (AcpError, OSError):
+                except Exception as exc:
+                    if not isinstance(exc, OSError) and not is_acp_error(exc):
+                        raise
                     logger.warning(
                         "peer interrupt steer failed for slot %s", slot.key, exc_info=True
                     )
                     steered = False
                 if steered:
-                    # The steer reaches the live model directly, so append the
-                    # same envelope for the transcript card after acceptance.
                     slot.append(
                         "inject",
                         interrupt_text,
@@ -448,7 +387,6 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
                 try:
                     slot._pending_steers.remove(interrupt_text)
                 except ValueError:
-                    # The runner requeued it while steer() was suspended.
                     state.push_slots_update()
                     return "queued"
 
@@ -464,23 +402,16 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
         from kiro_crew.dashboard.session_control import containment_meta
 
         queue_meta = containment_meta(state, slot)
+        kwargs = {
+            "kind": PEER_CHANNEL_REQUEST_KIND,
+            "peer_channel_id": channel.id,
+            "peer_message_id": message.id,
+            "meta": queue_meta,
+        }
         if queue_index is None:
-            queue(
-                request_text,
-                kind=PEER_CHANNEL_REQUEST_KIND,
-                peer_channel_id=channel.id,
-                peer_message_id=message.id,
-                meta=queue_meta,
-            )
+            queue(request_text, **kwargs)
         else:
-            queue(
-                queue_index,
-                request_text,
-                kind=PEER_CHANNEL_REQUEST_KIND,
-                peer_channel_id=channel.id,
-                peer_message_id=message.id,
-                meta=queue_meta,
-            )
+            queue(queue_index, request_text, **kwargs)
         if slot.running or slot._in_stage_execution:
             await save_slot_off_loop(state, slot, force=True, best_effort=False)
             state.push_slots_update()
@@ -496,9 +427,6 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
         await _start_next_queued_turn(state, slot)
     state.push_slots_update()
     return "started" if message.msg_type == "mention" else "delivered"
-
-
-# ── Messages ──
 
 
 async def api_channel_post(request: web.Request) -> web.Response:
@@ -521,21 +449,15 @@ async def api_channel_post(request: web.Request) -> web.Response:
     if raw_mention is not None:
         if isinstance(raw_mention, list):
             if not all(isinstance(name, str) for name in raw_mention):
-                return web.json_response(
-                    {
-                        "error": "mention entries must be strings",
-                        "code": "channel_message_mention_type_invalid",
-                    },
-                    status=400,
+                return _agent_field_error(
+                    "mention entries must be strings",
+                    "channel_message_mention_type_invalid",
                 )
             raw_mention = [name for name in raw_mention if name in ch.members]
         elif not isinstance(raw_mention, str):
-            return web.json_response(
-                {
-                    "error": "mention must be a string or an array of strings",
-                    "code": "channel_message_mention_type_invalid",
-                },
-                status=400,
+            return _agent_field_error(
+                "mention must be a string or an array of strings",
+                "channel_message_mention_type_invalid",
             )
         elif raw_mention not in ch.members:
             raw_mention = None
@@ -543,12 +465,9 @@ async def api_channel_post(request: web.Request) -> web.Response:
     thread_id = body.get("thread_id")
     if thread_id is not None:
         if not isinstance(thread_id, str):
-            return web.json_response(
-                {
-                    "error": "thread_id must be a string",
-                    "code": "channel_message_thread_id_type_invalid",
-                },
-                status=400,
+            return _agent_field_error(
+                "thread_id must be a string",
+                "channel_message_thread_id_type_invalid",
             )
     if thread_id and thread_id not in ch._msg_index:
         thread_id = None
@@ -563,11 +482,11 @@ async def api_channel_post(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "message": msg.to_dict()})
 
 
+# ── Agent management ──
+
+
 def _agent_field_error(error: str, code: str) -> web.Response:
     return web.json_response({"error": error, "code": code}, status=400)
-
-
-# ── Agent management ──
 
 
 async def api_channel_add_agent(request: web.Request) -> web.Response:
@@ -621,12 +540,6 @@ async def api_channel_update_agent(request: web.Request) -> web.Response:
     if not agent:
         return web.json_response({"error": "agent not found"}, status=404)
 
-    coordinator = body.get("coordinator")
-    if coordinator is not None and (not isinstance(coordinator, bool) or coordinator is not True):
-        return _agent_field_error(
-            "coordinator must be true", "channel_agent_coordinator_invalid"
-        )
-
     approval_policy = agent.approval_policy
     listen_mode = agent.listen_mode
     if "approval" in body:
@@ -643,13 +556,7 @@ async def api_channel_update_agent(request: web.Request) -> web.Response:
             return _agent_field_error("listen must be a valid mode", "channel_agent_listen_invalid")
     agent.approval_policy = approval_policy
     agent.listen_mode = listen_mode
-    # Promotion runs last and persists on its own: it forces the coordinator's
-    # listen mode to ALL, so it must see -- and override -- the mode this
-    # request just applied rather than be overwritten by it.
-    if coordinator:
-        ch.set_coordinator(agent.id)
-    else:
-        ch._save()
+    ch._save()
     return web.json_response({"ok": True, "agent": agent.to_dict()})
 
 
@@ -786,25 +693,9 @@ async def api_channel_approve_agent(request: web.Request) -> web.Response:
 
 
 async def clear_agent_context(state: "DashboardState", agent) -> bool:
-    """Reset one channel worker's LLM session, preserving channel configuration.
-
-    This is the per-worker "Clear context" lifecycle in one place so every
-    surface that offers it runs the same semantics: the worker's ACP session is
-    torn down, while its membership, task, listen mode, and the channel's shared
-    message buffer are untouched, so its next message cold-starts on fresh
-    context. Returns ``False`` for a member that owns no session to reset.
-
-    Tearing the session down ends whatever turn it was running; it is neither a
-    cooperative stop nor a dismissal -- ``Channel.remove_agent`` drops the
-    membership row and leaves the session running. Any surface offering this
-    must keep those three distinct.
-    """
+    """Reset one channel worker session while preserving its membership."""
     if not agent.session_key:
         return False
-    # ``ends_conversation``: the user asked this agent to forget the conversation,
-    # so its sub-agent runs have nothing left to report into. The default is the
-    # recycle, which is what the wedged-session and watchdog resets in
-    # `channel.py` want; this route is the opposite intent.
     await state.sessions.reset(agent.session_key, ends_conversation=True)
     return True
 
@@ -812,7 +703,7 @@ async def clear_agent_context(state: "DashboardState", agent) -> bool:
 def broadcast_context_cleared(
     channel, scope: str, agent_id: str | None, cleared: list[str]
 ) -> None:
-    """Tell other clients their buffered view of this channel is stale."""
+    """Tell other clients their buffered channel view is stale."""
     channel._broadcast(
         "channel_context_cleared",
         {

@@ -37,7 +37,7 @@ Paths below are relative to `src/kiro_crew/`.
 | Bytecode-cache GC limits | `pycache_gc.py` | `PYCACHE_MAX_AGE_DAYS`, `PYCACHE_MAX_TOTAL_BYTES`, `PYCACHE_GC_INTERVAL_SECS` (the `<data home>/cache/pycache` TTL, size cap, and periodic-sweep cadence). |
 | Shell audit log cap | `shell_audit_log.py` | `SHELL_AUDIT_LOG_NAME`, `SHELL_AUDIT_LOG_MAX_BYTES` (the file the bundled `postToolUse` hook appends to, and the size at which the session cleanup loop rotates it aside to one `.1` generation). |
 | Slack UX strings and pacing | `slack/handler.py` | `_THINKING`, `_CURSOR`, `_NO_RESPONSE`, `_STATUS_WORKING`, `_TRUNCATION_MARKER`, plus `_EDIT_INTERVAL`, `_APPROVAL_TIMEOUT`, `_SLACK_SECTION_TEXT_LIMIT`, the stall thresholds and the phase debounce. |
-| Cross-cutting shared constants | `constants.py` | `KIROCREW_SPAWNED_ENV`, `ENV_TRUTHY`, `CHAT_TURN_TIMEOUT`, `COMPACT_WAIT_TIMEOUT_SECS` (one budget, shared by manual and automatic compaction), the `[OPTIONS:]` parse regexes, `BANNER`, `MAX_BANNER_CHARS` and `ARTIFACT_MAX_CONTENT_BYTES` (bounds `validation.py` — a leaf — must read without importing the service module that enforces them; `artifacts.MAX_CONTENT_BYTES` re-exports the latter). |
+| Cross-cutting shared constants | `constants.py` | `KIROCREW_SPAWNED_ENV`, `ENV_TRUTHY`, `CHAT_TURN_TIMEOUT`, `COMPACT_WAIT_TIMEOUT_SECS` (one budget, shared by manual and automatic compaction; `session.compact_wait_secs` raises it for both, resolved for every caller by `SessionManager.compact_wait_budget_secs()`), the `[OPTIONS:]` parse regexes, `BANNER`, `MAX_BANNER_CHARS` and `ARTIFACT_MAX_CONTENT_BYTES` (bounds `validation.py` — a leaf — must read without importing the service module that enforces them; `artifacts.MAX_CONTENT_BYTES` re-exports the latter). |
 | Gateway shutdown budget | `gateway_shutdown_budget.py` | Gateway cooperative timeout, service-manager signal margin, and the derived systemd/launchd stop deadline. |
 | Process-wide shutdown signal | `__init__.py` | `shutdown_event`. Background loops `await shutdown_event.wait()` with a timeout instead of a plain `asyncio.sleep`, so they wake instantly on Ctrl-C. |
 | Base agent config | `config/defaults.json` | `tools`, `allowedTools`, `resources`, `hooks`, model. Packaged as package data, so editing it needs no code change. |
@@ -97,6 +97,10 @@ hotspot of every cleanup PR. The legacy markers the tree still carries are not
 tracked; a marker can re-enter only on an added line, which is what the gate
 judges. Without the env the script prints whole-tree counts and does not enforce.
 
+The rule applies to every comment. The gate enforces it only on added lines of
+`.py` files under `src/kiro_crew` and `test`; comments elsewhere (`website/`, the
+Electron shell, workflow files) are held to the rule by review.
+
 ```bash
 COMMENT_HISTORY_BASE_REF=origin/main python3 scripts/check_comment_history.py
 ```
@@ -120,7 +124,9 @@ CI's job (`local-gate.py --full` exists for a human who wants it locally).
 any enforcement, so a repo-wide run reformats ~95,800 lines. Those files are
 recorded in `.github/black-baseline.txt` and exempted; every other file must be
 clean, and a file that *becomes* clean must be pruned from the list, so it only
-ever shrinks. Format what you touched with
+ever shrinks. Prune with `python3 scripts/check_black_formatting.py
+--update-baseline`; it refuses unless the installed black equals the
+`pyproject.toml` pin (`black==26.3.1`). The read-only check does not need the pin. Format what you touched with
 `black --target-version py310 <paths>`, never the whole tree.
 
 **On macOS, run `mypy --platform linux src/kiro_crew`.** CI type-checks on Linux, and

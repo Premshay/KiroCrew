@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from kiro_crew.llm_helpers import StepIncomplete
+from kiro_crew.agent_sdk import is_acp_prompt_busy
 from kiro_crew.metrics.events import WORKFLOW_RUNS, emit_counter
 
 from . import _DEFAULT_TOOL_CALL_LIMIT, _MAX_TOOL_CALL_LIMIT, BudgetExceeded, WorkflowEvent
@@ -55,13 +56,6 @@ from .registry import (
 )
 from .schema import run_with_schema
 from .validate import CORE_CTX_SURFACE, check_ctx_surface, validate
-
-try:
-    from kiro_crew.acp.transport_errors import AcpPromptBusy
-except ImportError:  # pragma: no cover - standalone engine without the ACP adapter
-    _PROMPT_BUSY_ERRORS: tuple[type[Exception], ...] = ()
-else:
-    _PROMPT_BUSY_ERRORS = (AcpPromptBusy,)
 
 # Optional dependency (gate F1): the SEL security event log lives in the app
 # layer, and the workflows engine must stay importable as a standalone unit
@@ -513,7 +507,7 @@ class _RunContext:
             if isinstance(exc, StepIncomplete):
                 self._incomplete_error = exc
             if session is not None and (
-                isinstance(exc, _PROMPT_BUSY_ERRORS)
+                is_acp_prompt_busy(exc)
                 or (
                     getattr(exc, "code", None) == -32602
                     and "a prompt is already in flight for this session" in str(exc)
@@ -654,8 +648,8 @@ class WorkflowRunner:
     ``agent_fn`` is the injected agent executor (stub in tests). ``timeout_secs``
     is the B5 wall-clock ceiling — a runaway backstop, not a data-loss event: every
     terminal path returns the agent results collected so far. ``concurrency`` bounds
-    agent calls RUN-GLOBALLY (and each ``parallel``/``pipeline`` fan-out); the caller
-    passes ``resolve_max_subagents()`` in prod, ``None`` for no limit.
+    agent calls RUN-GLOBALLY (and each ``parallel``/``pipeline`` fan-out); the
+    dashboard passes its fixed workflow cap in prod, a test ``None`` for no limit.
     """
 
     def __init__(

@@ -5083,6 +5083,170 @@ class TestGitCoord:
 
         await git_coord.revert_step(run)  # should not raise
 
+    @pytest.mark.asyncio
+    async def test_revert_success_pops_one_and_reverts_worktree(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Baseline unchanged: a successful reset reverts the tree, pops exactly
+        one commit hash, and emits no log line at default (non-debug) levels."""
+        import logging
+
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        tracked = work_dir / "tracked.txt"
+        tracked.write_text("v1")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "revert_ok"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+
+        # Commit a second version of the tracked file through commit_step.
+        (Path(run.work_dir) / "tracked.txt").write_text("v2")
+        step = Step(index=1, title="change", description="d")
+        sha = await git_coord.commit_step(run, step)
+        assert sha
+        assert run.commit_hashes == [sha]
+        assert (Path(run.work_dir) / "tracked.txt").read_text() == "v2"
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.git_coord"):
+            await git_coord.revert_step(run)
+
+        assert run.commit_hashes == []  # exactly one popped
+        assert (Path(run.work_dir) / "tracked.txt").read_text() == "v1"  # reverted
+        assert caplog.records == []  # silent at default levels
+
+        await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_revert_retries_a_windows_sharing_violation_then_succeeds(
+        self, monkeypatch, caplog
+    ) -> None:
+        """On Windows a held-handle unlink failure is transient; revert_step
+        retries the bounded window and, once the handle clears, pops normally."""
+        import logging
+
+        from kiro_crew import git_coord
+
+        monkeypatch.setattr(git_coord.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(git_coord.asyncio, "sleep", AsyncMock())  # no real delay
+
+        calls = {"n": 0}
+
+        async def _flaky_git(work_dir, *args):
+            if args[:2] == ("reset", "--hard"):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise RuntimeError(
+                        "git reset --hard HEAD~1 failed: error: unable to unlink old "
+                        "'tracked.txt': Invalid argument\nfatal: Could not reset index "
+                        "file to revision 'HEAD~1'."
+                    )
+                return ""
+            return ""
+
+        monkeypatch.setattr(git_coord, "_git", _flaky_git)
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.git_enabled = True
+        run.work_dir = "/w"
+        run.commit_hashes = ["aaa", "bbb"]
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.git_coord"):
+            await git_coord.revert_step(run)
+
+        assert calls["n"] == 3  # two contended attempts, third succeeds
+        assert run.commit_hashes == ["aaa"]  # exactly one popped after success
+        # No WARNING because the revert ultimately succeeded.
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    async def test_revert_exhausts_retries_warns_and_does_not_pop(
+        self, monkeypatch, caplog
+    ) -> None:
+        """A sharing violation that never clears: after the bounded retries the
+        failure surfaces at WARNING and commit_hashes is left untouched so it
+        stays consistent with the un-reverted worktree."""
+        import logging
+
+        from kiro_crew import git_coord
+
+        monkeypatch.setattr(git_coord.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(git_coord.asyncio, "sleep", AsyncMock())
+
+        calls = {"n": 0}
+
+        async def _always_locked(work_dir, *args):
+            if args[:2] == ("reset", "--hard"):
+                calls["n"] += 1
+                raise RuntimeError(
+                    "git reset --hard HEAD~1 failed: error: unable to unlink old "
+                    "'tracked.txt': Invalid argument"
+                )
+            return ""
+
+        monkeypatch.setattr(git_coord, "_git", _always_locked)
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.git_enabled = True
+        run.work_dir = "/w"
+        run.commit_hashes = ["aaa", "bbb"]
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.git_coord"):
+            await git_coord.revert_step(run)
+
+        assert calls["n"] == git_coord._REVERT_MAX_ATTEMPTS  # tried the whole budget
+        assert run.commit_hashes == ["aaa", "bbb"]  # NOT popped — stays consistent
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "git revert failed" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_revert_non_sharing_violation_failure_warns_without_retry(
+        self, monkeypatch, caplog
+    ) -> None:
+        """A failure that is not a transient Windows sharing violation (e.g. on
+        POSIX, or an unrelated git error) is NOT retried into a false success:
+        it surfaces at WARNING on the first attempt and does not pop."""
+        import logging
+
+        from kiro_crew import git_coord
+
+        # POSIX: a reset failure is a genuine fault — no retry window.
+        monkeypatch.setattr(git_coord.platform_compat, "IS_WINDOWS", False)
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(git_coord.asyncio, "sleep", sleep_mock)
+
+        calls = {"n": 0}
+
+        async def _hard_fail(work_dir, *args):
+            if args[:2] == ("reset", "--hard"):
+                calls["n"] += 1
+                raise RuntimeError("git reset --hard HEAD~1 failed: fatal: bad revision")
+            return ""
+
+        monkeypatch.setattr(git_coord, "_git", _hard_fail)
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.git_enabled = True
+        run.work_dir = "/w"
+        run.commit_hashes = ["aaa"]
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.git_coord"):
+            await git_coord.revert_step(run)
+
+        assert calls["n"] == 1  # no retry
+        sleep_mock.assert_not_awaited()
+        assert run.commit_hashes == ["aaa"]  # not popped
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "git revert failed" in warnings[0].getMessage()
+
 
 class TestTaskNaming:
     """Tests for the task naming feature."""
@@ -5242,13 +5406,13 @@ class TestWorkspaceDirValidation:
 
 
 class TestMaxParallelStepsClamp:
-    """`compute_max_subagents` is the host-safe ceiling; a positive
+    """`compute_memory_sized_parallel_cap` is the host-safe ceiling; a positive
     `max_parallel_steps` may only lower it, never raise it above the ceiling."""
 
     def _cap(self, value):
         sessions = _make_mock_sessions()
         # Pin the computed host-safe ceiling to a known value (9).
-        with patch("kiro_crew.taskrunner.compute_max_subagents", return_value=9):
+        with patch("kiro_crew.taskrunner.compute_memory_sized_parallel_cap", return_value=9):
             runner = TaskRunner(sessions=sessions, auto_test=False, max_parallel_steps=value)
         return runner._max_parallel_steps
 
@@ -5268,7 +5432,10 @@ class TestMaxParallelStepsClamp:
 
     def test_compute_failure_falls_back_to_legacy_default(self):
         sessions = _make_mock_sessions()
-        with patch("kiro_crew.taskrunner.compute_max_subagents", side_effect=RuntimeError("boom")):
+        with patch(
+            "kiro_crew.taskrunner.compute_memory_sized_parallel_cap",
+            side_effect=RuntimeError("boom"),
+        ):
             runner = TaskRunner(sessions=sessions, auto_test=False, max_parallel_steps=0)
         # Falls back to _MAX_PARALLEL_TASKS (3) when the ceiling can't be computed.
         assert runner._max_parallel_steps == 3
@@ -5327,7 +5494,9 @@ class TestSemaphoreParallelScheduling:
         assertion would then hold even if the knob were ignored entirely, so
         without this the test proves nothing.
         """
-        monkeypatch.setattr("kiro_crew.taskrunner.compute_max_subagents", lambda _cfg: 64)
+        monkeypatch.setattr(
+            "kiro_crew.taskrunner.compute_memory_sized_parallel_cap", lambda _cfg: 64
+        )
         sessions = _make_mock_sessions()
         runner = TaskRunner(
             sessions=sessions, auto_test=False, work_dir=tmp_path, max_parallel_steps=3
@@ -5351,7 +5520,9 @@ class TestSemaphoreParallelScheduling:
         to isolate the knob. This one pins it BELOW the knob to prove the OOM
         guard still wins — the property those tests deliberately stop covering.
         """
-        monkeypatch.setattr("kiro_crew.taskrunner.compute_max_subagents", lambda _cfg: 2)
+        monkeypatch.setattr(
+            "kiro_crew.taskrunner.compute_memory_sized_parallel_cap", lambda _cfg: 2
+        )
         runner = TaskRunner(
             sessions=_make_mock_sessions(),
             auto_test=False,
@@ -5373,7 +5544,9 @@ class TestSemaphoreParallelScheduling:
         ceiling's own authority is covered by
         ``test_host_ceiling_still_caps_the_knob``.
         """
-        monkeypatch.setattr("kiro_crew.taskrunner.compute_max_subagents", lambda _cfg: 64)
+        monkeypatch.setattr(
+            "kiro_crew.taskrunner.compute_memory_sized_parallel_cap", lambda _cfg: 64
+        )
         sessions = _make_mock_sessions()
         runner = TaskRunner(
             sessions=sessions, auto_test=False, work_dir=tmp_path, max_parallel_steps=6

@@ -359,7 +359,8 @@ def validate(parser: str, text: str) -> tuple[bool, str]:
 
 # A probe that mirrors what the gateway actually needs: the launcher's split
 # unshare sequence. Run INSIDE the profile via aa-exec, because the process doing
-# the install is not itself confined by it (systemd applies it to the service), so
+# the install is not itself confined by it (the profile is path-attached and the
+# kernel applies it at execve() of the launcher), so
 # probing here would report the unpatched host and look like a failure.
 # A SELF-CONTAINED replica of the launcher's split unshare sequence. It must not
 # import kiro_crew: this runs under sudo, and importing our own package would
@@ -940,6 +941,56 @@ def installed_attachment(
         return None
     match = _attachment_re(profile_name).search(body)
     return match.group("path") if match else None
+
+
+def service_profile_attachment(
+    launcher: str,
+    unit_path: Path,
+    profile_path: Path | None = None,
+    profile_name: str | None = None,
+) -> str | None:
+    """The launcher the service profile really applies to today, or ``None``.
+
+    The confining mechanism is a path attachment, not a systemd
+    ``AppArmorProfile=<name>`` directive: the profile is attached BY PATH to the
+    launcher script ``ExecStart`` uses, and installing the directive alongside a
+    path attachment makes the directive silently win, defeating the attachment.
+    So the profile applies only when its attachment clause names the launcher
+    as it resolves NOW (*launcher*, resolved strictly) AND the unit at
+    *unit_path* carries no ``AppArmorProfile=`` line. A moved or reinstalled
+    launcher reads as ``None`` until ``kirocrew service install`` re-renders the
+    profile. Shared by ``kirocrew doctor`` and the update engine's re-attach
+    question, so the two can never disagree.
+
+    *profile_path*/*profile_name* default to the service profile, resolved in
+    the body so a test's ``monkeypatch.setattr(apparmor, "PROFILE_PATH", ...)``
+    applies.
+    """
+    if profile_path is None:
+        profile_path = PROFILE_PATH
+    if profile_name is None:
+        profile_name = PROFILE_NAME
+    attached = installed_attachment(profile_path, profile_name)
+    if attached is None:
+        return None
+    try:
+        current = str(Path(launcher).resolve(strict=True))
+    except OSError:
+        return None
+    if attached != current:
+        return None
+    # A unit that still carries ``AppArmorProfile=`` (a hand-edited unit, a
+    # drop-in, an older install) silently WINS over the path attachment. Best
+    # effort: an unreadable unit (or none installed) proves nothing and does not
+    # flip a verified attachment.
+    try:
+        # errors="replace": undecodable bytes must not crash the verdict.
+        unit_text = unit_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return attached
+    if any(line.strip().startswith("AppArmorProfile=") for line in unit_text.splitlines()):
+        return None
+    return attached
 
 
 def install_launcher(

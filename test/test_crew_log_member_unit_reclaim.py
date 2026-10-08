@@ -356,7 +356,7 @@ def test_no_reclaim_call_sits_outside_a_namespace_lock_hold():
     import ast
     import inspect
 
-    source = inspect.getsource(agents_mod)
+    source = inspect.getsource(agents_mod.api_kirocrew_agent_delete)
     tree = ast.parse(source)
     parents: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):

@@ -29,8 +29,6 @@ Captured per enrichment:
 * an explicit UTC **stall timestamp** and the observed heartbeat silence —
   the crash-dump filename carries boot time, so the log line is what
   records the real stall time;
-* the bounded Python stack currently executing on the event-loop thread, so a
-  recovered stall retains the causal evidence otherwise available only at exit;
 * every ESTABLISHED non-loopback TCP connection owned by this process,
   with local/remote endpoints and the kernel ``tx_queue``/``rx_queue``
   byte counts (a large ``rx_queue`` at stall time is direct evidence of an
@@ -76,7 +74,7 @@ def _event_loop_stack_lines(frames: dict[int, object] | None = None) -> list[str
         return ["(event-loop stack unavailable: no main-thread frame)"]
     try:
         extracted = traceback.extract_stack(frame, limit=_EVENT_LOOP_STACK_LIMIT)
-    except Exception as exc:  # noqa: BLE001 — enrichment must never hurt the watchdog
+    except Exception as exc:
         return [f"(event-loop stack capture failed: {exc!r})"]
     if not extracted:
         return ["(event-loop stack unavailable: empty main-thread stack)"]
@@ -146,7 +144,7 @@ def collect_stall_enrichment(silence_secs: float) -> list[str]:
     lines = [header]
     try:
         lines.extend(_event_loop_stack_lines())
-    except Exception as exc:  # noqa: BLE001 — a frame can disappear mid-capture
+    except Exception as exc:
         lines.append(f"(event-loop stack capture failed: {exc!r})")
     if not sys.platform.startswith("linux"):
         lines.append("(socket capture unavailable: non-Linux platform)")

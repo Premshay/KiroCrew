@@ -17,16 +17,16 @@ interface Props {
   blocked: Blocked | null
   showAuth: boolean
   busy: boolean
-  agents: KiroCrewAgent[]
-  defaultAgent: string
-  selectedAgent: string
-  setSelectedAgent: (agent: string) => void
-  contexts: ProjectContext[]
-  brief: ReviewBrief
-  setBrief: (patch: Partial<ReviewBrief>) => void
-  selectContext: (contextId: string) => void
-  saveContext: () => void
-  deleteContext: () => void
+  agents?: KiroCrewAgent[]
+  defaultAgent?: string
+  selectedAgent?: string
+  setSelectedAgent?: (agent: string) => void
+  contexts?: ProjectContext[]
+  brief?: ReviewBrief
+  setBrief?: (patch: Partial<ReviewBrief>) => void
+  selectContext?: (contextId: string) => void
+  saveContext?: () => void
+  deleteContext?: () => void
   err: string
   /** A client-side check or a not-failed status — plain text, never an error surface. */
   hint: string
@@ -49,6 +49,8 @@ interface Props {
 export default function Composer(p: Props) {
   const ime = useImeGuard()
   const { staged, refText, dragging, blocked, showAuth, busy, err, hint, inputRef } = p
+  const agents = p.agents ?? []
+  const hasScopeBuilder = p.contexts && p.brief && p.setBrief && p.selectContext && p.saveContext && p.deleteContext
 
   const canStart = !busy && (staged.length > 0 || !!refText.trim())
   const det = detectKind(refText)
@@ -140,25 +142,25 @@ export default function Composer(p: Props) {
           {subLine}
           {staged.length ? <button style={S.clearLink} onClick={p.clearStaged}>{i18nT('apps.designCritique.composer.clear_all')}</button> : null}
         </p>
-        {p.agents.length ? (
+        {agents.length && p.defaultAgent && p.selectedAgent && p.setSelectedAgent ? (
           <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '8px' }}>
             <AgentSelector
-              agents={p.agents}
+              agents={agents}
               defaultAgent={p.defaultAgent}
               value={p.selectedAgent}
               onChange={p.setSelectedAgent}
             />
           </div>
         ) : null}
-        <ScopeBuilder
-          contexts={p.contexts}
-          brief={p.brief}
+        {hasScopeBuilder ? <ScopeBuilder
+          contexts={p.contexts!}
+          brief={p.brief!}
           busy={busy}
-          onChange={p.setBrief}
-          onSelectContext={p.selectContext}
-          onSaveContext={p.saveContext}
-          onDeleteContext={p.deleteContext}
-        />
+          onChange={p.setBrief!}
+          onSelectContext={p.selectContext!}
+          onSaveContext={p.saveContext!}
+          onDeleteContext={p.deleteContext!}
+        /> : null}
         {hint ? <div style={{ fontSize: '12.5px', color: 'var(--warn)', textAlign: 'center' }}>{hint}</div> : null}
         {/* No hand-off: the staged screens, the pasted link and the brief in this
             composer are unsaved until a critique starts. */}

@@ -42,7 +42,7 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
-from ..spine.git_safety import GIT_SAFE_CONFIG, require_pinned
+from ..spine.git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned
 
 #: Alias the ONE shared safe-config so this helper cannot drift from the others (the
 #: structural test in `test_dogfood_learnings` asserts identity). See `backend/commit.py`.
@@ -1208,6 +1208,7 @@ def checkout_branch(
                 where,
                 f"--work-tree={where}",
                 *_GIT_SAFE_CONFIG,
+                *hook_off_args(where, env=_git_env()),
                 *args,
             ],
             capture_output=True,

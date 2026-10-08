@@ -323,7 +323,18 @@ export const messageReducers = {
       if (e.type === 'tool' && e.output == null && !e.rejected) e.rejected = true
     }
   },
-  clearMessages(state: ChatState) { state.messages = []; setPagingCursor(state, false, 0); state.voiceAudio = null; state.voicePlaying = false; state.voiceBusy = false; if (state.activeSlot) delete state.thinkingOrphans?.[safeKey(state.activeSlot)]; if (state.activeSlot) evictMcpApps(state, state.activeSlot); if (state.activeSlot) writeSlotPage(state, state.activeSlot, [], false) },
+  clearMessages(state: ChatState) {
+    state.messages = []
+    state.lastChunkSeq = undefined
+    state.lastChunkGen = undefined
+    setPagingCursor(state, false, 0)
+    state.voiceAudio = null
+    state.voicePlaying = false
+    state.voiceBusy = false
+    if (state.activeSlot) delete state.thinkingOrphans?.[safeKey(state.activeSlot)]
+    if (state.activeSlot) evictMcpApps(state, state.activeSlot)
+    if (state.activeSlot) writeSlotPage(state, state.activeSlot, [], false)
+  },
   /** A server-confirmed clear for a slot that is NOT the active view. The
    *  active-slot case routes through `clearMessages`; this one exists so a
    *  background slot's cached page cannot outlive its authoritative clear --
@@ -334,6 +345,11 @@ export const messageReducers = {
     const slot = action.payload
     if (isUnsafeKey(slot)) return
     writeSlotPage(state, slot, [], false)
+    const run = state.slotRun?.[safeKey(slot)]
+    if (run) {
+      run.lastChunkSeq = undefined
+      run.lastChunkGen = undefined
+    }
     delete state.thinkingOrphans?.[safeKey(slot)]
     evictMcpApps(state, slot)
   },
@@ -356,8 +372,8 @@ export const messageReducers = {
    *  unbounded one. The reverse is refused, and a superseded slot cannot upgrade
    *  again, so this cannot loop.
    *  No-op for the active slot (its mirror is already live). */
-  hydrateSlotMessages(state: ChatState, action: PayloadAction<{ slot: string; messages: ChatMessage[]; hasMore?: boolean; bounded?: boolean; total?: number; running?: boolean }>) {
-    const { slot, messages, hasMore, bounded, total, running } = action.payload
+  hydrateSlotMessages(state: ChatState, action: PayloadAction<{ slot: string; messages: ChatMessage[]; hasMore?: boolean; bounded?: boolean; total?: number; running?: boolean; nextBefore?: number }>) {
+    const { slot, messages, hasMore, bounded, total, running, nextBefore } = action.payload
     if (isUnsafeKey(slot)) return
     if (slot === state.activeSlot) return
     const k = safeKey(slot)
@@ -374,7 +390,7 @@ export const messageReducers = {
       const tail = tailNotInPage(prior.slice(boundedLen), messages)
       // Reasoning is broadcast-only so the wider page never carries it back.
       // Scoped to the REPLACED region: `tail` already keeps the live tail's own.
-      writeSlotPage(state, slot, mergePreservedThinking(prior.slice(0, boundedLen), [...messages, ...tail], messages), hasMore)
+      writeSlotPage(state, slot, mergePreservedThinking(prior.slice(0, boundedLen), [...messages, ...tail], messages), hasMore, undefined, nextBefore)
       retainServerTotal(state, slot, total, running)
       return
     }
@@ -386,7 +402,7 @@ export const messageReducers = {
     if (state.slotPaneHasMore?.[k] !== undefined) return
     // Seeded frames are NEWER rows appended after the page, so the page's
     // has-more still describes what precedes it; dropping it hid the marker.
-    writeSlotPage(state, slot, [...messages, ...cur], hasMore, bounded ? messages.length : undefined)
+    writeSlotPage(state, slot, [...messages, ...cur], hasMore, bounded ? messages.length : undefined, nextBefore)
     retainServerTotal(state, slot, total, running)
   },
   sseChatMessageUpdate(state: ChatState, action: PayloadAction<{ slot: string; tool_call_id?: string; ts?: string; content?: string; meta?: Record<string, unknown> }>) {

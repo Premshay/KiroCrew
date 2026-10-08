@@ -67,10 +67,13 @@ from kiro_crew.messaging.commands import (  # noqa: F401
     YOLO_PHRASING_PLAIN,
     compact_unsupported_backend,
     compact_unsupported_reply,
+    context_recycle_warning,
     cron_command_reply,
     format_ttl,
     lists_host_state,
     parse_dashboard_ttl,
+    recycle_backend,
+    recycle_warning_should_send,
     run_yolo_command,
     spawn_task_reply,
     stop_running_turn,
@@ -89,6 +92,7 @@ from kiro_crew.messaging.dispatch import (
     predecessor_sid,
     rearm_reinjection,
     requested_model_sid,
+    rollback_skill_bodies,
     slot_workspace,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
@@ -865,12 +869,21 @@ class TelegramDispatcher:
                 await self._reply(chat_id, _BUSY_OPTIONS_REFUSAL, thread=reply_thread)
                 return
             if resumed_key is not None:
-                await self._reply(
-                    chat_id,
-                    "⏳ That session is busy with a turn started elsewhere. Send your "
-                    "message again once it finishes, or /unlink to return to your "
-                    "Telegram conversation.",
+                # NOT `_handle_busy`: that queues into THIS dispatcher's queue, drained
+                # only at the tail of a TELEGRAM-driven turn and replayed with resume
+                # routing off, so the message would run later in the NATIVE session.
+                # The dashboard slot has its own steer path and queue; the refusal
+                # stays for the cases the slot cannot take.
+                await self._handle_resumed_busy(
+                    session_key,
+                    msg,
+                    text,
+                    override_mode,
                     thread=reply_thread,
+                    route=route,
+                    interpret_commands=interpret_commands,
+                    drain=drain,
+                    principal=str(user_id),
                 )
                 return
             await self._handle_busy(
@@ -1015,6 +1028,9 @@ class TelegramDispatcher:
         # turn consumed the one-shot flag, and whether it landed (recorded success).
         _needs_reinjection = False
         _turn_landed = False
+        # The turn's driver, for the finally: it records whether the backend
+        # compacted the session, on every exit path.
+        driver: TurnDriver | None = None
         try:
             # Ack placeholder first (before the potentially slow cold-start);
             # on_turn_start is idempotent so the driver's later call no-ops.
@@ -1472,11 +1488,17 @@ class TelegramDispatcher:
             # and leaves the real window armed past the end of its turn.
             _APPROVAL_REGISTRY.discard_session(session_key)
             # A turn that consumed the post-compaction flag but never landed
-            # discarded the prompt carrying the re-injected context; put the
-            # flag back so the next turn re-injects it.
+            # discarded the prompt carrying the re-injected context, and a backend
+            # that compacted the session during the turn dropped it; either way
+            # the flag is set so the next turn re-injects it.
             rearm_reinjection(
-                self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
+                self.sessions,
+                session_key,
+                consumed=_needs_reinjection,
+                landed=_turn_landed,
+                compacted=getattr(driver, "compaction_completed", False) is True,
             )
+            rollback_skill_bodies(self.ctx_builder, session_key, landed=_turn_landed)
             # Always finalize the placeholder (no perma-"🤔 …"), even if
             # get_or_create raised before the semaphore was held. Only release
             # the semaphore if we actually acquired it.
@@ -1529,6 +1551,7 @@ class TelegramDispatcher:
 
     # dispatch/midturn.py
     _handle_busy = _midturn._handle_busy
+    _handle_resumed_busy = _midturn._handle_resumed_busy
 
     async def _drain_queue(self, session_key: str) -> None:
         """Collapse every message ONE SENDER queued during the just-finished turn
@@ -2375,6 +2398,15 @@ class TelegramDispatcher:
         """
         pct = self.sessions.check_context_usage(session_key, provider)
         soft_pct = self._soft_threshold()
+        if recycle_backend(provider):
+            # Crew restarts this backend's session at the threshold; warn once
+            # before it, offering a fresh start instead of a compaction.
+            if recycle_warning_should_send(self.sessions, self._conv, route, session_key, pct):
+                assert self.client is not None
+                await self._reply(
+                    chat_id, context_recycle_warning(), thread=self._route_thread(route)
+                )
+            return
         if pct >= soft_pct and compact_unsupported_backend(provider):
             # Capability gate: the nudge advises /compact, which this
             # backend refuses — it compacts on its own as context fills, so

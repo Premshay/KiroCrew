@@ -110,8 +110,10 @@ class PerToolDeny(str, Enum):
     three members.
     """
 
-    #: The restriction reaches the harness as a per-tool rule in a file Crew writes,
-    #: so the narrowed server stays MOUNTED and the harness itself refuses the tool.
+    #: The restriction reaches the harness as a per-tool rule in config Crew writes --
+    #: a settings file for claude, the inline OPENCODE_CONFIG_CONTENT block for
+    #: opencode -- so the narrowed server stays MOUNTED and the harness itself
+    #: refuses the tool.
     SETTINGS_FILE = "settings-file"
     #: No per-tool slot on the wire, but the backend asks permission per MCP call
     #: with an identity Crew can match, so Crew refuses the call itself. The narrowed
@@ -260,34 +262,28 @@ PROJECTIONS: dict[str, McpProjection] = {
     ACP_BACKEND_OPENCODE: McpProjection(
         kind=ProjectionKind.MIRROR,
         reason="opencode.py -- the wire face alone, and the entry that shows why a "
-        "no-channel claim has to be measured rather than inferred. It was declared "
-        "no-channel on the reading that opencode's initialize advertises "
-        "mcpCapabilities of http and sse and NO stdio, so the session/new array "
-        "could not carry Crew's stdio servers. That inference was wrong: ACP's "
-        "McpCapabilities schema has exactly two boolean fields, http and sse, and "
-        "no stdio field at all, so a conforming agent cannot advertise stdio and "
-        "that answer is what FULL support looks like. Driven against opencode "
-        "1.18.30, the element acp.session_mcp.acp_server_element already emits is "
-        "accepted, the child is spawned, its tools are listed and the element's env "
-        "reaches it. The same entry also contradicted itself -- its last sentence "
-        "said the array carries the shared gateway's broker stubs, which are stdio "
-        "elements too -- and both halves could not be true. Crew writes no opencode "
+        "no-channel claim has to be measured rather than inferred. opencode's "
+        "initialize advertises mcpCapabilities of http and sse and no stdio, and "
+        "that is not evidence of a missing channel: ACP's McpCapabilities schema "
+        "has exactly two boolean fields, http and sse, and no stdio field at all, "
+        "so a conforming agent cannot advertise stdio and that answer is what FULL "
+        "support looks like. Driven against opencode 1.18.30, the element "
+        "acp.session_mcp.acp_server_element already emits is accepted, the child "
+        "is spawned, its tools are listed and the element's env reaches it. Crew "
+        "writes no opencode "
         "MCP config: OPENCODE_CONFIG_CONTENT (which Crew does seed, for the "
         "permission routing alone) MERGES rather than replaces, and declaring one "
         "server in both that block and the array double-mounts it, so the array is "
         "this backend's whole MCP channel",
-        # WHOLE-SERVER ONLY, and declared rather than enforced. There is no per-tool
-        # slot on the element and no file of Crew's, and unlike codex there is no
-        # per-call fallback either: this harness emits no _meta.kiro and no
-        # rawInput.server/tool -- only a fused `<server>_<tool>` title -- so
-        # AcpClient._deny_spec_disabled_tool has nothing to match and the mirror
-        # returns an empty deny set rather than pairs that could never fire. A
-        # narrowed server is therefore withheld whole, Crew's own control plane
-        # included (providers/mirrors/opencode.py::narrowed_control_plane), which is
-        # where this backend parts company with codex. Per-tool MCP deny is not a
-        # requirement on every provider; what this field owes a reader is that they
-        # are getting the whole-server form here BEFORE a session runs.
-        per_tool_deny=PerToolDeny.WHOLE_SERVER,
+        # SETTINGS-FILE, where the "file" is the inline config block Crew already seeds
+        # for the permission routing (OPENCODE_CONFIG_CONTENT). Each switched-off tool
+        # becomes a `deny` rule under the harness's own tool id, placed after the seed's
+        # `"*": "ask"`; measured on opencode 1.18.30, that hides the one tool while its
+        # siblings stay listed and still ask. The routing read-back then evaluates the
+        # resolved rules the way the harness does (last match wins), and a server whose
+        # rule a lower config source outranked is withheld whole
+        # (providers/mirrors/opencode.py::opencode_projection).
+        per_tool_deny=PerToolDeny.SETTINGS_FILE,
     ),
     ACP_BACKEND_PI: McpProjection(
         kind=ProjectionKind.NO_CHANNEL,
@@ -317,7 +313,7 @@ PROJECTIONS: dict[str, McpProjection] = {
         reason="goose.py -- the second single-binary spec harness to carry a session "
         "array, and the entry that shows what a MEASURED channel claim costs versus an "
         "inferred one. Its initialize advertises mcpCapabilities of http and sse with no "
-        "stdio flag, the same reading that once had opencode declared no-channel, and it "
+        "stdio flag, the same shape opencode advertises, and it "
         "is the same non-evidence: ACP's McpCapabilities schema has exactly two boolean "
         "fields and no stdio field, so a conforming agent cannot advertise stdio. Rather "
         "than infer either way this was driven end to end against goose 1.50.1: the "
@@ -332,16 +328,15 @@ PROJECTIONS: dict[str, McpProjection] = {
         "element whose command cannot start is DROPPED rather than failing session/new, so "
         "an unstartable pooled broker stub costs no session and leaves a healthy-looking "
         "one carrying none of Crew's tools",
-        # WHOLE-SERVER as a CONSERVATIVE choice, which is the one way this differs from
-        # opencode's identical verdict. goose puts the pair on the wire, as
-        # _meta.goose.toolCall.toolName and extensionName on the tool_call frame, and Crew
-        # reads it -- the identity table in acp._dispatch carries a row for that channel,
-        # so the per-call deny path does match a denied pair here. The half still missing
-        # is the projection side: no per-tool form mounts a narrowed server with its denied
-        # tools filtered out of the array, the way codex's does. Withholding the server
-        # whole, Crew's own control plane included, is the direction that cannot leave a
-        # switched-off tool reachable while that is true. Follow-up: a per-tool projection
-        # for this harness, after which the verdict is TRANSLATED per tool.
+        # WHOLE-SERVER, and it stays that way until two things hold. goose puts the pair
+        # on the wire as _meta.goose.toolCall.{extensionName,toolName}, and asks for
+        # every MCP call under GOOSE_MODE=approve, so a per-call refusal is reachable.
+        # It is not SAFE yet: (a) the refusal must trust only that _meta pair and refuse
+        # when it is absent, never the model-authored rawInput; and (b) goose's own
+        # permission.yaml can pre-approve a tool so it never asks, and the agent's shell
+        # can write that file mid-session, so the sandbox must deny writes to goose's
+        # config directory. Until both land, a narrowed server is withheld whole, Crew's
+        # own control plane included (providers/mirrors/goose.py::goose_projection).
         per_tool_deny=PerToolDeny.WHOLE_SERVER,
     ),
     ACP_BACKEND_DEEPSEEK: McpProjection(

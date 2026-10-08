@@ -62,7 +62,10 @@ from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
 from kiro_crew.messaging.commands import (
     compact_unsupported_backend,
     compact_unsupported_reply,
+    context_recycle_warning,
     note_user_stop,
+    recycle_backend,
+    recycle_warning_should_send,
 )
 from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
@@ -1941,6 +1944,12 @@ class WebexDispatcher:
         route = _route_of(inbound)
         pct = self.sessions.check_context_usage(session_key, provider)
         soft_pct, hard_pct = self._thresholds()
+        if recycle_backend(provider):
+            # Crew restarts this backend's session at the threshold; warn once
+            # before it, offering a fresh start instead of a compaction.
+            if recycle_warning_should_send(self.sessions, self._conv, route, session_key, pct):
+                await self._reply(inbound, context_recycle_warning("`/new`"))
+            return
         if pct >= soft_pct:
             # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
@@ -1985,7 +1994,9 @@ class WebexDispatcher:
         """
         try:
             await asyncio.wait_for(provider.compact(), timeout=_COMPACT_TIMEOUT_S)
-            result = await provider.wait_for_compaction()
+            result = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
         except asyncio.TimeoutError:
             logger.warning("Webex: compaction timed out after %.0fs", _COMPACT_TIMEOUT_S)
             return False, "timed out"

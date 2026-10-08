@@ -27,7 +27,15 @@ from kiro_crew.doctor_checks import render
 # per-spawn reclaim covers steady-state orphans, so a count above this is either
 # a backlog this gateway has not drained yet or one it cannot drain (another
 # data home's aliases, an unreadable lease record); the warning tells which.
-_SKILL_VIEW_BACKLOG_WARN = 2000
+#
+# This is the SAME number the projection enforces as a hard ceiling
+# (:data:`kiro_crew.acp.skill_projection.SKILL_VIEW_PROJECTION_CEILING`): at or
+# above it, preparation stops minting new views and falls back to the authored
+# agent, so a host the doctor warns about is a host whose next spawn already fell
+# back. Read through the ``cli_doctor`` facade, not imported by name here: this
+# family binds no project module (test_cli_doctor_refactor_family_reads), and the
+# facade holds the constant so the two can never drift.
+_SKILL_VIEW_BACKLOG_WARN = cli_doctor.SKILL_VIEW_PROJECTION_CEILING
 
 
 # Where SwapTotal is read from. A module attribute (not inlined) so tests can
@@ -55,6 +63,24 @@ def _swap_total_kib() -> int | None:
     return None
 
 
+def _gateway_lock_indeterminate() -> bool:
+    """True when the gateway lock probe cannot say whether a gateway runs.
+
+    The distinction :func:`kiro_crew.cli_perf._read_gateway_pid` deliberately
+    collapses (it fails closed, since its caller must not profile the wrong
+    process) but a report must keep: "nobody holds the lock" is a fact about
+    the gateway, an indeterminate probe is a fact about the probe. Any other
+    exception propagates to the caller's own "probe failed" line.
+    """
+    from kiro_crew import gateway_lock
+
+    try:
+        gateway_lock.lock_holder(cli_doctor.config_dir())
+    except gateway_lock.LockProbeError:
+        return True
+    return False
+
+
 def _gateway_memory_lines() -> list[str]:
     """The ``session ceiling`` and ``gateway rss`` lines of the Memory Pressure section.
 
@@ -63,7 +89,8 @@ def _gateway_memory_lines() -> list[str]:
     usually asking "what stops a runaway session tree?"). The RSS is read from
     the live gateway's pid via the lock-holder oracle ``cli_perf`` already uses,
     so a stale recorded pid can never be reported as the gateway's memory; no
-    live gateway prints "not running". Every failure degrades to a line saying
+    live gateway prints "not running", and a lock probe that cannot answer says
+    so rather than reading as "not running". Every failure degrades to a line saying
     so — this is advisory and must never abort doctor.
     """
     lines: list[str] = []
@@ -84,7 +111,18 @@ def _gateway_memory_lines() -> list[str]:
             )
     try:
         pid = cli_doctor._read_gateway_pid()
-        if pid is None:
+        if pid is None and _gateway_lock_indeterminate():
+            # ``_read_gateway_pid`` folds "the probe could not answer" into the
+            # same None as "nobody holds the lock". On Windows a serving
+            # gateway holds its lock file under a mandatory lock, so the pid
+            # inside cannot be read and the probe is indeterminate -- printing
+            # "not running" there contradicts the Connectivity row of the same
+            # run. Say what is actually known instead.
+            lines.append(
+                "  gateway rss:     ⚠️  could not locate the gateway process to measure "
+                "it (lock probe indeterminate; this does not mean it is stopped)"
+            )
+        elif pid is None:
             lines.append("  gateway rss:     ⏹ not running")
         else:
             rss = cli_doctor._gateway_rss_bytes(pid)
@@ -474,19 +512,25 @@ _RUN_DIR_BACKLOG_WARN = 1000
 def _doctor_run_dirs() -> None:
     """Report, in one line, the run directories the gateway's sweep cannot reclaim.
 
-    Advisory and read-only. A subagent or stateless cron run gets a directory
-    under the workspace root that the provider marks at first start and reclaims
-    at shutdown; the gateway sweeps what a dead predecessor of its own data home
-    left. Two figures from one bounded walk, judged by the sweep's own rule:
-    directories from builds that wrote no marker (a name is not provenance, so
-    the sweep deletes nothing it cannot prove Crew made), and marked directories
-    this data home cannot act on -- another data home's, an unreadable marker,
-    or a gateway the pid ledger still retains entries for. Named, never done:
-    the doctor deletes nothing.
+    Advisory and read-only. A subagent, a stateless cron run or a memory
+    consolidation call gets a directory under the workspace root that the provider
+    marks at first start and reclaims at shutdown; the gateway sweeps what a dead
+    predecessor of its own data home left. A memory consolidation folder is never
+    marked on the by-name walk (Windows), so the census counts it with the
+    unmarked ones. Three figures from one bounded walk, judged by the sweep's own
+    rule: directories from builds that wrote no marker (a name is not provenance,
+    so the sweep deletes nothing it cannot prove Crew made); marked directories
+    this data home cannot act on -- another data home's, an unreadable marker, or
+    a gateway the pid ledger still retains entries for; and marked directories
+    the rule permits yet the sweep keeps for what they hold beyond Crew's own
+    residue -- a folder the by-name walk keeps for kiro-cli's ``.kiro/agents``,
+    or any marked folder that gained a file. Named, never done: the doctor
+    deletes nothing.
     """
     from kiro_crew.config.loader import workspace_root
     from kiro_crew.session_pid import retained_gateway_pids
     from kiro_crew.session_work_dir import DERIVED_NAME_RE, RUN_DIR_MARKER, count_run_dirs
+    from kiro_crew.workspace_cli_settings import CLI_SETTINGS_LOCK_NAME
 
     try:
         # Resolve only: the default resolver creates the tree, and a read-only
@@ -503,22 +547,25 @@ def _doctor_run_dirs() -> None:
         print("  run dirs:    ⚠️  the session pid ledger cannot be read; census skipped")
         return
     census = count_run_dirs(root, retained_gateway_pids=retained)
-    if not census.unmarked and not census.refused:
+    if not census.unmarked and not census.refused and not census.kept:
         print("  run dirs:    ✅ no run directories left behind that the sweep cannot reclaim")
         return
     suffix = "+" if census.floor else ""
-    warn = census.unmarked > _RUN_DIR_BACKLOG_WARN or census.refused > 0
+    warn = census.unmarked > _RUN_DIR_BACKLOG_WARN or census.refused > 0 or census.kept > 0
     print(
         f"  run dirs:    {'⚠️ ' if warn else '✅'} under {root}: {census.unmarked}{suffix} run"
-        f" director(ies) carry no {RUN_DIR_MARKER} marker (left by a build that wrote none);"
-        f" {census.refused}{suffix} marked director(ies) this data home cannot reclaim (another"
-        f" data home's, an unreadable marker, or a gateway the pid ledger still retains)"
+        f" director(ies) carry no {RUN_DIR_MARKER} marker (left by a build that did not mark that"
+        f" kind); {census.refused}{suffix} marked director(ies)"
+        f" this data home cannot reclaim (another data home's, an unreadable marker, or a"
+        f" gateway the pid ledger still retains); {census.kept}{suffix} marked director(ies) the"
+        f" sweep keeps for what they hold beyond .kiro/settings residue"
     )
     if census.unmarked > _RUN_DIR_BACKLOG_WARN:
         print(
             f"{render._INDENT}The gateway reclaims only marked run directories. With the gateway"
-            f" stopped, move directories matching {DERIVED_NAME_RE.pattern} that hold only"
-            f" .kiro/settings/cli.json out of {root}; a live run recreates its own."
+            f" stopped, move directories matching {DERIVED_NAME_RE.pattern} that hold nothing"
+            f" beyond .kiro/settings/cli.json, .kiro/settings/{CLI_SETTINGS_LOCK_NAME} and an"
+            f" empty .kiro/agents out of {root}; a live run recreates its own."
         )
 
 
@@ -615,6 +662,14 @@ def _doctor_skill_view_census(agents_dir: Path) -> None:
     print(
         f"{render._INDENT}kiro-cli reads every file here on startup, so this many slows every"
         f" session start.{drain}"
+    )
+    print(
+        f"{render._INDENT}The gateway has stopped creating new skill views at this count;"
+        f" new spawns run under their authored agent until it drops, so the leak cannot deepen"
+        f" while it stands (sessions already projecting keep refreshing their own view)."
+        f" The count is every {alias_glob} file here -- kiro-cli reads them"
+        f" all at startup, including any written by a different gateway that shares this"
+        f" directory -- so the move below clears a share this gateway cannot drain itself."
     )
     print(
         f"{render._INDENT}To clear it at once: {stopped}, move the {alias_glob} files and the"

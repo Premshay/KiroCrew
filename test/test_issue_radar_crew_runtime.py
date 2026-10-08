@@ -384,9 +384,22 @@ class TestSeedingSurvivesABriefLogLock:
         assert probes and probes[0], f"the read-back never met the held lock: {probes}"
 
     def test_the_held_lock_is_real_contention(self, tmp_path, monkeypatch):
-        """Negative control: the same write made ON the loop is refused."""
+        """Negative control: the same write made ON the loop is refused.
+
+        The setup write leaves the crew log's own background holders behind it --
+        the writer thread landing the entry and the eager folder reading the unit
+        right after -- and an on-loop acquire makes one attempt, so meeting either
+        of them raises a bare ``OSError`` from the write's preparing fold before
+        the read-back this control is about is ever reached. Both are settled
+        first, so the only holder the on-loop write can meet is the planted one.
+        """
+        from kiro_crew.crew_log import eager as crew_log_eager
+        from kiro_crew.crew_log import emit as crew_log_emit
+
         crew = _crew(tmp_path, unattended=True)
         _item(tmp_path, crew["id"], 2201, phase="awaiting-ci")
+        assert crew_log_emit.flush(timeout=30), "the setup write never landed"
+        assert crew_log_eager.drain(timeout=30), "the setup write's fold never settled"
         probes = self._hold_the_log_lock_during_read_back(monkeypatch)
 
         async def on_the_loop() -> None:
@@ -2095,41 +2108,6 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
             cr.dispatch_crew_turn(state, slot, "advance one item")
             await slot.runners[-1](state, slot, slot.prompts[-1])
         self.assertEqual([m for m in slot.messages if m["role"] == "error"], [])
-
-    async def test_a_dispatch_between_a_plans_stages_queues(self):
-        """``dispatch_crew_turn`` relies on the admission point, so the gate is the gate.
-
-        Its own docstring states the reliance -- "``enqueue_or_run_prompt`` queues
-        instead of racing when the crew is mid-turn" -- and it carries no mid-plan
-        check of its own. Between a plan's stages ``slot.running`` reads False while
-        the plan is still live, so gating on ``running`` alone would put a crew turn
-        alongside the plan, with no recovery once two turns own one slot.
-
-        Driven through a REAL ``_ChatSlot``, not this module's ``_FakeSlot``: the
-        fake implements its own admission, so a test through it would pass on the
-        double's rule rather than on the product's.
-
-        Mutation guard: drop ``or self._in_stage_execution`` from the gate and this
-        starts a turn.
-        """
-        from kiro_crew.dashboard.state import _ChatSlot
-
-        slot = _ChatSlot(key="chat-1")
-        # The inter-stage shape: nothing in flight, plan still executing.
-        slot.task = None
-        slot._in_stage_execution = True
-        state = mock.MagicMock()
-        state._background_tasks = set()
-
-        started = cr.dispatch_crew_turn(state, slot, "advance one item")
-
-        self.assertFalse(started, "a mid-plan crew dispatch must be queued")
-        self.assertIsNone(slot.task, "and must not open a turn alongside the plan")
-        self.assertEqual(
-            [q["content"] for q in slot._queue],
-            ["advance one item"],
-            "the prompt is held for the plan's own drain",
-        )
 
 
 # ── unblock signal detection (pure) ─────────────────────────────────────────

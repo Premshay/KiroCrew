@@ -374,25 +374,22 @@ def _redact_tool_field(text: str | None, *, limit: int = _MAX_TOOL_FIELD) -> str
     return text
 
 
-def _build_stream_chunk(msg: dict, *, include_row_meta: bool = False) -> str:
-    """Build a JSON SSE chunk from a slot message, with meta redaction for permissions.
+#: Wire frame pushed onto ``slot._pending`` at a turn's end, before the queue
+#: drain or the cycle's end writes anything (``chat_runner._mark_turn_end``); a
+#: recovery the ending turn queued for itself is the same turn and gets none.
+#: ``done`` marks the end of the whole queue cycle; this marks the end of one
+#: turn, which is where an app's stream on a user's session stops
+#: (``chat_handlers.api_chat``). Never a row: other readers skip it.
+TURN_END_WIRE_CLS = "turn_end"
 
-    ``include_row_meta`` carries the row's own durable ``meta`` dict (tool
-    input/output, call identity) into the record. Off by default so the ordinary
-    SSE / OpenAI-compat stream keeps its "only permission rows carry meta"
-    contract; the RELAY drain turns it on, because a relay reader (``_apply_row``)
-    rebuilds the local row from this record and would otherwise lose that tool
-    correlation permanently on a local refresh.
-    """
+
+def _build_stream_chunk(msg: dict) -> str:
+    """Build a JSON SSE chunk from a slot message, with meta redaction for permissions."""
     try:
         meta = parse_cls_meta(msg.get("cls", "")) if msg.get("role") == "permission" else None
     except Exception:
         logger.warning("Failed to parse cls meta for permission message", exc_info=True)
         meta = None
-    if meta is None and include_row_meta:
-        row_meta = msg.get("meta")
-        if isinstance(row_meta, dict):
-            meta = row_meta
     if meta:
         meta = _redact_deep(meta)
     # One shared guard for content: redact recursively and hold the
@@ -485,9 +482,12 @@ _BLOCKED_SLASH_COMMANDS = (
     | _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
 )
 
-# Single source of truth for slash-command descriptions surfaced by the
-# dashboard API (GET /api/slash-commands) and mirrored by the frontend
-# autocomplete fallback. Keys are slash-prefixed command names. Covers every
+# Slash-command descriptions surfaced by the dashboard API
+# (GET /api/slash-commands): the English text for API clients and the fallback
+# the frontend shows for a command it has no catalog key for. A command with a
+# ``slashCommandMenu.desc_*`` key in the frontend's i18n catalog renders that
+# catalog text instead (SlashCommandMenu.tsx ``commandDescription``), so the two
+# can differ. Keys are slash-prefixed command names. Covers every
 # command in _SLASH_COMMANDS plus the claude_code-only /init, /review, and
 # /security-review so no command renders a blank description in either path.
 SLASH_COMMAND_DESCRIPTIONS: dict[str, str] = {
@@ -1310,7 +1310,7 @@ def _attached_verdict(running: Any, queued: int, slot: _ChatSlot | None) -> bool
 
 
 async def chat_done_payload(
-    state: DashboardState, slot: _ChatSlot, *, continuing: bool = False
+    state: DashboardState, slot: _ChatSlot, *, continuing: bool = False, queue_held: bool = False
 ) -> dict[str, Any]:
     """Describe whether a turn boundary actually hands the floor to the user.
 
@@ -1324,6 +1324,10 @@ async def chat_done_payload(
     and every caller here is a turn-boundary frame on the gateway loop, so the
     read belongs on the store's writer thread
     (:func:`subagents_attached_async`).
+
+    ``queue_held`` says the turn ending here held the queue (a sign-in,
+    memory-preparation or setup failure): nothing drains it until the user's
+    next send, so its entries are not work that continues.
     """
     # Avoid a circular import: autonudge's slot lookup imports dashboard.state.
     from kiro_crew.autonudge import get_instance
@@ -1334,9 +1338,8 @@ async def chat_done_payload(
         workflows = getattr(state, "workflow_service", None)
         continuing = bool(
             continuing
-            or slot._in_stage_execution
             or slot._pending_synthesis
-            or (slot.queue_depth and not slot._last_turn_auth_required)
+            or (slot.queue_depth and not queue_held and not slot._last_turn_auth_required)
             or await subagents_attached_async(
                 state, slot, effective_session_key(slot), "completion_sound"
             )
@@ -2273,6 +2276,23 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
         return out
     out = {k: _redact_value(v) for k, v in list(meta.items()) if k not in REDACTION_RECORD_FIELDS}
     out.update({k: v for k, v in validated_records.items() if v})
+    if role == "user" and isinstance(meta.get("quote"), dict):
+        # The whole-message quote record (``chat_delivery.quote_meta``) must
+        # byte-match the ``>`` block that opens this row's content, and a user
+        # row's content is served as typed (``_prepare_messages``): the record
+        # follows the same rule, or the card is drawn beside the raw block and
+        # the next queue edit drops it. A sender other than the session's human
+        # had the record redacted where it entered (``quote_meta``). Rebuilt
+        # through the same bounded validator rather than passed through: a
+        # transcript line is attacker-writable, so an oversized or malformed
+        # record is dropped here like every other retention point drops it.
+        from kiro_crew.dashboard.chat_delivery import quote_meta
+
+        bounded = quote_meta({"quote": meta["quote"]}, user_origin=True)
+        if bounded:
+            out["quote"] = bounded["quote"]
+        else:
+            out.pop("quote", None)
     return out
 
 
@@ -2948,7 +2968,6 @@ def should_notice_leaked_tool_call(
     is_cancelled: bool,
     refusal_reasons: list,
     turn_tool_calls: int = 0,
-    in_stage_execution: bool = False,
 ) -> bool:
     """Decide whether to surface the leaked-tool-call NOTICE.
 
@@ -2977,11 +2996,7 @@ def should_notice_leaked_tool_call(
     different shape (it is the same leak) but because THIS path un-lands the
     turn, and a turn whose earlier calls had real side effects must not be
     marked unacted; that shape is noticed without un-landing by
-    :func:`should_notice_mixed_turn_leak` — is top-level, is NOT a
-    stage-execution turn (the orchestrator's stage loop reads the turn result
-    for stage accounting, and un-landing a stage turn from here would let the
-    loop record an unfinished stage as complete — same exclusion as the
-    promise-only guard), and its final segment carries the machine-shaped
+    :func:`should_notice_mixed_turn_leak` — is top-level, and its final segment carries the machine-shaped
     leak (:func:`has_leaked_tool_call`). No one-shot budget: nothing is
     re-queued, so there is no loop to bound, and every leaked turn deserves
     its own visible mark.
@@ -2989,8 +3004,6 @@ def should_notice_leaked_tool_call(
     if is_cancelled or refusal_reasons:
         return False
     if turn_tool_calls != 0:
-        return False
-    if in_stage_execution:
         return False
     if stop_reason != end_turn_reason:
         return False
@@ -3030,14 +3043,6 @@ def should_notice_mixed_turn_leak(
     at least one dispatched tool call, a NORMAL end-turn (which excludes the
     cancelled stop reason), top-level, and a final segment carrying the
     machine-shaped leak (:func:`has_leaked_tool_call`).
-
-    Deliberately NOT gated on ``in_stage_execution``, unlike its sibling: that
-    exclusion exists so the orchestrator's stage loop cannot read an unfinished
-    stage as complete, and a notice-only card changes no turn result the loop
-    reads. One mismatch follows and is accepted: the card's guidance ("check
-    what landed before re-sending") addresses a human driving the chat, not the
-    stage loop, so on a stage-execution turn it offers advice its reader cannot
-    act on — harmless, and better than hiding the leak on those turns.
 
     The card says the earlier calls were ATTEMPTED rather than ran, and never
     "nothing was run" as the sibling does, because ``turn_tool_calls`` counts
@@ -3105,9 +3110,7 @@ def should_notice_compaction_dropped_leak(
     re-issued by this layer under any of the three auto-approval routes
     (:func:`should_notice_leaked_tool_call` documents why). It therefore needs
     no ``turn_tool_calls`` gate: that gate exists to protect UN-LANDING, and
-    there is nothing here to un-land. It needs no ``in_stage_execution`` gate
-    either, for the reason its mixed-turn sibling does not: a notice changes no
-    turn result the orchestrator's stage loop reads.
+    there is nothing here to un-land.
 
     Owning no outcome is also why the caller evaluates this OUTSIDE the
     ``if``/``elif`` chain its siblings sit in. Every arm of that chain owns the
@@ -3399,7 +3402,6 @@ def should_recover_promise_only(
     successful_tool_call_ids: frozenset[str] = frozenset(),
     builtin_identity_trusted: bool = False,
     directive_user_origin: bool = False,
-    in_stage_execution: bool = False,
     stop_in_progress: bool = False,
     stop_generation_unchanged: bool = True,
     queue_empty: bool = True,
@@ -3454,10 +3456,6 @@ def should_recover_promise_only(
         full-matched false current-tool blocker above after read-only preparation.
         Because the runner resets its segment buffer at every tool boundary,
         ``final_segment_text`` is exactly the text AFTER the last tool call;
-      * this is NOT a stage-execution turn (``in_stage_execution``). A turn run by
-        the orchestrator's stage loop must not spawn async recovery: the loop
-        records the stage complete and advances before the continuation finishes,
-        corrupting stage attribution;
       * this is a top-level turn (``prompt_depth == 0``) and the one-shot budget
         is unspent (``promise_only_retries < 1``) — bounded to a single attempt,
         never a loop.
@@ -3482,8 +3480,6 @@ def should_recover_promise_only(
         return False
     if turn_tool_calls and not directive_user_origin:
         return False
-    if in_stage_execution:
-        return False
     if stop_reason != end_turn_reason:
         return False
     if not produced_visible_output:
@@ -3507,7 +3503,6 @@ def should_continue_after_compaction(
     compaction_continue_retries: int,
     is_cancelled: bool,
     refusal_reasons: list,
-    in_stage_execution: bool = False,
     stop_in_progress: bool = False,
     stop_generation_unchanged: bool = True,
     queue_empty: bool = True,
@@ -3559,7 +3554,7 @@ def should_continue_after_compaction(
         user-intent gates every sibling recovery path uses, for the same reason:
         a queued continuation must never jump ahead of, or act against, input
         the user has already given;
-      * this is NOT a stage-execution turn, it IS top-level
+      * this IS a top-level turn
         (``prompt_depth == 0``), and the one-shot budget is unspent
         (``compaction_continue_retries < 1``) — one attempt, never a loop. The
         bound matters more here than elsewhere: if the continuation itself
@@ -3578,8 +3573,6 @@ def should_continue_after_compaction(
     if not no_pending_steers:
         return False
     if is_cancelled or refusal_reasons:
-        return False
-    if in_stage_execution:
         return False
     if stop_reason != end_turn_reason:
         return False
@@ -3839,26 +3832,12 @@ MCP_APP_MESSAGE_KIND = "mcp_app_message"
 APP_MESSAGE_PREFIX = "[MCP app message from "
 APP_MESSAGE_END = "[End of MCP app message]"
 
-#: Queue-entry kinds whose turns must settle before an Autopilot stage advances.
-STAGE_DELIVERY_KINDS = frozenset((SUBAGENT_COMPLETION_KIND, SYNTHETIC_RECOVERY_KIND))
-
-
-def owned_stage_delivery_entry(boundary: Any, entries: list[dict]) -> dict | None:
-    """Return the first stage-delivery entry owned by *boundary*."""
-    return next(
-        (
-            entry
-            for entry in entries
-            if entry.get("kind") in STAGE_DELIVERY_KINDS and boundary.owns_entry(entry)
-        ),
-        None,
-    )
+#: Queue-entry kinds that can carry sub-agent delivery debt.
+SUBAGENT_DELIVERY_KINDS = frozenset((SUBAGENT_COMPLETION_KIND, SYNTHETIC_RECOVERY_KIND))
 
 
 #: All system-injection kinds (for set-membership checks).
-# MERGE-REVIEW: Peer and restart deliveries still carry trusted queue metadata;
-# upstream's stage-delivery set covers only subagent completions and recovery.
-_SYSTEM_INJECTION_KINDS = STAGE_DELIVERY_KINDS | frozenset(
+_SYSTEM_INJECTION_KINDS = SUBAGENT_DELIVERY_KINDS | frozenset(
     (
         CRON_NOTIFICATION_KIND,
         PEER_CHANNEL_REQUEST_KIND,
@@ -4000,16 +3979,31 @@ def carries_attachments(item: dict) -> bool:
     meta = item.get("meta")
     if not isinstance(meta, dict):
         return False
+    # A whole-message quote (``meta.quote``) drains alone for the same reason:
+    # the row's card strips the quote's block from the START of the content,
+    # and a merged row would open with another entry's text instead.
+    if isinstance(meta.get("quote"), dict) and meta.get("quote"):
+        return True
     return any(isinstance(meta.get(k), list) and meta.get(k) for k in ATTACHMENT_META_KEYS)
+
+
+def _stamped_turn_actor(item: dict) -> Any:
+    """The turn actor stamped on a queue entry's meta, or ``""`` for none."""
+    # circular import: chat_delivery imports this module at load.
+    from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY
+
+    meta = item.get("meta")
+    return meta.get(TURN_ACTOR_META_KEY, "") if isinstance(meta, dict) else ""
 
 
 def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
     """Drain the queue: merge non-cron messages or pop the first one.
 
     A merge run stops at a system injection, at an attachment-bearing entry
-    (see :func:`carries_attachments`) and at a possibly-delivered steer
-    (``STEER_POSSIBLY_DELIVERED_META``); either of the last two at the head of
-    the queue pops alone.
+    (see :func:`carries_attachments`), at a possibly-delivered steer
+    (``STEER_POSSIBLY_DELIVERED_META``) and where the stamped turn actor
+    changes, so an app's queued send never folds into the user's own words; an
+    entry that starts no run pops alone.
     """
     if merge_enabled and len(slot._queue) > 1:
         to_merge: list[dict] = []
@@ -4022,6 +4016,8 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
                 or (item.get("meta") or {}).get(STEER_POSSIBLY_DELIVERED_META)
             ):
                 break
+            if to_merge and _stamped_turn_actor(item) != _stamped_turn_actor(to_merge[0]):
+                break
             to_merge.append(item)
         if len(to_merge) > 1:
             del slot._queue[: len(to_merge)]
@@ -4031,14 +4027,9 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
     return item["content"], [item]
 
 
-def _dequeue_next_system_message(
-    slot,
-    *,
-    exclude_cron: bool = False,
-    preferred_id: str = "",
-) -> tuple:
-    """Pop a preferred queued system injection, or the first one, leaving
-    plain user messages queued.
+def _dequeue_next_system_message(slot) -> tuple:
+    """Pop the first queued system injection, leaving plain user messages
+    queued.
 
     Implements the (always-on) queue-during-subagents behavior: while background
     sub-agents run for a slot, a tangential user message is held (not drained)
@@ -4046,32 +4037,9 @@ def _dequeue_next_system_message(
     keep flowing (sub-agent completions, cron notifications) are still drained.
     Returns ``(content, [item])`` for the drained item, or ``(None, [])`` when
     only held (user) messages remain queued.
-
-    ``exclude_cron`` additionally holds cron notifications. A multi-stage plan
-    runs each stage as its own ``_run_chat`` whose tail-drain fires while
-    ``_in_stage_execution`` is still set; without this a cron notification
-    queued during the plan is pulled BETWEEN stages and starts a turn that
-    scatters the plan. Sub-agent completions and synthetic recovery still flow
-    (a stage may legitimately spawn sub-agents or re-queue a continuation) --
-    only the external cron injection waits for the plan to end.
-
-    ``preferred_id`` is selected by the stage boundary's single owner predicate.
-    It changes queue order only for that owned row; this helper never re-decides
-    ownership.
     """
-
-    def _eligible(item: dict) -> bool:
-        return is_system_injection_item(item) and not (
-            exclude_cron and item.get("kind") == CRON_NOTIFICATION_KIND
-        )
-
-    if preferred_id:
-        for i, item in enumerate(slot._queue):
-            if item.get("id") == preferred_id and _eligible(item):
-                popped = slot.queue_pop(i)
-                return popped["content"], [popped]
     for i, item in enumerate(slot._queue):
-        if _eligible(item):
+        if is_system_injection_item(item):
             popped = slot.queue_pop(i)
             return popped["content"], [popped]
     return None, []

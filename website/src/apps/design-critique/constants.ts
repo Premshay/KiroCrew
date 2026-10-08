@@ -35,6 +35,7 @@ import { i18nT } from '../../i18n/t'
 // longer installed. The critic persona travels with the prompt rather than a
 // bundled app agent (see the CRITIC note in prompts.ts).
 export const DEFAULT_AGENT = 'kirocrew'
+export const AGENT = DEFAULT_AGENT
 export const AGENTKEY = 'dc-agent-v1'
 export const BRIEFKEY = 'dc-review-brief-v1'
 export const HKEY = 'dc-history-v1'

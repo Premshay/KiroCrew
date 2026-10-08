@@ -14,8 +14,6 @@ import contextlib
 import json
 import logging
 import os
-import shutil
-import secrets
 import tempfile
 import time
 import uuid
@@ -24,7 +22,14 @@ from dataclasses import dataclass, field
 from aiohttp import web
 
 from kiro_crew import aws_consent
-from kiro_crew.config.loader import config_path, read_config_text
+from kiro_crew.config.loader import (
+    ConfigReadError,
+    ConfigWriteRefused,
+    coerce_dict_section,
+    config_path,
+    update_config_locked,
+)
+from kiro_crew.dashboard.chat_utils import run_config_write
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.piper_runtime import PiperRuntime
@@ -32,10 +37,8 @@ from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES, SandboxUnavailableError
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.slack.handler import _vc
 from kiro_crew.voice_reply import (
-    DEFAULT_POCKET_VOICE,
     PROVIDER_PIPER,
     PROVIDER_POLLY,
-    PROVIDER_POCKET,
     PROVIDER_SYSTEM,
     VALID_ENGINES,
     VALID_PROVIDERS,
@@ -48,7 +51,6 @@ from kiro_crew.voice_reply import (
     resolve_polly_cli,
     resolve_system_tts_async,
     stitch_mp3s,
-    stream_pocket_speech,
     streaming_piper_reply,
     streaming_voice_reply,
     synthesize_speech,
@@ -59,41 +61,30 @@ from kiro_crew.voice_reply import (
 
 logger = logging.getLogger(__name__)
 
-_REPLAY_JOB_TTL_SECS = 120
-_MAX_REPLAY_JOBS = 32
-
-
-@dataclass(frozen=True)
-class _PocketReplayJob:
-    text: str
-    voice_id: str
-    piper_binary: str
-    piper_model: str
-    piper_model_config: str
-    length_scale: float
-    expires_at: float
-
-
-_pocket_replay_jobs: dict[str, _PocketReplayJob] = {}
-
-
-def _purge_expired_pocket_replay_jobs(now: float) -> None:
-    for candidate, job in list(_pocket_replay_jobs.items()):
-        if job.expires_at <= now:
-            _pocket_replay_jobs.pop(candidate, None)
-
-
-def _take_pocket_replay_job(job_id: str) -> _PocketReplayJob | None:
-    now = time.monotonic()
-    _purge_expired_pocket_replay_jobs(now)
-    job = _pocket_replay_jobs.pop(job_id, None)
-    return job if job and job.expires_at > now else None
-
-
 _MAX_SYNTHESIS_TEXT_CHARS = 20000
 _MAX_ACTIVE_SYNTHESES = 2
 _MAX_REQUEST_ID_CHARS = 128
 _CANCELLED_REQUEST_TTL = 60.0
+
+#: The live ``_vc`` attribute each config PUT field lands on, mapped to the key
+#: it is stored under in config.json's ``voice_reply`` block (the names the
+#: loader in slack/handler.py reads back).
+_VOICE_ATTR_TO_CONFIG_KEY: dict[str, str] = {
+    "global_enabled": "enabled",
+    "auto_speak": "auto_speak",
+    "provider": "provider",
+    "default_voice": "voice_id",
+    "default_engine": "engine",
+    "default_rate": "rate",
+    "default_pitch": "pitch",
+    "aws_profile": "aws_profile",
+    "region": "region",
+    "piper_binary": "piper_binary",
+    "piper_model": "piper_model",
+    "piper_model_config": "piper_model_config",
+    "piper_length_scale": "piper_length_scale",
+    "system_voice": "system_voice",
+}
 _MAX_CANCELLED_REQUESTS = 128
 
 
@@ -279,10 +270,6 @@ async def api_voice_config(request: web.Request) -> web.Response:
         and body["provider"] in VALID_PROVIDERS
     ):
         pending["provider"] = body["provider"]
-        # Switching to the pocket provider without naming a voice adopts its
-        # own default; the "voice" branch below owns the case where one is named.
-        if body["provider"] == PROVIDER_POCKET and "voice" not in body:
-            pending["default_voice"] = DEFAULT_POCKET_VOICE
     if "voice" in body:
         # A voice NAME, same class as system_voice: a wrong type must be refused
         # rather than stringified, because "{}" is a name no engine can satisfy.
@@ -341,42 +328,42 @@ async def api_voice_config(request: web.Request) -> web.Response:
         # as unserializable JSON that breaks the browser's config GET.
         pending["piper_length_scale"] = validate_length_scale(body["piper_length_scale"])
 
+    # Persist FIRST, then apply to the live `_vc`: a write that failed must not
+    # leave the gateway running a setting the file does not hold, which the next
+    # restart would silently revert. The write is a locked delta RMW of the keys
+    # this request named, MERGED into the existing voice_reply block -- the
+    # loader (slack/handler.py) also reads auto_reply_to_voice from here, and
+    # every other section of config.json is left as it was. A truncate-then-write
+    # here would let a concurrent load read a torn file as defaults, so a failed
+    # write answers 5xx instead of {"ok": true}.
+    if pending:
+
+        def _apply_voice(doc: dict) -> dict:
+            vr = coerce_dict_section(doc, "voice_reply")
+            for _attr, _new in pending.items():
+                vr[_VOICE_ATTR_TO_CONFIG_KEY[_attr]] = _new
+            return doc
+
+        try:
+            await run_config_write(update_config_locked, config_path(), mutate=_apply_voice)
+        except ConfigReadError:
+            logger.warning("voice config PUT: config.json is unreadable", exc_info=True)
+            return web.json_response(
+                {"error": "config.json is corrupt", "code": "config_corrupt"}, status=500
+            )
+        except ConfigWriteRefused as exc:
+            return web.json_response(
+                {"error": str(exc), "code": "config_write_refused"}, status=400
+            )
+        except OSError:
+            logger.warning("voice config PUT: config.json write failed", exc_info=True)
+            return web.json_response(
+                {"error": "failed to write config file", "code": "config_write_failed"},
+                status=500,
+            )
+
     for _attr, _new in pending.items():
         setattr(_vc, _attr, _new)
-
-    # Persist to config.json. MERGE into the existing voice_reply block rather
-    # than rewriting it wholesale — the loader (slack/handler.py) also reads
-    # auto_speak / auto_reply_to_voice from here, and a wholesale rewrite would
-    # silently drop any key not in this handler's set.
-    try:
-        cfg_path = config_path()
-        cfg = json.loads(read_config_text(cfg_path))
-        vr = cfg.get("voice_reply")
-        if not isinstance(vr, dict):
-            vr = {}
-        vr.update(
-            {
-                "enabled": _vc.global_enabled,
-                "auto_speak": _vc.auto_speak,
-                "provider": _vc.provider,
-                "voice_id": _vc.default_voice,
-                "engine": _vc.default_engine,
-                "rate": _vc.default_rate,
-                "pitch": _vc.default_pitch,
-                "aws_profile": _vc.aws_profile,
-                "region": _vc.region,
-                "piper_binary": _vc.piper_binary,
-                "piper_model": _vc.piper_model,
-                "piper_model_config": _vc.piper_model_config,
-                "piper_length_scale": _vc.piper_length_scale,
-                "system_voice": _vc.system_voice,
-            }
-        )
-        cfg["voice_reply"] = vr
-        with open(cfg_path, "w") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception:
-        logger.exception("Failed to persist voice config")
 
     return web.json_response({"ok": True})
 
@@ -642,7 +629,6 @@ async def _synthesize_nonstreaming(
             )
         audio_bytes = await asyncio.to_thread(_read_audio, audio_path)
         audio_b64 = base64.b64encode(audio_bytes).decode()
-        audio_mime = "audio/wav" if audio_path.lower().endswith(".wav") else "audio/mpeg"
         state.broadcast_ws(
             "voice_chunk",
             {
@@ -650,12 +636,12 @@ async def _synthesize_nonstreaming(
                 "index": 0,
                 "sentence": text,
                 "audio": audio_b64,
-                "audioMime": audio_mime,
+                "audioMime": "audio/wav",
             },
         )
         state.broadcast_ws(
             "voice_complete",
-            {**identity, "audio": audio_b64, "chunks": 1, "audioMime": audio_mime},
+            {**identity, "audio": audio_b64, "chunks": 1, "audioMime": "audio/wav"},
         )
         return web.json_response({"ok": True, "chunks": 1, "request_id": identity["request_id"]})
     except SandboxUnavailableError as exc:
@@ -678,100 +664,6 @@ async def _synthesize_nonstreaming(
         if audio_path:
             with contextlib.suppress(OSError):
                 os.unlink(audio_path)
-
-
-async def api_voice_replay(request: web.Request) -> web.Response:
-    """Create a one-time Pocket replay URL, or select the legacy path."""
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        return web.json_response(
-            {"code": "voice_replay_invalid_json", "error": "invalid JSON"}, status=400
-        )
-    if not isinstance(body, dict):
-        return web.json_response(
-            {"code": "voice_replay_invalid_json", "error": "invalid JSON"}, status=400
-        )
-    text = str(body.get("text") or "").strip()
-    if not text:
-        return web.json_response(
-            {"code": "voice_replay_text_required", "error": "text required"}, status=400
-        )
-    if _vc.provider != PROVIDER_POCKET:
-        return web.json_response({"mode": "legacy"})
-
-    text, _ = redact_exfiltration_urls(text)
-    text, _ = redact_credentials(text)
-    now = time.monotonic()
-    _purge_expired_pocket_replay_jobs(now)
-    if len(_pocket_replay_jobs) >= _MAX_REPLAY_JOBS:
-        oldest = min(_pocket_replay_jobs, key=lambda key: _pocket_replay_jobs[key].expires_at)
-        _pocket_replay_jobs.pop(oldest, None)
-    job_id = secrets.token_urlsafe(24)
-    _pocket_replay_jobs[job_id] = _PocketReplayJob(
-        text=text,
-        voice_id=_vc.default_voice,
-        piper_binary=_vc.piper_binary,
-        piper_model=_vc.piper_model,
-        piper_model_config=_vc.piper_model_config,
-        length_scale=_vc.piper_length_scale,
-        expires_at=now + _REPLAY_JOB_TTL_SECS,
-    )
-    return web.json_response(
-        {"mode": "stream", "mime": "audio/ogg; codecs=opus", "url": f"/api/voice/replay/{job_id}"}
-    )
-
-
-async def api_voice_replay_stream(request: web.Request) -> web.StreamResponse:
-    """Stream a one-time Pocket replay URL as browser-playable Ogg Opus."""
-    job = _take_pocket_replay_job(request.match_info["job_id"])
-    if job is None:
-        return web.json_response(
-            {"code": "voice_replay_missing", "error": "voice replay is no longer available"},
-            status=404,
-        )
-    stream = stream_pocket_speech(
-        job.text,
-        voice_id=job.voice_id,
-        piper_binary=job.piper_binary,
-        piper_model=job.piper_model,
-        piper_model_config=job.piper_model_config,
-        length_scale=job.length_scale,
-    )
-    try:
-        first_chunk = await anext(stream)
-    except StopAsyncIteration:
-        with contextlib.suppress(Exception):
-            await stream.aclose()
-        return web.json_response(
-            {"code": "voice_replay_empty", "error": "voice replay produced no audio"}, status=502
-        )
-    except Exception:
-        with contextlib.suppress(Exception):
-            await stream.aclose()
-        logger.exception("Pocket replay could not start")
-        return web.json_response(
-            {"code": "voice_replay_unavailable", "error": "voice replay is unavailable"}, status=502
-        )
-
-    response = web.StreamResponse(
-        status=200,
-        headers={"Content-Type": "audio/ogg; codecs=opus", "Cache-Control": "no-store"},
-    )
-    await response.prepare(request)
-    try:
-        await response.write(first_chunk)
-        async for chunk in stream:
-            await response.write(chunk)
-        await response.write_eof()
-    except ConnectionError:
-        logger.debug("Pocket replay client disconnected")
-    except Exception:
-        logger.exception("Pocket replay stream failed after response started")
-    finally:
-        with contextlib.suppress(Exception):
-            await stream.aclose()
-    return response
 
 
 # ── Voices list (cached) ──

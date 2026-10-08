@@ -1,4 +1,3 @@
-import { useEffect, useMemo, useRef } from 'react'
 import { useMutation, useQuery, type QueryClient } from '@tanstack/react-query'
 
 import { api } from '../../../api/client'
@@ -6,9 +5,8 @@ import type { KiroCrewAgent } from '../../../components/AgentSelector'
 import { filterInteractiveModels, legacyCodexEffort, modelWithoutEffort } from '../../../hooks/useInteractiveModels'
 import { useKirocrewConfigReader } from '../../../hooks/useKirocrewConfigReader'
 import { useSettingsDefaultModel } from '../../../hooks/useSettingsDefaultModel'
-import type { useRemoteCapabilities } from '../../../hooks/useRemoteCapabilities'
 import { i18nT } from '../../../i18n/t'
-import { effortSupportedForCrew } from '../../../lib/effort'
+import { modelSupportsEffort, selectionCapabilitiesFailed } from '../../../lib/effort'
 import { displayModel, modelChipMarker } from '../../../lib/model'
 import type { useProvider } from '../../../providers'
 import { useModelsDegraded } from '../../../providers/modelListHealth'
@@ -20,21 +18,18 @@ import type { ChatSlot } from '../../../types'
 import { uniqueNotificationTs } from './notificationTs'
 
 interface ComposerChipsOptions {
-  slotRunning: boolean
-  crewEffortLevels: string[] | undefined
   currentSlot: ChatSlot | undefined
   /** The configured default agent and the one a new session would open on. */
   defaultAgent: string | undefined
   pendingAgent: string
   installedAgents: KiroCrewAgent[]
   provider: ReturnType<typeof useProvider>
-  /** The roster the picker offers (the peer's for a remote-bound session). */
+  /** The roster the picker offers. */
   availableModels: ModelInfo[]
   codexPairModels: boolean
   /** The slot's ACP capability answer, once known. */
   selectionCapabilities: Awaited<ReturnType<typeof api.chatSlotSelectionCapabilities>> | undefined
-  selectionCapabilitiesQ: { isError: boolean }
-  remoteCrew: ReturnType<typeof useRemoteCapabilities>
+  selectionCapabilitiesQ: { isError: boolean; error?: unknown }
   dispatch: AppDispatch
   queryClient: QueryClient
   showActionError: (message: string, title?: string) => void
@@ -47,8 +42,6 @@ interface ComposerChipsOptions {
  * and the model picker's "set as the agent's default" write.
  */
 export function useComposerChips({
-  slotRunning,
-  crewEffortLevels,
   currentSlot,
   defaultAgent,
   pendingAgent,
@@ -58,7 +51,6 @@ export function useComposerChips({
   codexPairModels,
   selectionCapabilities,
   selectionCapabilitiesQ,
-  remoteCrew,
   dispatch,
   queryClient,
   showActionError,
@@ -133,14 +125,12 @@ export function useComposerChips({
     // a bare `auto` for a session running one specific model.
     codexPairModels ? modelWithoutEffort(currentSlot?.served_model || '') : currentSlot?.served_model,
   )
-  const effortSupported = provider.capabilities.reasoningEffort && !selectionCapabilitiesQ.isError && (
+  const effortSupported = provider.capabilities.reasoningEffort && !selectionCapabilitiesFailed(selectionCapabilitiesQ) && (
     selectionCapabilities
       ? selectionCapabilities.effort_supported === true
-      : effortSupportedForCrew(crewEffortLevels, shownModel === 'auto' ? '' : shownModel)
+      : modelSupportsEffort(shownModel === 'auto' ? '' : shownModel)
   )
-  const effortLevelsOverride = selectionCapabilities
-    ? selectionCapabilities.effort_levels
-    : remoteCrew.isRemote ? (remoteCrew.capabilities?.effort_levels ?? []) : undefined
+  const effortLevelsOverride = selectionCapabilities?.effort_levels
   // The same answer WITHOUT that substitution, for the pin-to-agent row: that
   // row asks about the PIN, and it must stay disabled for a withheld one even
   // now that the chip names the model the session inherited instead.
@@ -152,7 +142,7 @@ export function useComposerChips({
   )
   // The chip says `default` only for the Settings default; a model picked for
   // the user (Auto router, withheld pin's fallback) is marked `auto` instead.
-  const chipDefault = useSettingsDefaultModel(_slotAgentName, remoteCrew.isRemote, codexPairModels)
+  const chipDefault = useSettingsDefaultModel(_slotAgentName, codexPairModels)
   const modelMarker = modelChipMarker(
     currentSlot?.model || '',
     shownModel,
@@ -160,17 +150,6 @@ export function useComposerChips({
     chipDefault.settingsDefault,
     chipDefault.agentPinned,
   )
-  // Context-window fallback for a peer-bound session BEFORE its first turn. Once a
-  // turn has run the real number arrives with the relayed `context_usage` frame and
-  // wins; until then `provider.getContextWindow` would answer from THIS machine's
-  // model knowledge, which can differ from the peer's for the same model name.
-  const remoteContextWindow = useMemo(() => {
-    if (!remoteCrew.isRemote) return 0
-    const picked = shownModel === 'auto' ? '' : shownModel
-    return remoteCrew.capabilities?.models.find(m =>
-      (codexPairModels ? modelWithoutEffort(m.model_name) : m.model_name) === picked,
-    )?.context_window || 0
-  }, [remoteCrew.isRemote, remoteCrew.capabilities, shownModel, codexPairModels])
   // True when the pin row would be a no-op: the agent already stores the
   // selected base model. 'auto' is the inherit spelling, never a stored pin.
   // Read the slot's pin through displayPin, not the fallback shownModel: a
@@ -213,43 +192,6 @@ export function useComposerChips({
     refetchOnWindowFocus: true,
     retry: false,
   })
-  // Working-tree summary for the composer footer badge. Shares the Git panel's
-  // ['git-status', dir] key so panel and footer dedupe into one fetch — while
-  // the panel is open its 5s interval drives the shared cache and this observer
-  // just reads it. Gated on repo=true so a non-repo project never runs a git
-  // subprocess on an interval; the cheap HEAD-file probe above answers that.
-  const { data: projectGitStatus, isError: projectGitStatusError } = useQuery({
-    queryKey: ['git-status', _slotProject],
-    queryFn: () => api.projectGitStatus(_slotProject),
-    enabled: !!_slotProject && !projectGitError && !!projectGit?.repo,
-    staleTime: 15_000,
-    refetchInterval: 60_000,
-    refetchOnWindowFocus: true,
-    retry: false,
-  })
-  const gitBadge =
-    !projectGitStatusError && projectGitStatus?.repo
-      ? {
-          dirty: projectGitStatus.files.length,
-          // The listing is capped server-side, so the count here is a floor, not
-          // a total. The badge reads the same flag the Git panel does; without it
-          // the badge states the cap as the number of changed files.
-          dirtyTruncated: projectGitStatus.truncated === true,
-          ahead: projectGitStatus.ahead ?? 0,
-          behind: projectGitStatus.behind ?? 0,
-        }
-      : undefined
-  // The badge asserts "clean" by ABSENCE, so a stale reading right after the
-  // agent finishes editing files is misleading at exactly the decision moment
-  // the badge exists for. Invalidate the shared key on the running→idle
-  // transition; the 60s interval covers everything else.
-  const prevGitRunningRef = useRef(false)
-  useEffect(() => {
-    if (prevGitRunningRef.current && !slotRunning && _slotProject) {
-      queryClient.invalidateQueries({ queryKey: ['git-status', _slotProject] })
-    }
-    prevGitRunningRef.current = slotRunning
-  }, [slotRunning, _slotProject, queryClient])
   // React Query keeps the last successful data after a failed refetch, so a
   // project that was deleted or revoked would keep showing its old branch
   // indefinitely. Treat an errored query as "no branch" and fall back to the
@@ -258,9 +200,9 @@ export function useComposerChips({
     ? ''
     : projectGit?.branch || (projectGit?.detached ? projectGit.head || '' : '')
   return {
-    shownModel, _pinShownModel, chipDefault, modelMarker, effortSupported, effortLevelsOverride, remoteContextWindow,
+    shownModel, _pinShownModel, chipDefault, modelMarker, effortSupported, effortLevelsOverride,
     _modelPinAgent, _modelPinActive, _modelPinPinned, pinModelToAgentMut,
     defaultEffort, effectiveEffort,
-    _slotProject, projectGit, projectGitError, projectBranch, gitBadge,
+    _slotProject, projectGit, projectGitError, projectBranch,
   }
 }

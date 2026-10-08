@@ -29,13 +29,29 @@ _CREW_LOG_CALLS = frozenset(
         "commit_work_progress",
         "record_crew_checkpoint",
         "open_session_log",
+        "CrewLog.open",
+        "iter_from",
         "session_ledger.read_state",
         "sl.read_state",
+        # Removal waits for the eager folder to finish its batch before unlinking, and
+        # on the event-loop thread that wait is skipped: Windows then refuses to
+        # unlink the segment the fold has open, and the unit is reported not removed.
+        "store.sweep_expired",
+        "store.remove_unit",
     }
 )
 
 #: Substrings that make a module worth parsing.
-_SCAN_IF = ("commit_work_progress", "record_crew_checkpoint", "open_session_log", "read_state")
+_SCAN_IF = (
+    "commit_work_progress",
+    "record_crew_checkpoint",
+    "open_session_log",
+    "CrewLog.open",
+    "iter_from",
+    "read_state",
+    "sweep_expired",
+    "remove_unit",
+)
 
 #: ``(file name, async function)`` pairs that make the on-loop call on purpose.
 _ON_LOOP_ON_PURPOSE = frozenset(
@@ -152,12 +168,26 @@ async def reads():
 async def via_reader():
     reader()
 
+def folded():
+    handle = CrewLog.open("session", "s")
+    return tuple(handle.iter_from(1))
+
+async def via_folded():
+    folded()
+
 async def unrelated_read_state():
     redaction_switch.read_state()
+
+async def sweeps():
+    store.sweep_expired(30)
+
+async def unrelated_sweep():
+    decisions_log.sweep_expired()
 
 async def via_hop():
     hopped()
     off_loop(reader)
+    off_loop(store.sweep_expired, 30)
     await asyncio.to_thread(cs.commit_work_progress, 1)
 
 def installs_a_fake(monkeypatch):
@@ -174,4 +204,6 @@ async def installs_fakes(monkeypatch):
         "via_helper",
         "reads",
         "via_reader",
+        "via_folded",
+        "sweeps",
     ]

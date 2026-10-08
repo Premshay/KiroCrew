@@ -140,9 +140,11 @@ Both are standing obligations, not run artifacts. A run that produces neither
 has learned nothing it can hand to the next one.
 
 The scripts below are the deterministic half of the loop — run them via
-`execute_bash`, read their output, never re-derive what they compute. Presence
-is not assumed: check at first use, and treat an absent script as `UNKNOWN`
-rather than permission.
+`execute_bash` the way Startup step 1 runs `spec_check.py`: through
+`"$KIROCREW_RUNTIME_PYTHON" -I -B "<skill-dir>/scripts/<name>.py"`, never bare
+`python3` and never a path relative to your working directory. Read their
+output, never re-derive what they compute. Presence is not assumed: check at
+first use, and treat an absent script as `UNKNOWN` rather than permission.
 
 - `scripts/claim_preflight.py` — one verdict per candidate item before you
   dispatch it: `CLAIM` / `SKIP` / `CLOSE` / `REVIEW` / `UNKNOWN`.
@@ -313,6 +315,12 @@ via `monitor_update`, see "Live steering"):
 
 ## Your panel: publish JUDGMENTS, never numbers
 
+The panel is STORED and read back through the panel route; the Dashboard tab beside
+your chat draws the crewmate's own dashboard instead. So an item under `you` reaches
+a reader only if you also write it to an agentic dashboard field with
+`dashboard_write`, where it appears under "Needs you" with the act it needs. Publish
+the panel for a reader who asks for it; write the dashboard for one who has not.
+
 `panel_publish` with template `kirocrew-pipeline-conductor` takes exactly four keys,
 and nothing else — an unknown key is refused and the refusal names it:
 
@@ -329,6 +337,14 @@ count all come from the `work` projection. `you` and `checks` are keyed by ITEM 
 not by column, so a sentence lands on the card it is about. A `checks` value that is
 not a bare `N/M` is dropped and the cell reads as not said — that cell means a tally
 you read off a forge, and the work log has none.
+
+Every key is optional: one you leave out reads as not said. A `you` value shorter
+than 8 characters or without a space also reads as not said — a name is not an
+action. `notes` is read only for the tile keys `items`, `entries` and `round`; any
+other key is ignored. The host clips what it prints: `lede` at 400
+bytes, each `notes` gloss and each row cell at 120, a `you` line at 200, and a
+clipped value ends ` [trimmed]`. Make the `lede` name the round it describes; do
+not write "nothing yet" beside a `round` tile that is not zero.
 
 ## How the ledger behaves
 
@@ -516,8 +532,8 @@ PR. Run this over the WHOLE candidate list before you record the backlog, and
 again whenever pickup rebuilds it:
 
 ```
-python3 scripts/coverage_filter.py --repo <owner/repo> --items 10890,10849,9736 [--json]
-python3 scripts/coverage_filter.py --repo <owner/repo> --items -   # numbers on stdin
+"$KIROCREW_RUNTIME_PYTHON" -I -B "<skill-dir>/scripts/coverage_filter.py" --repo <owner/repo> --items 10890,10849,9736 [--json]
+"$KIROCREW_RUNTIME_PYTHON" -I -B "<skill-dir>/scripts/coverage_filter.py" --repo <owner/repo> --items -   # numbers on stdin
 ```
 
 One forge call for the whole batch, up to 500 candidates — the same question
@@ -550,7 +566,7 @@ One call answers every cheap question about one candidate and returns ONE
 verdict. Branch on the exit code, never on the prose:
 
 ```
-python3 scripts/claim_preflight.py --repo <owner/repo> --item <N> \
+"$KIROCREW_RUNTIME_PYTHON" -I -B "<skill-dir>/scripts/claim_preflight.py" --repo <owner/repo> --item <N> \
     [--default-branch main] [--repo-dir <clone of the base>] [--json]
 ```
 
@@ -565,6 +581,12 @@ python3 scripts/claim_preflight.py --repo <owner/repo> --item <N> \
 
 Exit 3 is why the verdicts are exit codes at all: an unanswerable question is
 not a green light, and partial data yields `UNKNOWN` rather than `CLAIM`.
+
+Pass `--repo-dir` every time, pointing at a read-only clone of the base that
+its owner keeps current (the script never fetches). Without it, an item whose
+merged PR claims to close it, or whose text names a backticked identifier, reads
+`UNKNOWN ... reason=no-repo-dir` (exit 3) on every call unless an earlier rule
+already decides it, and re-running later cannot change that.
 
 Six checks run on every call, and the verdict is the FIRST match down this
 precedence list:
@@ -598,8 +620,9 @@ precedence list:
    at this and did not fix it* — usually a real dispatch, occasionally work in
    flight whose author never wrote a keyword, which is why it takes the live
    recheck rather than the batch.
-3. `prose_claim` — a closure request in the body or the last comment ("this is
-   resolved", "please close") **from the item's own reporter or a repository
+3. `prose_claim` — a closure request in the newest human comment, or in the body
+   only when the item has no human comment at all ("this is resolved",
+   "please close") **from the item's own reporter or a repository
    insider** → **REVIEW** `reporter-asked-close` at `risk=high`. **Prose never
    closes anything.** It is the weakest evidence this script collects — nine
    separate false-CLOSE paths reached review in one change, and a ratchet that
@@ -728,9 +751,10 @@ reading, and it comes back as `REVIEW` for you to confirm.
   full-width dispatch round CANNOT complete inside one window — plan two rounds,
   and remember that a create refused by the limiter is a post-claim failure, so
   unclaim per the rule above.
-- Worker sessions must be granted **trust mode before seeding** — an unattended
-  session stuck on an approval prompt runs zero turns; if you cannot grant it,
-  tell the operator instead of seeding sessions that will hang.
+- Worker sessions must be in **trust mode before seeding** — an unattended
+  session stuck on an approval prompt runs zero turns. No tool you hold grants it
+  (`session_create` takes no permission mode), so the operator arms each worker
+  session; ask for that and do not seed a session that is not armed.
 - **Check the SHARED CHECKOUT once, before you cut worktrees from it.** One
   `git status --porcelain` there. It is the shared root of every worktree in the
   fleet, so it is exactly the state a conductor is supposed to inspect before
@@ -841,9 +865,10 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > no `tox`, no `nox`, no `run-tests`/`local-gate`/"run the gates" wrapper of any
 > kind: a wrapper that escalates to the full suite satisfies the letter of a
 > targeted-only brief. The ban is on suite wrappers, NOT on the push gate
-> below — `preflight.py` and `push_guard.py` shell out only to `git` and `gh`
-> and run no test at all, so a targeted-test brief never licenses an unguarded
-> push. Pass `-n0` **explicitly** on every run: omitting `-n`
+> below — `preflight.py` and `push_guard.py` spawn only `git`, `gh` and the
+> OS tree-kill tool, and run no test at all (`--commit` / `--squash` run the
+> repository's own git hooks, as any commit does), so a targeted-test brief
+> never licenses an unguarded push. Pass `-n0` **explicitly** on every run: omitting `-n`
 > does not mean single process, it inherits whatever the project's pytest
 > `addopts` sets, and `-n auto` is a common default. Canonical line —
 > `timeout 900 python3 -m pytest -n0 <test file> -x -q </dev/null`. Do not
@@ -867,7 +892,8 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > look partly correct for entirely the wrong reason.
 > NEVER COMMIT FROM THE SHARED CHECKOUT. You may `cd` there for `gh` calls, but
 > its index is not yours and may hold hundreds of staged files left by another
-> operation, so one `git commit -a` there sweeps unrelated work into your PR.
+> operation, so one `git commit -a` there — or any commit after staging even a
+> single file — sweeps that staged work into your PR.
 > Each worktree has its own index; commit only from yours. Run nothing there
 > that moves its HEAD or writes its index or files (merge, pull, reset, clean,
 > checkout, restore, `gh pr checkout`, `gh repo sync`); report its state and
@@ -879,7 +905,7 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > actual pre-push hook over the real payload before naming a cause: process
 > liveness cannot distinguish a credential prompt from a slow hook.
 > PUSH GATE (mandatory, every push): the scripts live in `<gate>` =
-> `<crew-home>/skills/kirocrew-dev/prepare-pr/scripts`, where `<crew-home>` is
+> `<crew-home>/skills/kirocrew-dev/kirocrew-prepare-pr/scripts`, where `<crew-home>` is
 > `KIROCREW_HOME` when set and `$HOME/.kiro/crew` otherwise. Invoke them through
 > Kiro Crew's runtime interpreter the way Startup invokes `spec_check.py`, and
 > quote the resolved path: on POSIX `"$KIROCREW_RUNTIME_PYTHON" -B
@@ -891,16 +917,37 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > every push.
 > Run `preflight.py` before the first commit. Then before EVERY push confirm
 > `git status --porcelain` is empty and run `<gate>/push_guard.py
-> --base {default_branch} --max-ahead {max_commits}`, which refuses a stale base
-> or a replayed upstream commit. Pass `--max-ahead` explicitly and fill it from
+> --base {default_branch} --max-ahead {max_commits}`, which refuses a stale base,
+> a replayed upstream commit, anything staged that HEAD lacks, or a changed path
+> the gate did not commit on this branch and no other author's pushed commit
+> carries (a commit made by hand). When it lists such paths, read each diff: name
+> the ones that are yours after `--` on the same command (that vouch rewrites
+> nothing), and report any that are not.
+> Pass `--max-ahead` explicitly and fill it from
 > the spec, never from memory: the script defaults to 5, which is looser than
 > most repositories' own PR commit-count gate, so omitting it lets a branch read
 > `SAFE TO PUSH` and then fail that gate. Add `--require-single-on-base` only
-> when you actually squashed to one commit; it asserts `HEAD~1 ==
-> origin/<base>` and refuses a legitimate multi-commit branch.
-> Read the exit code, do not just test for zero: `0` proceed; `30`/`40` the gate
-> REFUSED, so do not push and report the code with the branch state; `2` the gate
-> could not RUN — an environment error, not a verdict — so do not push and report
+> when you actually squashed to one commit with the gate's `--squash`; it
+> asserts HEAD's only parent is `origin/<base>` and that the gate committed
+> every path HEAD changes, and refuses a legitimate multi-commit branch or a
+> squash made by hand.
+> Commit and amend through the gate, by name: `<gate>/push_guard.py --commit -m
+> "<subject>" -- <path>...` (or `-F <message file>`) and `--amend -- <path>...`,
+> never `git commit -a` or a bare `git commit`: the index can hold paths you
+> did not stage. Squash, if you squash, with `<gate>/push_guard.py --base {default_branch} --squash`
+> after writing the message to `<git-dir>/prepare-pr-commit-msg-<branch>.txt`
+> (`/` as `-`): it runs the checks above on the commits BEFORE squashing them
+> (so never `--max-ahead {max_commits}` there), then commits your branch's tree,
+> never an index, and `--require-single-on-base` then enforces the one commit.
+> A `40` whose text is the commits-ahead refusal, on commits you authored, is
+> answered once with the `--max-ahead N` it prints. Before any `git rebase
+> --continue`, `<gate>/push_guard.py --check-index` must exit `0`.
+> Read the exit code, do not just test for zero: `0` proceed; `30`/`40`/`41` the gate
+> REFUSED, so do not push and report the code with the branch state and stderr (a
+> git or network failure inside the gate is a `40` whose stderr names the failed
+> command; a `41` prints the staged paths and their remedy — follow it); `64` is
+> your own command-line mistake — fix it and retry; `2` the gate could not RUN —
+> not a git repository, no git, or a missing script — so do not push and report
 > `BLOCKED: push gate inoperative` with the code and stderr, because a worker
 > whose sandbox cannot reach the scripts has to surface that once instead of
 > stalling every item silently. A non-empty `git status --porcelain` is also a
@@ -908,7 +955,10 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > Unstaged work and a stale base are what otherwise reach the
 > PR and cost a review round to find what a git-only check catches in a second.
 > PR: English body (What/Why/How/Tests/Other), `Closes #{n}`, full URL in
-> your reply. Babysit to green (`monitor_start` ~300s, staggered off a round
+> your reply. Do NOT merge and do NOT arm auto-merge (`enable_automerge.py`,
+> `gh pr merge --auto`), whatever another skill's default says: the conductor
+> verifies your GREEN and a person approves the merge. Babysit to green
+> (`monitor_start` ~300s, staggered off a round
 > number so a dozen loops do not poll in lockstep, preferring REST over
 > GraphQL/search — the whole fleet shares one account's rate limit). Fix every
 > Critical/High; disposition every advisory explicitly; read reviewer JOB
@@ -1035,8 +1085,8 @@ and ages into `IDLE`.
 `cmd=` on a `BANNED` line is the matched command reduced to what cannot hold a
 secret: a recognised runner or launcher name, recognised option names with their
 values dropped, `+<n>` for the arguments withheld, and a trailing `~` on any single
-token long enough to be clipped. NO option value is printed, the cap flag's
-included — `-n0` prints as `-n`, because a custom rule can point this scan at a
+token long enough to be clipped. NO option value is printed, the worker-count
+flag's included — `-n0` prints as `-n`, because a custom rule can point this scan at a
 program whose `-n` value is a numeric secret and nothing tells that apart from a
 worker count. Recognised means drawn from a fixed list, so a program or long option
 the list does not name is counted rather than printed — a word that looks like a
@@ -1045,7 +1095,7 @@ spelling is recognised by SHAPE instead: a versioned pytest alias, which prints 
 the fixed label `pytest-<version>` or `py.test-<version>` rather than as itself, so
 the version it carried never reaches the line. An inline
 `KEY=value` in front of the command is withheld whole. Read it before stopping
-anyone — it is what separates a real uncapped run from a command that merely names
+anyone — it is what separates a real budget-bypassing run from a command that merely names
 one, and no argv is echoed. When the program itself is withheld, `rule=` is what
 identifies the command: it is the rule that selected this pid.
 
@@ -1055,7 +1105,8 @@ shape the probe recognises from the argv tokens instead, because the joined comm
 line cannot express it: `argv:pytest-runner-uncapped` is a runner spelling that is
 also a well-formed filename or path component — a versioned alias (`pytest-3`),
 `py.test`, or `pytest.exe` — standing in the program position with an explicit numeric
-worker count of two or more among its own arguments (the budget-bypassing form). There
+worker count of two or more among its own arguments (the budget-bypassing form;
+"uncapped" is the label's historical name, kept because consumers pin it). There
 is no regex to look up for such a row, so `cmd=` is the corroborating field: the runner
 name prints there, because an `argv:` row has no rule text to identify it by. An
 `argv:` shape is offered whatever the rule list
@@ -1383,6 +1434,11 @@ resolves it. The brief still mandates `-n0` on a worker's own test runs -- a
 budgeted pool is still a pool -- but the probe only reports the shape that
 escapes the budget. The other banned shape is a full-suite runner invoked with
 no file argument.
+
+A zero banned count is not proof that no such run exists. Known misses: an
+unquoted separator (`|`, `&`) inside an option value ahead of `-n N`, a pytest
+console script installed with `pip install --user`, and a count carried in the
+`addopts` of a file named by `-c other.ini`.
 
 Standing constants: `session_ceiling` machine-wide, `-n0` on every worker test
 run, targeted tests only, ≤2 subagents per worker. `-n0` rather than a small

@@ -451,7 +451,7 @@ function AgentControlRow({
   // keyboard contract moves focus INTO the menu on open, and the row holding
   // it is unmounted by the close — without a restore, focus would be orphaned
   // on <body>. Outside-click dismissal is left alone (the browser routes focus
-  // per the click target), matching the MicSourceMenu posture (#6267).
+  // per the click target), matching the MicSourceMenu posture.
   const triggerRef = useRef<HTMLButtonElement>(null)
   // The role="menu" element itself — narrower than `menuRef` (which wraps the
   // trigger too) so item discovery never picks up the trigger button.
@@ -460,7 +460,7 @@ function AgentControlRow({
 
   // role="menu" promises the WAI-ARIA menu keyboard contract (arrow-key row
   // navigation with wrap, Home/End, Tab containment). The shared hook owns it
-  // for all role="menu" surfaces rather than re-spelled here (#6231, #6269).
+  // for all role="menu" surfaces rather than re-spelled here.
   // The rows are native <button>s (`Btn`), so the hook's item discovery finds
   // them with no extra markup. Escape stays owned by the dismiss effect below:
   // what "close" means here — menu state, focus restore — is this host's
@@ -1429,10 +1429,7 @@ export default function ChannelPage() {
                   key={ch.id}
                   ch={ch}
                   active={ch.id === activeId}
-                  onClick={() => {
-                    setActiveId(ch.id)
-                    openDetail()
-                  }}
+                  onClick={() => { setActiveId(ch.id); openDetail() }}
                 />
               ))}
             </div>
@@ -1455,10 +1452,7 @@ export default function ChannelPage() {
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0">
                   <Btn
-                    onClick={() => {
-                      setShowAgents((v) => !v)
-                      if (isMobile) setThreadId(null)
-                    }}
+                    onClick={() => { setShowAgents(v => !v); if (isMobile) setThreadId(null) }}
                   >
                     <Users className="lucide-inline" />{' '}
                     {i18nT('pages.channelPage.agent_2', {
@@ -1605,8 +1599,7 @@ export default function ChannelPage() {
                                 onChange={setThreadInput}
                                 onSend={async () => {
                                   if (!threadInput.trim() || !threadId) return
-                                  if (await sendMessage(threadInput, threadId))
-                                    discardThreadDraft(threadId)
+                                  if (await sendMessage(threadInput, threadId)) discardThreadDraft(threadId)
                                 }}
                               />
                             </>
@@ -1685,6 +1678,7 @@ export default function ChannelPage() {
                       initialWidth={360}
                       minWidth={300}
                       storageKey="mc-channel-agents-width"
+                      frameClassName={isMobile ? 'w-full' : 'w-64 shrink-0 border-l border-border'}
                       noPadding
                       customHeader={
                         <div className="px-3 py-2.5 border-b border-border flex items-center justify-between">

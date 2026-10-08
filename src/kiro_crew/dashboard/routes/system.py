@@ -111,8 +111,7 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/tailnet/mobile/unpublish", handlers.api_tailnet_mobile_unpublish)
     app.router.add_post("/api/tailnet/mobile/qr", handlers.api_tailnet_mobile_qr)
     app.router.add_post("/api/sessions/restart", handlers.api_sessions_restart)
-    # Registered before "/api/sessions/{key}" for the same reason as /search:
-    # the path parameter would otherwise capture "restart-blockers".
+    # Fixed paths must precede /api/sessions/{key}.
     app.router.add_get("/api/sessions/restart-blockers", handlers.api_sessions_restart_blockers)
     app.router.add_post(
         "/api/sessions/restart-blockers/clear", handlers.api_sessions_clear_restart_blockers
@@ -153,6 +152,11 @@ def register(app: web.Application) -> None:
     app.router.add_put("/api/security/trusted-apps/allow-all", handlers.api_trusted_apps_allow_all)
     app.router.add_post("/api/security/trusted-apps/{name}", handlers.api_trusted_app_grant)
     app.router.add_delete("/api/security/trusted-apps/{name}", handlers.api_trusted_app_revoke)
+    app.router.add_get("/api/security/trusted-registries", handlers.api_trusted_registries_list)
+    app.router.add_post("/api/security/trusted-registries", handlers.api_trusted_registry_grant)
+    app.router.add_post(
+        "/api/security/trusted-registries/revoke", handlers.api_trusted_registry_revoke
+    )
     # Read-only governance policy viewer — effective Level-1 ∩ Level-2 ceiling
     # across every governed scope (no write path; the ceiling is file-authored).
     app.router.add_get("/api/governance/policy", handlers.api_governance_policy)
@@ -192,9 +196,6 @@ def register(app: web.Application) -> None:
     # strip's tooltip reads. Browser-called by the chat surface, like the consent
     # pair above.
     app.router.add_post("/api/decisions/feedback", handlers.api_decisions_feedback)
-    app.router.add_post("/api/decisions/preference", handlers.api_preference_advice)
-    app.router.add_post("/api/preference-consult", handlers.api_preference_consult)
-    app.router.add_post("/api/decisions/preference/feedback", handlers.api_preference_feedback)
     # Flagged-file delivery consent. Owner-gated in the handler; deliberately NOT
     # on the strict-internal list in server.py, because unlike the file_send legs
     # its only legitimate caller IS the owner's browser.

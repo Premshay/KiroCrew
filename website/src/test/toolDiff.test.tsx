@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { fireEvent } from "@testing-library/react";
+import { fireEvent, screen } from "@testing-library/react";
 import { renderWithProviders, createTestStore } from "./helpers";
 import ToolCallLine, { resetOpenedDiffCards } from "../pages/chat/ToolCallLine";
 import {
@@ -157,7 +157,7 @@ describe("ToolCallLine diff presentation", () => {
             type: "tool",
             text: "fs_write",
             kind: "edit",
-            input: UNIFIED_DIFF,
+            input: bigDiff(40),
             tool_call_id: "tc_d1",
             output: "ok",
             ts: 1,
@@ -179,7 +179,7 @@ describe("ToolCallLine diff presentation", () => {
     expect(
       container.querySelector('[data-testid="tool-diff-chip"]'),
     ).toBeTruthy();
-    fireEvent.click(getByText("app.py"));
+    fireEvent.click(getByText("big.txt"));
     expect(container.querySelector(".diff-block")).toBeTruthy();
   });
 
@@ -248,7 +248,7 @@ describe("ToolCallLine diff presentation", () => {
       role: "tool",
       content: "🔧 fs_write",
       cls: "",
-      meta: { tool_call_id: "tc_hist", kind: "edit", input: UNIFIED_DIFF },
+      meta: { tool_call_id: "tc_hist", kind: "edit", input: bigDiff(40) },
     };
     const store = createTestStore({
       chat: {
@@ -263,7 +263,7 @@ describe("ToolCallLine diff presentation", () => {
     );
     // The promotion is what this asserts, so open the fold and check the patch
     // came from meta.input rather than a live toolLog entry.
-    fireEvent.click(getByText("app.py"));
+    fireEvent.click(getByText("big.txt"));
     expect(container.querySelector(".diff-block")).toBeTruthy();
   });
 
@@ -279,7 +279,7 @@ describe("ToolCallLine diff presentation", () => {
             type: "tool",
             text: "fs_write",
             kind: "edit",
-            input: UNIFIED_DIFF,
+            input: bigDiff(40),
             tool_call_id: "tc_d1",
             rejected: true,
             ts: 1,
@@ -304,7 +304,7 @@ describe("ToolCallLine diff presentation", () => {
             type: "tool",
             text: "fs_write",
             kind: "edit",
-            input: UNIFIED_DIFF,
+            input: bigDiff(40),
             tool_call_id: "tc_d1",
             output: "ok",
             ts: 1,
@@ -348,7 +348,7 @@ describe("ToolCallLine diff presentation", () => {
               type: "tool",
               text: "fs_write",
               kind: "edit",
-              input: UNIFIED_DIFF,
+              input: bigDiff(40),
               tool_call_id: "tc_persist",
               output: "ok",
               ts: 1,
@@ -367,7 +367,7 @@ describe("ToolCallLine diff presentation", () => {
       <ToolCallLine message={msg} running={false} />,
       { store: mkStore() },
     );
-    fireEvent.click(first.getByText("app.py"));
+    fireEvent.click(first.getByText("big.txt"));
     expect(first.container.querySelector(".diff-block")).toBeTruthy();
     first.unmount();
     // Remount (what virtualizer recycling does): the expansion is remembered,
@@ -377,7 +377,7 @@ describe("ToolCallLine diff presentation", () => {
       { store: mkStore() },
     );
     expect(second.container.querySelector(".diff-block")).toBeTruthy();
-    expect(second.queryByText("app.py")).toBeNull();
+    expect(second.getAllByText("big.txt")).toHaveLength(2);
   });
 });
 

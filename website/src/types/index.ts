@@ -256,6 +256,8 @@ export interface UpdateCheckResult {
   remediation?: { kind?: string; message?: string; command?: string } | null
   current_version?: string
   auto_update?: boolean
+  /** Whether config.local.json sets `auto_update`, so the switch cannot change it. */
+  overlay_override?: boolean
   minimum_version_enforced?: string
   update_required?: boolean
   /** Legacy alias some older payloads carried; `latest_version` is authoritative. */
@@ -613,6 +615,10 @@ export interface Skill {
    *  its figure historical. `null`/absent means no ledger entry, which is NOT
    *  the same as zero (an entry can also age out of the window). */
   deliveries?: number | null
+  /** Unix time (seconds) of the latest delivery; `null`/absent exactly when
+   *  `deliveries` is. Drives the Skills list's "last used" text and its
+   *  Recently used sort. */
+  last_used_at?: number | null
   /** False when the SKILL.md lives outside the directory Kiro Crew owns (e.g. a
    *  `skills.extra_paths` entry). Such a skill is listed but not ours to rewrite,
    *  so the injection toggle must not be offered — the endpoint refuses it. */
@@ -1161,6 +1167,9 @@ export interface ChatSlot {
   row_identity?: string
   /** Provider session identity when it differs from the dashboard slot key. */
   linked_session_key?: string
+  /** The transcript filename stem the server resolved for this slot: the key the
+   *  Older sessions list gives the same session, sent verbatim to reopen it. */
+  history_key?: string
   /** Prompts held for a later turn on this slot. */
   queue_depth?: number
   key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_scope?: string; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue'; identity?: string }[]; source_links_total?: number
@@ -1176,6 +1185,13 @@ export interface ChatSlot {
    * DM thread to the worker sessions it drives — the Crew Members drawer
    * filters the live slots on it. */
   created_by?: string
+  /** Whether THIS gateway process stamped `created_by` at mint, rather than
+   * rehydrating it from the transcript. `created_by` is restored from a metadata
+   * line an agent's file tools can edit, so on its own it is a claim; this says
+   * whether it is the gateway's own witness. `_attach_slot_parents` requires it
+   * before nesting a row that has no session-tree node yet — a child between
+   * `session_create` and its first turn, which has no crew log to fold. */
+  lineage_minted?: boolean
   /** The session tree's parent edge for this slot, attached to every row by
    * `_attach_slot_parents`: `{slot, key}`, or null when this slot has no parent.
    * `slot` is the parent's own citation and `key` names the parent's row IN THIS
@@ -1194,7 +1210,12 @@ export interface ChatSlot {
   /** Metadata for kind="webapp" artifacts (deploy state, architecture, costs). */
   webapp_metadata?: WebAppMetadata
   // Board fields
-  has_options?: boolean; options_ts?: string; options?: string[]; pending_approval_info?: PendingApproval | null; last_activity_ts?: string; waiting_for_input?: boolean; prompt_preview?: string; subagents_running?: boolean; orchestrating?: boolean
+  has_options?: boolean; options_ts?: string; options?: string[]; pending_approval_info?: PendingApproval | null; last_activity_ts?: string; waiting_for_input?: boolean; prompt_preview?: string; subagents_running?: boolean
+  /** The sub-agent queued depth the gateway last published for this session —
+   * the same value as its newest `subagent_queued` frame. Read only to
+   * reconcile `chat.subagentQueued` on a `slots` push; absent from a
+   * `slot_patch` and from an older gateway. */
+  subagents_queued?: number
   /** An unanswered question card the turn is parked on, so the row would
    * otherwise read "Thinking…" with nothing able to advance it. Narrower than
    * `waiting_for_input` (true of every finished turn, and therefore no signal)
@@ -1476,6 +1497,10 @@ export interface ChatMessage {
 
 export interface SubagentActivity {
   id: string; task: string; agent: string
+  /** The wave this agent belongs to, absent for a solo spawn. Folded from the
+   *  `batch_id` the gateway stamps on every spawn/done/snapshot frame; shown as
+   *  a short batch chip in the Subagents panel so wave siblings group (#759). */
+  batchId?: string
   /** Model the live session actually resolved to serve, '' when unknown. Folded
    *  from the `model` field on the `subagent_spawn`/`subagent_done`/snapshot WS
    *  frames; shown beside the agent pill in the Subagents panel so a model-pinned
@@ -1786,6 +1811,9 @@ export interface Artifact {
   created_at: string
   updated_at: string
   content?: string
+  /** Opaque optimistic-concurrency token for `content`; echo it back as
+   * `expected_token` on a content save. Absent for live file-backed artifacts. */
+  content_token?: string
   /** Original source path for file-backed artifacts (live pointer). */
   source_path?: string
   /** True when the live state differs from the latest numbered snapshot.

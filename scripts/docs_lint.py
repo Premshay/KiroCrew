@@ -204,6 +204,11 @@ SKIP_DIR_PATHS: frozenset[str] = frozenset(
     }
 )
 
+#: Build trees whose names carry a per-build id, so they are skipped by prefix:
+#: the scratch, ready and previous trees of website/scripts/publish-dist.mjs,
+#: and the staged copies src/kiro_crew/static/dist links to.
+SKIP_DIR_PREFIXES: tuple[str, ...] = ("website/.dist", "src/kiro_crew/static/.dist")
+
 # Source trees scanned for citations of documentation paths. Broad on purpose: a
 # stale pointer is just as misleading in an agent-facing SKILL.md or an Electron
 # source file as in the backend, and those trees were where the stale ones hid.
@@ -747,7 +752,8 @@ def _prune(root: Path, dirpath: str, dirnames: list[str]) -> None:
         if d in SKIP_DIR_NAMES:
             continue
         full = Path(dirpath) / d
-        if _rel(full, root) in SKIP_DIR_PATHS:
+        rel = _rel(full, root)
+        if rel in SKIP_DIR_PATHS or rel.startswith(SKIP_DIR_PREFIXES):
             continue
         if _is_dir_link(full):
             continue
@@ -2593,7 +2599,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--accept-new",
         action="store_true",
-        help="ADD the triples firing now to the baseline, printing each one (needs a reason)",
+        help=(
+            "ADD the triples firing now to the baseline, printing each one "
+            "(each one is an exemption a reviewer must agree with)"
+        ),
     )
     parser.add_argument(
         "--strict-identifiers",

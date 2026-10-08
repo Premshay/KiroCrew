@@ -152,7 +152,10 @@ with no row here.
    * - ``ACP_BACKENDS_SEED_LOCAL_SETTINGS``
      - driver-internal (whether ``settings.local.json`` is re-seeded on switch)
    * - ``ACP_BACKENDS_KIRO_SLASH_COMMANDS``
-     - driver-internal (whether ``_kiro.dev/commands/execute`` exists)
+     - semantic question (``SessionCapabilities.effort_via_slash_command``), and
+       driver-internal everywhere else (whether ``_kiro.dev/commands/execute`` exists)
+   * - ``ACP_BACKENDS_NATIVE_TODOS``
+     - semantic question (``SessionCapabilities.supports_native_todos``)
    * - ``ACP_BACKENDS_TOOL_SEARCH_OVERLAY``
      - driver-internal (whether the workspace ``cli.json`` Tool Search keys are written)
    * - ``ACP_BACKENDS_CLIENT_META_SETTINGS``
@@ -161,10 +164,6 @@ with no row here.
      - pre-session registry query (whether the dashboard may skip a session reset)
    * - ``ACP_BACKENDS_STRUCTURED_REFUSAL``
      - driver-internal (whether the metadata refusal parser is consulted)
-   * - ``ACP_BACKENDS_NATIVE_COMPACTION``
-     - driver-internal (whether ``initialize`` advertises ``session.compaction``)
-   * - ``ACP_BACKENDS_SESSION_NOTICES``
-     - driver-internal (whether ``initialize`` advertises ``session.notices``)
    * - ``ACP_BACKENDS_HOOKS_LIST``
      - driver-internal (whether this harness's agent asks its client for the hooks
        matching a trigger and to run one, read by the session dispatch loop that
@@ -199,6 +198,10 @@ with no row here.
        a semantic question: it describes where a HOST reads agent specs from, and
        no consumer above the boundary asks it -- what a consumer would ask about
        is the resulting server list, which it already receives
+   * - ``ACP_BACKENDS_HONOR_ZERO_TOOL_BAN``
+     - semantic question (``SessionCapabilities.honors_zero_tool_ban``)
+   * - ``ACP_BACKENDS_ACP_CLIENT_SPAWNABLE``
+     - semantic question (``SessionCapabilities.acp_client_spawnable``)
 
 The two non-set tables ``SessionCapabilities`` also translates are
 :func:`model_registry_namespace` (the model-id namespace) and
@@ -832,22 +835,11 @@ def resolve_selected_backend(value: object) -> str:
 # reach is recorded here rather than claimed.
 ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
 
-# Backends that can verify an enrolled member's saved spec at spawn.
+# Backends that can load an enrolled member's full saved agent spec at spawn.
 # Separate from session sharing and per-session dispatch (harness-parity H6):
-# support for either does not establish saved-spec loading. Only kiro-cli has
-# demonstrated native loading. The others prove consumption of their saved
-# projection -- the digest of the spec their session array was built from against
-# the saved intent (agent_capabilities.consumed_spec_matches) -- and report
-# unrepresented fields as projection gaps, which keeps the runtime view unverified:
-#
-# * claude and deepseek on the one-process-per-session AcpClient path
-#   (AcpClient._confirm_member_projection); deepseek through its mirror.
-# * codex on the shared AcpRuntime path (ACP_BACKENDS_ACP_RUNTIME), where the
-#   runtime records the consumed spec on the session handle and
-#   AcpSessionProvider.confirm_member_projection checks it before the provider owns
-#   the runtime.
-#
-# Each requires a live dedicated runtime before reporting a saved template.
+# support for either does not establish full-spec loading. Only kiro-cli has
+# demonstrated it; the provider still requires a live dedicated runtime and a
+# confirmed active template before reporting that the saved spec is loaded.
 ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset(
     {ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_DEEPSEEK}
 )
@@ -918,14 +910,13 @@ ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset(
 # identity, while the entry mounted here is Crew's own and carries this session's key
 # and its signed stub token.
 #
-# One restriction the mount must NOT step over, and this harness is the only member it
-# binds: switching off a tool of the dashboard server is honoured here by withholding
-# the whole server (``registry.PerToolDeny.WHOLE_SERVER`` -- no deny slot on the
-# element, no file of Crew's, and no structured identity on a tool call to refuse by).
-# So ``AcpClient._append_member_dispatch_server`` withholds the mount for a member
-# whose dashboard server is narrowed, and that thread runs as plain chat rather than
-# reaching a tool the operator switched off. codex and claude keep their mounts there:
-# both hold a second channel that still refuses the call.
+# One restriction the mount must NOT step over: switching off a tool of the dashboard
+# server. This harness carries it as a ``deny`` rule in the permission config Crew
+# seeds (``registry.PerToolDeny.SETTINGS_FILE``), so the mount keeps its server and the
+# harness hides the tool. Where that rule did not come out in force -- a lower config
+# source outranked it -- the projection names the server in ``unhonoured_servers`` and
+# ``AcpClient._member_mount_withheld`` withholds the mount, so that thread runs as plain
+# chat rather than reaching a tool the operator switched off.
 #
 # Switching that server off WHOLE (``disabled``) is a stronger rule and carries no
 # backend condition, because the form has no per-call spelling for any harness to
@@ -971,9 +962,9 @@ ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset(
 # fixture pins for ``crew-probe``), so a dispatch call arrives as a placed server
 # rather than as a drifted one.
 #
-# The per-tool rule binds here for opencode's reason: this harness's declared
-# ``registry.PerToolDeny`` is ``WHOLE_SERVER``, so narrowing a dashboard tool withholds
-# the whole mount and the thread runs as plain chat.
+# The per-tool rule binds here: this harness's declared ``registry.PerToolDeny`` is
+# ``WHOLE_SERVER``, so narrowing a dashboard tool withholds the whole mount and the
+# thread runs as plain chat.
 #
 # pi is excluded on the evidence in ``ACP_BACKENDS_SESSION_MCP_ARRAY``: the array is
 # accepted and never forwarded to the agent, so a member dispatch mounted through it
@@ -1049,10 +1040,9 @@ ACP_BACKENDS_MEMBER_DISPATCH = frozenset(
 #
 # pi and deepseek are excluded for the reasons the dispatch set states and neither
 # reason is about session control specifically: pi accepts the array and never
-# forwards it, so a mounted panel server would be inert, and deepseek's routing is
-# ``Routing.UNVERIFIED``, so a session that cannot be gated is never refused --
-# projecting an approval-free grant onto a harness whose tool calls Crew does not
-# decide is the thing both exclusions protect against.
+# forwards it, so a mounted panel server would be inert, and deepseek, though its
+# routing (``Routing.VERIFIED_GATE_EXTENSION``) is enforced, has had no member
+# round trip driven on it, so H6 gives no decision for this harness.
 #
 # kiro is excluded and cannot be added by this set alone: a member session's key is
 # what every mount reads, and ``providers/acp.py`` ``_member_session_key`` gates
@@ -1070,10 +1060,8 @@ ACP_BACKENDS_MEMBER_PANEL = frozenset(
 )
 
 # Backends implementing the ``_session/steer`` extension (mid-turn steer).
-# claude-agent-acp speaks its own spelling (``_session/steering``, answered with
-# ``{outcome: injected|startedNewTurn|failed}`` and advertised as
-# ``initialize._meta.steering.supported``), so its membership is gated on the
-# handshake advertisement (``ACP_BACKENDS_STEER_ADVERTISED``).
+# claude-agent-acp does not implement it, so a steer sent there is answered with
+# method-not-found rather than reaching the turn.
 # codex-acp (1.11.0) has a steering channel, but not this one and not usable for
 # what membership buys. Measured against a real adapter: it is a different method
 # (``_session/steering``, ``{sessionId, prompt: [ContentBlock]}``, answered with
@@ -1092,24 +1080,21 @@ ACP_BACKENDS_MEMBER_PANEL = frozenset(
 # ``sessionCapabilities`` of close, fork, list and resume, and nothing else.
 # pi is not a member: pi-acp's ``initialize`` result advertises ``loadSession`` and
 # ``sessionCapabilities`` of list and delete, and no steering extension.
-# deepseek is a member: its bridge serves the kiro-cli-dialect ``_session/steer``
-# verb (``@deepseek-ai/dsh-acp``), splices the message at the running turn's next
-# step, and echoes ``steering_queued``/``steering_consumed`` over ``session/update``
-# exactly like kiro-cli. Membership is gated on the handshake advertisement
-# (``ACP_BACKENDS_STEER_ADVERTISED``), so an installed dsh-acp without the verb
-# reads as unsteerable and takes the queue fallback instead of dropping a message.
+# deepseek is not a member: it advertises close, list and resume only, and permits
+# one in-flight prompt per session, so a mid-turn steer has no verb to travel on.
 #
 # This set answers the DENY-NOTICE question as well as the user one: a member's
 # steer can carry a refusal reason into the turn that was refused. A backend that
 # can take a USER's mid-turn message but not a deny notice belongs in
 # ``ACP_BACKENDS_STEERING_REQUEST`` below instead, and the two questions are read
 # off separate properties (``supports_steer`` and ``supports_refusal_steer``).
-ACP_BACKENDS_STEER = frozenset({
-    ACP_BACKEND_KIRO,
-    ACP_BACKEND_KAS,
-    ACP_BACKEND_CLAUDE,
-    ACP_BACKEND_DEEPSEEK,
-})
+ACP_BACKENDS_STEER = frozenset(
+    {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE, ACP_BACKEND_DEEPSEEK}
+)
+
+# These adapters expose steering conditionally and advertise the installed
+# binary's support in initialize._meta.steering.supported.
+ACP_BACKENDS_STEER_ADVERTISED = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_DEEPSEEK})
 
 # Backends that take a USER's mid-turn message over codex-acp's
 # ``_session/steering`` request rather than kiro-cli's ``_session/steer``.
@@ -1307,6 +1292,12 @@ ACP_BACKENDS_HARNESS_MANAGED_COMPACTION = frozenset({ACP_BACKEND_KAS})
 # is reported rather than silent while somebody decides which set it belongs in.
 ACP_BACKENDS_CONTEXT_RECYCLE = frozenset({ACP_BACKEND_DEEPSEEK})
 
+# Adapters that negotiate provider-owned compaction and notice updates through
+# clientCapabilities.session. These are wire contracts, independent of whether
+# the session uses the shared or per-process transport.
+ACP_BACKENDS_NATIVE_COMPACTION = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX})
+ACP_BACKENDS_SESSION_NOTICES = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX})
+
 # Backends that finish a manual ``/compact`` INSIDE the ``session/prompt`` turn,
 # so the turn's terminal frame is the done signal and there is no asynchronous
 # compaction status to await. A NON-member emits the result separately and the
@@ -1351,23 +1342,6 @@ ACP_BACKENDS_INLINE_COMPACTION = frozenset(
         ACP_BACKEND_GOOSE,
     }
 )
-
-# Backends whose handshake advertises ``clientCapabilities.session.compaction``,
-# which switches the adapter to native ``compaction_update`` frames. Only
-# adapters observed emitting those frames, and a subset of
-# ``ACP_BACKENDS_INLINE_COMPACTION`` so every member's frames are translated:
-# codex-acp 2.0.0 and claude-agent-acp 0.84.0, both captured live.
-# opencode is not a member: no capture shows it emitting native frames, and the
-# advertisement replaces a legacy path that works rather than sitting inert.
-# kiro and kas are not members: they report compaction on their own channels.
-ACP_BACKENDS_NATIVE_COMPACTION = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX})
-# Backends whose handshake advertises ``clientCapabilities.session.notices``,
-# which moves the adapter's provider notices out of the transcript into
-# ``notice`` session updates. Only adapters that emit them: codex-acp 2.0.0 and
-# claude-agent-acp 0.84.0 (a live Claude hook message arrived as a ``notice``).
-# kiro and kas are not members: neither emits ``notice`` updates, and their
-# handshakes stay byte-identical until one does.
-ACP_BACKENDS_SESSION_NOTICES = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX})
 
 # Backends carrying their OWN internal OS sandbox, which on macOS cannot nest
 # inside Kiro Crew's seatbelt (kernel EPERM) — so ``sandbox.wrap_argv`` skips
@@ -1478,6 +1452,25 @@ ACP_BACKENDS_POD_HOME_REMAP = frozenset({ACP_BACKEND_KIRO})
 # is why membership here is a statement about the TRANSPORT and nothing else --
 # every kiro-family convention is its own set, and codex is absent from each.
 ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX})
+
+# Backends ``AcpClient._spawn`` can construct a session for directly: kiro (the
+# resolve-and-exec branch a backend with no process adapter falls through to)
+# plus the five with an entry in ``kiro_crew.acp.harness._PROCESS_ADAPTERS``.
+# A POSITIVE allowlist, not "every backend except kas/codex": a future backend
+# added to ``BASELINE_SELECTABLE_BACKENDS`` with no arm here must fail closed
+# (report not-spawnable) rather than silently fall to the kiro-cli branch under
+# its own identity the way kas and codex do today -- the exact bug this fact
+# exists to let a caller avoid.
+ACP_BACKENDS_ACP_CLIENT_SPAWNABLE = frozenset(
+    {
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_PI,
+        ACP_BACKEND_DEEPSEEK,
+    }
+)
 
 # Backends that load an agent defined as ONE markdown file (YAML frontmatter
 # plus the body as the system prompt) -- the form the v3 engine and Kiro IDE
@@ -2077,6 +2070,56 @@ def model_registry_namespace(backend: str) -> str:
 # deepseek is not a member and publishes no command list either: it carries commands
 # internally and its ACP surface rejects them, so it exposes none over the wire.
 ACP_BACKENDS_KIRO_SLASH_COMMANDS = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends that interpret ``/todos`` as a native prompt command. This is separate
+# from ``ACP_BACKENDS_KIRO_SLASH_COMMANDS``: that set names the private RPC used by
+# the kiro family, while this command is implemented by claude-agent-acp inside
+# ``session/prompt``. A new backend stays out until its adapter demonstrates the
+# same command, so an unknown harness is refused rather than receiving prompt text
+# it may interpret as an ordinary user request.
+ACP_BACKENDS_NATIVE_TODOS = frozenset({ACP_BACKEND_CLAUDE})
+
+# Backends on which an agent spec's ``"tools": []`` is honoured as a total ban --
+# no MCP server AND no harness-native tool (Bash, file edit, ...) is callable --
+# rather than merely an MCP-server allowlist that leaves native tools reachable.
+#
+# Membership is the join of three facts, not a name pattern:
+#
+# * ``Routing.AGENT_SPEC`` (kiro, kas) -- the harness itself reads the spec and
+#   refuses every tool NATIVELY, so nothing else is needed.
+# * a routing in ``tool_gate.ENFORCED_ROUTINGS`` whose non-ROUTED verdict actually
+#   refuses a session, AND a mirror in ``providers/mirrors/registry.py``'s
+#   ``MIRRORS`` that reports ``SessionProjection.zero_tools`` from the spec parse
+#   (``acp/session_mcp.py``), AND the session is served by ``AcpClient`` rather than
+#   ``AcpRuntime`` -- because the refusal that closes the gap,
+#   ``AcpClient._deny_zero_tools``, lives ONLY on ``AcpClient``.
+#
+# Today that is exactly opencode and goose (``Routing.VERIFIED_SEEDED_SETTINGS``,
+# mirrored, not in ``ACP_BACKENDS_ACP_RUNTIME``).
+#
+# claude is NOT a member: its routing, ``Routing.SEEDED_SETTINGS``, is declared but
+# not enforced by this core (see ``Routing``'s docstring and
+# ``tool_gate.ENFORCED_ROUTINGS``) -- an operator's own ``~/.claude`` settings can
+# pre-approve a tool, which skips ``session/request_permission`` entirely, so
+# ``_deny_zero_tools`` never runs to close the mirror's allowlist-only translation.
+#
+# codex is NOT a member: its sessions are served by ``AcpRuntime`` /
+# ``AcpSessionHandle`` (``acp/runtime.py``, ``acp/session_handle.py``), which carry
+# ``spec_denied_tools`` but no ``zero_tools`` and no ``_deny_zero_tools`` equivalent
+# -- the refusal exists only on ``AcpClient``, so nothing refuses on a codex session
+# even though its ``Routing.SESSION_CONFIG`` is itself enforced.
+#
+# pi and deepseek are NOT members: neither has a mirror at all
+# (``providers/mirrors/registry.py``'s ``MIRRORS``), so nothing computes
+# ``zero_tools`` for them and ``AcpClient`` never refuses on their sessions.
+ACP_BACKENDS_HONOR_ZERO_TOOL_BAN = frozenset(
+    {
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_GOOSE,
+    }
+)
 
 # Backends that read the MCP Tool Search setting from the workspace ``cli.json``
 # overlay (``toolSearch.*`` keys). Only kiro-cli's Rust engine does. KAS shares

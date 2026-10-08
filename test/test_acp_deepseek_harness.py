@@ -1,12 +1,8 @@
-"""DeepseekHarness: the seam answers for the dsh ACP host.
+"""DeepseekHarness: shared-runtime adaptation of the verified dsh launch.
 
-The deepseek host is the operator-owned UNVERIFIED seat: no credential mask on
-either transport, the host's own workspace-write sandbox deciding tool calls,
-and reachable only through an engine map entry. What is pinned here is that the
-runtime harness answers every seam exactly like the client transport already
-serves the same seat -- same argv, same permission-mode pin, same no-mask
-posture -- so a review worker started through either transport sees one
-environment.
+The shared runtime delegates its launch to the same adapter that seals and
+probes the gate extension, resolves the credential mask, and injects vault
+credentials for the dedicated client path.
 
 A real dsh cannot stand in for the full exchange here for the same reason the
 codex suite uses a fake peer: a live probe is only taken as far as the transport
@@ -17,13 +13,13 @@ this file. The seam-level contract every harness answers is parametrised in
 
 from __future__ import annotations
 
-import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
-from kiro_crew.acp import client as client_mod
 from kiro_crew.acp.harness import harness_for
-from kiro_crew.acp.harness.base import SpawnContext, TeardownPolicy
+from kiro_crew.acp.harness import deepseek as deepseek_mod
+from kiro_crew.acp.harness.base import SpawnContext, SpawnPlan, TeardownPolicy
 from kiro_crew.acp.types import (
     ACP_BACKEND_DEEPSEEK,
     ACP_CLIENT_CAPABILITIES,
@@ -41,13 +37,16 @@ def _ctx(tmp_path, *, model: str | None = None) -> SpawnContext:
     )
 
 
-def _pin_binary(monkeypatch, value):
-    """Pin the resolver AND empty its cache: the client caches the first real
-    resolution, so a patch aimed at the resolver alone is unreachable. The real
-    resolver takes the backend, so the zero-argument fixtures are adapted here
-    rather than at every call site."""
-    monkeypatch.setattr(client_mod, "_self_served_bin_caches", {})
-    monkeypatch.setattr(client_mod, "_resolve_self_served_bin", lambda _backend: value())
+def _pin_launch(monkeypatch) -> AsyncMock:
+    launch = AsyncMock(
+        return_value=SpawnPlan(
+            argv=["/bin/dsh", "--profile", "acp", "--patch", "/sealed/gate.yml"],
+            extra_hidden_dirs=("/home/operator/.aws",),
+            extra_expose_files=("/home/operator/.aws/config",),
+        )
+    )
+    monkeypatch.setattr(deepseek_mod.DeepseekLaunch, "resolve_spawn", launch)
+    return launch
 
 
 # ── Seam 1: spawn ──
@@ -55,18 +54,18 @@ def _pin_binary(monkeypatch, value):
 
 @pytest.mark.asyncio
 async def test_spawn_argv_is_the_binary_plus_the_profile_selector(monkeypatch, tmp_path):
-    _pin_binary(monkeypatch, lambda: ("/bin/dsh", "/s"))
+    launch = _pin_launch(monkeypatch)
     plan = await harness_for(ACP_BACKEND_DEEPSEEK).resolve_spawn(_ctx(tmp_path))
-    assert plan.argv == ["/bin/dsh", "--profile", "acp"]
-    # No credential mask on either transport: the UNVERIFIED seat's documented
-    # posture is the harness's own sandbox deciding tool calls.
-    assert plan.extra_hidden_dirs == ()
-    assert plan.extra_expose_files == ()
+    assert plan.argv == ["/bin/dsh", "--profile", "acp", "--patch", "/sealed/gate.yml"]
+    assert plan.extra_hidden_dirs == ("/home/operator/.aws",)
+    assert plan.extra_expose_files == ("/home/operator/.aws/config",)
+    delegated = launch.await_args.args[0]
+    assert delegated.session._spawn_work_dir == str(tmp_path)
 
 
 @pytest.mark.asyncio
 async def test_the_model_rides_the_plan_not_argv(monkeypatch, tmp_path):
-    _pin_binary(monkeypatch, lambda: ("/bin/dsh", "/s"))
+    _pin_launch(monkeypatch)
     plan = await harness_for(ACP_BACKEND_DEEPSEEK).resolve_spawn(
         _ctx(tmp_path, model="deepseek-v4-pro")
     )
@@ -81,6 +80,7 @@ def test_spawn_env_strips_the_kiro_key_and_pins_the_permission_mode(monkeypatch)
     monkeypatch.setattr(
         loader_mod, "strip_kiro_cli_api_key", lambda env: calls.append("strip"), raising=False
     )
+    monkeypatch.setattr(deepseek_mod, "_deepseek_vault_env", lambda: ({}, ()))
     env = {"KIRO_API_KEY": "secret", "DSH_PERMISSION_MODE": "unconfined"}
     harness_for(ACP_BACKEND_DEEPSEEK).apply_spawn_env(env)
     assert calls == ["strip"]
@@ -114,9 +114,7 @@ async def test_session_extras_are_empty(tmp_path):
 
 def test_the_mcp_array_passes_through_unchanged():
     requested = [{"name": "a", "command": "x"}]
-    out = harness_for(ACP_BACKEND_DEEPSEEK).session_mcp_servers(
-        requested, agent_capabilities={}
-    )
+    out = harness_for(ACP_BACKEND_DEEPSEEK).session_mcp_servers(requested, agent_capabilities={})
     assert out is requested
 
 

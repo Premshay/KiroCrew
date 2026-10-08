@@ -71,8 +71,6 @@ from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     api_chat_slot_reload,
     api_chat_slot_reset_conversation,
     api_chat_slot_resume,
-    api_chat_slot_return_handoff,
-    api_chat_slot_runtime,
     api_chat_slot_selection_capabilities,
     api_chat_slot_source_link_unlink,
     api_chat_slot_source_links,
@@ -83,6 +81,9 @@ from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     api_chat_slots,
     api_chat_slots_cleanup,
     api_chat_slots_model,
+    api_favorite_project_add,
+    api_favorite_project_remove,
+    api_favorite_projects,
     api_recent_projects,
 )
 from kiro_crew.dashboard.chat_mirror import (  # noqa: F401
@@ -175,8 +176,6 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: F401
 )
 from kiro_crew.dashboard.chat_voice import (  # noqa: F401
     api_voice_config,
-    api_voice_replay,
-    api_voice_replay_stream,
     api_voice_synthesize,
     api_voice_system_voices,
     api_voice_voices,

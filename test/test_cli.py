@@ -2349,6 +2349,20 @@ class TestStop:
         ):
             yield
 
+    @pytest.fixture(autouse=True)
+    def _no_alias_service(self):
+        # ``_stop`` consults ``service_alias_holder()`` before the foreground
+        # SIGTERM-by-port path (an alias of another unit must not be signalled).
+        # The real call shells out to ``systemctl show kirocrew.service`` on the
+        # test host, so pin it None here, as ``TestRestart`` does; the alias
+        # refusal test overrides it. Keeping this a dedicated fixture (not folded
+        # into ``_no_service``) makes the hermeticity guard explicit.
+        with patch(
+            "kiro_crew.cli_server.service_controller.service_alias_holder",
+            return_value=None,
+        ):
+            yield
+
     def _ports(self, pids):
         return patch("kiro_crew.cli_server.platform_compat.find_listening_pids", return_value=pids)
 
@@ -2790,6 +2804,84 @@ class TestStop:
         out = capsys.readouterr().out
         assert "SIGTERM" in out or "Terminated" in out
 
+    def test_an_alias_holding_the_name_is_refused_before_the_foreground_path(self, capsys):
+        """When ``kirocrew.service`` is an alias of another unit, ``stop_service()``
+        fails closed (returns False), but the foreground fallback must NOT then
+        SIGTERM the alias target's managed process: refuse, exit 1, signal
+        nothing, and never consult ``find_listening_pids``."""
+        from kiro_crew.cli_server import _stop
+        from kiro_crew.service.linux import AliasHolder
+
+        mock_sel = MagicMock()
+        holder = AliasHolder("system", "other.service")
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            patch(
+                "kiro_crew.cli_server.service_controller.service_alias_holder",
+                return_value=holder,
+            ),
+            patch("kiro_crew.cli_server.platform_compat.find_listening_pids") as mock_find,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _stop()
+            assert exc.value.code == 1
+        mock_find.assert_not_called()
+        out = capsys.readouterr().out
+        assert "alias of other.service" in out
+        assert "system scope" in out
+        assert "does not manage that unit" in out
+        # The remedy names the verb the user asked for (stop, not restart) and
+        # the system-scope spelling (sudo systemctl, not --user).
+        assert "`sudo systemctl stop other.service`" in out
+        assert "restart" not in out
+        resources = mock_sel.log_api_access.call_args.kwargs["resources"]
+        assert "reason=service_name_is_alias" in resources
+        assert "scope=system" in resources
+        assert mock_sel.log_api_access.call_args.kwargs["outcome"] == "denied"
+
+    def test_a_user_scope_alias_refusal_names_the_user_manager_and_the_stop_verb(self, capsys):
+        """A user-scope alias must be managed with ``systemctl --user`` (plain
+        ``sudo systemctl`` reaches the system manager and misses it), and a
+        ``kirocrew stop`` must point at ``stop``, not ``restart``."""
+        from kiro_crew.cli_server import _stop
+        from kiro_crew.service.linux import AliasHolder
+
+        mock_sel = MagicMock()
+        holder = AliasHolder("user", "other.service")
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            patch(
+                "kiro_crew.cli_server.service_controller.service_alias_holder",
+                return_value=holder,
+            ),
+            patch("kiro_crew.cli_server.platform_compat.find_listening_pids") as mock_find,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _stop()
+            assert exc.value.code == 1
+        mock_find.assert_not_called()
+        out = capsys.readouterr().out
+        assert "user scope" in out
+        assert "`systemctl --user stop other.service`" in out
+        assert "sudo" not in out
+        assert "restart" not in out
+
+    def test_an_explicit_port_bypasses_the_alias_refusal(self, capsys):
+        """``kirocrew stop --port N`` explicitly targets a foreground gateway on
+        that port, so the service short-circuit (and its alias guard) is skipped."""
+        from kiro_crew.cli_server import _stop
+
+        with (
+            self._mock_sel(),
+            patch("kiro_crew.cli_server.service_controller.service_alias_holder") as mock_alias,
+            self._ports([]),
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _stop(5476)
+            assert exc.value.code == 1
+        mock_alias.assert_not_called()
+        assert "No Kiro Crew gateway" in capsys.readouterr().out
+
 
 class TestWaitForPidsExit:
     """Tests for the bounded ``_wait_for_pids_exit`` helper."""
@@ -2868,6 +2960,18 @@ class TestRestart:
         with patch(
             "kiro_crew.cli_server.service_controller.is_service_active",
             return_value=False,
+        ):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def _no_alias_service(self):
+        # ``_restart`` consults ``service_alias_holder()`` before the foreground
+        # path (an alias of another unit must not be SIGTERM'd/respawned). The
+        # real call shells out to systemctl, so pin it None here; the alias
+        # refusal test overrides it.
+        with patch(
+            "kiro_crew.cli_server.service_controller.service_alias_holder",
+            return_value=None,
         ):
             yield
 
@@ -3985,6 +4089,45 @@ class TestRestart:
         mock_spawn.assert_called_once()
         assert "does not look like a Kiro Crew gateway" not in capsys.readouterr().out
 
+    def test_an_alias_holding_the_name_is_refused_before_the_foreground_path(self, capsys):
+        """When ``kirocrew.service`` is an alias of another unit, ``restart_service()``
+        returns an empty report and ``is_service_active()`` is False, but the
+        foreground fallback must NOT then SIGTERM the alias target's managed
+        process and spawn a replacement beside it: refuse, exit 1, signal and
+        spawn nothing."""
+        from kiro_crew.cli_server import _restart
+        from kiro_crew.service.common import RestartReport
+        from kiro_crew.service.linux import AliasHolder
+
+        mock_sel = MagicMock()
+        holder = AliasHolder("system", "other.service")
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=RestartReport(),
+            ),
+            patch(
+                "kiro_crew.cli_server.service_controller.service_alias_holder",
+                return_value=holder,
+            ),
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+            patch("kiro_crew.cli_server.platform_compat.find_listening_pids") as mock_ports,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _restart(None)
+            assert exc.value.code == 1
+        mock_spawn.assert_not_called()
+        mock_ports.assert_not_called()
+        out = capsys.readouterr().out
+        assert "alias of other.service" in out
+        assert "system scope" in out
+        # restart verb + system-scope spelling.
+        assert "`sudo systemctl restart other.service`" in out
+        resources = mock_sel.log_api_access.call_args.kwargs["resources"]
+        assert "reason=service_name_is_alias" in resources
+        assert "scope=system" in resources
+
 
 class TestRestartReadinessVerdict:
     """`restart` must report success only once the REPLACEMENT is serving.
@@ -4816,6 +4959,36 @@ class TestDoctorMcpTools:
             f"{ref} auto-approve forbidden by ceiling (repair from the owning install)"
             for ref in ("@kirocrew-cron", "@kirocrew-core")
         ] + ["agent config (auto-fix skipped: shared home)"]
+
+    def test_ceiling_revoke_drops_per_tool_grants_too(self, tmp_path, capsys):
+        """Withholding auto-approve drops the bare ref and every ``@server/tool``
+        grant of that server, duplicates included, and nothing else."""
+        from kiro_crew.cli_doctor import _doctor_mcp_tools
+
+        agent_path = tmp_path / "kirocrew.json"
+        _write_agent_config(
+            agent_path,
+            tools=["@kirocrew-core"],
+            allowed=[
+                "@kirocrew-core",
+                "@kirocrew-core/send_message",
+                "@kirocrew-core/send_message",
+                "@kirocrew-corex/run",
+                "fs_read",
+            ],
+            servers={"kirocrew-core": {"command": "/bin/kirocrew", "args": ["mcp-core"]}},
+        )
+        issues: list[str] = []
+        with (
+            patch("kiro_crew.agent._decline_shared_agent_home", return_value=None),
+            patch("kiro_crew.cli_doctor.may_skip_gate_now", return_value=False),
+            patch("kiro_crew.cli_doctor.sel", MagicMock()),
+            self._mock_probe({}),
+        ):
+            _doctor_mcp_tools(agent_path, issues)
+        written = json.loads(agent_path.read_text(encoding="utf-8"))
+        assert written["allowedTools"] == ["@kirocrew-corex/run", "fs_read"]
+        assert "@kirocrew-core" in written["tools"]
 
     def test_auto_fix_never_blanket_allows_computer_use(self, tmp_path, capsys):
         """**Doctor must never add ``@kirocrew-computer`` to ``allowedTools``.**

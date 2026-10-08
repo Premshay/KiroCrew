@@ -446,7 +446,9 @@ class TestSetupCliLoggingDetached:
         root_fhs = [h for h in _effective_handlers("") if isinstance(h, RotatingFileHandler)]
         assert len(root_fhs) == 1
         assert Path(root_fhs[0].baseFilename) == config_dir() / "gateway.log"
-        assert [h for h in _effective_handlers("kiro_crew") if isinstance(h, RotatingFileHandler)] == []
+        assert [
+            h for h in _effective_handlers("kiro_crew") if isinstance(h, RotatingFileHandler)
+        ] == []
         kc_qhs = [
             h for h in logging.getLogger("kiro_crew").handlers if isinstance(h, _CliLogQueueHandler)
         ]
@@ -535,7 +537,7 @@ class TestSetupCliLoggingDetached:
         def _deny(*_a, **_k):
             raise PermissionError(1, "Operation not permitted")
 
-        monkeypatch.setattr("kiro_crew.cli.RotatingFileHandler", _deny)
+        monkeypatch.setattr("kiro_crew.cli._OwnerOnlyRotatingFileHandler", _deny)
         monkeypatch.setattr("kiro_crew.cli._FdTrackingRotatingFileHandler", _deny)
         with pytest.raises(PermissionError):
             _setup_cli_logging("gateway", 1)
@@ -561,23 +563,19 @@ class TestSetupCliLoggingForeground:
         # does not reach).
         assert kc_qhs[0].level == logging.NOTSET
         assert logging.getLogger("kiro_crew").level == logging.INFO
-        assert not any(
-            isinstance(h, _CliLogQueueHandler) for h in logging.getLogger().handlers
-        )
+        assert not any(isinstance(h, _CliLogQueueHandler) for h in logging.getLogger().handlers)
         # Same contract read through the queue: kiro_crew owns the file handler
         # in foreground, root owns none.
-        kc_fhs = [
-            h for h in _effective_handlers("kiro_crew") if isinstance(h, RotatingFileHandler)
-        ]
+        kc_fhs = [h for h in _effective_handlers("kiro_crew") if isinstance(h, RotatingFileHandler)]
         assert len(kc_fhs) == 1
         assert [h for h in _effective_handlers("") if isinstance(h, RotatingFileHandler)] == []
         # No inline file handler on either logger.
         for logger in (logging.getLogger(), logging.getLogger("kiro_crew")):
             assert not any(isinstance(h, RotatingFileHandler) for h in logger.handlers)
         (fh,) = cli_mod._LOG_QUEUE_LISTENER.handlers
-        # Foreground keeps the plain handler: no fds were redirected, so
-        # there is nothing to re-point on rollover.
-        assert type(fh) is RotatingFileHandler
+        # Foreground keeps the plain (owner-only) handler: no fds were redirected,
+        # so there is nothing to re-point on rollover.
+        assert type(fh) is cli_mod._OwnerOnlyRotatingFileHandler
         assert fh.level == logging.NOTSET
 
     def test_record_written_once_to_file(self):
@@ -608,7 +606,7 @@ class TestSetupCliLoggingForeground:
         def _deny(*_a, **_k):
             raise PermissionError(1, "Operation not permitted")
 
-        monkeypatch.setattr("kiro_crew.cli.RotatingFileHandler", _deny)
+        monkeypatch.setattr("kiro_crew.cli._OwnerOnlyRotatingFileHandler", _deny)
         monkeypatch.setattr("kiro_crew.cli._FdTrackingRotatingFileHandler", _deny)
         _setup_cli_logging("mcp-core", 0)  # must not raise
         assert cli_mod._LOG_QUEUE_LISTENER is None
@@ -623,7 +621,7 @@ class TestSetupCliLoggingForeground:
             raise PermissionError(1, "Operation not permitted")
 
         redaction = MagicMock()
-        monkeypatch.setattr("kiro_crew.cli.RotatingFileHandler", _deny)
+        monkeypatch.setattr("kiro_crew.cli._OwnerOnlyRotatingFileHandler", _deny)
         monkeypatch.setattr("kiro_crew.cli._FdTrackingRotatingFileHandler", _deny)
         monkeypatch.setattr("kiro_crew.cli.install_log_redaction", redaction)
         _setup_cli_logging("gateway", 1)  # must not raise
@@ -1059,8 +1057,10 @@ class TestEveryGatewayHardExitDrainsTheQueue:
         return names
 
     def _hard_exit_functions(self, tree):
-        """(function node, line) for each ``os._exit(...)`` call, attributed to
-        the nearest enclosing function."""
+        """(function node, line) for each ``os._exit(...)`` or
+        ``platform_compat.hard_exit(...)`` call (the spelling that cancels an
+        update apply in flight first, then ``os._exit``), attributed to the nearest
+        enclosing function."""
         parents: "dict[ast.AST, ast.AST]" = {}
         for node in ast.walk(tree):
             for child in ast.iter_child_nodes(node):
@@ -1070,9 +1070,11 @@ class TestEveryGatewayHardExitDrainsTheQueue:
             if not (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_exit"
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "os"
+                and (
+                    (node.func.attr == "_exit" and node.func.value.id == "os")
+                    or (node.func.attr == "hard_exit" and node.func.value.id == "platform_compat")
+                )
             ):
                 continue
             cur = parents.get(node)

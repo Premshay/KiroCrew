@@ -54,7 +54,9 @@ from kiro_crew.apps.builtins.auto_research.session_keys import (
 from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
     AUTONUDGE_STOP_REASON,
+    CONSECUTIVE_FAILURE_REASON,
     MONITOR_TERMINAL_REASON,
+    STOP_SENTINEL_REASON,
     is_channel_key,
 )
 from kiro_crew.autonudge_judge import screen_phrase
@@ -1008,6 +1010,27 @@ async def _monitor_update(
                 bound = (
                     "a tool it needed went unanswered at the approval prompt; "
                     "re-enable auto-approve, then re-arm it with monitor_start"
+                )
+            elif reason == CONSECUTIVE_FAILURE_REASON:
+                # Not a cap and not a human pause: several of its own cycles
+                # reached a session and died in a row. Raising a bound does not
+                # fix the fault, so this stays in the deny path with the remedy
+                # that works — look at the error, fix the cause, re-arm; a cycle
+                # that completes clears the streak.
+                bound = (
+                    "several of its cycles reached a model session and then died "
+                    "in a row (a backend error, a persistent tool failure or a "
+                    "timeout); look at the session for the error, fix the cause, "
+                    "then re-arm it with monitor_start"
+                )
+            elif reason == STOP_SENTINEL_REASON:
+                # Finished, not paused: the stop file is how the agent reports the
+                # goal reached, and the service refuses to revive such a loop
+                # whatever the patch. Said here so the remedy is a NEW goal rather
+                # than a bound to raise or a user to ask.
+                bound = (
+                    "its stop file was created, so the goal is finished and there "
+                    "is nothing to resume; arm monitor_start again only for a NEW goal"
                 )
             else:
                 bound = "it was paused manually; ask the user, or use monitor_start"

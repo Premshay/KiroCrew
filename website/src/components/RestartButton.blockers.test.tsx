@@ -34,6 +34,7 @@ describe('RestartButton with blocked restarts', () => {
   beforeEach(() => {
     restartSessions.mockReset()
     restartBlockers.mockReset()
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
     restartBlockers.mockResolvedValue({
       ok: true,
       maintenance: {
@@ -59,6 +60,8 @@ describe('RestartButton with blocked restarts', () => {
     })
   })
 
+  afterEach(() => vi.restoreAllMocks())
+
   it('names the blockers when the gateway refuses the reset', async () => {
     restartSessions.mockRejectedValue(ackRequired())
     render(<RestartButton />)
@@ -78,7 +81,9 @@ describe('RestartButton with blocked restarts', () => {
 
     fireEvent.click(screen.getByText(/apply & restart/i))
 
-    expect(await screen.findByText('zzq-restart-broke')).toBeInTheDocument()
+    expect(await screen.findByTestId('restart-button-error')).toHaveTextContent(
+      'zzq-restart-broke',
+    )
     expect(screen.queryByTestId('restart-blockers')).not.toBeInTheDocument()
     expect(restartBlockers).not.toHaveBeenCalled()
   })

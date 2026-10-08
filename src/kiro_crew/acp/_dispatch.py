@@ -5,9 +5,8 @@ process-per-session) and ``AcpRuntime``/``AcpSessionHandle`` (shared runtime,
 single-reader demux) must send identically. Keeping these here prevents the
 two parallel implementations from drifting.
 
-Frame-shaping functions are pure; ``SessionNoticeState`` is bounded and owned by
-each session. Each class keeps its own I/O model (``_turn_lock`` reader vs
-per-session queue)
+These are pure, stateless functions: they take primitives and return dicts, so
+each class keeps its own I/O model (``_turn_lock`` reader vs per-session queue)
 while sharing the data-shaping logic: session/new params, set_mode/set_model
 request shapes, per-turn metadata/credit capture, and notification classification.
 """
@@ -29,8 +28,8 @@ from typing import Any, NamedTuple, cast
 from kiro_crew import mcp_apps_render, session_directive
 from kiro_crew.acp.harness_tool_names import MAX_HARNESS_TOOL_NAME_LEN, qualified_harness_tool_id
 from kiro_crew.acp.types import (
-    EVENT_NOTICE,
     EVENT_PERMISSION_REQUEST,
+    EVENT_NOTICE,
     EVENT_TEXT_CHUNK,
     EVENT_THINKING_CHUNK,
     EVENT_TODO_UPDATE,
@@ -99,34 +98,25 @@ def parse_notice(update: object) -> AcpEvent | None:
         return None
     title = update.get("title")
     severity = update.get("severity")
-    if not isinstance(title, str) or not title.strip() or not isinstance(severity, str):
+    description = update.get("description", "")
+    if not isinstance(title, str) or not title or not isinstance(severity, str):
         return None
-    description = update.get("description")
-    description = description if isinstance(description, str) else ""
 
-    def clean(value: str, limit: int) -> str:
-        value = redact_text(value)
-        return "".join(c for c in value if c in "\n\t" or c.isprintable())[:limit]
+    def clean(value: object, limit: int) -> str:
+        if not isinstance(value, str):
+            return ""
+        return redact_text("".join(ch for ch in value if ch >= " " or ch in "\n\t"))[:limit]
 
-    title = clean(title.strip(), NOTICE_TITLE_MAX)
-    if not title:
-        return None
     return AcpEvent(
         kind=EVENT_NOTICE,
-        title=title,
+        title=clean(title, NOTICE_TITLE_MAX),
         text=clean(description, NOTICE_DESCRIPTION_MAX),
         notice_severity=clean(severity, NOTICE_SEVERITY_MAX),
     )
 
 
 class SessionNoticeState:
-    """Per-session notice dedupe window and between-turn staging queue.
-
-    Both are capped at ``NOTICE_STATE_MAX``. The dedupe window forgets its oldest
-    key when full, which can only let a repeat through. The staging queue drops
-    its oldest notice when full; each drop is counted, and ``drain`` reports the
-    count once as a warning notice so a truncated backlog never reads as complete.
-    """
+    """Bounded per-session notice dedupe and between-turn staging state."""
 
     def __init__(self) -> None:
         self.session_id = ""
@@ -140,7 +130,7 @@ class SessionNoticeState:
         params = msg.params if isinstance(msg.params, dict) else {}
         if not session_id or params.get("sessionId") != session_id:
             return None
-        if not msg.is_method(METHOD_SESSION_UPDATE) or msg.fanout_no_owner:
+        if getattr(msg, "fanout_no_owner", False):
             return None
         if self.session_id != session_id:
             self._reset(session_id)
@@ -570,40 +560,6 @@ def parse_metadata(params: dict[str, Any]) -> tuple[float | None, float]:
     return pct_val, credits
 
 
-#: ``update.sessionUpdate`` discriminants of the mid-turn steer lifecycle
-#: extension. kiro-cli spells consumed twice (``steering_consumed`` on its own
-#: wire dialect, ``AgentExecutionSteeringInjected`` on the KAS one) and the
-#: bridge dsh-acp speaks the kiro-cli-dialect kind.
-STEER_UPDATE_DISCRIMINANTS = (
-    "steering_queued",
-    "steering_consumed",
-    "steering_cleared",
-    "AgentExecutionUserMessageQueued",
-    "AgentExecutionSteeringInjected",
-)
-
-
-def steer_discriminant(params: object) -> str:
-    """Return the steer discriminant of a session-update frame, or ``""``.
-
-    A steer notification rides the ordinary session-update methods and is told
-    apart only by ``update.sessionUpdate``, so every dispatch loop has to make
-    the same read before it can route one. Returns the discriminant (truthy)
-    for a steer frame and ``""`` for every other update, which lets callers ask
-    the question without repeating the shape checks.
-
-    Shared so AcpClient and AcpSessionHandle cannot drift on steer recognition:
-    a loop that misses it swallows the whole lifecycle as a plain update, and a
-    ``steering_consumed`` nobody reads leaves the steer in the slot's pending
-    list until teardown requeues it -- running the user's message twice.
-    """
-    update = params.get("update") if isinstance(params, dict) else None
-    discriminant = update.get("sessionUpdate") if isinstance(update, dict) else None
-    if isinstance(discriminant, str) and discriminant in STEER_UPDATE_DISCRIMINANTS:
-        return discriminant
-    return ""
-
-
 def classify_notification(msg: JsonRpcMessage) -> str:
     """Classify an incoming JSON-RPC notification into an action string.
 
@@ -623,7 +579,15 @@ def classify_notification(msg: JsonRpcMessage) -> str:
     # through unchanged. Shared here so AcpClient and AcpSessionHandle cannot
     # drift on steer recognition.
     if msg.is_method(METHOD_SESSION_UPDATE) or msg.is_method(METHOD_KIRO_SESSION_UPDATE):
-        if steer_discriminant(msg.params):
+        _u = msg.params.get("update") if isinstance(msg.params, dict) else None
+        _disc = _u.get("sessionUpdate") if isinstance(_u, dict) else None
+        if _disc in (
+            "steering_queued",
+            "steering_consumed",
+            "steering_cleared",
+            "AgentExecutionUserMessageQueued",
+            "AgentExecutionSteeringInjected",
+        ):
             return "steer"
     if msg.is_method(METHOD_SESSION_UPDATE):
         return "update"
@@ -1142,91 +1106,6 @@ class BackgroundLaunchRecord:
 _CODEX_COMPACTION_META_KEY = "contextCompaction"
 
 
-#: Retention bounds for native compaction lifecycle state. Both fields come from
-#: the adapter, so both are capped where they are retained: the id's length (real
-#: ids are UUIDs, 36 chars) and the number of ids remembered per session.
-NATIVE_COMPACTION_ID_MAX_CHARS = 128
-NATIVE_COMPACTION_STATES_MAX = 64
-
-#: A native terminal carrying no verdict. The adapter reports ``cancelled`` when
-#: its turn is stopped mid-compaction (claude-agent-acp 0.84.0 ``reset()``); that
-#: is neither a success to reset counts for nor a failure to count toward the
-#: auto-compact failure streak, so callers close the lifecycle silently.
-NATIVE_COMPACTION_CANCELLED = "cancelled"
-
-
-class NativeCompactionStates:
-    """Per-session native compaction lifecycle, bounded and counting its overflow.
-
-    Tracks each id's last translated status so duplicate terminals and late
-    starts after a terminal are dropped. Entries are kept in recency order, and
-    overflow evicts settled entries before an in-flight one, so a burst of new
-    ids cannot make a live compaction's terminal read as fresh.
-    """
-
-    def __init__(self) -> None:
-        self._states: dict[str, str] = {}
-        self.evicted = 0
-
-    def __len__(self) -> int:
-        return len(self._states)
-
-    def get(self, compaction_id: str) -> str | None:
-        return self._states.get(compaction_id[:NATIVE_COMPACTION_ID_MAX_CHARS])
-
-    def record(self, compaction_id: str, status: str) -> None:
-        key = compaction_id[:NATIVE_COMPACTION_ID_MAX_CHARS]
-        self._states.pop(key, None)
-        self._states[key] = status
-        while len(self._states) > NATIVE_COMPACTION_STATES_MAX:
-            victim = next(
-                (k for k, v in self._states.items() if v != "started"),
-                next(iter(self._states)),
-            )
-            del self._states[victim]
-            self.evicted += 1
-            logger.warning(
-                "Native compaction state over %d ids: evicted %r (%d evicted this session)",
-                NATIVE_COMPACTION_STATES_MAX,
-                victim[:40],
-                self.evicted,
-            )
-
-
-def parse_native_compaction_update(
-    update: dict[str, Any], states: NativeCompactionStates
-) -> str | None:
-    """Translate an ACP ``compaction_update`` frame, or ``None``.
-
-    Returns ``started``/``completed``/``failed`` (the shared status vocabulary) or
-    :data:`NATIVE_COMPACTION_CANCELLED`, which is a lifecycle close and never an
-    event. ``None`` for anything else, and for a repeat or a late start.
-    """
-    if update.get("sessionUpdate") != "compaction_update":
-        return None
-    compaction_id = update.get("compactionId")
-    status = update.get("status")
-    if not isinstance(compaction_id, str) or not compaction_id:
-        return None
-    translated = (
-        {
-            "in_progress": "started",
-            "completed": "completed",
-            "failed": "failed",
-            "cancelled": NATIVE_COMPACTION_CANCELLED,
-        }.get(status)
-        if isinstance(status, str)
-        else None
-    )
-    if translated is None:
-        return None
-    previous = states.get(compaction_id)
-    if previous is not None and (previous != "started" or translated == previous):
-        return None
-    states.record(compaction_id, translated)
-    return translated
-
-
 def parse_codex_compaction_update(update: dict[str, Any]) -> str | None:
     """Classify a codex-acp context-compaction frame, or ``None``.
 
@@ -1450,6 +1329,10 @@ def classify_tool_call(update: dict[str, Any]) -> ToolCallIdentity:
             kind_resolved, shell_by_kind, meta_server, meta_tool, bool(meta_tool)
         )
 
+    claude_tool = _claude_core_mcp_tool_name(update)
+    if claude_tool:
+        return ToolCallIdentity(kind_resolved, shell_by_kind, CORE_MCP_SERVER, claude_tool, True)
+
     # codex-acp: adapter marker plus the adapter-resolved (server, tool) pair.
     if meta.get(_CODEX_MCP_TOOL_CALL_MARKER) is True:
         raw = update.get("rawInput")
@@ -1461,10 +1344,6 @@ def classify_tool_call(update: dict[str, Any]) -> ToolCallIdentity:
         # shell cache is left unwritten and the permission path fails closed
         # to low fidelity instead of a minted non-shell verdict.
         return ToolCallIdentity(False, False, "", "", False)
-
-    core_tool = _claude_core_mcp_tool_name(update) or _codex_core_mcp_tool_name(update)
-    if core_tool:
-        return ToolCallIdentity(kind_resolved, shell_by_kind, CORE_MCP_SERVER, core_tool, True)
 
     # No MCP marker: the kind decides. The harness's built-in tool name (no
     # server) is still carried so hooks can match a host-known built-in.
@@ -2906,13 +2785,7 @@ def _kiro_mcp_server_name(update: dict[str, Any]) -> str:
 
 
 def _claude_core_mcp_tool_name(update: dict[str, Any]) -> str:
-    """Return a KiroCrew core tool from Claude adapter metadata, or ``""``.
-
-    ``claude-agent-acp`` obtains this field from an SDK ``mcp_tool_use``
-    record.  It is not the model-authored display title.  The exact core-server
-    prefix keeps generic Claude metadata from granting another MCP server the
-    authority to issue session directives.
-    """
+    """Return a KiroCrew core tool from Claude adapter metadata, or empty."""
     meta = update.get("_meta")
     if not isinstance(meta, dict):
         return ""
@@ -2927,13 +2800,7 @@ def _claude_core_mcp_tool_name(update: dict[str, Any]) -> str:
 
 
 def _codex_core_mcp_tool_name(update: dict[str, Any]) -> str:
-    """Return a KiroCrew core tool from Codex ACP metadata, or ``\"\"``.
-
-    ``codex-acp`` constructs this update from an app-server ``mcpToolCall``
-    item. The provenance bit, raw server/tool pair, and canonical ACP kind must
-    all agree. This rejects an ordinary tool that merely places matching strings
-    in its model-visible input.
-    """
+    """Return a KiroCrew core tool from Codex adapter metadata, or empty."""
     meta = update.get("_meta")
     raw_input = update.get("rawInput")
     if not isinstance(meta, dict) or meta.get("is_mcp_tool_call") is not True:
@@ -2952,15 +2819,7 @@ def _codex_core_mcp_tool_name(update: dict[str, Any]) -> str:
 
 
 def trusted_mcp_identity(update: dict[str, Any]) -> tuple[str, str, bool]:
-    """Return ``(tool, server, trusted)`` from adapter-owned metadata only.
-
-    Kiro emits the pair directly in ``_meta.kiro``. Claude emits its SDK tool
-    name as ``mcp__<server>__<tool>`` in ``_meta.claudeCode``. Codex emits an
-    adapter-created raw server/tool pair with an explicit MCP provenance bit.
-    Provider-specific fallbacks accept only KiroCrew's own core server. Missing
-    or malformed metadata fails closed rather than consulting the title or model
-    arguments.
-    """
+    """Return a trusted core MCP identity from adapter-owned metadata."""
     tool_name = _kiro_tool_name(update)
     server_name = _kiro_mcp_server_name(update)
     if tool_name or server_name:
@@ -3221,8 +3080,8 @@ def parse_session_update(
     kind = update.get("sessionUpdate")
     events: list[AcpEvent] = []
     if kind == "notice":
-        notice = parse_notice(update)
-        return [notice] if notice is not None else []
+        event = parse_notice(update)
+        return [event] if event is not None else []
     if kind in (UPDATE_AGENT_MESSAGE_CHUNK, UPDATE_AGENT_THOUGHT_CHUNK):
         text, is_thinking = parse_text_chunk(update)
         if text:
@@ -3402,12 +3261,13 @@ __all__ = [
     "set_model_params",
     "parse_metadata",
     "classify_notification",
-    "steer_discriminant",
-    "STEER_UPDATE_DISCRIMINANTS",
     "GATE_ENVELOPE_MARKER",
     "build_permission_event",
     "gate_envelope",
     "parse_session_update",
+    "parse_notice",
+    "SessionNoticeState",
+    "NOTICE_STATE_MAX",
     "parse_usage_update",
     "parse_usage_cost",
     "parse_prompt_token_usage",

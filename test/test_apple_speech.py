@@ -1135,6 +1135,33 @@ class TestStreamingSession:
         await session.close()
         await session.close()
 
+    @pytest.mark.asyncio
+    async def test_a_helper_line_that_is_not_an_object_is_skipped_mid_utterance(self):
+        """``RecursionError`` (a line nested past the decoder) and the plain
+        ``ValueError`` of an over-long integer are not ``JSONDecodeError``s:
+        unlisted, either ended the reader and dictation with it."""
+        from types import SimpleNamespace
+
+        from stray_line_helpers import STRAY_LINES
+
+        stdout = asyncio.StreamReader(limit=1 << 20)
+        for line in (
+            b'{"type": "partial", "text": "hel"}\n',
+            *(make() for make in STRAY_LINES.values()),
+            b'{"type": "final", "text": "hello"}\n',
+        ):
+            stdout.feed_data(line)
+        stdout.feed_eof()
+        session = apple_speech.StreamingSession()
+        session._proc = SimpleNamespace(stdout=stdout)  # type: ignore[assignment]
+
+        await asyncio.wait_for(session._read_events(), timeout=10)
+
+        kinds = []
+        while (event := session._queue.get_nowait()) is not None:
+            kinds.append(event["type"])
+        assert kinds == ["partial", "final"]
+
 
 class TestHelperArgvPinsFast:
     """Pin the ``--fast`` flag in the STREAMING helper argv.
@@ -1754,6 +1781,70 @@ class TestNoBlockingCallOnEventLoop:
         assert "_swiftc()" in inspect.getsource(apple_speech._build_helper)
 
 
+_PREFERRED_SAY_VOICE = "Samantha"
+
+
+def _en_us_say_voice(listing: str) -> str | None:
+    """Pick an installed en_US voice from ``say -v '?'`` output.
+
+    Each line reads ``<name>  <locale>  # <sample>``. A name can hold spaces and
+    parentheses, so the locale is the last field before the ``#``. Samantha wins
+    when present; otherwise the first en_US voice listed is used.
+    """
+    voices = []
+    for line in listing.splitlines():
+        fields = line.split("#", 1)[0].split()
+        if len(fields) >= 2 and fields[-1] == "en_US":
+            voices.append(" ".join(fields[:-1]))
+    if _PREFERRED_SAY_VOICE in voices:
+        return _PREFERRED_SAY_VOICE
+    return voices[0] if voices else None
+
+
+async def _say_voice_args() -> list[str]:
+    """``say`` flags that pin an installed en_US voice, or none at all.
+
+    With no en_US voice installed the fixture uses the host's default voice.
+    """
+    import asyncio
+
+    proc = await asyncio.create_subprocess_exec("say", "-v", "?", stdout=asyncio.subprocess.PIPE)
+    out, _ = await proc.communicate()
+    voice = _en_us_say_voice(out.decode("utf-8", "replace"))
+    return ["-v", voice] if voice else []
+
+
+class TestEnUsSayVoice:
+    """The e2e fixtures synthesize English, so the voice must speak en_US.
+
+    The host's default voice can be non-English or mis-speak the phrase, while
+    the recognizer is pinned to en-US.
+    """
+
+    LISTING = (
+        "Albert              en_US    # Hello! My name is Albert.\n"
+        "Anna                de_DE    # Hallo! Ich heiße Anna.\n"
+        "Eddy (English (US)) en_US    # Hello! My name is Eddy.\n"
+        "Samantha            en_US    # Hello! My name is Samantha.\n"
+    )
+
+    def test_prefers_samantha(self):
+        assert _en_us_say_voice(self.LISTING) == "Samantha"
+
+    def test_falls_back_to_first_en_us_voice(self):
+        listing = self.LISTING.replace("Samantha ", "Zoe      ")
+        assert _en_us_say_voice(listing) == "Albert"
+
+    def test_keeps_a_name_with_spaces(self):
+        listing = "Anna   de_DE  # Hallo\nEddy (English (US)) en_US # Hi\n"
+        assert _en_us_say_voice(listing) == "Eddy (English (US))"
+
+    def test_none_when_no_en_us_voice(self):
+        listing = "Anna   de_DE  # Hallo\nDaniel en_GB # Hello\n"
+        assert _en_us_say_voice(listing) is None
+        assert _en_us_say_voice("") is None
+
+
 @pytest.mark.skipif(
     not _IS_MACOS or sys.platform != "darwin",
     reason="Apple on-device speech is macOS-only",
@@ -1776,14 +1867,17 @@ class TestEndToEndMacOS:
             pytest.skip("no Swift toolchain on this host")
         if not shutil.which("say"):
             pytest.skip("no `say` to synthesize a fixture")
+        voice_args = await _say_voice_args()
 
         audio = tmp_path / "sample.aiff"
+        # ``-v`` pins an en_US voice, when one is installed, to match the en-US
+        # recognizer below.
         # ``-o`` makes ``say`` write the AIFF instead of playing it through the
         # sound output, so the fixture is silent on the developer's machine. The
         # child runs from tmp_path so any file it creates lands there, not in
         # the checkout it would otherwise inherit as CWD.
         proc = await asyncio.create_subprocess_exec(
-            "say", "-o", str(audio), "the build is green", cwd=tmp_path
+            "say", *voice_args, "-o", str(audio), "the build is green", cwd=tmp_path
         )
         await proc.wait()
         assert audio.is_file()
@@ -1813,12 +1907,14 @@ class TestEndToEndMacOS:
         for tool in ("say", "afconvert"):
             if not shutil.which(tool):
                 pytest.skip(f"no `{tool}` to build a 16 kHz fixture")
+        voice_args = await _say_voice_args()
 
         aiff = tmp_path / "s.aiff"
         # ``-o`` writes the AIFF instead of playing it; cwd=tmp_path keeps any
         # stray output out of the checkout (see test_round_trip).
         proc = await asyncio.create_subprocess_exec(
             "say",
+            *voice_args,
             "-o",
             str(aiff),
             "the continuous integration build is green and the tests all pass",

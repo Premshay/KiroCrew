@@ -70,11 +70,12 @@ async def _audit_async(user_id: str, outcome: str, error: str = "") -> None:
 async def api_auth_mobile_link(request: web.Request) -> web.Response:
     """Mint a short-lived link to the configured external dashboard origin."""
     if not check_origin(request, require=False):
-        _audit("", "bad_origin", request.headers.get("Origin", ""))
+        await _audit_async("", "bad_origin", request.headers.get("Origin", ""))
         return web.json_response({"error": "bad_origin", "code": "bad_origin"}, status=403)
 
     user_id = request.get("user", "")
     if not user_id:
+        await _audit_async("", "unauthenticated")
         return web.json_response(
             {"error": "unauthenticated", "code": "unauthenticated"}, status=401
         )
@@ -105,7 +106,7 @@ async def api_auth_mobile_link(request: web.Request) -> web.Response:
 
     external_origin = dashboard_origin(request.app.get("dashboard_url", ""))
     if not external_origin:
-        _audit(user_id, "external_origin_unavailable")
+        await _audit_async(user_id, "external_origin_unavailable")
         return web.json_response(
             {"error": "external_origin_unavailable", "code": "external_origin_unavailable"},
             status=409,

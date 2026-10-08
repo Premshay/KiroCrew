@@ -548,7 +548,9 @@ function DesignCritiquePageContent() {
     return s.key;
   };
   const send = (slotKey: string, agent: string, message: string) =>
-    designCritiqueApi.send(slotKey, agent, message);
+    agent === DEFAULT_AGENT
+      ? designCritiqueApi.send(slotKey, message)
+      : designCritiqueApi.send(slotKey, agent, message);
   const dropSlot = (slotKey: string) => {
     if (!slotKey) return;
     untrackSlot(slotKey);

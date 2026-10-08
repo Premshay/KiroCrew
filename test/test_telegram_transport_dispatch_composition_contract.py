@@ -161,6 +161,7 @@ BASE_NAMES = frozenset(
         "compact_unsupported_backend",
         "compact_unsupported_reply",
         "consume_reinjection",
+        "context_recycle_warning",
         "cron_command_reply",
         "dataclass",
         "delivery_is_muted",
@@ -200,6 +201,8 @@ BASE_NAMES = frozenset(
         "rearm_reinjection",
         "rebind_conversation_location",
         "receipt_address_key",
+        "recycle_backend",
+        "recycle_warning_should_send",
         "redact",
         "redact_local_paths",
         "refused_resume_is_restricted",
@@ -207,6 +210,7 @@ BASE_NAMES = frozenset(
         "release_conversation_location",
         "requested_model_sid",
         "reserve_new_generation",
+        "rollback_skill_bodies",
         "run_in_embed_pool",
         "run_yolo_command",
         "runtime_death",
@@ -276,7 +280,7 @@ MOVED_MEMBERS = {
         "_reply_markdown",
         "_require_direct_chat",
     ),
-    "midturn": ("_handle_busy",),
+    "midturn": ("_handle_busy", "_handle_resumed_busy"),
     "pickers": (
         "_agent_choices",
         "_apply_agent",
@@ -520,8 +524,9 @@ BASE_MEMBERS = {
 }
 
 #: Members the composition added: the turn engine ``handle_message`` hands an admitted
-#: message to. Anything else new on the class is unexplained surface.
-ADDED_MEMBERS = frozenset({"_run_turn"})
+#: message to, and the midturn owner's hand-off of a message into a busy RESUMED
+#: dashboard session. Anything else new on the class is unexplained surface.
+ADDED_MEMBERS = frozenset({"_run_turn", "_handle_resumed_busy"})
 
 
 def _owner(stem: str) -> ModuleType:

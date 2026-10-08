@@ -120,15 +120,25 @@ class TestApiDoesNotStringifyModels:
 
     @staticmethod
     def _handler_source() -> str:
+        """The agents handlers' source: the facade and every owner it composes.
+
+        The CRUD handlers live in ``dashboard/agent_admin`` and run on the facade's
+        globals, so the fence reads the owners as part of ``handlers.agents``.
+        """
         import inspect
 
+        from kiro_crew.dashboard import agent_admin
         from kiro_crew.dashboard.handlers import agents as agents_mod
 
-        return inspect.getsource(agents_mod)
+        owners = sorted(Path(agent_admin.__file__).parent.glob("[!_]*.py"))
+        return "\n".join(
+            [inspect.getsource(agents_mod), *(p.read_text(encoding="utf-8") for p in owners)]
+        )
 
     def test_no_str_coercion_around_the_normalizer(self) -> None:
         """Structural guard: str() must not wrap a normalize_agent_model arg."""
         src = self._handler_source()
+        assert src.count("normalize_agent_model(") >= 3
         assert "normalize_agent_model(str(" not in src
 
     @pytest.mark.parametrize("bad", [123, 1.5, [], {}, None, True])

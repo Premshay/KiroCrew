@@ -54,11 +54,9 @@ export function composeContextReadout(
 ): string {
   const parts: string[] = []
   if (showPct) parts.push(fmtPercent(contextPctClamped(pct) / 100))
-  if (showTokens && Number.isFinite(used) && used > 0) {
+  if (showTokens && Number.isFinite(used) && used > 0 && Number.isFinite(total) && total > 0) {
     const prefix = approx ? '~' : ''
-    parts.push(Number.isFinite(total) && total > 0
-      ? `${prefix}${fmtTokens(used)}/${fmtTokens(total)}`
-      : `${prefix}${fmtTokens(used)}`)
+    parts.push(`${prefix}${fmtTokens(used)}/${fmtTokens(total)}`)
   }
   return parts.join(' · ')
 }

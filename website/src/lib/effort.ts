@@ -6,6 +6,7 @@
  * don't have to re-export it.
  */
 
+import { isNotFoundError } from '../api/apiError'
 import { i18nT } from '../i18n/t'
 
 /**
@@ -61,21 +62,14 @@ export const EFFORT_LEVELS = ['', 'low', 'medium', 'high', 'xhigh', 'max'] as co
 export const REASONING_EFFORT_PROVIDERS = new Set(['acp'])
 
 /**
- * Pre-discovery effort capability fallback, keyed on model FAMILY.
+ * Per-model effort capability — mirrors the backend `model_supports_effort`
+ * (kiro_crew/effort.py): effort is available on Fable/Opus/Sonnet and GPT-5.x
+ * models; Haiku/auto/empty and the other third-party models (deepseek, minimax,
+ * glm, qwen) cannot use it. Gates the dropdown so a non-capable model never
+ * shows a control that would silently no-op on the backend.
  *
- * The authoritative answer comes from the running crew itself: its model catalog
- * carries the reasoning-effort selector its runtime advertised
- * (`effortLevels` in useAvailableModels), and the composer gates on that
- * whenever it is known. This allowlist answers only the case where no crew
- * runtime has reported yet -- the generic catalog, a cold slot -- so it is
- * deliberately conservative and returns false for anything it cannot place
- * rather than guessing a capability.
- *
- * In particular it does NOT know DeepSeek: a DeepSeek session runs through a
- * harness whose model ids are `["provider","model"]` route pairs, and that
- * harness advertises its own effort selector. That case is covered by
- * `effortLevels`, which is exactly why this function is a fallback and not the
- * gate.
+ * Keep this in sync with the backend allowlist — it is a conservative list of
+ * known-capable families, not a "non-Claude means unsupported" denylist.
  */
 export function modelSupportsEffort(model: string | undefined): boolean {
   if (!model) return false
@@ -84,24 +78,26 @@ export function modelSupportsEffort(model: string | undefined): boolean {
   return m.includes('opus') || m.includes('sonnet') || m.includes('fable') || m.includes('gpt')
 }
 
-/**
- * May the effort control render for a session?
- *
- * `crewLevels` is what the running crew's own runtime advertised
- * (`useAvailableModels` returns it as `effortLevels`). It is authoritative when
- * present: a non-empty list opens the control, and an EMPTY list closes it --
- * discovery ran and the runtime offered no selector, which outranks any guess
- * from the model id.
- *
- * `undefined` means no crew runtime answered (the generic catalog, a cold
- * slot), and only then does the family allowlist decide. That ordering is what
- * lets a harness whose model ids the allowlist cannot parse still expose its
- * own effort selector.
- */
+/** Prefer the running crew's advertised effort levels over model-name guesses. */
 export function effortSupportedForCrew(
   crewLevels: string[] | undefined,
   model: string | undefined,
 ): boolean {
   if (crewLevels !== undefined) return crewLevels.length > 0
   return modelSupportsEffort(model)
+}
+
+/**
+ * Did the slot's selection-capability read actually FAIL?
+ *
+ * A 404 is not a failure: the gateway answers `slot_not_found` while a new chat's
+ * slot has not been registered yet, which is the same "no ACP session has
+ * advertised its options" state that `known: false` reports. Treating it as an
+ * error flashed the "could not verify effort options" notice, and disabled the
+ * effort control, on every cold-start poll (issue #14817). Only a real fault --
+ * a 403, a 503 `peer_unavailable`, a transport failure -- counts, which keeps the
+ * notice's "until the connection recovers" claim true.
+ */
+export function selectionCapabilitiesFailed(q: { isError: boolean; error?: unknown }): boolean {
+  return q.isError && !isNotFoundError(q.error)
 }

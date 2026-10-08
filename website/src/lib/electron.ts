@@ -123,14 +123,39 @@ export async function openFileInEditor(
 export const WIN_CAPTION_OVERLAY_WIDTH = 138
 
 /**
- * Content reserve for that overlay: its raw width plus a small clearance so
- * the rightmost control never sits flush against the caption buttons. This is
- * the value the `.win-electron` and `.embedded-win-inset` header rules in
- * index.css hard-code as 142px — keep them in sync (pinned by the stylesheet
- * assertions in EmbeddedSwitcher.test.tsx). `WIN_CAPTION_OVERLAY_WIDTH` above
- * stays the raw geometry, used for drag-strip clipping.
+ * Height of the caption band at the top of a frameless window: the 42px header
+ * row. The Windows titleBarOverlay is sized to it (its height is derived from
+ * the header px, scaled by renderer zoom — `titleBarOverlayOptions` in
+ * electron/windows-titlebar.js:30-37, so 42 CSS px at any zoom) and the injected
+ * Linux caption controls hard-code the same 42px tall band
+ * (electron/runtime/window/linux-captions.js:49).
+ *
+ * This constant RESTATES those two values rather than deriving them, so if the
+ * header height ever changes update all three in lockstep: the Windows overlay
+ * is driven by the runtime header px, the Linux CSS hard-codes 42px, and this
+ * is the renderer-side mirror the portaled viewers read.
  */
-export const WIN_CAPTION_RESERVE_PX = WIN_CAPTION_OVERLAY_WIDTH + 4
+export const CAPTION_BAND_HEIGHT_PX = 42
+
+/**
+ * Top clearance for the controls of a full-window overlay that is portaled to
+ * <body> (the image and diagram viewers). Those overlays sit outside the shell
+ * div that carries `.win-electron` / `.linux-electron`, so the header's CSS
+ * insets never reach them, and their top-right controls land under the OS
+ * caption buttons and inside the window drag strip. Pushing the control row
+ * below the band keeps it in the corner users expect, without parking the
+ * viewer's close button next to the window's own.
+ *
+ * Non-zero on frameless Windows, frameless Linux, and inside an embedded
+ * remote pane whose Windows host relays `.embedded-win-inset` on <html>
+ * (EmbeddedHostBridge). Read at render time, not module load, because that
+ * class toggles at runtime.
+ */
+export function overlayCaptionClearancePx(): number {
+  if (isWinElectron || isLinuxFramelessElectron) return CAPTION_BAND_HEIGHT_PX
+  if (document.documentElement.classList.contains('embedded-win-inset')) return CAPTION_BAND_HEIGHT_PX
+  return 0
+}
 
 /**
  * True when an app declares `platform.requiresDesktopApp` but we are in a

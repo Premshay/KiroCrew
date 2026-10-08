@@ -99,7 +99,15 @@ from kiro_crew.agent_sdk.context import (
     ContextPromptProvider,
     ContextStreamEvent,
 )
-from kiro_crew.agent_sdk.drivers.acp import context_provider_of, finish_suspended_spawn
+from kiro_crew.agent_sdk.drivers.acp import (
+    acp_model_config_options,
+    build_acp_provider,
+    context_provider_of,
+    finish_suspended_spawn,
+    is_acp_error,
+    is_acp_prompt_busy,
+    is_acp_timeout,
+)
 from kiro_crew.agent_sdk.host_auth import (
     UNKNOWN_AGENT_AUTH,
     AgentAuthDeclaration,
@@ -131,6 +139,11 @@ __all__ = [
     "CONTEXT_EVENT_TEXT",
     "CONTEXT_EVENT_TOOL",
     "context_provider_of",
+    "acp_model_config_options",
+    "build_acp_provider",
+    "is_acp_error",
+    "is_acp_prompt_busy",
+    "is_acp_timeout",
     "AgentTurnUsage",
     "MODEL_NAMESPACE_ACP",
     "SessionCapabilities",

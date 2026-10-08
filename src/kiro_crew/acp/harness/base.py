@@ -1,8 +1,14 @@
-"""The backend-neutral harness contract ``AcpRuntime`` talks to.
+"""The backend-neutral harness contract both ACP drivers talk to.
 
 A :class:`HarnessAdapter` is the answer to "what does this host do differently".
 Each implementation answers every question in one file, so onboarding a host is
 writing that file. The runtime reads answers rather than testing identities.
+
+Its spawn half, :class:`LaunchAdapter`, is the part BOTH drivers share: the shared
+runtime asks a :class:`HarnessAdapter` for its plan, and ``AcpClient`` asks a
+:class:`ProcessAdapter` -- a host it starts one process per session for -- through
+``process_adapter_for``. Either way the plan goes to the one launch tail in
+:mod:`kiro_crew.acp.launch`.
 
 That matters because the questions are unrelated to each other and scattered
 across the runtime's 3700 lines. An answer per host per question, all in one
@@ -31,11 +37,14 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 __all__ = [
     "HarnessAdapter",
+    "LaunchAdapter",
     "NotificationAliases",
+    "ProcessAdapter",
+    "ProcessSession",
     "ReclaimPolicy",
     "SessionExtras",
     "SpawnContext",
@@ -98,12 +107,74 @@ class SpawnContext:
     on the same grounds instead of each carrying a copy of them.
     """
 
+    session: ProcessSession | None = field(default=None, kw_only=True)
+    """The per-process session this launch serves, or ``None`` on the shared runtime.
+
+    Only a :class:`ProcessAdapter` reads it. It is how such a host takes the session's
+    own steps at the point its launch needs them (the MCP array warm, a settings
+    seed) and records there the facts the session's turn-time code reads back (a
+    gate nonce, a resolved adapter version)."""
+
+    extra_env: Mapping[str, str] = field(default_factory=dict, kw_only=True)
+    """Caller-owned environment additions applied to the real child.
+
+    A verified shared-process preflight uses this to boot the same host
+    configuration before the real child exists. It stays separate from
+    :attr:`environ`, whose snapshot owns executable resolution.
+    """
+
+
+class ProcessSession(Protocol):
+    """What a :class:`ProcessAdapter` may read, write and ask of the session it launches.
+
+    ``AcpClient`` is the production implementation; a test hands in a plain object
+    carrying these members. The attributes are the session's own state, named as the
+    session names them, because the session's turn-time code reads them after the
+    launch: the gate tripwires read the nonces, the settings writer reads the
+    adapter version, the routing check reads the config's MCP server names.
+    """
+
+    _spawn_work_dir: str
+    _extra_env: dict[str, str]
+    _session_key: str | None
+    _model: str
+    _agent_version_read: bool
+    _claude_adapter_disk_version: str
+    _opencode_config_mcp_servers: tuple[str, ...]
+    _session_harness_deny_rules: tuple[str, ...]
+    _session_mcp_unhonoured: frozenset[str]
+    _opencode_denies_in_force: frozenset[str] | None
+    _opencode_denies_unenforced: frozenset[str]
+    _opencode_native_mounts: frozenset[str]
+    _session_mcp_cache: list[dict[str, Any]] | None
+    _pi_gate_nonce: str
+    _deepseek_gate_nonce: str
+
+    def _scrub_observed(self, value: object) -> object:
+        """*value*, a string the harness reported back, with credentials and exfil URLs
+        redacted, before a refusal quotes it or a log line records it."""
+
+    async def _prepare_session_mcp(self) -> None:
+        """Warm the session's ``mcpServers`` array off the loop."""
+
+    def _resolve_session_mcp_servers(self) -> list[dict[str, Any]]:
+        """Translate the agent spec into this session's ``mcpServers`` array (blocking)."""
+
+    async def _seed_session_settings(self) -> None:
+        """Seed the session's own settings file, best-effort."""
+
 
 @dataclass(frozen=True)
 class SpawnPlan:
     """The argv to spawn, plus what the spawn decided about itself."""
 
     argv: list[str]
+
+    spawn_label: str = field(default="", kw_only=True)
+    """The name the spawn is logged under, and the label the Windows resume reports."""
+
+    stderr_label: str = field(default="", kw_only=True)
+    """The name the child's stderr lines are forwarded under."""
 
     rss_depth: int | None = field(default=None, kw_only=True)
     """Resolved RSS generations below the pid Crew launches.
@@ -148,23 +219,10 @@ class SpawnPlan:
     """
 
     session_model: str | None = None
-    """The model this spawn could NOT pin, for the runtime to apply per session.
-
-    ``None`` when the host took :attr:`SpawnContext.model` on its command line
-    (kiro-cli's ``--model``), ignores it, or leaves the choice to the provider
-    that re-applies its configured model once the session is live. A host whose
-    adapter has no model flag, and which a direct ``AcpRuntime`` consumer reaches
-    with no provider behind it, names the model here -- otherwise every session on
-    the process silently runs the adapter's default.
-    """
+    """A model the host cannot pin on argv, applied to every shared session."""
 
     session_meta: Mapping[str, Any] | None = None
-    """A ``_meta`` envelope every ``session/new`` on this process carries.
-
-    ``None`` for a host that reads no envelope of Crew's. Decided with the spawn
-    because it is a fact about the adapter the process runs, not about any one
-    session.
-    """
+    """A host-owned ``_meta`` envelope for shared session creation and load."""
 
     private_state_env: str | None = None
     """Environment variable this host needs pointed at a per-process directory.
@@ -290,13 +348,12 @@ class ReclaimPolicy:
 # ── The contract ──
 
 
-class HarnessAdapter(abc.ABC):
-    """One host's answers to the nine questions ``AcpRuntime`` has to ask.
+class LaunchAdapter(abc.ABC):
+    """One host's spawn: how its process is started, and nothing about its sessions.
 
-    Implement every member. A default that "usually works" is how a new backend
-    silently inherits kiro-cli's behaviour on the one seam it actually differs
-    on, which is the failure this layer exists to prevent -- so the base class
-    supplies no defaults for the per-host facts.
+    The half of a harness both drivers need. Everything after the plan -- scratch,
+    the sandbox wrap, the shared environment, the suspended spawn -- is the launch
+    tail's, so a host is complete for launching once these two members answer.
     """
 
     #: The ``ACP_BACKEND_*`` id this harness serves. Every membership question
@@ -323,6 +380,65 @@ class HarnessAdapter(abc.ABC):
         scrubbed, so a host can both add its own variables and remove one the
         generic path would otherwise pass through.
         ``spawned_binary`` names the executable before sandbox and scope wrappers.
+        """
+
+
+class ProcessAdapter(LaunchAdapter):
+    """A host ``AcpClient`` starts one process per session for.
+
+    One instance per spawn: :meth:`resolve_spawn` keeps on it what the same launch
+    later puts on the child's environment (a launcher path, a nonce, a routing seed),
+    so the two halves cannot disagree about which spawn they describe. Every host
+    error is an ``AcpError`` -- the type ``AcpClient.ensure_ready`` ladders on -- and
+    a missing component's carries the command that installs it.
+    """
+
+    async def prepare_spawn_env(
+        self,
+        env: dict[str, str],
+        *,
+        to_thread: Callable[..., Awaitable[Any]],
+    ) -> None:
+        """This host's additions to the child's environment, before session identity.
+
+        Applied after the base environment is assembled and before the session's
+        identity, credential repair and scrub. *to_thread* is the driver's guarded
+        off-loop hop: the sandbox launcher already exists when this runs, so a host
+        that must read a file here goes through it, and a cancellation cannot orphan
+        that launcher. Most hosts need no hop at all, which is this default.
+        """
+        self.apply_spawn_env(env)
+
+
+class HarnessAdapter(LaunchAdapter):
+    """One host's answers to the nine questions ``AcpRuntime`` has to ask.
+
+    Implement every member. A default that "usually works" is how a new backend
+    silently inherits kiro-cli's behaviour on the one seam it actually differs
+    on, which is the failure this layer exists to prevent -- so the base class
+    supplies no defaults for the per-host facts.
+    """
+
+    # ── Seam 1: spawn (with :meth:`resolve_spawn` and :meth:`apply_spawn_env`) ──
+
+    @abc.abstractmethod
+    def apply_spawn_env(
+        self,
+        env: dict[str, str],
+        *,
+        spawned_binary: str | None = None,
+        cli_owned_auth: bool = False,
+    ) -> None:
+        """Mutate the child's environment in place for this host.
+
+        Called after the generic environment is assembled and before it is
+        scrubbed, so a host can both add its own variables and remove one the
+        generic path would otherwise pass through.
+        ``spawned_binary`` names the executable before sandbox and scope wrappers.
+        ``cli_owned_auth`` is the spawn plan's answer to who owns the child's
+        credential: True when the child authenticates itself (no Crew callback,
+        :attr:`SpawnPlan.host_auth` False). It defaults to False so a caller that
+        does not say keeps the stricter Crew-owned treatment.
         """
 
     @property

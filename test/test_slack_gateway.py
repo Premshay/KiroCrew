@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import importlib
 import inspect
 import json
 import logging
@@ -15,12 +16,14 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from wheel_update_test_helpers import ARTIFACT_BASE, FEED_BASE, wire_wheel_apply
 
 from kiro_crew.autonudge import NudgeLoop
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard.handlers import updates as dashboard_updates
 from kiro_crew.slack import gateway as gw
 from kiro_crew.slack.gateway import (
     _CRON_MSG_LIMIT,
@@ -33,6 +36,102 @@ from kiro_crew.slack.gateway import (
     GatewayOrchestrator,
     _result_hash,
 )
+
+#: Lost-run ceiling for a wait the test itself must end (a stub it parks, a
+#: writer it holds, a signal production raises on the way). Timed wait by wait,
+#: every one of them took at most 0.04 s at ``-n 4`` on a loaded 32-CPU host and
+#: at most 0.01 s with every executor hop delayed by 1.2 s (a starved-runner
+#: model). The one exception spans a whole update and waits on progress instead
+#: (see ``_PROGRESS_WINDOW_SECS``). 60 s is half the module's ``--timeout=120``.
+_LOST_RUN_SECS = 60.0
+
+#: The lost-run ceiling of a wait that spans many executor hops: how long it may go
+#: without a hop being submitted or finishing. Over ten times one hop's 1.2 s under
+#: the starved-runner model. The update ahead of the queued reinstall makes about
+#: nine such hops (the whole test took 10.9 s under that model, 0.04 s at ``-n 4``),
+#: so a slow pool keeps the wait alive while a wedged one fails within one window.
+#: Such a wait is also capped at ``_LOST_RUN_SECS`` in all: a livelock backstop held
+#: at the half-timeout limit, not a race bound.
+_PROGRESS_WINDOW_SECS = 15.0
+
+
+async def _until_set_while_progressing(event, progress, what: str) -> None:
+    """Wait for *event* while ``progress()`` keeps changing.
+
+    For a wait that spans many executor hops: a slow pool keeps it alive, and it
+    fails once a whole ``_PROGRESS_WINDOW_SECS`` passes with no change, or after
+    ``_LOST_RUN_SECS`` in all, naming *what* and the elapsed time.
+    """
+    started = last_change = time.monotonic()
+    seen = progress()
+    while not event.is_set():
+        now = time.monotonic()
+        if progress() != seen:
+            seen, last_change = progress(), now
+        if now - last_change > _PROGRESS_WINDOW_SECS or now - started > _LOST_RUN_SECS:
+            pytest.fail(
+                f"{what} did not happen: {now - started:.1f}s elapsed, "
+                f"{now - last_change:.1f}s since the last progress (count {seen})"
+            )
+        await asyncio.sleep(0.05)
+
+
+async def _within_lost_run(awaitable, what: str):
+    """Await *awaitable* under ``_LOST_RUN_SECS``; on expiry fail naming *what*.
+
+    A bare ``wait_for`` raises an empty ``TimeoutError``. This one says what never
+    finished, the ceiling and the elapsed time. A ``TimeoutError`` the awaited code
+    raises on its own, before the ceiling, propagates unchanged.
+    """
+    started = time.monotonic()
+    try:
+        return await asyncio.wait_for(awaitable, _LOST_RUN_SECS)
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - started
+        # A loop timer can fire up to one clock tick early (15.6 ms on Windows 3.12).
+        if elapsed < _LOST_RUN_SECS - 1.0:
+            raise
+        pytest.fail(
+            f"{what} did not finish within the {_LOST_RUN_SECS:.0f}s lost-run ceiling "
+            f"({elapsed:.1f}s elapsed)"
+        )
+
+
+class _ImportlibWithoutReload:
+    """``importlib`` as the gateway sees it, except that ``reload`` returns its argument.
+
+    A completed update re-imports ``kiro_crew`` to log the rebuilt version. In a
+    test that re-runs ``kiro_crew/__init__.py`` inside the worker's one package
+    and leaves a NEW ``kiro_crew.shutdown_event`` there, while every module that
+    imported the name keeps the old object. A later test on the same worker that
+    sets ``kiro_crew.shutdown_event`` then never wakes ``gateway.run()``:
+    ``TestRunMethod::test_run_raises_on_shutdown`` hung to ``--timeout`` behind
+    any update test that completes an update (15 tests in the venv and reset
+    classes). Only the gateway's binding is replaced.
+    """
+
+    def reload(self, module):
+        return module
+
+    def __getattr__(self, name):
+        return getattr(importlib, name)
+
+
+@pytest.fixture(autouse=True)
+def _restore_update_check_cache():
+    """Hand the next test the update-check cache this one inherited.
+
+    ``dashboard.handlers.updates._update_info`` is one process-wide dict, and the
+    gateway imported it by identity, so it is restored in place, never rebound. Tests
+    here clear it and seed their own verdicts, and the provider path writes
+    ``managed_by="command"`` into it; left behind, that key makes a later legacy check
+    on the same worker read "a policy update command owns this install" and only
+    notify, so an apply the test expects never runs.
+    """
+    inherited = dict(dashboard_updates._update_info)
+    yield
+    dashboard_updates._update_info.clear()
+    dashboard_updates._update_info.update(inherited)
 
 
 def _install_effect(effect: str = "install", route: str | None = "git"):
@@ -1080,22 +1179,20 @@ class TestCheckForUpdates:
         import kiro_crew.dashboard.handlers as _h
         from kiro_crew.platform.governance import UpdatePins
 
-        orig = _h._update_info.copy()
         # Create a config with auto_update=False
         fake_cfg = MagicMock()
         fake_cfg.auto_update = False
-        try:
-            _h._update_info.update({"update_available": True, "version": "9.9.9"})
-            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
-                with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
-                    with patch(
-                        "kiro_crew.platform.governance.active_update_pins",
-                        return_value=UpdatePins(),
-                    ):
-                        await orch._check_for_updates()
-        finally:
-            _h._update_info.clear()
-            _h._update_info.update(orig)
+        # The check's verdict and nothing else: an earlier test's keys (a provider's
+        # managed_by) must not decide the branch. The module fixture restores it.
+        _h._update_info.clear()
+        _h._update_info.update({"update_available": True, "version": "9.9.9"})
+        with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
+                with patch(
+                    "kiro_crew.platform.governance.active_update_pins",
+                    return_value=UpdatePins(),
+                ):
+                    await orch._check_for_updates()
         orch._auto_apply_update.assert_not_awaited()
         ds.push_refresh.assert_called_with("update_available")
 
@@ -1118,22 +1215,18 @@ class TestCheckForUpdates:
 
         fake_cfg = MagicMock()
         fake_cfg.auto_update = True
-        orig = _h._update_info.copy()
-        try:
-            _h._update_info.update(
-                {"update_available": True, "can_apply": True, "version_newer": False}
-            )
-            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
-                with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
-                    with patch(
-                        "kiro_crew.platform.update_governance.update_required",
-                        return_value=False,
-                    ):
-                        with _install_effect():
-                            await orch._check_for_updates()
-        finally:
-            _h._update_info.clear()
-            _h._update_info.update(orig)
+        _h._update_info.clear()
+        _h._update_info.update(
+            {"update_available": True, "can_apply": True, "version_newer": False}
+        )
+        with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
+                with patch(
+                    "kiro_crew.platform.update_governance.update_required",
+                    return_value=False,
+                ):
+                    with _install_effect():
+                        await orch._check_for_updates()
         orch._auto_apply_update.assert_not_awaited()
         ds.push_refresh.assert_called_with("update_available")
 
@@ -1147,22 +1240,16 @@ class TestCheckForUpdates:
 
         fake_cfg = MagicMock()
         fake_cfg.auto_update = True
-        orig = _h._update_info.copy()
-        try:
-            _h._update_info.update(
-                {"update_available": True, "can_apply": True, "version_newer": True}
-            )
-            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
-                with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
-                    with patch(
-                        "kiro_crew.platform.update_governance.update_required",
-                        return_value=False,
-                    ):
-                        with _install_effect():
-                            await orch._check_for_updates()
-        finally:
-            _h._update_info.clear()
-            _h._update_info.update(orig)
+        _h._update_info.clear()
+        _h._update_info.update({"update_available": True, "can_apply": True, "version_newer": True})
+        with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
+                with patch(
+                    "kiro_crew.platform.update_governance.update_required",
+                    return_value=False,
+                ):
+                    with _install_effect():
+                        await orch._check_for_updates()
         orch._auto_apply_update.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1184,39 +1271,30 @@ class TestCheckForUpdates:
         import kiro_crew.dashboard.handlers as _h
         from kiro_crew.platform.update_capability import CHECK_SUCCEEDED
 
-        orig = _h._update_info.copy()
-        try:
-            # A git checkout (`can_apply`) below the floor whose check SUCCEEDED
-            # but found no newer `__version__` (version_newer False). The wheel
-            # layout's equivalent no-newer-build path is
-            # test_mandatory_wheel_no_newer_build_notifies.
-            _h._update_info.update(
-                {
-                    "update_available": False,
-                    "can_apply": True,
-                    "version_newer": False,
-                    "check_status": CHECK_SUCCEEDED,
-                }
-            )
-            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
-                with patch(
-                    "kiro_crew.platform.update_governance.update_required", return_value=True
-                ):
-                    with _install_effect("mandatory"):
-                        await orch._check_for_updates()
-            # Captured before the finally restores the pre-test cache.
-            update_available = _h._update_info["update_available"]
-            check_status = _h._update_info["check_status"]
-        finally:
-            _h._update_info.clear()
-            _h._update_info.update(orig)
+        # A git checkout (`can_apply`) below the floor whose check SUCCEEDED
+        # but found no newer `__version__` (version_newer False). The wheel
+        # layout's equivalent no-newer-build path is
+        # test_mandatory_wheel_no_newer_build_notifies.
+        _h._update_info.clear()
+        _h._update_info.update(
+            {
+                "update_available": False,
+                "can_apply": True,
+                "version_newer": False,
+                "check_status": CHECK_SUCCEEDED,
+            }
+        )
+        with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.platform.update_governance.update_required", return_value=True):
+                with _install_effect("mandatory"):
+                    await orch._check_for_updates()
         orch._auto_apply_update.assert_not_awaited()
         ds.push_refresh.assert_called_with("update_available")
         # The notify path refreshes the badge but does NOT clobber the shared
         # check cache: the verdict the check wrote (no update available, check
         # succeeded) survives, mirroring the wheel branch.
-        assert update_available is False
-        assert check_status == CHECK_SUCCEEDED
+        assert _h._update_info["update_available"] is False
+        assert _h._update_info["check_status"] == CHECK_SUCCEEDED
 
     @pytest.mark.asyncio
     async def test_min_version_mandate_applies_when_a_newer_build_is_available(self):
@@ -1232,20 +1310,12 @@ class TestCheckForUpdates:
         orch._auto_apply_update = AsyncMock()
         import kiro_crew.dashboard.handlers as _h
 
-        orig = _h._update_info.copy()
-        try:
-            _h._update_info.update(
-                {"update_available": True, "can_apply": True, "version_newer": True}
-            )
-            with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
-                with patch(
-                    "kiro_crew.platform.update_governance.update_required", return_value=True
-                ):
-                    with _install_effect("mandatory"):
-                        await orch._check_for_updates()
-        finally:
-            _h._update_info.clear()
-            _h._update_info.update(orig)
+        _h._update_info.clear()
+        _h._update_info.update({"update_available": True, "can_apply": True, "version_newer": True})
+        with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
+            with patch("kiro_crew.platform.update_governance.update_required", return_value=True):
+                with _install_effect("mandatory"):
+                    await orch._check_for_updates()
         orch._auto_apply_update.assert_awaited_once()
         # The floor-mandated apply is marked so a no-op outcome stays visible.
         assert orch._auto_apply_update.await_args.kwargs.get("mandatory") is True
@@ -2464,9 +2534,74 @@ class TestInitSubagents:
         assert orch.dashboard_state.push_slots_update.call_count == 2
 
     @pytest.mark.asyncio
+    async def test_subagent_queued_pushes_slots_debounced(self):
+        """A queued-depth frame changes slots[].subagents_queued, so it schedules
+        the same debounced push: the next slots frame reconciles a client that
+        missed the depth frame itself, including one not showing that session."""
+        from kiro_crew.subagent import SubagentInfo
+
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = _mock_context_builder()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        on_event = self._capture_on_event(orch)
+
+        info = SubagentInfo(id="_queue", task="", parent_session_key="dashboard:s1")
+        await on_event("subagent_queued", info, {"queued": 1})
+        await on_event("subagent_queued", info, {"queued": 0})
+        assert orch.dashboard_state.push_slots_update.call_count == 0  # debounced
+        await asyncio.sleep(0.3)
+        assert orch.dashboard_state.push_slots_update.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_queued_frame_carries_its_tabs_sum_across_parents(self):
+        """Two parents that route to one cron tab: each frame carries the tab's
+        sum, which is what serialize_slots reports, so a frame and the next slots
+        push agree -- including after one of the parents publishes 0."""
+        from kiro_crew.dashboard.state import _published_queued_by_slot
+        from kiro_crew.subagent import SubagentInfo
+
+        def _slot(key: str) -> str:
+            return "cron-job7" if key.startswith("cron:job7") else key.removeprefix("dashboard:")
+
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = _mock_context_builder()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        table: dict[str, int] = {}
+        with (
+            patch("kiro_crew.slack.gateway.subagent_event_slot", _slot),
+            patch("kiro_crew.dashboard.chat_utils.subagent_event_slot", _slot),
+        ):
+            on_event = self._capture_on_event(orch)
+            orch.subagent_mgr.published_queued_depths = lambda: dict(table)
+
+            async def publish(parent: str, depth: int) -> int:
+                # The manager records before on_event runs (_fire_event).
+                table.pop(parent, None)
+                if depth:
+                    table[parent] = depth
+                info = SubagentInfo(id="_queue", task="", parent_session_key=parent)
+                await on_event("subagent_queued", info, {"queued": depth})
+                frame = orch.dashboard_state.broadcast_ws.call_args.args[1]
+                assert frame["slot"] == "cron-job7"
+                assert frame["queued"] == _published_queued_by_slot(orch.subagent_mgr).get(
+                    "cron-job7", 0
+                )
+                return frame["queued"]
+
+            assert await publish("cron:job7:run1", 2) == 2
+            assert await publish("cron:job7:writer", 1) == 3
+            assert await publish("cron:job7:run1", 0) == 1
+            assert await publish("cron:job7:writer", 0) == 0
+
+    @pytest.mark.asyncio
     async def test_subagent_tool_event_does_not_push_slots(self):
         """High-frequency subagent_tool events must NOT trigger slots pushes —
-        only spawn/done flip the subagents_running truth value."""
+        only spawn/done flip the subagents_running truth value (and a queued
+        frame moves subagents_queued)."""
         from kiro_crew.subagent import SubagentInfo
 
         orch = _make_orchestrator()
@@ -2555,95 +2690,6 @@ class TestSubagentDoneStoppedClassification:
         assert "Stopped by the user" not in body
         assert "stopped by user" not in body
         assert "partial notes so far" in body
-
-    @pytest.mark.asyncio
-    async def test_boundary_cancelled_completion_is_not_routed(self):
-        """A completion that lost stage authority never reaches its parent."""
-        orch = _make_orchestrator()
-        orch.sessions = _mock_sessions()
-        orch.ctx_builder = _mock_context_builder()
-        orch.ctx_builder.hooks = MagicMock()
-        orch.dashboard_state = _mock_dashboard_state()
-
-        slot = MagicMock()
-        slot.key = "gone"
-        slot.running = False
-        slot.task = None
-        slot._subagent_deliveries_inflight = 0
-        slot._subagents_inline_collected = set()
-        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
-        on_done = self._capture_on_done(orch)
-        info = self._stopped_info()
-        info._stage_boundary_cancelled = True
-        info.batch_id = "cancelled-wave"
-        info.batch_total = 1
-
-        run_chat = AsyncMock()
-        with patch("kiro_crew.slack.gateway._run_chat", run_chat):
-            await on_done(info)
-            await asyncio.sleep(0)
-
-        run_chat.assert_not_awaited()
-        slot.queue_append.assert_not_called()
-        orch.dashboard_state.notify.assert_not_called()
-        orch.subagent_mgr.finalize_batch.assert_called_once_with("cancelled-wave")
-        assert "cancelled-wave" not in orch._batch_progress
-
-    @pytest.mark.asyncio
-    async def test_completed_owner_revoked_while_report_waits_is_not_routed(self):
-        """Cancellation that lands during report bookkeeping wins before route."""
-        from kiro_crew.dashboard.state import StageBoundary
-
-        orch = _make_orchestrator()
-        orch.sessions = _mock_sessions()
-        orch.ctx_builder = _mock_context_builder()
-        orch.ctx_builder.hooks = MagicMock()
-        orch.dashboard_state = _mock_dashboard_state()
-
-        owner = "owner-a"
-        slot = MagicMock()
-        slot.key = "gone"
-        slot.running = False
-        slot.task = None
-        slot._in_stage_execution = False
-        slot._subagent_deliveries_inflight = 0
-        slot._subagents_inline_collected = set()
-        slot.stage_boundary = StageBoundary(stage=1, generation=owner)
-        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
-        on_done = self._capture_on_done(orch)
-        info = self._stopped_info()
-        info.user_stopped = False
-        info.result = "completed before cancellation"
-        info._stage_boundary_owner = owner
-        info.batch_id = "cancel-race-wave"
-        info.batch_total = 2
-        bookkeeping_started = asyncio.Event()
-        release_bookkeeping = asyncio.Event()
-
-        async def _blocked_pending(*_args):
-            bookkeeping_started.set()
-            await release_bookkeeping.wait()
-            return False
-
-        run_chat = AsyncMock()
-        with (
-            patch(
-                "kiro_crew.slack.gateway._subagent_batch_pending",
-                side_effect=_blocked_pending,
-            ),
-            patch("kiro_crew.slack.gateway._run_chat", run_chat),
-        ):
-            routing = asyncio.create_task(on_done(info))
-            await bookkeeping_started.wait()
-            info.user_stopped = True
-            info._stage_boundary_cancelled = True
-            release_bookkeeping.set()
-            await routing
-            await asyncio.sleep(0)
-
-        run_chat.assert_not_awaited()
-        slot.queue_append.assert_not_called()
-        orch.dashboard_state.notify.assert_not_called()
 
 
 class TestSubagentFinalSummaryDirective:
@@ -2747,6 +2793,194 @@ class TestSubagentFinalSummaryDirective:
         slot = await self._done_slot([], probe_error=True)
         assert slot._pending_synthesis is False
         assert slot._subagent_deliveries_inflight == 0
+
+
+class TestSynthesisAfterAOneTurnBatch:
+    """The post-fan-out synthesis runs only when the batch's results reached
+    the parent in two or more completion turns. Completions go through the
+    real ``on_done`` into a real slot, and each completion turn ends through
+    ``chat_runner._finish_queue_cycle``, which takes the fire decision."""
+
+    def _wire(self, tmp_path):
+        from chat_test_helpers import _make_state
+
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = _mock_context_builder()
+        orch.ctx_builder.hooks = MagicMock()
+        state = _make_state(tmp_path)
+        orch.dashboard_state = state
+        on_done = TestSubagentFinalSummaryDirective()._capture_on_done(orch)
+        mgr = orch.subagent_mgr
+        # Every fire-gate probe set: a bare MagicMock probe reads as a child.
+        mgr.running_agents_for = MagicMock(return_value=[])
+        mgr.has_in_memory_pending_work_for = MagicMock(return_value=False)
+        mgr.queued_count_for_async = AsyncMock(return_value=0)
+        mgr.queued_count_or_none_async = AsyncMock(return_value=0)
+        mgr.published_queued_depths = MagicMock(return_value={})
+        state.subagents = mgr
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+        return on_done, state, slot, mgr
+
+    @staticmethod
+    async def _complete(on_done, slot, agent_id, *, busy=False, **fields):
+        """Route one completion; *busy* parks it behind a turn still running."""
+        from kiro_crew.subagent import SubagentInfo
+
+        info = SubagentInfo(
+            id=agent_id, task=f"do {agent_id}", parent_session_key="dashboard:s1", **fields
+        )
+        blocker = asyncio.create_task(asyncio.sleep(30)) if busy else None
+        if blocker is not None:
+            slot.task = blocker
+        try:
+            with (
+                patch("kiro_crew.slack.gateway._run_chat", new=AsyncMock()),
+                patch("kiro_crew.slack.gateway.INJECTION_TIMEOUT", 0.01),
+            ):
+                await on_done(info)
+                turn = slot.task
+                if turn is not None and turn is not blocker:
+                    await turn  # the completion turn (a stub) runs
+        finally:
+            if blocker is not None:
+                blocker.cancel()
+                slot.task = None
+
+    @staticmethod
+    async def _turn_end(state, slot) -> bool:
+        """End the turn that just ran; True when a synthesis turn was started."""
+        from kiro_crew.dashboard import chat_runner
+
+        with (
+            patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()) as synth,
+            # A completion still queued drains as a stub turn.
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()),
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            await chat_runner._finish_queue_cycle(state, slot)
+            await asyncio.sleep(0)
+        return synth.called
+
+    @staticmethod
+    async def _user_message_drains(state, slot, *, turn_tail=False, **kwargs):
+        """Queue a user message and drain it. *turn_tail* drains it the way a
+        turn's end does (``_hand_off_queue``, with the ending turn still holding
+        the floor); otherwise the direct drain, as the queued card's Run now."""
+        from kiro_crew.dashboard import chat_runner
+
+        qid = slot.queue_append("thanks, carry on")
+        if kwargs.get("allow_user_during_subagents"):
+            kwargs["required_queue_id"] = qid
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            if not turn_tail:
+                assert await chat_runner._start_next_queued_turn(state, slot, **kwargs) is True
+                return
+            assert not kwargs
+            slot.task = ending = asyncio.get_running_loop().create_future()
+            try:
+                await chat_runner._hand_off_queue(
+                    state, slot, drain=True, allow_automatic_successor=True
+                )
+            finally:
+                ending.cancel()
+            assert spawn.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("busy", [False, True], ids=["launched", "queued"])
+    async def test_a_lone_completion_gets_no_synthesis(self, tmp_path, busy):
+        on_done, state, slot, _ = self._wire(tmp_path)
+
+        await self._complete(on_done, slot, "a1", busy=busy)
+        assert slot._pending_synthesis is True, "the arm itself is unchanged"
+
+        assert await self._turn_end(state, slot) is False
+        assert slot._pending_synthesis is False, "the arm is consumed, not left for later"
+
+    @pytest.mark.asyncio
+    async def test_a_wave_digest_in_one_turn_gets_no_synthesis(self, tmp_path):
+        """Two members of one spawn wave arrive as ONE digest turn."""
+        on_done, state, slot, _ = self._wire(tmp_path)
+
+        await self._complete(on_done, slot, "m1", batch_id="w1", batch_total=2)
+        assert slot._queue == [] and slot.task is None, "the first member is held"
+        await self._complete(on_done, slot, "m2", batch_id="w1", batch_total=2)
+
+        assert await self._turn_end(state, slot) is False
+
+    @pytest.mark.asyncio
+    async def test_completions_in_two_turns_still_get_one_synthesis(self, tmp_path):
+        on_done, state, slot, mgr = self._wire(tmp_path)
+
+        mgr.running_agents_for.return_value = [{"id": "a2"}]
+        await self._complete(on_done, slot, "a1")
+        assert await self._turn_end(state, slot) is False, "a2 is still running"
+        mgr.running_agents_for.return_value = []
+        await self._complete(on_done, slot, "a2")
+
+        assert await self._turn_end(state, slot) is True
+
+    @pytest.mark.asyncio
+    async def test_a_user_message_before_the_last_completion_keeps_the_batch(self, tmp_path):
+        """A message run beside the fan-out (the queued card's Run now) does not
+        split the batch: the two results still earn their synthesis."""
+        on_done, state, slot, mgr = self._wire(tmp_path)
+
+        mgr.running_agents_for.return_value = [{"id": "a2"}]
+        await self._complete(on_done, slot, "a1")
+        await self._turn_end(state, slot)
+        await self._user_message_drains(state, slot, allow_user_during_subagents=True)
+        await self._turn_end(state, slot)
+        mgr.running_agents_for.return_value = []
+        await self._complete(on_done, slot, "a2")
+
+        assert await self._turn_end(state, slot) is True
+
+    @pytest.mark.asyncio
+    async def test_a_user_message_after_the_arm_ends_the_batch(self, tmp_path):
+        """The user replies while the last completion's report streams, so the
+        message drains at that turn's end. The user takes over (the armed
+        synthesis is disarmed, as before), and the next lone completion starts
+        a batch of its own."""
+        on_done, state, slot, mgr = self._wire(tmp_path)
+
+        mgr.running_agents_for.return_value = [{"id": "a2"}]
+        await self._complete(on_done, slot, "a1")
+        await self._turn_end(state, slot)
+        mgr.running_agents_for.return_value = []
+        await self._complete(on_done, slot, "a2")
+        await self._user_message_drains(state, slot, turn_tail=True)
+        assert slot._pending_synthesis is False
+        assert await self._turn_end(state, slot) is False
+
+        await self._complete(on_done, slot, "a3")
+        assert await self._turn_end(state, slot) is False
+
+    @pytest.mark.asyncio
+    async def test_a_user_message_during_a_follow_up_batch_keeps_its_synthesis(self, tmp_path):
+        """A lone completion's turn spawns b1 and b2, so its arm is still set
+        when b1's completion turn and a Run-now message drain. The message
+        disarms as before but must not zero the count of a batch that is still
+        running: b1 and b2 reached the parent in two turns and earn one
+        synthesis."""
+        on_done, state, slot, mgr = self._wire(tmp_path)
+
+        await self._complete(on_done, slot, "a1")
+        mgr.running_agents_for.return_value = [{"id": "b1"}, {"id": "b2"}]
+        assert await self._turn_end(state, slot) is False, "b1 and b2 are running"
+        mgr.running_agents_for.return_value = [{"id": "b2"}]
+        await self._complete(on_done, slot, "b1")
+        assert await self._turn_end(state, slot) is False, "b2 is still running"
+        await self._user_message_drains(state, slot, allow_user_during_subagents=True)
+        assert await self._turn_end(state, slot) is False
+        mgr.running_agents_for.return_value = []
+        await self._complete(on_done, slot, "b2")
+
+        assert await self._turn_end(state, slot) is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3436,6 +3670,9 @@ class TestAutoApplyUpdateGitPath:
                 "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
                 return_value="/trusted/bin/git",
             ),
+            # A completed update reloads the kiro_crew package; see
+            # _ImportlibWithoutReload for what that left the next test.
+            patch.object(gw, "importlib", _ImportlibWithoutReload()),
             patch(
                 # The interpreter-floor gate reads the pinned commit with a real
                 # `git show`; against a non-repo that read FAILS, and a failed read
@@ -3683,23 +3920,39 @@ class TestRunMethod:
 
         events = []
         stall = threading.Event()
+        write_started = threading.Event()
+        late_cleared = threading.Event()
         original_write_marker = run_marker.write_marker
         original_clear_marker = run_marker.clear_marker
         original_clear_late = run_marker.clear_late_marker_write
 
         def stalled_write_marker(port):
             events.append("write-start")
-            stall.wait(5.0)  # far longer than the shrunk 0.05s budget
+            write_started.set()
+            # Held until the finally below releases it, so the shutdown finds the
+            # write in flight however long the boot before it takes. No timeout on
+            # purpose: any bound here is a wall-clock bound on run()'s boot, which is
+            # the race this replaced (the old 5 s stall ended on its own under a
+            # slow boot), and the finally always releases it.
+            stall.wait()
             original_write_marker(port)  # late write republishes the marker
             events.append("write-end")
 
         def recording_clear_marker(port):
+            # The case is a clear that lands WHILE the write is stalled. On a
+            # starved pool the writer can still be queued when the 0.05 s budget
+            # expires, so wait for it to start rather than race it.
+            if not write_started.wait(_LOST_RUN_SECS):
+                events.append("writer-never-started")
             events.append("clear")
             original_clear_marker(port)
 
         def recording_clear_late(port):
             events.append("late-clear")
-            return original_clear_late(port)
+            try:
+                return original_clear_late(port)
+            finally:
+                late_cleared.set()
 
         monkeypatch.setattr(run_marker, "write_marker", stalled_write_marker)
         monkeypatch.setattr(run_marker, "clear_marker", recording_clear_marker)
@@ -3745,10 +3998,9 @@ class TestRunMethod:
             # teardown would restore the real config_dir/write_marker and the
             # worker would wake later and write markers OUTSIDE tmp_path.
             stall.set()
-            for _ in range(200):  # up to ~10s; normally a few ms
-                if "write-start" not in events or "late-clear" in events:
-                    break
-                await asyncio.sleep(0.05)
+            if write_started.is_set():
+                # Bounded inside the thread: a cancelled to_thread cannot stop it.
+                await asyncio.to_thread(late_cleared.wait, _LOST_RUN_SECS)
 
         # The stalled write did not complete before the bounded wait expired,
         # yet the marker was cleared and graceful shutdown still ran — the
@@ -3766,6 +4018,10 @@ class TestRunMethod:
         # does not identify its owner, so it removes only this process's own
         # write and only while the pid record still names this process. The
         # shutdown-side ``clear_marker`` runs once and holds the listener.
+        assert late_cleared.is_set(), (
+            f"the released writer did not self-clear within the {_LOST_RUN_SECS:.0f}s "
+            f"lost-run ceiling: {events}"
+        )
         assert "write-end" in events
         assert events.index("write-end") > events.index("clear")
         assert events.count("clear") == 1  # the timed-out shutdown clear
@@ -4007,123 +4263,6 @@ class TestSubagentDone:
 
         orch.dashboard_state.notify.assert_not_called()
         orch.dashboard_state.push_slots_update.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_dashboard_completion_routes_to_exact_run_owner(self):
-        """A tagged run routes to its owner even when another alias armed later."""
-        from kiro_crew.dashboard.state import StageBoundary, _ChatSlot
-        from kiro_crew.subagent import SubagentInfo
-
-        orch, mock_sm = self._setup_orch_with_subagent_mgr()
-        on_done = mock_sm.call_args[1]["on_done"]
-        parent = "dashboard:chat-1"
-        canonical = _ChatSlot("chat-1")
-        canonical.mode = "chat"
-        first = _ChatSlot("chat-1-first")
-        first.mode = "chat"
-        first.linked_session_key = parent
-        first.stage_boundary = StageBoundary(
-            stage=1,
-            generation="first-owner",
-            parent_session_keys={parent},
-            armed_at=2,
-        )
-        first._in_stage_execution = True
-        second = _ChatSlot("chat-1-second")
-        second.mode = "chat"
-        second.linked_session_key = parent
-        second.stage_boundary = StageBoundary(
-            stage=1,
-            generation="second-owner",
-            parent_session_keys={parent},
-            armed_at=1,
-        )
-        second._in_stage_execution = True
-        orch.dashboard_state._slots = {
-            canonical.key: canonical,
-            first.key: first,
-            second.key: second,
-        }
-        orch.dashboard_state.get_slot = MagicMock(return_value=canonical)
-
-        info = SubagentInfo(id="alias-agent", task="alias task", parent_session_key=parent)
-        info.done = True
-        info.result = "alias result"
-        info._stage_boundary_owner = second.stage_boundary.owner or ""
-        with patch("kiro_crew.slack.gateway._run_chat", new_callable=AsyncMock) as run_chat:
-            await on_done(info)
-            await asyncio.sleep(0)
-
-        assert not canonical._queue
-        assert not first._queue
-        assert not first._subagent_delivery_pending
-        assert len(second._queue) == 1
-        assert second._subagent_delivery_pending
-        assert second.stage_boundary.owns_entry(second._queue[0])
-        status_payload = next(
-            call.args[1]
-            for call in orch.dashboard_state.broadcast_ws.call_args_list
-            if call.args[0] == "subagent_status"
-        )
-        assert status_payload["slot"] == second.key
-        run_chat.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_retry_after_released_boundary_routes_to_live_canonical_slot(self):
-        """A retry cannot keep an owner after that exact boundary is released."""
-        from kiro_crew.dashboard.handlers.messaging import api_spawn_retry
-        from kiro_crew.dashboard.state import StageBoundary, _ChatSlot
-        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
-        from kiro_crew.subagent import SubagentInfo
-
-        orch, mock_sm = self._setup_orch_with_subagent_mgr()
-        on_done = mock_sm.call_args[1]["on_done"]
-        manager = orch.subagent_mgr
-        parent = "dashboard:chat-1"
-        canonical = _ChatSlot("chat-1")
-        canonical.mode = "chat"
-        canonical.stage_boundary = StageBoundary(
-            stage=1,
-            generation="released-owner",
-            parent_session_keys={parent},
-        )
-        canonical.stage_boundary.clear()
-        orch.dashboard_state._slots = {canonical.key: canonical}
-        orch.dashboard_state.get_slot = MagicMock(return_value=canonical)
-        orch.dashboard_state.subagents = manager
-
-        old = SubagentInfo(id="old", task="failed", parent_session_key=parent)
-        old.done = True
-        old.error = "boom"
-        old._stage_boundary_owner = "released-owner"
-        old.execution_context = ExecutionContext(
-            None, MemoryStoreRef("default"), "template", "kirocrew"
-        )
-        retry = SubagentInfo(id="retry", task="failed", parent_session_key=parent)
-        manager.get.return_value = old
-        manager.spawn.return_value = retry
-        request = MagicMock()
-        request.app = {"state": orch.dashboard_state}
-        request.match_info = {"agent_id": old.id}
-        request.get.return_value = None
-        response = await api_spawn_retry(request)
-        assert response.status == 200
-        retry._stage_boundary_owner = manager.spawn.call_args.kwargs["_stage_boundary_owner"]
-
-        canonical.stage_boundary.arm(2)
-        canonical.stage_boundary.parent_session_keys.add(parent)
-        canonical._in_stage_execution = True
-        retry.done = True
-        retry.result = "retry result"
-        with patch("kiro_crew.slack.gateway._run_chat", new_callable=AsyncMock) as run_chat:
-            await on_done(retry)
-            await asyncio.sleep(0)
-
-        assert retry._stage_boundary_owner == ""
-        assert len(canonical._queue) == 1
-        assert canonical._queue[0]["kind"] == "subagent_completion"
-        orch.dashboard_state.notify.assert_not_called()
-        run_chat.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_dashboard_slot_busy_queues(self):
@@ -4534,6 +4673,9 @@ class TestAutoApplyUpdateVenvPath:
                 "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
                 return_value="/trusted/bin/git",
             ),
+            # A completed update reloads the kiro_crew package; see
+            # _ImportlibWithoutReload for what that left the next test.
+            patch.object(gw, "importlib", _ImportlibWithoutReload()),
             patch(
                 # The interpreter-floor gate reads the pinned commit with a real
                 # `git show`; against a non-repo that read FAILS, and a failed read
@@ -5384,6 +5526,9 @@ class TestAutoApplyUpdateResetPath:
                 "kiro_crew.slack.gateway.platform_compat.trusted_git_bin",
                 return_value="/trusted/bin/git",
             ),
+            # A completed update reloads the kiro_crew package; see
+            # _ImportlibWithoutReload for what that left the next test.
+            patch.object(gw, "importlib", _ImportlibWithoutReload()),
             patch(
                 # The interpreter-floor gate reads the pinned commit with a real
                 # `git show`; against a non-repo that read FAILS, and a failed read
@@ -5518,6 +5663,200 @@ class TestAutoApplyUpdateResetPath:
         mock_build.assert_awaited()
         ds.push_update_progress.assert_any_call("building", "Building frontend…")
         ds.push_update_progress.assert_any_call("building", "Rebuilding package…")
+
+    @staticmethod
+    async def _run_git_apply(orch, *, sync=None, build=None, reset_rc=0, reset_spawn_error=None):
+        _git_fake = _git_exec_fake(status_out=b"", reset_rc=reset_rc)
+
+        async def _fake_exec(*args, **kwargs):
+            if reset_spawn_error is not None and "reset" in args:
+                raise reset_spawn_error
+            return await _git_fake(*args, **kwargs)
+
+        sync = sync or (lambda *a, **k: 0)
+        with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}):
+            with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
+                with patch("kiro_crew.dep_sync.sync_or_reinstall", side_effect=sync):
+                    with patch(
+                        "kiro_crew.slack.gateway.build_frontend_async", build or AsyncMock()
+                    ):
+                        with patch("os.execv"):
+                            with patch("shutil.which", return_value=None):
+                                await orch._auto_apply_update()
+
+    @pytest.mark.asyncio
+    async def test_the_rewrite_owns_the_bundle_gap(self):
+        """The build and the reinstall are what the stale-asset watchdog stands down for."""
+        from kiro_crew import update_ownership
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.sessions = _mock_sessions()
+        seen = []
+
+        async def _build(*_a, **_k):
+            seen.append(update_ownership.current_owner())
+
+        def _sync(*_a, **_k):
+            seen.append(update_ownership.current_owner())
+            return 0
+
+        await self._run_git_apply(orch, sync=_sync, build=_build)
+
+        assert seen == ["the git auto-update"] * 2
+        assert update_ownership.current_owner() is None
+
+    @pytest.mark.asyncio
+    async def test_the_rewrite_hands_the_gap_to_the_restart(self):
+        """No update step is still open around the restart, so its own maximum binds."""
+        from kiro_crew import update_ownership
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.sessions = _mock_sessions()
+        open_at_restart = []
+        orch._restart_after_update = AsyncMock(
+            side_effect=lambda _respawn: open_at_restart.append(list(update_ownership._live))
+        )
+
+        await self._run_git_apply(orch)
+
+        assert open_at_restart == [[]]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_sync_that_stays_up_refuses_the_watchdogs_relaunch(self):
+        """The step keeps the gateway on its loaded code; the watchdog must too."""
+        from kiro_crew import update_ownership
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.sessions = _mock_sessions()
+
+        await self._run_git_apply(orch, sync=lambda *a, **k: gw.dep_sync.REFUSED)
+
+        assert update_ownership.restart_refusal() is not None
+
+    @pytest.mark.asyncio
+    async def test_a_later_update_that_fails_before_the_reset_keeps_the_refusal(self):
+        """The unsynced tree the refusal describes is still on disk."""
+        from kiro_crew import update_ownership
+
+        update_ownership.refuse_restart("an earlier sync did not complete")
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.sessions = _mock_sessions()
+
+        await self._run_git_apply(orch, reset_rc=128)
+
+        assert update_ownership.restart_refusal() == "an earlier sync did not complete"
+
+    @pytest.mark.asyncio
+    async def test_a_later_update_that_syncs_its_tree_ends_the_refusal(self):
+        from kiro_crew import update_ownership
+
+        update_ownership.refuse_restart("an earlier sync did not complete")
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.sessions = _mock_sessions()
+        orch._restart_after_update = AsyncMock()
+
+        await self._run_git_apply(orch)
+
+        assert update_ownership.restart_refusal() is None
+        orch._restart_after_update.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_reset_that_never_spawned_records_no_refusal(self):
+        """A fork failure wrote nothing to the checkout, so nothing describes a moved tree."""
+        from kiro_crew import update_ownership
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.sessions = _mock_sessions()
+
+        await self._run_git_apply(
+            orch, reset_spawn_error=BlockingIOError(11, "Resource temporarily unavailable")
+        )
+
+        assert update_ownership.restart_refusal() is None
+
+    @pytest.mark.asyncio
+    async def test_an_update_that_raises_after_the_reset_refuses_the_relaunch(self):
+        """The tree moved and its dependencies never synced: a relaunch would die at import."""
+        from kiro_crew import update_ownership
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.sessions = _mock_sessions()
+
+        await self._run_git_apply(orch, build=AsyncMock(side_effect=RuntimeError("vite crashed")))
+
+        assert "after the tree moved" in (update_ownership.restart_refusal() or "")
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_update_never_starts_a_queued_reinstall(self, monkeypatch):
+        """Cancelling the step while pip is still queued must cancel pip too.
+
+        A shutdown cancels the update task; a reinstall that started anyway
+        would rewrite the venv while the gateway exits.
+        """
+        import concurrent.futures
+        import threading
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.sessions = _mock_sessions()
+        reinstall_queued = asyncio.Event()
+
+        class _SaturatedPool(concurrent.futures.ThreadPoolExecutor):
+            """One worker, held by the test; reports the next job it is handed."""
+
+            def submit(self, fn, /, *args, **kwargs):
+                future = super().submit(fn, *args, **kwargs)
+                if fn != busy.wait:
+                    reinstall_queued.set()  # run_in_executor submits on the loop thread
+                return future
+
+        busy = threading.Event()
+        pool = _SaturatedPool(1)
+        # The one worker is taken until the finally releases it. No timeout on
+        # purpose: a wall-clock hold could end while a slow update was still on its
+        # way to the reinstall, and the finally always releases it.
+        pool.submit(busy.wait)
+        ran = []
+
+        async def _build(*_a, **_k):
+            # From here on the reinstall goes to the saturated pool.
+            monkeypatch.setattr(gw, "subprocess_executor", lambda: pool)
+
+        # The update ahead of the reinstall makes about nine executor hops; count
+        # them (submitted and finished) so the wait below can tell slow from stuck.
+        loop = asyncio.get_running_loop()
+        hops = [0]
+        real_run_in_executor = loop.run_in_executor
+
+        def _counted(executor, func, *args):
+            hops[0] += 1
+            future = real_run_in_executor(executor, func, *args)
+            future.add_done_callback(lambda _f: hops.__setitem__(0, hops[0] + 1))
+            return future
+
+        monkeypatch.setattr(loop, "run_in_executor", _counted)
+        task = asyncio.ensure_future(
+            self._run_git_apply(orch, sync=lambda *a, **k: ran.append(1) or 0, build=_build)
+        )
+        try:
+            # The reinstall is queued behind the busy worker: cancel now.
+            await _until_set_while_progressing(
+                reinstall_queued, lambda: hops[0], "the update reaching the queued reinstall"
+            )
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await _within_lost_run(task, "the cancelled update")
+        finally:
+            busy.set()
+            pool.shutdown(wait=True)
+        assert ran == []
 
     @pytest.mark.asyncio
     async def test_uncommitted_tracked_changes_refuse_the_reset(self):
@@ -7810,7 +8149,7 @@ class TestSlackSubagentCompletionPersistence:
                 orch._init_subagents()
         return orch, mock_sm
 
-    def _make_info(self, parent_key="C123:1234567890.123456"):
+    def _make_info(self, parent_key="1234567890.123456"):
         info = MagicMock()
         info.id = "agent-persist"
         info.parent_session_key = parent_key
@@ -8014,6 +8353,29 @@ class TestSlackSubagentCompletionPersistence:
         # Exactly ONE completion persisted (2 appends: user + assistant), not 4.
         assert orch.conv_log.append.call_count == 2
 
+    @pytest.mark.asyncio
+    async def test_taskrunner_parent_injects_without_slack_post(self):
+        """A machine parent keeps the synthesized turn but is not a Slack thread."""
+        orch, mock_sm = self._setup()
+        on_done = mock_sm.call_args[1]["on_done"]
+        info = self._make_info("taskrunner:TASK_example:review")
+
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="synthesized response",
+            ),
+            patch("kiro_crew.slack.gateway.is_thread_temporary", return_value=False),
+            patch("kiro_crew.slack.gateway.is_thread_incognito", return_value=False),
+        ):
+            await on_done(info)
+
+        assert orch.conv_log.append.call_count == 2
+        orch.slack.open_dm.assert_not_awaited()
+        orch.slack.post_message.assert_not_awaited()
+        orch.slack.post_blocks.assert_not_awaited()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tests: subagent completion delivery to non-Slack channel parents
@@ -8114,6 +8476,9 @@ class TestSubagentChannelTransportDelivery:
         addressed to the session's own conversation id, never through Slack."""
         transport = self._fake_transport("telegram")
         orch, mock_sm = self._setup(parent_channel="telegram:12345", transport=transport)
+        # set_channel() persists an empty thread sentinel for non-Slack sessions;
+        # it must not turn this Telegram route into an implicit Slack mirror.
+        orch.sessions.get_thread = MagicMock(return_value="")
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("telegram:kirocrew:direct:12345")
 
@@ -8640,10 +9005,9 @@ class TestCountInFlightWork:
         finished = MagicMock()
         finished.done.return_value = True
         state._slots = {
-            "normal": SimpleNamespace(task=running, _in_stage_execution=False),
-            "remote": SimpleNamespace(task=remote, _in_stage_execution=False),
-            "finished": SimpleNamespace(task=finished, _in_stage_execution=False),
-            "stage-gap": SimpleNamespace(task=None, _in_stage_execution=True),
+            "normal": SimpleNamespace(task=running),
+            "remote": SimpleNamespace(task=remote),
+            "finished": SimpleNamespace(task=finished),
         }
         orch.dashboard_state = state
         orch._session_tasks = {}
@@ -8652,7 +9016,7 @@ class TestCountInFlightWork:
         orch._running_script_ids = set()
         orch.task_runner = None
 
-        assert orch._in_flight_work_counts() == (2, 1)
+        assert orch._in_flight_work_counts() == (2, 0)
 
     @pytest.mark.asyncio
     async def test_final_drain_collects_dashboard_and_stage_tasks(self):
@@ -8743,6 +9107,165 @@ class TestCallbackSafeUpdateRestart:
 
         assert order == ["drain:30.0", "fence", "close", "drain:None", "exec"]
         assert orch._pending_update_respawn is None
+
+    @pytest.mark.asyncio
+    async def test_a_stop_signalled_during_the_restart_is_not_swallowed(
+        self, monkeypatch, tmp_path
+    ):
+        # The installer finished before the stop reached ``_shutdown``. Exec'ing
+        # now would bring the gateway straight back up on the new version.
+        stopping = {"set": False}
+        monkeypatch.setattr(gw, "shutdown_event", SimpleNamespace(is_set=lambda: stopping["set"]))
+        orch = _make_orchestrator()
+        orch.dashboard_state = None
+        orch.sessions = SimpleNamespace(
+            inbound_callback_count=0,
+            fence_update_restart=MagicMock(return_value=True),
+            close_all=AsyncMock(),
+        )
+
+        async def drain(*, timeout):
+            if timeout is None:
+                stopping["set"] = True
+            return True
+
+        orch._drain_update_callback_work = AsyncMock(side_effect=drain)
+        monkeypatch.setattr(gw, "flush_breadcrumb_writes", lambda _timeout: None)
+        reexec = MagicMock()
+        monkeypatch.setattr(gw.platform_compat, "reexec_python_module", reexec)
+        interpreter = tmp_path / "python.exe"
+        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        gw.platform_compat.chmod_safe(interpreter, 0o700)
+
+        await orch._restart_after_update(lambda: str(interpreter))
+
+        reexec.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_restart_owns_the_bundle_gap_while_it_runs(self, monkeypatch, tmp_path):
+        """Its teardown must not be raced by the stale-asset watchdog."""
+        from kiro_crew import update_ownership
+
+        seen: list[object] = []
+        orch = _make_orchestrator()
+        orch.dashboard_state = None
+        orch.sessions = SimpleNamespace(
+            inbound_callback_count=0,
+            fence_update_restart=MagicMock(return_value=True),
+            close_all=AsyncMock(side_effect=lambda: seen.append(update_ownership.current_owner())),
+        )
+        orch._drain_update_callback_work = AsyncMock(return_value=True)
+        monkeypatch.setattr(gw, "flush_breadcrumb_writes", lambda _timeout: None)
+        monkeypatch.setattr(
+            gw.platform_compat,
+            "reexec_python_module",
+            lambda *_a, **_k: seen.append(update_ownership.current_owner()),
+        )
+        interpreter = tmp_path / "python.exe"
+        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        gw.platform_compat.chmod_safe(interpreter, 0o700)
+
+        await orch._restart_after_update(lambda: str(interpreter))
+
+        assert seen == ["the restart into an applied update"] * 2
+        assert update_ownership.current_owner() is None
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_restart_keeps_owning_the_gap(self, monkeypatch, tmp_path):
+        """The watchdog must not force the restart the update just put off."""
+        from kiro_crew import update_ownership
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = None
+        orch.sessions = SimpleNamespace(inbound_callback_count=0)
+        orch._drain_update_callback_work = AsyncMock(return_value=False)
+        monkeypatch.setattr(gw, "flush_breadcrumb_writes", lambda _timeout: None)
+        interpreter = tmp_path / "python.exe"
+        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        gw.platform_compat.chmod_safe(interpreter, 0o700)
+
+        await orch._restart_after_update(lambda: str(interpreter))
+
+        assert orch._update_apply_deferred is True
+        assert update_ownership.current_owner() == "a deferred restart into an applied update"
+
+    @pytest.mark.asyncio
+    async def test_a_retry_that_defers_again_keeps_the_first_deadline(self, monkeypatch, tmp_path):
+        """The coordinator retries every few minutes; that must not hold the watchdog off for good."""
+        from kiro_crew import update_ownership
+
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(update_ownership, "_now", lambda: clock["t"])
+        orch = _make_orchestrator()
+        orch.dashboard_state = None
+        orch.sessions = SimpleNamespace(inbound_callback_count=0)
+        orch._drain_update_callback_work = AsyncMock(return_value=False)
+        monkeypatch.setattr(gw, "flush_breadcrumb_writes", lambda _timeout: None)
+        interpreter = tmp_path / "python.exe"
+        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        gw.platform_compat.chmod_safe(interpreter, 0o700)
+
+        await orch._restart_after_update(lambda: str(interpreter))
+        clock["t"] += update_ownership.DEFERRED_RESTART_MAX_SECS - 1
+        await orch._restart_after_update(lambda: str(interpreter))
+        assert update_ownership.current_owner() == "a deferred restart into an applied update"
+        clock["t"] += 1
+
+        assert update_ownership.current_owner() is None
+
+    @pytest.mark.asyncio
+    async def test_no_usable_interpreter_leaves_the_gap_to_the_supervisor(self, tmp_path):
+        """The pruned tree took the bundle too; the watchdog's exit is what relaunches."""
+        from kiro_crew import update_ownership
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = None
+        orch.sessions = SimpleNamespace(inbound_callback_count=0)
+
+        await orch._restart_after_update(lambda: str(tmp_path / "pruned" / "python"))
+
+        assert orch._update_apply_deferred is True
+        assert update_ownership.current_owner() is None
+
+    @pytest.mark.asyncio
+    async def test_a_retry_with_no_usable_interpreter_ends_an_earlier_drain_deferral(
+        self, tmp_path
+    ):
+        """A drain deferral must not keep owning the gap once the interpreter is pruned."""
+        from kiro_crew import update_ownership
+
+        update_ownership.note_restart_deferred()  # the earlier attempt's drain deferral
+        orch = _make_orchestrator()
+        orch.dashboard_state = None
+        orch.sessions = SimpleNamespace(inbound_callback_count=0)
+
+        await orch._restart_after_update(lambda: str(tmp_path / "pruned" / "python"))
+
+        assert orch._update_apply_deferred is True
+        assert update_ownership.current_owner() is None
+
+    @pytest.mark.asyncio
+    async def test_a_committed_restart_ends_the_deferral_it_retried(self, monkeypatch, tmp_path):
+        from kiro_crew import update_ownership
+
+        update_ownership.note_restart_deferred()
+        orch = _make_orchestrator()
+        orch.dashboard_state = None
+        orch.sessions = SimpleNamespace(
+            inbound_callback_count=0,
+            fence_update_restart=MagicMock(return_value=True),
+            close_all=AsyncMock(),
+        )
+        orch._drain_update_callback_work = AsyncMock(return_value=True)
+        monkeypatch.setattr(gw, "flush_breadcrumb_writes", lambda _timeout: None)
+        monkeypatch.setattr(gw.platform_compat, "reexec_python_module", lambda *_a, **_k: None)
+        interpreter = tmp_path / "python.exe"
+        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        gw.platform_compat.chmod_safe(interpreter, 0o700)
+
+        await orch._restart_after_update(lambda: str(interpreter))
+
+        assert update_ownership.current_owner() is None
 
 
 class TestUnreadyChannelBadge:
@@ -9081,166 +9604,387 @@ class TestProviderFailureDoesNotFallBackToLegacy:
         legacy.assert_awaited_once()
 
 
-class TestWheelInstallerRejectsUnsafeCdnBase:
-    """The installer command embeds the CDN bases and is handed to a shell, and
-    KIROCREW_CDN_BASE is operator-set, so a metacharacter could append a second
-    command. `kirocrew update` already gates on this; the unattended path must too."""
+class TestWheelAutoApplyRefusals:
+    """The unattended managed-venv apply runs the one preflight, in its one order.
+
+    The policy source pin first (feed base, then artifact base), then the shape
+    of the operator-set KIROCREW_CDN_BASE. Either refusal stops the apply before
+    anything is fetched or built, and so does a promotion that would detach the
+    sandbox's AppArmor profile.
+    """
+
+    @staticmethod
+    def _wire(monkeypatch, *, safe: bool = True, blocked_base: str = "", reattach: bool = False):
+        seen: list[str] = []
+
+        def _safe() -> bool:
+            seen.append("shape")
+            return safe
+
+        def _blocked(base: str) -> str | None:
+            seen.append(f"pin:{base}")
+            return "pinned elsewhere" if base == blocked_base else None
+
+        engine = wire_wheel_apply(monkeypatch, safe=_safe, blocked=_blocked, reattach=reattach)
+        return seen, engine
 
     @pytest.mark.asyncio
-    async def test_unsafe_base_refuses_before_spawning(self, monkeypatch):
-        import kiro_crew.dashboard.handlers as handlers
+    async def test_the_source_pin_refuses_first(self, monkeypatch):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        seen, engine = self._wire(monkeypatch, blocked_base=FEED_BASE)
+
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
+
+        assert seen == [f"pin:{FEED_BASE}"]
+        engine.assert_not_called()
+        ds.push_refresh.assert_called_with("update_available")
+
+    @pytest.mark.asyncio
+    async def test_a_version_outside_the_release_grammar_refuses_before_the_pin(self, monkeypatch):
+        """The feed check admits a wider grammar than a tree name; nothing that
+        names one (the AppArmor probe, the engine) runs for such a version."""
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        seen, engine = self._wire(monkeypatch, reattach=True)
+
+        await orch._auto_apply_wheel_update("stable", "1.0-rc1")
+
+        assert seen == []
+        engine.assert_not_called()
+        ds.notify.assert_not_called()
+        ds.push_refresh.assert_called_with("update_available")
+
+    @pytest.mark.asyncio
+    async def test_the_artifact_base_is_pinned_too(self, monkeypatch):
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        seen, engine = self._wire(monkeypatch, blocked_base=ARTIFACT_BASE)
+
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
+
+        assert seen == [f"pin:{FEED_BASE}", f"pin:{ARTIFACT_BASE}"]
+        engine.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unsafe_cdn_base_refuses_after_the_pin(self, monkeypatch):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        seen, engine = self._wire(monkeypatch, safe=False)
+
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
+
+        assert seen == [f"pin:{FEED_BASE}", f"pin:{ARTIFACT_BASE}", "shape"]
+        engine.assert_not_called()
+        ds.push_refresh.assert_called_with("update_available")
+
+    @pytest.mark.asyncio
+    async def test_a_promotion_that_would_detach_the_sandbox_profile_waits_for_the_operator(
+        self, monkeypatch
+    ):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        _seen, engine = self._wire(monkeypatch, reattach=True)
+
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
+
+        engine.assert_not_called()
+        ds.notify.assert_called_once()
+        assert "kirocrew service install" in ds.notify.call_args.args[2]
+        ds.push_update_progress.assert_not_called()
+
+
+class TestWheelAutoApplyUsesTheShadowEngine:
+    """The unattended apply builds beside the live venv; it never re-runs cli.sh.
+
+    cli.sh moves the LIVE venv aside and rebuilds it in place, which a stop in
+    that window strands. The shadow engine the CLI and the approve route use
+    builds a sibling tree and flips the stable link, so the served tree is never
+    touched, and admission stays open until the restart into the new tree.
+    """
+
+    @pytest.mark.asyncio
+    async def test_applies_through_the_engine_with_admission_open_then_restarts(self, monkeypatch):
+        from kiro_crew.platform.wheel_engine import ApplyCancel, respawn_executable
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        sessions = MagicMock()
+        sessions.pause_turn_admission_for_update = AsyncMock(return_value=True)
+        orch.sessions = sessions
+        paused_during_build: list[bool] = []
+
+        def engine(**kwargs):
+            paused_during_build.append(sessions.pause_turn_admission_for_update.await_count > 0)
+            return Path("/x/crew-venv-9.9.9")
+
+        engine_mock = MagicMock(side_effect=engine)
+        wire_wheel_apply(monkeypatch, apply=engine_mock)
+        spawn = AsyncMock()
+        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+        restart = AsyncMock()
+        monkeypatch.setattr(orch, "_restart_after_update", restart)
+        monkeypatch.setattr(orch, "_finish_auto_update_apply", AsyncMock())
+        monkeypatch.setattr(orch, "_in_flight_work_counts", lambda: (0, 0))
+
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
+
+        spawn.assert_not_awaited()
+        kwargs = engine_mock.call_args.kwargs
+        assert (kwargs["channel"], kwargs["expected_version"]) == ("stable", "9.9.9")
+        assert (kwargs["feed_base"], kwargs["artifact_base"]) == (FEED_BASE, ARTIFACT_BASE)
+        assert isinstance(kwargs["cancel"], ApplyCancel)
+        assert paused_during_build == [False], "turns must keep running while the tree builds"
+        sessions.pause_turn_admission_for_update.assert_awaited_once()
+        restart.assert_awaited_once_with(respawn_executable)
+
+    @pytest.mark.asyncio
+    async def test_a_promotion_the_restart_cannot_reach_never_restarts(self, monkeypatch):
+        """A restart that would exec the running version again (the stable link
+        leads elsewhere) is never scheduled: its successor would find the same
+        update, promote and restart again, for ever, closing every session."""
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        wire_wheel_apply(monkeypatch, reaches=False)
+        restart = AsyncMock()
+        monkeypatch.setattr(orch, "_restart_after_update", restart)
+
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
+
+        restart.assert_not_awaited()
+        assert orch._pending_update_respawn is None, "no restart is left pending either"
+        ds.notify.assert_called_once()
+        assert "Re-run the installer" in ds.notify.call_args.args[2]
+
+    @pytest.mark.asyncio
+    async def test_a_mandatory_apply_keeps_its_grace_on_every_restart_retry(self, monkeypatch):
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        wire_wheel_apply(monkeypatch)
+        prepare = AsyncMock(return_value=False)  # busy: the restart is retried later
+        monkeypatch.setattr(orch, "_prepare_auto_update_apply", prepare)
+
+        await orch._auto_apply_wheel_update("stable", "9.9.9", mandatory=True, mandatory_key="k")
+        await orch._retry_pending_update_restart()  # the coordinator loop's bare retry
+
+        assert prepare.await_args_list == [
+            call(mandatory=True, mandatory_key="k"),
+            call(mandatory=True, mandatory_key="k"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_mandatory_grace_warning_fires_across_real_retries(self, monkeypatch, caplog):
+        """Two retries of a deferred mandatory restart, 601 s apart: the grace
+        warning fires, because the deferral clock is not restarted by a retry."""
+        orch = _make_orchestrator()
+        sessions = MagicMock()
+        sessions.pause_turn_admission_for_update = AsyncMock(return_value=True)
+        sessions.resume_turn_admission_after_update = AsyncMock()
+        orch.sessions = sessions
+        orch._schedule_inbound_replay = MagicMock()
+        monkeypatch.setattr(orch, "_in_flight_work_counts", lambda: (1, 0))
+        orch._pending_update_respawn = lambda: "/x/python3"
+        orch._pending_update_mandatory = True
+        orch._pending_update_mandatory_key = "floor:9.9.9"
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.slack.gateway"):
+            await orch._retry_pending_update_restart()
+            # Age the recorded deferral rather than freezing ``loop.time``: the
+            # loop clock is the one every timer on this loop waits on, so a
+            # frozen one strands any bounded await the retry path makes.
+            assert orch._mandatory_update_deferred_at is not None
+            orch._mandatory_update_deferred_at -= orch._MANDATORY_UPDATE_MAX_DEFER_SECS + 1
+            await orch._retry_pending_update_restart()
+
+        assert "remains deferred after its grace period" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_held_lock_defers_quietly(self, monkeypatch):
+        from kiro_crew.platform.wheel_engine import WheelUpdateBusy
 
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
         orch.dashboard_state = ds
-
-        handlers._update_info.clear()
-        handlers._update_info.update(
-            {
-                "remediation": {
-                    "kind": "command",
-                    "message": "Re-run the installer to upgrade.",
-                    "command": "curl x | sh",
-                }
-            }
+        wire_wheel_apply(
+            monkeypatch, apply=MagicMock(side_effect=WheelUpdateBusy("already in progress"))
         )
-        monkeypatch.setattr("kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: False)
-        spawn = AsyncMock()
-        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+        restart = AsyncMock()
+        monkeypatch.setattr(orch, "_restart_after_update", restart)
 
-        await orch._auto_apply_wheel_update()
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
 
-        spawn.assert_not_awaited()
-        ds.push_refresh.assert_called_with("update_available")
-
-
-class TestWheelApplyReadsTheCapabilityCommand:
-    """``_auto_apply_wheel_update`` must read the command the CALLER selected it with.
-
-    The caller enters this branch on ``remediation_command(info)``, and the
-    capability contract carries the installer command inside ``remediation``. A
-    method reading a separate ``update_command`` key is entered and then no-ops,
-    so a mandated update logs a warning instead of applying — and every other test
-    here hides that by mocking this method out. This one does not mock it.
-    """
+        assert orch._update_apply_deferred is True, "retried on the short cadence"
+        ds.push_update_progress.assert_not_called()
+        restart.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_the_installer_is_spawned_from_the_remediation_command(self, monkeypatch):
-        import kiro_crew.dashboard.handlers as handlers
+    async def test_a_cancelled_apply_is_retried_on_the_short_cadence(self, monkeypatch):
+        from kiro_crew.platform.wheel_engine import WheelUpdateCancelled
 
         orch = _make_orchestrator()
-        orch.dashboard_state = _mock_dashboard_state()
-
-        handlers._update_info.clear()
-        handlers._update_info.update(
-            {
-                "remediation": {
-                    "kind": "command",
-                    "message": "Re-run the installer to upgrade.",
-                    "command": "sh -c true",
-                }
-            }
-        )
-        monkeypatch.setattr("kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: True)
-        # cli.sh is POSIX shell, so the method refuses before spawning on a host
-        # with no trusted `sh` — which is every Windows runner, and is why this
-        # test pins the platform AND the shell lookup. The point under test is the
-        # command SOURCE, which is platform-independent; the refusals themselves
-        # are pinned by the two tests below.
-        monkeypatch.setattr("kiro_crew.slack.gateway.sys.platform", "linux")
-        monkeypatch.setattr("kiro_crew.platform_compat.trusted_system_bin", lambda name: "/bin/sh")
-        monkeypatch.setattr(
-            "kiro_crew.platform.update_provider._trusted_path_env",
-            lambda: {"PATH": "/usr/bin:/bin"},
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        wire_wheel_apply(
+            monkeypatch,
+            apply=MagicMock(side_effect=WheelUpdateCancelled("stopped", reason="exec")),
         )
 
-        proc = MagicMock()
-        proc.returncode = 1  # a failed install: stops before the execv restart
-        # ``None`` streams drain to empty, which is all this assertion needs; the
-        # bounded reader awaits ``wait()`` afterwards.
-        proc.stdout = None
-        proc.stderr = None
-        proc.wait = AsyncMock(return_value=1)
-        spawn = AsyncMock(return_value=proc)
-        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
 
-        await orch._auto_apply_wheel_update()
-
-        spawn.assert_awaited_once()
-        assert "sh -c true" in " ".join(str(a) for a in spawn.await_args.args)
+        assert orch._update_apply_deferred is True
+        ds.push_update_progress.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_windows_refuses_before_spawning(self, monkeypatch):
-        """The installer is POSIX shell, so Windows must not reach the spawn."""
-        import kiro_crew.dashboard.handlers as handlers
+    async def test_an_incompatible_release_is_noticed_once_and_decided_again_each_cycle(
+        self, monkeypatch
+    ):
+        from kiro_crew.platform.wheel_engine import WheelUpdateIncompatible
 
         orch = _make_orchestrator()
-        orch.dashboard_state = _mock_dashboard_state()
-
-        handlers._update_info.clear()
-        handlers._update_info.update(
-            {
-                "remediation": {
-                    "kind": "command",
-                    "message": "Re-run the installer to upgrade.",
-                    "command": "sh -c true",
-                }
-            }
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        engine = wire_wheel_apply(
+            monkeypatch,
+            apply=MagicMock(
+                side_effect=WheelUpdateIncompatible(
+                    "kirocrew 9.9.9 requires Python >= 3.99", version="9.9.9", sha256="a" * 64
+                )
+            ),
         )
-        monkeypatch.setattr("kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: True)
-        monkeypatch.setattr("kiro_crew.slack.gateway.sys.platform", "win32")
-        spawn = AsyncMock()
-        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
 
-        await orch._auto_apply_wheel_update()
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
 
-        spawn.assert_not_awaited()
+        ds.notify.assert_called_once()
+        body = ds.notify.call_args.args[2]
+        assert "requires Python >= 3.99" in body
+        assert "Re-run the installer" in body and "cli.sh" in body, body
+        assert engine.call_count == 2, "the signed metadata is checked again every cycle"
+        ds.push_update_progress.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_trusted_shell_refuses_before_spawning(self, monkeypatch):
-        """`curl … | sh` needs a trusted shell; a bare name would reopen the hole."""
-        import kiro_crew.dashboard.handlers as handlers
+    async def test_a_failed_apply_reports_redacted_and_does_not_restart(self, monkeypatch):
+        from kiro_crew.platform.wheel_engine import WheelUpdateError
 
         orch = _make_orchestrator()
-        orch.dashboard_state = _mock_dashboard_state()
-
-        handlers._update_info.clear()
-        handlers._update_info.update(
-            {
-                "remediation": {
-                    "kind": "command",
-                    "message": "Re-run the installer to upgrade.",
-                    "command": "sh -c true",
-                }
-            }
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        secret = "https://user:hunter2@bytes.example/cli"
+        wire_wheel_apply(
+            monkeypatch, apply=MagicMock(side_effect=WheelUpdateError(f"could not fetch {secret}"))
         )
-        monkeypatch.setattr("kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: True)
-        monkeypatch.setattr("kiro_crew.slack.gateway.sys.platform", "linux")
-        monkeypatch.setattr("kiro_crew.platform_compat.trusted_system_bin", lambda name: None)
-        spawn = AsyncMock()
-        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+        restart = AsyncMock()
+        monkeypatch.setattr(orch, "_restart_after_update", restart)
 
-        await orch._auto_apply_wheel_update()
+        await orch._auto_apply_wheel_update("stable", "9.9.9")
 
-        spawn.assert_not_awaited()
+        restart.assert_not_awaited()
+        step, detail = ds.push_update_progress.call_args.args
+        assert step == "failed"
+        assert "hunter2" not in detail
+        assert "kirocrew update" in detail
 
     @pytest.mark.asyncio
-    async def test_no_command_in_the_capability_does_not_spawn(self, monkeypatch):
-        import kiro_crew.dashboard.handlers as handlers
+    async def test_a_mandatory_floor_that_waits_for_the_operator_retries_soon(self, monkeypatch):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        engine = wire_wheel_apply(monkeypatch, reattach=True)
+
+        await orch._auto_apply_wheel_update("stable", "9.9.9", mandatory=True, mandatory_key="k")
+
+        engine.assert_not_called()
+        assert orch._update_apply_deferred is True, "a floor is never left for 12 h"
+        ds.notify.assert_called_once()
+
+    def test_a_stop_cancels_the_apply_in_flight_synchronously(self, monkeypatch):
+        """The signal handler's path: the cancel is set synchronously, nothing is awaited."""
+        from kiro_crew import platform_compat
+        from kiro_crew.platform import wheel_apply
+        from kiro_crew.platform.wheel_engine import ApplyCancel
+
+        cancel = ApplyCancel()
+        running = wheel_apply._Running(cancel, MagicMock())
+        monkeypatch.setattr(wheel_apply, "_IN_FLIGHT", {running})
+
+        platform_compat.cancel_wheel_applies_in_flight("shutdown")
+
+        assert cancel.is_set() and cancel.reason == "shutdown"
+
+    @pytest.mark.asyncio
+    async def test_a_pending_restart_waits_for_an_apply_in_flight_without_cancelling_it(
+        self, monkeypatch
+    ):
+        """A deferred retry at an idle tick must not kill an approved apply of a newer
+        release and exec the older promotion over it; it defers until that apply ends."""
+        from kiro_crew.platform import wheel_apply
+        from kiro_crew.platform.wheel_engine import ApplyCancel
 
         orch = _make_orchestrator()
-        orch.dashboard_state = _mock_dashboard_state()
+        sessions = MagicMock()
+        sessions.pause_turn_admission_for_update = AsyncMock(return_value=True)
+        sessions.resume_turn_admission_after_update = AsyncMock()
+        orch.sessions = sessions
+        orch._schedule_inbound_replay = MagicMock()
+        cancel = ApplyCancel()
+        monkeypatch.setattr(wheel_apply, "_IN_FLIGHT", {wheel_apply._Running(cancel, MagicMock())})
+        orch._pending_update_respawn = lambda: "/x/python3"
+        restart = AsyncMock()
+        monkeypatch.setattr(orch, "_restart_after_update", restart)
 
-        handlers._update_info.clear()
-        handlers._update_info.update({"remediation": None})
-        monkeypatch.setattr("kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: True)
-        spawn = AsyncMock()
-        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+        await orch._retry_pending_update_restart()
 
-        await orch._auto_apply_wheel_update()
+        restart.assert_not_awaited()
+        assert orch._update_apply_deferred is True
+        assert not cancel.is_set(), "the approved apply keeps building"
 
-        spawn.assert_not_awaited()
+    @pytest.mark.asyncio
+    async def test_the_shutdown_wait_never_imports_the_apply_module(self, monkeypatch):
+        """With the install tree gone the module cannot be imported; the shutdown
+        must not try, and still waits for the update coordinator."""
 
+        class _RefuseApplyModule:
+            def find_spec(self, name, path=None, target=None):
+                if name == "kiro_crew.platform.wheel_apply":
+                    raise ImportError("the install tree is gone")
+                return None
+
+        monkeypatch.delitem(sys.modules, "kiro_crew.platform.wheel_apply", raising=False)
+        monkeypatch.setattr(sys, "meta_path", [_RefuseApplyModule(), *sys.meta_path])
+        orch = _make_orchestrator()
+        task = asyncio.create_task(asyncio.sleep(10))
+        task.cancel()
+
+        await orch._settle_update_work(task)
+
+        assert task.done()
+
+    @pytest.mark.asyncio
+    async def test_an_update_restart_waits_while_another_restart_owns_the_exec(self, monkeypatch):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        ds._gateway_restart_in_progress = True
+        orch.dashboard_state = ds
+        monkeypatch.setattr(gw, "resolve_restart_launcher", lambda: None)
+        monkeypatch.setattr("kiro_crew.platform_compat.execv_target_available", lambda _path: True)
+        claimed = AsyncMock()
+        monkeypatch.setattr(orch, "_restart_after_update_claimed", claimed)
+
+        await orch._restart_after_update(lambda: "/x/python3")
+
+        claimed.assert_not_awaited()
+        assert orch._update_apply_deferred is True
+        assert ds._gateway_restart_in_progress is True, "the other restart's claim is kept"
+
+
+class TestProviderStateIsPublishedBeforeNotifying:
     """The SSE snapshot renders the update badge from _update_info["available"],
     which only the legacy check writes. A provider carries its own result, so
     notifying without publishing it left the badge reading a stale False and the
@@ -9335,10 +10079,10 @@ class TestWheelApplyReadsTheCapabilityCommand:
 
 
 class TestMandatoryUpdateOnWheelInstall:
-    """A policy min-version makes an update mandatory. On a wheel/cli.sh install
-    the gateway now auto-applies via the signed installer (cli.sh handles
-    RSA-SHA256 verification). The _auto_apply_wheel_update method is called
-    instead of merely lighting the dashboard badge."""
+    """A policy min-version makes an update mandatory. On a managed-venv install
+    the gateway applies it through the shadow engine (signed manifest, wheel
+    digest, a sibling tree promoted by symlink): _auto_apply_wheel_update is
+    called instead of merely lighting the dashboard badge."""
 
     @pytest.mark.asyncio
     async def test_mandatory_update_on_wheel_auto_applies(self, monkeypatch):
@@ -9353,7 +10097,7 @@ class TestMandatoryUpdateOnWheelInstall:
             return None
 
         # Wheel install below a policy floor with a NEWER build available: the
-        # mandatory update applies through the installer. (The no-newer-build
+        # mandatory update applies through the shadow engine. (The no-newer-build
         # case is test_mandatory_wheel_no_newer_build_notifies below — that path
         # must NOT apply, to avoid an infinite update→restart loop.)
         handlers._update_info.clear()
@@ -9374,7 +10118,7 @@ class TestMandatoryUpdateOnWheelInstall:
         monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
         monkeypatch.setattr(gov, "update_required", lambda _v: True)
         monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
-        # Only the managed venv may drive cli.sh automatically. Runtime
+        # Only the managed venv may self-update automatically. Runtime
         # ownership covers both stamped and older unstamped managed installs.
         monkeypatch.setattr(
             "kiro_crew.platform.wheel_engine.running_from_managed_venv", lambda: True

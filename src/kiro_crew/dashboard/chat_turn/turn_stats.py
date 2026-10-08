@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         _ChatSlot,
-        logger,
         turn_stats_meta,
     )
 
@@ -16,15 +15,22 @@ if TYPE_CHECKING:
 def _context_usage_payload(slot_key: str, client: Any) -> dict[str, Any]:
     """Build the ``context_usage`` WS payload: pct plus real token counts.
 
-    The token counts let the frontend show exact usage from the adapter's usage
-    update; when a served window is known, a 44%-of-200k reading is not
-    misread as 44%-of-1M.
+    The token counts let the frontend ring tooltip show "used / window" in
+    absolute tokens (sourced from the adapter's usage_update), so a 44%-of-200k
+    reading is not misread as 44%-of-1M.
 
-    A provider may know the exact used count without attesting a context-window
-    denominator. In that case the payload ships ``used_tokens`` alone; the UI
-    shows the measured count but no percentage or capacity estimate. When the
-    used count itself is unavailable the payload carries ``reset: True`` so the
-    frontend drops counts that no longer describe this session.
+    When real per-turn token counts are unavailable the payload carries
+    ``reset: True`` instead of the ``used_tokens``/``window_tokens`` pair. This
+    is load-bearing, not cosmetic: the frontend keeps the percentage and the
+    token counts in two independent slices (``slotContextPct`` vs
+    ``slotContextTokens``), so a bare ``{slot, pct}`` frame updates the
+    percentage while leaving whatever token counts the ring last stored in
+    place — a headline that disagrees with the count beside it. Emitting
+    ``reset`` whenever ``used`` is unknown — a fresh session before the first
+    ``usage_update``, or the post-compaction / post-model-switch state where the
+    provider zeroes ``used`` but keeps the window — moves the two fields
+    together: the ring drops its stored counts and the meter self-corrects on
+    the next turn's telemetry. Harmless when nothing is stored.
     """
     pct = client.context_usage_pct()
     payload: dict[str, Any] = {"slot": slot_key, "pct": round(pct, 1)}
@@ -38,17 +44,11 @@ def _context_usage_payload(slot_key: str, client: Any) -> dict[str, Any]:
     # {used: 0, window: W} would assert a false "0 / W tokens", so we omit the
     # pair and signal a reset instead.
     used = 0
-    if hasattr(client, "context_used_tokens"):
-        try:
-            raw_used = client.context_used_tokens()
-            if isinstance(raw_used, int) and not isinstance(raw_used, bool) and raw_used > 0:
-                used = raw_used
-        except Exception:
-            logger.debug("context token accessor failed", exc_info=True)
-    if used:
+    if window and hasattr(client, "context_used_tokens"):
+        used = client.context_used_tokens()
+    if window and used:
         payload["used_tokens"] = used
-        if window:
-            payload["window_tokens"] = window
+        payload["window_tokens"] = window
     else:
         payload["reset"] = True
     return payload

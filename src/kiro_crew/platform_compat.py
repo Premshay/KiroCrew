@@ -14,6 +14,7 @@ import ctypes.util
 import enum
 import errno
 import functools
+import hashlib
 import importlib
 import io
 import ipaddress
@@ -37,7 +38,7 @@ import types
 from asyncio import subprocess as aio_subprocess
 from ctypes import wintypes  # type aliases only; imports cleanly on every platform
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping, NamedTuple, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Mapping, NamedTuple, Optional, Sequence
 
 # Loaded with this module, so each owner is complete before the forwarding at the end of
 # this file is installed and before any reader can reach it (see ``_owner``).
@@ -78,6 +79,59 @@ def _ensure_utf8_process_environment() -> None:
     os.environ.update(_UTF8_PROCESS_ENV)
 
 
+#: Variables this process took out of its own environment so its descendants do
+#: not inherit them, but that its OWN exec successor must see again. Each
+#: ``reexec_*`` puts them back right before the exec.
+_KEPT_FOR_REEXEC: dict[str, str] = {}
+
+
+def keep_for_reexec(name: str, value: str) -> None:
+    """Hand *name* back to this process's exec successor, and only to it."""
+    _KEPT_FOR_REEXEC[name] = value
+
+
+def kept_for_reexec() -> dict[str, str]:
+    return dict(_KEPT_FOR_REEXEC)
+
+
+#: The one module whose work must not outlive this process image: the
+#: managed-venv update apply, whose build child would otherwise keep writing a
+#: tree after the process that supervised it is gone.
+_WHEEL_APPLY_MODULE = "kiro_crew.platform.wheel_apply"
+
+
+def cancel_wheel_applies_in_flight(reason: str) -> None:
+    """Cancel every managed-venv apply this process is running, if any can be.
+
+    Called by both exec seams and :func:`hard_exit`, and directly by a shutdown
+    that wants the apply stopped before its own teardown starts. The apply
+    module is looked up in ``sys.modules`` and never imported: no apply can be
+    in flight in a process that never loaded it, so an unloaded module costs
+    nothing, and the exit paths must not import from a tree an update may have
+    changed. Its cancel is synchronous and quick; one that raises never stops
+    the exit or exec that called this.
+    """
+    module = sys.modules.get(_WHEEL_APPLY_MODULE)
+    if module is None:
+        return
+    try:
+        module.cancel_wheel_applies(reason)
+    except Exception:
+        pass
+
+
+def hard_exit(code: int) -> None:
+    """End the process at once, after cancelling any apply, skipping teardown.
+
+    The one spelling for an ``os._exit`` that is not the gateway's own final
+    exit: the owner's ``/kirocrew restart``, the second-signal force exit. Same
+    contract as the exec seams: a managed-venv apply in flight does not outlive
+    this one.
+    """
+    cancel_wheel_applies_in_flight("exit")
+    os._exit(code)
+
+
 def _disarm_process_alarm_before_exec() -> None:
     """Cancel any pending process alarm before ``execv`` replaces this image.
 
@@ -103,9 +157,11 @@ def reexec_launcher(launcher: str, args: Sequence[str]) -> None:
     :func:`_disarm_process_alarm_before_exec`).
     """
     _ensure_utf8_process_environment()
+    os.environ.update(_KEPT_FOR_REEXEC)
     argv = [launcher, *args]
     if IS_WINDOWS:
         argv = [subprocess.list2cmdline([arg]) for arg in argv]
+    cancel_wheel_applies_in_flight("exec")
     _disarm_process_alarm_before_exec()
     os.execv(launcher, argv)
 
@@ -131,6 +187,7 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     # Windows ANSI stream or a hostile POSIX PYTHONIOENCODING and crashes on the
     # first emoji printed during boot.
     _ensure_utf8_process_environment()
+    os.environ.update(_KEPT_FOR_REEXEC)
     resolved = executable or sys.executable
     argv0 = ntpath.basename(resolved) if IS_WINDOWS else resolved
     # ``-P``: the successor inherits this process's cwd -- the home directory
@@ -139,6 +196,7 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     # there would shadow the stdlib in the restarted process.
     argv = isolated_python_argv("-P", "-m", module, *args, executable=resolved)
     argv[0] = argv0
+    cancel_wheel_applies_in_flight("exec")
     _disarm_process_alarm_before_exec()
     os.execv(resolved, argv)
 
@@ -1205,6 +1263,46 @@ def proc_phys_footprint_bytes_for_pid(pid: int) -> int | None:
     return _darwin_process_phys_footprint_bytes(pid)
 
 
+def darwin_libproc_available() -> bool:
+    """True when ``libproc`` loads, so the macOS memory and tree probes can answer."""
+    return _darwin_libproc_handle() is not None
+
+
+def darwin_footprint_tree_mb(
+    pid: int, exclude_pids: "frozenset[int] | set[int]" = frozenset()
+) -> float | None:
+    """Footprint (MiB) of *pid* plus its live descendants on macOS; None elsewhere.
+
+    The session RSS ceiling's macOS reading. Each process is measured by
+    ``phys_footprint`` (see ``_darwin_process_phys_footprint_bytes``), the figure
+    the runtime ceilings judge by. Children come from the kernel's own
+    ``proc_listchildpids`` list of a live parent, so no stale parent field can
+    attach a stranger's subtree. A pid in *exclude_pids* is skipped with its
+    subtree, and a descendant whose footprint cannot be read adds nothing.
+
+    None when the root itself cannot be read: "unknown, do not judge", the
+    contract :func:`proc_rss_tree_mb_for_pid` keeps on Windows. In-process
+    libproc calls only, one or two per process; executor thread, never the loop.
+    """
+    if not IS_MACOS:
+        return None
+    if pid in exclude_pids:
+        return 0.0
+    total = _darwin_process_phys_footprint_bytes(pid)
+    if total is None:
+        return None
+    seen = {pid}
+    frontier = [pid]
+    while frontier:
+        for child in darwin_child_pids(frontier.pop()) or ():
+            if child in seen or child in exclude_pids:
+                continue
+            seen.add(child)
+            total += _darwin_process_phys_footprint_bytes(child) or 0
+            frontier.append(child)
+    return total / (1024 * 1024)
+
+
 def _darwin_process_start_microtime(pid: int) -> str | None:
     """macOS start time of *pid* via the atomic ``proc_bsdinfo`` reader."""
     identity = _darwin_process_start_identity(pid)
@@ -1856,18 +1954,13 @@ def process_cwd(pid: int) -> str | None:
 def get_ppid(pid: int) -> int:
     """Return the parent PID of *pid*, or ``-1`` on failure.
 
-    Linux: ``/proc/<pid>/status``.
+    Linux: ``PPid:`` of ``/proc/<pid>/status``, through :func:`read_proc_status_int`.
     macOS: ``libproc.proc_pidinfo`` (no entitlement required).
     Windows: ``CreateToolhelp32Snapshot``.
     """
     if sys.platform == "linux":
-        try:
-            for ln in Path(f"/proc/{pid}/status").read_text().splitlines():
-                if ln.startswith("PPid:"):
-                    return int(ln.split()[1])
-        except Exception:
-            pass
-        return -1
+        ppid = read_proc_status_int(pid, "PPid")
+        return -1 if ppid is None else ppid
     if sys.platform == "darwin":
         try:
             path = ctypes.util.find_library("proc")
@@ -2021,22 +2114,10 @@ def get_process_start_identity(
     if pid <= 0:
         return None
     if sys.platform == "linux":
-        stat_path = (
-            Path(f"/proc/{pid}/stat") if proc_root is None else proc_root / str(pid) / "stat"
-        )
-        try:
-            stat_data = stat_path.read_text(encoding="utf-8", errors="replace")
-            close_paren = stat_data.rfind(")")
-            if close_paren < 0:
-                return None
-            fields = stat_data[close_paren + 2 :].split()
-            ppid = int(fields[1])
-            start_id = fields[19]
-            if ppid < 0 or not start_id.isdigit():
-                return None
-            return ProcessStartIdentity(start_id, ppid)
-        except (OSError, ValueError, IndexError):
+        stat = read_proc_stat(pid, proc_root=proc_root)
+        if stat is None or stat.ppid is None or stat.start_ticks is None:
             return None
+        return ProcessStartIdentity(str(stat.start_ticks), stat.ppid)
     if sys.platform == "darwin":
         return _darwin_process_start_identity(pid)
     return None
@@ -4536,8 +4617,20 @@ def descendant_termination_handles(
         raise
 
 
+#: How long :func:`terminate_process_handle` waits for a refused process object to
+#: signal when its exit code cannot settle the refusal: a process whose exit code is
+#: 259, or one that is genuinely refused. Off the event loop only. A wait that ends
+#: unsignalled keeps the refusal an error, which the drain retains and retries.
+_WINDOWS_TERMINATE_REFUSAL_WAIT_MS = 250
+
+
 def terminate_process_handle(handle: int) -> bool:
-    """Terminate the exact Windows process object referenced by *handle*."""
+    """Terminate the exact Windows process object referenced by *handle*.
+
+    Returns ``True`` when this call terminated a live process and ``False`` when
+    the process had already exited, including one whose own exit begins between
+    the liveness read and the terminate.
+    """
 
     if type(handle) is not int or handle <= 0:
         raise ValueError(f"terminate_process_handle: refusing invalid handle {handle!r}")
@@ -4551,15 +4644,45 @@ def terminate_process_handle(handle: int) -> bool:
     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
     kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
     process_handle = wintypes.HANDLE(handle)
     exit_code = wintypes.DWORD()
     still_active = 259
+    error_access_denied = 5
+    wait_object_0 = 0x00000000
     if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
         raise OSError(_windows_last_error(), "GetExitCodeProcess failed")
     if exit_code.value != still_active:
         return False
     if not kernel32.TerminateProcess(process_handle, 1):
-        raise OSError(_windows_last_error(), "TerminateProcess failed")
+        error = _windows_last_error()
+        # The kernel answers a terminate aimed at a process whose exit has begun
+        # with ERROR_ACCESS_DENIED, the same code a genuine refusal carries. A
+        # process that starts exiting between the read above and the call lands
+        # here -- a console host leaving once its last client is gone does this
+        # inside a drain. Its exit publishes the exit code, then runs the process
+        # down (from which point the terminate is refused), and only then signals
+        # the object, so the refusal can arrive while the object is unsignalled.
+        # An exit code other than STILL_ACTIVE proves the exit, since a running
+        # process always reads STILL_ACTIVE. While it still reads STILL_ACTIVE (a
+        # process whose exit code IS 259, or a live one), the signal decides,
+        # within a bounded wait -- a zero-time look on the event loop, which must
+        # never wait. A refusal the signal does not settle, including one on a
+        # handle that cannot be waited on, stays an error, as does any other
+        # error.
+        if error == error_access_denied:
+            if (
+                kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code))
+                and exit_code.value != still_active
+            ):
+                return False
+            wait_ms = (
+                0 if platform_lock_compat._on_event_loop() else _WINDOWS_TERMINATE_REFUSAL_WAIT_MS
+            )
+            if int(kernel32.WaitForSingleObject(process_handle, wait_ms)) == wait_object_0:
+                return False
+        raise OSError(error, "TerminateProcess failed")
     return True
 
 
@@ -5263,14 +5386,30 @@ def process_argv_matches_exact(pid: int, expected_argv: Sequence[str]) -> bool:
     reports the argv space-joined, so the comparison is against
     ``" ".join(expected_argv)``; exact only when no expected element contains
     a space, which holds for the argv shapes this guards (option tokens and
-    validated host/target strings). Windows: always False — the raw
-    ``Win32_Process.CommandLine`` string (see :func:`process_command_line`)
-    carries shell quoting rather than an argv vector, so element-exact
-    equality is not verifiable there; the guard fails closed and callers must
-    not signal.
+    validated host/target strings).
+
+    Windows: a process has no argv vector, only the one command-line string
+    ``CreateProcess`` was given. ``subprocess`` builds that string from a list
+    with :func:`subprocess.list2cmdline`, so the check is that the live
+    ``Win32_Process.CommandLine`` (read by :func:`process_command_line`, whose
+    only interpolated value is the int pid) equals
+    ``list2cmdline(expected_argv)`` character for character. This proves the
+    string, not the vector: two argv lists that quote to the same string are
+    indistinguishable, and a process may rewrite its own command line after
+    start. An unreadable command line (access denied, process gone, WMI
+    failure) answers False. A target launched through a ``.cmd``/``.bat`` shim
+    runs under ``cmd.exe`` with a different command line, so it never matches
+    and is never signalled.
     """
     if type(pid) is not int or pid <= 1 or not expected_argv:
         return False
+    if IS_WINDOWS:
+        try:
+            expected = subprocess.list2cmdline([str(a) for a in expected_argv])
+            actual = process_command_line(pid)
+        except Exception:
+            return False
+        return bool(actual) and actual == expected
     try:
         if sys.platform == "linux":
             raw = Path(f"/proc/{pid}/cmdline").read_bytes()
@@ -5293,6 +5432,44 @@ def process_argv_matches_exact(pid: int, expected_argv: Sequence[str]) -> bool:
     except Exception:
         return False
     return False
+
+
+def process_argv_fingerprint(pid: int) -> str | None:
+    """Return a sha256 hex fingerprint of *pid*'s live argv, or None if unreadable.
+
+    The point is ONE basis for "recorded" and "observed": the caller takes the
+    fingerprint of its own child right after spawning it, and later takes it
+    again from whatever runs at the recorded pid. Equal fingerprints mean the
+    kernel reports the same command line both times, whatever the kernel did to
+    it (a shebang ``aws`` entrypoint shows up as ``<interpreter> /path/aws ...``
+    in both reads). Comparing a stored fingerprint never depends on rebuilding
+    the command line from settings that may have changed since.
+
+    Linux: ``/proc/<pid>/cmdline`` as the NUL-separated vector. macOS: the
+    ``KERN_PROCARGS2`` vector from :func:`darwin_process_argv`, NUL-joined.
+    Windows answers None, so a Windows record keeps the exact command-line
+    check, which never matches a ``.cmd``/``.bat`` shim. An empty, unreadable or
+    unsupported argv answers None, never a fingerprint of nothing.
+    """
+    if IS_WINDOWS or type(pid) is not int or pid <= 1:
+        return None
+    try:
+        if sys.platform == "linux":
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            if raw.endswith(b"\0"):
+                raw = raw[:-1]  # trailing NUL terminator
+        elif sys.platform == "darwin":
+            argv = darwin_process_argv(pid)
+            if not argv:
+                return None
+            raw = b"\0".join(a.encode("utf-8", errors="surrogatepass") for a in argv)
+        else:
+            return None
+    except Exception:
+        return None
+    if not raw:
+        return None  # zombie / kernel thread: no argv to fingerprint
+    return hashlib.sha256(raw).hexdigest()
 
 
 def listening_pid_tool() -> str:
@@ -6122,15 +6299,10 @@ def pid_is_zombie(pid: int) -> bool | None:
     if pid <= 0:
         return None
     if sys.platform == "linux":
-        try:
-            stat_data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        stat = read_proc_stat(pid)
+        if stat is None or stat.state is None:
             return None
-        close_paren = stat_data.rfind(")")
-        fields = stat_data[close_paren + 2 :].split() if close_paren >= 0 else []
-        if not fields:
-            return None
-        return fields[0] in ("Z", "X", "x")
+        return stat.state in _LINUX_EXITED_STATES
     if sys.platform == "darwin":
         return darwin_pid_is_zombie(pid)
     return None
@@ -6184,13 +6356,10 @@ def process_start_time(pid: int) -> str | None:
       guard decline to act, never act on the wrong process.
     """
     if sys.platform == "linux":
-        try:
-            stat = Path(f"/proc/{pid}/stat").read_text()
-            # The comm field can contain spaces and parens; split after the
-            # LAST ')' so a process named "(evil) 1 2 3" cannot shift the index.
-            return stat.rsplit(")", 1)[1].split()[19]
-        except (OSError, ValueError, IndexError):
+        stat = read_proc_stat(pid)
+        if stat is None or stat.start_ticks is None:
             return None
+        return str(stat.start_ticks)
     if IS_WINDOWS:
         # Opened and closed through the shared seams so this READ and the
         # identity-pinned TERMINATE below cannot drift in how they acquire or
@@ -6318,13 +6487,7 @@ def process_thread_count(pid: int) -> int | None:
     """
     if sys.platform != "linux":
         return None
-    try:
-        for ln in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if ln.startswith("Threads:"):
-                return int(ln.split()[1])
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
+    return read_proc_status_int(pid, "Threads")
 
 
 def _file_identity(target: str | os.PathLike | os.stat_result) -> os.stat_result | None:
@@ -6404,15 +6567,8 @@ def parent_pid(pid: int) -> int | None:
     """
     if sys.platform != "linux":
         return None
-    try:
-        stat_data = Path(f"/proc/{pid}/stat").read_text()
-        # comm (field 2) may contain spaces/parens -- parse after the LAST ')'
-        close_paren = stat_data.rfind(")")
-        if close_paren < 0:
-            return None
-        return int(stat_data[close_paren + 2 :].split()[1])
-    except Exception:
-        return None
+    stat = read_proc_stat(pid)
+    return stat.ppid if stat is not None else None
 
 
 def pids_holding_file(path: str | os.PathLike | os.stat_result) -> list[int] | None:
@@ -6785,6 +6941,30 @@ def _shares_own_process_group(pid: int) -> bool:
         return False
 
 
+def kill_popen_tree(proc: subprocess.Popen[Any]) -> None:
+    """Kill a ``Popen`` child and its descendants; never raises.
+
+    The synchronous counterpart of :func:`kill_and_reap`'s kill step, for a child
+    started in its own process group (``start_new_session`` on POSIX, a new
+    process group on Windows). The group is signalled only while *proc* is
+    unreaped: its pid (also its group id) cannot be reused before ``waitpid``,
+    so the signal cannot land on an unrelated group. The direct ``kill``
+    afterwards covers a platform where the tree walk failed. That ``kill`` polls
+    first (``Popen.send_signal``), so it may reap a child that already exited:
+    the caller collects through ``Popen.wait()``/``poll()`` (which then report the
+    status) and must tolerate ``ChildProcessError`` from any lower-level wait.
+    """
+    if proc.returncode is None:
+        if IS_POSIX:
+            with contextlib.suppress(OSError, ValueError):
+                kill_process_group(proc.pid, SIGKILL)
+        else:
+            with contextlib.suppress(Exception):
+                kill_process_tree(proc.pid)
+    with contextlib.suppress(OSError):
+        proc.kill()
+
+
 async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | None = None) -> None:
     """Kill *proc* AND its descendants, then wait for it under a bound.
 
@@ -6802,7 +6982,10 @@ async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | No
     ``start_new_session``) has no tree of its own to signal — the group kill
     is skipped for it and the pid-scoped ``kill()`` below covers it, instead
     of tripping :func:`kill_process_tree`'s broadcast guard on every routine
-    timeout.
+    timeout. Likewise, a child that asyncio has already reaped
+    (``proc.returncode is not None``) is skipped: its pid may have been
+    recycled onto a different process, and the pid-scoped ``kill()`` below is
+    harmless because the handle refers to a child that has already exited.
 
     The reap goes through ``communicate()`` rather than ``wait()`` so the
     pipes are drained: ``wait_for`` already cancelled the original
@@ -6812,16 +6995,23 @@ async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | No
     and the reap are best-effort, since the caller is already handling a
     timeout or a cancellation and must not have it masked by a cleanup error.
 
-    The whole sequence runs in a shielded inner task: a (repeat) cancellation
-    of the caller landing mid-cleanup must not abandon the kill or leave the
-    child un-reaped — the cancellation is absorbed until cleanup finishes and
-    then re-delivered once.
+    The whole sequence runs in a shielded inner task (see
+    :func:`_run_cleanup_shielded`). A child whose own TERM handling matters
+    uses :func:`terminate_and_reap` instead.
     """
 
     async def _cleanup() -> None:
         # Bare-name lookup so a test can pin the probe (see
         # ``_shares_own_process_group``) without reaching into ``os``.
-        if not _shares_own_process_group(proc.pid):
+        #
+        # ``proc.returncode is None`` guards against a recycled pid: once
+        # asyncio has recorded the child's exit, the OS may hand that pid to
+        # an unrelated process (even another of our own gateway children, whose
+        # parent pid would also be ours), so a pid-addressed group SIGKILL could
+        # reach a stranger's tree. A child that has not been reaped yet still
+        # owns its pid. This is the same ``reaped=proc.returncode is not None``
+        # test ``_isolated_group_of_live_child`` / ``terminate_and_reap`` use.
+        if proc.returncode is None and not _shares_own_process_group(proc.pid):
             # Bare-name lookup resolves through this module's namespace at
             # call time, so tests patching ``kiro_crew.platform_compat.
             # kill_process_tree_async`` still intercept the tree kill.
@@ -6835,7 +7025,17 @@ async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | No
                 timeout=REAP_TIMEOUT_SECS if timeout is None else timeout,
             )
 
-    cleanup = asyncio.ensure_future(_cleanup())
+    await _run_cleanup_shielded(_cleanup())
+
+
+async def _run_cleanup_shielded(coro: Coroutine[Any, Any, None]) -> None:
+    """Run a kill-and-reap *coro* to completion even if the caller is cancelled.
+
+    A (repeat) cancellation of the caller landing mid-cleanup must not abandon
+    the kill or leave the child un-reaped: the cancellation is absorbed until
+    the cleanup finishes and then re-delivered once.
+    """
+    cleanup = asyncio.ensure_future(coro)
     cancelled = False
     while True:
         try:
@@ -6850,6 +7050,150 @@ async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | No
                 break
     if cancelled:
         raise asyncio.CancelledError
+
+
+def _isolated_group_of_live_child(pid: int, *, reaped: bool) -> int | None:
+    """The process group a child leads, or ``None`` when it cannot be signalled safely.
+
+    Read only while the caller still holds the child un-reaped (*reaped* is
+    False), so its pid cannot have been handed to another process yet, and
+    kept only for an isolated leader (``pgid == pid``, which is what
+    ``start_new_session=True`` makes it; a child is never init or the leader
+    of our own group, so that also rules both out).
+    """
+    if not IS_POSIX or type(pid) is not int or reaped:
+        return None
+    try:
+        pgid = pgroup_of(pid)
+    except (OverflowError, ValueError):
+        return None
+    return pgid if pgid == pid else None
+
+
+async def _discard_output_until_exit(proc: asyncio.subprocess.Process) -> None:
+    """Drain *proc*'s pipes to EOF, keeping nothing, then wait for it.
+
+    ``communicate()`` would buffer everything a still-running child writes in
+    this process's memory; a stopping installer can be chatty.
+    """
+
+    async def _discard(stream: asyncio.StreamReader | None) -> None:
+        if stream is None:
+            return
+        while await stream.read(65536):
+            pass
+
+    await asyncio.gather(_discard(proc.stdout), _discard(proc.stderr))
+    await proc.wait()
+
+
+async def terminate_and_reap(
+    proc: asyncio.subprocess.Process, *, grace: float, reap_timeout: float | None = None
+) -> None:
+    """Stop *proc*'s process group gracefully: SIGTERM, up to *grace*, then SIGKILL.
+
+    For a child whose own cleanup matters: an installer that moved the install
+    aside before rebuilding it restores it from a TERM trap, and the SIGKILL
+    :func:`kill_and_reap` sends first skips that trap and strands the install.
+
+    POSIX, for a live child that leads its own group (see
+    :func:`_isolated_group_of_live_child`): the group gets SIGTERM, its pipes
+    are drained (and discarded), and the GROUP is waited on until it empties or
+    *grace* runs out. Pipe EOF alone is not the end of the trap: a member that
+    holds neither pipe (``cmd >log 2>&1``, ``cmd | tee``) can still be rolling
+    back. Whatever is left then gets SIGKILL, addressed to the group id read
+    at the start, which cannot name another group while any member of this
+    one is alive. The leader is then reaped without resolving anything from
+    its pid again, bounded by *reap_timeout* (default
+    :data:`REAP_TIMEOUT_SECS`). A descendant that ``setsid()``-ed into a session
+    of its own is outside the group and is not signalled; the trap of the
+    process that started it is what stops it.
+
+    Otherwise (Windows, a child already reaped, or one that does not lead its
+    own group) this is :func:`kill_and_reap`. Shielded like it: a cancellation
+    of the caller is re-delivered after the stop has finished.
+    """
+    reap = REAP_TIMEOUT_SECS if reap_timeout is None else reap_timeout
+
+    async def _cleanup() -> None:
+        pgid = _isolated_group_of_live_child(proc.pid, reaped=proc.returncode is not None)
+        if pgid is None:
+            await kill_and_reap(proc, timeout=reap)
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + grace
+        with contextlib.suppress(Exception):
+            kill_process_group(pgid, SIGTERM)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(_discard_output_until_exit(proc), timeout=grace)
+        while pgroup_exists(pgid) and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+        if pgroup_exists(pgid):
+            with contextlib.suppress(Exception):
+                kill_process_group(pgid, SIGKILL)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(_discard_output_until_exit(proc), timeout=reap)
+
+    await _run_cleanup_shielded(_cleanup())
+
+
+def terminate_and_reap_sync(
+    proc: subprocess.Popen, *, grace: float, reap_timeout: float | None = None
+) -> None:
+    """Blocking sibling of :func:`terminate_and_reap`, for a ``Popen`` child.
+
+    Same policy: on POSIX, for a live child that leads its own group
+    (``start_new_session=True``), SIGTERM the group, wait for the GROUP to
+    empty for up to *grace* seconds, SIGKILL whatever is left (the leader by
+    pid too, should the group signal be refused), then reap the leader within
+    *reap_timeout* (default :data:`REAP_TIMEOUT_SECS`). For a child with PIPE
+    stdio use the async helper, which drains them; this one is for a child
+    writing to the caller's own terminal. Otherwise (Windows, a child already
+    reaped, or one that does not lead its own group) it is killed outright the
+    way :func:`kill_and_reap` kills: its tree, unless it shares our group.
+
+    A Ctrl-C landing mid-stop does not abandon it: KeyboardInterrupt is held
+    until the stop has finished, then re-raised once.
+    """
+    reap = REAP_TIMEOUT_SECS if reap_timeout is None else reap_timeout
+    interrupted = False
+
+    def _wait(seconds: float) -> None:
+        nonlocal interrupted
+        deadline = time.monotonic() + seconds
+        while True:
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+                return
+            except subprocess.TimeoutExpired:
+                return
+            except KeyboardInterrupt:
+                interrupted = True
+
+    pgid = _isolated_group_of_live_child(proc.pid, reaped=proc.poll() is not None)
+    if pgid is not None:
+        deadline = time.monotonic() + grace
+        with contextlib.suppress(Exception):
+            kill_process_group(pgid, SIGTERM)
+        _wait(grace)
+        while pgroup_exists(pgid) and time.monotonic() < deadline:
+            try:
+                time.sleep(0.05)
+            except KeyboardInterrupt:
+                interrupted = True
+        if pgroup_exists(pgid):
+            with contextlib.suppress(Exception):
+                kill_process_group(pgid, SIGKILL)
+    else:
+        if type(proc.pid) is int and not _shares_own_process_group(proc.pid):
+            with contextlib.suppress(Exception):
+                kill_process_tree(proc.pid, SIGKILL)
+    if proc.poll() is None:
+        with contextlib.suppress(Exception):
+            proc.kill()
+    _wait(reap)
+    if interrupted:
+        raise KeyboardInterrupt
 
 
 async def descendant_termination_handles_async(
@@ -8141,7 +8485,10 @@ def _linux_peak_rss_bytes() -> int | None:
     """
     global _LINUX_PEAK_RSS_FLOOR
     try:
-        peak = _peak_rss_from_status(_LINUX_STATUS_PATH.read_text(encoding="utf-8"))
+        # ``errors="replace"``: the ``Name:`` line is this process's raw comm.
+        peak = _peak_rss_from_status(
+            _LINUX_STATUS_PATH.read_text(encoding="utf-8", errors="replace")
+        )
     except (OSError, ValueError):
         return None
     if peak is None:
@@ -8505,9 +8852,9 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
 # ceiling would let a fix to either policy reach only one surface.
 # :func:`proc_subtree_sample` is the
 # single entry point for BOTH, and the helpers below are the per-process reads it
-# is built from -- module-private, because no caller outside this module wants a
-# single read on its own. Pure stdlib: on a host without ``/proc`` every access
-# raises ``OSError`` and each reading degrades to its own sentinel.
+# is built from -- module-private, except :func:`read_proc_stat`, the stat
+# reader for callers elsewhere. Pure stdlib: on a host without ``/proc`` every
+# access raises ``OSError`` and each reading degrades to its own sentinel.
 #
 # NOT the only way this repository walks a process tree, and deliberately so.
 # ``session_pid._build_child_map`` sums a session's tree from a full ``/proc``
@@ -8544,31 +8891,182 @@ def _proc_status_rss_kb(pid: int) -> int:
     has a Windows path: this one is the Linux subtree walk's per-process read and
     keeps ``-1`` as its "unreadable" sentinel rather than ``None``.
     """
-    try:
-        with open(f"/proc/{pid}/status", encoding="ascii") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-    return -1
+    rss_kb = read_proc_status_int(pid, "VmRSS")
+    return -1 if rss_kb is None else rss_kb
+
+
+def _stat_tokens(stat: bytes) -> "list[bytes] | None":
+    """The fields after ``comm`` in raw ``/proc/<pid>/stat`` bytes, or None.
+
+    ``comm`` is parenthesised and may contain spaces and ``)``, so the split is
+    after the LAST ``)``. It is also arbitrary bytes -- any process may name
+    itself through ``prctl(PR_SET_NAME)``, and the kernel truncates a multibyte
+    name at 15 bytes mid-character -- so the line is never decoded. Index 0 is
+    ``state`` (field 3), so field *N* is index *N - 3*. None only when the line
+    has no ``)`` at all; any other damage shows up as missing or non-numeric
+    tokens.
+    """
+    rparen = stat.rfind(b")")
+    if rparen < 0:
+        return None
+    return stat[rparen + 1 :].split()
+
+
+#: Longest stat token read as a number: a 64-bit counter has 20 digits, and the
+#: bound keeps ``int()`` clear of the interpreter's digit limit on a hostile line.
+_STAT_TOKEN_MAX_DIGITS = 20
+
+
+def _stat_token_int(tokens: "list[bytes] | None", index: int) -> "int | None":
+    """Post-``comm`` token *index* as a non-negative int, or None when absent or not digits."""
+    if tokens is None or index >= len(tokens):
+        return None
+    token = tokens[index]
+    if not token.isdigit() or len(token) > _STAT_TOKEN_MAX_DIGITS:
+        return None
+    return int(token)
 
 
 def _parse_ppid(stat: bytes) -> "int | None":
-    """The parent pid from raw ``/proc/<pid>/stat`` bytes, or None on a parse error.
+    """The parent pid (field 4) from raw ``/proc/<pid>/stat`` bytes, or None."""
+    return _stat_token_int(_stat_tokens(stat), 1)
 
-    Splits after the final ``)`` for the same reason :func:`_parse_cpu_jiffies`
-    does: ``comm`` may contain spaces and parens. ppid is field 4 (1-indexed),
-    index 1 of the post-comm tokens.
+
+class ProcStat(NamedTuple):
+    """Fields of one ``/proc/<pid>/stat`` line.
+
+    Each is None on its own when its token is missing or not a number, which no
+    line the kernel writes produces; a fixture or a truncated read can.
+    ``ProcStat()`` is the reading with every field unknown.
     """
-    try:
-        rparen = stat.rindex(b")")
-        return int(stat[rparen + 2 :].split()[1])
-    except (ValueError, IndexError):
+
+    state: str | None = None
+    ppid: int | None = None
+    pgrp: int | None = None
+    session: int | None = None
+    start_ticks: int | None = None
+    rss_pages: int | None = None
+
+
+def _linux_proc_root(proc_root: "Path | None") -> "Path | None":
+    """*proc_root* when a fixture process table is given, else ``/proc`` on Linux.
+
+    None off Linux with no fixture: the ``/proc`` readers then answer "unknown".
+    """
+    if proc_root is not None:
+        return proc_root
+    return Path("/proc") if IS_LINUX else None
+
+
+def read_proc_stat(pid: int, *, proc_root: "Path | None" = None) -> "ProcStat | None":
+    """*pid*'s ``/proc/<pid>/stat`` from ONE bytes read, or None. Linux only.
+
+    The stat reader new code uses. It never decodes ``comm`` (see :func:`_stat_tokens`): a
+    text read raises ``UnicodeDecodeError`` on a process whose name is not
+    UTF-8, which an ``except OSError`` does not catch. Every field comes from the
+    same read, so a caller needing several never mixes two processes behind a
+    recycled pid. ``start_ticks`` is in clock ticks since boot;
+    :func:`process_age_secs` turns it into an age. ``rss_pages`` is in pages of
+    ``SC_PAGE_SIZE``.
+
+    None when the file cannot be read (gone, permission, no ``/proc``) or the
+    line has no ``)``; otherwise a :class:`ProcStat` whose fields may each be
+    None. *proc_root* substitutes a fixture process table on every host.
+    """
+    proc_root = _linux_proc_root(proc_root)
+    if proc_root is None:
         return None
+    try:
+        raw = (proc_root / str(pid) / "stat").read_bytes()
+    except OSError:
+        return None
+    tokens = _stat_tokens(raw)
+    if tokens is None:
+        return None
+    return ProcStat(
+        state=tokens[0].decode("ascii", "replace") if tokens else None,
+        ppid=_stat_token_int(tokens, 1),
+        pgrp=_stat_token_int(tokens, 2),
+        session=_stat_token_int(tokens, 3),
+        start_ticks=_stat_token_int(tokens, 19),
+        rss_pages=_stat_token_int(tokens, 21),
+    )
 
 
-def proc_child_map() -> "dict[int, list[int]] | None":
+#: ``stat`` states of a process that has finished running: a zombie, or one
+#: being torn down (``X``; older kernels print ``x``).
+_LINUX_EXITED_STATES = frozenset({"Z", "X", "x"})
+
+
+def linux_pgroup_members(
+    pgid: int, *, proc_root: "Path | None" = None
+) -> "dict[int, int | None] | None":
+    """``{pid: start_ticks}`` for every RUNNING member of process group *pgid*. Linux only.
+
+    The Linux counterpart of :func:`darwin_pgroup_members`: one pass over
+    ``/proc``, each ``stat`` read as bytes with ``comm`` never decoded, so a
+    member whose name is not UTF-8 is still a member. A process that has
+    finished running (``Z``/``X``) does not hold the group open and is left
+    out. The start ticks come from the SAME read as the group and state, so a
+    caller pinning a later signal to them never pairs a recycled pid with the
+    member it admitted; a member whose start cannot be read maps to None.
+
+    None -- off Linux, and when ``/proc`` cannot be listed -- means "unknown",
+    never "empty". *proc_root* substitutes a fixture process table on every host.
+    """
+    proc_root = _linux_proc_root(proc_root)
+    if proc_root is None:
+        return None
+    try:
+        names = os.listdir(proc_root)
+    except OSError:
+        logger.debug("linux_pgroup_members: cannot list %s", proc_root, exc_info=True)
+        return None
+    members: dict[int, int | None] = {}
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"{proc_root}/{name}/stat", "rb") as fh:
+                tokens = _stat_tokens(fh.read())
+        except OSError:
+            continue  # exited between the listing and the read
+        if (
+            tokens
+            and _stat_token_int(tokens, 2) == pgid
+            and tokens[0].decode("ascii", "replace") not in _LINUX_EXITED_STATES
+        ):
+            members[int(name)] = _stat_token_int(tokens, 19)
+    return members
+
+
+def read_proc_status_int(pid: int, label: str, *, proc_root: "Path | None" = None) -> "int | None":
+    """The first number on *label*'s line of ``/proc/<pid>/status``, or None. Linux only.
+
+    ``PPid``, ``Threads`` and ``VmRSS`` (in KiB) are the labels callers read.
+    ONE bytes read, never decoded as a whole: the ``Name:`` line is the raw
+    comm, so a strict text read raises ``UnicodeDecodeError`` on a process whose
+    name is not UTF-8 -- and a strict ASCII read on any non-ASCII name, even a
+    valid UTF-8 one. None when the file is unreadable, the label is absent, or
+    its value is not a number. *proc_root* substitutes a fixture process table
+    on every host.
+    """
+    proc_root = _linux_proc_root(proc_root)
+    if proc_root is None:
+        return None
+    prefix = label.encode("ascii") + b":"
+    try:
+        with open(f"{proc_root}/{pid}/status", "rb") as fh:
+            for line in fh:
+                if line.startswith(prefix):
+                    value = line[len(prefix) :].split()
+                    return _stat_token_int(value, 0)
+    except OSError:
+        return None
+    return None
+
+
+def proc_child_map(*, proc_root: "Path | None" = None) -> "dict[int, list[int]] | None":
     """Every live process's children, from ONE pass over ``/proc``. Linux only.
 
     For the caller that needs the subtrees of MANY roots at once. Asking the
@@ -8601,28 +9099,39 @@ def proc_child_map() -> "dict[int, list[int]] | None":
       browser poll. ``_get_rss_tree_mb``'s own note records the same choice for
       the same reason: the Linux branch reads ``/proc`` directly and never
       spawns.
-    * :func:`parent_pid` parses one pid's ppid out of the same ``stat`` line, but
-      through ``read_text``, so a process whose ``comm`` is not valid UTF-8 --
-      any process may set its own name to arbitrary bytes with
-      ``prctl(PR_SET_NAME)`` -- raises and is reported as unknown. In a map that
-      would drop that process AND every descendant behind it from a caller's
-      tree, silently. :func:`_parse_ppid` reads bytes, so it answers. The
-      difference is pinned by a test.
+    * :func:`parent_pid` answers the same question for one pid through
+      :func:`read_proc_stat`, which parses every field of the line. This pass
+      needs only the ppid of every process on the host, so it parses that one
+      field with :func:`_parse_ppid`. Both read the file as bytes: a process
+      whose ``comm`` is not valid UTF-8 -- any process may set its own name to
+      arbitrary bytes with ``prctl(PR_SET_NAME)`` -- answers through either,
+      and one test pins both.
+
+    *proc_root* substitutes a fixture process table and is honoured on every
+    host, as :func:`read_proc_stat` does.
+
+    Windows deliberately has NO branch here: Toolhelp's ``th32ParentProcessID``
+    is never cleared when a parent exits and Windows recycles PIDs aggressively,
+    so a raw Toolhelp parent map can attach an unrelated subtree to a recycled
+    PID. A Windows caller walks a lineage-validated route instead
+    (:func:`proc_rss_tree_mb_for_pid`).
 
     Blocking: one read per process on the host. Executor thread, never the loop.
     """
-    if not IS_LINUX:
+    proc_root = _linux_proc_root(proc_root)
+    if proc_root is None:
         return None
     try:
-        names = os.listdir("/proc")
+        names = os.listdir(proc_root)
     except OSError:
+        logger.debug("proc_child_map: cannot list %s", proc_root, exc_info=True)
         return None
     children: dict[int, list[int]] = {}
     for name in names:
         if not name.isdigit():
             continue
         try:
-            with open(f"/proc/{name}/stat", "rb") as fh:
+            with open(f"{proc_root}/{name}/stat", "rb") as fh:
                 raw = fh.read()
         except OSError:
             # Exited between the listing and the open: it is in no live tree.
@@ -8677,12 +9186,11 @@ def _parse_cpu_jiffies(stat: bytes) -> int:
     handled. utime/stime are fields 14/15 (1-indexed) → indices 11/12 of the
     post-comm tokens. Returns 0 on any parse error.
     """
-    try:
-        rparen = stat.rindex(b")")
-        fields = stat[rparen + 2 :].split()
-        return int(fields[11]) + int(fields[12])
-    except (ValueError, IndexError):
+    tokens = _stat_tokens(stat)
+    utime, stime = _stat_token_int(tokens, 11), _stat_token_int(tokens, 12)
+    if utime is None or stime is None:
         return 0
+    return utime + stime
 
 
 def _proc_cpu_jiffies(pid: int) -> int:
@@ -9434,6 +9942,40 @@ def boottime_now() -> float | None:
         return None
 
 
+def process_start_boot_secs(starttime_ticks: float) -> float | None:
+    """A process's ``starttime`` ticks as seconds on the :func:`boottime_now` clock.
+
+    None when the tick rate cannot be read — including on a platform with no
+    ``os.sysconf`` at all (Windows raises AttributeError, not OSError), where
+    there is no ``/proc`` to date processes against either. Callers read None as
+    "cannot attribute", never as a time.
+    """
+    try:
+        hz = os.sysconf("SC_CLK_TCK")
+    except (AttributeError, OSError, ValueError):
+        return None
+    if hz <= 0:
+        return None
+    return starttime_ticks / hz
+
+
+def process_age_secs(starttime_ticks: int, *, now: float | None = None) -> float | None:
+    """Age of a process whose stat ``starttime`` is *starttime_ticks*, or None.
+
+    ``boottime_now() - process_start_boot_secs(ticks)``, floored at 0: both are
+    on the suspend-inclusive clock ``starttime`` counts on. *now* replaces the
+    ``boottime_now()`` reading, for a fixture process table that carries its
+    own ``uptime``. None when either side cannot be read, which callers read as
+    "age unknown".
+    """
+    started = process_start_boot_secs(starttime_ticks)
+    if now is None:
+        now = boottime_now()
+    if started is None or now is None:
+        return None
+    return max(0.0, now - started)
+
+
 # ---------------------------------------------------------------------------
 # strftime portability
 # ---------------------------------------------------------------------------
@@ -10059,6 +10601,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "acquire_lock",
         "release_lock",
         "try_acquire_lock",
+        "try_acquire_lock_or_raise",
         "probe_file_persistence",
         "tempfile",
     ),
@@ -10191,6 +10734,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         release_lock,
         tempfile,
         try_acquire_lock,
+        try_acquire_lock_or_raise,
     )
     from kiro_crew.platform_owner_compat import (  # noqa: F401
         _OWNER_RIGHTS_SID,

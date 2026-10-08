@@ -15,7 +15,7 @@ import time
 import urllib.request
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, Literal, NamedTuple, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.acp.types import JSONRPC_METHOD_NOT_FOUND
@@ -25,6 +25,12 @@ from kiro_crew.install_liveness import (
     INSTALL_PRUNED_EXIT_CODE,
     install_pruned,
     respawned_by_pool,
+)
+from kiro_crew.json_line import (
+    ID_PROBE_BYTES,
+    parse_json_object_line,
+    recover_line_id,
+    recover_top_level_id,
 )
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_caller import (
@@ -42,6 +48,11 @@ from kiro_crew.sel import sel
 from kiro_crew.session_directive import neutralize_markers
 from kiro_crew.session_token_sig import session_key_from_env_token
 from kiro_crew.validation import (
+    JSONRPC_INTERNAL_ERROR,
+    JSONRPC_INVALID_PARAMS,
+    JSONRPC_INVALID_REQUEST,
+    JSONRPC_PARSE_ERROR,
+    JsonRpcEnvelopeError,
     ValidationError,
     build_tool_response,
     validate_jsonrpc_request,
@@ -88,6 +99,10 @@ PENDING_CALLS_MAX = 32
 # process; retaining them in an unbounded set leaks one entry per cancel. Once
 # this cap is reached the oldest ids are evicted FIFO.
 CANCELLED_IDS_MAX = 1024
+
+MAX_CONTENT_LENGTH_BYTES = 64 * 1024 * 1024
+_MAX_DRAINABLE_LENGTH_BYTES = 16 * MAX_CONTENT_LENGTH_BYTES
+_DRAIN_CHUNK_BYTES = 1024 * 1024
 
 
 def _evict_oldest_evictable(
@@ -183,8 +198,17 @@ class ToolCancelled(Exception):
     pass
 
 
-# Module-level flag: set True once we detect Content-Length framing from client.
-_use_content_length = False
+_framing: Literal["bare", "content-length"] | None = None
+
+
+class _Skipped:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "SKIP"
+
+
+SKIP = _Skipped()
 
 # ── Private stdout descriptor for JSON-RPC responses ───────────────────────
 # The vendored llama-cpp runtime wraps its multi-second GGUF model load in
@@ -1069,7 +1093,7 @@ def respond(req_id: Any, result: Any, error: dict | None = None) -> None:
             "error": {"code": -32603, "message": "Internal error"},
         }
     body = json.dumps(resp)
-    if _use_content_length:
+    if _framing == "content-length":
         payload = body.encode("utf-8")
         frame = f"Content-Length: {len(payload)}\r\n\r\n".encode("utf-8") + payload
     else:
@@ -1108,7 +1132,7 @@ def respond(req_id: Any, result: Any, error: dict | None = None) -> None:
                         exc.__class__.__name__,
                     )
                     return
-    if _use_content_length:
+    if _framing == "content-length":
         sys.stdout.buffer.write(frame)
         sys.stdout.buffer.flush()
     else:
@@ -1194,63 +1218,114 @@ def call_tool_with_logging(
     return result
 
 
-def _read_message(stdin) -> dict[str, Any] | None:
-    """Read one JSON-RPC message, auto-detecting Content-Length vs bare JSON framing.
-
-    Uses stdin.buffer (binary mode) for all reads so that Content-Length byte
-    counts are honoured correctly for multi-byte UTF-8 content.
-    """
-    global _use_content_length
-    # select() observes the fd, not BufferedReader's prefetched next frame.
-    # Reading ahead here can strand another session's call until a new write.
-    raw = getattr(stdin.buffer, "raw", stdin.buffer)
+def _read_message(stdin) -> dict[str, Any] | _Skipped | None:
+    """Read one bounded JSON-RPC frame, returning ``SKIP`` for a dropped frame."""
+    global _framing
+    raw = stdin.buffer
+    line = raw.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if stripped[:15].lower() != b"content-length:":
+        msg = parse_json_object_line(line)
+        if msg is None:
+            _answer_unparseable(line)
+            return SKIP
+        _framing = _framing or "bare"
+        return msg
+    if _framing == "bare":
+        return SKIP
+    try:
+        length = int(stripped[15:])
+    except ValueError:
+        length = -1
+    if length < 0:
+        logger.error(
+            "unreadable Content-Length header %r; the framing is lost, ending the stream",
+            stripped[:80],
+        )
+        return None
+    if length > _MAX_DRAINABLE_LENGTH_BYTES:
+        logger.error(
+            "Content-Length %d is past any drainable size; the framing is lost, ending the stream",
+            length,
+        )
+        return None
+    _framing = "content-length"
     while True:
-        line = raw.readline()
-        if not line:
-            return None  # EOF
-        line_str = line.decode("utf-8").strip()
-        if not line_str:
+        sep = raw.readline()
+        if sep.strip() == b"":
+            break
+    keep = length <= MAX_CONTENT_LENGTH_BYTES
+    chunks: list[bytes] = []
+    head = tail = b""
+    remaining = length
+    while remaining > 0:
+        chunk = raw.read(min(remaining, _DRAIN_CHUNK_BYTES))
+        if not chunk:
+            return None
+        remaining -= len(chunk)
+        if keep:
+            chunks.append(chunk)
             continue
-        if line_str.lower().startswith("content-length:"):
-            try:
-                length = int(line_str.split(":", 1)[1].strip())
-                _use_content_length = True
-                # Consume the blank line separator
-                while True:
-                    sep = raw.readline()
-                    if sep.strip() == b"":
-                        break
-                # Read exactly `length` bytes. A single raw.read(length) may
-                # return fewer bytes than requested on a partial read (the
-                # RawIOBase/socket contract permits short reads), which would
-                # truncate the body, fail json.loads, and desync the stream for
-                # every subsequent message. Loop until we have the full body or
-                # hit EOF. (io.BufferedReader blocks for the full count today, so
-                # this is robustness hardening for non-buffered/custom streams.)
-                chunks: list[bytes] = []
-                remaining = length
-                while remaining > 0:
-                    chunk = raw.read(remaining)
-                    if not chunk:
-                        break  # EOF before the full body arrived
-                    chunks.append(chunk)
-                    remaining -= len(chunk)
-                if remaining > 0:
-                    # EOF before the declared body fully arrived — the message is
-                    # incomplete. Discard it explicitly rather than handing a truncated
-                    # body to json.loads, which could otherwise return a message the
-                    # sender never finished transmitting if the partial bytes happen to
-                    # be valid JSON (e.g. a well-formed prefix).
-                    continue
-                body = b"".join(chunks)
-                return json.loads(body.decode("utf-8"))
-            except ValueError:
-                continue
-        # Bare JSON line (backwards compat)
+        if len(head) < ID_PROBE_BYTES:
+            head += chunk[: ID_PROBE_BYTES - len(head)]
+        tail = (tail + chunk[-ID_PROBE_BYTES:])[-ID_PROBE_BYTES:]
+    if not keep:
+        req_id = recover_top_level_id(head, tail, requests_only=True)
+        logger.warning(
+            "Content-Length %d is over the %d-byte cap; body discarded (id %r)",
+            length,
+            MAX_CONTENT_LENGTH_BYTES,
+            req_id,
+        )
+        if req_id is not None:
+            respond(
+                req_id,
+                None,
+                error={
+                    "code": JSONRPC_INVALID_REQUEST,
+                    "message": f"Request over the {MAX_CONTENT_LENGTH_BYTES}-byte limit",
+                },
+            )
+        return SKIP
+    body = b"".join(chunks)
+    msg = parse_json_object_line(body)
+    if msg is None:
+        _answer_unparseable(body)
+        return SKIP
+    return msg
+
+
+def _answer_unparseable(frame: bytes) -> None:
+    if not frame.lstrip().startswith(b"{"):
+        return
+    req_id = recover_line_id(frame, requests_only=True)
+    logger.warning("unparseable JSON-RPC frame dropped (id %r)", req_id)
+    if req_id is not None:
+        respond(req_id, None, error={"code": JSONRPC_PARSE_ERROR, "message": "Parse error"})
+
+
+def _stdin_holds_a_line(stdin) -> bool:
+    raw: Any = getattr(stdin, "buffer", None)
+    peek = getattr(raw, "peek", None)
+    if peek is None:
+        return False
+    try:
+        fd = raw.fileno()
+        was_blocking = os.get_blocking(fd)
+    except (AttributeError, OSError, ValueError):
+        return False
+    try:
+        os.set_blocking(fd, False)
         try:
-            return json.loads(line_str)
-        except json.JSONDecodeError:
-            continue
+            held = peek(1)
+        except (BlockingIOError, OSError, ValueError):
+            return False
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            os.set_blocking(fd, was_blocking)
+    return b"\n" in held
 
 
 def _hard_exit_on_signal(_signum: int, _frame: Any) -> None:
@@ -1624,6 +1699,52 @@ def _run_stdio_dispatch_loop(
             )
             respond(queued_id, None, error=error)
 
+    def _refuse_tool_call(req_id: Any, caller_key: str, detail: str) -> None:
+        try:
+            sel().log_api_access(
+                caller=caller_key or _ambient_audit_session(),
+                operation="tool_call.invalid_params",
+                outcome="rejected",
+                source="mcp",
+                resources=f"server={server_name},{detail}",
+            )
+        except Exception as sel_exc:
+            logger.warning("SEL audit failed for a refused tool call: %s", sel_exc)
+        if req_id is not None:
+            respond(
+                req_id,
+                None,
+                error={
+                    "code": JSONRPC_INVALID_PARAMS,
+                    "message": "Invalid params: tools/call takes an object params "
+                    "with a non-empty string name",
+                },
+            )
+
+    def _servable(req: object) -> tuple[str, Any, dict[str, Any]] | None:
+        try:
+            method, req_id, params = validate_jsonrpc_request(req)  # type: ignore[arg-type]
+        except JsonRpcEnvelopeError as exc:
+            if exc.method == "tools/call" and exc.invalid_params:
+                raw_params = req.get("params") if isinstance(req, dict) else None
+                _refuse_tool_call(exc.req_id, "", f"params_type={type(raw_params).__name__}")
+            elif exc.req_id is not None:
+                code = JSONRPC_INVALID_PARAMS if exc.invalid_params else JSONRPC_INVALID_REQUEST
+                respond(exc.req_id, None, error={"code": code, "message": f"Invalid {exc}"})
+            return None
+        except ValidationError:
+            return None
+        name = params.get("name")
+        if method == "tools/call" and (not isinstance(name, str) or not name):
+            caller = CallerContext.from_meta(params.get("_meta"))
+            _refuse_tool_call(
+                req_id,
+                caller.session_key if caller is not None else "",
+                f"name_type={type(name).__name__}",
+            )
+            return None
+        return method, req_id, params
+
     while True:
         for key, work in list(_active.items()):
             if not work.ready.is_set():
@@ -1643,7 +1764,7 @@ def _run_stdio_dispatch_loop(
         if req is not None:
             _pending_calls.remove(req)
         else:
-            if _active:
+            if _active and not _stdin_holds_a_line(sys.stdin):
                 readable, _, _ = select.select([sys.stdin], [], [], 0.1)
                 if not readable:
                     continue
@@ -1658,10 +1779,10 @@ def _run_stdio_dispatch_loop(
                         work.thread.join(timeout=max(0.0, deadline - time.monotonic()))
                 break
 
-        try:
-            method, req_id, _params = validate_jsonrpc_request(req)
-        except ValidationError:
+        servable = _servable(req)
+        if servable is None:
             continue
+        method, req_id, _params = servable
 
         if method == "initialize":
             _caps: dict[str, Any] = {"tools": {"listChanged": False}}
@@ -1688,8 +1809,7 @@ def _run_stdio_dispatch_loop(
             pass
         elif method == "notifications/cancelled":
             # Record queued cancellations and signal only the matching worker.
-            params = req.get("params", {})
-            cancelled_rid = params.get("requestId")
+            cancelled_rid = _params.get("requestId")
             if cancelled_rid is not None:
                 _remember_cancelled_id(
                     _cancelled_ids,
@@ -1700,7 +1820,17 @@ def _run_stdio_dispatch_loop(
                 if work := _active.get(str(cancelled_rid)):
                     work.cancel.set()
         elif method == "tools/list":
-            respond(req_id, {"tools": _listable_tools(_req_caller(req))})
+            try:
+                tools = _listable_tools(_req_caller(req))
+            except Exception:
+                logger.exception("tools/list dispatch failed")
+                respond(
+                    req_id,
+                    None,
+                    error={"code": JSONRPC_INTERNAL_ERROR, "message": "Internal error"},
+                )
+            else:
+                respond(req_id, {"tools": tools})
         elif method == "ping":
             respond(req_id, {})
         elif method == "tools/call":
@@ -1723,7 +1853,7 @@ def _run_stdio_dispatch_loop(
                 else:
                     _pending_calls.append(req)
                 continue
-            params = req.get("params", {})
+            params = _params
             tool_name = params.get("name", "")
             tool_args = params.get("arguments", {})
             if not isinstance(tool_args, dict):
@@ -1917,12 +2047,13 @@ def _run_stdio_dispatch_loop(
                 else:
                     _refusal = (
                         f"Error: tool '{tool_name}' is unavailable because this "
-                        f"session's tool policy could not be read "
-                        f"({_policy.unresolved}): the gateway found an agent spec it "
-                        f"could not parse, or a managedToolPolicy of the wrong "
-                        f"shape. Refusing the call rather than ignoring an "
-                        f"operator's exclusion list; fix or remove the unreadable "
-                        f"spec in the agents directory."
+                        f"session's tool policy could not be read ({_policy.unresolved}): "
+                        f"the gateway answered. This is not a connection problem and "
+                        f"a restart will not clear it. An agent spec could not be read or "
+                        f"parsed, two specs declare the same name, or managedToolPolicy "
+                        f"has the wrong shape. Refusing the call rather than ignoring an "
+                        f"operator's exclusion list; fix or remove the unreadable spec in "
+                        f"the agents directory."
                     )
                     # The gateway's 409 body names the file and what to do with
                     # it; without that line the operator has to validate every
@@ -2008,7 +2139,22 @@ def _run_stdio_dispatch_loop(
                     ),
                     daemon=True,
                 )
-                work.thread.start()
+                try:
+                    work.thread.start()
+                except Exception:
+                    _active.pop(str(req_id), None)
+                    work.thread = None
+                    _sel_audit(
+                        "failed",
+                        tool_name,
+                        req_id,
+                        _caller_ctx.session_key if _caller_ctx else "",
+                    )
+                    respond(
+                        req_id,
+                        None,
+                        error={"code": JSONRPC_INTERNAL_ERROR, "message": "Internal error"},
+                    )
         elif req_id is not None:
             respond(
                 req_id,

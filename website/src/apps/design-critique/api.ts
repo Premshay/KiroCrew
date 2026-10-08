@@ -8,6 +8,7 @@ import type {
   SlotData,
 } from "./types";
 import type { KiroCrewAgent } from "../../components/AgentSelector";
+import { DEFAULT_AGENT } from "./constants";
 
 export interface AgentList {
   agents: KiroCrewAgent[];
@@ -185,8 +186,10 @@ export const designCritiqueApi = {
 
   // Fire a message at a slot. The response body is not JSON we care about, so a
   // parse error is swallowed — only a real HTTP/network error propagates.
-  send: (slotKey: string, agent: string, message: string): Promise<void> =>
-    jsonFetch<void>("/api/chat", {
+  send: (slotKey: string, agentOrMessage: string, maybeMessage?: string): Promise<void> => {
+    const agent = maybeMessage === undefined ? DEFAULT_AGENT : agentOrMessage;
+    const message = maybeMessage === undefined ? agentOrMessage : maybeMessage;
+    return jsonFetch<void>("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // memory_mode AND mode must be repeated here, not only at slot creation.
@@ -208,7 +211,8 @@ export const designCritiqueApi = {
     }).catch((e: unknown) => {
       if (e instanceof SyntaxError) return;
       throw e;
-    }),
+    });
+  },
 
   deleteSlot: (slotKey: string): Promise<void> =>
     jsonFetch<void>("/api/chat/slots/" + encodeURIComponent(slotKey), {

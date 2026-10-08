@@ -39,6 +39,18 @@ from kiro_crew.artifact_store.rules import normalize_tag as _normalize_artifact_
 # no native library is loaded on any platform. Aliased so the schema block below
 # reads as "the computer-use vocabulary" rather than bare names.
 from kiro_crew.computer_use import types as _cu_types
+from kiro_crew.checkpoint_contract import (
+    SESSION_CHECKPOINT_ATTENTION_KEY_MAX,
+    SESSION_CHECKPOINT_GOAL_MAX,
+    SESSION_CHECKPOINT_MAIN_ITEM_MAX,
+    SESSION_CHECKPOINT_MAIN_ITEMS_MAX,
+    SESSION_CHECKPOINT_MILESTONE_MAX,
+    SESSION_CHECKPOINT_NEXT_ACTION_MAX,
+    SESSION_CHECKPOINT_PROGRESS_LABEL_MAX,
+    SESSION_CHECKPOINT_SUMMARY_MAX,
+    SESSION_CHECKPOINT_TRAIL_MAX,
+    SESSION_RESTART_CONTINUATION_MAX,
+)
 from kiro_crew.config.sections import SUBAGENT_MAX_TURNS_CEILING
 from kiro_crew.constants import (
     ARTIFACT_MAX_CONTENT_BYTES,
@@ -156,17 +168,6 @@ MAX_ACP_SESSION_ID_LEN = 128
 # than the validated surfaces.
 MAX_CRON_MESSAGE = 50_000
 MAX_RESPONSE_LEN = 100_000  # truncate tool responses
-
-SESSION_CHECKPOINT_SUMMARY_MAX = 360
-SESSION_CHECKPOINT_GOAL_MAX = 240
-SESSION_CHECKPOINT_NEXT_ACTION_MAX = 160
-SESSION_CHECKPOINT_MAIN_ITEMS_MAX = 4
-SESSION_CHECKPOINT_MAIN_ITEM_MAX = 160
-SESSION_CHECKPOINT_MILESTONE_MAX = 220
-SESSION_CHECKPOINT_TRAIL_MAX = 7
-SESSION_CHECKPOINT_PROGRESS_LABEL_MAX = 160
-SESSION_CHECKPOINT_ATTENTION_KEY_MAX = 120
-SESSION_RESTART_CONTINUATION_MAX = 2_000
 
 # Allowed categories for lessons
 ALLOWED_LESSON_CATEGORIES = frozenset({"tool", "preference", "knowledge"})
@@ -478,6 +479,19 @@ class ValidationError(Exception):
 #: here would silently attribute the sanitizer's removals to the truncation. Kept
 #: short so it costs almost none of the field's budget.
 _CLAMP_NOTE = " [... truncated, dropped {n} chars]"
+
+#: Reads :data:`_CLAMP_NOTE` back off a clamped value. Derived from that
+#: constant so the stamp and its reader cannot drift apart.
+_CLAMP_NOTE_RE = re.compile(re.escape(_CLAMP_NOTE).replace(r"\{n\}", r"(\d+)") + r"\Z")
+
+
+def clamp_report(value: str) -> tuple[int, int] | None:
+    """Return ``(before, kept)`` for a value stamped by ``clamp_to_max_len``."""
+    match = _CLAMP_NOTE_RE.search(value)
+    if not match:
+        return None
+    kept = len(value) - (match.end() - match.start())
+    return kept + int(match.group(1)), kept
 
 
 @dataclass
@@ -1160,6 +1174,24 @@ def sanitize_response(text: str, max_len: int = MAX_RESPONSE_LEN) -> str:
 # ── JSON-RPC Envelope Validation ──
 
 
+JSONRPC_PARSE_ERROR = -32700
+JSONRPC_INVALID_REQUEST = -32600
+JSONRPC_INVALID_PARAMS = -32602
+JSONRPC_INTERNAL_ERROR = -32603
+
+
+class JsonRpcEnvelopeError(ValidationError):
+    """A malformed JSON-RPC object and the response identity it retained."""
+
+    def __init__(
+        self, field: str, message: str, *, req_id: Any, method: Any, invalid_params: bool
+    ) -> None:
+        super().__init__(field, message)
+        self.req_id = req_id
+        self.method = method
+        self.invalid_params = invalid_params
+
+
 def validate_jsonrpc_request(req: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
     """Validate a JSON-RPC 2.0 request envelope.
 
@@ -1167,17 +1199,28 @@ def validate_jsonrpc_request(req: dict[str, Any]) -> tuple[str, Any, dict[str, A
     """
     if not isinstance(req, dict):
         raise ValidationError("request", "must be a JSON object")
-    if req.get("jsonrpc") not in ("2.0", None):
-        raise ValidationError("jsonrpc", "must be '2.0'")
-
-    method = req.get("method")
-    if method is not None and not isinstance(method, str):
-        raise ValidationError("method", "must be a string")
-
     req_id = req.get("id")
-    params = req.get("params", {})
-    if not isinstance(params, dict):
+    method = req.get("method")
+    if req.get("jsonrpc") not in ("2.0", None):
+        raise JsonRpcEnvelopeError(
+            "jsonrpc", "must be '2.0'", req_id=req_id, method=method, invalid_params=False
+        )
+    if method is not None and not isinstance(method, str):
+        raise JsonRpcEnvelopeError(
+            "method", "must be a string", req_id=req_id, method=method, invalid_params=False
+        )
+
+    params = req.get("params")
+    if params is None:
         params = {}
+    elif not isinstance(params, dict):
+        raise JsonRpcEnvelopeError(
+            "params",
+            f"must be an object, not {type(params).__name__}",
+            req_id=req_id,
+            method=method,
+            invalid_params=True,
+        )
 
     return method or "", req_id, params
 
@@ -2382,6 +2425,11 @@ _ARTIFACT_KIND_RE = re.compile(r"^(widget|html|markdown|svg|json|text|image|weba
 # must be alphanumeric so a value can never be parsed as a CLI flag, and the
 # charset covers real model ids, including provider-qualified effort variants.
 MODEL_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._\[\]-]{0,127}$")
+# Adapter catalogs use qualified model IDs with provider separators, aliases,
+# and effort brackets. Keep the picker list bounded while accepting that
+# catalog vocabulary.
+MODEL_PICKER_HIDDEN_MODEL_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/~\[\]@-]{0,254}$")
+MODEL_PICKER_HIDDEN_MODELS_MAX = 2048
 _ARTIFACT_SOURCE_RE = re.compile(r"^(chat|cron|subagent|manual|import)$")
 # Single source of truth: the MCP save/update field cap MUST equal the store's
 # own content cap, else the tool path rejects content the store would accept
@@ -3070,8 +3118,7 @@ def code_review_sage_call_allowed(method: object, path: object) -> bool:
     if (method, path) in CODE_REVIEW_SAGE_ALLOWED_CALLS:
         return True
     return any(
-        method == allowed_method and rx.match(path)
-        for allowed_method, rx in _CRS_DYNAMIC_CALLS
+        method == allowed_method and rx.match(path) for allowed_method, rx in _CRS_DYNAMIC_CALLS
     )
 
 
@@ -3095,6 +3142,21 @@ CODE_REVIEW_SAGE_API_SCHEMA = ToolSchema(
         FieldSpec("body_json", str, max_len=_CRS_MAX_BODY, default=""),
     ],
     custom_validator=_validate_crs_api,
+)
+
+# Design Tweak thread progress. The tool exposes only forward progress; the app
+# owns the rest of the thread lifecycle.
+_DESIGN_TWEAK_ALLOWED_STATUSES = frozenset({"done"})
+_DESIGN_TWEAK_MAX_TEXT = 2_048
+
+DESIGN_TWEAK_UPDATE_THREAD_SCHEMA = ToolSchema(
+    tool_name="design_tweak_update_thread",
+    fields=[
+        FieldSpec("request_id", str, required=True, max_len=200),
+        FieldSpec("comment_id", str, max_len=200, default=""),
+        FieldSpec("text", str, max_len=_DESIGN_TWEAK_MAX_TEXT, default=""),
+        FieldSpec("status", str, allowed=_DESIGN_TWEAK_ALLOWED_STATUSES, default=""),
+    ],
 )
 
 # Dev Fleet pod lifecycle (agent surface). A pod name is a git worktree basename,
@@ -4227,6 +4289,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "issue_radar_record_investigation": ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
     "ops_mission_control_api": OPS_MISSION_CONTROL_API_SCHEMA,
     "code_review_sage_api": CODE_REVIEW_SAGE_API_SCHEMA,
+    "design_tweak_update_thread": DESIGN_TWEAK_UPDATE_THREAD_SCHEMA,
     "pod_up": POD_UP_SCHEMA,
     "pod_down": POD_DOWN_SCHEMA,
     "pod_status": POD_STATUS_SCHEMA,
@@ -4710,9 +4773,46 @@ PANEL_PUBLISH_SCHEMA = ToolSchema(
 # would pass it through unvalidated.
 PANEL_TEMPLATES_SCHEMA = ToolSchema(tool_name="panel_templates")
 
+DASHBOARD_FIELDS_SCHEMA = ToolSchema(tool_name="dashboard_fields")
+
+DASHBOARD_WRITE_SCHEMA = ToolSchema(
+    tool_name="dashboard_write",
+    fields=[
+        FieldSpec("field", str, required=True, max_len=64),
+        FieldSpec("value", (bool, int, float, str, list, dict), required=True),
+    ],
+)
+
+DASHBOARD_TEMPLATES_SCHEMA = ToolSchema(
+    tool_name="dashboard_templates",
+    fields=[FieldSpec("query", str, max_len=200)],
+)
+
+DASHBOARD_PREVIEW_SCHEMA = ToolSchema(
+    tool_name="dashboard_preview",
+    fields=[
+        FieldSpec("template_id", str, max_len=64),
+        FieldSpec("manifest", dict),
+        FieldSpec("html", str, max_len=64 * 1024),
+    ],
+)
+
+DASHBOARD_APPLY_SCHEMA = ToolSchema(tool_name="dashboard_apply")
+
+DASHBOARD_ROLLBACK_SCHEMA = ToolSchema(
+    tool_name="dashboard_rollback",
+    fields=[FieldSpec("to_version", int, required=True, min_val=1)],
+)
+
 MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
     "panel_publish": PANEL_PUBLISH_SCHEMA,
     "panel_templates": PANEL_TEMPLATES_SCHEMA,
+    "dashboard_fields": DASHBOARD_FIELDS_SCHEMA,
+    "dashboard_write": DASHBOARD_WRITE_SCHEMA,
+    "dashboard_templates": DASHBOARD_TEMPLATES_SCHEMA,
+    "dashboard_preview": DASHBOARD_PREVIEW_SCHEMA,
+    "dashboard_apply": DASHBOARD_APPLY_SCHEMA,
+    "dashboard_rollback": DASHBOARD_ROLLBACK_SCHEMA,
 }
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {

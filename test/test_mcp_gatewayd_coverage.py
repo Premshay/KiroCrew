@@ -15,6 +15,7 @@ the per-test ``KIROCREW_HOME`` that Kiro Crew's conftest pins.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import json
 import logging
 import os
@@ -86,20 +87,14 @@ class _FakeReader:
         return self._line
 
 
-def _pool_key(server: str = "demo-mcp", agent: str = "cov-agent", env_hash: str = "e" * 8) -> PoolKey:
+def _pool_key(server: str = "demo-mcp", env_hash: str = "e" * 8) -> PoolKey:
     return PoolKey(
         server_name=server,
-        agent_name=agent,
         command_args_hash="a" * 8,
         effective_env_hash=env_hash,
         work_dir="/tmp/cov",
         binary_version="1.0",
         os_uid=1000,
-        sandbox_mode="none",
-        autoapprove_set_hash="b" * 8,
-        approval_mode="reads",
-        trust_all_tools=False,
-        config_snapshot_hash="c" * 8,
     )
 
 
@@ -771,6 +766,21 @@ class TestReadFirstFrame:
     async def test_non_object_json_is_refused(self, line):
         assert await gw._read_first_frame(cast(Any, _FakeReader(line=line))) is None
 
+    @pytest.mark.asyncio
+    async def test_a_frame_nested_past_the_decoder_is_refused_not_raised(self):
+        """``RecursionError`` is not a ``JSONDecodeError``: the frame closes one
+        connection cleanly instead of raising out of the connection handler."""
+        from stray_line_helpers import too_deep_line
+
+        assert await gw._read_first_frame(cast(Any, _FakeReader(line=too_deep_line()))) is None
+
+    def test_the_ping_probe_reads_every_stray_frame_as_not_a_ping(self):
+        from stray_line_helpers import STRAY_LINES
+
+        for make in STRAY_LINES.values():
+            assert gw._is_ping_frame(make()) is False
+        assert gw._is_ping_frame(b'{"type":"ping"}\n') is True
+
 
 class TestWriteJsonLine:
     @pytest.mark.asyncio
@@ -915,12 +925,18 @@ class TestDrainInboxToStub:
 # --- declared env + target resolution ---------------------------------------
 
 
+#: The agent these sidecars are written for. The daemon reads it off the
+#: Register frame, not off the PoolKey, so a test writing a sidecar names it the
+#: same way the rewriter does.
+_DECLARING_AGENT = "demo-agent"
+
+
 class TestDeclaredNonSecretEnv:
     def _write_sidecar(self, key: PoolKey, payload: dict[str, str]) -> Path:
         overlay = resolve_overlay_dir()
         directory = env_sidecar_dir(overlay)
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / env_sidecar_name(key.agent_name, key.server_name)
+        path = directory / env_sidecar_name(_DECLARING_AGENT, key.server_name)
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
@@ -945,7 +961,7 @@ class TestDeclaredNonSecretEnv:
         overlay = resolve_overlay_dir()
         directory = env_sidecar_dir(overlay)
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / env_sidecar_name(key.agent_name, key.server_name)).write_text(
+        (directory / env_sidecar_name(_DECLARING_AGENT, key.server_name)).write_text(
             "{not json", encoding="utf-8"
         )
         assert gw._declared_non_secret_env(key) == {}
@@ -1599,7 +1615,94 @@ class TestRespawnBackendForStub:
         )
 
         assert out is not None
-        fresh.attach_stub.assert_awaited_once_with("stub-r9")
+        # ``agent`` carries the dead backend's per-stub label onto the
+        # replacement, so a render spooled after the respawn still names its
+        # producing agent. Empty here: this double declares none.
+        fresh.attach_stub.assert_awaited_once_with("stub-r9", agent="")
+        await _drain_task(out[2])
+
+    @pytest.mark.asyncio
+    async def test_the_respawn_carries_the_agent_read_before_the_detach(self, monkeypatch):
+        """The replacement inherits the dead backend's per-stub agent.
+
+        ORDERING is the whole test, which is why ``detach_stub`` is left REAL
+        here while the sibling tests mock it: detach prunes ``_stub_agents``
+        with the inbox, so reading the agent after it would hand the replacement
+        ``""`` and every render spooled through the respawned backend would name
+        no producing agent and have its callbacks refused. The read therefore
+        sits beside the ``replay_uris``/``old_surface`` captures, before the
+        detach.
+        """
+        key = _pool_key(server="respawn-surface-mcp")
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        same = {"read_file": '{"type":"object"}'}
+        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r21")
+        # Real detach, and a real attach to populate what it prunes.
+        del old.detach_stub
+        await old.attach_stub("stub-r21", agent="gpu-dev")
+        assert old.agent_for_stub("stub-r21") == "gpu-dev", "premise: the agent is recorded"
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            key,
+            lambda k: None,
+            "stub-r21",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+        )
+
+        assert out is not None
+        fresh.attach_stub.assert_awaited_once_with("stub-r21", agent="gpu-dev")
+        # And the detach really did run, so the pass above is about ordering
+        # rather than about a detach that never happened.
+        assert old.agent_for_stub("stub-r21") == ""
+        await _drain_task(out[2])
+
+    @pytest.mark.asyncio
+    async def test_the_respawn_acquire_carries_the_agent_too(self, monkeypatch):
+        """The SPAWN needs the agent, not just the attach that follows it.
+
+        The declared-env sidecar of a connection-private backend is named for
+        the agent that declared it, and the spawn is where that env is read
+        (``_declared_env_for_private_backend``). A respawn that named the stub
+        but not its agent would look the sidecar up under ``""``, find none, and
+        bring the replacement up with no declared env -- so every server that
+        needs one dies at prime and the transparent recovery fails. The attach
+        happens after the spawn, so carrying it only there is too late.
+        """
+        key = _pool_key(server="respawn-surface-mcp")
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        same = {"read_file": '{"type":"object"}'}
+        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r22")
+        del old.detach_stub
+        await old.attach_stub("stub-r22", agent="gpu-dev")
+        acquire = AsyncMock(return_value=(fresh, True))
+        monkeypatch.setattr(gw, "_acquire_backend", acquire)
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            key,
+            lambda k: None,
+            "stub-r22",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+        )
+
+        assert out is not None
+        assert acquire.await_args is not None
+        assert acquire.await_args.kwargs.get("declaring_agent") == "gpu-dev", (
+            "the respawn spawned without its declaring agent, so a private "
+            "backend's replacement would come up with no declared env"
+        )
         await _drain_task(out[2])
 
     @pytest.mark.asyncio
@@ -1685,7 +1788,7 @@ class TestRespawnBackendForStub:
         owner = CallerContext(session_key="dashboard:old-owner")
         conn = gw._StubConn("stub-r18", [], "pool", owner)
 
-        async def _attach_then_rekey(stub_uuid):
+        async def _attach_then_rekey(stub_uuid, *, agent=""):
             # The claim lands during the adoption await, past the early check.
             conn.caller = CallerContext(session_key="dashboard:new-owner")
             return asyncio.Queue()
@@ -1712,7 +1815,7 @@ class TestRespawnBackendForStub:
 
         # The stub it had just attached is released, or the refcount holds a stub
         # that is about to be told the adoption failed.
-        fresh.attach_stub.assert_awaited_once_with("stub-r18")
+        fresh.attach_stub.assert_awaited_once_with("stub-r18", agent="")
         fresh.detach_stub.assert_awaited_once_with("stub-r18")
 
     @pytest.mark.asyncio
@@ -1742,7 +1845,7 @@ class TestRespawnBackendForStub:
         )
 
         assert out is not None
-        fresh.attach_stub.assert_awaited_once_with("stub-r15")
+        fresh.attach_stub.assert_awaited_once_with("stub-r15", agent="")
         await _drain_task(out[2])
 
     @pytest.mark.asyncio
@@ -2043,14 +2146,15 @@ class TestWriteDiagnostic:
         # never-raises contract would silently drop the record.
         path = tmp_path / "diag.jsonl"
         opens: list[str] = []
-        real_open = Path.open
+        real_open = builtins.open
 
-        def counting_open(self, *args, **kwargs):
-            if self == path:
+        def counting_open(file, *args, **kwargs):
+            if os.fspath(file) == os.fspath(path):
                 opens.append(str(args))
-            return real_open(self, *args, **kwargs)
+            return real_open(file, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "open", counting_open)
+        # The writer opens through builtins.open (it passes an owner-only opener).
+        monkeypatch.setattr(builtins, "open", counting_open)
         gw._write_diagnostic(path, {"tag": "probe", "n": 1}, {"tag": "zombie_detected", "n": 2})
         assert len(opens) == 1
         lines = path.read_text(encoding="utf-8").strip().splitlines()

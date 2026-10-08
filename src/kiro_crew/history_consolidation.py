@@ -601,6 +601,8 @@ def _consolidation_chunk(messages: list[dict]) -> list[dict]:
 def _prompt_rows(messages: list[dict]) -> list[dict]:
     """*messages* without display-only rows, which no consolidation prompt carries."""
     return [m for m in messages if m.get("role") not in DISPLAY_ONLY_ROLES]
+
+
 _PLACEHOLDER_BODIES = frozenset(
     {
         "unchanged",
@@ -1394,14 +1396,20 @@ class HistoryConsolidator:
             messages = await asyncio.to_thread(self._log._read_messages, key)
             if _session_touched_sensitive(messages):
                 return ConsolidationOutcome(
-                    "skipped", detail="sensitive session", old_offset=old_offset,
-                    new_offset=last_offset, complete=False,
+                    "skipped",
+                    detail="sensitive session",
+                    old_offset=old_offset,
+                    new_offset=last_offset,
+                    complete=False,
                 )
             outcome = await self._consolidate(key, include_history=True)
             if isinstance(outcome, _ConsolidationRefusedSentinel):
                 return ConsolidationOutcome(
-                    "skipped", detail="session memory policy refuses consolidation",
-                    old_offset=old_offset, new_offset=last_offset, complete=False,
+                    "skipped",
+                    detail="session memory policy refuses consolidation",
+                    old_offset=old_offset,
+                    new_offset=last_offset,
+                    complete=False,
                 )
             if not outcome.completed:
                 return outcome
@@ -1415,9 +1423,7 @@ class HistoryConsolidator:
                     "consolidated", old_offset=old_offset, new_offset=last_offset, complete=False
                 )
             remaining = after
-        return ConsolidationOutcome(
-            "consolidated", old_offset=old_offset, new_offset=last_offset
-        )
+        return ConsolidationOutcome("consolidated", old_offset=old_offset, new_offset=last_offset)
 
     async def _consolidate(
         self, key: str, include_history: bool = True
@@ -3765,6 +3771,14 @@ class HistoryConsolidator:
         # Logged at DEBUG: silent in normal operation, surfaced only when
         # log_level is raised to investigate a consolidation stall.
         t_start = _time.monotonic()
+        turn_kwargs: dict[str, object] = {"memory_store": memory_store}
+        if not memory_store:
+            turn_kwargs.update(
+                {
+                    "session_key": _CONSOLIDATE_SESSION_KEY,
+                    "reset_conversation": True,
+                }
+            )
         async with contextlib.AsyncExitStack() as stack:
             try:
                 client = await stack.enter_async_context(
@@ -3775,11 +3789,9 @@ class HistoryConsolidator:
                         crew_log_kind="memory_consolidation",
                         crew_log_session_key=session_key,
                         # A private V2 store gets its own generated, bound and
-                        # retired session from background_turn; everything else
-                        # shares the dedicated consolidation key, reset per turn.
-                        memory_store=memory_store,
-                        session_key="" if memory_store else _CONSOLIDATE_SESSION_KEY,
-                        reset_conversation=not bool(memory_store),
+                        # retired session; shared consolidation reuses its key
+                        # but resets the native conversation before every pass.
+                        **turn_kwargs,
                     )
                 )
             except Exception as exc:

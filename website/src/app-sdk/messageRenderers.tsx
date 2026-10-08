@@ -31,6 +31,7 @@ import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
 import NudgeCard from '../pages/chat/NudgeCard'
 import NoticeCard from '../pages/chat/NoticeCard'
 import { SystemNoticeRow, isSystemNoticeRow } from '../pages/chat/CompactionCard'
+import SkillLoadCard, { isSkillLoadRow } from '../pages/chat/SkillLoadCard'
 import { ErrorCard } from '../pages/chat/ErrorCard'
 import { decisionStripFieldOf } from '../pages/chat/decisionRecord'
 import { resolveTransientNotice } from '../pages/chat/transientNotice'
@@ -74,6 +75,11 @@ export interface MessageRenderContext {
    *  chat-core/composer/selectionActions). Absent = Copy only. */
   onQuote?: (text: string, rect: DOMRect) => void
   onAsk?: (text: string) => void
+  /** Quote a WHOLE row into the host's next send (`chat-core/composer/messageQuote`).
+   *  A host capability, like `onQuote`: absent, no row offers Quote and no
+   *  bubble arms its context menu. Receives the row's own fields, so the
+   *  renderer never has to know what the host stores. */
+  onQuoteMessage?: (role: 'user' | 'assistant', content: string, ts?: string, mid?: string) => void
   /** Drop mcp_oauth banners a Connections card already owns. */
   hideCardOwnedOAuth: boolean
   /** tool_call_ids whose call a policy or hook blocked. */
@@ -367,12 +373,14 @@ export interface AssistantBubbleOptions {
    *  another reply, which the SDK's own rule reads as "the turn goes on".
    *  Streaming rows never draw a footer, whatever this says. */
   forceFooter?: boolean
-  /** Decide the steer-chip suppression against a transcript the host holds
-   *  instead of `ctx.messages`. A host that FILTERS the list before rendering
-   *  (a crewmate's chat drops the `inject` rows) must pass the unfiltered one,
-   *  or the policy-block marker is never found and a system-forced
-   *  continuation is credited to the user. */
-  policyBlockTranscript?: { messages: ChatMessage[]; index: number }
+  /** Never draw the "Steered" chip, whatever the reply's `[STEERING …]` ack
+   *  says. A host whose every busy send IS a steer (a crewmate's chat: one
+   *  named peer, no queue) sets it — there the chip would end nearly every
+   *  reply with the very mechanics the surface hides (#17838). Off (default)
+   *  the SDK rule applies: the chip draws unless the turn's steer was a
+   *  system policy notice rather than the user's (`turnHadPolicyBlock`). The
+   *  raw marker is stripped from the prose either way. */
+  suppressSteerAck?: boolean
   /** Session routing for the reply's markdown: open a session chip, plus the
    *  roster and the active key the chip resolver needs. All three or none — the
    *  renderer gates on (`onSessionOpen` AND `sessions`), so a half-wired host
@@ -401,6 +409,23 @@ export interface AssistantBubbleOptions {
  * Returns null for a say-nothing row (bare U+200B): invisible-only content
  * would draw as an empty bubble.
  */
+/** The row's Quote handler, bound to its own fields; undefined while the row
+ *  streams (nothing final to quote) or when the host offers no Quote.
+ *
+ *  `shown` is the text the bubble is DISPLAYING when the caller knows it
+ *  differs from `m.content`: an assistant row browsing its variants locally
+ *  renders `variants[i].content`, and quoting must take what the reader sees,
+ *  never the stored default (fork GPT review). A caller with nothing to add
+ *  passes nothing and the row's own content is quoted. */
+export function quoteMessageFor(m: ChatMessage, ctx: MessageRenderContext, role: 'user' | 'assistant'): ((shown?: string) => void) | undefined {
+  const fn = ctx.onQuoteMessage
+  if (!fn || m.role === 'streaming' || !m.content.trim()) return undefined
+  const mid = typeof m.meta?.mid === 'string' && m.meta.mid ? m.meta.mid : undefined
+  // Typed check, not `??`: a user row wires this straight to `onClick`, which
+  // hands over the click event, and an event must never become the quote.
+  return (shown?: string) => fn(role, typeof shown === 'string' ? shown : m.content, m.ts, mid)
+}
+
 export function renderAssistantBubble(
   m: ChatMessage,
   ctx: MessageRenderContext,
@@ -455,13 +480,10 @@ export function renderAssistantBubble(
       decisionsStrip={decisionStripFieldOf(m)}
       fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
       fileChangesOmittedFiles={(m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files}
-      suppressSteerAck={
-        opts.policyBlockTranscript
-          ? turnHadPolicyBlock(opts.policyBlockTranscript.messages, opts.policyBlockTranscript.index)
-          : turnHadPolicyBlock(ctx.messages, ctx.index)
-      }
+      suppressSteerAck={opts.suppressSteerAck || turnHadPolicyBlock(ctx.messages, ctx.index)}
       bubbleClassName={bubbleClassName}
       onReplyInThread={isStreaming ? undefined : replyInThreadFor(m, ctx)}
+      onQuoteMessage={quoteMessageFor(m, ctx, 'assistant')}
     />
   )
   // The column's child is the bubble itself unless this message has a thread
@@ -471,11 +493,19 @@ export function renderAssistantBubble(
 }
 
 /**
- * The built-in registry, in resolution order. A stop event and a sub-agent
- * completion are recognised by shape rather than by role, so they claim `'*'`
- * and gate on `match`; they come first for that reason.
+ * The built-in registry, in resolution order. Skill loads, stop events and
+ * sub-agent completions are recognised by shape rather than by a broad role,
+ * so they gate on `match` before generic role entries.
  */
 export const defaultMessageRenderers: readonly MessageRenderer[] = [
+  {
+    id: 'skill_load',
+    roles: ['system'],
+    match: isSkillLoadRow,
+    render: (m, ctx) => ctx.row(
+      <SkillLoadCard message={m} disclosureKey={ctx.key} />,
+    ),
+  },
   {
     id: 'stop_event',
     roles: ['*'],
@@ -525,6 +555,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
           timestampTitle={fmtMessageTimeFull(m.ts)}
           renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
           onReplyInThread={replyInThreadFor(m, ctx)}
+          onQuoteMessage={quoteMessageFor(m, ctx, 'user')}
         />
       )
       // The bubble alone on every surface without a thread footer to draw, so

@@ -26,6 +26,7 @@ from typing import Any
 from aiohttp import web
 
 import kiro_crew.dashboard.handlers as _h
+from kiro_crew import crew_recency
 from kiro_crew import members as members_mod
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -216,6 +217,25 @@ async def _deny_app_caller(request: web.Request, operation: str) -> web.Response
     return web.json_response({"error": "not found", "code": "not_found"}, status=404)
 
 
+def _audit_owner_read(request: web.Request, operation: str) -> None:
+    """Record an owner gate grant, as the briefing and rules reads do.
+
+    A denied-only trail cannot answer who read the owner's view of the crew, so a
+    granted read leaves an ``allowed`` record too. Best effort: an audit must never
+    change the outcome.
+    """
+    try:
+        _sel().log_api_access(
+            caller=request.remote or "",
+            operation=operation,
+            outcome="allowed",
+            source="dashboard",
+            resources="owner_grant",
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for %s failed", operation, exc_info=True)
+
+
 def _member_name_is_addressable(value: object) -> bool:
     return members_mod.is_dispatchable_member_name(value)
 
@@ -353,6 +373,14 @@ async def api_members(request: web.Request) -> web.Response:
     denied = await _deny_app_caller(request, "members.list")
     if denied is not None:
         return denied
+    # Owner gate, the briefing and rules endpoints' boundary: every row carries the
+    # owner's view of a crewmate (its last DM line, its slot, its projections), and
+    # a non-owner dashboard session holds the same empty app claim the app-caller
+    # guard lets through. Gated before the config load, so a denial costs no read.
+    owner_denied = await require_owner_dashboard_request(request, "members.list.read")
+    if owner_denied is not None:
+        return owner_denied
+    _audit_owner_read(request, "members.list.read")
     state: DashboardState | None = request.app.get("state")
     # Loaded WITH the digest of the bytes it was parsed from. Every config-derived row
     # field below comes from this one load, and the per-row reconcile that writes them
@@ -821,7 +849,102 @@ async def api_members(request: web.Request) -> web.Response:
         row["projections"] = _redact_projection_value(_roster_only(block))
         row["last_active_ts"] = _recency_for_row(block, row.get("last_active_ts"))
 
+    # When the PERSON last messaged each crew, in its DM or in a normal chat
+    # (`crew_recency`). `last_active_ts` above also moves for background work (a
+    # patrol turn, a reply), so the Crewmates list filters and orders by this one
+    # instead. 0 = never chatted. The default crew also owns a chat that picked
+    # no crew (recorded under "").
+    default_name = cfg.default_agent or "default"
+
+    def _chat_recency() -> dict[str, float]:
+        if not crew_recency.needs_seed():
+            return crew_recency.read_recency()
+        found = _seed_from_dm_threads(state, rows, bindings, has_message)
+        if found is None:
+            # A thread could not be read this time: serve what is recorded and
+            # leave the seed for a later read, never mark it done half-read.
+            return crew_recency.read_recency()
+        return crew_recency.seed(found)
+
+    recency = await asyncio.to_thread(_chat_recency)
+    for row in rows:
+        ts = recency.get(row["name"], 0.0)
+        if row["name"] == default_name:
+            ts = max(ts, recency.get("", 0.0))
+        row["last_chat_ts"] = ts
+
     return web.json_response({"members": rows})
+
+
+def _seed_from_dm_threads(
+    state: DashboardState | None,
+    rows: list[dict],
+    bindings: dict[str, dict | None],
+    has_message: set[str],
+) -> dict[str, float] | None:
+    """One-time backfill for `crew_recency`: the newest row the user typed in
+    each crew's DM thread, from before that record existed. ``None`` when a
+    thread could not be read (no log, a busy or unreadable transcript), so the
+    seed runs again on a later read; a withheld (restricted) thread is skipped.
+
+    Typed = a user-role speech row carrying `history.HUMAN_TURN_META_KEY`, the
+    allowlist marker the human send paths set; in a thread with any marked row,
+    an unmarked row (a peer's delivery, a wake, a heartbeat) never counts. A
+    thread with no marked row predates the marker and falls back to "does not
+    open with `[`". Runs once per data home (`crew_recency.needs_seed`).
+    """
+    from kiro_crew.dashboard.system_notices import is_speech_row
+    from kiro_crew.eventlog.members_projections import _parse_ts
+    from kiro_crew.history import HUMAN_TURN_META_KEY, TranscriptBusy, TranscriptWithheld
+
+    log = getattr(state, "conversation_log", None)
+    found: dict[str, float] = {}
+    if log is None:
+        return None
+    for row in rows:
+        if not row["slot_key"] or row["slot_key"] not in has_message:
+            continue
+        binding = bindings.get(row["slug"])
+        generation = binding.get("memory_store", "") if binding is not None else ""
+        key = members_mod.member_thread_session_alias(row["slug"], generation)
+        try:
+            messages = log.derive_messages(key)  # the derivation seam: a withheld log raises
+        except TranscriptBusy:  # a TranscriptWithheld subclass, but retryable
+            return None
+        except TranscriptWithheld:
+            continue
+        except Exception:
+            logger.debug("crew recency seed could not read %r", key, exc_info=True)
+            return None
+        # A thread written before the marker existed carries it on no row: there
+        # the old rule (a user speech row not opening with `[`, the shape every
+        # gateway-injected user row takes) is the only reading available.
+        marked = any(_is_human_row(msg, HUMAN_TURN_META_KEY) for msg in messages)
+        for msg in reversed(messages):
+            content = msg.get("content")
+            if msg.get("role") != "user" or not isinstance(content, str):
+                continue
+            meta = msg.get("meta")
+            if marked and not _is_human_row(msg, HUMAN_TURN_META_KEY):
+                continue
+            if not marked and content.lstrip().startswith("["):
+                continue
+            if not is_speech_row("user", content, meta):
+                continue
+            raw_ts = msg.get("ts")
+            try:
+                ts = float(raw_ts)  # the live row's epoch (a number or its string)
+            except (TypeError, ValueError):
+                ts = _parse_ts(raw_ts) or 0.0  # an ISO stamp
+            if 0 < ts < float("inf"):
+                found[row["name"]] = max(found.get(row["name"], 0.0), ts)
+            break
+    return found
+
+
+def _is_human_row(msg: dict, marker: str) -> bool:
+    meta = msg.get("meta")
+    return isinstance(meta, dict) and bool(meta.get(marker))
 
 
 def _recency_for_row(block: dict, transcript_ts: Any) -> float:
@@ -1308,6 +1431,10 @@ async def api_member_projections(request: web.Request) -> web.Response:
     denied = await _deny_app_caller(request, "members.projections")
     if denied is not None:
         return denied
+    owner_denied = await require_owner_dashboard_request(request, "members.projections.read")
+    if owner_denied is not None:
+        return owner_denied
+    _audit_owner_read(request, "members.projections.read")
     slug = request.match_info["slug"]
     try:
         members_mod.validate_slug(slug)
@@ -1436,6 +1563,10 @@ async def api_member_activity(request: web.Request) -> web.Response:
     denied = await _deny_app_caller(request, "members.activity")
     if denied is not None:
         return denied
+    owner_denied = await require_owner_dashboard_request(request, "members.activity.read")
+    if owner_denied is not None:
+        return owner_denied
+    _audit_owner_read(request, "members.activity.read")
     slug = request.match_info["slug"]
     try:
         members_mod.validate_slug(slug)
@@ -1602,8 +1733,8 @@ async def api_member_briefing(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     # Owner gate, the rules endpoint's boundary: the briefing is the crewmate's
-    # private working memory, written for its owner. Any allowed Slack user can
-    # mint a dashboard session (`!dashboard`), so the app-caller guard alone
+    # private working memory, written for its owner. A Telegram, Teams or Webex
+    # allowlist user can mint a dashboard session, so the app-caller guard alone
     # would let a non-owner colleague read notes the owner never shared. Gated
     # before any validation or file IO, so a denial costs no read.
     owner_denied = await require_owner_dashboard_request(request, "members.briefing.read")
@@ -1725,8 +1856,8 @@ async def api_member_rules_get(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     # Owner gate, same boundary as the PUT: the rules are the OWNER's private
-    # safety instructions for this member. Any allowed Slack user can mint a
-    # dashboard session (`!dashboard`), so without this gate a non-owner
+    # safety instructions for this member. A Telegram, Teams or Webex allowlist
+    # user can mint a dashboard session, so without this gate a non-owner
     # colleague could read boundaries the owner never shared — disclosure is
     # one-way, so the read is gated exactly like the write.
     owner_denied = await require_owner_dashboard_request(request, "members.rules.read")

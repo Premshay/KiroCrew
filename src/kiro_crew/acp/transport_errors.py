@@ -19,8 +19,13 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from kiro_crew.acp._dispatch import redact_text
-from kiro_crew.acp.runtime_models import DEFAULT_MODEL, model_is_unusable
-from kiro_crew.acp.types import ACP_BACKENDS_HOST_AUTH_CALLBACK
+from kiro_crew.acp.runtime_models import (
+    DEFAULT_MODEL,
+    advertised_model_ids,
+    model_is_unusable,
+    resolve_pin_spelling_on,
+)
+from kiro_crew.acp.types import ACP_BACKENDS_HOST_AUTH_CALLBACK, ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.credential_errors import is_credential_propagation_delay
 from kiro_crew.sandbox import (
@@ -440,6 +445,7 @@ class AcpModelUnavailable(AcpError):  # noqa: N818
         advertised: Sequence[str] | None = None,
         *,
         advertised_but_refused: bool = False,
+        backend: str,
     ) -> None:
         self.model_id = model_id
         self.advertised = list(advertised or [])
@@ -472,13 +478,61 @@ class AcpModelUnavailable(AcpError):  # noqa: N818
                 transient=False,
             )
             return
-        super().__init__(
-            f"The model {model_id!r} is not available on your account. "
-            f"Available models: {usable}. "
-            f"If you expected this model to be included in your plan, check which "
-            f"account you are signed in as with `kiro-cli whoami` — a Builder ID "
-            f"sign-in carries a different entitlement than organization SSO.",
-            transient=False,
+        # The hint is for every harness that signs in through the host kiro-cli
+        # identity store (kiro itself and KAS, spawned as ``kiro-cli acp
+        # --auth-method cli``): there `kiro-cli whoami` names the account whose
+        # entitlement the advertised list reflects. ``host_auth`` owns that fact,
+        # so a backend's own string is not the test.
+        if not host_auth.signs_in_separately(backend):
+            super().__init__(
+                f"The model {model_id!r} is not available on your account. "
+                f"Available models: {usable}. "
+                f"If you expected this model to be included in your plan, check which "
+                f"account you are signed in as with `kiro-cli whoami` — a Builder ID "
+                f"sign-in carries a different entitlement than organization SSO.",
+                transient=False,
+            )
+            return
+        # The sign-in advice above is about the host kiro-cli identity store:
+        # `kiro-cli whoami` and Builder ID versus organization SSO mean nothing to
+        # a harness that signs in separately, and there a miss is as likely a
+        # catalog spelling as an entitlement. Say only what is known. "Does the
+        # list carry this id" is the shared predicate's question, asked here only
+        # when there IS a list: its empty-set answer is "allow", which would read
+        # as "advertised" against "none advertised".
+        if self.advertised and not model_is_unusable(model_id, self.advertised):
+            detail = (
+                f"The {backend} adapter refused to switch to the model "
+                f"{model_id!r}, which it advertises; it may not be available to "
+                f"the account this session uses."
+            )
+        else:
+            detail = (
+                f"The model {model_id!r} is not among the models this {backend} "
+                f"session advertises."
+            )
+        super().__init__(f"{detail} Available models: {usable}.", transient=False)
+
+    @classmethod
+    def for_recorded_refusal(
+        cls, model_id: str, available_models: object, *, backend: str
+    ) -> AcpModelUnavailable:
+        """The error for a pick that a non-strict apply recorded as refused.
+
+        Callers outside the ACP layer hold only the provider's raw
+        ``available_models()`` entries and the backend name. The wording verdict
+        (the advertised ids, and whether a pair-id harness's list serves the bare
+        id) is computed here, so those callers need no ACP model helpers.
+        """
+        advertised = advertised_model_ids(available_models)
+        return cls(
+            model_id,
+            advertised,
+            backend=backend,
+            advertised_but_refused=(
+                backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
+                and bool(resolve_pin_spelling_on(model_id, advertised, backend=backend))
+            ),
         )
 
 
@@ -489,6 +543,18 @@ class AcpPromptBusy(AcpError):  # noqa: N818
     between messages). Callers should reset the session so the next message
     cold-starts cleanly.
     """
+
+
+class AcpProviderStreamInterrupted(AcpError):  # noqa: N818
+    """A provider ended a turn before emitting a terminal result."""
+
+
+class AcpContextWindowExceeded(AcpError):  # noqa: N818
+    """The model rejected a prompt beyond its context window."""
+
+
+class AcpConversationPayloadExceeded(AcpContextWindowExceeded):  # noqa: N818
+    """The provider retained attachments beyond its request-size limit."""
 
 
 # Named by the path callers import them from: an error chain renders each raised class
@@ -506,37 +572,12 @@ for _raised in (
     PiGateExtensionTampered,
     AcpModelUnavailable,
     AcpPromptBusy,
+    AcpProviderStreamInterrupted,
+    AcpContextWindowExceeded,
+    AcpConversationPayloadExceeded,
 ):
     _raised.__module__ = "kiro_crew.acp.client"
 del _raised
-
-
-class AcpProviderStreamInterrupted(AcpError):  # noqa: N818
-    """A provider ended a turn before it emitted a terminal result.
-
-    This is deliberately distinct from a content refusal: interactive callers
-    may cold-start and replay only when no text or tool activity was observed.
-    A normal reset would preserve the provider's broken native conversation.
-    """
-
-
-class AcpContextWindowExceeded(AcpError):  # noqa: N818
-    """The upstream model rejected a prompt that exceeds its context window.
-
-    Interactive callers must start a fresh native session before retrying: a
-    normal reset preserves the stored native session ID and would resume the
-    same oversized history.
-    """
-
-
-class AcpConversationPayloadExceeded(AcpContextWindowExceeded):  # noqa: N818
-    """The provider retained attachments beyond its native request-size limit.
-
-    KiroCrew cannot inspect provider-owned retained attachments.  Interactive
-    callers must therefore discard that native conversation and rebuild it
-    from bounded dashboard history before retrying, just as for a token-window
-    overflow.
-    """
 
 
 # Auth failure on stderr is detected during spawn/prompt so we can raise
@@ -587,9 +628,7 @@ _RE_INVALID_MODEL_ID = re.compile(r"[Ii]nvalid model ID:\s*([^\s,;'\"]+)")
 _RE_THROTTLE_NAMED = re.compile(
     r"\b(ThrottlingException|TooManyRequestsException|ServiceQuotaExceededException)\b"
 )
-_RE_THROTTLE_GENERIC = re.compile(
-    r"\b(rate.?limit|throttl(?:e|ed|ing)|too many requests)\b", re.IGNORECASE
-)
+_RE_THROTTLE_GENERIC = re.compile(r"\b(rate.?limit|throttl(?:e|ed|ing))\b", re.IGNORECASE)
 _RE_AUTH = re.compile(
     r"\b(AccessDenied(?:Exception)?|UnauthorizedException|ExpiredToken(?:Exception)?"
     r"|InvalidSignatureException|UnrecognizedClientException)\b"
@@ -602,7 +641,8 @@ _RE_5XX_NAMED = re.compile(
     re.IGNORECASE,
 )
 _RE_5XX_STATUS = re.compile(
-    r"(?:HTTP|status|API\s+Error:?)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE
+    r"(?:HTTP|status|API\s+Error:?)\s*(?:code\s*)?(?:50[0234]|529)\b",
+    re.IGNORECASE,
 )
 _RE_CONNECTION = re.compile(
     r"\bE(?:CONNREFUSED|CONNRESET|CONNABORTED|TIMEDOUT|PIPE|HOSTUNREACH|AI_AGAIN)\b"
@@ -610,9 +650,6 @@ _RE_CONNECTION = re.compile(
     r"|\bfetch failed\b"
     r"|\bconnection (?:refused|reset|closed|error|timed ?out)\b",
     re.IGNORECASE,
-)
-_RE_5XX_PHRASE = re.compile(
-    r"\binternal server error\b|\bservice unavailable\b|\bno available lane\b", re.IGNORECASE
 )
 # Genuine retry hint only. "response stream" is deliberately NOT matched here,
 # because that would make this branch a catch-all: kiro-cli wraps EVERY mid-stream
@@ -1199,19 +1236,15 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
         # Auth is terminal — a retry can't fix an expired/denied credential.
         return False
     if _is_session_expired(haystack):
-        # An expired or rejected kiro-cli login is terminal too.  Keep this
-        # before connection/5xx handling because aborted requests often carry
-        # a transport wrapper beside the credential failure.
+        # Session expiry is terminal — retrying can't refresh an expired login.
         return False
     if _RE_CONNECTION.search(haystack):
-        # Recognized terminal signals above take precedence; an otherwise unknown
-        # cause with connection wording may consume only this bounded retry budget.
+        # A temporary endpoint failure is safe for the bounded retry ladder.
         return True
     return bool(
         _RE_5XX_NAMED.search(haystack)
         or _RE_5XX_STATUS.search(haystack)
         or _RE_5XX_HINT.search(haystack)
-        or _RE_5XX_PHRASE.search(haystack)
         or _RE_GENERATE_FAILED.search(data)
         or _RE_PROCESS_FAILED.search(data)
     )
@@ -1357,7 +1390,7 @@ def _format_acp_error(
 
         unentitled = _model_is_unentitled(data, available_models)
 
-        # The fleet router admits requests before forwarding.  Its machine code
+        # The fleet router admits requests before forwarding. Its machine code
         # tells interactive callers to rebuild from bounded KiroCrew history;
         # do not leak the router's JSON error envelope to the user.
         if _CONVERSATION_PAYLOAD_EXCEEDED_RE.search(haystack):
@@ -1559,17 +1592,14 @@ def _format_acp_error(
         elif _RE_CONNECTION.search(haystack):
             formatted = (
                 "Could not reach the model backend (connection refused, reset, "
-                "or timed out). On a local lane this is usually a router "
-                "restart or a model swap and clears within seconds — retry in "
-                "a moment. If it keeps happening, check that the backend "
-                "endpoint is up and listening."
+                "or timed out). Retry in a moment. If it keeps happening, check "
+                "that the backend endpoint is up and listening."
                 f"{req_id_suffix}"
             )
         elif (
             _RE_5XX_NAMED.search(haystack)
             or _RE_5XX_STATUS.search(haystack)
             or _RE_5XX_HINT.search(haystack)
-            or _RE_5XX_PHRASE.search(haystack)
         ):
             # Transient backend 5xx — Bedrock/Codewhisperer surfaces a
             # momentary InternalServerError (often wrapped in a
@@ -1608,12 +1638,6 @@ def _format_acp_error(
                 "backend call died before streaming started, usually a momentary "
                 "capacity blip). Retry in a moment; if it keeps happening, switch "
                 "to a different model in the picker."
-                f"{req_id_suffix}"
-            )
-        elif _CONTEXT_WINDOW_EXCEEDED_RE.search(haystack):
-            formatted = (
-                "The local model context window is full. The conversation must "
-                "be rebuilt from a shorter history before this request can run."
                 f"{req_id_suffix}"
             )
         elif _RE_PROCESS_FAILED.search(data):
@@ -1754,9 +1778,9 @@ def _raise_acp_error(
 ) -> None:
     """Format and raise the appropriate :class:`AcpError` for *error*.
 
-    Delegates formatting to ``_format_acp_error`` and raises a typed error for
-    known recovery paths, including ``AcpPromptBusy`` and a context-window
-    admission rejection. Other failures receive structural, model, auth, or usage tags from their raw frame.
+    Delegates formatting to ``_format_acp_error``. Prompt-busy uses
+    ``AcpPromptBusy``; other failures use ``AcpError`` and receive any
+    structural, model, auth, or usage tags from their raw frame.
 
     *available_models* is passed to BOTH the formatter and the transient
     classifier so a model-rejection's wording and its retry verdict are decided

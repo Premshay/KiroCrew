@@ -36,18 +36,32 @@ PIPELINE_CONDUCTOR_AGENT_FILENAME = "kirocrew-pipeline-conductor.json"
 LEDGER_CONDUCTOR_AGENT_FILENAME = "kirocrew-ledger-conductor.json"
 SECURITY_CONDUCTOR_AGENT_FILENAME = "kirocrew-security-conductor.json"
 WORKER_AGENT_FILENAME = "kirocrew-worker.json"
+# The dashboard-author crewmate: authors ONE dashboard template and lands it as a
+# pull request, writing no runtime code. Its own file because it is a dispatched,
+# worker-shaped agent with its own charter and tool surface -- it writes files and
+# drives git, but mounts neither the work-ledger set nor the publication surface, so
+# it is neither the default-mirroring worker nor a conductor. Its system prompt and
+# tool charter are the shipped ``dashboard-template/agent-spec.md`` (parsed at install);
+# its installer lives in ``worker_agent.py`` beside the other dispatched-agent installer.
+DASHBOARD_AUTHOR_AGENT_FILENAME = "kirocrew-dashboard-author.json"
 KNOWLEDGE_AGENT_FILENAME = "kirocrew-knowledge.json"
 RESEARCH_AGENT_FILENAME = "kirocrew-research.json"
 HEARTBEAT_AGENT_FILENAME = "kirocrew-heartbeat.json"
-# A tightly scoped CPU-fast reconnaissance worker. It is optional: the
-# coordinator dispatch surface advertises it only after this managed spec is
-# present and carries its required core MCP server.
+DASHBOARD_MANAGER_AGENT_FILENAME = "kirocrew-dashboard-manager.json"
 FAST_RECON_AGENT_FILENAME = "kirocrew-fast.json"
-# History consolidation's own identity. Same empty shell as lite, split out
-# because its payload class differs: consolidation feeds a whole session tail
-# into one prompt, so deployments route it to a large-context engine while
-# lite's micro-jobs (titles, link labels) stay on the cheap seat.
 CONSOLIDATE_AGENT_FILENAME = "kirocrew-consolidate.json"
+
+# The dashboard manager's agent NAME, derived from its filename rather than spelled
+# a second time. kiro-cli resolves an agent by reading ``<agents dir>/<name>.json``,
+# so the two are the same string by construction -- and this one is also a wire
+# string in the member base prompt, which routes a crewmate's page work to it. A
+# name that drifts from the filename routes the member to an agent that does not
+# resolve, which fails the turn rather than the feature.
+#
+# It lives HERE, with the filenames, because this module imports nothing from the
+# package: ``context_assembly.member`` needs the name for the prompt it builds, and
+# reading it off ``agent.py`` would close an import cycle at module scope.
+DASHBOARD_MANAGER_AGENT_NAME = DASHBOARD_MANAGER_AGENT_FILENAME[: -len(".json")]
 
 # Collective allowlists — the EXACT filenames KiroCrew owns in each dir. Used by
 # the Playwright convergence sweep (browser/setup.py) so it rewrites only files
@@ -62,9 +76,11 @@ OWNED_KIRO_AGENT_FILES = (
     LEDGER_CONDUCTOR_AGENT_FILENAME,
     SECURITY_CONDUCTOR_AGENT_FILENAME,
     WORKER_AGENT_FILENAME,
+    DASHBOARD_AUTHOR_AGENT_FILENAME,
     KNOWLEDGE_AGENT_FILENAME,
     RESEARCH_AGENT_FILENAME,
     HEARTBEAT_AGENT_FILENAME,
+    DASHBOARD_MANAGER_AGENT_FILENAME,
     FAST_RECON_AGENT_FILENAME,
     CONSOLIDATE_AGENT_FILENAME,
 )
@@ -78,10 +94,10 @@ OWNED_KIRO_AGENT_FILES = (
 #     compaction, heartbeat), reached via ``SessionManager.get_bg_session``.
 # The remaining OWNED_KIRO_AGENT_FILES entries are deliberately excluded because
 # each one only disables its own feature (guest replies, goal conducting,
-# Knowledge extraction, Research Lab, unattended heartbeat polling, or bounded
-# fast reconnaissance). Their installer calls in ``agent.py`` degrade to
-# ``logger.debug`` on failure, except ``kirocrew-guest.json``, which
-# ``_install_aim_capabilities`` writes unguarded after the lite fallback.
+# Knowledge extraction, Research Lab, unattended heartbeat polling). Their
+# installer calls in ``agent.py`` degrade to ``logger.debug`` on failure, except
+# ``kirocrew-guest.json``, which ``_install_aim_capabilities`` writes unguarded
+# after the lite fallback.
 REQUIRED_KIRO_AGENT_FILES = (
     AGENT_FILENAME,
     LITE_AGENT_FILENAME,

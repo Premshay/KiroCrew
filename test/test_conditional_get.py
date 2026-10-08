@@ -209,11 +209,19 @@ def test_every_media_route_uses_the_shared_helper() -> None:
     replaced, so any reappearance in the four route modules fails here.
     """
     import inspect
+    from pathlib import Path
 
     from kiro_crew.apps import routes as apps_routes
+    from kiro_crew.dashboard import agent_admin
     from kiro_crew.dashboard.handlers import agents, appearances, themes
 
     for mod in (apps_routes, agents, appearances, themes):
         src = inspect.getsource(mod)
+        if mod is agents:
+            # The agents handlers run the functions their agent_admin owners
+            # define, so the fence reads those owners as part of the module.
+            owners = sorted(Path(agent_admin.__file__).parent.glob("[!_]*.py"))
+            assert len(owners) >= 13
+            src += "".join(owner.read_text(encoding="utf-8") for owner in owners)
         assert 'headers.get("If-None-Match")' not in src, mod.__name__
         assert "request.if_none_match" not in src, mod.__name__

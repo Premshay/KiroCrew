@@ -100,6 +100,16 @@ _SEND_ID_RE = re.compile(rf"^[A-Za-z0-9_-]{{1,{SEND_ID_MAX_LEN}}}$")
 ATTACHMENT_LIST_MAX_ITEMS = 256
 ATTACHMENT_PATH_MAX_LEN = 4096
 
+# The whole-message quote a send may carry (``meta.quote``, minted by the
+# dashboard's ``chat-core/composer/messageQuote.ts``): the quoted text is capped
+# client-side at 1500 chars plus an ellipsis, so anything past this bound is not
+# a quote the client produced. The other fields are short identifiers / a
+# display name.
+QUOTE_META_KEY = "quote"
+QUOTE_TEXT_MAX_LEN = 2048
+QUOTE_FIELD_MAX_LEN = 256
+QUOTE_ROLES = frozenset({"user", "assistant"})
+
 
 def normalize_send_id(value: object) -> str | None:
     """Return *value* when it is a usable client send-correlation id, else None.
@@ -327,13 +337,8 @@ async def steer_into_running_turn(
     """Inject *message* into the slot's RUNNING turn; return a ``STEER_*`` outcome.
 
     Requires a live, steer-capable inner ACP client that the turn published on
-    the slot. Fire-and-forget by design: this never awaits the backend's answer,
-    because the running turn's read loop is the sole consumer of that stream.
-    Settlement therefore arrives out of band, and which signal carries it is the
-    backend's business — kiro-cli echoes ``steering_consumed``; claude-agent-acp
-    answers the steer request itself, which the client turns into the same echo.
-    Either way an UNSETTLED steer is requeued as a visible card when the turn
-    ends, so no path here loses the text.
+    the slot. Fire-and-forget by design: the inline steer card materializes when
+    kiro-cli echoes ``steering_consumed``.
 
     ``send_id`` is the client-minted correlation id from the send's meta (the
     same ``sendId`` convention the plain send path persists). When present it is
@@ -403,6 +408,7 @@ async def steer_into_running_turn(
     a restored transcript, and only an id names THIS delivery.
     """
     send_id = normalize_send_id(send_id)
+    quote = quote_meta(attachments)
     attachments = attachment_meta(attachments)
     client = getattr(slot, "_acp_client", None)
     if client is None or not getattr(client, "supports_steer", False):
@@ -520,8 +526,12 @@ async def steer_into_running_turn(
         slot._turn_channel_narrowed = True
     if admission is not None:
         slot._steer_admissions[message] = admission
-    if attachments:
-        slot._steer_attachment_meta[message] = attachments
+    if attachments or quote:
+        # Retained for the REQUEUE with the attachment lists: a steer the turn
+        # ended before consuming is drained as a queued row, and that row is
+        # rebuilt from this map -- without the quote here it would render its
+        # blockquote as text instead of the card.
+        slot._steer_attachment_meta[message] = {**attachments, **quote}
     if decision_strip:
         # Recorded for the REQUEUE, like the maps above: the three `STEER_REQUEUED`
         # returns below all come back before the stamp on the persisted row, and the
@@ -844,6 +854,8 @@ async def steer_into_running_turn(
         meta["sendId"] = send_id
     if attachments:
         meta.update(attachments)
+    if quote:
+        meta.update(quote)
     # The row survives a page reload via the dirty-flush cycle. The session's own
     # human's steer is stored as typed, like an ordinary send's row; a peer's is
     # stored sanitized, because its text has no human author to be its reader. A
@@ -877,6 +889,10 @@ async def steer_into_running_turn(
         push_payload["sendId"] = send_id
     if attachments:
         push_payload["meta"] = attachments
+    if quote:
+        # Another open tab draws the steer row from this frame: without the
+        # quote it would render the blockquote as text until a reload.
+        push_payload.setdefault("meta", {}).update(quote)
     state.broadcast_ws("steer_push", push_payload)
     return STEER_STEERED
 
@@ -891,6 +907,20 @@ async def steer_into_running_turn(
 #: spelled in two places.
 TURN_ACTOR_META_KEY = "turnActor"
 
+#: Entry meta key marking a queued payload as turn CONTENT: the drain hands it to
+#: the model as literal text and never reads its first word as a dashboard command.
+#: Stamped by the channel hand-off (``channel_handoff._queue_arm``, and the requeue
+#: of a channel steer the turn never consumed): a channel's own queue already
+#: replays every entry with command interpretation off, because a queued ``/new``
+#: or ``/clear`` is the sender's words waiting for the turn, not an instruction to
+#: run when it ends. Without this mark the one path that crosses from a channel
+#: into the dashboard queue would be the one path where a queued ``/clear`` wiped
+#: the session. Deliberately a ``meta`` key, so the durable copy keeps it across a
+#: restart: the mark only ever REMOVES a capability, so a hand-edited line that
+#: carries it turns a command into prose and nothing more -- the opposite of the
+#: provenance flags, which grant authority and are therefore never persisted.
+COMMANDS_OFF_META_KEY = "commands_off"
+
 
 def queue_for_next_turn(
     state: "DashboardState",
@@ -904,11 +934,20 @@ def queue_for_next_turn(
     decision_strip: dict | None = None,
     turn_actor: str = "",
     channel_recipient: dict[str, Any] | None = None,
+    quote: dict[str, Any] | None = None,
+    commands_off: bool = False,
 ) -> str:
     """Append *message* to the slot's queue and announce it; return the queue id.
 
     The running turn's teardown drains the queue, so this is how a message
     reaches a busy slot when steering is unavailable or not asked for.
+
+    *commands_off* stamps :data:`COMMANDS_OFF_META_KEY` on the entry: the drained
+    turn hands the text to the model as content and never runs its first word as a
+    dashboard command. Passed by the channel hand-off, whose text is a channel
+    human's words crossing into this queue; the composer leaves it False, because
+    a queued ``/clear`` typed into the session's own surface is that human's own
+    command to run.
 
     *channel_recipient* is the channel conversation the message came FROM -- the
     address ``session_control.channel_recipient_meta`` builds (channel type,
@@ -971,8 +1010,18 @@ def queue_for_next_turn(
         meta["sendId"] = send_id
     if attachments:
         meta.update(attachments)
+    if quote:
+        # The whole-message quote rides the entry for the same reason the
+        # attachment lists do: the drain unions entry meta onto the row it
+        # writes, and without it the row would render its blockquote as text
+        # instead of the card (fork GPT review). Already bounded by
+        # :func:`quote_meta`, which also redacted it when the sender was not
+        # the session's own human.
+        meta[QUOTE_META_KEY] = quote
     if decision_strip:
         meta["decisions_strip"] = decision_strip
+    if commands_off:
+        meta[COMMANDS_OFF_META_KEY] = True
     qid = slot.queue_append(
         message,
         meta=meta,
@@ -1011,6 +1060,8 @@ def queue_for_next_turn(
         # The card this frame draws is what a cancel later restores from, on a
         # tab that never held the send's own composer state.
         push["meta"] = attachments
+    if quote:
+        push.setdefault("meta", {})[QUOTE_META_KEY] = quote
     state.broadcast_ws("queue_push", push)
     # Accepted, and possibly not persisted: the write ceilings refuse an entry
     # past the count cap or the byte budget and the send is still accepted, so
@@ -1116,6 +1167,60 @@ def _log_queue_persist_failure(future: "asyncio.Future[Any]") -> None:
         logger.warning("Queued-prompt persist failed; the flush still owes it", exc_info=exc)
 
 
+def quote_meta(user_meta: dict | None, *, user_origin: bool = True) -> dict[str, dict[str, str]]:
+    """The whole-message quote of a send's ``meta``, bounded, or ``{}``.
+
+    Same retention discipline as :func:`attachment_meta`: a record the
+    dashboard's card could not draw (wrong role, missing or non-string text, a
+    field over its bound) is dropped WHOLE rather than trimmed -- a trimmed quote
+    is a different quote, and the text beside it still carries the blockquote,
+    so nothing is lost by refusing the card. The text and the display name are
+    user-supplied; ``user_origin`` decides whether the record is redacted here
+    (see the tail of this function).
+    """
+    if not isinstance(user_meta, dict):
+        return {}
+    raw = user_meta.get(QUOTE_META_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    role = raw.get("role")
+    text = raw.get("text")
+    # Type-gated before the set lookup: an unhashable role (a list, a dict)
+    # off the request body must refuse the record, not raise out of the send.
+    if not isinstance(role, str) or role not in QUOTE_ROLES:
+        return {}
+    if not isinstance(text, str) or not text.strip():
+        return {}
+    if len(text) > QUOTE_TEXT_MAX_LEN:
+        logger.warning(
+            "quote meta refused: %d-char text over the %d-char bound", len(text), QUOTE_TEXT_MAX_LEN
+        )
+        return {}
+    out: dict[str, str] = {"role": role, "text": text}
+    for key in ("ts", "mid", "author"):
+        value = raw.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if len(value) > QUOTE_FIELD_MAX_LEN:
+            logger.warning(
+                "quote meta refused: %r over the %d-char bound", key, QUOTE_FIELD_MAX_LEN
+            )
+            return {}
+        out[key] = value
+    # The session's own human's record is stored as given: the same text already
+    # opens the row's ``content`` as the ``>`` block they sent, and their row
+    # keeps its content as typed (``queued_text_for_display``). The card is drawn
+    # only where ``content`` starts with the block this record serializes to, so
+    # a record redacted on its own would never match -- card AND raw block, and
+    # the first queue edit would drop the record. Any other sender (an app's
+    # token, a peer) gets the display redaction its text gets, here, once, so
+    # every frame and row the record rides carries the redacted form.
+    if user_origin:
+        return {QUOTE_META_KEY: out}
+    redacted = _redact_meta({QUOTE_META_KEY: out})
+    return {QUOTE_META_KEY: redacted[QUOTE_META_KEY]}
+
+
 def attachment_meta(user_meta: dict | None) -> dict[str, list[str]]:
     """The attachment lists of a send's ``meta``, reduced to lists of strings.
 
@@ -1205,6 +1310,12 @@ def queue_entry_view(item: dict[str, Any]) -> dict[str, Any]:
     attachments = attachment_meta(item.get("meta"))
     if attachments:
         view["meta"] = attachments
+    # Redacted unless the entry is the session's own human's (an entry restored
+    # from disk carries no origin stamp and so stays redacted), the same rule
+    # the entry's text follows in `queued_text_for_display`.
+    quote = quote_meta(item.get("meta"), user_origin=queue_entry_is_user_origin(item))
+    if quote:
+        view.setdefault("meta", {}).update(quote)
     # The structural kind tag rides in ``meta`` so the queue card can classify
     # a system entry (an MCP-App message, for one) without parsing its text —
     # the same enqueue-time source the server's own drain reads, and the same

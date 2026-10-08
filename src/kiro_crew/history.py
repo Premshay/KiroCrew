@@ -32,6 +32,11 @@ from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write, atomic_write_at
 from kiro_crew.chat_attachments import persist_inline_images, same_text_modulo_images
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
+
+# Every ``memory_mode`` a transcript header may record, least strict first. The one
+# allowlist lives in `execution_context`, whose order `stricter_memory_mode` reads;
+# re-exported here for the header parse and the dashboard's ``VALID_MEMORY_MODES``.
+from kiro_crew.execution_context import MEMORY_MODES  # noqa: F401 - facade re-export
 from kiro_crew.executors import run_in_embed_pool  # noqa: F401 - facade re-export
 from kiro_crew.frontmatter import (  # noqa: F401 - facade re-exports
     SKILL_UPDATE,
@@ -142,6 +147,7 @@ from kiro_crew.llm_helpers import (  # noqa: F401 - facade re-exports
     stream_and_collect_json,
 )
 from kiro_crew.messaging.link import canonical_key, is_legacy_slack_key, legacy_key
+from kiro_crew.owner_only_files import OWNER_ONLY_FILE_MODE, mkdirs_owner_only, owner_only_opener
 from kiro_crew.preview_text import (  # noqa: F401 - facade re-export
     PREVIEW_MAX_CHARS,
     strip_markdown_preview,
@@ -230,17 +236,11 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "executor",
         "instance_id",
         "remote_slot",
-        # In-flight relay marker: the slot save writes it only while a relay is
-        # running and omits it once the turn ends. Absence therefore means "not
-        # in flight" and must clear the on-disk value — left unowned, the `true`
-        # written at relay start is carried forward past a clean completion, so
-        # every later restart would append a false "interrupted" row.
-        "relay_in_flight",
         # Local-turn crash marker: the generation of the turn ``_run_chat``
         # admitted, written before provider dispatch and omitted once the turn
-        # reaches teardown. Owned for the same reason as ``relay_in_flight``:
-        # absence IS the clear, so a carried-forward value would flag every
-        # later restart as interrupted after one clean completion.
+        # reaches teardown. Owned because absence IS the clear: a
+        # carried-forward value would flag every later restart as interrupted
+        # after one clean completion.
         "turn_in_flight_generation",
         # The row that opened that turn (role, content, cls, ts, meta), carried
         # with the generation so a restart inside the periodic flush window
@@ -249,6 +249,12 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "turn_in_flight_prompt",
         "folder_id",
         "app",
+        "declared_goal",
+        "session_checkpoint",
+        "checkpoint_freshness",
+        "session_timeline",
+        "peer_channel_inbox",
+        "post_restart_continuation",
         "artifact",
         # Durable copy of the slot's held /note lines. Owned, not
         # monotonic: the hold is written while notes are held and must be
@@ -458,8 +464,10 @@ class OnLoopPersistError(AssertionError):
     The offload invariant (see the ``_locked`` contract and
     ``docs/system-specs/modules/history.md``) is that NO session-JSONL mutator
     runs on the gateway event loop: on-loop callers route through
-    ``append_off_loop`` / ``append_if_absent_off_loop`` / ``update_metadata_off_loop``
-    / ``save_slot_off_loop`` (or ``asyncio.to_thread``), all of which dispatch
+    ``append_off_loop`` / ``append_if_absent_off_loop`` /
+    ``append_rows_if_absent_off_loop`` / ``update_metadata_off_loop`` (here), or
+    ``dashboard.chat_persistence.save_slot_off_loop`` (or ``asyncio.to_thread``),
+    all of which dispatch
     the mutation to a worker thread so ``_locked`` runs OFF the loop and takes
     the patient acquire path. A raw on-loop mutator call works in every low-
     traffic test and use (the flock is uncontended) and only loses data under
@@ -573,9 +581,10 @@ def _check_on_loop_persist_discipline(key: str) -> None:
     if _on_loop_persist_strict():
         raise OnLoopPersistError(
             f"session mutation for {key!r} entered _locked on the event loop; "
-            f"on-loop callers MUST offload (append_off_loop / "
-            f"append_if_absent_off_loop / update_metadata_off_loop / "
-            f"save_slot_off_loop / asyncio.to_thread) so the write takes the "
+            f"on-loop callers MUST offload (history.append_off_loop / "
+            f"append_if_absent_off_loop / append_rows_if_absent_off_loop / "
+            f"update_metadata_off_loop, dashboard.chat_persistence."
+            f"save_slot_off_loop, or asyncio.to_thread) so the write takes the "
             f"patient off-loop acquire path — a raw on-loop mutation loses data "
             f"under real contention (HistoryLockTimeout swallowed as silent "
             f"transcript loss). Wrap in history.allow_on_loop_persist() only to "
@@ -843,6 +852,44 @@ def update_metadata_off_loop(
 # can't silently diverge between surfaces.
 INCOGNITO_MEMORY_MODES = frozenset({"incognito", "temporary"})
 
+#: The most of a transcript's first line any reader parses for its mode. The
+#: metadata line is a small JSON object; a longer first line is unknown to every
+#: reader alike, so the write gate and the export cannot disagree about it.
+TRANSCRIPT_HEADER_MAX_BYTES = 64 * 1024
+
+
+def memory_mode_from_header_line(first_line: bytes) -> str | None:
+    """The ``memory_mode`` a transcript's first line records, or ``None`` when unknown.
+
+    The one parse of a transcript header's mode, shared by the restricted-session
+    write gate and the whole-install export and import, so the readers that must
+    fail closed cannot drift apart. Pure: the caller reads (and bounds) the line.
+
+    * a JSON object with ``_type: metadata`` and no ``memory_mode`` (or ``null``)
+      is a legacy persistent session -> ``"persistent"``;
+    * a string mode is ``strip().lower()``-ed and must then be in
+      :data:`MEMORY_MODES`;
+    * anything else -- not JSON, not an object, not a metadata header, a
+      non-string or unrecognised mode -> ``None``. Callers deny on ``None``.
+    """
+    try:
+        data = json.loads(first_line.decode("utf-8", "replace"))
+    except (ValueError, RecursionError):
+        # ValueError covers JSONDecodeError and an integer past the interpreter's
+        # digit limit; deep nesting raises RecursionError.
+        return None
+    if not isinstance(data, dict) or data.get("_type") != "metadata":
+        return None
+    mode = data.get("memory_mode")
+    if mode is None:
+        return "persistent"
+    if not isinstance(mode, str):
+        return None
+    # Allowlist, not normalize-and-hope: `"incognito "` must not read as an
+    # unrestricted mode just because it misses INCOGNITO_MEMORY_MODES.
+    normalized = mode.strip().lower()
+    return normalized if normalized in MEMORY_MODES else None
+
 
 def is_incognito_transcript(memory_mode: object) -> bool:
     """True when *memory_mode* marks a transcript private (incognito/temporary).
@@ -1033,7 +1080,7 @@ def _archive_lines(
     import itertools
 
     adir = _archive_dir(base)
-    adir.mkdir(parents=True, exist_ok=True)
+    mkdirs_owner_only(adir)
     now = datetime.now()
     stamp = now.strftime("%Y%m%d-%H%M%S")
     safekey = _safe_key(key)
@@ -1056,7 +1103,7 @@ def _archive_lines(
         suffix = f"-{n}" if n else ""
         candidate = adir / f"{safekey}{ARCHIVE_SEGMENT_DELIMITER}{stamp}{suffix}.jsonl"
         try:
-            with candidate.open("x", encoding="utf-8") as f:
+            with open(candidate, "x", encoding="utf-8", opener=owner_only_opener) as f:
                 f.write(payload)
             break
         except FileExistsError:
@@ -1390,7 +1437,7 @@ def _write_thread_sidecar(path: Path, document: str) -> None:
     Session Storage's opener degrades.
     """
     parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
+    mkdirs_owner_only(parent)
     if platform_compat.is_link_or_junction(parent) or not stat.S_ISDIR(os.lstat(parent).st_mode):
         raise ThreadStoreUnreadable(f"thread sidecar directory is not a directory: {parent}")
     if not platform_compat.IS_POSIX:
@@ -1403,7 +1450,7 @@ def _write_thread_sidecar(path: Path, document: str) -> None:
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
-        atomic_write_at(dir_fd, path.name, document)
+        atomic_write_at(dir_fd, path.name, document, mode=OWNER_ONLY_FILE_MODE)
     finally:
         os.close(dir_fd)
 
@@ -1599,6 +1646,18 @@ class ConversationLog:
     # serialize on it.
     _flock_state: dict[str, list[int]] = {}
     _flock_guard = threading.Lock()
+
+    # Permanent deletes in flight in THIS process, keyed by store directory and
+    # transcript lock stem (see ``_delete_in_flight_marks``) and counted so nested windows (the session-delete
+    # handler's window around ``delete_session``'s own) release cleanly. A
+    # delete holds the transcript lock across its whole transaction, so a
+    # lock-free existence probe made inside it still sees the file and cannot
+    # tell "present" from "about to be unlinked". Resume consults this before
+    # it publishes a slot (see :meth:`delete_in_flight`). Cross-process deletes
+    # (the CLI) are not visible here; the slot save's delete-won guard is the
+    # backstop for those.
+    _deletes_in_flight: dict[str, int] = {}
+    _deletes_in_flight_guard = threading.Lock()
 
     # Monotonic count of cross-process flock RELEASES per lock_key, bumped
     # under ``_flock_guard`` when a deferred release actually retires a held
@@ -1905,7 +1964,7 @@ class ConversationLog:
                 state = ConversationLog._flock_state.get(lock_key)
                 if state is None:
                     lock_path = self._lock_path(key)
-                    lock_path.parent.mkdir(parents=True, exist_ok=True)
+                    mkdirs_owner_only(lock_path.parent)
                     fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
                     state = [fd, 0, 0]  # fd, depth, held
                     ConversationLog._flock_state[lock_key] = state
@@ -2074,8 +2133,8 @@ class ConversationLog:
         self._run_fd_cleanup_off_loop(_release_and_close)
 
     def init(self) -> None:
-        """Create sessions directory if missing."""
-        self._dir.mkdir(parents=True, exist_ok=True)
+        """Create sessions directory if missing (owner-only, like every transcript in it)."""
+        mkdirs_owner_only(self._dir)
 
     def _path(self, key: str) -> Path:
         p = self._dir / f"{_safe_key(key)}.jsonl"
@@ -2598,7 +2657,7 @@ class ConversationLog:
             created_now = False
             if not path.exists():
                 created_now = True
-                self._dir.mkdir(parents=True, exist_ok=True)
+                mkdirs_owner_only(self._dir)
                 meta: dict = {
                     "_type": "metadata",
                     "created_at": metadata_now_iso(),
@@ -2609,7 +2668,9 @@ class ConversationLog:
                 if tab_id:
                     meta["tab_id"] = tab_id
                     created_with_tab_id = True
-                path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+                # Created 0600: a transcript is the conversation itself.
+                with open(path, "w", encoding="utf-8", opener=owner_only_opener) as f:
+                    f.write(json.dumps(meta) + "\n")
 
             msg: dict = {
                 "role": role,
@@ -2652,7 +2713,7 @@ class ConversationLog:
 
             # Session transcripts are intentionally local plaintext JSONL (the
             # documented storage format), not a credential/secret store.
-            with open(path, "a", encoding="utf-8") as f:
+            with open(path, "a", encoding="utf-8", opener=owner_only_opener) as f:
                 f.write(json.dumps(msg) + "\n")  # lgtm[py/clear-text-storage-sensitive-data]
 
             # Invalidate cache since file changed
@@ -3512,14 +3573,18 @@ class ConversationLog:
     def _canonical_key(key: str) -> str:
         return SessionCatalogProjection._canonical_key(key)
 
-    def list_sessions(self) -> list[dict]:
-        return self._catalog_projection.list_sessions()
+    def list_sessions(self, *, keys: Iterable[str] | None = None) -> list[dict]:
+        if keys is None:
+            return self._catalog_projection.list_sessions()
+        return self._catalog_projection.list_sessions(keys=keys)
 
     def agent_usage(self) -> dict[str, tuple[int, float]]:
         return self._catalog_projection.agent_usage()
 
-    def search_sessions(self, query: str, limit: int = 50) -> list[dict]:
-        return self._catalog_projection.search_sessions(query, limit)
+    def search_sessions(
+        self, query: str, limit: int = 50, *, keys: Container[str] | None = None
+    ) -> list[dict]:
+        return self._catalog_projection.search_sessions(query, limit, keys=keys)
 
     def _folded_content(self, key: str) -> tuple[int, str]:
         return self._catalog_projection._folded_content(key)
@@ -3604,6 +3669,48 @@ class ConversationLog:
     def note_tab_id(self, key: str, tab_id: str | None) -> None:
         self._read_projection.note_tab_id(key, tab_id)
 
+    @contextlib.contextmanager
+    def delete_in_flight_window(self, key: str) -> Iterator[None]:
+        """Mark *key*'s transcript as being permanently deleted for the block.
+
+        Non-blocking bookkeeping only, so it is safe on the event loop. Held by
+        ``delete_session`` for its whole transaction, and by callers whose
+        delete spans more than that call (the session-delete handler captures
+        which slot to remove before its first await, so the window has to open
+        there for a slot published after that capture to be refused).
+        """
+        marks = self._delete_in_flight_marks(key)
+        with ConversationLog._deletes_in_flight_guard:
+            for mark in marks:
+                ConversationLog._deletes_in_flight[mark] = (
+                    ConversationLog._deletes_in_flight.get(mark, 0) + 1
+                )
+        try:
+            yield
+        finally:
+            with ConversationLog._deletes_in_flight_guard:
+                for mark in marks:
+                    depth = ConversationLog._deletes_in_flight.get(mark, 0) - 1
+                    if depth > 0:
+                        ConversationLog._deletes_in_flight[mark] = depth
+                    else:
+                        ConversationLog._deletes_in_flight.pop(mark, None)
+
+    def delete_in_flight(self, key: str) -> bool:
+        """True while a permanent delete of *key* is in flight in this process."""
+        marks = self._delete_in_flight_marks(key)
+        with ConversationLog._deletes_in_flight_guard:
+            return any(mark in ConversationLog._deletes_in_flight for mark in marks)
+
+    def _delete_in_flight_marks(self, key: str) -> tuple[str, ...]:
+        # The transcript lock stems, not ``_path``: ``_path`` stats the disk and
+        # picks the legacy Slack file only while it exists, so a mark taken
+        # before the unlink and a probe made after it would name different
+        # files. The stems are pure string math and every spelling of one
+        # session maps to the same set, exactly as the transcript lock does.
+        base = str(self._dir)
+        return tuple(f"{base}{os.sep}{stem}" for stem in transcript_lock_stems(key))
+
     @overload
     def delete_session(self, key: str, *, skip_pinned: Literal[False] = ...) -> bool: ...
 
@@ -3611,10 +3718,11 @@ class ConversationLog:
     def delete_session(self, key: str, *, skip_pinned: Literal[True]) -> bool | None: ...
 
     def delete_session(self, key: str, *, skip_pinned: bool = False) -> bool | None:
-        if skip_pinned:
-            deleted = self._metadata_projection.delete_session(key, skip_pinned=True)
-        else:
-            deleted = self._metadata_projection.delete_session(key, skip_pinned=False)
+        with self.delete_in_flight_window(key):
+            if skip_pinned:
+                deleted = self._metadata_projection.delete_session(key, skip_pinned=True)
+            else:
+                deleted = self._metadata_projection.delete_session(key, skip_pinned=False)
         if deleted:
             # A deleted session's restart-surviving vouch goes with it, so the
             # vouched-executions/ files track live sessions, not every one ever made.

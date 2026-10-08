@@ -30,7 +30,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kiro_crew.mcp_gateway import gatewayd as gw
-from kiro_crew.mcp_gateway.backend import Backend, BackendGone, _PendingRequest
+from kiro_crew.mcp_gateway.backend import (
+    _RECYCLE_EXEMPT_METHODS,
+    Backend,
+    BackendGone,
+    _PendingRequest,
+    has_recyclable_in_flight,
+)
 from kiro_crew.mcp_gateway.pool import BackendUnavailable, PoolAtCapacity, PoolKey
 
 pytestmark = pytest.mark.xdist_group("mcp_gateway")
@@ -547,6 +553,9 @@ class TestRegisterBookkeeping:
 #: the mark keeps its argvalues alive on the function object. One test needs the
 #: payload; all of them were paying for it.
 _OVERSIZE_FRAME = "oversize-frame"
+#: Stands in for a frame nested past the decoder's ceiling, built in the body
+#: for the same reason: probing the decoder depth is not free at import.
+_DEEP_FRAME = "deep-frame"
 
 
 class TestBridgeFrameHygiene:
@@ -559,8 +568,18 @@ class TestBridgeFrameHygiene:
             (_OVERSIZE_FRAME, True),
             (b"not json at all\n", False),
             (b"[1, 2, 3]\n", False),
+            (b"\x80\xff{}\n", False),
+            (_DEEP_FRAME, False),
         ],
-        ids=["limit-overrun", "empty-line", "oversize", "non-json", "non-object"],
+        ids=[
+            "limit-overrun",
+            "empty-line",
+            "oversize",
+            "non-json",
+            "non-object",
+            "undecodable",
+            "nested-past-the-decoder",
+        ],
     )
     async def test_bad_bridge_frames_never_reach_the_backend(
         self, peer_ok, monkeypatch, bad_frame, is_fatal
@@ -572,6 +591,12 @@ class TestBridgeFrameHygiene:
         monkeypatch.setattr(gw, "_acquire_backend", acquire)
         if bad_frame is _OVERSIZE_FRAME:
             bad_frame = b"x" * (gw._MAX_FRAME_BYTES + 2)
+        if bad_frame is _DEEP_FRAME:
+            # ``RecursionError`` is not a ``JSONDecodeError``, so a catch set
+            # that names only the latter lets it end the bridge loop.
+            from stray_line_helpers import too_deep_line
+
+            bad_frame = too_deep_line()
         # The trailing ping is the probe: it is answered only if the connection
         # survived the bad frame.
         reader = _ScriptedReader(_register_frame(), bad_frame, {"type": "ping"})
@@ -586,6 +611,59 @@ class TestBridgeFrameHygiene:
         else:
             assert [f["type"] for f in writer.frames()] == ["registered", "pong"]
             assert reader.remaining == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_frame",
+        [
+            b'{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"n":'
+            + b"9" * 5000
+            + b"}}\n",
+            b'{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"s":"\xff"}}\n',
+            b'{"method":"tools/list","params":{"s":"\xff"},"jsonrpc":"2.0","id":7}\n',
+        ],
+        ids=["over-digit-limit", "undecodable", "undecodable-id-last"],
+    )
+    async def test_an_unparseable_request_is_answered_not_stranded(
+        self, peer_ok, monkeypatch, bad_frame
+    ):
+        """Answered, so kiro-cli does not wait for its own timeout while the
+        ping-gated wedge check sees a healthy connection."""
+        acquire = AsyncMock()
+        monkeypatch.setattr(gw, "_acquire_backend", acquire)
+        reader = _ScriptedReader(_register_frame(), bad_frame, {"type": "ping"})
+        writer = _FakeWriter()
+
+        await _handle(reader, writer, _fake_pool())
+
+        acquire.assert_not_awaited()
+        registered, answer, pong = writer.frames()
+        assert registered["type"] == "registered" and pong["type"] == "pong"
+        assert answer["id"] == 7 and answer["error"]["code"] == -32700
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_frame",
+        [
+            b'{"jsonrpc":"2.0","id":3,"result":{"roots":[{"uri":"\xff"}]}}\n',
+            b'{"jsonrpc":"2.0","id":3,"error":{"code":1,"message":"\xff"}}\n',
+            b'{"result":{"roots":[{"uri":"\xff"}]},"jsonrpc":"2.0","id":3}\n',
+        ],
+        ids=["result", "error", "result-id-last"],
+    )
+    async def test_an_unparseable_response_is_dropped_unanswered(
+        self, peer_ok, monkeypatch, bad_frame
+    ):
+        """kiro-cli answering a backend's own request uses the backend's id,
+        which kiro-cli's own requests may share: an error under it would fail
+        whichever kiro-cli call has that number."""
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock())
+        reader = _ScriptedReader(_register_frame(), bad_frame, {"type": "ping"})
+        writer = _FakeWriter()
+
+        await _handle(reader, writer, _fake_pool())
+
+        assert [f.get("type") for f in writer.frames()] == ["registered", "pong"]
 
     @pytest.mark.asyncio
     async def test_bridge_ping_is_answered_without_acquiring_a_backend(
@@ -934,6 +1012,53 @@ class TestDisconnectTeardown:
         assert any(b"notifications/cancelled" in payload for payload in sent)
         assert backend.refcount == 0
         recycle.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", sorted(_RECYCLE_EXEMPT_METHODS))
+    async def test_an_abandoned_listing_keeps_the_warm_backend(
+        self, peer_ok, monkeypatch, method
+    ):
+        """a stub that leaves with only a listing in flight must not cost
+        the backend it just started."""
+        backend = _fake_backend()
+        backend._pending_requests["f1"] = _PendingRequest(
+            stub_uuid=_STUB, original_id=7, method=method
+        )
+        recycle = AsyncMock(return_value=True)
+        backend.recycle_if_idle = recycle  # type: ignore[method-assign]
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(backend, True)))
+
+        await _handle(
+            _ScriptedReader(_register_frame(), {"type": "ensure_backend"}),
+            _FakeWriter(),
+            _fake_pool(),
+        )
+
+        sent = [call.args[0] for call in backend.stdin.write.call_args_list]
+        assert any(b"notifications/cancelled" in payload for payload in sent)
+        assert backend.refcount == 0
+        recycle.assert_not_awaited()
+
+    def test_the_exempt_set_is_the_documented_one(self):
+        assert _RECYCLE_EXEMPT_METHODS == {
+            "ping",
+            "tools/list",
+            "prompts/list",
+            "resources/list",
+            "resources/templates/list",
+        }
+
+    def test_tool_work_alongside_a_listing_still_counts(self):
+        backend = _fake_backend()
+        backend._pending_requests["f1"] = _PendingRequest(
+            stub_uuid=_STUB, original_id=1, method="tools/list"
+        )
+        assert not has_recyclable_in_flight(backend._pending_requests, _STUB)
+        backend._pending_requests["f2"] = _PendingRequest(
+            stub_uuid=_STUB, original_id=2, method="tools/call"
+        )
+        assert has_recyclable_in_flight(backend._pending_requests, _STUB)
+        assert not has_recyclable_in_flight(backend._pending_requests, "another-stub")
 
     @pytest.mark.asyncio
     async def test_a_failing_cancel_still_detaches_the_stub(self, peer_ok, monkeypatch):

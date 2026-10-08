@@ -95,19 +95,13 @@ class DashboardPersistenceCoordinator:
             for slot in list(owner._slots.values()):
                 apply_pending_slot_memory_mode(owner, slot)
 
-    def flush_slot_now(self, owner: Any, slot: Any) -> bool:
-        """Write one dirty slot and clear only the generation that was saved.
-
-        Returns whether the slot is now on disk. Callers that admit work only
-        once it is durable read this — the dashboard's send path discards a
-        row it could not persist rather than answering for one that may not
-        survive a restart — so "nothing to write" and "the write failed" must
-        not collapse into the same silent return.
-        """
-        # Keep a provisional endpoint-metadata update out of an unpinned
-        # periodic flush; callers receive a clear non-durable result.
+    def flush_slot_now(self, owner: Any, slot: Any) -> None:
+        """Write one dirty slot and clear only the generation that was saved."""
+        # Endpoint metadata is applied to the live slot before its guarded
+        # history write.  Do not let this unpinned periodic writer make that
+        # provisional value durable while the guarded writer is still waiting.
         if getattr(slot, "_metadata_persist_inflight", 0):
-            return False
+            return
         # Nor while the slot's NAME is being retracted. A fenced slot is still
         # the occupant of its name until the pop, so this 5-second pass still
         # visits it, and this write carries no ``expected_slot_name`` -- so the
@@ -117,16 +111,15 @@ class DashboardPersistenceCoordinator:
         # adopts the name next. ``_dirty`` is deliberately left armed: the next
         # pass writes it if the close is abandoned, and a close that completes
         # persists the window itself through its own archival save.
-        # MERGE-REVIEW: upstream returns None here; the fork's durable-send
-        # contract needs a bool, and a closing slot was not written, so False.
         if getattr(slot, "is_closing", False):
-            return False
-        if not owner.conversation_log:
-            return False
+            return
+        if not owner.conversation_log or not slot.messages:
+            return
+        # A queued user prompt is persisted by the metadata line, not by a row,
+        # so an enqueue does not make the transcript dirty. Save on either
+        # signal: ``_dirty`` for the window, queue drift for the queue.
         if not slot._dirty and not getattr(slot, "queue_persist_pending", False):
-            return True
-        if not slot.messages and not getattr(slot, "queue_persist_pending", False):
-            return True
+            return
         save_slot_to_history = self._slot_saver_provider()
 
         # Keep the dirty bit true for the whole save. chat_fork treats it as
@@ -151,11 +144,9 @@ class DashboardPersistenceCoordinator:
         except Exception:
             # A failed write remains owed to the next periodic pass.
             self._logger_provider().warning("Flush failed for slot %s", slot.key, exc_info=True)
-            return False
         else:
             if slot._dirty_gen == generation:
                 slot._dirty = False
-            return True
 
     def _flush_dirty_slots(self, owner: Any) -> None:
         """Persist dirty transcripts, open tabs, then context snapshots."""
@@ -188,6 +179,37 @@ class DashboardPersistenceCoordinator:
         )
         persist_context_snapshots()
 
+    def _read_persisted_open_slot_keys(self, path: Path) -> list[str] | None:
+        """Return the raw string ``keys`` already on disk.
+
+        Used only to merge the existing seed into a pre-restore snapshot so a
+        flush in the boot window cannot shrink it. Touches no slot state, so it
+        is safe to call under the periodic flush.
+
+        Returns an empty list when the file is genuinely absent (no seed yet) or
+        holds no usable ``keys`` -- a merge against nothing is a safe no-op.
+        Returns ``None`` on a TRANSIENT read failure (e.g. a Windows sharing
+        violation from a foreign handle open on the file): the seed exists but
+        could not be read, so the caller must NOT write -- a merge against an
+        empty read would shrink the file and lose the very tabs the seed holds.
+        """
+        try:
+            raw = self._json_codec_provider().loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
+        except Exception:
+            # The seed may well exist and be non-empty; we just could not read
+            # it this instant. Signal "unknown" so the caller skips the write
+            # and preserves the on-disk seed for the next flush to retry.
+            self._logger_provider().debug(
+                "open_slots.json unreadable; skipping pre-restore write", exc_info=True
+            )
+            return None
+        keys = raw.get("keys") if isinstance(raw, dict) else None
+        if not isinstance(keys, list):
+            return []
+        return [key for key in keys if isinstance(key, str)]
+
     def _persist_open_slots(self, owner: Any) -> None:
         """Atomically snapshot the current persistent open-slot keys."""
         if owner.restoring_open_slots:
@@ -216,6 +238,33 @@ class DashboardPersistenceCoordinator:
                 for key in getattr(owner, "unrestored_slot_keys", frozenset())
                 if key not in seen
             )
+            # The periodic flush loop is armed BEFORE the startup open-tab
+            # restore runs, so a flush can fire while ``_slots`` has not been
+            # populated yet. In that gap ``_slots`` is not the authoritative
+            # open-tab set: it is empty, or holds only a tab created during boot
+            # (the HTTP listener binds before restore). Pruning the seed down to
+            # it would drop every tab the restore has yet to read, so the NEXT
+            # restart places those sessions in "older sessions". Until the
+            # restore latch flips, MERGE instead of prune: fold the existing
+            # on-disk seed in so a crash in this window keeps both the seeded
+            # tabs and any boot-time tab. After restore has run, _slots is
+            # authoritative and the merge is a no-op (its keys are already live).
+            if not getattr(owner, "open_slots_restored", False):
+                seed = self._read_persisted_open_slot_keys(path)
+                if seed is None:
+                    # The seed exists but could not be read this instant (a
+                    # transient failure such as a Windows sharing violation).
+                    # Merging an empty read would shrink the file and lose the
+                    # tabs the seed holds, so skip the whole write and let the
+                    # next flush retry against the intact on-disk seed.
+                    self._logger_provider().debug(
+                        "open_slots snapshot skipped: pre-restore seed unreadable"
+                    )
+                    return
+                for key in seed:
+                    if key not in seen:
+                        seen.add(key)
+                        keys.append(key)
             payload = self._json_codec_provider().dumps(
                 {"keys": keys, "ts": self._wall_time_provider()}
             )
@@ -302,6 +351,16 @@ class DashboardPersistenceCoordinator:
         if owner.restoring_open_slots:
             self._logger_provider().debug("context snapshot flush skipped: restore in progress")
             return
+        # Same pre-restore gap as _persist_open_slots: the flush loop is armed
+        # before the open-tab restore, and this write prunes the snapshot map
+        # down to ``set(owner._slots)``. In the gap that set is empty (or holds
+        # only a boot-time tab), so pruning would delete the context readings of
+        # every tab the restore has yet to rebuild. Until the restore latch
+        # flips, write WITHOUT pruning: ``ensure_loaded()`` below folds the disk
+        # snapshots into memory, so the write is the union of disk and live
+        # readings and a crash in this window loses nothing. After restore has
+        # run, _slots is authoritative and the prune resumes.
+        prune = bool(getattr(owner, "open_slots_restored", False))
         with owner._context_snapshots_lock:
             if not owner._context_snapshots_dirty:
                 return
@@ -322,9 +381,12 @@ class DashboardPersistenceCoordinator:
             try:
                 with owner._context_snapshots_lock:
                     owner._context_snapshots_dirty = False
-                    live_keys = set(owner._slots)
-                    for key in [key for key in owner._context_snapshots if key not in live_keys]:
-                        del owner._context_snapshots[key]
+                    if prune:
+                        live_keys = set(owner._slots)
+                        for key in [
+                            key for key in owner._context_snapshots if key not in live_keys
+                        ]:
+                            del owner._context_snapshots[key]
                     payload = self._json_codec_provider().dumps(owner._context_snapshots)
                 self._atomic_write_provider()(
                     self._config_dir_provider() / "context_snapshots.json",

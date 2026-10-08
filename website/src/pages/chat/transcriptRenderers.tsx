@@ -35,9 +35,9 @@ import type React from 'react'
 import ThinkingBlock from './ThinkingBlock'
 import ToolCallLine from './ToolCallLine'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
-import RecoveryCard, { injectOpensTurn, resolveInjectCard } from './RecoveryCard'
-import PeerChannelRequestCard, { parsePeerChannelRequest } from './PeerChannelRequestCard'
+import RecoveryCard, { opensTurn, resolveInjectCard } from './RecoveryCard'
 import { SystemNoticeRow, isSystemNoticeRow } from './CompactionCard'
+import SkillLoadCard, { isSkillLoadRow } from './SkillLoadCard'
 import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, isAuthRequired, isCapabilitiesChanged, isModelUnentitled, isSessionStartFailed, isUsageLimit, sessionStartFailureStreak } from './ErrorCard'
 import { FEATURE_REQUEST_FORM_URL, isFeatureRequestRow } from '../../prompts/featureRequest'
 import NoticeCard from './NoticeCard'
@@ -47,12 +47,12 @@ import SubagentRunCard, { extractSpawnRunLaunch, isSpawnRunTool } from './Subage
 import WorkflowCompletionCard, { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
 import SubagentCompletionCard from './SubagentCompletionCard'
 import { isSubagentCompletionMessage, type ParsedSubagentCompletion } from './subagentCompletion'
-import { REASONING_ROLES, TURN_OPENER_ROLES, hasReasoningContent } from './groupDisplayItems'
+import { REASONING_ROLES, hasReasoningContent } from './groupDisplayItems'
 import { FileCard } from '../../components/FileCard'
 import UserMessage from './UserMessage'
 import CrewmateMessage, { type CrewmateIdentity } from './CrewmateMessage'
 import { crewmateBubbleClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
-import { formatTs, renderAssistantBubble, replyInThreadFor, threadFooterFor, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
+import { formatTs, quoteMessageFor, renderAssistantBubble, replyInThreadFor, threadFooterFor, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
 import { renderUserContent } from './ChatPageMessageContent'
 import { fmtMessageTimeFull } from './messageTime'
 import type { ChatMessage } from '../../types'
@@ -164,32 +164,11 @@ export interface TranscriptRendererOptions {
    *  drawn. */
   crewmate?: CrewmateIdentity
   /** The UNFILTERED transcript behind a crewmate's chat. The rows the pane
-   *  draws are `ctx.messages`; the rows the pane dropped (the `inject` row a
-   *  policy block writes among them) are only here. Read for the steer-chip
-   *  decision, never for layout. Meaningless without `crewmate`. */
+   *  draws are `ctx.messages`; the turn boundaries the pane dropped (a patrol
+   *  wake, a cron or sub-agent envelope between two replies) are only here.
+   *  Read for the run position, never for layout. Meaningless without
+   *  `crewmate`. */
   crewmateTranscript?: ChatMessage[]
-}
-
-/** Whether `row` OPENS a turn, for the two feature-request scans below. Read
- *  from the transcript's own row-kind vocabulary, not a role list of this
- *  module's: the opener ROLES (`TURN_OPENER_ROLES`: a typed row, an auto-nudge
- *  cycle, a drained sub-agent completion) minus a STEER, plus the inject KINDS
- *  the gateway stamps as a prompt of their own (`injectOpensTurn`: a cron
- *  notification, a fan-out synthesis -- a `recovery` or `user_replay` continues
- *  the request above it, and an unstamped inject dispatches nothing). A steer is
- *  persisted as a `user` row with `meta.steer` (chat_delivery.py) and appended
- *  optimistically in the same shape (ChatPage `steer()`), but it was injected
- *  INTO a running turn, so it cannot begin one. Same answer as the store's
- *  `isTurnBoundaryUser`, `selectSlotPendingApproval`'s walk and the turn-head
- *  walk in `app-sdk/turnPolicyBlock.ts`. Every steer row is exempt, the
- *  optimistic bubble included: a bubble the server turned into a NEW turn is
- *  reconciled by the echo that carries its `sendId` (the store deletes its
- *  `steer` flag), and until then a misread here only moves a link between two
- *  rows -- it never splices content, which is the one reason
- *  `isTurnBoundaryUser` keeps its optimistic exception. */
-function opensTurn(row: ChatMessage): boolean {
-  if (row.role === 'user') return !row.meta?.steer
-  return TURN_OPENER_ROLES.has(row.role) || injectOpensTurn(row)
 }
 
 /** True when the error row at `index` is the seeded feature-request turn's own
@@ -289,6 +268,17 @@ export function createTranscriptRenderers(
 
   return [
     // ── Shape-matched rows, ahead of anything keyed only by role ──
+    {
+      // A dollar-picked skill is gateway-authored context, not a conversational
+      // reply. Its metadata carries the exact redacted body that entered this
+      // turn, so the card remains truthful after the source skill changes.
+      id: 'skill_load',
+      roles: ['system'],
+      match: isSkillLoadRow,
+      render: (m, ctx) => ctx.row(
+        <SkillLoadCard key={ctx.key} message={m} disclosureKey={ctx.key} />,
+      ),
+    },
     {
       // Replaces the default: same card, but wired to open a folder and the
       // side panel the way the single-chat surface does.
@@ -406,26 +396,6 @@ export function createTranscriptRenderers(
         ),
     },
     {
-      // Refines `inject`, and must precede `recovery_inject`: a peer-channel
-      // delivery arrives as an inject row whose content is a machine-facing
-      // envelope, so both entries claim the role and only the parse tells the
-      // two apart. It lives HERE rather than on ChatPage because the page's
-      // `bubble` entry claims `inject` unguarded and outranks every role-keyed
-      // default -- the SDK's own `peer_channel_request` is therefore
-      // unreachable on that surface, and a page-local copy would be the fork
-      // this factory exists to end. Same component and the same `tight` row as
-      // the default it replaces, so no pane's output changes.
-      id: 'peer_channel_request',
-      roles: ['inject'],
-      match: m => parsePeerChannelRequest(m.content) !== null,
-      render: (m, ctx) => {
-        const parsed = parsePeerChannelRequest(m.content)
-        return parsed
-          ? ctx.row(<PeerChannelRequestCard parsed={parsed} disclosureKey={ctx.key} />, true)
-          : null
-      },
-    },
-    {
       // Refines `inject`: a gateway-authored injection is a one-line card, not
       // the cron-notification bubble the default draws.
       //
@@ -481,7 +451,8 @@ export function createTranscriptRenderers(
     },
     // Replaces the SDK's `assistant` entry (same id) ONLY for a crewmate's
     // chat: the same AssistantMessage (markdown, option chips, hover actions),
-    // placed as a bubble in a run under the crewmate's avatar and name. The
+    // placed as a bubble in a run with grouped corners (no author line:
+    // the DM header already names the speaker). The
     // run position is derived from the list the pane already filtered, so the
     // neighbours it reads are the rows drawn next to it. The two assistant-role
     // refinements above (system notice, workflow completion) still precede it;
@@ -496,14 +467,14 @@ export function createTranscriptRenderers(
             const pos = crewmateRunPosition(ctx.messages, ctx.index, crewmateTranscript)
             // The run ends here (single / end): the row after it is a boundary
             // the user sees or the turn ended, so this bubble is the one that
-            // carries the hover actions. The policy-block read goes to
-            // the unfiltered transcript — see `crewmateTranscript`; the row is
-            // located by identity, since the filter keeps the same objects.
-            const full = crewmateTranscript
-            const fullIndex = full ? full.indexOf(m) : -1
+            // carries the hover actions. No "Steered" chip on any bubble: in a
+            // DM with one named peer every send while it works is a steer, so
+            // the ack kiro-cli emits would close nearly every reply with the
+            // mechanics this surface hides (#17838). The marker is still
+            // stripped from the prose.
             const bubble = renderAssistantBubble(m, ctx, crewmateBubbleClass(pos), {
               forceFooter: pos === 'single' || pos === 'end',
-              policyBlockTranscript: full && fullIndex >= 0 ? { messages: full, index: fullIndex } : undefined,
+              suppressSteerAck: true,
               // A crewmate's reply is prose about the crew's own work, so it
               // names sessions constantly. Same triple the single-chat page
               // hands its bubble, and `m.ts` with it so the SHORT form resolves
@@ -515,7 +486,7 @@ export function createTranscriptRenderers(
             })
             if (bubble === null) return null
             return ctx.row(
-              <CrewmateMessage crewmate={crewmate} pos={pos} ts={m.ts}>{bubble}</CrewmateMessage>,
+              <CrewmateMessage pos={pos} author={crewmate.label || crewmate.name}>{bubble}</CrewmateMessage>,
               true,
             )
           },
@@ -614,7 +585,12 @@ export function createTranscriptRenderers(
                   messageTs: m.ts,
                 })}
                 hideSteerBadge
+                // The accent fill pairs with the crewmate's gray bubble above
+                // (#17839); a host that hides the steer badge without a
+                // crewmate (none today) keeps the neutral surface.
+                tone={crewmate ? 'accent' : 'default'}
                 onReplyInThread={replyInThreadFor(m, ctx)}
+                onQuoteMessage={quoteMessageFor(m, ctx, 'user')}
               />
               {threadFooterFor(m, ctx, 'end')}
             </>,

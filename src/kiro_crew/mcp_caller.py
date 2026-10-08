@@ -381,9 +381,13 @@ def _identity_from_pid_mapping() -> OwnIdentity:
     ladder is not attached to this rung. Owning it here is what makes the
     promise true for every caller, including one added later.
     """
-    # circular import: config.loader imports mcp_caller top-level for
-    # CallerContext typing; we can only reach config_dir here.
-    from kiro_crew.config.loader import config_dir
+    # Imported here rather than at module level because ``config.loader``
+    # imports this module for ``CallerContext`` typing. ``config.paths`` is the
+    # leaf that DEFINES ``config_dir`` -- ``config.loader`` only re-exports the
+    # same object -- and taking it from there costs about 190 modules less. This
+    # rung runs on the warm-pool path of every stub that has no session key yet,
+    # so that graph would otherwise land once per session per MCP server.
+    from kiro_crew.config.paths import config_dir
     from kiro_crew.session_pid_sig import REFUSAL_ABSENT, read_session_pid_mapping
 
     try:

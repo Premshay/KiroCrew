@@ -19,7 +19,7 @@ on:
   workflow_run:
     workflows:
       - CI
-      # The eleven cheap blocking gates, split out of CI so the fork reviewers can
+      # The cheap blocking gates in fast-gate.yml, split out of CI so the fork reviewers can
       # key on them. It is a lane in its own right -- a red gate must red the PR --
       # and its completion is also what releases CI's heavy jobs.
       - Fast Gate
@@ -203,8 +203,8 @@ jobs:
     # (see the allowlist note above). Admitting it only reached the resolve
     # step's empty lookup. The allowlist is the primary fence -- no monitored
     # workflow is `workflow_run`-triggered any more -- and this is the second:
-    # re-adding such a lane has to clear both, which `test_ci_surface_tests.py`
-    # refuses.
+    # re-adding such a lane has to clear both, which
+    # `test/test_ai_review_workflows.py` refuses.
     if: >-
       github.event_name != 'workflow_run'
       || github.event.workflow_run.event == 'pull_request'
@@ -219,16 +219,23 @@ jobs:
         internal-content-scan-gate.yml claude-review.yml codex-review.yml
         design-review.yml ux-review.yml first-principles-review.yml
         security-scope-review.yml
+      # Old check-run name -> current name for the fork lanes #16238 renamed,
+      # read by the publish step's fork re-check (the one read that binds a row
+      # by name). Why and how: docs/ci/ci-and-reviews.md. Remove once no open
+      # PR has a pre-#16238 head (#16373).
+      LEGACY_LANE_NAMES: >-
+        {"Opus 5 Review": "Opus 5.5 Review", "GPT 5.6 Review": "GPT 6.1 Review"}
     steps:
       # Transient network/TLS errors between the runner and api.github.com can
-      # abort a single-shot `gh` call, and under `set -e` that ended the whole
-      # evaluation before the publish step could run -- leaving a permanently
-      # red check unrelated to actual readiness (issue #2753: the same commit
-      # evaluated green then red 39 seconds apart with nothing pushed). Every
-      # READ-ONLY gh call below now goes through this bounded helper: 3
+      # abort a single-shot `gh` call, and under `set -e` that would end the
+      # whole evaluation before the publish step could run, leaving a red
+      # check unrelated to actual readiness. Every read-only gh call whose
+      # failure would end the evaluation goes through this bounded helper: 3
       # attempts with short backoff, mirroring the bounded-attempts convention
-      # in publish-installer.yml. Stdout is buffered per attempt so a failed
-      # attempt's partial output (e.g. an aborted --paginate stream) never
+      # in publish-installer.yml. Two reads deliberately do not: the existing
+      # PR Readiness status read uses `bounded` alone and falls back to
+      # `__unreadable__`, and the rate-limit log line is best-effort. Stdout
+      # is buffered per attempt so a failed attempt's partial output (e.g. an aborted --paginate stream) never
       # leaks into a pipe. WRITE calls are deliberately NOT retried here; the
       # label writes have their own narrow race tolerance (see drop_label /
       # ensure_label), and a lost-response retry of a DELETE outside that
@@ -605,11 +612,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch || github.ref_name }}
-          sparse-checkout: src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts
+          sparse-checkout: src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts
           persist-credentials: false
 
       # Issue #6658: the one-lane / one-rationale-per-finding disposition rule
-      # was mechanical only for a writer running the prepare-pr loop, so a
+      # was mechanical only for a writer running the kirocrew-prepare-pr loop, so a
       # writer who skips that loop could post a blanket single-rationale
       # `target=gpt` record that codex-review.yml's adjudication ledger admits
       # with full downgrade power while nothing on the merge path objected.
@@ -649,7 +656,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ steps.context.outputs.pr }}
           SHA: ${{ steps.context.outputs.sha }}
-          GATE: ${{ github.workspace }}/src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts/pr_status.py
+          GATE: ${{ github.workspace }}/src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/pr_status.py
         run: |
           set -uo pipefail
 
@@ -701,7 +708,7 @@ jobs:
       # goes green over a block nobody adjudicated away.
       #
       # Evaluated HERE for the same reason the disposition rule is: a reader that
-      # only runs in the local prepare-pr loop binds whoever runs that loop, and
+      # only runs in the local kirocrew-prepare-pr loop binds whoever runs that loop, and
       # #13951's own finding was that the record existed in GraphQL
       # userContentEdits while nothing read it. A reader no gate calls reproduces
       # that shape one layer up -- the reading exists and nothing consumes it.
@@ -754,7 +761,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ steps.context.outputs.pr }}
           SHA: ${{ steps.context.outputs.sha }}
-          GATE: ${{ github.workspace }}/src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts/pr_status.py
+          GATE: ${{ github.workspace }}/src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/pr_status.py
         run: |
           set -uo pipefail
 
@@ -1236,14 +1243,14 @@ jobs:
                 # exception: the fork UX lane completes as `failure` when an
                 # attachment download from the description failed for a
                 # transport reason, a `cannot evaluate` that a re-run of that
-                # lane clears. NOTE: `/ai-review
-                # override` records the judgment and re-runs the Stage-2 fork
-                # lane (located via the run URL its check-run carries), but the
-                # fork lanes consume no override marker, so the re-run is a
-                # fresh review roll -- a fork false BLOCK clears via a clean
-                # re-roll or a new commit, never a forced pass -- identical to
-                # the fork Opus / GPT / Design lanes, which already block a
-                # fork PR the same way.
+                # lane clears. A false BLOCK clears with `/ai-review override`:
+                # the handler records the judgment and re-runs the bound
+                # Stage-2 lane run (located through the lane-run marker in its
+                # check-run's output), whose "Resolve human override" step
+                # reads the record for this exact head, skips the model, and
+                # completes this row `success` with the override note in the
+                # slot -- the same outcome as the same-repo lane. This branch
+                # therefore reads that row like any other.
                 if [ "$fail" -gt 0 ]; then
                   failed+=("$label (BLOCK)")
                 elif [ "$pass" -gt 0 ]; then
@@ -1599,17 +1606,18 @@ jobs:
                 [ -n "$lane" ] || continue
                 # Both halves of this text were wrong and each sent the reader
                 # somewhere the code does not look. `/ai-review override <lane>
-                # <head>` is an exit for EVERY lane: its arm replaces the slot
-                # with a note that deliberately carries no `[<LANE>-REVIEWED]
-                # <head>` stamp, so `current_stamped` goes False and the gate
-                # stops naming the lane. And what clears the GPT lane by decision
+                # <head>` is an exit for EVERY lane, fork PRs included: the
+                # lane's re-run replaces the block with the override note, and
+                # the gate also reads the accepted record itself as adjudicating
+                # every block the lane raised at this head before it was
+                # recorded. And what clears the GPT lane by decision
                 # is the workflow-authored `(all downgraded on adjudication)`
                 # heading, NOT the `[BLOCK-MERGE-DOWNGRADED]` marker, which sits
                 # in embedded model output. A new head is the expensive advice: it
                 # discards every other lane's verdict for this head.
                 case "$lane" in
                   GPT) remedy="record a legitimate clear at this head with /ai-review override, or an adjudication pass, whose '(all downgraded on adjudication)' heading is read as cleared; a new head also re-samples it, at the cost of every other lane's verdict for this head" ;;
-                  *) remedy="record a legitimate clear at this head with /ai-review override, whose note carries no review stamp and so is not read as a same-head replacement; this lane has no adjudication heading, so the only other exit is a new head, at the cost of every other lane's verdict for this head" ;;
+                  *) remedy="record a legitimate clear at this head with /ai-review override, whose accepted record adjudicates every block this lane raised at this head before it, on a fork PR too; this lane has no adjudication heading, so the only other exit is a new head, at the cost of every other lane's verdict for this head" ;;
                 esac
                 failed+=("superseded verdict: $lane blocked this head in a replaced sample and the body now presented does not - read the comment's stored history; $remedy")
               done <<<"${SUPERSESSION_DROPPED:-}"
@@ -1996,8 +2004,10 @@ jobs:
                 DESCRIPTION="readiness check(s) changed since evaluation; re-checking Fast Gate"
               elif fork_state="$(gh_retry gh api --method GET --paginate \
                 "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
-                | jq -rs --arg pr "$PR" --arg fg "$fast_gate" '
-                  {"Internal Content Scan": "internal-content-scan-pr-",
+                | jq -rs --arg pr "$PR" --arg fg "$fast_gate" \
+                  --argjson legacy "$LEGACY_LANE_NAMES" '
+                  ($legacy | with_entries({key: .value, value: .key})) as $old_name
+                  | {"Internal Content Scan": "internal-content-scan-pr-",
                    "Opus 5.5 Review": "opus-pr-",
                    "GPT 6.1 Review": "gpt-pr-",
                    "Design Review": "design-pr-",
@@ -2007,8 +2017,11 @@ jobs:
                   | [.[].check_runs[]] as $rows
                   | [$lanes | to_entries[]
                      | .key as $name | (.value + $pr + "-" + $fg) as $want
-                     | ($rows | map(select(.name == $name and (.external_id // "") == $want))
-                        | max_by(.id)) as $row
+                     | ($rows | map(select((.external_id // "") == $want))) as $bound
+                     # A pre-rename row answers only when no current-name row
+                     # is bound; see LEGACY_LANE_NAMES.
+                     | (($bound | map(select(.name == $name)) | max_by(.id))
+                        // ($bound | map(select(.name == $old_name[$name])) | max_by(.id))) as $row
                      | {name: $name, row: $row}]
                   | (map(select(.row != null and .row.status == "completed"
                                 and ((.row.conclusion // "")
@@ -2143,7 +2156,8 @@ jobs:
             fi
           done
           if ! grep -Fxq "$TARGET_LABEL" <<<"$current"; then
-            jq -n --arg label "$TARGET_LABEL" '{labels: [$label]}' \
+            # Not `--arg label`: `label` is a jq keyword that jq 1.6 rejects.
+            jq -n --arg name "$TARGET_LABEL" '{labels: [$name]}' \
               | gh api --method POST "repos/$REPO/issues/$PR/labels" \
                   --input - >/dev/null
           fi

@@ -25,8 +25,13 @@ from aiohttp import web
 from kiro_crew import members as members_mod
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.context import _neutralize_structural_markers
-from kiro_crew.dashboard.chat_runner import _run_chat
+from kiro_crew.dashboard.chat_runner import TURN_FAILED_META, _run_chat
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
+from kiro_crew.dashboard.relay_archive import (
+    RELAY_ARCHIVE_CODE,
+    RELAY_ARCHIVE_ERROR,
+    is_relay_archive,
+)
 from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key
 from kiro_crew.dashboard.turn_dispatch import chat_turn_timeout_secs
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -348,42 +353,32 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                 },
                 status=409,
             )
-        # A remote-bound slot runs its turn on a connected peer and streams the
-        # reply over the dashboard WebSocket; this endpoint has no such channel —
-        # its collectors read only local `chunk`/`assistant` rows. Reaching the
-        # local dispatch chokepoint (`_run_chat`, keyed on `executor == "remote"`)
-        # would append the prompt and emit a WS-only `chat_done`, leaving this HTTP
-        # caller waiting forever on a turn the peer never received and history
-        # holding an unsent turn. Refuse BEFORE any mutation — keyed on
-        # `executor` (not `is_remote`) so a half-open binding is refused too,
-        # matching the chokepoint and the `api_chat` incomplete-binding guard. A
-        # freshly-created slot is always local, so this only rejects an existing
-        # remote-bound target.
-        if getattr(slot, "executor", "") == "remote":
+        # A relay archive is read-only. Reaching the local dispatch chokepoint
+        # (`_run_chat`) would append the prompt and emit a WS-only `chat_done`,
+        # leaving this HTTP caller waiting on a turn that never runs. Refuse
+        # BEFORE any mutation. A freshly-created slot is always local, so this
+        # only rejects an existing archive.
+        if is_relay_archive(slot):
             sel().log_api_access(
                 caller=request.remote or "",
                 operation="openai_compat.chat",
                 outcome="denied",
                 source="openai_compat",
                 resources=f"slot={slot_id}",
-                error="remote-bound slot not supported on OpenAI-compat endpoint",
+                error="relay archive is read-only",
             )
             return web.json_response(
                 {
                     "error": {
-                        "message": (
-                            "this session is bound to a remote crew; the "
-                            "OpenAI-compatible endpoint cannot relay remote turns"
-                        ),
+                        "message": RELAY_ARCHIVE_ERROR,
                         "type": "invalid_request_error",
-                        "code": "remote_slot_unsupported",
+                        "code": RELAY_ARCHIVE_CODE,
                     },
-                    "code": "remote_slot_unsupported",
+                    "code": RELAY_ARCHIVE_CODE,
                 },
                 status=409,
             )
-        # Busy check — prevent concurrent writes to the same slot. ``running``
-        # also covers a pending stage boundary while no turn occupies ``slot.task``.
+        # Busy check — prevent concurrent writes to the same slot.
         if slot.running is True:
             sel().log_api_access(
                 caller=request.remote or "",
@@ -642,6 +637,25 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
             return await _blocking_response(state, slot, completion_id, model, created, ephemeral)
 
 
+_SERVER_ERROR = {"error": {"message": "internal error", "type": "server_error"}}
+
+
+def _turn_failed(msg: dict[str, Any]) -> bool:
+    """Whether *msg* is the error row of a turn that failed before it started.
+
+    That turn's cycle still ends with a ``done`` row, which on its own reads as
+    an empty successful reply."""
+    meta = msg.get("meta")
+    return isinstance(meta, dict) and bool(meta.get(TURN_FAILED_META))
+
+
+async def _stream_server_error(resp: web.StreamResponse) -> web.StreamResponse:
+    """End an SSE completion with the server-error frame and ``[DONE]``."""
+    await resp.write(f"data: {json.dumps(_SERVER_ERROR)}\n\n".encode())
+    await resp.write(b"data: [DONE]\n\n")
+    return resp
+
+
 async def _stream_response(
     request: web.Request,
     state: DashboardState,
@@ -661,9 +675,13 @@ async def _stream_response(
     try:
         _redact_buffer = ""
         _last_emitted_len = 0
+        failed = False
         while True:
             pending = slot.drain()
             for msg in pending:
+                failed = failed or _turn_failed(msg)
+                if msg.get("cls") == "done" and failed:
+                    return await _stream_server_error(resp)
                 if msg.get("cls") == "done":
                     # Flush remaining buffer
                     if _redact_buffer:
@@ -732,10 +750,7 @@ async def _stream_response(
                     slot.task.result()
                 except BaseException as exc:
                     logger.warning("chat task failed: %s", exc)
-                    err_data = {"error": {"message": "internal error", "type": "server_error"}}
-                    await resp.write(f"data: {json.dumps(err_data)}\n\n".encode())
-                    await resp.write(b"data: [DONE]\n\n")
-                    return resp
+                    return await _stream_server_error(resp)
 
             try:
                 await asyncio.wait_for(slot.event.wait(), timeout=30)
@@ -765,11 +780,25 @@ async def _blocking_response(
     counts at the slot layer.
     """
     collected: list[str] = []
+    failed = False
 
     try:
         while True:
             pending = slot.drain()
             for msg in pending:
+                failed = failed or _turn_failed(msg)
+                if msg.get("cls") == "done" and failed:
+                    return web.json_response(
+                        {
+                            "error": {
+                                "message": "internal error",
+                                "type": "server_error",
+                                "code": "server_error",
+                            },
+                            "code": "server_error",
+                        },
+                        status=500,
+                    )
                 if msg.get("cls") == "done":
                     content = _redact("".join(collected))
                     return web.json_response(
@@ -804,7 +833,14 @@ async def _blocking_response(
                 except BaseException as exc:
                     logger.warning("chat task failed: %s", exc)
                     return web.json_response(
-                        {"error": {"message": "internal error", "type": "server_error"}},
+                        {
+                            "error": {
+                                "message": "internal error",
+                                "type": "server_error",
+                                "code": "server_error",
+                            },
+                            "code": "server_error",
+                        },
                         status=500,
                     )
 

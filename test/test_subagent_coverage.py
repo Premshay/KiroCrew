@@ -697,46 +697,6 @@ class TestCompletionKeepSetter:
         assert (mgr._completion_keep, mgr._completion_keep_chars) == ("tail", 1234)
 
 
-class TestApprovalLogging:
-    @pytest.mark.asyncio
-    async def test_approve_logs_auto_when_reason_present(self) -> None:
-        client = AsyncMock()
-        event = SimpleNamespace(title="read", tool_kind="fs")
-        with patch.object(sa, "sel") as sel_mock:
-            await SubagentManager._approve_and_log(
-                client, "req-1", "subagent:a1", event, metadata={"reason": "allowlisted"}
-            )
-        client.approve_tool.assert_awaited_once_with("req-1")
-        assert sel_mock().log_tool_invocation.call_args.kwargs["outcome"] == "auto_approved"
-
-    @pytest.mark.asyncio
-    async def test_approve_logs_plain_without_reason(self) -> None:
-        client = AsyncMock()
-        event = SimpleNamespace(title="read", tool_kind="fs")
-        with patch.object(sa, "sel") as sel_mock:
-            await SubagentManager._approve_and_log(client, 2, "subagent:a1", event)
-        assert sel_mock().log_tool_invocation.call_args.kwargs["outcome"] == "approved"
-
-    @pytest.mark.asyncio
-    async def test_reject_logs_denied_with_error(self) -> None:
-        client = AsyncMock()
-        event = SimpleNamespace(title="write", tool_kind="fs")
-        with patch.object(sa, "sel") as sel_mock:
-            await SubagentManager._reject_and_log(
-                client, 3, "subagent:a1", event, cause=None, error="policy denied"
-            )
-        client.reject_tool.assert_awaited_once_with(3)
-        assert sel_mock().log_tool_invocation.call_args.kwargs["outcome"] == "denied"
-
-    @pytest.mark.asyncio
-    async def test_reject_logs_rejected_without_error(self) -> None:
-        client = AsyncMock()
-        event = SimpleNamespace(title="write", tool_kind="fs")
-        with patch.object(sa, "sel") as sel_mock:
-            await SubagentManager._reject_and_log(client, 4, "subagent:a1", event, cause=None)
-        assert sel_mock().log_tool_invocation.call_args.kwargs["outcome"] == "rejected"
-
-
 # ── Manager: orphan / pid helpers ─────────────────────────────────────────
 
 
@@ -1147,6 +1107,21 @@ class TestReadSurfaces:
         mgr._agents["queued"] = _info("queued", queued=True)
         assert mgr.task_memory_rows() == []
 
+    def test_task_memory_rows_carry_the_key_a_child_names_as_parent(self) -> None:
+        """The System Sessions table nests a nested run under its parent
+        task by matching the child's ``parent`` to this key. A continued run
+        keeps ``subagent:<original>``, so the key is NOT always ``subagent:<id>``."""
+        mgr = _manager()
+        mgr._agents["fresh"] = _info("fresh", parent_session_key="dash:1")
+        mgr._agents["cont"] = _info(
+            "cont", parent_session_key="dash:1", conversation_key="subagent:orig"
+        )
+        mgr._agents["kid"] = _info("kid", parent_session_key="subagent:orig")
+        rows = {r["id"]: r for r in mgr.task_memory_rows()}
+        assert rows["fresh"]["session_key"] == "subagent:fresh"
+        assert rows["cont"]["session_key"] == "subagent:orig"
+        assert rows["kid"]["parent"] == rows["cont"]["session_key"]
+
     def test_task_memory_rows_redact_before_truncate(self) -> None:
         """A credential straddling the 80-char cut must not leak a fragment.
 
@@ -1203,7 +1178,7 @@ class TestReadSurfaces:
         mgr._report_tasks = {report}
         mgr._followup_watchers = {"run": followup}
         mgr._reconcile_task = reconcile
-        mgr._abandoned_state_writers = {"state-writer"}
+        mgr._abandoned_state_writers = {"state-writer": {report}}
         try:
             # queue + recovery + report + follow-up + reconciliation + writer
             assert mgr.pending_work_count == 6
@@ -1922,21 +1897,24 @@ class TestReleaseConversation:
 
 
 class TestSweepConversations:
-    def test_fresh_conversation_kept(self) -> None:
+    @pytest.mark.asyncio
+    async def test_fresh_conversation_kept(self) -> None:
         mgr = _manager()
         mgr._conversations["subagent:c1"] = 1000.0
-        mgr._sweep_conversations(now=1001.0)
+        await mgr._sweep_conversations_async(now=1001.0)
         assert "subagent:c1" in mgr._conversations
 
-    def test_busy_conversation_refreshed_not_released(self) -> None:
+    @pytest.mark.asyncio
+    async def test_busy_conversation_refreshed_not_released(self) -> None:
         mgr = _manager()
         mgr._conversations["subagent:c1"] = 0.0
         mgr._agents["c1"] = _info("c1")
         now = float(sa._CONVERSATION_TTL_SECS * 3)
-        mgr._sweep_conversations(now=now)
+        await mgr._sweep_conversations_async(now=now)
         assert mgr._conversations["subagent:c1"] == now
 
-    def test_expired_conversation_released(self) -> None:
+    @pytest.mark.asyncio
+    async def test_expired_conversation_released(self) -> None:
         mgr = _manager()
         mgr._conversations["subagent:c1"] = 0.0
         mgr._sessions.forget_conversation.return_value = "sid-1"
@@ -1944,7 +1922,7 @@ class TestSweepConversations:
             patch.object(sa, "update_state"),
             patch.object(sa, "_cleanup_session_files_sync"),
         ):
-            mgr._sweep_conversations(now=float(sa._CONVERSATION_TTL_SECS * 3))
+            await mgr._sweep_conversations_async(now=float(sa._CONVERSATION_TTL_SECS * 3))
         assert "subagent:c1" not in mgr._conversations
 
 

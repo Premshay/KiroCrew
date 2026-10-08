@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import logging
+import math
 import os
 import shutil
 import socket
@@ -23,15 +24,36 @@ import zipfile
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path, PurePath, PurePosixPath
+from typing import Any, cast
 
-from kiro_crew import crew_teams, pinned_fs, platform_compat
+from kiro_crew import crew_teams, pinned_fs, platform_compat, ui_prefs
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent_discovery import parsed_agent_specs
 from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
+from kiro_crew.atomic_write import atomic_write
+from kiro_crew.chat_attachments import ATTACHMENTS_DIR_SUFFIX
+from kiro_crew.config.loader import (
+    ConfigReadError,
+    ConfigWriteRefused,
+    update_config_locked,
+)
 from kiro_crew.config.paths import config_dir, kiro_agents_dir
+from kiro_crew.history import (
+    ARCHIVE_DIR_NAME,
+    ARCHIVE_SEGMENT_DELIMITER,
+    INCOGNITO_MEMORY_MODES,
+    SESSIONS_DIR_NAME,
+    THREADS_DIR_NAME,
+    THREADS_SIDECAR_SUFFIX,
+    TRANSCRIPT_HEADER_MAX_BYTES,
+    ConversationLog,
+    _safe_key,
+    memory_mode_from_header_line,
+)
 from kiro_crew.mcp_cron import _log_cron_denial, _vet_shell_command
 from kiro_crew.member_memory_backup import hold_stores_for_read
 from kiro_crew.memory_stores import MEMORY_STORES_DIR_NAME, is_host_local_store_state
+from kiro_crew.notifications.settings import ChannelSettings, parse_imported_settings
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.snapshot import (
     _DB_SIDECAR_GLOBS,
@@ -48,7 +70,7 @@ from kiro_crew.snapshot import (
     _staging_is_pinned,
     is_product_tree_database,
 )
-from kiro_crew.user_json import strip_utf8_bom
+from kiro_crew.user_json import MAX_DOCUMENT_NESTING, exceeds_nesting, strip_utf8_bom
 from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
 logger = logging.getLogger(__name__)
@@ -64,13 +86,27 @@ EXPORT_EXCLUDE = frozenset(
         # BASENAME and `_is_excluded` runs over the workspace/, plan_memory/ and
         # skills/ trees, so an entry here would silently drop any USER file that
         # happens to share the name. They need no entry: root-level export is a
-        # hard-coded allowlist (config.json, hooks.json, crons.json,
-        # notifications.jsonl, project_dir, workspace_dir, crew-teams/teams.json), so a
-        # root beacon file is never selected in the first place.
+        # hard-coded allowlist (config.json, the settings documents in
+        # `_SETTINGS_DOCUMENTS`, hooks.json, crons.json, notifications.jsonl,
+        # project_dir, workspace_dir, crew-teams/teams.json), so a root beacon file is
+        # never selected in the first place.
         "session_map.json",
         "kiro_session_pids.txt",
         "kiro_pids.txt",
     }
+)
+
+#: The settings documents beside ``config.json`` -- everything else a dashboard Settings
+#: choice is persisted in. ``config.local.json`` is the overlay that ``config set --local``
+#: and ``save()`` keep overlay-owned values in, so those values exist ONLY there;
+#: ``ui-prefs.json`` is the host backup of the browser-held Settings (`ui_prefs.py`);
+#: ``notification_settings.json`` holds the Settings > Notifications mutes and priorities
+#: (`notifications/settings.py`). The snapshot ``config`` component carries the same
+#: three, so the two whole-install backups agree on what a setting is.
+_SETTINGS_DOCUMENTS: tuple[str, ...] = (
+    "config.local.json",
+    "ui-prefs.json",
+    "notification_settings.json",
 )
 
 EXCLUDE_DIRS = frozenset(
@@ -393,6 +429,40 @@ def _open_verified(target: str, root_real: str, *, fenced_ok: bool = False) -> i
                 os.close(fd)
 
 
+@contextlib.contextmanager
+def _open_contained_file(root_real: str, rel: PurePath) -> Iterator[int | None]:
+    """Open one export file with every ancestor pinned until its descriptor closes."""
+    with contextlib.ExitStack() as held:
+        here = root_real
+        try:
+            for part in ("", *rel.parts[:-1]):
+                here = os.path.join(here, part)
+                pin = platform_compat.pin_directory(here)
+                held.callback(os.close, pin)
+        except OSError:
+            yield None
+            return
+        fd = _open_verified(os.path.join(root_real, *rel.parts), root_real)
+        if fd is not None:
+            held.callback(os.close, fd)
+        yield fd
+
+
+# ZIP's DOS date fields have a seven-bit year and two-second resolution.
+_ZIP_DATE_MIN = (1980, 1, 1, 0, 0, 0)
+_ZIP_DATE_MAX = (2107, 12, 31, 23, 59, 58)
+
+
+def _zip_date_time(epoch: float) -> tuple[int, int, int, int, int, int]:
+    """Clamp header time only; session manifests retain the descriptor's true epoch."""
+    try:
+        date_time = time.localtime(epoch)[:6]
+    except (OSError, OverflowError, ValueError):
+        # Some platforms cannot convert negative or very large filesystem epochs.
+        return _ZIP_DATE_MIN if epoch < 0 else _ZIP_DATE_MAX
+    return min(_ZIP_DATE_MAX, max(_ZIP_DATE_MIN, date_time))
+
+
 def _add_from_fd(zf: zipfile.ZipFile, fd: int, arcname: str) -> None:
     """Stream the bytes behind *fd* into *zf* as *arcname*.
 
@@ -414,7 +484,7 @@ def _add_from_fd(zf: zipfile.ZipFile, fd: int, arcname: str) -> None:
     one defect for another.
     """
     st = os.fstat(fd)
-    info = zipfile.ZipInfo(arcname, date_time=time.localtime(st.st_mtime)[:6])
+    info = zipfile.ZipInfo(arcname, date_time=_zip_date_time(st.st_mtime))
     info.compress_type = zf.compression
     info.external_attr = (st.st_mode & 0xFFFF) << 16
     os.lseek(fd, 0, os.SEEK_SET)
@@ -423,6 +493,292 @@ def _add_from_fd(zf: zipfile.ZipFile, fd: int, arcname: str) -> None:
         zf.open(info, "w", force_zip64=True) as dest,
     ):
         shutil.copyfileobj(src, dest)
+
+
+#: A dashboard transcript's file name: ``<stem>.jsonl`` directly under ``sessions/``.
+_TRANSCRIPT_SUFFIX = ".jsonl"
+
+#: The longest first line a transcript header is read up to: the same bound the
+#: restricted-session write gate reads, so a longer line is unknown to both.
+_MAX_TRANSCRIPT_HEADER_BYTES = TRANSCRIPT_HEADER_MAX_BYTES
+
+
+def _transcript_stem(name: str) -> str | None:
+    """The session stem of a ``sessions/`` entry named *name*, or ``None``.
+
+    A stem is accepted only in the spelling ``history._safe_key`` writes (word
+    characters, ``-`` and ``.``), so an archive member cannot name a file this
+    platform's history layer would never produce -- a ``:`` or ``\\`` in it, say.
+    """
+    if not name.endswith(_TRANSCRIPT_SUFFIX):
+        return None
+    stem = name[: -len(_TRANSCRIPT_SUFFIX)]
+    if stem in ("", ".", "..") or _safe_key(stem) != stem:
+        return None
+    return stem
+
+
+#: The stem every dashboard chat's transcript carries: a dashboard slot key is
+#: ``dashboard:<slot>`` (`dashboard.chat_utils.dashboard_slot_key`), which
+#: ``history._safe_key`` writes as ``dashboard_<slot>``. Channel threads, cron runs
+#: and subagent runs keep transcripts under other stems and are not chats here.
+_DASHBOARD_STEM_PREFIX = "dashboard_"
+
+
+def _chat_stem(name: str) -> str | None:
+    """The stem of the dashboard chat whose transcript is *name*, or ``None``.
+
+    The one selection rule for which ``sessions/`` entries this feature carries, on
+    export and on import alike: a valid `_transcript_stem` that starts with
+    `_DASHBOARD_STEM_PREFIX` and names a slot after it.
+    """
+    stem = _transcript_stem(name)
+    if stem is None or not stem.startswith(_DASHBOARD_STEM_PREFIX):
+        return None
+    if len(stem) == len(_DASHBOARD_STEM_PREFIX):
+        return None
+    return stem
+
+
+def _transcript_header_verdict(first_line: bytes | None) -> str | None:
+    """Why a transcript may not travel in an archive, or ``None`` when it may.
+
+    Applied on both ends, export and import, so an archive can only ever carry what
+    an export of this build would write. The rule is the one every derived reader
+    applies to Incognito and Temporary chats: they are kept for the user's own
+    History and never exported or transferred. The mode comes from
+    `history.memory_mode_from_header_line`, the same parse the restricted-session
+    write gate uses, and the verdict fails CLOSED -- only a header that reads
+    persistent passes:
+
+    * a metadata header with no ``memory_mode`` reads persistent (a transcript
+      written before the mode existed);
+    * ``memory_mode`` ``persistent`` (any case, surrounding whitespace ignored)
+      passes;
+    * ``incognito`` and ``temporary`` are withheld as private chats;
+    * anything the parse cannot place -- no metadata header, a first line that is
+      not a JSON object, a non-string or unrecognised mode -- is withheld as
+      unreadable.
+    """
+    if first_line is None:
+        return "unreadable header"
+    if not first_line.strip():
+        return "empty transcript"
+    mode = memory_mode_from_header_line(first_line)
+    if mode == "persistent":
+        return None
+    if mode in INCOGNITO_MEMORY_MODES:
+        return "incognito or temporary chat"
+    return "unreadable header"
+
+
+def _read_first_line_fd(fd: int) -> bytes | None:
+    """The first line behind *fd*, without its newline; ``None`` past the header cap."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    buf = bytearray()
+    while len(buf) <= _MAX_TRANSCRIPT_HEADER_BYTES:
+        chunk = os.read(fd, 64 * 1024)
+        if not chunk:
+            return bytes(buf)
+        cut = chunk.find(b"\n")
+        if cut >= 0:
+            buf += chunk[:cut]
+            return bytes(buf) if len(buf) <= _MAX_TRANSCRIPT_HEADER_BYTES else None
+        buf += chunk
+    return None
+
+
+def _keep_top_level_transcript(rel: PurePath) -> bool:
+    """``sessions/<stem>.jsonl`` for a dashboard chat (`_chat_stem`) and nothing else.
+
+    Lexical only, like every walk filter.
+    """
+    return (
+        len(rel.parts) == 2
+        and rel.parts[0] == SESSIONS_DIR_NAME
+        and _chat_stem(rel.parts[1]) is not None
+    )
+
+
+def _rotation_segment_for_stem(name: str, stem: str) -> bool:
+    """Match the complete stem, including when another stem contains the delimiter."""
+    owner, delimiter, suffix = name.rpartition(ARCHIVE_SEGMENT_DELIMITER)
+    return owner == stem and bool(delimiter) and suffix.endswith(_TRANSCRIPT_SUFFIX)
+
+
+def _is_rotation_header(first_line: bytes | None) -> bool:
+    """Only retained rotation history travels; discarded edits never do."""
+    if first_line is None:
+        return False
+    try:
+        header = json.loads(first_line)
+    except (ValueError, RecursionError):
+        return False
+    return (
+        isinstance(header, dict)
+        and header.get("_type") == "archive"
+        and header.get("reason") == "rotate"
+    )
+
+
+def _add_session_from_fd(
+    zf: zipfile.ZipFile, fd: int, arcname: str, mtimes: dict[str, float]
+) -> None:
+    """Record absolute activity time from the same descriptor as the archived bytes."""
+    mtime = os.fstat(fd).st_mtime
+    _add_from_fd(zf, fd, arcname)
+    mtimes[arcname] = mtime
+
+
+#: Minimum manifest allowance in the archive's uncompressed-byte budget. The actual
+#: envelope is measured too, including the three counters at their maximum width.
+_MANIFEST_BASE_RESERVE = 64 * 1024
+#: Per record, beyond its JSON-encoded name: a float takes at most 24 ASCII bytes;
+#: indentation, colon, comma and newline take 8. This allowance covers both.
+_MANIFEST_PER_MEMBER_RESERVE = 64
+
+
+def _export_sessions(
+    zf: zipfile.ZipFile,
+    mc_real: str,
+    prefix: str,
+    mtimes: dict[str, float],
+    *,
+    manifest: dict,
+) -> tuple[int, int, int]:
+    """Write the persistent dashboard chats into *zf*; ``(exported, withheld, skipped)``.
+
+    The pinned walk discovers candidate stems only. Each transcript is reopened and
+    judged under its canonical history lock, which stays held through its threads
+    and images so a deleted chat's private replacement cannot donate companions.
+
+    The finished archive must pass this build's own import inventory check, so the
+    chats are budgeted against the caps import enforces, `_MAX_IMPORT_MEMBERS` and
+    `_MAX_IMPORT_UNCOMPRESSED`, counting every member already in *zf* and a reserve
+    for the manifest still to be written. Chats are taken most recently active first
+    (transcript mtime) and only whole: a chat whose files do not all fit is left out
+    and counted in ``skipped``, and a later, smaller chat may still fit.
+    """
+    candidates: list[tuple[float, str]] = []
+    for rel, fd in _walk_contained(
+        mc_real, PurePath(SESSIONS_DIR_NAME), _keep_top_level_transcript
+    ):
+        try:
+            mtime = os.fstat(fd).st_mtime
+        finally:
+            os.close(fd)
+        stem = _chat_stem(rel.parts[1])
+        if stem is not None:
+            candidates.append((mtime, stem))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+
+    # These are the only fields filled after selection; each is at most the number
+    # of candidates. Measure the actual envelope (including host/user strings) with
+    # those upper bounds, using the writer's indent and default ASCII escaping.
+    envelope = {
+        **manifest,
+        "contents": {
+            **manifest["contents"],
+            "session_count": len(candidates),
+            "sessions_withheld": len(candidates),
+            "sessions_skipped_size": len(candidates),
+        },
+        "session_mtimes": {},
+    }
+    # A nonempty nested map adds a newline plus two closing-brace indent spaces.
+    manifest_base = len(json.dumps(envelope, indent=2).encode("utf-8")) + 3
+    manifest_bytes_left = _MAX_SETTINGS_DOCUMENT_BYTES - manifest_base
+    infos = zf.infolist()
+    # +1: the manifest itself is one more member, so timestamp records also stay
+    # below _read_session_mtimes' _MAX_IMPORT_MEMBERS record cap.
+    members_left = _MAX_IMPORT_MEMBERS - len(infos) - 1
+    bytes_left = (
+        _MAX_IMPORT_UNCOMPRESSED
+        - sum(i.file_size for i in infos)
+        - max(_MANIFEST_BASE_RESERVE, manifest_base)
+    )
+
+    history = ConversationLog(base_dir=Path(mc_real) / SESSIONS_DIR_NAME)
+    exported = withheld = skipped = 0
+    for _mtime, stem in candidates:
+        with history.locked_stems([stem]):
+            rel = PurePath(SESSIONS_DIR_NAME, f"{stem}{_TRANSCRIPT_SUFFIX}")
+            with _open_contained_file(mc_real, rel) as transcript_fd:
+                if transcript_fd is None:
+                    continue
+                if _transcript_header_verdict(_read_first_line_fd(transcript_fd)) is not None:
+                    withheld += 1
+                    continue
+                # Sized in one pass and written in a second, both under the lock; the
+                # companions open one at a time, so an image-heavy chat never holds a
+                # descriptor per image.
+                members = 1
+                manifest_need = _manifest_entry_size(f"{prefix}/{rel.as_posix()}")
+                need = os.fstat(transcript_fd).st_size
+                for comp_rel, fd in _chat_companions(mc_real, stem):
+                    members += 1
+                    need += os.fstat(fd).st_size
+                    manifest_need += _manifest_entry_size(f"{prefix}/{comp_rel.as_posix()}")
+                need += manifest_need
+                if (
+                    members > members_left
+                    or need > bytes_left
+                    or manifest_need > manifest_bytes_left
+                ):
+                    skipped += 1
+                    continue
+                before = len(zf.infolist())
+                _add_session_from_fd(zf, transcript_fd, f"{prefix}/{rel.as_posix()}", mtimes)
+            for comp_rel, fd in _chat_companions(mc_real, stem):
+                _add_session_from_fd(zf, fd, f"{prefix}/{comp_rel.as_posix()}", mtimes)
+            # Charge what was actually written, not the estimate: a file that grew, or a
+            # companion that appeared, between the two passes still counts against the cap.
+            written = zf.infolist()[before:]
+            members_left -= len(written)
+            written_manifest_bytes = sum(_manifest_entry_size(i.filename) for i in written)
+            manifest_bytes_left -= written_manifest_bytes
+            bytes_left -= sum(i.file_size for i in written) + written_manifest_bytes
+            exported += 1
+    return exported, withheld, skipped
+
+
+def _manifest_entry_size(arcname: str) -> int:
+    """Reserve a record using the manifest writer's default JSON string escaping."""
+    return len(json.dumps(arcname).encode("utf-8")) + _MANIFEST_PER_MEMBER_RESERVE
+
+
+def _chat_companions(mc_real: str, stem: str) -> Iterator[tuple[PurePath, int]]:
+    """``(rel, fd)`` for each companion of *stem* that travels; each fd closes on resume.
+
+    The reply-thread sidecar, the flat image directory and the retained rotation
+    segments. Callers hold the chat's history lock across the whole iteration.
+    """
+    sidecar = PurePath(SESSIONS_DIR_NAME, THREADS_DIR_NAME, f"{stem}{THREADS_SIDECAR_SUFFIX}")
+    with _open_contained_file(mc_real, sidecar) as sidecar_fd:
+        if sidecar_fd is not None:
+            yield sidecar, sidecar_fd
+    # sessions/<stem>.attachments/ is flat: only its direct files travel.
+    images = PurePath(SESSIONS_DIR_NAME, f"{stem}{ATTACHMENTS_DIR_SUFFIX}")
+    for rel, fd in _walk_contained(
+        mc_real,
+        images,
+        lambda rel: len(rel.parts) == 3 and rel.parts[1] == f"{stem}{ATTACHMENTS_DIR_SUFFIX}",
+    ):
+        try:
+            yield rel, fd
+        finally:
+            os.close(fd)
+    archive = PurePath(SESSIONS_DIR_NAME, ARCHIVE_DIR_NAME)
+    for rel, fd in _walk_contained(
+        mc_real,
+        archive,
+        lambda rel: len(rel.parts) == 3 and _rotation_segment_for_stem(rel.name, stem),
+    ):
+        try:
+            if _is_rotation_header(_read_first_line_fd(fd)):
+                yield rel, fd
+        finally:
+            os.close(fd)
 
 
 _MANAGED_TEMPLATES = frozenset(Path(name).stem for name in OWNED_KIRO_AGENT_FILES)
@@ -506,8 +862,15 @@ def missing_crew_templates(config_path: Path) -> tuple[list[dict[str, str]], int
     return rows, len(missing) - len(kept)
 
 
-def create_export_zip() -> tuple[bytes, dict]:
-    """Create a zip archive of KiroCrew state. Returns (zip_bytes, manifest_dict)."""
+def create_export_zip(*, include_sessions: bool = False) -> tuple[bytes, dict]:
+    """Create a zip archive of Kiro Crew state. Returns (zip_bytes, manifest_dict).
+
+    *include_sessions* adds the dashboard chats (`_export_sessions`). It is off by
+    default because a transcript holds everything the agent was shown, so an archive
+    that carries chats is a different thing to hand around than one that does not;
+    the manifest then records ``session_count`` and ``sessions_withheld``. With it
+    off the archive is unchanged.
+    """
     mc = _mc_dir()
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     prefix = f"kirocrew-export-{ts}"
@@ -522,6 +885,7 @@ def create_export_zip() -> tuple[bytes, dict]:
         # Core JSON/text files
         for fname in (
             "config.json",
+            *_SETTINGS_DOCUMENTS,
             "hooks.json",
             "crons.json",
             "notifications.jsonl",
@@ -602,7 +966,8 @@ def create_export_zip() -> tuple[bytes, dict]:
                     stores.add(rel.parts[1])
         contents_summary["memory_store_count"] = len(stores)
 
-        # Manifest
+        # Build the envelope before selecting chats so their timestamp map is
+        # budgeted against the same document the importer will read.
         manifest = {
             "version": EXPORT_MANIFEST_VERSION,
             "format": "zip",
@@ -611,6 +976,15 @@ def create_export_zip() -> tuple[bytes, dict]:
             "user": os.environ.get("USER", "unknown"),
             "contents": contents_summary,
         }
+        if include_sessions:
+            session_mtimes: dict[str, float] = {}
+            exported, withheld, skipped = _export_sessions(
+                zf, mc_real, prefix, session_mtimes, manifest=manifest
+            )
+            contents_summary["session_count"] = exported
+            contents_summary["sessions_withheld"] = withheld
+            contents_summary["sessions_skipped_size"] = skipped
+            manifest["session_mtimes"] = session_mtimes
         zf.writestr(f"{prefix}/MANIFEST.json", json.dumps(manifest, indent=2))
 
     return buf.getvalue(), manifest
@@ -929,14 +1303,520 @@ def _strip_host_local_store_state(snap: Path) -> None:
                 _strip(stores_pin, ())
 
 
-def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
+class _SettingsRefused(Exception):
+    """An archive settings document is not the shape its reader needs; the message says why."""
+
+
+#: The largest archive settings document an import will read. The archive itself may
+#: hold 2 GiB, and these documents are parsed before Merge decides to keep this
+#: install's copy, so an unbounded read could exhaust the gateway's memory on a file it
+#: then throws away. Real settings documents are a few KiB.
+_MAX_SETTINGS_DOCUMENT_BYTES = 8 * 1024 * 1024
+
+
+def _read_archive_text(path: Path) -> str:
+    """The archive's *path* as text, read no further than the settings-document cap."""
+    with open(path, "rb") as fh:
+        raw = fh.read(_MAX_SETTINGS_DOCUMENT_BYTES + 1)
+    if len(raw) > _MAX_SETTINGS_DOCUMENT_BYTES:
+        raise _SettingsRefused(
+            f"the archive's {path.name} is larger than {_MAX_SETTINGS_DOCUMENT_BYTES} bytes"
+        )
+    return raw.decode("utf-8")
+
+
+def _read_archive_object(path: Path) -> dict:
+    """Parse the archive's *path* as a JSON object, or raise :class:`_SettingsRefused`.
+
+    Only the top-level shape is checked, as the snapshot restore checks it
+    (`_refuse_unless_json_object`): every consumer of these files reads an object and
+    treats anything else as empty, which is exactly the silent reset an import must not
+    install. The archive's ``meta`` block is dropped -- it records the SOURCE install's
+    writer and load state, and the destination's own writer stamps a fresh one.
+    """
+    try:
+        doc = json.loads(_read_archive_text(path))
+    except (OSError, ValueError, RecursionError) as exc:
+        raise _SettingsRefused(f"the archive's {path.name} is not readable JSON ({exc})") from None
+    if not isinstance(doc, dict):
+        raise _SettingsRefused(
+            f"the archive's {path.name} is a JSON {type(doc).__name__}, not an object"
+        )
+    # Parsing succeeds well past the depth the config readers can walk: a document a
+    # few hundred levels deep installs, then every later load raises RecursionError.
+    if exceeds_nesting(doc):
+        raise _SettingsRefused(
+            f"the archive's {path.name} nests deeper than {MAX_DOCUMENT_NESTING} levels"
+        )
+    doc.pop("meta", None)
+    return doc
+
+
+def _skip_setting(summary: dict, label: str, why: str) -> None:
+    summary["items"].append(f"{label} (skipped: {why})")
+    summary.setdefault("refused_merges", []).append(label)
+
+
+def _vet_archive_settings(snap: Path, summary: dict) -> dict[str, object]:
+    """Validate every settings document the archive carries, BEFORE either branch applies one.
+
+    Returns the parsed form of each document that passed, keyed by file name. A document
+    that failed is reported as skipped and REMOVED from the extracted archive, so neither
+    branch can install it: merge never reads it, and replace (`_do_replace`) leaves the
+    live copy in place for a file the bundle does not carry.
+
+    The two documents whose readers filter on the way in are also rewritten in the
+    extracted archive to their filtered form, so a replace installs what a merge into an
+    install without the file would: ``ui-prefs.json`` without its credential-shaped keys
+    and unstorable values, ``notification_settings.json`` without a mute on a protected
+    channel.
+    """
+    vetted: dict[str, object] = {}
+    for name, label in (
+        ("config.json", "config"),
+        ("config.local.json", "config.local"),
+        ("ui-prefs.json", "ui-prefs"),
+        ("notification_settings.json", "notification-settings"),
+    ):
+        src = snap / name
+        if not src.is_file():
+            continue
+        try:
+            if name == "ui-prefs.json":
+                try:
+                    patch, dropped = ui_prefs.parse_imported_ui_prefs(src)
+                except ui_prefs.UiPrefsError as exc:
+                    raise _SettingsRefused(f"the archive's {name} is {exc}") from None
+                except OSError as exc:
+                    raise _SettingsRefused(f"the archive's {name} is unreadable ({exc})") from None
+                # Staged as the store's own bytes, so what a Replace installs is the
+                # exact document the parse just held to the store's size bound.
+                atomic_write(
+                    src, ui_prefs.render_document(patch).encode("utf-8"), restrict_to_owner=True
+                )
+                vetted[name] = (patch, dropped)
+            elif name == "notification_settings.json":
+                try:
+                    text = _read_archive_text(src)
+                    channels, dropped = parse_imported_settings(text)
+                except (OSError, ValueError) as exc:
+                    raise _SettingsRefused(f"the archive's {name} is unusable ({exc})") from None
+                src.write_text(
+                    json.dumps({"channel_settings": channels}, indent=2), encoding="utf-8"
+                )
+                vetted[name] = (channels, dropped)
+            else:
+                vetted[name] = _read_archive_object(src)
+            # Replace installs the STAGED file's mode (`_backup_and_copy` copies it
+            # from the source fstat), and the extractor creates every staged file at
+            # the umask default -- typically group/world-readable. The config writer
+            # creates at 0o600, so a replace must not install those documents wider
+            # than their own writer ever would (the ui-prefs rewrite above already
+            # wrote 0o600). notification_settings.json is left alone: its live
+            # writer (`atomic_write` with no mode) uses the umask too.
+            if name in ("config.json", "config.local.json"):
+                # An extracted copy inside the import's private (0o700) temp dir.
+                platform_compat.restrict_to_owner(src)  # lockdown-ok: private staged copy
+        except _SettingsRefused as exc:
+            _skip_setting(summary, label, str(exc))
+            src.unlink()
+    return vetted
+
+
+#: What a Merge says about a settings document it left alone. Replace is the path
+#: that restores one over this install's own.
+_KEPT_NOTE = "kept this install's; import with Replace to restore the archive's"
+
+
+def _merge_settings(
+    mc: Path,
+    vetted: dict[str, object],
+    summary: dict,
+    channel_settings: ChannelSettings | None,
+) -> None:
+    """Apply the archive's settings documents the way Merge applies everything: never overwrite.
+
+    Per document, not per setting. A document this install LACKS is installed from the
+    vetted archive copy and reported ``"<label> (restored)"``; a document this install
+    HAS is left untouched, byte for byte, and reported as kept. Replace is the path that
+    restores the archive's settings over this install's (backing the old ones up first).
+
+    * ``config.json`` -- installed through `update_config_locked`, which re-checks the
+      absence under the config lock, writes owner-only, stamps this install's ``meta``
+      and wakes the live watcher.
+    * ``config.local.json`` -- NEVER installed by a Merge, even where this install has
+      none: the overlay outranks ``config.json`` at load, so an installed copy would set
+      every key it names over this install's own config -- the rule ``snapshot._do_merge``
+      follows for the same file.
+    * ``ui-prefs.json`` -- through the store's validated writer
+      (`ui_prefs.install_imported_ui_prefs`), which re-checks the absence under its lock.
+    * ``notification_settings.json`` -- through the running gateway's store when there
+      is one (`ChannelSettings.install_imported`), so a restored mute applies at once and
+      the in-memory copy does not write the old settings back over it.
+
+    Every document the archive carried that this Merge did not apply is named in
+    ``summary["settings_kept"]``. The entries are the four file names above, never
+    archive-authored text, so the list is bounded by construction (at most four).
+    """
+    kept: list[str] = []
+
+    def _keep(name: str, label: str, note: str = _KEPT_NOTE) -> None:
+        kept.append(name)
+        summary["items"].append(f"{label} ({note})")
+
+    incoming = vetted.get("config.json")
+    if isinstance(incoming, dict):
+        target = mc / "config.json"
+        installed: list[bool] = []
+
+        def _install_if_absent(_current: dict) -> dict | None:
+            # Inside the config lock: a writer that created the file first wins.
+            if os.path.lexists(target):
+                return None
+            installed.append(True)
+            return dict(incoming)
+
+        if os.path.lexists(target):
+            _keep("config.json", "config")
+        else:
+            try:
+                update_config_locked(target, mutate=_install_if_absent)
+            except (ConfigReadError, ConfigWriteRefused, OSError) as exc:
+                _skip_setting(summary, "config", str(exc))
+            else:
+                if installed:
+                    summary["items"].append("config (restored)")
+                else:
+                    _keep("config.json", "config")
+
+    if "config.local.json" in vetted:
+        if os.path.lexists(mc / "config.local.json"):
+            _keep("config.local.json", "config.local")
+        else:
+            _keep(
+                "config.local.json",
+                "config.local",
+                "not installed: a Merge never installs the overlay, which would outrank "
+                "this install's config.json; import with Replace to restore the archive's",
+            )
+
+    prefs = vetted.get("ui-prefs.json")
+    if isinstance(prefs, tuple):
+        patch, dropped = prefs
+        note = f"; {dropped} unstorable entr{'y' if dropped == 1 else 'ies'} dropped"
+        try:
+            installed_prefs = bool(patch) and ui_prefs.install_imported_ui_prefs(patch)
+        except (ui_prefs.UiPrefsError, OSError) as exc:
+            _skip_setting(summary, "ui-prefs", str(exc))
+        else:
+            if installed_prefs:
+                summary["items"].append(f"ui-prefs (restored{note if dropped else ''})")
+                summary["ui_prefs_restored"] = True
+            elif not patch:
+                summary["items"].append(f"ui-prefs (nothing to restore{note if dropped else ''})")
+            else:
+                _keep("ui-prefs.json", "ui-prefs")
+
+    notes = vetted.get("notification_settings.json")
+    if isinstance(notes, tuple):
+        channels, dropped = notes
+        note = f"; {dropped} invalid value{'' if dropped == 1 else 's'} dropped"
+        try:
+            live = channel_settings if channel_settings is not None else ChannelSettings()
+            installed_notes = live.install_imported(channels)
+        except OSError as exc:
+            _skip_setting(summary, "notification-settings", str(exc))
+        else:
+            if installed_notes:
+                summary["items"].append(
+                    f"notification-settings (restored{note if dropped else ''})"
+                )
+            else:
+                _keep("notification_settings.json", "notification-settings")
+
+    if kept:
+        summary["settings_kept"] = kept
+
+
+def _listing(directory: Path) -> dict[str, os.DirEntry]:
+    """The entries of *directory* by name; empty when it cannot be listed."""
+    try:
+        with os.scandir(directory) as scan:
+            return {entry.name: entry for entry in scan}
+    except OSError:
+        return {}
+
+
+def _real_dir(entry: os.DirEntry | None) -> bool:
+    """A directory that is no link or reparse point, classified from its listing."""
+    return entry is not None and not _entry_is_link(entry) and entry.is_dir(follow_symlinks=False)
+
+
+def _real_file(entry: os.DirEntry | None) -> bool:
+    """A regular file that is no link or reparse point, classified from its listing."""
+    return entry is not None and not _entry_is_link(entry) and entry.is_file(follow_symlinks=False)
+
+
+@contextlib.contextmanager
+def _open_import_session_file(root: Path, rel: PurePath) -> Iterator[int | None]:
+    """Open an extracted file with every component below the extraction root pinned.
+
+    The root is the private extraction directory, not the archive-supplied top-level
+    name. Descendants must never be resolved before opening: doing so would bless an
+    ancestor replaced by a symlink. The caller owns the yielded descriptor until exit.
+    """
+    with contextlib.ExitStack() as held:
+        fd: int | None = None
+        try:
+            parent = held.enter_context(
+                pinned_fs.open_pinned_descendant_dir(
+                    root, rel.parts[:-1], what="imported chat source"
+                )
+            )
+            if parent is None:
+                fd = platform_compat.open_file_no_reparse(root / rel, nonblocking=True)
+            else:
+                fd = os.open(
+                    rel.name,
+                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                    dir_fd=parent,
+                )
+            held.callback(os.close, fd)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                fd = None
+        except (OSError, pinned_fs.PinnedPathRefusal):
+            fd = None
+        yield fd
+
+
+def _copy_import_session_fd(
+    mc: Path,
+    rel: PurePath,
+    fd: int,
+    *,
+    held: contextlib.ExitStack,
+    parents: dict[PurePath, int | None],
+    created: dict[PurePath, tuple[int, int]],
+) -> bool:
+    """Keep each destination pin and created inode until this chat commits or rolls back."""
+    if rel.parent not in parents:
+        parents[rel.parent] = held.enter_context(
+            pinned_fs.open_pinned_descendant_dir(
+                mc, rel.parts[:-1], what="imported chat destination", create=True
+            )
+        )
+    parent = parents[rel.parent]
+
+    def record_opened(st: os.stat_result) -> None:
+        # The descriptor's identity is available even when the first write fails.
+        created[rel] = (st.st_dev, st.st_ino)
+
+    os.lseek(fd, 0, os.SEEK_SET)
+    # The primitive takes ownership; the reader's context still owns fd.
+    return pinned_fs.copy_file_pinned(
+        str(mc / rel),
+        str(mc / rel),
+        src_fd=os.dup(fd),
+        dst_dir_fd=parent,
+        dst_name=rel.name if parent is not None else None,
+        skip_existing=True,
+        on_opened=record_opened,
+    )
+
+
+def _rollback_import_session(
+    mc: Path,
+    parents: dict[PurePath, int | None],
+    created: dict[PurePath, tuple[int, int]],
+) -> list[str]:
+    """Remove only this call's files, through the pins held for their creation."""
+    left = []
+    for rel, identity in reversed(created.items()):
+        parent = parents[rel.parent]
+        try:
+            if parent is None:
+                removed = pinned_fs.unlink_verified_by_name(mc / rel.parent, rel.name, identity)
+            else:
+                removed = pinned_fs.unlink_verified(parent, rel.name, identity)
+        except OSError:
+            removed = False
+        if not removed:
+            left.append(rel.as_posix())
+    return left
+
+
+def _merge_sessions(snap: Path, mc: Path, summary: dict, *, allow_unpinned: bool) -> None:
+    """Add the archive's dashboard chats this install does not have yet.
+
+    Never overwrites: a transcript whose file name already exists here is left as
+    it is, along with its threads and images, so a re-import is a no-op and two
+    machines' copies of one chat are never spliced. Each candidate is re-judged by
+    `_transcript_header_verdict` -- the archive is not trusted to have come from an
+    export that applied it -- and by `_chat_stem`, so only dashboard chats, in the
+    spelling this platform's history layer writes, are installed.
+
+    Listings select candidates only. Every accepted file is opened with the whole
+    extraction-relative chain pinned, then copied from that descriptor into the
+    pinned destination with exclusive creation. Transcript and rotation headers
+    are judged through the descriptor that supplies the installed bytes. Nothing
+    is moved out of the extraction tree. Platforms without directory descriptors
+    use the import driver's declared unpinned policy and still copy, never move.
+
+    Records ``sessions_added``, ``sessions_skipped_existing``, ``sessions_withheld``
+    and ``sessions_failed`` in *summary*. Copy failures roll back only this call's
+    files under the stem lock and use the existing items/refused_merges reporting.
+    An archive without a ``sessions/`` tree records nothing.
+    """
+    if not _real_dir(_listing(snap).get(SESSIONS_DIR_NAME)):
+        return
+    src = snap / SESSIONS_DIR_NAME
+    entries = _listing(src)
+    threads_dir = entries.get(THREADS_DIR_NAME)
+    threads = _listing(src / THREADS_DIR_NAME) if _real_dir(threads_dir) else {}
+    archive_dir = entries.get(ARCHIVE_DIR_NAME)
+    segments = _listing(src / ARCHIVE_DIR_NAME) if _real_dir(archive_dir) else {}
+    _staging_is_pinned(allow_unpinned=allow_unpinned, what="chat import")
+    dest = mc / SESSIONS_DIR_NAME
+    history = ConversationLog(base_dir=dest)
+    added = existing = withheld = failed = 0
+    for name in sorted(entries):
+        entry = entries[name]
+        stem = _chat_stem(name)
+        if stem is None or not _real_file(entry):
+            continue
+        rel = PurePath(SESSIONS_DIR_NAME, name)
+        with _open_import_session_file(snap.parent, PurePath(snap.name) / rel) as fd:
+            if fd is None or _transcript_header_verdict(_read_first_line_fd(fd)) is not None:
+                withheld += 1
+                continue
+            # Exclusive file creation alone cannot keep two imports' companions
+            # together. Hold the transcript writers' lock through the whole install.
+            with history.locked_stems([stem]):
+                if os.path.lexists(dest / name):
+                    existing += 1
+                    continue
+                companions: list[PurePath] = []
+                sidecar = threads.get(f"{stem}{THREADS_SIDECAR_SUFFIX}")
+                if sidecar is not None and _real_file(sidecar):
+                    companions.append(PurePath(THREADS_DIR_NAME, sidecar.name))
+                images = entries.get(f"{stem}{ATTACHMENTS_DIR_SUFFIX}")
+                if images is not None and _real_dir(images):
+                    # Attachments are flat: only regular files directly inside.
+                    for image in _listing(Path(images.path)).values():
+                        if _real_file(image):
+                            companions.append(PurePath(images.name, image.name))
+                companions.extend(
+                    PurePath(ARCHIVE_DIR_NAME, segment.name)
+                    for segment in segments.values()
+                    if _rotation_segment_for_stem(segment.name, stem) and _real_file(segment)
+                )
+                with contextlib.ExitStack() as held:
+                    parents: dict[PurePath, int | None] = {}
+                    created: dict[PurePath, tuple[int, int]] = {}
+
+                    def install(member: PurePath, source_fd: int) -> None:
+                        if not _copy_import_session_fd(
+                            mc, member, source_fd, held=held, parents=parents, created=created
+                        ):
+                            raise OSError(f"chat file could not be installed: {member.as_posix()}")
+
+                    try:
+                        for companion in companions:
+                            member = PurePath(SESSIONS_DIR_NAME) / companion
+                            with _open_import_session_file(
+                                snap.parent, PurePath(snap.name) / member
+                            ) as companion_fd:
+                                if companion_fd is None:
+                                    continue
+                                if companion.parts[0] == ARCHIVE_DIR_NAME:
+                                    if not _is_rotation_header(_read_first_line_fd(companion_fd)):
+                                        continue
+                                install(member, companion_fd)
+                        # The transcript is the existing-chat marker; publish it last.
+                        install(rel, fd)
+                    except (OSError, pinned_fs.PinnedPathRefusal) as exc:
+                        left = _rollback_import_session(mc, parents, created)
+                        failed += 1
+                        summary["items"].append(f"sessions/{name} (failed: {exc})")
+                        if left:
+                            summary["items"].append(
+                                "sessions rollback incomplete (not removed: "
+                                + ", ".join(left)
+                                + ")"
+                            )
+                        continue
+                added += 1
+    summary["sessions_added"] = added
+    summary["sessions_skipped_existing"] = existing
+    summary["sessions_withheld"] = withheld
+    summary["sessions_failed"] = failed
+    if failed:
+        summary.setdefault("refused_merges", []).append("sessions")
+    summary["items"].append(
+        f"sessions (merged: {added} added, {existing} already here, {withheld} withheld, "
+        f"{failed} failed)"
+    )
+
+
+def _read_session_mtimes(zf: zipfile.ZipFile) -> dict[str, float]:
+    """Read optional absolute session times; unusable records leave extraction time.
+
+    This is bounded by both the settings-document byte cap and archive member cap.
+    ZIP wall-clock fields carry no zone, so they are never a fallback for activity.
+    """
+    manifests = [
+        info
+        for info in zf.infolist()
+        if len(PurePosixPath(info.filename).parts) == 2
+        and PurePosixPath(info.filename).name == "MANIFEST.json"
+    ]
+    if len(manifests) != 1 or manifests[0].file_size > _MAX_SETTINGS_DOCUMENT_BYTES:
+        return {}
+    try:
+        with zf.open(manifests[0]) as src:
+            raw = src.read(_MAX_SETTINGS_DOCUMENT_BYTES + 1)
+        if len(raw) > _MAX_SETTINGS_DOCUMENT_BYTES:
+            return {}
+        manifest = json.loads(raw)
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(manifest, dict):
+        return {}
+    records = manifest.get("session_mtimes")
+    if not isinstance(records, dict) or len(records) > _MAX_IMPORT_MEMBERS:
+        return {}
+    mtimes: dict[str, float] = {}
+    for name, value in records.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        try:
+            epoch = float(value)
+        except OverflowError:
+            continue
+        if math.isfinite(epoch):
+            mtimes[name] = epoch
+    return mtimes
+
+
+def apply_import_zip(
+    zip_path: Path, mode: str = "merge", *, channel_settings: ChannelSettings | None = None
+) -> dict:
     """Extract and apply an import zip.
 
     Args:
         zip_path: Path to validated zip file.
-        mode: "merge" (default, non-destructive) or "replace" (overwrites).
+        mode: "merge" (default, non-destructive) or "replace" (overwrites). Merge
+            never overwrites memory, crons, workspace files or skills, and installs
+            an archive settings document only where this install has none -- never
+            the ``config.local.json`` overlay -- naming each it kept in
+            ``settings_kept`` (see `_merge_settings`). Replace restores all four.
+        channel_settings: the running gateway's notification-settings store, so a
+            restored mute applies at once and is not written back over by the
+            in-memory copy. ``None`` (no gateway in this process) loads one from disk.
 
-    Returns summary dict of what was imported.
+    Returns summary dict of what was imported. ``ui_prefs_restored`` is True when the
+    browser-preference backup was installed, which tells the dashboard to re-read it.
     """
     try:
         vet_zip_inventory(zip_path, max_members=_MAX_IMPORT_MEMBERS)
@@ -1018,13 +1898,21 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
                     f"Import archive uncompressed size {total_uncompressed} exceeds cap "
                     f"{_MAX_IMPORT_UNCOMPRESSED} (possible zip bomb)"
                 )
+            session_mtimes = _read_session_mtimes(zf)
             for info in infos:
                 parts = PurePosixPath(info.filename).parts
                 if ".." in parts or info.filename.startswith("/"):
                     continue
                 if _is_link_entry(info):
                     continue
-                zf.extract(info, work)
+                extracted = zf.extract(info, work)
+                if len(parts) >= 3 and parts[1] == SESSIONS_DIR_NAME and not info.is_dir():
+                    # Only accepted chats are copied out of this private staging tree;
+                    # no-overwrite copying preserves these epochs on installed files.
+                    ts = session_mtimes.get(info.filename)
+                    if ts is not None:
+                        with contextlib.suppress(OSError, OverflowError, ValueError):
+                            os.utime(extracted, (ts, ts))
 
         snap_dirs = [d for d in work.iterdir() if d.is_dir()]
         if len(snap_dirs) != 1:
@@ -1071,6 +1959,10 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
             snap, ["memory", "crew-teams"], mc_for_merge=None if mode == "replace" else mc
         )
 
+        # Before either branch too: a settings document neither branch may install is
+        # removed from the extraction here, and reported.
+        vetted_settings = _vet_archive_settings(snap, summary)
+
         if mode == "replace":
             # Strip sensitive files and skills/auto/ from snapshot before replace
             for excluded_name in EXPORT_EXCLUDE:
@@ -1100,8 +1992,24 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
             # dashboard rendered "Import complete" over a data home nothing had been
             # written to. Raised in review. Propagating reaches the existing error
             # path, which is the one that tells the user the import did not happen.
-            _do_replace(snap, mc, None, allow_unpinned=not staging_pinned)
+            # Each settings store whose file this swap replaces is held at its writer
+            # lock for the whole swap (rollback included): a write from another tab or
+            # channel in between would publish its pre-import copy over the restored
+            # file. The notification store also re-reads its file before letting go.
+            # Taken in one fixed order, ui-prefs then notifications.
+            with contextlib.ExitStack() as swap_guard:
+                if "ui-prefs.json" in vetted_settings:
+                    swap_guard.enter_context(ui_prefs.replacing_file())
+                if channel_settings is not None and "notification_settings.json" in vetted_settings:
+                    channels, _dropped = cast(
+                        "tuple[dict[str, dict[str, Any]], int]",
+                        vetted_settings["notification_settings.json"],
+                    )
+                    swap_guard.enter_context(channel_settings.replacing_file(channels))
+                _do_replace(snap, mc, None, allow_unpinned=not staging_pinned)
             summary["items"].append("full replace")
+            if "ui-prefs.json" in vetted_settings:
+                summary["ui_prefs_restored"] = True
         else:
             # Merge mode
             if (snap / "memory.db").is_file():
@@ -1148,9 +2056,7 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
                 else:
                     summary["items"].append("hooks (skipped, already exists)")
 
-            if (snap / "config.json").is_file() and not (mc / "config.json").is_file():
-                shutil.copy2(str(snap / "config.json"), str(mc / "config.json"))
-                summary["items"].append("config (restored)")
+            _merge_settings(mc, vetted_settings, summary, channel_settings)
 
             if (snap / "notifications.jsonl").is_file():
                 if (mc / "notifications.jsonl").is_file():
@@ -1228,6 +2134,11 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
                     elif item.is_file() and not target.exists():
                         shutil.copy2(str(item), str(target))
                 summary["items"].append("skills (merged, auto/ skipped)")
+
+        # Both modes, and add-only in both: Replace restores the components it
+        # names, and chats are not one of them, so an archive -- with chats or
+        # without -- never deletes or overwrites a chat this install already has.
+        _merge_sessions(snap, mc, summary, allow_unpinned=not staging_pinned)
 
     # Warn, never refuse: the rows are already written, and a template can be
     # installed afterwards without importing again.

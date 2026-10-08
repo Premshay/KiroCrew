@@ -141,6 +141,7 @@ from kiro_crew.acp.harness.base import (
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
+    ACP_CLIENT_CAPABILITIES,
     acp_client_capabilities,
     METHOD_SESSION_CLOSE,
     METHOD_SESSION_UPDATE,
@@ -298,7 +299,13 @@ class CodexHarness(MembershipHarness):
             private_state_env=None if ctx.environ.get(_SQLITE_HOME_ENV) else _SQLITE_HOME_ENV,
         )
 
-    def apply_spawn_env(self, env: dict[str, str], *, spawned_binary: str | None = None) -> None:
+    def apply_spawn_env(
+        self,
+        env: dict[str, str],
+        *,
+        spawned_binary: str | None = None,
+        cli_owned_auth: bool = False,
+    ) -> None:
         """Take kiro-cli's API key OUT of the child's environment.
 
         A foreign adapter must never receive it, and removing it is the positive
@@ -364,7 +371,7 @@ class CodexHarness(MembershipHarness):
 
     @property
     def client_capabilities(self) -> dict[str, Any]:
-        return acp_client_capabilities(ACP_BACKEND_CODEX)
+        return acp_client_capabilities(self.backend)
 
     # ── Seam 3: session/new and session/load extras ──
 

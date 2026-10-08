@@ -15,6 +15,7 @@ doesn't need to branch on every method call.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -45,7 +46,6 @@ from kiro_crew.acp.runtime import (
 )
 from kiro_crew.acp.session_handle import WatchdogSettings
 from kiro_crew.acp.types import (
-    ACP_BACKEND_KIRO,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
 )
@@ -53,6 +53,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION as ACP_BACKENDS_HARNESS_MANAGED,
 )
 from kiro_crew.acp.types import (
+    ACP_BACKEND_KIRO,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_SESSION_EVICTION,
     STOP_REASON_END_TURN,
@@ -100,11 +101,10 @@ class AcpSessionProvider(LLMProvider):
     ) -> None:
         self._handle = handle
         self._runtime = runtime
+        self._mcp_gateway_socket = getattr(runtime, "_mcp_gateway_socket", None)
         # When True, shutdown() kills the runtime (parent session owns it).
         # When False, shutdown() only destroys the session handle (subagent).
         self._owns_runtime = owns_runtime
-        # Set only by confirm_member_projection, for a projecting (mirrored) backend.
-        # kiro-cli loads its member natively and answers from the handle instead.
         self._confirmed_projection_template = ""
         self._capability_projection_gaps: tuple[str, ...] = ()
         # This provider's LEASE on the runtime, or None when it holds none.
@@ -573,12 +573,18 @@ class AcpSessionProvider(LLMProvider):
         return dict(self._handle.native_context_documents)
 
     @property
+    def member_dispatch_mounted(self) -> bool | None:
+        # A handle that never recorded an answer is no evidence, not a refusal.
+        mounted = getattr(self._handle, "member_dispatch_mounted", None)
+        return None if mounted is None else bool(mounted)
+
+    @property
     def native_steering(self) -> bool:
         from kiro_crew.acp.types import ACP_BACKEND_KAS
 
         return self.backend == ACP_BACKEND_KAS
 
-    async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
+    async def stream(self, message: str, *, allow_image: bool = True) -> AsyncIterator[LLMEvent]:
         """Send a prompt and yield LLMEvent objects until the turn completes."""
         # Re-establish this session's gateway claim before the turn can call a
         # tool. The shared identity publisher does the same at every surface that
@@ -600,11 +606,12 @@ class AcpSessionProvider(LLMProvider):
         except Exception:
             logger.debug("stream: stub re-claim failed", exc_info=True)
         claim = self._claim_shared_turn()
+        send = self._handle.prompt
+        if not allow_image:
+            send = functools.partial(send, allow_image=False)
         try:
             async with aclosing(
-                self.essential_delivery.stream(
-                    message, self._handle.prompt, lambda: self.context_incarnation
-                )
+                self.essential_delivery.stream(message, send, lambda: self.context_incarnation)
             ) as events:
                 async for event in events:
                     yield event
@@ -811,7 +818,6 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def session_activity_at(self) -> float | None:
-        """See AcpSessionHandle.session_activity_at."""
         return self._handle.session_activity_at
 
     def is_alive(self) -> bool:
@@ -863,20 +869,16 @@ class AcpSessionProvider(LLMProvider):
             if self._handle.active_agent == self._runtime._agent:
                 return self._handle.active_agent
             return ""
-        return self._confirmed_projection_template
+        if self.member_capabilities_supported:
+            return self._confirmed_projection_template
+        return ""
 
     @property
     def capability_projection_gaps(self) -> tuple[str, ...]:
         return self._capability_projection_gaps
 
     def confirm_member_projection(self) -> None:
-        """Confirm a projecting backend consumed the member's saved spec. Blocking.
-
-        The shared-runtime counterpart of ``AcpClient._confirm_member_projection``:
-        judged on the spec the session's array was built from (recorded on the
-        handle by the runtime), never on a re-read of the file after startup. kiro-cli
-        loads its member natively, so it needs no confirmation here.
-        """
+        """Confirm a projecting backend consumed the member's saved spec. Blocking."""
         if self._runtime.acp_backend == ACP_BACKEND_KIRO:
             return
         from kiro_crew import agent_state
@@ -905,17 +907,21 @@ class AcpSessionProvider(LLMProvider):
         return proc.returncode if proc else None
 
     def touch_activity(self) -> None:
-        """Refresh activity timestamp on the runtime.
+        """Refresh activity timestamp on the runtime, and stamp this session's handle.
 
-        PROCESS-level: the clock belongs to the runtime, so one session's
-        activity refreshes it for every session on it. An idle co-tenant is
-        therefore never idle while a neighbour talks, which is the SAFE
-        direction for anything that reaps on idleness (it defers, never
+        The runtime half is PROCESS-level: the clock belongs to the runtime, so
+        one session's activity refreshes it for every session on it. An idle
+        co-tenant is therefore never idle while a neighbour talks, which is the
+        SAFE direction for anything that reaps on idleness (it defers, never
         signals early) and the wrong one for anything that reports idle time
-        as a fact about a session. A per-session activity stamp is the fix;
-        this method cannot be it, because it has only the runtime to write to.
+        as a fact about a session.
+
+        The handle half is per-session: the tool-stall watchdog ignores the
+        runtime clock, so without it a blocking tool's keepalive pings
+        (``wait``, ``spawn_sub_agents``) would not keep its own turn alive.
         """
         self._runtime._last_activity = time.monotonic()
+        self._handle.note_keepalive()
 
     def rekey(
         self,
@@ -1205,6 +1211,7 @@ class AcpSessionProvider(LLMProvider):
         the fresh answer ALSO lacks the model. A failed probe keeps the stale
         verdict (fail-safe: no evidence, no entitlement granted).
         """
+        backend = self.backend if isinstance(self.backend, str) else ACP_BACKEND_KIRO
         advertised = acp_config_option_values(self.acp_config_options, "model")
         advertised.extend(advertised_model_ids(self._handle.available_models))
         if model_is_unusable(model_id, advertised):
@@ -1217,7 +1224,7 @@ class AcpSessionProvider(LLMProvider):
             # handle do the wire translation rather than hard-killing a provider
             # on a pin the harness routinely stores. Only refuse when the
             # resolver also finds nothing, after a fresh probe.
-            if not resolve_pin_spelling_on(model_id, advertised, backend=self.backend):
+            if not resolve_pin_spelling_on(model_id, advertised, backend=backend):
                 # A user's explicit pick must earn a FRESH probe, not be refused
                 # on a recent no-evidence failure the picker read path may have
                 # cached (force=True skips the failure/empty attempt-clock replay).
@@ -1225,9 +1232,9 @@ class AcpSessionProvider(LLMProvider):
                     await self._guarded(self._handle.refresh_available_models(force=True))
                 )
                 if not resolve_pin_spelling_on(
-                    model_id, fresh, backend=self.backend
+                    model_id, fresh, backend=backend
                 ) and model_is_unusable(model_id, fresh or advertised):
-                    raise AcpModelUnavailable(model_id, fresh or advertised)
+                    raise AcpModelUnavailable(model_id, fresh or advertised, backend=backend)
         await self._guarded(self._handle.set_model(model_id))
 
     async def set_mode(self, agent_name: str) -> None:
@@ -1283,6 +1290,21 @@ class AcpSessionProvider(LLMProvider):
         return self._runtime._work_dir
 
     @property
+    def cwd(self) -> str:
+        """The directory THIS session is bound to, not the runtime's.
+
+        Overrides the ``LLMProvider`` default ("") so reuse validation reads the real
+        path through the public capability rather than probing a private attribute.
+        Reads it off the HANDLE: a shared runtime carries sessions opened against
+        different projects, so answering with the runtime's own directory would report a
+        workspace this session never bound, and reuse validation would evict a live
+        session -- losing its conversation -- for failing to be somewhere it never was.
+        Falls back to the runtime for a handle predating the record, which is the
+        single-session case where the two agree anyway.
+        """
+        return str(getattr(self._handle, "_bound_cwd", "") or self._work_dir)
+
+    @property
     def _permission_mode(self) -> str:
         """Permission mode — always empty for kiro (no CC permission modes)."""
         return ""
@@ -1329,10 +1351,6 @@ class AcpSessionProvider(LLMProvider):
         """Valid effort levels from config options."""
         return self._handle.get_valid_effort_levels()
 
-    def effort_config_option_id(self) -> str | None:
-        """ACP id used to change reasoning effort on this backend."""
-        return self._handle.effort_config_option_id()
-
     def supports_config_option(self, config_id: str) -> bool:
         """Whether the session advertised a config option with this id."""
         return self._handle.supports_config_option(config_id)
@@ -1377,7 +1395,7 @@ class AcpSessionProvider(LLMProvider):
 
     # ── Streaming (AcpClient-compatible method name) ──
 
-    def stream_events(self, message: str) -> AsyncIterator[LLMEvent]:
+    def stream_events(self, message: str, *, allow_image: bool = True) -> AsyncIterator[LLMEvent]:
         """Send a prompt and yield events. AcpClient-compatible name for stream().
 
         Delegates to stream() (NOT self._handle.prompt() directly) so it
@@ -1386,7 +1404,7 @@ class AcpSessionProvider(LLMProvider):
         AcpRuntimeError, not an AcpError) escape chat_runner's handlers on a
         runtime death at prompt start -> unhandled crash instead of retry/login.
         """
-        return self.stream(message)
+        return self.stream(message, allow_image=allow_image)
 
     @property
     def resumed(self) -> bool:
@@ -1417,11 +1435,6 @@ class AcpSessionProvider(LLMProvider):
     def _child_pids(self) -> dict[int, Any]:
         """Child PIDs of the runtime (for process sweep)."""
         return getattr(self._runtime, "_child_pids", {})
-
-    @property
-    def _mcp_gateway_socket(self) -> str | None:
-        """Gateway control socket of the backing runtime."""
-        return getattr(self._runtime, "_mcp_gateway_socket", None)
 
     @property
     def _start_time(self) -> int | None:

@@ -17,6 +17,7 @@ from typing import Any, Callable
 from kiro_crew import dep_sync, frontend, hooks, platform_compat
 from kiro_crew.apps.builtins.dev_fleet import fleet_state, live, npm_preflight, repository, runtime
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.git_config_hooks import ConfigHookScanError
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import sandboxed_spawn_argv, shielded_prepare_off_loop
 
@@ -1737,10 +1738,11 @@ def _frontend_build_steps(
     return [
         ([npm_bin, "ci", "--prefix", "website"], "strict", runtime._build_env(), "npm ci"),
         # Build and stage as ONE step, holding the staging lock across both.
-        # `npm run build` empties website/dist, so a peer flow (the dashboard's
-        # own update, pod provisioning) staging concurrently would copy a
-        # partially written tree — and a bundle's lazy chunks are not reachable
-        # from index.html, so no post-hoc inspection detects that reliably.
+        # `npm run build` swaps a new tree into website/dist
+        # (website/scripts/publish-dist.mjs), so a peer flow (the dashboard's own
+        # update, pod provisioning) copying concurrently could copy half of each
+        # — and a bundle's lazy chunks are not reachable from index.html, so no
+        # post-hoc inspection detects that reliably.
         # Covering only the copy is not enough; the holder has to span the build.
         #
         # Run with THIS backend's interpreter, not the target checkout's: the
@@ -2138,11 +2140,11 @@ async def _sync_start_locked() -> dict:
     #
     # The build runs under _build_env(), whose allowlist (_SAFE_ENV_KEYS) drops
     # KIROCREW_EDITION_DIR and KIROCREW_ALLOW_EDITION, so on an edition
-    # composition root `npm run build` can only compile the STOCK SPA -- and vite
-    # builds with emptyOutDir, so it OVERWRITES website/dist. On a source-tree
-    # install frontend.ensure_dev_dist_symlink() has pointed static/dist at
-    # website/dist, which means the build alone replaces the served edition
-    # dashboard with upstream's, with or without a staging step. Skipping the
+    # composition root `npm run build` can only compile the STOCK SPA -- and it
+    # publishes that into website/dist. An edition checkout serves a private
+    # copy, but one whose static/dist links to website/dist (no private edition
+    # copy, or one that could not be made) would have the build alone replace the served edition dashboard
+    # with upstream's, with or without a staging step. Skipping the
     # build is therefore the only way to make this safe, and it costs an edition
     # nothing: the only artifact this path could produce for it is a stock SPA it
     # must never serve. It is the same call frontend's own
@@ -2184,6 +2186,22 @@ async def _sync_start_locked() -> dict:
         cleanups += [str(dep_sync_snapshot), str(dep_sync_snapshot.parent)]
     wrapped_steps: list[dict] = []
     for argv, mode, base_env, label in raw_steps:
+        try:
+            argv = await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), runtime._with_config_hooks_off, argv, str(repo), base_env
+            )
+        except ConfigHookScanError as exc:
+            for _p in cleanups:
+                try:
+                    os.unlink(_p)
+                except (IsADirectoryError, PermissionError):
+                    try:
+                        os.rmdir(_p)
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+            return {"ok": False, "error": f"git hook config refused: {exc}"}
         w_argv, w_env, cleanup = await shielded_prepare_off_loop(
             functools.partial(sandboxed_spawn_argv, argv, mode, env=base_env),
             executor=subprocess_executor(),

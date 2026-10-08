@@ -309,7 +309,6 @@ class TerminalCoordinator(ManagerComponent):
                 # rebuilt from this event alone, so without it the live-downgrade
                 # amber chip would silently vanish from a downgraded finished run.
                 "requested_model": _redact(info.requested_model),
-                "route_reason": info.route_reason,
                 "result": _done_result(info.result),
                 # WHY the run ended and whether ``result`` is a partial, so the
                 # parent does not infer success from ``error`` being unset.
@@ -355,11 +354,16 @@ class TerminalCoordinator(ManagerComponent):
             # the hold, and marking the siblings it was holding, leaves no injector
             # armed for the wave. The siblings are NOT marked delivered -- their results
             # never reached a parent, so orphan reconciliation must still be able to
-            # find them.
+            # find them. A memory-wait expiry held here is the exception: it has no
+            # folder, and the store owes its report only to the parent that ended,
+            # so the mark is cleared rather than left for a restart to deliver.
             info._digest_held_at = 0.0
             held, info._digest_settle_deliveries = info._digest_settle_deliveries, []
             if held:
                 self._manager._teardown_cancelled_ids.update(delivery.agent_id for delivery in held)
+                owed = [delivery.agent_id for delivery in held if delivery.report_owed]
+                if owed:
+                    self._manager._admission.taskq_clear_owed_reports(owed)
             logger.info("Reaper: skipping parent delivery for %s — its parent ended", info.id)
             # The gate has now done its job for this run: the delivery it existed to stop
             # has been stopped, and ``_on_done`` was never called, so none of the gateway's
@@ -472,8 +476,7 @@ class TerminalCoordinator(ManagerComponent):
         """Spawn the shielded terminal report and block until it completes.
 
         Convenience for callers that have no cancellable ``await`` between
-        taking the claim and reporting (the cancel-recovery failure arm, the
-        boundary redeliveries): there is no window in which a cancellation
+        taking the claim and reporting (the cancel-recovery failure arm): there is no window in which a cancellation
         could strand the outcome before the report task exists, so spawning and
         awaiting can be adjacent. Callers that DO have awaits between the claim
         and the report must instead :meth:`_spawn_terminal_report` BEFORE those
@@ -537,20 +540,10 @@ class TerminalCoordinator(ManagerComponent):
             self._manager._report_tasks.discard(t)
             owner = self._manager._report_owners.pop(t, None)
             self._manager._run_events._forget_finished_live_state(info)
-            if owner is None:
-                return
-            failed = t.cancelled()
-            if not failed:
-                try:
-                    failed = t.result() is False
-                except asyncio.CancelledError:
-                    failed = True
-                except Exception:
-                    failed = True
-            if failed:
-                self._manager._latch_report_failure(owner)
-            else:
-                self._manager._clear_report_failure(owner)
+            if owner is not None and not t.cancelled():
+                # Retrieve the outcome so a failed report never logs
+                # "Task exception was never retrieved".
+                t.exception()
 
         task.add_done_callback(_forget)
         return task
@@ -610,7 +603,10 @@ class TerminalCoordinator(ManagerComponent):
             )
             await asyncio.shield(in_flight)
             return
-        if info._reap_started:
+        if info._reap_started or info._ending_claimed:
+            # Reaped already, or ending completed on its own: the run claimed
+            # its completed ending (see ``SubagentInfo._ending_claimed``),
+            # which is ``done`` to every stop.
             return
         settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._manager._reaps_in_flight[agent_id] = settled
@@ -646,6 +642,9 @@ class TerminalCoordinator(ManagerComponent):
         # `_reap_started`, NOT `reaped`: setting `reaped` this early makes a run
         # woken by our own session reset skip its error synthesis and report a
         # false SUCCESS before we own the record. See `_reap_started`.
+        # Read before ``_reap_started`` takes the run out of ``_in_startup``: a
+        # startup reap of a run already out of startup had its runtime up.
+        runtime_up = reason == "startup_timeout" and not self._manager._in_startup(info)
         info._reap_started = True
         # Snapshot what the reap is interrupting BEFORE the first await below.
         # Both flags are cleared by their owners' ``finally`` -- the approval
@@ -957,6 +956,10 @@ class TerminalCoordinator(ManagerComponent):
                         from kiro_crew.subagent_manager.monitoring import _START_QUEUE_MAX_SECS
 
                         info.error = f"Never started: start queues saturated (over {int(_START_QUEUE_MAX_SECS)}s queued for start permits in total, behind other starts) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
+                    elif runtime_up:
+                        from kiro_crew.subagent_manager.monitoring import _FIRST_PROMPT_SILENT_SECS
+
+                        info.error = f"Runtime launched but its first prompt got no answer within {int(_FIRST_PROMPT_SILENT_SECS)}s (no turn produced) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
                     elif reason == "startup_timeout":
                         info.error = f"Failed to start within {self._manager._startup_deadline}s (no runtime launched, no turn produced; {info._startup_cotenant_frames} co-tenant frame(s) received, none addressed to this session) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
                     else:
@@ -1008,6 +1011,9 @@ class TerminalCoordinator(ManagerComponent):
             if self._manager._release_slot(info):
                 self._manager._running_count = max(0, self._manager._running_count - 1)
                 self._manager._drain_queue()
+            # The reap ended its process: a start waiting for memory is
+            # re-checked now (a no-op when none waits).
+            self._manager._admission.wake_memory_waits("child_terminal")
 
             try:
                 sel().log_tool_invocation(
@@ -1361,6 +1367,11 @@ class TerminalCoordinator(ManagerComponent):
             # the gateway's injection paths), so gating it once covers them all.
             logger.info("Reaper: skipping failure announce for %s — its parent ended", info.id)
             return
+        # Every route that gives up on an injection comes through here, and most
+        # then return normally from ``_on_done``, so this is where the record
+        # learns its report did not reach the parent. Set before the slot check:
+        # a parent with no tab gets no notice at all.
+        info._report_undelivered = True
         try:
             # Lazy: the dashboard layer must not be imported by a core module at
             # import time.

@@ -44,6 +44,7 @@ from kiro_crew.metrics.sessions import (
     record_sessions_ended,
 )
 from kiro_crew.process_identity import ProcessHandle, process_handle_of
+from kiro_crew.session_pool import pool_kiro_agent
 from kiro_crew.start_priority import PrioritySemaphore
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
@@ -400,6 +401,25 @@ def adopt_parked_queue(session: Any, key: str) -> int:
     return len(parked)
 
 
+def allocation_identity(owner: Any, key: str, session: Any) -> dict[str, Any]:
+    """The ``get_or_create`` arguments that rebuild *session*'s identity for *key*.
+
+    Shared by the reset successor and the compaction restart
+    (``session_compaction._restart_held``) so the two cannot drift: agent,
+    approval policy, cwd, bound channel, the model the allocation selected and
+    the crew member. A caller's ``extra_env`` is not recorded on a session, so
+    it cannot be carried.
+    """
+    return {
+        "agent": getattr(session, "agent", "") or None,
+        "approval_policy": getattr(session, "approval_policy", ""),
+        "cwd": getattr(session.provider, "cwd", None) or None,
+        "channel_id": owner.get_channel(key) or None,
+        "model": getattr(session, "requested_model", "") or None,
+        "crew_agent": getattr(session, "capability_member", "") or None,
+    }
+
+
 async def hand_queue_to_successor(sessions: Any, key: str, entries: tuple[Any, ...]) -> bool:
     """Put *entries* (plus anything already parked for *key*) at the head of the
     key's successor queue and wake their channels. Returns whether they landed.
@@ -507,6 +527,7 @@ class _SessionEntry(Protocol):
     provider: Any
     semaphore: asyncio.BoundedSemaphore
     queue: Any
+    cancelled: set[str]
     first_turn: object
     provider_switch_replay: bool
     retire_on_identity_change: bool
@@ -654,6 +675,8 @@ class SessionLifecycleConstants:
     drain_active_turns_timeout_secs: float
     unbind_reason_session_destroyed: str
     first_turn_nothing_armed: object
+    first_turn_fresh: object
+    first_turn_resumed: object
     provider_label_claude: str
 
 
@@ -718,6 +741,11 @@ class SessionLifecycleState:
     # while the sweep runs and cleared only by the sweep that completes it, so an
     # outstanding change stays its own trigger for the next turn.
     identity_sweep_fingerprint: str = ""
+    # What the LAST sweep could not finish, one short label each (a session key,
+    # tagged when it is a busy or channel-member holder, or the runtime that
+    # stayed up). Empty after a complete sweep. Read by the caller's warning so
+    # an incomplete sweep names what it is waiting on.
+    identity_sweep_waiting_on: tuple[str, ...] = ()
     recycling: dict[str, _SessionEntry] = field(default_factory=dict)
     # Folded key -> the session ``reset`` popped under it, for exactly the life of
     # that teardown. ``reset`` pops the session out of the live map under the
@@ -1204,11 +1232,7 @@ class SessionLifecycleService:
                 # OLD pool size and agent, and the TTL was never re-adopted by
                 # any path. Same clamp as WarmSessionPool._state_from_owner.
                 owner._pool_size = min(constants.max_pool, max(0, cfg.session.pool_size))
-                owner._pool_agent = cfg.session.pool_agent or getattr(
-                    cfg.agent,
-                    "default_agent",
-                    "",
-                )
+                owner._pool_agent = pool_kiro_agent(cfg)
                 owner._pool_ttl_secs = max(0, cfg.session.pool_ttl_secs)
                 owner._pool_cwd = pool_cwd
                 while not owner._warm_pool.empty():
@@ -1254,11 +1278,7 @@ class SessionLifecycleService:
                 # handler that loads a disk-edited pool_ttl_secs must not evict
                 # the warm pool at the stale TTL until the watcher's next cycle.
                 owner._pool_size = min(constants.max_pool, max(0, cfg.session.pool_size))
-                owner._pool_agent = cfg.session.pool_agent or getattr(
-                    cfg.agent,
-                    "default_agent",
-                    "",
-                )
+                owner._pool_agent = pool_kiro_agent(cfg)
                 owner._pool_ttl_secs = max(0, cfg.session.pool_ttl_secs)
                 owner._pool_cwd = pool_cwd
                 while not owner._warm_pool.empty():
@@ -1399,9 +1419,9 @@ class SessionLifecycleService:
             # the provider shutdown) is where a teardown hangs. The scope keeps the
             # popped session readable through ``tearing_down`` for exactly the life
             # of this call -- the facade releases it when this method ends, however
-            # it ends -- and tells the caller which session THIS reset popped (its
-            # ``popped``, and its ``on_pop`` hook, run here so a caller's read of the
-            # session is atomic with the pop). One entry per teardown in flight
+            # it ends -- and tells the caller which session THIS reset popped: its
+            # ``on_pop(session)`` hook, run here so a caller's read of the
+            # session is atomic with the pop. One entry per teardown in flight
             # under the key, in pop order; no scope, no record.
             if scope is not None and current is not None:
                 scope.note_pop(key, current)
@@ -1439,6 +1459,13 @@ class SessionLifecycleService:
                 self._suppress_replay.discard(key)
             owner._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
+            # Same lock hold as the pop, so a successor that registers in any of
+            # the awaits below already finds these entries parked and adopts them.
+            rescued = (
+                self._park_reset_queue(key, session)
+                if session is not None and not ends_conversation
+                else 0
+            )
             if session is not None:
                 # Order matters: the holder is recorded BEFORE its waiters are
                 # woken, so the successor a woken waiter creates is already
@@ -1576,11 +1603,45 @@ class SessionLifecycleService:
                 await owner.release_subagent_runtime(key)
             except Exception:
                 logger.debug("Reset %s: subagent runtime cleanup failed", key, exc_info=True)
+        if rescued and session is not None:
+            # Nothing else starts a successor for a key whose turn just failed: the
+            # next message might never come, and the end-of-turn drain of the failed
+            # turn finds no live session. The respawn registers one, which adopts
+            # the parked entries, and its release wakes their channels' drains.
+            # It starts under the popped session's own identity: a later claim
+            # takes a live session as-is, so a default-agent successor would run
+            # every follow-up, and every message after them, as the wrong agent.
+            task = asyncio.create_task(
+                self._respawn_as(key, allocation_identity(owner, key, session))
+            )
+            owner._background_tasks.add(task)
+            task.add_done_callback(owner._background_tasks.discard)
         if shutdown_error is not None:
             # The caller still sees what went wrong; it just sees it after this parent's
             # children have been dealt with rather than instead of that.
             raise shutdown_error
         return session is not None
+
+    def _park_reset_queue(self, key: str, session: _SessionEntry) -> int:
+        """Park the popped *session*'s live queue entries for the key's successor.
+
+        A recycling reset ends a process, not a conversation, and the queue holds
+        follow-ups people sent while the turn ran: acknowledged messages nobody
+        asked to drop. Entries a mid-turn cancel marked in ``cancelled`` stay on
+        the popped queue, so the teardown's unlink removes their files as before.
+        Parking is bounded (``PARKED_QUEUE_MAX``); what does not fit is dropped,
+        counted and logged by ``_park_queue``. Returns how many were parked.
+        """
+        cancelled = session.cancelled
+        kept = tuple(entry for entry in session.queue if entry[0] not in cancelled)
+        if not kept:
+            return 0
+        wanted = {id(entry) for entry in kept}
+        remaining = [entry for entry in session.queue if id(entry) not in wanted]
+        session.queue.clear()
+        session.queue.extend(remaining)
+        _park_queue(self._owner, key, kept)
+        return len(kept)
 
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register the watchdog recycle notification callback."""
@@ -1952,6 +2013,7 @@ class SessionLifecycleService:
         doomed: list[tuple[str, Any]] = []
         teardown_children_by_key: dict[str, tuple[str, ...]] = {}
         skipped = False
+        waiting_on: list[str] = []
         # One sweep at a time: the drain below is not re-entrant (a second
         # concurrent drain raises), so a peer sweep waits here for this one.
         async with self._identity_sweep_lock:
@@ -2013,6 +2075,12 @@ class SessionLifecycleService:
                             sess.retire_on_identity_change = True
                             invalidated_keys.append(key)
                             skipped = True
+                            holder = (
+                                "channel member"
+                                if getattr(sess, "lifecycle_lease", False)
+                                else "busy"
+                            )
+                            waiting_on.append(f"{key} ({holder})")
                             continue
                         del owner._sessions[key]
                         owner._advance_session_generation(key)
@@ -2077,21 +2145,26 @@ class SessionLifecycleService:
                     exc_info=True,
                 )
                 skipped = True
+                waiting_on.append(f"{key} (shutdown failed)")
 
         # Warm-pool policy remains owned by the pool service; route through the
         # facade to retain direct manager monkeypatches and its fill-lock policy.
         if not await owner._retire_kiro_warm_pool():
             skipped = True
+            waiting_on.append("warm pool")
         # Same spare for the companion runtimes: one that provably spawned
         # under the live account is neither reaped nor a reason to re-sweep.
         if not await owner._retire_kiro_subagent_runtimes(live=fingerprint):
             skipped = True
+            waiting_on.append("sub-agent runtimes")
         if not await owner._retire_kiro_bg_runtime(live=fingerprint):
             skipped = True
+            waiting_on.append("background runtime")
         if owner._starting_pids:
             # With every cold-start permit held above, residue here means a
             # producer bypassed the barrier; fail toward another sweep.
             skipped = True
+            waiting_on.append("cold starts in flight")
         complete = not skipped
         if complete:
             # Only the sweep that OWNS the pending fingerprint may retire it. The
@@ -2105,6 +2178,8 @@ class SessionLifecycleService:
                 self.state.identity_sweep_fingerprint = ""
             else:
                 complete = False
+                waiting_on.append("a newer identity change")
+        self.state.identity_sweep_waiting_on = tuple(waiting_on)
         return retired, complete
 
     async def _retire_kiro_subagent_runtimes(
@@ -3110,6 +3185,38 @@ class SessionLifecycleService:
             self._owner.release(key)
         except Exception:
             self._deps.logger.debug("Eager respawn failed for %s", key, exc_info=True)
+
+    async def _respawn_as(self, key: str, identity: dict[str, Any]) -> None:
+        """Start a successor for *key* under *identity* and release its lease.
+
+        The reset's counterpart of :meth:`_eager_respawn`: registration adopts the
+        entries the reset parked, and the release wakes their channels' drains.
+        The successor's first-turn observation belongs to the first queued turn,
+        not to this call: a non-speculative creator registers its session with
+        nothing armed and keeps the observation for itself, so it is re-armed
+        here from the flags the start returned. A failed native resume then
+        still reads as a fresh start and the queued turn replays the history.
+        """
+        owner = self._owner
+        try:
+            provider, is_new, resumed = await owner.get_or_create(key, **identity)
+        except Exception:
+            self._deps.logger.debug("Reset respawn failed for %s", key, exc_info=True)
+            return
+        try:
+            live = owner._sessions.get(key)
+            constants = self._deps.constants()
+            if (
+                is_new
+                and live is not None
+                and live.provider is provider
+                and live.first_turn is constants.first_turn_nothing_armed
+            ):
+                live.first_turn = (
+                    constants.first_turn_resumed if resumed else constants.first_turn_fresh
+                )
+        finally:
+            owner.release(key)
 
     async def drain_all_providers(self) -> list[Any]:
         """Pop every registered session and return its providers.

@@ -42,6 +42,7 @@ from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     driver_turn_landed,
     rearm_reinjection,
+    rollback_skill_bodies,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
@@ -507,6 +508,9 @@ async def handle_message_transport(
     # turn consumed the one-shot flag, and whether it landed (recorded success).
     _needs_reinjection = False
     _turn_landed = False
+    # The turn's driver, for the finally: it records whether the backend
+    # compacted the session, on every exit path.
+    driver: TurnDriver | None = None
     # This turn's thread-replies read; its watermark moves in the finally.
     _thread_replies: ThreadReplies | None = None
 
@@ -1313,13 +1317,21 @@ async def handle_message_transport(
         # armed past the end of its turn.
         _APPROVAL_REGISTRY.discard_session(session_key)
         # A turn that consumed the post-compaction flag but never landed
-        # discarded the prompt carrying the re-injected context; put the flag
-        # back so the next turn re-injects it.
-        rearm_reinjection(sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed)
+        # discarded the prompt carrying the re-injected context, and a backend
+        # that compacted the session during the turn dropped it; either way the
+        # flag is set so the next turn re-injects it.
+        rearm_reinjection(
+            sessions,
+            session_key,
+            consumed=_needs_reinjection,
+            landed=_turn_landed,
+            compacted=getattr(driver, "compaction_completed", False) is True,
+        )
         # The replies watermark moves only past a turn that landed after a good
         # read; a cancelled or failed turn discarded the prompt that carried them.
         if _turn_landed and _thread_replies is not None and _thread_replies.read_ok:
             note_turn(session_key, thread_ts or msg_ts, msg_ts)
+        rollback_skill_bodies(context_builder, session_key, landed=_turn_landed)
         # Guarantee renderer teardown even if TurnDriver.run() raised before
         # on_done: cancels the 30s tool-elapsed timer so it can't survive the
         # turn and keep hitting append_task against a dead stream.

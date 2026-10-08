@@ -20,7 +20,8 @@ import logging
 import time
 import uuid
 from dataclasses import fields
-from typing import TYPE_CHECKING, Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 
 from kiro_crew import autonudge_stop_log
 from kiro_crew.autonudge_service.maintenance import (
@@ -31,13 +32,15 @@ from kiro_crew.autonudge_service.maintenance import (
     _unclaim_mutation_lock,
 )
 from kiro_crew.autonudge_service.model import (
+    _KEPT_STOP_REASONS,
     _MAX_IDLE_SECS,
     _MIN_IDLE_SECS,
-    _TERMINAL_BOUND_REASONS,
     AUTONUDGE_STOP_REASON,
     CYCLE_CAP_REASON,
+    FINISHED_LOOP_REASONS,
     MANUAL_STOP_REASON,
     RUNTIME_BUDGET_REASON,
+    STOP_SENTINEL_REASON,
     AutoNudgeStaleBaseline,
     MonitorUpdateConflict,
     NudgeAdmissionRefused,
@@ -47,8 +50,14 @@ from kiro_crew.autonudge_service.model import (
     cap_reached,
     is_structured_monitor_loop,
     new_goal_token,
+    reason_in,
 )
-from kiro_crew.autonudge_service.subject import infer_monitor, infer_subject
+from kiro_crew.autonudge_service.subject import (
+    infer_monitor,
+    infer_subject,
+    needs_session_texts,
+    read_session_texts,
+)
 from kiro_crew.monitoring.limits import validate_runtime_secs
 from kiro_crew.monitoring.models import MONITOR_STATE_VERSION, MonitorCreationSurface
 
@@ -57,6 +66,19 @@ if TYPE_CHECKING:
 
 # The service's own logger: callers and tests filter on it by name.
 logger = logging.getLogger("kiro_crew.autonudge")
+
+
+def _stop_file_lifted(loop: NudgeLoop) -> bool:
+    """Whether a loop its stop file finished may run again: the file is gone.
+
+    Only a ``stop_sentinel`` row with a known path answers True, and only while
+    nothing exists at that path. A finished watch has no file to lift, and a row
+    whose path was dropped at load (``repair_sentinel_path``) has nothing to
+    consult, so both stay finished. The same ``exists`` the timer runs.
+    """
+    if loop.stopped_reason != STOP_SENTINEL_REASON or not loop.stop_sentinel_path:
+        return False
+    return not Path(loop.stop_sentinel_path).exists()
 
 
 async def add(
@@ -83,6 +105,7 @@ async def add(
     self_armed: bool = False,
     loop_id: str | None = None,
     creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
+    default_patrol: bool = False,
 ) -> NudgeLoop:
     # CANCELLATION SAFETY: the mutate+persist runs as a SHIELDED task. If
     # the awaiting caller is cancelled mid-write, a bare await would release
@@ -114,6 +137,7 @@ async def add(
             self_armed=self_armed,
             loop_id=loop_id,
             creation_surface=creation_surface,
+            default_patrol=default_patrol,
         )
     )
     self._inflight_adds.add(inner)
@@ -146,6 +170,22 @@ def _mint_loop_id(self: AutoNudgeService, requested: str | None) -> str:
     return requested
 
 
+def detach_firing_default_timer(svc: AutoNudgeService, existing: NudgeLoop) -> Any:
+    """Unregister a FIRING default patrol's timer without cancelling it.
+
+    The conductor's own arm usually runs inside that patrol's wake. On a channel
+    session the wake's timer task awaits the whole turn, so the cancel that
+    ``remove_sync`` would apply aborts the very turn issuing the arm. Taking the
+    task out of ``_timers`` first lets ``remove_sync`` find nothing to cancel;
+    the delivery finishes, and the fire cycle's own ``loop.id not in
+    self._loops`` check drops its bookkeeping for the removed row. Returns the
+    detached task (or ``None``) so a failed replacement can put it back.
+    """
+    if existing.id not in svc._firing:
+        return None
+    return svc._timers.pop(existing.id, None)
+
+
 async def _add_locked(
     self: AutoNudgeService,
     slot_key: str,
@@ -165,6 +205,7 @@ async def _add_locked(
     self_armed: bool = False,
     loop_id: str | None = None,
     creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
+    default_patrol: bool = False,
 ) -> NudgeLoop:
     async with _maintenance_lock(self._base_dir):
         return await self._add_unserialized(
@@ -184,6 +225,7 @@ async def _add_locked(
             self_armed=self_armed,
             loop_id=loop_id,
             creation_surface=creation_surface,
+            default_patrol=default_patrol,
         )
 
 
@@ -206,11 +248,20 @@ async def _add_unserialized(
     self_armed: bool = False,
     loop_id: str | None = None,
     creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
+    default_patrol: bool = False,
 ) -> NudgeLoop:
     from kiro_crew import autonudge as seams  # read at call time: the facade imports us
 
     validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
     idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
+    # A bare ``PR <number>`` resolves against the session's own log. Reading it is a
+    # whole-transcript read, so it runs in a worker thread BEFORE the lock is taken,
+    # never on the event loop and never while other mutations wait.
+    arm_session_texts = (
+        await asyncio.to_thread(read_session_texts, message, slot_key, watch)
+        if (gate or watch) and needs_session_texts(message, slot_key, watch)
+        else None
+    )
     async with self._lock:
         if admission_check is not None and not admission_check():
             raise NudgeAdmissionRefused("session changed before nudge arm committed")
@@ -219,6 +270,18 @@ async def _add_unserialized(
         # removal+add atomically, avoiding a duplicate blocking save here.
         existing = self._find_by_slot(slot_key)
         restore_existing_provider_credentials = False
+        detached_timer: Any = None
+        # An agent's own create-only arm replaces the gateway's ACTIVE default
+        # patrol rather than meeting a 409 (``NudgeLoop.default_patrol``). A
+        # stopped default patrol keeps the ordinary retained-row rules below, so a
+        # person's stop of it is still evidence, and one default never displaces
+        # another.
+        displaces_default = bool(
+            existing is not None
+            and existing.default_patrol is True
+            and existing.active
+            and not default_patrol
+        )
         if existing:
             # Create-only (``replace_existing=False``) refuses ANY existing
             # record by default — the dashboard REST creates depend on that:
@@ -234,7 +297,11 @@ async def _add_unserialized(
             # record whose accepted wake is awaiting completion evidence
             # keeps its own refusal rather than having its correlation
             # orphaned by a replacement.
-            if not replace_existing and (existing.active or not replace_stopped):
+            if (
+                not replace_existing
+                and not displaces_default
+                and (existing.active or not replace_stopped)
+            ):
                 raise MonitorUpdateConflict("session already has an automation")
             existing_monitor = existing.monitor
             if (
@@ -256,6 +323,7 @@ async def _add_unserialized(
             if (
                 not replace_existing
                 and replace_stopped
+                and not displaces_default
                 and not _stopped_row_is_replaceable(existing)
             ):
                 # Owner ruling (option A): only system-imposed stops are
@@ -269,7 +337,14 @@ async def _add_unserialized(
                     "and is not replaceable by a re-arm; its owner must clear it "
                     "first from the dashboard's goal popover"
                 )
-            if existing_monitor is not None and existing_monitor.wake_in_flight:
+            # A default patrol's in-flight wake is usually the very turn issuing
+            # this arm; nothing waits on its completion once the agent's own loop
+            # replaces it, so it does not hold the replacement off.
+            if (
+                existing_monitor is not None
+                and existing_monitor.wake_in_flight
+                and not displaces_default
+            ):
                 raise MonitorUpdateConflict(
                     "existing monitor cannot be replaced while a wake is in flight"
                 )
@@ -277,6 +352,8 @@ async def _add_unserialized(
                 existing
             )
             await self._revoke_provider_credentials_before_removal(existing.id)
+            if displaces_default:
+                detached_timer = detach_firing_default_timer(self, existing)
             self.remove_sync(existing.id, persist=False, emit=False)
         now = time.time()
         # Scrubbed ONCE, then used for both the stored field and the subject the
@@ -340,6 +417,7 @@ async def _add_unserialized(
                     judge=stored_judge,
                     watch=watch,
                     slot_key=slot_key,
+                    session_texts=arm_session_texts,
                 )
                 # An explicit ``watch`` gates on its own, without ``gate``. This
                 # path defaults to UNGATED for the reason above, so requiring
@@ -358,6 +436,7 @@ async def _add_unserialized(
             gate=bool(gate or watch),
             banner=banner,
             self_armed=self_armed,
+            default_patrol=bool(default_patrol),
         )
         self._loops[loop.id] = loop
         # Persist WITHOUT blocking the event loop (no-blocking-call rule:
@@ -374,7 +453,10 @@ async def _add_unserialized(
                 self._loops[existing.id] = existing
                 if restore_existing_provider_credentials:
                     await self._restore_provider_credentials(existing)
-                if existing.active:
+                if detached_timer is not None and not detached_timer.done():
+                    # Still delivering: give it back rather than arm a second timer.
+                    self._timers[existing.id] = detached_timer
+                elif existing.active:
                     self._arm_from_deadline(existing)
             raise
         self._arm_from_deadline(loop)
@@ -531,6 +613,23 @@ async def _update_unserialized(
 
     if max_runtime_secs is not None:
         validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
+    # The session log a retarget's bare ``PR <number>`` resolves against, read in a
+    # worker thread BEFORE the lock, keyed by the message and session it was read for.
+    # Inside the hold it is used only when the loop still carries exactly that pair;
+    # otherwise the bare number resolves nothing, the same as an unreadable log.
+    peeked = self._loops.get(loop_id)
+    retarget_key: tuple[str, str] | None = None
+    retarget_texts: list[str] | None = None
+    if peeked is not None:
+        peeked_message = message if message is not None else peeked.message
+        peeked_watch = str(watch or "").strip() or (
+            peeked.monitor.kind if peeked.monitor is not None else ""
+        )
+        if needs_session_texts(peeked_message, peeked.slot_key, peeked_watch):
+            retarget_key = (peeked_message, peeked.slot_key)
+            retarget_texts = await asyncio.to_thread(
+                read_session_texts, peeked_message, peeked.slot_key, peeked_watch
+            )
     async with self._lock:
         loop = self._loops.get(loop_id)
         if not loop:
@@ -711,6 +810,9 @@ async def _update_unserialized(
             # text alone, answers "this instruction names nothing observable", and leaves
             # the monitor None -- so the field would validate, reach here, and do nothing.
             watch_kind = requested_watch or (loop.monitor.kind if loop.monitor is not None else "")
+            session_texts = (
+                retarget_texts if retarget_key == (loop.message, loop.slot_key) else None
+            )
             inferred = (
                 infer_monitor(
                     loop.message,
@@ -718,6 +820,7 @@ async def _update_unserialized(
                     judge=loop.judge,
                     watch=watch_kind,
                     slot_key=loop.slot_key,
+                    session_texts=session_texts,
                 )
                 if loop.gate
                 else None
@@ -729,17 +832,23 @@ async def _update_unserialized(
             # "unchanged" and keep polling the wrong server. This is the
             # third of the three places that comparison had to reach; the
             # other two are the post-poll binding and the dedupe identity.
+            # The OLD subject is the one the current monitor was bound to, so a bare
+            # number in the previous message resolves against that, never the log.
+            from kiro_crew.autonudge_judge import watched_pr_subject
+
             old_probe = infer_subject(
                 str(previous.get("message") or ""),
                 previous.get("judge"),
                 watch=watch_kind,
                 slot_key=loop.slot_key,
+                monitor_target=watched_pr_subject(loop),
             )
             new_probe = infer_subject(
                 loop.message,
                 loop.judge,
                 watch=watch_kind,
                 slot_key=loop.slot_key,
+                session_texts=session_texts,
             )
             same_host = (old_probe.host_key if old_probe else None) == (
                 new_probe.host_key if new_probe else None
@@ -810,6 +919,8 @@ async def _update_unserialized(
             loop.max_cycles = max(0, int(max_cycles))
         if max_runtime_secs is not None:
             loop.max_runtime_secs = max(0, int(max_runtime_secs))
+        #: Set when ``active=True`` reached a FINISHED row and was declined.
+        refused_revival = False
         if active is not None:
             if (
                 active
@@ -837,6 +948,34 @@ async def _update_unserialized(
                 # activated.
                 loop.active = False
                 loop.next_due_ts = 0.0
+            elif (
+                active
+                and not loop.active
+                and reason_in(loop.stopped_reason, FINISHED_LOOP_REASONS)
+                and not _stop_file_lifted(loop)
+            ):
+                # A FINISHED loop: the agent created its stop file, or the watched
+                # subject merged or closed (that one is usually refused above by
+                # its outcome; this also covers a row whose monitor was cleared by
+                # a retarget after it finished). There is nothing to resume --
+                # reviving would re-fire a goal the agent declared met, or poll a
+                # settled subject -- so the revival is declined whoever asks: the
+                # popover's Play, ``monitor_update``, an app reconciler. The
+                # record stays inactive under its reason; clearing it, or arming
+                # a NEW loop that displaces it, are the ways on.
+                #
+                # The one exception is a stop file that is GONE: Issue Radar and
+                # Research Lab arm the same file as an operator's kill switch, and
+                # an operator who deletes it means "run again" -- their reconciler
+                # re-arms the row on its next pass. The goal popover never deletes
+                # the file (the next arm on the slot does, after Clear), so its Done
+                # stays as it is.
+                logger.info(
+                    "AutoNudge: loop %s is finished (%s) — not reviving it",
+                    loop.id,
+                    loop.stopped_reason,
+                )
+                refused_revival = True
             # TERMINAL-TRANSITION ATOMICITY: a bound-tagged deactivation
             # (stopped_reason supplied — the _timer's cycle_cap /
             # runtime_budget paths) must never OVERWRITE a deactivation
@@ -868,21 +1007,27 @@ async def _update_unserialized(
                 not active
                 and stopped_reason is None
                 and not loop.active
-                and loop.stopped_reason in _TERMINAL_BOUND_REASONS
+                and reason_in(loop.stopped_reason, _KEPT_STOP_REASONS)
             ):
                 # The MIRROR of the race above: the bound landed first and a
                 # reasonless pause (the goal popover's, pressed off a stale
                 # running reading) arrives second. A repeat of an inactive state
                 # is not a new stop, and "manual" over the bound would lose why
-                # the loop ended.
+                # the loop ended. A FINISHED stop is kept for one more reason:
+                # its reason is what refuses the revival, so "manual" over it
+                # would hand Play back on a loop with nothing to resume.
                 logger.info(
                     "AutoNudge: loop %s keeps its %s stop on reasonless inactive update",
                     loop.id,
                     loop.stopped_reason,
                 )
-            elif stopped_reason in _TERMINAL_BOUND_REASONS and not active and not loop.active:
+            elif reason_in(stopped_reason, _KEPT_STOP_REASONS) and not active and not loop.active:
+                # A bound or the stop file landing on a loop already inactive --
+                # a pause that beat the timer's own stop to the lock -- is not a
+                # new transition either, and must not make that pause look like
+                # a finished or capped-out loop.
                 logger.info(
-                    "AutoNudge: loop %s already deactivated (%s) — %s bound " "not overwriting it",
+                    "AutoNudge: loop %s already deactivated (%s) — %s stop not overwriting it",
                     loop.id,
                     loop.stopped_reason or MANUAL_STOP_REASON,
                     stopped_reason,
@@ -908,9 +1053,10 @@ async def _update_unserialized(
                     # silence this stop exists to end.
                     if not was_active:
                         loop.approval_stalled = False
-                        # Same rule, same reason: the streak is evidence
+                        # Same rule, same reason: the streaks are evidence
                         # about a PAST run, and a revival starts a fresh one.
                         loop.consecutive_start_failures = 0
+                        loop.consecutive_failed_cycles = 0
                         # The user's resume resets the counter BEHIND A SPENT
                         # BOUND, and only that one: a spent cycle cap zeroes
                         # ``cycle_count``, a spent time budget re-anchors
@@ -953,6 +1099,21 @@ async def _update_unserialized(
                             loop.created_ts = time.time()
                 else:
                     loop.stopped_reason = stopped_reason or MANUAL_STOP_REASON
+        if (
+            refused_revival
+            and not any(
+                value is not None
+                for value in (message, idle_secs, max_cycles, max_runtime_secs, banner, judge)
+            )
+            and not requested_watch
+        ):
+            # Only the revival was asked, and it was declined, so nothing changed:
+            # no store write, no ``updated`` frame. The Issue Radar and Research Lab
+            # reconcilers re-arm every inactive loop of a live crew or campaign on
+            # each pass (every 60 s and 5 s), so a finished row they cannot revive
+            # would otherwise cost a full store rewrite and a broadcast per pass
+            # for the life of the campaign.
+            return loop
         revived = loop.active and not was_active
         if revived:
             # A revival re-arms the loop for a fresh run: a structural verdict

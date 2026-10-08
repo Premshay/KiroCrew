@@ -664,15 +664,17 @@ export default [
               // a closed DOM set cannot match prose — no English phrase is
               // `AltRight` — and a new key code has to be added here on purpose.
               '^(?:Alt|Control|Meta|Shift)(?:Left|Right)$',
-              // The TWO provider-CLI LOGIN COMMANDS the pull-request panel offers
-              // as copyable recovery text (`pullRequestErrorDetails` returns one
-              // verbatim and the panel renders it in a <code> block). A command
-              // typed into a terminal is a wire string: translating it breaks
-              // it. Enumerated rather than shaped, like the key codes above — a
-              // "lowercase words" shape would exempt exactly the prose this
-              // config fights hardest, and this is a closed two-member set that
-              // grows only when a new provider CLI is wired in on purpose.
+              // The provider-CLI LOGIN COMMANDS: the pull-request panel offers
+              // one as copyable recovery text (`pullRequestErrorDetails` returns
+              // it verbatim and the panel renders it in a <code> block), and Issue
+              // Radar's `providerTerms().loginCommand` shows one in its sign-in
+              // hint. A command typed into a terminal is a wire string:
+              // translating it breaks it. Enumerated rather than shaped, like the
+              // key codes above — a "lowercase words" shape would exempt exactly
+              // the prose this config fights hardest, and this is a closed set
+              // that grows only when a new provider CLI is wired in on purpose.
               '^(?:gh|glab) auth login$',
+              '^az login$',
               // A `mc:`-NAMESPACED BROWSER-STORAGE KEY, e.g.
               // `mc:notif:activeKinds:v2`, `mc:notif:seenChannels`. The dashboard
               // namespaces every localStorage key it owns under `mc:`, and such
@@ -1553,6 +1555,33 @@ export default [
   // row) lives in the catalog.
   {
     files: ['src/utils/customFontCandidates.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // PASTE-TOKEN FORMAT ONLY, same "format IS the interface" category as
+  // `scrollInspector.ts` above: the one words-shaped literal in this module is
+  // `formatToken`'s `[ Paste #N · M lines ]` serialization (which also carries
+  // the block's stable id between two invisible U+2063 fences). It is a protocol
+  // token embedded verbatim in composer/message text and matched back by
+  // `PASTE_TOKEN_REGEX`; translating it would break that round-trip — the regex
+  // would stop recognising the token and the paste would be sent as literal
+  // text. The chip label the USER reads is a separate, translated string
+  // (`i18nT('components.pastedChip.paste_lines', …)`) rendered by the chip
+  // components; this module renders nothing (no JSX, no i18nT, pure
+  // serialization plus the localStorage side-table) and holds no other prose.
+  // The file passed the gate until #13851 touched `formatToken` to add the
+  // stable id, which moved the long-standing literal onto a line this branch
+  // wrote; [added-lines] then charged a format string that was never copy.
+  //
+  // Scoped to this one file for the reason the exemptions above are: a
+  // `words.exclude` shape for the token's `[ Paste #` / ` lines ]` quasis would
+  // also release that prose anywhere else in the tree. Copy added here later
+  // belongs in the catalog, not under this exemption; keep this module
+  // serialization-only.
+  {
+    files: ['src/utils/pasteTokens.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

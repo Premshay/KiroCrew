@@ -292,6 +292,37 @@ describe('ChatInput', () => {
       }
     })
 
+    // jsdom has no CompositionEvent, so carry the committed text the way a browser does.
+    const compositionEnd = (el: HTMLElement, data: string) => {
+      const event = new Event('compositionend', { bubbles: true })
+      Object.defineProperty(event, 'data', { value: data })
+      fireEvent(el, event)
+    }
+
+    it('sends on the first Enter after a Hangul commit (Korean has no candidate step)', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="안녕" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.compositionStart(ta)
+      // The keydown that ends the composition is still flagged as composing.
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: true })
+      compositionEnd(ta, '녕')
+      // The browser's follow-up Enter is the user's own and must send.
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+      expect(onSend).toHaveBeenCalledOnce()
+    })
+
+    it('still guards the Enter right after a Japanese commit', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="にほん" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.compositionStart(ta)
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: true })
+      compositionEnd(ta, 'にほん')
+      fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
     it('consumes the swallowed Enter so no newline lands in the draft', () => {
       // The reported symptom: pick a candidate, press Enter to send, and the draft
       // gains a line break instead. The guard is allowed to decline the submit; it is
@@ -413,6 +444,92 @@ describe('ChatInput', () => {
       renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={onCancelUpload} uploading />)
       fireEvent.click(screen.getByRole('button', { name: 'Cancel upload' }))
       expect(onCancelUpload).toHaveBeenCalledTimes(1)
+    })
+
+    /* A send fired mid-upload left without the file, and the file then landed
+     * in the emptied composer as a stray attachment for the next message. */
+    it('holds Send and Enter while an attachment is on its way', () => {
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="look at this" onSend={onSend} onUploadFiles={vi.fn()} uploading holdSend />)
+      const send = screen.getByRole('button', { name: 'Send' })
+      expect(send).toBeDisabled()
+      expect(send).toHaveAttribute('title', 'Waiting for the attachment to finish')
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
+    it('holds the busy steer/queue send while an attachment is on its way', () => {
+      const onSend = vi.fn()
+      const onSteer = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps} value="look at this" onSend={onSend} onSteer={onSteer} canSteer isRunning onStop={vi.fn()} onUploadFiles={vi.fn()} uploading holdSend />,
+      )
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSteer).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
+      // The split button's fire half says why it is dimmed, like the other sends.
+      const held = screen.getByTestId('busy-send-button')
+      expect(held).toHaveAttribute('title', 'Steer — Waiting for the attachment to finish')
+      expect(held).toBeDisabled()
+    })
+
+    it('keeps Queue message in the held queue tooltip before the wait reason', () => {
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          value="look at this"
+          isRunning
+          onStop={vi.fn()}
+          onUploadFiles={vi.fn()}
+          uploading
+          holdSend
+        />,
+      )
+      expect(screen.getByRole('button', { name: 'Queue message' })).toHaveAttribute(
+        'title',
+        'Queue message — Waiting for the attachment to finish',
+      )
+    })
+
+    it('says in words why a held draft is waiting', () => {
+      // The Send tooltip reaches no touch or screen-reader user, and a held
+      // Enter would otherwise do nothing visible.
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} value="look at this" onUploadFiles={vi.fn()} uploading holdSend />)
+      expect(screen.getByTestId('composer-send-held')).toHaveTextContent('Waiting for the attachment to finish')
+      expect(screen.getByTestId('composer-send-held')).toHaveAttribute('role', 'status')
+      unmount()
+      // No draft: the upload spinner already says enough.
+      const empty = renderWithProviders(<ChatInput {...defaultProps} value="" onUploadFiles={vi.fn()} uploading holdSend />)
+      expect(screen.queryByTestId('composer-send-held')).not.toBeInTheDocument()
+      empty.unmount()
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" onUploadFiles={vi.fn()} uploading />)
+      expect(screen.queryByTestId('composer-send-held')).not.toBeInTheDocument()
+    })
+
+    it('says why a refs-only composer is waiting', () => {
+      // The idle Send counts a staged session ref as a payload, so it dims for
+      // the hold; the row explaining it must not go by the text-or-files draft.
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          value=""
+          pendingSessions={[{ key: 'chat-9', title: 'Release notes', messages: 12 }]}
+          onUploadFiles={vi.fn()}
+          uploading
+          holdSend
+        />,
+      )
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+      expect(screen.getByTestId('composer-send-held')).toHaveTextContent('Waiting for the attachment to finish')
+    })
+
+    it('keeps Send live when the upload belongs to another composer', () => {
+      // `uploading` alone only drives the attach controls: an upload started in
+      // another slot lands in that slot's draft and must not hold this send.
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="hi" onSend={onSend} onUploadFiles={vi.fn()} uploading />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter' })
+      expect(onSend).toHaveBeenCalled()
     })
   })
 
@@ -1383,7 +1500,8 @@ describe('ChatInput', () => {
       const onSelect = vi.fn()
       renderWithProviders(<ChatInput {...defaultProps} followUpOptions={['Go']} followUpPicked={new Set()} onFollowUpSelect={onSelect} quickSend={true} />)
       fireEvent.click(screen.getByRole('button', { name: 'Go' }))
-      expect(onSelect).toHaveBeenCalledWith('Go', expect.any(Object))
+      // Fourth arg: the composer's chip send, which the host's quick-send uses.
+      expect(onSelect).toHaveBeenCalledWith('Go', expect.any(Object), undefined, expect.any(Function))
     })
   })
 

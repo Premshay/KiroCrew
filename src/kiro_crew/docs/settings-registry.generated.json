@@ -2,23 +2,25 @@
   "$comment": "AUTO-GENERATED from the dashboard settings panels by website/scripts/gen-settings-registry.mjs — DO NOT EDIT. How to use a route: settings-deeplink.md (same directory).",
   "settings": [
     {
-      "id": "about.auto-update-on-restart",
-      "label": "Auto-update on restart",
+      "id": "about.install-app-updates-automatically",
+      "label": "Install app updates automatically",
       "tab": "about",
-      "route": "/settings/about?highlight=about.auto-update-on-restart"
-    },
-    {
-      "id": "about.update-notifications",
-      "label": "Notify when an update is available",
-      "tab": "about",
-      "route": "/settings/about?highlight=key%3Aauto_update",
-      "configKey": "auto_update"
+      "route": "/settings/about?highlight=about.install-app-updates-automatically",
+      "description": "Downloads new versions in the background and installs them the next time you quit the app."
     },
     {
       "id": "about.update-channel",
       "label": "Update channel",
       "tab": "about",
       "route": "/settings/about?highlight=about.update-channel"
+    },
+    {
+      "id": "about.update-the-gateway-automatically",
+      "label": "Update the gateway automatically",
+      "tab": "about",
+      "route": "/settings/about?highlight=key%3Aauto_update",
+      "description": "Installs a new release once no work is running and restarts the gateway, on installs that can update themselves.",
+      "configKey": "auto_update"
     },
     {
       "id": "browser.attach-token",
@@ -45,7 +47,7 @@
       "label": "Allowed enterprise orgs (Slack)",
       "tab": "channels",
       "route": "/settings/channels/slack?highlight=channels.allowed-enterprise-orgs-slack",
-      "description": "Enterprise Grid org IDs to allow (starts with E or T). Leave empty to allow all orgs."
+      "description": "Enterprise Grid org or workspace IDs to allow (starts with E or T). On Enterprise Grid, list the org's E… ID and each workspace's T… ID: messages are checked by workspace, so a list with only the E… ID denies every message. Leave empty to allow all orgs."
     },
     {
       "id": "channels.allowed-handles-imessage",
@@ -120,6 +122,14 @@
       "tab": "channels",
       "route": "/settings/channels/teams?highlight=channels.app-password-client-secret-teams",
       "description": "Azure Bot client secret. Stored only in .env (never config.json)."
+    },
+    {
+      "id": "channels.connect-new-sessions-to-slack-automatically-slack",
+      "label": "Connect new sessions to Slack automatically (Slack)",
+      "tab": "channels",
+      "route": "/settings/channels/slack?highlight=key%3Aslack.auto_link_sessions",
+      "description": "Every new dashboard session gets a Slack thread on its first message, in your private direct message with the bot. Sessions started by cron, apps or sub-agents, sessions that began in Slack or another messaging app, and incognito or temporary sessions are left alone. A session connected this way does not count as a Slack session for the folder setting below: it stays where it is in the sidebar, and only conversations that start in Slack are filed.",
+      "configKey": "slack.auto_link_sessions"
     },
     {
       "id": "channels.enable-imessage-channel-imessage",
@@ -473,7 +483,7 @@
       "label": "Completion Event Truncation",
       "tab": "chat",
       "route": "/settings/chat/advanced?highlight=chat.completion-event-truncation",
-      "description": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default, matches legacy behavior). Tail preserves the final summary. Both keeps a slice from each end with a marker between them."
+      "description": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default). Tail preserves the final summary. Both keeps a slice from each end with a marker between them."
     },
     {
       "id": "chat.confirm-before-closing-session",
@@ -525,6 +535,13 @@
       "tab": "chat",
       "route": "/settings/chat/aboutyou?highlight=chat.describe-your-role",
       "description": "Kiro uses this description to adapt vocabulary and examples to your role."
+    },
+    {
+      "id": "chat.dim-inactive-panes",
+      "label": "Dim Inactive Panes",
+      "tab": "chat",
+      "route": "/settings/chat/sessions?highlight=chat.dim-inactive-panes",
+      "description": "In split view, fade every pane that does not have keyboard focus. When off, all panes stay at full brightness and the accent border marks the focused one."
     },
     {
       "id": "chat.double-click-to-edit-your-messages",
@@ -651,7 +668,7 @@
       "label": "Response Verbosity",
       "tab": "chat",
       "route": "/settings/chat/transcript?highlight=chat.response-verbosity",
-      "description": "How terse the agent's prose is. Ultra-concise keeps the whole reply short: answer first, bullets over paragraphs, no filler. Code, commands, and error strings stay verbatim at every level; security warnings always appear but stay brief, and multi-step instructions stay complete. Answer-only goes further and drops explanation entirely: one sentence at most, and detail only when you ask for it — or when a decision is consequential enough (security, exposure, data loss, spend, anything hard to undo) that you need the reasoning to choose correctly."
+      "description": "How terse the agent's prose is. Concise trims filler and narration. Answer only gives just the answer in the plainest words, with detail when you ask. At every level, code, commands and error strings stay verbatim, security warnings still appear, and multi-step instructions stay complete."
     },
     {
       "id": "chat.restore-sessions",
@@ -757,6 +774,13 @@
       "route": "/settings/chat/sessions?highlight=chat.split-view-session-grid"
     },
     {
+      "id": "chat.style-markdown-while-typing",
+      "label": "Style Markdown While Typing",
+      "tab": "chat",
+      "route": "/settings/chat/composer?highlight=chat.style-markdown-while-typing",
+      "description": "Show bold, italic, strikethrough and inline code in the message input as you type. Turning it on also switches the message input to a rich-text editor that is still in beta; turn this off to go back to the plain input. The markdown markers stay visible and the message you send is unchanged."
+    },
+    {
       "id": "chat.subagent-effort",
       "label": "Subagent Effort",
       "tab": "chat",
@@ -803,7 +827,7 @@
       "label": "What Enter does while the agent is working",
       "tab": "chat",
       "route": "/settings/chat/composer?highlight=chat.what-enter-does-while-the-agent-is-working",
-      "description": "Steer interrupts the current turn; Queue waits for it."
+      "description": "Steer adds your message to the current turn without stopping it; Queue waits for the turn to finish."
     },
     {
       "id": "chat.widget-density",
@@ -915,6 +939,14 @@
       "description": "Publish an artifact to a public HTTPS URL in your own AWS account. Off by default: every deploy spends money in your account and serves the content on the open internet."
     },
     {
+      "id": "developer.automatic-cards-for-all-sessions",
+      "label": "Automatic cards for all sessions",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=key%3Adashboard.dynamic_dashboard_cards",
+      "description": "Summaries of each session’s recent work and next steps.",
+      "configKey": "dashboard.dynamic_dashboard_cards"
+    },
+    {
       "id": "developer.chat-on-a-crew",
       "label": "Chat on a crew",
       "tab": "developer",
@@ -982,7 +1014,7 @@
       "label": "Remote crew sessions",
       "tab": "developer",
       "route": "/settings/developer?highlight=developer.remote-crew-sessions",
-      "description": "Merge a connected remote crew's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished."
+      "description": "Merge a connected remote crew's live sessions into the Sessions list, each marked with a server badge. A remote crew is another machine you have connected, not your agents. Functional, but not finished."
     },
     {
       "id": "developer.reply-threads-on-crewmate-chat-messages",
@@ -996,7 +1028,7 @@
       "label": "Run a local gateway",
       "tab": "developer",
       "route": "/settings/developer?highlight=developer.run-a-local-gateway",
-      "description": "Start a gateway on this machine. Turn it off to use Kiro Crew as a client only, connecting to the gateway you have configured instead of running one here. Takes effect next time you open the app."
+      "description": "Start a gateway on this machine. Leave it on unless this app's port already reaches a crew on another machine, or the app cannot connect the next time it opens, which is when this takes effect. That needs the crew saved for this port with “Set Remote Host…” in the Connection menu, plus a tunnel: tick “Keep an SSH tunnel to this crew open” there (macOS and Linux) or keep your own SSH tunnel running. Settings → Remote Crew connections stop when this is off, so they do not count."
     },
     {
       "id": "developer.webhooks",

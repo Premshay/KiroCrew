@@ -27,13 +27,14 @@ if TYPE_CHECKING:
         _subagents_attached_response,
         _sync_dashboard_slots,
         _unblock_pending_waits,
+        deny_app_slot_access,
         effective_session_key,
         logger,
         note_slot_closed,
         read_bounded_json,
         save_slot_off_loop,
         sel,
-        stage_boundary_for,
+        slot_not_found,
         time,
     )
 
@@ -253,12 +254,11 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
     the shared sub-agent runtime — so it takes the same guards the sibling
     teardown route does, through the same shared helpers rather than a third
     policy of its own: authorization on the SESSION (not merely the slot),
-    ``provider.has_active_turn()``, ``running`` widened with
-    ``_in_stage_execution``, and the sub-agent gate. Each of the four protects
-    work the caller cannot see from the outside: a turn running on the session
-    with no dashboard task behind it (an inbound channel message), a turn
-    mid-write, a plan between stages, and children still running after their
-    parent's turn ended.
+    ``provider.has_active_turn()``, ``running``, and the sub-agent gate. Each of
+    the three protects work the caller cannot see from the outside: a turn
+    running on the session with no dashboard task behind it (an inbound channel
+    message), a turn mid-write, and children still running after their parent's
+    turn ended.
 
     The ``has_active_turn()`` check is a best-effort fast path; the
     authoritative guard is the discard's ``skip_if_busy``, which probes the
@@ -338,14 +338,6 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
                 "code": "turn_in_flight",
                 "slot": name,
             },
-            status=409,
-        )
-    if slot._in_stage_execution:
-        # An autopilot plan reads ``running`` False BETWEEN stages while it is
-        # still mid-plan, so ``running`` alone would discard the conversation the
-        # plan is writing into and cold-start its next stage.
-        return web.json_response(
-            {"error": "slot is orchestrating", "code": "slot_orchestrating", "slot": name},
             status=409,
         )
     # ``discard_conversation`` is a full teardown: it also releases the shared
@@ -626,29 +618,6 @@ async def _close_slot(
     from kiro_crew.execution_context import read_live_session_execution
 
     closing_key = effective_session_key(slot)
-    closing_boundary = stage_boundary_for(slot)
-    closing_failure_parents = {
-        f"dashboard:{slot.key}",
-        closing_key,
-        *closing_boundary.parent_session_keys,
-    }
-    failure_scope_manager = getattr(state, "subagents", None)
-    closing_boundary_owner = closing_boundary.owner or closing_boundary.generation
-    closing_failure_scopes = (
-        tuple((parent, closing_boundary_owner) for parent in closing_failure_parents if parent)
-        if closing_boundary_owner
-        else ()
-    )
-
-    def discard_closing_failure_scopes() -> None:
-        discard_failure_scopes = getattr(
-            failure_scope_manager,
-            "discard_report_failure_scopes",
-            None,
-        )
-        if callable(discard_failure_scopes):
-            discard_failure_scopes(closing_failure_scopes)
-
     closing_execution = read_live_session_execution(closing_key)
     # Retire the auto-nudge loop BEFORE the awaits below, so no nudge can expire
     # into the session being closed and resurrect it. See
@@ -847,7 +816,6 @@ async def _close_slot(
         _resettle_restricted_key(state, name)
         _sync_dashboard_slots(state)
         state.push_slots_update()
-        discard_closing_failure_scopes()
         if slot._app:
             # Same decision the failure arm below takes, and it must be as visible:
             # this is the MORE common hand-over, so a silent one would hide every
@@ -899,8 +867,7 @@ async def _close_slot(
             # arm already ends in `SlotCloseError`, so a lost tail is reported to the
             # caller either way. The drain only decides whether the rows survived.
             await _persist_handover_tail(state, name, slot)
-            discard_closing_failure_scopes()
-        # Whichever way that went, the key-scoped restricted marker has to describe
+            # Whichever way that went, the key-scoped restricted marker has to describe
         # whoever holds `name` when this frame ends — the restored original, or the
         # replacement that kept the key. This arm never reaches the discard below
         # the save, so it settles the marker itself.
@@ -960,7 +927,6 @@ async def _close_slot(
         # Durable, so no rollback can retract this frame — a client pruning its
         # per-slot cards on it can never be pruning a slot that comes back.
         state.push_slot_removed(name)
-        discard_closing_failure_scopes()
         # Committed, so the conductor may be told now and not before.
         await _wake_conductor_for_closed_worker(name)
     # The app was already told, and compensated if the persist above failed — see
@@ -994,34 +960,14 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:
-        return web.json_response({"error": "not found"}, status=404)
+        return slot_not_found()
 
     # App ownership check (App Kit §5.2): app can only delete slots it created.
     # Unscoped slots (empty _app) cannot be deleted by app tokens.
     # Dashboard users (empty request_app) can delete anything.
-    request_app = request.get("app", "")
-    if request_app and slot._app != request_app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="slot_delete",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={name}",
-            error="app does not own this slot",
-        )
-        return web.json_response({"error": "not found"}, status=404)
-    if request_app and not slot._app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="slot_delete",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={name}",
-            error="app cannot delete unscoped slots",
-        )
-        # 404 (not 403): a foreign/unscoped slot is indistinguishable from a
-        # missing one — anti-enumeration (CWE-204); true reason logged via SEL.
-        return web.json_response({"error": "not found"}, status=404)
+    denied = deny_app_slot_access(request.get("app", ""), slot, name, "slot_delete")
+    if denied is not None:
+        return denied
 
     try:
         await close_slot(state, slot, name)

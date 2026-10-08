@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Literal, MutableMapping
 
 from kiro_crew import agent_state, platform_compat
 from kiro_crew.agent_discovery import (
+    SKILL_URI_PREFIX,
     AmbiguousAgentSpecError,
     _declared_project_agent_name,
     _read_agent_spec,
@@ -58,9 +59,11 @@ from kiro_crew.agent_discovery import (
     project_agent_name,
     project_agent_names,
 )
+from kiro_crew.agent_files import DASHBOARD_MANAGER_AGENT_NAME  # noqa: F401
 from kiro_crew.agent_files import (
     AGENT_FILENAME,
 )
+from kiro_crew.agent_files import DASHBOARD_AUTHOR_AGENT_FILENAME as _DASHBOARD_AUTHOR_FILENAME
 from kiro_crew.agent_files import CONSOLIDATE_AGENT_FILENAME as _CONSOLIDATE_AGENT_FILENAME
 from kiro_crew.agent_files import FAST_RECON_AGENT_FILENAME as _FAST_RECON_AGENT_FILENAME
 from kiro_crew.agent_files import HEARTBEAT_AGENT_FILENAME as _HEARTBEAT_AGENT_FILENAME
@@ -88,6 +91,7 @@ from kiro_crew.config.paths import (
 )
 from kiro_crew.env import mcp_search_path, resolved_command_casing, spec_path_key
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
+from kiro_crew.owner_only_files import mkdirs_owner_only, write_text_owner_only
 from kiro_crew.platform import (
     current_context,
 )
@@ -233,7 +237,6 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         _SOURCE_OWNED_MCP_KEYS,
         MCP_PATH_HINT,
         _app_owned_mcp_keys,
-        _AppOwnership,
         _collect_app_mcp_servers,
         _extra_mcp_scope_globals,
         _merge_source_owned,
@@ -252,10 +255,12 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         without_marker,
     )
     from kiro_crew.agent_materialization.service_agents import (  # noqa: F401
+        _DASHBOARD_MANAGER_AGENT_FILENAME,
         _GUEST_AGENT_FILENAME,
         _KNOWLEDGE_AGENT_FILENAME,
         _LITE_AGENT_FILENAME,
         _RESEARCH_AGENT_FILENAME,
+        _install_dashboard_manager_agent,
         _install_guest_agent,
         _install_knowledge_agent,
         _install_lite_agent_fallback,
@@ -275,11 +280,14 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         _drop_servers,
         _excluded_verb,
         _file_identity,
+        _foreign_dashboard_author_spec_reason,
         _foreign_worker_spec_reason,
         _glob_hits,
         _grant_reaches_excluded,
+        _install_dashboard_author_agent,
         _install_worker_agent,
         _installed_default_spec,
+        _is_confirmed_managed_dashboard_author,
         _pattern_reaches_excluded,
         _refuse_foreign_worker_spec,
         _require_fresh_worker_spec,
@@ -375,14 +383,21 @@ def _atomic_json_write(path: Path, data: dict) -> None:
 
     Uses mkstemp for a unique temp file per call so concurrent writers
     to the same path don't clobber each other's temp files.
+
+    The result is owner-only on POSIX (``0o600`` for a new file; an existing
+    file keeps its owner bits and loses every group/other bit). An agent spec
+    is where the vault's secrets are projected for kiro-cli -- a pre-registered
+    ``oauth.clientSecret``, remote ``headers`` credentials -- and kiro-cli runs
+    as the same user, so no reader needs more. On Windows
+    ``fchmod_safe`` is a no-op and the file inherits the directory's ACL.
     """
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             try:
-                mode = stat.S_IMODE(path.stat().st_mode)
+                mode = stat.S_IMODE(path.stat().st_mode) & 0o700
             except FileNotFoundError:
-                mode = 0o644
+                mode = 0o600
             platform_compat.fchmod_safe(f.fileno(), mode)
             json.dump(data, f, indent=2)
             f.write("\n")
@@ -795,6 +810,23 @@ def _kirocrew_bin_subpath(root: Path) -> Path:
     return root / "bin" / "kirocrew"
 
 
+def _through_stable_link(path: str) -> str:
+    """*path* as a launcher that outlives this process names it.
+
+    On a managed venv the running tree is one versioned tree among several, and
+    a later update's prune may delete it once no process runs from it; the
+    stable link follows every promotion (see
+    :func:`kiro_crew.platform.tree_liveness.through_stable_link`). Only for the
+    ``~/.local/bin`` shim: :func:`_resolve_kirocrew_bin` itself keeps the running
+    tree, because what this process hands its own children (the built-in MCP
+    servers, the jail re-exec) must run the version this process runs, not one a
+    promotion made current before this process restarted.
+    """
+    from kiro_crew.platform.tree_liveness import through_stable_link
+
+    return through_stable_link(path)
+
+
 def _resolve_kirocrew_bin() -> str:
     """Resolve the absolute path of the ``kirocrew`` executable.
 
@@ -1173,34 +1205,6 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
 }
 
 
-def session_capability_servers(session_key: str | None = None) -> list[dict]:
-    """Return ACP entries for session-bound KiroCrew capabilities.
-
-    ACP backends receive these entries through ``session/new`` instead of a
-    provider-global configuration file.  ACP backends may spawn the MCP
-    process themselves, so carry the gateway-owned session key in the server
-    definition rather than assuming process-tree inheritance.  ``mcp_shared``
-    then applies the caller's managed tool policy before advertising tools.
-    """
-    # Owned by agent_materialization since the module split; this module only
-    # re-exports it lazily, and a bare name inside a function does not reach
-    # the module-level __getattr__ that serves those re-exports.
-    from kiro_crew.agent_materialization.managed_mcp import _managed_mcp_env as managed_mcp_env
-
-    command, args = _kirocrew_mcp_invocation("mcp-core")
-    env = managed_mcp_env()
-    if session_key:
-        env["KIROCREW_SESSION_KEY"] = session_key
-    return [
-        {
-            "name": "kirocrew-core",
-            "command": command,
-            "args": args,
-            "env": [{"name": key, "value": value} for key, value in env.items()],
-        }
-    ]
-
-
 def _extra_mcp_servers() -> dict[str, dict]:
     """Edition-contributed MCP servers from the active PlatformContext.
 
@@ -1262,6 +1266,9 @@ def ensure_kirocrew_on_path(
         return None
 
     target = _resolve_kirocrew_bin()
+    if os.path.isabs(target):
+        # The shim outlives this process, so it follows promotions.
+        target = _through_stable_link(target)
     # Nothing concrete to point at — bare "kirocrew" or a non-executable file.
     if not (os.path.isabs(target) and os.path.isfile(target) and os.access(target, os.X_OK)):
         return None
@@ -1387,7 +1394,7 @@ def run_first_run_setup() -> None:
     """Deliver the install-time steps the desktop app needs without a terminal.
 
     The Electron app only runs ``kirocrew gateway`` — never ``kirocrew
-    setup`` — yet two concerns aren't covered by the gateway's agent-config
+    setup`` — yet several concerns aren't covered by the gateway's agent-config
     rebuild. This is invoked from gateway startup to close that gap:
 
     * **PATH shim** — ``ensure_kirocrew_on_path()`` is idempotent and only
@@ -1469,8 +1476,8 @@ def run_first_run_setup() -> None:
             logger.info("First-run: purged stale managed MCP entries: %s", removed)
         # Mark done even when nothing was removed, so the global mcp.json is
         # never re-read/rewritten on later starts.
-        _migrations_dir().mkdir(parents=True, exist_ok=True)
-        stale_marker.write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
+        mkdirs_owner_only(_migrations_dir())
+        write_text_owner_only(stale_marker, datetime.now(timezone.utc).isoformat() + "\n")
     except Exception:
         logger.warning("First-run: stale MCP purge failed", exc_info=True)
 
@@ -1887,7 +1894,6 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
     "kiro_crew.agent_materialization.mcp_sources": (
         "_extra_mcp_scope_globals",
         "_collect_app_mcp_servers",
-        "_AppOwnership",
         "_app_owned_mcp_keys",
         "_SOURCE_OWNED_MCP_KEYS",
         "_merge_source_owned",
@@ -1925,6 +1931,8 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "_install_lite_agent_fallback",
         "_install_knowledge_agent",
         "_install_research_agent",
+        "_install_dashboard_manager_agent",
+        "_DASHBOARD_MANAGER_AGENT_FILENAME",
         "_GUEST_AGENT_FILENAME",
         "_KNOWLEDGE_AGENT_FILENAME",
         "_LITE_AGENT_FILENAME",
@@ -1965,6 +1973,8 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "DerivedSpecStale",
         "ForeignAgentSpec",
         "_foreign_worker_spec_reason",
+        "_foreign_dashboard_author_spec_reason",
+        "_is_confirmed_managed_dashboard_author",
         "_refuse_foreign_worker_spec",
         "default_spec_fingerprint",
         "_spec_fingerprint",
@@ -1975,6 +1985,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "require_unchanged_derived_spec",
         "_require_fresh_worker_spec",
         "rederive_worker_agent",
+        "_install_dashboard_author_agent",
         "_WORKER_AGENT_FILENAME",
     ),
 }
@@ -2167,9 +2178,10 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     # ``_load_existing_config`` path takes entries from an on-disk spec that
     # never comes through here; for that caller this filter is idempotent (the
     # predicate is pure, so filtering twice equals filtering once). A caller
-    # that replaces ``allowedTools`` wholesale (``_install_conductor_agent``)
-    # is unaffected. The SEL audit inside is best-effort and never raises, so
-    # the purity note above still holds for config/managed-state.
+    # that builds its own ``allowedTools`` from a grant tuple plus the entries on
+    # its installed spec (``conductor_agents._governed_grants``) is unaffected:
+    # it filters that list itself. The SEL audit inside is best-effort and never
+    # raises, so the purity note above still holds for config/managed-state.
     auto_approve._apply_allowed_tools_ceiling(config, source="build_agent_config")
     return config
 
@@ -2296,7 +2308,7 @@ def _refresh_dynamic_fields(
     # Imported lazily: config.loader imports this module, so a top-level import
     # would close the cycle. Warm by the time this runs (importing agent pulls
     # config.loader in), so the lookup costs nothing on the caller's thread.
-    from kiro_crew.config.loader import DEFAULT_MODEL, normalize_agent_model
+    from kiro_crew.config.loader import DEFAULT_MODEL, coerce_config_field, normalize_agent_model
 
     # Default-model tracking: when the model is managed (not an explicit user
     # pick), re-sync it from the shipped defaults.json so a default bump
@@ -2332,13 +2344,14 @@ def _refresh_dynamic_fields(
     # (` auto `, an int) from reaching a spec kiro-cli validates with
     # deny_unknown_fields — a spec it rejects wholesale, silently falling back to
     # the default agent.
-    mc_model = normalize_agent_model((mc_cfg.get("agent") or {}).get("model"))
+    mc_model = normalize_agent_model(coerce_config_field(mc_cfg, "agent", dict, {}).get("model"))
     if mc_model and not fork:
         config["model"] = mc_model
 
     # Ensure kiro-cli uses agent-level mcpServers exclusively (not global
     # mcp.json).  Existing configs created before this field was added lack
     # it, causing kiro-cli to fall back to the (possibly empty) global file.
+    config.pop("useLegacyMcpJson", None)
     config["includeMcpJson"] = False
 
     # Seed workspace-relative resources (steering files, AGENTS.md, etc.)
@@ -2452,6 +2465,153 @@ def migrate_agent_specs() -> int:
     return cleaned
 
 
+def _relocated_skill_uri(uri: str, moves: dict[Path, Path]) -> str | None:
+    """The new ``skill://`` URI for *uri* when it names a relocated skill, else ``None``.
+
+    Only a ``~/`` or absolute URI is matched: a workspace-relative one points into
+    a project tree, never at the builtin skills home. The rewrite keeps the URI's
+    form, so a ``~/`` mapping stays portable across machines.
+    """
+    if not uri.startswith(SKILL_URI_PREFIX):
+        return None
+    raw = uri[len(SKILL_URI_PREFIX) :]
+    home_form = raw.startswith("~/")
+    if home_form:
+        path = Path.home() / raw[2:]
+    elif Path(raw).is_absolute():
+        path = Path(raw)
+    else:
+        return None
+    new = moves.get(Path(os.path.normpath(path)))
+    if new is None:
+        return None
+    if home_form:
+        try:
+            return f"{SKILL_URI_PREFIX}~/{new.relative_to(Path.home()).as_posix()}"
+        except ValueError:
+            pass
+    return f"{SKILL_URI_PREFIX}{new.as_posix()}"
+
+
+def migrate_relocated_skill_uris() -> int:
+    """Point agent specs that map a relocated builtin skill at its new path.
+
+    A builtin skill that moves (``skills._RELOCATED_SKILLS``) leaves its old
+    ``SKILL.md`` quarantined, so an agent spec that maps the old path by
+    ``skill://`` would silently load nothing. This rewrites each such resource to
+    the new path, in place and in order, and drops it instead when the spec
+    already maps the new path. A move counts only once the new ``SKILL.md`` is
+    installed and the old one is gone, so a mapping is never pointed at a file
+    that does not exist, and a skill still loadable at its old path keeps its
+    mapping. Idempotent and safe to run on every rebuild. Returns the number of
+    spec files rewritten.
+    """
+    from kiro_crew.skills import _RELOCATED_SKILLS, skills_dir  # noqa: PLC0415
+
+    agents_dir = kiro_agents_dir_path()
+    if not agents_dir.is_dir():
+        return 0
+    base = skills_dir()
+    moves: dict[Path, Path] = {}
+    for old_name, new_name in _RELOCATED_SKILLS.items():
+        old_md = base / old_name / "SKILL.md"
+        new_md = base / new_name / "SKILL.md"
+        if new_md.is_file() and not old_md.exists():
+            moves[Path(os.path.normpath(old_md))] = new_md
+    if not moves:
+        return 0
+    rewritten = 0
+    # Every template-spec writer holds this lock, and the read sits INSIDE it:
+    # a snapshot taken before a concurrent PATCH saved would otherwise be
+    # written back over that edit.
+    try:
+        with agents_spec_lock(agents_dir):
+            # JSON only, for the same reason as migrate_agent_specs: a markdown spec is
+            # never rewritten by Kiro Crew.
+            for spec_path in sorted(agents_dir.glob("*.json")):
+                if not _spec_path_is_safe(spec_path, agents_dir):
+                    continue
+                data = _read_agent_spec(
+                    spec_path,
+                    operation="migrate_relocated_skill_uris",
+                    source="unknown",
+                )
+                if data is None:
+                    continue
+                name = data.get("name") or spec_path.stem
+                try:
+                    enrolled = agent_state.get_capabilities(str(name)) is not None
+                except (ValueError, OSError):
+                    enrolled = True
+                if enrolled:
+                    # An enrolled member's spec is a saved generation whose
+                    # digest its capability intent records; rewriting it in
+                    # place would make reconcile refuse new sessions. It is
+                    # left for a re-save in Capabilities.
+                    continue
+                resources = data.get("resources")
+                if not isinstance(resources, list):
+                    continue
+                present = {r for r in resources if isinstance(r, str)}
+                updated: list[object] = []
+                changed = False
+                for resource in resources:
+                    new_uri = (
+                        _relocated_skill_uri(resource, moves) if isinstance(resource, str) else None
+                    )
+                    if new_uri is None:
+                        updated.append(resource)
+                        continue
+                    changed = True
+                    if new_uri not in present:
+                        updated.append(new_uri)
+                        present.add(new_uri)
+                if not changed:
+                    continue
+                # The skill-URI migration is a managed WRITER of this spec. For the
+                # dashboard-author stem, decide ownership from the PRE-rewrite bytes and renew
+                # the digest after the write only when they were our confirmed managed write
+                # -- otherwise the installer would read its own migrated spec as foreign and
+                # stop re-filtering its grants against a tightened ceiling. A user file (no
+                # recorded digest) is never stamped. ``worker_agent`` is the module global
+                # bound by the core's tail import, resolved at call time.
+                pre_migration_confirmed = (
+                    str(name) == worker_agent._MANAGED_OWNED_NAME
+                    and spec_path.stem == (worker_agent._MANAGED_OWNED_NAME)
+                    and worker_agent._is_confirmed_managed_dashboard_author(data)
+                )
+                pre_migration_digest = (
+                    agent_state.spec_digest(data) if pre_migration_confirmed else None
+                )
+                data["resources"] = updated
+                try:
+                    if pre_migration_confirmed:
+                        # Two-phase: keep the current on-disk digest in the finalized slot,
+                        # record the migrated bytes' digest as pending, write, finalize -- so
+                        # an interruption leaves the file matching a recorded slot.
+                        agent_state.begin_managed_write(
+                            spec_path.stem,
+                            agent_state.spec_digest(data),
+                            current=pre_migration_digest,
+                        )
+                        _atomic_json_write(spec_path, data)
+                        agent_state.finalize_managed_write(spec_path.stem)
+                    else:
+                        _atomic_json_write(spec_path, data)
+                    rewritten += 1
+                except OSError as exc:
+                    logger.warning(
+                        "Could not rewrite relocated skill mapping in %s: %s", spec_path, exc
+                    )
+    except OSError:
+        # The lock already logged why it could not be taken; try again on
+        # the next rebuild rather than write unserialized.
+        return rewritten
+    if rewritten:
+        logger.info("Pointed %d agent spec(s) at relocated builtin skills", rewritten)
+    return rewritten
+
+
 def clear_model_pin(config: MutableMapping[str, object], name: str) -> None:
     """Drop *config*'s ``model`` pin and resume tracking the shipped default.
 
@@ -2507,18 +2667,40 @@ def _spec_path_is_safe(path: Path, agents_dir: Path) -> bool:
     Also refuses a resolved path that leaves the agents directory, and any
     sensitive path, which is the same fence this module already applies before
     touching a resolved path elsewhere.
+
+    A metadata probe that itself fails (``OSError``) is refused too: for a
+    caller about to rewrite in place, not knowing the shape is the same as a
+    bad one. A caller that must tell the two apart -- the conductor installer,
+    which leaves a spec alone rather than lose its entries over a probe that may
+    succeed next time -- asks :func:`_spec_path_shape_refusal` directly.
     """
     try:
-        if path.is_symlink():
-            return False
-        resolved = path.resolve()
-        if resolved.parent != agents_dir.resolve():
-            return False
-        if is_sensitive_path(str(resolved)):
-            return False
+        return _spec_path_shape_refusal(path, agents_dir) is None
     except OSError:
         return False
-    return True
+
+
+def _spec_path_shape_refusal(path: Path, agents_dir: Path) -> str | None:
+    """Why *path* is not a plain spec file inside *agents_dir*, or ``None`` when it is.
+
+    The one implementation of :func:`_spec_path_is_safe`'s fence, kept apart so
+    its two outcomes stay distinct: a SHAPE that is refused for good (a link at
+    the spec's name, a path that resolves outside the agents directory or onto a
+    sensitive target) comes back as the reason, while a probe that failed to read
+    the metadata at all -- a stale NFS handle, an I/O error on the directory --
+    raises the ``OSError`` for the caller to classify. Collapsing both to "unsafe"
+    is right for a caller that only needs permission to rewrite; it is wrong for
+    one that would REPLACE the file on that answer, because then a transient error
+    on the probe would destroy a spec that was intact.
+    """
+    if path.is_symlink():
+        return "a link stands at the spec's name"
+    resolved = path.resolve()
+    if resolved.parent != agents_dir.resolve():
+        return "the path resolves outside the agents directory"
+    if is_sensitive_path(str(resolved)):
+        return "the path resolves to a sensitive target"
+    return None
 
 
 def agent_spec_path(name: str, *, agents_dir: Path | None = None) -> Path | None:
@@ -2711,12 +2893,33 @@ def reset_agent_model(name: str) -> tuple[Path, str]:
             raise FileNotFoundError(f"could not read agent spec {spec_path}: {exc}") from exc
         if not isinstance(data, dict):
             raise FileNotFoundError(f"agent spec {spec_path} is not readable as a JSON object")
+        # Snapshot the PRE-edit bytes to decide ownership BEFORE this writer mutates them:
+        # the digest is renewed below only when the file WAS already our confirmed managed
+        # write, never for a user file at the once-user-creatable stem.
+        pre_write_confirmed = name == worker_agent._MANAGED_OWNED_NAME and (
+            worker_agent._is_confirmed_managed_dashboard_author(data)
+        )
+        # Digest of the CURRENT on-disk bytes (pre-edit), captured before mutation so
+        # ``begin_managed_write`` can keep the file confirmable if this write is interrupted.
+        pre_write_digest = agent_state.spec_digest(data) if pre_write_confirmed else None
         previous = data.get("model") or ""
         clear_model_pin(data, name)
         # Same strip every spec writer runs: kiro-cli validates with
         # deny_unknown_fields and drops the whole agent on an unknown key.
         agent_state.lift_and_strip_bookkeeping(data, name)
-        _atomic_json_write(spec_path, data)
+        # An authorized reset of the managed dashboard-author spec legitimately rewrites its
+        # bytes. Ownership is the installer-recorded DIGEST, renewed ONLY when the PRE-edit
+        # content was already our confirmed managed write (``pre_write_confirmed``) -- a user
+        # file at the stem is never stamped. Two-phase so a crash cannot leave bytes and
+        # record out of step: record the new bytes' digest as pending, write, finalize.
+        if pre_write_confirmed:
+            agent_state.begin_managed_write(
+                name, agent_state.spec_digest(data), current=pre_write_digest
+            )
+            _atomic_json_write(spec_path, data)
+            agent_state.finalize_managed_write(name)
+        else:
+            _atomic_json_write(spec_path, data)
     return spec_path, str(previous)
 
 
@@ -2802,6 +3005,17 @@ def _existing_specs_are_mine(target: Path, own_home: Path | None) -> bool | None
         # and a dangling one would then read as "no spec here" — an absence
         # verdict an attacker can manufacture in the same-uid agents dir.
         if not os.path.lexists(spec_path):
+            continue
+        # The dashboard-author stem was a user-creatable template name before it became
+        # owned, and its managed ``mcpServers`` entry carries no ``KIROCREW_HOME`` pin on
+        # either branch -- the installer's own write omits it, and a leftover user file at
+        # the stem never had one. So this stem can never contribute a legitimate home-pin
+        # signal, and letting it into the probe makes a non-default home read every such
+        # file (ours OR an untouched user leftover) as foreign and refuse creation of every
+        # required spec. Exclude it from the pin probe regardless of its provenance; its
+        # provenance is the installer-recorded ownership digest, checked at the install gate,
+        # not a home pin.
+        if name == _DASHBOARD_AUTHOR_FILENAME:
             continue
         found = True
         if expected is None:
@@ -2934,8 +3148,8 @@ def _decline_shared_agent_home(*, audit: bool = True) -> Path | None:
     — the dedicated ``<data home>/kiro/agents`` this instance's teardown owns.
 
     That second case is the *mechanism* by which a genuinely isolated instance will
-    own its specs; it is NOT advice to set ``KIRO_HOME`` today. Nothing in this
-    repo sets it (``build_pod_env`` deliberately does not) because it also
+    own its specs; it is NOT advice to set ``KIRO_HOME`` by hand. A pod sets it
+    (``build_pod_env`` passes ``KIRO_HOME=<pod home>/kiro``), but setting it also
     relocates kiro-cli's session storage while KiroCrew still reads the host path
     — see ``kiro_home()``'s scope caveat. The exemption is matched exactly rather
     than by ancestry: "beneath the data home" reads the machine-wide
@@ -2996,7 +3210,7 @@ def _decline_shared_agent_home(*, audit: bool = True) -> Path | None:
                 "Refusing to rewrite the shared agent home %s from a non-default "
                 "data home (KIROCREW_HOME=%s%s): the specs would pin this "
                 "instance's home into every managed MCP server entry and break "
-                "strict session identity for the default-home gateway (#9690). "
+                "strict session identity for the default-home gateway. "
                 "This instance will use the existing specs instead. If no "
                 "default-home install exists anymore (the data home was "
                 "permanently relocated), the existing specs are stale leftovers: "
@@ -3023,9 +3237,9 @@ def _decline_shared_agent_home(*, audit: bool = True) -> Path | None:
     # Ephemerality must be POSITIVE evidence that this instance is throwaway.
     # "Has an isolated KIROCREW_HOME" is NOT that: a CI test gateway and a user
     # who permanently relocated their data home both look identical under that
-    # rule, and neither should be stopped from writing its own specs (an earlier
-    # revision used it and broke the offline E2E gateway, which boots on a tmp data
-    # home and then found no agents). A pod needs no arm here: ``build_pod_env``
+    # rule, and neither should be stopped from writing its own specs: the offline
+    # E2E gateway boots on a tmp data home and must still write its agent specs,
+    # or it finds no agents. A pod needs no arm here: ``build_pod_env``
     # gives it its own ``KIRO_HOME``, so its target is its own dedicated directory
     # and the private-target exemption above already lets it through.
     #
@@ -3136,6 +3350,20 @@ _projected_ceiling_generation: int | None = None
 #: on every confirming poll.
 _pending_projection_warned_generation: int | None = None
 
+#: Whether the LAST ``rebuild_agent_config`` left a conductor spec on disk unwritten
+#: (the verdict its ``_held_out`` out-parameter hands the caller that ran it). Kept
+#: here for the two readers that did not run the rebuild they have to know about:
+#: :func:`prime_ceiling_projection` seeds the ceiling baseline AFTER the boot rebuild,
+#: and a baseline seeded over a held spec would mark the current generation
+#: projected onto an ``allowedTools`` list that was never re-derived -- with no poll
+#: ever retrying it, because the hook skips an unchanged generation; and
+#: :func:`retry_held_conductor_specs`, the gateway's hourly maintenance wake, which
+#: is the only retry a host WITHOUT central distribution has -- there the hook has no
+#: poll to run on at all. Written by every rebuild where its installers' verdicts are
+#: settled, so a hold raised by any rebuild that ran before the baseline is seeded
+#: reaches it, not only the first, and a retry that rewrites every spec clears it.
+_conductor_spec_held: bool = False
+
 
 def prime_ceiling_projection() -> None:
     """Record the ceiling generation boot projected the agent config under.
@@ -3145,11 +3373,78 @@ def prime_ceiling_projection() -> None:
     changed since boot" and "nothing has changed since the first poll" — and the first poll
     can install a new ceiling, so the latter would record that generation and skip the very
     rebuild it needed.
+
+    Seeds nothing while the last rebuild left a conductor spec unwritten
+    (``_conductor_spec_held``): that spec's ``allowedTools`` still reflect whatever ceiling
+    wrote them, so the current generation is NOT projected, and a seeded baseline would
+    have the hook skip every poll until the ceiling moved again -- the one retry lost for
+    the process lifetime. An unseeded baseline is the documented safe direction: the first
+    poll rebuilds, that rebuild reports its own hold through ``_held_out``, and the memo
+    advances only once every spec is rewritten. A host without central distribution has
+    no poll; there :func:`retry_held_conductor_specs` is the retry.
     """
     global _projected_ceiling_generation
     from kiro_crew.platform.context import governance_generation
 
+    if _conductor_spec_held:
+        _projected_ceiling_generation = None
+        logger.warning(
+            "a conductor spec was left unwritten by the boot rebuild (it could not be "
+            "read or written), so the ceiling baseline stays unseeded: the first "
+            "distribution poll, or the hourly maintenance wake where no distribution "
+            "is configured, retries the rebuild, and on-disk auto-approvals reflect "
+            "the previous ceiling until it lands"
+        )
+        return
     _projected_ceiling_generation = governance_generation()
+
+
+def retry_held_conductor_specs() -> bool:
+    """Rewrite the conductor specs the last rebuild left unwritten, if there are any.
+
+    The gateway's hourly maintenance wake calls this (``_run_agent_scratch_sweep``),
+    and it is the retry a host WITHOUT central distribution otherwise has none of:
+    :func:`reproject_for_ceiling_change` runs only as a post-install hook of the
+    distribution poller, and ``policy_distribution.start_refresher`` starts no poller
+    unless the active policy names a source and a refresh interval. The ceiling itself
+    changes on such a host at boot alone (``set_context`` is called by the platform
+    bootstrap and by ``apply_ceiling``, nothing watches the policy file), so a
+    tightening takes effect at the next boot -- and if THAT boot's rebuild held a
+    conductor spec (its read failed past the bounded retry, or its write raised), the
+    spec kept the ``allowedTools`` the previous boot's ceiling wrote, kiro-cli kept
+    loading them, and nothing in the process was ever going to re-derive them. The
+    boot warning and the installer's own name the hold; this closes it.
+
+    The hold is the rebuild's own verdict (``_conductor_spec_held``), so this is a
+    no-op on every wake of a healthy host. When a spec IS held, one reporting rebuild
+    runs: the memo is rewritten where the four conductor installers' verdicts settle,
+    so it clears exactly when every spec was written and stays while any one is not,
+    and the next wake retries again. The ceiling baseline is left as it stands: a
+    standalone host never reads it, and on a distributed one an unseeded baseline has
+    the next confirming poll rebuild once more -- the documented safe direction --
+    rather than this path seeding a generation whose ceiling may have moved since the
+    rebuild it ran.
+
+    Returns whether every conductor spec is written now.
+    """
+    if not _conductor_spec_held:
+        return True
+    logger.info("retrying the conductor specs the last agent-config rebuild left unwritten")
+    held_out: list[bool] = []
+    _path, wrote = rebuild_agent_config_reporting(_held_out=held_out)
+    if wrote and not (held_out and held_out[0]):
+        logger.info(
+            "the conductor specs an earlier rebuild left unwritten are rewritten under "
+            "the current governance ceiling"
+        )
+        return True
+    logger.warning(
+        "a conductor spec is still unwritten after the retry (it could not be read or "
+        "written); its on-disk auto-approvals reflect the previous ceiling until the next "
+        "maintenance wake rewrites it -- repair it, or run "
+        "`kirocrew setup --agent-only --clean` to rebuild it"
+    )
+    return False
 
 
 def reproject_for_ceiling_change() -> None:
@@ -3191,37 +3486,43 @@ def reproject_for_ceiling_change() -> None:
     generation = governance_generation()
     if _projected_ceiling_generation == generation:
         return
-    _path, wrote = rebuild_agent_config_reporting()
-    if not wrote:
-        # The shared specs are not this instance's to rewrite, so the moved
-        # ceiling CANNOT be projected from here — and the memo must say so.
-        # The refusal verdict comes from the SAME evaluation that gated the
-        # write, inside the rebuild itself: probing the guard first and then
-        # rebuilding leaves a window where a concurrent default-home boot
-        # rewrites the specs between the two reads, the rebuild refuses, and
-        # a memo advanced on the stale probe marks the generation
-        # synchronised while the on-disk ``allowedTools`` were never narrowed
-        # — silently auto-approving tools the ceiling now forbids (the
-        # harness short-circuits them before PreToolUse). Leaving the memo
-        # behind keeps the advance-only-after-success rule literal for
-        # refusals: every later poll retries, and the pending generation is
-        # projected the moment the refusal clears instead of being lost for
-        # the process lifetime.
+    held_out: list[bool] = []
+    _path, wrote = rebuild_agent_config_reporting(_held_out=held_out)
+    if not wrote or bool(held_out and held_out[0]):
+        # Either the shared specs are not this instance's to rewrite, or a
+        # conductor spec on disk was left unwritten -- it could not be read, or
+        # its installer raised on the write (``conductor_agents._governed_grants``,
+        # ``rebuild_agent_config``) -- in both cases the moved
+        # ceiling was NOT projected onto every ``allowedTools`` list on disk,
+        # and the memo must say so. The refusal verdict comes from the SAME
+        # evaluation that gated the write, inside the rebuild itself: probing
+        # the guard first and then rebuilding leaves a window where a
+        # concurrent default-home boot rewrites the specs between the two
+        # reads, the rebuild refuses, and a memo advanced on the stale probe
+        # marks the generation synchronised while the on-disk ``allowedTools``
+        # were never narrowed -- silently auto-approving tools the ceiling now
+        # forbids (the harness short-circuits them before PreToolUse). Leaving
+        # the memo behind keeps the advance-only-after-success rule literal
+        # for refusals: every later poll retries, and the pending generation
+        # is projected the moment the refusal clears instead of being lost
+        # for the process lifetime.
         #
         # The pending state is the security-relevant half of the refusal, so
-        # it logs at WARNING — the same tier as the decline itself — but once
+        # it logs at WARNING -- the same tier as the decline itself -- but once
         # per generation rather than per confirming poll, which fires every
         # refresh interval. The decline arm's own refusal warning and SEL
-        # event fire per attempt, which is the audit posture every other
-        # caller of the rebuild already has.
+        # event, and the installer's warning naming the spec it left alone,
+        # fire per attempt, which is the audit posture every other caller of
+        # the rebuild already has.
         global _pending_projection_warned_generation
         if _pending_projection_warned_generation != generation:
             _pending_projection_warned_generation = generation
             logger.warning(
                 "ceiling generation %s is pending: this instance may not rewrite "
-                "the shared agent home, so its on-disk auto-approvals still "
-                "reflect the previous ceiling until the owning instance projects "
-                "the new one (or this instance's refusal clears)",
+                "the shared agent home, or a conductor spec on disk could not be "
+                "read or written and was left unchanged, so on-disk auto-approvals "
+                "still reflect the previous ceiling until the owning instance "
+                "projects the new one (or this instance's refusal clears)",
                 generation,
             )
         return
@@ -3234,6 +3535,7 @@ def rebuild_agent_config(
     clean: bool = False,
     refresh_forks: bool | Literal["defer"] = True,
     _wrote_out: list[bool] | None = None,
+    _held_out: list[bool] | None = None,
 ) -> Path:
     """Rebuild and write the merged kirocrew.json to ~/.kiro/agents/.
 
@@ -3262,7 +3564,12 @@ def rebuild_agent_config(
     the private *_wrote_out* out-parameter — the verdict comes from the SAME
     single evaluation of :func:`_decline_shared_agent_home` that gates the
     write below, never from a separate probe a concurrent default-home boot
-    could race.
+    could race. The conductor installers' own reports of whether they wrote
+    travel separately, through *_held_out*, because the two verdicts have
+    different readers: a refusal means ``kirocrew.json`` was NOT rewritten
+    (the dashboard's default-model applier reads that as "the change did not
+    land"), while a conductor spec held on disk leaves ``kirocrew.json``
+    written and only the ceiling memo with something left to do.
 
     Args:
         clean: If True, ignore existing config and regenerate from defaults.
@@ -3270,11 +3577,22 @@ def rebuild_agent_config(
             the write landed and the whole function returned, ``False`` when
             the shared-home guard refused. Pass a FRESH empty list: the
             reader consumes the first element, so a reused list misreports.
+        _held_out: private — when given, receives one bool: ``True`` when a
+            conductor installer left its spec on disk unwritten — because the
+            file could not be read for a reason that may clear on retry
+            (``conductor_agents._governed_grants``), or because the installer
+            raised and the failure was logged rather than propagated — so an
+            ``allowedTools`` list on disk was NOT re-derived and a moved
+            ceiling must stay pending rather than be marked projected.
+            ``False`` otherwise, including when the guard refused (nothing
+            ran). Same fresh-list rule as *_wrote_out*.
     """
     declined = _decline_shared_agent_home()
     if declined is not None:
         if _wrote_out is not None:
             _wrote_out.append(False)
+        if _held_out is not None:
+            _held_out.append(False)
         return declined
 
     kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
@@ -3283,6 +3601,8 @@ def rebuild_agent_config(
     # One-time (idempotent) self-heal: strip KiroCrew bookkeeping keys from
     # every kiro agent spec into the sidecar so kiro-cli accepts them all.
     migrate_agent_specs()
+    # A relocated builtin skill keeps working for agents that map its old path.
+    migrate_relocated_skill_uris()
 
     # Managed MCP sync happens after config is fully built (see below).
 
@@ -3297,7 +3617,7 @@ def rebuild_agent_config(
     # a POSITIVE enablement answer for any key either read claims: an app that
     # vanished answers nothing, and defaulting that to "exempt" would leave its
     # auto-approve grant on the name for whatever is bound there next.
-    _app_owned_at_start, _ownership_full_at_start = mcp_sources._app_owned_mcp_keys()
+    _app_owned_at_start = mcp_sources._app_owned_mcp_keys()
 
     if not clean and path.exists():
         # Existing config — preserve user customizations, only refresh
@@ -3439,35 +3759,53 @@ def rebuild_agent_config(
     except Exception:
         logger.debug("kirocrew-research agent install failed", exc_info=True)
 
+    # Install kirocrew-dashboard-manager agent (the subagent a crewmate hands page
+    # work to). Degrades to a debug line like the two above: with the spec absent a
+    # crewmate still has `dashboard_fields` and `dashboard_write`, so the page it has
+    # keeps working and only CHANGING the page is unavailable.
+    try:
+        service_agents._install_dashboard_manager_agent()
+    except Exception:
+        logger.debug("kirocrew-dashboard-manager agent install failed", exc_info=True)
+
     # Install kirocrew-heartbeat agent (used by HeartbeatService for unattended polling)
     try:
         _install_heartbeat_agent()
     except Exception:
         logger.debug("kirocrew-heartbeat agent install failed", exc_info=True)
 
-    # Install the bounded CPU-fast reconnaissance identity used only by the
-    # coordinator work-item dispatcher.
     try:
         _install_fast_recon_agent()
     except Exception:
         logger.debug("kirocrew-fast agent install failed", exc_info=True)
 
-    # Install kirocrew-consolidate agent (history consolidation's own identity)
     try:
         _install_consolidate_agent()
     except Exception:
         logger.debug("kirocrew-consolidate agent install failed", exc_info=True)
 
-    # Install kirocrew-conductor agent (goal decomposition + session-control dispatch)
+    # Install kirocrew-conductor agent (goal decomposition + session-control dispatch).
+    # ``clean`` is passed through: the conductor installers carry the user's own
+    # ``allowedTools`` entries forward across a rebuild, and a clean rebuild is the
+    # explicit reset that drops them, as it drops every customization above. Each
+    # reports whether it wrote: a spec left on disk because it could not be read
+    # is a list this rebuild did NOT re-derive, and so is one whose installer
+    # raised -- a failed write (a read-only file, a refused ``os.replace``) leaves
+    # the previous list on disk exactly as a refused read does -- and ``_held_out``
+    # must say so in both cases, or a moved ceiling is marked projected onto a
+    # list that still carries the old grants.
+    conductor_held = False
     try:
-        conductor_agents._install_conductor_agent()
+        conductor_held |= not conductor_agents._install_conductor_agent(clean=clean)
     except Exception:
+        conductor_held = True
         logger.debug("kirocrew-conductor agent install failed", exc_info=True)
 
     # Install kirocrew-pipeline-conductor agent (repository pipeline fleet supervision)
     try:
-        conductor_agents._install_pipeline_conductor_agent()
+        conductor_held |= not conductor_agents._install_pipeline_conductor_agent(clean=clean)
     except Exception:
+        conductor_held = True
         logger.debug("kirocrew-pipeline-conductor agent install failed", exc_info=True)
 
     # Install the deprecated kirocrew-ledger-conductor alias (the same spec as
@@ -3479,15 +3817,22 @@ def rebuild_agent_config(
     # already running under the old name resolves it on every dispatch, which is
     # what the alias exists to keep working.
     try:
-        conductor_agents._install_ledger_conductor_agent()
+        conductor_held |= not conductor_agents._install_ledger_conductor_agent(clean=clean)
     except Exception:
+        conductor_held = True
         logger.debug("kirocrew-ledger-conductor alias install failed", exc_info=True)
 
     # Install kirocrew-security-conductor agent (one security audit's worker fleet)
     try:
-        conductor_agents._install_security_conductor_agent()
+        conductor_held |= not conductor_agents._install_security_conductor_agent(clean=clean)
     except Exception:
+        conductor_held = True
         logger.debug("kirocrew-security-conductor agent install failed", exc_info=True)
+    # Settled here, not at the end: ``prime_ceiling_projection`` seeds the ceiling
+    # baseline from this after the boot rebuild, and a rebuild that raises further
+    # down must still leave the installers' verdict behind, not the previous one.
+    global _conductor_spec_held
+    _conductor_spec_held = conductor_held
 
     # Install kirocrew-worker agent (the default toolset plus the work-ledger set).
     #
@@ -3509,6 +3854,49 @@ def rebuild_agent_config(
     except Exception:
         logger.debug("kirocrew-worker agent install failed", exc_info=True)
 
+    # Install kirocrew-dashboard-author agent (authors one dashboard template and lands
+    # it as a PR). EAGER for the same forced reason spelled out on the worker above:
+    # ``session_create`` refuses an agent it cannot resolve, resolution reads a boot-time
+    # in-memory snapshot that no spec write refreshes, so a lazily-materialized spec is
+    # invisible to the validation that runs ahead of the spawn -- a conductor could never
+    # dispatch it on a clean install. Being here also re-filters its grants through the
+    # governance ceiling on every boot, so the spec normally cannot outlive a tightened
+    # ceiling -- with one exception: a file at the stem that is NOT this installer's own
+    # (its bytes do not reproduce the installer-recorded ownership digest) is left untouched,
+    # so a hand-authored user spec at the once-user-creatable stem -- or a copy of another
+    # owned agent renamed onto it -- is never overwritten. Ownership is the digest the
+    # installer records in the ``agent_state`` sidecar for this name.
+    dashboard_author_install_error: Exception | None = None
+    try:
+        worker_agent._install_dashboard_author_agent()
+    except Exception as exc:
+        # Capture, do NOT swallow. An installer failure must not ABORT the independent
+        # repairs below (fork governance refresh, hook repair) -- those run for every other
+        # installer's failure too -- so we let them run first. But it must not be reported as
+        # a SUCCESSFUL rebuild either: this spec's ``allowedTools`` is re-filtered through the
+        # governance ceiling on every rebuild, so a ceiling-TIGHTENING rebuild whose
+        # author-spec rewrite failed (e.g. a Windows sharing violation, a spec-lock timeout)
+        # leaves the spec's forbidden auto-approvals live. If this rebuild then reported
+        # success, ``reproject_for_ceiling_change`` would advance its generation memo and the
+        # next poll would NOT retry -- the forbidden grants would persist for the process
+        # lifetime. So the failure is re-raised at the END of the rebuild (after the
+        # independent repairs), which (a) escapes before ``_wrote_out`` is marked True, so
+        # ``rebuild_agent_config_reporting`` does not report a write, and (b) leaves the
+        # reprojection memo behind so the next poll retries -- the safe direction the
+        # success contract already documents for a post-write exception.
+        dashboard_author_install_error = exc
+        # A tightened ceiling whose author-spec rewrite failed leaves revoked auto-
+        # approvals live. Mark the hold so ``prime_ceiling_projection`` does not seed
+        # the ceiling as projected, and ``retry_held_conductor_specs`` retries the
+        # rewrite on the next maintenance poll (GPT 6.1 F1: boot-time author install
+        # failures lose the governance retry).
+        _conductor_spec_held = True
+        logger.warning(
+            "kirocrew-dashboard-author agent install failed; completing independent repairs "
+            "then failing the rebuild so a tightened ceiling is retried, not marked synced",
+            exc_info=True,
+        )
+
     # Bidirectional sync: ensure packages installed for one provider
     # are also available for the other (agents↔plugins, skills).
     sync_aim_packages()
@@ -3518,8 +3906,22 @@ def rebuild_agent_config(
     # Security: sanitize invalid hook keys in agent configs
     repair_agent_configs()
 
+    if dashboard_author_install_error is not None:
+        # The independent repairs have run; now fail the rebuild. ``_wrote_out`` is left
+        # UNMARKED (so the reporting wrapper returns ``wrote=False``-equivalent by never
+        # appending True) and the exception propagates, which is what keeps a tightened
+        # ceiling from being recorded as projected while the governed spec was not rewritten.
+        raise dashboard_author_install_error
+
     if _wrote_out is not None:
         _wrote_out.append(True)
+    if _held_out is not None:
+        # ``True`` when a conductor spec was left on disk unwritten: its
+        # ``allowedTools`` were not re-derived, so the ceiling memo must not
+        # advance over it (see ``_held_out`` above). Kept apart from the guard
+        # verdict: ``kirocrew.json`` above WAS written, and the dashboard's
+        # model applier must not read a held conductor spec as a refused rebuild.
+        _held_out.append(conductor_held)
     return path
 
 
@@ -3722,7 +4124,7 @@ def require_fork_governance(agent: str | None, project_dir: str | Path | None = 
         )
 
 
-def rebuild_agent_config_reporting() -> tuple[Path, bool]:
+def rebuild_agent_config_reporting(*, _held_out: list[bool] | None = None) -> tuple[Path, bool]:
     """:func:`rebuild_agent_config`, reporting whether it actually wrote.
 
     Returns ``(path, wrote)``. ``wrote`` is ``False`` exactly when the
@@ -3732,12 +4134,19 @@ def rebuild_agent_config_reporting() -> tuple[Path, bool]:
     returned: an exception after the write escapes instead, the memo a caller
     keeps stays behind, and the next poll rewrites — the safe direction. The
     verdict comes from the rebuild's own single guard evaluation, so no
-    caller-side probe exists for a concurrent default-home boot to race. A
-    caller needing ``clean`` uses :func:`rebuild_agent_config` directly — the
-    one consumer here (the ceiling-reprojection hook) never does.
+    caller-side probe exists for a concurrent default-home boot to race.
+
+    A conductor spec left on disk unwritten is NOT a refusal: ``kirocrew.json``
+    was written, so the two consumers of ``wrote`` must not read it as one —
+    the dashboard's default-model applier would announce a change that landed
+    as failed and retry it forever. That hold reaches the one reader with
+    something left to do, the ceiling-reprojection hook, through the private
+    *_held_out* out-parameter (``rebuild_agent_config``'s, forwarded). A
+    caller needing ``clean`` uses :func:`rebuild_agent_config` directly —
+    neither consumer here does.
     """
     wrote_out: list[bool] = []
-    path = rebuild_agent_config(_wrote_out=wrote_out)
+    path = rebuild_agent_config(_wrote_out=wrote_out, _held_out=_held_out)
     return path, bool(wrote_out and wrote_out[0])
 
 
@@ -3798,28 +4207,8 @@ def _install_aim_capabilities() -> None:
     service_agents._install_guest_agent()
 
 
-#: What a non-operator channel sender's agent is told. Conversational, because a
-#: human is on the other end; explicit about having no tools, because the spec
-#: mounts none and the model should not promise to act.
-GUEST_AGENT_PROMPT = (
-    "You are answering a guest: a person the operator allowed to message this "
-    "account, not the operator. Reply to what they ask, briefly and helpfully, "
-    "from the conversation alone. You have no tools: you cannot run commands, read "
-    "or write files, browse, or act on anything, so never claim to have done so. "
-    "If a request needs any of that, say the account owner has to do it."
-)
-
-
 def _install_consolidate_agent() -> None:
-    """Write the kirocrew-consolidate config (history consolidation).
-
-    Identical shell to kirocrew-lite — no tools, no MCP, no prompt — under its
-    own name so deployments can route it independently: consolidation feeds an
-    entire session tail into one prompt, which overflows a small-context lane
-    that lite's micro-jobs (titles, link labels) fit comfortably (observed
-    2026-08-11: four consolidation attempts rejected as oversized on a 32k
-    lane while lite titles succeeded).
-    """
+    """Write the tool-less history-consolidation agent under its own identity."""
     path = kiro_agents_dir_path() / _CONSOLIDATE_AGENT_FILENAME
     config = {
         "name": "kirocrew-consolidate",
@@ -3832,11 +4221,23 @@ def _install_consolidate_agent() -> None:
     agent_state.set_cc_model("kirocrew-consolidate", _background_cc_model())
 
 
+#: What a non-operator channel sender's agent is told. Conversational, because a
+#: human is on the other end; explicit about having no tools, because the spec
+#: mounts none and the model should not promise to act.
+GUEST_AGENT_PROMPT = (
+    "You are answering a guest: a person the operator allowed to message this "
+    "account, not the operator. Reply to what they ask, briefly and helpfully, "
+    "from the conversation alone. You have no tools: you cannot run commands, read "
+    "or write files, browse, or act on anything, so never claim to have done so. "
+    "If a request needs any of that, say the account owner has to do it."
+)
+
+
 _KNOWLEDGE_SYSTEM_PROMPT = (
     "You are a knowledge extraction specialist for KiroCrew's Knowledge Library. "
     "Your job is to analyze documents and extract structured information.\n\n"
     "You ALWAYS output valid JSON. No markdown, no explanation — just the JSON object.\n\n"
-    "Be precise with entity names — use the canonical form the text gives in full, not an abbreviation.\n"
+    "Be precise with entity names — use canonical forms (e.g., 'DynamoDB' not 'dynamo' or 'DDB').\n"
     "Only extract entities explicitly mentioned in the text, do not infer.\n"
     "Relations must reference entities that appear in your entities list."
 )
@@ -3869,9 +4270,9 @@ automatically. The Research Lab app drives you; the nudge names the campaign and
    `findings/cycle_*.json` files, zero-padded to 3 digits** (first cycle ->
    `cycle_000.json`, next -> `cycle_001.json`, ...). NEVER reuse or overwrite an
    existing cycle file. The filename pattern is a HARD contract: the Research Lab
-   counts findings and detects completion by matching `cycle_NNN.json` ONLY. A
-   finding written under any other name (e.g. a descriptive `01-topic.md`) is
-   INVISIBLE — the campaign will show 0 findings and appear stalled even though
+   counts findings and detects completion by matching cycle-numbered JSON names
+   (`cycle_NNN.json`). A finding written under any other name (e.g. a
+   descriptive `01-topic.md`) is INVISIBLE — the campaign will show 0 findings and appear stalled even though
    your work is on disk. When in doubt, match `cycle_NNN.json` exactly. Keys:
    `cycle` (= NNN), `summary, sources_checked, sources_empty, new_findings_count,
    evidence_strength, key_insight, sub_question`; append the cycle to `FINDINGS.md`
@@ -3898,11 +4299,11 @@ automatically. The Research Lab app drives you; the nudge names the campaign and
   sub-questions yourself from the question and scope. Use FIRST PRINCIPLES to steer
   which open sub-question (or weak-evidence gap) to pursue each cycle. When a
   finding surfaces a genuinely new high-value angle not in the checklist, you MAY
-  append it as an emergent sub-question and pursue it (note it in FINDINGS.md
-  `## Research State`).
+  propose it as an emergent sub-question in `emergent_questions.json`, in the
+  shape brief.md gives; the campaign admits it to the checklist.
 - Follow brief.md's questions directive: when allowed, you MAY pause with ONE
-  high-leverage clarification question — write {"question": ..., "why": ...} to
-  questions.json and end the turn — when the goal or scope is genuinely ambiguous
+  high-leverage clarification question — write it to questions.json in the
+  shape brief.md gives, and end the turn — when the goal or scope is genuinely ambiguous
   in a way that would materially change your research direction. Keep the bar high:
   proceed on a best-reasoned assumption (and record it) for anything minor or that
   you can resolve yourself.
@@ -3975,17 +4376,47 @@ it.
 ## Patrol
 
 Arm a loop on your own session with `monitor_start`, carrying the cycle
-instructions AND the exit condition, then end the turn. Take its bounds from
-the goal-conductor skill's `patrol_budget.py check`, and on every cycle whose
-nudge's `[patrol budget: ...]` line ends `10% or less left`, run `patrol_budget.py
-renew` and apply what it prints with `monitor_update` — a spent loop cannot be
-renewed later. A reply saying
+instructions AND the exit condition, then end the turn. **Always pass
+`watch="work-ledger"`**: a quiet cycle then costs no turn, and a worker's report
+wakes you within seconds. A loop without it must be fixed with
+`monitor_update(watch="work-ledger")` before anything else. Keep
+`interval_secs` within 300..900 seconds, whatever the round waits on. Take the
+bounds from the goal-conductor skill's `patrol_budget.py check` (it never
+raises the user's runtime; on exit 21 ask them for a longer one), and on every
+cycle whose nudge's `[patrol budget: ...]` line ends `10% or less left`, run
+`patrol_budget.py renew` and apply what it prints with `monitor_update` — a
+spent loop cannot be renewed later. A reply saying
 *requested* confirms receipt only — do not retry it in the same turn.
 Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If arming is refused outright, say no
-loop is running and drive that one round with `wait`. Call `autonudge_stop` when
-you stop. (The loop is on a timer today. When `monitor_start` accepts a
-`watch: "work-ledger"` field, gate on that instead and the quiet cycles stop
-costing a turn.)
+loop is running and drive that one round with `wait`.
+
+**Rounds run back to back.** When a round lands, report it, then plan and
+dispatch the next round in the same turn. Do not wait for the user: the one
+Round-0 go-ahead covers every round.
+
+**Rounds are not gated, but spend is bounded.** Count from the ledger. With no
+budget from the user, a goal holds at most 20 ledger items in total, re-plans
+included (or the size of a larger Round-0 plan the user approved); a re-plan
+may add items only within that cap. When two rounds in a
+row land with no item accepted, do not re-plan again. Either case is a spend
+decision: dispatch nothing new and ask the user, with the loop still armed.
+
+**Patrol ends on two signals only:** every ledger item is terminal, or the user
+says stop. Call `autonudge_stop` only then. `max_cycles` is a runaway backstop,
+not a stop signal. Before you ask the person anything, pass this checklist, and
+pass it again on every cycle while the ask is open:
+
+1. Is it credentials, spend, deleting or overwriting someone's work, or
+   irreversible? Then a default never settles it. If the item can simply be
+   parked (skipped, nothing changed), close it `abandoned` and report it;
+   otherwise ask (step 3).
+2. Not risky? Pick a default and do not ask.
+3. Park just this item and keep the rest going: ask about that item alone and
+   keep patrolling the others.
+4. Never stop the loop for a question. It stays armed and picks the answer up
+   on the next cycle. A worker's report still takes a turn, which can push the
+   card out of view, so while a question is open put it first in every turn
+   that speaks to the user.
 
 Each cycle, `work_ledger_read` with `compact=true` FIRST. It returns every
 item's status columns and the derived `orphaned` and `stale` flags — small
@@ -4086,8 +4517,10 @@ field is your parent's instruction); `work_report` `status: progress` when you
 dispatch or close a round; `question` when a decision is your parent's, not
 yours; `blocked` when an external dependency stops the whole goal; and `done`
 only when your own ledger shows every item accepted — with the evidence in
-`artifacts`. `work_brief` never prompts; `work_report` does, deliberately, so
-report at round boundaries, not on a timer, and the cost stays small. A root
+`artifacts`. `work_brief` never prompts. A `done`, `blocked` or `question`
+report wakes a parent whose loop watches the work ledger; `progress` does not,
+and waits for its next wake. So report at round boundaries, not on a timer, and
+the cost stays small. A root
 conductor gets `not_bound` from `work_brief` and knows it has no parent.
 
 Your tools:
@@ -4218,6 +4651,8 @@ handle immediately.
 #:   person has not touched since, and refuses an app or crew member outright.
 #:   It is withheld for the ``session_summary`` reason: no conductor step calls
 #:   it yet. A skill whose cleanup step adopts it adds it here with that step.
+#: * ``chat_folder_update`` — WITHHELD. Renames or restyles an existing folder,
+#:   which may be the person's, and no conductor step needs it.
 #: * ``chat_tag_list`` / ``chat_tag_create`` / ``chat_tag_update`` — WITHHELD,
 #:   not because any fails the invariant (a read, a create that dedups on name,
 #:   and a metadata edit that loses no assignment) but because no conductor step
@@ -4353,10 +4788,97 @@ _MEMBER_DASHBOARD_GRANTS: tuple[str, ...] = _CONDUCTOR_DASHBOARD_GRANTS + (
 #: with nobody at the keyboard, so an approval prompt on the write verb stalls
 #: exactly the unattended loop the drawer is watched during, and the operator's
 #: real switch for that is ``agent.crew_panel``.
+#:
+#: The dynamic dashboard's verbs join on the same invariant. ``dashboard_fields``
+#: is a read of the crewmate's own fields and mistake book. ``dashboard_write``
+#: writes an agentic value into the calling crewmate's OWN dashboard, resolved from
+#: the calling session exactly as ``panel_publish`` is, and every write is
+#: type-checked against that crewmate's manifest before it lands. A prompt on
+#: either would stall the unattended cycle the dashboard is refreshed from.
+#:
+#: The PAGE's four join them, and the bound is worth stating because these are the
+#: first of this server's verbs that change what a person sees rather than what it
+#: says. ``dashboard_templates`` is a read of the catalog. ``dashboard_preview``
+#: records nothing at all: it stages a page beside the record, moves no version and
+#: writes no history row, so the page somebody is reading is untouched.
+#: ``dashboard_apply`` and ``dashboard_rollback`` do change the page -- and they are
+#: granted rather than prompted on the same ownership test the tuple above is judged
+#: by. The page is the calling crewmate's own, resolved from the calling session and
+#: not from any argument; apply installs the page that was STAGED and takes no
+#: argument at all, so it cannot be pointed at a page nobody looked at; and every
+#: earlier version stays on disk, so the worst case is a crewmate changing its own
+#: page and the person saying "go back".
+#:
+#: What makes the person's YES part of the flow is the preview/apply SPLIT and the
+#: ``dashboard`` skill that drives it, not an approval dialog: a prompt on apply
+#: would ask the person to confirm a page the agent has not shown them yet, which is
+#: the wrong question at the wrong time.
 _MEMBER_PANEL_GRANTS: tuple[str, ...] = (
     "@kirocrew-panel/panel_templates",
     "@kirocrew-panel/panel_publish",
+    "@kirocrew-panel/dashboard_fields",
+    "@kirocrew-panel/dashboard_write",
+    "@kirocrew-panel/dashboard_templates",
+    "@kirocrew-panel/dashboard_preview",
+    "@kirocrew-panel/dashboard_apply",
+    "@kirocrew-panel/dashboard_rollback",
 )
+
+_DASHBOARD_MANAGER_SYSTEM_PROMPT = """# Kiro Crew Dashboard Manager
+
+You change ONE crewmate's Dashboard page, and you change nothing else.
+
+A crewmate hands you a request because somebody said one of three things about
+the page in front of them: "show me another one", "keep this one", "go back".
+Your whole job is to carry that out and say what happened.
+
+## The flow
+
+1. `dashboard_templates` -- list the catalog, or pass `query` to search it. The
+   search covers each template's title, its description AND the fold paths its
+   fields read, so a person asking for "cost" finds the page that shows a usage
+   number whose author never used the word.
+2. `dashboard_preview` -- stage the one that fits, by `template_id`. That is the
+   only argument. This records NOTHING: no version is written and the page they
+   are reading is untouched. It hands back a link.
+3. ASK. Give them the link and wait for an answer. This is not a formality: the
+   page is theirs, and a page swapped without asking is one they have to undo.
+4. `dashboard_apply` -- only after they say yes. It takes no arguments, so what
+   lands is the page they looked at.
+
+"Go back" skips all of that: `dashboard_fields` lists the versions a rollback can
+still reach, and `dashboard_rollback` restores one. A rollback moves FORWARD --
+version 1 over version 2 becomes version 3 -- so going back is itself undoable.
+
+## You cannot write the page
+
+Only a template that shipped with the product can be previewed or kept. A
+dashboard page runs its own script against this crewmate's task titles and
+summaries, inside a frame that can navigate itself, so a page nobody here has
+looked at could carry them out. Custom templates come later, behind a wrapper
+document this gateway mints.
+
+So if nothing in the catalog fits, say so and name the one that came closest. Do
+not write a manifest and html: the preview refuses them, and the refusal is a
+cycle you can spend on the answer instead.
+
+## The rule behind the whole design
+
+**Read every number from a fold. Never type one.** A number you type is true at
+the moment you typed it and wrong every time the page is opened afterwards. A
+template already declares which fold each of its fields reads; the fields it
+leaves to you are the ones marked `{"agentic": true}`, and `dashboard_fields`
+lists them.
+
+## What you do not do
+
+You do not do the crewmate's work. You do not answer the question its page is
+about, read its task list for the user, or report what the page shows -- they are
+looking at it. You change the page, or you say why you did not, and you stop.
+
+Load the `dashboard` skill first. It carries this flow in full; this prompt is
+the charter, not the procedure.
+"""
 
 
 #: The kirocrew-core verbs the goal conductor may call WITHOUT an approval
@@ -4409,25 +4931,57 @@ _MEMBER_PANEL_GRANTS: tuple[str, ...] = (
 #: is not an error but a silent approval prompt on every patrol cycle, which is
 #: why they are spelled out rather than left to the whole-server ref.
 #:
-#: Reachable from ``_conductor_spec`` alone, which both ``kirocrew-conductor``
-#: and its deprecated ``kirocrew-ledger-conductor`` alias call.
-#: ``kirocrew-pipeline-conductor`` and ``kirocrew-security-conductor`` do not: their
-#: children report through their own skills' scripts, so the mount would grant a
-#: flow whose procedure neither of them runs. The tuple keeps its name because
-#: ``kirocrew-ledger-conductor`` is still an installed spec.
+#: The first two are the BASE every conductor spec ships
+#: (``_CONDUCTOR_BASE_WORK_GRANTS``): every conductor records its items in the
+#: ledger, because the dashboard's ``workstreams`` fold mints a board only from
+#: ``work/recorded`` entries. This tuple is the goal conductor's superset, shipped
+#: by ``_conductor_spec``, which both ``kirocrew-conductor`` and its deprecated
+#: ``kirocrew-ledger-conductor`` alias call; the name stays because that alias is
+#: still an installed spec.
 #:
-#: ``work_brief`` is the third entry, and it is the one worker-half verb granted:
-#: it only READS the caller's own bound item (or answers ``not_bound``), which is
-#: the same rule the two conductor verbs rest on. It is also a second-level
-#: conductor's mandated FIRST call, in a child session nobody opened — gated, that
-#: call is an approval stall before any planning happens. ``work_report`` stays
-#: gated: it WRITES into the parent's record, across a dispatch relationship.
-_LEDGER_CONDUCTOR_WORK_GRANTS: tuple[str, ...] = (
+#: ``work_ledger_rebuild`` is the goal conductor's recovery step and no other
+#: conductor's procedure names it. ``work_brief`` is the one worker-half verb
+#: granted: it only READS the caller's own bound item (or answers ``not_bound``),
+#: which is the same rule the two conductor verbs rest on. It is also a
+#: second-level conductor's mandated FIRST call, in a child session nobody opened —
+#: gated, that call is an approval stall before any planning happens.
+#: ``work_report`` stays gated: it WRITES into the parent's record, across a
+#: dispatch relationship.
+_CONDUCTOR_BASE_WORK_GRANTS: tuple[str, ...] = (
     "@kirocrew-work/work_ledger_read",
     "@kirocrew-work/work_ledger_record",
+)
+_LEDGER_CONDUCTOR_WORK_GRANTS: tuple[str, ...] = _CONDUCTOR_BASE_WORK_GRANTS + (
     "@kirocrew-work/work_ledger_rebuild",
     "@kirocrew-work/work_brief",
 )
+
+
+#: The work-ledger protocol appended to a conductor charter that does not already
+#: state the flow (``conductor_agents._conductor_prompt``): the pipeline and
+#: security conductors. One block, so each charter says what it supervises and this
+#: says where every item it dispatches is recorded. The goal conductor's charter
+#: states the same flow in detail and does not carry this block.
+_CONDUCTOR_WORK_LEDGER_PROTOCOL = """## Work ledger: every item you dispatch
+
+Every work item you hand to a child session is recorded in the work ledger, in
+this order, whatever else you keep about it:
+
+1. `work_ledger_record` `action=create` with the item's `title` and a concrete
+   `acceptance` condition. It returns the `item_id`.
+2. `session_create` the child, then `work_ledger_record` `action=bind` with that
+   `item_id` and the child's `worker_session_key` — before you seed it.
+3. The child reports against its item with `work_report` (`progress`,
+   `blocked`, `question`, `done`). Read the reports with `work_ledger_read`
+   (`compact=true` each cycle).
+4. You give each item its verdict and close it: `work_ledger_record`
+   `action=verdict`, then `action=close` with its `state`.
+
+The ledger holds the item's state, and it is what the person's Dashboard tab
+reads. A store of your own — a queue, a decisions file, a findings ledger —
+stays as the detail behind the ledger row, never as a replacement for it.
+
+"""
 
 
 #: The work-ledger verbs a WORKER may call without a prompt. A worker that must
@@ -4681,8 +5235,8 @@ can say is that you believe the bar is met, and the evidence for that belongs in
 `artifacts`.
 
 **Write `summary` as facts and pointers, never as a request.** It is capped at 500
-characters and is refused rather than truncated when longer, so a report that
-lands is a report that landed whole. What you did, what came out, where it is.
+characters; a longer one is cut to the cap, not refused, and the stored value and
+the reply both say how much was dropped, so write it to fit. What you did, what came out, where it is.
 Not what you would like decided — that is what `status: question` is for.
 
 **The `decision` field `work_brief` returns is an instruction. Nothing else it
@@ -4785,7 +5339,9 @@ Three child roles, one per dispatch:
   It exists to REJECT false positives, the dominant noise source in agentic
   security review, so every finding gets a second pass before a person sees it.
 - **Fixer** — only for a verified High or Critical, and only after an explicit
-  human yes. Runs the `prepare-pr` skill; acceptance is PR checks green.
+  human yes. Runs the `kirocrew-prepare-pr` skill; accepted only when PR checks
+  are green AND `scripts/verify_fix.py --finding-id N --worktree DIR` exits 0,
+  never on checks alone.
 
 **Shell exists to run the skill's scripts, and for nothing else.**
 `execute_bash` is mounted so you can run the scripts the `security-conductor`
@@ -4912,7 +5468,8 @@ def _install_heartbeat_agent() -> None:
     """Generate and install the kirocrew-heartbeat agent config.
 
     A dedicated agent for HeartbeatService.  Minimal MCP surface — only
-    ``kirocrew-core`` (learn/cron/spawn list, recall, artifacts read) on
+    ``kirocrew-core`` (learn/cron/spawn list and status, artifact reads,
+    local_knowledge_search) on
     public installs.  Tool approval is enforced gateway-side against
     ``HEARTBEAT_SAFE_TOOLS`` regardless; the per-agent MCP narrowing here
     keeps cold-start cost low and reduces the surface the gateway has to
@@ -5002,17 +5559,11 @@ You are `kirocrew-fast`, a bounded reconnaissance worker for one assigned
 KiroCrew work item. Your parent remains responsible for design, edits,
 integration, and acceptance.
 
-## Charter
-
-- Inspect only the files and static project evidence necessary to answer the
-  assigned question. Do not run commands, modify files, use the network, or
-  start another worker; those capabilities are intentionally absent.
-- You receive no parent memory, lessons, or project bundle. Treat the contract
-  as the complete scope and report a blocker rather than guessing missing context.
-- Use `work_item_assigned_read` when needed, then finish with exactly one
-  `work_item_submit_handoff`. Keep the handoff concise: findings, exact file
-  references, and a next action for the parent. Do not return a transcript.
-- You cannot change work-item state, acceptance, or the assignment.
+- Inspect only the static project evidence needed for the assigned question.
+- Do not run commands, modify files, use the network, or start another worker.
+- Use `work_item_assigned_read` as needed and finish with exactly one
+  `work_item_submit_handoff` containing findings, file references, and a next action.
+- Do not change work-item state, acceptance, or assignment.
 """
 
 _FAST_RECON_ALLOWED_CORE_TOOLS = frozenset(
@@ -5026,10 +5577,7 @@ _FAST_RECON_ALLOWED_CORE_TOOLS = frozenset(
 
 
 def _fast_recon_excluded_core_tools() -> list[str]:
-    """Deny every managed core tool except the worker's fixed handoff surface."""
-    # Deliberately derive the complement from the live product tool registry:
-    # a later core tool is excluded by default until this narrow contract names
-    # it after review, rather than silently widening a read-only worker.
+    """Deny managed core tools outside the worker's fixed handoff surface."""
     from kiro_crew.mcp_tools import build_tool_list
 
     return sorted(
@@ -5042,8 +5590,7 @@ def _fast_recon_excluded_core_tools() -> list[str]:
 def _fast_recon_core_mcp() -> dict[str, dict]:
     """Copy the resolved core server without inherited visibility filters."""
     main_config = _load_json(kiro_agents_dir_path() / AGENT_FILENAME)
-    main_mcp = main_config.get("mcpServers", {}) or {}
-    entry = main_mcp.get("kirocrew-core")
+    entry = (main_config.get("mcpServers", {}) or {}).get("kirocrew-core")
     if not isinstance(entry, dict):
         return {}
     cleaned = dict(entry)
@@ -5075,12 +5622,7 @@ def _install_fast_recon_agent() -> None:
     mcp = _fast_recon_core_mcp()
     config: dict[str, object] = {
         "name": "kirocrew-fast",
-        "description": (
-            "Bounded read-only reconnaissance worker for one coordinator work item. "
-            "It uses the local fast lane and can only inspect and submit a handoff."
-        ),
-        # ``fast`` is the fleet role. The router resolves it to the active CPU
-        # lane; the dispatcher separately verifies this exact spec at launch.
+        "description": "Bounded read-only reconnaissance worker for one work item.",
         "model": "fast",
         "includeMcpJson": False,
         "prompt": _FAST_RECON_SYSTEM_PROMPT,
@@ -5124,13 +5666,24 @@ def _sanitize_agent_hooks() -> None:
     agents_dir = kiro_agents_dir_path()
     for filename in OWNED_KIRO_AGENT_FILES:
         f = agents_dir / filename
+        # Refuse a symlink or out-of-dir resolution BEFORE touching the file: the sweep
+        # reads every owned name, and following a link at an owned stem (e.g. one planted at
+        # kirocrew-dashboard-author.json pointing at ~/.docker/config.json) would read a
+        # file outside the agents dir. ``_spec_path_is_safe`` is the same no-follow fence the
+        # install and reset paths use; an absent file simply is not safe-and-present, so it
+        # is skipped here as before.
+        if not os.path.lexists(f) or not _spec_path_is_safe(f, agents_dir):
+            continue
         try:
             mtime = f.stat().st_mtime
         except OSError:
             continue
         if _hooks_sanitized_mtimes.get(str(f)) == mtime:
             continue
-        data = _load_json(f)
+        # Capped, no-follow read (the hardened spec reader) rather than ``_load_json``,
+        # which follows symlinks and is uncapped: a sweep over owned names must never slurp
+        # or launder a file the reader may not open.
+        data = _read_spec_capped(f)
         if not data:
             continue
         hooks = data.get("hooks")
@@ -5141,12 +5694,34 @@ def _sanitize_agent_hooks() -> None:
         if not removed_keys:
             _hooks_sanitized_mtimes[str(f)] = mtime
             continue
+        # Decide ownership from the PRE-sweep bytes: the digest is renewed below only when
+        # the file as READ already reproduced the recorded digest, i.e. it was our confirmed
+        # managed write. Keying on "a digest exists" (a stale record from a managed install
+        # the user later replaced at the stem) would stamp the user's swept bytes as managed
+        # and let the next rebuild overwrite them. ``worker_agent`` is a module global bound
+        # by the tail import below (like ``kiro_hooks`` above), resolved at call time.
+        stem = filename.removesuffix(".json")
+        pre_sweep_confirmed = stem == worker_agent._MANAGED_OWNED_NAME and (
+            worker_agent._is_confirmed_managed_dashboard_author(data)
+        )
+        pre_sweep_digest = agent_state.spec_digest(data) if pre_sweep_confirmed else None
         data["hooks"] = {
             key: value
             for key, value in hooks.items()
             if key not in kiro_hooks._LEGACY_KIROCREW_HOOK_KEYS
         }
-        _atomic_json_write(f, data)
+        # The sweep changes the bytes the ownership digest was recorded against. Renew it to
+        # match -- but ONLY when the pre-sweep file was already our confirmed managed write
+        # (``pre_sweep_confirmed``); a user file is never stamped. Two-phase so a crash leaves
+        # bytes and record in step: record the swept bytes' digest as pending, write, finalize.
+        if pre_sweep_confirmed:
+            agent_state.begin_managed_write(
+                stem, agent_state.spec_digest(data), current=pre_sweep_digest
+            )
+            _atomic_json_write(f, data)
+            agent_state.finalize_managed_write(stem)
+        else:
+            _atomic_json_write(f, data)
         _hooks_sanitized_mtimes[str(f)] = f.stat().st_mtime
         logger.info("Removed legacy Kiro Crew hook keys %s from %s", removed_keys, f.name)
         sel().log_api_access(

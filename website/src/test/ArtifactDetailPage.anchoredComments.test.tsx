@@ -313,7 +313,7 @@ describe('ArtifactDetailPage anchored comments', () => {
     await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
 
     expect(selectInBody('beta')).toBe(true)
-    fireEvent.change(await screen.findByLabelText('Add a comment'), { target: { value: 'clarify this step' } })
+    fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'clarify this step' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
 
     await waitFor(() => expect(vi.mocked(api).postArtifactComment).toHaveBeenCalledTimes(1))

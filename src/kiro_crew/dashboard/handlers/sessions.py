@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import json
@@ -59,8 +60,8 @@ from kiro_crew.dashboard.handlers._shared import (
     SESSION_SEARCH_TEXT_FIELDS,
     guard_owner_surface_routes,
     internal_memory_scope,
-    member_scope_denied_refusal,
 )
+from kiro_crew.dashboard.interaction_coordinator import _slot_decision
 from kiro_crew.dashboard.kiro_readiness import (
     _POLL_GATE_MAX_AGE_SECS,
     reject_if_kiro_unverified,
@@ -86,7 +87,7 @@ from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.mcp_discovery import sync_discovered_servers
 from kiro_crew.messaging.link import _in_namespace, canonical_key
 from kiro_crew.platform import redact_log_via_context
-from kiro_crew.platform_compat import kill_and_reap
+from kiro_crew.platform_compat import _SUBPROCESS_NO_WINDOW, kill_and_reap
 from kiro_crew.runtime_ownership import release_session_lease
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
@@ -94,7 +95,11 @@ from kiro_crew.sandbox import (
     scrub_agent_subprocess_env,
     wrap_argv,
 )
-from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    redact,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.validation import (
     SESSION_CHECKPOINT_SCHEMA,
     SESSION_RESTART_CONTINUATION_SCHEMA,
@@ -851,6 +856,11 @@ async def _fetch_whoami_or_none(kiro_bin: str) -> dict[str, object] | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=scrub_agent_subprocess_env(),
+            # Windows: the gateway has no console, so a helper spawned without
+            # CREATE_NO_WINDOW gets a fresh console allocated and flashes on
+            # screen ~every 30s. Suppress it (no-op on POSIX, where the flag is
+            # 0). Same guard the ACP spawn paths and kiro_prerequisite apply.
+            creationflags=_SUBPROCESS_NO_WINDOW,
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
         raw = (out or err or b"").decode(errors="replace")
@@ -1193,6 +1203,11 @@ async def _fetch_usage_bg() -> str | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=scrub_agent_subprocess_env(),
+            # Windows: the gateway has no console, so a helper spawned without
+            # CREATE_NO_WINDOW gets a fresh console allocated and flashes on
+            # screen ~every 30s. Suppress it (no-op on POSIX, where the flag is
+            # 0). Same guard the ACP spawn paths and kiro_prerequisite apply.
+            creationflags=_SUBPROCESS_NO_WINDOW,
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
         raw = (out or err or b"").decode(errors="replace")
@@ -1504,6 +1519,153 @@ def _is_machine_only_session(key: str) -> bool:
     return any(_in_namespace(key, ns) for ns in _MACHINE_NAMESPACES)
 
 
+#: The SEL reason for every refusal of a transcript the caller app does not own.
+_NOT_TRANSCRIPT_OWNER = "app does not own this transcript"
+#: The approvals list contains state-level requests, which no app may resolve.
+_STATE_APPROVALS_NOT_APP_VISIBLE = "state-level approvals are not app-visible"
+
+
+def _audit_app_decision(
+    request_app: str, operation: str, resource: str, outcome: str, reason: str = ""
+) -> None:
+    """Record one app-isolation decision in the SEL, best-effort.
+
+    A log fault never turns the caller's answer into a 500.
+    """
+    try:
+        _sel().log_api_access(
+            caller=request_app,
+            operation=operation,
+            outcome=outcome,
+            source="app_isolation",
+            resources=resource,
+            error=reason,
+        )
+    except Exception:  # pragma: no cover - audit is best-effort
+        logger.debug("SEL audit failed for %s %s", operation, outcome, exc_info=True)
+
+
+def _audit_app_denial(request_app: str, operation: str, resource: str, reason: str) -> None:
+    """Record one app-isolation refusal in the SEL, best-effort."""
+    _audit_app_decision(request_app, operation, resource, "denied", reason)
+
+
+def _audit_app_allow(request_app: str, operation: str, resource: str) -> None:
+    """Record one app-isolation grant, so every ownership decision leaves a record."""
+    _audit_app_decision(request_app, operation, resource, "allowed")
+
+
+def _app_not_found(request_app: str, operation: str, resource: str, reason: str) -> web.Response:
+    """Audit one app-isolation refusal and return the uniform 404.
+
+    The body is the one every app refusal and every genuinely missing target
+    shares, so an app cannot tell "not yours" from "does not exist"; the reason
+    goes to the security-event log instead.
+    """
+    # Imported here: chat_handlers imports this package at module scope.
+    from kiro_crew.dashboard.chat_handlers import _slot_not_found
+
+    _audit_app_denial(request_app, operation, resource, reason)
+    return _slot_not_found()
+
+
+def _app_transcript_busy() -> web.Response:
+    """The retryable answer when an owned read could not take the transcript lock.
+
+    Only reached after the unlocked ownership check passed, so it says nothing
+    about a transcript the app does not own.
+    """
+    return web.json_response(
+        {"error": "This session is busy. Try again in a moment.", "code": "session_busy"},
+        status=503,
+    )
+
+
+def _app_owns_transcript(log: ConversationLog, request_app: str, key: str) -> bool:
+    """Whether the transcript *key* records *request_app* as its owner app.
+
+    THE transcript-owner rule for app-token callers on ``/api/sessions*``: the
+    ``app`` field the slot save writes on the metadata line must equal the caller.
+    Identity is positive -- a transcript with no recorded app (every user, cron
+    and channel session) belongs to no app, and a missing transcript to nobody.
+    Blocking file IO; call it off the event loop.
+    """
+    if not log.has_log(key):
+        return False
+    return str(log.get_metadata(key).get("app") or "") == request_app
+
+
+def _app_may_claim_transcript(log: ConversationLog, request_app: str, key: str) -> bool:
+    """Whether a NEW slot *request_app* opens may bind to transcript *key*.
+
+    The marker :func:`_app_owns_transcript` trusts is written by the slot save,
+    so an app slot born over somebody else's transcript would rewrite it to name
+    the app. The chat create, send and resume routes therefore admit a new app
+    slot only onto a transcript that is missing or already the app's own.
+    Blocking file IO; call it off the event loop.
+    """
+    return not log.has_log(key) or _app_owns_transcript(log, request_app, key)
+
+
+def _app_owned_messages(log: ConversationLog, request_app: str, key: str) -> list[dict] | None:
+    """*key*'s rows while *request_app* owns it, else None.
+
+    The ownership verdict and the read run under one hold of *key*'s transcript
+    locks, so a same-key delete and recreate cannot land between them and hand
+    the app a transcript it does not own. Callers run the unlocked
+    :func:`_app_transcript_refusal` first, so no lock sidecar is created for a
+    key the app has no claim on. Blocking; off the loop. A lock timeout raises
+    ``HistoryLockTimeout``.
+    """
+    with log.locked_stems(transcript_lock_stems(key)):
+        if not _app_owns_transcript(log, request_app, key):
+            return None
+        return log.read_messages(key)
+
+
+async def _app_transcript_refusal(
+    request: web.Request, state: DashboardState, key: str, operation: str
+) -> web.Response | None:
+    """The uniform 404 for an app caller naming a transcript it does not own, else None."""
+    request_app = str(request.get("app") or "")
+    if not request_app:
+        return None
+    log = state.conversation_log
+    if log is not None and await asyncio.to_thread(_app_owns_transcript, log, request_app, key):
+        return None
+    return _app_not_found(request_app, operation, f"session={key}", _NOT_TRANSCRIPT_OWNER)
+
+
+def _app_owned_sessions(log: ConversationLog, request_app: str, sessions: list[dict]) -> list[dict]:
+    """The rows of *sessions* whose transcript *request_app* owns. Blocking; off the loop."""
+    owned: list[dict] = []
+    for row in sessions:
+        key = row.get("key", "")
+        if not _app_owns_transcript(log, request_app, key):
+            continue
+        try:
+            with log._locked(key):
+                if not _app_owns_transcript(log, request_app, key):
+                    continue
+                # The unlocked catalog row may describe a foreign incarnation.
+                owned.extend(log.list_sessions(keys=(key,)))
+        except HistoryLockTimeout:
+            continue
+    return owned
+
+
+def _app_bulk_history_refusal(request: web.Request, operation: str) -> web.Response | None:
+    """The uniform 404 for an app caller on a whole-history route, else None.
+
+    ``DELETE /api/sessions`` and its ``clearable/count`` act on every closed
+    transcript at once, and no app owns that set, so an app is refused outright.
+    """
+    request_app = str(request.get("app") or "")
+    if not request_app:
+        return None
+    return _app_not_found(request_app, operation, "sessions=*", "whole-history route")
+
+
 async def api_sessions(request: web.Request) -> web.Response:
     """GET /api/sessions — list conversation session files.
 
@@ -1553,6 +1715,14 @@ async def api_sessions(request: web.Request) -> web.Response:
     # the event loop freezes chat, heartbeat, and every other coroutine for the
     # full duration. Offload to a worker thread.
     all_sessions = await asyncio.to_thread(state.conversation_log.list_sessions)
+    request_app = str(request.get("app") or "")
+    if request_app:
+        # Before every count, so ``total`` and ``has_more`` describe the app's
+        # own list rather than the size of everyone else's.
+        all_sessions = await asyncio.to_thread(
+            _app_owned_sessions, state.conversation_log, request_app, all_sessions
+        )
+        _audit_app_allow(request_app, "session_list", f"sessions={len(all_sessions)}")
     if exclude_open:
         open_keys = _open_slot_transcript_keys(state)
         # Fold through ``_canonical_key`` as well: ``list_sessions`` deduplicates
@@ -1584,6 +1754,19 @@ async def api_sessions(request: web.Request) -> web.Response:
                 return True
 
         def _user_rows(sessions: list[dict]) -> list[dict]:
+            if request_app:
+                owned: list[dict] = []
+                for row in sessions:
+                    key = row.get("key", "")
+                    if _is_machine_only_session(key):
+                        continue
+                    try:
+                        with log._locked(key):
+                            if _app_owns_transcript(log, request_app, key) and _has_content(row):
+                                owned.append(row)
+                    except HistoryLockTimeout:
+                        continue
+                return owned
             return [
                 s
                 for s in sessions
@@ -1608,18 +1791,42 @@ async def api_sessions(request: web.Request) -> web.Response:
                 text, _ = _h.redact_credentials(text)
                 return text
 
+            if request_app:
+                owned: list[dict] = []
+                for row in sessions:
+                    key = row.get("key", "")
+                    try:
+                        # Keep the verdict, metadata and preview in one incarnation.
+                        with log._locked(key):
+                            if not _app_owns_transcript(log, request_app, key):
+                                continue
+                            current = log.list_sessions(keys=(key,))
+                            if not current:
+                                continue
+                            row = current[0]
+                            preview = log.last_message_preview(key, sanitize=_sanitize)
+                            if preview:
+                                row["preview"] = preview
+                            owned.append(row)
+                    except HistoryLockTimeout:
+                        continue
+                sessions[:] = owned
+                return
             for s in sessions:
                 preview = log.last_message_preview(s.get("key", ""), sanitize=_sanitize)
                 if preview:
                     s["preview"] = preview
 
         # Tail reads are sync file IO — keep them off the event loop.
+        page_size = len(page)
         await asyncio.get_running_loop().run_in_executor(None, _attach_previews, page)
+        if request_app:
+            total -= page_size - len(page)
     return web.json_response(
         {
             "sessions": page,
             "total": total,
-            "has_more": offset + limit < total,
+            "has_more": offset + (len(page) if request_app else limit) < total,
         }
     )
 
@@ -1691,13 +1898,18 @@ def _build_summary_prompt(messages: list[dict]) -> str | None:
     return _SUMMARIZE_PROMPT.format(transcript="\n".join(lines))
 
 
-async def _summarize_one(state: DashboardState, key: str) -> str:
+async def _summarize_one(state: DashboardState, key: str, *, owner_app: str = "") -> str:
     """Generate a one-line LLM summary for a single session. "" on any failure.
 
     Mirrors dashboard.chat_title._generate_title_via_kiro: uses an ephemeral
     background session on the cheap/fast model and destroys it in a finally.
     Best-effort — every failure path returns "" so the caller falls back to the
     session's stored title.
+
+    With *owner_app* set (an app caller), both transcript reads -- the cached
+    summary and the rows -- re-judge :func:`_app_owns_transcript` inside their own
+    lock hold, so a same-key delete and recreate after the caller's check yields
+    "" instead of a summary of somebody else's transcript.
     """
     log = state.conversation_log
     if not log:
@@ -1711,6 +1923,11 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
         # persistent summary readable. Unreadable fails closed.
         with log.derivation_hold(transcript_lock_stems(key)):
             if transcript_withholds_derivation(log, key):
+                return None, False
+            if owner_app and not _app_owns_transcript(log, owner_app, key):
+                _audit_app_denial(
+                    owner_app, "session_summarize", f"session={key}", _NOT_TRANSCRIPT_OWNER
+                )
                 return None, False
             return log.get_cached_summary(key), True
 
@@ -1736,22 +1953,32 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
     # preserves the mtime while advancing this counter, and stamping the new
     # content identity onto the older summary would bless it as fresh.
     generation = await loop.run_in_executor(None, log.rotation_generation, key)
+
     # Through the DERIVATION seam, not the plain ``recent``: the line checked
     # above is a snapshot, and a writer can tighten it before the rows are read
     # (a same-key hand-over landing a closed restricted tab's rows). The seam
     # validates the line with the rows under one lock hold and raises instead of
     # yielding rows a restricted (or unreadable) line governs.
-    try:
-        messages = await loop.run_in_executor(
-            None,
-            functools.partial(
-                log.derive_recent,
-                key,
-                max_messages=_SUMMARIZE_MSG_LIMIT,
-                roles={"user", "assistant"},
-            ),
+    def _derive_rows() -> list[dict] | None:
+        derive = functools.partial(
+            log.derive_recent, key, max_messages=_SUMMARIZE_MSG_LIMIT, roles={"user", "assistant"}
         )
+        if not owner_app:
+            return derive()
+        # derive_recent re-enters the same (reentrant) hold.
+        with log.derivation_hold(transcript_lock_stems(key)):
+            if not _app_owns_transcript(log, owner_app, key):
+                _audit_app_denial(
+                    owner_app, "session_summarize", f"session={key}", _NOT_TRANSCRIPT_OWNER
+                )
+                return None
+            return derive()
+
+    try:
+        messages = await loop.run_in_executor(None, _derive_rows)
     except TranscriptWithheld:
+        return ""
+    if messages is None:
         return ""
     prompt = _build_summary_prompt(messages)
     if not prompt:
@@ -1843,14 +2070,44 @@ async def api_sessions_summarize(request: web.Request) -> web.Response:
             ordered.append(k)
     ordered = ordered[:_SUMMARIZE_MAX_SESSIONS]
 
+    log = state.conversation_log
+    request_app = str(request.get("app") or "")
     summaries: dict[str, str] = {}
     for key in ordered:
-        if not state.conversation_log.has_log(key):
+        if request_app:
+            # Skipped like a missing key, so the reply cannot tell the two apart.
+            if not await asyncio.to_thread(_app_owns_transcript, log, request_app, key):
+                _audit_app_denial(
+                    request_app, "session_summarize", f"session={key}", _NOT_TRANSCRIPT_OWNER
+                )
+                continue
+            _audit_app_allow(request_app, "session_summarize", f"session={key}")
+        elif not log.has_log(key):
             continue
-        summary = await _summarize_one(state, key)
+        summary = await _summarize_one(state, key, owner_app=request_app)
         if summary:
             summaries[key] = summary
     return web.json_response({"summaries": summaries})
+
+
+class _AppOwnedKeys:
+    """The transcript keys *request_app* owns, judged per lookup.
+
+    Lazy, so a search reads the owner marker of only the keys in its own scan
+    window instead of listing and judging every transcript up front.
+    """
+
+    def __init__(self, log: ConversationLog, request_app: str) -> None:
+        self._log = log
+        self._request_app = request_app
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and _app_owns_transcript(self._log, self._request_app, key)
+
+
+def _app_search(log: ConversationLog, request_app: str, q: str, limit: int) -> list[dict]:
+    """*q* ranked over only the transcripts *request_app* owns. Blocking; off the loop."""
+    return log.search_sessions(q, limit, keys=_AppOwnedKeys(log, request_app))
 
 
 async def api_sessions_search(request: web.Request) -> web.Response:
@@ -1873,9 +2130,17 @@ async def api_sessions_search(request: web.Request) -> web.Response:
         limit = max(1, min(int(request.query.get("limit", "50")), 200))
     except (TypeError, ValueError):
         limit = 50
-    sessions = await asyncio.get_running_loop().run_in_executor(
-        None, state.conversation_log.search_sessions, q, limit
-    )
+    request_app = str(request.get("app") or "")
+    if request_app:
+        # The ownership filter runs inside the ranking, before the limit cap, so
+        # other sessions' matches cannot crowd the app's off the page.
+        log = state.conversation_log
+        sessions = await asyncio.to_thread(_app_search, log, request_app, q, limit)
+        _audit_app_allow(request_app, "session_search", f"sessions={len(sessions)}")
+    else:
+        sessions = await asyncio.get_running_loop().run_in_executor(
+            None, state.conversation_log.search_sessions, q, limit
+        )
     for s in sessions:
         for field in SESSION_SEARCH_TEXT_FIELDS:
             value = s.get(field)
@@ -1888,8 +2153,26 @@ async def api_session_detail(request: web.Request) -> web.Response:
     """GET /api/sessions/{key} — return messages for a session."""
     state: DashboardState = request.app["state"]
     key = request.match_info["key"]
+    refusal = await _app_transcript_refusal(request, state, key, "session_detail")
+    if refusal is not None:
+        return refusal
     if not state.conversation_log:
         return web.json_response([])
+    log = state.conversation_log
+    request_app = str(request.get("app") or "")
+    if request_app:
+        # Re-judged with the read under one lock hold: the check above is a
+        # snapshot a same-key delete and recreate can outlive.
+        try:
+            messages = await asyncio.to_thread(_app_owned_messages, log, request_app, key)
+        except HistoryLockTimeout:
+            return _app_transcript_busy()
+        if messages is None:
+            return _app_not_found(
+                request_app, "session_detail", f"session={key}", _NOT_TRANSCRIPT_OWNER
+            )
+        _audit_app_allow(request_app, "session_detail", f"session={key}")
+        return web.json_response(messages)
     # read_messages() opens and parses the transcript on a cache miss, which for
     # the multi-MB sessions a long-lived store accumulates is 100-300 ms of
     # blocking file IO — on the event loop, stalling every other request. Off the
@@ -2154,6 +2437,14 @@ CRON_OWNERSHIP_UNKNOWN_CODE = "cron_ownership_unknown"
 #: left alone: deleting it would leave its work state readable by the next session
 #: in the same slot, which is not recoverable by the person it happens to.
 LEDGER_EXCLUSION_UNWRITABLE_CODE = "ledger_exclusion_unwritable"
+
+
+class _AppOwnershipLost(Exception):
+    """An app's delete REFUSED because the transcript stopped recording that app.
+
+    Raised by :func:`_delete_history_session` inside the transcript hold, before
+    any exclusion or unlink, so the row is intact.
+    """
 
 
 class _OwnerKeyUnreadable(Exception):
@@ -2567,8 +2858,14 @@ def _delete_history_session(
     # the functions that use it -- this handler does not import the ledger at module
     # scope, and the tests pass a stub in its place.
     exclude: "Callable[[str], Any] | None" = None,
+    owner_app: str = "",
 ) -> tuple[bool | None, _HistoryDeleteClaim]:
     """Bind slot and cron ownership, then unlink under one transcript lock.
+
+    With *owner_app* set (an app caller), :func:`_app_owns_transcript` is re-judged
+    first inside the hold and a failure raises :class:`_AppOwnershipLost` before
+    anything is excluded or unlinked, so the handler's earlier check cannot be
+    outlived by a same-key delete and recreate.
 
     *exclude* records this slot's ledger units and answers the ids it added. It runs
     INSIDE the lock and only once the claim is RESOLVED, because that is the first point
@@ -2582,6 +2879,8 @@ def _delete_history_session(
     # and a legacy-file delete cannot synchronize on different sidecars.
     try:
         with log.locked_stems(transcript_lock_stems(key)):
+            if owner_app and not _app_owns_transcript(log, owner_app, key):
+                raise _AppOwnershipLost(key)
             resolved_claim = _resolve_history_delete_claim(log, key, claim)
             linked, readable = _linked_session_key_for_history_key(log, key)
             if not readable:
@@ -2830,12 +3129,52 @@ async def api_session_delete(request: web.Request) -> web.Response:
     """DELETE /api/sessions/{key} — permanently delete a history session."""
     state: DashboardState = request.app["state"]
     key = request.match_info["key"]
+    refusal = await _app_transcript_refusal(request, state, key, "session_delete")
+    if refusal is not None:
+        return refusal
     if not state.conversation_log:
         return web.json_response({"error": "no conversation log"}, status=400)
-
     # Freeze the slot/transcript/manager route before the first await. The strict
     # cron-store scan establishes exact owner keys independently of that route.
-    delete_claim = _capture_history_delete_claim(state, key)
+    request_app = str(request.get("app") or "")
+    with contextlib.ExitStack() as delete_window:
+        delete_claim = _claim_history_delete(delete_window, state, key)
+        if (
+            request_app
+            and delete_claim.slot is not None
+            and getattr(delete_claim.slot, "_app", "") != request_app
+        ):
+            # The transcript records this app, but the live slot the cleanup would
+            # pop is not the app's: the slot is the server-side record, the metadata
+            # line is not, so the slot decides. Same 404 as any other refusal.
+            return _app_not_found(
+                request_app, "session_delete", f"session={key}", "app does not own the live slot"
+            )
+        return await _delete_claimed_session(state, key, delete_claim, request_app)
+
+
+def _claim_history_delete(
+    windows: contextlib.ExitStack, state: DashboardState, key: str
+) -> _HistoryDeleteClaim:
+    """Open *key*'s delete-in-flight window on *windows*, then capture its claim.
+
+    The one way a delete handler takes a slot claim. The claim names the slot the
+    delete will remove afterwards, so the window has to be open from that instant
+    until the cleanup ran: a resume that published before it is in the claim, and
+    one that re-checks after it sees the window and refuses with a retryable
+    ``resume_conflict``. Both steps are synchronous, so nothing can land
+    between them. The caller closes *windows* after its slot cleanup.
+    """
+    assert state.conversation_log is not None
+    windows.enter_context(state.conversation_log.delete_in_flight_window(key))
+    return _capture_history_delete_claim(state, key)
+
+
+async def _delete_claimed_session(
+    state: DashboardState, key: str, delete_claim: _HistoryDeleteClaim, request_app: str
+) -> web.Response:
+    """The body of :func:`api_session_delete`, run inside its in-flight window."""
+    assert state.conversation_log is not None
     crons = getattr(state, "crons", None)
     try:
         swept = await _owner_keys_bound_to_transcript(crons, (key,))
@@ -2863,6 +3202,11 @@ async def api_session_delete(request: web.Request) -> web.Response:
             delete_claim,
             exact_owner_keys=swept.get(key, ()),
             exclude=lambda _slot: _exclude_slot_units(state, session_ledger, delete_claim),
+            owner_app=request_app,
+        )
+    except _AppOwnershipLost:
+        return _app_not_found(
+            request_app, "session_delete", f"session={key}", _NOT_TRANSCRIPT_OWNER
         )
     except _OwnerKeyUnreadable:
         return _cron_ownership_unknown_refusal(crons, swept.get(key, ()))
@@ -2891,6 +3235,9 @@ async def api_session_delete(request: web.Request) -> web.Response:
             return _ledger_rollback_refusal()
 
     if ok:
+        if request_app:
+            # Only a completed delete proves the in-hold ownership check ran.
+            _audit_app_allow(request_app, "session_delete", f"session={key}")
         try:
             await _unstrand_shared_ledger_unit(state, session_ledger, delete_claim)
         except session_ledger.LedgerExclusionError:
@@ -3439,11 +3786,12 @@ def _remove_session_crew_logs(
 
 async def api_sessions_clear(request: web.Request) -> web.Response:
     """DELETE /api/sessions — permanently delete closed history sessions only."""
+    refusal = _app_bulk_history_refusal(request, "sessions_clear")
+    if refusal is not None:
+        return refusal
     state: DashboardState = request.app["state"]
     if not state.conversation_log:
         return web.json_response({"error": "no conversation log"}, status=400)
-
-    from kiro_crew import session_ledger
 
     log = state.conversation_log
     clearable, skipped, unreadable = await asyncio.to_thread(_clearable_history_keys, state, log)
@@ -3455,6 +3803,27 @@ async def api_sessions_clear(request: web.Request) -> web.Response:
         swept = await _owner_keys_bound_to_transcript(crons, clearable)
     except (CronStoreBusy, CronStoreUnreadable) as exc:
         return _cron_store_refusal(exc, cleared=0, skipped=skipped, failed=0)
+
+    # Every row's window stays open until the batch's slot cleanup below has run,
+    # because that is when the claim it took is acted on.
+    with contextlib.ExitStack() as delete_windows:
+        return await _clear_history_rows(
+            state, log, clearable, skipped, unreadable, swept, crons, delete_windows
+        )
+
+
+async def _clear_history_rows(
+    state: DashboardState,
+    log: Any,
+    clearable: list[str],
+    skipped: int,
+    unreadable: list[str],
+    swept: dict[str, set[str]],
+    crons: Any,
+    delete_windows: contextlib.ExitStack,
+) -> web.Response:
+    """The per-row body of :func:`api_sessions_clear`, inside the rows' windows."""
+    from kiro_crew import session_ledger
 
     count = 0
     failed = 0
@@ -3468,7 +3837,7 @@ async def api_sessions_clear(request: web.Request) -> web.Response:
             skipped += 1
             continue
 
-        delete_claim = _capture_history_delete_claim(state, key)
+        delete_claim = _claim_history_delete(delete_windows, state, key)
         # Per ROW, the same precondition the single delete applies: the ledger
         # exclusion is written before this row's transcript is unlinked, because a
         # failure after the unlink has nothing left to refuse and would leave this
@@ -3658,6 +4027,9 @@ async def api_sessions_clearable_count(request: web.Request) -> web.Response:
     :func:`_clearable_history_keys` for why offering one here would report a
     subset of what the delete actually takes.
     """
+    refusal = _app_bulk_history_refusal(request, "sessions_clearable_count")
+    if refusal is not None:
+        return refusal
     state: DashboardState = request.app["state"]
     if not state.conversation_log:
         return web.json_response(
@@ -3674,9 +4046,86 @@ async def api_sessions_clearable_count(request: web.Request) -> web.Response:
 
 
 async def api_approvals(request: web.Request) -> web.Response:
-    """GET /api/approvals — list pending tool approvals."""
+    """GET /api/approvals — list pending tool approvals.
+
+    The list holds only STATE-level approvals (cron, autonudge, subagent,
+    taskrunner), and an app token never resolves one of those -- the same rule
+    ``POST /api/chat/slots/{slot}/approve`` applies. So an app caller is shown
+    none of them rather than every pending request on the instance.
+    """
     state: DashboardState = request.app["state"]
+    request_app = str(request.get("app") or "")
+    if request_app:
+        _audit_app_denial(
+            request_app, "approval_list", "approvals=*", _STATE_APPROVALS_NOT_APP_VISIBLE
+        )
+        return web.json_response([])
     return web.json_response(list(state._pending_approvals.values()))
+
+
+async def _resolve_app_approval(
+    request: web.Request, state: DashboardState, request_app: str, approval_id: str, action: str
+) -> web.Response:
+    """Resolve *approval_id* for an app caller, or refuse it.
+
+    The slot approve route's rule, in its order: ``deny_session_approval_caller``
+    first, so an app without ``permissions.sessionApproval`` gets the same 403
+    there and here, even for its own slot; then ``_app_may_send_to_slot`` on the
+    slot whose future owns the id. A state-level approval is never resolvable by
+    an app, so the coordinator target and the state registry are not consulted.
+
+    ACP request ids are connection-scoped and recur across slots, so the id must
+    name exactly ONE pending request the app may control. Two or more is refused
+    rather than guessed: the slot route, which names the slot, is the way to
+    decide one of them. The candidates are the (slot, future) pairs live BEFORE
+    the awaited permission reads, and only the judged future itself is resolved:
+    a request settled meanwhile is never replaced by a same-id sibling, on
+    another slot or on the same one. Every other refusal and a missing id return
+    the same 404 body, so an app cannot tell "not yours" from "does not exist".
+    A resolution is recorded in the SEL under the app's name, as the slot route
+    records it.
+    """
+    # Imported here: chat_handlers imports this package at module scope.
+    from kiro_crew.dashboard.chat_handlers import (
+        _app_may_send_to_slot,
+        deny_session_approval_caller,
+    )
+
+    denied = await deny_session_approval_caller(request, "approval_resolve")
+    if denied is not None:
+        return denied
+    live: list[tuple[Any, asyncio.Future[str]]] = []
+    if "origin" not in request.query:
+        # Snapshot before any await: the permission reads below yield the loop.
+        live = [
+            (slot, future)
+            for slot in list(state._slots.values())
+            if (future := slot._approval_futures.get(approval_id)) and not future.done()
+        ]
+    controllable = [pair for pair in live if await _app_may_send_to_slot(request_app, pair[0])]
+    if len(controllable) == 1:
+        slot, future = controllable[0]
+        approved, rejected_once = action == "approve", action == "reject_once"
+        if state.resolve_slot_approval(
+            slot, approval_id, approved, rejected_once=rejected_once, expected_future=future
+        ):
+            # The slot route's record shape, so either route's decision names the app.
+            try:
+                _sel().log_api_access(
+                    caller=f"app:{request_app}",
+                    operation=f"tool_approval:{action}",
+                    outcome=_slot_decision(approved, rejected_once),
+                    resources=approval_id,
+                )
+            except Exception:  # pragma: no cover - audit is best-effort
+                logger.warning("SEL audit failed for approval %s", approval_id, exc_info=True)
+            return web.json_response({"ok": True})
+    reason = (
+        "approval id is pending on more than one session this app may control"
+        if len(controllable) > 1
+        else "no pending approval on a session this app may control"
+    )
+    return _app_not_found(request_app, "approval_resolve", f"approval={approval_id}", reason)
 
 
 async def api_approval_resolve(request: web.Request) -> web.Response:
@@ -3686,6 +4135,9 @@ async def api_approval_resolve(request: web.Request) -> web.Response:
     action = request.match_info["action"]
     if action not in ("approve", "reject", "reject_once"):
         return web.json_response({"error": "invalid action"}, status=400)
+    request_app = str(request.get("app") or "")
+    if request_app:
+        return await _resolve_app_approval(request, state, request_app, approval_id, action)
     if "origin" in request.query:
         # Dynamic Dashboard echoes the inventory record's origin, exact slot and
         # instance. Do not fall through to native futures when that displayed
@@ -4534,7 +4986,11 @@ async def api_session_checkpoint(request: web.Request) -> web.Response:
     state.push_slots_update()
     calls = slot.note_checkpoint_call() if hasattr(slot, "note_checkpoint_call") else 1
     return web.json_response(
-        {"ok": True, "session_checkpoint": slot.session_checkpoint_payload(), "calls_this_turn": calls}
+        {
+            "ok": True,
+            "session_checkpoint": slot.session_checkpoint_payload(),
+            "calls_this_turn": calls,
+        }
     )
 
 
@@ -4552,7 +5008,10 @@ async def api_session_restart_continuation(request: web.Request) -> web.Response
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         return web.json_response(
-            {"error": "request body must be a JSON object", "code": "invalid_restart_continuation"},
+            {
+                "error": "request body must be a JSON object",
+                "code": "invalid_restart_continuation",
+            },
             status=400,
         )
     try:
@@ -4679,7 +5138,10 @@ async def api_session_channel(request: web.Request) -> web.Response:
     attached = _channel_memberships(state, session_key)
     if not attached and not session_key.startswith("dashboard:"):
         return web.json_response(
-            {"error": "caller is not a persistent channel member", "code": "channel_membership_required"},
+            {
+                "error": "caller is not a persistent channel member",
+                "code": "channel_membership_required",
+            },
             status=403,
         )
     action = body.get("action")
@@ -4687,7 +5149,9 @@ async def api_session_channel(request: web.Request) -> web.Response:
         return web.json_response(
             {
                 "ok": True,
-                "channels": [_channel_status_payload(state, channel, member) for channel, member in attached],
+                "channels": [
+                    _channel_status_payload(state, channel, member) for channel, member in attached
+                ],
             }
         )
     if action not in {"post", "add_agent", "remove_member"}:
@@ -4703,10 +5167,15 @@ async def api_session_channel(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "channel_id required", "code": "invalid_channel_id"}, status=400
         )
-    selected = next(((channel, member) for channel, member in attached if channel.id == channel_id), None)
+    selected = next(
+        ((channel, member) for channel, member in attached if channel.id == channel_id), None
+    )
     if selected is None:
         return web.json_response(
-            {"error": "caller is not attached to that channel", "code": "channel_membership_required"},
+            {
+                "error": "caller is not attached to that channel",
+                "code": "channel_membership_required",
+            },
             status=403,
         )
     channel, member = selected
@@ -4728,7 +5197,9 @@ async def api_session_channel(request: web.Request) -> web.Response:
             if not isinstance(task, str) or not task.strip() or len(task) > 2000:
                 return web.json_response({"error": "task must be 1 to 2000 characters"}, status=400)
             if not isinstance(agent_name, str) or len(agent_name) > 100:
-                return web.json_response({"error": "agent must be at most 100 characters"}, status=400)
+                return web.json_response(
+                    {"error": "agent must be at most 100 characters"}, status=400
+                )
             if "approval" in body:
                 return web.json_response(
                     {"error": "worker approval policy is fixed by the channel safety policy"},
@@ -4779,7 +5250,10 @@ async def api_session_channel(request: web.Request) -> web.Response:
         or len(set(recipients)) != len(recipients)
     ):
         return web.json_response(
-            {"error": "recipients must be one to eight distinct agent ids", "code": "invalid_recipients"},
+            {
+                "error": "recipients must be one to eight distinct agent ids",
+                "code": "invalid_recipients",
+            },
             status=400,
         )
     if member.id in recipients or any(recipient not in channel.members for recipient in recipients):
@@ -4839,12 +5313,7 @@ async def api_session_channel(request: web.Request) -> web.Response:
 
 
 async def api_session_maintenance(request: web.Request) -> web.Response:
-    """Read or acknowledge the active coordinated session-reset barrier.
-
-    This endpoint is strict-internal only. The caller key is resolved by the
-    MCP process identity; a browser cannot forge an acknowledgement for an
-    agent it does not control.
-    """
+    """Read or acknowledge the active coordinated session-reset barrier."""
     state: DashboardState = request.app["state"]
     session_key = request.headers.get("X-Session-Key", "").strip()
     if not session_key:
@@ -4857,8 +5326,7 @@ async def api_session_maintenance(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         return web.json_response(
-            {"error": "request body must be a JSON object", "code": "invalid_request"},
-            status=400,
+            {"error": "request body must be a JSON object", "code": "invalid_request"}, status=400
         )
     action = body.get("action")
     if action not in {"status", "acknowledge"}:
@@ -5122,17 +5590,6 @@ async def api_sessions_restart(request: web.Request) -> web.Response:
     Also syncs MCP servers from mcp.json → kirocrew.json so newly
     installed servers (e.g. via AIM) are picked up on restart.
     """
-    # Open or refresh the barrier before doing any slow sync work. A reset
-    # drains every ACP process, so busy slotless workers are a hard block rather
-    # than an acknowledgement we cannot truthfully obtain.
-    state: DashboardState = request.app["state"]
-    status = await _restart_barrier_status(state, open_if_busy=True)
-    if status["ready"] is not True:
-        _publish_restart_barrier(state)
-        return web.json_response(
-            {"ok": False, "code": "restart_ack_required", "maintenance": status}, status=409
-        )
-
     # Sync MCP servers before restarting so new installs take effect.
     # Run in thread — the sync does blocking file I/O. Cap at 30s so a hung
     # rebuild doesn't stall the restart. sync_discovered_servers serializes
@@ -5148,45 +5605,20 @@ async def api_sessions_restart(request: web.Request) -> web.Response:
         # the on-disk config does not back.
         sync_ok = False
         logger.warning("MCP server sync failed before restart", exc_info=True)
-    # Synchronisation can take up to 30 seconds; repeat the live check just
-    # before draining providers so a new in-flight turn cannot slip through.
-    status = await _restart_barrier_status(state, open_if_busy=True)
-    if status["ready"] is not True:
-        _publish_restart_barrier(state)
-        return web.json_response(
-            {"ok": False, "code": "restart_ack_required", "maintenance": status}, status=409
-        )
-    state.restart_barrier.clear()
-    _publish_restart_barrier(state)
     count = await _reset_all_sessions(request)
     return web.json_response(
         {"ok": True, "sessions_reset": count, "mcp_synced": synced, "mcp_sync_ok": sync_ok}
     )
 
 
-# ── Coordinated-reset blockers owned by channels ──
-
-# A blocking slotless session this surface has no safe action for. The reason is
-# what the operator is shown INSTEAD of a control, so each value names why no
-# button appears rather than collapsing to "unknown".
 _BLOCKER_NOT_A_CHANNEL_WORKER = "not_a_channel_worker"
 _BLOCKER_ATTACHED_DASHBOARD_SESSION = "attached_dashboard_session"
-# Rejected on the clear path only: the barrier moved between the operator
-# reading the list and confirming, so this key is no longer blocking anything.
 _BLOCKER_NOT_BLOCKING = "not_blocking"
-
-# One confirmation covers a bounded batch. A request naming more keys than any
-# channel could hold is a malformed caller, not an operator clicking a button.
 _MAX_BLOCKER_CLEAR_KEYS = 64
 
 
 def _blocker_lock(state: DashboardState) -> LoopBoundLock:
-    """Serialise bulk clears so two operators cannot interleave one batch.
-
-    DashboardState can outlive the event loop that first serves this endpoint,
-    so a LoopBoundLock prevents a later loop from awaiting a lock bound to a
-    closed predecessor.
-    """
+    """Serialise blocker clears across every request loop using this state."""
     lock = getattr(state, "_restart_blocker_lock", None)
     if not isinstance(lock, LoopBoundLock):
         lock = LoopBoundLock()
@@ -5197,14 +5629,6 @@ def _blocker_lock(state: DashboardState) -> LoopBoundLock:
 def _restart_blocker_view(
     state: DashboardState, status: dict[str, object]
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Name every slotless session blocking the reset, and who owns it.
-
-    Dashboard-slot sessions are deliberately absent: they acknowledge for
-    themselves through ``/api/session-maintenance`` and are reported by the
-    barrier's own ``pending`` list.  This split is what keeps a channel-owned
-    worker -- which has no operator to acknowledge on its behalf -- from being
-    the anonymous "busy slotless worker" that a reset simply refuses on.
-    """
     manager = getattr(state, "channel_manager", None)
     finder = getattr(manager, "find_member", None) if manager is not None else None
     channel_blockers: list[dict[str, object]] = []
@@ -5219,9 +5643,6 @@ def _restart_blocker_view(
             continue
         channel, member = found
         if member.attached_session:
-            # An attached member is an operator's own dashboard session that
-            # joined a channel. Its reset belongs to the slot that owns it, not
-            # to a channel-maintenance control, so no action is offered here.
             other_blockers.append(
                 {"session_key": key, "reason": _BLOCKER_ATTACHED_DASHBOARD_SESSION}
             )
@@ -5244,85 +5665,45 @@ def _restart_blocker_view(
 
 
 def _blocker_payload(state: DashboardState, status: dict[str, object]) -> dict[str, object]:
-    """The wire shape both endpoints answer with."""
     channel_blockers, other_blockers = _restart_blocker_view(state, status)
     return {"channel_blockers": channel_blockers, "other_blockers": other_blockers}
 
 
 async def api_sessions_restart_blockers(request: web.Request) -> web.Response:
-    """GET /api/sessions/restart-blockers — name what is blocking a reset.
-
-    Read-only: it refreshes an ALREADY-OPEN barrier against live work but never
-    opens one, so merely viewing the maintenance surface cannot start requiring
-    acknowledgements from sessions nobody asked to reset.
-    """
     state: DashboardState = request.app["state"]
     status = await _restart_barrier_status(state, open_if_busy=False)
     return web.json_response({"ok": True, "maintenance": status, **_blocker_payload(state, status)})
 
 
 async def api_sessions_clear_restart_blockers(request: web.Request) -> web.Response:
-    """POST /api/sessions/restart-blockers/clear — clear channel workers' context.
-
-    Body: ``{"confirm": true, "session_keys": ["channel:<id>:<agent>", ...]}``.
-
-    Each key runs the channel's own per-worker Clear context lifecycle
-    (:func:`kiro_crew.dashboard.handlers_channel.clear_agent_context`), so this
-    surface adds reach, not new semantics: channel membership, the shared
-    message buffer and exchange counts all survive, and the worker cold-starts
-    on its next message.  It is NOT a dismissal and not a cooperative stop.
-
-    The barrier is re-read before every key and once more at the end, so a
-    worker that finished on its own between the operator's read and their
-    confirmation is skipped rather than reset, and the returned blocker list is
-    the state after the batch rather than the state that prompted it.
-    """
     state: DashboardState = request.app["state"]
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
-        return web.json_response(
-            {"error": "request body must be a JSON object", "code": "invalid_request"}, status=400
-        )
+        return web.json_response({"error": "request body must be an object"}, status=400)
     keys = body.get("session_keys")
     if not isinstance(keys, list) or not keys or not all(isinstance(k, str) and k for k in keys):
         return web.json_response(
-            {
-                "error": "session_keys must be a non-empty list of strings",
-                "code": "invalid_request",
-            },
-            status=400,
+            {"error": "invalid session_keys", "code": "invalid_request"}, status=400
         )
-    # Deduplicated, but order-preserving: the operator sees results in the order
-    # the list was shown to them.
-    requested: list[str] = list(dict.fromkeys(keys))
+    requested = list(dict.fromkeys(keys))
     if len(requested) > _MAX_BLOCKER_CLEAR_KEYS:
         return web.json_response(
             {"error": "too many session keys", "code": "too_many_keys"}, status=400
         )
     if body.get("confirm") is not True:
         return web.json_response(
-            {
-                "error": "clearing channel worker context requires confirmation",
-                "code": "confirmation_required",
-            },
-            status=409,
+            {"error": "confirmation required", "code": "confirmation_required"}, status=409
         )
-
     manager = getattr(state, "channel_manager", None)
     if manager is None or not callable(getattr(manager, "find_member", None)):
         return web.json_response(
-            {"error": "channels are unavailable", "code": "channels_unavailable"}, status=409
+            {"error": "channels unavailable", "code": "channels_unavailable"}, status=409
         )
 
-    # Deferred: handlers_channel imports the channel runtime, which this module
-    # sits upstream of in the dashboard's import order.
-    from kiro_crew.dashboard.handlers_channel import (
-        broadcast_context_cleared,
-        clear_agent_context,
-    )
+    from kiro_crew.dashboard.handlers_channel import broadcast_context_cleared, clear_agent_context
 
     results: list[dict[str, object]] = []
     async with _blocker_lock(state):
@@ -5330,7 +5711,7 @@ async def api_sessions_clear_restart_blockers(request: web.Request) -> web.Respo
         if status.get("active") is not True:
             return web.json_response(
                 {
-                    "error": "no coordinated reset is waiting on these sessions",
+                    "error": "no coordinated reset is waiting",
                     "code": "no_active_barrier",
                     "maintenance": status,
                     **_blocker_payload(state, status),
@@ -5338,9 +5719,6 @@ async def api_sessions_clear_restart_blockers(request: web.Request) -> web.Respo
                 status=409,
             )
         for key in requested:
-            # Re-read per key: an earlier clear in this batch, an unrelated
-            # reset, or the worker simply finishing all change what is still
-            # blocking, and a stale membership row must not authorise a reset.
             status = await _restart_barrier_status(state, open_if_busy=False)
             clearable, unactionable = _restart_blocker_view(state, status)
             row = next(
@@ -5371,29 +5749,24 @@ async def api_sessions_clear_restart_blockers(request: web.Request) -> web.Respo
             try:
                 cleared = await clear_agent_context(state, member)
             except asyncio.CancelledError:
-                # The operator's request went away mid-batch. Report nothing as
-                # having happened that did not, and let the cancel propagate.
                 raise
             except Exception as exc:
-                logger.warning(
-                    "Clearing channel worker %s during restart maintenance failed",
-                    key,
-                    exc_info=True,
-                )
+                detail = redact(str(exc))
+                logger.warning("Clearing restart blocker %s failed", key, exc_info=True)
                 _sel().log_api_access(
                     caller="dashboard",
                     operation="channel.clear_context",
                     outcome="denied",
                     source="dashboard",
                     resources=f"restart-blocker:{key}",
-                    error=redact(str(exc)),
+                    error=detail,
                 )
                 results.append(
                     {
                         "session_key": key,
                         "outcome": "failed",
                         "reason": "clear_failed",
-                        "detail": redact(str(exc)),
+                        "detail": detail,
                     }
                 )
                 continue
@@ -5498,37 +5871,13 @@ async def api_session_archive_read(request: web.Request) -> web.Response:
     return web.Response(text=redacted, content_type="application/x-ndjson")
 
 
-async def _member_channel_report_guard(request: web.Request) -> web.Response | None:
-    """Let a member read and post in its own channels, never change membership."""
-    scope, refusal = await internal_memory_scope(request, "api_session_channel")
-    if refusal is not None or scope is None:
-        return refusal
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        return None  # the handler reports the malformed body
-    if isinstance(body, dict) and body.get("action") in {"status", "post"}:
-        return None
-    return await member_scope_denied_refusal("api_session_channel")
-
-
 # Every ``api_session*`` handler is an owner surface, so a private member's
-# internal call is refused before it runs (audit label = handler name). The
-# member-scoped ones act only on the caller's own slot and verify it
-# themselves; the channel route admits a member to its own channels for status
-# and post only. Maintenance stays owner-only: its status lists every busy
-# session.
+# internal call is refused before it runs (audit label = handler name). These
+# three verify and scope their own caller instead.
 guard_owner_surface_routes(
     globals(),
     prefix="api_session",
     member_scoped=frozenset(
-        {
-            "api_session_checkpoint",
-            "api_session_directive",
-            "api_session_keepalive",
-            "api_session_restart_continuation",
-            "api_session_tool_policy",
-        }
+        {"api_session_directive", "api_session_keepalive", "api_session_tool_policy"}
     ),
-    resource_scoped={"api_session_channel": _member_channel_report_guard},
 )

@@ -21,14 +21,16 @@ model through their own tier, and none of them has an owner watching the price.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from test_decisions_strip_rides_message import _quiet_sel, _runner_state, _settle, _slot
+from turn_harness import ScriptedProvider, SlotSpec, TurnContext, TurnScript, run_turn
 
-from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
+from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
 from kiro_crew.config.sections import DECISION_PROVIDER_ENDPOINT_DEFAULT, DecisionsConfig
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.decisions import gate as gate_mod
@@ -36,6 +38,7 @@ from kiro_crew.decisions import log as log_mod
 from kiro_crew.decisions import outcomes
 from kiro_crew.decisions.points import model_route as mr
 from kiro_crew.decisions.types import Answer
+from kiro_crew.hooks import HOOK_EVENT_USER_PROMPT_SUBMIT
 from kiro_crew.providers.base import LLMEvent
 
 ADVERTISED = ["model-a", "model-b", "model-c"]
@@ -133,6 +136,17 @@ def _rows(tmp_path):
             if line.strip():
                 rows.append(json.loads(line))
     return rows
+
+
+def _outcome_rows(tmp_path):
+    """The routed turn's OUTCOME rows, picked out by the field only they carry.
+
+    Selected by shape, never by position. The gate's own call row for the same
+    decision is a best-effort append that the gate stops waiting for after its write
+    budget, so on a slow host it can commit after the outcome row the runner awaits:
+    "the last row" is whichever writer reached the file last.
+    """
+    return [row for row in _rows(tmp_path) if "model_chosen" in row]
 
 
 def _switched_to(client) -> list[str]:
@@ -754,10 +768,62 @@ class TestASwitchThatDoesNotTake:
         await _settle(slot)
 
         assert _switched_to(client) == ["model-c"], "the switch should still be attempted"
-        row = _rows(tmp_path)[-1]
+        outcomes_written = _outcome_rows(tmp_path)
+        assert len(outcomes_written) == 1, f"expected one outcome row, got {_rows(tmp_path)}"
+        row = outcomes_written[0]
         assert row["model_chosen"] == "model-c"
         assert row["applied"] is False
         assert row["model_used"] == "model-b"
+
+    @pytest.mark.asyncio
+    async def test_the_outcome_row_is_read_when_the_call_row_lands_after_it(
+        self, tmp_path, answers, monkeypatch
+    ):
+        """The order a slow host produces, arranged on events rather than timing.
+
+        The gate's call row is held until the outcome row has committed, and the
+        outcome append returns only once the held row is on disk too, so the file ends
+        with the call row. The gate gives up waiting on its own append after its write
+        budget, which is what lets the turn reach the outcome row while the call row is
+        still held. Each wait carries a 30 s backstop so a broken arrangement fails
+        here instead of hanging the worker.
+        """
+        real_append = log_mod.append
+        outcome_written = threading.Event()
+        call_landed = threading.Event()
+
+        def _ordered_append(row, **kwargs):
+            if row.get("point") == mr.POINT and "model_chosen" not in row and not row.get("error"):
+                assert outcome_written.wait(30), "the outcome row was never written"
+                try:
+                    return real_append(row, **kwargs)
+                finally:
+                    call_landed.set()
+            written = real_append(row, **kwargs)
+            if "model_chosen" in row:
+                outcome_written.set()
+                assert call_landed.wait(30), "the held call row never landed"
+            return written
+
+        monkeypatch.setattr(log_mod, "append", _ordered_append)
+        answers("complex")
+        state, client = _runner_state(tmp_path)
+        _turn_client(state, client)
+        slot = _routed_slot()
+        slot.served_model = "model-b"
+
+        with _quiet_sel():
+            await chat_runner._run_chat(
+                state, slot, "please redesign the scheduler", _directive_user_origin=True
+            )
+        await _settle(slot)
+
+        rows = _rows(tmp_path)
+        assert "model_chosen" not in rows[-1], f"the call row did not land last: {rows}"
+        outcomes_written = _outcome_rows(tmp_path)
+        assert len(outcomes_written) == 1, f"expected one outcome row, got {rows}"
+        assert outcomes_written[0]["model_chosen"] == "model-c"
+        assert outcomes_written[0]["applied"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +936,48 @@ def _crew_log_calls(monkeypatch) -> list[str]:
     for name in ("on_message_received", "on_turn_refused", "on_turn_started"):
         _spy(name)
     return seen
+
+
+class _RoutedSession(ScriptedProvider):
+    """A session on model-c holding 100k tokens, whose served model follows a switch."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._served = "model-c"
+
+    @property
+    def served_model(self) -> str:
+        return self._served
+
+    def available_models(self):
+        return [{"modelId": name} for name in ADVERTISED]
+
+    async def set_model(self, name: str) -> None:
+        self.record("set_model", name)
+        self._served = name
+
+    def context_used_tokens(self) -> int:
+        return 100_000
+
+    def context_window_tokens(self) -> int:
+        return 0
+
+    def context_usage_unknown(self) -> bool:
+        return False
+
+
+class _InjectsContext:
+    """A hook store whose one ``UserPromptSubmit`` hook prints *text* as context."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    async def fire(self, event, *args, **kwargs):
+        if event != HOOK_EVENT_USER_PROMPT_SUBMIT or not self._text:
+            return []
+        return [
+            SimpleNamespace(exit_code=0, stdout=self._text, stderr="", error="", hook_name="ctx")
+        ]
 
 
 def _refusals(tmp_path) -> list[dict]:
@@ -1221,16 +1329,54 @@ class TestTheFitReadingSizesTheAssembledPrompt:
             is True
         ), "150k tokens of CJK does not"
 
-    def test_the_hook_is_handed_the_prompt_the_turn_sends(self):
-        """Two texts reach this hook and only one of them is what the turn sends. The
-        person's words are what the tier is classified from; ``full_message`` carries
-        the request prefix, the replayed history and the hook context. A call site
-        handing the typed text to both reads as correct and undercounts every injected
-        prefix, so the pair is asserted here rather than left to two variable names."""
-        import inspect
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hook_context", [True, False], ids=["hook-context", "control"])
+    async def test_the_fit_rule_sizes_the_prompt_the_turn_sends(
+        self, tmp_path, answered, windows, hook_context
+    ):
+        """Two texts reach the hook, and only one of them is what the turn sends.
 
-        packed = "".join(inspect.getsource(chat_runner._run_chat).split())
-        assert "state,slot,client,_jev_route_text,session_key,prompt=full_message" in packed
+        Through the real ``_run_chat``: the person's words are what the tier is
+        classified from; the prompt the provider is handed also carries the hook
+        context (and any request prefix and replayed history). A downgrade sized
+        on the typed text alone fits a window the sent prompt does not. Here a
+        ``UserPromptSubmit`` hook injects ~50k tokens: on a session holding 100k,
+        the 200k target window reads 75% full -- over the 70% limit -- so the
+        downgrade is refused; sized on the typed words alone it reads 50% and
+        the turn would be moved onto a window its own prompt nearly fills.
+        """
+        answered("simple", 0.95)
+        injected = "x" * 200_000 if hook_context else ""
+
+        def _arrange(ctx: TurnContext) -> None:
+            ctx.slot.jev_route = True
+            ctx.state._hook_store = _InjectsContext(injected)
+            ctx.state.sessions.effective_autocompact_pct = lambda _key: 70.0
+
+        record = await run_turn(
+            TurnScript(
+                events=[
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="an answer"),
+                    AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+                ],
+                message="please rename this variable",
+                setup=_arrange,
+                provider=_RoutedSession,
+            ),
+            slot=SlotSpec(key="chat-fit-hook"),
+        )
+        [sent] = [call.args[0] for call in record.calls("stream")]
+        switched = [call.args[0] for call in record.calls("set_model")]
+        if hook_context:
+            assert "[Hook context]" in sent and len(sent) > 200_000
+            assert switched == []
+            [refusal] = _refusals(tmp_path)
+            assert (refusal["tier"], refusal["p"]) == ("simple", 0.95)
+        else:
+            # Without the injected prefix the same turn fits, so the refusal above
+            # is the prefix's doing and not the history's.
+            assert switched == ["model-a"]
+            assert _refusals(tmp_path) == []
 
 
 class TestTheWindowTheSwitchActuallyLandedOn:

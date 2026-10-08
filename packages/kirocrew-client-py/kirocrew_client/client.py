@@ -58,6 +58,23 @@ async def _network_errors(request: Any) -> AsyncIterator[aiohttp.ClientResponse]
         raise KiroCrewError(ErrorCode.NETWORK_ERROR, str(exc)) from exc
 
 
+async def _error_body(resp: aiohttp.ClientResponse) -> Any:
+    """Read an error response body as a dict when it is JSON, else as text.
+
+    ``http_error`` reads ``body["code"]`` to tell ``context_not_queued`` apart
+    from a transient 429, so an error body must reach it parsed, not as a raw
+    string. A non-JSON or unparseable body falls back to its text.
+    """
+    text = await resp.text()
+    ct = resp.headers.get("content-type", "")
+    if "application/json" in ct and text:
+        try:
+            return json.loads(text)
+        except (ValueError, TypeError):
+            return text
+    return text or None
+
+
 def _list_field(result: Any, key: str) -> list[dict[str, Any]]:
     """Read a list the Gateway returns bare or wrapped as ``{key: [...]}``."""
     if isinstance(result, dict):
@@ -301,12 +318,16 @@ class KiroCrewClient:
 
                     # Non-retryable 4xx (except 429)
                     if 400 <= resp.status < 500 and resp.status != 429:
-                        text = await resp.text()
-                        raise http_error(resp.status, text or None)
+                        raise http_error(resp.status, await _error_body(resp))
 
-                    # Retryable
-                    text = await resp.text()
-                    last_error = http_error(resp.status, text or None)
+                    # Retryable — except a full-queue 429, which no backoff can
+                    # clear (only a turn drains the queue, and the client cannot
+                    # send one while it is sleeping on retries). Carve it out so
+                    # it fails fast with its own code instead of RATE_LIMITED.
+                    err = http_error(resp.status, await _error_body(resp))
+                    if err.code == ErrorCode.CONTEXT_NOT_QUEUED:
+                        raise err
+                    last_error = err
 
                     if resp.status != 429 and method not in _RETRYABLE_METHODS:
                         raise last_error
@@ -581,7 +602,12 @@ class KiroCrewClient:
     # ── Approvals ──
 
     async def list_approvals(self) -> list[dict[str, Any]]:
-        """List pending tool approvals across all slots."""
+        """List pending background approvals (cron, autonudge, subagent, task runner).
+
+        A slot's own tool prompts are not in this list; they are rows in that
+        slot's history. An app token never resolves a background approval, so
+        for an app caller the Gateway returns an empty list.
+        """
         result = await self._get("/api/approvals")
         return result if isinstance(result, list) else []
 
@@ -606,7 +632,16 @@ class KiroCrewClient:
         (``trust``, ``trust_reads``, ``trust_command``, ``trust_base``,
         ``yolo``). ``trust_command`` and
         ``trust_base`` require the pending card's server-derived *pattern*.
-        The Gateway enforces which actions an app token may use.
+
+        With an app token, both routes require the app's manifest to declare
+        ``permissions.sessionApproval``, even for the app's own slots, and
+        answer 403 ``session_approval_not_granted`` without it. With the grant,
+        either route resolves a request only on a slot the app owns or on a
+        local user session, and never a background approval. Request ids can
+        recur across sessions, so without *slot_id* an id pending on more than
+        one session the app may control is refused; pass *slot_id* to name it.
+        Any refusal other than the missing grant is the 404 an unknown id also
+        gets, raised as ``ErrorCode.NOT_FOUND``.
         """
         if not request_id:
             raise KiroCrewError(ErrorCode.VALIDATION_ERROR, "request_id is required")
@@ -862,13 +897,25 @@ class KiroCrewClient:
             },
         )
 
-    async def flush_pending_context(self, slot_id: str) -> None:
+    async def flush_pending_context(self, slot_id: str) -> int:
+        """Post every buffered context entry to *slot_id*.
+
+        Returns the number of entries the full queue refused and this call
+        dropped. A ``context_not_queued`` refusal is not transient — only a turn
+        drains the queue, and ``send_message`` calls this right before sending
+        that turn — so re-queuing such an entry and raising would block every
+        later send behind a queue only the blocked send could drain. Those
+        entries are dropped (with a warning) and the call returns rather than
+        raising. A transient failure (network, auth, 5xx) is different: the entry
+        is put back and the first such error is raised, so a retry can resend it.
+        """
         now = time.time()
         to_flush = [
             e for e in self._pending_buffer if e.max_age is None or e.injected_at + e.max_age >= now
         ]
         self._pending_buffer.clear()
-        failed: list[Any] = []
+        requeue: list[Any] = []
+        dropped = 0
         last_exc: Exception | None = None
         for entry in to_flush:
             try:
@@ -881,12 +928,27 @@ class KiroCrewClient:
                         "maxAge": entry.max_age,
                     },
                 )
+            except KiroCrewError as exc:
+                if exc.code == ErrorCode.CONTEXT_NOT_QUEUED:
+                    # The queue is full; this entry cannot be seated now and no
+                    # retry here can change that. Drop it so the pending send is
+                    # not blocked, and warn so the loss is visible.
+                    dropped += 1
+                    logger.warning(
+                        "Dropped a pending context entry for slot %s: the "
+                        "Gateway's context queue is full (context_not_queued)",
+                        slot_id,
+                    )
+                    continue
+                last_exc = exc
+                requeue.append(entry)
             except Exception as exc:
                 last_exc = exc
-                failed.append(entry)
-        self._pending_buffer.extend(failed)
+                requeue.append(entry)
+        self._pending_buffer.extend(requeue)
         if last_exc:
             raise last_exc
+        return dropped
 
     def set_default_slot(self, slot_id: str) -> None:
         self._default_slot = slot_id

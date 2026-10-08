@@ -112,8 +112,6 @@ def register(app: web.Application) -> None:
         "/api/chat/slots/{slot}/reset-conversation", chat.api_chat_slot_reset_conversation
     )
     app.router.add_post("/api/chat/slots/{slot}/agent", chat.api_chat_slot_agent)
-    app.router.add_get("/api/chat/slots/{slot}/runtime", chat.api_chat_slot_runtime)
-    app.router.add_post("/api/chat/slots/{slot}/runtime", chat.api_chat_slot_runtime)
 
     # Optimizer
     app.router.add_post("/api/optimizer/optimize", handlers.handle_optimize)
@@ -134,10 +132,15 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/chat/slots/{slot}/followup", chat.api_chat_slot_followup)
     app.router.add_post("/api/worktree/create", api_worktree_create)
     app.router.add_get("/api/recent-projects", chat.api_recent_projects)
+    # Favourited project directories: the picker's third tab. Separate persistence from
+    # the recents list above (see _favorite_projects_path), so the three verbs are their
+    # own handlers rather than a flag on the recents read.
+    app.router.add_get("/api/favorite-projects", chat.api_favorite_projects)
+    app.router.add_post("/api/favorite-projects", chat.api_favorite_project_add)
+    app.router.add_delete("/api/favorite-projects", chat.api_favorite_project_remove)
     app.router.add_patch("/api/chat/slots/{slot}/color", chat.api_chat_slot_color)
     # Context injection (App Kit — silent background context)
     app.router.add_post("/api/chat/slots/{slot}/context", chat.api_chat_slot_context)
-    app.router.add_post("/api/chat/slots/{slot}/return-handoff", chat.api_chat_slot_return_handoff)
     # Note — visible transcript line + silent next-turn context, no LLM turn
     app.router.add_post("/api/chat/slots/{slot}/note", chat.api_chat_slot_note)
     app.router.add_post("/api/chat/slots/{slot}/fork", chat.api_chat_slot_fork)
@@ -149,6 +152,7 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/chat/threads/{mid}/reply", chat_threads.api_chat_thread_reply)
     app.router.add_post("/api/chat/slots/{slot}/side/open", handlers.api_side_open)
     app.router.add_post("/api/chat/slots/{slot}/side/turn", handlers.api_side_turn)
+    app.router.add_post("/api/chat/slots/{slot}/side/stop", handlers.api_side_stop)
     app.router.add_post("/api/chat/slots/{slot}/side/close", handlers.api_side_close)
     app.router.add_delete(
         "/api/chat/slots/{slot}/side/queue/{queue_id}",

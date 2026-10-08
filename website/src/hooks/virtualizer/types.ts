@@ -231,6 +231,9 @@ export interface UseVirtualChatReturn<T> {
   scrollToIndex: (index: number, opts?: ScrollToIndexOptions) => void
   /** Scroll to the bottom (latest message). */
   scrollToBottom: (behavior?: ScrollBehavior) => void
+  /** Keep every row in the inclusive-start, exclusive-end range mounted;
+   * unmounting a native selection endpoint can move the selection into chrome. */
+  retainRange: (range: RetainedVirtualRange | null) => void
   /** Ensure `index` is mounted (in the window) without scrolling — lets a
    * caller's DOM-based scroll target an off-window item. Returns `true` when
    * the target is FAR (off the current window by more than the near-jump
@@ -244,10 +247,6 @@ export interface UseVirtualChatReturn<T> {
    * frame while steering toward an unmounted row. `null` with no scroller or
    * no items. */
   estimateRowTop: (index: number) => number | null
-  /** Keep every item in `range` mounted until the caller clears it. This is
-   * for a native text selection whose endpoints would otherwise be unmounted
-   * while the user scrolls a selection handle. */
-  retainRange: (range: RetainedVirtualRange | null) => void
   /** Ref callback used per-item to register ResizeObserver measurement. */
   measureRef: (index: number) => (el: HTMLElement | null) => void
   /** True while an anchored entry is still waiting for its row to hydrate, so a

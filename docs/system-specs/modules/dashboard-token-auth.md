@@ -46,7 +46,7 @@ surfaces, and `X-Session-Key: dashboard:ui` stays correlation metadata.
 |---|---|
 | Proactive rotation before the access cookie expires, and the cold-start `GET /api/auth/me` → `POST /api/auth/refresh` recovery | `website/src/hooks/useRefreshScheduler.ts`, mounted by `DashboardBootstrap` outside the prerequisite gate |
 | The one in-flight `POST /api/auth/refresh` that every trigger shares | `website/src/api/refreshOnce.ts` |
-| The `X-Session-Key` default, the request helpers and the `j`/`jNullable` parsers; the warm-path silent refresh on a 403 `X-Auth-Required`; the embedded-pane hand-off; the re-auth banner with its in-place `GET /api/auth/me?token=` exchange; the 401 `stale_session_reauth` prompt; and the sign-in instruction shown in place of the gateway's own refusal reason | `website/src/api/client.ts` |
+| The `X-Session-Key` default, the request helpers and the `j`/`jNullable`/`jInstancesDisabled` parsers (the last one reads `/api/instances` and does not journal the expected 403 a disabled instances control plane answers); the warm-path silent refresh on a 403 `X-Auth-Required`; the embedded-pane hand-off; the re-auth banner with its in-place `GET /api/auth/me?token=` exchange; the 401 `stale_session_reauth` prompt; and the sign-in instruction shown in place of the gateway's own refusal reason | `website/src/api/client.ts` |
 | The `api` object's endpoint methods, grouped by domain under `website/src/api/client/`, each module built on the transport above rather than its own; the mobile sign-in mint `POST /api/auth/mobile-link` is `mobileLoginLink` in `website/src/api/client/remoteAccess.ts`. Four methods stay defined in `client.ts`: three that other docs or the i18n gate pin there, and `wakatimeExportDownload`, which reads a sibling through `api` at call time | the domain endpoint modules |
 | The words for an interposed proxy's sign-in page, and the generic error text other failures render with | `website/src/api/edgeAuthChallenge.ts` and `website/src/api/apiError.ts` |
 
@@ -58,7 +58,7 @@ The sequence below is the Slack implementation. Telegram, Teams and Webex call
 ```mermaid
 sequenceDiagram
     participant Owner as Slack Owner
-    participant Handler as handler.py (!dashboard)
+    participant Handler as commands.py (_bang_dashboard)
     participant Allowlist as allowlist.py (send_dashboard_link)
     participant TokenGen as token_auth.py
     participant Browser as Browser
@@ -96,16 +96,33 @@ sequenceDiagram
 > with per-session revocation (`revoke_access_cookie`), an individual leaked
 > session can be killed without the global generation bump.
 
-Middleware chain (explicit ordering in `server.py`):
+Middleware chain, outermost first (the explicit list `start_dashboard` in `server.py`
+installs through `_install_dashboard_middlewares` in `server_runtime/middleware_chain.py`;
+the last two gates are appended by their lifecycle registrations):
 
 ```mermaid
 graph LR
-    Z[deny_audit] --> A[host_canonical_redirect] --> B[host_validation] --> C[no_cache] --> D[csrf] --> E[token_auth] --> F[sel_audit] --> G[spa_fallback]
+    L[route_latency] --> Z[deny_audit] --> A[host_canonical_redirect] --> B[host_validation] --> C[no_cache] --> D[csrf] --> E[token_auth] --> F[sel_audit] --> S[slot_ownership] --> G[spa_fallback] --> W[_workflow_ready] --> P[_crewmate_prune_gate]
 ```
 
-1. CSRF checks run first (reject cross-origin mutating requests)
-2. Token auth validates identity
-3. SEL audit logs the authenticated operation
+1. Route latency is outermost, so it times the full in-gateway handling, and the
+   deny-audit boundary sits inner to it only
+2. The host barriers and CSRF reject a wrong `Host` and a cross-origin mutating
+   request before token auth runs
+3. Token auth validates identity
+4. SEL audit logs the authenticated operation
+5. The per-slot checkpoint (`slot_ownership_middleware`,
+   `dashboard/slot_ownership.py`) decides an app caller's reach on every
+   `/api/chat/slots/{slot}/*` route before its handler runs. It reads the `app`
+   claim token auth published, and a refusal it answers is inside the SEL audit
+   record. It is not an auth layer: a request with no app claim passes it
+   untouched. Contract: [App Kit platform §13](app-kit-platform.md).
+6. `_workflow_ready` (`_register_workflow_lifecycle`) answers 503 on `/api/workflows`
+   until the workflow service is ready, and `_crewmate_prune_gate`
+   (`_register_crewmate_prune_gate`, dashboard only) holds every mutating request,
+   and any request under `/api/members`, until the crewmate prune settles, 503
+   past its timeout.
+   Both RETURN their refusal, inner to `sel_audit`.
 
 `deny_audit` (`_make_deny_audit_middleware`, installed on both entrypoints) is
 outer to every barrier that can refuse, and `sel_audit` is inner to all of them —
@@ -118,7 +135,10 @@ for the mutating `/api/` requests it actually logs, and the two WebSocket-origin
 handlers that log their own denial. `token_auth` RETURNS its 401/403 rather than
 raising and audits each itself, so returned responses are not inspected. Not
 claiming is the safe direction — the boundary then records the refusal under a
-generic reason.
+generic reason. Three refusing layers sit inner to `sel_audit`, and each RETURNS
+rather than raises, so the boundary never sees them: the per-slot checkpoint (a
+404, plus its own `app_isolation` row for a slot that exists) and the two appended
+gates (`_workflow_ready`, `_crewmate_prune_gate`, each a 503).
 
 ## Components
 
@@ -131,8 +151,12 @@ Location: `src/kiro_crew/dashboard/token_auth.py`
 `base64url(payload).base64url(HMAC-SHA256-signature)` where payload is compact JSON:
 
 ```json
-{"sub":"U1234ABCD","exp":1711000300.0,"session_exp":1711003600.0,"iat":1711000000.0}
+{"sub":"U1234ABCD","exp":1711000300.0,"session_exp":1711003600.0,"iat":1711000000.0,"nonce":"…","gen":0}
 ```
+
+`generate_token` always emits these six claims: `nonce` makes each token distinct,
+and `gen` is the revocation generation `validate_token` compares against the persisted
+value. `app`, `prompt`, `peer_key` and the scoping claims below are added only when set.
 
 Two expiry times:
 - `exp`: link click expiry; query-param validation uses this claim (`token_auth.validate_token`).
@@ -295,7 +319,14 @@ The `local_only` parameter is accepted for backward compatibility but does not c
 
 Request flow:
 1. Internal-path handling is separate: a loopback caller with a valid `X-Internal-Secret` is admitted, a mixed internal path can validate a cookie, and a strict internal path denies non-loopback callers; ordinary loopback requests continue to the token gate (`token_auth_middleware`; `test_loopback_requires_token`).
-2. Bypass named non-secret routes: prefix routes `/assets/`, `/static/`, `/fonts/`, `/vendor/`, `/artifact-app/`, `/sandbox-doc/`, and `/browser-view/`; exact routes `/logo.png`, `/favicon.ico`, `/manifest.json`, `/sw.js`, `/pcm-worklet.js`, `/api/token/local`, `/api/shutdown`, `/api/logout`, `/api/theme/boot`, `/api/health`, `/api/live`, `/api/ready`, and `/browser-view` (the bare form, which the trailing-slash prefix misses — bypassed so the relay's uniform 404 answers instead of the middleware's distinguishable 403); anchored icon files; and method-scoped routes `GET`/`HEAD /apps/<name>/ui/*`, `POST /api/hooks/agent`, `POST /api/messaging/teams`, `POST /api/apps/<name>/token`, `POST /api/auth/refresh`, and `POST /api/auth/logout` (`_BYPASS_PREFIXES`, `_BYPASS_EXACT`, `_BYPASS_EXACT_METHODS`, and `token_auth_middleware()`). `/browser-view/` is unlike every other bypass on this list: it is the one route that **proxies foreign content** (the Playwright CLI browser view) rather than serving gateway-owned assets. It carries its own authentication — a per-instance capability token embedded in the path, minted by the view supervisor and disclosed only through the cookie-authed, owner-gated `/api/browser/view` payload, constant-time-compared before any per-request ownership probe runs — and every tokenless or wrong-token request answers a uniform 404. The full model (post-connect ownership re-proof, CSP sandbox stamp, SEL audit of every allow/deny) is specified in `dashboard/handlers/browser_view_relay.py` and the [browser module spec](browser.md).
+2. Bypass named non-secret routes: prefix routes `/assets/`, `/static/`, `/fonts/`, `/vendor/`, `/artifact-app/`, `/sandbox-doc/`, and `/browser-view/`; exact routes `/logo.png`, `/favicon.ico`, `/manifest.json`, `/sw.js`, `/pcm-worklet.js`, `/api/token/local`, `/api/shutdown`, `/api/logout`, `/api/theme/boot`, `/api/health`, `/api/live`, `/api/ready`, and `/browser-view` (the bare form, which the trailing-slash prefix misses — bypassed so the relay's uniform 404 answers instead of the middleware's distinguishable 403); anchored icon files; and method-scoped routes `GET`/`HEAD /apps/<name>/ui/*`, `POST /api/hooks/agent`, `POST /api/messaging/teams`, `POST /api/apps/<name>/token`, `POST /api/auth/refresh`, `POST /api/auth/logout`, and `POST /api/update/revalidate` (`UPDATE_REVALIDATE_PATH`: the CLI's post-update badge revalidate, which self-authenticates over loopback with `X-Local-Secret`, re-checked in `api_update_revalidate`) (`_BYPASS_PREFIXES`, `_BYPASS_EXACT`, `_BYPASS_EXACT_METHODS`, and `token_auth_middleware()`). `/browser-view/` is unlike every other bypass on this list: it is the one route that **proxies foreign content** (the Playwright CLI browser view) rather than serving gateway-owned assets. It carries its own authentication — a per-instance capability token embedded in the path, minted by the view supervisor and disclosed only through the cookie-authed, owner-gated `/api/browser/view` payload, constant-time-compared before any per-request ownership probe runs — and every tokenless or wrong-token request answers a uniform 404. The full model (post-connect ownership re-proof, CSP sandbox stamp, SEL audit of every allow/deny) is specified in `dashboard/handlers/browser_view_relay.py` and the [browser module spec](browser.md).
+
+   `/api/token/local` carries its own gate: loopback (or a same-principal unix
+   peer), then `X-Local-Secret`, then the local-owner process check. Each
+   refusal is a `403` with a machine-readable `code` matching its SEL
+   `token.local` record's `resources`: `loopback_only` (`non-loopback`),
+   `invalid_secret` (`invalid-secret`) and `member_owner_token_refused`
+   (`unverified-owner-process`).
 3. Extract token from `?token=` query param or `mc_token_{port}` cookie
 4. Validate signature + expiry (link window for query param, session_exp for cookie)
 5. Check IP binding
@@ -373,8 +404,8 @@ weekend), the browser requests `GET /` with no token. Instead of a dead-end
 can boot and silently refresh its own session. Only the shell HTML goes out
 unauthenticated — all data stays gated.
 
-**How it works:** any `GET`/`HEAD` request **outside** the excluded data
-prefixes (`SPA_FALLBACK_EXCLUDED_PREFIXES`, below) is treated as a client-side
+**How it works:** any `GET`/`HEAD` request that `_is_spa_shell_request` (below)
+accepts is treated as a client-side
 SPA navigation, and the middleware serves the shell **directly** (an injected
 `spa_shell_handler`, i.e. `handlers.index`) — it does **not** fall through to
 the matched route handler. The booted app then runs its cold-start
@@ -384,14 +415,25 @@ If `index()` cannot read the static bundle, its `FileNotFoundError` fallback
 body (`_DASHBOARD_HTML_NOT_FOUND` in `handlers/core.py`) is likewise static and
 secret-free, honoring the same unauthenticated cold-start contract.
 
-**One exclusion list, no drift:** `SPA_FALLBACK_EXCLUDED_PREFIXES` in
-`token_auth.py` is the single source of truth for "paths that are never the SPA
-shell" — `/api/`, `/apps/`, `/v1/` (OpenAI-compat data API), and the static
-mounts. Both the auth middleware (this bypass) and `server.py`'s SPA fallback
-read the same list, so they cannot diverge. `/apps/` and `/v1/` are matched
-routes that never reach the fallback anyway; listing them just makes the auth
-gate explicit. `test_no_get_route_outside_shell_exclusions` fails CI if a new
-data `GET` route is ever added outside this list.
+**One predicate, no drift:** `_is_spa_shell_request` in `token_auth.py` is the
+single source of truth for "paths that are never the SPA shell". It combines
+three exclusions:
+
+- `SPA_FALLBACK_EXCLUDED_PREFIXES`: `/api/`, `/v1/` (OpenAI-compat data API),
+  the static mounts (`/assets/`, `/static/`, `/sprites/`, `/vendor/`, `/fonts/`,
+  `/app-assets/`, `/artifact-app/`, `/sandbox-doc/`), `/feature-videos/` and
+  `/browser-view`. `/apps/` is deliberately not in the tuple.
+- `_APPS_SPA_EXCLUDED_RE` for `/apps/`: only `/apps/<name>/api/…`,
+  `/apps/<name>/art/…` and `/apps/<name>/ui/…` have server handlers. Every
+  other `/apps/` path (bare `/apps/<name>`, `/apps/detail/<name>`,
+  `/apps/migrate/<name>`) is a React Router entry and gets the shell.
+- The app window entry paths `server.py` registers at startup
+  (`register_app_window_paths`), matched exactly.
+
+Both the auth middleware (this bypass) and the SPA fallback middleware in
+`server_runtime/middleware_chain.py` call the same predicate, so they cannot
+diverge. `test_no_get_route_outside_shell_exclusions` fails CI if a new data
+`GET` route is ever added outside these exclusions.
 
 Security invariants:
 - **GET/HEAD only** — no state-changing method ever bypasses auth.
@@ -419,7 +461,7 @@ _state: TokenStateManager                  # Singleton instance
 
 class TokenStateManager:
     _nonces: OrderedDict[str, float]       # link nonce -> expiry (FIFO, max 50)
-    _ip_bindings: dict[str, tuple[str, float]]  # token -> (ip, exp)
+    _peer_bindings: dict[str, tuple[str, float, bool]]  # pin key -> (peer_key, exp, proxied)
     _consumed: dict[str, float]            # token -> exp
 ```
 
@@ -441,13 +483,18 @@ An **app token** (payload carries a non-empty `app` claim, minted by the `X-App-
 - It is enforced in **every** middleware branch that admits a token (the normal cookie/query-param flow and the cross-app `/apps/<other>/api` reverse-proxy re-check) — otherwise an app token could reach a mixed internal path (e.g. `/api/chat`, `/api/spawn`) with no app identity set and be mistaken for the dashboard user (privilege escalation).
 - It is a **no-op for dashboard-user tokens** (empty `app` claim), which bypass the gate entirely.
 
-### 2. `origin.py` — Dashboard URL & Bind Address Resolution
+### 2. `urls.py` / `origin.py` — Dashboard URL & Bind Address Resolution
 
-Location: `src/kiro_crew/dashboard/origin.py`
+Location: `src/kiro_crew/dashboard/urls.py` (the request-independent helpers, a
+stdlib-only leaf) and `src/kiro_crew/dashboard/origin.py` (the per-request origin
+checks, which also re-exports the `urls.py` helpers so existing imports keep
+working).
 
-Centralizes dashboard URL parsing, bind-address resolution, origin-set construction, and per-request origin validation. Shared by `server.py`, `ws.py`, `gateway.py`, and `allowlist.py`.
+Together they centralize dashboard URL parsing, bind-address resolution,
+origin-set construction, and per-request origin validation. Shared by
+`server.py`, `ws.py`, `gateway.py`, and `allowlist.py`.
 
-Key functions:
+Key functions (in `urls.py`):
 
 ```python
 def parse_dashboard_url(url: str) -> tuple[str, int]: ...
@@ -456,15 +503,17 @@ def parse_dashboard_url(url: str) -> tuple[str, int]: ...
 
 def is_local_only(dashboard_host: str, slack_connected: bool) -> bool: ...
     # Determines bind address and CSRF origins (not token auth; ordinary loopback requests remain token-gated by token_auth_middleware, as test_loopback_requires_token verifies)
-    # True when: no Slack, loopback host, or localhost machine → bind 127.0.0.1
-    # False when: non-loopback host configured with Slack → bind 0.0.0.0
+    # Always True in the public build; False only behind a managed proxy
+    # (devspaces_proxy_url), and there is none in OSS
 
 def bind_address_for(local_only: bool) -> str: ...
     # "127.0.0.1" if local_only, "0.0.0.0" otherwise
+    # KIROCREW_BIND (env) overrides the bind ADDRESS only, e.g. 0.0.0.0 inside a container
 
 def resolve_dashboard_host(local_only: bool, configured_host: str = "") -> str: ...
-    # Returns hostname for URL construction
-    # Returns kirocrew.localhost directly for local-only mode (RFC 6761)
+    # Returns hostname for URL construction: the configured host if set,
+    # else "localhost" for local-only mode (Safari and the macOS resolver
+    # do not resolve *.localhost names)
 
 def build_allowed_origins(port: int, local_only: bool, configured_host: str = "") -> set[str]: ...
     # CSRF origin allowed list
@@ -472,33 +521,40 @@ def build_allowed_origins(port: int, local_only: bool, configured_host: str = ""
 
 ### 3. `!dashboard` Command Handler
 
-Location: `src/kiro_crew/slack/handler.py` → `_handle_slash_command`
+Location: `src/kiro_crew/slack/handler_runtime/commands.py` → `_bang_dashboard`, dispatched by `_handle_slash_command` (re-exported by `slack/handler.py`)
 
-Parses `!dashboard [duration]`, delegates to `allowlist.send_dashboard_link()`:
+Parses `!dashboard [duration]`, delegates to `allowlist.send_dashboard_link()`
+(abbreviated body of `_bang_dashboard`):
 
 ```python
-if cmd == "!dashboard":
-    parts = cmd_text.split()
-    ttl = 3600
-    if len(parts) >= 2:
-        parsed = parse_duration(parts[1])
-        if parsed is None:
-            # reply with usage message
-        ttl = parsed
-    url = await send_dashboard_link(slack, user_id, ttl)
+parts = cmd_text.split()
+ttl = 3600
+if len(parts) >= 2:
+    parsed = parse_duration(parts[1])
+    if parsed is None:
+        await slack.post_message(channel, "Usage: `!dashboard [<N>h|<N>m]` …", reply_ts)
+        return ""
+    ttl = parsed
+
+url = await send_dashboard_link(slack, user_id, ttl)
+if url:
+    await slack.post_message(channel, "🔗 Dashboard link sent via DM.", reply_ts)
+else:
+    await slack.post_message(channel, "❌ Failed to send dashboard link.", reply_ts)
+return ""
 ```
 
 ### 4. `send_dashboard_link()` — Token URL Generation & DM Delivery
 
 Location: `src/kiro_crew/slack/allowlist.py`
 
-Generates the token, constructs the URL using `origin.py` helpers, and DMs it to the owner (never posted in channels to prevent token leakage):
+Generates the token, constructs the URL using the `urls.py` helpers, and DMs it to the owner (never posted in channels to prevent token leakage). Abbreviated; the real function also handles the opt-in tunnel URL (`slack.use_tunnel_url`):
 
 ```python
 async def send_dashboard_link(slack, user_id, ttl=3600) -> str:
     session_ttl = min(ttl, MAX_SESSION_TTL_SECS)
     cfg = KiroCrewConfig.load()
-    configured_host, port = parse_dashboard_url(cfg.dashboard_url)
+    configured_host, port = parse_dashboard_url(cfg.dashboard.url)
     local_only = is_local_only(configured_host, True)
     host = resolve_dashboard_host(local_only, configured_host)
     token = generate_token(user_id, session_ttl)
@@ -510,37 +566,59 @@ async def send_dashboard_link(slack, user_id, ttl=3600) -> str:
 
 ### 5. `server.py` Integration
 
-`start_dashboard()` accepts `local_only: bool` and `configured_host: str`, wires the middleware:
+`start_dashboard()` accepts `local_only: bool` and `configured_host: str`, builds the
+barriers from the shared factories, and installs the chain
+(`server_runtime/middleware_chain.py`):
 
 ```python
 app.middlewares[:] = [
+    make_route_latency_middleware(),
     deny_audit_middleware,
     host_canonical_redirect,
     host_validation_middleware,
+    reject_compressed_body_middleware,
     no_cache_middleware,
     csrf_middleware,
-    token_auth_middleware(local_only=local_only),
+    token_auth_middleware(
+        internal_paths=_STRICT_INTERNAL_API_PATHS,
+        mixed_internal_paths=_mixed_internal_api_paths(),
+        local_only=local_only,
+        spa_shell_handler=handlers.index,
+        ...,
+    ),
     sel_audit_middleware,
+    slot_ownership_middleware,
     spa_fallback,
 ]
-site = web.TCPSite(runner, bind_address_for(local_only), port)
+# appended before runner.setup(): _workflow_ready, then _crewmate_prune_gate
+site = web.SockSite(runner, _dashboard_sock)
+# _dashboard_sock: _reserve_dashboard_port(bind_address_for(local_only), port)
 ```
 
-The two internal-path sets passed to `token_auth_middleware` are module-level
-constants — `_STRICT_INTERNAL_API_PATHS` and `_MIXED_INTERNAL_API_PATHS` — so
-the headless server (below) binds to the **same** sets and the two entrypoints
-cannot drift.
+`reject_compressed_body_middleware` (`dashboard/slowloris.py`) answers `415`
+`unsupported_content_encoding` for any request with a body and a
+`Content-Encoding` other than `identity`. It pairs with the hardened runner
+(`SlowlorisAppRunner`), which forces aiohttp's `auto_decompress=False` so a
+compressed body is never inflated synchronously on the event loop; without the
+middleware such a body would reach a handler as raw bytes.
+
+The two internal-path sets passed to `token_auth_middleware` are the module-level
+`_STRICT_INTERNAL_API_PATHS` and `_MIXED_INTERNAL_API_PATHS` in `server.py`, the
+second read through `_mixed_internal_api_paths()` so an edition's mixed paths join
+it — so the headless server (below) binds to the **same** sets and the two
+entrypoints cannot drift.
 
 #### `start_api_server()` — headless (`--slack-only`) parity
 
 The `--slack-only` gateway starts `start_api_server()` instead of
 `start_dashboard()`. It serves the **same** MCP tool route surface
-(`_register_mcp_routes`), so it mounts an auth chain at parity:
-`deny_audit_middleware → host_validation_middleware → csrf_middleware →
-token_auth_middleware(
+(`_register_mcp_routes`), so it mounts an auth chain at parity
+(`_install_api_middlewares`):
+`route_latency → deny_audit_middleware → host_validation_middleware →
+reject_compressed_body_middleware → csrf_middleware → token_auth_middleware(
 internal_paths=_STRICT_INTERNAL_API_PATHS,
-mixed_internal_paths=_MIXED_INTERNAL_API_PATHS, spa_shell_handler=None) →
-sel_audit_middleware`. It generates and persists the same
+mixed_internal_paths=_mixed_internal_api_paths(), spa_shell_handler=None) →
+sel_audit_middleware → slot_ownership_middleware`, then `_workflow_ready`. It generates and persists the same
 `~/.kiro/crew/.local_secret` (or the explicit `KIROCREW_HOME`), sets
 `app["local_secret"]`, and builds
 `app["allowed_origins"]`. `spa_shell_handler=None` because there is no UI — a
@@ -562,8 +640,8 @@ same-uid process can read `.local_secret`), but the session identity in
 any session's key. To close that gap, both server entrypoints additionally
 bind a `web.UnixSite` on the **same** `AppRunner` at
 `dashboard_socket_path(port)` (`~/.kiro/crew/dashboard-<port>.sock`,
-port-suffixed so multi-instance homes don't collide; see
-`server._start_unix_site`). Windows and any bind failure degrade to TCP-only
+port-suffixed so multi-instance homes don't collide; see `_start_unix_site` in
+`server_runtime/listener.py`). Windows and any bind failure degrade to TCP-only
 — today's behavior — after one log line. The socket file is unlinked
 best-effort at shutdown and self-heals from stale files at startup.
 
@@ -577,7 +655,7 @@ either auth flavor can grant (see `_verify_unix_peer`):
    `AF_UNIX` connection always yields peer credentials, so `UNVERIFIABLE`
    means the attestation mechanism itself failed.
 2. `socketsec.get_peer_pid` (`SO_PEERCRED` / `LOCAL_PEERPID`) → peer pid.
-3. `peer_resolve.resolve_peer_identity(..., signed_only=True)` (the same
+3. `peer_resolve.resolve_peer_tenancy(..., signed_only=True)` (the same
    host-namespace /proc ancestry walk gatewayd uses for stub registration,
    offloaded to the subprocess executor) → the session key of the nearest
    ancestor whose `session_pid_<pid>.txt` **HMAC sidecar verifies**. The bare
@@ -611,8 +689,14 @@ either auth flavor can grant (see `_verify_unix_peer`):
    declared key absent from a SHORT membership is still challenged rather than
    admitted as "membership unknown". Both outcomes are SEL-recorded, including
    the admitted one, and each names the roster shape it judged so the trail
-   distinguishes a full membership from a short one. A 1:1 pid is unchanged and
-   requires no token.
+   distinguishes a full membership from a short one. A verified token is
+   not the last check: the declared key must also hold a live entry for the
+   peer's process chain in one of the two ownership tables (lease or tenancy,
+   `_bound_session_keys_on_chain`). When those tables bind any session there
+   and the declared key is not among them → **403** `peer_session_unbound`,
+   SEL `dashboard.peer-session-unbound`. An admitted row records
+   `binding=confirmed` or `binding=no evidence`. The same check follows every
+   token demand below. A 1:1 pid is unchanged and requires no token.
 6. A mapping exists in the ancestry and its **MAC does not verify** → the same
    token demand as step 5, `peer_session_unattested` on failure. That includes a
    `.sig` whose text is not a hex MAC at all: the resolver compares the MAC as
@@ -632,8 +716,11 @@ either auth flavor can grant (see `_verify_unix_peer`):
    that the pid moved on rather than ambiguity about who is calling, an agent
    cannot plant a signed one, and the orphan sweep leaves one for every live
    recycled pid — so it goes to step 7.
-7. Nothing resolved on disk, but the **live session manager** reports the peer's
-   ancestry hosting several sessions → the same token demand as step 5. Disk
+7. Nothing resolved on disk, so the **live session manager** is asked which
+   sessions the peer's ancestry hosts. Exactly one, equal to the declared key →
+   proceed with `request["peer_verified"] = True` and no token: the manager
+   itself attests the 1:1 binding. Exactly one, with a different key, or
+   several → the same token demand as step 5. Disk
    absence is not evidence here: the pair lives in the data-home root, which is
    writable inside the agent sandbox, so a co-tenant reaches this arm with one
    `unlink` — and the roster it read before deleting tells it which sibling key to
@@ -641,9 +728,8 @@ either auth flavor can grant (see `_verify_unix_peer`):
    the deleter picks its moment. The manager answers from memory, in this process,
    about runtimes it owns, so it is the one account of a pid's tenancy an agent
    cannot edit. Its rows are filtered to sessions (`sid` present) for the same
-   reason the publisher filters them, and the demand is keyed on a count ABOVE
-   ONE: one session is not evidence of sharing, and an unreachable manager answers
-   zero, which is no evidence rather than a verdict.
+   reason the publisher filters them. An unreachable manager answers zero, which
+   is no evidence rather than a verdict.
 8. Nothing resolved and no evidence of sharing from either source — no mapping in
    the ancestry, or only a proven recycle, and a manager that knows of none or
    cannot answer → proceed under today's semantics (a warm-pool runtime before
@@ -687,10 +773,10 @@ byte-identical to the pre-token scheme. The senders are `mcp_core`'s own
 
 ### 6. `gateway.py` Integration
 
-`_init_dashboard()` resolves config and passes to `start_dashboard()`:
+`_init_dashboard()` resolves config and passes to `start_dashboard()` (abbreviated):
 
 ```python
-configured_host, dashboard_port = parse_dashboard_url(self._cfg.dashboard_url)
+configured_host, dashboard_port = parse_dashboard_url(self._cfg.dashboard.url)
 self._local_only = is_local_only(configured_host, self._slack_enabled)
 await start_dashboard(
     ...,
@@ -727,12 +813,15 @@ Single `dashboard.url` field on `KiroCrewConfig` (default: `""`), loaded from `c
 }
 ```
 
-`is_local_only()` determines the bind address and CSRF origins (not token auth):
-- No Slack → local-only (bind 127.0.0.1, no remote access)
-- Loopback host → local-only
-- Non-loopback host → all interfaces (`0.0.0.0`), token auth required for non-loopback clients
-- No URL + remote machine + Slack → all interfaces
-- No URL + localhost machine → local-only
+`is_local_only()` determines the bind address and CSRF origins (not token auth).
+In the public build it always answers local-only, so the gateway binds
+`127.0.0.1` whatever `dashboard.url` names; it answers otherwise only behind a
+managed proxy, and there is none in OSS. To reach the dashboard from elsewhere,
+run your own reverse proxy and add its origin through `dashboard.url` or
+`KIROCREW_CORS_ORIGINS`. `KIROCREW_BIND` (env) overrides only the bind address
+(`bind_address_for`): the container image sets `0.0.0.0` so a published port is
+reachable, and URLs, CSRF origins and host canonicalization still follow
+local-only.
 
 Note: Loopback is accepted by `origin.check_origin()`'s no-Origin CSRF branch, supporting local POST clients. Ordinary loopback requests remain token-gated (`token_auth.token_auth_middleware()`; `test_loopback_requires_token`); internal routes use their separate secret or mixed cookie-authentication branches.
 
@@ -767,6 +856,8 @@ Note: Loopback is accepted by `origin.check_origin()`'s no-Origin CSRF branch, s
 | Consumed token from different client | 403 | JSON for `/api/*`, HTML for pages |
 | Malformed token (can't decode) | 403 | JSON for `/api/*`, HTML for pages |
 | Invalid duration in `!dashboard` | N/A | Slack usage message |
+| `POST /api/auth/refresh` whose rotation, or whose reuse revocation, could not be persisted | 503 | JSON `code: refresh_state_unavailable`; the refresh store is then degraded and fails every refresh closed until its storage is repaired and the gateway restarted |
+| `POST /api/auth/logout` whose revocation could not be persisted | 503 | JSON `logged_out: false`, `code: refresh_state_unavailable`; the cookies are still cleared |
 
 HTML 403 page includes instructions to run `!dashboard` in Slack. The middleware never raises unhandled exceptions.
 
@@ -804,4 +895,4 @@ token flow, which could not clear it.
 9. Bounded concurrent nonces (`TokenStateManager`) — prevents unbounded memory growth while allowing active link nonces to refresh their eviction position
 10. Explicit revocation via `kirocrew logout` — clears all nonces, IP bindings, and consumed tokens, and bumps the persisted revocation generation, ending every outstanding access cookie and refresh chain
 11. App-token scope confinement (CWE-269) — an `app`-claim token is confined deny-by-default to its own namespace (`/apps/<name>`, `/api/apps/<name>`) + its manifest `permissions.api` allowlist, enforced at every grant point; no-op for dashboard-user tokens
-12. Headless (`--slack-only`) auth parity — `start_api_server()` serves the same MCP route surface as the dashboard and mounts the same `deny_audit → host_validation → csrf → token_auth → sel_audit` chain against the shared `_STRICT_INTERNAL_API_PATHS`/`_MIXED_INTERNAL_API_PATHS` sets. Internal MCP routes require loopback **plus** `X-Internal-Secret` (loopback alone is not sufficient for these paths — port forwarders can spoof `127.0.0.1`); `sel_audit_middleware` alone only logs and is never a substitute for the token-auth chain
+12. Headless (`--slack-only`) auth parity — `start_api_server()` serves the same MCP route surface as the dashboard and mounts the same `route_latency → deny_audit → host_validation → csrf → token_auth → sel_audit → slot_ownership` chain (then `_workflow_ready`) against the shared `_STRICT_INTERNAL_API_PATHS`/`_MIXED_INTERNAL_API_PATHS` sets. Internal MCP routes require loopback **plus** `X-Internal-Secret` (loopback alone is not sufficient for these paths — port forwarders can spoof `127.0.0.1`); `sel_audit_middleware` alone only logs and is never a substitute for the token-auth chain

@@ -1,4 +1,4 @@
-"""Tests for the prepare-pr preflight.py write-permission gate.
+"""Tests for the kirocrew-prepare-pr preflight.py write-permission gate.
 
 The gate closes a stranding failure mode: a comment/issue-triggered agent run
 does all its work (clone, plan, implement, test, review, commit) and only
@@ -55,7 +55,7 @@ PREFLIGHT = str(
     / "kiro_crew"
     / "builtin_skills"
     / "kirocrew-dev"
-    / "prepare-pr"
+    / "kirocrew-prepare-pr"
     / "scripts"
     / "preflight.py"
 )
@@ -729,6 +729,17 @@ class TestProbeTimeout:
         assert rc == 124
         assert "timed out" in err
         assert elapsed < 15, "run() blocked on the hanging child instead of killing it"
+
+    def test_a_call_without_a_bound_gets_the_git_bound(self, tmp_path, monkeypatch):
+        """gh auth status, gh pr view and the rev-list pass no timeout; none is unbounded."""
+        monkeypatch.chdir(tmp_path)
+        mod = _preflight_module()
+        monkeypatch.setattr(mod, "_WORKTREE_ROOT", str(tmp_path))
+        monkeypatch.setattr(mod, "GIT_TIMEOUT_S", 1)
+        start = time.monotonic()
+        rc, _, err = mod.run([sys.executable, "-c", "import time; time.sleep(30)"])
+        assert rc == 124 and "timed out" in err
+        assert time.monotonic() - start < 15
 
     def test_run_without_timeout_expiry_passes_through(self, tmp_path, monkeypatch):
         """A subprocess that finishes inside the bound is unaffected."""

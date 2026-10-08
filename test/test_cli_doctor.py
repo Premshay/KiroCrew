@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew import cli_doctor, cron, extras
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_PI
 
@@ -196,6 +196,25 @@ class TestDataHome:
         assert "Data Home" in out
         assert "legacy:" not in out
         assert "rm -rf" not in out
+
+    def test_location_prints_the_symlink_resolved_spelling(
+        self, monkeypatch, tmp_path: Path, capsys
+    ) -> None:
+        # A data home reached through a ``current`` symlink to a versioned
+        # directory is printed as its canonical target, so it cannot read as a
+        # second install beside the (already canonical) PATH launcher row.
+        versioned = tmp_path / "install" / "1.2.3"
+        versioned.mkdir(parents=True)
+        current = tmp_path / "install" / "current"
+        make_dir_link(current, versioned)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(cli_doctor, "config_dir", lambda: current)
+
+        cli_doctor._doctor_data_home()
+
+        out = capsys.readouterr().out
+        assert f"location:    ✅ {os.path.realpath(versioned)}" in out
+        assert str(current) not in out
 
 
 class TestPodSessionBus:
@@ -925,13 +944,13 @@ class TestSelectedBackendProjectionRow:
         record drift, so the selected-harness row states the kind's own gap and
         nothing about the reach.
 
-        Driven on the shipped opencode declaration, which carries `whole-server`, so
+        Driven on the shipped goose declaration, which carries `whole-server`, so
         the assertion is about the report rather than about a stub.
         """
-        cli_doctor._doctor_selected_backend_projection(self._cfg("opencode"))
+        cli_doctor._doctor_selected_backend_projection(self._cfg("goose"))
         assert capsys.readouterr().out == ""
 
-        cli_doctor._doctor_backend_ability_cards(self._cfg("opencode"))
+        cli_doctor._doctor_backend_ability_cards(self._cfg("goose"))
         out = capsys.readouterr().out
         assert out.count("per-tool deny: 'whole-server'") == 1, out
 
@@ -1359,11 +1378,47 @@ class TestGatewayMemoryLines:
         assert "412 MiB" in rss and "4242" in rss
 
     def test_disabled_ceiling_is_called_out(self, monkeypatch) -> None:
+        from kiro_crew.doctor_checks import resources
+
         self._cfg(monkeypatch, 0)
         monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: None)
+        monkeypatch.setattr(resources, "_gateway_lock_indeterminate", lambda: False)
         ceiling, rss = cli_doctor._gateway_memory_lines()
         assert "disabled" in ceiling and "nothing bounds" in ceiling
         assert "not running" in rss
+
+    def test_indeterminate_lock_probe_is_not_reported_as_not_running(self, monkeypatch) -> None:
+        """A serving Windows gateway's lock reads as indeterminate, not absent.
+
+        The same run's Connectivity row says the gateway is running; this row
+        must say the probe could not locate it rather than contradict that.
+        """
+        from kiro_crew import gateway_lock
+
+        self._cfg(monkeypatch, 1536)
+        monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: None)
+
+        def _indeterminate(home):
+            raise gateway_lock.LockProbeError(home / "gateway.lock", OSError("locked"))
+
+        monkeypatch.setattr(gateway_lock, "lock_holder", _indeterminate)
+        _ceiling, rss = cli_doctor._gateway_memory_lines()
+        assert "not running" not in rss
+        assert "could not locate the gateway process" in rss
+        assert "does not mean it is stopped" in rss
+
+    def test_free_lock_still_reads_as_not_running(self, monkeypatch) -> None:
+        from kiro_crew import gateway_lock
+
+        self._cfg(monkeypatch, 1536)
+        monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: None)
+        monkeypatch.setattr(
+            gateway_lock,
+            "lock_holder",
+            lambda home: gateway_lock.LockHolder(pid=None, alive=False, source="none"),
+        )
+        _ceiling, rss = cli_doctor._gateway_memory_lines()
+        assert "⏹ not running" in rss
 
     def test_unreadable_rss_and_config_never_raise(self, monkeypatch) -> None:
         monkeypatch.setattr(cli_doctor.KiroCrewConfig, "load", MagicMock(side_effect=OSError))
@@ -1950,6 +2005,27 @@ class TestPathLauncherOwnership:
         out = capsys.readouterr().out
         assert "kirocrew CLI: ✅" in out
         assert "different install" not in out
+
+    def test_matching_launcher_prints_the_symlink_resolved_spelling(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        # The clean row prints the same canonical form the mismatch rows and the
+        # Data Home row print, not the PATH spelling through a ``current`` link.
+        versioned = tmp_path / "install" / "1.2.3"
+        (versioned / "bin").mkdir(parents=True)
+        exe = versioned / "bin" / "kirocrew"
+        exe.write_text("")
+        current = tmp_path / "install" / "current"
+        make_dir_link(current, versioned)
+        via_link = current / "bin" / "kirocrew"
+        monkeypatch.setattr(cli_doctor.shutil, "which", lambda c, **kw: str(via_link))
+        monkeypatch.setattr("kiro_crew.agent._resolve_kirocrew_bin", lambda: str(exe))
+
+        cli_doctor._doctor_path_launcher()
+
+        out = capsys.readouterr().out
+        assert f"kirocrew CLI: ✅ {os.path.realpath(exe)}" in out
+        assert str(via_link) not in out
 
     def test_divergent_launcher_names_both_paths(self, monkeypatch, tmp_path, capsys) -> None:
         wheel = tmp_path / "crew-venv" / "bin" / "kirocrew"
@@ -4392,6 +4468,10 @@ class TestRunDirCensus:
         monkeypatch.setattr(cli_doctor, "_RUN_DIR_BACKLOG_WARN", 2)
         out = self._run(monkeypatch, capsys, root)
         assert "⚠️ " in out and "With the gateway stopped, move directories matching" in out
+        assert (
+            "hold nothing beyond .kiro/settings/cli.json,"
+            " .kiro/settings/.kirocrew-cli-settings.lock and an empty .kiro/agents"
+        ) in out
         original = session_work_dir.count_run_dirs
         monkeypatch.setattr(
             session_work_dir,
@@ -4400,6 +4480,29 @@ class TestRunDirCensus:
         )
         out = self._run(monkeypatch, capsys, root)
         assert "2+ run director(ies) carry no" in out and "0+ marked" in out
+
+    @pytest.mark.parametrize("pinned", [True, False])
+    def test_an_unmarked_memory_consolidation_backlog_is_counted_on_either_walk(
+        self, pinned: bool, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        """The by-name walk never marks these folders, so the census is where they surface."""
+        from kiro_crew import session_work_dir
+
+        monkeypatch.setattr(session_work_dir.pinned_fs, "supports_pinned_walk", lambda: pinned)
+        root = tmp_path / "ws"
+        for n in range(1, 4):
+            name = f"memory-consolidation_work_{n:032x}"
+            (root / name / ".kiro" / "settings").mkdir(parents=True)
+        before = sorted(p.name for p in root.rglob("*"))
+        monkeypatch.setattr(cli_doctor, "_RUN_DIR_BACKLOG_WARN", 2)
+        out = self._run(monkeypatch, capsys, root)
+        (line,) = [ln for ln in out.splitlines() if "run dirs:" in ln]
+        assert "⚠️ " in line and "3 run director(ies) carry no" in line
+        assert "(left by a build that did not mark that kind)" in line
+        assert "With the gateway stopped, move directories matching" in out
+        assert session_work_dir.DERIVED_NAME_RE.pattern in out
+        assert r"memory\-consolidation" in out
+        assert sorted(p.name for p in root.rglob("*")) == before
 
     def test_a_root_with_nothing_the_sweep_cannot_reclaim_is_clean(
         self, tmp_path: Path, monkeypatch, capsys
@@ -4425,3 +4528,20 @@ class TestRunDirCensus:
         cli_doctor._doctor_run_dirs()
         out = capsys.readouterr().out
         assert "⚠️  the session pid ledger cannot be read; census skipped" in out
+
+    def test_a_content_keep_is_reported_as_the_third_figure(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        """A permitted-marked folder the sweep keeps for its contents prints as *kept*."""
+        from kiro_crew.session_work_dir import data_home_id
+
+        root = tmp_path / "ws"
+        kept = self._marked(root, "subagent_00000001", f"{data_home_id()}\n23456")
+        (kept / "notes.txt").write_text("mine", encoding="utf-8")
+        before = sorted(p.name for p in root.rglob("*"))
+        out = self._run(monkeypatch, capsys, root)
+        (line,) = [ln for ln in out.splitlines() if "run dirs:" in ln]
+        assert line.startswith("  run dirs:    ⚠️ ")
+        assert "1 marked director(ies) the sweep keeps for what they hold" in line
+        assert "no run directories left behind" not in out
+        assert sorted(p.name for p in root.rglob("*")) == before

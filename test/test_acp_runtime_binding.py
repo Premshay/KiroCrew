@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from kiro_crew.acp.client import PROTOCOL_VERSION_CLAUDE
-from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
+from kiro_crew.acp.runtime import CLIENT_VERSION, AcpRuntime, AcpSessionHandle
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_CLIENT_CAPABILITIES, METHOD_SESSION_NEW
 from kiro_crew.platform import acp_binding
 
@@ -106,7 +106,7 @@ async def test_claude_runtime_uses_bound_session_set_model(monkeypatch):
             METHOD_SESSION_NEW,
             {"cwd": "/tmp", "mcpServers": [], "_meta": {"claudeCode": {"options": {}}}},
             timeout=90.0,
-    )
+        )
     set_model.assert_awaited_once_with("fast")
     set_option.assert_not_awaited()
 
@@ -133,48 +133,31 @@ async def test_claude_runtime_uses_config_option_without_bound_switch_method(mon
 async def test_claude_runtime_spawn_uses_claude_adapter_protocol(monkeypatch, tmp_path):
     """Direct runtimes must not send Kiro's incompatible handshake to Claude."""
     runtime = AcpRuntime(work_dir=str(tmp_path), acp_backend=ACP_BACKEND_CLAUDE)
-    process = SimpleNamespace(pid=12345, stdout=object(), stderr=object())
-    create_process = AsyncMock(return_value=process)
     handshake = AsyncMock(return_value={"agentCapabilities": {}})
-    wrapped: dict[str, object] = {}
-
-    def wrap(argv, **kwargs):
-        wrapped["argv"] = argv
-        wrapped.update(kwargs)
-        return argv, None
-
-    async def no_reader():
-        return None
 
     monkeypatch.delenv("CLAUDE_CODE_EXECUTABLE", raising=False)
-    monkeypatch.setattr("kiro_crew.acp.runtime._resolve_claude_acp_bin", lambda: ["claude-agent-acp"])
-    monkeypatch.setattr("kiro_crew.acp.runtime._resolve_claude_code_executable", lambda: "/usr/bin/claude")
-    monkeypatch.setattr("kiro_crew.acp.runtime.wrap_argv", wrap)
-    monkeypatch.setattr("kiro_crew.acp.runtime.cgroup_scope_argv", lambda argv: argv)
-    monkeypatch.setattr("kiro_crew.acp.runtime.create_subprocess_limited", create_process)
-    monkeypatch.setattr("kiro_crew.acp.runtime._track_pid", lambda _pid: None)
-    monkeypatch.setattr("kiro_crew.acp.runtime._track_session_pid", lambda _pid: None)
-    monkeypatch.setattr("kiro_crew.acp.runtime.register_protected_pid", lambda _pid: None)
-    monkeypatch.setattr("kiro_crew.acp.runtime._get_start_time", lambda _pid: None)
-    monkeypatch.setattr(runtime, "_reader_loop", no_reader)
-    monkeypatch.setattr(runtime, "_drain_stderr", no_reader)
+    monkeypatch.setattr(
+        "kiro_crew.acp.harness.claude._resolve_claude_acp_bin",
+        lambda: (["claude-agent-acp"], ""),
+    )
+    monkeypatch.setattr(
+        "kiro_crew.acp.harness.claude._resolve_claude_code_executable",
+        lambda: "/usr/bin/claude",
+    )
     monkeypatch.setattr(runtime, "_send_and_await", handshake)
 
-    await runtime.spawn()
-
-    assert wrapped == {
-        "argv": ["claude-agent-acp"],
-        "is_kiro_cli": None,
-        "mode": "auto",
-        "strip_python_env": True,
-    }
-    assert create_process.await_args.args == ("claude-agent-acp",)
-    assert create_process.await_args.kwargs["env"]["CLAUDE_CODE_EXECUTABLE"] == "/usr/bin/claude"
+    plan = await runtime._resolve_spawn_plan()
+    assert plan.argv == ["claude-agent-acp"]
+    env: dict[str, str] = {}
+    runtime._harness.apply_spawn_env(env)
+    assert env["CLAUDE_CODE_EXECUTABLE"] == "/usr/bin/claude"
+    await runtime._initialize_handshake(ACP_CLIENT_CAPABILITIES)
     handshake.assert_awaited_once_with(
         "initialize",
         {
             "clientCapabilities": ACP_CLIENT_CAPABILITIES,
-            "clientInfo": {"name": "kirocrew", "version": "0.1.2"},
+            "clientInfo": {"name": "kirocrew", "version": CLIENT_VERSION},
             "protocolVersion": PROTOCOL_VERSION_CLAUDE,
         },
+        timeout=90.0,
     )

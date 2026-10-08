@@ -422,9 +422,11 @@ jobs:
             load-bearing, and each one gives a control a named cause, which makes
             it DERIVED rather than speculative --
               - the AGENT is untrusted with respect to its own governance
-                ceiling: it can neither read nor write security_policy.json,
-                profiles/, admission_policy.json or computer_use.json, and the
-                PreToolUse gate, the deny rules and the OS sandbox enforce that;
+                ceiling: it can never WRITE security_policy.json, profiles/,
+                admission_policy.json or computer_use.json -- the OS sandbox
+                mounts them read-only in every mode -- and the PreToolUse
+                sensitive-path gate refuses its file tools reading them; a read
+                through a spawned shell is permitted by design;
               - an ENTERPRISE ADMINISTRATOR sits above the local user, composing
                 a policy ceiling tightest-wins that a running agent or app can
                 narrow but never loosen;
@@ -524,7 +526,7 @@ jobs:
                helper that builds the path, the record field, the symbol. Cover
                every entry point, not only the one the PR is about: crew page
                (website/src/, the dashboard routes), chat (dashboard/chat_runner.py,
-               session_agent_selection.py), subagent spawn, continue and resume
+               dashboard/chat_turn/, session_agent_selection.py), subagent spawn, continue and resume
                (subagent_manager/, subagent_persistence.py), cron (cron_script.py,
                cron_service/), app bundles and manifests (apps/, an app.json's
                crons and hooks, code an app runs out of its own install dir), the
@@ -567,7 +569,8 @@ jobs:
             or line-level), DROP it. Merge findings that share one root cause. If
             you drifted into line-level review, delete it.
 
-            VERDICT (advisory — pick exactly one for the `verdict` field):
+            VERDICT (pick exactly one for the `verdict` field; PASS and CONCERNS
+            are advisory, BLOCK fails this check):
             - PASS: a real problem, solved by a sound and proportionate design.
             - CONCERNS: acceptable to proceed, but a notable design risk humans
               should see.
@@ -837,9 +840,36 @@ jobs:
             echo "verdict=OVERRIDE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # #13595: the skip arm must leave a keyed slot for THIS head even on a
+          # first-time skip, CREATING one when none exists rather than patching
+          # only an occupant. The body names `$HEAD` in prose, which is the
+          # per-head marker readiness scopes the skip exemption on (pr_status.py
+          # `slots_naming_head`). Head FIRST, slot read LAST, mirroring the
+          # human-override arm above.
           if [ "$ACTOR" = "dependabot[bot]" ]; then
             echo "Dependabot PR: design review skipped (no Bedrock secrets/OIDC)."
             echo "verdict=SKIPPED" >> "$GITHUB_OUTPUT"
+            {
+              echo "$MARKER"
+              echo "## Design Review (Opus 5.5) — ⏭️ skipped"
+              echo
+              echo "_Revision \`$HEAD\` is a Dependabot pull request, which runs with no Bedrock secrets/OIDC, so the design review was skipped. Advisory — does not block merge._"
+            } > "${RUNNER_TEMP:-/tmp}/design-comment.md"
+            confirm_head
+            find_existing
+            if [ "$head_unchanged" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
+              confirm_head
+              if [ "$head_unchanged" -eq 1 ]; then
+                gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+                  --field body="$(cat "${RUNNER_TEMP:-/tmp}/design-comment.md")" >/dev/null || true
+                echo "Updated existing design-review comment #$existing to skip notice"
+              fi
+            elif [ "$head_unchanged" -eq 1 ] && [ "$lookup_ok" -eq 1 ]; then
+              gh pr comment "$PR" --body-file "${RUNNER_TEMP:-/tmp}/design-comment.md" || true
+              echo "Created design-review skip notice for $HEAD"
+            elif [ "$lookup_ok" -eq 0 ]; then
+              echo "::warning::This lane's slot was unreadable after 6 attempts, so the design skip notice for $HEAD was not written. Re-run this lane to record the notice."
+            fi
             exit 0
           fi
           # Capture the model's final review text from the run transcript
@@ -1030,7 +1060,7 @@ jobs:
           #
           # A marker comment is the ONLY thing a freshness verifier reads. A
           # write that does not land therefore leaves the PR indistinguishable
-          # from one no lane ever reviewed: prepare-pr's pr_status.py refuses a
+          # from one no lane ever reviewed: kirocrew-prepare-pr's pr_status.py refuses a
           # PR whose check-runs, readiness status and mergeable state all pass,
           # and the only way out is manufacturing a new head -- which re-rolls
           # the non-deterministic review lanes and discards the verdicts they
@@ -1286,7 +1316,7 @@ jobs:
             # would invent a BLOCK nobody judged out of an infrastructure fault.
             # The annotation is what says so: the required readiness status reads
             # check-run CONCLUSIONS and has no stamp-freshness read, so the reader
-            # that catches a head with no verdict is prepare-pr's own marker
+            # that catches a head with no verdict is kirocrew-prepare-pr's own marker
             # evaluation, run before a PR is called ready.
             if [ -n "$slot" ]; then
               occupied=""
@@ -1746,7 +1776,7 @@ jobs:
               # reply. A job cannot report itself `neutral` the way the fork
               # lanes' check-runs can, so the punchline goes on the job as an
               # annotation and the Watch items go to the run summary, where the
-              # local prepare-pr loop and a human read the same text.
+              # local kirocrew-prepare-pr loop and a human read the same text.
               if [ "$VERDICT" = "CONCERNS" ]; then
                 punchline="${CONCERNS_PUNCHLINE:-read the Watch items in the Design Review comment on this PR}"
                 echo "::warning title=Design Review CONCERNS::$punchline"

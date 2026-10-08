@@ -47,8 +47,9 @@ Lark).
    ```
 
 DM the bot in Feishu and it answers. The panel's badge tells you where you are:
-**Needs setup** until both credentials are stored, **Not connected** once they
-are but the receiver is not running, **Connected** when it is.
+**Needs setup** until both credentials are stored, the channel is turned on, and
+at least one `open_id` is on the allow-list; **Not connected** once all of that
+is in place but the receiver is not running; **Connected** when it is.
 
 <details>
 <summary>Prefer to edit the files directly?</summary>
@@ -98,7 +99,7 @@ Deny-by-default, in both directions:
   never evaluated can never run a turn.
 - **Every denial is audited.** Rejected inbound messages write a SEL audit
   record with `source: feishu`, so an unexpected sender shows up in
-  `kirocrew security posture` rather than vanishing.
+  `kirocrew security events` rather than vanishing.
 - Feishu itself only delivers a group message to the bot when it is
   **@-mentioned**, so a bot in a busy group does not see unrelated chatter.
 - **Mentions reach the agent as names.** Feishu puts opaque placeholders
@@ -130,7 +131,7 @@ Deny-by-default, in both directions:
 | `feishu.session_folder` | `""` | Sidebar folder for sessions that start here. Empty = unfiled. |
 
 Everything above except `hard_threshold_pct` is editable in **Settings →
-Channels → Feishu**; that one is file-only, because the panel exposes the soft
+Messaging Channels → Feishu**; that one is file-only, because the panel exposes the soft
 threshold as the single number worth tuning and keeps the hard ceiling as a
 safety net.
 
@@ -160,7 +161,10 @@ Known gaps, all follow-up work rather than defects:
 
 - **No streaming.** Feishu supports `PATCH /im/v1/messages/{id}`, so
   edit-in-place streaming is a natural next step.
-- **Text only.** Non-text messages (images, files, audio) are ignored inbound.
+- **Text only.** Non-text messages (images, files, audio) are not read inbound.
+  The bot answers with a short line saying so rather than staying silent, so a
+  photo does not look like a dead bot — but only to a sender who is already on
+  the allow-list, and in a group only one that is allow-listed too.
 - **Replies only.** The bot answers an inbound message and cannot start a
   conversation, so it is not a proactive-notification target.
 - **The panel configures the channel; it does not install it.** `lark-oapi` is an
@@ -196,7 +200,7 @@ channel uses.
 | --- | --- |
 | `feishu/client.py` | `lark-oapi` WebSocket receive + REST reply |
 | `feishu/transport.py` | Authorisation (deny-by-default) and normalisation |
-| `feishu/renderer.py` | Buffers the turn, sends one reply |
+| `feishu/renderer.py` | Buffers the turn, sends one reply, plus a best-effort notice reply when the answer was redacted |
 | `feishu/transport_dispatch.py` | Drives `TurnDriver`, handles `/new` `/compact` |
 | `feishu/gateway.py` | `maybe_start_feishu()` boot entry point |
 

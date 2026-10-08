@@ -31,6 +31,7 @@ from kiro_crew.crew_main_contract import (
 )
 from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
 from kiro_crew.dashboard.dynamic_cards import (
+    MAX_HTML_BYTES,
     MAX_INPUT_CHARS,
     MAX_OUTPUT_BYTES,
     RESTORED,
@@ -55,6 +56,23 @@ _EVIDENCE_ROLES = frozenset({"user", "assistant", "error", "tool_result", "injec
 #: Rows read from the transcript, and serialized characters of evidence kept.
 _EVIDENCE_ROWS = 32
 _EVIDENCE_CHARS = 6000
+#: Serialized characters of tool names the model gets from the ``tools`` fold. A
+#: quarter of the evidence budget, picked by hand rather than measured: enough for
+#: dozens of names, small enough that the window above keeps its room.
+_TOOL_NAMES_CHARS = _EVIDENCE_CHARS // 4
+
+
+class _CardReads(CrewMainReads, total=False):
+    """The fold reads one card generation takes: the card's four, and the unit answer.
+
+    ``unit`` is the crew log unit the slot writes now, ``""`` when there is none, and
+    ``no_unit`` says the store holds no unit of the slot at all. They feed no card field:
+    :func:`_read_card_tools` reads the slot's tool calls from them.
+    """
+
+    unit: str
+    no_unit: bool
+
 
 _ROOT_PROMPT = f"""Create this session's concise status card.
 Write lede, you and notes in ONE language, the one "language" names: when it has
@@ -78,6 +96,13 @@ number. Show EVERY fact: put data-dashboard-field="<its field name>" on an empty
 container, once per fact; the host binds the value. A layout that leaves any fact out
 is REFUSED. Label facts in words. Do not restate, round, total or compare them yourself.
 
+recent_messages hold no tool calls, and they are only the newest part of the session.
+"tools_called" lists the tools the crew log recorded a call to across every log this
+session ran under, newest first. Never say a tool was or was not called unless
+"tools_called" says so. Make no claim that a tool was never called unless
+"tools_whole" is true: when it is false the list may be cut short or miss an earlier
+log. Never say something did not happen just because recent_messages do not show it.
+
 NO DIGITS anywhere you write: not in data, and not in any text the HTML shows. A card
 containing a digit is REFUSED whole. Write numbers in no form at all.
 
@@ -89,7 +114,7 @@ notes: one sentence of caveat, or "".
 At most {JUDGMENT_TEXT_LIMIT} characters each. The only names data-dashboard-field may use
 are the fact names and lede, you, notes.
 You design the HTML/CSS layout freely. No scripts, remote resources, forms or
-navigation. At most 8192 UTF-8 bytes of HTML. Use readable names, responsive layout
+navigation. At most {MAX_HTML_BYTES} UTF-8 bytes of HTML. Use readable names, responsive layout
 down to 320px and theme variables such as var(--bg), var(--text), var(--muted) and
 var(--accent). No fixed-width canvas.
 When previous has html that still fits, or previous lists only fields, OMIT html and
@@ -99,7 +124,7 @@ This is a bounded recent-window update, not an authoritative full-history summar
 A message with role "automation" was injected by a scheduler or another agent, not
 typed by the user; never present it as the user's request or decision.
 """
-"""The prompt for every automatic card, which is now a ROOT session's card.
+"""The prompt for every automatic card (a root session's card).
 
 The numbers reach the model as facts it can bind but not write: the layout names a fact
 by its field and the host fills the value from the fold, after the model has returned.
@@ -423,14 +448,14 @@ def _card_language(rows: list[dict], ui_language: str) -> dict[str, str] | None:
     return {"user_wrote": sample[:_USER_SAMPLE_CHARS]} if sample else None
 
 
-def _read_card_folds(slot_key: str) -> CrewMainReads:
-    """The four fold renders a root card's numbers come from. Blocking; call off-loop.
+def _read_card_folds(slot_key: str) -> _CardReads:
+    """The four fold renders a root card's numbers come from. Blocking.
 
     Each fold is read in its OWN try, and a failure answers
     :data:`~kiro_crew.crew_main_contract.FOLD_UNREADABLE` for that fold alone, so one
     unreadable file reads "could not be read" in its own fields and nowhere else.
 
-    The three session-keyed folds are keyed by the crew log UNIT the slot writes, not by
+    The session-keyed folds are keyed by the crew log UNIT the slot writes, not by
     the slot's session key: a fold of a name no unit carries is not an error, it is an
     empty record, and every count in it reads as zero. So the unit comes from
     :func:`~kiro_crew.crew_log.emit.slot_previous_store`, the store's own answer to which
@@ -438,19 +463,22 @@ def _read_card_folds(slot_key: str) -> CrewMainReads:
     fold it. No unit of this slot at all: the folds are read and empty, so each field
     says ``not recorded``. Units the store cannot rank: ``could not be read``.
 
-    Those three folds come in one pass over one file, because that is what
+    Those folds come in one pass over one file, because that is what
     ``fold_session`` is. ``work`` is slot-keyed and eager, so this is usually a memo
-    lookup rather than a walk.
+    lookup rather than a walk. ``unit`` and ``no_unit`` carry that answer to
+    :func:`_read_card_tools`, which only the prompt path calls.
     """
     from kiro_crew.crew_log import projection as projections
     from kiro_crew.crew_log.emit import slot_previous_store
     from kiro_crew.work_vocab import WORK_FOLD_NAME
 
-    reads: CrewMainReads = {
+    reads: _CardReads = {
         "status": FOLD_UNREADABLE,
         "usage": FOLD_UNREADABLE,
         "approvals": FOLD_UNREADABLE,
         "work": FOLD_UNREADABLE,
+        "unit": "",
+        "no_unit": False,
     }
     session_folds = ("status", "usage", "approvals")
     try:
@@ -459,6 +487,7 @@ def _read_card_folds(slot_key: str) -> CrewMainReads:
         logger.debug("root card: no unit answer for %s", slot_key, exc_info=True)
         unit, decided, complete = "", False, False
     if unit:
+        reads["unit"] = unit
         try:
             bundle = projections.fold_session(unit, session_folds)
         except Exception:
@@ -470,6 +499,7 @@ def _read_card_folds(slot_key: str) -> CrewMainReads:
                 except Exception:
                     logger.debug("root card: fold %s unreadable", name, exc_info=True)
     elif decided and complete:
+        reads["no_unit"] = True
         for name in session_folds:
             reads[name] = {}  # type: ignore[literal-required]
     try:
@@ -479,6 +509,99 @@ def _read_card_folds(slot_key: str) -> CrewMainReads:
     except Exception:
         logger.debug("root card: work fold unreadable for %s", slot_key, exc_info=True)
     return reads
+
+
+def _read_card_tools(slot_key: str, reads: _CardReads) -> Any:
+    """The ``tools`` render over the crew log units this conversation ran under. Blocking.
+
+    A slot that resumed into a successor unit keeps the earlier unit's turns in its
+    transcript, so a list from the newest unit alone looks whole while the call the
+    model is asked about sits in the unit before it. So the units are the slot's
+    succession chain (:func:`~kiro_crew.crew_log.read.slot_chain`, the one walk over
+    ``previous`` edges), and the ``tools`` fold runs over them oldest first through
+    :func:`~kiro_crew.crew_log.projection.fold_slot_warm`, kept warm so a later read
+    folds only the newest unit's new entries.
+
+    The chain, not every unit whose header names the slot: a slot that was reset opens
+    a unit with no ``previous`` edge, and the units before it belong to an earlier
+    conversation. Listing their tool calls would let the card say a stop call was made
+    in a conversation that never made one. One unit list then answers both the names
+    and whether they are whole.
+
+    ``units_whole`` is added to the render: true only when the chain reached a unit
+    that STATES it starts the slot's chain
+    (:data:`~kiro_crew.crew_log.session_tree.CHAIN_END_FIRST`, which the walk now
+    reports only for an :data:`~kiro_crew.crew_log.session_tree.EDGE_NONE` oldest
+    log), in a scan that saw the whole store, or when the slot has no unit at all. A
+    unit that cites nothing because its writer could not name the predecessor, or
+    that predates the edge keys, ends the walk at
+    :data:`~kiro_crew.crew_log.session_tree.CHAIN_END_GAP` and is not whole. Any
+    other end -- a unit retention took, another slot's unit, a loop, the cap --
+    leaves it false too, and a list that is not whole must never license a "never
+    called" claim. A fold that cannot be read, or units the store cannot rank, are
+    ``FOLD_UNREADABLE``.
+
+    Called on the prompt path only: the refresh path binds numbers and has no use for
+    tool names.
+    """
+    from kiro_crew.crew_log import projection as projections
+    from kiro_crew.crew_log.read import slot_chain
+    from kiro_crew.crew_log.session_tree import CHAIN_END_FIRST
+
+    unit = reads.get("unit", "")
+    if not unit:
+        return {"by_name": {}, "units_whole": True} if reads.get("no_unit") else FOLD_UNREADABLE
+    reading = slot_chain(unit)
+    units = tuple(reversed(reading.chain.sids)) or (unit,)
+    try:
+        checkpoint = projections.fold_slot_warm("tools", units, slot=slot_key)
+        render = projections.projection_of(checkpoint).value
+    except Exception:
+        logger.debug("root card: tools fold unreadable for %s", slot_key, exc_info=True)
+        return FOLD_UNREADABLE
+    if not isinstance(render, dict):
+        return FOLD_UNREADABLE
+    whole = reading.chain.ended == CHAIN_END_FIRST and not reading.incomplete
+    return {**render, "units_whole": whole}
+
+
+def _tool_record(tools: Any) -> dict[str, Any]:
+    """What the model is told about tool calls, from the ``tools`` fold render.
+
+    The transcript rows the model reads carry no tool calls, so without this it can
+    only guess whether a tool ran, and a guess of "never" contradicts the log. Names
+    go newest first and stop at :data:`_TOOL_NAMES_CHARS`; ``tools_omitted`` counts
+    every name left out, the fold's own omitted names included, so a short list never
+    reads as the whole one. An unreadable fold is ``None``: nothing is known.
+
+    ``tools_whole`` is true only when nothing was cut AND the render covers every unit
+    of the slot (:func:`_read_card_tools`'s ``units_whole``). It is the one field
+    the prompt lets a "never called" claim rest on.
+    """
+    if not isinstance(tools, dict):
+        return {"tools_called": None, "tools_omitted": 0, "tools_whole": False}
+    by_name = tools.get("by_name")
+    rows = by_name if isinstance(by_name, dict) else {}
+    called = [name for name, row in rows.items() if isinstance(row, dict) and row.get("calls")]
+
+    def last(name: str) -> int:
+        time = rows[name].get("last_time")
+        return time if isinstance(time, int) else 0
+
+    called.sort(key=last, reverse=True)
+    names: list[str] = []
+    for name in called:
+        if len(json.dumps(names + [name], ensure_ascii=False)) > _TOOL_NAMES_CHARS:
+            break
+        names.append(name)
+    omitted = tools.get("names_omitted")
+    extra = omitted if isinstance(omitted, int) and omitted > 0 else 0
+    left_out = len(called) - len(names) + extra
+    return {
+        "tools_called": names,
+        "tools_omitted": left_out,
+        "tools_whole": left_out == 0 and tools.get("units_whole") is True,
+    }
 
 
 def _bound_workers(reads: CrewMainReads) -> frozenset[str]:
@@ -694,8 +817,7 @@ def _derived_allowed(slot: Any) -> bool:
     definition and cannot be redirected that way.
     """
     return not (
-        getattr(slot, "is_remote", False)
-        or getattr(slot, "executor", "") == "remote"
+        getattr(slot, "executor", "") == "remote"
         or is_incognito_transcript(getattr(slot, "memory_mode", ""))
     )
 
@@ -1040,11 +1162,13 @@ class CardLifecycle:
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
         if not cfg.dashboard.dynamic_dashboard_cards:
             return None
-        facts = dict(build_crew_main(await asyncio.to_thread(_read_card_folds, entry.key)))
+        reads = await asyncio.to_thread(_read_card_folds, entry.key)
+        facts = dict(build_crew_main(reads))
         previous = entry.payload
         evidence: dict[str, Any] = {
             "event": entry.reason,
             "facts": facts,
+            **_tool_record(await asyncio.to_thread(_read_card_tools, entry.key, reads)),
             # The model gets back its own layout and its own three sentences, never the
             # folded values bound into that layout: those are under "facts", read-only.
             "previous": (

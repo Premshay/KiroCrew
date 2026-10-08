@@ -26,24 +26,7 @@ import pytest
 from chat_test_helpers import _make_state
 
 from kiro_crew.acp.client import AcpAuthRequired
-from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
-
-
-@pytest.mark.asyncio
-async def test_start_next_holds_user_while_orchestrating(tmp_path) -> None:
-    """While a plan orchestrates, the queue drain HOLDS plain user messages
-    (system/recovery still drain) so a mid-plan message never runs concurrently
-    with the plan. It is handed off only after the loop clears the flag."""
-    state = _make_state(tmp_path)
-    state.subagents = None  # isolate the orchestrating condition of hold_users
-    slot = state.get_or_create_slot("orch-hold")
-    slot._in_stage_execution = True
-    slot.queue_append("user typed mid-plan")
-
-    started = await _start_next_queued_turn(state, slot)
-
-    assert started is False  # held, not started
-    assert [i["content"] for i in slot._queue] == ["user typed mid-plan"]
+from kiro_crew.dashboard.chat_runner import _run_chat
 
 
 @pytest.mark.asyncio
@@ -106,7 +89,9 @@ def _stream_raises(client: MagicMock, exc: BaseException) -> None:
 
 class TestTurnTeardownRelease:
     @pytest.mark.asyncio
-    async def test_hung_identity_check_does_not_block_session_start(self, tmp_path, monkeypatch) -> None:
+    async def test_hung_identity_check_does_not_block_session_start(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """A protective account check must not leave an unrelated provider thinking forever."""
         from kiro_crew.dashboard import chat_runner
 

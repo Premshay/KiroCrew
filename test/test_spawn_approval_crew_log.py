@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from off_loop_helpers import off_loop
 
 from kiro_crew.crew_log import crew_log_path, emit
 from kiro_crew.crew_log.projection import fold_approvals
@@ -80,13 +81,22 @@ def _of(kind: str) -> list[dict]:
     return [entry["data"] for entry in _entries()[1:] if entry["type"] == kind]
 
 
-def _folded() -> dict:
-    """The ``approvals`` fold over the session's whole log, as a reader sees it."""
+def _read_folded() -> dict:
     handle = CrewLog.open("session", SESSION)
     try:
         return fold_approvals(tuple(handle.iter_from(1)))
     finally:
         handle.release_ownership()
+
+
+def _folded() -> dict:
+    """The ``approvals`` fold over the session's whole log, as a reader sees it.
+
+    Read off the event-loop thread, as product readers do: the callers are async
+    tests, and an on-loop acquire of the unit lock is refused outright whenever the
+    writer or the eager folder holds it (``test_crew_log_off_loop_pin.py``).
+    """
+    return off_loop(_read_folded)
 
 
 def _open_session() -> None:
@@ -415,12 +425,14 @@ def test_the_decision_helper_is_a_no_op_for_a_request_that_was_not_written():
 
     The request helper answers ``("", 0)`` when it wrote nothing, and handing that
     back is what makes the decision write nothing too -- so a log can never hold a
-    spawn decision whose request is absent.
+    spawn decision whose request is absent. The closer lives on
+    ``ManagerComponent`` because a running child's tool prompts owe the log the
+    same pair, so this reaches it through the gate, the asker under test here.
     """
     from kiro_crew.subagent_manager.admission.gate import _GateMixin
 
     _open_session()
-    _GateMixin._record_crew_log_spawn_approval_decided(
+    _GateMixin._record_crew_log_approval_decided(
         SimpleNamespace(),
         ("", 0),
         approval_id="spawn:orphan",

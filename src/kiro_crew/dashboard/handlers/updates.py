@@ -14,7 +14,6 @@ import re
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
@@ -22,7 +21,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import __version__ as _local_version
-from kiro_crew import dep_sync, platform_compat, shutdown_event
+from kiro_crew import dep_sync, platform_compat, shutdown_event, update_ownership
 from kiro_crew.changelog import Release, base_version, build_release_list, release_of_build
 from kiro_crew.config.live import ConfigChange
 from kiro_crew.config.loader import (
@@ -43,6 +42,11 @@ from kiro_crew.dashboard.status_counts import cached_status_snapshot
 from kiro_crew.dashboard.urls import is_loopback
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.gateway_restart import resolve_restart_launcher
+from kiro_crew.git_divergence import (
+    UNREADABLE_TIMEOUT,
+    DivergenceUnreadable,
+    count_divergence,
+)
 from kiro_crew.platform import feed_trust
 from kiro_crew.platform.update_capability import (
     AUTO_EFFECT_UNKNOWN,
@@ -89,24 +93,6 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 logger = logging.getLogger(__name__)
 
 _SSE_INTERVAL_SECS = 5
-
-
-@dataclass(frozen=True)
-class GatewayRestartResult:
-    """The observed outcome of one gateway restart attempt.
-
-    A reset can become unsafe after a long update has already completed.  The
-    maintenance payload preserves that refusal for the caller that still has a
-    browser connection, instead of reducing it to a falsey result and leaving
-    the UI to wait for a restart that will not happen.
-    """
-
-    restarted: bool
-    maintenance: dict[str, object] | None = None
-
-    @property
-    def blocked(self) -> bool:
-        return self.maintenance is not None
 
 # ── Update ──
 
@@ -1069,40 +1055,14 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
     # and the second is precisely the case with commits to lose. Only a checkout
     # that is behind and NOT ahead can be fast-forwarded, so only that one is
     # offered an update.
-    ahead = behind = 0
-    count = await asyncio.create_subprocess_exec(
-        "git",
-        "rev-list",
-        "--count",
-        "--left-right",
-        "HEAD...@{u}",
-        cwd=proj,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        count_out, _ = await asyncio.wait_for(count.communicate(), timeout=10)
-    except asyncio.TimeoutError:
-        try:
-            count.kill()
-        except ProcessLookupError:
-            pass
-        await count.communicate()
+    counts = await count_divergence(proj, "@{u}")
+    if isinstance(counts, DivergenceUnreadable):
+        # A check that could not count must not answer "you are on the latest
+        # version" — the unattended auto-apply reads this verdict.
+        logger.warning("Could not count commits against upstream in %s (%s)", proj, counts.reason)
         _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
         return
-    if count.returncode != 0:
-        logger.warning("Could not count commits against upstream in %s", proj)
-        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
-        return
-    # ``--left-right`` with the three-dot range prints "<ahead>\t<behind>": left
-    # is reachable from HEAD only, right from the upstream only.
-    try:
-        ahead_text, behind_text = count_out.decode(errors="replace").split()
-        ahead, behind = int(ahead_text), int(behind_text)
-    except ValueError:
-        logger.warning("Unparseable rev-list count in %s", proj)
-        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
-        return
+    ahead, behind = counts.ahead, counts.behind
     # Fast-forwardable: behind, and carrying nothing of its own to lose.
     can_fast_forward = behind > 0 and ahead == 0
 
@@ -1715,13 +1675,13 @@ async def _venv_pip_install(proj: str, state: DashboardState) -> bool:
             timeout=600,
         ),
     )
-    await asyncio.sleep(0)
     return rc == 0
 
 
+@update_ownership.owning(update_ownership.Step.RESTART)
 async def _restart_gateway(
     state: DashboardState, *, resolver: Callable[[], str] | None = None
-) -> GatewayRestartResult:
+) -> bool:
     """Save state, close sessions, and exec the selected gateway entry point once.
 
     Restart is a process-wide transition.  Two callers must never both drain
@@ -1730,33 +1690,16 @@ async def _restart_gateway(
     not return; a refused or test-double exec releases the claim.  An exec the
     kernel refuses does not: by then the sessions are closed, so it exits the
     process rather than release a claim nothing can use.
+
+    Owns a missing bundle while it runs (``update_ownership``): after an apply,
+    or after an installer run from a terminal, the stale-asset watchdog must not
+    shut the gateway down in the middle of this teardown.
     """
     if state._gateway_restart_in_progress:
         logger.info("Gateway restart already in progress; coalescing duplicate request")
-        return GatewayRestartResult(restarted=False)
+        return False
     state._gateway_restart_in_progress = True
     try:
-        # This route bypasses ``/api/sessions/restart`` and would otherwise kill
-        # active ACP turns during a self-update. Keep the lifecycle gate shared
-        # with the ordinary reset endpoint rather than inventing an update-only
-        # acknowledgement protocol.
-        from kiro_crew.dashboard.handlers.sessions import (
-            _publish_restart_barrier,
-            _restart_barrier_status,
-        )
-
-        status = await _restart_barrier_status(state, open_if_busy=True)
-        if status["ready"] is not True:
-            _publish_restart_barrier(state)
-            state.push_update_progress(
-                "blocked",
-                "Gateway restart is waiting for session acknowledgements; "
-                "no sessions were stopped.",
-                maintenance=status,
-            )
-            return GatewayRestartResult(restarted=False, maintenance=status)
-        state.restart_barrier.clear()
-        _publish_restart_barrier(state)
         state.push_update_progress("restarting", "Restarting server…")
         # Resolve off-loop and before saving/draining. An explicit broken launcher
         # must not fall back to the running bundle's interpreter and import path.
@@ -1765,7 +1708,7 @@ async def _restart_gateway(
         except (ValueError, OSError) as exc:
             logger.warning("Gateway launcher unavailable: %s", exc)
             state.push_update_progress("error", "Cannot restart: invalid gateway launcher path")
-            return GatewayRestartResult(restarted=False)
+            return False
         exe = None
         if launcher is None:
             # Applying callers load this resolver before the install can replace
@@ -1788,10 +1731,13 @@ async def _restart_gateway(
                 # with admission shut and nothing able to reopen it. Refusing
                 # before the drain keeps every session answerable and leaves the
                 # operator a repair-then-relaunch they can actually perform.
+                # The pruned tree took the bundle too, so a deferred restart
+                # into an applied update does not hold the watchdog's exit.
+                update_ownership.clear_restart_deferral()
                 state.push_update_progress(
                     "error", "Cannot restart: invalid Python executable path"
                 )
-                return GatewayRestartResult(restarted=False)
+                return False
         # circular import: kiro_crew.dashboard.chat imports from
         # kiro_crew.dashboard.handlers (which re-exports this module), so this
         # must stay inline to avoid an import cycle at module load.
@@ -1812,6 +1758,10 @@ async def _restart_gateway(
             )
         except Exception:
             logger.debug("History save before restart failed", exc_info=True)
+        # Past the last refusal: the restart commits here, so a deferred restart
+        # into an applied update is over. Not at entry: a restart that coalesces
+        # or finds a broken launcher above leaves the deferral it found in place.
+        update_ownership.restart_committed()
         try:
             await state.sessions.close_all()
         except Exception:
@@ -1852,8 +1802,8 @@ async def _restart_gateway(
         # Same point of no return as the orchestrator path: the refusal above
         # removed the reachable failures, but only the kernel can refuse the
         # image itself, and the sessions closed above do not come back. Exit on
-        # that rather than fall through to reporting a restart that did not
-        # happen from a process that cannot serve.
+        # that rather than fall through to ``return True``, which reports a
+        # restart that did not happen from a process that cannot serve.
         try:
             if launcher is not None:
                 reexec_launcher(launcher, sys.argv[1:])
@@ -1861,7 +1811,7 @@ async def _restart_gateway(
                 reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
         except OSError:
             await exit_after_failed_restart_exec(launcher or exe)
-        return GatewayRestartResult(restarted=True)
+        return True
     finally:
         state._gateway_restart_in_progress = False
 
@@ -1873,19 +1823,10 @@ async def api_update_apply(request: web.Request) -> web.Response:
         return owner_denied
     state: DashboardState = request.app["state"]
 
-    # Refuse before a policy-owned update command can mutate the installation.
-    # A later recheck in _restart_gateway still catches work that begins while
-    # a long update, build, or install is running.
-    from kiro_crew.dashboard.handlers.sessions import (
-        _publish_restart_barrier,
-        _restart_barrier_status,
-    )
-
-    status = await _restart_barrier_status(state, open_if_busy=True)
-    if status["ready"] is not True:
-        _publish_restart_barrier(state)
+    if shutdown_event.is_set():
+        # An apply started now would be cut off by the shutdown mid-write.
         return web.json_response(
-            {"ok": False, "code": "restart_ack_required", "maintenance": status}, status=409
+            {"error": "The gateway is shutting down", "code": "shutting_down"}, status=503
         )
 
     # A policy-defined provider OWNS the update on this host. Checked before the
@@ -1909,16 +1850,7 @@ async def api_update_apply(request: web.Request) -> web.Response:
                 },
                 status=500,
             )
-        restart = await _restart_gateway(state, resolver=respawn_executable)
-        if restart.blocked:
-            return web.json_response(
-                {
-                    "ok": False,
-                    "code": "restart_ack_required",
-                    "maintenance": restart.maintenance,
-                },
-                status=409,
-            )
+        await _restart_gateway(state, resolver=respawn_executable)
         return web.json_response({"ok": True, "status": "updating"})
 
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
@@ -2020,32 +1952,15 @@ async def api_update_apply(request: web.Request) -> web.Response:
             },
             status=409,
         )
-    count = await asyncio.create_subprocess_exec(
-        "git",
-        "rev-list",
-        "--count",
-        "--left-right",
-        "HEAD...@{u}",
-        cwd=proj,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        count_out, _ = await asyncio.wait_for(count.communicate(), timeout=10)
-    except asyncio.TimeoutError:
-        try:
-            count.kill()
-        except ProcessLookupError:
-            pass
-        await count.communicate()
-        return web.json_response(
-            {"error": "Timed out checking upstream distance", "code": "git_read_failed"},
-            status=500,
-        )
-    try:
-        ahead_text, behind_text = count_out.decode(errors="replace").split()
-        ahead, behind = int(ahead_text), int(behind_text)
-    except ValueError:
+    counts = await count_divergence(proj, "@{u}")
+    if isinstance(counts, DivergenceUnreadable):
+        if counts.reason == UNREADABLE_TIMEOUT:
+            return web.json_response(
+                {"error": "Timed out checking upstream distance", "code": "git_read_failed"},
+                status=500,
+            )
+        # A failed or unparseable count alike: the guard cannot read the
+        # distance, so it refuses rather than waving the pull through.
         logger.warning("Update refused: could not count commits against upstream in %s", proj)
         return web.json_response(
             {
@@ -2054,6 +1969,7 @@ async def api_update_apply(request: web.Request) -> web.Response:
             },
             status=409,
         )
+    ahead, behind = counts.ahead, counts.behind
     if ahead > 0 and behind > 0:
         logger.warning(
             "Update refused: checkout diverged from upstream (%d ahead, %d behind)", ahead, behind
@@ -2138,6 +2054,12 @@ async def api_update_apply(request: web.Request) -> web.Response:
         )
 
     async def _apply() -> None:
+        # Owns a missing bundle from the merge until the restart takes over.
+        owned = contextlib.ExitStack()
+        owned.enter_context(update_ownership.step(update_ownership.Step.DASHBOARD_UPDATE))
+        # Set once the merge may have moved the tree, cleared once its
+        # dependencies are installed: in between, a relaunch could die at import.
+        tree_moved = False
         try:
             state.push_update_progress("pulling", "Pulling latest changes…")
             # Fast-forward to the PINNED commit, not `git pull`: a pull refetches
@@ -2156,6 +2078,9 @@ async def api_update_apply(request: web.Request) -> web.Response:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            # Only a merge that started can have moved the tree: a spawn that
+            # raised wrote nothing.
+            tree_moved = True
             try:
                 await asyncio.wait_for(pull.communicate(), timeout=60)
             except asyncio.TimeoutError:
@@ -2187,21 +2112,35 @@ async def api_update_apply(request: web.Request) -> web.Response:
 
             # Reinstall the package so any new Python deps / entry points land.
             if not await _venv_pip_install(proj, state):
+                # On the new revision with its dependencies unsynced, and not
+                # restarting: a relaunch would die at import, so the stale-asset
+                # watchdog must not take one either.
+                update_ownership.refuse_restart(
+                    "the dependency install after the dashboard update did not complete"
+                )
                 return
+            # The tree and its dependencies agree again: a refusal an earlier
+            # attempt recorded does not describe the install.
+            tree_moved = False
+            update_ownership.clear_restart_refusal()
 
             # Restart: save history + clean up sessions then exec the same process.
             logger.info("Update complete — saving history and cleaning up before restart")
-            restart = await _restart_gateway(state, resolver=respawn_executable)
-            if restart.blocked:
-                # The initial request already returned 200 before this long
-                # operation reached its second barrier check.  The structured
-                # progress event is therefore the response path the UI can use
-                # to stop its updating state and render the blocker controls.
-                return
+            # Hand the gap to the restart: this step's ownership ends here and
+            # the restart's begins as the await starts, with no yield between.
+            owned.close()
+            await _restart_gateway(state, resolver=respawn_executable)
         except Exception:
             logger.exception("Update failed")
+            if tree_moved:
+                update_ownership.refuse_restart(
+                    "the dashboard update failed after the tree moved, before its "
+                    "dependencies were installed"
+                )
             state.push_update_progress("failed", "Update failed — check logs")
             state.push_refresh("update_failed")
+        finally:
+            owned.close()
 
     task = asyncio.create_task(_apply())
     state._background_tasks.add(task)
@@ -2839,12 +2778,15 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
     if owner_denied is not None:
         return owner_denied
     state: DashboardState = request.app["state"]
-    if state._gateway_restart_in_progress:
-        return web.json_response({"ok": True, "already_in_progress": True})
 
-    # Claim before the response-flush delay, or a second click could schedule a
-    # second task before _restart_gateway reaches its own process-wide guard.
-    state._gateway_restart_in_progress = True
+    # Coalesce repeat clicks/requests BEFORE the response-flush sleep below.
+    # Without this latch, every POST creates a restart task and they all reach
+    # session drain together.  _restart_gateway has its own process-wide claim
+    # for callers from other routes; this task-level latch also avoids needless
+    # duplicate work on this public endpoint.
+    existing = state._gateway_restart_task
+    if existing is not None and not existing.done():
+        return web.json_response({"ok": True, "status": "restarting", "already_in_progress": True})
 
     # Reply BEFORE restarting. os.execv replaces the process image, so a restart
     # kicked off inline would tear down the connection mid-response and the
@@ -2853,19 +2795,21 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
         # Let the response flush before the process image is replaced.
         await asyncio.sleep(0.25)
         try:
-            # No await occurs between releasing the response-time reservation
-            # and entering _restart_gateway, whose claim is synchronous.
-            state._gateway_restart_in_progress = False
             await _restart_gateway(state)
         except Exception:
             logger.exception("Gateway restart failed")
             state.push_update_progress("failed", "Restart failed — check logs")
-        finally:
-            state._gateway_restart_in_progress = False
 
     task = asyncio.create_task(_restart())
+    state._gateway_restart_task = task
     state._background_tasks.add(task)
-    task.add_done_callback(state._background_tasks.discard)
+
+    def _restart_done(done: asyncio.Task[None]) -> None:
+        state._background_tasks.discard(done)
+        if state._gateway_restart_task is done:
+            state._gateway_restart_task = None
+
+    task.add_done_callback(_restart_done)
     return web.json_response({"ok": True, "status": "restarting"})
 
 
@@ -3174,9 +3118,11 @@ async def api_update_approve(request: web.Request) -> web.Response:
     """POST /api/update/approve — consume the nonce and run the shadow apply.
 
     Called by ``kirocrew update approve`` on the gateway host, which read the
-    nonce from the data home. On success the apply runs as a background task:
-    shadow build + verify + promote (all off-loop), then the shared gateway
-    restart, with progress on the same SSE feed the git apply uses.
+    nonce from the data home. On success the apply runs as a background task
+    through :func:`kiro_crew.platform.wheel_apply.run_wheel_apply`, the path the
+    gateway's unattended apply runs too: shadow build + verify + promote (all
+    off-loop), then the shared gateway restart, with progress on the same SSE
+    feed the git apply uses. A shutdown or an exec restart stops it first.
     """
     if not _loopback_peer(request):
         return web.json_response(
@@ -3195,12 +3141,12 @@ async def api_update_approve(request: web.Request) -> web.Response:
             {"error": "nonce must be a string", "code": "invalid_nonce"}, status=400
         )
     # Function-local: boot-path rule, same as the other update handlers.
-    from kiro_crew.platform import update_stepup
-    from kiro_crew.platform.update_layout import cdn_bases as _cdn
-    from kiro_crew.platform.update_layout import cdn_bases_are_safe as _cdn_safe
+    from kiro_crew.platform import update_stepup, wheel_apply
     from kiro_crew.platform.wheel_engine import (
         WheelUpdateError,
-        apply_wheel_update,
+        check_release_version,
+        hold_update_lock,
+        release_update_lock,
         respawn_executable,
     )
 
@@ -3218,24 +3164,44 @@ async def api_update_approve(request: web.Request) -> web.Response:
             },
             status=409,
         )
-    # Source pin BEFORE the nonce is consumed: a pinned fleet's policy decides
-    # where this host may take code from, and a host approval is not that
-    # authority (same seam the git apply and the CLI wheel path enforce).
-    # Checked pre-consume so a policy-refused attempt leaves the armed request
-    # intact rather than burning it on a request that could never proceed.
-    feed_base, artifact_base = _cdn()
-    blocked = update_blocked_reason(feed_base) or update_blocked_reason(artifact_base)
-    if blocked:
-        logger.warning("In-app update approval refused by source pin: %s", blocked)
+    # Every refusal that does not depend on the approval itself runs BEFORE the
+    # nonce is consumed, so a refused attempt leaves the armed request intact:
+    # the preflight (a pinned fleet's policy decides where this host may take
+    # code from, and a host approval is not that authority), the memory copy's
+    # readiness, and the update lock, which is then HELD through the apply so
+    # "is another update running" is decided exactly once.
+    try:
+        feed_base, artifact_base = wheel_apply.preflight_bases()
+    except wheel_apply.WheelApplyRefused as exc:
+        if exc.code == "blocked_by_policy":
+            logger.warning("In-app update approval refused by source pin: %s", exc.message)
+            return web.json_response(
+                {"error": exc.message, "code": "approve_blocked_by_policy", "governance": True},
+                status=403,
+            )
+        return web.json_response({"error": exc.message, "code": "approve_bad_cdn"}, status=409)
+    try:
+        await asyncio.to_thread(wheel_apply.check_memory_ready)
+    except WheelUpdateError as exc:
+        outcome = wheel_apply.classify(exc)
+        code = "approve_memory_preparing" if outcome.status == "deferred" else "approve_memory"
+        return web.json_response({"error": outcome.message, "code": code}, status=409)
+    state: DashboardState = request.app["state"]
+    if state._gateway_restart_in_progress is True:
+        # The restart's exec would stop the apply before it could be audited.
         return web.json_response(
-            {"error": blocked, "code": "approve_blocked_by_policy", "governance": True},
-            status=403,
-        )
-    if not _cdn_safe():
-        return web.json_response(
-            {"error": "CDN base URL contains disallowed characters", "code": "approve_bad_cdn"},
+            {
+                "error": "the gateway is restarting; approve the update again once it is back",
+                "code": "approve_restarting",
+            },
             status=409,
         )
+    try:
+        lock_fd = await asyncio.to_thread(hold_update_lock)
+    except WheelUpdateError as exc:
+        outcome = wheel_apply.classify(exc)
+        code = "approve_busy" if outcome.status == "busy" else "approve_lock_failed"
+        return web.json_response({"error": outcome.message, "code": code}, status=409)
 
     # SEL-audited at every verdict: an approval is a code-install
     # authorization, which is exactly the class of event the audit chain
@@ -3253,11 +3219,24 @@ async def api_update_approve(request: web.Request) -> web.Response:
             required=required,
         )
 
+    async def _refuse(response: web.Response) -> web.Response:
+        await asyncio.shield(asyncio.to_thread(release_update_lock, lock_fd))
+        return response
+
     try:
         pending = await asyncio.to_thread(update_stepup.consume, body["nonce"])
     except update_stepup.StepUpError as exc:
         await _audit("denied", error=str(exc))
-        return web.json_response({"error": str(exc), "code": "approve_refused"}, status=403)
+        return await _refuse(
+            web.json_response({"error": str(exc), "code": "approve_refused"}, status=403)
+        )
+    try:
+        check_release_version(pending.version)
+    except WheelUpdateError as exc:
+        await _audit("denied", error=str(exc))
+        return await _refuse(
+            web.json_response({"error": str(exc), "code": "approve_refused"}, status=409)
+        )
     if _downgrade_target_below_min_version(pending.version, pending.channel):
         error = "selected release is below the required minimum version"
         await _audit(
@@ -3265,13 +3244,15 @@ async def api_update_approve(request: web.Request) -> web.Response:
             error=error,
             resources=f"v{pending.version} ({pending.channel})",
         )
-        return web.json_response(
-            {
-                "error": error,
-                "code": "approve_below_min_version",
-                "governance": True,
-            },
-            status=409,
+        return await _refuse(
+            web.json_response(
+                {
+                    "error": error,
+                    "code": "approve_below_min_version",
+                    "governance": True,
+                },
+                status=409,
+            )
         )
     try:
         await _audit("granted", resources=f"v{pending.version} ({pending.channel})", required=True)
@@ -3283,54 +3264,59 @@ async def api_update_approve(request: web.Request) -> web.Response:
             "update.approve audit could not be written; refusing unaudited install",
             exc_info=True,
         )
-        return web.json_response(
-            {
-                "error": "approval audit could not be recorded; the update was not started",
-                "code": "approve_audit_failed",
-            },
-            status=503,
+        return await _refuse(
+            web.json_response(
+                {
+                    "error": "approval audit could not be recorded; the update was not started",
+                    "code": "approve_audit_failed",
+                },
+                status=503,
+            )
         )
 
-    state: DashboardState = request.app["state"]
-    loop = asyncio.get_running_loop()
-
-    def _progress(msg: str) -> None:
-        # Called from the executor thread; push on the serving loop.
-        loop.call_soon_threadsafe(state.push_update_progress, "building", msg)
+    # Asked before the promotion moves the launcher it compares against.
+    reattach = await asyncio.to_thread(wheel_apply.userns_reattach_needed, pending.version)
 
     async def _apply() -> None:
         state.push_refresh("updating")
-        state.push_update_progress("pulling", f"Applying update to v{pending.version}…")
-        try:
-            await asyncio.to_thread(
-                apply_wheel_update,
-                channel=pending.channel,
-                feed_base=feed_base,
-                artifact_base=artifact_base,
-                expected_version=pending.version,
-                progress=_progress,
-            )
-        except WheelUpdateError as exc:
-            # Redacted BEFORE the log line as well as the progress push: the
-            # message can embed the CDN base (an operator override may carry
-            # basic-auth credentials in the URL), and the kiro_crew logger
-            # feeds the ring buffer that /api/logs streams to the dashboard —
-            # a raw log line is the same exposure as a raw progress push.
-            message, _ = redact_credentials(str(exc))
-            message, _ = redact_exfiltration_urls(message)
-            logger.warning("In-app wheel update failed: %s", message)
-            await _audit("failed", error=message, resources=f"v{pending.version}")
-            state.push_update_progress("failed", message)
-            state.push_refresh("update_failed")
+        outcome = await wheel_apply.run_wheel_apply(
+            channel=pending.channel,
+            version=pending.version,
+            feed_base=feed_base,
+            artifact_base=artifact_base,
+            state=state,
+            held_lock_fd=lock_fd,
+        )
+        resources = f"v{pending.version}"
+        if outcome.status == "promoted":
+            await _audit("success", resources=f"{resources} promoted")
+            if reattach:
+                state.notify(
+                    "update",
+                    f"Kiro Crew {pending.version}: re-attach the sandbox profile",
+                    wheel_apply.userns_reattach_after_apply(pending.version),
+                )
+            if not await asyncio.to_thread(wheel_apply.restart_reaches, pending.version):
+                # A restart would exec the running version again; say so instead.
+                remedy = wheel_apply.restart_unreachable_remedy(pending.version, pending.channel)
+                logger.error("In-app wheel update to v%s: %s", pending.version, remedy)
+                state.push_update_progress("failed", remedy)
+                state.push_refresh("update_failed")
+                return
+            logger.info("In-app wheel update to v%s promoted; restarting", pending.version)
+            await _restart_gateway(state, resolver=respawn_executable)
             return
-        except Exception:
-            logger.exception("In-app wheel update failed unexpectedly")
-            state.push_update_progress("failed", "Update failed — check logs")
-            state.push_refresh("update_failed")
+        if outcome.status == "cancelled":
+            # A deliberate stop (a shutdown, an exec), not a failed install: no
+            # failure is pushed over the restart or shutdown the stop belongs to.
+            await _audit("cancelled", error=outcome.message, resources=resources)
             return
-        logger.info("In-app wheel update to v%s promoted; restarting", pending.version)
-        await _audit("success", resources=f"v{pending.version} promoted")
-        await _restart_gateway(state, resolver=respawn_executable)
+        await _audit("failed", error=outcome.message, resources=resources)
+        detail = outcome.message
+        if outcome.status == "incompatible":
+            detail = f"{detail}. {wheel_apply.incompatible_remedy(pending.channel)}"
+        state.push_update_progress("failed", detail)
+        state.push_refresh("update_failed")
 
     task = asyncio.create_task(_apply())
     state._background_tasks.add(task)

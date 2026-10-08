@@ -763,10 +763,11 @@ _403_HTML = (
     "</style></head><body>"
     "<div class='c'>"
     "<div class='logo'>👻</div>"
-    "<h1>Sign in required</h1>"
+    "<h1>Sign in required — {reason}</h1>"
     "<p>This browser does not have a dashboard session.</p>"
     "<p>On a device already signed in, open <strong>Settings → Security → Sign in on mobile</strong>, "
     "then send the sign-in link to this device. Or paste a sign-in link below.</p>"
+    "<p>No other signed-in device? Run <code>kirocrew token</code> in your terminal, then paste the URL below.</p>"
     "<input id='u' type='text' placeholder='Paste sign-in link or token…' autofocus>"
     "<button onclick='go()'>Connect</button>"
     "<div class='err' id='e'>Invalid URL</div>"
@@ -983,10 +984,6 @@ def validate_token(token: str, *, use_session_exp: bool = False) -> tuple[bool, 
         return False, "", "revocation state unavailable"
     if int(data.get("gen", 0)) < current_gen:
         return False, "", "session revoked"
-    # MERGE-REVIEW: restored from upstream. The fork's mobile-pairing file split
-    # dropped this check, but left the claim-carrying half of the mechanism in
-    # place (the exchange copies ``boot`` onto the session token and the refresh
-    # chain inherits it) — without the check those claims enforce nothing.
     # Boot binding: a token minted with a ``boot`` claim is scoped to the
     # gateway PROCESS that issued it, so a restart ends it. This is what makes
     # an opt-in "the phone stays signed in until the gateway restarts" session
@@ -1261,9 +1258,10 @@ def write_app_secret(app_name: str, secret: str) -> None:
     Creates the directory if needed and sets file mode to 0o600.
     """
     from kiro_crew.config.loader import config_dir
+    from kiro_crew.owner_only_files import mkdirs_owner_only
 
     secret_dir = config_dir() / "apps" / app_name
-    secret_dir.mkdir(parents=True, exist_ok=True)
+    mkdirs_owner_only(secret_dir)  # apps/ and apps/<name>/ are born 0700
     secret_path = secret_dir / ".app_secret"
     # os.O_TRUNC truncates any pre-existing file BEFORE the DACL tightens,
     # then restrict_to_owner locks it down while it is still empty, then we
@@ -1591,12 +1589,14 @@ def _api_pattern_matches(pattern: str, path: str) -> bool:
 # (``useDashboardHealthProbe``), which runs on a dashboard-user token and never
 # reaches this list. An app that genuinely wants it declares it in
 # ``permissions.api`` — the shipped ``design_critique`` manifest does.
-_APP_TOKEN_IMPLICIT_ALLOW: frozenset[str] = frozenset({
-    # Connecting grants no events by itself: the socket records the caller's
-    # manifest declarations and every frame is filtered per socket, payload AND
-    # envelope, in ws_event_scope.py / DashboardState._serialize_for_client.
-    "/api/ws",
-})
+_APP_TOKEN_IMPLICIT_ALLOW: frozenset[str] = frozenset(
+    {
+        # Connecting grants no events by itself: the socket records the caller's
+        # manifest declarations and every frame is filtered per socket, payload AND
+        # envelope, in ws_event_scope.py / DashboardState._serialize_for_client.
+        "/api/ws",
+    }
+)
 
 
 def app_token_path_allowed(app_name: str, path: str) -> bool:
@@ -2964,9 +2964,7 @@ def token_auth_middleware(
         # qualifies as "local" for the internal branch even though it has no
         # loopback peer IP (request.remote is empty for AF_UNIX transports).
         _unix_sock = _unix_request_socket(request) if _matches_internal else None
-        if _matches_internal and (
-            _unix_sock is not None or is_loopback(request.remote or "")
-        ):
+        if _matches_internal and (_unix_sock is not None or is_loopback(request.remote or "")):
             # Kernel-attested peer verification (AF_UNIX only): deny a caller
             # whose /proc ancestry resolves to a DIFFERENT session than the
             # one its X-Session-Key header declares. Runs before either auth

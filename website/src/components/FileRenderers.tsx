@@ -10,6 +10,7 @@ import { useCanOpenFile, useCopyAck } from './FilePathMenu'
 import { fileDownloadUrl, fileStreamUrl, fileOfficePreviewUrl, fileOfficeSlidesUrl, fileOfficeSlideUrl } from '../utils/fileReadUrl'
 import { sendErrorToChat } from '../utils/errorReport'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+import { pathBasename } from '../utils/pathBasename'
 /* ── extension helpers ── */
 const IMG_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.avif', '.svg', '.ico'])
 const CSV_EXTS = new Set(['.csv', '.tsv'])
@@ -82,7 +83,7 @@ export const ImageViewer = memo(function ImageViewer({ filePath }: { filePath: s
         <a href={rawUrl} target="_blank" rel="noreferrer" className="max-w-full max-h-full">
           <img
             src={rawUrl}
-            alt={filePath.split('/').pop()}
+            alt={pathBasename(filePath)}
             className="max-w-full max-h-full object-contain cursor-pointer"
             draggable={false}
           />
@@ -385,7 +386,7 @@ function OfficeCard({ filePath, showBigDownload, hideHint, compact }: {
   // arrive as `C:\Users\…\report.docx`, and a `/`-only split would surface the
   // whole path as the "filename". Matches the pattern in MarkdownRenderer.tsx
   // and VectorMemoryCard.tsx.
-  const filename = filePath.split(/[\\/]/).pop() || filePath
+  const filename = pathBasename(filePath) || filePath
   // `BIN` fallback: the binary card is reached by a byte sniff, not by an
   // extension list, so `coredump` and `a.out` land here with nothing to show.
   const ext = extOf(filePath).replace('.', '').toUpperCase() || 'BIN'
@@ -828,7 +829,7 @@ export function OfficeViewer({ filePath, hideHint }: { filePath: string; hideHin
  *  a broken renderer, which is the report that produced this component. */
 export const OfficeSlidesRenderer = memo(function OfficeSlidesRenderer({ filePath, hideHint }: { filePath: string; hideHint?: boolean }) {
   useLanguageGeneration()
-  const filename = filePath.split(/[\\/]/).pop() || filePath
+  const filename = pathBasename(filePath) || filePath
   const query = useQuery<SlideManifest | { status: 'failed'; message: string }>({
     queryKey: ['office-slides', filePath],
     queryFn: async ({ signal }) => {
@@ -1000,7 +1001,7 @@ function SlidePager({ filePath, filename, manifest, onRerender }: {
 /** The text preview / download card — the pre-slides Office surface. */
 const OfficeTextViewer = memo(function OfficeTextViewer({ filePath, hideHint, degrade }: { filePath: string; hideHint?: boolean; degrade?: SlideDegrade }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
-  const filename = filePath.split(/[\\/]/).pop() || filePath
+  const filename = pathBasename(filePath) || filePath
   const previewable = OFFICE_PREVIEWABLE_EXTS.has(extOf(filePath))
   const structured = OFFICE_STRUCTURED_EXTS.has(extOf(filePath))
   // React Query (repo convention for server fetches — see ArtifactPanel /
@@ -1116,7 +1117,7 @@ const OfficeTextViewer = memo(function OfficeTextViewer({ filePath, hideHint, de
 export const MediaPlayer = memo(function MediaPlayer({ filePath, kind }: { filePath: string; kind: 'video' | 'audio' }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [failed, setFailed] = useState(false)
-  const filename = filePath.split(/[\\/]/).pop() || filePath
+  const filename = pathBasename(filePath) || filePath
   const src = fileStreamUrl(filePath)
   const Icon = kind === 'video' ? Film : Music
   if (failed) {

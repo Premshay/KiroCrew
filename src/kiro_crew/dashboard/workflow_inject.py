@@ -18,6 +18,7 @@ import re
 from typing import Any, Callable, Optional
 
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+from kiro_crew.dashboard.slot_ownership import app_holds_gateway_key
 from kiro_crew.dashboard.state import (
     DashboardState,
     append_and_surface,
@@ -59,13 +60,7 @@ def _summarize(snapshot: dict) -> str:
     status = snapshot.get("status", "")
     run_id = snapshot.get("run_id", "")
     lines = ["[Workflow completion event]", f"Workflow `{name}` ({run_id}) → **{status}**"]
-    if snapshot.get("task_outcome") == "incomplete":
-        lines.append(
-            "Execution ended; task incomplete. This does not establish that the team stopped."
-        )
-    if snapshot.get("child_status") == "unknown":
-        lines.append("Team state: unknown. Check child liveness before recovery.")
-    if status == "finished" or snapshot.get("task_outcome") == "incomplete":
+    if status == "finished":
         result = snapshot.get("result")
         try:
             body = json.dumps(result, indent=2, default=str)
@@ -171,6 +166,10 @@ def inject_workflow_result(
         # 2. Fall back to a dedicated workflow slot only if the chat is gone.
         if slot is None:
             if snapshot.get("memory_mode", "persistent") != "persistent":
+                return False
+            # Never adopt an app-owned slot under the run's key: linking it would
+            # hand the app the originating session's transcript.
+            if app_holds_gateway_key(state, f"workflow-{run_id}", "workflow.inject_result"):
                 return False
             slot = state.get_or_create_slot(name=f"workflow-{run_id}")
             if not getattr(slot, "linked_session_key", ""):

@@ -21,7 +21,7 @@ import type { ChatMessage } from '../types'
 const msg = (role: string, content = 'x', meta?: Record<string, unknown>): ChatMessage =>
   ({ role, content, cls: '', ...(meta ? { meta } : {}) }) as ChatMessage
 
-const state = (over: Partial<{ messages: ChatMessage[]; slotRunning: boolean; slotStopping: boolean; pendingTurnSlot: string | null }> = {}, slots: Array<{ key: string; orchestrating?: boolean; subagents_running?: boolean; executor?: 'local' | 'remote' }> = []) =>
+const state = (over: Partial<{ messages: ChatMessage[]; slotRunning: boolean; slotStopping: boolean; pendingTurnSlot: string | null }> = {}, slots: Array<{ key: string; subagents_running?: boolean; executor?: 'local' | 'remote' }> = []) =>
   ({
     chat: {
       messages: [],
@@ -142,31 +142,24 @@ describe('selectContinuable', () => {
     expect(selectContinuable(state({ messages: [msg('user')], pendingTurnSlot: 'slot-1' }))).toBe(false)
   })
 
-  it('is false while an autopilot plan is mid-flight', () => {
-    // A plan reads `running` False BETWEEN stages, so `running` alone would offer
-    // Continue on a slot the server refuses with `slot_orchestrating`.
-    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', orchestrating: true }]))).toBe(false)
-  })
-
   it('is false while a subagent is still running on the slot', () => {
     expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', subagents_running: true }]))).toBe(false)
   })
 
-  it('is unaffected by another slot orchestrating', () => {
-    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'other', orchestrating: true }]))).toBe(true)
+  it('is unaffected by a subagent running on another slot', () => {
+    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'other', subagents_running: true }]))).toBe(true)
   })
 
   it('is false on a crew-bound slot — the server refuses Continue there', () => {
-    // `remote_bound_refusal` answers 409 `remote_action_unsupported` for
+    // `relay_archive_refusal` answers 409 `relay_archive_read_only` for
     // `executor == "remote"`, so an offer here is a button that cannot work.
     expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', executor: 'remote' }]))).toBe(false)
   })
 
   it('is false on a crew-bound slot whose relayed turn died mid-stream', () => {
-    // The reported shape, and the reason the guard is not merely defensive:
-    // `relay_remote_turn`'s failure path appends this trailing `error` row, so
-    // without the guard a dropped tunnel leaves the composer offering a
-    // guaranteed-409 Resume. `selectTurnInterrupted` still reads it as
+    // An archive whose last relayed turn died ends on this trailing `error`
+    // row, so without the guard the composer would offer a guaranteed-409
+    // Resume. `selectTurnInterrupted` still reads it as
     // interrupted — that half is true and unchanged; only availability moves.
     const bound = state({ messages: [
       msg('user', 'what shall we do?'),
@@ -444,7 +437,7 @@ describe('selectTurnInterrupted', () => {
  * The shared crew-bound predicate. `selectContinuable` (above) and ChatPage's
  * regenerate / edit-resend gates both route through this ONE spelling, so the
  * two client surfaces cannot drift from each other or from the server's
- * `remote_bound_refusal`. The `selectContinuable` cases above already exercise
+ * `relay_archive_refusal`. The `selectContinuable` cases above already exercise
  * it end-to-end (executor: 'remote' -> not continuable); these pin the predicate
  * itself, including the keying that a slot-object test could otherwise leave
  * ambiguous.

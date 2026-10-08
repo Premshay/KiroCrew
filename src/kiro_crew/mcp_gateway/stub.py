@@ -12,7 +12,11 @@ inheriting this process's stdio (see :func:`_fallback_spawn_child`).
 Register fields match :meth:`PoolKey.from_register`; hashes use SHA-256
 (stdlib). Bridge phase is NOT wrapped in a timeout (learned correction
 — a single timeout around a long-lived session silently kills healthy
-streams). Import budget: stdlib + pool + mcp_caller only.
+streams). Import budget: stdlib, ``transport`` and the stdlib-only leaves it
+needs to connect. The stub runs once per session per MCP server, so anything
+else -- pool, config, metrics, the caller and cleanup helpers -- is imported by
+the function that uses it (see :data:`_DEFERRED`), and
+``test_mcp_gateway_stub_import_budget.py`` holds the line.
 """
 
 from __future__ import annotations
@@ -38,30 +42,46 @@ from typing import Any, Callable, Mapping, NoReturn, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.executors import configure_default_executor, subprocess_executor
-from kiro_crew.jsonl_util import bounded_records, rotate_jsonl_at
-from kiro_crew.mcp_caller import (
-    POOLING_REQUIRES_TENANT_NONCE,
-    CallerContext,
-    _parent_pid,
-)
+from kiro_crew.json_line import parse_json_object_line
+from kiro_crew.mcp_caller import CallerContext, _parent_pid
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.mcp_gateway.hashing import (
     decode_target_args,
     expand_stub_flags,
+    format_pool_label,
     hash_command,
     hash_effective_env,
+    runs_install_code,
 )
-from kiro_crew.mcp_gateway.pool import (
+from kiro_crew.mcp_gateway.read_limits import (
     _DEFAULT_READ_BUFFER_LIMIT,
-    READ_BUFFER_LIMIT_BYTES,
-    PoolKey,
+    read_buffer_limit_from_flag,
 )
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
-from kiro_crew.metrics.events import MCP_RECONNECTS, emit_counter
 
 logger = logging.getLogger(__name__)
+
+# --- Import budget ----------------------------------------------------------
+# The stub runs once per session per MCP server, so what it loads is multiplied
+# by every session on the host. Two rules keep that bounded, and they are
+# different rules because they bound different things:
+#
+# * The modules ABOVE are the ones every run reaches anyway -- it builds a
+#   Register payload and connects on every start -- so importing them here
+#   rather than inside a function changes when, not whether, and the eager
+#   spelling is the readable one.
+# * ``mcp_gateway.pool``, ``metrics.events`` and ``jsonl_util`` are NOT on that
+#   path, and ``pool`` in particular costs the whole config package (its body
+#   resolves the read-buffer ceiling, which reads config). They are imported by
+#   the function that needs them: a reconnect counter, a fallback record, a
+#   degrade check. ``test_mcp_gateway_stub_import_budget.py`` holds that line.
+#
+# The ceiling the stub DOES need comes from the stdlib-only ``read_limits``
+# leaf, and the pool label it logs comes from ``hashing.format_pool_label``, so neither
+# requires ``pool`` itself.
+
 
 _HANDSHAKE_TIMEOUT_SECS = 3.0
 
@@ -201,8 +221,49 @@ _STDIN_QUEUE_MAXSIZE = 256
 # reader was willing to return can never trip it alone, and is floored at the
 # SHIPPED read limit so tuning ``mcp_gateway.read_buffer_limit_bytes`` down (1 KiB
 # is accepted) cannot tighten the hold along with it.
+#
+# All three start at the SHIPPED default and are replaced by
+# :func:`_adopt_read_ceiling` before the stub opens anything. The default is a
+# plain integer from a stdlib-only leaf, so this module's body still reads no
+# config -- which is the whole point, since a config read costs roughly 140
+# modules in a process that exists once per session per MCP server.
+READ_BUFFER_LIMIT_BYTES = _DEFAULT_READ_BUFFER_LIMIT
 _HELD_FRAME_BYTES = READ_BUFFER_LIMIT_BYTES
 _HELD_TOTAL_BYTES = max(_DEFAULT_READ_BUFFER_LIMIT, _HELD_FRAME_BYTES)
+
+
+def _adopt_read_ceiling(args: argparse.Namespace) -> int:
+    """Bind the read ceiling this stub was LAUNCHED with, before it connects.
+
+    The rewriter resolves the ceiling when it writes the overlay -- it has
+    config loaded anyway -- and stamps the answer into ``--read-limit``.
+    Adopting it off argv is what keeps a running stub out of the config package.
+
+    Called from the entry point, because a launch parameter is adopted once, by
+    whoever read argv. A stub whose overlay predates the flag adopts nothing
+    usable and :func:`read_buffer_limit_from_flag` resolves the long way, so the
+    precedence an operator sees -- env var, then the config key, then the
+    default -- is the same either way.
+
+    Writes the two retention bounds as well, so every reader of them sees one
+    answer. ``_HELD_TOTAL_BYTES`` is floored at the SHIPPED default on purpose:
+    tuning the key DOWN (1 KiB is accepted) must not tighten what a disconnected
+    stub may hold, or a reconnect would drop frames it could have replayed.
+    """
+    raw = getattr(args, "read_limit", None)
+    flag_value: Optional[int] = None
+    if raw is not None:
+        try:
+            flag_value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("ignoring unparsable --read-limit %r", raw)
+    value = read_buffer_limit_from_flag(flag_value)
+    globals()["READ_BUFFER_LIMIT_BYTES"] = value
+    globals()["_HELD_FRAME_BYTES"] = value
+    globals()["_HELD_TOTAL_BYTES"] = max(_DEFAULT_READ_BUFFER_LIMIT, value)
+    return value
+
+
 # Coupled to the DEFAULT of ``mcp_gateway.spawn_queue_wait_secs``
 # (``config/integration_sections.py``): the daemon holds a queued stub for about that long
 # before a capacity refusal, and this budget is how long the stub keeps
@@ -257,9 +318,11 @@ _CAPACITY_ERROR_CODE = -32001
 _BINARY_HASH_CAP_BYTES = 4 * 1024 * 1024
 # Placeholder: stub does not yet observe a config snapshot, so all
 # same-session stubs agree on this value (never a false split).
-# Safety note: approval_mode and sandbox_mode are already separate PoolKey
-# dimensions, so the dangerous config divergences (permission escalation,
-# sandbox escape) are already covered by distinct pool entries.
+# Safety note: the config divergences a reader reaches for first --
+# permission escalation and sandbox escape -- are not pool concerns. The
+# sandbox is not applied to a gateway-spawned backend at all, and kiro-cli
+# evaluates the permission surface per agent before a call reaches this
+# process; the ``pool`` module docstring carries the full argument.
 # TODO: Hash relevant config fields (e.g. tool allowlists,
 # hook settings) in a future iteration to detect non-security config drift
 # that could cause subtle behavioral differences across pooled sessions.
@@ -394,6 +457,13 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=os.environ.get("KIROCREW_MCP_SOCKET") or os.environ.get("MC_MCP_SOCKET") or _default_socket_path(),
     )
     p.add_argument("--real-stub", default=None, dest="real_stub")
+    # The read ceiling, pre-resolved from config by the rewriter that wrote this
+    # overlay. Taking it on argv is what keeps a running stub out of the config
+    # package: see :func:`_adopt_read_ceiling`. Absent on an overlay written
+    # before the flag existed, which the resolver handles. ``type=str`` and not
+    # ``int``: an unparsable value must degrade to the resolver, and argparse's
+    # own int conversion would exit the process instead.
+    p.add_argument("--read-limit", default=None, dest="read_limit")
     return p.parse_args(argv)
 
 
@@ -491,8 +561,14 @@ def _parse_auto_approve(raw: str) -> list[str]:
 def _hash_permission_profile(
     auto_approve: list[str], approval_mode: str, trust_all: bool
 ) -> str:
-    """Hash ``(autoApprove sorted, approval_mode, trust_all)`` — two
-    sessions with different permission surfaces MUST NOT share a backend."""
+    """Hash ``(autoApprove sorted, approval_mode, trust_all)`` for the
+    ``autoapprove_set_hash`` register field.
+
+    Wire-compat ballast for an adopted daemon that still keys on it, which is
+    why the encoding stays injective. A current daemon ignores the field --
+    see the ``pool`` module docstring on why a permission surface kiro-cli
+    evaluates per agent, before any call reaches this process, does not
+    partition the pool."""
     h = hashlib.sha256()
     for tool in sorted(auto_approve):
         h.update(tool.encode("utf-8"))
@@ -567,14 +643,25 @@ def _pool_binary_identity(command: str, target_args: list[str]) -> tuple[str, st
     its existing argv-based identity.
     """
     base = _binary_version(command)
-    if not any(a in _KIROCREW_MCP_SUBCOMMANDS for a in target_args):
+    # Two ways a target runs Kiro Crew's own code: one of the reserved
+    # subcommands, or the gateway interpreter pinned by ``apps/bridges.py``
+    # with ``-m kiro_crew...`` / the deps_boot shim in argv
+    # (``hashing.runs_install_code``). The second needs the fold here too: with
+    # the versioned directory gone from ``command_args_hash``, this token is
+    # the only identity dimension left that can see the code change. A
+    # third-party server that merely runs ON that interpreter is excluded, so
+    # its pool is not re-partitioned on every Kiro Crew commit.
+    managed = any(a in _KIROCREW_MCP_SUBCOMMANDS for a in target_args)
+    if not managed and not runs_install_code(command, target_args):
         return base, ""
     # Imported here, not at module top: the stub's cold-start path is timed
     # and this module is only needed on the Kiro Crew branch.
     from kiro_crew.code_fingerprint import code_fingerprint
 
-    generation = code_fingerprint()
-    return f"{base}+{generation}", generation
+    fingerprint = code_fingerprint()
+    # The generation stays argv-selected: only a managed subcommand runs the
+    # daemon-generation check, so an install-code app bridge reports none.
+    return f"{base}+{fingerprint}", (fingerprint if managed else "")
 
 
 def pool_binary_version(command: str, target_args: list[str]) -> str:
@@ -615,6 +702,7 @@ def _ancestor_pids() -> list[int]:
     lookup failure, or the depth cap. Always contains at least
     ``os.getppid()`` when resolvable.
     """
+
     chain: list[int] = []
     pid = os.getppid()
     seen: set[int] = set()
@@ -638,6 +726,7 @@ def _build_caller_block(channel_id: Optional[str]) -> dict[str, str]:
     al.) that need session identity. Sharing the backend-side resolver keeps
     both ends of the wire in agreement. If the key is still unknown at register
     (claim hasn't happened yet), the recaller loop repairs it later."""
+
     session_key = CallerContext.from_env().session_key
     # Diagnostic identity only — the OS user. USERNAME is the Windows spelling
     # of USER; check both so this dimension is not empty on one platform.
@@ -667,6 +756,7 @@ def build_register_payload(args: argparse.Namespace) -> dict:
 
     The result is accepted verbatim by :meth:`PoolKey.from_register` —
     callers do not post-process."""
+
     target_args = _resolve_target_args(args)
     binary_version, stub_code_fingerprint = _pool_binary_identity(args.target_command, target_args)
     # Prefer --env-json when present (commas/equals round-trip intact);
@@ -698,6 +788,21 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         "type": "register",
         "stub_uuid": str(uuid.uuid4()),
         "server_name": args.server,
+        # NOT a pool dimension — the agent name never reaches the backend
+        # process, so two agents declaring one server identically share it (see
+        # the ``pool`` module docstring). LOAD-BEARING ANYWAY, and this list is
+        # what a future removal has to answer to. A daemon reads it off the
+        # frame (``daemon.connection``'s ``stub_agent``) for three things:
+        #   * a daemon predating the pool-dimension removal runs a
+        #     ``PoolKey.from_register`` that hard-requires the key and would
+        #     reject every new stub as malformed;
+        #   * it names the declared-env sidecar a connection-PRIVATE backend
+        #     reads (``daemon.launch._read_declared_env_sidecar``), so dropping
+        #     it would start such a backend with no declared env; and
+        #   * it is stamped into an intercepted app render's spool record
+        #     (``Backend.agent_for_stub`` -> ``backend._fetch_and_deliver_ui``),
+        #     which is the governance identity of that render's callbacks, so
+        #     dropping it would have every app callback refused.
         "agent_name": args.agent,
         "command_args_hash": hash_command(args.target_command, target_args),
         "effective_env_hash": hash_effective_env(env_pairs, identity_keys=identity_keys),
@@ -710,6 +815,16 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         # SID-derived int on Windows, so the PoolKey dimension keeps both its
         # type and its partitioning meaning.
         "os_uid": platform_compat.local_user_id(),
+        # Wire-compat ballast, NOT pool dimensions — same treatment as
+        # ``user_identity`` below, and for the same reason: an adopted daemon
+        # predating their removal runs a ``PoolKey.from_register`` that
+        # hard-requires all four, so omitting them would make that daemon
+        # reject every register as malformed and un-pool the whole install.
+        # A current daemon ignores them; the ``pool`` module docstring records
+        # why none of them isolates anything (the sandbox is not applied to a
+        # pooled backend, and kiro-cli decides approval per agent before a
+        # call reaches this process). Safe to drop once no daemon predating
+        # their removal can be adopted.
         "sandbox_mode": args.sandbox_mode,
         "autoapprove_set_hash": _hash_permission_profile(
             auto_approve, args.approval_mode, bool(args.trust_all)
@@ -732,6 +847,10 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         # the key. Safe to drop once no daemon predating the key can be adopted.
         "user_identity": caller["principal_id"] or "unknown",
         "channel_id": channel_id,
+        # Wire-compat ballast on the same terms as ``user_identity`` above, and
+        # inert from the start: this has always been a constant run of 64 zeros,
+        # so it never partitioned anything. Deleted as a pool dimension; still
+        # sent so a daemon predating the deletion keeps accepting this register.
         "config_snapshot_hash": _CONFIG_SNAPSHOT_PLACEHOLDER,
         "caller": caller,
         # Claim-push (gateway → gatewayd ``claim`` frame): the ancestor PID
@@ -786,17 +905,48 @@ async def _write_frame(writer: asyncio.StreamWriter, obj: dict) -> None:
         await writer.drain()
 
 
+class _NonObjectFrame(json.JSONDecodeError):
+    """A gateway frame that is valid JSON but neither an object nor ``null``.
+
+    A ``JSONDecodeError``, so every catch set that degrades on a bad frame
+    still does; the admission wait catches it first and reads the next frame.
+    """
+
+
 async def _read_frame(reader: asyncio.StreamReader) -> Optional[dict]:
     try:
         line = await reader.readuntil(b"\n")
     except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
         return None
+    if not line:
+        return None
     # errors="replace": an invalid-UTF-8 byte must NOT raise UnicodeDecodeError
     # (a ValueError, not json.JSONDecodeError) out through the handshake /
     # ensure_backend catch sets — that would kill the stub before fallback_exec.
-    # A replaced char just yields a JSONDecodeError below, which IS caught and
-    # degrades cleanly to a per-session exec.
-    return json.loads(line.decode("utf-8", errors="replace")) if line else None
+    # Every unusable frame (not JSON, not an object, nested past the decoder's
+    # ceiling, which raises RecursionError) becomes the one JSONDecodeError
+    # those catch sets handle, and degrades cleanly to a per-session exec. A
+    # non-object value raises the _NonObjectFrame subclass, which only the
+    # admission wait tells apart.
+    msg = parse_json_object_line(line, errors="replace")
+    if msg is not None:
+        return msg
+    if _is_json_non_object(line):
+        raise _NonObjectFrame("gateway frame is not a JSON object", "", 0)
+    raise json.JSONDecodeError("gateway frame is not JSON", "", 0)
+
+
+def _is_json_non_object(line: bytes) -> bool:
+    """True when *line* is JSON other than an object or ``null``.
+
+    Run only for a frame the shared parser already refused, so the second
+    parse costs nothing on the frames that matter.
+    """
+    try:
+        value = json.loads(line.decode("utf-8", errors="replace"))
+    except (ValueError, RecursionError):
+        return False
+    return value is not None
 
 
 async def _safe_close(writer: asyncio.StreamWriter) -> None:
@@ -886,6 +1036,8 @@ def must_degrade_nonce_blind(
     by a nonce-blind daemon, and degrading all of them would spend one process per
     session on any host whose daemon outlived a package upgrade.
     """
+    from kiro_crew.mcp_caller import POOLING_REQUIRES_TENANT_NONCE
+
     if server not in POOLING_REQUIRES_TENANT_NONCE:
         return False
     return poolable and "tenant_nonce" not in capabilities
@@ -934,17 +1086,6 @@ async def handshake(
     if resp is None:
         await _safe_close(writer)
         raise FallbackRequestedError("gateway closed during handshake")
-    if not isinstance(resp, dict):
-        # _read_frame returns raw json.loads output, which can be a non-dict
-        # (list / number / string) for a malformed broker reply. resp.get(...)
-        # would then raise AttributeError OUTSIDE the caught
-        # (OSError, ConnectionError, json.JSONDecodeError) set above, crashing
-        # the stub before fallback_exec and defeating the always-degrade-to-
-        # per-session guarantee. Treat it as a fallback-eligible bad reply.
-        await _safe_close(writer)
-        raise FallbackRequestedError(
-            f"unexpected handshake reply (not an object): {type(resp).__name__}"
-        )
 
     msg_type = resp.get("type")
     if msg_type == "registered":
@@ -1135,11 +1276,8 @@ class StubSession:
                     break
         ids = []
         for line in lines:
-            try:
-                msg = json.loads(line)
-            except (ValueError, TypeError):
-                continue
-            if isinstance(msg, dict) and "method" in msg and "id" in msg:
+            msg = parse_json_object_line(line)
+            if msg is not None and "method" in msg and "id" in msg:
                 ids.append(msg["id"])
         return ids
 
@@ -1273,16 +1411,16 @@ async def run_bridge(
                 return
             # Track outbound JSON-RPC request IDs (have "method" + "id"), and
             # let the session keep whatever a reconnect will need.
-            # Best-effort: parse failures are silently ignored — the frame is
-            # still forwarded verbatim.
-            try:
-                msg = json.loads(line)
-                if isinstance(msg, dict):
+            # Best-effort: a line that does not parse as an object (nested
+            # past the decoder's ceiling included) is still forwarded verbatim.
+            msg = parse_json_object_line(line)
+            if msg is not None:
+                try:
                     session.note_outbound(line, msg)
                     if "method" in msg and "id" in msg:
                         _outstanding_ids.add(msg["id"])
-            except (ValueError, TypeError):
-                pass
+                except (ValueError, TypeError):
+                    pass
             try:
                 # Serialize with _recaller_loop's _write_frame writes on the
                 # same socket: the write itself is whole-frame atomic, but a
@@ -1372,9 +1510,9 @@ async def run_bridge(
                 # requests.
                 # Best-effort: parse failures pass the line through verbatim.
                 _is_control = False
+                msg = parse_json_object_line(line)
                 try:
-                    msg = json.loads(line)
-                    if isinstance(msg, dict):
+                    if msg is not None:
                         _mtype = msg.get("type")
                         if _mtype == _BRIDGE_PONG_TYPE:
                             _pong_received.set()
@@ -1643,11 +1781,8 @@ async def _replay_initialize(
             line = await reader.readuntil(b"\n")
             if not line:
                 return _REPLAY_RETRY, None, "closed_during_replay"
-            try:
-                msg = json.loads(line.decode("utf-8", errors="replace"))
-            except (ValueError, TypeError):
-                continue
-            if not isinstance(msg, dict):
+            msg = parse_json_object_line(line, errors="replace")
+            if msg is None:
                 continue
             if msg.get("type") in (_BRIDGE_PONG_TYPE, _BRIDGE_KEEPALIVE_TYPE, _SPAWN_QUEUED_TYPE):
                 continue
@@ -1740,12 +1875,13 @@ async def _ensure_backend_admitted(
             msg = await asyncio.wait_for(_read_frame(reader), timeout=min(silence_secs, remaining))
         except asyncio.TimeoutError:
             return _ADMIT_TIMEOUT, None
+        except _NonObjectFrame:
+            # A stray value costs that frame; the daemon still holds our place.
+            continue
         except (OSError, ConnectionError, json.JSONDecodeError):
             return _ADMIT_CLOSED, None
         if msg is None:
             return _ADMIT_CLOSED, None
-        if not isinstance(msg, dict):
-            continue
         if queue_aware and _admission_control_frame(msg):
             # Proof the daemon is alive and still holds our place: renew the
             # silence window, never the total budget.
@@ -1815,11 +1951,8 @@ async def _serve_capacity_refusal(
             return 1
         if not line:
             return 0
-        try:
-            msg = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(msg, dict) or "method" not in msg or "id" not in msg:
+        msg = parse_json_object_line(line)
+        if msg is None or "method" not in msg or "id" not in msg:
             continue
         error = {
             "jsonrpc": "2.0",
@@ -2032,10 +2165,8 @@ async def _drain_while_disconnected(
                     # have, and stop draining: nothing else is coming.
                     held.append((line, None, 0.0))
                     return
-                try:
-                    msg = json.loads(line)
-                except (ValueError, TypeError):
-                    msg = None
+                # Any: ``failable`` below is what proves it a dict with an id.
+                msg: Any = parse_json_object_line(line)
                 failable = _is_failable_request(msg)
                 if _no_room_to_hold(line, held, held_bytes):
                     # Retention is full in one of its dimensions, so this frame
@@ -2300,6 +2431,8 @@ async def _reconnect(
                 return None
             session.note_init_result(json.loads(forward))
         session.reconnects += 1
+        from kiro_crew.metrics.events import MCP_RECONNECTS, emit_counter
+
         emit_counter(MCP_RECONNECTS, {"pool": bool(pool_label)})
         logger.info(
             "stub reconnected to a restarted gateway (%s, reconnect #%d) pool=%s",
@@ -2355,8 +2488,13 @@ def log_fallback(
     written before the field existed has no key and so still counts as a
     fallback — which is what it was."""
     try:
+        # The log is always under the stub's own data home (_crew_home), so it is
+        # owner-only unconditionally: no lexical home test, which would compare
+        # a raw KIROCREW_HOME against the resolved one and import config.paths.
+        from kiro_crew.owner_only_files import mkdirs_owner_only, owner_only_opener
+
         log_path = _fallback_log_path()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+        mkdirs_owner_only(log_path.parent)
         record = {
             "ts": time.time(),
             "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -2378,8 +2516,10 @@ def log_fallback(
         # unopenable lock file degrades to not rotating), so the append below
         # always still runs; only a failure of the append itself may drop the
         # record, caught by this function's own handler.
+        from kiro_crew.jsonl_util import rotate_jsonl_at
+
         rotate_jsonl_at(log_path, _FALLBACK_LOG_MAX_BYTES)
-        with open(log_path, "a", encoding="utf-8") as f:
+        with open(log_path, "a", encoding="utf-8", opener=owner_only_opener) as f:
             f.write(json.dumps(record, separators=(",", ":")) + "\n")
     except OSError:
         pass
@@ -2414,6 +2554,8 @@ def fallback_counts() -> dict[str, Any]:
     were.
     """
     cutoff = time.time() - _FALLBACK_COUNT_WINDOW_SECS
+    from kiro_crew.jsonl_util import bounded_records
+
     total = 0
     by_server: dict[str, int] = {}
     by_reason: dict[str, int] = {}
@@ -2677,6 +2819,7 @@ def _fallback_target_is_own_control_plane(
     module-level SSL setup) into every third-party fallback that the vetting
     then refuses on its first line anyway.
     """
+
     server_name = str(getattr(args, "server", "") or "")
     if server_name not in KIROCREW_BIN_MCP_SERVERS:
         return False
@@ -2898,6 +3041,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
         stream=sys.stderr,
     )
     args = _parse_args(argv)
+    _adopt_read_ceiling(args)
     # build_register_payload -> _build_caller_block -> CallerContext.from_env
     # does a synchronous /proc ancestry walk + file reads (and _binary_version
     # hashes the target binary), so offload the whole cold-start resolution to
@@ -2907,10 +3051,10 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
     payload = await loop.run_in_executor(subprocess_executor(), build_register_payload, args)
 
     try:
-        pool_label = PoolKey.from_register(payload).human_readable()
+        pool_label = format_pool_label(payload)
     except ValueError as exc:
         # Defensive — our own payload should never be malformed.
-        logger.warning("built malformed PoolKey payload: %s", exc)
+        logger.warning("built an unlabelable Register payload: %s", exc)
         pool_label = f"{args.agent}:{args.server}"
 
     stop_event = asyncio.Event()

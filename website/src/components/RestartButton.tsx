@@ -60,10 +60,10 @@ export default function RestartButton() {
 
   return (
     <div className="flex flex-col items-end gap-1">
-    // `flex-wrap` + the notice's `basis-full`: a failure gets its own row under
-    // the hint and the button instead of squeezing both into two-line wraps
-    // inside the Connections header band (the ok tick is one short line and
-    // stays beside the button).
+    {/* `flex-wrap` + the notice's `basis-full`: a failure gets its own row under
+        the hint and the button instead of squeezing both into two-line wraps
+        inside the Connections header band (the ok tick is one short line and
+        stays beside the button). */}
     <div className="flex flex-wrap items-center justify-end gap-2">
       {ok && <span className="text-[13px] animate-rise text-ok">{ok}</span>}
       {/* No hand-off: the failure goes through ErrorNotice like every other error the user

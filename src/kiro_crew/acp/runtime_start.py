@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from kiro_crew.acp.types import JsonRpcMessage
 from kiro_crew.config import live
+from kiro_crew.session_start_sizing import effective_session_start_concurrency
 from kiro_crew.start_priority import PrioritySemaphore, StartPriority
 
 if TYPE_CHECKING:
@@ -85,15 +86,30 @@ _cold_start_admissions_lock = threading.Lock()
 
 
 def _cold_start_admission() -> _ColdStartAdmission:
+    """The current loop's admission, at the configured width.
+
+    The width is ``agent.runtime_spawn_concurrency`` as the process's session
+    manager published it (``cold_start_sizing.configured_runtime_spawn_width``),
+    else :data:`_COLD_START_MAX_CONCURRENT` for a caller that built none. The
+    published width can grow once the gateway's post-bind host reading lands, so
+    every lookup widens an existing admission to it (an int compare; it never
+    shrinks). A spawn that ran before the manager published is therefore not
+    stuck at the default for the loop's lifetime.
+    """
     from kiro_crew.acp.runtime import weakref
+    from kiro_crew.cold_start_sizing import configured_runtime_spawn_width
 
     loop = asyncio.get_running_loop()
+    published = configured_runtime_spawn_width()
+    width = _COLD_START_MAX_CONCURRENT if published is None else published
     with _cold_start_admissions_lock:
         admission_ref = _cold_start_admissions.get(loop)
         admission = admission_ref() if admission_ref is not None else None
         if admission is None:
-            admission = _ColdStartAdmission(_COLD_START_MAX_CONCURRENT)
+            admission = _ColdStartAdmission(width)
             _cold_start_admissions[loop] = weakref.ref(admission)
+        elif width > admission.semaphore.limit:
+            admission.semaphore.widen_to(width)
         return admission
 
 
@@ -111,7 +127,8 @@ def _cold_start_counts() -> tuple[int, int]:
 # burst of subagent starts every session/new competes for the same process,
 # each one gets slower, and the 90s budget is hit by requests that would have
 # completed in isolation -- a timeout that says nothing about the runtime's
-# health. The gate keeps at most ``agent.session_start_concurrency`` (default 2)
+# health. The gate keeps at most ``agent.session_start_concurrency`` (default
+# ``auto``: sized once per process from the host by ``session_start_sizing``)
 # session/new requests outstanding per event loop; waiters are ordered by
 # ``StartPriority`` (rule: ``kiro_crew.start_priority``).
 # It is a FIXED semaphore on purpose: the adaptive loop lives in the gatewayd
@@ -152,7 +169,10 @@ def _resolve_session_start_concurrency() -> int:
         from kiro_crew.config import KiroCrewConfig
 
         cfg = KiroCrewConfig.load()
-        return max(_SESSION_START_CONCURRENCY_FLOOR, int(cfg.agent.session_start_concurrency))
+        return max(
+            _SESSION_START_CONCURRENCY_FLOOR,
+            effective_session_start_concurrency(cfg.agent.session_start_concurrency),
+        )
     except Exception:
         logger.debug("session_start_concurrency unreadable -- using default", exc_info=True)
         return _SESSION_START_CONCURRENCY_DEFAULT
@@ -260,6 +280,10 @@ class StartPermit:
         """The gate's queue state, for a log line (``PrioritySemaphore.describe``)."""
         return self._gate.semaphore.describe()
 
+    def gate_counts(self) -> tuple[int, int]:
+        """``(active, queued)`` for the gate this permit came from."""
+        return (self._gate.active, self._gate.queued)
+
     def hold_for_collector(self) -> bool:
         """Let a :class:`StartCollector` keep this permit, if the gate allows it.
 
@@ -306,8 +330,11 @@ async def session_start_gate() -> SessionStartGate:
     snap = live.snapshot()
     limit: int | None = None
     if snap is not None:
+        # An explicit integer is used as is; "auto" needs the host probe (disk
+        # I/O), so it falls through to the off-loop resolver below.
         try:
-            limit = int(snap.agent.session_start_concurrency)
+            raw = snap.agent.session_start_concurrency
+            limit = None if isinstance(raw, str) else int(raw)
         except Exception:
             limit = None
     if limit is None:
@@ -320,15 +347,37 @@ async def session_start_gate() -> SessionStartGate:
     return gate
 
 
-def session_start_gate_counts() -> tuple[int, int]:
-    """``(active, queued)`` for the current loop's gate; ``(0, 0)`` when none exists."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return (0, 0)
+# ── Session-start gate for the shared ``_bg`` runtime ─────────────────────────
+#
+# Every ``run_bg_oneliner`` (auto-titles, nav labels, folder icons, summaries,
+# STT endpointing) opens a fresh ``session/new`` on the one shared ``_bg``
+# runtime, and that one process answers them serially (~0.9 s each). On the gate
+# above they cost people their starts even with start priority: a title fires on
+# the first send, so in a burst the titles reach the gate seconds before the
+# senders' own starts have finished spawning and take the permits first, and each
+# one holds its permit for as long as it waits inside the ``_bg`` process. So
+# ``_bg`` starts take this gate instead and never hold or queue for a user permit.
+# One permit, because the process serializes them anyway; ordered by start
+# priority like the user gate, so a FOREGROUND one-liner goes ahead of queued
+# titles. Fixed, not configured: it bounds no resource the operator sizes. At one
+# permit ``collector_hold_ceiling`` is 0, so a timed-out ``_bg`` start never
+# parks the only permit in a collector.
+_BG_RUNTIME_SESSION_START_CONCURRENCY = 1
+
+_bg_runtime_session_start_gates: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, SessionStartGate
+] = weakref.WeakKeyDictionary()
+
+
+async def bg_runtime_session_start_gate() -> SessionStartGate:
+    """The current loop's gate for ``session/new`` on the shared ``_bg`` runtime."""
+    loop = asyncio.get_running_loop()
     with _session_start_gates_lock:
-        gate = _session_start_gates.get(loop)
-    return (gate.active, gate.queued) if gate is not None else (0, 0)
+        gate = _bg_runtime_session_start_gates.get(loop)
+        if gate is None:
+            gate = SessionStartGate(_BG_RUNTIME_SESSION_START_CONCURRENCY)
+            _bg_runtime_session_start_gates[loop] = gate
+    return gate
 
 
 # Bounds every init-frame holder: ``_split_init_frames`` and ``StartCollector`` below,

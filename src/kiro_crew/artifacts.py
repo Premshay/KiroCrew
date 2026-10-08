@@ -55,6 +55,7 @@ with one identity, so callers import from here.
 from __future__ import annotations
 
 import hashlib
+import hmac as _hmac
 import importlib
 import json
 import logging
@@ -89,6 +90,7 @@ from kiro_crew.artifact_store.model import (  # noqa: F401 - facade surface
     Artifact,
     ArtifactAlreadyExistsError,
     ArtifactComment,
+    ArtifactConflictError,
     ArtifactError,
     ArtifactNotFoundError,
     ArtifactPublication,
@@ -129,6 +131,10 @@ from kiro_crew.deploy.webapp_types import (  # noqa: F401 - facade surface
     webapp_metadata_from_dict,
 )
 from kiro_crew.metrics.events import ARTIFACTS_CREATED, emit_counter
+from kiro_crew.owner_only_files import GROUP_OTHER_BITS as _GROUP_OTHER_BITS
+from kiro_crew.owner_only_files import is_owner_only_target as _is_owner_only_target
+from kiro_crew.owner_only_files import mkdirs_owner_only as _mkdirs_owner_only
+from kiro_crew.owner_only_files import owner_only_opener as _owner_only_opener
 from kiro_crew.publish_provider import DEFAULT_PROVIDER  # noqa: F401 - facade surface
 from kiro_crew.security import (
     canonical_path_refusal,
@@ -216,6 +222,7 @@ for _moved in (
     ArtifactValidationError,
     ArtifactStillPublishedError,
     ArtifactReplacedError,
+    ArtifactConflictError,
 ):
     _moved.__module__ = __name__
 del _moved
@@ -274,6 +281,15 @@ def _now_iso() -> str:
     deterministically by ``updated_at``.
     """
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+#: Shape of a wire ``content_token`` / ``expected_token``: 256 random bits as hex.
+_TOKEN_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _new_content_token() -> str:
+    """Return a fresh random optimistic-concurrency token."""
+    return os.urandom(32).hex()
 
 
 def _validate_content(content: str) -> str:
@@ -377,6 +393,37 @@ def _open_pinned_for_read(resolved: Path) -> int:
     )
 
 
+def _owner_only_tmp_opener(path: str, flags: int) -> int:
+    """:func:`_owner_only_opener` for a fixed-name ``.tmp`` that a crash can leave behind.
+
+    ``os.open`` applies the mode only when it creates the file, so a ``.tmp`` an
+    earlier version left at ``0644`` would be truncated, reused and then
+    published at that mode by the rename. The descriptor belongs to this write
+    alone (no lock is ever taken on a ``.tmp``), so it is narrowed here before
+    any byte is written.
+    """
+    fd = _owner_only_opener(path, flags)
+    if not platform_compat.IS_POSIX:
+        return fd
+    try:
+        mode = os.fstat(fd).st_mode & 0o7777
+        if mode & _GROUP_OTHER_BITS:
+            os.fchmod(fd, mode & ~_GROUP_OTHER_BITS)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _prepare_store_write(resolved: Path, *, owner_only: bool) -> Callable[[str, int], int] | None:
+    """Create *resolved*'s parent and return the opener for its tmp file."""
+    if owner_only:
+        _mkdirs_owner_only(resolved.parent)
+        return _owner_only_tmp_opener
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    return None
+
+
 class ArtifactStore:
     """File-system backed store for artifacts.
 
@@ -405,13 +452,55 @@ class ArtifactStore:
         # Keyed by the RESOLVED root so a symlinked alias of the same
         # directory still shares the lock, not just a literal path match.
         self._lock = _lock_for_root(resolved)
-        self._root.mkdir(parents=True, exist_ok=True)
+        # Owner-only (0600 files, 0700 directories) when the root is in the data
+        # home. Decided once, on the root as it is SPELLED: the data-home test is
+        # lexical, and every path below the root is resolved (_artifact_dir), so
+        # under a symlinked, relocated home a per-write test would never match.
+        self._owner_only = _is_owner_only_target(self._root)
+        self._mkdirs(self._root)
+
+    def _mkdirs(self, path: Path) -> None:
+        """``mkdir -p`` for a store directory, 0700 when the store is owner-only."""
+        if self._owner_only:
+            _mkdirs_owner_only(path)
+        else:
+            path.mkdir(parents=True, exist_ok=True)
 
     # ── public API ────────────────────────────────────────────────────────
 
     @property
     def root(self) -> Path:
         return self._root
+
+    def _ensure_content_token_locked(self, art: Artifact) -> None:
+        """Assign and persist a token for an untokened store-backed artifact.
+
+        Called under the store lock by paths that serve or compare the token.
+        """
+        if not art.content_token:
+            art.content_token = _new_content_token()
+            self._write_meta(art)
+
+    def _rotate_content_token_locked(self, slug: str) -> str:
+        """Persist a fresh token for *slug* before its content is rewritten.
+
+        The token lives in meta.json and the content in current.html, and the
+        two writes are not atomic together. Rotating first means a failure
+        between them leaves a token that refuses every earlier read (a false
+        409), never one that still admits a stale save over the new content.
+        Only the token is written here; the caller persists its other changes
+        with the rest of its write. Called under the store lock.
+        """
+        token = _new_content_token()
+        on_disk = self._load_meta(slug)
+        on_disk.content_token = token
+        self._write_meta(on_disk)
+        return token
+
+    @staticmethod
+    def _is_live_pointer(art: Artifact) -> bool:
+        """True when reads come from ``source_path`` rather than the store's own copy."""
+        return bool(art.source_path) and not art.source_copy_only
 
     def set_change_listener(self, listener: Callable[[str, str], None] | None) -> None:
         """Register a callback fired after a content-affecting mutation.
@@ -541,6 +630,8 @@ class ArtifactStore:
             )
             art.events_backfilled = True
             self._write_artifact(art, content)
+            if self._is_live_pointer(art):
+                art.content_token = None
             logger.info("artifact created: slug=%s name=%s kind=%s", slug, name, kind)
         self._fire_change("upsert", slug)
         # After the write, so a failed create contributes nothing. ``kind`` and
@@ -708,7 +799,7 @@ class ArtifactStore:
         # the lock and an image artifact's bytes are never rewritten in place.
         return self._read_image_asset_bytes(asset), mime
 
-    def get(self, slug: str, *, version: int | None = None) -> Artifact:
+    def get(self, slug: str, *, version: int | None = None, assign_token: bool = False) -> Artifact:
         """Return an artifact (with content) by slug, optionally a specific version.
 
         Live-pointer behavior: for file-backed artifacts (those
@@ -722,6 +813,12 @@ class ArtifactStore:
         If the source file is missing or unreadable, falls back to the
         last-known snapshot in ``current.html`` so the artifact stays
         viewable even after the source file moves or is deleted.
+
+        A current store-backed read returns the stored ``content_token``. An
+        artifact saved before content tokens existed has none, and only a read
+        with ``assign_token`` gives it one, persisted to meta.json so the read
+        can guard a later save. That is a write, so the caller must be off the
+        event loop: the dashboard's detail read is the one that sets it.
         """
         slug = _validate_slug(slug)
         with self._lock:
@@ -752,6 +849,7 @@ class ArtifactStore:
                 if vk:
                     meta.kind = vk
                 meta.live_dirty = False  # historical view — not "live"
+                meta.content_token = None
                 return meta
             # Current view: prefer source_path for file-backed artifacts.
             # A copy never reads from disk: it records source_path purely as
@@ -768,8 +866,23 @@ class ArtifactStore:
                     # own makes a dead pointer look completely healthy.
                     meta.source_missing = True
                     meta.content = self._read_text(self._artifact_dir(slug) / "current.html")
+                meta.content_token = None
             else:
                 meta.content = self._read_text(self._artifact_dir(slug) / "current.html")
+                if assign_token:
+                    try:
+                        self._ensure_content_token_locked(meta)
+                    except OSError:
+                        # An untokened artifact on an unwritable data directory must
+                        # still open. Serve it without a token (last-write-wins): the
+                        # token assigned in memory was never persisted, so returning
+                        # it would 409 every later guarded save from this client.
+                        logger.warning(
+                            "artifact %s: could not persist a content token; serving it unguarded",
+                            slug,
+                            exc_info=True,
+                        )
+                        meta.content_token = None
             # Compute live_dirty by comparing the live content to the
             # latest numbered snapshot. Catches both silent saves AND
             # external file edits to source_path that we never saw —
@@ -1004,6 +1117,7 @@ class ArtifactStore:
         event_type: str | None = None,
         from_version: int | None = None,
         snapshot: bool = False,
+        expected_token: str | None = None,
     ) -> Artifact:
         """Update an artifact in place. Content writes always update the live
         state (source_path on disk for file-backed artifacts, current.html
@@ -1023,10 +1137,38 @@ class ArtifactStore:
         ``user``. Must be in :data:`ALLOWED_EVENT_TYPES` if provided.
         ``from_version`` is recorded on ``reverted`` events so the timeline
         can show "Reverted to vN".
+
+        ``expected_token`` makes a content write conditional: it is the
+        ``content_token`` a prior ``get()`` returned, and when the stored token
+        differs the write raises :class:`ArtifactConflictError` and changes
+        nothing. A change written to current.html outside this store is not
+        detected. Omitted, the write is last-write-wins. It applies to
+        store-backed artifacts only; a live file-backed artifact serves no token
+        and ignores it, because its content is owned by the source file.
         """
         slug = _validate_slug(slug)
+        if expected_token is not None and not (
+            isinstance(expected_token, str) and _TOKEN_RE.fullmatch(expected_token)
+        ):
+            raise ArtifactValidationError(
+                "expected_token must be the 64-character hex content_token from a prior read"
+            )
         with self._lock:
             art = self._load_meta(slug)
+            guarded = (
+                expected_token is not None
+                and content is not None
+                and not self._is_live_pointer(art)
+            )
+            if guarded:
+                assert expected_token is not None  # narrowed by ``guarded``
+                self._ensure_content_token_locked(art)
+                assert art.content_token is not None
+                if not _hmac.compare_digest(art.content_token, expected_token):
+                    raise ArtifactConflictError(
+                        f"artifact {slug!r} changed since it was read; refetch and re-base",
+                        current_token=art.content_token,
+                    )
             changed_content = False
             # True when this call READ art.content off source_path (snapshot path),
             # which makes writing it back unsafe -- see the snapshot branch below.
@@ -1118,6 +1260,8 @@ class ArtifactStore:
                         )
                         art.kind = detected
                 prev = self._artifact_dir(slug) / "current.html"
+                if content is not None:
+                    art.content_token = self._rotate_content_token_locked(slug)
                 self._write_text(prev, live_content)
                 # Never mirror back for a copy — editing it must not rewrite
                 # the user's original file — and never for content this call
@@ -1200,6 +1344,8 @@ class ArtifactStore:
                     k: v for k, v in art.version_kinds.items() if k.isdigit() and int(k) > cutoff
                 }
             self._write_meta(art)
+            if self._is_live_pointer(art):
+                art.content_token = None
             self._prune_versions(slug)
             logger.info(
                 "artifact updated: slug=%s version=%s changed_content=%s snapshot=%s",
@@ -1483,6 +1629,7 @@ class ArtifactStore:
         Metadata is preserved untouched: the user may well have named or tagged the
         document before typing, and this is a content write, not a reset.
         """
+        art.content_token = self._rotate_content_token_locked(art.slug)
         self._write_text(self._artifact_dir(art.slug) / "current.html", draft)
         art.content = draft
         # A settled draft is this document's first content, so it gets the same
@@ -2355,10 +2502,10 @@ class ArtifactStore:
 
     def _write_artifact(self, art: Artifact, content: str) -> None:
         adir = self._artifact_dir(art.slug)
-        adir.mkdir(parents=True, exist_ok=True)
-        (adir / "versions").mkdir(parents=True, exist_ok=True)
+        self._mkdirs(adir / "versions")  # creates adir too
         self._write_text(adir / "current.html", content)
         self._snapshot_version(art.slug, art.version, adir / "current.html")
+        art.content_token = _new_content_token()
         self._write_meta(art)
 
     def _write_image_artifact(self, art: Artifact, data: bytes) -> None:
@@ -2372,12 +2519,12 @@ class ArtifactStore:
         gated byte writer.
         """
         adir = self._artifact_dir(art.slug)
-        adir.mkdir(parents=True, exist_ok=True)
-        (adir / "versions").mkdir(parents=True, exist_ok=True)
+        self._mkdirs(adir / "versions")  # creates adir too
         self._write_text(adir / "current.html", art.content or "")
         self._snapshot_version(art.slug, art.version, adir / "current.html")
         assert art.image is not None  # set by create_image before this is called
         self._write_bytes(adir / f"asset.{art.image.ext}", data)
+        art.content_token = _new_content_token()
         self._write_meta(art)
 
     def _snapshot_version(self, slug: str, version: int, src: Path) -> None:
@@ -2465,10 +2612,13 @@ class ArtifactStore:
         resolved = Path(os.path.realpath(path))
         if reason := _fence_refusal(resolved, "write"):
             raise ArtifactError(reason)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write: tmp file + rename.
+        # Atomic write: tmp file + rename. Inside the data home the tmp is 0600
+        # before the first byte is written (created so, or narrowed when a crash
+        # left one behind), so the published file is never readable by others.
+        opener = _prepare_store_write(resolved, owner_only=self._owner_only)
         tmp = resolved.with_suffix(resolved.suffix + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8", opener=opener) as fh:
+            fh.write(text)
         tmp.replace(resolved)
 
     def _read_bytes(self, path: Path) -> bytes:
@@ -2524,9 +2674,10 @@ class ArtifactStore:
         resolved = Path(os.path.realpath(path))
         if reason := _fence_refusal(resolved, "write"):
             raise ArtifactError(reason)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
+        opener = _prepare_store_write(resolved, owner_only=self._owner_only)
         tmp = resolved.with_suffix(resolved.suffix + ".tmp")
-        tmp.write_bytes(data)
+        with open(tmp, "wb", opener=opener) as fh:
+            fh.write(data)
         tmp.replace(resolved)
 
     def _prune_versions(self, slug: str) -> None:
