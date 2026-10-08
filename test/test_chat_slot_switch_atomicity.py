@@ -1835,9 +1835,12 @@ class TestLinkedSlotSessionKey:
             assert slot.agent_kind == "member"
             # The restore wrote the rolled-back agent back into the
             # transcript metadata (last call).
+            # The switch clears the pinned model and persists that, so the
+            # restore writes the rolled-back model back as well.
             assert log.update_metadata.call_args.args[1] == {
                 "agent": "old-agent",
                 "agent_kind": "member",
+                "model": "",
             }
 
     @pytest.mark.asyncio
