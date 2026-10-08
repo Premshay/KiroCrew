@@ -141,7 +141,7 @@ _BASELINE_SITES = 144
 
 #: Owner-marked sites in ``src``. Pinned for the same reason the total is: marking
 #: an ordinary reader would otherwise move a site out of the total for free.
-_BASELINE_OWNER_MARKED = 3
+_BASELINE_OWNER_MARKED = 5
 
 #: Files that hold sites at the baseline and are not yet migrated. Each must still
 #: be found, so a scanner that matches nothing cannot pass as a clean tree. Drop a

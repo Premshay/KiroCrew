@@ -110,9 +110,7 @@ def _capability_session(provider: Any) -> str:
     the provider instance (``capability_binds_to_instance``): a per-turn process has
     no session id at verification time, so its per-instance token stands in.
     """
-    if provider.capability_binds_to_instance is True:
-        return provider.process_instance
-    return provider.session_id
+    return provider.capability_stamp_session_id
 
 
 def loaded_stamp(provider: Any, prepared: CapabilityPreparation) -> LoadedCapabilities:

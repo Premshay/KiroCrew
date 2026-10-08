@@ -105,6 +105,19 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Design critique review data and prompts",
+        "apps/builtins/design_critique/backend/routes.py",
+        "Operator-supplied project context, review findings and generated design prompts "
+        "are scrubbed before they are stored, returned to the dashboard or sent "
+        "to a design agent. Redaction failure replaces the text with a refusal marker.",
+    ),
+    (
+        "Peer-channel messages delivered to crew members",
+        "dashboard/handlers_channel.py",
+        "The message body is scrubbed before it enters a member's queue and can "
+        "reach that member's agent or dashboard transcript.",
+    ),
+    (
         "Thread, GIL and loop-stall diagnostics",
         "diag/threads.py",
         "Python frames, folded stacks and loop-stall dump text, on their way to an "

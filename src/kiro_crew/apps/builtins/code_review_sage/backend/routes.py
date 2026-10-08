@@ -2600,7 +2600,7 @@ async def _handle_consolidation_preview_apply(request: web.Request) -> web.Respo
     status = 200 if result.get("ok") else 409
     if result.get("code") == "confirmation_required":
         status = 400
-    return web.json_response(result, status=status)
+    return web.json_response({**result, "code": result["code"]}, status=status)
 
 
 # --- follow-up sessions -----------------------------------------------------

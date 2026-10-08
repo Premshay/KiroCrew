@@ -328,6 +328,12 @@ OPERATOR_LINES: Tuple[_LineSpec, ...] = (
 #: DEFECT rather than an absent feature, and a card that listed defect classes in
 #: front of someone choosing a harness would be worse than one line shorter.
 OFF_CARD_SETS: Mapping[str, str] = {
+    "ACP_BACKENDS_STEER_ADVERTISED": (
+        "whether the installed adapter advertised its mid-turn steering extension "
+        "during initialization. The steer capability line is decided by "
+        "ACP_BACKENDS_STEER; this set only gates use of that path for adapters "
+        "whose installed version might lack the extension"
+    ),
     "ACP_BACKENDS_SERIAL_SESSION_STARTS": (
         "which backend's process answers session starts and mode switches one at a "
         "time. It decides only what a timed-out start's error says about the "

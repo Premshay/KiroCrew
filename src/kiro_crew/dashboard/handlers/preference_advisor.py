@@ -214,7 +214,9 @@ async def api_preference_consult(request: web.Request) -> web.Response:
     if refusal is not None:
         return refusal
     if _is_restricted_session(state, request):
-        return web.json_response({"reason": "restricted_session"}, status=403)
+        return web.json_response(
+            {"reason": "restricted_session", "code": "restricted_session"}, status=403
+        )
     body, error = await read_bounded_json(request)
     if error is not None:
         return error
@@ -241,7 +243,9 @@ async def api_preference_consult(request: web.Request) -> web.Response:
     if refusal is not None:
         return refusal
     if _is_restricted_session(state, request):
-        return web.json_response({"reason": "restricted_session"}, status=403)
+        return web.json_response(
+            {"reason": "restricted_session", "code": "restricted_session"}, status=403
+        )
     result.pop("evidence", None)
     return web.json_response({**result, "advisory": True, "role": role})
 

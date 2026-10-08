@@ -47,9 +47,9 @@ the only form that tells the converter where to start.
                    This is the debt, and the only bucket a static check can call
                    with certainty.
 ``opaque_body``    literal ``status >= 400``, body is a variable, a call, or a
-                   dict containing a ``**spread``. The ``code`` may well be in
-                   there; this scan cannot see it, so it is counted separately and
-                   never reported as a violation.
+                   dict containing a ``**spread`` without a later explicit
+                   ``code``. The spread may supply or overwrite a code, so this
+                   scan counts it separately.
 ``dynamic_status`` ``status=`` is an expression (``status=code``,
                    ``status=500 if ... else 400``) without an explicit,
                    unshadowed ``code`` in a dict-literal body. A transparent
@@ -168,19 +168,24 @@ def _body(call: ast.Call) -> ast.expr | None:
 def _dict_code(node: ast.Dict) -> tuple[bool, bool, str | None]:
     """``(is_transparent, has_code, literal_code_value)``.
 
-    A ``**spread`` makes the dict opaque: ``code`` may arrive from the spread and
-    this scan cannot follow it.
+    A spread is opaque unless a later explicit ``code`` overrides its value.
     """
     has_code = False
     value: str | None = None
+    spread = False
     for key, val in zip(node.keys, node.values):
         if key is None:
-            return False, False, None
+            spread = True
+            has_code = False
+            value = None
+            continue
         if isinstance(key, ast.Constant) and key.value == "code":
             has_code = True
             if isinstance(val, ast.Constant) and isinstance(val.value, str):
                 value = val.value
-    return True, has_code, value
+            else:
+                value = None
+    return not spread or has_code, has_code, value
 
 
 def scan(src: pathlib.Path = _SRC) -> list[_Finding]:
@@ -381,6 +386,7 @@ def test_dynamic_status_requires_an_explicit_unshadowed_code(tmp_path) -> None:
                 'web.json_response({"code": "invalid", **payload}, status=status)',
                 'web.json_response({"error": message, "code": "invalid"}, status=status)',
                 'web.json_response({"error": message, "code": "Bad request!"}, status=status)',
+                'web.json_response({**payload, "code": "explicit"}, status=status)',
             ]
         ),
         encoding="utf-8",
@@ -390,6 +396,7 @@ def test_dynamic_status_requires_an_explicit_unshadowed_code(tmp_path) -> None:
         "dynamic_status",
         "dynamic_status",
         "dynamic_status",
+        "compliant",
         "compliant",
         "compliant",
     ]

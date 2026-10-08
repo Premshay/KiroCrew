@@ -5176,10 +5176,16 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
     assert body is not None
     selected = body.get("runtime_agent")
     if not isinstance(selected, str):
-        return web.json_response({"error": "invalid execution seat"}, status=400)
+        return web.json_response(
+            {"error": "invalid execution seat", "code": "invalid_execution_seat"}, status=400
+        )
     if selected and not any(row["name"] == selected and row["supported"] for row in choices):
         return web.json_response(
-            {"error": "This execution seat cannot verify saved member capabilities"}, status=409
+            {
+                "error": "This execution seat cannot verify saved member capabilities",
+                "code": "execution_seat_capabilities_unverified",
+            },
+            status=409,
         )
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(slot._lock)
@@ -5193,7 +5199,10 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
             selected_row = next(row for row in choices if row["name"] == selected)
             if not selected_row["member_capable"]:
                 return web.json_response(
-                    {"error": "Saved member capabilities are not verified on this runtime"},
+                    {
+                        "error": "Saved member capabilities are not verified on this runtime",
+                        "code": "runtime_member_capabilities_unverified",
+                    },
                     status=409,
                 )
         denied = deny_app_slot_access(request.get("app", ""), slot, name, "slot_runtime")
@@ -5218,7 +5227,8 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
         ):
             return web.json_response(
                 {
-                    "error": "Linked views disagree on conversation identity; reload the conversation before switching"
+                    "error": "Linked views disagree on conversation identity; reload the conversation before switching",
+                    "code": "linked_views_disagree",
                 },
                 status=409,
             )
@@ -5314,7 +5324,11 @@ async def api_chat_slot_runtime(request: web.Request) -> web.Response:
         if effective_session_key(slot) != session_key:
             rollback()
             return web.json_response(
-                {"error": "session changed during execution switch"}, status=409
+                {
+                    "error": "session changed during execution switch",
+                    "code": "session_changed_during_execution_switch",
+                },
+                status=409,
             )
         # The teardown alone resumes the stored conversation when the new seat
         # shares the old one's backend label; mark it so allocation starts fresh.

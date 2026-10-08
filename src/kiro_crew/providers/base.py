@@ -441,6 +441,13 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def capability_stamp_session_id(self) -> str:
+        """Identity this provider binds a verified capability stamp to."""
+        if self.capability_binds_to_instance:
+            return self.process_instance  # pid-owner-ok: provider owns its stamp identity
+        return self.session_id
+
+    @property
     def capability_projection_gaps(self) -> tuple[str, ...]:
         """Saved fields this runtime cannot demonstrate applying."""
         return ()

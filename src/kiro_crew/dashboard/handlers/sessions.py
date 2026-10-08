@@ -5187,16 +5187,29 @@ async def api_session_channel(request: web.Request) -> web.Response:
             task = body.get("task")
             agent_name = body.get("agent", "")
             if not isinstance(role, str) or not role.strip() or len(role) > 100:
-                return web.json_response({"error": "role must be 1 to 100 characters"}, status=400)
+                return web.json_response(
+                    {"error": "role must be 1 to 100 characters", "code": "invalid_worker_role"},
+                    status=400,
+                )
             if not isinstance(task, str) or not task.strip() or len(task) > 2000:
-                return web.json_response({"error": "task must be 1 to 2000 characters"}, status=400)
+                return web.json_response(
+                    {"error": "task must be 1 to 2000 characters", "code": "invalid_worker_task"},
+                    status=400,
+                )
             if not isinstance(agent_name, str) or len(agent_name) > 100:
                 return web.json_response(
-                    {"error": "agent must be at most 100 characters"}, status=400
+                    {
+                        "error": "agent must be at most 100 characters",
+                        "code": "invalid_worker_agent",
+                    },
+                    status=400,
                 )
             if "approval" in body:
                 return web.json_response(
-                    {"error": "worker approval policy is fixed by the channel safety policy"},
+                    {
+                        "error": "worker approval policy is fixed by the channel safety policy",
+                        "code": "worker_approval_policy_fixed",
+                    },
                     status=400,
                 )
             agent = channel.add_agent(
@@ -5217,12 +5230,24 @@ async def api_session_channel(request: web.Request) -> web.Response:
         force = body.get("force", False)
         target = channel.members.get(member_id) if isinstance(member_id, str) else None
         if target is None or target.id == member.id:
-            return web.json_response({"error": "select another current channel member"}, status=400)
+            return web.json_response(
+                {
+                    "error": "select another current channel member",
+                    "code": "invalid_channel_member",
+                },
+                status=400,
+            )
         if not isinstance(force, bool):
-            return web.json_response({"error": "force must be boolean"}, status=400)
+            return web.json_response(
+                {"error": "force must be boolean", "code": "invalid_force_value"}, status=400
+            )
         if target.state not in {"done", "failed"} and not force:
             return web.json_response(
-                {"error": "only terminal members can be removed without force"}, status=409
+                {
+                    "error": "only terminal members can be removed without force",
+                    "code": "channel_member_active",
+                },
+                status=409,
             )
         if force and not target.attached_session and target._task and not target._task.done():
             target._task.cancel()
@@ -5796,12 +5821,14 @@ async def api_sessions_clear_restart_blockers(request: web.Request) -> web.Respo
     async with _blocker_lock(state):
         status = await _restart_barrier_status(state, open_if_busy=False)
         if status.get("active") is not True:
+            blockers = _blocker_payload(state, status)
             return web.json_response(
                 {
                     "error": "no coordinated reset is waiting on these sessions",
                     "code": "no_active_barrier",
                     "maintenance": status,
-                    **_blocker_payload(state, status),
+                    "channel_blockers": blockers["channel_blockers"],
+                    "other_blockers": blockers["other_blockers"],
                 },
                 status=409,
             )
@@ -5854,7 +5881,7 @@ async def api_sessions_clear_restart_blockers(request: web.Request) -> web.Respo
                     outcome="denied",
                     source="dashboard",
                     resources=f"restart-blocker:{key}",
-                    error=redact(str(exc)),
+                    error=redact_log_via_context(str(exc)),
                 )
                 results.append(
                     {

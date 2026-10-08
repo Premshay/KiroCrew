@@ -5887,7 +5887,7 @@ class AcpClient:
         startup configuration as initialization, and retain the old session if
         any part of that setup fails.
         """
-        if not self.is_process_alive():
+        if not self.is_process_alive():  # pid-owner-ok: this client owns the child process
             raise AcpProcessDied("Process is not alive — cannot start a new conversation")
         if not self._session_id:
             raise AcpError("Cannot reset a conversation before the session is initialized")
