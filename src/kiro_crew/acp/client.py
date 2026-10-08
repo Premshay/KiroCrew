@@ -65,7 +65,9 @@ from kiro_crew.acp import runtime_models, runtime_process_tree, seed_provenance,
 from kiro_crew.acp._dispatch import (
     ACP_BACKENDS_META_IDENTITY,
     DRAIN_YIELD_AFTER_S,
+    NATIVE_COMPACTION_CANCELLED,
     BackgroundLaunchRecord,
+    NativeCompactionStates,
     SessionNoticeState,
     _dumps_degraded,
     _loggable_request_id,
@@ -88,6 +90,7 @@ from kiro_crew.acp._dispatch import (
     meta_builtin_server_names,
     parse_claude_compaction_notice,
     parse_codex_compaction_update,
+    parse_native_compaction_update,
     parse_prompt_token_usage,
     parse_refusal,
     parse_session_modes,
@@ -12840,10 +12843,23 @@ class AcpClient:
         update = params.get("update")
         if not isinstance(update, dict):
             return None
-        status_type = parse_codex_compaction_update(update)
+        native = update.get("sessionUpdate") == "compaction_update"
+        if native:
+            if not hasattr(self, "_native_compaction_states"):
+                self._native_compaction_states = NativeCompactionStates()
+            status_type = parse_native_compaction_update(update, self._native_compaction_states)
+        else:
+            status_type = parse_codex_compaction_update(update)
         if status_type is None:
             return None
-        if status_type != "started" and not self._codex_compaction_pending:
+        if status_type == NATIVE_COMPACTION_CANCELLED:
+            # A stopped compaction gives no verdict: no count reset, no failure
+            # streak, and no synthesized failure at turn end -- the same silence
+            # ``_settle_claude_compaction`` keeps when a Stop ends the turn.
+            logger.info("Compaction status (native): cancelled, no verdict")
+            self._codex_compaction_pending = False
+            return None
+        if not native and status_type != "started" and not self._codex_compaction_pending:
             return None
         logger.info("Compaction status (codex): %s", status_type)
         self._codex_compaction_pending = status_type == "started"
