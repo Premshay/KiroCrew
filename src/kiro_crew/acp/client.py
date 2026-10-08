@@ -10695,8 +10695,8 @@ class AcpClient:
 
     # ── Private Helpers ──
 
-    async def _send_prompt(self, message: str) -> int:
-        allow_image = self.supports_image_prompt is not False
+    async def _send_prompt(self, message: str, *, allow_image: bool = True) -> int:
+        allow_image = allow_image and self.supports_image_prompt is not False
         blocks = await asyncio.to_thread(build_prompt_blocks, message, allow_image=allow_image)
         try:
             return await self._send_request(
