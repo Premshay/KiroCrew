@@ -14,6 +14,7 @@ import re
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
@@ -93,6 +94,24 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 logger = logging.getLogger(__name__)
 
 _SSE_INTERVAL_SECS = 5
+
+
+@dataclass(frozen=True)
+class GatewayRestartResult:
+    """The observed outcome of one gateway restart attempt.
+
+    A reset can become unsafe after a long update has already completed.  The
+    maintenance payload preserves that refusal for the caller that still has a
+    browser connection, instead of reducing it to a falsey result and leaving
+    the UI to wait for a restart that will not happen.
+    """
+
+    restarted: bool
+    maintenance: dict[str, object] | None = None
+
+    @property
+    def blocked(self) -> bool:
+        return self.maintenance is not None
 
 # ── Update ──
 
@@ -1681,7 +1700,7 @@ async def _venv_pip_install(proj: str, state: DashboardState) -> bool:
 @update_ownership.owning(update_ownership.Step.RESTART)
 async def _restart_gateway(
     state: DashboardState, *, resolver: Callable[[], str] | None = None
-) -> bool:
+) -> GatewayRestartResult:
     """Save state, close sessions, and exec the selected gateway entry point once.
 
     Restart is a process-wide transition.  Two callers must never both drain
@@ -1697,9 +1716,30 @@ async def _restart_gateway(
     """
     if state._gateway_restart_in_progress:
         logger.info("Gateway restart already in progress; coalescing duplicate request")
-        return False
+        return GatewayRestartResult(restarted=False)
     state._gateway_restart_in_progress = True
     try:
+        # This route bypasses ``/api/sessions/restart`` and would otherwise kill
+        # active ACP turns during a self-update. Keep the lifecycle gate shared
+        # with the ordinary reset endpoint rather than inventing an update-only
+        # acknowledgement protocol.
+        from kiro_crew.dashboard.handlers.sessions import (
+            _publish_restart_barrier,
+            _restart_barrier_status,
+        )
+
+        status = await _restart_barrier_status(state, open_if_busy=True)
+        if status["ready"] is not True:
+            _publish_restart_barrier(state)
+            state.push_update_progress(
+                "blocked",
+                "Gateway restart is waiting for session acknowledgements; "
+                "no sessions were stopped.",
+                maintenance=status,
+            )
+            return GatewayRestartResult(restarted=False, maintenance=status)
+        state.restart_barrier.clear()
+        _publish_restart_barrier(state)
         state.push_update_progress("restarting", "Restarting server…")
         # Resolve off-loop and before saving/draining. An explicit broken launcher
         # must not fall back to the running bundle's interpreter and import path.
@@ -1708,7 +1748,7 @@ async def _restart_gateway(
         except (ValueError, OSError) as exc:
             logger.warning("Gateway launcher unavailable: %s", exc)
             state.push_update_progress("error", "Cannot restart: invalid gateway launcher path")
-            return False
+            return GatewayRestartResult(restarted=False)
         exe = None
         if launcher is None:
             # Applying callers load this resolver before the install can replace
@@ -1737,7 +1777,7 @@ async def _restart_gateway(
                 state.push_update_progress(
                     "error", "Cannot restart: invalid Python executable path"
                 )
-                return False
+                return GatewayRestartResult(restarted=False)
         # circular import: kiro_crew.dashboard.chat imports from
         # kiro_crew.dashboard.handlers (which re-exports this module), so this
         # must stay inline to avoid an import cycle at module load.
@@ -1811,7 +1851,7 @@ async def _restart_gateway(
                 reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
         except OSError:
             await exit_after_failed_restart_exec(launcher or exe)
-        return True
+        return GatewayRestartResult(restarted=True)
     finally:
         state._gateway_restart_in_progress = False
 
@@ -1827,6 +1867,21 @@ async def api_update_apply(request: web.Request) -> web.Response:
         # An apply started now would be cut off by the shutdown mid-write.
         return web.json_response(
             {"error": "The gateway is shutting down", "code": "shutting_down"}, status=503
+        )
+
+    # Refuse before a policy-owned update command can mutate the installation.
+    # A later recheck in _restart_gateway still catches work that begins while
+    # a long update, build, or install is running.
+    from kiro_crew.dashboard.handlers.sessions import (
+        _publish_restart_barrier,
+        _restart_barrier_status,
+    )
+
+    status = await _restart_barrier_status(state, open_if_busy=True)
+    if status["ready"] is not True:
+        _publish_restart_barrier(state)
+        return web.json_response(
+            {"ok": False, "code": "restart_ack_required", "maintenance": status}, status=409
         )
 
     # A policy-defined provider OWNS the update on this host. Checked before the
@@ -1850,7 +1905,16 @@ async def api_update_apply(request: web.Request) -> web.Response:
                 },
                 status=500,
             )
-        await _restart_gateway(state, resolver=respawn_executable)
+        restart = await _restart_gateway(state, resolver=respawn_executable)
+        if restart.blocked:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "restart_ack_required",
+                    "maintenance": restart.maintenance,
+                },
+                status=409,
+            )
         return web.json_response({"ok": True, "status": "updating"})
 
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
@@ -2129,7 +2193,13 @@ async def api_update_apply(request: web.Request) -> web.Response:
             # Hand the gap to the restart: this step's ownership ends here and
             # the restart's begins as the await starts, with no yield between.
             owned.close()
-            await _restart_gateway(state, resolver=respawn_executable)
+            restart = await _restart_gateway(state, resolver=respawn_executable)
+            if restart.blocked:
+                # The initial request already returned 200 before this long
+                # operation reached its second barrier check.  The structured
+                # progress event is therefore the response path the UI can use
+                # to stop its updating state and render the blocker controls.
+                return
         except Exception:
             logger.exception("Update failed")
             if tree_moved:
