@@ -584,7 +584,8 @@ async def test_app_catalog_does_not_return_metadata_from_a_foreign_incarnation(
     assert replaced == [key]
     assert _keys(rows) == {key}
     current = real_list()[0]
-    for field in ("title", "messages", "created", "modified"):
+    # The fork lists sessions without upstream's size-based "messages" estimate.
+    for field in ("title", "created", "modified"):
         assert rows[0][field] == current[field]
     assert "foreign" not in json.dumps(rows)
 
