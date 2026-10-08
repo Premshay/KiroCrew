@@ -1641,6 +1641,7 @@ async def start_dashboard(
     # (pinned by test_streaming_bypasses_the_app_client_max_size). Reading this
     # number as a global request cap is the false invariant to avoid.
     app["state"] = state
+    app["platform_context"] = current_context()
 
     # Bind the serving loop once, here: this runs ON that loop, so every
     # surface that later hands work in from a foreign thread -- slots
