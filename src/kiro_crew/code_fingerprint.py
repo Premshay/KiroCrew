@@ -12,12 +12,11 @@ a gateway on new code, and the two disagreed about the shape of a control frame
 
 The fingerprint is derived from the package tree itself, in this order:
 
-1. **Git.** When ``kiro_crew/`` sits inside a git worktree, the HEAD commit plus
-   ``+<digest of the tracked diff>`` when tracked files differ. A bare dirty
-   bit is not enough: two edits to the same HEAD would read as the same code,
-   and a daemon from the first edit would be adopted by a gateway on the
-   second -- the exact miss this module exists to prevent, in the exact
-   setting (an editable install being hacked on) where it matters most.
+1. **Git.** When ``kiro_crew/`` sits inside a git worktree, the committed tree
+   object for that package plus ``+<digest of the tracked package diff>`` when
+   its files differ. A test-only commit must not split a live gateway from a
+   newly launched MCP stub, while two edits to the same package tree must not
+   be mistaken for the same running code.
 2. **Source mtimes.** Otherwise the newest ``st_mtime_ns`` over every ``*.py``
    under the package, mixed with the installed distribution version. A wheel
    install is immutable until it is replaced, and replacing it moves the mtimes.
@@ -74,7 +73,7 @@ def hardened_git_env(**pins: str) -> dict[str, str]:
 
 
 def _git_fingerprint(root: Path) -> str | None:
-    """``<HEAD sha>[+<diff digest>]`` when *root* is inside a git worktree, else None."""
+    """``<package tree sha>[+<diff digest>]`` inside a git worktree, else None."""
     # Resolved from fixed system directories, never PATH: the gateway's PATH
     # can lead with agent-writable directories, and a planted ``git`` shim
     # would run with the gateway's privileges on every fingerprint. No trusted
@@ -84,20 +83,32 @@ def _git_fingerprint(root: Path) -> str | None:
         return None
     env = hardened_git_env()
     try:
-        head = subprocess.run(
-            [git, "-C", str(root), "-c", "core.pager=cat", "rev-parse", "HEAD"],
+        prefix = subprocess.run(
+            [git, "-C", str(root), "-c", "core.pager=cat", "rev-parse", "--show-prefix"],
             capture_output=True,
             timeout=5,
             check=False,
             env=env,
             **UTF8_TEXT,
         )
-        if head.returncode != 0 or not head.stdout.strip():
+        if prefix.returncode != 0:
             return None
-        sha = head.stdout.strip()
+        package_path = prefix.stdout.strip().rstrip("/")
+        tree_ref = f"HEAD:{package_path}" if package_path else "HEAD^{tree}"
+        tree = subprocess.run(
+            [git, "-C", str(root), "-c", "core.pager=cat", "rev-parse", tree_ref],
+            capture_output=True,
+            timeout=5,
+            check=False,
+            env=env,
+            **UTF8_TEXT,
+        )
+        if tree.returncode != 0 or not tree.stdout.strip():
+            return None
+        sha = tree.stdout.strip()
         # Tracked-file changes only; an untracked scratch file is not code
         # the process runs differently for. The diff TEXT is digested, not
-        # just its presence: two different uncommitted states of one HEAD
+        # just its presence: two different uncommitted states of one tree
         # must not compare equal.
         dirty = subprocess.run(
             [

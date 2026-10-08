@@ -89,7 +89,7 @@ class TestCodeFingerprint:
         assert cf.code_fingerprint() == cf.code_fingerprint()
         assert cf.code_fingerprint()
 
-    def test_a_git_tree_reports_head_and_a_digest_of_the_dirty_diff(
+    def test_a_git_tree_ignores_other_commits_and_digests_its_dirty_diff(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_git_fingerprint: None
     ) -> None:
         env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "HOME": str(tmp_path)}
@@ -116,8 +116,8 @@ class TestCodeFingerprint:
         git("init", "-q")
         git("-c", "user.name=t", "-c", "user.email=t@t", "add", ".")
         git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init")
-        head = subprocess.run(
-            ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        tree = subprocess.run(
+            ["git", "-C", str(tmp_path), "rev-parse", "HEAD:pkg"],
             capture_output=True,
             check=True,
             cwd=tmp_path,
@@ -125,17 +125,24 @@ class TestCodeFingerprint:
             **UTF8_TEXT,
         ).stdout.strip()
 
-        assert cf.fingerprint_of(pkg) == head
+        assert cf.fingerprint_of(pkg) == tree
+        (tmp_path / "test.txt").write_text("fixture changed\n", encoding="utf-8")
+        git("add", "test.txt")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "test only")
+        assert cf.fingerprint_of(pkg) == tree
         (pkg / "a.py").write_text("x = 2\n", encoding="utf-8")
         first_edit = cf.fingerprint_of(pkg)
-        assert first_edit.startswith(f"{head}+") and first_edit != head
-        # A SECOND uncommitted edit on the same HEAD is different code, and
+        assert first_edit.startswith(f"{tree}+") and first_edit != tree
+        # A SECOND uncommitted edit on the same tree is different code, and
         # must not read as the same fingerprint -- a bare dirty bit did, and a
         # daemon from the first edit was then adopted by a gateway on the second.
         (pkg / "a.py").write_text("x = 3\n", encoding="utf-8")
         second_edit = cf.fingerprint_of(pkg)
         assert second_edit != first_edit
-        assert second_edit.startswith(f"{head}+")
+        assert second_edit.startswith(f"{tree}+")
+        git("add", "pkg/a.py")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "package change")
+        assert cf.fingerprint_of(pkg) != tree
 
     def test_git_is_resolved_from_system_dirs_and_runs_with_no_planted_config(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -155,6 +162,8 @@ class TestCodeFingerprint:
         def fake_run(argv, **kw):
             seen.append((argv, kw["env"]))
             r = _R()
+            if "--show-prefix" in argv:
+                r.stdout = "pkg/\n"
             if "diff" in argv:
                 r.stdout = b""
             return r
@@ -164,7 +173,7 @@ class TestCodeFingerprint:
         monkeypatch.setenv("GIT_EXTERNAL_DIFF", "/tmp/evil")
         monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'diff.external=/tmp/evil'")
         assert cf._git_fingerprint(tmp_path) == "abc"
-        assert len(seen) == 2
+        assert len(seen) == 3
         for argv, env in seen:
             assert argv[0] == "/usr/bin/git"
             assert env["GIT_CONFIG_GLOBAL"] == os.devnull
@@ -175,7 +184,8 @@ class TestCodeFingerprint:
                 for k in env
             )
             assert "core.pager=cat" in argv
-        diff_argv = seen[1][0]
+        assert "HEAD:pkg" in seen[1][0]
+        diff_argv = seen[2][0]
         assert "--no-ext-diff" in diff_argv and "--no-textconv" in diff_argv
 
     def test_no_trusted_git_means_the_mtime_rule(
