@@ -37,7 +37,7 @@ export default memo(function PeerChannelRequestCard({
         type="button"
         onClick={() => setExpanded(value => !value)}
         aria-expanded={expanded}
-        className="w-full flex items-center gap-1.5 px-2.5 py-1.5 min-w-0 text-left text-[13px] hover:text-fg transition-colors"
+        className="w-full flex items-center gap-1.5 px-2.5 py-1.5 min-w-0 text-left text-[13px] hover:text-text transition-colors"
         data-testid="peer-channel-request-toggle"
       >
         <ChevronRight
@@ -45,7 +45,7 @@ export default memo(function PeerChannelRequestCard({
           aria-hidden="true"
         />
         <MessageCircle className="lucide-inline w-[13px] h-[13px] shrink-0 text-accent" aria-hidden="true" />
-        <span className="font-medium text-fg shrink-0">{label}</span>
+        <span className="font-medium text-text shrink-0">{label}</span>
         <span className="truncate text-[12px] opacity-75 min-w-0">{parsed.fromRole}</span>
       </button>
       {expanded && (

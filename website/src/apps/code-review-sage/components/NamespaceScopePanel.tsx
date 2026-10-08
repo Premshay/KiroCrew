@@ -24,10 +24,6 @@ const SCOPE_OPTIONS: ScopeChoice[] = ['global', 'repository']
 const repositoryOption = (repo: PinnedRepo) =>
   `github.com/${repo.owner.toLowerCase()}/${repo.repo.toLowerCase()}`
 
-const SELECT_CLASS =
-  'text-[12.5px] px-2 py-1 rounded-md bg-bg-elevated text-text border border-border '
-  + 'outline-none focus:border-accent cursor-pointer'
-
 export interface NamespaceScopePanelProps {
   namespaces: string[]
   activeNamespaces: string[]
@@ -120,7 +116,7 @@ export default function NamespaceScopePanel({
                   onChange={(v) => chooseScope(name, v)}
                   clearLabel={i18nT('apps.codeReviewSage.components.namespaceScopePanel.option_unscoped')}
                   disabled={saving}
-                  className={SELECT_CLASS}
+                  className="text-[12.5px] px-2 py-1 rounded-md bg-bg-elevated text-text border border-border outline-none focus:border-accent cursor-pointer"
                 />
               </div>
 
@@ -133,7 +129,7 @@ export default function NamespaceScopePanel({
                     onChange={(value) => chooseRepository(name, value)}
                     triggerFallback={i18nT('pages.settings.postureDisclosure.unavailable')}
                     disabled={saving || repositoryOptions.length === 0}
-                    className={SELECT_CLASS}
+                    className="text-[12.5px] px-2 py-1 rounded-md bg-bg-elevated text-text border border-border outline-none focus:border-accent cursor-pointer"
                   />
                 </div>
               )}
