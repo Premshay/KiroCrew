@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 import { api } from '../api/client'
+import { contextTraceKey } from '../hooks/useWebSocket'
 import ErrorNotice from '../components/ErrorNotice'
 import { fmtNumber } from '../i18n/format'
 import { i18nT } from '../i18n/t'
@@ -29,6 +30,9 @@ export interface ContextTurn {
    *  true no matter how many older turns the fold dropped or this day view excluded,
    *  where a count applied to the array index would not. */
   ordinal: number
+  /** Whether this row is the session's real start rather than a later rebuild, as the
+   *  backend fold marked it. Absent on a gateway older than the field. */
+  first_start?: boolean
 }
 
 export interface ContextTrace {
@@ -41,6 +45,12 @@ export interface ContextTrace {
   peak_context_used: number
   context_window: number
   window_days: number
+  /** Whether the gateway is recording at all. `false` means nothing will ever arrive
+   *  while the switch stays off, so the empty state must not promise otherwise. Absent
+   *  on a payload from a gateway older than the field, which reads as recording. */
+  recording?: boolean
+  /** The `.env` file the gateway reads, sent only while recording is off. */
+  env_file?: string
 }
 
 /** The user's own text, and the labels the backend groups under one bucket. */
@@ -198,6 +208,8 @@ interface ChartTurn {
   total: number
   cats: Record<Category, number>
   isStart: boolean
+  /** The session's real start, not a rebuild. */
+  isFirstStart: boolean
 }
 
 /**
@@ -462,7 +474,15 @@ function StartTurnRow({ turn, selected, onSelect }: { turn: ChartTurn; selected:
       }`}
       onClick={() => onSelect(turn.n)}
     >
-      <span>{i18nT('pages.contextBreakdown.start_row', { n: fmtN(turn.displayN) })}</span>
+      <span>
+        {/* Each row is a session-start COMPOSITION, and a unit emits one per start or
+            rebuild. Only the fold's first one is the session's beginning; a later one
+            is a rebuild, and labelling it "session start" reads as a session that
+            began there. */}
+        {turn.isFirstStart
+          ? i18nT('pages.contextBreakdown.start_row', { n: fmtN(turn.displayN) })
+          : i18nT('pages.contextBreakdown.rebuild_row', { n: fmtN(turn.displayN) })}
+      </span>
       <span className="font-mono text-[12px] text-muted tabular-nums shrink-0">
         {i18nT('pages.contextBreakdown.turn_button_chars', { chars: fmtN(turn.total) })}
       </span>
@@ -527,9 +547,15 @@ export function ContextBreakdownPanel({
       </div>
     )
   } else if (!trace || trace.turns.length === 0) {
+    // Four roads lead here and only one is final. A session recorded before the fold,
+    // one with no completed turn yet, and one whose rows all fall outside the day
+    // window each fill on the next turn, so "yet" is true for them. With recording
+    // switched off nothing ever arrives, and the payload says so.
     body = (
-      <div className="text-muted text-[11px] py-6 text-center">
-        {i18nT('pages.contextBreakdown.empty')}
+      <div className="text-muted text-[11px] py-6 text-center" data-testid={trace?.recording === false ? 'context-breakdown-off' : undefined}>
+        {trace?.recording === false
+          ? i18nT('pages.contextBreakdown.empty_off', { file: trace.env_file || '~/.kiro/crew/.env' })
+          : i18nT('pages.contextBreakdown.empty')}
       </div>
     )
   } else {
@@ -553,16 +579,27 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
     total: turn.total_chars,
     cats: categorise(turn.blocks),
     isStart: turn.phase === 'session_start',
+    // The fold's own mark, never the ordinal: a refused turn 1 puts the real start at
+    // ordinal 2. An older gateway sends no mark, and turn 1 is the best guess there.
+    isFirstStart: turn.first_start ?? (turn.ordinal || i + 1) === 1,
   }))
+  // One entry per TURN, not per row. A retried or recomposed turn writes one row per
+  // attempt and every attempt carries that turn's single ordinal, so listing rows would
+  // show "Turn N" twice and count it twice. Keep the newest attempt, the one the turn
+  // ended on, at the turn's first position. Session-start turns follow the same rule:
+  // a replay that regenerates a turn re-emits its session-start composition.
+  const startByTurn = new Map<number, ChartTurn>()
+  const byTurn = new Map<number, ChartTurn>()
+  for (const t of all) {
+    const map = t.isStart ? startByTurn : byTurn
+    // A recomposed turn keeps the newest attempt, but stays the session start if any
+    // of its rows was.
+    if (map.get(t.displayN)?.isFirstStart) t.isFirstStart = true
+    map.set(t.displayN, t)
+  }
   // Session-start turns are listed above the chart: one of them is many times
   // the size of any later turn and would pin the y-axis, flattening the rest.
-  const starts = all.filter(t => t.isStart)
-  // One column per TURN, not per row. A retried or recomposed turn writes one row per
-  // attempt and every attempt carries that turn's single ordinal, so drawing rows would
-  // show "Turn N" twice and count it twice. Keep the newest attempt, the one the turn
-  // ended on, at the turn's first position.
-  const byTurn = new Map<number, ChartTurn>()
-  for (const t of all) if (!t.isStart) byTurn.set(t.displayN, t)
+  const starts = [...startByTurn.values()]
   const regular = [...byTurn.values()]
   // The chart draws the newest MAX_CHART_TURNS regular turns; the rest are earlier.
   const clipped = Math.max(0, regular.length - MAX_CHART_TURNS)
@@ -573,15 +610,26 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
   // never a turn shown above as a session-start row. Exact and window-scoped, because
   // the first shown row is chosen after the day-window filter.
   const firstShown = shown[0]
-  // DISTINCT ordinals, not rows. An ordinal numbers a TURN, and one turn can own more
-  // than one row: a failed replay that regenerates a turn re-emits its session-start
-  // injection, and both rows carry that turn's single ordinal. Counting rows would
-  // subtract two for one turn position and understate `hidden`, so the line would claim
-  // fewer earlier turns than there are -- and the claim is the one a reader cannot check.
+  // `starts` holds one entry per turn, so this counts turn positions, not rows.
   const startsBeforeFirstShown = firstShown
-    ? new Set(starts.filter(t => t.displayN < firstShown.displayN).map(t => t.displayN)).size
+    ? starts.filter(t => t.displayN < firstShown.displayN).length
     : 0
   const hidden = firstShown ? Math.max(0, firstShown.displayN - 1 - startsBeforeFirstShown) : 0
+  // Worded as the RANGE of earlier turns, not a count. A count reads as a set you could
+  // open, and the fold keeps no detail for most of these turns; a range also reconciles
+  // on sight with the first turn the chart draws, and naming the session-start rows
+  // explains why the range is wider than the turns it hides.
+  const lastEarlier = firstShown ? firstShown.displayN - 1 : 0
+  const earlierText =
+    startsBeforeFirstShown > 0
+      ? i18nT('pages.contextBreakdown.earlier_range_starts', {
+          first: fmtN(1),
+          last: fmtN(lastEarlier),
+          count: startsBeforeFirstShown,
+        })
+      : lastEarlier === 1
+        ? i18nT('pages.contextBreakdown.earlier_single', { n: fmtN(1) })
+        : i18nT('pages.contextBreakdown.earlier_range', { first: fmtN(1), last: fmtN(lastEarlier) })
   const newest = all.length
   const selectable = new Set([...starts, ...shown].map(t => t.n))
   const selected = pinned !== null && selectable.has(pinned) ? pinned : newest
@@ -589,8 +637,8 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
   const selectedChart = all[selected - 1]
   // The previous TURN, not the previous row: a retried turn's earlier attempts are not
   // drawn, so comparing against one would label attempt-vs-attempt as turn-vs-turn.
-  const kept = new Set<ChartTurn>(regular)
-  const sequence = all.filter(t => t.isStart || kept.has(t))
+  const kept = new Set<ChartTurn>([...starts, ...regular])
+  const sequence = all.filter(t => kept.has(t))
   const at = sequence.indexOf(selectedChart)
   const previous = at > 0 ? sequence[at - 1].total : undefined
   const delta = deltaText(selectedChart.total, previous)
@@ -627,8 +675,8 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
               <span className="text-[12px] text-muted">{i18nT('pages.contextBreakdown.scope_unit')}</span>
             </div>
             {hidden > 0 ? (
-              <p className="m-0 mb-2 text-[12px] text-muted">
-                {i18nT('pages.contextBreakdown.earlier_hidden', { count: hidden })}
+              <p className="m-0 mb-2 text-[12px] text-muted" data-testid="earlier-turns">
+                {earlierText}
               </p>
             ) : null}
 
@@ -694,18 +742,22 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
  */
 export function ContextBreakdownTab({ slot, subagents }: { slot: string; subagents?: Record<string, SubagentActivity> }) {
   const { data, isLoading, error } = useQuery<ContextTrace>({
-    queryKey: ['context-trace', slot],
+    queryKey: contextTraceKey(slot),
     queryFn: () => api.telemetryContextTrace(slot),
     enabled: !!slot,
-    // The trace grows by one row per turn, so a tab left open goes stale.
-    refetchInterval: 15_000,
+    // Read on every mount, even over a cached value: the app's default staleTime
+    // is Infinity, and frames that landed while the tab was closed refreshed
+    // nothing. After that nothing polls: a pushed `usage` frame for this slot
+    // asks for one re-read (`hooks/websocket/contextTraceRefresh.ts`), and a
+    // reconnect re-reads once.
+    refetchOnMount: 'always',
   })
 
   return (
     <div className="h-full overflow-auto p-3">
       <SessionBreakdownTree subagents={subagents ?? {}} />
       {/* A failed trace read otherwise rendered as an empty panel. Read-only
-          side tab, so the hand-off loses nothing; the poll above retries. */}
+          side tab, so the hand-off loses nothing; the next pushed frame re-reads. */}
       <ErrorNotice message={error ? (error instanceof Error ? error.message : String(error)) : null} askAgent className="mb-3" />
       <ContextBreakdownPanel trace={data} isLoading={isLoading} />
     </div>

@@ -71,7 +71,6 @@ from kiro_crew.apps.manager import (
     app_enabled_state,
     app_lifecycle_lock,
     apps_dir,
-    cleanup_migrated_builtin,
     disable_app,
     enable_app,
     get_app,
@@ -91,9 +90,16 @@ from kiro_crew.apps.official_category_order import load_category_order
 from kiro_crew.apps.official_editorial import forget_cache as forget_editorial_cache
 from kiro_crew.apps.official_editorial import load_sections
 from kiro_crew.apps.registry import (
+    _ART_IMAGE_EXTENSIONS,
+    _ART_MANIFEST_FIELDS,
+    _ART_MANIFEST_LIST_FIELDS,
+    _ART_MAX_BYTES,
     _REGISTRY_TRUST_TIERS,
+    _SAFE_PATH_RE,
     _TRUST_INDEX,
     _TRUST_OWNER,
+    _blob_cache_dir,
+    _blob_cache_key,
     _context_clone_sandbox_mode,
     _entry_git_url,
     _git_fetch_branch,
@@ -103,6 +109,8 @@ from kiro_crew.apps.registry import (
     _owner_designated_repo_target,
     _pinned_registries,
     _registry_identity_key,
+    _registry_trust_tier_of,
+    _repo_key_owner_count,
     _same_git_target,
     _sel_credential_grant,
     _strip_git_target_userinfo,
@@ -118,6 +126,7 @@ from kiro_crew.apps.registry import (
     registry_name_from_source,
     resolve_installed_trust_repository,
 )
+from kiro_crew.apps.registry_pipeline.checkout import _HOOKS_NEUTRALIZER_ARGV
 from kiro_crew.apps.spawn_sdk import build_spawn_impl
 from kiro_crew.apps.teardown import forget_app_hooks, teardown_app_runtime
 from kiro_crew.apps.version import check_min_version as _check_min_version_str
@@ -125,7 +134,6 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewConfig,
-    config_dir,
     config_path,
     read_config_text,
     update_config_locked,
@@ -719,11 +727,18 @@ async def _restore_app_after_failed_update(name: str) -> None:
     unconditional re-register would publish a disabled app's agents, skills,
     MCP servers and crons, and nothing scrubs them again until the next
     enable/disable. Live read: a failed update leaves the record unchanged.
+
+    Recovery failures are logged and never escape: the caller still owes the
+    failed-update audit line and the 400 body, and the cause of the failed
+    update (disk full, no free port) is often what breaks the restore too.
     """
     if not await _app_may_run_after_install(name):
         return
-    await _register_app_off_loop(name)
-    await asyncio.get_running_loop().run_in_executor(subprocess_executor(), start_app_backend, name)
+    try:
+        await _register_app_off_loop(name)
+    except Exception:
+        logger.warning("Re-register after failed update failed for app %s", name, exc_info=True)
+    await _start_backend_after_install(name)
 
 
 async def _suspend_app_for_session_approval_reconsent(
@@ -1255,15 +1270,6 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             status=400,
         )
 
-    resources = info.get("resources", "gateway")
-    manifest = info.get("manifest", {})
-    uninstall_log: list[str] = []
-    # Serialized as ``warnings``, which ``print_result`` renders per item, so a
-    # delegated uninstall surfaces it too. A still-listening port is also
-    # appended to ``uninstall_log`` above, because that is the field the
-    # dashboard's uninstall reads.
-    backend_warnings: list[str] = []
-
     # Parse body
     # Preserve app data unless the caller supplies the dedicated destructive
     # action. Legacy ``keep_data: false`` payloads are intentionally ignored:
@@ -1284,6 +1290,37 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             keep_specific = [k for k in raw_keep if isinstance(k, str) and k]
     except Exception:
         pass
+
+    return await _run_uninstall(
+        request,
+        name,
+        info,
+        keep_data=keep_data,
+        keep_dependencies=keep_dependencies,
+        keep_specific=keep_specific,
+    )
+
+
+async def _run_uninstall(
+    request: web.Request,
+    name: str,
+    info: dict[str, Any],
+    *,
+    keep_data: bool,
+    keep_dependencies: bool,
+    keep_specific: list[str],
+    retired_builtin: bool = False,
+) -> web.Response:
+    """Run the uninstall preconditions and teardown for an owner-authorized request."""
+    operation = "app_migrate_cleanup" if retired_builtin else "app_uninstall"
+    resources = info.get("resources", "gateway")
+    manifest = info.get("manifest", {})
+    uninstall_log: list[str] = []
+    # Serialized as ``warnings``, which ``print_result`` renders per item, so a
+    # delegated uninstall surfaces it too. A still-listening port is also
+    # appended to ``uninstall_log`` above, because that is the field the
+    # dashboard's uninstall reads.
+    backend_warnings: list[str] = []
 
     # Per-app lifecycle lock, wrapping the ENTIRE uninstall sequence:
     # cron-cleanup precondition → onUninstall script → backend stop →
@@ -1306,10 +1343,27 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     dropped = 0
     pointer_flush_failed = False
     async with app_lifecycle_lock(name):
+        if retired_builtin:
+            from kiro_crew.apps.manager import migrated_builtin_cleanup_applies
+
+            if not await asyncio.to_thread(migrated_builtin_cleanup_applies, name):
+                sel().log_api_access(
+                    caller="dashboard",
+                    operation=operation,
+                    outcome="denied",
+                    resources=name,
+                    error="not a migrated builtin",
+                )
+                return web.json_response(
+                    {"ok": False, "error": "not a migrated builtin", "code": "not_orphaned"},
+                    status=400,
+                )
         # A retained startup hook still owns the old app's AppContext. Bound the
         # wait and refuse the uninstall if it remains live; deleting files or
         # withdrawing trust first would falsely report that old code is gone.
-        startup_refusal = await _refuse_while_startup_hook_runs(name, action="uninstall")
+        startup_refusal = await _refuse_while_startup_hook_runs(
+            name, action="migrate_cleanup" if retired_builtin else "uninstall"
+        )
         if startup_refusal is not None:
             return startup_refusal
 
@@ -1336,7 +1390,7 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             )
             sel().log_api_access(
                 caller="dashboard",
-                operation="app_uninstall",
+                operation=operation,
                 outcome="denied",
                 resources=f"app={name}",
                 error=f"trust grant not removable, uninstall aborted: {grant_blocked}",
@@ -1417,7 +1471,7 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                 )
                 sel().log_api_access(
                     caller="dashboard",
-                    operation="app_uninstall",
+                    operation=operation,
                     outcome="denied",
                     resources=f"app={name}",
                     error=f"cron cleanup failed, uninstall aborted: {exc}",
@@ -1454,7 +1508,7 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                 )
                 sel().log_api_access(
                     caller="dashboard",
-                    operation="app_uninstall",
+                    operation=operation,
                     outcome="denied",
                     resources=f"app={name}",
                     error=f"cron store unreadable, uninstall aborted: {exc}",
@@ -1492,7 +1546,7 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                 )
                 sel().log_api_access(
                     caller="dashboard",
-                    operation="app_uninstall",
+                    operation=operation,
                     outcome="denied",
                     resources=f"app={name}",
                     error=f"cron cleanup failed, uninstall aborted: {exc}",
@@ -1518,7 +1572,8 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
         # non-idempotent teardown never runs on an uninstall that will be
         # retried.
         on_uninstall = (manifest.get("setup") or {}).get("onUninstall", "")
-        if on_uninstall:
+        if on_uninstall and not retired_builtin:
+            # The successor inherits data/, so retired code must not run a destructive hook.
             script_output = await _run_lifecycle_script(
                 name,
                 on_uninstall,
@@ -1598,7 +1653,9 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             backend_warnings.append(message)
             uninstall_log.append(message)
         if resources == "gateway":
-            await _deregister_app_off_loop(name)
+            deregistered = await _deregister_app_off_loop(name)
+            if retired_builtin:
+                backend_warnings.extend(deregistered.errors)
 
         # Step 4: Clean dependencies (atomic classify + ledger update)
         cleaned_deps: list[str] = []
@@ -1611,7 +1668,10 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             # and classification emits canonical ones — comparing the two raw
             # would drop the keep and delete a dep the user chose to keep.
             keep_canonical = [canonical_dep_key(k) for k in keep_specific]
-            classification = classify_and_clean_for_uninstall(
+            # Off-loop: the classification takes a blocking ledger lock and
+            # rewrites the ledger, the same shape the preview offloads above.
+            classification = await asyncio.to_thread(
+                classify_and_clean_for_uninstall,
                 name,
                 declared_deps,
                 keep_specific=keep_canonical,
@@ -1651,7 +1711,12 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
 
         async with _get_config_lock():
             result = await asyncio.get_running_loop().run_in_executor(
-                subprocess_executor(), lambda: uninstall_app(name, keep_data=keep_data)
+                subprocess_executor(),
+                lambda: (
+                    uninstall_app(name, keep_data=keep_data, retired_builtin=True)
+                    if retired_builtin
+                    else uninstall_app(name, keep_data=keep_data)
+                ),
             )
 
         # Step 6: drop the resume pointer of every conversation the app owned.
@@ -1792,7 +1857,7 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     if not result.ok:
         sel().log_api_access(
             caller="dashboard",
-            operation="app_uninstall",
+            operation=operation,
             outcome="failed",
             resources=name,
             error=result.error,
@@ -1817,9 +1882,24 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             uninstall_log.append(f"Dropped {dropped} conversation pointer(s)")
 
     sel().log_api_access(
-        caller="dashboard", operation="app_uninstall", outcome="completed", resources=name
+        caller="dashboard", operation=operation, outcome="completed", resources=name
     )
     resp = result.to_dict()
+    if retired_builtin:
+        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+        for index, warning in enumerate(backend_warnings):
+            cleaned, _ = redact_exfiltration_urls(warning)
+            backend_warnings[index], _ = redact_credentials(cleaned)
+        notices = list(backend_warnings)
+        if pointer_flush_failed:
+            notices.append(
+                "Conversation pointers were dropped in memory, but the write "
+                "did not persist -- a reinstall may still resume one"
+            )
+        if notices:
+            notice, _ = redact_exfiltration_urls("\n".join(notices))
+            resp["notice"], _ = redact_credentials(notice)
     if uninstall_log:
         resp["uninstall_log"] = "\n".join(uninstall_log)
     if backend_warnings:
@@ -2773,40 +2853,17 @@ _CONTENT_TYPES = {
 }
 
 
-#: Store-art fields an installed app's manifest may declare. A path under
-#: ``/apps/{name}/art/`` is servable ONLY when it is one of these values
-#: verbatim, which is what makes the route need no traversal reasoning of its
-#: own: the manifest, not the request, chooses the file.
+#: Store-art field names, image extension allowlist and size ceiling are ONE set
+#: for all three art readers -- this installed-app route, the blob proxy below and
+#: the registry's owner-tier prewarm (``registry_pipeline.store_art``, which owns
+#: them). The parity is load-bearing: a file one reader serves and another refuses
+#: means the same app's art renders or 403s depending only on whether it happens to
+#: be installed, or on which path its bytes arrived through.
 #:
-#: Deliberately NOT a path filter rooted at the install directory. That
-#: directory is the app's whole checkout and ``_ALLOWED_EXTENSIONS`` admits
-#: ``.json``, so a filter would also serve ``installed.json``, ``app.json`` and
-#: every other JSON in the tree — a widening nobody asked for to display an icon.
-_ART_MANIFEST_FIELDS = (
-    "iconPath",
-    "iconPathDark",
-    "heroImage",
-    "heroImageDark",
-    "heroImageDetail",
-    "heroImageDetailDark",
-)
-
-#: The same, for the fields that hold a LIST of paths.
-_ART_MANIFEST_LIST_FIELDS = ("screenshots", "screenshotsDark")
-
-#: Images only — narrower than ``_ALLOWED_EXTENSIONS`` on purpose. Store art is
-#: rendered into an ``<img>``, so nothing script-shaped (``.mjs``/``.js``) or
-#: data-shaped (``.json``) belongs here. ``.svg`` stays because an SVG loaded as
-#: an ``<img>`` source cannot execute script.
-#:
-#: ONE set for both art paths — this route for an installed app, the blob proxy
-#: for a not-installed external-registry row. The parity is load-bearing rather
-#: than incidental: the route REPLACES the proxy per surface, so a file the proxy
-#: would serve and this refuses (or the reverse) means the same app's art renders
-#: or 403s depending only on whether it happens to be installed. Two frozensets
-#: spelled separately were identical member-for-member and nothing pinned them,
-#: which is a divergence waiting for whoever edits one of them next.
-_ART_IMAGE_EXTENSIONS = frozenset({".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico"})
+#: The field tuple is deliberately NOT a path filter rooted at the install
+#: directory. That directory is the app's whole checkout and ``_ALLOWED_EXTENSIONS``
+#: admits ``.json``, so a filter would also serve ``installed.json``, ``app.json``
+#: and every other JSON in the tree -- a widening nobody asked for to display an icon.
 
 
 def _declared_art_paths(name: str) -> set[str]:
@@ -2832,14 +2889,6 @@ def _declared_art_paths(name: str) -> set[str]:
             if isinstance(value, str) and value:
                 declared.add(value[2:] if value.startswith("./") else value)
     return declared
-
-
-#: Ceiling on one art file this route will hold. The bytes are read under a pinned
-#: descriptor rather than streamed from a path (see :func:`_read_declared_art`), so
-#: without a cap an app could make the gateway buffer an arbitrarily large file by
-#: declaring one. Generous against the publishing guide's own limits — a 512px
-#: icon, a 16:9 hero — so a real asset never meets it.
-_ART_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _read_declared_art(name: str, file_path: str) -> tuple[bytes, str] | None:
@@ -3570,36 +3619,6 @@ async def handle_app_dev_mode(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 
-def _blob_cache_dir() -> Path:
-    return config_dir() / "cache" / "blobs"
-
-
-def _blob_cache_key(repo: str, clone_url: str = "") -> str:
-    """Derive a flat, filesystem-safe AND injective cache key for a repo.
-
-    ``repo`` may be a full git URL (``/``, ``:``), so it can't be used as a
-    directory tree.  Slugification alone is not injective (``org/app`` and
-    ``org_app`` would collide and serve each other's blobs), so a short stable
-    sha256 is appended to guarantee distinct repos never share a cache directory.
-
-    The cache key is bound to the blob's PROVENANCE — the resolved clone URL
-    (``clone_url``), not the ``repo`` key alone.  A ``repo`` key is not stable
-    provenance: two registries can publish the same ``repo`` key over time
-    (registry A is removed and registry B is later configured reusing key X), so
-    a key derived from ``repo`` alone would let B's request hit A's cached
-    (possibly private) bytes — a stale-provenance cross-registry read.  Folding
-    the resolved clone URL into the hash namespaces the cache by the URL the
-    bytes were actually cloned from, so a repo-key reuse across registries lands
-    in a DISTINCT cache directory (a miss, then a fresh clone of B's own URL)
-    rather than serving A's stale bytes.  ``clone_url`` defaults to empty only so
-    the pure key of a bare-name repo with no resolvable URL stays stable; when a
-    URL is resolved it MUST be threaded in.
-    """
-    slug = re.sub(r"[^A-Za-z0-9_.-]", "_", repo)
-    digest = hashlib.sha256(f"{repo}\x00{clone_url}".encode("utf-8")).hexdigest()[:16]
-    return f"{slug}-{digest}"
-
-
 _BLOB_FETCH_TIMEOUT = 30  # seconds — shallow clone of a single-branch repo
 _BLOB_FETCH_SEMAPHORE = asyncio.Semaphore(3)  # max 3 concurrent git fetches
 # Bare-name repo identifier (legacy registry entries) — no scheme, no path.
@@ -3621,12 +3640,13 @@ _SAFE_SSH_URL_RE = re.compile(
     r"^ssh://(?:[A-Za-z0-9._\-]+@)?[A-Za-z0-9.\-]+(?::[0-9]+)?/[A-Za-z0-9._/\-]+$"
 )
 # `\Z`, not `$`: Python's `$` also matches immediately BEFORE a trailing newline, so with
-# the `.match` calls in the blob handler a value like "main\n" passes -- and both of these
-# feed git argv and a filesystem join. Same defect class as the catalog-side coordinate
-# patterns; these are the blob handler's instances. (The class is wider than this file:
-# other `$`-anchored request-path patterns exist elsewhere, e.g. papyrus's GIT_URL_RE.)
+# the `.match` calls in the blob handler a value like "main\n" passes -- and this feeds
+# git argv. Same defect class as the catalog-side coordinate patterns; this is the blob
+# handler's ref instance. (The class is wider than this file: other `$`-anchored
+# request-path patterns exist elsewhere, e.g. papyrus's GIT_URL_RE.) The `path` grammar
+# is `_SAFE_PATH_RE`, imported from the registry facade: the owner-tier prewarm applies
+# the same object to a declared path before caching it, so the two cannot drift.
 _SAFE_REF_RE = re.compile(r"^[A-Za-z0-9._/-]+\Z")
-_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+\Z")
 
 
 def _is_safe_repo_identifier(repo: str) -> bool:
@@ -3683,70 +3703,6 @@ def _derive_registry_name(repo: str) -> str:
     # Disambiguate on the original repo so distinct URLs never collide.
     digest = hashlib.sha256(repo.strip().encode("utf-8")).hexdigest()[:8]
     return f"{slug}-{digest}"
-
-
-def _repo_key_owner_count(repo: str) -> int:
-    """Count the configured registry SOURCES that publish an entry keyed on ``repo``.
-
-    The blob credential carve-out grants owner credentials only when
-    :func:`_owner_designated_repo_target` confirms the resolved entry's clone URL is
-    byte-identical to *its own* registry's configured ``repo``.  That predicate is
-    entry-scoped and sound for the entry it is handed — but the entry is SELECTED
-    by :func:`get_registry_app_by_repo`, which returns the FIRST source (bundled,
-    then each external/federated registry) whose entry ``repo`` key equals the
-    served ``repo``.  The selection is keyed on ``repo`` alone and provenance-blind.
-
-    So if two configured registries both publish the same ``repo`` key, a request
-    reachable through registry B can resolve to registry A's owner-designated
-    entry and clone A's private repo with A's credentials, serving A's private
-    image bytes to a caller who only had access to B — a cross-registry
-    confused-deputy read.  The grant is only honestly attributable to a single
-    owner when exactly ONE configured source claims the key.
-
-    This counts the DISTINCT sources (the bundled registry counts once; each
-    external registry counts once) whose entries carry ``entry["repo"] == repo``,
-    using the SAME union :func:`known_registry_repos` admits — reading local sync
-    caches only (``ignore_ttl``), never fetching, so it is safe on the per-request
-    blob worker thread.  A return of ``> 1`` means the provenance is ambiguous and
-    the caller must downgrade to anonymous+strict.  On any read failure it returns
-    ``2`` (treat-as-ambiguous): a provenance we cannot establish must never buy a
-    credential grant.
-    """
-    from kiro_crew.apps.registry import (
-        _effective_registries,
-        _external_registry_cache_identity,
-        _load_registry_file,
-        _read_external_registry_cache,
-    )
-
-    try:
-        sources = 0
-        if any(
-            isinstance(e.get("repo"), str) and _same_git_target(e["repo"], repo)
-            for e in _load_registry_file()
-        ):
-            sources += 1
-        for reg in _effective_registries():
-            cached = _read_external_registry_cache(
-                _external_registry_cache_identity(reg), ignore_ttl=True
-            )
-            if any(
-                isinstance(e, dict)
-                and isinstance(e.get("repo"), str)
-                and _same_git_target(e["repo"], repo)
-                for e in cached or []
-            ):
-                sources += 1
-                if sources > 1:
-                    return sources  # already ambiguous — no need to keep counting
-        return sources
-    except Exception:  # provenance unresolvable → treat as ambiguous, never grant
-        logger.debug(
-            "_repo_key_owner_count: read failed for %r",
-            _strip_git_target_userinfo(repo),
-            exc_info=True,
-        )
-        return 2
 
 
 async def _fetch_git_blob(
@@ -3903,6 +3859,7 @@ async def _fetch_git_blob(
         else:
             clone_cmd = [
                 "git",
+                *_HOOKS_NEUTRALIZER_ARGV,
                 "clone",
                 "--depth",
                 "1",
@@ -3981,6 +3938,20 @@ async def _fetch_git_blob(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(cache_path.write_bytes, data)
     return True
+
+
+def _touch_served_blob(cache_path: Path) -> None:
+    """Bump a served blob's mtime to now without touching a link's target.
+
+    ``os.utime(follow_symlinks=False)`` where the platform supports it; elsewhere
+    (Windows) the name must lstat as a plain regular file before it is touched.
+    """
+    if os.utime in os.supports_follow_symlinks:
+        os.utime(cache_path, None, follow_symlinks=False)
+        return
+    if not stat.S_ISREG(os.lstat(cache_path).st_mode):
+        return
+    os.utime(cache_path, None)
 
 
 async def handle_blob_proxy(request: web.Request) -> web.Response:
@@ -4184,6 +4155,27 @@ async def handle_blob_proxy(request: web.Request) -> web.Response:
                     return web.json_response({"error": "failed to fetch blob"}, status=502)
 
     content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    # Keep a SERVED file young. ``_gc_blob_cache_dir`` reclaims a blob-cache file whose
+    # mtime has aged past the grace, and only the owner-tier prewarm re-publishes (and
+    # so re-dates) a live row's art; an index-tier blob the proxy wrote once is never
+    # re-published, so without this a file that is still being served every day would
+    # age out and be reclaimed, then re-cloned on the next browse. Touching the mtime on
+    # each serve makes "being served" keep a file young exactly as a rewrite does, so the
+    # sweep only reclaims art that is neither served nor rewritten. Off the event loop:
+    # ``os.utime`` is a blocking syscall (it can round-trip a network-homed data home),
+    # and this handler runs on the loop. Best-effort: a serve must not fail because the
+    # touch did (a read-only mount, a racing GC unlink), so any error is ignored -- the
+    # file is served regardless, and at worst ages out one grace window later than it
+    # might have. ``follow_symlinks=False``: the name was validated by the containment
+    # check above, and a link planted at it afterwards must not have its TARGET touched.
+    # Windows has no ``follow_symlinks=False`` for ``os.utime`` (it raises
+    # NotImplementedError, which would skip every touch there), so where the flag is
+    # unsupported the name is lstat-checked as a plain regular file first and touched
+    # by name.
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _touch_served_blob, cache_path)
+    except (OSError, NotImplementedError):
+        pass
     sel().log_api_access(
         caller="dashboard",
         operation="app_blob_proxy",
@@ -4262,11 +4254,24 @@ _PROXY_HOP_HEADERS = frozenset(
     }
 )
 
-# Strip sensitive auth headers — app backends use X-KiroCrew-Proxy HMAC, not user cookies
+# Strip sensitive auth headers — app backends authenticate via the per-app
+# X-KiroCrew-Proxy HMAC (injected below), never via user cookies or the
+# gateway's own internal-auth headers. The internal-auth set (X-Internal-Secret,
+# X-Session-Token, X-Session-Key, X-Internal-Caller) is stripped because a
+# credentialed internal caller — the design_tweak_update_thread MCP tool is the
+# first to reach an app backend through this proxy — would otherwise hand the
+# gateway-wide secret (which opens every strict internal route) to an app
+# subprocess that also serves content from the user's own projects. The HMAC is
+# all the backend needs to trust a proxied request, so dropping the rest is a
+# pure hardening with no functional loss.
 _PROXY_STRIP_HEADERS = _PROXY_HOP_HEADERS | frozenset(
     {
         "cookie",
         "authorization",
+        "x-internal-secret",
+        "x-session-token",
+        "x-session-key",
+        "x-internal-caller",
     }
 )
 
@@ -4529,59 +4534,112 @@ def _end_relay_midbody(request: web.Request, resp: web.StreamResponse) -> web.St
 
 
 async def handle_migrate_cleanup(request: web.Request) -> web.Response:
-    """DELETE /api/apps/{name}/migrate-cleanup — remove orphaned builtin metadata.
-
-    Validates:
-    1. Target app is an orphaned builtin
-    2. The standalone replacement is installed
-
-    Preserves data/ directory.
-    """
-    name = request.match_info["name"]
-    result = cleanup_migrated_builtin(name)
-    if not result.ok:
-        # Map structured error_code to HTTP status
-        _cleanup_status = {
-            "not_orphaned": 400,
-            "replacement_missing": 409,
-            "io_error": 500,
-        }
-        status = _cleanup_status.get(result.error_code, 400)
-        sel().log_api_access(
-            caller="dashboard",
-            operation="app_migrate_cleanup",
-            outcome="failed",
-            resources=name,
-            error=result.error,
-        )
-        return web.json_response(result.to_dict(), status=status)
-    sel().log_api_access(
-        caller="dashboard", operation="app_migrate_cleanup", outcome="completed", resources=name
+    """DELETE /api/apps/{name}/migrate-cleanup — uninstall a retired builtin, keeping data."""
+    from kiro_crew.apps.manager import (
+        AppResult,
+        _check_path_safety,
+        _read_installed,
+        migrated_builtin_cleanup_applies,
     )
-    return web.json_response(result.to_dict())
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    if request.get("app"):
+        sel().log_api_access(
+            caller=request.get("app", ""),
+            operation="app_migrate_cleanup",
+            outcome="denied",
+            resources=request.path,
+            error="app token cannot clean up migrated apps",
+        )
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "app tokens cannot clean up migrated apps",
+                "code": "app_token_forbidden",
+            },
+            status=403,
+        )
+    denied = await require_owner_dashboard_request(request, "app_migrate_cleanup")
+    if denied is not None:
+        return denied
+
+    name = request.match_info["name"]
+    result = AppResult(
+        ok=False, name=name, error="not a migrated builtin", error_code="not_orphaned"
+    )
+    if _check_path_safety(name):
+        meta = await asyncio.to_thread(_read_installed, name)
+        if meta is None:
+            result = AppResult(ok=True, name=name, message="not installed — nothing to clean up")
+        elif meta.origin != "builtin":
+            result = AppResult(
+                ok=True, name=name, message="already migrated — standalone version is in place"
+            )
+        elif await asyncio.to_thread(migrated_builtin_cleanup_applies, name):
+            info = await asyncio.to_thread(get_app, name)
+            if info is not None:
+                response = await _run_uninstall(
+                    request,
+                    name,
+                    info,
+                    keep_data=True,
+                    keep_dependencies=False,
+                    keep_specific=[],
+                    retired_builtin=True,
+                )
+                # Uninstall precondition refusals retain their status and retry contract.
+                payload = json.loads(response.text or "{}")
+                payload["ok"] = response.status < 400
+                return web.json_response(payload, status=response.status)
+    sel().log_api_access(
+        caller="dashboard",
+        operation="app_migrate_cleanup",
+        outcome="completed" if result.ok else "denied",
+        resources=name,
+        error=result.error,
+    )
+    if result.ok:
+        return web.json_response(result.to_dict())
+    return web.json_response(
+        {"ok": False, "name": name, "error": result.error, "code": "not_orphaned"}, status=400
+    )
 
 
 async def handle_registries(request: web.Request) -> web.Response:
     """GET/PUT /api/apps/registries — manage external federated registries."""
     if request.method == "GET":
         config = KiroCrewConfig.load()
-        # Operator rows report `index` as their tier because that is what is in
-        # FORCE for them: `registry._registry_trust_tier` resolves `owner` only
-        # from build-pinned rows, since `config.json` is agent-writable. Echoing a
-        # hand-edited `owner` back would report a grant the runtime does not honour.
-        # `label`/`review` are reported empty for the same reason: they are claims
-        # only the build may make, so an operator row makes neither.
-        registries = [
-            {
-                "name": r.name,
-                "repo": _strip_git_target_userinfo(r.repo),
-                "branch": r.branch,
-                "trust": _TRUST_INDEX,
-                "label": "",
-                "review": "",
-            }
-            for r in config.registries
-        ]
+
+        # Operator rows report the tier in FORCE for them, never the one the row
+        # declares: `registry._registry_trust_tier` reads `owner` only from a
+        # build-pinned row or from the operator's keystone grant
+        # (`registry_trust.json`, written through `/api/security/trusted-registries`),
+        # since `config.json` is agent-writable and a hand-edited `owner` there is
+        # a claim the runtime does not honour. `label`/`review` are reported empty
+        # for the same reason: they are claims only the build may make, so an
+        # operator row makes neither. The tier is read off each row object, never
+        # by name, so two rows sharing a name each report their own grant; a row
+        # whose name a pinned registry takes is not served and reads `index`. The
+        # lookup reads the grant file, so it runs off the event loop.
+        def _operator_rows() -> list[dict[str, Any]]:
+            pinned_keys = {_registry_identity_key(p.name or p.repo) for p in _pinned_registries()}
+            return [
+                {
+                    "name": r.name,
+                    "repo": _strip_git_target_userinfo(r.repo),
+                    "branch": r.branch,
+                    "trust": (
+                        _TRUST_INDEX
+                        if _registry_identity_key(r.name or r.repo) in pinned_keys
+                        else _registry_trust_tier_of(r)
+                    ),
+                    "label": "",
+                    "review": "",
+                }
+                for r in config.registries
+            ]
+
+        registries = await asyncio.to_thread(_operator_rows)
         # Edition-pinned registries are reported SEPARATELY and read-only. They
         # are not part of ``registries`` because PUT replaces that list verbatim:
         # a GET→edit→PUT round-trip would persist an edition default into the
@@ -4680,19 +4738,21 @@ async def handle_registries(request: web.Request) -> web.Response:
         if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_\-./]*$", branch) or ".." in branch:
             return _deny(f"invalid branch name: {branch!r}", f"branch={branch}")
         # `trust` is accepted only as `index` for an operator row, and that is the
-        # value stored. `registry._registry_trust_tier` resolves `owner` solely
-        # from `default_registries()` — the build — because `config.json` is
-        # agent-writable, so a tier persisted here could never be honoured.
-        # Accepting it would hand back a setting the runtime ignores, and there is
-        # correspondingly no tier to PRESERVE across a replace-all PUT: an omitted
-        # value simply means `index`, which is what an operator row always is.
+        # value stored. `registry._registry_trust_tier` never reads `owner` off a
+        # config row — `config.json` is agent-writable, so a tier persisted here
+        # could never be honoured. The operator lifts a row to `owner` through
+        # Settings > Security (`/api/security/trusted-registries`), which writes
+        # the keystone `registry_trust.json` keyed by the row's repository, so
+        # there is correspondingly no tier to PRESERVE across a replace-all PUT: an
+        # omitted value simply means `index`, which is what a stored row always is.
         raw_trust = entry.get("trust")
         trust = _TRUST_INDEX if raw_trust is None else (str(raw_trust).strip() or _TRUST_INDEX)
         if trust not in _REGISTRY_TRUST_TIERS:
             return _deny(f"invalid registry trust: {trust!r}", f"trust={trust}")
         if trust == _TRUST_OWNER:
             return _deny(
-                "the trusted tier is supplied by this build, not by configuration",
+                "the trusted tier is supplied by this build or granted in "
+                "Settings > Security, not by configuration",
                 f"owner_trust_refused={name}",
             )
         # A name an edition-pinned registry already owns is refused rather than

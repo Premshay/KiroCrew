@@ -486,6 +486,8 @@ class TestNodeAllBinDirs:
         )
         monkeypatch.delenv("MISE_DATA_DIR", raising=False)
         monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        # A macOS runner can carry real Homebrew node kegs; keep them out.
+        monkeypatch.setattr(env_mod, "_HOMEBREW_NODE_KEG_ROOT", str(tmp_path / "no-homebrew"))
         return tmp_path
 
     def test_empty_when_no_managers(self, fake_home) -> None:
@@ -580,6 +582,26 @@ class TestNodeAllBinDirs:
         """Strict-superset pin vs the retired scan, which globbed
         ``~/.fnm/node-versions/<ver>/bin`` (no ``installation`` segment)."""
         d = fake_home / ".fnm" / "node-versions" / "v20.0.0" / "bin"
+        d.mkdir(parents=True)
+        assert str(d) in node_all_bin_dirs()
+
+    def test_covers_macos_fnm_default_location(self, fake_home) -> None:
+        """fnm on macOS defaults to the Apple data dir, not XDG and not
+        ``~/.fnm``. Without this glob a plain macOS fnm install is a false
+        "no Node was found", sending the user down the wrong remediation.
+        The dir carries a space ("Application Support"), which must glob
+        correctly. Not run on a real macOS host -- the layout is reproduced
+        under a fake HOME, so this covers the path on every runner."""
+        d = (
+            fake_home
+            / "Library"
+            / "Application Support"
+            / "fnm"
+            / "node-versions"
+            / "v22.9.0"
+            / "installation"
+            / "bin"
+        )
         d.mkdir(parents=True)
         assert str(d) in node_all_bin_dirs()
 

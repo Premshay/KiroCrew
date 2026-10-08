@@ -38,7 +38,9 @@ if TYPE_CHECKING:
 
 def _initialize_memory_worker(self: GatewayOrchestrator) -> bool:
     """Restore and open the already-wired memory objects after readiness."""
+    from kiro_crew.config.loader import data_home
     from kiro_crew.context import reset_memory_caches
+    from kiro_crew.cron_service.identity import migrate_legacy_member_schedules
     from kiro_crew.memory_backup import apply_pending_member_restores
     from kiro_crew.memory_stores import repair_legacy_member_stores
 
@@ -60,6 +62,15 @@ def _initialize_memory_worker(self: GatewayOrchestrator) -> bool:
                 upgraded = repair_legacy_member_stores()
                 if upgraded:
                     logger.info("Upgraded member memory stores: %s", ", ".join(upgraded))
+                # Then the schedules those stores' members own, once, before
+                # the scheduler arms (it waits on this barrier). Same store
+                # directory the gateway's CronService uses; never raises.
+                captured = migrate_legacy_member_schedules(data_home())
+                if captured:
+                    logger.info(
+                        "Captured the member execution of %d pre-identity schedule(s)",
+                        len(captured),
+                    )
                 if startup.stopped:
                     return False
                 restored = apply_pending_member_restores(
@@ -128,11 +139,27 @@ def _schedule_memory_preparation(self: GatewayOrchestrator) -> "asyncio.Task[Non
     if self._memory_startup_task is None:
 
         async def initialize() -> None:
+            import contextvars
+
+            from kiro_crew.executors import memory_preparation_executor
+
+            # Its own thread, not asyncio.to_thread: the loop's default executor
+            # is shared by every boot task, and admission stays closed while
+            # this job waits for a free slot there. The context copy keeps
+            # to_thread's contextvars behaviour.
+            pool = memory_preparation_executor()
+            run = contextvars.copy_context().run
             try:
-                await asyncio.to_thread(self._initialize_memory_worker)
+                await asyncio.get_running_loop().run_in_executor(
+                    pool, run, self._initialize_memory_worker
+                )
             except asyncio.CancelledError:
                 await asyncio.to_thread(self._stop_memory_startup)
                 raise
+            finally:
+                # A worker still running after cancellation keeps its thread
+                # until it returns; stop() above already told it to close.
+                pool.shutdown(wait=False)
 
         task = asyncio.create_task(initialize())
         self._memory_startup_task = task

@@ -52,6 +52,35 @@ from kiro_crew.config.fields import _coerce_bool
 #     and prescribed by the dashboard's "no checkout found" banner.
 _APP_OWNED_TOP_KEYS: frozenset = frozenset({"dev_fleet"})
 
+# Top-level config.json sections THIS CORE itself writes and reads, but does not
+# model as a dataclass field. The settings UI persists them into config.json and
+# a core module reads them back on startup -- so, exactly like the keys save()
+# stamps (CONFIG_RESERVED_TOP_KEYS), the product wrote them itself and warning
+# "unrecognized" about them is a false positive. They differ from the reserved
+# keys in that they carry live operator settings that must survive save(): the
+# loader captures them into _extra_sections and re-emits them via to_dict(), so
+# they are NOT reserved (reserved keys are dropped on save). They differ from
+# _APP_OWNED_TOP_KEYS only in who owns the reader -- core here, a builtin app
+# there -- which is why they are a separate set and the "second member becomes a
+# registration mechanism" note on the app-owned set does not govern this one:
+# a core-owned section has no manifest to declare itself through.
+# Excluded only in the shape the reader keeps -- a JSON object -- so a scalar
+# written by hand keeps the one warning that says it is being ignored.
+#   * voice_reply -- the dashboard/Slack voice settings block. Written by
+#     slack/interactions.py (``data.setdefault("voice_reply", {})``) and
+#     dashboard/chat_voice.py (persisted with json.dump), and read back on
+#     startup by slack/handler_runtime/voice.py::load_voice_reply_config
+#     (``cfg.raw.get("voice_reply")``), and also by
+#     telegram/transport_dispatch.py (``raw.get("voice_reply")``). No
+#     SCHEMA_REGISTRY entry.
+#   * connections -- the Connections block. The Settings "OAuth Apps" form
+#     writes ``connections.oauth_clients.<slug>.client_id``
+#     (dashboard/handlers/connections.py::_write_oauth_client), read back by
+#     connections/oauth_clients.py::_config_client_id; the
+#     ``connections.tool_aliases`` gate is read by
+#     agent_materialization/mcp_aliases.py. No SCHEMA_REGISTRY entry.
+_CORE_OWNED_TOP_KEYS: frozenset = frozenset({"voice_reply", "connections"})
+
 try:
     import jsonschema
 
@@ -226,6 +255,12 @@ _FAIL_CLOSED_PATHS = frozenset(
         "workspaces",
     }
 )
+
+
+def _is_flat_workspace_string(dot_path: str, value: object) -> bool:
+    """Whether *value* is the flat ``workspaces.<name>: "<dir>"`` form."""
+    parts = dot_path.split(".")
+    return len(parts) == 2 and parts[0] == "workspaces" and isinstance(value, str)
 
 
 def _apply_field_default(data: dict, dot_path: str) -> bool:
@@ -461,17 +496,22 @@ def validate_config_data(data: dict) -> dict:
     # config's *sections*, so the keys save() stamps itself are not in it and
     # must be excluded — otherwise every load of a config Kiro Crew has ever
     # saved warns about Kiro Crew's own bookkeeping. A section a builtin app owns
-    # and reads from the file directly (_APP_OWNED_TOP_KEYS) is not in the
-    # registry either, and is excluded for the same reason: the product told the
-    # operator to write it. Excluded only in the shape the app reads -- a JSON
-    # object. The app's reader keeps only a dict (repository.py
-    # ``isinstance(raw.get("dev_fleet"), dict)``) and silently falls back to
-    # discovery on anything else, so a scalar ``dev_fleet: "/opt/kc"`` would
+    # and reads from the file directly (_APP_OWNED_TOP_KEYS), or that this core
+    # writes and reads without a dataclass model (_CORE_OWNED_TOP_KEYS), is not
+    # in the registry either and is excluded for the same reason: the product
+    # told the operator to write it, or wrote it itself. Excluded only in the
+    # shape the reader keeps -- a JSON object. A reader keeps only a dict and
+    # silently falls back on anything else, so a scalar written by hand would
     # otherwise lose the one warning that tells the operator it is being ignored.
     known_top_keys = {e.path for e in SCHEMA_REGISTRY if "." not in e.path and e.path != "*"}
     app_owned_sections = {k for k in _APP_OWNED_TOP_KEYS if isinstance(data.get(k), dict)}
+    core_owned_sections = {k for k in _CORE_OWNED_TOP_KEYS if isinstance(data.get(k), dict)}
     unknown = sorted(
-        set(data.keys()) - known_top_keys - CONFIG_RESERVED_TOP_KEYS - app_owned_sections
+        set(data.keys())
+        - known_top_keys
+        - CONFIG_RESERVED_TOP_KEYS
+        - app_owned_sections
+        - core_owned_sections
     )
     if unknown:
         logger.warning("Config: unrecognized top-level keys: %s", ", ".join(unknown))
@@ -515,6 +555,14 @@ def validate_config_data(data: dict) -> dict:
     # rule (``fields._coerce_bool``) for a host without ``jsonschema``.
     if "auto_update" in data and not isinstance(data["auto_update"], bool):
         data["auto_update"] = _coerce_bool(data["auto_update"], False)
+
+    # 3c. A retired verbosity level is renamed, not rejected: the enum check
+    # would otherwise delete it and drop the user back to the verbose default.
+    dashboard = data.get("dashboard")
+    if isinstance(dashboard, dict) and "verbosity" in dashboard:
+        from kiro_crew.config.sections import normalize_verbosity
+
+        dashboard["verbosity"] = normalize_verbosity(dashboard["verbosity"])
 
     # 3a. Resolve the STT provider and model through the loader's own degradation
     # rules before the enum check can discard them. Both fields accept values that
@@ -570,6 +618,11 @@ def validate_config_data(data: dict) -> dict:
                     "using default" if removed else "value kept (validated by its consumer)",
                 )
             elif err.validator == "type":
+                if _is_flat_workspace_string(dot_path, value):
+                    # The loader migrates this form to {"dir": ...} and writes
+                    # it back, so the string stays for it to read.
+                    logger.info("Config: flat workspace string at '%s' is migrated", dot_path)
+                    continue
                 expected = err.schema.get("type", "unknown")
                 actual = _actual_type_name(value)
                 removed = _apply_field_default(data, dot_path)

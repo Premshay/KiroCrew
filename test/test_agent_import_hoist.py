@@ -31,6 +31,24 @@ _HOISTED_FILES = (
 )
 
 
+#: ``handlers/agents.py`` runs the functions its ``dashboard/agent_admin`` owners
+#: define on its own globals, so the ratchet reads those owners as part of it.
+_COMPOSED_OWNERS = {
+    "kiro_crew/dashboard/handlers/agents.py": "kiro_crew/dashboard/agent_admin",
+}
+
+
+def _hoisted_text(rel: str) -> str:
+    """*rel*'s source, followed by the owner modules it composes."""
+    text = (_SRC / rel).read_text(encoding="utf-8")
+    owner_dir = _COMPOSED_OWNERS.get(rel)
+    if owner_dir is None:
+        return text
+    owners = sorted((_SRC / owner_dir).glob("[!_]*.py"))
+    assert len(owners) >= 13, f"{owner_dir}: the composed owners were not found"
+    return "\n".join([text, *(owner.read_text(encoding="utf-8") for owner in owners)])
+
+
 def _fresh_import(statements: str) -> None:
     """Run import statements in a fresh child interpreter; fail on any error."""
     res = subprocess.run(
@@ -78,7 +96,7 @@ def test_no_function_local_agent_imports_remain() -> None:
     )
     offenders = {}
     for rel in _HOISTED_FILES:
-        text = (_SRC / rel).read_text(encoding="utf-8")
+        text = _hoisted_text(rel)
         hits = local_import.findall(text)
         if hits:
             offenders[rel] = len(hits)

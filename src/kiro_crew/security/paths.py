@@ -476,6 +476,9 @@ _CREW_SECRET_LEAVES: list[str] = [
     "policy_cache",
     "admission_policy.json",
     "denied_commands.json",
+    # Operator grants of ``owner`` trust to hand-configured app registries, on the same floor
+    # as ``denied_commands.json``: a writable grant clones a registry the agent controls.
+    "registry_trust.json",
     # The cron store. It holds access-control state, not just scheduling data:
     # ``session_key`` decides which session may manage a job through the MCP cron
     # tools and where the job's output is delivered, ``approval_mode`` is a
@@ -1928,6 +1931,22 @@ def _mark_stalled(prefix: str, budget: float) -> None:
 _UNC_PREFIX_RE = re.compile(r"^[\\/]{2}[^\\/]")
 _ON_WINDOWS = os.name == "nt"
 
+#: Local-drive namespace prefixes and default-stream suffixes: Windows opens each
+#: spelling as the plain drive path. UNC, volume GUID and named streams stay as written.
+_WIN_LOCAL_NS_RE = re.compile(r"^(?:[\\/]{2}[?.]|\\\?\?)[\\/](?=[A-Za-z]:(?:[\\/]|$))")
+_WIN_DEFAULT_STREAM_RE = re.compile(
+    r"(?:::\$DATA|::\$INDEX_ALLOCATION|:\$I30:\$INDEX_ALLOCATION)$", re.IGNORECASE
+)
+
+
+def _fold_windows_alias(path: str) -> str:
+    """Lexically fold a Windows alias of a local path to its plain spelling; identity off Windows."""
+    if not _ON_WINDOWS:
+        return path
+    folded = _WIN_LOCAL_NS_RE.sub("", path, count=1)
+    folded += "\\" if folded != path and len(folded) == 2 else ""  # bare volume -> drive root
+    return _WIN_DEFAULT_STREAM_RE.sub("", folded)
+
 
 def _is_unc_path(expanded: str) -> bool:
     """``\\\\server\\share\\...`` in either separator spelling.
@@ -2209,7 +2228,10 @@ def _candidate_forms(
     :func:`is_sensitive_resolved_path`; see there for why a caller may claim it.
     """
     # Expand ~ and $HOME
-    expanded = os.path.expanduser(os.path.expandvars(path_str))
+    raw = os.path.expanduser(os.path.expandvars(path_str))
+    # Fold before resolving (a ``\\?\`` spelling would skip resolution as UNC-shaped);
+    # the raw spelling stays a lexical candidate, so folding only adds candidates.
+    expanded = _fold_windows_alias(raw)
 
     # Anchor a relative input against the supplied workspace dir so it resolves
     # to the real file rather than the gateway's CWD.  Absolutize base_dir
@@ -2230,6 +2252,8 @@ def _candidate_forms(
     candidates: set[str] = set() if pre_resolved else _resolved_forms_bounded(expanded)
     candidates.add(os.path.normpath(expanded))
     candidates.add(expanded)
+    if raw != expanded:
+        candidates.update((os.path.normpath(raw), raw))
     return candidates
 
 
@@ -3266,7 +3290,7 @@ def _path_in_home_dirs(
     implementation means the symlink/casefold hardening below cannot drift
     between the two gates.
 
-    ── Symlink robustness (pentest AWS-345 / AWS-62) ──
+    ── Symlink robustness ──
     A workspace symlink pointing at ``~/.aws/credentials`` (absolute OR relative
     ``../../.aws/credentials`` traversal) must NOT be readable through the link.
     We therefore check MULTIPLE candidate forms of the input and return True if
@@ -3443,7 +3467,7 @@ def is_sensitive_resolved_path(resolved: str) -> bool:
     same mount would. Nothing is admitted while it blocks.
     """
     return _path_in_home_dirs(resolved, _SENSITIVE_HOME_DIRS, pre_resolved=True) or (
-        resolved.casefold().endswith(_KEYSTONE_ARTIFACT_SUFFIXES)
+        _fold_windows_alias(resolved).casefold().endswith(_KEYSTONE_ARTIFACT_SUFFIXES)
         and _is_keystone_publish_artifact(resolved, pre_resolved=True)
     )
 
@@ -3546,7 +3570,9 @@ def sensitive_path_refusal(path_str: str, base_dir: str | None = None) -> str | 
     return None
 
 
-def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:
+def path_contains_sensitive(
+    dir_str: str, base_dir: str | None = None, *, pre_resolved: bool = False
+) -> bool:
     """Return True if a read+write-sensitive location lies UNDER *dir_str*.
 
     The REVERSE direction of :func:`is_sensitive_path`: that gate answers "is
@@ -3564,12 +3590,21 @@ def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:
     *dir_str* is a huge tree. Shares :func:`_candidate_forms` and
     :func:`_home_dir_targets` with :func:`_path_in_home_dirs` so the
     symlink/casefold hardening cannot drift between the two directions.
+
+    ``pre_resolved`` is :func:`_candidate_forms`'s flag of the same name, paired
+    with inline anchors exactly as :func:`_path_in_home_dirs` pairs them, and it
+    carries :func:`is_sensitive_resolved_path`'s preconditions verbatim: no
+    ``mc-pathres`` submission on either half, *dir_str* MUST be the
+    ``os.path.realpath`` the caller computed on its OWN worker thread, and a
+    caller on the event loop forfeits the bound the pool exists to give it. See
+    there for why a bulk walk may claim it. One question per directory, so the
+    walk that asks it would pay a pool hop per directory for nothing.
     """
     if not dir_str:
         return False
     try:
-        sensitive_targets = _home_dir_targets(_SENSITIVE_HOME_DIRS)
-        candidates = _candidate_forms(dir_str, base_dir)
+        sensitive_targets = _home_dir_targets(_SENSITIVE_HOME_DIRS, inline=pre_resolved)
+        candidates = _candidate_forms(dir_str, base_dir, pre_resolved=pre_resolved)
     except PathResolutionStalled:
         return True  # fail closed: see _path_in_home_dirs
     for cand in candidates:

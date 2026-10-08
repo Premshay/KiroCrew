@@ -2082,6 +2082,39 @@ class TestBlockedStateReadsThePublicSlotContract(unittest.IsolatedAsyncioTestCas
         # Falls back to the PUBLIC attribute, not to the old private reach-in.
         self.assertTrue(result["pending_approval"])
 
+    def test_waiting_for_input_is_read_from_the_serializer(self):
+        """The chat slot exposes its open-question flag only through ``to_dict()``."""
+
+        class _Slot:
+            running = False
+            messages: list = []
+
+            def __init__(self, public: dict | None):
+                self.public = public
+
+            def to_dict(self, **_kw):
+                if self.public is None:
+                    raise RuntimeError("slot serializer blew up")
+                return self.public
+
+        def read(slot):
+            class _State:
+                @staticmethod
+                def get_slot(key):
+                    return slot
+
+            class _Req:
+                app = {"state": _State()}
+
+            result = routes._slot_state(cast(web.Request, _Req()), "probe")
+            assert result is not None, "the stub always resolves a slot"
+            return result["waiting_for_input"]
+
+        self.assertTrue(read(_Slot({"needs_input": True, "waiting_for_input": True})))
+        # A finished turn (assistant spoke last, nothing asked) is not blocked on input.
+        self.assertFalse(read(_Slot({"needs_input": False, "waiting_for_input": True})))
+        self.assertFalse(read(_Slot(None)), "a serializer fault degrades to False")
+
 
 class TestRotationDescribeDoesNotBlockTheLoop(unittest.IsolatedAsyncioTestCase):
     """``rotation.describe`` reaches the same ``gh api user`` spawn the gate does.

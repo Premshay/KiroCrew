@@ -2,7 +2,7 @@
 
 The deployed unit is Kiro Crew's own backend, run in *dashboard mode*, on
 loopback, with no interface served (`docs/system-specs/modules/aws-control.md`,
-"Three processes, one task"). Dashboard mode is
+"Four processes, one task"). Dashboard mode is
 required and `--no-dashboard` is wrong: the smaller ``_init_api_server`` it
 starts has neither the chat endpoints nor the slot registry this design calls,
 and it quiets nothing, so headless here means "no interface exposed", not
@@ -135,6 +135,15 @@ ENV_TELEMETRY_DISABLED: str = "KIROCREW_TELEMETRY_DISABLED"
 #: The front's control-plane secret. Named here so the strip below is a named
 #: constant rather than a bare string, and so a reader can find every use of it.
 ENV_CONTROL_SECRET: str = "SMC_CONTROL_SECRET"
+
+#: Set to ``"1"`` on the backend's environment when the task restored its
+#: authority pair from a remote committed snapshot. The transcripts are NOT
+#: restored with it (they load lazily, per turn), so the backend's open-slot
+#: restore keeps a listed slot whose transcript is absent from local disk as a
+#: reopen seed rather than pruning it -- see
+#: ``dashboard.chat_persistence._transcripts_may_be_remote_only``. Unset on an
+#: ordinary (non-container) boot, where an absent transcript is a genuine answer.
+ENV_AUTHORITY_RESTORED: str = "KIROCREW_CONTAINER_AUTHORITY_RESTORED"
 
 #: Every messaging transport the gateway can start, by the name of its config
 #: section. ``write_backend_config`` turns each one OFF in a file the container owns.
@@ -273,7 +282,8 @@ def build_backend_argv(settings: Settings) -> list[str]:
 #:
 #: `acp_backend` selects the KAS harness, which is what keeps the model credential out
 #: of the worker's environment. `acp/harness/kas.KasHarness.apply_spawn_env` strips the
-#: API key from the relay's environment and the relay asks the host for a token
+#: API key from a Crew-owned relay's environment -- the vault `seed_model_identity`
+#: fills makes every relay here Crew-owned -- and the relay asks the host for a token
 #: instead, which `acp/kas_host_auth.answer_get_access_token` answers from the vault.
 #: Leaving this to the default would make the credential's location a property of
 #: whatever `config.json` the task was given, and `build_backend_env` withholding the
@@ -382,7 +392,7 @@ def write_backend_config(settings: Settings) -> Path:
     a transport it starts there is already connected by the time anything else could
     object.
 
-    ``config_dir`` equals ``data_home`` (see the spec's "Three processes, one task").
+    ``config_dir`` equals ``data_home`` (see the spec's "Four processes, one task").
 
     Written through a sibling temp and one atomic replace, because the failure this
     file has is in the FUTURE: nothing reads it during this write, and a truncated
@@ -529,7 +539,8 @@ def build_backend_env(settings: Settings, base: Mapping[str, str] | None = None)
     # therefore reachable by prompt content whatever the sandbox is doing.
     #
     # The worker does not need one. ``acp/harness/kas.KasHarness.apply_spawn_env``
-    # strips the API key from the relay's environment, and the relay asks the HOST
+    # strips the API key from a Crew-owned relay's environment (the seeded vault
+    # makes it one), and the relay asks the HOST
     # for a token over ``_kiro/auth/getAccessToken``, which
     # ``acp/kas_host_auth.answer_get_access_token`` answers from the vault inside the
     # backend process.

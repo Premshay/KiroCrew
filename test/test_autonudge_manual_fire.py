@@ -241,7 +241,12 @@ async def test_a_manual_trigger_still_honours_the_stop_sentinel(tmp_path, svc_ba
     await _run_armed_cycle(svc, loop.id)
 
     assert fired == []
-    assert loop.id not in svc._loops
+    # The stop file FINISHES the loop: the record is kept, inactive, under its
+    # own reason, and a manual press cannot buy a turn past it (``fire_now``
+    # refuses an inactive loop).
+    kept = svc._loops[loop.id]
+    assert kept.active is False and kept.stopped_reason == "stop_sentinel"
+    assert (await svc.fire_now(loop.id))[2] == 409
     svc.stop()
 
 
@@ -249,7 +254,7 @@ async def test_a_manual_trigger_still_honours_the_stop_sentinel(tmp_path, svc_ba
 async def test_fire_now_refuses_an_inactive_loop(svc_base_dir) -> None:
     """One condition covers every terminal bound, so none is restated.
 
-    A cap, a spent runtime budget, an approval stall and a sentinel removal all
+    A cap, a spent runtime budget, an approval stall and the stop file all
     leave the loop inactive, so refusing on ``active`` refuses all of them
     without a second copy of the list to drift.
     """
@@ -339,9 +344,14 @@ class _FakeSvc:
         self.loops = loops
         self.fired: list[str] = []
         self.result: tuple[NudgeLoop | None, str, int] | None = None
+        self.released: list[tuple[str, bool]] = []
 
     def get_by_id(self, loop_id: str) -> NudgeLoop | None:
         return next((lp for lp in self.loops if lp.id == loop_id), None)
+
+    async def release_approval_hold(self, slot_key: str, *, why: str, arm: bool = True) -> bool:
+        self.released.append((slot_key, arm))
+        return False
 
     async def fire_now(self, loop_id: str) -> tuple[NudgeLoop | None, str, int]:
         self.fired.append(loop_id)
@@ -398,12 +408,9 @@ def _body(response: web.StreamResponse) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
-def _slot(*, running: bool = False, in_stage: bool = False) -> MagicMock:
+def _slot(*, running: bool = False) -> MagicMock:
     slot = MagicMock()
     slot.running = running
-    # Modelled explicitly: a bare MagicMock attribute is truthy and would trip
-    # the busy guard on every test.
-    slot._in_stage_execution = in_stage
     return slot
 
 
@@ -420,6 +427,28 @@ async def test_route_fires_and_returns_the_updated_loop(monkeypatch) -> None:
     assert body["ok"] is True
     assert body["loop"]["id"] == "lp-1"
     assert svc.fired == ["lp-1"]
+    # A press is a person: it ends an approval hold first, unarmed, because the
+    # fire arms the tick itself -- else the tick would find the loop still held.
+    assert svc.released == [("chat-1-111", False)]
+
+
+@pytest.mark.asyncio
+async def test_route_refuses_when_the_approval_hold_cannot_be_released(monkeypatch) -> None:
+    """A release the store refused leaves the loop held, so a fire would do nothing."""
+    loop = NudgeLoop(id="lp-1", slot_key="chat-1-111", message="check", idle_secs=300)
+
+    class _Svc(_FakeSvc):
+        async def release_approval_hold(self, slot_key: str, *, why: str, arm: bool = True) -> bool:
+            raise OSError("disk full")
+
+    svc = _Svc([loop])
+    monkeypatch.setattr(h, "_autonudge_get", lambda: svc)
+
+    resp = await h.api_autonudge_fire(_mk("lp-1", slot=_slot()))
+
+    assert resp.status == 503
+    assert _body(resp)["code"] == "approval_hold_release_failed"
+    assert svc.fired == []
 
 
 @pytest.mark.asyncio
@@ -435,25 +464,6 @@ async def test_route_refuses_when_the_session_already_has_a_turn_in_flight(monke
     monkeypatch.setattr(h, "_autonudge_get", lambda: svc)
 
     resp = await h.api_autonudge_fire(_mk("lp-1", slot=_slot(running=True)))
-
-    assert resp.status == 409
-    assert _body(resp)["code"] == "session_busy"
-    assert svc.fired == []
-
-
-@pytest.mark.asyncio
-async def test_route_refuses_between_the_stages_of_a_multi_stage_plan(monkeypatch) -> None:
-    """``slot.running`` alone reads False in that window.
-
-    Which is exactly why the canonical predicate is two-term. Without the
-    ``_in_stage_execution`` half this press would land a concurrent turn on top
-    of a plan that is mid-flight.
-    """
-    loop = NudgeLoop(id="lp-1", slot_key="chat-1-111", message="check", idle_secs=300)
-    svc = _FakeSvc([loop])
-    monkeypatch.setattr(h, "_autonudge_get", lambda: svc)
-
-    resp = await h.api_autonudge_fire(_mk("lp-1", slot=_slot(running=False, in_stage=True)))
 
     assert resp.status == 409
     assert _body(resp)["code"] == "session_busy"

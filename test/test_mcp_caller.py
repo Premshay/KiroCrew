@@ -204,7 +204,7 @@ def test_from_env_uses_host_pid_env_before_walk(tmp_path, monkeypatch) -> None:
         {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": "987654"},
         clear=False,
     ):
-        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+        with mock.patch("kiro_crew.config.paths.config_dir", return_value=tmp_path):
             ctx = CallerContext.from_env()
     assert ctx.session_key == "hostpid-session-789"
     assert ctx.session_type == "pidfile"
@@ -222,7 +222,7 @@ def test_from_env_host_pid_missing_file_falls_back_to_walk(tmp_path, monkeypatch
         {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": "999999"},
         clear=False,
     ):
-        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+        with mock.patch("kiro_crew.config.paths.config_dir", return_value=tmp_path):
             ctx = CallerContext.from_env()
     assert ctx.session_key == "walk-session-111"
 
@@ -254,7 +254,7 @@ def test_a_malformed_nearer_mapping_does_not_stop_the_walk(tmp_path, monkeypatch
         {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": "987654"},
         clear=False,
     ):
-        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+        with mock.patch("kiro_crew.config.paths.config_dir", return_value=tmp_path):
             ctx = CallerContext.from_env()
     assert ctx.session_key == "real-ancestor-session"
 
@@ -272,7 +272,7 @@ def test_a_malformed_mapping_mid_chain_does_not_stop_the_walk(tmp_path, monkeypa
         {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": ""},
         clear=False,
     ):
-        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+        with mock.patch("kiro_crew.config.paths.config_dir", return_value=tmp_path):
             with mock.patch.object(
                 kiro_crew.mcp_caller, "_parent_pid", side_effect=lambda p: further
             ):
@@ -299,7 +299,7 @@ def test_a_recycled_mapping_does_not_stop_the_walk(tmp_path, monkeypatch) -> Non
         {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": ""},
         clear=False,
     ):
-        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+        with mock.patch("kiro_crew.config.paths.config_dir", return_value=tmp_path):
             with mock.patch.object(
                 platform_compat, "get_process_start_id", return_value="live-token-bbb"
             ):
@@ -328,7 +328,7 @@ def test_a_co_tenant_refusal_still_stops_the_walk(tmp_path, monkeypatch) -> None
         {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": ""},
         clear=False,
     ):
-        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+        with mock.patch("kiro_crew.config.paths.config_dir", return_value=tmp_path):
             with mock.patch.object(
                 kiro_crew.mcp_caller, "_parent_pid", side_effect=lambda p: further
             ):
@@ -353,7 +353,7 @@ def _exhausted_walk(tmp_path, *, plant: str | None, live_token: str = "live-toke
         {"KIROCREW_SESSION_KEY": "", "KIROCREW_HOST_PID": ""},
         clear=False,
     ):
-        with mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path):
+        with mock.patch("kiro_crew.config.paths.config_dir", return_value=tmp_path):
             with mock.patch.object(
                 platform_compat, "get_process_start_id", return_value=live_token
             ):
@@ -523,10 +523,10 @@ def test_the_pid_rung_reports_a_broken_data_home_instead_of_raising(monkeypatch)
     the guarantee to the rung rather than to a call site is what makes it true
     for every consumer, including one added later.
     """
-    import kiro_crew.config.loader as loader
+    import kiro_crew.config.paths as paths
 
     _decline_rungs_1_to_3(monkeypatch)
-    monkeypatch.setattr(loader, "config_dir", _raise_config_dir)
+    monkeypatch.setattr(paths, "config_dir", _raise_config_dir)
 
     identity = kiro_crew.mcp_caller._identity_from_pid_mapping()
     assert identity.failed is True
@@ -542,10 +542,10 @@ def test_from_env_survives_a_broken_data_home(monkeypatch):
     takes the whole stub down -- losing every server in that session -- instead
     of reaching the deliberate degradation below it.
     """
-    import kiro_crew.config.loader as loader
+    import kiro_crew.config.paths as paths
 
     _decline_rungs_1_to_3(monkeypatch)
-    monkeypatch.setattr(loader, "config_dir", _raise_config_dir)
+    monkeypatch.setattr(paths, "config_dir", _raise_config_dir)
 
     ctx = CallerContext.from_env()
     assert ctx.session_key == ""
@@ -563,10 +563,10 @@ def test_the_guarded_ladder_caller_is_unchanged_by_the_rungs_own_guard(monkeypat
     what makes this a strictly additive fix rather than a behaviour change for
     the three resolvers that reach rung 4 through the ladder.
     """
-    import kiro_crew.config.loader as loader
+    import kiro_crew.config.paths as paths
 
     _decline_rungs_1_to_3(monkeypatch)
-    monkeypatch.setattr(loader, "config_dir", _raise_config_dir)
+    monkeypatch.setattr(paths, "config_dir", _raise_config_dir)
 
     identity = kiro_crew.mcp_caller.resolve_own_identity()
     assert identity.failed is True

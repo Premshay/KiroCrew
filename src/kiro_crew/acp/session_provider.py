@@ -15,6 +15,7 @@ doesn't need to branch on every method call.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -573,12 +574,18 @@ class AcpSessionProvider(LLMProvider):
         return dict(self._handle.native_context_documents)
 
     @property
+    def member_dispatch_mounted(self) -> bool | None:
+        # A handle that never recorded an answer is no evidence, not a refusal.
+        mounted = getattr(self._handle, "member_dispatch_mounted", None)
+        return None if mounted is None else bool(mounted)
+
+    @property
     def native_steering(self) -> bool:
         from kiro_crew.acp.types import ACP_BACKEND_KAS
 
         return self.backend == ACP_BACKEND_KAS
 
-    async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
+    async def stream(self, message: str, *, allow_image: bool = True) -> AsyncIterator[LLMEvent]:
         """Send a prompt and yield LLMEvent objects until the turn completes."""
         # Re-establish this session's gateway claim before the turn can call a
         # tool. The shared identity publisher does the same at every surface that
@@ -600,11 +607,12 @@ class AcpSessionProvider(LLMProvider):
         except Exception:
             logger.debug("stream: stub re-claim failed", exc_info=True)
         claim = self._claim_shared_turn()
+        send = self._handle.prompt
+        if not allow_image:
+            send = functools.partial(send, allow_image=False)
         try:
             async with aclosing(
-                self.essential_delivery.stream(
-                    message, self._handle.prompt, lambda: self.context_incarnation
-                )
+                self.essential_delivery.stream(message, send, lambda: self.context_incarnation)
             ) as events:
                 async for event in events:
                     yield event
@@ -905,17 +913,21 @@ class AcpSessionProvider(LLMProvider):
         return proc.returncode if proc else None
 
     def touch_activity(self) -> None:
-        """Refresh activity timestamp on the runtime.
+        """Refresh activity timestamp on the runtime, and stamp this session's handle.
 
-        PROCESS-level: the clock belongs to the runtime, so one session's
-        activity refreshes it for every session on it. An idle co-tenant is
-        therefore never idle while a neighbour talks, which is the SAFE
-        direction for anything that reaps on idleness (it defers, never
+        The runtime half is PROCESS-level: the clock belongs to the runtime, so
+        one session's activity refreshes it for every session on it. An idle
+        co-tenant is therefore never idle while a neighbour talks, which is the
+        SAFE direction for anything that reaps on idleness (it defers, never
         signals early) and the wrong one for anything that reports idle time
-        as a fact about a session. A per-session activity stamp is the fix;
-        this method cannot be it, because it has only the runtime to write to.
+        as a fact about a session.
+
+        The handle half is per-session: the tool-stall watchdog ignores the
+        runtime clock, so without it a blocking tool's keepalive pings
+        (``wait``, ``spawn_sub_agents``) would not keep its own turn alive.
         """
         self._runtime._last_activity = time.monotonic()
+        self._handle.note_keepalive()
 
     def rekey(
         self,
@@ -1227,7 +1239,7 @@ class AcpSessionProvider(LLMProvider):
                 if not resolve_pin_spelling_on(
                     model_id, fresh, backend=self.backend
                 ) and model_is_unusable(model_id, fresh or advertised):
-                    raise AcpModelUnavailable(model_id, fresh or advertised)
+                    raise AcpModelUnavailable(model_id, fresh or advertised, backend=self.backend)
         await self._guarded(self._handle.set_model(model_id))
 
     async def set_mode(self, agent_name: str) -> None:
@@ -1281,6 +1293,21 @@ class AcpSessionProvider(LLMProvider):
     def _work_dir(self) -> Path:
         """Working directory (AcpClient-compatible attribute)."""
         return self._runtime._work_dir
+
+    @property
+    def cwd(self) -> str:
+        """The directory THIS session is bound to, not the runtime's.
+
+        Overrides the ``LLMProvider`` default ("") so reuse validation reads the real
+        path through the public capability rather than probing a private attribute.
+        Reads it off the HANDLE: a shared runtime carries sessions opened against
+        different projects, so answering with the runtime's own directory would report a
+        workspace this session never bound, and reuse validation would evict a live
+        session -- losing its conversation -- for failing to be somewhere it never was.
+        Falls back to the runtime for a handle predating the record, which is the
+        single-session case where the two agree anyway.
+        """
+        return str(getattr(self._handle, "_bound_cwd", "") or self._work_dir)
 
     @property
     def _permission_mode(self) -> str:
@@ -1377,7 +1404,7 @@ class AcpSessionProvider(LLMProvider):
 
     # ── Streaming (AcpClient-compatible method name) ──
 
-    def stream_events(self, message: str) -> AsyncIterator[LLMEvent]:
+    def stream_events(self, message: str, *, allow_image: bool = True) -> AsyncIterator[LLMEvent]:
         """Send a prompt and yield events. AcpClient-compatible name for stream().
 
         Delegates to stream() (NOT self._handle.prompt() directly) so it
@@ -1386,7 +1413,7 @@ class AcpSessionProvider(LLMProvider):
         AcpRuntimeError, not an AcpError) escape chat_runner's handlers on a
         runtime death at prompt start -> unhandled crash instead of retry/login.
         """
-        return self.stream(message)
+        return self.stream(message, allow_image=allow_image)
 
     @property
     def resumed(self) -> bool:

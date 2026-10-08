@@ -30,7 +30,11 @@ grant still lives with kiro-cli and nothing here reads it. Kiro Crew keeps the
 secret in the encrypted vault (`CONNECTIONS_<SLUG>_CLIENT_SECRET`) as the source
 of truth and writes it into the emitted agent spec as `oauth.clientSecret` only
 because that file is the one thing kiro-cli reads — **the same footing the
-existing `headers` secrets have: vault is truth, the spec is a projection.** See
+existing `headers` secrets have: vault is truth, the spec is a projection.** The
+projection is owner-only on POSIX: every agent-spec write lands at `0o600` (an
+existing file keeps its owner bits and loses group/other), so the plaintext is
+never readable by another local user. Moving the secret off disk entirely needs a
+kiro-cli runtime secret channel and is tracked in #10702. See
 "Pre-registered OAuth clients" below.
 
 ## Status and cancel
@@ -117,7 +121,7 @@ inventing a label locally would put an unverified identity on the card.
 ### The mint contract is preserved, not replaced
 
 `POST /api/connections/mint` and `GET /api/connections/mint?slug=…` keep their
-existing contract exactly: the POST reserves a row and returns
+existing contract, with one additive optional field: the POST reserves a row and returns
 `{ok, slug, state, token}`, the GET is the card's authoritative feed for a
 card-initiated mint (`idle|minting|waiting|granted|failed|expired`, with
 `oauth_url` only while `waiting`), and the frontend keeps polling it at its own
@@ -128,7 +132,9 @@ that dedicated process, protected PID, and ephemeral spec, then creates one
 fresh dedicated attempt with a new provider OAuth state. The retry keeps the
 caller's row token, so the initiating tab continues to own the result. A second
 rejection is terminal and surfaces the existing `failed` / `mint_url_rejected`
-state; no other failure class retries. Warm URLs pass the same credential gate
+state; no other failure class retries. Beside `reason: mint_url_rejected` the GET
+may carry an optional `rejected_endpoint`, present only when the rejected endpoint
+can be named; the naming rules are in [security](security.md). Warm URLs pass the same credential gate
 before they become adoptable. A rejected warm claim is released, so a later
 Connect follows the cold path and reaches this single retry owner rather than
 carrying a second policy in the warm engine or dashboard handler.

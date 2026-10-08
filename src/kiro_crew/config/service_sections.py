@@ -1,6 +1,6 @@
 """Sections that configure the gateway's background services.
 
-Owns the DTOs and defaults for ``taskrunner``, ``orchestrator``, ``messaging``,
+Owns the DTOs and defaults for ``taskrunner``, ``messaging``,
 ``cron_history``, ``monitoring``, ``heartbeat`` and ``watchdog``. The monitoring
 runtime bounds come from ``monitoring.limits``, their single owner.
 ``config.sections`` re-exports every name; this module never imports it, the
@@ -11,15 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from kiro_crew.config.fields import _meta
+from kiro_crew.config.fields import _meta, field_default
 from kiro_crew.monitoring.limits import DEFAULT_RUNTIME_CEILING_SECS, MAX_RUNTIME_CEILING_SECS
 
-# Ceiling for a WHOLE orchestrator plan. The per-stage timeout multiplies by
-# stage count, so this is the only bound on total unattended runtime.
-
-
 DEFAULT_MAX_PARALLEL_STEPS = (
-    0  # 0 = auto: derive from agent.subagent_auto_max via compute_max_subagents
+    0  # 0 = auto: host memory over the per-agent cost (compute_memory_sized_parallel_cap)
 )
 
 
@@ -29,7 +25,7 @@ class TaskRunnerConfig:
         default=DEFAULT_MAX_PARALLEL_STEPS,
         metadata=_meta(
             "Max Parallel Steps",
-            "Maximum task steps to run in parallel. 0 = auto (the host-safe cap from agent.subagent_auto_max, clamped to memory/CPU). A positive value only *lowers* concurrency — it is capped at the auto maximum and can never exceed the host-safe limit.",
+            "Maximum task steps to run in parallel. 0 = auto: a host-safe cap sized from available memory and agent.subagent_cost_gb, between 3 and agent.subagent_auto_max (3 when memory cannot be read). A positive value only *lowers* concurrency — it is capped at the auto maximum and can never exceed the host-safe limit.",
         ),
     )
     workspace_dir: str = field(
@@ -99,12 +95,14 @@ class MessagingConfig:
 
     def __post_init__(self) -> None:
         # Fail safe on hand-edited values (mirrors WeComConfig): an unknown scope
-        # or mode falls back to the safe default, and the reset windows clamp to
-        # valid ranges so a bad config can't wedge dispatch.
+        # narrows to per-peer sessions whatever the default is, since "unified"
+        # puts two people's DMs in one session; an unknown mode falls back to the
+        # field default; and the reset windows clamp to valid ranges so a bad
+        # config can't wedge dispatch.
         if self.dm_scope not in ("per-channel-peer", "unified"):
             self.dm_scope = "per-channel-peer"
         if self.queue_mode not in ("steer", "queue"):
-            self.queue_mode = "steer"
+            self.queue_mode = field_default(MessagingConfig, "queue_mode")
         self.idle_reset_minutes = max(0, self.idle_reset_minutes)
         if not 0 <= self.daily_reset_hour <= 23:
             self.daily_reset_hour = -1
@@ -135,8 +133,9 @@ class MonitoringConfig:
     """Monitor arming preference and finite wall-clock policy.
 
     The preference changes tool guidance, not eligibility. The runtime ceiling
-    is enforced across tools, API mutations and persistence; raising it never
-    extends an existing loop's stored budget or creation time.
+    is checked whenever a budget is written (monitor tools, API mutations,
+    structured-monitor writes); persisted records are not re-checked on load.
+    Raising it never extends an existing loop's stored budget or creation time.
     """
 
     max_runtime_secs: int = field(
@@ -260,9 +259,11 @@ class WatchdogConfig:
             "Hard cap (s)",
             "Absolute ceiling for UNKNOWN-verdict forbearance (e.g. the extended "
             "probably-thinking window) and for any per-agent "
-            "watchdog_tool_stall_* override. Applies ONLY to UNKNOWN verdicts — "
-            "never to a WORKING session, which is deferred before this cap is "
-            "consulted and is therefore bounded only by the turn's own ceiling. "
+            "watchdog_tool_stall_* override. Also bounds an opaque MCP tool "
+            "whose only WORKING evidence is movement somewhere in the runtime's "
+            "process tree. Every other WORKING reading (a matched shell child, "
+            "a declared wait, a keepalive-pinging core tool) is deferred before "
+            "this cap is consulted and is bounded only by the turn's own ceiling. "
             "Default 2h, clamped against the transport's per-prompt timeout like "
             "the suspect window.",
         ),

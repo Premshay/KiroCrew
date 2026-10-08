@@ -643,7 +643,7 @@ async def authorize_and_update_nudge(
 
     if svc is None:
         _audit("error", "autonudge disabled")
-        return None, "auto-nudge disabled (KIROCREW_AUTONUDGE not set)", 503
+        return None, "auto-nudge disabled (KIROCREW_AUTONUDGE is 0/false/no)", 503
     if not loop_id:
         return _deny("loop_id required", 400)
     # ONE read serving BOTH consumers below. Called directly, NOT behind a ``hasattr``
@@ -861,6 +861,9 @@ async def authorize_and_add_nudge(
     initiator_slot_key: str = "",
     creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
     grant_owner_provider_credentials: bool = False,
+    #: Arm the gateway's default conductor patrol (``NudgeLoop.default_patrol``):
+    #: set by ``conductor_patrol`` alone, and only on a prompt loop.
+    default_patrol: bool = False,
 ) -> tuple[Any | None, str | None, int]:
     """Validate + authorize + arm a nudge loop; return ``(loop, error, status)``.
 
@@ -921,7 +924,7 @@ async def authorize_and_add_nudge(
 
     if svc is None:
         _audit("error", "autonudge disabled")
-        return None, "auto-nudge disabled (KIROCREW_AUTONUDGE not set)", 503
+        return None, "auto-nudge disabled (KIROCREW_AUTONUDGE is 0/false/no)", 503
     monitor_wake_instructions = ""
     if monitor is not None:
         monitor_wake_instructions = monitor.wake_instructions
@@ -1100,7 +1103,19 @@ async def authorize_and_add_nudge(
         get_by_slot = getattr(svc, "get_by_slot", None)
         existing = get_by_slot(slot_key) if callable(get_by_slot) else None
         existing_monitor = getattr(existing, "monitor", None)
-        if isinstance(existing_monitor, MonitorState) and existing_monitor.wake_in_flight:
+        # The service lets a non-default arm replace an ACTIVE default patrol even
+        # mid-wake (``mutations._add_unserialized``); refusing here first would
+        # turn that replacement back into a 409.
+        displaces_default = bool(
+            getattr(existing, "default_patrol", False) is True
+            and getattr(existing, "active", False)
+            and not default_patrol
+        )
+        if (
+            isinstance(existing_monitor, MonitorState)
+            and existing_monitor.wake_in_flight
+            and not displaces_default
+        ):
             return _deny(
                 "existing monitor cannot be replaced while a wake is in flight",
                 409,
@@ -1303,6 +1318,10 @@ async def authorize_and_add_nudge(
                 add_kwargs["self_armed"] = True
             if reserved_loop_id is not None:
                 add_kwargs["loop_id"] = reserved_loop_id
+            if default_patrol:
+                # Conditional, like ``self_armed``: the contract tests compare this
+                # dict by equality, so every other caller's kwargs stay as they were.
+                add_kwargs["default_patrol"] = True
             loop = await svc.add(
                 **add_kwargs,
             )

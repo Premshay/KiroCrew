@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from aiohttp import web
 
+from kiro_crew.dashboard.slot_ownership import slot_ownership_middleware
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import ConversationLog
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
@@ -35,6 +36,24 @@ def move_transcript_past(log: ConversationLog, key: str, sig: float) -> None:
     """
     path = log._path(key)
     os.utime(path, (sig + 1, sig + 1))
+
+
+def close_before_resume(log: ConversationLog, key: str) -> None:
+    """Backdate a closed session's ``closed_at`` so it predates any resume that follows.
+
+    A resume clears ``closed`` only when ``closed_at`` is strictly earlier than the
+    moment the resume started (``clear_closed(only_if_closed_before=...)``); a tie
+    keeps the marker on purpose and the resume answers ``resume_conflict``. Both
+    values come from ``time.time()``, which moves every ~15.6 ms on Windows CPython
+    3.12, so a close followed at once by a resume ties there and not on Linux. The
+    precondition a close-then-resume test means is "closed BEFORE the resume
+    begins", so it is stated here rather than left to clock granularity, the way
+    ``test_session_control_revive._archive`` states it.
+    """
+    meta = log.get_metadata(key)
+    assert meta.get("closed"), f"{key} is not closed"
+    assert meta.get("closed_at") is not None, f"{key} is closed but carries no closed_at stamp"
+    log.update_metadata(key, {"closed_at": float(meta["closed_at"]) - 60.0})
 
 
 async def drain_background_tasks(state) -> None:
@@ -75,6 +94,35 @@ async def drain_background_tasks(state) -> None:
         f"background tasks still pending after {_DRAIN_ROUNDS} drain rounds: "
         f"{sorted(t.get_name() for t in state._background_tasks if not t.done())}"
     )
+
+
+def chat_done_frames(state) -> list:
+    """Every ``chat_done`` payload sent through a ``MagicMock`` ``broadcast_ws``."""
+    return [
+        c.args[1] for c in state.broadcast_ws.call_args_list if c.args and c.args[0] == "chat_done"
+    ]
+
+
+#: The bound on every turn a test awaits: a regression that hangs a hand-off then
+#: fails its own test by name instead of losing the worker (testing-conventions
+#: class 6).
+TURN_WAIT_SECS = 5
+
+
+async def run_as_slot_task(slot, coro) -> "asyncio.Task":
+    """Run *coro* as ``slot.task``, the way a dispatcher does, and await it."""
+    task = asyncio.ensure_future(coro)
+    slot.task = task
+    await asyncio.wait_for(task, timeout=TURN_WAIT_SECS)
+    return task
+
+
+async def await_successor(slot, predecessor) -> "asyncio.Task":
+    """Await the turn *predecessor*'s queue hand-off published in ``slot.task``."""
+    successor = slot.task
+    assert successor is not None and successor is not predecessor, "no successor dispatched"
+    await asyncio.wait_for(successor, timeout=TURN_WAIT_SECS)
+    return successor
 
 
 class _ReadyKiroPrerequisiteService(KiroPrerequisiteService):
@@ -331,7 +379,10 @@ def _make_app(state: DashboardState) -> web.Application:
             request["user"] = "local-app"  # recognized as owner
         return await handler(request)
 
-    app = web.Application(middlewares=[_test_auth_middleware])
+    # The per-slot app-ownership checkpoint runs inner to auth, as in the real
+    # server chain, so an app-identity test exercises the decision every
+    # /api/chat/slots/{slot}/* route takes before its handler.
+    app = web.Application(middlewares=[_test_auth_middleware, slot_ownership_middleware])
     app["state"] = state
     app.router.add_post("/api/chat", api_chat)
     app.router.add_get("/api/chat/slots", api_chat_slots)
@@ -366,7 +417,7 @@ def _make_app_with_agent_routes(state: DashboardState) -> web.Application:
         api_chat_slots,
     )
 
-    app = web.Application()
+    app = web.Application(middlewares=[slot_ownership_middleware])
     app["state"] = state
     app.router.add_get("/api/chat/slots", api_chat_slots)
     app.router.add_post("/api/chat/slots", api_chat_slot_create)

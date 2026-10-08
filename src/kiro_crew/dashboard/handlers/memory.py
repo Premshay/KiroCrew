@@ -54,7 +54,7 @@ from kiro_crew.executors import embed_executor, run_in_embed_pool, run_with_reca
 from kiro_crew.history import is_incognito_transcript, transcript_privacy_mode
 from kiro_crew.hooks import FileTooLargeError
 from kiro_crew.loop_lock import LoopBoundLock
-from kiro_crew.memory import normalize_projects_document
+from kiro_crew.memory import normalize_projects_document, projects_cap_overflow
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.platform.context import redact_log_via_context
@@ -166,6 +166,18 @@ def _memory_document_changed_response() -> web.Response:
         {
             "error": "memory changed while this document was being saved",
             "code": "memory_document_changed",
+        },
+        status=409,
+    )
+
+
+def _memory_document_undecodable_response(name: str) -> web.Response:
+    """Refuse a document whose bytes are not UTF-8; the file is left as it is."""
+    return web.json_response(
+        {
+            "error": f"{name} is not valid UTF-8 and cannot be shown or saved",
+            "code": "memory_document_undecodable",
+            "file": name,
         },
         status=409,
     )
@@ -438,11 +450,15 @@ async def api_memory_preferences(request: web.Request) -> web.Response:
                         return _memory_document_changed_response()
                 except _MemoryDocumentRedacted:
                     return _memory_document_redacted_response()
+                except UnicodeDecodeError:
+                    return _memory_document_undecodable_response("preferences.md")
                 except (UnknownMemoryStore, OSError) as exc:
                     return _store_unavailable_response(store, exc)
         return web.json_response({"ok": True})
     try:
         content = await asyncio.to_thread(mem.read_preferences)
+    except UnicodeDecodeError:
+        return _memory_document_undecodable_response("preferences.md")
     except (UnknownMemoryStore, OSError) as exc:
         return _store_unavailable_response(store, exc)
     return _memory_document_response(content)
@@ -520,11 +536,29 @@ async def api_memory_projects(request: web.Request) -> web.Response:
                         return _memory_document_changed_response()
                 except _MemoryDocumentRedacted:
                     return _memory_document_redacted_response()
+                except UnicodeDecodeError:
+                    return _memory_document_undecodable_response("projects.md")
                 except (UnknownMemoryStore, OSError) as exc:
                     return _store_unavailable_response(store, exc)
+                from datetime import datetime
+
+                today = datetime.now().strftime("%Y-%m-%d")
+                overflow = projects_cap_overflow(normalize_projects_document(content, today=today))
+                if overflow:
+                    # Saved whole, but session startup injects only the head: say so.
+                    return web.json_response(
+                        {
+                            "ok": True,
+                            "warning": "Saved, but sessions only load the start of Active "
+                            f"Projects: {overflow} chars past the limit are cut off.",
+                            "overflow_chars": overflow,
+                        }
+                    )
         return web.json_response({"ok": True})
     try:
         content = await asyncio.to_thread(mem.read_projects)
+    except UnicodeDecodeError:
+        return _memory_document_undecodable_response("projects.md")
     except (UnknownMemoryStore, OSError) as exc:
         return _store_unavailable_response(store, exc)
     return _memory_document_response(content)
@@ -1899,9 +1933,8 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
 async def api_memory_disable_embeddings(request: web.Request) -> web.Response:
     """POST /api/memory/disable-embeddings — gone: embeddings are always-on.
 
-    Kept as a graceful 410 (not a 404) because the shipped frontend still
-    renders a Disable button until its companion change lands. Remove
-    together with the frontend button.
+    A 410 (not a 404) compatibility stub for older clients that still post
+    here. The current frontend renders no Disable button and never calls it.
     """
     return web.json_response(
         {
@@ -2282,7 +2315,7 @@ async def api_memory_consolidate(request: web.Request) -> web.Response:
     # an LLM turn on the same span. The claim is released again on every path
     # that does not hand the key to _consolidate, which discards it in its own
     # finally once the task ends.
-    if key in state.consolidator._running:
+    if state.consolidator._busy(key):  # another spelling of this transcript counts too
         return web.json_response({"error": "consolidation already running"}, status=409)
     state.consolidator._running.add(key)
     dispatched = False

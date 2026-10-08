@@ -47,6 +47,7 @@ from typing import Any, Callable, Iterable, Sequence
 from kiro_crew import platform_compat
 from kiro_crew.metrics.events import TASKQ_COMPLETIONS, emit_counter
 from kiro_crew.on_loop_db import OnLoopDBGuard
+from kiro_crew.owner_only_files import prepare_owner_only_sqlite
 
 from . import lanes as _lanes
 from . import migrate
@@ -105,16 +106,19 @@ STRICT_ON_LOOP_ENV = "KIROCREW_STRICT_ON_LOOP_TASK_STORE"
 #    and a dropped terminal write leaves the row active for the next boot's
 #    reconciler (see ``Admitted.settle_async``).
 # 2. ``subagent_manager.admission.taskq_cancel_queued``, reached from
-#    ``_unqueue`` on the Stop-all path: the row has to be cancelled before a
+#    a single ``cancel`` (``cancel_impl``): the row has to be cancelled before a
 #    drain can claim it AND out of the in-memory window before a stagger timer
 #    can start it, and an await between those two is a race in either order.
+#    Stop all is restructured out of this class: it queues one writer-thread job
+#    for every row's cancel and only then drops the window entries, both before
+#    its first await (``taskq_post_cancel_queued``).
 #
 # Those takes are on-loop and cannot simply be offloaded, so arming this from
-# ``KIROCREW_DEV_MODE`` would raise on a cancel or a Stop-all -- a Stop all whose
-# unqueue raises leaves that row waiting and fails the request before it reaps
-# anything -- and the developer's rational response, unsetting that variable,
-# silences every OTHER surface's guard too. Flip it back to True once both
-# classes are either restructured or inside a vetted ``allow_on_loop()`` block.
+# ``KIROCREW_DEV_MODE`` would raise on a cancel -- an unqueue that raises leaves
+# that row waiting and fails the request -- and the developer's rational
+# response, unsetting that variable, silences every OTHER surface's guard too.
+# Flip it back to True once both classes are either restructured or inside a
+# vetted ``allow_on_loop()`` block.
 _ON_LOOP_DB_GUARD = OnLoopDBGuard(
     label="task store",
     remedy=(
@@ -169,6 +173,13 @@ _UNSTARTED: frozenset[str] = CLAIMABLE | {ADMITTED}
 _SQL_UNSTARTED = "(" + ",".join(f"'{s}'" for s in sorted(_UNSTARTED)) + ")"
 #: The ``children_only`` filter the dispatch reads and their wake share: nested rows.
 _SQL_CHILD_ONLY = " AND parent_id IS NOT NULL AND parent_id <> ''"
+#: Ids per ``IN (...)`` list in a multi-row event read: under the 999
+#: host-parameter ceiling of an older SQLite build.
+_EVENT_ID_CHUNK = 500
+#: The key a terminal ``transition`` event carries when its writer still owes
+#: the row a report (``finish(report_owed=True)``), and the event that clears it.
+_REPORT_OWED_BY = "report_owed_by"
+_EVENT_REPORTED = "reported"
 
 
 class _CorruptStore(Exception):
@@ -584,6 +595,7 @@ class TaskStore:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             platform_compat.restrict_dir_to_owner(self._path.parent)
+            prepare_owner_only_sqlite(self._path)
             conn = sqlite3.connect(
                 str(self._path),
                 timeout=self._busy_timeout_secs,
@@ -817,7 +829,13 @@ class TaskStore:
     # -- events --------------------------------------------------------------
 
     def _append_event_in_tx(
-        self, conn: sqlite3.Connection, task_id: str, kind: str, data: dict[str, Any]
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        kind: str,
+        data: dict[str, Any],
+        *,
+        ts: float | None = None,
     ) -> None:
         seq_row = conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM task_events WHERE task_id=?", (task_id,)
@@ -825,7 +843,13 @@ class TaskStore:
         seq = int(seq_row[0]) if seq_row else 1
         conn.execute(
             "INSERT INTO task_events(task_id, seq, ts, kind, data_json) VALUES(?,?,?,?,?)",
-            (task_id, seq, self.now(), kind, json.dumps(data, sort_keys=True, default=str)),
+            (
+                task_id,
+                seq,
+                self.now() if ts is None else ts,
+                kind,
+                json.dumps(data, sort_keys=True, default=str),
+            ),
         )
 
     def append_event(self, task_id: str, kind: str, data: dict[str, Any] | None = None) -> None:
@@ -911,6 +935,86 @@ class TaskStore:
                 kind=str(r["kind"]),
                 data=data if isinstance(data, dict) else {},
             )
+        return out
+
+    @_typed_read
+    def deferred_longer_than(
+        self,
+        kind: str,
+        bound: float,
+        *,
+        exclude_ids: Sequence[str] = (),
+        limit: int = 64,
+    ) -> list[TaskRecord]:
+        """Waiting rows of *kind* parked by :meth:`defer` NOW that have spent *bound* seconds parked.
+
+        Waiting means any state :meth:`defer` parks (``CLAIMABLE``: ``queued``,
+        ``retry_wait``, ``recovering``), so a restart survivor or a retried run
+        the memory gates keep deferring is bounded too. Oldest first, at most *limit*. Parked now means ``next_run_at`` is still
+        in the future: a row whose deferral has lapsed is eligible again and waits
+        for whatever picks it, which is not a deferral.
+
+        The time counted is the time the row was actually PARKED in its current
+        wait: each ``deferred`` event after the row's last ``claimed`` or
+        ``transition`` event (the closers the queued listing applies too,
+        ``_defer_details`` in the admission bridge) parks it from its ``ts`` to
+        its ``until``, cut short by the next deferral or by now. A gap between a
+        lapsed deferral and the next one is NOT counted: the row was eligible
+        then and waited for a slot to be re-checked in, not for memory. So a row
+        that was held back once and then queued behind a full cap is measured by
+        its parked time alone, while a row the host keeps short (re-checked every
+        admit wait) accrues almost all of its wall-clock time. Every re-check
+        appends one more event, so the clock is never restarted by one; a claim
+        or a re-queue ends the wait and the next deferral starts a new one.
+        """
+        excl_sql, excl_args = self._exclusion(exclude_ids)
+        now = self.now()
+        cutoff = now - float(bound)
+        with self._lock:
+            conn = self._c()
+            # The SQL keeps only rows whose current wait BEGAN at or before the
+            # cutoff -- necessary, since parked time never exceeds the time since
+            # the first deferral -- so the event walk below reads only rows that
+            # could be past the bound.
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE kind=? AND state IN {_SQL_CLAIMABLE} AND next_run_at>?"
+                f"{excl_sql} AND (SELECT MIN(d.ts) FROM task_events d "
+                "WHERE d.task_id=tasks.id AND d.kind='deferred' AND d.seq > "
+                "COALESCE((SELECT MAX(c.seq) FROM task_events c WHERE c.task_id=tasks.id "
+                "AND c.kind IN ('claimed', 'transition')), 0)) <= ? "
+                "ORDER BY created_at, rowid",
+                [kind, now, *excl_args, cutoff],
+            ).fetchall()
+            records = [TaskRecord.from_row(r) for r in rows]
+            parked: dict[str, list[tuple[float, float]]] = {rec.id: [] for rec in records}
+            ids = list(parked)
+            for i in range(0, len(ids), _EVENT_ID_CHUNK):
+                chunk = ids[i : i + _EVENT_ID_CHUNK]
+                marks = ", ".join("?" for _ in chunk)
+                for ev in conn.execute(
+                    "SELECT e.task_id, e.ts, e.data_json FROM task_events e "
+                    f"WHERE e.task_id IN ({marks}) AND e.kind='deferred' AND e.seq > "
+                    "COALESCE((SELECT MAX(c.seq) FROM task_events c WHERE c.task_id=e.task_id "
+                    "AND c.kind IN ('claimed', 'transition')), 0) ORDER BY e.task_id, e.seq",
+                    chunk,
+                ).fetchall():
+                    try:
+                        data = json.loads(ev["data_json"])
+                        until = float(data["until"])
+                    except (TypeError, ValueError, KeyError):
+                        until = float(ev["ts"])
+                    parked[str(ev["task_id"])].append((float(ev["ts"]), until))
+        out: list[TaskRecord] = []
+        for rec in records:
+            spans = parked[rec.id]
+            total = 0.0
+            for n, (ts, until) in enumerate(spans):
+                end = spans[n + 1][0] if n + 1 < len(spans) else now
+                total += max(0.0, min(until, end, now) - ts)
+            if total >= float(bound):
+                out.append(rec)
+                if len(out) >= int(limit):
+                    break
         return out
 
     @staticmethod
@@ -1240,14 +1344,63 @@ class TaskStore:
         generation: int | None = None,
         result_ref: str | None = None,
         error: str | None = None,
+        report_owed: bool = False,
     ) -> bool:
-        """Write a terminal state; a stale generation or an already-terminal row is a no-op."""
+        """Write a terminal state; a stale generation or an already-terminal row is a no-op.
+
+        *report_owed* records, in the same transaction, that the writer still
+        owes this terminal a report it has not made yet: the row is named by
+        :meth:`owed_reports` until :meth:`mark_reported` clears it, so a process
+        lost between this commit and the report leaves the next one the work.
+        """
         if not is_terminal(state):
             raise InvalidTransition("?", state)
-        detail = {"error": error[:500]} if error else None
+        detail: dict[str, Any] = {"error": error[:500]} if error else {}
+        if report_owed:
+            detail[_REPORT_OWED_BY] = self.incarnation
         return self.transition(
-            task_id, state, generation=generation, result_ref=result_ref, detail=detail
+            task_id, state, generation=generation, result_ref=result_ref, detail=detail or None
         )
+
+    def mark_reported(self, task_id: str) -> None:
+        """Clear the report a :meth:`finish` with ``report_owed`` left owing."""
+        self.append_event(task_id, _EVENT_REPORTED)
+
+    @_typed_read
+    def owed_reports(
+        self, kind: str, *, limit: int = 256, after: tuple[float, str] | None = None
+    ) -> list[TaskRecord]:
+        """Terminal rows of *kind* an EARLIER incarnation owed a report it never made.
+
+        A row whose terminal ``transition`` carries the owing incarnation, with no
+        ``reported`` event after it, oldest terminal first (``updated_at``, then
+        ``id``). This incarnation's own rows are left out: their reports are in
+        flight in this process. *after* is the ``(updated_at, id)`` of the last
+        row of the previous page; only rows ordered after it are named, so a
+        caller pages through every owed row without re-reading one whose clear
+        has not landed yet.
+        """
+        cursor_sql = ""
+        args: list[Any] = [self.incarnation, kind, _EVENT_REPORTED]
+        if after is not None:
+            cursor_sql = "AND (t.updated_at>? OR (t.updated_at=? AND t.id>?)) "
+            args += [float(after[0]), float(after[0]), str(after[1])]
+        with self._lock:
+            rows = (
+                self._c()
+                .execute(
+                    "SELECT t.* FROM tasks t JOIN task_events e ON e.task_id=t.id "
+                    "AND e.kind='transition' "
+                    f"AND json_extract(e.data_json, '$.{_REPORT_OWED_BY}') IS NOT NULL "
+                    f"AND json_extract(e.data_json, '$.{_REPORT_OWED_BY}')<>? "
+                    f"WHERE t.kind=? AND t.state IN {_SQL_TERMINAL} AND NOT EXISTS ("
+                    "SELECT 1 FROM task_events r WHERE r.task_id=t.id AND r.kind=? "
+                    f"AND r.seq>e.seq) {cursor_sql}ORDER BY t.updated_at, t.id LIMIT ?",
+                    [*args, int(limit)],
+                )
+                .fetchall()
+            )
+        return [TaskRecord.from_row(r) for r in rows]
 
     def cancel(
         self,
@@ -1326,14 +1479,21 @@ class TaskStore:
         emit_counter(TASKQ_COMPLETIONS, {"outcome": CANCELLED})
         return old
 
-    def defer(self, task_id: str, until: float, *, reason: str) -> bool:
-        """Keep a waiting row waiting, but not eligible before *until*.
+    def defer(self, task_id: str, *, wait: float, reason: str) -> bool:
+        """Keep a waiting row waiting, but not eligible for *wait* more seconds.
 
-        The memory-posture gate uses this instead of refusing: the row stays
+        The spawn gate's memory floor uses this instead of refusing: the row stays
         accepted, holds nothing, and the dispatcher skips it until the clock
         passes ``next_run_at``.
+
+        ``next_run_at`` is the event's own ``ts`` plus *wait*, both from one
+        clock read, so the park spans exactly *wait* in
+        :meth:`deferred_longer_than`, for whole-second waits on an epoch clock.
+        A caller-computed ``now() + wait`` could not promise that: the clock
+        moves between the caller's read and this one.
         """
         ts = self.now()
+        until = ts + float(wait)
         with self._lock:
             conn = self._c()
             try:
@@ -1345,13 +1505,57 @@ class TaskStore:
                 )
                 if cur.rowcount == 1:
                     self._append_event_in_tx(
-                        conn, task_id, "deferred", {"until": float(until), "reason": reason}
+                        conn,
+                        task_id,
+                        "deferred",
+                        {"until": float(until), "reason": reason},
+                        ts=ts,
                     )
                 conn.execute("COMMIT")
             except sqlite3.Error as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task defer failed: {exc}") from exc
         return cur.rowcount == 1
+
+    def expedite(self, task_ids: Sequence[str]) -> int:
+        """Make the deferred rows among *task_ids* eligible now; how many were.
+
+        The early end of a :meth:`defer`: a waiting row whose ``next_run_at`` is
+        still ahead is brought to now, so the next dispatch read may take it.
+        It appends NO event. The deferral's own ``deferred`` event stays the
+        record of the park, and :meth:`deferred_longer_than` counts only a row
+        parked now, so a row brought forward and then claimed is never counted.
+        One brought forward and parked AGAIN before its old ``until`` is
+        charged the gap between the two: that span is cut at the next
+        deferral, not at this call, so at most what was left of the deferral
+        counts. The memory wake brings forward only rows that now fit, so that
+        gap is a re-check that lost a race. A row that is not waiting, or not
+        deferred, is left as it is.
+        """
+        ids = [str(i) for i in task_ids if i]
+        if not ids:
+            return 0
+        ts = self.now()
+        changed = 0
+        with self._lock:
+            conn = self._c()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for i in range(0, len(ids), _EVENT_ID_CHUNK):
+                    chunk = ids[i : i + _EVENT_ID_CHUNK]
+                    marks = ", ".join("?" for _ in chunk)
+                    cur = conn.execute(
+                        "UPDATE tasks SET next_run_at=?, updated_at=? "
+                        f"WHERE id IN ({marks}) AND state IN {_SQL_CLAIMABLE} "
+                        "AND next_run_at>?",
+                        (ts, ts, *chunk, ts),
+                    )
+                    changed += max(0, cur.rowcount)
+                conn.execute("COMMIT")
+            except sqlite3.Error as exc:
+                self._rollback(conn)
+                raise TaskStoreUnavailable(f"task expedite failed: {exc}") from exc
+        return changed
 
     # -- waits (taskq.waits) ------------------------------------------------
 

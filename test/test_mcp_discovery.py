@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from stray_line_helpers import STRAY_LINES, too_deep_line
 
 from conftest import host_abs
 from kiro_crew import mcp_cleanup, platform_compat
@@ -2848,6 +2849,21 @@ class TestReadJsonrpcResponse:
         assert result["result"] == {"ok": True}
 
     @pytest.mark.asyncio
+    async def test_sse_a_stray_data_line_is_skipped(self) -> None:
+        """``RecursionError`` is not a ``JSONDecodeError``: unlisted, one data
+        line nested past the decoder failed the whole probe."""
+        strays = "".join(
+            "data: " + make().decode("utf-8", "replace") for make in STRAY_LINES.values()
+        )
+        resp = MagicMock()
+        resp.content_type = "text/event-stream"
+        resp.text = AsyncMock(
+            return_value=strays + 'data: {"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}\n'
+        )
+        result = await _read_jsonrpc_response(resp)
+        assert result["result"] == {"ok": True}
+
+    @pytest.mark.asyncio
     async def test_sse_empty_returns_empty_dict(self) -> None:
         resp = MagicMock()
         resp.content_type = "text/event-stream"
@@ -5396,6 +5412,30 @@ class TestReadStdioJsonrpcResponse:
         assert resp["id"] == 1
 
     @pytest.mark.asyncio
+    async def test_skips_a_line_nested_past_the_decoder(self) -> None:
+        """``RecursionError`` is not a ``JSONDecodeError``: unlisted, one such
+        line failed the probe instead of being skipped."""
+        stream = asyncio.StreamReader(limit=1 << 20)
+        stream.feed_data(too_deep_line())
+        stream.feed_data(b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+        stream.feed_eof()
+        resp = await _read_stdio_jsonrpc_response(stream, timeout=5)
+        assert resp is not None
+        assert resp["id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_non_object_json_lines_do_not_count_toward_cap(self) -> None:
+        """A server printing a JSON progress counter before it answers is not a
+        flood: valid JSON is bounded by the timeout, like a notification."""
+        from kiro_crew.mcp_discovery import _MAX_BANNER_LINES
+
+        progress = [f"{n}\n".encode() for n in range(1, 2 * _MAX_BANNER_LINES + 1)]
+        stream = _make_stream([*progress, b'{"jsonrpc":"2.0","id":1,"result":{}}\n'])
+        resp = await _read_stdio_jsonrpc_response(stream, timeout=5)
+        assert resp is not None
+        assert resp["id"] == 1
+
+    @pytest.mark.asyncio
     async def test_notifications_do_not_count_toward_cap(self) -> None:
         """>_MAX_BANNER_LINES JSON-RPC notifications must NOT trip the banner cap."""
         from kiro_crew.mcp_discovery import _MAX_BANNER_LINES
@@ -5784,6 +5824,100 @@ class TestWindowsTeardownOffLoop:
                     "to_thread" in line or "platform_compat.kill_process_tree," in line
                 ), f"kill_process_tree called on the loop: {line.strip()}"
         assert "asyncio.to_thread(" in src
+
+
+class TestWindowsProbeReapLogging:
+    """The Windows probe tree reap must distinguish an expected already-exited
+    process from a genuine cleanup failure.
+
+    ``kill_process_tree`` maps ``taskkill`` rc=128 to ``ProcessLookupError``
+    (the Windows analog of a POSIX process-not-found result) and other failures
+    to ``OSError``. The reap handler must log the expected case WITHOUT a
+    traceback -- otherwise a routine cleanup race looks identical to a real reap
+    failure in the log -- while keeping the traceback for genuine failures,
+    mirroring the POSIX branch just above it. Driven on this POSIX host by
+    flipping ``IS_WINDOWS``/``IS_POSIX`` and faking the reap; no ``taskkill`` is
+    launched and no real process is signaled.
+    """
+
+    def _make_mock_proc(self, pid: int = 4242) -> AsyncMock:
+        proc = AsyncMock()
+        proc.pid = pid
+        proc.returncode = None
+        proc.stdin = MagicMock()
+        proc.stdin.close = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock(return_value=0)
+        proc.stdout = AsyncMock()
+        proc.stdout.readline = AsyncMock(return_value=b"")
+        return proc
+
+    async def _run_probe_windows_reap(self, monkeypatch, reap_exc: BaseException | None):
+        """Drive probe_server down the Windows reap arm with a faked reap."""
+        from kiro_crew import mcp_discovery
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(platform_compat, "IS_POSIX", False)
+        monkeypatch.setattr(mcp_discovery.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(mcp_discovery.platform_compat, "IS_POSIX", False)
+
+        def _reap(_pid: int, _sig: int) -> None:
+            if reap_exc is not None:
+                raise reap_exc
+
+        monkeypatch.setattr(mcp_discovery.platform_compat, "kill_process_tree", _reap)
+
+        proc = self._make_mock_proc(pid=4242)
+        server = McpServerInfo(name="win-reap", command="echo")
+        with (
+            patch(
+                "kiro_crew.mcp_discovery.asyncio.create_subprocess_exec",
+                return_value=proc,
+            ),
+            patch("kiro_crew.mcp_discovery.shutil.which", return_value="C:\\echo.exe"),
+        ):
+            return await probe_server(server)
+
+    @pytest.mark.asyncio
+    async def test_expected_already_exited_logs_without_traceback(
+        self, monkeypatch, caplog
+    ) -> None:
+        """rc=128 -> ProcessLookupError: no traceback, no 'reap failed' line."""
+        caplog.set_level(logging.DEBUG, logger="kiro_crew.mcp_discovery")
+        result = await self._run_probe_windows_reap(
+            monkeypatch, ProcessLookupError("[taskkill rc=128] not found")
+        )
+        # Teardown must not clobber the probe result.
+        assert result.name == "win-reap"
+        reap_records = [
+            r
+            for r in caplog.records
+            if r.name == "kiro_crew.mcp_discovery" and "Probe tree" in r.message
+        ]
+        assert reap_records, "expected a DEBUG line for the already-gone tree"
+        for r in reap_records:
+            # The expected already-exited case carries NO traceback and does
+            # not use the alarming 'reap failed' wording.
+            assert r.exc_info is None, "already-exited reap must not log a traceback"
+            assert "reap failed" not in r.message
+
+    @pytest.mark.asyncio
+    async def test_genuine_failure_retains_traceback(self, monkeypatch, caplog) -> None:
+        """A non-ProcessLookupError OSError keeps its traceback diagnostic."""
+        caplog.set_level(logging.DEBUG, logger="kiro_crew.mcp_discovery")
+        result = await self._run_probe_windows_reap(
+            monkeypatch, OSError("[taskkill rc=1] access denied")
+        )
+        assert result.name == "win-reap"
+        failed = [
+            r
+            for r in caplog.records
+            if r.name == "kiro_crew.mcp_discovery" and "Probe tree reap failed" in r.message
+        ]
+        assert failed, "a genuine reap failure must still be logged"
+        assert any(
+            r.exc_info is not None for r in failed
+        ), "genuine reap failure must retain a traceback"
 
 
 class TestProbeSandboxUnavailable:

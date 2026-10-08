@@ -9,9 +9,9 @@ tags: [skill, kirocrew, monitor, babysit]
 # Babysit
 
 General-purpose monitoring: this skill works without a Kiro Crew checkout or
-prepare-pr installed. It owns loop mechanics, not a repository's repair policy.
+kirocrew-prepare-pr installed. It owns loop mechanics, not a repository's repair policy.
 For Kiro Crew PR CI AI comments ONLY, MUST load
-[prepare-pr: Review repair routing](../prepare-pr/SKILL.md#review-repair-routing)
+[kirocrew-prepare-pr: Review repair routing](../kirocrew-prepare-pr/SKILL.md#review-repair-routing)
 before any fix. That procedure requires model-pinned repair subagents; parent
 self-fixing does not satisfy it. Prepare-pr owns that repo's local reviewers,
 PR gates, dispositions and publication rules. Do not require it for other work.
@@ -39,7 +39,8 @@ recording `last_status: ok`; heartbeat's allowlist has no shell or push.
 Use one session-owned driver, not two watchers.
 
 A gated `monitor_start` hands its whole pull-request reading, comment and review
-bodies included, to the wake judge, so `wake_when` may name prose.
+bodies included, to the wake judge, so `wake_when` may name prose. No
+judge lane: only an unchanged subject is free.
 
 An installation can set how firmly this table's facts-decided row points at the
 structured path. With `monitoring.prefer_structured_arming` on, `monitor_watch` is
@@ -113,7 +114,7 @@ explicit restart action. Never erase that evidence or retry the refusal.
 
 ```text
 monitor_start({
-  "message": "Watch https://github.com/kirodotdev/KiroCrew/pull/123. On each injected cycle, inspect current review comments and checks. Act only on a real change. Kiro Crew AI repairs MUST follow prepare-pr Review repair routing with model-pinned subagents and parent verification; commit and push only if authorized. If ready, terminal, blocked, stopped by the user or out of budget, report the outcome and any open findings, then call autonudge_stop with a reason.",
+  "message": "Watch https://github.com/kirodotdev/KiroCrew/pull/123. On each injected cycle, inspect current review comments and checks. Act only on a real change. Kiro Crew AI repairs MUST follow kirocrew-prepare-pr Review repair routing with model-pinned subagents and parent verification; commit and push only if authorized. If ready, terminal, blocked, stopped by the user or out of budget, report the outcome and any open findings, then call autonudge_stop with a reason.",
   "interval_secs": 300,
   "max_cycles": 24,
   "max_runtime_secs": 14400,
@@ -143,8 +144,8 @@ bound and no blanket grant: normal PreToolUse governance and approvals apply.
 A rejected or timed-out approval is a stall, not success or permission to loosen
 security. Fix, commit and push only within the user's authorization.
 
-- Naming exactly ONE public GitHub PR by full URL in `message` can select
-  observation gating; a bare number or owner/repo shorthand cannot.
+- Name ONE public GitHub PR by full URL in `message` to select gating. A
+  bare `PR <n>` gates only if this session already named its URL.
 - `gate=true` is the default. Quiet subjects avoid turns, with eventual delivery
   after enough quiet intervals. Use `gate=false` for generic comments/advisory
   scans and duties that act despite silence, such as chasing a missing reviewer
@@ -158,8 +159,8 @@ security. Fix, commit and push only within the user's authorization.
   `target`, `objective`, `max_agent_turns`, `max_tokens`, `max_provider_errors`
   or `wake_instructions`. On Webex, stop and create a new finite loop instead.
 - One automation occupies a session. `monitor_start` is create-only; update an
-  active loop rather than replacing it. A budget-paused legacy loop resumes only
-  by raising the bound it reached with user authorization. Manual pauses and user
+  active loop rather than replacing it. A new arm replaces a cap/budget-stopped
+  legacy loop, only with user authorization. Manual pauses and user
   stops stay preserved; retained evidence needs the owner action above. Do not
   rearm merged/closed work as if it still needed repairs.
 
@@ -168,7 +169,7 @@ security. Fix, commit and push only within the user's authorization.
 1. Write a self-contained instruction naming subject, allowed actions, success,
    blocker/stall conditions and stop tool. Include worktree/branch and whether
    pushes are authorized. Pass positive cycle and runtime bounds. For Kiro Crew
-   preparation use prepare-pr's budget; never raise its cap yourself.
+   preparation use kirocrew-prepare-pr's budget; never raise its cap yourself.
 2. Load the MCP tool by exact `tool_search` ID before calling it. Report only
    that monitoring was REQUESTED and END YOUR TURN immediately. Application
    happens when the turn's result is processed, not synchronously with the call.
@@ -255,7 +256,7 @@ stop with the blocking review quoted.
 
 ### Optional GitHub helper
 
-If prepare-pr is installed, run its complete script bundle from the TARGET repo,
+If kirocrew-prepare-pr is installed, run its complete script bundle from the TARGET repo,
 not the skill directory. Resolve an absolute `SKILL_DIR` first from the active
 installation; never use an unresolved default expansion as a path argument.
 
@@ -314,7 +315,7 @@ For comment-aware legacy monitoring, declare review-ready only when all hold:
   an identical tree, and only the re-run separates those.
 - No conflict, behind-base state, draft or changes-requested hold remains, and
   where the optional helper is installed, `green_age.py` is not reporting exit 30.
-- No current-head finding lacks a disposition. For Kiro Crew, use prepare-pr's
+- No current-head finding lacks a disposition. For Kiro Crew, use kirocrew-prepare-pr's
   disposition contract rather than inventing a second ledger format.
 
 Never stop silently with an unanswered finding. A blocker, budget or user stop

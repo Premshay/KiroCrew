@@ -50,6 +50,7 @@ from kiro_crew.constants import (
     STEER_NOTICE_BOUND_SECS,
 )
 from kiro_crew.deny_notice import steer_refusal_notice
+from kiro_crew.executors import run_in_tool_gate_pool
 from kiro_crew.messaging.empty_turn_copy import (
     EMPTY_TURN_NOTICE,
     EMPTY_TURN_NOTICE_AFTER_WORK,
@@ -536,6 +537,12 @@ class TurnDriver:
         # reads it to record the reply the renderer was already handed (and the
         # user already saw), instead of filing the turn as if it produced nothing.
         self.partial_text: str = ""
+        # Whether the backend reported a ``completed`` compaction during the last
+        # run(). A backend that compacts its own window drops the session-start
+        # context, so the dispatcher's settle arms the one-shot re-injection flag
+        # from this. Set the moment the status arrives, so it survives an
+        # exception the way ``partial_text`` does.
+        self.compaction_completed: bool = False
         # Synchronous pre-registration shutdown gate, supplied by the dispatcher
         # as a zero-arg closure over its SessionManager and session key. It lives
         # HERE rather than at each call site because the only placement that is
@@ -550,6 +557,7 @@ class TurnDriver:
         accumulated = ""
         self.empty_turn_notice = ""
         self.partial_text = ""
+        self.compaction_completed = False
         # Whether this turn did work a reply could be missing FROM: a tool call
         # or a reasoning chunk. Decides between the two end-of-turn notices; a
         # replayed message would re-run what these already did.
@@ -795,7 +803,12 @@ class TurnDriver:
                 # overridden by auto-approve, per-session Trust, or YOLO
                 # (mirrors native handle_message's hooks.on_tool_call gate).
                 if self.tool_gate is not None:
-                    _gate = self.tool_gate(event)
+                    # Off the loop: the gate is ``hooks.on_tool_call``, whose path
+                    # tier waits on the resolver child (see
+                    # ``executors.run_in_tool_gate_pool``), on the dedicated
+                    # ``mc-toolgate`` pool. Same verdict, and the gate's
+                    # ``last_deny_reason`` is read only after it returns.
+                    _gate = await run_in_tool_gate_pool(self.tool_gate, event)
                     if _gate == "deny":
                         sel().log_api_access(
                             caller="turn_driver",
@@ -962,6 +975,9 @@ class TurnDriver:
                     resources=f"request_id={event.request_id} mode={self.approval_mode}",
                 )
             elif kind == EVENT_COMPACTION_STATUS:
+                # Before the dispatch, so a renderer that raises cannot lose it.
+                if event.text == "completed":
+                    self.compaction_completed = True
                 await self.renderer.dispatch(
                     OutputEvent(kind=COMPACTION, context_usage_pct=event.context_usage_pct)
                 )

@@ -126,6 +126,9 @@ class _Rig:
         self.tmp = tmp_path
         self.monkeypatch = monkeypatch
         self.cfg = KiroCrewConfig()
+        # Goldens pin composition, not reply style: start every scenario at
+        # normal length; scenarios that test a level set it themselves.
+        self.cfg.dashboard.verbosity = "default"
         monkeypatch.setattr(ctx, "datetime", _FrozenClock)
         monkeypatch.setattr(ctx, "get_local_tz", lambda: ("UTC", timezone.utc))
         monkeypatch.setattr(ctx.KiroCrewConfig, "load", lambda *a, **k: self.cfg)
@@ -235,10 +238,14 @@ _STABLE_TEXT = {
     "critical_rules": lambda: ctx._CRITICAL_RULES,
     "critical_rules_channel": lambda: ctx._CRITICAL_RULES_CHANNEL,
     "member_how_you_work": lambda: ctx._MEMBER_HOW_YOU_WORK,
+    # Item 7 included, because the ASSEMBLY includes it on this variant too: the
+    # Dashboard tab is rendered from the instance store and does not depend on
+    # layer 4. A pin built without it would freeze text the builder never emits.
     "member_how_you_work_unavailable": lambda: (
-        ctx._MEMBER_HOW_YOU_WORK_COMMON + ctx._MEMBER_BRIEFING_ITEM_UNAVAILABLE
+        ctx._MEMBER_HOW_YOU_WORK_COMMON
+        + ctx._MEMBER_BRIEFING_ITEM_UNAVAILABLE
+        + ctx._MEMBER_DASHBOARD_ITEM
     ),
-    "reply_ultra": lambda: ctx._reply_style_rules("ultra"),
     "reply_concise": lambda: ctx._reply_style_rules("concise"),
     "reply_answer_only": lambda: ctx._reply_style_rules("answer_only"),
     "response_preferences_frame": lambda: (
@@ -254,11 +261,10 @@ _STABLE_TEXT_SHA256 = {
     "critical_rules": "06ea61438802e0538dbf1f107e2e6b07cf2416348734f330e0cf0ec3ef52e899",
     "critical_rules_channel": "7e0dc53a1e4db382d51bb8ead062cd94ed5752dbb30b40149b6d9728ba734742",
     "docs_section": "971b6008afbd9ff048c498c06cffecc6dafc7a58b0df75ff9db0b15cf9e26c09",
-    "member_how_you_work": "a815570887d9b4d15feb491fb49de2db00d5d7ca765f1762000dc0e9898bc248",
-    "member_how_you_work_unavailable": "0c77e7625768a1a10f8a5ea309f85a10137457e94699a9ac22ac0f08c1676d25",
+    "member_how_you_work": "fee6317b439c1bfc2799b25e4a278080985a48eb9fe77d778ccad22e09166180",
+    "member_how_you_work_unavailable": "c236aa71c582826abc550052cc35bcb2c3eefae8c914c056a915c7a0a3c990f3",
     "reply_answer_only": "f0bd694165ff81cdbe123048042070588b846bd43a224b31adc79d9f8768bfce",
     "reply_concise": "5d3e25d89e682469332237e46373f0e9aac8516eefd63047134d1ec0575aac2a",
-    "reply_ultra": "6a0c7d259cc93b4f39bc612d23fa25704e1524635322ab157bade6757d552592",
     "response_preferences_frame": "08ee149ae459c828213d47643f1cdbd6661d8a77a2223b8be5d0aa6fbb6cdc18",
     "ui_language_ja": "1ff57b08f963a1d5cab08ba0d58655ca56dd0bdcc81e7567fb00cf1d9ffed168",
 }
@@ -457,7 +463,7 @@ def _user_range_with_prefix(rig: _Rig) -> str:
 
 def _subagent_scope(rig: _Rig) -> str:
     rig.seed_memory()
-    rig.cfg.dashboard.verbosity = "ultra"
+    rig.cfg.dashboard.verbosity = "answer_only"
     return _turn(
         rig,
         "sub task",
@@ -934,25 +940,25 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "slack_thread_metadata_only": (
-        "3f1df5b63f5c84ddd58e901c8d07975836253f8ccf31b3efcc9a98a0dafb622e",
+        "b46068a888959b719d7ca022d8e0d54e20938664bd663ca16d58f55ecefa98e3",
         [
-            ("channel_context", 266),
+            ("channel_context", 276),
             ("reply_format_rules", 495),
             ("request_header", 44),
         ],
     ),
     "slack_thread_parent": (
-        "261c97e3733c75d5bbd8e5c091bdc33f7e28d9c652daa432e99fdc8aeb24c951",
+        "bfb9acc17934e77dc98342b6c0d47e3c5b0354369508a81ff22945acdb45a210",
         [
-            ("channel_context", 680),
+            ("channel_context", 690),
             ("reply_format_rules", 495),
             ("request_header", 51),
         ],
     ),
     "slack_thread_parent_injection": (
-        "2f2561dab9c5367c81bd1796b01c6ce112bd18173eb135ff88c9c22511b93071",
+        "6d176be4bda29c294a4b6d12c4fd8a81ea56e7ddc4f338ff9cbc50f37f5fa59b",
         [
-            ("channel_context", 436),
+            ("channel_context", 446),
             ("reply_format_rules", 495),
             ("request_header", 51),
         ],
@@ -1201,7 +1207,12 @@ _FACADE_IMPORTS: dict[str, tuple[str, str]] = {
 #: ContextBuilder members: kind and signature, frozen before the split.
 _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
     "_CAP_FIGURE_SESSIONS": ("attr", "512"),
+    "_COMPUTER_USE_TOKEN": ("attr", "'{{COMPUTER_USE_BLOCK}}'"),
     "_MAX_SUBAGENTS_TOKEN": ("attr", "'{{MAX_SUBAGENTS}}'"),
+    "_SENT_SKILL_BODY_ENTRIES": ("attr", "64"),
+    "_SENT_SKILL_BODY_SESSIONS": ("attr", "512"),
+    "_SKILL_DELIVERY_AUDIT_NAMES": ("attr", "64"),
+    "_SKILL_DELIVERY_AUDIT_NAME_LEN": ("attr", "128"),
     "__init__": (
         "method",
         "(self, memory: 'MemoryStore | None' = None, skills: 'SkillsLoader | None' = None, hooks: 'HookManager | None' = None, lessons: 'LessonStore | None' = None, conversation_log: \"'ConversationLog | None'\" = None, channel_history: \"'ChannelHistory | None'\" = None, bot_name: 'str' = '')",
@@ -1215,8 +1226,13 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
         "(self, memory_store: 'str | None', *, member: 'str' = '', member_is_id: 'bool' = True, project: 'str | None' = None, workspace: 'str | None' = None, blocks_reads: 'bool' = False, context_groups: 'frozenset[str] | None' = None, profile_overrides: 'dict[str, str] | None' = None, native_documents: 'dict[str, str] | None' = None, native_envelope_out: 'list[str] | None' = None, execution_template: 'str' = '', member_template: 'str' = '', conditional_index: 'bool' = False, trigger_text: 'str' = '', steering_dirs: 'tuple[str, ...]' = (), desk_withheld: 'bool' = False, provider_type: 'str' = 'acp') -> 'str'",
     ),
     "_cap_memo_key": ("static", "(session_key: 'str') -> 'str'"),
+    "_dedup_triggered_bodies": (
+        "method",
+        "(self, session_key: 'str | None', agent: 'str | None', reset: 'bool', candidates: 'list[tuple[str, str]]') -> 'set[str]'",
+    ),
     "_forget_shown_lessons": ("method", "(self, session_key: 'str') -> 'None'"),
     "_live_cap_figure": ("static", "() -> 'str'"),
+    "_live_computer_use_gate": ("static", "() -> 'bool'"),
     "_live_shown_lessons": ("method", "(self, session_key: 'str') -> '_ShownLessons'"),
     "_load_agent_prompt": (
         "static",
@@ -1232,6 +1248,14 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
         "(prompt: 'str', session_key: 'str', cap_figure: 'str' = '') -> 'str'",
     ),
     "_session_cap_figure": ("method", "(self, session_key: 'str', *, refresh: 'bool') -> 'str'"),
+    "_session_computer_use_gate": (
+        "method",
+        "(self, session_key: 'str', *, refresh: 'bool') -> 'bool'",
+    ),
+    "_session_reading": (
+        "method",
+        "(self, memo: 'dict[str, _ReadingT]', lock: 'threading.Lock', session_key: 'str', live: 'Callable[[], _ReadingT]', *, refresh: 'bool') -> '_ReadingT'",
+    ),
     "_substitute_bot_name": ("method", "(self, prompt: 'str') -> 'str'"),
     "_turn_lessons_block": (
         "method",
@@ -1245,6 +1269,7 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
         "method",
         "(self, session_key: 'str | None' = None, agent: 'str | None' = None, resumed: 'bool' = False, workspace: 'str | None' = None, memory_store: 'str | None' = None, compressed_history: 'str | None' = None, mode: 'str' = '', blocks_reads: 'bool' = False, provider_type: 'str' = 'acp', minimal_context: 'bool' = False, *, runtime_source: 'str | None' = None, exclude_last_n: 'int' = 0, model_window: 'int | None' = None, context_groups: 'frozenset[str] | None' = None, query_text: 'str' = '', project: 'str | None' = None, member: 'str' = '', execution_context: 'Any' = None, steering_dirs: 'tuple[str, ...]' = (), _v2_essentials: 'str | None' = None) -> 'str'",
     ),
+    "commit_skill_bodies": ("method", "(self, session_key: 'str | None') -> 'None'"),
     "ensure_store": ("static", "(memory_store: 'str | None') -> \"'VectorMemoryStore | None'\""),
     "get_lessons_for": (
         "static",
@@ -1254,6 +1279,7 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
         "static",
         "(workspace: 'str | None' = None, memory_store: 'str | None' = None) -> 'MemoryStore'",
     ),
+    "rollback_skill_bodies": ("method", "(self, session_key: 'str | None') -> 'None'"),
 }
 
 

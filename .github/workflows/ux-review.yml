@@ -632,6 +632,9 @@ jobs:
 
       # PASS 2 -- RECONCILE AND REVIEW. This is the pass whose verdict the
       # lane publishes (id: review is what the posting step reads).
+      # This prompt owns the lens text fork-ux-review.yml copies (the fork
+      # lane must run a trusted static prompt, so it cannot splice this one);
+      # test/test_review_lane_prompt_parity.py pins the shared blocks.
       - name: UX review (Opus 5.5)
         id: review
         # No continue-on-error: if the model call fails, this step fails and
@@ -724,11 +727,13 @@ jobs:
                temp-screenshots/ or .github/screenshots/ still counts. The map
                file pairs each opaque name with its origin — the attachment
                URL or the repository path — so the report's entries line up
-               with the description and the diff. Every attachment the
-               description offered is in the list or the run failed before
-               you were called (a download that fails for a transport
-               reason fails the evidence step), so you never review a
-               partial fetch. The blind reader never saw
+               with the description and the diff. A download that fails for a
+               transport reason fails the evidence step before you are called,
+               so you never review a partial fetch. The list can still omit an
+               attachment the description offered: a URL the asset host
+               definitively rejects (a 4xx other than 403/408/429), a file of
+               an unsupported type (an SVG, a non-media file), and URLs past
+               the download cap are skipped, not listed. The blind reader never saw
                the origins — an author-chosen filename, URL or alt text would
                have primed it. Read each image (they are images; you can see
                them). They show the RENDERED UI — ground visual findings in
@@ -744,15 +749,17 @@ jobs:
             friendly, muted) while dialogs/settings/onboarding are TRANSIENT
             surfaces (occasional use — spacious, self-evident). The frontend
             uses a theme-token system (CSS variables) and Radix/shadcn
-            primitives in website/src/components/ui/. CLAUDE.md and
+            primitives in website/src/components/ui/. AGENTS.md (root) and
             website/AGENTS.md hold the conventions. website/AGENTS.md is a
             router, so open the doc its routing table names for the area under
             review.
 
-            THIS IS A UX REVIEW, NOT A CODE OR DESIGN REVIEW. Three other
+            THIS IS A UX REVIEW, NOT A CODE OR DESIGN REVIEW. The other
             automated reviewers already cover line-level correctness, security,
-            and style (Opus 5.5 / GPT 6.1) and design-level problem/solution
-            fit (Design Review). Do NOT duplicate them: no correctness bugs, no
+            and style (Opus 5.5 / GPT 6.1), design-level problem/solution fit
+            (Design Review), whether each capability should exist at all (First
+            Principles Review) and newly refused operations (Security Scope
+            Review). Do NOT duplicate them: no correctness bugs, no
             security findings, no style/naming/import nits, no "is this the
             right architecture". Your lens is exclusively what a HUMAN USING
             THE PRODUCT experiences: comprehension, copy, flows, states,
@@ -762,8 +769,7 @@ jobs:
             what the user will see and what the author meant; whether the
             user understands it is answered by the blind read, never by the
             diff. A label that exists, is localized and is reversible proves
-            nothing about comprehension — that reasoning is exactly how a
-            "Pinned turn" chip nobody could identify was passed. Vocabulary a
+            nothing about comprehension. Vocabulary a
             first-time user would not know is jargon even when the codebase
             uses it everywhere.
 
@@ -990,9 +996,8 @@ jobs:
                  gridline restraint (whitespace and subtle rules over full
                  grids).
             12. BLIND-READ RECONCILIATION & SCREENSHOT EVIDENCE (always runs;
-                this is the cold-read test with the reader actually cold — it
-                replaces the old five-second proxy, which asked you to imagine
-                an uninformed reader after you had read the diff):
+                this is the cold-read test with the reader actually cold, so
+                never imagine an uninformed reader after you have read the diff):
                - Coverage: every user-visible control the diff adds or changes
                  must appear in at least one screenshot the PR supplies (an
                  attachment in its description or a committed file), and every
@@ -1007,8 +1012,9 @@ jobs:
                  NOT PERFORMED case blocks; UNAVAILABLE is the lane's own
                  failure and caps at CONCERNS (evidence source 0). An image the
                  description links that the evidence step did not admit
-                 (not a github.com/user-attachments asset and not a file
-                 committed at HEAD — e.g. a raw URL pinned to a commit
+                 (not a github.com/user-attachments asset and not a regular
+                 file this PR adds or modifies under temp-screenshots/ or
+                 .github/screenshots/ — e.g. a raw URL pinned to a commit
                  outside this PR, or one the description itself says
                  shows another PR's state) is not evidence for this
                  revision; name it as the artifact that failed to close
@@ -1076,9 +1082,10 @@ jobs:
                  videos and GIFs attached to the PR description
                  (github.com/user-attachments assets, which the body usually
                  carries as a bare URL line — the normal path) and any
-                 committed .gif/.webm/.mp4/.mov. A link elsewhere in the
-                 description ending in .gif/.mp4/.webm/.mov counts too. The
-                 repository ships a browser-recording skill for exactly this.
+                 .gif/.webm/.mp4/.mov this PR adds or modifies under
+                 temp-screenshots/ or .github/screenshots/. A link the list does
+                 not carry is not a recording. The repository ships a
+                 browser-recording skill for exactly this.
                  No recording → EVIDENCE GAP, a BLOCK like every gap
                  (`cannot evaluate: missing <recording of the state
                  change>`), named under ### Evidence gaps with the state
@@ -1364,34 +1371,66 @@ jobs:
             echo "verdict=OVERRIDE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # #13595: every skip arm below leaves a keyed slot for THIS head
+          # whenever it runs, CREATING one when none exists rather than patching
+          # only an occupant. The body names `$HEAD` in prose, which is the
+          # per-head marker readiness scopes the skip exemption on (pr_status.py
+          # `slots_naming_head`): an absent slot on a `success` conclusion then
+          # means exactly one thing -- the lane could not publish -- so readiness
+          # can hold the lane set without wedging a PR nothing can clear. The
+          # arms follow the human-override idiom: head FIRST, slot read LAST
+          # (the head backoff can run over a minute, and an empty slot means
+          # POST, so deciding CREATE from a minute-old read would let another
+          # run on this same head fill the slot inside the gap).
           if [ "$ACTOR" = "dependabot[bot]" ]; then
             echo "Dependabot PR: UX review skipped (no Bedrock secrets/OIDC)."
             echo "verdict=SKIPPED" >> "$GITHUB_OUTPUT"
+            {
+              echo "$MARKER"
+              echo "## UX Review (Opus 5.5) — ⏭️ skipped"
+              echo
+              echo "_Revision \`$HEAD\` is a Dependabot pull request, which runs with no Bedrock secrets/OIDC, so the UX review was skipped. Advisory — does not block merge._"
+            } > "${RUNNER_TEMP:-/tmp}/ux-comment.md"
+            confirm_head
+            find_existing
+            if [ "$head_unchanged" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
+              confirm_head
+              if [ "$head_unchanged" -eq 1 ]; then
+                gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+                  --field body="$(cat "${RUNNER_TEMP:-/tmp}/ux-comment.md")" >/dev/null || true
+                echo "Updated existing ux-review comment #$existing to skip notice"
+              fi
+            elif [ "$head_unchanged" -eq 1 ] && [ "$lookup_ok" -eq 1 ]; then
+              gh pr comment "$PR" --body-file "${RUNNER_TEMP:-/tmp}/ux-comment.md" || true
+              echo "Created ux-review skip notice for $HEAD"
+            elif [ "$lookup_ok" -eq 0 ]; then
+              echo "::warning::This lane's slot was unreadable after 6 attempts, so the UX skip notice for $HEAD was not written. Re-run this lane to record the notice."
+            fi
             exit 0
           fi
           if [ "$UI_SCOPE" != "true" ]; then
             echo "No UI-relevant changes: UX review skipped."
             echo "verdict=SKIPPED" >> "$GITHUB_OUTPUT"
+            {
+              echo "$MARKER"
+              echo "## UX Review (Opus 5.5) — ⏭️ skipped"
+              echo
+              echo "_Revision \`$HEAD\` touches no user-facing surface (no changes under \`website/\` or committed screenshots), so the UX review was skipped. Advisory — does not block merge._"
+            } > "${RUNNER_TEMP:-/tmp}/ux-comment.md"
+            confirm_head
             find_existing
-            # This arm replaces a comment already in the slot and never creates one, so
-            # the head question is only asked once an occupant is found: asking it first
-            # makes a run with an empty slot report a withheld notice that this arm was
-            # never going to write.
-            if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            if [ "$head_unchanged" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
               confirm_head
               if [ "$head_unchanged" -eq 1 ]; then
-                {
-                  echo "$MARKER"
-                  echo "## UX Review (Opus 5.5) — ⏭️ skipped"
-                  echo
-                  echo "_Revision \`$HEAD\` touches no user-facing surface (no changes under \`website/\` or committed screenshots), so the UX review was skipped. Advisory — does not block merge._"
-                } > "${RUNNER_TEMP:-/tmp}/ux-comment.md"
                 gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
                   --field body="$(cat "${RUNNER_TEMP:-/tmp}/ux-comment.md")" >/dev/null || true
                 echo "Updated existing ux-review comment #$existing to skip notice"
               fi
+            elif [ "$head_unchanged" -eq 1 ] && [ "$lookup_ok" -eq 1 ]; then
+              gh pr comment "$PR" --body-file "${RUNNER_TEMP:-/tmp}/ux-comment.md" || true
+              echo "Created ux-review skip notice for $HEAD"
             elif [ "$lookup_ok" -eq 0 ]; then
-              echo "::warning::This lane's slot was unreadable after 6 attempts, so a comment already in it still shows an earlier revision's outcome rather than the skip notice for $HEAD."
+              echo "::warning::This lane's slot was unreadable after 6 attempts, so the UX skip notice for $HEAD was not written. Re-run this lane to record the notice."
             fi
             exit 0
           fi
@@ -1611,7 +1650,7 @@ jobs:
           #
           # A marker comment is the ONLY thing a freshness verifier reads. A
           # write that does not land therefore leaves the PR indistinguishable
-          # from one no lane ever reviewed: prepare-pr's pr_status.py refuses a
+          # from one no lane ever reviewed: kirocrew-prepare-pr's pr_status.py refuses a
           # PR whose check-runs, readiness status and mergeable state all pass,
           # and the only way out is manufacturing a new head -- which re-rolls
           # the non-deterministic review lanes and discards the verdicts they
@@ -1867,7 +1906,7 @@ jobs:
             # would invent a BLOCK nobody judged out of an infrastructure fault.
             # The annotation is what says so: the required readiness status reads
             # check-run CONCLUSIONS and has no stamp-freshness read, so the reader
-            # that catches a head with no verdict is prepare-pr's own marker
+            # that catches a head with no verdict is kirocrew-prepare-pr's own marker
             # evaluation, run before a PR is called ready.
             if [ -n "$slot" ]; then
               occupied=""
@@ -2334,7 +2373,7 @@ jobs:
               # reply. A job cannot report itself `neutral` the way the fork
               # lanes' check-runs can, so the punchline goes on the job as an
               # annotation and the Watch items go to the run summary, where the
-              # local prepare-pr loop and a human read the same text.
+              # local kirocrew-prepare-pr loop and a human read the same text.
               if [ "$VERDICT" = "CONCERNS" ]; then
                 punchline="${CONCERNS_PUNCHLINE:-read the Watch items in the UX Review comment on this PR}"
                 echo "::warning title=UX Review CONCERNS::$punchline"

@@ -225,8 +225,9 @@ def drain_for_shutdown(timeout: float = SHUTDOWN_DRAIN_SECONDS) -> bool:
 
 #: The config-derived fields the roster view carries and a member/config event
 #: snapshots. Kept in lockstep with ``members_projections._CONFIG_FIELDS`` and
-#: with the snapshot the config-save hook writes in ``handlers/agents.py`` — the
-#: reconcile below compares exactly these against ``cfg.agents[name]`` so a
+#: with the snapshot the config-save hook writes in
+#: ``dashboard/agent_admin/crew_update.py`` — the reconcile below compares exactly these
+#: against ``cfg.agents[name]`` so a
 #: hand-edited config still lands a correcting member/config event.
 _CONFIG_FIELDS = (
     "kiro_agent",
@@ -244,8 +245,9 @@ def _config_snapshot_for_agent(agent_cfg) -> dict:
     """The config-derived fields as a member/config would carry them.
 
     ``starred`` is coerced to ``bool`` (it is a load-time-coerced flag), matching
-    the snapshot ``handlers/agents.py`` writes and the ``bool(agent_cfg.starred)``
-    the roster endpoint sends. ``source`` is bounded to the roster vocabulary via
+    the snapshot ``dashboard/agent_admin/crew_update.py`` writes and the
+    ``bool(agent_cfg.starred)`` the roster endpoint sends. ``source`` is bounded to the
+    roster vocabulary via
     the same ``normalize_member_source`` the HTTP row uses, so a credential- or
     URL-shaped value planted in the agent-writable ``source`` cannot reach the
     browser through the durable projection either (the roster row already

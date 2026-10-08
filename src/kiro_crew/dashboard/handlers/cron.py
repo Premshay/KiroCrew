@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -50,6 +51,7 @@ from kiro_crew.dashboard.handlers._shared import (
     require_owner_dashboard_request,
 )
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+from kiro_crew.dashboard.slot_ownership import app_holds_gateway_key
 from kiro_crew.dashboard.state import DashboardState, SlotOrigin, note_crew_log_class
 from kiro_crew.executors import discovery_executor
 from kiro_crew.history import is_incognito_transcript
@@ -2038,7 +2040,19 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
         return _e
+    app_denied = await _refuse_foreign_app_job(request, state, [job_id], "crons.to_chat")
+    if app_denied is not None:
+        return app_denied
     slot_name = f"cron-{job_id}"
+    # The job's tab key is held by an app's slot: it is not adopted (see
+    # slot_ownership.app_holds_gateway_key), so there is no tab to open.
+    if app_holds_gateway_key(
+        state, slot_name, "cron.to_chat", actor=str(request.get("app") or "dashboard")
+    ):
+        return web.json_response(
+            {"error": "this job's chat tab is unavailable", "code": "cron_slot_unavailable"},
+            status=409,
+        )
     jobs = state.crons.list_jobs(include_disabled=True)
     job = next((j for j in jobs if j.id == job_id), None)
     if job:
@@ -2202,6 +2216,9 @@ async def api_cron_history(request: web.Request) -> web.Response:
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
         return _e
+    app_denied = await _refuse_foreign_app_job(request, state, [job_id], "crons.history")
+    if app_denied is not None:
+        return app_denied
     try:
         limit = int(request.query.get("limit", "20"))
     except (ValueError, TypeError):
@@ -2229,6 +2246,9 @@ async def api_cron_history_detail(request: web.Request) -> web.Response:
     run_id = request.match_info["run_id"]
     if (_e := _invalid_path_id_response(run_id, "run_id")) is not None:
         return _e
+    app_denied = await _refuse_foreign_app_job(request, state, [job_id], "crons.history_detail")
+    if app_denied is not None:
+        return app_denied
     detail = await state.crons.get_history().get_run_detail(job_id, run_id)
     if not detail:
         return web.json_response({"error": "run not found"}, status=404)
@@ -2388,6 +2408,9 @@ async def api_cron_script_source(request: web.Request) -> web.Response:
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
         return _e
+    app_denied = await _refuse_foreign_app_job(request, state, [job_id], "crons.script_source")
+    if app_denied is not None:
+        return app_denied
     # Freshness-guaranteed lookup, same rationale as api_cron_run: the job may
     # have been minted by another process and not yet be in the cache snapshot.
     job = await state.crons.get_job_async(job_id)
@@ -2439,9 +2462,36 @@ async def api_cron_history_all(request: web.Request) -> web.Response:
         offset = int(request.query.get("offset", "0"))
     except (ValueError, TypeError):
         offset = 0
-    runs, total = await state.crons.get_history().get_all_history(
-        job_id=job_id, limit=limit, offset=offset
-    )
+    app = _app_caller(request)
+    if app:
+        # An app sees only the runs of jobs it owns, judged by the same
+        # ``created_by`` stamp ``_refuse_foreign_app_job`` reads. The filter
+        # runs before pagination so ``total`` counts the app's own runs; the
+        # index is capped by ``cron_max_index_records``, so the full read is
+        # bounded. Function-local import for the reason ``api_crons`` gives.
+        from kiro_crew.apps.cron_sdk import app_owner_name
+
+        owned = {
+            j.id
+            for j in state.crons.list_jobs(include_disabled=True)
+            if app_owner_name(j.created_by) == app
+        }
+        rows, _ = await state.crons.get_history().get_all_history(
+            job_id=job_id, limit=sys.maxsize, offset=0
+        )
+        rows = [row for row in rows if row.get("job_id") in owned]
+        total = len(rows)
+        runs = rows[offset : offset + limit]
+        # Record the ownership scoping decision: this branch applies an
+        # access-control filter to an app token's read, and token-auth events
+        # log only authentication while dashboard GET auditing is excluded, so
+        # without this SEL row no event records that the app was confined to its
+        # own runs. One row per request on this on-demand (not polled) route.
+        _audit_app_cron(app, "crons.history_all", "allowed", f"rows={total}")
+    else:
+        runs, total = await state.crons.get_history().get_all_history(
+            job_id=job_id, limit=limit, offset=offset
+        )
     # Enrich with job_name
     jobs_by_id = {j.id: j for j in state.crons.list_jobs(include_disabled=True)}
     for run in runs:
@@ -2874,6 +2924,15 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             rule_emb_generation,
             repo_scope,
             applies=applies,
+            # Stored lessons that still lack a vector are the standing repair
+            # sweep's to fill. Embedding them here is PRIORITY_BULK work with no
+            # deadline, queued behind every other bulk job, so it can hold this
+            # request past the MCP client's read timeout (``mcp_core._post``) while
+            # the write still lands later. Until the sweep fills such a row, both
+            # semantic checks (dedup here, the contradiction scan below) pass it
+            # over; the exact-rule, substring and keyword-overlap rules still apply
+            # to it.
+            defer_backfills=True,
         )
         # Sweep ONLY when the lesson actually landed. The write declines for a value
         # its preflight refuses (reachable because ``negative`` is forwarded here) and
@@ -2984,9 +3043,9 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # outcome can still have mutated the store. ``write_lesson``'s second pass
     # DELETES a row it supersedes and keeps scanning, so with a containment chain
     # (A inside R inside B) whose rows are visited A-first -- and the scan order is
-    # effectively random, since get_lessons orders by md5 key -- A is removed and the
-    # call then returns ``deduped`` for B. The store changed while ``wrote`` is False,
-    # so gating on it left connected dashboards showing a lesson that is gone.
+    # effectively random, since get_lessons orders by updated_at DESC, then by md5
+    # key within one stamp -- A is removed and the call then returns ``deduped`` for
+    # B. The store changed while ``wrote`` is False, so gating on it left connected dashboards showing a lesson that is gone.
     # Reporting mutation separately would buy nothing over refreshing always: an extra
     # refresh on a no-op re-submit costs a redundant list fetch, a missed one shows
     # deleted data.
@@ -3161,7 +3220,7 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "exact must be a boolean", "code": "exact_not_bool"}, status=400
         )
-    # Delete from vector store if active, else JSONL
+    # Delete from the vector store if active; fall through to JSONL (V1) below.
     # THE CALLER'S silo, not the global store. This is the agent's only durable
     # memory-write surface, so writing globally let a crew bound to one silo steer
     # every other crew's turns -- and, in the other direction, the crew's own
@@ -3184,9 +3243,14 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
     # `vs and` rather than `vs_lessons` alone: the rows do not narrow the store,
     # and the store is a real union now that it is resolved per caller instead of
     # arriving untyped from the global getter.
+    ok = False
     if vs and (vs_lessons or vs.algorithm_version == "v2"):
         ok = await asyncio.to_thread(vs.delete_lesson, rule_sub, repo_scope, exact=exact)
-    else:
+    # V1 only: when the vector store matched nothing, try the JSONL tier, as
+    # ``kirocrew learn remove`` does. Injection falls back to that file when every
+    # vector row is withheld, so a lesson active in every turn must stay
+    # removable. A V2 member's database is its only lesson store, so it stops here.
+    if not ok and not (vs is not None and vs.algorithm_version == "v2"):
         store = _lesson_jsonl_store(state, _lesson_silo, scope, workspace)
         # Off the loop. remove() now takes the store's shared lock, which a worker
         # thread can be holding across file I/O for a concurrent save_or_enrich --
@@ -3214,6 +3278,24 @@ async def api_crons(request: web.Request) -> web.Response:
     # loop with the store read/hash. The hot per-connection status push and the
     # other mutation handlers keep using the cache-only list_jobs().
     jobs = await state.crons.list_jobs_async(include_disabled=True)
+    # An app token reaches this list route, but like every per-job cron route
+    # it sees only the jobs it created, judged by the same host-written
+    # ``created_by`` ``app:<name>`` stamp ``_refuse_foreign_app_job`` reads.
+    # Without this the dashboard's polling endpoint would hand an app every
+    # job's ``message``, ``last_result``, ``last_error``, ``command`` and
+    # ``script`` -- exactly the run data the per-job gates on this PR protect --
+    # leaving the trust boundary open on the one route that returns it in bulk.
+    # Filtered here so every field below is already scoped. The app-only branch
+    # writes one SEL row recording the ownership scoping decision: token-auth
+    # events log only authentication and dashboard GET auditing is excluded, so
+    # this is the only record that the app was confined to its own jobs. The
+    # row is written ONLY on the app path -- the owner, dashboard and
+    # internal-secret callers (``app == ""``) skip the filter and the audit, so
+    # the owner-view poll stays unaudited and unaffected, as before.
+    app = _app_caller(request)
+    if app:
+        jobs = [j for j in jobs if app_owner_name(j.created_by) == app]
+        _audit_app_cron(app, "crons.list", "allowed", f"jobs={len(jobs)}")
     now = time.time()
     tz_name, _ = get_local_tz()
     # Secret-grant metadata is owner-view only (see the field comment below).

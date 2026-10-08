@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { RefreshCw, Plug, AlertTriangle, Check, ChevronRight, Zap, X, Download, Braces } from 'lucide-react'
+import { RefreshCw, Plug, AlertTriangle, Check, ChevronRight, Zap, X, Download, Braces, ToggleLeft, ToggleRight } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Trans } from 'react-i18next'
 import { Link } from 'react-router-dom'
@@ -215,8 +215,8 @@ function ScopeBadge({
       ? i18nT('pages.overview.mcpTab.scope_disabled_in_config', { label })
       : i18nT('pages.overview.mcpTab.pending_uninstall', { label }))
     : pendingChange
-      ? `${label}: ${active ? 'pending enable' : 'pending disable'} (click to revert)`
-      : `${label}: ${active ? 'on' : 'off'} (click to ${active ? 'disable' : 'enable'})`
+      ? i18nT(active ? 'pages.overview.mcpTab.scope_switch_pending_on' : 'pages.overview.mcpTab.scope_switch_pending_off', { label })
+      : i18nT(active ? 'pages.overview.mcpTab.scope_switch_on' : 'pages.overview.mcpTab.scope_switch_off', { label })
   const bg = disabled
     ? 'bg-bg-elevated text-muted'
     : active
@@ -225,16 +225,28 @@ function ScopeBadge({
   const pendingRing = pendingChange
     ? 'ring-1 ring-[var(--warn)] ring-offset-1 ring-offset-bg border-dashed'
     : ''
+  // Each badge is an on/off switch for one scope (#13076): the Kiro Crew
+  // badge is the per-server enable/disable for Kiro Crew sessions. A bare
+  // coloured word did not read as a control, so it carries switch semantics
+  // and a toggle glyph that shows the state without relying on colour.
+  // An inert switch (shared-config disable or a staged uninstall) is off
+  // whatever its presence says: the server will not load either way, so the
+  // switch state, glyph and accessible name must all read off together.
+  const checked = active && !disabled
+  const Glyph = checked ? ToggleRight : ToggleLeft
   return (
     <button
       type="button"
+      role="switch"
+      aria-checked={checked}
       disabled={disabled}
       onClick={onClick}
       title={title}
       aria-label={title}
-      className={`px-1.5 py-0.5 rounded text-[11px] font-mono cursor-pointer transition-colors ${bg} ${pendingRing}`}
+      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-mono cursor-pointer transition-colors ${bg} ${pendingRing}`}
       data-scope={scope}
     >
+      <Glyph className="lucide-inline" aria-hidden="true" data-testid="mcp-scope-switch-glyph" data-on={checked ? 'true' : 'false'} />
       {label}
     </button>
   )
@@ -339,7 +351,7 @@ function mcpStatusVariant(status: string, auth: McpAuthState): 'ok' | 'err' | 'w
  * what the row becomes — waits here, because it is only useful once the sign-in is
  * done, and an always-visible cell in a dense table pays for every sentence.
  */
-function mcpStatusHint(status: string, serverName: string, auth: McpAuthState): string | undefined {
+function mcpStatusHint(status: string, serverName: string, auth: McpAuthState, probeFailing = false): string | undefined {
   // "Online" is the gateway's OWN probe result: it started the server in the
   // gateway process, under the gateway's client identity. It says nothing about
   // whether any particular agent session mounted it, and reading it as if it did
@@ -348,6 +360,18 @@ function mcpStatusHint(status: string, serverName: string, auth: McpAuthState): 
   // so it carries it here rather than leaving the reader to assume the stronger
   // claim.
   if (status === 'ok') return i18nT('pages.overview.mcpTab.online_help')
+  // "Outdated" usually means the last result aged past the probe TTL
+  // (`_PROBE_TTL_SECS` in mcp_discovery.py -- the "30 minutes" in this copy is
+  // a second copy of that constant), and the refresh button re-probes it. A
+  // row past the consecutive-failure threshold is ALSO "outdated", because
+  // every probe pass skips it (docs/system-specs/modules/mcp-probe-quarantine.md
+  // §3), and refresh alone does nothing for it. That row always carries the
+  // Failing badge in the same cell, whose tip says probing stopped and names
+  // Reset count, so this badge stays silent there rather than repeat it or
+  // send the reader to a refresh that will not work (#15516).
+  if (status === 'outdated') {
+    return probeFailing ? undefined : i18nT('pages.overview.mcpTab.outdated_help')
+  }
   if (status !== 'needs_auth') return undefined
   if (auth === 'sign_in_required') return i18nT('pages.overview.mcpTab.sign_in_required_next')
   if (auth === 'signed_in') return i18nT('pages.overview.mcpTab.signed_in_help', { provider: serverName })
@@ -799,21 +823,24 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                       "it is up", and a peripheral scan of a 12-row table reads
                       colour long before it reads 11px text. */}
                   {s.probeMode === 'declared' && s.status === 'ok' ? (
-                    <Badge variant="warn" title={i18nT('pages.overview.mcpTab.tool_list_read_from_the_package_s_declaration_th')}>
-                      {i18nT('pages.overview.mcpTab.declared')}
-                    </Badge>
+                    /* The hint rides a focusable InfoTip, not a hover-only
+                       `title`: a native tooltip is unreachable by keyboard,
+                       touch, and AT (#3626, #8359). */
+                    <span className="inline-flex items-center gap-1.5">
+                      <Badge variant="warn">
+                        {i18nT('pages.overview.mcpTab.declared')}
+                      </Badge>
+                      <InfoTip text={i18nT('pages.overview.mcpTab.tool_list_read_from_the_package_s_declaration_th')} placement="top" />
+                    </span>
                   ) : (
-                    /* The needs_auth hint is the only default-reachable
-                       explanation of the OAuth probe limitation, so it cannot
-                       live in `title` alone: a native tooltip is hover-only and
-                       so unreachable by keyboard, touch, and AT (#3626). For
-                       needs_auth the badge carries no `title` — InfoTip is the
-                       sole, focusable and tappable affordance for the hint, so
-                       pointer and AT users get the same one path to it rather
-                       than a native tooltip duplicating (and outrunning) it.
-                       Every other status keeps its `title` hint (today that is
-                       only 'ok', whose host-check caveat mcpStatusHint returns;
-                       the rest get undefined and thus no attribute). */
+                    /* The hint rides a focusable InfoTip, not a hover-only
+                       `title`: a native tooltip is unreachable by keyboard,
+                       touch, and AT (#3626, #8359). `mcpStatusHint` returns a
+                       string only for `ok` (the host-check caveat),
+                       `outdated` when not quarantined (why, and how to re-probe) and
+                       `needs_auth`; every other status returns undefined and
+                       so gets no InfoTip — this stays a named exception rather
+                       than a blanket hint on every badge. */
                     <span className="inline-flex items-center gap-1.5">
                       <Badge
                         /* Muted, not the amber the status would otherwise take: amber is
@@ -822,7 +849,6 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                            value is the exception -- a config error to repair, so it wears
                            the error tone rather than the off-switch grey. */
                         variant={disabledInConfigVariant(s) ?? mcpStatusVariant(s.status, mcpAuthState(s))}
-                        title={s.status === 'needs_auth' ? undefined : mcpStatusHint(s.status, s.name, mcpAuthState(s))}
                       >
                         {/* The label tells the two off states apart in words: a
                             deliberate disable reads "Disabled", a non-boolean value
@@ -830,9 +856,10 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                             only distinction. */}
                         {invalidValue ? i18nT('pages.overview.mcpTab.status_invalid_value') : mcpStatusLabel(s.status, mcpAuthState(s))}
                       </Badge>
-                      {s.status === 'needs_auth' && (
-                        <InfoTip text={mcpStatusHint(s.status, s.name, mcpAuthState(s)) || ''} placement="top" />
-                      )}
+                      {(() => {
+                        const hint = mcpStatusHint(s.status, s.name, mcpAuthState(s), s.probeFailing === true)
+                        return hint ? <InfoTip text={hint} placement="top" /> : null
+                      })()}
                     </span>
                   )}
                   {s.probeFailing && (
@@ -849,9 +876,11 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                        already fill the action cell, and a third control there
                        would need an overflow menu this table does not have. */
                     <div className="mt-0.5 flex items-center gap-1.5">
-                      <Badge variant="err" title={i18nT('pages.overview.mcpTab.probe_failing_help', { failures: s.probeFailures ?? 0 })}>
+                      <Badge variant="err">
                         {i18nT('pages.overview.mcpTab.probe_failing')}
                       </Badge>
+                      {/* Focusable InfoTip, not a hover-only `title` (#3626, #8359). */}
+                      <InfoTip text={i18nT('pages.overview.mcpTab.probe_failing_help', { failures: s.probeFailures ?? 0 })} placement="top" />
                       <button
                         className="whitespace-nowrap text-[11px] text-accent hover:text-accent-hover cursor-pointer transition-colors disabled:cursor-not-allowed disabled:text-muted"
                         onClick={() => resetFailures.mutate(s.name)}

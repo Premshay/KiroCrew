@@ -95,7 +95,8 @@ here, and opens the dashboard — all from your laptop.
    bootstrapper does this and hands off to the wizard. Verify prerequisites with
    `kirocrew cloud doctor`. Attach the least-privilege policy printed by
    `kirocrew cloud iam-policy` to the AWS profile you'll launch with.
-2. **Launch.** Run `kirocrew cloud launch` — interactive (size picker + confirm),
+2. **Launch.** Run `kirocrew cloud launch` — interactive (size picker + a confirm
+   that names the AWS account and profile the stack will be created in),
    or non-interactive, e.g. `kirocrew cloud launch --size power --region us-west-2
    --profile dev -y`. Useful flags: `--new` (a separate box instead of resuming
    your saved one) and `--keep-on-failure` (disable CloudFormation rollback to
@@ -134,7 +135,9 @@ SSM-aware health probe.
 `cloud destroy` deletes the AWS stack and then unregisters the instance.
 `unregister_instance` matches the box by `ssm_target` (native registration), and
 still falls back to matching `ssh_host` so a box registered the legacy way is
-cleaned up too.
+cleaned up too. It removes the box together with every crew chained through it
+(`remove_cascade`, the same helper the dashboard's delete uses), because a chained
+crew rides the box's forward and cannot connect without it.
 
 ## Related
 

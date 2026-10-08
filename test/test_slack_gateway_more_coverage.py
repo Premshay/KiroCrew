@@ -45,7 +45,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.autonudge import APPROVAL_STALL_REASON, NudgeLoop
+from kiro_crew.autonudge import APPROVAL_STALL_REASON, CONSECUTIVE_FAILURE_REASON, NudgeLoop
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.monitoring.models import (
     DEFAULT_MONITOR_CADENCE_SECS,
@@ -545,6 +545,71 @@ class TestShutdownExtras:
             await orch._shutdown()
         orch._socket_client.close.assert_awaited_once()
         assert model.cancelled() and migrate.cancelled() and update.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_the_update_task_finishes_stopping_before_the_teardown(self):
+        """An installer's rollback finishes before services are torn down.
+
+        The update task's own cancel arm stops the installer with SIGTERM and a
+        grace. Shutdown cancels it first and waits for it before the teardown,
+        or its 10 s cap can exit the process with the installer orphaned
+        mid-write.
+        """
+        orch = _make_orchestrator()
+        orch.cron_svc = None
+        orch.heartbeat_svc = None
+        orch.subagent_mgr = None
+        orch.sessions = None
+        orch.dashboard_state = None
+        orch._dashboard_runner = None
+        stopped: list[str] = []
+        orch._stop_mcp_broker = AsyncMock(side_effect=lambda: stopped.append("teardown"))
+
+        async def _installer_running() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)  # the installer's own rollback
+                stopped.append("update")
+                raise
+
+        orch._update_check_task = asyncio.create_task(_installer_running())
+        await asyncio.sleep(0)
+        with patch.object(gw.registry, "shutdown_tasks", return_value=[]):
+            await asyncio.wait_for(orch._shutdown(), timeout=10)
+
+        assert stopped == ["update", "teardown"]
+
+    @pytest.mark.asyncio
+    async def test_an_update_task_that_will_not_stop_does_not_hold_shutdown(self, monkeypatch):
+        orch = _make_orchestrator()
+        orch.cron_svc = None
+        orch.heartbeat_svc = None
+        orch.subagent_mgr = None
+        orch.sessions = None
+        orch.dashboard_state = None
+        orch._dashboard_runner = None
+        orch._stop_mcp_broker = AsyncMock()
+        monkeypatch.setattr(gw, "UPDATE_INSTALLER_STOP_SECS", 0.05)
+        release = asyncio.Event()
+
+        async def _wedged() -> None:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+        update = asyncio.create_task(_wedged())
+        orch._update_check_task = update
+        await asyncio.sleep(0)
+        try:
+            with patch.object(gw.registry, "shutdown_tasks", return_value=[]):
+                await asyncio.wait_for(orch._shutdown(), timeout=10)
+            assert not update.done()
+        finally:
+            release.set()
+            await asyncio.wait_for(update, timeout=5)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1275,6 +1340,32 @@ class TestNotifyNudgeExpired:
         # auto-approve was perfectly healthy; telling them to re-enable it would
         # send them to change a setting that was never off.
         assert "away" in body
+        assert "restart the loop" in body
+
+    def test_consecutive_failure_names_its_own_remedy(self):
+        """Failing cycles must not be reported as a cap the loop never hit.
+
+        Before this branch the stop fell through to the final ``else`` ("hit its
+        cycle cap" / "raise the cap"), telling the operator to raise a bound that
+        was never the problem. The cause is the loop's own cycles dying, so the
+        remedy is to look at the error and restart.
+        """
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-cf",
+            slot_key="chat-5",
+            message="keep checking",
+            max_cycles=24,
+            cycle_count=5,
+            stopped_reason=CONSECUTIVE_FAILURE_REASON,
+        )
+        orch._notify_nudge_expired(loop)
+        title = ds.notify.call_args.args[1]
+        body = ds.notify.call_args.args[2]
+        assert title == "Monitoring loop stopped — its cycles kept failing"
+        assert "cycle cap" not in body
         assert "restart the loop" in body
 
     def test_cycle_cap_outranks_a_stall(self):

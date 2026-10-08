@@ -231,6 +231,9 @@ def test_background_exclusion_is_by_owned_file_not_by_name():
     assert not agent_catalog._is_background_only(project_lite)
     assert agent_catalog._is_background_only(_owned("kirocrew-lite"))
     assert agent_catalog._is_background_only(_owned("kirocrew-guest"))
+    # Withheld for what it CANNOT do: the panel server and ``fs_read`` and nothing
+    # else, so a chat run as it would be an agent that cannot answer anything.
+    assert agent_catalog._is_background_only(_owned("kirocrew-dashboard-manager"))
     assert not agent_catalog._is_background_only(_owned("kirocrew"))
     assert not agent_catalog._is_background_only(_owned("kirocrew-worker"))
 
@@ -246,6 +249,7 @@ def test_every_owned_spec_is_classified_for_the_picker():
         agent_files.LEDGER_CONDUCTOR_AGENT_FILENAME,
         agent_files.SECURITY_CONDUCTOR_AGENT_FILENAME,
         agent_files.WORKER_AGENT_FILENAME,
+        agent_files.DASHBOARD_AUTHOR_AGENT_FILENAME,
         agent_files.KNOWLEDGE_AGENT_FILENAME,
         agent_files.RESEARCH_AGENT_FILENAME,
         agent_files.HEARTBEAT_AGENT_FILENAME,

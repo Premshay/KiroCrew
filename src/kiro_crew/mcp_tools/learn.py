@@ -89,12 +89,11 @@ def schemas() -> list[dict[str, Any]]:
                 "clause. Clause endings are the field end, a newline, punctuation, or "
                 "the documented closed connector class. A following plain noun makes "
                 "the ID a durable tooling qualifier. "
-                "The check covers only the registry families pinned by the trusted review "
-                "workflow; other backend IDs are not lesson-refused. A model version "
-                "mentioned by itself is allowed. Free-form wording remains a best-effort "
-                "check. Future phrasing misses are handled by this instruction, not new "
-                "regex branches, so do not disguise either refused class. Include "
-                "both the rule (what to do) and negative (what not to do)."
+                "The check covers only a fixed set of model-ID families; other "
+                "backend IDs are not lesson-refused. A model version mentioned by "
+                "itself is allowed. Free-form wording remains a best-effort check, "
+                "so do not disguise either refused class. Give the rule (what to "
+                "do); negative (what not to do) is optional."
             ),
             "inputSchema": {
                 "type": "object",
@@ -331,6 +330,18 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
                 "a new Slack thread or dashboard tab and re-state the "
                 "lesson you want to save — it will not carry over "
                 "from this session automatically."
+            )
+        # ``transport_error`` marks a failure after the request may have reached the
+        # gateway, most often this client's read timeout while the route is still
+        # writing. The lesson can land after this call returns, so a bare error reads
+        # as a failed save: the model retries a write that is already in flight and
+        # tells the user the lesson was lost. A refused connection never sets the
+        # flag, because nothing was sent.
+        if d.get("transport_error"):
+            return (
+                f"Error: {err_val}. The outcome is unknown: the gateway may still "
+                "finish saving this lesson after this call stopped waiting. Check "
+                "learn_list for it before retrying, and do not report it as unsaved."
             )
         # ``err_val`` is already redacted at the trust boundary by
         # ``_http_error_body`` (HTTP bodies are untrusted external content), and
@@ -683,6 +694,11 @@ def learn_remove(name: str, args: dict[str, Any]) -> str:
                 + mcp_core.strict_identity_diagnosis()
             )
         return f"Error: {err_val}"
+    # The route answers ``ok: false`` when no row matched. Reporting that as a
+    # removal would tell a remove-then-re-add consolidation its old lesson is
+    # gone while it is still injected. A reply without the key reads as removed.
+    if d.get("ok") is False:
+        return f"No lessons were removed: nothing matches: {query}"
     return f"Removed lessons matching: {query}"
 
 

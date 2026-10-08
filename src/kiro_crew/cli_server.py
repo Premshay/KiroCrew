@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from kiro_crew import __version__, dep_sync, platform_compat
+from kiro_crew.app_lifecycle_client import _deadline_expired
 from kiro_crew.beacon import distribution, is_default_home
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
@@ -63,6 +64,7 @@ from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, is_bundled_kiro_cli, pin_
 from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen, unix_socket_urlopen
 from kiro_crew.memory import MemoryStore
+from kiro_crew.owner_only_files import owner_only_opener
 from kiro_crew.platform.update_capability import (
     EXTERNALLY_MANAGED_MESSAGES,
     MANAGED_BY_GIT,
@@ -156,6 +158,12 @@ def _probe_dashboard_health(port: int) -> None:
         pass
 
 
+# How long the token command waits for the gateway to answer. A gateway whose
+# event loop is starved by a CPU-bound thread can take 12-14 s to answer while
+# still being healthy.
+_TOKEN_REQUEST_TIMEOUT = 20.0
+
+
 def _token(args: argparse.Namespace) -> None:
     """Print a dashboard URL with a fresh auth token.
 
@@ -189,7 +197,7 @@ def _token(args: argparse.Namespace) -> None:
         url += f"&embed_parent_port={int(epp)}"
     req = urllib.request.Request(url, headers={"X-Local-Secret": secret})
     try:
-        with loopback_urlopen(req, timeout=5) as resp:
+        with loopback_urlopen(req, timeout=_TOKEN_REQUEST_TIMEOUT) as resp:
             data = json.loads(resp.read())
             token = data.get("token", "")
     except urllib.error.HTTPError as exc:
@@ -206,7 +214,18 @@ def _token(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
     except Exception as exc:
-        print(f"❌ Could not reach gateway on port {port}: {exc}", file=sys.stderr)
+        if _deadline_expired(exc):
+            # Something is listening and took the request, so the gateway is
+            # alive. Saying "could not reach" sends the operator to restart a
+            # healthy gateway. The line names no other probe command: the
+            # status command's own short timeout reports a busy gateway as down.
+            print(
+                f"❌ Gateway on port {port} is up but did not answer within "
+                f"{_TOKEN_REQUEST_TIMEOUT:g} s (busy). Try again in a moment.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"❌ Could not reach gateway on port {port}: {exc}", file=sys.stderr)
         sys.exit(1)
 
     if not token:
@@ -573,6 +592,52 @@ def _stop_expected_pid(port: int, expect_pid: int) -> None:
     _stop_mcp_gateway_daemon()
 
 
+def _refuse_service_alias(operation: str, port: int) -> bool:
+    """Refuse ``kirocrew stop`` / ``kirocrew restart`` when ``kirocrew.service``
+    is an alias of another unit, before the foreground-gateway fallback.
+
+    Returns True (and prints the refusal, audits it, and the caller must exit 1)
+    when a systemd scope holds our name as an alias; False when none does, so the
+    caller proceeds unchanged.
+
+    ``service_controller.stop_service()`` / ``restart_service()`` /
+    ``is_service_active()`` all fail CLOSED on an alias — the aliased unit is not
+    this gateway, so they never select, count, or act on it. That is correct, but
+    it reads to the fallback below like "no managed service here", which then
+    finds the process the alias target's manager is supervising on the port,
+    SIGTERMs it (the manager restarts it at once — the rendered unit carries
+    ``Restart=always``) and, for restart, spawns a detached replacement that
+    competes for the port and the ``KIROCREW_HOME`` lock. The CLI cannot justify
+    mutating a process it does not manage, so it stops here: exit 1, nothing
+    signalled, nothing spawned. ``service uninstall`` already refuses an alias
+    whole and ``service status`` already names it; this is the same guard for the
+    two verbs that otherwise fall through to signalling.
+    """
+    holder = service_controller.service_alias_holder()
+    if holder is None:
+        return False
+    sel().log_api_access(
+        caller="cli",
+        operation=operation,
+        outcome="denied",
+        source="cli",
+        resources=f"port={port} reason=service_name_is_alias scope={holder.scope}",
+    )
+    # Spell the remedy for the ACTUAL scope and verb, not a fixed
+    # `sudo systemctl restart`: a user-scope alias is reached with
+    # `systemctl --user` (plain `sudo systemctl` hits the system manager and
+    # answers "Unit not found" or acts on a different unit), and a user who ran
+    # `kirocrew stop` must be told to STOP the holder, not restart it.
+    verb = "restart" if operation == "gateway_restart" else "stop"
+    systemctl = "systemctl --user" if holder.scope == "user" else "sudo systemctl"
+    print(
+        f"❌ kirocrew.service is an alias of {holder.unit_id} in the {holder.scope} "
+        f"scope; this command does not manage that unit. {verb.capitalize()} it with\n"
+        f"   `{systemctl} {verb} {holder.unit_id}`, or remove the alias."
+    )
+    return True
+
+
 def _stop(cli_port: int | None = None, *, expect_pid: int | None = None) -> None:
     """Stop a running KiroCrew gateway.
 
@@ -606,6 +671,13 @@ def _stop(cli_port: int | None = None, *, expect_pid: int | None = None) -> None
         print("✅ Stopped kirocrew service. To remove it: kirocrew service uninstall")
         _stop_mcp_gateway_daemon()
         return
+
+    # Before the foreground-gateway fallback: refuse when our name is an alias of
+    # another unit. ``stop_service()`` returned False for it (it fails closed on
+    # an alias), but the fallback below would then SIGTERM the alias target's
+    # managed process on the port — exactly what this CLI must not do.
+    if cli_port is None and _refuse_service_alias("gateway_stop", port):
+        sys.exit(1)
 
     # Cross-platform port -> listening PID lookup (lsof on POSIX, netstat -ano
     # on Windows — there is no lsof there, so an lsof-only lookup makes
@@ -1102,7 +1174,8 @@ def _spawn_detached_gateway(port: int | None = None) -> subprocess.Popen[bytes]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # Open in append mode so successive restarts accumulate history in
     # one log file. The fd is owned by the child after Popen returns.
-    log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+    # Created 0600, like every file in the data home (owner_only_files).
+    log_fh = open(log_path, "a", encoding="utf-8", opener=owner_only_opener)  # noqa: SIM115
 
     bin_path = _own_console_script() or shutil.which("kirocrew")
     if bin_path:
@@ -1528,6 +1601,14 @@ def _restart(cli_port: int | None = None) -> None:
             print("\n".join(lines))
             sys.exit(1)
 
+        # The restart attempted nothing and no managed unit is active — but our
+        # name may be an alias of another unit (restart_service() /
+        # is_service_active() both fail closed on an alias). Refuse before the
+        # foreground path below, which would SIGTERM the alias target's managed
+        # process on the port and spawn a detached replacement beside it.
+        if _refuse_service_alias("gateway_restart", port):
+            sys.exit(1)
+
     # No service active — bounce the foreground gateway and detach a fresh one.
     # Reuse _stop() for the SIGTERM path so behavior stays in sync if _stop
     # ever gains new safety checks. _stop() exits the process with sys.exit(1)
@@ -1734,13 +1815,9 @@ def _snapshot_memory_or_exit() -> None:
     around the one store nothing else can rebuild is the loss this prevents.
     """
     from kiro_crew import memory_backup
+    from kiro_crew.platform.wheel_apply import snapshot_memory_before_update
 
-    try:
-        keep = int(KiroCrewConfig.load().memory.backup_keep)
-        snapshot = memory_backup.back_up_all_stores(keep, force=True)
-        failure = f"{snapshot['failed']} store(s) not copied" if snapshot["failed"] else ""
-    except Exception as exc:
-        snapshot, failure = {"backed_up": 0}, str(exc) or exc.__class__.__name__
+    copied, failure = snapshot_memory_before_update()
     if failure:
         print(f"  ❌ Pre-update memory snapshot failed: {failure}")
         print("     Not updating: the store would be rewritten with no fresh copy of it.")
@@ -1750,7 +1827,7 @@ def _snapshot_memory_or_exit() -> None:
     # store would point at the wrong place.
     newest = memory_backup.newest_backup()
     where = f"; default store copies in {newest.parent}" if newest is not None else ""
-    print(f"  💾 Memory snapshot: {snapshot['backed_up']} store(s) copied{where}\n")
+    print(f"  💾 Memory snapshot: {copied} store(s) copied{where}\n")
 
 
 def _update(force: bool = False) -> None:
@@ -2266,40 +2343,28 @@ def _update_wheel(layout) -> None:
     """
 
     from kiro_crew import __version__ as local_version
-    from kiro_crew.platform.update_governance import update_blocked_reason
+    from kiro_crew.platform import wheel_apply
     from kiro_crew.platform.update_layout import (
-        cdn_bases,
-        cdn_bases_are_safe,
         non_managed_pip_update_hint,
         release_channel,
         wheel_update_command,
     )
-    from kiro_crew.platform.wheel_engine import (
-        WheelUpdateError,
-        apply_wheel_update,
-        running_from_managed_venv,
-        running_from_pipx,
-    )
+    from kiro_crew.platform.wheel_engine import running_from_managed_venv, running_from_pipx
 
     channel = release_channel()
-    feed_base, artifact_base = cdn_bases()
-    feed_url = f"{feed_base}/feed/{channel}/latest-cli.json"
-
-    # Source-pin governance check: same seam the git path uses, applied to the
-    # feed URL so a pinned fleet's wheel installs cannot bypass the ceiling.
-    blocked = update_blocked_reason(feed_base)
-    if not blocked:
-        blocked = update_blocked_reason(artifact_base)
-    if blocked:
-        print(f"  🛡️  Update blocked by security policy: {blocked}")
-        sys.exit(1)
-
-    # Shell safety: cdn_bases() reads KIROCREW_CDN_BASE which is operator-set.
-    # Reject metacharacters that could enable command injection when the URL
+    # The one preflight every apply route runs, in its one order: the policy
+    # source pin on both CDN bases (a pinned fleet's wheel installs cannot bypass
+    # the ceiling), then the shape of the operator-set KIROCREW_CDN_BASE, which
     # flows through wheel_update_command() into ``sh -c``.
-    if not cdn_bases_are_safe():
-        print("  ❌ CDN base URL contains disallowed characters")
+    try:
+        feed_base, artifact_base = wheel_apply.preflight_bases()
+    except wheel_apply.WheelApplyRefused as exc:
+        if exc.code == "blocked_by_policy":
+            print(f"  🛡️  Update blocked by security policy: {exc.message}")
+        else:
+            print("  ❌ CDN base URL contains disallowed characters")
         sys.exit(1)
+    feed_url = f"{feed_base}/feed/{channel}/latest-cli.json"
 
     print(f"  📦 Install type: {layout.kind} (channel: {channel})")
     # feed_url embeds the CDN base; a userinfo-bearing KIROCREW_CDN_BASE
@@ -2352,7 +2417,7 @@ def _update_wheel(layout) -> None:
         sys.exit(1)
 
     remote_version = manifest.get("version", "")
-    if not remote_version:
+    if not remote_version or not isinstance(remote_version, str):
         print("  ❌ No version in release feed")
         sys.exit(1)
 
@@ -2376,44 +2441,7 @@ def _update_wheel(layout) -> None:
     # other shape (pipx, a bare venv the operator manages) keeps the
     # installer re-run, whose behavior is owned by cli.sh.
     if running_from_managed_venv():
-        _snapshot_memory_or_exit()
-        print("\n  🔄 Building the new version beside the current one…")
-        try:
-            promoted = apply_wheel_update(
-                channel=channel,
-                feed_base=feed_base,
-                artifact_base=artifact_base,
-                expected_version=remote_version,
-                progress=lambda msg: print(f"     {msg}"),
-            )
-        except (WheelUpdateError, OSError) as e:
-            # The engine wraps its own I/O failures in WheelUpdateError, but
-            # staging-filesystem errors raised outside those conversion sites
-            # (a full or unwritable disk at mkdir/tempdir time) surface as raw
-            # OSError — both take the same operator-facing failure path
-            # instead of a traceback.
-            # Failure text can quote the URL it tried, and the fallback
-            # installer command embeds the CDN base — either may carry
-            # credentials (a token-bearing KIROCREW_CDN_BASE), and this
-            # print lands in terminal history/scrollback. Same redaction
-            # pair the dashboard update surface applies before showing
-            # failure text.
-            from kiro_crew.security import (
-                redact_credentials,
-                redact_exfiltration_urls,
-            )
-
-            msg, _ = redact_credentials(str(e))
-            msg, _ = redact_exfiltration_urls(msg)
-            fallback, _ = redact_credentials(wheel_update_command(channel))
-            print(f"\n  ❌ {msg}")
-            print("  The current install was not modified. To update by")
-            print("  re-running the installer instead:")
-            print(f"    {fallback}")
-            sys.exit(1)
-        print(f"\n✅ Kiro Crew {remote_version} installed at {promoted}")
-        print("\n  Restart the gateway to switch to it:")
-        print("    kirocrew restart")
+        _update_managed_venv(channel, feed_base, artifact_base, remote_version)
         return
 
     # A plain `pip install` into an environment the user manages (not pipx, not
@@ -2468,23 +2496,47 @@ def _update_wheel(layout) -> None:
 
     # After the Windows refusal, so a host that cannot self-update never spends a copy.
     _snapshot_memory_or_exit()
+    # The installer moves the venv aside and restores it from its TERM trap,
+    # so it is never killed outright: it runs in its own session (one group to
+    # signal, not ours) and a timeout or Ctrl-C stops it with SIGTERM and a
+    # rollback grace before anything is SIGKILLed.
+    from kiro_crew.platform.update_provider import INSTALLER_TIMEOUT_TERM_GRACE_SECS
+
+    proc: subprocess.Popen | None = None
     try:
-        result = subprocess.run(
-            ["sh", "-c", cmd],
-            timeout=300,
-        )
+        proc = subprocess.Popen(["sh", "-c", cmd], start_new_session=True)
+        returncode = proc.wait(timeout=300)
     except FileNotFoundError:
         print("  ❌ 'sh' not found — cannot run the installer.")
         print("  To update manually, run:")
         print(f"    {cmd}")
         sys.exit(1)
     except subprocess.TimeoutExpired:
+        if proc is not None:
+            try:
+                platform_compat.terminate_and_reap_sync(
+                    proc, grace=INSTALLER_TIMEOUT_TERM_GRACE_SECS
+                )
+            except KeyboardInterrupt:
+                pass  # the stop already completed; still print the guidance below
         print("\n  ❌ Installer timed out (5 min)")
         print("  Try running manually:")
         print(f"    {cmd}")
         sys.exit(1)
-    if result.returncode != 0:
-        print(f"\n  ❌ Installer exited with code {result.returncode}")
+    except KeyboardInterrupt:
+        # The installer is outside the terminal's foreground group now, so
+        # Ctrl-C reaches only this process; pass the stop on gracefully.
+        if proc is not None:
+            print("\n  Stopping the installer (it restores the previous install)…")
+            try:
+                platform_compat.terminate_and_reap_sync(
+                    proc, grace=INSTALLER_TIMEOUT_TERM_GRACE_SECS
+                )
+            except KeyboardInterrupt:
+                pass  # a second Ctrl-C during the stop; the stop already completed
+        sys.exit(130)
+    if returncode != 0:
+        print(f"\n  ❌ Installer exited with code {returncode}")
         print("  Try running manually:")
         print(f"    {cmd}")
         sys.exit(1)
@@ -2492,6 +2544,81 @@ def _update_wheel(layout) -> None:
     print(f"\n✅ Kiro Crew updated to {remote_version}!")
     print("\n  Restart the gateway to use the new version:")
     print("    kirocrew restart")
+
+
+def _update_managed_venv(
+    channel: str, feed_base: str, artifact_base: str, remote_version: str
+) -> None:
+    """``kirocrew update`` on the managed venv: the shadow engine, in this shell.
+
+    The new version is built into a fresh sibling tree while this install keeps
+    working, verified, then promoted atomically; the running gateway is never
+    overwritten in place, and its restart picks the new tree up through the
+    stable link. Memory readiness is checked before anything is downloaded and
+    the copy taken just before promotion, the same steps every apply route runs.
+    Children get THIS shell's full environment (``trusted_env=False``), so a
+    toolchain on the operator's PATH reaches a source build. How the apply ended
+    is read through the one classification the gateway uses, and the installer
+    re-run is offered only where it is a real way forward: never while another
+    update holds the lock (it would race that apply's promotion) and never for a
+    refused memory copy (it would perform the un-copied update).
+    """
+    from kiro_crew.platform import wheel_apply
+    from kiro_crew.platform.wheel_engine import WheelUpdateError, apply_wheel_update
+
+    print("\n  🔄 Building the new version beside the current one…")
+
+    def _progress(msg: str) -> None:
+        print(f"     {msg}")
+
+    failure: BaseException | None = None
+    reattach = False
+    try:
+        # Inside the try: a feed version outside the release grammar is refused here.
+        reattach = wheel_apply.userns_reattach_needed(remote_version)
+        promoted = apply_wheel_update(
+            channel=channel,
+            feed_base=feed_base,
+            artifact_base=artifact_base,
+            expected_version=remote_version,
+            progress=_progress,
+            preflight=wheel_apply.check_memory_ready,
+            before_promote=wheel_apply.memory_snapshot_hook(_progress),
+            trusted_env=False,
+        )
+    except (WheelUpdateError, OSError) as exc:
+        # The engine wraps its own I/O failures in WheelUpdateError, but
+        # staging-filesystem errors raised outside those conversion sites (a
+        # full or unwritable disk at mkdir/tempdir time) surface as raw OSError;
+        # both take the operator-facing path instead of a traceback.
+        failure = exc
+    outcome = wheel_apply.classify(failure)
+    if outcome.status == "promoted":
+        print(f"\n✅ Kiro Crew {remote_version} installed at {promoted}")
+        if reattach:
+            print(f"\n  ⚠️  {wheel_apply.userns_reattach_after_apply(remote_version)}")
+            return
+        print("\n  Restart the gateway to switch to it:")
+        print("    kirocrew restart")
+        return
+    # Redacted: failure text can quote the URL it tried, which may carry
+    # credentials from a token-bearing KIROCREW_CDN_BASE.
+    message = wheel_apply.shown_failure_text(str(failure), limit=None)
+    if outcome.status == "busy":
+        print(f"\n  ⏳ {message}")
+        print("     Another update (possibly the gateway's own) is in progress. Wait for it")
+        print("     to finish, then run `kirocrew update` again.")
+        sys.exit(1)
+    print(f"\n  ❌ {message}")
+    if outcome.status in ("snapshot_failed", "deferred"):
+        sys.exit(1)
+    if outcome.status == "incompatible":
+        print(f"  {wheel_apply.incompatible_remedy(channel)}")
+        sys.exit(1)
+    print("  The current install was not modified. To update by")
+    print("  re-running the installer instead:")
+    print(f"    {wheel_apply.installer_rerun_command(channel)}")
+    sys.exit(1)
 
 
 def _update_approve() -> None:
@@ -2773,8 +2900,10 @@ async def _gateway(
     # Resolve the dashboard's React build. Skipped in slack-only mode since no
     # dashboard will be served. When the prebuilt dist/ is missing the gateway
     # has no dashboard shell to serve and returns the "not found" guidance page;
-    # build the frontend to restore the full dashboard.
-    if not no_dashboard and ensure_dev_dist_symlink() is None:
+    # build the frontend to restore the full dashboard. Off the event loop: under
+    # an edition it waits for the staging lock and copies the whole bundle, and
+    # a lock acquire on the loop thread never waits at all.
+    if not no_dashboard and await asyncio.to_thread(ensure_dev_dist_symlink) is None:
         logging.getLogger(__name__).warning(
             "Dashboard dist/ not found — the dashboard will show the "
             "'not built' guidance page until the SPA is bundled. "

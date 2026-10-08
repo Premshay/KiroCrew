@@ -78,7 +78,6 @@ from kiro_crew.cron_service.claims import (  # noqa: F401 -- re-exported
     RunClaims,
     _manual_run_refused,
     _RunClaim,
-    _RunMarkers,
 )
 from kiro_crew.cron_service.execution import (  # noqa: F401 -- re-exported
     _SUBPROC_CLEANUP_ALLOWANCE_SECS,
@@ -96,6 +95,7 @@ from kiro_crew.cron_service.fields import (  # noqa: F401 -- re-exported
     _validate_cron_string_fields,
     apply_job_update,
     build_job,
+    validate_managed_by,
 )
 from kiro_crew.cron_service.folders import (  # noqa: F401 -- re-exported
     _CRON_FOLDERS_FILE,
@@ -167,6 +167,8 @@ from kiro_crew.cron_service.store import (  # noqa: F401 -- re-exported
     cron_store_lock,
     decode_jobs,
     encode_store,
+    quarantine_copies,
+    quarantine_unreadable_store,
     store_digest,
 )
 from kiro_crew.executors import cron_gate_budget  # noqa: F401 -- re-exported
@@ -272,6 +274,12 @@ def _default_dir() -> Path:
 
 # The doctor's two store readers stay defined here: `kirocrew doctor`'s facade
 # test pins `kiro_crew.cron` as the module that defines them.
+def cron_store_quarantine_copies() -> tuple[Path, list[Path]]:
+    """The cron store's path and every copy gateway startup moved aside, for doctor."""
+    store = config_dir() / _CRONS_FILE
+    return store, quarantine_copies(store)
+
+
 def unhealthy_jobs_from_disk() -> tuple[list[tuple[str, str]], list[tuple[str, str]], bool]:
     """Return ``(auto_paused, errored, loadable)`` for the doctor's cron check.
 
@@ -467,6 +475,8 @@ class CronService:
     ):
         self._dir = base_dir if base_dir is not None else _default_dir()
         self._path = self._dir / _CRONS_FILE
+        #: Where :meth:`create` moved an unparseable store, or None.
+        self.quarantined_store: Path | None = None
         self._on_job = on_job
         self._jobs: list[CronJob] = []
         self._timer_task: asyncio.Task[None] | None = None
@@ -615,6 +625,8 @@ class CronService:
         cls,
         base_dir: Path | None = None,
         on_job: Callable[[CronJob], Awaitable[str | None]] | None = None,
+        *,
+        quarantine_unreadable: bool = False,
     ) -> "CronService":
         """Async factory for event-loop contexts (the gateway).
 
@@ -630,6 +642,13 @@ class CronService:
 
         Genuinely-sync, loop-less processes (CLI, MCP server, apps SDK, tests)
         must keep using the plain constructor, which loads inline.
+
+        ``quarantine_unreadable`` is for gateway startup. A store that failed to
+        load refuses every write, and startup writes to it (app cron cleanup), so
+        a corrupt file stopped the gateway from serving at all. With the flag, an
+        unparseable file is renamed aside -- never rewritten or deleted -- and the
+        store reloads as missing: empty and writable. :attr:`quarantined_store`
+        then names the copy so the caller can tell the user where the jobs are.
         """
         self = cls(base_dir=base_dir, on_job=on_job, _defer_initial_load=True)
         # Bind to the gateway loop so off-loop mutation paths (async mutators'
@@ -637,9 +656,32 @@ class CronService:
         # re-arm the timer thread-safely — see _arm_timer / __init__ _loop.
         self._loop = asyncio.get_running_loop()
         await asyncio.to_thread(self._load)
+        if quarantine_unreadable and self._load_failed:
+            self.quarantined_store = await asyncio.to_thread(self._quarantine_unreadable_locked)
         # Resolve history usability off the loop too (deferred in __init__).
         await asyncio.to_thread(self._history.prepare)
         return self
+
+    def _quarantine_unreadable_locked(self) -> Path | None:
+        """Rename an unparseable store aside under the store lock and reload."""
+        try:
+            with self._file_lock():
+                moved = quarantine_unreadable_store(self._path)
+                if moved is not None:
+                    self._load()
+        except (CronStoreBusy, OSError):
+            # The startup this exists to rescue must not fail on the lock itself
+            # (busy, or an unwritable lock file): keep the refusing store as-is.
+            logger.warning("Could not lock the cron store; leaving the unreadable store in place")
+            return None
+        if moved is not None:
+            logger.warning(
+                "Cron store %s could not be parsed; moved it to %s and started with an "
+                "empty schedule. Run `kirocrew doctor` for how to restore it.",
+                self._path,
+                moved,
+            )
+        return moved
 
     async def start(self) -> None:
         """Load jobs and start the timer loop.
@@ -815,9 +857,9 @@ class CronService:
             # for stands in its place. The sweep skips all three itself; this
             # covers a store that changed under the sweep's awaits.
             return
-        # Mark the run this reap took: its finalizer consumes only its own
-        # marker.
-        self._runs.reaped.mark(job_id, taken)
+        # Flag the run this reap took: its finalizer reads the flag off its
+        # own claim, so no other run of the job can see it.
+        taken.reaped = True
         reap_started_at = taken.claimed_at
         reap_trigger = taken.trigger
         # The kill, then the finish -- in a ``finally``, so the claim this reap
@@ -1409,10 +1451,9 @@ class CronService:
         start-id reads around the child walk, the group signal (by the group id
         retained while the leader was alive once the leader is gone), the
         pid-scoped fallback, the escaped-children sweep -- is
-        :func:`kiro_crew.process_identity.kill_verified_process`, whose only
-        caller today is this method; the sub-agent manager's twin of this path
-        still runs its own copy of the old kill, and its move onto the same
-        function is tracked follow-up work, not a change here. It never
+        :func:`kiro_crew.process_identity.kill_verified_process`, the one
+        definition this method shares with the sub-agent manager's teardown
+        paths. It never
         raises (the caller took the run's claim and must still finish it) and
         never swallows: it returns what stopped the kill, and the caller records
         it so the audit does not say the run was reaped over a process tree left
@@ -1505,11 +1546,9 @@ class CronService:
         """
         # A finished task is not a running execution, whatever the claim says.
         # Trusting the claim here would kill nothing, answer True, record a
-        # "Cancelled by user after Ns" row for a run that ended long ago, and
-        # mark the run in self._runs.cancelled for a finally that never runs (the
-        # task is done) -- so the job's NEXT real run would be treated as
-        # cancelled and drop its result. Release the leftovers and answer
-        # "not running" instead; a live task is untouched and cancels below.
+        # "Cancelled by user after Ns" row for a run that ended long ago.
+        # Release the leftovers and answer "not running" instead; a live
+        # task is untouched and cancels below.
         self.discard_finished_run(job_id)
         if job_id not in self._claims:
             return False
@@ -1524,10 +1563,9 @@ class CronService:
             # answer "not running", as the route does for an idle job.
             return False
         logger.info("Cancel: user-initiated cancellation of cron job %s", job_id)
-        # Mark the run this cancel took (see _RunMarkers): a marker keyed by
-        # job id alone would be consumed by whichever finalizer of this job
-        # reads it first.
-        self._runs.cancelled.mark(job_id, claim)
+        # Flag the run this cancel took (_RunClaim.cancelled): the flag lives
+        # on this run's claim, so only this run's finalizer can read it.
+        claim.cancelled = True
         started_at = claim.claimed_at
         trigger = claim.trigger
         elapsed = time.time() - started_at
@@ -1826,6 +1864,43 @@ class CronService:
             return None
         self._arm_timer()
         logger.info("Added cron job '%s' (%s) [if-absent]", job.name, job.id)
+        return job
+
+    def add_managed_job(self, managed_by: str, **kwargs: Any) -> CronJob:
+        """Create the job an installer owns under the key *managed_by*.
+
+        *kwargs* are :meth:`add_job`'s fields and are validated by the same
+        :func:`build_job` before any disk work. The key is unique across the
+        store, and this is its only writer, so the uniqueness holds by
+        construction: an existing job under the key is a refusal
+        (``ValueError`` naming its id), checked INSIDE the store lock after
+        ``_sync_for_write()`` so two installers racing the same key cannot both
+        see it absent and persist two jobs.
+
+        There is deliberately no replace-in-place. Every run-driven removal --
+        a script that raises ``Done``, a one-shot consumed on completion, a
+        deferred removal -- deletes its row BY ID with no record of which
+        definition the run started from, so a replacement reusing the id would
+        be deleted by the run it replaced. An installer re-installs with
+        ``cron remove --managed-by KEY`` then ``cron add --managed-by KEY``: the
+        new job gets a fresh id, so an in-flight run can only remove the dead
+        one. Replace-in-place needs a definition-generation fence first.
+        """
+        validate_managed_by(managed_by)
+        job = self._build_job(**kwargs)
+        job.managed_by = managed_by
+        # The shared locked check-then-append core: the key check runs after
+        # the in-lock reload, so two racing installers cannot both persist.
+        if not self._persist_add_if_absent_locked(lambda j: j.managed_by == managed_by, job):
+            existing = ", ".join(
+                j.id for j in self.list_jobs(include_disabled=True) if j.managed_by == managed_by
+            )
+            raise ValueError(
+                f"a job is already managed by {managed_by!r} ({existing}); "
+                f"remove it with 'cron remove --managed-by {managed_by}' first"
+            )
+        self._arm_timer()
+        logger.info("Added managed cron job '%s' (%s) for %s", job.name, job.id, managed_by)
         return job
 
     def _persist_add_if_absent_locked(
@@ -3171,16 +3246,6 @@ class CronService:
     def _claims(self, claims: dict[str, _RunClaim]) -> None:
         self._runs.claims = claims
 
-    @property
-    def _reaped_jobs(self) -> _RunMarkers:
-        """Runs the reaper killed, keyed by their claim (:attr:`RunClaims.reaped`)."""
-        return self._runs.reaped
-
-    @property
-    def _cancelled_jobs(self) -> _RunMarkers:
-        """Runs ``cancel()`` took, keyed by their claim (:attr:`RunClaims.cancelled`)."""
-        return self._runs.cancelled
-
     def _claim_run(self, job_id: str, trigger: str) -> _RunClaim:
         """Claim ``job_id`` for a new run and return the claim (:meth:`RunClaims.claim`).
 
@@ -3265,12 +3330,8 @@ class CronService:
         except BaseException:
             # No run will consume the claim: release it unless cancel() already
             # took it (the fence fails) or a newer claim has replaced it. A
-            # cancel() that reached us here also marked this claim in
-            # self._runs.cancelled for _run_job_isolated's finally to consume -- a
-            # finally this run never spawns -- so consume it here, or the
-            # marker would outlive its run.
+            # cancel flag cancel() set goes with the claim.
             self._runs.release(job_id, claim)
-            self._runs.cancelled.consume(job_id, claim)
             raise
         if not self._runs.holds(job_id, claim):
             # cancel() took the claim while the refresh was in flight and is
@@ -3278,9 +3339,6 @@ class CronService:
             # tracked task only after its process-kill / session-reset awaits,
             # so this coroutine can resume inside that gap. Dispatching here
             # would start the very run cancel() is about to report cancelled.
-            # The marker cancel() left is keyed to this claim, for a
-            # _run_job_isolated finally that never runs; consume it here.
-            self._runs.cancelled.consume(job_id, claim)
             return False
         job = next((j for j in snapshot if j.id == job_id), None)
         if not job:
@@ -3692,7 +3750,7 @@ class CronService:
         a ``cancel()`` in that gap takes the claim, marks the cancellation for
         it, and awaits the process kill BEFORE it cancels the task, so the task
         starts inside ``cancel()``: a claim read back from the store there would
-        be one this run does not own, the finally's marker lookup would miss,
+        be one this run does not own, the finally's flag read would miss,
         and the run would be filed as a failure beside the cancelled row
         ``cancel()`` writes.
         """
@@ -3701,10 +3759,8 @@ class CronService:
             # wrote the run's terminal row and is about to cancel this task.
             # Run nothing -- a stamp set now would sit on a claim that is no
             # longer this run's to release, and that finally would double the
-            # row already written. The markers cancel() and the reaper key to
-            # this claim are consumed here, the one place left that can.
-            self._runs.cancelled.consume(job.id, claim)
-            self._runs.reaped.consume(job.id, claim)
+            # row already written. The flags cancel() and the reaper set live
+            # on this claim and go with it.
             return
         # This run's generation, drawn while it verifiably holds the claim;
         # the finally stamps it on the record it merges (see CronJob).
@@ -3764,10 +3820,8 @@ class CronService:
             # The jitter sleep MUST live inside this try: hourly/daily jobs
             # sleep up to 59 min here, and a user cancel() during that window
             # raises CancelledError at the sleep — if that happened BEFORE the
-            # try, the finally below would never run, leaking this run's
-            # self._runs.cancelled marker (and the rest of the bookkeeping): the
-            # run-keyed marker stays inert for later runs, but nothing else
-            # would ever consume it.
+            # try, the finally below would never run, leaking the rest of this
+            # run's bookkeeping (the in-flight marker, the claim release).
             if jitter > 0:
                 logger.debug("Cron: applying %.0fs jitter to job '%s'", jitter, job.name)
                 await _sleep_out_jitter(jitter)
@@ -3807,7 +3861,7 @@ class CronService:
                 logger.debug("push_refresh failed on job start", exc_info=True)
             await self._execute_with_timeout(job, claim)
         except asyncio.CancelledError:
-            # stop() cancels this task WITHOUT marking self._runs.cancelled, so the
+            # stop() cancels this task WITHOUT setting claim.cancelled, so the
             # finally must know not to clear the last completed run's result.
             being_cancelled = True
             raise
@@ -3834,14 +3888,14 @@ class CronService:
                 )
             except Exception:
                 logger.debug("in-flight marker not cleared for %s", job.id, exc_info=True)
-            # Consume only THIS run's markers (identity on its claim).
-            # cancel() and the reaper mark the run they took; a marker keyed
-            # by job id alone would let this finalizer, stalled in the clear
-            # above while a replacement run was accepted and cancelled, eat
-            # that run's marker -- its finalizer then finds none and appends a
-            # failure row after the cancelled row cancel() already wrote.
-            reaped = self._runs.reaped.consume(job.id, claim)
-            cancelled = self._runs.cancelled.consume(job.id, claim)
+            # Read only THIS run's flags, off its own claim. cancel() and the
+            # reaper flag the claim they took; a marker keyed by job id alone
+            # would let this finalizer, stalled in the clear above while a
+            # replacement run was accepted and cancelled, eat that run's
+            # marker -- its finalizer then finds none and appends a failure
+            # row after the cancelled row cancel() already wrote.
+            reaped = claim.reaped
+            cancelled = claim.cancelled
             # This run's terminal record, taken BEFORE the release below. The
             # job object is shared by every run of the job, and the release
             # lets a replacement start while the merge and history append are
@@ -4061,16 +4115,16 @@ class CronService:
                 # "error" without counting a failure) stay neutral: a policy
                 # denial neither spends nor refills the budget. Callback
                 # paths that already called record_success() are unaffected
-                # (resetting 0 to 0 is idempotent). The self._runs.cancelled
+                # (resetting 0 to 0 is idempotent). The claim.cancelled
                 # check closes a cancel race: cancel() kills the sandboxed
                 # subprocess BEFORE task.cancel(), and the gateway's
                 # cancelled branch returns None without setting last_status,
                 # so a callback returning in that window would otherwise
                 # reach this branch — and cancel() documents that it leaves
-                # consecutive_failures untouched. Asked for THIS run's claim:
-                # cancel() has taken the stored claim by now, and a marker
-                # left by another run of the job is not this run's.
-                if not self._runs.cancelled.has(job.id, claim):
+                # consecutive_failures untouched. Read off THIS run's claim:
+                # cancel() has taken the stored claim by now, and a flag set
+                # on another run of the job is not this run's.
+                if claim is None or not claim.cancelled:
                     job.record_success()
         except Exception as exc:
             job.last_status = "error"

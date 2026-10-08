@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator, NamedTuple
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from kiro_crew import platform_compat
@@ -49,6 +49,7 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.owner_only_files import ensure_directory
 from kiro_crew.pinned_fs import supports_pinned_walk
 from kiro_crew.platform import current_context, safe_context_call
 from kiro_crew.platform_compat import is_link_or_junction
@@ -78,7 +79,7 @@ def app_dir(name: str) -> Path:
 def app_data_dir(name: str) -> Path:
     """Return the app-scoped data directory: ``~/.kiro/crew/apps/{name}/data/``."""
     d = app_dir(name) / "data"
-    d.mkdir(parents=True, exist_ok=True)
+    ensure_directory(d)  # 0700 in the data home, apps/ and apps/<name>/ included
     return d
 
 
@@ -1382,19 +1383,23 @@ def _remove_any_shape(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
+def uninstall_app(name: str, *, keep_data: bool = True, retired_builtin: bool = False) -> AppResult:
     """Uninstall an app while preserving its ``data/`` directory by default.
 
     Passing ``keep_data=False`` is the explicit purge action. Resource
     deregistration should be done before calling this.
-    Built-in apps cannot be uninstalled — only disabled.
+    Built-in apps stay locked unless explicitly cleaning up an eligible retired builtin.
     """
     if not _check_path_safety(name):
         return AppResult(ok=False, name=name, error=f"unsafe app name: {name!r}")
     meta = _read_installed(name)
     if not meta:
         return AppResult(ok=False, name=name, error=f"app {name!r} is not installed")
-    if meta.lifecycle == "locked":
+    if retired_builtin and not migrated_builtin_cleanup_applies(name):
+        return AppResult(
+            ok=False, name=name, error="not a migrated builtin", error_code="not_orphaned"
+        )
+    if meta.lifecycle == "locked" and not retired_builtin:
         return AppResult(
             ok=False,
             name=name,
@@ -1509,7 +1514,7 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
                 # Same creator election as the provisioner: uninstall can race
                 # its first open before either caller holds the dependency lock.
                 _lfd = platform_compat.open_create_or_existing(
-                    _lock_name, _lflags, 0o644, dir_fd=_data_pin.fd,
+                    _lock_name, _lflags, 0o600, dir_fd=_data_pin.fd,
                 )
                 _deps_lock = contextlib.ExitStack()
                 _lf = _deps_lock.enter_context(os.fdopen(_lfd, "r+"))
@@ -1778,6 +1783,9 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
         remove_dev_app(name)
     except Exception:
         logger.debug("dev-mode cleanup on uninstall of %r failed", name, exc_info=True)
+    # The orphan set may have named this app; a successor installed under the
+    # same name must not inherit its stale `orphaned` flag.
+    invalidate_orphan_cache()
     return AppResult(ok=True, name=name, message=f"uninstalled {name}{residual}")
 
 
@@ -2326,120 +2334,6 @@ def list_apps() -> list[dict[str, Any]]:
     return result
 
 
-class AppsListing(NamedTuple):
-    """What :func:`list_apps` returned, and whether it saw every app on disk."""
-
-    #: Exactly what :func:`list_apps` returns, unchanged.
-    apps: list[dict[str, Any]]
-    #: False when at least one entry in the apps root stood for an app that
-    #: :func:`list_apps` dropped. An app absent from ``apps`` then carries no
-    #: information: it cannot be read as "no such app is installed".
-    complete: bool
-
-
-def _path_is_occupied(path: Path) -> bool:
-    """Whether something is AT *path*, judged without resolving it.
-
-    ``Path.exists`` follows a symlink, so a dangling ``installed.json`` link reads
-    absent while :func:`_read_installed` still fails on it -- and the two answers
-    together say "no such app" about an app that is on disk. ``is_symlink`` does not
-    close it either: it is False for a Windows directory junction, so a dangling
-    junction stays invisible to every predicate that resolves its target.
-
-    Anything uninspectable counts as present, the same fail-to-unknown direction
-    :func:`_absence_is_genuine` takes.
-    """
-    try:
-        return path.exists() or path.is_symlink() or is_link_or_junction(path)
-    except OSError:
-        return True
-
-
-def _entry_stands_for_a_dropped_app(entry: Path) -> bool:
-    """Whether a root entry :func:`list_apps` did not return still holds an app's claim.
-
-    A DIRECTORY that still has its record file counts: :func:`list_apps` reaches
-    ``if not meta: continue`` for a record that does not read and drops the app
-    silently, so the directory is the only remaining evidence the app is there.
-
-    A non-directory entry counts when it is link-ish or uninspectable.
-    :func:`list_apps` skips any entry that is not a readable directory, so an app
-    root replaced by a dangling symlink or junction is not a dir, is not listed, and
-    its record is unreachable -- every resolving predicate agrees the app is absent
-    when something is plainly occupying its name.
-
-    An entry that inspects cleanly as a plain FILE is deliberately NOT counted. It
-    cannot be told apart from an ordinary non-app file in this directory, and
-    treating every such file as a dropped app would leave the listing permanently
-    incomplete, which costs every caller that reads completeness as doubt. An app
-    root overwritten by a plain file is the residue that leaves.
-    """
-    try:
-        if entry.is_dir():
-            return _path_is_occupied(entry / INSTALLED_META_FILENAME)
-        return entry.is_symlink() or is_link_or_junction(entry)
-    except OSError:
-        return True
-
-
-def list_apps_with_skips() -> AppsListing:
-    """:func:`list_apps`, plus whether it dropped an app that is on disk.
-
-    :func:`list_apps` drops an app whose installed record does not read, and drops
-    it SILENTLY rather than raising, so its return value on its own cannot separate
-    "no such app is installed" from "that app's record went unread". A caller that
-    must tell those apart -- one deciding whether an absent app means a name is
-    genuinely unclaimed -- has no way to ask, and the wrong answer is on the
-    unrecoverable side.
-
-    This reports the second case, so the decision belongs to the module that owns
-    the skip rules. ``agent.py``'s rebuild consumed a copy of this walk before, in a
-    module where a change to ``list_apps``'s record layout or skip behaviour would
-    have left the copy stale with nothing failing.
-
-    ``complete`` is a property of the LISTING, not of any one app: it says only that
-    something on disk stood for an app the list does not carry. It does not name
-    which, because the dropped record is exactly the thing that could not be read.
-
-    Raises only what :func:`list_apps` raises, so an unreadable registry stays
-    distinguishable from an empty one. A root that cannot be WALKED is reported as an
-    incomplete listing instead, because the apps it would have vouched for are
-    already in ``apps``.
-    """
-    apps = list_apps()
-    try:
-        named = {app.get("name") for app in apps if isinstance(app, dict)}
-        root = apps_dir()
-        if not root.is_dir():
-            # Nothing can be enumerated here, so the two shapes are told apart by
-            # whether anything is AT the root rather than by walking it.
-            #
-            # An ABSENT root is the ordinary "nothing installed" case, and
-            # :func:`list_apps` returns the same empty list for it, so the listing is
-            # complete and an app missing from it really is not installed.
-            #
-            # A root something else OCCUPIES is the opposite answer. Every installed
-            # app's record is underneath it and none of them can be reached, while no
-            # entry can stand for them either because the walk cannot run at all. So
-            # completeness is unknown, and reporting it as unknown is what stops a
-            # caller pruning a claim it merely could not read.
-            #
-            # A plain FILE counts here, where :func:`_entry_stands_for_a_dropped_app`
-            # deliberately does not count one. The reason is the position, not the
-            # shape: a file BESIDE the app directories is an ordinary member of a
-            # healthy apps root, and counting it would hold every normal listing
-            # incomplete, whereas a file standing WHERE the root belongs has replaced
-            # the whole directory and no healthy installation looks like that.
-            return AppsListing(apps, not _path_is_occupied(root))
-        dropped = any(
-            entry.name not in named and _entry_stands_for_a_dropped_app(entry)
-            for entry in root.iterdir()
-        )
-    except Exception:  # noqa: BLE001 — a root that cannot be read vouches for nothing
-        return AppsListing(apps, False)
-    return AppsListing(apps, not dropped)
-
-
 def get_app(name: str) -> dict[str, Any] | None:
     """Return full metadata for a single installed app, or None."""
     meta = _read_installed(name)
@@ -2594,6 +2488,24 @@ def is_app_enabled(name: str) -> bool:
     """
     meta = _read_installed(name)
     return bool(meta and meta.enabled)
+
+
+# The builtin that owns the Task Runner page. Its routes are host-owned, so the
+# start paths read this app's switch themselves (see ``app_disabled``).
+TASK_RUNNER_APP = "projects"
+TASK_RUNNER_DISABLED_MESSAGE = "Task Runner is disabled. Enable it in Library to start tasks."
+
+
+def app_disabled(name: str) -> bool:
+    """True only when the app is installed and switched off.
+
+    Not ``not is_app_enabled(name)``: that is also True when no record exists,
+    and a host-owned surface (Task Runner on a headless host or in tests) runs
+    without one. Only an explicit ``enabled: false`` reads as disabled here.
+    Read-only, like :func:`is_app_enabled`.
+    """
+    meta = _read_installed(name)
+    return meta is not None and not meta.enabled
 
 
 def set_app_source(name: str, source: str) -> bool:
@@ -3644,7 +3556,7 @@ def register_builtin_apps() -> int:
         existing = _read_installed(name)
 
         dest = app_dir(name)
-        dest.mkdir(parents=True, exist_ok=True)
+        ensure_directory(dest)  # apps/<name>/ is born 0700 in the data home
 
         # A pre-existing entry this function did not write belongs to the USER:
         # they installed an app that happens to share this builtin's name. Taking
@@ -3820,6 +3732,30 @@ def invalidate_orphan_cache() -> None:
 # ---------------------------------------------------------------------------
 # Migration cleanup
 # ---------------------------------------------------------------------------
+
+
+def migrated_builtin_cleanup_applies(name: str) -> bool:
+    """Whether a safe builtin-owned record qualifies for migration teardown and removal.
+
+    An app directory that is a symlink or junction is ineligible, and so is anything
+    at ``data`` that is not a real directory (:func:`gateway_data_dir_obstruction`):
+    the teardown keeps only a directory there, so it would delete anything else.
+    """
+    from kiro_crew.apps.builtins import _MIGRATED_BUILTINS
+
+    if not _check_path_safety(name):
+        return False
+    path = app_dir(name)
+    if path.is_symlink() or is_link_or_junction(path):
+        return False
+    if gateway_data_dir_obstruction(path):
+        return False
+    meta = _read_installed(name)
+    return bool(
+        meta
+        and meta.origin == "builtin"
+        and (name in _MIGRATED_BUILTINS or name in detect_orphaned_builtins(force_refresh=True))
+    )
 
 
 def cleanup_migrated_builtin(name: str) -> AppResult:

@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from turn_harness import Do, ScriptedProvider, SlotSpec, TurnScript, run_turn
 
+from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, STOP_REASON_END_TURN, AcpEvent
 from kiro_crew.crew_log import bus, emit
 from kiro_crew.crew_log import session_tree_projection as stp
 from kiro_crew.crew_log.session_tree import EDGE_NAMED, EDGE_NONE, EdgeRecord, OpenedRecord
@@ -151,6 +154,38 @@ def test_a_restored_slot_s_first_turn_seeds_before_it_reads():
     restored = SimpleNamespace(key="worker", _created_by="lead")
     asyncio.run(chat_runner._crew_log_seed_tree(restored))
     assert chat_runner._crew_log_inherited_parent(restored, "s-worker-1") == "lead"
+
+
+@pytest.mark.asyncio
+async def test_a_restored_child_that_never_ran_writes_no_creator_into_its_first_log():
+    """The nesting a just-dispatched child gets is IN MEMORY, and a restart ends it.
+
+    The sidebar nests such a child from the row's own ``created_by``, gated on
+    ``lineage_minted`` -- a witness this process holds and never persists. After a
+    restart the slot comes back with the claim and without the witness, so it nests
+    nowhere and its first ``session/opened`` cites no creator.
+
+    That is base behaviour and it is pinned here on purpose, because the obvious
+    improvement is unsafe: the claim is restored from a transcript an agent's file
+    tools can edit, and a slot KEY is reusable, so promoting it would let a fenced
+    caller that forged an archived tab's ``created_by`` be recorded as that tab's
+    creator in an append-only entry -- which is what
+    ``session_control.revive_session``'s ownership check then reads.
+    """
+    emit.on_session_opened("s-lead", agent="kirocrew-lead", slot="lead")
+    assert emit.flush(timeout=5.0) is True
+    stp.reset_for_tests()
+    emit.reset_caches()
+
+    record = await run_turn(
+        TurnScript(events=_LANDS, setup=_restored_worker), slot=SlotSpec(key="worker")
+    )
+
+    # ``_restored_worker`` carries the claim and not the witness, which is exactly the
+    # shape a restart leaves -- so the refusal below is the rule, not a missing input.
+    [opened] = _opened(record)
+    assert opened["previous_sid"] == ""
+    assert opened["parent_slot"] == ""
 
 
 def test_a_new_slot_on_a_reused_key_inherits_nothing():
@@ -396,6 +431,72 @@ def test_a_moved_parent_is_pushed_once_as_a_patch(state, monkeypatch):
     ]
 
 
+def _opened_log(sid: str, slot: str, *, parent: str | None = None) -> None:
+    """One session log on disk, opened the way the emitter opens one."""
+    from kiro_crew import crew_log as lg
+    from kiro_crew.crew_log import CrewLog
+
+    handle = CrewLog.create(lg.KIND_SESSION, sid, owner="raymond", agent="kirocrew", slot=slot)
+    data: dict[str, object] = {
+        "agent": "kirocrew",
+        "slot": slot,
+        "model": "opus",
+        "cwd": "/w",
+        "owner": "raymond",
+        "resumed": False,
+    }
+    if parent:
+        data["parent"] = {"slot": parent}
+    handle.append("session/opened", data, src="gateway")
+    del handle
+
+
+def _dispatch(state, key: str, creator: str) -> None:
+    """A child minted by *creator* through ``session_create``, before its first turn."""
+    child = state.get_or_create_slot(key, origin=SlotOrigin.USER)
+    child._created_by = creator
+    child._lineage_minted = True
+
+
+def test_a_sibling_s_first_log_keeps_a_pending_child_nested(state):
+    """Two dispatched workers; A opens its log first and the tree's patch fires.
+
+    B still has no node, so only its own mint witness can place it. The patch must
+    nest B under the lead exactly as the full frame does, not send ``parent: null``.
+    """
+    state.get_or_create_slot("lead", origin=SlotOrigin.USER)
+    _dispatch(state, "worker-a", "lead")
+    _dispatch(state, "worker-b", "lead")
+    ws = _WS()
+    state.register_ws(ws)  # type: ignore[arg-type]
+    _opened_log("s-lead", "lead")
+    _opened_log("s-a", "worker-a", parent="lead")
+    stp.projection().ensure_seeded()
+    assert "worker-b" not in stp.projection().nodes(), "B must not have a node yet"
+
+    state.push_lineage_patch()
+
+    rows = {row["key"]: row for frame in ws.patches() for row in frame}
+    assert rows["worker-a"]["parent"] == {"slot": "lead", "key": "lead"}
+    assert rows["worker-b"]["parent"] == {"slot": "lead", "key": "lead"}
+
+
+def test_a_removed_lead_re_states_its_pending_child_as_orphaned(state):
+    """The lead closes before its dispatched child ran: the removal patch must carry
+    the child with ``parent.key: None``, the value the full frame now gives it."""
+    state.get_or_create_slot("lead", origin=SlotOrigin.USER)
+    _dispatch(state, "worker-b", "lead")
+    ws = _WS()
+    state.register_ws(ws)  # type: ignore[arg-type]
+    _opened_log("s-lead", "lead")
+    stp.projection().ensure_seeded()
+
+    state._slots.pop("lead")
+    state.push_slot_removed("lead")
+
+    assert [{"key": "worker-b", "parent": {"slot": "lead", "key": None}}] in ws.patches()
+
+
 def test_the_publisher_coalesces_a_burst_into_one_push():
     from kiro_crew.dashboard.handlers.crew_log import COALESCE_SECONDS, CrewLogPublisher
 
@@ -499,22 +600,150 @@ def test_the_walk_passes_through_logs_loaded_from_a_checkpoint():
     assert stp.inherited_parent("worker", "s-worker-2") == "lead"
 
 
-def test_nothing_yields_between_the_class_read_and_the_emit():
-    """The take clears the slot's predecessor latch. A turn cancelled at an await after it
-    would lose the predecessor the next log has to cite, so the seed is awaited first."""
-    import inspect
+class _SeedHook:
+    """Stands in for the tree's ``ensure_seeded`` -- the one await before a restored
+    slot's log is opened -- and runs *during* it, on the worker thread it runs on."""
 
-    from kiro_crew.dashboard import chat_runner
+    def __init__(self, during=None) -> None:
+        self._real = stp.projection().ensure_seeded
+        self._during = during
+        self.calls = 0
 
-    source = inspect.getsource(chat_runner._run_chat)
-    take = source.index("slot.take_crew_log_previous(")
-    emit_at = source.index("crew_log_emit.on_session_opened(", take)
-    seed = source.index("await _crew_log_seed_tree(slot)")
-    # The class read is recorded in the same entry, so a yield after it would let a
-    # channel binding commit unseen and the opening would state a stale class.
-    class_read = source.index("= _crew_log_class(state, slot)")
-    assert seed < class_read < take
-    assert "await " not in source[class_read:emit_at]
+    def __call__(self) -> None:
+        self.calls += 1
+        if self._during is not None and self.calls == 1:
+            self._during()
+        self._real()
+
+
+def _restored_worker(ctx, *, predecessor: str = "") -> None:
+    """A slot restored after a restart: its creator is known, no lineage minted."""
+    ctx.slot._created_by = "lead"
+    ctx.slot._lineage_minted = False
+    if predecessor:
+        ctx.slot._crew_log_opened_sid = predecessor
+
+
+def _opened(record) -> list[dict]:
+    return [dict(call.kwargs) for call in record.crew("on_session_opened")]
+
+
+_LANDS = [
+    AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+    AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+]
+
+
+class _NewStore(ScriptedProvider):
+    """The slot's next turn lands on a new store."""
+
+    @property
+    def session_id(self) -> str:
+        return "acp-new"
+
+
+@pytest.mark.asyncio
+async def test_a_channel_bound_while_the_tree_seeds_is_in_the_opening_class(monkeypatch):
+    """The class is read AFTER the seed's await, so a channel binding that commits
+    while the tree seeds is in the opening entry -- not a stale "unpublished" class
+    whose later move had no log to land in."""
+    held: dict = {}
+
+    def _bind_now() -> None:
+        # The binding commits on the loop while the seed runs on its worker.
+        bound = threading.Event()
+
+        def _bind() -> None:
+            held["slot"].linked_session_key = "telegram:-100999"
+            bound.set()
+
+        held["loop"].call_soon_threadsafe(_bind)
+        assert bound.wait(timeout=5)
+
+    seed = _SeedHook(during=_bind_now)
+    monkeypatch.setattr(stp.projection(), "ensure_seeded", seed)
+
+    def _arrange(ctx) -> None:
+        _restored_worker(ctx)
+        held["slot"], held["loop"] = ctx.slot, asyncio.get_running_loop()
+
+    def _unbind(ctx) -> None:
+        # Back to unlinked once the log is open: delivery is not under test.
+        ctx.slot.linked_session_key = ""
+
+    record = await run_turn(
+        TurnScript(events=[Do(_unbind), *_LANDS], setup=_arrange), slot=SlotSpec(key="worker")
+    )
+    assert seed.calls == 1, "the tree was never seeded, so nothing was tested"
+    [opened] = _opened(record)
+    assert opened["channel"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_turn_cancelled_while_the_tree_seeds_keeps_its_predecessor(monkeypatch):
+    """The predecessor latch is read-and-clear, owed to exactly one log. The take
+    comes after the seed's await, so a turn cancelled there (Stop, tab close,
+    shutdown) leaves it for the slot's NEXT log to cite -- taken first, it would
+    be lost and that log would cite the wrong store, a gap no chain walker sees."""
+    held: dict = {}
+
+    def _cancel_the_turn() -> None:
+        held["loop"].call_soon_threadsafe(held["slot"].task.cancel)
+
+    monkeypatch.setattr(stp.projection(), "ensure_seeded", _SeedHook(during=_cancel_the_turn))
+
+    def _arrange(ctx) -> None:
+        _restored_worker(ctx, predecessor="s-prev")
+        held["slot"], held["loop"] = ctx.slot, asyncio.get_running_loop()
+
+    record = await run_turn(
+        TurnScript(
+            events=_LANDS,
+            setup=_arrange,
+            then=TurnScript(events=_LANDS, message="again", provider=_NewStore),
+        ),
+        slot=SlotSpec(key="worker"),
+    )
+    # The cancel landed in the seed: no log opened and the provider was never prompted.
+    assert _opened(record) == []
+    assert record.calls("stream") == []
+    assert record.then is not None
+    [opened] = _opened(record.then)
+    assert opened["previous_sid"] == "s-prev"
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_requested_while_the_class_is_read_finds_the_log_opened(monkeypatch):
+    """Nothing yields from the class read to the emit: the class, the predecessor
+    take and the ``session/opened`` entry are one moment. A cancel requested while
+    the class is being read therefore lands AFTER the log is open; a yield inside
+    that span would deliver it there and lose both the opening and the latch."""
+    held: dict = {"seeded": False, "armed": False}
+
+    def _seeded() -> None:
+        held["seeded"] = True
+
+    monkeypatch.setattr(stp.projection(), "ensure_seeded", _SeedHook(during=_seeded))
+
+    def _arrange(ctx) -> None:
+        _restored_worker(ctx, predecessor="s-prev")
+        read_mirror = ctx.state.sessions.get_mirror_link
+
+        def _get_mirror_link(key):
+            # The opening class read is the first mirror probe after the seed.
+            if held["seeded"] and not held["armed"]:
+                held["armed"] = True
+                asyncio.get_running_loop().call_soon(ctx.slot.task.cancel)
+            return read_mirror(key)
+
+        ctx.state.sessions.get_mirror_link = _get_mirror_link
+
+    record = await run_turn(TurnScript(events=_LANDS, setup=_arrange), slot=SlotSpec(key="worker"))
+    assert held["armed"], "the class read never probed the mirror, so nothing was tested"
+    [opened] = _opened(record)
+    assert opened["previous_sid"] == "s-prev"
+    # ...and the cancel did land, right after: the provider was never prompted.
+    assert record.calls("stream") == []
 
 
 def test_a_replay_marks_every_unit_whose_decision_it_did_not_read(monkeypatch):

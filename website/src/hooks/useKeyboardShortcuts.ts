@@ -1,11 +1,10 @@
 import { useEffect, useCallback, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAppDispatch, useAppStore } from '../store'
-import { switchSlot, deleteSlot, openActivityToTab, selectSidebarSubagentCounts, selectSidebarApprovalCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys } from '../store/chatSlice'
-import { inferLane } from '../pages/chat/sessionLane'
-import { normalizeRunSessionKey } from '../apps/workflows/runModel'
+import { switchSlot, deleteSlot, openActivityToTab } from '../store/chatSlice'
+import { sessionIsBusyForClose } from '../lib/closeBusyGate'
 import { loadChatConfig } from '../pages/chat/ChatSettings'
-import { queryComposerOrExpand, queryPendingApprovalAction, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
+import { focusComposerElement, queryComposerOrExpand, queryPendingApprovalAction, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { reportSeamCollision } from '../apps/seamCollision'
 import {
   loadPanelToggleOverrides,
@@ -38,6 +37,14 @@ import { canGoBack, canGoForward } from '../lib/routeHistoryPosition'
 import { useGuardedHistoryStep } from '../components/NavigationLeaveGuard'
 import { MOBILE_BREAKPOINT } from './useIsMobile'
 import { isEditableTarget } from '../utils/editableTarget'
+import { closeShownCrewWindow, crewWindowShown } from '../pages/chat/crew-window/crewWindowStore'
+
+/** Shortcuts scoped to the session on screen (see the crew-window guard). */
+const CREW_WINDOW_SCOPED: ReadonlySet<string> = new Set([
+  'close-chat', 'focus-input', 'focus-approval',
+  'cycle-agent', 'cycle-prev-agent', 'cycle-reasoning', 'cycle-prev-reasoning',
+  'cycle-approval', 'cycle-prev-approval', 'cycle-model', 'cycle-prev-model',
+])
 
 /**
  * Group ids + ordering live in the registry (`lib/shortcutRegistry`); re-exported
@@ -278,6 +285,8 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'edit-last-message': 'hooks.useKeyboardShortcuts.edit_last_message',
   'agent-monitor': 'hooks.useKeyboardShortcuts.open_agent_monitor',
   'stop-speaking': 'hooks.useKeyboardShortcuts.stop_speaking',
+  'notification-prev': 'hooks.useKeyboardShortcuts.previous_notification',
+  'notification-next': 'hooks.useKeyboardShortcuts.next_notification',
   'instance-1': 'hooks.useKeyboardShortcuts.switch_to_local',
   'instance-2': 'hooks.useKeyboardShortcuts.switch_to_remote_crew',
   'instance-3': 'hooks.useKeyboardShortcuts.switch_to_remote_crew',
@@ -699,10 +708,14 @@ interface UseKeyboardShortcutsOpts {
    * nav row disappears.
    */
   onToggleTerminal?: () => void
+  /** Add a docked terminal tab (VS Code's Create New Terminal), opening the
+   *  panel if needed. Same ownership and unbound-when-undefined rule as
+   *  `onToggleTerminal`. */
+  onNewTerminal?: () => void
   disabled?: boolean
 }
 
-export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, disabled }: UseKeyboardShortcutsOpts) {
+export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, disabled }: UseKeyboardShortcutsOpts) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const guardedHistoryStep = useGuardedHistoryStep()
@@ -786,7 +799,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     'session-panel': onToggleSessionPanel,
     'side-panel': onToggleSidePanel,
     'terminal': onToggleTerminal,
-  }), [onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal])
+    'terminal-new': onNewTerminal,
+  }), [onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal])
 
   const handler = useCallback((e: KeyboardEvent) => {
     const isInput = isEditableTarget(e)
@@ -1002,39 +1016,21 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         // composer was COLLAPSED and had to be asked back — without that, "focus
         // text input" silently did nothing for as long as the user left it
         // collapsed, which outlives a reload.
-        'focus-input': () => queryComposerOrExpand(ta => ta.focus()),
+        'focus-input': () => queryComposerOrExpand(focusComposerElement),
         // ⌘N / Ctrl+N (alias Option/Alt+Shift+N): new session.
         'new-chat': () => onNewChat(),
         // ⌘W / Ctrl+W (alias Option/Alt+Shift+W): close the current session —
-        // same semantics as the header-menu close (gated by confirmCloseSession,
-        // dispatches deleteSlot). One addition for the NEW chord surface: a
-        // session that is not IDLE always confirms. ⌘W/Ctrl+W is the most
+        // same semantics as the header-menu / sidebar close (gated by
+        // confirmCloseSession, dispatches deleteSlot, and a session that is not
+        // idle always confirms — `sessionIsBusyForClose`). ⌘W/Ctrl+W is the most
         // habitual chord there is (it closed the WINDOW in the previous desktop
-        // release on Windows/Linux), and `confirmCloseSession` defaults off — a
-        // default calibrated for the hard-to-mispress ⌥⇧W. An idle session is
-        // losslessly reopenable from the sidebar's older-sessions list, so it
-        // keeps the user's confirm setting; anything else is where a stray
-        // keystroke costs work, so it asks.
-        //
-        // "Not idle" is the sidebar's own lane inference, not `slot.running`: that
-        // flag covers only the slot's own turn and reads FALSE between the cycles
-        // of an armed goal loop, during a dynamic workflow, and while background
-        // sub-agents run — all of which `deleteSlot` retires. Reusing `inferLane`
-        // with the same extras the sidebar computes keeps this gate and the
-        // Working/Waiting/Needs-approval lanes from ever disagreeing.
+        // release on Windows/Linux). The ⌥⇧W alias keeps its shipped behaviour:
+        // only the user's confirm setting gates it.
         'close-chat': () => {
           if (!activeSlot) return
-          const slot = slots.find(s => s.key === activeSlot)
-          const state = appStore.getState()
-          const subagentsRunning = selectSidebarSubagentCounts(state)[activeSlot] || 0
-          const lane = slot ? inferLane(slot, {
-            subagentAwaiting: Math.min(selectSidebarApprovalCounts(state)[activeSlot] || 0, subagentsRunning),
-            workflowActive: normalizeRunSessionKey(activeSlot) in selectSidebarWorkflowActive(state),
-            goalLoopActive: selectSidebarAutomationRunningKeys(state).includes(activeSlot),
-            detailedSubagentsRunning: subagentsRunning > 0,
-          }) : 'idle'
           const modChord = e.metaKey || e.ctrlKey
-          const mustConfirm = loadChatConfig().confirmCloseSession || (modChord && lane !== 'idle')
+          const mustConfirm = loadChatConfig().confirmCloseSession
+            || (modChord && sessionIsBusyForClose(appStore.getState(), activeSlot))
           if (!mustConfirm || confirm(i18nT('hooks.useKeyboardShortcuts.close_this_session'))) {
             dispatch(deleteSlot(activeSlot))
           }
@@ -1042,6 +1038,14 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       }
       // Every `registry` entry has an action here (shortcutRegistry.test pins the
       // two sets). An id without one is left unclaimed rather than swallowed.
+      // A crew window covers the local session: shortcuts that act on "the
+      // current session" must not reach the hidden one. Close closes the
+      // window; the rest do nothing there.
+      if (crewWindowShown() && CREW_WINDOW_SCOPED.has(hit)) {
+        e.preventDefault()
+        if (hit === 'close-chat') closeShownCrewWindow()
+        return
+      }
       const action = Object.prototype.hasOwnProperty.call(actions, hit) ? actions[hit] : undefined
       if (action) {
         e.preventDefault()

@@ -28,6 +28,7 @@ from kiro_crew.jsonl_util import (
     UndecodableRecord,
     UnreadableRecord,
     bounded_raw_records,
+    bounded_raw_records_with_offsets,
     bounded_records,
     rotate_jsonl_at,
     strict_raw_records,
@@ -160,6 +161,24 @@ class TestBoundedRecordReaders:
         path = self._write(tmp_path, b'{"a":1}\n', b'{"a":2}\n')
         with open(path, "rb") as fh:
             assert list(bounded_records(fh, path, cap=RECORD_CAP)) == ['{"a":1}\n', '{"a":2}\n']
+
+    def test_offsets_resume_past_an_over_cap_record(self, tmp_path):
+        """A tail reader resumes from ``end``: an over-cap record is reported as
+        ``None`` so the offset moves past it instead of re-reading it every poll,
+        and an unterminated last record is told apart by its missing terminator."""
+        records = [b'{"a":1}\n', b"y" * 201 + b"\n", b'{"a":2}\r\n', b'{"a":3']
+        path = self._write(tmp_path, *records)
+        with open(path, "rb") as fh:
+            fh.seek(len(records[0]))
+            got = list(bounded_raw_records_with_offsets(fh, path, cap=200))
+        first = len(records[0])
+        second = first + len(records[1])
+        third = second + len(records[2])
+        assert got == [
+            (first, second, None),
+            (second, third, b'{"a":2}\r\n'),
+            (third, third + len(records[3]), b'{"a":3'),
+        ]
 
     def test_record_exactly_at_cap_survives(self, tmp_path):
         """The cap is INCLUSIVE: a cap-length record plus its terminator is fine."""
@@ -687,7 +706,6 @@ _KERNEL_PSEUDO_FILE_READERS = {
     ("platform_compat.py", "/proc/meminfo"),
     ("platform_compat.py", "/proc/locks"),
     ("platform_compat.py", "/proc/<pid>/status"),
-    ("acp/runtime_process_tree.py", "/proc/<pid>/status"),
 }
 # Fenced from agent file tools by security._CREW_SECRET_LEAVES, so it is outside
 # this issue's "agent-writable" premise. It is the tamper-evident audit chain, so
@@ -770,3 +788,40 @@ class TestNoUnboundedHandleIteration:
         src = Path(kiro_crew.__file__).parent
         for rel in sorted(_ALLOWED_UNBOUNDED_FILES):
             assert (src / rel).is_file(), f"excused reader {rel} no longer exists"
+
+
+def test_the_byte_ceiling_is_enforced_while_the_handle_is_consumed(tmp_path):
+    """``fstat`` describes the file at OPEN time, so the size check alone bounds nothing.
+
+    A writer holding the same path can append while the handle is being consumed, and the pre-fix
+    reader then delivered every one of those bytes. The cap has to be charged against what the
+    caller actually receives; removing that accounting re-fails this.
+    """
+    import errno
+
+    from kiro_crew.jsonl_util import open_regular_nofollow
+
+    path = tmp_path / "grows-under-the-reader.jsonl"
+    path.write_bytes(b'{"one":1}\n')
+
+    with pytest.raises(OSError) as caught:
+        with open_regular_nofollow(path, max_bytes=64) as handle:
+            # The open already passed its size check, so only a cumulative cap can see this.
+            with open(path, "ab") as writer:
+                writer.write(b"x" * 8192)
+            handle.read()
+
+    assert caught.value.errno == errno.EFBIG, caught.value
+
+
+def test_a_file_of_exactly_the_ceiling_still_reads_to_the_end(tmp_path):
+    """The cap must refuse only an OVERRUN: charging the EOF read would refuse a legal file."""
+    from kiro_crew.jsonl_util import open_regular_nofollow
+
+    path = tmp_path / "exactly-at-the-ceiling.jsonl"
+    payload = b"y" * 64
+    path.write_bytes(payload)
+
+    with open_regular_nofollow(path, max_bytes=64) as handle:
+        assert handle.read() == payload
+        assert handle.read() == b""

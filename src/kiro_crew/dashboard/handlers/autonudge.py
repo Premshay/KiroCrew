@@ -346,6 +346,9 @@ def _autonudge_loop_reading(loop: Any) -> dict[str, Any]:
         "created_ts": loop.created_ts,
         "next_due_ts": loop.next_due_ts,
         "stopped_reason": loop.stopped_reason,
+        # Active but holding: a cycle's approval went unanswered and it fires
+        # nothing until a person answers one, sends a message or fires it.
+        "paused_for_approval": bool(loop.approval_stalled) and not is_structured_monitor_loop(loop),
         "has_banner": bool(loop.banner),
     }
 
@@ -944,7 +947,7 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
     if svc is None:
         return web.json_response(
             {
-                "error": "auto-nudge disabled (KIROCREW_AUTONUDGE not set)",
+                "error": "auto-nudge disabled (KIROCREW_AUTONUDGE is 0/false/no)",
                 "code": "autonudge_disabled",
             },
             status=503,
@@ -1223,12 +1226,10 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
       product decision — the fire path this route arms already made it, with its
       reason written down at the site: queueing "would stack identical 3KB+
       nudges and blow up the context window" (``_fire_dashboard_nudge``). The
-      predicate is the repository's canonical one, ``slot.running or
-      slot._in_stage_execution``, read here exactly as the cron-injection
-      handler reads it (``handlers/messaging.py``) — ``slot.running`` alone is
-      False between the stages of a multi-stage plan, so it would let this land
-      a concurrent turn on top of the plan. Note the two consumers of that
-      predicate diverge deliberately: the cron path QUEUES, this one REFUSES,
+      predicate is the repository's canonical one, ``slot.running``, read here
+      exactly as the cron-injection handler reads it
+      (``handlers/messaging.py``). Note the two consumers of that predicate
+      diverge deliberately: the cron path QUEUES, this one REFUSES,
       and the nudge path's stated reason is the one that applies here.
 
       This check is an AFFORDANCE, not a guarantee: a turn that starts between
@@ -1359,7 +1360,7 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
         )
     state: DashboardState = request.app["state"]
     slot = state.get_slot(existing.slot_key)
-    if slot is not None and (slot.running or slot._in_stage_execution):
+    if slot is not None and slot.running:
         # Names the OUTCOME and the NEXT STEP, not just the condition. "a turn is
         # in flight" leaves a reader unable to tell a refusal from a delay, and
         # the distinction is the whole point here: the press was refused, not
@@ -1384,6 +1385,24 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
                 "error": "audit log unavailable: the nudge was NOT sent, "
                 "so fix the audit store and press again",
                 "code": "audit_unavailable",
+            },
+            status=503,
+        )
+    # A person pressed fire: that ends an approval hold first, or the armed tick
+    # would find the loop still paused and the press would do nothing. Unarmed,
+    # because fire_now arms the tick itself.
+    try:
+        await svc.release_approval_hold(existing.slot_key, why="fired by hand", arm=False)
+    except Exception:
+        # The hold stays as the store has it, so a fire now would only hold
+        # again: refuse it out loud rather than report a press that did nothing.
+        logger.warning("autonudge: releasing the approval hold failed", exc_info=True)
+        await _audit("denied", existing.slot_key, "approval_hold_release_failed")
+        return web.json_response(
+            {
+                "error": "nudge not sent: the loop is paused for approval and could "
+                "not be resumed, so press again",
+                "code": "approval_hold_release_failed",
             },
             status=503,
         )

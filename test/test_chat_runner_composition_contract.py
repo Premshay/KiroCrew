@@ -105,13 +105,14 @@ _BASE_NAMES = frozenset("""
         SESSION_NOT_FOUND_CANCELLED_TEXT
         SESSION_NOT_FOUND_GIVE_UP_TEXT SESSION_NOT_FOUND_RETRY_TEXT
         SESSION_RECOVERY_MAX_ATTEMPTS SESSION_START_FAILED_KIND SLACK_NAMESPACE
-        STAGE_DELIVERY_KINDS STALE_RECOVERY_PREFIX
+        STALE_RECOVERY_PREFIX
         STEER_NOTICE_BOUND_SECS STEER_POSSIBLY_DELIVERED_META
         STEER_POSSIBLY_DELIVERED_NOTE STEER_STATE_CONSUMED
         STEER_STATE_REQUEUED STOP_CLASS_FAILED STOP_REASON_CANCELLED
         STOP_REASON_COMPACTION_FAILED STOP_REASON_END_TURN STOP_REASON_REFUSAL
         STOP_REASON_STALE_RECOVER STOP_REASON_TOOL_STALL STOP_RECOVERY_MAX_RETRIES
-        SUBAGENT_COMPLETION_KIND SUBAGENT_COMPLETION_PREFIXES SUBAGENT_SYNTHESIS_PREFIX
+        SUBAGENT_COMPLETION_KIND SUBAGENT_COMPLETION_PREFIXES SUBAGENT_DELIVERY_KINDS
+        SUBAGENT_SYNTHESIS_PREFIX
         SUBAGENT_SYNTHESIS_PROMPT SYNTHESIS_CLEAR SYNTHESIS_HELD SYNTHESIS_UNKNOWN
         SYNTHETIC_RECOVERY_KIND SecurityEvent SessionBusyError
         SessionClosingError SessionEndingError
@@ -156,7 +157,7 @@ _BASE_NAMES = frozenset("""
         _begin_local_turn_marker _broadcast_auto_tool _broadcast_compaction_result
         _broadcast_expired_oauth_banners _cap_armed_prefetches _cap_redacted
         _clear_eager_spawn_failures _clear_fallback_sticky_state
-        _clear_local_turn_marker _clear_session_not_found_replay
+        _clear_local_turn_marker
         _clip_card_error _configured_refusal_fallback _connections_managed_mcp_names
         _consume_pending_reset _context_usage_payload _credential_tool_hint_for _crew_log_class
         _crew_log_lineage _crew_log_model _crew_log_workspace _current_turn_carries_image_ref
@@ -190,7 +191,7 @@ _BASE_NAMES = frozenset("""
         _prewarm_allowance _probe_fallback_restore_for_slot
         _probe_fallback_restore_for_slot_locked _prompt_read_within_root
         _publish_session_mcp_report _queue_entry_is_orchestration
-        _read_and_tighten_turn_execution _recipient_principal _reconstruct_str_replace_before
+        _read_and_tighten_turn_execution _recipient_principal _classify_str_replace_before
         _record_session_mcp_event _record_turn_snapshot _recover_app_agent_binding
         _recovery_delay _redact_acp_string _redact_display_text _redact_for_display
         _redact_meta_for_role _redact_segment _redact_segment_text _redact_tool_field
@@ -201,11 +202,11 @@ _BASE_NAMES = frozenset("""
         _resolve_channel_target _resolve_folder_steering_dirs _resolve_mirror_target
         _resolve_prompt_mention _resolve_refusal_fallback_target _restore_refusal_fallback
         _retain_terminal_native _retire_local_turn_marker _retire_sessions_on_identity_change
-        _retry_cancel_reason _route_history_source _route_model_for_turn _run_chat
+        _route_history_source _route_model_for_turn _run_chat
         _run_pending_synthesis _safe_native_crew_debug_title _safe_read_snapshot
         _schedule_prefetch_ttl _schedule_widget_registration _segment_row_meta
         _session_auto_approves _session_mcp_report
-        _session_not_found_replay_revoked _session_principal
+        _session_principal
         _session_stop_generation_for _settle_consumed_steers _shared_dependency_delay
         _should_suppress_requeue _slot_binding _slot_is_trusted _slot_predecessor_store
         _slot_prompt_project _snapshot_write_target _spawn_admitted_prefetch
@@ -244,7 +245,7 @@ _BASE_NAMES = frozenset("""
         logging math mcp_apps_render member_lifecycle mint_options_token mirror_is_paused
         model_is_unusable model_registry normalize_agent_model normalize_banner
         normalize_stop_reason note_coding_activity oauth_url_contains_credential os
-        owned_stage_delivery_entry parse_hook_continuations parse_session_key
+        parse_hook_continuations parse_session_key
         parse_workflow_command payload_for_replay
         persist_token_record_async person_priority pick_epoch_host
         pin_human_approval post_linked_approval pre_tool_match_names prepare_store_vectors
@@ -275,7 +276,7 @@ _BASE_NAMES = frozenset("""
         should_notice_mixed_turn_leak should_queue_hook_continuation
         should_queue_refusal_recovery should_recover_promise_only shutdown_event
         slack_mirror_is_paused slot_history_key slot_steering_principal
-        slot_switch_session_lock spawn_guarded_turn split_blocks stage_boundary_for stat_module
+        slot_switch_session_lock spawn_guarded_turn split_blocks stat_module
         stricter_memory_mode strip_control_comments subagents_attached_async
         subprocess_executor synthesis_fire_verdict
         telemetry_channel_of tighten_live_session_execution
@@ -309,20 +310,30 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(entries: 'list[dict[str, Any]]') -> 'tuple[list[dict[str, Any]], int, int]'",
         ),
         (
+            "_classify_str_replace_before",
+            "function",
+            "(path: 'str', raw_params: 'dict') -> 'tuple[str | None, str | None]'",
+        ),
+        (
             "_line_change_input",
             "function",
             "(fc: 'dict[str, Any]', after: '_Snapshot | None') -> 'dict[str, str] | None'",
         ),
         ("_note_reply_row", "function", "(slot: \"'_ChatSlot'\", row: 'dict[str, Any]') -> 'None'"),
         (
-            "_reconstruct_str_replace_before",
+            "_pending_str_replace_payload",
             "function",
-            "(path: 'str', raw_params: 'dict') -> 'str | None'",
+            "(content: 'str', old_str: 'str', new_str: 'str') -> 'dict[str, _Snapshot]'",
         ),
         (
             "_record_turn_snapshot",
             "function",
-            "(slot: \"'_ChatSlot'\", snapshot: 'dict[str, Any]') -> 'None'",
+            "(slot: \"'_ChatSlot'\", snapshot: 'dict[str, Any]', writer_key: 'str' = '') -> 'None'",
+        ),
+        (
+            "_resolve_pending_str_replace",
+            "function",
+            "(pending: 'dict[str, Any]', after: 'str') -> '_Snapshot | None'",
         ),
         ("_safe_read_snapshot", "function", "(path: 'str') -> '_Snapshot | None'"),
         (
@@ -451,11 +462,6 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(slot_key: 'str', exc: 'BaseException', *, self_wake: 'bool') -> 'None'",
         ),
         ("_recovery_delay", "async function", "(secs: 'float') -> 'None'"),
-        (
-            "_retry_cancel_reason",
-            "function",
-            "(rebound: 'bool', superseded: 'bool', stopped: 'bool') -> 'str'",
-        ),
         (
             "_session_stop_generation_for",
             "function",
@@ -743,9 +749,8 @@ _AWAIT_FREE_PHASES = (
     "_rearm_turn_episode",
     "_checklist_resync",
     "_purge_superseded_continuations",
-    "_drop_superseded_model_access_replay",
-    "_drop_superseded_image_recovery",
-    "_drop_superseded_refusal_replay",
+    "_drop_revoked_replays",
+    "_replay_vetoed_at_consume",
     "_requeue_auth_retry",
     "_requeue_after_prompt_busy",
     "_report_unclaimed_directives",
@@ -778,69 +783,22 @@ def test_an_await_free_phase_never_suspends(name: str) -> None:
     assert not _suspends(fn), f"{name} gained a suspension point"
 
 
-#: Owner phases cut from such blocks whose decision ends the turn with one awaited
-#: ``chat_done`` broadcast. The check and every slot change still run without a
-#: suspension point; nothing after the first one reads the slot or writes any
-#: state, so the check-then-mutate stays atomic and only the broadcast suspends.
-_DECIDE_THEN_SUSPEND_PHASES = ("_refusal_replay_vetoed_at_consume",)
-_STATE_WRITES = frozenset(
-    {"STORE_ATTR", "DELETE_ATTR", "STORE_SUBSCR", "DELETE_SUBSCR", "STORE_GLOBAL"}
-)
-
-
-def _touches_state_after_suspending(fn: Any) -> bool:
-    instructions = list(dis.get_instructions(fn))
-    first = next(index for index, ins in enumerate(instructions) if ins.opname in _SUSPENDING_OPS)
-    for ins in instructions[first:]:
-        if ins.opname in _STATE_WRITES:
-            return True
-        names = ins.argval if isinstance(ins.argval, tuple) else (ins.argval,)
-        if ins.opname.startswith("LOAD_FAST") and "slot" in names:
-            return True
-    return False
-
-
-def test_the_decide_then_suspend_scan_sees_state_after_an_await() -> None:
-    async def decides_then_awaits(slot: Any) -> None:
-        slot.decided = True
-        await asyncio.sleep(0)
-
-    async def awaits_then_writes(slot: Any) -> None:
-        await asyncio.sleep(0)
-        slot.decided = True
-
-    async def awaits_then_reads(slot: Any) -> bool:
-        await asyncio.sleep(0)
-        return bool(slot.decided)
-
-    assert not _touches_state_after_suspending(decides_then_awaits)
-    assert _touches_state_after_suspending(awaits_then_writes)
-    assert _touches_state_after_suspending(awaits_then_reads)
-
-
-@pytest.mark.parametrize("name", _DECIDE_THEN_SUSPEND_PHASES)
-def test_a_phase_suspends_only_after_its_decision(name: str) -> None:
-    fn = getattr(cr, name)
-    assert inspect.iscoroutinefunction(fn)
-    assert Path(fn.__code__.co_filename).resolve().parent == _OWNER_DIR
-    assert _suspends(fn), f"{name} no longer suspends: list it in _AWAIT_FREE_PHASES"
-    assert not _touches_state_after_suspending(fn), f"{name} suspends before its decision"
-
-
 def test_run_chat_keeps_its_entry_signature() -> None:
     sig = inspect.signature(cr._run_chat)
     assert list(sig.parameters) == [
         "state",
         "slot",
+        # Supplied by the exit guard (``_hands_off_queue_on_exit``), never by a
+        # caller; the signature follows ``__wrapped__`` to the turn itself.
+        "turn_exit",
         "message",
         "_prompt_depth",
         "_attachments",
         "_attachment_meta",
         "_synthetic_payload",
-        "_refusal_replay",
-        "_image_recovery",
-        "_session_not_found_recovery",
+        "_replay",
         "_synthetic_recovery_turn",
+        "_replays_completion",
         "_steer_possibly_delivered",
         "_directive_user_origin",
         "_post_restart_continuation",
@@ -851,6 +809,7 @@ def test_run_chat_keeps_its_entry_signature() -> None:
         "_directive_loop_id",
         "_directive_loop_gen",
         "_directive_channel_origin",
+        "_commands_off",
         "_turn_actor",
         "regenerate_hint",
         "_on_consumed",
@@ -858,7 +817,7 @@ def test_run_chat_keeps_its_entry_signature() -> None:
         "monitor_completion",
         "_current_message",
     ]
-    assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in list(sig.parameters.values())[3:])
+    assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in list(sig.parameters.values())[4:])
     assert inspect.iscoroutinefunction(cr._run_chat)
 
 
@@ -1614,7 +1573,8 @@ _STAYS_IN_THE_RUNNER = (
     r"except AcpProcessDied",
     r"\.recent\(",
     r"warm_project_agent_names\(",
-    r"\.on_tool_call\(",
+    # The tool-gate consultation: the sync call, or the awaitable form a coroutine uses.
+    r"\.on_tool_call\(|run_in_tool_gate_pool\(\s*[\w.]+\.on_tool_call,",
     r"spawn_guarded_turn\(",
     r"create_task\(",
     r"ensure_future\(",

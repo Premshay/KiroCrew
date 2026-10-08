@@ -14,7 +14,7 @@ from unittest.mock import patch
 from kiro_crew.mcp_core import _resolve_session_key
 
 _PPID = "kiro_crew.mcp_caller._parent_pid"
-_CFG = "kiro_crew.config.loader.config_dir"
+_CFG = "kiro_crew.config.paths.config_dir"
 
 
 class TestResolveSessionKey:

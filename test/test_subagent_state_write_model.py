@@ -43,7 +43,9 @@ measurement, not a wish, so rule two has no allowlist at all.
 SCOPE BOUNDARY. ``asyncio.to_thread(update_state, ...)`` passes the writer as a
 bare Name rather than calling it, so the sanctioned off-loop helper is not a site
 here; that route has its own gate, which keeps every off-loop writer on the
-drained helper.
+drained helper. ``write_finished_result`` is the one other worker that route
+hands a writer to (as ``state_writer``), so its merge is listed below and a
+direct call to it from a coroutine is caught like any other write.
 
 ONE RECORDING PLACE. An exception is recorded in the census and nowhere else, so
 the fence and the site sit together where the policy lives. The detector matches a
@@ -65,7 +67,9 @@ from source_corpus import parsed_candidates, src_root
 #: Names whose call performs, or delegates, a read / merge / whole-file rewrite.
 #: ``state_writer`` is retention promotion's injected seam, whose default IS the
 #: whole-file writer, so the call through it is a write site like any other.
-_WRITER_NAMES = frozenset({"update_state", "update_execution_context", "state_writer"})
+_WRITER_NAMES = frozenset(
+    {"update_state", "update_execution_context", "state_writer", "write_finished_result"}
+)
 
 #: The low-level writer. A caller that bypasses the helpers still lands the same
 #: whole-file rewrite, so it is a site on the same terms.
@@ -97,9 +101,13 @@ _WRITE_SITES: dict[tuple[str, str, str], tuple[int, str]] = {
     ): (1, "off loop at every call site; serialized by the callee's unconditional lock"),
     (
         "kiro_crew/subagent_manager/continuation.py",
-        "release_conversation_impl",
+        "_release_disk_sync",
         "update_state",
-    ): (1, "on loop; fenced by the release path refusing while the run is in flight"),
+    ): (
+        1,
+        "off loop from every event-loop caller (release_conversation_async), which "
+        "holds the conversation until the worker lands; inherits the per-agent lock",
+    ),
     (
         "kiro_crew/subagent_persistence.py",
         "create_agent_folder",
@@ -110,6 +118,15 @@ _WRITE_SITES: dict[tuple[str, str, str], tuple[int, str]] = {
         "create_agent_folder",
         "_atomic_write(state.json)",
     ): (1, "creation path; writes the initial file before any writer can race"),
+    (
+        "kiro_crew/subagent_persistence.py",
+        "write_finished_result",
+        "state_writer",
+    ): (
+        1,
+        "off loop: the drained write_finished_result worker is handed update_state; "
+        "serialized by update_state's per-agent lock",
+    ),
     (
         "kiro_crew/subagent_persistence.py",
         "promote_retention",

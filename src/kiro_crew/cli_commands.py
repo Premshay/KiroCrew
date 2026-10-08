@@ -97,6 +97,7 @@ from kiro_crew.cron import (
     is_valid_timezone,
     lookup_cron_folder_id,
     parse_time_string,
+    validate_managed_by,
 )
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.cron_trigger import trigger_cron_job
@@ -1765,7 +1766,21 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
     timeout = getattr(args, "timeout", None)
     timeout_secs = getattr(args, "timeout_secs", None)
     folder_ref = (getattr(args, "folder", "") or "").strip()
+    # None means the flag was not given; an explicit "" is a refusal, never
+    # "unmanaged": an installer whose $KEY is unset would otherwise store a
+    # keyless job on every run that its `remove --managed-by ""` can't find.
+    managed_by = getattr(args, "managed_by", None)
     message = args.message or ""
+
+    # ── Installer ownership key ──
+    # Not stripped: the key is compared on bytes with the one the installer
+    # recomputes, so a padded key is refused by the shape check below rather
+    # than silently becoming a different key than the one it will look up.
+    if managed_by is not None:
+        try:
+            validate_managed_by(managed_by)
+        except ValueError as e:
+            _cron_add_fail(str(e))
 
     # ── Job kind: exactly one of agent / script / command ──
     if script and command:
@@ -1936,7 +1951,7 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
     minimal_context = bool(getattr(args, "minimal_context", False))
 
     try:
-        job = svc.add_job(
+        fields = dict(
             name=args.name,
             message=message,
             every_secs=every,
@@ -1961,6 +1976,10 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
             timeout=int(timeout) if timeout else 0,
             timeout_secs=int(timeout_secs) if timeout_secs else 0,
         )
+        if managed_by is not None:
+            job = svc.add_managed_job(managed_by, **fields)
+        else:
+            job = svc.add_job(**fields)
     except CronStoreBusy:
         # The store lock stayed contended past its timeout (another writer --
         # the gateway, a dashboard create -- holds it). Nothing was written;
@@ -1987,6 +2006,7 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
             resources=(
                 f"job_id={job.id} kind={kind} approval_mode={approval_mode or 'default'} "
                 f"agent={agent or 'default'} silent={silent}"
+                + (f" managed_by={managed_by}" if managed_by else "")
             ),
         )
     except Exception:
@@ -2046,6 +2066,8 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 detail = "owner: none (manage from CLI or the dashboard Schedule page)"
             if provenance:
                 detail += f"  created by: {provenance}"
+            if j.managed_by:
+                detail += f"  managed by: {j.managed_by}"
             print(f"      {detail}")
 
     elif action == "adopt":
@@ -2210,11 +2232,37 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             print(f"Job not found: {args.job_id}")
 
     elif action == "remove":
-        removed = svc.remove_job(args.job_id, actor="cli", source="cli")
+        job_id = getattr(args, "job_id", None)
+        managed_by = getattr(args, "managed_by", None)
+        if managed_by is not None:
+            # An empty or malformed key must never reach the match below: every
+            # unmanaged job carries managed_by == "", so `--managed-by ""` (an
+            # installer whose $KEY is unset) would otherwise delete all of them.
+            try:
+                validate_managed_by(managed_by)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            # Read-decide-write: an unreadable store reads as empty, which would
+            # report "nothing to remove" over a corrupt file an installer then
+            # believes is clean. Probe first so that case refuses instead.
+            svc.raise_if_store_unreadable()
+            jobs = svc.list_jobs(include_disabled=True)
+            owned = [j.id for j in jobs if j.managed_by == managed_by]
+            if not owned:
+                print(f"No job is managed by: {managed_by}")
+                return
+            # Removed by the ids just read: a re-install that lands in between
+            # mints a fresh id, which this removal cannot touch.
+            for jid in owned:
+                if svc.remove_job(jid, actor="cli", source="cli"):
+                    print(f"Removed job: {jid} (managed by {managed_by})")
+            return
+        removed = svc.remove_job(job_id, actor="cli", source="cli")
         if removed:
-            print(f"Removed job: {args.job_id}")
+            print(f"Removed job: {job_id}")
         else:
-            print(f"Job not found: {args.job_id}")
+            print(f"Job not found: {job_id}")
 
     elif action == "pause":
         if svc.enable_job(args.job_id, enabled=False):
@@ -2258,7 +2306,7 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
 def _cron_preview(args: argparse.Namespace) -> None:
     """Dry-run a script cron with real MCP tools but suppressed hooks."""
     # Imported here (not at module top) to avoid a cron_script import cycle.
-    from kiro_crew.cron_script import Done, McpToolClient, Report, Skip, resolve_script_path
+    from kiro_crew.cron_script import Done, KeptMcpServers, Report, Skip, resolve_script_path
 
     # Resolve and validate script path (same validation as production cron runner:
     # format, existence, sensitive path, containment under ~/.kiro/crew/crons/)
@@ -2315,22 +2363,23 @@ def _cron_preview(args: argparse.Namespace) -> None:
         def __init__(self, message: str):
             self.message = message
             self.job = _PreviewJob()
+            # Bare on purpose: the preview presents no cron identity to its servers.
+            self._kept_servers = KeptMcpServers()
 
         def call_tool(self, server: str, tool: str, tool_args: dict) -> str:
             # Redact credentials/exfiltration URLs (same as production ScriptContext.call_tool)
             args_str = json.dumps(tool_args)
             args_str = redact(args_str)
             safe_args = json.loads(args_str)
-            # Per-call spawn + close (same lifecycle as production ScriptContext.call_tool)
-            client = McpToolClient(server)
+            # One server per name kept for the run, stopped by close() once the
+            # script returns (same lifecycle as production ScriptContext.call_tool)
             outcome = "ok"
             try:
-                result = client.call_tool(tool, safe_args)
+                result = self._kept_servers.call_tool(server, tool, safe_args)
             except Exception:
                 outcome = "error"
                 raise
             finally:
-                client.close()
                 sel().log_tool_invocation(
                     session_key=f"cron:{self.job.id}",
                     tool_name=f"{server}/{tool}",
@@ -2353,7 +2402,7 @@ def _cron_preview(args: argparse.Namespace) -> None:
             return {}
 
         def close(self):
-            pass
+            self._kept_servers.close()
 
     ctx = _LiveTestCtx(message=args.message)
     outcome = "ok"
@@ -3263,6 +3312,26 @@ _IMPORT_FACET_KEYS = ("scope", "surface", "crew", "session_key", "derived_from")
 #: collection this list misses is one that raises AFTER the store was created.
 _IMPORTED_COLLECTIONS = ("semantic", "episodic")
 
+#: Printed after `memory import` when rows still lack a vector. The CLI store has
+#: no embed_fn (loading the model would add its startup cost to every invocation),
+#: so `import_memory`'s `_try_embed` returns None and every imported episode lands
+#: keyword-only; the export file carries no vectors either. Without this line the
+#: summary ("Skipped: 0") reads as complete while semantic recall over the imported
+#: rows silently does not work. The gateway's paced repair loop and its boot sweep
+#: (`slack/gateway_runtime/memory_lifecycle.py`) are what fill them, each only once
+#: the embedding backend is ready -- hence "once", not a promised time.
+_IMPORT_EMBED_NOTE = (
+    "Note: embedding vectors are not built by this command. The gateway's background\n"
+    "  re-embed sweep fills them once its embedding backend is ready; until then the\n"
+    "  imported rows are keyword-searchable only. `kirocrew memory stats` shows the\n"
+    "  progress on its Embedded line."
+)
+
+#: Most rows ``memory export`` writes per collection. A cut collection is named on
+#: stderr with its full count, so a short file never reads as a complete one.
+_EXPORT_EPISODIC_LIMIT = 10_000
+_EXPORT_EVENTS_LIMIT = 1_000
+
 
 def _markdown_memory_store() -> MemoryStore:
     """MemoryStore anchored where the DEFAULT runtime writer writes.
@@ -3447,10 +3516,21 @@ def _memory_backup_cmd(action: str, args: argparse.Namespace) -> None:
         keep = getattr(args, "keep", None)
         if keep is None:
             keep = KiroCrewConfig.load().memory.backup_keep
-        result = memory_backup.back_up_all_stores(int(keep))
+        # ``force``: the interval guard exists for the heartbeat, whose per-process tick
+        # counter would otherwise take a copy on every restart. An operator typing this
+        # verb is asking for a copy of the store as it is NOW -- usually right before a
+        # restore or an out-of-band edit -- and silently declining for the next twenty
+        # hours made the verb do nothing at all. Same call the dashboard's "back up now"
+        # and the pre-update snapshot make; the scheduled sweep alone keeps the guard.
+        result = memory_backup.back_up_all_stores(int(keep), force=True)
+        # All four counters. With the guard bypassed, ``skipped`` is ``backup_store``'s
+        # other outcome -- the store has never been opened or its file is empty -- and a
+        # pass that copied nothing must say so rather than print three zeros that read
+        # as a successful no-op.
         print(
             f"Backed up {result['backed_up']} store(s); "
-            f"removed {result['pruned']} old; {result['failed']} failed."
+            f"removed {result['pruned']} old; {result['failed']} failed; "
+            f"{result['skipped']} skipped (nothing to copy)."
         )
 
     elif action == "backups":
@@ -4043,6 +4123,14 @@ def _memory_verb(args: argparse.Namespace) -> None:
                     f"  Episodic: {stats['episodic_active']} active, {stats['episodic_deleted']} deleted"
                 )
                 print(f"  Embedded: {stats['embedded_count']}/{stats['episodic_active']}")
+                pending = stats["episodic_active"] - stats["embedded_count"]
+                if pending > 0:
+                    # A bare ratio reads as a fault. Name what fills the gap, so a
+                    # just-imported store is not mistaken for a broken one.
+                    print(
+                        f"    {pending} row(s) wait for the gateway's background re-embed "
+                        "sweep (keyword-searchable until then)"
+                    )
                 if stats["faiss_available"]:
                     print(f"  FAISS accelerator: {stats['faiss_index_size']} vectors indexed")
                 else:
@@ -4078,15 +4166,11 @@ def _memory_verb(args: argparse.Namespace) -> None:
 
             elif action == "export":
                 if getattr(args, "include_markdown", False) and named_store_or_empty(store_name):
-                    # REFUSED rather than shipped empty. A named store's markdown tree sits
-                    # under `memory_stores/`, a keystone leaf in
-                    # `security._CREW_SECRET_LEAVES`, and `markdown_snapshot` reaches a
-                    # NON-private store through the fenced reader
-                    # (`hooks.safe_read_file_bytes_nolink`), which refuses that subtree and
-                    # answers None. `_guarded_entry` then shapes the refusal exactly like a
-                    # missing file, so this combination would report `content: ""` for a
-                    # store whose preferences.md is on disk and non-empty -- and an operator
-                    # moving a store would read that as "there was no markdown to carry".
+                    # REFUSED, a conservative contract: a named store's markdown tree is
+                    # not part of this verb's payload. Named V1 stores read their markdown
+                    # through the descriptor-pinned reader (`MemoryFiles._read_entry_bytes`),
+                    # so this is not a fence that would answer empty; the refusal keeps an
+                    # operator moving a store from reading a partial payload as complete.
                     # The rows are unaffected and still export on their own.
                     print(
                         f"Error: the markdown layer of memory store {store_name!r} cannot be "
@@ -4096,10 +4180,26 @@ def _memory_verb(args: argparse.Namespace) -> None:
                         "Re-run without --include-markdown to export the store's rows."
                     )
                     return
+                episodic = store.get_episodic_list(limit=_EXPORT_EPISODIC_LIMIT)
+                events = store.get_events(limit=_EXPORT_EVENTS_LIMIT)
+                # A full page may hide more rows. Reading past the limit counts
+                # them through the same query the export used, on V1 and V2 alike.
+                for collection, rows, limit, rest in (
+                    ("episodes", episodic, _EXPORT_EPISODIC_LIMIT, store.get_episodic_list),
+                    ("events", events, _EXPORT_EVENTS_LIMIT, store.get_events),
+                ):
+                    if len(rows) >= limit:
+                        omitted = len(rest(limit=-1, offset=limit))
+                        if omitted:
+                            print(
+                                f"warning: exported {len(rows)} of {len(rows) + omitted} "
+                                f"{collection}; {omitted} omitted",
+                                file=sys.stderr,
+                            )
                 data: dict[str, object] = {
                     "semantic": store.get_all_semantic(),
-                    "episodic": store.get_episodic_list(limit=10000),
-                    "events": store.get_events(limit=1000),
+                    "episodic": episodic,
+                    "events": events,
                 }
                 if getattr(args, "include_markdown", False):
                     # Opt-in so the default payload shape stays byte-identical
@@ -4157,6 +4257,8 @@ def _memory_verb(args: argparse.Namespace) -> None:
                 print(f"  Semantic: {counts['semantic']}")
                 print(f"  Episodic: {counts['episodic']}")
                 print(f"  Skipped:  {counts['skipped']}")
+                if counts["episodic"] > 0 and store.has_pending_embeddings():
+                    print(_IMPORT_EMBED_NOTE)
                 if dropped and memory_store_version(store_name) != 2:
                     # A V2 export reads the canonical relation, so its rows carry
                     # scope, surface, crew, session_key and derived_from;

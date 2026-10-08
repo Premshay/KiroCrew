@@ -21,6 +21,7 @@ import {
   TAILWIND_RUNTIME_SRC,
 } from './src/lib/vendorPaths'
 import { precompressPlugin } from './scripts/precompress.mjs'
+import { atomicPublishPlugin } from './scripts/publish-dist.mjs'
 import { CONTEXT_SINGLETON_DEDUPE } from './vite.shared'
 import {
   parseBrandingConfig,
@@ -257,11 +258,16 @@ function excalidrawFontsPlugin(): Plugin {
 }
 
 function swVersionPlugin(): Plugin {
+  // The resolved outDir: atomicPublishPlugin builds into a scratch sibling of
+  // the live dist and publishes it afterwards (scripts/publish-dist.mjs).
+  let swPath = ''
   return {
     name: 'kirocrew-sw-version',
     apply: 'build',
+    configResolved(config) {
+      swPath = path.resolve(config.root, config.build.outDir, 'sw.js')
+    },
     closeBundle() {
-      const swPath = path.resolve(__dirname, 'dist/sw.js')
       try {
         let content = readFileSync(swPath, 'utf-8')
         if (!content.includes('%%SW_BUILD_HASH%%')) {
@@ -272,7 +278,7 @@ function swVersionPlugin(): Plugin {
           // the placeholder was renamed/removed in sw.js: fail loudly.
           if (!/const CACHE_VERSION = '[^'%]+'/.test(content)) {
             throw new Error(
-              'swVersionPlugin: neither placeholder %%SW_BUILD_HASH%% nor an injected CACHE_VERSION found in dist/sw.js'
+              `swVersionPlugin: neither placeholder %%SW_BUILD_HASH%% nor an injected CACHE_VERSION found in ${swPath}`
             )
           }
           return
@@ -684,7 +690,7 @@ export default defineConfig({
   // `editionExtensionPlugin()` precedes `tailwindcss()` on purpose: both run
   // `enforce: 'pre'` transforms, and the edition `@source` must be spliced into
   // index.css before Tailwind compiles it (see the plugin's `transform`).
-  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), editionLanguagesPlugin(), tailwindcss(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
+  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), editionLanguagesPlugin(), tailwindcss(), bundleReportPlugin(), appWindowUrls(), precompressPlugin(), atomicPublishPlugin()],
   // Worker bundles do not inherit `plugins`; the hljs worker needs the edition
   // languages module (see editionLanguagesPlugin).
   worker: { plugins: () => [editionLanguagesPlugin()] },
@@ -754,6 +760,11 @@ export default defineConfig({
       },
     },
     setupFiles: './integration/setup.ts',
+    // Reset every vi.stubEnv before each test, a beforeAll or module-level stub
+    // included, so env is stubbed in beforeEach or the test (a full-suite trial broke
+    // nothing). unstubGlobals stays off: it would undo a file-wide stub such as
+    // pipelineBoardCard.test.ts's module-level CSSStyleSheet.
+    unstubEnvs: true,
     css: true,
     pool: 'forks',  // More stable than threads on ARM64 build fleet (avoids ERR_IPC_CHANNEL_CLOSED)
     // Bound fork memory. Without a cap, vitest spawns one worker per core
@@ -796,8 +807,8 @@ export default defineConfig({
     // load-induced flakes while still failing real hangs.
     testTimeout: 15000,
     include: ['integration/**/*.test.{ts,tsx}', 'src/**/*.test.{ts,tsx}'],
+    // act() warnings are counted per file by integration/setup.ts, never filtered here.
     onConsoleLog: (log) =>
-      !log.includes('was not wrapped in act(') &&
       // TipCard's useTipTrigger issues tipsStatus/tipsNext queries; the 232
       // tests that vi.mock('../api/client') without stubbing those two fields
       // leave queryFn undefined, so React Query logs "No queryFn was passed"
@@ -864,6 +875,9 @@ export default defineConfig({
   },
   server: {
     port: 3000,
+    // A build's scratch and swapped-aside trees (scripts/publish-dist.mjs) are
+    // thousands of files written and removed per build; nothing here imports them.
+    watch: { ignored: ['**/.dist*.next-*/**', '**/.dist*.ready-*/**', '**/.dist*.prev-*/**'] },
     proxy: {
       '/api': {
         target: `http://localhost:${backendPort}`,

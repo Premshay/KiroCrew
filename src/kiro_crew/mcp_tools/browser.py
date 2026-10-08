@@ -43,7 +43,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote_to_bytes, urlsplit
 
 from kiro_crew import mcp_core
 from kiro_crew.browser_cli import install
@@ -104,16 +104,37 @@ _DEFAULT_OP_TIMEOUT_MS = 15000
 
 _LOOPBACK_HOST_NAMES = {"localhost", "ip6-localhost", "ip6-loopback"}
 
+# Code points a browser refuses in a host once it is percent-decoded.
+_FORBIDDEN_DECODED_HOST_CHARS = frozenset("%/@?#[]:\\<>^| ")
+
+
+def _percent_decoded_host(host: str) -> str | None:
+    """Decode ``host`` once, as the browser's URL parser does.
+
+    ``urlsplit`` keeps ``%31%32%37.0.0.1`` encoded, but the browser decodes it
+    to ``127.0.0.1``. Returns None when the browser would reject the decoded
+    host (invalid UTF-8, or a char a host may not carry).
+    """
+    try:
+        decoded = unquote_to_bytes(host).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if any(
+        ch in _FORBIDDEN_DECODED_HOST_CHARS or ord(ch) < 0x21 or ord(ch) == 0x7F for ch in decoded
+    ):
+        return None
+    return decoded
+
 
 def _navigate_target_is_public(url: str) -> bool:
     """True iff ``url`` is an ordinary public http(s) page.
 
-    Mirrors the playwright-cli path's gate (``chat_runner._is_remote_navigable_host``):
-    the built-in Electron panel accepts ANY http(s) URL, so without this a
+    The built-in Electron panel accepts ANY http(s) URL, so without this a
     ``navigate`` op could drive a loopback control plane (this dashboard
-    included) or the ``169.254.169.254`` metadata endpoint -- an SSRF the CLI
-    path holds behind interactive approval. Kept LOCAL (not imported from the
-    dashboard) so the ``kirocrew-core`` shim stays free of dashboard deps.
+    included) or the ``169.254.169.254`` metadata endpoint -- an SSRF the
+    playwright-cli path holds behind the ordinary shell approval ladder. Kept
+    LOCAL (not imported from the dashboard) so the ``kirocrew-core`` shim stays
+    free of dashboard deps.
 
     ``is_global`` subsumes loopback/link-local/private/CGNAT/reserved in one
     predicate, applied to the address and any embedded IPv4 (``ipv4_mapped`` /
@@ -124,6 +145,9 @@ def _navigate_target_is_public(url: str) -> bool:
     names are NOT resolved (a blocking call + rebinding TOCTOU on the hot path);
     the residual public-name->private-IP risk is accepted, exactly as the CLI
     gate documents.
+
+    A percent-encoded host (``%31%32%37.0.0.1``, ``loc%61lhost``) is decoded
+    first, as the browser does, so every check below sees the browser's host.
     """
     raw = url.strip()
     # Parser-differential SSRF: reject backslash (Chromium treats it as '/'),
@@ -137,7 +161,13 @@ def _navigate_target_is_public(url: str) -> bool:
     parts = urlsplit(raw)
     if parts.scheme.lower() not in ("http", "https"):
         return False
-    host = (parts.hostname or "").lower().rstrip(".")
+    host = parts.hostname or ""
+    if "%" in host and ":" not in host:  # bracketed IPv6 keeps its own path
+        decoded = _percent_decoded_host(host)
+        if decoded is None:
+            return False
+        host = decoded
+    host = host.lower().rstrip(".")
     if not host or host in _LOOPBACK_HOST_NAMES or host.endswith(".localhost"):
         return False
     # Reject non-ASCII hosts: a fullwidth-digit / IDN form the browser may
@@ -366,7 +396,7 @@ def browser(name: str, args: dict[str, Any]) -> str:
     # loopback/private/link-local target could drive a local control plane (this
     # dashboard included) or the cloud-metadata endpoint. Only public http(s) is
     # auto-driven here; route non-public targets through playwright-cli, whose
-    # path prompts for the required approval (matching the CLI gate).
+    # commands go through the ordinary shell approval ladder.
     if op == "navigate":
         url = op_args.get("url")
         if not isinstance(url, str) or not _navigate_target_is_public(url):

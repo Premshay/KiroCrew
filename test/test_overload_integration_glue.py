@@ -53,6 +53,7 @@ from kiro_crew.taskq import store as store_mod
 from kiro_crew.taskq.adapters import runner as runner_mod
 from kiro_crew.taskq.store import TaskStore
 from kiro_crew.taskq.waits import WaitRecord
+from kiro_crew.testing.wait import async_wait_until
 
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
@@ -237,9 +238,9 @@ def test_gateway_without_a_manager_wires_nothing() -> None:
 def no_memory_pressure(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin the probe ``runner_admission_for`` reads for itself.
 
-    ``healthy_host_memory`` pins the copy ``subagent`` imported; the runner
-    admission imports its own from ``resource_status``, so without this a
-    loaded machine turns an admission into a defer.
+    ``healthy_host_memory`` pins only the floor reading ``subagent`` spawns on;
+    the runner admission reads the posture from ``resource_status``, so without
+    this a loaded machine turns an admission into a defer.
     """
     from kiro_crew import resource_status
 
@@ -1370,7 +1371,7 @@ async def test_stop_all_never_takes_the_queued_stop_path_for_a_claimable_residen
         await asyncio.sleep(3600)
 
     reported: list[str] = []
-    mgr._report_queued_stop = lambda params: reported.append(  # type: ignore[assignment]
+    mgr._report_queued_stop = lambda params, **_kw: reported.append(  # type: ignore[assignment]
         str(params.get("_preassigned_id") or "")
     )
     try:
@@ -1747,15 +1748,9 @@ class TestStoreOffLoop:
         await mgr.cancel_all()
 
     @staticmethod
-    def _critical() -> Any:
-        from kiro_crew import resource_status as rs
-
-        return rs.AdmissionDecision(
-            admitted=False,
-            posture=rs.POSTURE_CRITICAL,
-            available_gb=1.2,
-            reason="host memory is critical (~1.2 GB free, critical ≤ 2 GB)",
-        )
+    def _low_memory(*_a: Any, **_k: Any) -> tuple[bool, float]:
+        """The floor's reading on a host with 1.2 GB free: below any bar."""
+        return (False, 1.2)
 
     @pytest.mark.asyncio
     async def test_the_drained_defer_writes_off_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1781,9 +1776,7 @@ class TestStoreOffLoop:
             approval_mode=None,
         )
         assert mgr._admission.taskq_accept_record(rec) is None
-        monkeypatch.setattr(
-            "kiro_crew.subagent.cached_admission_check", lambda *a, **k: self._critical()
-        )
+        monkeypatch.setattr("kiro_crew.subagent.check_memory_available", self._low_memory)
         before = store.loop_thread_calls
         await mgr._drain_queue_async()
         await settle_store_writes(store)
@@ -1826,9 +1819,7 @@ class TestStoreOffLoop:
                 "_preassigned_id": "ghost0",
             }
         ]
-        monkeypatch.setattr(
-            "kiro_crew.subagent.cached_admission_check", lambda *a, **k: self._critical()
-        )
+        monkeypatch.setattr("kiro_crew.subagent.check_memory_available", self._low_memory)
         before = store.loop_thread_calls
         await mgr._drain_queue_async()
         await settle_store_writes(store)
@@ -1837,7 +1828,12 @@ class TestStoreOffLoop:
         assert await store.run(store.get, "ghost0") is None
         assert [i.id for i in announced] == ["ghost0"], announced
         assert announced[0].done is True and not announced[0].queued
-        assert "critical" in (announced[0].error or "")
+        # The store's verdict, not a capacity one: it says so and carries the
+        # store's retry code, with the memory figures only as context.
+        error = announced[0].error or ""
+        assert error.startswith("spawn refused: the task store could not record"), error
+        assert "1.2 GB available" in error, error
+        assert announced[0].error_code == admission_mod.TASK_STORE_UNAVAILABLE_CODE
         # Last, and through ``run`` above, so the only thing this can catch is
         # the defer sliding back onto the loop.
         assert store.loop_thread_calls == before
@@ -2504,20 +2500,10 @@ class TestStoreOffLoop:
         monkeypatch.setattr(
             type(mgr), "_announce_rejection", lambda self, info: announced.append(info) or info
         )
-        # Pressure refuses every spawn, so the drain takes the parked-defer path.
-        from kiro_crew import resource_status as rs
+        # Low memory defers every spawn, so the drain takes the parked-defer path.
         from kiro_crew import subagent as subagent_mod
 
-        monkeypatch.setattr(
-            subagent_mod,
-            "cached_admission_check",
-            lambda *a, **k: rs.AdmissionDecision(
-                admitted=False,
-                posture=rs.POSTURE_CRITICAL,
-                available_gb=1.2,
-                reason="host memory is critical",
-            ),
-        )
+        monkeypatch.setattr(subagent_mod, "check_memory_available", lambda *a, **k: (False, 1.2))
         monkeypatch.setattr(admission_mod.SpawnAdmissionCoordinator, "pump_off_loop", True)
 
         parked = threading.Event()
@@ -2587,19 +2573,22 @@ async def test_claim_unavailable_leaves_the_row_queued_instead_of_starting(
     await mgr.cancel_all()
 
 
-# ── mutable gates run once per submission; a drained refusal cancels its row ─
+# ── mutable gates re-run after the memory read; a refused row is failed ──────
 
 
 @pytest.mark.asyncio
-async def test_store_accepted_reentry_skips_the_mutable_gates(
+async def test_store_accepted_row_is_re_vetted_after_its_awaits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``spawn_async`` commits the row after ``prepare_spawn`` passed the policy
-    gates; the ``_store_accepted`` re-entry must not evaluate them again, so a
-    governance/cwd change during the commit cannot refuse a committed row."""
+    gates, then awaits the commit and the memory read. A governance change
+    made during those awaits must still hold: the read's re-entry vets the
+    committed row again, refuses it, and fails the row in the store, so the
+    refused work can never run."""
     from unittest.mock import AsyncMock, MagicMock
 
     from kiro_crew import subagent as subagent_mod
+    from kiro_crew import taskq as _taskq
     from kiro_crew.subagent import SubagentManager
 
     sessions = MagicMock()
@@ -2637,9 +2626,12 @@ async def test_store_accepted_reentry_skips_the_mutable_gates(
 
     monkeypatch.setattr(store, "accept_one", _flip_then_accept)
     info = await mgr.spawn_async("hello", parent_session_key="web-1")
-    assert info is not None and not info.error, info
-    assert calls == ["gov"], "the gate ran exactly once, in prepare_spawn"
-    assert info.id in mgr._agents and not mgr._agents[info.id].done
+    assert info is not None and info.done, info
+    assert "spawn refused by governance" in info.error
+    assert calls == ["gov", "gov"], "vetted in prepare_spawn and again after the read"
+    assert info.id not in mgr._tasks
+    await settle_store_writes(store)  # the fail write is posted to the writer thread
+    assert store.state_of(info.id) == _taskq.FAILED, "the refused row is still runnable"
     await mgr.cancel_all()
 
 
@@ -3236,6 +3228,11 @@ async def test_a_raise_inside_reenter_releases_the_reservation(
 
 # ── the pump sees a deferred row only after its defer landed ─────────────────
 
+#: Lost-run bound for the gated defer and the spawn the test releases. The test's call
+#: measured at most 0.04 s in repeats at -n0, so this only ends a broken run, by name,
+#: well inside the suite's 120 s timeout.
+_DEFER_LOST_RUN_SECS = 30.0
+
 
 @pytest.mark.asyncio
 async def test_admitting_id_is_held_until_the_posted_defer_landed(
@@ -3250,30 +3247,48 @@ async def test_admitting_id_is_held_until_the_posted_defer_landed(
     monkeypatch.setattr(admission_mod.SpawnAdmissionCoordinator, "pump_off_loop", True)
     monkeypatch.setattr(subagent_mod, "check_memory_available", lambda min_gb: (False, 0.5))
     gate = threading.Event()
+    defer_entered = threading.Event()
     real_defer = store.defer
     seen: dict[str, Any] = {}
 
-    def _slow_defer(task_id, until, *, reason):
-        assert gate.wait(5)
-        seen["until"] = until
-        return real_defer(task_id, until, reason=reason)
+    def _slow_defer(task_id, *, wait, reason):
+        defer_entered.set()
+        assert gate.wait(_DEFER_LOST_RUN_SECS)
+        seen["wait"] = wait
+        return real_defer(task_id, wait=wait, reason=reason)
 
     monkeypatch.setattr(store, "defer", _slow_defer)
     task = asyncio.ensure_future(mgr.spawn_async("pressure", parent_session_key="web-1"))
-    for _ in range(20):
-        await asyncio.sleep(0.005)
-    admitting = getattr(mgr, "_admitting_ids")
-    assert (
-        len(admitting) == 1
-    ), "the row stays excluded from the refill while its defer is in flight"
-    (aid,) = tuple(admitting)
-    assert aid in mgr._admission.taskq_excluded_ids()
-    gate.set()
-    info = await task
+    try:
+        # The window under test opens when the posted defer is running and held by
+        # the gate. Wait for that, not for a count of loop turns: on a slow executor
+        # the spawn's off-loop hops outlast any count, and ``_admitting_ids`` does
+        # not exist until the spawn reaches the row it accepted. A spawn that
+        # returns without deferring ends the wait too, and fails below.
+        await async_wait_until(
+            lambda: defer_entered.is_set() or task.done(),
+            timeout=_DEFER_LOST_RUN_SECS,
+            describe=lambda: f"admitting={getattr(mgr, '_admitting_ids', None)!r}",
+        )
+        assert defer_entered.is_set(), f"the spawn never posted its defer: {task!r}"
+        admitting = getattr(mgr, "_admitting_ids", set())
+        assert (
+            len(admitting) == 1
+        ), "the row stays excluded from the refill while its defer is in flight"
+        (aid,) = tuple(admitting)
+        assert aid in mgr._admission.taskq_excluded_ids()
+    finally:
+        # Released on every path, so a failed assertion never leaves the store's
+        # writer thread parked on the gate.
+        gate.set()
+    info = await asyncio.wait_for(task, _DEFER_LOST_RUN_SECS)
     assert info is not None and info.queued
     assert not admitting, "cleared only once the defer landed"
     rec = store.get(info.id)
-    assert rec is not None and rec.next_run_at == seen["until"] > store.now()
+    assert seen["wait"] == mgr._admission.taskq_admit_wait_secs()
+    assert rec is not None and rec.next_run_at > store.now()
+    (deferred,) = [e for e in store.events(info.id) if e.kind == "deferred"]
+    assert rec.next_run_at == deferred.ts + seen["wait"], "until comes from the defer's own read"
     await mgr.cancel_all()
 
 

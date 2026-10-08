@@ -27,11 +27,11 @@ resumes where the last one stopped; this module owns no path and every failure
 over there is answered by folding from seq 1 again.
 
 Absent is never read as zero. ``turn/completed`` carries ``credits`` and
-``tokens`` only on a provider-reported close, so a synthesized closer omits them
--- and a total that counted those turns as costing nothing would state a
-measurement nobody made. Each total therefore rides beside the count of turns
-that contributed to it, and a caller comparing the two learns what the total
-covers.
+``tokens`` only when the provider reported them -- a synthesized closer omits
+both, a measured one omits whichever went unreported -- and a total that counted
+those turns as costing nothing would state a measurement nobody made. Each total
+therefore rides beside the count of turns that contributed to it, and a caller
+comparing the two learns what the total covers.
 
 Nothing here synthesizes history. An interrupted turn and an unmatched tool call
 are reported as OPEN, never closed with an invented outcome: closing them is the
@@ -45,7 +45,7 @@ reader has to know which kind of fold it is holding. The ``ledger`` fold is keye
 by SLOT, and a slot owns one ACP session id at a time rather than for its whole
 life, so the record it answers for is spread over a unit per id the slot ran
 under. It therefore joins those units (:func:`fold_slot`), which is a wider read
-than the five panel folds make and is why it is not one of them: the growth push
+than the six panel folds make and is why it is not one of them: the growth push
 and the side panel address a session, and a slot-wide value pushed under one
 session's id would report a partial answer as the whole one. The units it joins
 are still exactly one slot's own, so nothing here reads across slots.
@@ -65,13 +65,26 @@ import os
 import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, cast
 
 from kiro_crew.config.paths import data_home
 from kiro_crew.context_blocks import PHASE_SESSION_START
 from kiro_crew.crew_log.entry_types import (
+    DASHBOARD_AGENTIC_ENTRY_TYPE,
+    DASHBOARD_CODE_LIMIT,
+    DASHBOARD_FIELD_LIMIT,
+    DASHBOARD_FOLD_NAME,
+    DASHBOARD_REASON_LIMIT,
+    DASHBOARD_REFUSED_ENTRY_TYPE,
+    DASHBOARD_TYPE_LIMIT,
+    DASHBOARD_VALUE_BYTES,
+    DASHBOARD_VALUE_LIMIT,
+    MISTAKE_CORRECTED_CODE,
+    MISTAKE_CORRECTION_LIMIT,
+    MISTAKE_GROUP_LIMIT,
+    MISTAKES_FOLD_NAME,
     PANEL_CREW_KEY_LIMIT,
     PANEL_ENTRY_TYPE,
     PANEL_FOLD_NAME,
@@ -112,7 +125,7 @@ from kiro_crew.projection import ProjectionRegistry, Savepoint, attribute_seq
 if TYPE_CHECKING:
     # Type-only: the savepoint module imports this one, so a runtime import here
     # would close the cycle the function-local imports below exist to avoid.
-    from kiro_crew.crew_log.checkpoint import PrefixWitness
+    from kiro_crew.crew_log.checkpoint import CutWitness, PrefixWitness
 
 # The ledger fold reads a record whose semantics -- which phases end a workstream,
 # which event kinds exist, how much of each field is kept -- belong to the ledger
@@ -169,6 +182,11 @@ INTERNAL_PROJECTION_NAMES: Final[tuple[str, ...]] = ("class",)
 #: and are driven by :func:`fold_slot_checkpoint`, which joins several files.
 SESSION_FOLD_NAMES: Final[tuple[str, ...]] = PROJECTION_NAMES + INTERNAL_PROJECTION_NAMES
 
+#: The fold's registry name, spelled HERE rather than beside the rest of its
+#: constants because :data:`SLOT_PROJECTION_NAMES` below names it and that table is
+#: built at import, before the fold's own section is reached.
+WORKSTREAMS_FOLD_NAME: Final[str] = "workstreams"
+
 #: Projections keyed by a SLOT instead of by one crew log. A slot owns one ACP
 #: session id at a time, so a fact that belongs to the slot for its whole life --
 #: its work ledger -- is spread over a unit per id it ran under, and answering for
@@ -176,7 +194,21 @@ SESSION_FOLD_NAMES: Final[tuple[str, ...]] = PROJECTION_NAMES + INTERNAL_PROJECT
 #: :data:`PROJECTION_NAMES` for that reason: the growth push and the side panel
 #: address a session, and pushing a slot-wide value under one session's id would
 #: report a partial answer as the whole one.
-SLOT_PROJECTION_NAMES: Final[tuple[str, ...]] = ("ledger", "radar", "work", "panel")
+#:
+#: The two dashboard folds are slot-keyed for exactly that reason, and for them it
+#: is the point rather than an implementation detail. A crewmate's own dashboard
+#: values and its record of refused writes are facts about the CREWMATE, so a fold
+#: that reset every time its DM session was recreated would blank the dashboard and
+#: forget the lesson precisely when a fresh context most needs both.
+SLOT_PROJECTION_NAMES: Final[tuple[str, ...]] = (
+    "ledger",
+    "radar",
+    "work",
+    "panel",
+    DASHBOARD_FOLD_NAME,
+    MISTAKES_FOLD_NAME,
+    WORKSTREAMS_FOLD_NAME,
+)
 
 #: The slot-keyed fold served by its OWNER and by no generic route. This fold's owner
 #: (the Issue Radar crew store) orders a crew's units by the order the crew recorded
@@ -1519,6 +1551,9 @@ def _usage_start() -> dict[str, Any]:
         # left. Only a new unit -- a new session or a compaction, each its own crew log --
         # starts a new key space, because that is where turn numbers restart.
         "context_key_unit": 0,
+        # Whether a session-start composition has been folded yet, so exactly one row
+        # -- the session's real start -- is stamped ``first_start``.
+        "context_started": False,
         # A monotonic 1-based counter over the slot's TURN HISTORY, never reset by
         # truncation. Each composition row is stamped with its value as ``ordinal`` so a
         # retained row carries its TRUE position in the whole session history -- exact
@@ -1772,12 +1807,22 @@ def _usage_step(state: dict[str, Any], entry: Entry) -> None:
             per_model["credits_turns"] += 1
         tokens = data.get("tokens")
         if isinstance(tokens, dict):
-            state["tokens_turns"] += 1
+            # A block counts as a REPORT only when some dimension is above zero. Logs
+            # on disk carry four-zero blocks on closers whose provider sent no
+            # counts; a completed turn cannot have cost zero tokens, so a block of
+            # zeros is an absence written as a measurement, and counting it would
+            # tell a reader beside a real bill that the turn measured 0. The sums
+            # below are unaffected either way -- adding zeros moves nothing.
+            reported = False
             for dimension in TOKEN_DIMENSIONS:
                 measured = _as_int(tokens.get(dimension))
                 state["tokens"][dimension] += measured
                 if per_model is not None:
                     per_model["tokens"] += measured
+                if measured > 0:
+                    reported = True
+            if reported:
+                state["tokens_turns"] += 1
         # The fullest this window got, as the PROVIDER measured it, taken as one pair
         # so the reading and its window always come from the same turn.
         #
@@ -1955,6 +2000,14 @@ def _usage_step(state: dict[str, Any], entry: Entry) -> None:
         # when this turn is already the one it last accounted for, so a second
         # composition does not advance past the real turn sequence.
         row["ordinal"] = _count_turn_ordinal(state, state["context_key_unit"], row["turn"])
+        # Whether this row is the slot's FIRST session-start composition: the session's
+        # real start, as opposed to a later rebuild. Not derivable from the ordinal --
+        # a refused or composition-less turn 1 consumes ordinal 1, so the real start
+        # can carry 2 -- nor from the earliest retained row, which a trimmed window or
+        # a day view can make a rebuild. The fold sees every entry, so it marks it once.
+        row["first_start"] = row["phase"] == PHASE_SESSION_START and not state["context_started"]
+        if row["first_start"]:
+            state["context_started"] = True
         turns_window = state["context_turns"]
         turns_window.append(row)
         if len(turns_window) > CONTEXT_TURNS_LIMIT:
@@ -3748,8 +3801,12 @@ def _supplemental_units(slot: str, name: str) -> "tuple[str, ...]":
     return session_units_for_slot(slot)
 
 
-def _usage_units_in_succession(slot: str) -> "tuple[str, ...]":
-    """The slot's units for the ``usage`` fold, ordered by DURABLE succession.
+def units_in_succession(slot: str) -> "tuple[str, ...]":
+    """The slot's session units ordered by DURABLE succession rather than by the clock.
+
+    Read by every fold whose answer depends on which unit is folded LAST: ``usage``,
+    whose per-turn window trims from the front, and ``agentic``, which keeps the newest
+    value per field and so lets a predecessor folded last overwrite a newer one.
 
     The header fallthrough orders units by ``createdAt``, a wall-clock stamp: a clock
     that steps backward between two units of one slot -- an NTP correction, a VM
@@ -3847,6 +3904,14 @@ def _slot_units_for_fold(slot: str, name: str) -> "tuple[str, ...]":
         return session_ledger.crew_log_units(slot)
     if name == "work":
         return _work_units(slot, session_ledger.work_crew_log_units(slot))
+    if name == WORKSTREAMS_FOLD_NAME:
+        # The same units the ``work`` fold reads -- the conductor's, then every bound
+        # worker's -- because one session appends its work records AND its turn closers
+        # to one crew log, so the files carrying the boards are the files carrying the
+        # spend. No wider: the fold answers for the boards THIS slot reaches, and
+        # reading a slot nothing here binds would be a scan for data no reader asked
+        # for.
+        return _workstreams_units(slot)
     if name == PANEL_FOLD_NAME:
         # NOT the header fallthrough. A header's ``createdAt`` is stamped once and never
         # rewritten, so a backward clock step between two units of one slot would order
@@ -3859,7 +3924,14 @@ def _slot_units_for_fold(slot: str, name: str) -> "tuple[str, ...]":
         # and trims the oldest off the front, so a backward clock step that inverted two
         # units would evict the newest unit's rows and keep a retired session's. Order by
         # the durable succession chain instead of the header clock.
-        return _usage_units_in_succession(slot)
+        return units_in_succession(slot)
+    if name == DASHBOARD_FOLD_NAME:
+        # Nor here, and for the reason the panel fold gives: this fold keeps the LATEST
+        # value per field, so whichever unit is folded last wins each cell. A backward
+        # clock step between two units of one slot sorts the retired unit last under the
+        # header clock, and its stale value would then overwrite a value the live session
+        # wrote and the write path accepted -- silently, because both are well-formed.
+        return units_in_succession(slot)
     return session_units_for_slot(slot)
 
 
@@ -3913,6 +3985,15 @@ _SLOT_FOLD_ROW_BYTES: Final[dict[str, int]] = {
     # an item with title, summary and decision at their clamps; its acceptance and
     # artifacts have no clamp and are charged per container (``_work_opaque``)
     "work": 2_705,
+    # one agentic field: its value at DASHBOARD_VALUE_BYTES, plus the field name,
+    # the declared type, the stamp and the ownership digest
+    "agentic": 8_400,
+    # one mistake group: code, field and reason at their clamps, the ownership
+    # digest, two stamps and the bounded correction list (772 measured)
+    "mistakes": 1_100,
+    # a workstreams task with title and summary at their clamps, beside the hourly
+    # buckets a board and a spender each keep (measured below, see the test)
+    "workstreams": 1_150,
 }
 
 #: Default ceiling on the bytes EVERY warm slot cell may hold together, across every
@@ -4048,20 +4129,26 @@ class _UnitMark:
 
     The fingerprint settles the units a continuation does not re-read. It cannot settle
     the newest one, which a continuation exists to let GROW: an append moves size and
-    mtime by itself, so a stat has nothing left to compare there. That unit is settled
-    instead by :class:`_PrefixSeen`, a decode-free digest of the records already folded,
-    which is the only evidence that distinguishes a file that grew from one truncated
-    and regrown to the same reading.
+    mtime by itself, so a stat has nothing left to compare there.
+
+    ``cuts`` is what settles that one. It is :meth:`CrewLog.cuts`, the number of times
+    the store has cut this unit's history back, and a cut is the only thing that can
+    change a record a fold already consumed -- so the same count twice means those
+    records are the same bytes, read off a file a few bytes long rather than off the
+    log. ``None`` is NOT PROVEN rather than zero, and a mark carrying it falls back to
+    :class:`_PrefixSeen`, the decode-free digest of the records already folded, which is
+    what a log created before the counter existed is settled by.
     """
 
     origin: str | None
     last_seq: int
     size: int | None = None
     mtime_ns: int | None = None
+    cuts: int | None = None
 
 
 def _unit_mark(unit_id: str) -> _UnitMark:
-    """*unit_id*'s log identity, newest seq and fingerprint, or an unknown mark.
+    """*unit_id*'s log identity, newest seq, fingerprint and cut count.
 
     ``origin`` is ``None`` for an unreadable or header-less log, and every caller
     treats that as unknown and folds cold -- which is also why the fingerprint needs no
@@ -4075,7 +4162,13 @@ def _unit_mark(unit_id: str) -> _UnitMark:
         origin, size, mtime_ns = _log_identity(handle)
         # ``last_seq`` on a freshly opened handle is read off the file's tail, which
         # is what makes it usable as a growth signal for a reader that never appends.
-        return _UnitMark(origin, int(getattr(handle, "last_seq", 0) or 0), size, mtime_ns)
+        return _UnitMark(
+            origin,
+            int(getattr(handle, "last_seq", 0) or 0),
+            size,
+            mtime_ns,
+            handle.cuts(),
+        )
     except Exception:
         return _UnitMark(None, 0)
 
@@ -4129,6 +4222,64 @@ def _prefix_holds(unit_id: str, seen: _PrefixSeen) -> bool:
     """
     again = _unit_prefix(unit_id, seen.records)
     return again is not None and again.records == seen.records and again.sha == seen.sha
+
+
+#: What :func:`_folded_prefix_holds` concluded, and how.
+#:
+#: ``UNCUT`` and ``CUT`` are decided by the cut counter alone; ``UNPROVEN`` is the
+#: counter declining to answer, and the digest decides instead. Three values rather
+#: than a bool because the costs differ: two of them are a few bytes read, and the
+#: third is a byte walk of the whole folded prefix.
+_UNCUT = "uncut"
+_CUT = "cut"
+_UNPROVEN = "unproven"
+
+
+def _cut_verdict(now: "int | None", held: "int | None") -> str:
+    """Whether the cut counter proves this unit's folded records are still intact.
+
+    The store raises the counter ONCE BEFORE each cut and once after it, and
+    :meth:`CrewLog.cuts` answers ``None`` for the odd value in between. So a reading
+    that comes back at all was taken with the bytes settled, and two equal such readings
+    bracket a window in which no cut COMPLETED -- which is the question, because a cut
+    is the only thing in this store that can change a record already on disk. Equal
+    therefore means the folded records are the same bytes, and that is the whole proof.
+
+    One raise would not do it. It brackets "a cut STARTED since you last looked", and a
+    reader that sampled the raised value, folded the records that cut was about to
+    remove, and sampled the same value again afterwards would compare equal across the
+    rewrite.
+
+    Unequal means a cut landed, which is not a slow case to re-check but a decided one:
+    the records a fold consumed may be gone. Either reading being ``None`` proves nothing
+    in either direction -- an absent, unreadable or mid-cut counter is not a count.
+    """
+    if now is None or held is None:
+        return _UNPROVEN
+    return _UNCUT if now == held else _CUT
+
+
+def _folded_prefix_holds(unit_id: str, memo: "_SlotMemo", mark: _UnitMark) -> bool:
+    """Whether the records *memo* already folded from *unit_id* are still those bytes.
+
+    The cheap proof first. A unit whose cut counter reads the same as it did when the
+    memo was built has not been cut since, and nothing else in the store can disturb a
+    committed record -- so the question is settled by a few bytes, and the warm read
+    costs the same on a log of ten entries and a log of a hundred thousand.
+
+    The digest is the fallback, not the rule. It walks and hashes every record the fold
+    consumed, so its price rises with the log: the records it re-reads are exactly the
+    ones the reader has paid for once already. It is here for the readings the counter
+    declines to make -- a log created before the counter existed carries none until its
+    first cut, and a log whose cut is in flight right now has nothing settled to report
+    -- and for those the digest is the only evidence there is.
+    """
+    verdict = _cut_verdict(mark.cuts, memo.marks[-1].cuts if memo.marks else None)
+    if verdict == _UNCUT:
+        return True
+    if verdict == _CUT:
+        return False
+    return memo.prefix is not None and _prefix_holds(unit_id, memo.prefix)
 
 
 class _SlotFold:
@@ -4250,9 +4401,17 @@ class _SlotMemo:
     #: to whole-mark equality, so a rewrite there already folds cold; the newest unit is
     #: admitted precisely because it GREW, and growth moves its size and mtime by
     #: itself, which leaves a stat with nothing to say about the bytes underneath.
-    #: ``None`` means no digest is vouched for -- the file moved during the pass, or
-    #: could not be read -- and a continuation is refused rather than trusted.
+    #: ``None`` means no digest is vouched for, which has two causes now. The unit's cut
+    #: counter settles the question on its own, so no digest was taken -- the ordinary
+    #: case. Or one was wanted and could not be had: the file moved during the pass, or
+    #: could not be read. The two are told apart by the mark's own ``cuts``, and a
+    #: continuation with neither is refused rather than trusted.
     prefix: "_PrefixSeen | None" = None
+    #: The kernel ORDINAL this cell is persisted through on disk
+    #: (:func:`kiro_crew.crew_log.checkpoint.save_slot`), or 0 when nothing is. What
+    #: :func:`_persist_slot_fold` measures a write against, carried on the cell so a
+    #: continuation decides without reading the file to find out.
+    saved: int = 0
     #: What ORDERS this cell against every other value of the same (slot, fold). Minted
     #: when the cell is built, so a cell CARRIED FORWARD unchanged keeps its number and a
     #: cell that folded anything new gets a higher one. See :func:`_next_slot_revision`.
@@ -4560,15 +4719,22 @@ def fold_slot_warm(name: str, unit_ids: Sequence[str], *, slot: str) -> Checkpoi
     read streams every unit. Both go through the kernel, so there is no second folding
     path that could disagree with the first about the same bytes.
 
-    A continuation also HASHES that one file's already-folded records before trusting
-    them (:func:`_prefix_holds`). The store rewrites a committed prefix on two recovery
-    paths -- an unreachable chunk group is truncated away and closers are appended with
-    seqs continuing from the cut, and a failed append is truncated back after its bytes
-    reached the disk -- and a reader holds no append lock while either runs. Both leave
-    a file that has grown since the last read and reuses seqs the fold already consumed,
-    which is a pure append to every stat and to every seq comparison. The digest is
-    decode-free, so it costs a byte walk of one unit against the parse-and-fold walk of
-    every unit that a cold read would pay.
+    A continuation also PROVES that one file's already-folded records are still those
+    bytes before trusting them (:func:`_folded_prefix_holds`). The store rewrites a
+    committed prefix on two recovery paths -- an unreachable chunk group is truncated
+    away and closers are appended with seqs continuing from the cut, and a failed append
+    is truncated back after its bytes reached the disk -- and a reader holds no append
+    lock while either runs. Both leave a file that has grown since the last read and
+    reuses seqs the fold already consumed, which is a pure append to every stat and to
+    every seq comparison.
+
+    The proof is a COUNT, not a hash: the store raises the unit's cut counter before
+    each of those truncations, so two equal readings of a few bytes bracket a window in
+    which no committed record changed. That is what keeps a warm read the same price on
+    a log of ten entries and a log of a hundred thousand. Hashing the already-folded
+    records proves the same thing by re-walking exactly the bytes the reader has paid
+    for once, which charges the whole folded prefix per read; it is the fallback for a
+    log with no counter and nothing else.
 
     THE INVARIANT: the heights sampled before a pass reads are its READ PLAN, never the
     cell's claim about itself. What a memo remembers is what the pass actually FOLDED
@@ -4578,10 +4744,15 @@ def fold_slot_warm(name: str, unit_ids: Sequence[str], *, slot: str) -> Checkpoi
     holding the sample would sit permanently one entry short of itself and send every
     later read back to the file for a tail it has already folded.
 
-    In memory rather than on disk, per process, and best-effort by contract: a second
-    process folds cold, and so does the first after an eviction. What must never happen
-    is a WRONG answer, so every condition :func:`_continuable` does not admit refolds
-    from empty rather than carrying state that describes other bytes.
+    PERSISTED, so a second process and a cell that was evicted resume instead of
+    folding cold. The savepoint lives beside the newest unit's log and is admitted on
+    exactly the shapes :func:`_continuable` admits -- see
+    :mod:`kiro_crew.crew_log.checkpoint`'s slot section, which owns the file and every
+    condition that retires one. It is an OPTIMIZATION with no answer of its own: a
+    missing, stale or unreadable savepoint folds cold, which reaches the same value at
+    more cost. What must never happen is a WRONG answer, so every condition
+    :func:`_continuable` does not admit refolds from empty rather than carrying state
+    that describes other bytes.
     """
     return fold_slot_warm_revised(name, unit_ids, slot=slot)[0]
 
@@ -4635,12 +4806,8 @@ def _fold_slot_warm_locked(
             # one here would move the number on every poll of an idle board, and a client
             # would re-seed from a frame that carries the value it already holds.
             return _slot_checkpoint(name, memo)
-        if (
-            _continuable(marks, memo.marks)
-            and memo.prefix is not None
-            and _prefix_holds(units[-1], memo.prefix)
-        ):
-            before = _unit_prefix(units[-1])
+        if _continuable(marks, memo.marks) and _folded_prefix_holds(units[-1], memo, marks[-1]):
+            before = _digest_to_carry(units, marks)
             tail = _SlotStream(
                 units[-1:],
                 base=sum(mark.last_seq for mark in marks[:-1]),
@@ -4655,15 +4822,26 @@ def _fold_slot_warm_locked(
                 marks=_folded_marks(units, marks, tail, carried=memo.marks),
                 reached=tail.reached,
                 prefix=_vouched(units[-1], before),
+                saved=memo.saved,
                 revision=_minted_revision(),
                 weight=_cell_weight(name, memo.registry, memo.store),
             )
+            grown = _persist_slot_fold(name, grown, slot=slot, sampled=marks[-1])
             _remember_slot_fold(key, grown)
             return _slot_checkpoint(name, grown)
+    # Nothing warm to carry forward. Ask the DISK before folding every unit: a savepoint
+    # beside the newest unit's log reaches the same value over the entries appended since
+    # it was written, where the cold fold below streams every unit from its first record.
+    if known and units:
+        resumed = _resume_slot_fold(name, units, marks, slot=slot)
+        if resumed is not None:
+            resumed = _persist_slot_fold(name, resumed, slot=slot, sampled=marks[-1])
+            _remember_slot_fold(key, resumed)
+            return _slot_checkpoint(name, resumed)
     cold = _SlotStream(units)
     registry = ProjectionRegistry(seq_of=_ordinal_seq)
     registry.register(_SlotFold(_FOLDS[name], slot))
-    before = _unit_prefix(units[-1]) if units else None
+    before = _digest_to_carry(units, marks)
     registry.prime(slot, cold)
     fresh = _SlotMemo(
         registry=registry,
@@ -4672,6 +4850,9 @@ def _fold_slot_warm_locked(
         marks=_folded_marks(units, marks, cold),
         reached=cold.reached,
         prefix=_vouched(units[-1], before) if units else None,
+        # Nothing on disk is standing behind this value: a cold fold is what happens when
+        # no savepoint could be used, so the next write is owed for the whole position.
+        saved=0,
         # A cold fold is where the three rollover cases land -- a new unit, a unit
         # recreated under the same id, a rewritten prefix -- and every one of them can
         # leave ``reached`` unmoved or lower. The mint is what makes the value after them
@@ -4680,8 +4861,275 @@ def _fold_slot_warm_locked(
         weight=_cell_weight(name, registry, slot),
     )
     if known:
+        fresh = _persist_slot_fold(name, fresh, slot=slot, sampled=marks[-1] if units else None)
         _remember_slot_fold(key, fresh)
     return _slot_checkpoint(name, fresh)
+
+
+def _slot_cell(name: str, memo: _SlotMemo) -> "tuple[Any, int] | None":
+    """*memo*'s kernel cell for *name* as ``(state, watermark)``, or ``None``.
+
+    The watermark is the ORDINAL the cell stands at, which is the number a savepoint
+    resumes it at. It is read off the live cell rather than derived from ``reached``,
+    because the cell is what ``prime_checkpointed`` installs and a second derivation
+    could disagree with it about the same pass.
+    """
+    try:
+        return memo.registry.cells(memo.store)[name]
+    except Exception:  # pragma: no cover - a cell the registry did not build
+        return None
+
+
+def _identity_marks(marks: "Sequence[_UnitMark]") -> "list[list[Any]]":
+    """*marks* as the JSON a slot savepoint's identity block compares verbatim.
+
+    EVERY field of the mark, including ``cuts``, because the block's job is to be
+    admitted on exactly the shapes :func:`_continuable` admits and that function compares
+    an earlier unit's mark whole. An earlier unit that was cut therefore retires the
+    savepoint here as it folds cold there, rather than the two disagreeing about the same
+    unit vector.
+    """
+    return [[mark.origin, mark.last_seq, mark.size, mark.mtime_ns, mark.cuts] for mark in marks]
+
+
+def _resume_slot_fold(
+    name: str, units: "tuple[str, ...]", marks: "tuple[_UnitMark, ...]", *, slot: str
+) -> "_SlotMemo | None":
+    """A warm cell for *slot*'s *name*, resumed from the DISK savepoint, or ``None``.
+
+    The same three steps a warm continuation takes, standing on state a previous PROCESS
+    folded instead of on a cell in this one: the savepoint is admitted only if it
+    describes this unit vector and the newest unit's prefix still hashes to what its
+    writer read, the tail above it is folded through the kernel, and the result is a cell
+    exactly like the one a continuation builds.
+
+    The tail goes through ``prime_checkpointed`` rather than a seeding path of its own, so
+    a resumed fold and a cold fold run one implementation over the same events -- the
+    property that makes the resumed answer and the cold answer the same answer.
+
+    ``None`` for no savepoint and for every refusal, which is the cold fold.
+    """
+    from kiro_crew.crew_log import checkpoint as savepoints
+
+    handle = open_session_log(units[-1])
+    if handle is None:
+        return None
+    # Unit *i*'s ordinal base is the total height of the units before it, which is the
+    # derivation the warm continuation uses and the one the savepoint's own position is
+    # checked against. It is reproducible here only because every earlier mark is in the
+    # identity block and compared verbatim.
+    base = sum(mark.last_seq for mark in marks[:-1])
+    saved = savepoints.load_slot(
+        handle,
+        name,
+        slot=slot,
+        units=units,
+        marks=_identity_marks(marks[:-1]),
+        ordinal_base=base,
+    )
+    if saved is None:
+        return None
+    # The newest unit's own evidence, read before this pass consumes it -- the same thing
+    # the cold and warm paths read, and for the same reason. On a unit with a cut counter
+    # that is the counter, already in ``marks[-1]``, and nothing is hashed. On one without
+    # it is a FULL digest, and the savepoint's own witness cannot stand in for that
+    # digest: the witness ends at the seq the savepoint was written at, and this pass is
+    # about to fold the TAIL above it, so a cell carrying it would vouch for bytes it did
+    # not read. Two things go wrong when it does, and both are silent. A continuation then
+    # asks :func:`_prefix_holds` about the saved boundary only, so a tail rewritten in
+    # place -- the store's own recovery truncates an unreachable chunk group and
+    # re-appends with the seqs continuing from the cut -- compares equal, and the cell
+    # keeps state folded from bytes the file has replaced. And :func:`_persist_slot_fold`
+    # would write a witness whose ``seq`` is above its own ``prefix_records``, which
+    # :func:`prefix_admit` refuses on the next read, so every other restart pays a cold
+    # fold.
+    before = _digest_to_carry(units, marks)
+    registry = ProjectionRegistry(seq_of=_ordinal_seq)
+    registry.register(_SlotFold(_FOLDS[name], slot))
+    tail = _SlotStream(units[-1:], base=base, since=saved.reached)
+    try:
+        registry.prime_checkpointed(
+            slot,
+            _HeldCheckpoints(
+                {name: Checkpoint(name=name, last_seq=saved.watermark, state=saved.state)}
+            ),
+            {},
+            lambda _floor: tail,
+        )
+        # RENDERED here, and the value thrown away. It is the admission condition the
+        # shape checks cannot be: they read a state's top level, so a value malformed
+        # BELOW it -- an event row holding a number where a mapping belongs -- is
+        # admitted, survives a tail that touches nothing, and raises in the render the
+        # caller performs AFTER this function has returned. The ledger's reader answers
+        # that by logging and serving the empty record, so a payload like this would
+        # empty a live slot's ledger on every read for the life of the unit. A state no
+        # reader can be served is not a state to resume from, and asking costs one render
+        # of a bounded value on a read that resumed.
+        _FOLDS[name].render(registry.cells(slot)[name][0])
+    except Exception:
+        # A state that passed every admission condition and then could not be FOLDED or
+        # rendered. The file is retired and the caller folds cold, which is the answer
+        # ``_drive_session`` gives for a session savepoint and for the same reason --
+        # refusing it on the way in would take a per-fold walk of every nested container.
+        log_exception_text(
+            logger,
+            logging.DEBUG,
+            "crew log slot %s could not fold its resumed state; discarding and folding cold",
+            slot,
+        )
+        savepoints.discard_slot(handle, (name,))
+        return None
+    # The savepoint was admitted BEFORE this pass, and that window is not empty. The
+    # store's supersede repair replaces orphan chunk records at seqs the savepoint
+    # already consumed; the tail starts above them so this fold never reads the
+    # replacement, and ``before`` was captured after the repair so it matches the
+    # repaired file -- every check on this side passes while the state came from bytes
+    # the repair removed. So the savepoint is re-admitted against the file as it stands
+    # now, and one that fails to describe it costs a cold fold.
+    if not savepoints.slot_resume_still_verifies(
+        handle,
+        name,
+        slot=slot,
+        units=units,
+        marks=_identity_marks(marks[:-1]),
+        ordinal_base=base,
+        resumed=saved,
+    ):
+        logger.debug(
+            "crew log slot %s moved under its own savepoint while folding; folding cold", slot
+        )
+        return None
+    return _SlotMemo(
+        registry=registry,
+        store=slot,
+        units=units,
+        # ``carried=marks``: this pass re-stat'ed every unit, and the savepoint's identity
+        # block confirmed the earlier ones are the vector its state was folded over, so
+        # only the newest unit's height comes from the stream.
+        marks=_folded_marks(units, marks, tail, carried=marks),
+        reached=tail.reached,
+        prefix=_vouched(units[-1], before),
+        saved=saved.watermark,
+        revision=_minted_revision(),
+        weight=_cell_weight(name, registry, slot),
+    )
+
+
+def _persist_slot_fold(
+    name: str, memo: _SlotMemo, *, slot: str, sampled: "_UnitMark | None"
+) -> _SlotMemo:
+    """*memo*, with its savepoint on disk brought forward when a write is owed.
+
+    How far a fold must have moved to earn a write is the savepoint module's decision
+    (``checkpoint.write_is_earned``), not this one's: it is a property of the files, and
+    stating it here as well would give two places an answer that has to agree.
+
+    A WARM CONTINUATION WRITES TOO, and that is the one place this departs from the
+    session half, where a pass standing on a cached bundle writes nothing. The reason the
+    session half refuses is that a cached bundle records no evidence, so nothing a later
+    pass can read says anything about the bytes below its seq. A slot cell is different:
+    it CARRIES its evidence -- the newest unit's cut count in ``_SlotMemo.marks``, or its
+    digest in ``_SlotMemo.prefix`` on a unit that states no count -- and
+    :func:`_folded_prefix_holds` re-checks it before carrying the cell forward, so custody
+    of the already-folded prefix survives from the pass that folded it to this one.
+    Without this, a gateway that stays up leaves the savepoint wherever the process first
+    folded, and the restart it exists for replays the whole gap.
+
+    *sampled* is the newest unit's mark as read BEFORE the pass, and three of its fields
+    do the work. Its ``origin`` is the identity the pass folded under, which the write
+    refuses to differ from. Its ``last_seq`` is the boundary the evidence was taken at, so
+    a pass that ended somewhere ELSE -- the file grew under it -- matches nothing and
+    writes nothing: the evidence would then cover fewer bytes than the state was folded
+    from, which is the one savepoint no later read recovers from. That costs the savepoint
+    and never the read, which is already served. And its ``cuts`` is which of the two
+    witnesses this unit gets.
+
+    THE EVIDENCE IS CONFIRMED HERE, at the write, and that is what makes one rule cover
+    every pass that reaches this function. A digest taken before a pass and never asked
+    again would certify bytes a concurrent truncation changed afterwards, and because
+    every later resume recomputes the same changed bytes it would match, and the state
+    would be served for the life of the unit while disagreeing with a cold fold. The cold
+    and warm passes also vouch for their own digest (:func:`_vouched`), which they need
+    for their cell; asking again here costs one decode-free walk on a pass that has just
+    parsed and folded the same file, and it buys the property that NOTHING writes a
+    savepoint without re-reading the evidence its state came from. The counter is
+    re-confirmed for the same reason and at a fraction of the price -- and it is the
+    stronger of the two here, because a cut during the pass RAISES it rather than being
+    hashed into agreement with itself.
+    """
+    if not memo.units or sampled is None or sampled.origin is None:
+        return memo
+    if sampled.cuts is None and memo.prefix is None:
+        return memo
+    if memo.reached != sampled.last_seq:
+        return memo
+    if memo.weight > slot_fold_cache_bytes():
+        # A cell too big to keep WARM is one whose savepoint the store would refuse too:
+        # its cap is :data:`~kiro_crew.crew_log.checkpoint.MAX_CHECKPOINT_BYTES`, two
+        # orders of magnitude under this ceiling. The refusal is not the reason to skip --
+        # the store swallows it and the read is unaffected -- the MEMORY is: the store
+        # decides by serializing first, so attempting a ``radar`` cell at its declared
+        # caps would build a 2.4 GiB string to measure it and throw it away. And such a
+        # cell is not kept warm (:func:`_remember_slot_fold`), so every read of it would
+        # arrive here again. The charge is an upper bound that overestimates by a small
+        # factor, so this cannot skip a cell whose payload would really have fit.
+        return memo
+    cell = _slot_cell(name, memo)
+    if cell is None:
+        return memo
+    _state, watermark = cell
+    from kiro_crew.crew_log import checkpoint as savepoints
+
+    if not savepoints.write_is_earned(watermark, memo.saved):
+        return memo
+    handle = open_session_log(memo.units[-1])
+    if handle is None:
+        return memo
+    witness = _slot_witness(handle, memo, sampled)
+    if witness is None:
+        return memo
+    written = savepoints.save_slot(
+        handle,
+        name,
+        slot=slot,
+        units=memo.units,
+        marks=_identity_marks(memo.marks[:-1]),
+        ordinal_base=sum(mark.last_seq for mark in memo.marks[:-1]),
+        state=_state,
+        watermark=watermark,
+        prefix=witness,
+        expect_origin=sampled.origin,
+    )
+    if not written:
+        return memo
+    return replace(memo, saved=watermark)
+
+
+def _slot_witness(
+    handle: CrewLog, memo: _SlotMemo, sampled: _UnitMark
+) -> "PrefixWitness | CutWitness | None":
+    """The evidence *memo*'s savepoint records, re-confirmed now, or ``None``.
+
+    The cut count where the unit states one: *sampled*'s reading, taken before the pass,
+    checked against the live file here. A cut in between raises the live count, so this
+    answers ``None`` and the savepoint is skipped rather than written with a witness its
+    own resume could never admit.
+
+    The digest otherwise, re-labelled with the boundary it was taken at. It covers at
+    least every record the fold consumed -- a whole-file walk reaches past the newest
+    entry, never short of it -- so it is a witness through ``reached`` and a stricter one
+    than the seq span alone would be.
+    """
+    from kiro_crew.crew_log import checkpoint as savepoints
+
+    if sampled.cuts is not None:
+        held = savepoints.CutWitness(seq=memo.reached, cuts=sampled.cuts)
+        return held if savepoints.cuts_unchanged(handle, held) else None
+    if memo.prefix is None or not _prefix_holds(memo.units[-1], memo.prefix):
+        return None
+    return savepoints.PrefixWitness(
+        seq=memo.reached, records=memo.prefix.records, sha=memo.prefix.sha
+    )
 
 
 def _cell_weight(name: str, registry: ProjectionRegistry, store: str) -> int:
@@ -4696,6 +5144,25 @@ def _cell_weight(name: str, registry: ProjectionRegistry, store: str) -> int:
     except Exception:  # pragma: no cover - a cell the registry did not build
         return slot_fold_cell_bytes(name)
     return slot_fold_cell_bytes(name, state)
+
+
+def _digest_to_carry(
+    units: "tuple[str, ...]", marks: "tuple[_UnitMark, ...]"
+) -> "_PrefixSeen | None":
+    """The newest unit's whole-file digest, for a memo that will NEED one.
+
+    A memo needs one only when the next read of this unit cannot be settled by its cut
+    counter, and the counter's presence is what says which case this is. So a unit that
+    HAS a counter skips the hash on the write side of the memo as well as the read side
+    -- which is where most of the saving is, because this digest covers the whole file
+    rather than the records a fold consumed.
+
+    A unit with no counter gets the digest, and the next read is settled by it exactly
+    as before.
+    """
+    if not units or not marks:
+        return None
+    return None if marks[-1].cuts is not None else _unit_prefix(units[-1])
 
 
 def _vouched(unit_id: str, before: "_PrefixSeen | None") -> "_PrefixSeen | None":
@@ -4734,15 +5201,16 @@ def _folded_marks(
 
     *carried* is a warm continuation's earlier marks, which this pass did not read and
     has already found unchanged; only the newest unit is re-stated from the stream.
+
+    Built by REPLACING one field of the sampled mark rather than by naming the fields to
+    keep. A mark is compared whole, so a field this function forgot to carry would read
+    as changed on the very next pass and send every warm read of every slot back to a
+    cold fold -- a mark rebuilt field by field makes that the default outcome of adding
+    one.
     """
     base = list(carried if carried is not None else sampled)
     return tuple(
-        _UnitMark(
-            sampled[index].origin,
-            stream.heights.get(unit, base[index].last_seq),
-            sampled[index].size,
-            sampled[index].mtime_ns,
-        )
+        replace(sampled[index], last_seq=stream.heights.get(unit, base[index].last_seq))
         for index, unit in enumerate(units)
     )
 
@@ -5020,8 +5488,21 @@ def slot_of_session(session_id: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _work_units(slot: str, conductor_units: Sequence[str]) -> "tuple[str, ...]":
+def _work_units(
+    slot: str,
+    conductor_units: Sequence[str],
+    *,
+    limit: int | None = None,
+    on_drop: "Callable[[int], None] | None" = None,
+) -> "tuple[str, ...]":
     """The conductor's units followed by every bound worker's, oldest first.
+
+    *limit* caps what is RETAINED and stops the bind scan once reached, for a caller
+    whose own bound covers this list. It is optional because the two callers differ:
+    the ``work`` fold reads one board and is bounded by that, while ``workstreams``
+    follows nested boards and so states its own ceiling. Without it a bounded caller
+    still pays an unbounded peak here -- the whole listing lands in a list before the
+    caller can measure it, which is the bound describing a state the list already left.
 
     A worker's report is appended to the WORKER's log, and that log's header names
     the worker's own slot, so the header index alone never reaches it. The
@@ -5031,6 +5512,22 @@ def _work_units(slot: str, conductor_units: Sequence[str]) -> "tuple[str, ...]":
     entries naming this board, so the extra units add nothing that is not this
     board's.
     """
+    if limit is not None and limit <= 0:
+        return ()
+    # Bounded BEFORE the logs are opened: the bind scan below reads every entry of
+    # every conductor unit, so a cap applied to its output would still pay to read
+    # units it then discards.
+    #
+    # THE NEWEST ARE KEPT. These are oldest-first, so taking the head keeps a
+    # long-lived crewmate's oldest work and drops what it is doing now -- a dashboard
+    # showing finished boards and hiding the live one. The tail is what a reader came
+    # for, and the fold order below is unchanged: this selects which units, not the
+    # order they are folded in.
+    if limit is not None:
+        listed = list(conductor_units)
+        if on_drop is not None and len(listed) > limit:
+            on_drop(len(listed) - limit)
+        conductor_units = listed[-limit:]
     workers: list[str] = []
     seen: set[str] = set()
     for unit_id in conductor_units:
@@ -5041,7 +5538,14 @@ def _work_units(slot: str, conductor_units: Sequence[str]) -> "tuple[str, ...]":
             if entry.type != WORK_ENTRY_TYPE:
                 continue
             data = entry.data
-            if data.get("action") != "bind" or _as_str(data.get("slot")) != slot:
+            if _as_str(data.get("slot")) != slot:
+                continue
+            # A BASELINE names its worker too, and it is the only record of that
+            # binding once the ``bind`` entry's unit is pruned: a board rebuilt from
+            # baselines has the worker in every item and no `bind` action anywhere, so
+            # a scan for the action alone collects none of their units and every task
+            # on that board reports a cost nobody can be charged for.
+            if data.get("action") != "bind" and data.get("baseline") is not True:
                 continue
             worker = data.get("worker_session_key")
             if isinstance(worker, str) and worker and worker not in seen:
@@ -5051,9 +5555,17 @@ def _work_units(slot: str, conductor_units: Sequence[str]) -> "tuple[str, ...]":
     known = set(units)
     for worker in workers:
         for unit_id in session_ledger.work_crew_log_units(worker):
-            if unit_id not in known:
-                known.add(unit_id)
-                units.append(unit_id)
+            if unit_id in known:
+                continue
+            if limit is not None and len(units) >= limit:
+                # Counted, not just stopped: a worker's units refused here are boards
+                # and spend the snapshot will not carry, and a reader told nothing
+                # reads the short answer as the whole one.
+                if on_drop is not None:
+                    on_drop(1)
+                continue
+            known.add(unit_id)
+            units.append(unit_id)
     return tuple(units)
 
 
@@ -5570,6 +6082,1074 @@ def _work_render(state: dict[str, Any]) -> WorkBoardView:
     }
 
 
+# workstreams -- every board this slot reaches, each task costed by its own worker
+# --------------------------------------------------------------------------- #
+#
+# WHY A SECOND FOLD OVER THE SAME ENTRIES. ``work`` answers for ONE board: it binds
+# to the slot, drops every entry naming another, and resets itself when a new
+# generation appears under that slot. A project report asks a wider question -- what
+# is this crewmate running, across every board its own units and its workers' units
+# reach -- and it asks what each task COST, which no work entry carries. Neither half
+# can come from ``work``: the board it drops is a workstream the report must show, and
+# the spend lives in the ``usage`` entries of the bound worker's own log.
+#
+# So this fold groups by BOARD, keyed by ``(slot, generation)``, and joins each task
+# to the spend of the worker session bound to it. It reuses what is already here
+# rather than restating it: the same work entry type and the same conductor/worker
+# field tables as ``work``, and the same ``_bill_credits`` screen (via
+# :data:`_CREDIT_SOURCE_OF` and :func:`_credit_charge`) the ``usage`` fold bills with.
+#
+# HOW A CREDIT ENTRY FINDS ITS WORKER. An ``Entry`` carries no slot, so the fold reads
+# the one entry that marks where a unit begins and names its session's slot --
+# ``session/opened`` -- and attributes every charge after it to that slot. That is the
+# same marker ``usage`` keeps in :data:`USAGE_TYPES` for the same reason. A charge in a
+# unit whose opener this fold never saw is attributed to nothing and counted in
+# ``spend_unattributed``, never silently to the board: an unattributable charge is a
+# gap in the report, and reporting it as a task's cost would be an invention.
+#
+# COST IS NEVER ZERO BY DEFAULT. A task whose worker reported no charge renders
+# ``credits: 0.0`` WITH ``credits_reported: false``, which is the ``usage`` fold's own
+# posture (``reported`` beside each bucket): an unmetered provider writes no
+# ``credits`` key, and folding that in as a measurement nobody made is the one error
+# a spend report cannot be corrected out of.
+
+#: Boards one fold retains, newest activity first. A crewmate reads its own
+#: workstreams, and a page that lists more than this is not read -- so the cap is the
+#: page's, and every board past it is counted in ``omitted`` rather than dropped
+#: silently.
+WORKSTREAMS_BOARD_LIMIT: Final[int] = 12
+
+#: Tasks retained per board. Counted per board in ``tasks_omitted``, so a board that
+#: ran more says so instead of reading as complete at the cap.
+WORKSTREAMS_TASK_LIMIT: Final[int] = 40
+
+#: Hourly buckets kept per spender and per board: two days, which is the window the
+#: report's bar chart draws. The NEWEST are kept; older hours fall off the front.
+WORKSTREAMS_SERIES_LIMIT: Final[int] = 48
+
+#: Spender slots one fold retains. A board's workers are bound by its conductor, so
+#: this is bounded in practice by the boards x their items; the cap is what keeps a
+#: slot whose units name an unbounded number of sessions from growing the state.
+WORKSTREAMS_SPENDER_LIMIT: Final[int] = WORKSTREAMS_BOARD_LIMIT * WORKSTREAMS_TASK_LIMIT
+
+#: Units one read of this fold may collect, across every round of the bind walk. The
+#: ceiling that makes the walk a bounded read rather than one that grows with the bind
+#: graph, and the walk's ONLY bound: the fold shows 12 boards of 40 tasks, so a slot
+#: reaching more units than this has more history than the page can draw either way.
+WORKSTREAMS_UNIT_LIMIT: Final[int] = 512
+
+#: Work events one TASK's drawer shows, newest first. The drawer answers "what is
+#: this, and is the claim true" with the item's own narrative, and twenty lines is
+#: where a reader stops scrolling and starts asking the crewmate instead.
+WORKSTREAMS_EVENT_LIMIT: Final[int] = 20
+
+#: Events the WHOLE fold carries, across every board and task.
+#:
+#: The per-task cap alone does not bound this: 12 boards of 40 tasks at 20 events
+#: each is 9,600 lines, which is neither a state worth checkpointing nor a page a
+#: frame will mint. So the fold keeps ONE newest-first ring across every task and
+#: spends it globally -- a busy board's recent work crowds out an idle board's older
+#: work, which is the right way round for a reader opening a drawer.
+#:
+#: A task whose lines fell out of the ring is not silently empty: it carries
+#: ``events_seen``, so the drawer says "20 of 34" or "no events recorded" and never
+#: implies a task did nothing when the truth is that the fold stopped carrying it.
+WORKSTREAMS_EVENT_BUDGET: Final[int] = 400
+
+#: Characters of the conductor's ``decision`` a task row carries.
+#:
+#: The store takes 2000 and the ``work`` fold returns all of it. This fold cuts it,
+#: because here it is one of 480 possible rows rather than one board's own field, and
+#: the drawer shows the ruling's substance in its first lines. A reader who needs the
+#: whole text has the conductor's own board for it.
+WORKSTREAMS_DECISION_LIMIT: Final[int] = 400
+
+# The entry types this fold reads are :data:`WORKSTREAMS_TYPES`, declared beside the
+# ``usage`` fold's billing table because they are spelled FROM it.
+
+
+def _workstreams_hour(stamp_ms: int) -> str:
+    """An entry's epoch-millisecond ``time`` as the UTC hour it fell in.
+
+    UTC, and not the local spelling ``_work_iso`` renders: an hourly bucket is a KEY,
+    two buckets are compared by it, and a local offset that shrinks at an autumn DST
+    change spells a later hour as an earlier string -- so the chart's bars would swap
+    places for one hour a year. The report draws a bar per hour and labels it from
+    this key, so the key has to be ordered by the time it names.
+    """
+    try:
+        moment = datetime.fromtimestamp(stamp_ms / 1000, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return ""
+    return moment.strftime("%Y-%m-%dT%H:00Z")
+
+
+def _workstreams_bump(series: dict[str, Any], hour: str, key: str, amount: float) -> None:
+    """Add *amount* to *hour*'s *key* bucket, keeping the newest hours only.
+
+    The trim is by KEY order, which :func:`_workstreams_hour` makes a time order, so a
+    late-arriving entry for an hour already evicted does not reopen it at the cost of
+    the newest one.
+    """
+    if not hour:
+        return
+    bucket = series.get(hour)
+    if bucket is None:
+        if len(series) >= WORKSTREAMS_SERIES_LIMIT and hour < min(series):
+            # Older than every hour kept and the window is full: the chart does not
+            # draw it, and admitting it would evict an hour the chart does draw.
+            return
+        bucket = series[hour] = {"credits": 0.0, "accepted": 0}
+        for stale in sorted(series)[: max(0, len(series) - WORKSTREAMS_SERIES_LIMIT)]:
+            del series[stale]
+        bucket = series.setdefault(hour, {"credits": 0.0, "accepted": 0})
+    grown = bucket[key] + amount
+    if isinstance(grown, float) and not math.isfinite(grown):
+        return
+    bucket[key] = grown
+
+
+def _workstreams_start() -> dict[str, Any]:
+    return {
+        # The board this fold was asked about, which is the slot whose units lead the
+        # fold. Kept so a render can say which of the boards is the crewmate's own.
+        "slot": "",
+        # The session slot of the unit being folded, taken off its ``session/opened``.
+        # This is what a charge is attributed to; empty means no opener has been seen
+        # in this unit yet, and a charge then lands in ``spend_unattributed``.
+        "cursor": "",
+        "boards": {},
+        "order": [],
+        "omitted": 0,
+        # Session units this fold could not read, because the ceiling on what it
+        # retains was reached. Seeded by the bind hook from the selection that chose
+        # them; 0 means the record's whole reachable history is in this answer.
+        "units_omitted": 0,
+        # Per spender: what that session spent, how many charges the total covers, how
+        # long its turns ran, and its own hourly buckets. Joined to a task at RENDER by
+        # the task's ``worker_session_key`` rather than at step time, because a bind
+        # can be folded after the charge it explains (the conductor's units lead, but a
+        # board recorded from a worker's own baseline has no conductor unit at all).
+        "spend": {},
+        "spenders_omitted": 0,
+        # Charges in a unit whose opener was never folded. A gap the report states
+        # rather than a cost it assigns to a task that did not incur it.
+        "spend_unattributed": 0.0,
+        "spend_unattributed_reported": 0,
+        # THE NEWEST ENTRY THIS FOLD APPLIED, which is how the page tells "nothing is
+        # happening" from "nothing is reaching me". A gateway that died mid-run leaves
+        # every number on the page intact and correct as of a time the page cannot
+        # otherwise name, so without this the report reads as current forever.
+        #
+        # Across every entry kind the fold steps, not only work records: a charge
+        # arriving with no work entry beside it is still the log advancing, and
+        # treating that as silence would raise the band while spend was still moving.
+        "last_entry_ms": 0,
+        "last_entry_at": "",
+        # ONE newest-last ring of work events across every board and task, which is
+        # what a task drawer reads its own narrative from. Global rather than per
+        # task because the per-task cap alone does not bound the fold -- see
+        # `WORKSTREAMS_EVENT_BUDGET` for why, and for what a task whose lines fell
+        # out of it says instead of nothing.
+        "events": [],
+    }
+
+
+def _workstreams_bind_slot(state: dict[str, Any], slot: str) -> None:
+    """The board this fold was asked about, as the reader names it.
+
+    The unit-overflow count is collected here too, because this is the one hook that
+    runs between choosing the units and rendering them. A fold cannot count what it
+    never saw: a unit refused for want of room contributes no entry, so without this
+    the snapshot would report a short answer as a whole one.
+    """
+    state["slot"] = slot
+    state["units_omitted"] = _workstreams_units_dropped(slot)
+
+
+def _workstreams_new_board(board_id: str, slot: str, generation: str) -> dict[str, Any]:
+    return {
+        "id": board_id,
+        "slot": slot,
+        "generation": generation,
+        "goal": "",
+        "round": 0,
+        "items": {},
+        "order": [],
+        "tasks_omitted": 0,
+        "last_activity_ms": 0,
+        "last_activity_at": "",
+        "series": {},
+    }
+
+
+def _workstreams_new_item(item_id: str) -> dict[str, Any]:
+    """One task row's state, and THE declaration of what this fold keeps per item.
+
+    The step copies a field only when the item already has a key for it, so this dict
+    is the filter: the event tail, the acceptance, the artifacts map and the
+    conductor's ``decision`` are absent because the report draws one line per task and
+    the ``work`` fold already serves the board in full. ``decision`` in particular is
+    2000 clamped characters per item that nothing on this page renders.
+    """
+    return {
+        "item_id": item_id,
+        "title": "",
+        "state": "open",
+        "verdict": None,
+        "worker_session_key": None,
+        "round": 0,
+        "status": None,
+        "summary": "",
+        "pr": None,
+        # WHEN THIS TASK LAST PRODUCED ANYTHING, so a reader can tell a worker that is
+        # thinking from one that is dead -- the question the row's duration cannot
+        # answer, because duration is work time and reads the same either way.
+        #
+        # Written from the entry's own time on the actions where the WORKER is the one
+        # speaking, and deliberately NOT on a conductor action: a decide or a verdict
+        # is the conductor moving, and counting it would reset the silence of exactly
+        # the worker whose silence is being asked about.
+        #
+        # The millisecond stamp is kept beside its ISO rendering for the reason the
+        # board's pair is: the comparison is numeric, and an ISO string is empty for a
+        # stamp no ``datetime`` can hold.
+        "last_report_ms": 0,
+        "last_report_at": "",
+        # WHEN THIS TASK OPENED AND WHEN IT CLOSED -- the two ends of its span, which
+        # `last_report_at` and `duration_ms` together cannot give. Duration is the
+        # WORKER SESSION's measured work time, so a session bound to three tasks
+        # reports one figure for all three and nothing that places any of them on a
+        # clock; `last_report_at` is one instant. A per-worker timeline needs a start
+        # and an end per task, which is what these two are -- and they are spelled
+        # exactly as the ``work`` fold spells its own, so a page that reads one fold's
+        # span reads the other's with the same helper rather than a second vocabulary.
+        #
+        # ISO, not the millisecond pair ``last_report_at`` keeps beside it, because
+        # nothing here COMPARES them: the opener is written once and the closer is
+        # written from the item's own state, so neither needs the numeric guard a
+        # monotonic watermark does. ``_workstreams_item_span`` is the only writer.
+        "created_at": "",
+        "closed_at": "",
+        # The conductor's latest ruling on this item, clamped -- see
+        # `WORKSTREAMS_DECISION_LIMIT`. The drawer shows it because "what did the
+        # conductor decide" is the question a reader opens one task to ask.
+        "decision": "",
+        # How many events this task has produced, ALL of them, whether or not the
+        # fold is still carrying their text. The count and the carried tail are
+        # separate facts: a drawer reading only the tail cannot tell a task that did
+        # nothing from one whose lines fell out of the global ring, and saying "no
+        # events recorded" about the second is a lie about the work.
+        "events_seen": 0,
+        # The hour this item was ACCEPTED, so the chart's accepted line is drawn from
+        # the item's own transition rather than recomputed from a board total. Kept on
+        # the item (not added straight into the series) because a later close can move
+        # an item out of ``accepted`` again, and a counter already added cannot be
+        # moved back -- see ``_workstreams_item_state``.
+        "accepted_hour": "",
+    }
+
+
+def _workstreams_board_of(state: dict[str, Any], entry: Entry) -> dict[str, Any] | None:
+    """The board *entry* belongs to, minting it on first sight, or ``None`` when the
+    fold is already at its board cap.
+
+    Keyed by ``(slot, generation)``, because that pair is what names ONE board: a slot
+    reused after an earlier board was purged carries both boards' entries forever (the
+    log is append-only), and the generation is the id minted with each board's record.
+    A board from before the stamp existed has no generation and keys on its slot alone,
+    which is the one board such a slot can have.
+    """
+    data = entry.data
+    slot = _as_str(data.get("slot"))
+    if not slot:
+        return None
+    generation = _as_str(data.get("generation"))
+    board_id = f"{slot}#{generation}" if generation else slot
+    board = state["boards"].get(board_id)
+    if board is None:
+        if len(state["boards"]) >= WORKSTREAMS_BOARD_LIMIT:
+            state["omitted"] += 1
+            return None
+        board = state["boards"][board_id] = _workstreams_new_board(board_id, slot, generation)
+        state["order"].append(board_id)
+    if entry.time >= board["last_activity_ms"]:
+        board["last_activity_ms"] = entry.time
+        board["last_activity_at"] = _work_iso(entry.time)
+    return board
+
+
+def _workstreams_event(
+    state: dict[str, Any], board_id: str, item: dict[str, Any], entry: Entry
+) -> None:
+    """Record one work event into the fold's global ring, if it is one.
+
+    An entry with no ``event_kind`` is a field write and not a line of narrative, so
+    it is counted nowhere: the work vocabulary makes the kind the thing that says
+    "this is an event", and the ``work`` fold reads it the same way.
+
+    The count on the item moves whether or not the text is carried, which is what
+    lets a drawer distinguish a task that did nothing from one the ring has moved
+    past. Oldest lines fall off the front, because the question a drawer asks is
+    about now.
+    """
+    kind = _as_str(entry.data.get("event_kind"))
+    if not kind:
+        return
+    item["events_seen"] = _as_int(item.get("events_seen")) + 1
+    events: list[dict[str, Any]] = state["events"]
+    status = entry.data.get("status")
+    events.append(
+        {
+            "board": board_id,
+            "item_id": item["item_id"],
+            "at": _work_iso(entry.time),
+            "kind": kind[:TEXT_LIMIT],
+            "status": _as_str(status)[:TEXT_LIMIT] if isinstance(status, str) else None,
+            # Cut to `TEXT_LIMIT` by `_as_str` itself, which is the cut this field
+            # wants and the reason there is no second limit beside it: a drawer line
+            # is read at a glance, and the full text is in the `work` fold for
+            # anyone who needs it. A constant here would add a number that never
+            # fires, because `_as_str` has already cut below it.
+            "text": _as_str(entry.data.get("event")),
+        }
+    )
+    if len(events) > WORKSTREAMS_EVENT_BUDGET:
+        del events[: len(events) - WORKSTREAMS_EVENT_BUDGET]
+
+
+def _workstreams_item_state(
+    board: dict[str, Any], item: dict[str, Any], new: str, hour: str
+) -> None:
+    """Move *item* to state *new*, keeping the board's accepted-per-hour line honest.
+
+    An item can be accepted and then closed again under another state, so the line is
+    maintained as a DIFFERENCE: the hour an item was accepted in is remembered on the
+    item, and a move out of ``accepted`` takes its count back off that same hour. A
+    counter incremented on the way in and never on the way out would leave the chart
+    claiming an acceptance the board does not hold.
+    """
+    was = item["state"]
+    item["state"] = new
+    if was == new:
+        return
+    if new == "accepted":
+        item["accepted_hour"] = hour
+        _workstreams_bump(board["series"], hour, "accepted", 1)
+    elif was == "accepted":
+        _workstreams_bump(board["series"], item["accepted_hour"], "accepted", -1)
+        item["accepted_hour"] = ""
+
+
+def _workstreams_span_opened(item: dict[str, Any], data: Mapping[str, Any], stamp_ms: int) -> None:
+    """Stamp *item*'s ``created_at`` if it has none yet. Idempotent after that.
+
+    Written ONCE, by whichever entry reaches the item first -- which is not always a
+    ``create``. This fold mints an item from any action that names it (see
+    :func:`_workstreams_work`), so a board rebuilt from a baseline, or a worker report
+    folded ahead of its conductor's unit, would otherwise have no opener at all and
+    its row could not be placed on a clock.
+
+    A committed stamp the entry carries wins over the append time, the way
+    :func:`_work_stamp` already has it, so a span survives a rebuild unchanged.
+    """
+    if not item["created_at"]:
+        item["created_at"] = _work_stamp(data.get("created_at"), stamp_ms)
+
+
+def _workstreams_span_closed(item: dict[str, Any], data: Mapping[str, Any], stamp_ms: int) -> None:
+    """Keep *item*'s ``closed_at`` in step with the state it now holds.
+
+    Read off the item's own ``state`` AFTER the entry has been applied, rather than
+    from the ``close`` action, and that is what makes it ordering-tolerant: the state
+    is already guarded by :func:`_workstreams_item_state`, so this follows it instead
+    of keeping a second opinion about which action closes an item.
+
+    AND IT IS CLEARED WHEN AN ITEM REOPENS. An item can be closed and then moved back
+    to ``open`` -- the same transition ``_workstreams_item_state`` takes an accepted
+    count back off an hour for -- and a close stamp left standing would draw a bar
+    that ended, for a task that is still running.
+
+    Called on the CONDUCTOR path only, because only a conductor entry can be the one
+    that closed an item. A terminal item this fold never saw a conductor entry for
+    keeps an empty ``closed_at``, which is the fold's own posture everywhere else:
+    stamping it with whatever entry happened to arrive next would state a close time
+    the record never claimed, and a page reading it would draw a bar ending at a
+    moment nothing happened.
+    """
+    if item["state"] == "open":
+        item["closed_at"] = ""
+    elif not item["closed_at"]:
+        item["closed_at"] = _work_stamp(data.get("closed_at"), stamp_ms)
+
+
+def _workstreams_work(state: dict[str, Any], entry: Entry) -> None:
+    """Apply one work record to the board it names."""
+    data = entry.data
+    board = _workstreams_board_of(state, entry)
+    if board is None:
+        return
+    action = _as_str(data.get("action"))
+    hour = _workstreams_hour(entry.time)
+    if action == "goal":
+        board["goal"] = _work_text("goal", data.get("goal"))
+        board["round"] = max(board["round"], _as_int(data.get("round")))
+        return
+    item_id = _as_id(data.get("item_id"))
+    if not item_id:
+        state["omitted"] += 1
+        return
+    item = board["items"].get(item_id)
+    if item is None:
+        if len(board["items"]) >= WORKSTREAMS_TASK_LIMIT:
+            board["tasks_omitted"] += 1
+            return
+        # Minted by whichever action reaches the item first, not only by ``create``.
+        # The units are folded conductor-first, but a worker's report can still be the
+        # first record of an item this fold sees -- a board rebuilt from a baseline, or
+        # a conductor unit pruned -- and parking the entry the way ``work`` does would
+        # buy a report ordering this report-per-task row does not need.
+        item = board["items"][item_id] = _workstreams_new_item(item_id)
+        board["order"].append(item_id)
+        if data.get("baseline") is True:
+            # A BASELINE CARRIES THE WHOLE COMMITTED ITEM, so it seeds every field
+            # this fold keeps before the action delta below narrows to that action's
+            # own. Without this a task first seen through its close arrives with the
+            # close fields and nothing else: no title, no verdict, no worker -- a row
+            # the reader sees as an untitled task that was never worked, when the
+            # entry it was built from named all three.
+            for name in _WORK_BASELINE_FIELDS:
+                if name in data and name in item:
+                    item[name] = _work_field(name, data[name])
+            # The worker's own stamp rides along for the same reason the fields do:
+            # a baselined task that reported before the rebuild is not silent.
+            stamp = data.get("last_report_at")
+            if isinstance(stamp, str) and stamp:
+                item["last_report_at"] = _work_stamp(stamp, entry.time)
+    _workstreams_event(state, board["id"], item, entry)
+    # The span's open end, before either party's field copy: it depends on no field
+    # and must be set by whichever entry got here first, whoever wrote it.
+    _workstreams_span_opened(item, data, entry.time)
+    if data.get("actor") == "worker" or action == "report":
+        # THE WORKER SPOKE, so this is the stamp the row's silence is measured from.
+        # Set before the field copy and unconditionally: a report that carries no
+        # field this fold keeps is still the worker producing something, and reading
+        # it as silence would call a working worker dead.
+        if entry.time >= item["last_report_ms"]:
+            item["last_report_ms"] = entry.time
+            item["last_report_at"] = _work_iso(entry.time)
+        for name in _WORK_WORKER_FIELDS:
+            if name in data and name in item:
+                item[name] = _work_field(name, data[name])
+        return
+    fields = _WORK_CONDUCTOR_FIELDS.get(action, ())
+    for name in fields:
+        if name not in data or name not in item:
+            continue
+        if name == "state":
+            _workstreams_item_state(board, item, _work_field("state", data[name]), hour)
+            continue
+        if name == "decision":
+            # CUT HERE, not at the store's 2000: `_work_field` returns a decision
+            # whole because the `work` fold serves one board, and this one serves up
+            # to 480 rows inside a page. See `WORKSTREAMS_DECISION_LIMIT`.
+            item[name] = _work_text(name, data[name])[:WORKSTREAMS_DECISION_LIMIT]
+            continue
+        item[name] = _work_field(name, data[name])
+    # AFTER the field copy, so the state this reads is the one this entry set.
+    _workstreams_span_closed(item, data, entry.time)
+    if "round" in data:
+        board["round"] = max(board["round"], _as_int(data.get("round")))
+
+
+def _workstreams_spend(state: dict[str, Any], entry: Entry) -> None:
+    """Attribute one closer's charge and duration to the session that incurred it."""
+    data = entry.data
+    billed = _credit_charge(data.get("credits"))
+    # ``duration_ms`` is the turn closer's spelling and ``ms`` the subagent and
+    # background closers'; reading only one keeps half the log's durations out.
+    measured = _as_int(data.get("duration_ms")) or _as_int(data.get("ms"))
+    if billed is None and not measured:
+        return
+    slot = state["cursor"]
+    if not slot:
+        # No opener folded in this unit, so there is nothing this charge can be
+        # attributed to. Counted, never assigned.
+        if billed is not None:
+            grown = state["spend_unattributed"] + billed
+            if math.isfinite(grown) and grown >= state["spend_unattributed"]:
+                state["spend_unattributed"] = grown
+                state["spend_unattributed_reported"] += 1
+        return
+    row = state["spend"].get(slot)
+    if row is None:
+        if len(state["spend"]) >= WORKSTREAMS_SPENDER_LIMIT:
+            state["spenders_omitted"] += 1
+            return
+        row = state["spend"][slot] = {
+            "credits": 0.0,
+            "reported": 0,
+            "duration_ms": 0,
+            "series": {},
+        }
+    if measured:
+        row["duration_ms"] += measured
+    if billed is None:
+        return
+    # The same invariant ``_bill_credits`` keeps, for the same reason: a spend total
+    # stays finite and never goes down, and a broken one survives in the savepoint.
+    grown = row["credits"] + billed
+    if not math.isfinite(grown) or grown < row["credits"]:
+        return
+    row["credits"] = grown
+    row["reported"] += 1
+    _workstreams_bump(row["series"], _workstreams_hour(entry.time), "credits", billed)
+
+
+def _workstreams_advanced(state: dict[str, Any], entry: Entry) -> None:
+    """Remember that the fold applied *entry*, for the page's own staleness.
+
+    Guarded on ``>=`` like the board's stamp: a unit folded out of order must not
+    pull the watermark backwards and make a current page claim it is old.
+    """
+    if entry.time >= state["last_entry_ms"]:
+        state["last_entry_ms"] = entry.time
+        state["last_entry_at"] = _work_iso(entry.time)
+
+
+def _workstreams_step(state: dict[str, Any], entry: Entry) -> None:
+    if entry.type == "session/opened":
+        # Where a unit begins, and the only entry that names its session's slot. Every
+        # charge after this line is that session's until the next opener.
+        state["cursor"] = _as_str(entry.data.get("slot"))[:TEXT_LIMIT]
+        return
+    if entry.type == WORK_ENTRY_TYPE:
+        _workstreams_advanced(state, entry)
+        _workstreams_work(state, entry)
+        return
+    if entry.type in _CREDIT_SOURCE_OF:
+        _workstreams_advanced(state, entry)
+        _workstreams_spend(state, entry)
+
+
+def _workstreams_copy(state: dict[str, Any]) -> dict[str, Any]:
+    """A copy of every container ``step`` can reach, and no deeper.
+
+    The kernel requires a new object on a real change and the same one on none, so the
+    step edits a copy. Spelled out rather than left to the deep-copy fallback because
+    this state nests three levels (board -> item, board -> series, spender -> series)
+    and a deep copy of all of it is paid on every entry the fold reads -- which, with
+    three closers in ``affects``, is most of a busy worker's log.
+    """
+    boards = {}
+    for board_id, board in state["boards"].items():
+        boards[board_id] = {
+            **board,
+            "items": {item_id: dict(item) for item_id, item in board["items"].items()},
+            "order": list(board["order"]),
+            "series": {hour: dict(bucket) for hour, bucket in board["series"].items()},
+        }
+    return {
+        **state,
+        "boards": boards,
+        "order": list(state["order"]),
+        # The ring itself is copied; its rows are not, because nothing mutates a row
+        # after it is appended -- an event is a line of record, written once.
+        "events": list(state["events"]),
+        "spend": {
+            slot: {
+                **row,
+                "series": {hour: dict(bucket) for hour, bucket in row["series"].items()},
+            }
+            for slot, row in state["spend"].items()
+        },
+    }
+
+
+def _workstreams_series(series: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """One board's hourly buckets as a list, OLDEST FIRST, at the series cap.
+
+    Oldest first because the chart draws left to right in time; the cap is applied
+    here as well as in the step so a merge of several spenders' windows cannot hand a
+    reader more hours than the contract states.
+    """
+    hours = sorted(series)[-WORKSTREAMS_SERIES_LIMIT:]
+    return [
+        {
+            "hour": hour,
+            "credits": round(float(series[hour]["credits"]), 6),
+            "accepted": int(series[hour]["accepted"]),
+        }
+        for hour in hours
+    ]
+
+
+def _workstreams_merge(into: dict[str, Any], series: Mapping[str, Any]) -> None:
+    """Add every bucket of *series* into *into*, keeping the newest hours."""
+    for hour, bucket in series.items():
+        _workstreams_bump(into, hour, "credits", float(bucket["credits"]))
+        _workstreams_bump(into, hour, "accepted", int(bucket["accepted"]))
+
+
+def _workstreams_bound_tasks(state: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Which task each worker session was bound to, keyed by that session's slot.
+
+    THE NESTING LINK. A bound worker can be a conductor of its own board, and that
+    board's slot IS the worker session key its parent bound -- the same identity
+    :func:`_workstreams_units` follows to reach the sub-board's units. So the task a
+    nested board hangs under is already in this state, and the link is read here
+    rather than recorded in the step: a bind can be folded after the sub-board's own
+    entries, and a link written at step time would then be missing for exactly the
+    boards that have one.
+
+    First bind wins, in board order then item order, so a worker bound to two tasks
+    names one parent and names the same one on every read. Bounded by the board and
+    task caps already applied, so this map adds no limit of its own.
+    """
+    bound: dict[str, dict[str, Any]] = {}
+    for board_id in state["order"]:
+        board = state["boards"].get(board_id)
+        if board is None:
+            continue
+        for item_id in board["order"][:WORKSTREAMS_TASK_LIMIT]:
+            item = board["items"].get(item_id)
+            if item is None:
+                continue
+            worker = item["worker_session_key"]
+            if not isinstance(worker, str) or not worker or worker in bound:
+                continue
+            bound[worker] = {
+                "board": board_id,
+                "item_id": item_id,
+                "title": item["title"],
+            }
+    return bound
+
+
+def _workstreams_tails(state: Mapping[str, Any]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """The fold's global event ring, grouped into one newest-first tail per task.
+
+    Grouped at RENDER rather than kept per task at step time, because the budget is
+    global: a per-task list would have to be trimmed against a total it cannot see,
+    and the trimming would have to walk every other task to know whose turn it is.
+    One pass over a bounded ring answers it instead.
+
+    Keyed by (board, item) and not by item alone: two boards can carry the same item
+    id -- a board rebuilt under a new generation keeps its predecessor's ids -- and
+    merging their lines would put one board's narrative in the other's drawer.
+    """
+    tails: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    events = state.get("events")
+    if not isinstance(events, list):
+        return tails
+    # REVERSED, so the newest line is first and the per-task cut keeps the newest.
+    for row in reversed(events):
+        if not isinstance(row, Mapping):
+            continue
+        key = (_as_str(row.get("board")), _as_str(row.get("item_id")))
+        tail = tails.setdefault(key, [])
+        if len(tail) >= WORKSTREAMS_EVENT_LIMIT:
+            continue
+        tail.append({name: row[name] for name in ("at", "kind", "status", "text") if name in row})
+    return tails
+
+
+def _workstreams_render(state: dict[str, Any]) -> dict[str, Any]:
+    """The report's own shape: one row per board, each task costed by its worker.
+
+    THE JOIN HAPPENS HERE, not in the step, so it cannot depend on whether a bind was
+    folded before or after the charge it explains.
+
+    A board's ``credits`` sums its DISTINCT workers' spend. A worker session bound to
+    two items of one board spent its credits once, so each task row reports that
+    session's spend and the board counts it a single time -- a board total built by
+    adding up its task rows would multiply one session's bill by the number of items it
+    served. ``credits_reported`` is false exactly when no charge was folded for the
+    sessions concerned, which is what tells "spent nothing" from "nobody measured".
+
+    Each task row also carries the ``spender`` it was costed through, and a
+    nested board carries the ``parent`` task it hangs under
+    (:func:`_workstreams_bound_tasks`). Those two together make this flat board list a
+    TREE a reader can roll up: the parent link says where a sub-board belongs, and the
+    spender is what lets a roll-up bill one worker once however many tasks of that
+    subtree it served -- the rule this render already keeps for a board total, and the
+    one a reader adding up task rows cannot otherwise reproduce.
+
+    ``spender`` is an OPAQUE per-render alias, never the worker's session key. This
+    payload is embedded in a page any dashboard caller can read, and the conductor
+    ledger's rule is that no reader but the conductor sees a session key. An alias
+    keeps the only property a reader needs -- two rows billed to the same worker
+    carry the same token, two different workers do not -- while naming nobody. It is
+    minted per render, so the same worker is a different token in the next read and
+    the tokens cannot be accumulated across reads into a worker's history.
+    """
+    spend: Mapping[str, Any] = state["spend"]
+    bound = _workstreams_bound_tasks(state)
+    tails = _workstreams_tails(state)
+    boards: list[dict[str, Any]] = []
+    everywhere: dict[str, Any] = {}
+    counted: set[str] = set()
+    #: session key -> alias, for THIS render only. Ordinal rather than a hash: a hash
+    #: of a session key is still derived from it, so a caller holding a candidate key
+    #: could confirm a guess by hashing it the same way.
+    aliases: dict[str, str] = {}
+
+    def spender_of(worker: Any) -> str | None:
+        """The alias for *worker*, minting one on first sight. None when unbound."""
+        if not isinstance(worker, str) or not worker:
+            return None
+        alias = aliases.get(worker)
+        if alias is None:
+            #: A bare ordinal: each template supplies its own label around it, so a
+            #: token carrying the word "worker" would render as "worker worker 2".
+            alias = str(len(aliases) + 1)
+            aliases[worker] = alias
+        return alias
+
+    #: board id -> alias, for THIS render only. A board's own id is its conductor's
+    #: slot key (plus a generation), so the id is a THIRD party's session key and
+    #: leaks the same way a worker's would. The alias keeps what a page needs from an
+    #: id -- telling two boards apart, and a sub-board finding its parent -- and the
+    #: goal beside it is what a reader actually reads.
+    board_aliases: dict[str, str] = {}
+
+    def board_alias_of(board_id: str) -> str:
+        alias = board_aliases.get(board_id)
+        if alias is None:
+            alias = f"board-{len(board_aliases) + 1}"
+            board_aliases[board_id] = alias
+        return alias
+
+    for board_id in state["order"]:
+        board = state["boards"].get(board_id)
+        if board is None:
+            continue
+        tasks: list[dict[str, Any]] = []
+        total = 0.0
+        charges = 0
+        board_series: dict[str, Any] = {}
+        _workstreams_merge(board_series, board["series"])
+        seen: set[str] = set()
+        needs_you = 0
+        accepted = 0
+        for item_id in board["order"][:WORKSTREAMS_TASK_LIMIT]:
+            item = board["items"].get(item_id)
+            if item is None:
+                continue
+            worker = item["worker_session_key"]
+            row = spend.get(worker) if isinstance(worker, str) and worker else None
+            if item["state"] == "accepted":
+                accepted += 1
+            if item["status"] in ("question", "blocked"):
+                needs_you += 1
+            tasks.append(
+                {
+                    "item_id": item_id,
+                    "title": item["title"],
+                    "state": item["state"],
+                    "status": item["status"],
+                    "summary": item["summary"],
+                    "verdict": item["verdict"],
+                    "pr": item["pr"],
+                    "round": item["round"],
+                    # The spender the cost came through, so a roll-up over a subtree
+                    # can bill it once. A task with no bound worker carries None,
+                    # which is also why it has no cost of its own.
+                    "spender": spender_of(worker),
+                    "credits": round(float(row["credits"]), 6) if row else 0.0,
+                    # FALSE, never a zero cost: a worker whose provider does not bill
+                    # in credits wrote no charge, and a task with no bound worker at
+                    # all has nobody to have billed.
+                    "credits_reported": bool(row and row["reported"]),
+                    "duration_ms": int(row["duration_ms"]) if row else 0,
+                    # WHEN THIS TASK LAST SPOKE, which `duration_ms` cannot answer:
+                    # duration is work time, so a worker thinking for twenty minutes
+                    # and a worker that died twenty minutes ago read identically.
+                    # Empty for a task no worker has reported on, which is absence of
+                    # silence rather than a long one.
+                    "last_report_at": item["last_report_at"],
+                    # THE TWO ENDS OF THIS TASK'S SPAN, so a page can place the row on
+                    # a clock beside every other row and show what ran at the same
+                    # time. `duration_ms` above cannot: it is the worker SESSION's
+                    # total work time, one figure however many tasks that session
+                    # served, and it names no instant. Either may be empty -- a task
+                    # whose opener this fold never saw, or one still open -- and a
+                    # page draws an unplaceable or an unfinished end rather than
+                    # inventing a bound. See `_workstreams_span_opened` and
+                    # `_workstreams_span_closed`.
+                    "created_at": item["created_at"],
+                    "closed_at": item["closed_at"],
+                    # THE DRAWER'S OWN FIELDS. A reader opening one task asks what
+                    # the conductor decided and what the item's own record says, and
+                    # the page cannot fetch either: the frame it is minted into has
+                    # `connect-src 'none'`, so whatever a drawer shows has to be in
+                    # the document already.
+                    "decision": item["decision"],
+                    "events": tails.get((board_id, item_id), []),
+                    # The count beside the tail, so "20 of 34" and "no events
+                    # recorded" are different sentences. See the budget's own note.
+                    "events_seen": _as_int(item.get("events_seen")),
+                }
+            )
+            if row is None or not isinstance(worker, str) or worker in seen:
+                continue
+            seen.add(worker)
+            total += float(row["credits"])
+            charges += int(row["reported"])
+            _workstreams_merge(board_series, row["series"])
+            if worker not in counted:
+                counted.add(worker)
+                _workstreams_merge(everywhere, row["series"])
+        _workstreams_merge(everywhere, board["series"])
+        # A nested board: its own slot is a worker session key some task bound. Absent
+        # for a board nobody bound, and for a board whose bind is its own (a conductor
+        # bound as the worker of one of its items is not its own subtask).
+        parent = bound.get(board["slot"])
+        if parent is not None and parent["board"] == board_id:
+            parent = None
+        if parent is not None:
+            # The parent link names a BOARD, so it goes through the same table: a raw
+            # id here would carry the very key the board's own `id` withholds, and the
+            # two must agree or the tree cannot find its parent.
+            parent = dict(parent)
+            parent["board"] = board_alias_of(parent["board"])
+        boards.append(
+            {
+                "id": board_alias_of(board_id),
+                "goal": board["goal"],
+                "round": board["round"],
+                "parent": parent,
+                "total": len(board["order"]),
+                "accepted": accepted,
+                "open": sum(
+                    1
+                    for item_id in board["order"]
+                    if board["items"].get(item_id, {}).get("state") == "open"
+                ),
+                "needs_you": needs_you,
+                "credits": round(total, 6),
+                "credits_reported": charges > 0,
+                "last_activity_at": board["last_activity_at"],
+                "tasks": tasks,
+                "tasks_omitted": board["tasks_omitted"]
+                + max(0, len(board["order"]) - WORKSTREAMS_TASK_LIMIT),
+                "series": _workstreams_series(board_series),
+            }
+        )
+        #: Whether this is the SUBJECT's own board, decided from the board's slot
+        #: before the id is aliased. The alias carries no slot, by design, so the
+        #: ordering question has to be answered while the slot is still in hand.
+        #: Popped before the row is returned: it is an ordering fact, not a field the
+        #: page is told about, and the rendered keys are pinned as an exact set.
+        boards[-1]["_own"] = board["slot"] == state["slot"]
+        #: The MILLISECOND stamp, carried for the sort and popped with ``_own``.
+        #: ``last_activity_at`` is rendered by ``_work_iso`` and carries a LOCAL
+        #: offset, so comparing two of those as strings orders them by wall-clock
+        #: text: across an autumn DST hour or a timezone change a later board reads
+        #: as older, and at ``WORKSTREAMS_BOARD_LIMIT`` the board moved into
+        #: ``omitted`` can be the newest one. The epoch value has no such ambiguity
+        #: and is already kept beside it.
+        boards[-1]["_ms"] = board["last_activity_ms"]
+    # Newest activity first, which is the order the page lists them in. The board's own
+    # slot leads a tie so the crewmate's own workstream is not shuffled below a
+    # sub-board that happens to share its last stamp.
+    boards.sort(key=lambda row: (row["_ms"], row["_own"]), reverse=True)
+    for row in boards:
+        del row["_own"]
+        del row["_ms"]
+    return {
+        "schema": 1,
+        "slot": state["slot"],
+        "items": boards[:WORKSTREAMS_BOARD_LIMIT],
+        "omitted": state["omitted"] + max(0, len(boards) - WORKSTREAMS_BOARD_LIMIT),
+        "series": _workstreams_series(everywhere),
+        # The charges no session could be named for, stated rather than folded into a
+        # board. 0.0 with a false flag is "nothing was unattributable".
+        "unattributed": {
+            "credits": round(float(state["spend_unattributed"]), 6),
+            "credits_reported": state["spend_unattributed_reported"] > 0,
+        },
+        "spenders_omitted": state["spenders_omitted"],
+        # SESSION UNITS the ceiling refused, stated once for the whole answer. A page
+        # drawing boards from a truncated read looks complete, so this is what lets it
+        # say "and older history this does not reach" instead of implying there is
+        # none. It counts units rather than boards because a unit is what was refused;
+        # how many boards were in it is unknowable without reading it.
+        "units_omitted": _as_int(state.get("units_omitted")),
+        # WHEN THE LOG LAST REACHED THIS FOLD. The page's own staleness question is
+        # not "did a field fail to resolve" -- the frame's band already answers that
+        # -- but "are these numbers still being produced". A gateway that died leaves
+        # every value here intact and correct as of a time nothing else on the page
+        # names, so this is what lets the report say so instead of reading as current.
+        # Empty when the fold has applied nothing at all, which is a page with no
+        # numbers rather than old ones.
+        "last_entry_at": state["last_entry_at"],
+    }
+
+
+def _workstreams_rows(state: Mapping[str, Any]) -> int:
+    """``workstreams``: each board keeps its tasks and its hourly series, and each
+    spender keeps its own series."""
+    boards = state.get("boards")
+    rows = _rows_in(boards) + _rows_in(state.get("order")) + _rows_in(state.get("events"))
+    if isinstance(boards, dict):
+        for board in boards.values():
+            if isinstance(board, Mapping):
+                rows += (
+                    _rows_in(board.get("items"))
+                    + _rows_in(board.get("order"))
+                    + _rows_in(board.get("series"))
+                )
+    spend = state.get("spend")
+    rows += _rows_in(spend)
+    if isinstance(spend, dict):
+        for row in spend.values():
+            if isinstance(row, Mapping):
+                rows += _rows_in(row.get("series"))
+    return rows
+
+
+def _workstreams_binds_in(unit_ids: Iterable[str]) -> "tuple[str, ...]":
+    """Every ``worker_session_key`` bound in *unit_ids*, for ANY board, in order.
+
+    Not filtered to one board, which is the difference from :func:`_work_units`: this
+    fold shows every workstream the slot reaches, including a bound worker that is
+    itself a conductor, so the boards it must cost include that worker's own. The
+    binds for those are in the sub-conductor's log, which this fold already reads.
+    """
+    workers: list[str] = []
+    seen: set[str] = set()
+    for unit_id in unit_ids:
+        handle = open_session_log(unit_id)
+        if handle is None:
+            continue
+        for entry in handle.iter_from(1, known=KNOWN_TYPES):
+            if entry.type != WORK_ENTRY_TYPE or entry.data.get("action") != "bind":
+                continue
+            worker = entry.data.get("worker_session_key")
+            if isinstance(worker, str) and worker and worker not in seen:
+                seen.add(worker)
+                workers.append(worker)
+    return tuple(workers)
+
+
+def _workstreams_units(slot: str) -> "tuple[str, ...]":
+    """The slot's own units, then every bound worker's, then the nested boards', oldest first.
+
+    The conductor's units lead, which is what :func:`_work_units` establishes and what
+    makes a bind known before the worker's own entries are read; the workers follow in
+    the order their binds were recorded. A worker's units are the ones carrying its
+    ``usage`` entries -- the same files: one session appends its work records and its
+    turn closers to one crew log, so ``work_crew_log_units`` lists exactly the units
+    this fold needs for both halves.
+
+    THEN the nested boards. A bound worker can be a conductor of its own board, and
+    this fold shows that board (its entries are in a log already being read), so it
+    must be able to COST it: the sub-board's own workers are reached by following the
+    binds recorded in the logs already collected. A board the fold shows with no
+    reachable spend reports ``credits_reported: false`` honestly, but it reports
+    nothing a reader can act on, and the bind that would fix it is already in hand.
+
+    The walk runs to closure, NOT a fixed number of rounds, because a round count
+    cannot express the invariant: a board becomes VISIBLE when its conductor's units are
+    read, and becomes COSTABLE one round later, when that conductor's own workers are
+    read. Any fixed depth therefore has a last round whose boards it shows and cannot
+    cost -- the exact state this walk exists to prevent. :data:`WORKSTREAMS_UNIT_LIMIT`
+    is the bound instead, and it is the real one: a cycle is excluded by the dedupe, and
+    a round that adds no unit ends the walk, so the rounds cannot outnumber the units.
+
+    THE BOUND IS APPLIED AT ADMISSION, on every unit this function retains, including
+    the conductor's own and its direct workers'. A limit tested only between rounds
+    bounds the WALK and not the population: the first round is a whole slot's listing
+    plus every bound worker's, so a conductor with ten thousand units had ten thousand
+    in the list before the first test ran, and the bound it was given described a state
+    the list had already left.
+    """
+    units: list[str] = []
+    known: set[str] = set()
+    dropped = 0
+
+    def admit(candidate: "Sequence[str]") -> list[str]:
+        """Take units until the bound is reached, and COUNT the rest.
+
+        A unit refused for want of room is counted, because a snapshot that silently
+        shows fewer boards than the record holds reads as a complete answer. A unit
+        refused as a duplicate is not: it is already in.
+        """
+        nonlocal dropped
+        taken: list[str] = []
+        for unit_id in candidate:
+            if unit_id in known:
+                continue
+            if len(units) >= WORKSTREAMS_UNIT_LIMIT:
+                dropped += 1
+                continue
+            known.add(unit_id)
+            units.append(unit_id)
+            taken.append(unit_id)
+        return taken
+
+    # The conductor's own units and its direct workers', through the same gate as the
+    # nested boards below rather than as a list built first and measured after.
+    def refused(count: int) -> None:
+        nonlocal dropped
+        dropped += count
+
+    frontier = tuple(
+        admit(
+            _work_units(
+                slot,
+                session_ledger.work_crew_log_units(slot),
+                limit=WORKSTREAMS_UNIT_LIMIT,
+                on_drop=refused,
+            )
+        )
+    )
+    # The ceiling is NOT the loop's exit condition. Stopping on it leaves the round
+    # that would have been refused unoffered, and a unit never offered is a unit never
+    # counted -- the snapshot would then call a truncated read complete. `admit`
+    # refuses once full, so a full walk runs one more round, counts what it cannot
+    # take, and ends on that round adding nothing.
+    while frontier:
+        added = admit(
+            [
+                unit_id
+                for worker in _workstreams_binds_in(frontier)
+                for unit_id in session_ledger.work_crew_log_units(worker)
+            ]
+        )
+        if not added:
+            break
+        frontier = tuple(added)
+    _WORKSTREAMS_UNITS_DROPPED[slot] = dropped
+    if len(_WORKSTREAMS_UNITS_DROPPED) > _WORKSTREAMS_DROPPED_SLOTS:
+        # Bounded like everything else here. The map is a handoff and not a cache, so
+        # the oldest pending entry is the one nobody came back for.
+        _WORKSTREAMS_UNITS_DROPPED.pop(next(iter(_WORKSTREAMS_UNITS_DROPPED)), None)
+    return tuple(units)
+
+
+#: How many slots may have an unread unit-overflow count pending at once. One read
+#: selects units and then folds them, so an entry normally lives for one call; this
+#: only bounds the leak when a selection is never followed by its fold.
+_WORKSTREAMS_DROPPED_SLOTS: Final[int] = 64
+
+#: Units this fold refused for want of room, by slot, written by
+#: :func:`_workstreams_units` and read ONCE by :func:`_workstreams_bind_slot`.
+#:
+#: A handoff rather than shared state: the count is known only where the units are
+#: chosen, which is outside the fold, and it has to reach the render so a snapshot can
+#: say it is short. Keyed by slot because two reads for different slots can interleave,
+#: and read-and-cleared so a later fold of the same slot cannot inherit this number.
+#: Absent means zero, which is also what a warm fold that skipped selection reports.
+_WORKSTREAMS_UNITS_DROPPED: Final[dict[str, int]] = {}
+
+
+def _workstreams_units_dropped(slot: str) -> int:
+    """How many units the last selection for *slot* refused. Clears on read."""
+    return _WORKSTREAMS_UNITS_DROPPED.pop(slot, 0)
+
+
 # panel -- a crew's own webview, keyed by the publishing member's slot
 # --------------------------------------------------------------------------- #
 
@@ -5774,6 +7354,256 @@ def _panel_render(state: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+# -------------------------------------------------------------------------- #
+# the dynamic dashboard: agentic values, and the mistake book
+# -------------------------------------------------------------------------- #
+
+
+def _dashboard_value_fits(value: Any) -> bool:
+    """Whether one agentic value is small enough to retain.
+
+    RE-APPLIED here rather than trusted from the writer, like every other ceiling
+    in this file: this runs over bytes off a file the reader does not control, so a
+    planted or damaged line is exactly the input that ignores the writer's clamp.
+
+    Measured on the serialized form because that is what the ceiling is about, and
+    an unserializable value is refused by the same test -- a value the fold cannot
+    encode is one no reader can be handed.
+    """
+    try:
+        blob = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    return len(blob.encode("utf-8")) <= DASHBOARD_VALUE_BYTES
+
+
+def _dashboard_type_holds(declared: str, value: Any) -> bool:
+    """Whether *value* is of the manifest type *declared*.
+
+    THE SAME FIVE TYPES the manifest declares (``manifest.FIELD_TYPES``), checked
+    the same way the write path checks them. Two copies of one rule, and that is
+    deliberate rather than an oversight: this module must not import
+    ``dashboard_templates`` -- the manifest imports THIS one, for the fold names --
+    so the shared helper cannot live there without closing the cycle. A test pins
+    the two against one table of cases.
+
+    A bool is NOT a number, which is the one case worth stating: Python says
+    ``isinstance(True, int)``, so without the exclusion a crewmate writing ``true``
+    into a ``number`` field would pass the check and the page would render ``True``
+    where a count belongs.
+    """
+    if declared == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if declared == "string":
+        return isinstance(value, str)
+    if declared == "boolean":
+        return isinstance(value, bool)
+    if declared == "array":
+        return isinstance(value, list)
+    if declared == "object":
+        return isinstance(value, dict)
+    return False
+
+
+def _agentic_start() -> dict[str, Any]:
+    """One slot's agentic values: the latest per FIELD, and what was evicted.
+
+    Keyed by field rather than holding one document, because the fields are
+    independent cells: a crewmate that learns one number writes that one, and a
+    whole-document fold would make it restate the other twenty-three to report it.
+    That is the one place this fold parts company with ``panel``, whose entry
+    replaces a whole published panel.
+    """
+    return {"fields": {}, "fields_omitted": 0, "wrote": 0}
+
+
+def _agentic_step(state: dict[str, Any], entry: Entry) -> None:
+    if entry.type != DASHBOARD_AGENTIC_ENTRY_TYPE:
+        return
+    data = entry.data
+    name = _panel_text(data.get("field"), DASHBOARD_FIELD_LIMIT)
+    declared = _panel_text(data.get("type"), DASHBOARD_TYPE_LIMIT)
+    if not name or not declared:
+        # A line naming no field or no type cannot be applied to a cell: a damaged
+        # or planted entry, skipped rather than half-applied, for the reason
+        # ``_panel_step`` skips one missing its template.
+        return
+    wrapper = data.get("value")
+    # THROUGH THE WRAPPER's single key. The entry declares ``value`` as an object
+    # because this registry has no any-type (see the entry type's own note); the
+    # real value is ``v``. A line with no wrapper, or one carrying no ``v``, names
+    # no value at all and is skipped like one naming no field.
+    if not isinstance(wrapper, Mapping) or "v" not in wrapper:
+        return
+    value = wrapper["v"]
+    # THE TYPE IS RE-CHECKED, not taken on the writer's word. The write path checked
+    # it against the live manifest, but the entry is on disk and the reader is a
+    # different process at a different time: a line whose declared type and value
+    # disagree is exactly the corruption this re-check exists to drop, and applying
+    # it would put a string in a cell a chart reads as a number.
+    if not _dashboard_type_holds(declared, value) or not _dashboard_value_fits(value):
+        return
+    fields: dict[str, Any] = state["fields"]
+    if name not in fields and len(fields) >= DASHBOARD_VALUE_LIMIT:
+        # Bounded before the insert, and the LEAST RECENTLY WRITTEN field is what
+        # goes: a slot that has seen many field sets keeps the ones being written
+        # now. Ranked on the fold-order counter rather than on a stamp, because a
+        # stamp is empty for an entry whose ``time`` no ``datetime`` can hold --
+        # the same reason ``_panel_step`` ranks its owners that way.
+        oldest = min(fields, key=lambda key: _as_int(fields[key].get("order")))
+        del fields[oldest]
+        state["fields_omitted"] = _as_int(state.get("fields_omitted")) + 1
+    state["wrote"] = _as_int(state.get("wrote")) + 1
+    fields[name] = {
+        # UNWRAPPED for the reader. The wrapper is an artefact of what the entry
+        # registry can declare, and a reader of this fold should not have to know
+        # about it: a template's field is a value, not a value in a box.
+        "value": value,
+        "type": declared,
+        "at": _panel_iso(entry.time),
+        "instance_version": _as_int(data.get("instance_version")),
+        "crew_key": _panel_text(data.get("crew_key"), PANEL_CREW_KEY_LIMIT),
+        "order": state["wrote"],
+    }
+
+
+def _agentic_render(state: dict[str, Any]) -> dict[str, Any]:
+    """The agentic values, one row per field.
+
+    ``order`` is dropped: it is the fold's own eviction ranking and means nothing
+    to a reader, who gets ``at`` for the same question. ``wrote`` counts ACCEPTED
+    writes over the slot's whole life, which is what tells a reader "this crewmate
+    is writing and the cell is still empty" from "this crewmate has never written".
+    """
+    fields: dict[str, Any] = state["fields"]
+    return {
+        "fields": {
+            name: {key: row[key] for key in row if key != "order"} for name, row in fields.items()
+        },
+        "fields_omitted": _as_int(state.get("fields_omitted")),
+        "wrote": _as_int(state.get("wrote")),
+    }
+
+
+def _agentic_rows(state: Mapping[str, Any]) -> int:
+    """``agentic``: one row per field, each holding one capped value."""
+    return _rows_in(state.get("fields"))
+
+
+def _mistake_key(code: str, field: str) -> str:
+    """The group key, ``(code, field)`` flattened.
+
+    Flattened because fold state is JSON on disk and a tuple key is not, and
+    separated by a character neither half can contain: a refusal code is a bare
+    identifier and a field name matches ``manifest._FIELD``, so neither carries a
+    space. Without that the two halves could be split wrongly on read-back and two
+    different mistakes would land on one group.
+    """
+    return f"{code} {field}"
+
+
+def _mistakes_start() -> dict[str, Any]:
+    """The mistake book: one group per ``(code, field)``, plus what was evicted."""
+    return {"groups": {}, "groups_omitted": 0, "refused": 0, "seen": 0}
+
+
+def _mistakes_step(state: dict[str, Any], entry: Entry) -> None:
+    if entry.type != DASHBOARD_REFUSED_ENTRY_TYPE:
+        return
+    data = entry.data
+    code = _panel_text(data.get("code"), DASHBOARD_CODE_LIMIT)
+    if not code:
+        # A line that cannot say what it is cannot be applied to a group. The append
+        # validator refuses one too (``code`` is required on the type), so reaching
+        # here means a damaged or planted line -- skipped rather than counted, for
+        # the reason ``_panel_step`` skips one missing its template.
+        return
+    field = _panel_text(data.get("field"), DASHBOARD_FIELD_LIMIT)
+    stamp = _panel_iso(entry.time)
+    corrects = data.get("corrects")
+    # A CORRECTION, which an ACCEPTED write appends and a refusal never does: it is
+    # not a refusal, it is the answer to one. It names the fields an earlier refusal
+    # reached wrongly, and the fix is the field the accepted write actually used.
+    #
+    # Decided on the CODE, which is the one key always present, rather than on the
+    # presence of ``corrects``: an earlier draft branched on the list and gave a
+    # correction no code at all, which the append validator refused outright -- so
+    # every correction was dropped at the door and the book stayed a list of errors
+    # with no answers in it.
+    if code == MISTAKE_CORRECTED_CODE:
+        if not isinstance(corrects, list):
+            return
+        for raw in corrects:
+            wrong = _panel_text(raw, DASHBOARD_FIELD_LIMIT)
+            if not wrong:
+                continue
+            for key, group in state["groups"].items():
+                if key.endswith(f" {wrong}"):
+                    fixes: list[str] = group.setdefault("corrected_to", [])
+                    if field and field not in fixes:
+                        fixes.append(field)
+                        # NEWEST KEPT, oldest dropped: the useful answer is the
+                        # latest one, and a long list would make the reader choose
+                        # -- which is the problem this fold exists to remove.
+                        del fixes[:-MISTAKE_CORRECTION_LIMIT]
+                    group["corrected_at"] = stamp
+        return
+    state["refused"] = _as_int(state.get("refused")) + 1
+    key = _mistake_key(code, field)
+    groups: dict[str, Any] = state["groups"]
+    group = groups.get(key)
+    if group is None:
+        if len(groups) >= MISTAKE_GROUP_LIMIT:
+            # Least recently SEEN goes, so the groups kept are the mistakes still
+            # being made rather than the first ones ever made.
+            oldest = min(groups, key=lambda other: _as_int(groups[other].get("order")))
+            del groups[oldest]
+            state["groups_omitted"] = _as_int(state.get("groups_omitted")) + 1
+        group = {
+            "code": code,
+            "field": field,
+            "count": 0,
+            "first_seen": stamp,
+            "reason": "",
+            "corrected_to": [],
+            "corrected_at": "",
+        }
+        groups[key] = group
+    state["seen"] = _as_int(state.get("seen")) + 1
+    group["count"] = _as_int(group.get("count")) + 1
+    group["last_seen"] = stamp
+    group["order"] = state["seen"]
+    # The LATEST wording wins. The sentence is what the agent was told, so an
+    # updated refusal message should be what it reads back -- handing it the first
+    # wording would teach a correction the gateway has since improved.
+    group["reason"] = _panel_text(data.get("reason"), DASHBOARD_REASON_LIMIT)
+    group["crew_key"] = _panel_text(data.get("crew_key"), PANEL_CREW_KEY_LIMIT)
+
+
+def _mistakes_render(state: dict[str, Any]) -> dict[str, Any]:
+    """The mistake book, worst group first.
+
+    Ordered by COUNT rather than by recency, because the reader is an agent with
+    one short list to read before it writes: a mistake made five times is the one
+    most worth not repeating, and recency is already on each row as ``last_seen``.
+    """
+    groups: list[dict[str, Any]] = [
+        {key: value for key, value in group.items() if key != "order"}
+        for group in state["groups"].values()
+    ]
+    groups.sort(key=lambda group: (-_as_int(group.get("count")), str(group.get("field"))))
+    return {
+        "groups": groups,
+        "groups_omitted": _as_int(state.get("groups_omitted")),
+        "refused": _as_int(state.get("refused")),
+    }
+
+
+def _mistakes_rows(state: Mapping[str, Any]) -> int:
+    """``mistakes``: one row per group, each a small fixed record."""
+    return _rows_in(state.get("groups"))
+
+
 def _as_int(value: Any) -> int:
     """*value* when it is a real int, else 0 -- a bool is not a count."""
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
@@ -5942,6 +7772,18 @@ _CREDIT_SOURCE_OF: Final[dict[str, str]] = {
 
 #: Entry types ``tools`` pairs: a call and the completion that closes it.
 TOOL_TYPES: Final[frozenset[str]] = frozenset({"tool/called", "tool/completed"})
+
+#: Every entry type the ``workstreams`` fold reads: the work record, the opener that
+#: names a unit's slot, and the three closers that carry a charge.
+#:
+#: HERE rather than beside that fold's own constants because it is spelled FROM the
+#: billing table just above -- a fourth spender added to :data:`_CREDIT_SOURCE_OF` is
+#: then read by the report fold without a second edit, which is the whole point of
+#: deriving it. Declared after that table because a module-level expression cannot
+#: read a name defined further down the file.
+WORKSTREAMS_TYPES: Final[frozenset[str]] = frozenset(
+    {WORK_ENTRY_TYPE, "session/opened"} | set(_CREDIT_SOURCE_OF)
+)
 
 #: Entry types ``approvals`` pairs: a request and the decision that answers it.
 APPROVAL_TYPES: Final[frozenset[str]] = frozenset({"approval/requested", "approval/decided"})
@@ -6184,7 +8026,13 @@ _FOLDS: Final[dict[str, _Fold]] = {
         # Moved once more because the memo is now ``context_turn_keys``, one string
         # covering the whole rewindable range; a savepoint holding the old bounded map
         # carries neither the new field nor the turns that map had already evicted.
-        state_version=_FOLD_STATE_VERSION_BASE + 9,
+        # Moved again for a COUNTING fix that keeps every key: ``tokens_turns`` counts
+        # a block of four zeros as unreported, and a savepoint from a build that
+        # counted it as a report would resume onto this logic still carrying the
+        # inflated count for the life of the unit.
+        # Moved again for ``context_started`` and the per-row ``first_start``: a
+        # savepoint without them would mark a later rebuild as the session's start.
+        state_version=_FOLD_STATE_VERSION_BASE + 11,
     ),
     # The panel's feed section reads this one, so it is pushed like the rest; its value
     # is bounded by ``TIMELINE_LIMIT`` whatever the session's length.
@@ -6297,6 +8145,45 @@ _FOLDS: Final[dict[str, _Fold]] = {
         _panel_render,
         affects=frozenset({PANEL_ENTRY_TYPE}),
         count_rows=_panel_rows,
+    ),
+    # The two dashboard folds, EAGER like their four siblings and for the same
+    # reason: each answers one entry type in a log that is otherwise message bodies,
+    # so the read they serve is a memo lookup rather than a walk of every unit the
+    # slot ran under. That matters more here than anywhere else in this table --
+    # part 3 of the dynamic dashboard subscribes to these through the bus with a
+    # baseline, and its whole cost contract is O(fields) per read and never O(log).
+    DASHBOARD_FOLD_NAME: _Fold(
+        DASHBOARD_FOLD_NAME,
+        _agentic_start,
+        _agentic_step,
+        _agentic_render,
+        affects=frozenset({DASHBOARD_AGENTIC_ENTRY_TYPE}),
+        count_rows=_agentic_rows,
+    ),
+    MISTAKES_FOLD_NAME: _Fold(
+        MISTAKES_FOLD_NAME,
+        _mistakes_start,
+        _mistakes_step,
+        _mistakes_render,
+        affects=frozenset({DASHBOARD_REFUSED_ENTRY_TYPE}),
+        count_rows=_mistakes_rows,
+    ),
+    # The project report's fold, EAGER like every slot-keyed sibling. It is the widest
+    # ``affects`` of the slot folds -- a work record, the unit opener and the three
+    # closers that carry a charge -- which is the cost of answering "what did each task
+    # cost" at all: the spend is in the worker's ``usage`` entries and nowhere else.
+    # Still bounded per entry: the step is a dict write and the copy is spelled out
+    # (:func:`_workstreams_copy`), so no read walks the log and no entry pays a deep
+    # copy of three nested levels.
+    WORKSTREAMS_FOLD_NAME: _Fold(
+        WORKSTREAMS_FOLD_NAME,
+        _workstreams_start,
+        _workstreams_step,
+        _workstreams_render,
+        bind_slot=_workstreams_bind_slot,
+        affects=WORKSTREAMS_TYPES,
+        copy_state=_workstreams_copy,
+        count_rows=_workstreams_rows,
     ),
 }
 

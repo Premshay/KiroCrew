@@ -5,8 +5,10 @@ import { useMemo, useRef } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 import { store, type AppDispatch } from '../../store'
 import { sseSlots, sseYolo, setChannelTrusted, sseSlotPatch, fetchSlots, type SlotPatchFrame } from '../../store/dashboardSlice'
+import { reconcileSubagentQueuedFromSlots } from '../../store/chatSlice'
 import type { ChatSlot, ChatFolder } from '../../types'
 import type { FrameData } from './frames'
+import { CHAT_FOLDERS_WRITE_KEY } from '../../api/chatFoldersWrite'
 
 export interface SlotListSync {
   /** A new connection: forget the last-seen generations and raw frame. */
@@ -44,6 +46,13 @@ export function useSlotListSync(dispatch: AppDispatch, queryClient: QueryClient)
       lastSlotsRawRef.current = null
     },
     onSlots(msg, data, raw) {
+      // The queued-depth reconcile rides this frame only, never `fetchSlots`: a
+      // pushed frame is ordered with the `subagent_queued` frames on this one
+      // socket, while a GET answer can land after a newer frame and undo it.
+      // It runs ahead of the repeat check below: a push identical to the last
+      // one still corrects a count a `subagent_queued` frame moved in between,
+      // which is the very case the reconcile exists for.
+      if (Array.isArray(data)) dispatch(reconcileSubagentQueuedFromSlots(data))
       // An identical repeat carries identical values for every arm below, but
       // only while no other writer (fetchSlots) has since replaced the list.
       if (raw === lastSlotsRawRef.current
@@ -158,6 +167,15 @@ export function useSlotListSync(dispatch: AppDispatch, queryClient: QueryClient)
       // and every invalidate cancels the refetch the previous one started
       // and issues another, so separate calls put two identical GETs on the
       // wire where one answers them all.
+      //
+      // A folder refetch is deferred while an optimistic folder write is
+      // pending: its reply would be serialized before that write lands and
+      // would snap the folder back (see CHAT_FOLDERS_WRITE_KEY). The write's
+      // own settle refetches, and by then the store holds both the write and
+      // whatever change moved the generation, so nothing is lost by waiting.
+      if (staleKeys.has('chat-folders') && queryClient.isMutating({ mutationKey: CHAT_FOLDERS_WRITE_KEY }) > 0) {
+        staleKeys.delete('chat-folders')
+      }
       for (const key of staleKeys) queryClient.invalidateQueries({ queryKey: [key] })
       notifyAppsSlotsChanged()
     },

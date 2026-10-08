@@ -542,7 +542,7 @@ class TestScriptContextPost:
 
 
 class TestScriptContextCallTool:
-    def test_success_audits_ok_and_closes_the_client(self, monkeypatch):
+    def test_success_audits_ok_and_keeps_the_client_until_close(self, monkeypatch):
         ctx = _ctx()
         client = MagicMock()
         client.call_tool.return_value = "tool output"
@@ -553,6 +553,8 @@ class TestScriptContextCallTool:
         assert ctx.call_tool("kirocrew-core", "browse_search", {"query": "x"}) == "tool output"
 
         client.call_tool.assert_called_once_with("browse_search", {"query": "x"})
+        client.close.assert_not_called()
+        ctx.close()
         client.close.assert_called_once()
         assert audits == [(("kirocrew-core", "browse_search", "ok"), {})]
 
@@ -701,11 +703,47 @@ class TestMcpToolClientRpc:
         assert client._rpc("ping") == {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}}
         client.close()
 
+    def test_a_line_that_is_not_an_object_costs_that_line(self, mcp_spawn):
+        """A banner on stdout, a scalar or a line nested past the decoder used
+        to raise out of ``_rpc``, failing the call (or the handshake) outright."""
+        from stray_line_helpers import STRAY_LINES
+
+        client = self._client(
+            mcp_spawn,
+            [
+                "server banner v1.2\n",
+                *(make().decode("utf-8", "replace") for make in STRAY_LINES.values()),
+                '{"jsonrpc": "2.0", "id": 2, "result": {"ok": true}}\n',
+            ],
+        )
+
+        assert client._rpc("ping") == {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}}
+        client.close()
+
+    def test_a_server_that_writes_only_noise_fails_within_the_cap(self, mcp_spawn):
+        """Skipped inside ``_recv``, the lines never advanced the cap, and the
+        call read until EOF however long the server kept writing."""
+        client = self._client(mcp_spawn)
+        client._proc.stdout = _EndlessStdout("log line\n")
+
+        with pytest.raises(RuntimeError, match="within 1000 lines"):
+            client._rpc("ping")
+
+        assert client._proc.stdout.reads == 1000
+        client.close()
+
+    def test_stdout_decodes_utf8_with_replacement(self, mcp_spawn):
+        """A byte that is not UTF-8 must cost its line, not raise out of readline."""
+        client = self._client(mcp_spawn)
+        _argv, kwargs = mcp_spawn.calls[0]
+        assert (kwargs["encoding"], kwargs["errors"]) == ("utf-8", "replace")
+        client.close()
+
     def test_message_budget_is_bounded(self, mcp_spawn):
         client = self._client(mcp_spawn)
         client._proc.stdout = _EndlessStdout('{"jsonrpc": "2.0", "id": 99}\n')
 
-        with pytest.raises(RuntimeError, match="within 1000 messages"):
+        with pytest.raises(RuntimeError, match="within 1000 lines"):
             client._rpc("ping")
 
         assert client._proc.stdout.reads == 1000

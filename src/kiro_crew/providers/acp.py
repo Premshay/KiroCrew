@@ -91,6 +91,7 @@ from kiro_crew.effort import (
 )
 from kiro_crew.mcp_hot_reload import mcp_hot_reload_supported, parse_kiro_cli_version
 from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.platform_compat import pid_exists
 from kiro_crew.providers.base import (
     CancelOutcome,
     LLMEvent,
@@ -401,6 +402,32 @@ _RESUME_TRANSIENT_LOCK_MARKERS: tuple[str, ...] = (
 )
 
 
+def _unlink_dead_session_lock(session_id: str) -> bool:
+    """Remove ``<sid>.lock`` when the PID it names is dead; True when removed.
+
+    kiro-cli writes ``{"pid": N, "started_at": ...}`` and deletes it only on a
+    clean exit, so a SIGKILLed holder leaves a lock that refuses every later
+    session/load. A live holder (including one we may not signal) or a lock we
+    cannot read or parse is left alone.
+    """
+    sessions_dir = kiro_sessions_dir()
+    lock = sessions_dir / f"{session_id}.lock"
+    if not session_id or not _is_safe_path(lock, sessions_dir):
+        return False
+    try:
+        pid = json.loads(lock.read_text(encoding="utf-8"))["pid"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if type(pid) is not int or pid <= 0 or pid_exists(pid):
+        return False
+    try:
+        lock.unlink()
+    except OSError:
+        return False
+    logger.warning("Removed stale kiro session lock %s (holder PID %d is dead)", lock, pid)
+    return True
+
+
 def _is_transient_resume_lock_error(exc: BaseException) -> bool:
     """True when *exc* from ``session/load`` names a lock race worth retrying."""
     text = str(exc).lower()
@@ -663,10 +690,19 @@ class AcpProvider(LLMProvider):
         """Working directory this provider operates in.
 
         Overrides the ``LLMProvider`` default ("") so session_map can persist
-        the real workspace path for both ACP backends. The work_dir lives on
-        the underlying client (``self._client._work_dir``), not the provider.
+        the real workspace path for both ACP backends. The wrapper is what every
+        caller holds -- ``SessionMap.set(..., cwd=provider.cwd)``, reuse
+        validation, the transport dispatchers -- so it must forward the SAME
+        session-bound directory the inner provider now reports, not the shared
+        runtime's own. After startup ``self._client`` is an
+        ``AcpSessionProvider`` whose ``cwd`` reads the handle's bound dir (a
+        shared runtime carries sessions opened against different projects);
+        answering with ``self._client._work_dir`` here would report the
+        runtime's workspace and evict a live session on reuse validation. Before
+        startup / on the claude seam ``self._client`` is a raw ``AcpClient``
+        with no ``cwd``, so the fallback reads its ``_work_dir``.
         """
-        return str(self._client._work_dir)
+        return str(getattr(self._client, "cwd", "") or self._client._work_dir)
 
     def restrict_tools(self, allowed_tools: list[str]) -> None:
         self._client.restrict_tools(allowed_tools)
@@ -1106,17 +1142,32 @@ class AcpProvider(LLMProvider):
                                        genuine failure only wastes time).
         * runtime dies mid-retry   → return ``None`` (caller's respawn handles it).
         """
+
+        async def load() -> AcpSessionHandle:
+            return await runtime.load_session(
+                session_file,
+                resume_sid,
+                cwd=work_dir,
+                agent=agent or None,
+                member_session_key=member_session_key,
+                session_key=session_key,
+                channel_id=channel_id,
+            )
+
+        swept = False
         for attempt in range(_RESUME_MAX_ATTEMPTS):
             try:
-                handle = await runtime.load_session(
-                    session_file,
-                    resume_sid,
-                    cwd=work_dir,
-                    agent=agent or None,
-                    member_session_key=member_session_key,
-                    session_key=session_key,
-                    channel_id=channel_id,
-                )
+                try:
+                    handle = await load()
+                except Exception as exc:
+                    # A holder that died uncleanly keeps its lock forever, so
+                    # waiting cannot clear it: remove it and retry once, now.
+                    if swept or "active in another process" not in str(exc).lower():
+                        raise
+                    swept = True
+                    if not _unlink_dead_session_lock(resume_sid):
+                        raise
+                    handle = await load()
                 if attempt:
                     logger.info(
                         "Resume of kiro session %s recovered on attempt %d/%d "
@@ -2493,20 +2544,30 @@ class AcpProvider(LLMProvider):
         return {}
 
     @property
+    def member_dispatch_mounted(self) -> bool | None:
+        # Both transports answer from the composition that built THIS session's
+        # array: the shared runtime records it on the handle, the direct client
+        # on itself.
+        if isinstance(self._client, (AcpSessionProvider, AcpClient)):
+            return self._client.member_dispatch_mounted
+        return None
+
+    @property
     def native_steering(self) -> bool:
         # Kiro ACP manual/fileMatch support depends on version and engine;
         # the fallback keeps those guides reachable without a false capability.
         return self._client.backend == ACP_BACKEND_KAS
 
-    async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
+    async def stream(self, message: str, *, allow_image: bool = True) -> AsyncIterator[LLMEvent]:
         # The direct client can respawn in ensure_ready; resolve that BEFORE
         # comparing receipts so a recycled conversation receives the full text.
         if isinstance(self._client, AcpClient):
             await self._client.ensure_ready()
+        send = self._client.stream_events
+        if not allow_image:
+            send = functools.partial(send, allow_image=False)
         async with aclosing(
-            self.essential_delivery.stream(
-                message, self._client.stream_events, lambda: self.context_incarnation
-            )
+            self.essential_delivery.stream(message, send, lambda: self.context_incarnation)
         ) as events:
             async for e in events:
                 yield self._to_llm_event(e)

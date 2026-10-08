@@ -37,7 +37,7 @@ in the **same commit** when you change what it documents.
 | If you are touching… | Read first |
 |---|---|
 | `platform/`, editions, CPP seam, governance | [platform-context](docs/system-specs/modules/platform-context.md) + [governance](docs/system-specs/modules/governance.md) |
-| `security.py`, `hooks.py`, denied commands, sensitive paths | [security](docs/system-specs/modules/security.md) + [sel](docs/system-specs/modules/sel.md) |
+| `security.py`, `hooks.py`, `hook_runtime/`, denied commands, sensitive paths | [security](docs/system-specs/modules/security.md) + [sel](docs/system-specs/modules/sel.md) |
 | `config/` — the live watcher, `restart=True` marks, appliers, `config.json` writes | [config](docs/system-specs/modules/config.md) |
 | the security model as a whole, threat boundaries | [security-deep-dive](docs/architecture/security-deep-dive.md) |
 | `computer_use/` | [computer-use](docs/system-specs/modules/computer-use.md) |
@@ -51,8 +51,9 @@ in the **same commit** when you change what it documents.
 | killing a runtime, leases and tenancies, sweeps and reapers, `runtime_ownership.py`, `runtime_reconcile.py`, `session_pid.py`'s kill paths | [runtime-ownership](docs/system-specs/modules/runtime-ownership.md) |
 | session summaries, the chat summary panel, intent extraction | [session-summary](docs/system-specs/modules/session-summary.md) |
 | memory, embeddings, vectors, lessons, skills, hooks | [memory-skills-hooks](docs/system-specs/modules/memory-skills-hooks.md) |
-| `context.py`, `context_blocks.py`, what reaches the model's context | [context-management](docs/architecture/context-management.md) |
+| `context.py`, `context_blocks.py`, `context_assembly/`, what reaches the model's context | [context-management](docs/architecture/context-management.md) + [memory-skills-hooks: Context Builder](docs/system-specs/modules/memory-skills-hooks.md#context-builder-contextpy) (module ownership) |
 | MCP servers or tools (adding, changing, statelessness) | [mcp](docs/architecture/mcp.md) |
+| `mcp_gateway/` — `gatewayd.py`, `daemon/`, the daemon's lifecycle and facade | [mcp-gateway-daemon-lifecycle](docs/system-specs/modules/mcp-gateway-daemon-lifecycle.md) + [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
 | artifacts, companion chat | [artifacts](docs/system-specs/modules/artifacts.md) |
 | `stt/`, `transcribe.py`, `voice_reply.py`, the mic, dictation, TTS | [stt-streaming](docs/system-specs/modules/stt-streaming.md) + [voice-streaming](docs/system-specs/modules/voice-streaming.md) |
@@ -66,7 +67,7 @@ in the **same commit** when you change what it documents.
 | themes | [themes](docs/system-specs/modules/themes.md) + [theming-contract](website/docs/theming-contract.md) |
 | anything under `website/` | [`website/AGENTS.md`](website/AGENTS.md) |
 | user-facing strings, dates, numbers, sort order | [i18n-catalog](website/docs/i18n-catalog.md) (authoring) + [i18n-gates](docs/ci/i18n-gates.md) (CI) |
-| tests: flakes, hangs, speed, memory, fixtures, sharding, side effects, host state (`~/.kiro`, `Path.home()`, the systemd user manager), conftest isolation, `monkeypatch.undo()`, env-var leaks, host-dependent tests (Windows, Python 3.13, per-user tools, version-manager shims), spawning a real child or reaping one, `.worktrees/` in a repo-wide scan, what `TMPDIR` must not be, what a worker costs, collection-time probes that build a singleton, a `MagicMock` the code converts with `int()`, sizing a ReDoS / complexity guard | [testing-conventions](docs/system-specs/common/testing-conventions.md) + the [writing-tests](src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md) skill; frontend and Electron tests: [website/docs/testing.md](website/docs/testing.md) |
+| tests: flakes, hangs, speed, memory, fixtures, sharding, side effects, host state (`~/.kiro`, `Path.home()`, the systemd user manager), conftest isolation, `monkeypatch.undo()`, env-var leaks, host-dependent tests (Windows, Python 3.13, per-user tools, version-manager shims), spawning a real child or reaping one, `.worktrees/` in a repo-wide scan, what `TMPDIR` must not be, what a worker costs, collection-time probes that build a singleton, a `MagicMock` the code converts with `int()`, sizing a ReDoS / complexity guard, clocks and time, sleeps, ordering and timestamp ties, ports, timezone and locale, randomness, repeat and shuffle proof, a flaky CI red | [testing-conventions](docs/system-specs/common/testing-conventions.md) + the [writing-tests](src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md) skill; frontend and Electron tests: [website/docs/testing.md](website/docs/testing.md) |
 | browser E2E | [e2e-gate](docs/ci/e2e-gate.md) |
 | proving a worktree change against an isolated running gateway | [worktree-verification-recipes](docs/guides/worktree-verification-recipes.md) |
 | CI, PR flow, review gates, commit messages | [ci-and-reviews](docs/ci/ci-and-reviews.md) + [CONTRIBUTING.md](CONTRIBUTING.md) |
@@ -269,13 +270,20 @@ from the suffix rule: [release](docs/build/release.md).
 ```bash
 python3 scripts/check_black_formatting.py && python3 scripts/check_subprocess_encoding.py && isort src/kiro_crew test
 flake8 src/kiro_crew test && mypy src/kiro_crew
+BASE="$(git merge-base HEAD origin/main)" && COMMENT_HISTORY_BASE_REF="$BASE" python3 scripts/check_comment_history.py && BRAND_BASE_REF="$BASE" python3 scripts/check_brand_name.py
 python3 scripts/local-gate.py
 ```
+
+The third line runs the two diff-scoped Fast Gate checks most often red on a
+PR: history narration in an added comment, and a misspelled product name on an
+added line. If `check_black_formatting.py` reports a baselined file as now
+black-clean (formatting what you touched does that), run it with
+`--update-baseline` and commit the shorter baseline.
 
 `local-gate.py` runs the tests related to your diff on both surfaces with a
 bounded worker count; the full suite is CI's job and never runs locally unless a
 human passes `--full`. See
-[prepare-pr](src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/references/gate-floor.md).
+[kirocrew-prepare-pr](src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/references/gate-floor.md).
 
 - **On macOS, run `mypy --platform linux src/kiro_crew`.** Without it a local run
   reports errors you did not cause and MISSES the Linux-only errors CI fails on, so
@@ -288,12 +296,26 @@ human passes `--full`. See
   --max-worker-restart=2`; a bare override silently drops `--dist loadgroup` and
   scatters `@pytest.mark.xdist_group` tests into flaky races.
 
-Gates, the six flake classes, the conftest isolation floor and the traps that are
+Gates, the seven flake classes, the conftest isolation floor and the traps that are
 invisible when reading a test: [code-style](docs/system-specs/common/code-style.md) +
 [testing-conventions](docs/system-specs/common/testing-conventions.md). A test that
 can block forever is a lost RUN, not a failed test: on Windows pytest-timeout kills
 the xdist worker, and with `--max-worker-restart=0` one unbounded `await` aborts the
 whole job (class 6). Frontend and Electron: [website/docs/testing.md](website/docs/testing.md).
+
+Tests MUST be deterministic: wait on a signal, never sleep as a barrier; never sleep
+to make timestamps differ (set them); one clock, injected or frozen at the module's
+own binding; never assert an order you did not define; no literal port for a real
+listener (bind 0); no network beyond loopback; every self-unblocked await bounded.
+`AUTOSDE.yaml`'s `tests-are-deterministic` rule blocks these in review, the SAST
+job's `semgrep/test-determinism.yaml` refuses the commonest on a new line, and
+`test/test_flake_pattern_ratchet.py` counts per file the clock, wait, port, environment
+and module-cache shapes those patterns miss, failing a change that adds one to a file
+(measured against its merge-base; a deliberate one carries `# flake-ok: <reason>`).
+CI's Backend Tests checkout is depth 1 today, so the ratchet is a local, pre-push gate:
+run `python -m pytest -n0 test/test_flake_pattern_ratchet.py` before pushing.
+Contract:
+[testing-conventions § Determinism contract](docs/system-specs/common/testing-conventions.md#determinism-contract-read-this-first).
 
 ## Cross-platform
 

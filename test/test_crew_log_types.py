@@ -10,6 +10,7 @@ while the session families are checked.
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import os
 import subprocess
@@ -35,6 +36,7 @@ from kiro_crew.crew_log import store as store_mod
 from kiro_crew.crew_log import (
     validate_data,
 )
+from kiro_crew.crew_log import writer as writer_mod
 from kiro_crew.crew_log.store import (
     STOP_REASON_INTERRUPTED,
     TOOL_STATUS_UNKNOWN,
@@ -242,6 +244,35 @@ CANONICAL: dict[str, dict] = {
         "crew": "Fleet Conductor",
         "crew_key": "9f2c" + "0" * 60,
     },
+    "dashboard/instance_changed": {
+        "slug": "fleet-conductor",
+        "instance_version": 3,
+        "action": "rolled_back",
+        "template_id": "crew-log-kpis",
+        "template_version": 2,
+        "from_version": 1,
+        "fields": 6,
+        "html_bytes": 1842,
+        "at_ms": 1_759_490_000_000,
+    },
+    "dashboard/agentic_value": {
+        "field": "risk_note",
+        "type": "string",
+        "value": {"v": "two workers blocked on the same review"},
+        "instance_version": 4,
+        "crew_key": "9f2c" + "0" * 60,
+    },
+    # The REFUSAL shape. Its sibling shape -- a correction, which carries
+    # ``corrects`` and the field that worked and no ``code`` -- is exercised in
+    # ``test_dynamic_dashboard``; one canonical example per type is what this table
+    # holds, and the coded refusal is the one the type is named for.
+    "dashboard/agentic_refused": {
+        "code": "unknown_field",
+        "field": "credits_total",
+        "reason": "'credits_total' is not a field of template 'conductor' (version 3)",
+        "corrects": [],
+        "crew_key": "9f2c" + "0" * 60,
+    },
 }
 
 
@@ -287,7 +318,19 @@ def test_every_type_written_today_is_declared_and_nothing_else_is():
     # Subagents panel's durable half is a fold of this log, so a card the user cleared
     # has to be recorded here. It was held in a registry keyed on the run's folder, and
     # when that folder was reclaimed first the dismissed card came back.
-    assert len(SESSION_ENTRY_TYPES) == 35
+    #
+    # The one past THAT is the dynamic dashboard's ``dashboard/instance_changed``. A
+    # crewmate's dashboard instance is a copy it edits and rolls back, so what a reader
+    # needs is the sequence of changes rather than the current page -- and a sequence is
+    # what only an append-only log holds.
+    #
+    # The two past that are the dynamic dashboard's agentic pair, which join their
+    # siblings for a reason the panel entry's own note gives twice over: an agentic
+    # value's ONLY record is this log (no host Python computes a dashboard value, so
+    # there is no file beside it), and a refused write's whole worth is its history --
+    # a mistake book is a fold over refusals, and one overwritable document could hold
+    # none of it.
+    assert len(SESSION_ENTRY_TYPES) == 38
     # Nine types the vocabulary owns that nothing writes. Declaring one would state
     # a shape no writer produces, and the first emitter to land would have to
     # satisfy a contract written without it. They pass through undeclared instead.
@@ -365,13 +408,17 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
         ("work/recorded", "verdict"),
         ("work/recorded", "status"),
         ("work/recorded", "event_kind"),
+        # The dashboard instance store clamps its action the same way, and imports the
+        # vocabulary from the declaration beside the type, so the closed enum and the
+        # writer's set are one tuple.
+        ("dashboard/instance_changed", "action"),
     }
     emitted = set(_types_with_a_producing_site())
     assert {spec_type for spec_type, _ in closed} <= emitted
 
 
-#: The append primitives in :mod:`kiro_crew.crew_log.emit`, each mapped to the
-#: index of the positional argument that names the entry type.
+#: The append primitives in :mod:`kiro_crew.crew_log.emit` and its durable writer,
+#: each mapped to the index of the positional argument that names the entry type.
 #:
 #: Keyed on the CALLEE rather than on any type-shaped literal, because emit.py also
 #: hands an entry type to helpers that append nothing -- ``_entry_line_fits`` is
@@ -381,6 +428,12 @@ _EMIT_PRIMITIVES: dict[str, int] = {
     "_write": 1,
     "append": 0,
     "_append_body_entry": 1,
+    # The dashboard pair's shared awaited append. One helper for both types because
+    # they differ only in the type and must not differ in anything else -- a refusal
+    # that landed while the write it refused did not would leave the mistake book
+    # and the dashboard disagreeing. Its two callers pass the type as a LITERAL so
+    # this extractor can still read the vocabulary off the syntax.
+    "_append_dashboard": 1,
 }
 
 
@@ -406,9 +459,10 @@ def _types_the_writers_append() -> dict[str, bool]:
     of it ignorable.
 
     Parsed off the writers' own syntax trees, so a newly wired site is covered the
-    day it lands rather than the day someone remembers to extend a list here. Both
-    writers are read: the emitter, and ``store``'s crash-repair closer, which names
-    its types with a ``type=`` keyword instead. Missing a call shape would
+    day it lands rather than the day someone remembers to extend a list here. Every
+    writer is read: the emitter, its durable writer (which authors the
+    ``write/dropped`` loss marker itself), and ``store``'s crash-repair closer, which
+    names its types with a ``type=`` keyword instead. Missing a call shape would
     under-report the undeclared side -- the direction that breaks folds -- which is
     why the declared-but-never-appended column below is checked as a control rather
     than assumed empty.
@@ -425,7 +479,7 @@ def _types_the_writers_append() -> dict[str, bool]:
         # one non-ignorable append is all it takes to stop a folding reader.
         skippable[entry_type] = skippable.get(entry_type, True) and ignorable
 
-    for module in (emit, store_mod):
+    for module in (emit, writer_mod, store_mod):
         tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
@@ -463,8 +517,8 @@ def _types_with_a_producing_site():
     # producing module names it. This holds the closed-enum rule to code that
     # exists, so wiring a resolver cannot quietly leave an unenforceable set behind.
     sources = [
-        Path(emit.__file__).read_text(encoding="utf-8"),
-        Path(store_mod.__file__).read_text(encoding="utf-8"),
+        Path(module.__file__).read_text(encoding="utf-8")
+        for module in (emit, writer_mod, store_mod)
     ]
     for spec_type in SESSION_ENTRY_TYPES:
         if any(f'"{spec_type}"' in text for text in sources):
@@ -944,8 +998,30 @@ def test_an_oversize_body_and_its_chunk_group_validate():
 
 
 def test_the_loss_marker_the_writer_builds_validates():
-    loss = emit._PendingLoss(dropped_count=3, dropped_bytes=2048)
-    validate_data("session", "write/dropped", loss.data())
+    """The marker the writer authors is the frozen ``write/dropped`` shape.
+
+    Driven through the writer's interface: three appends refused at a zero ceiling owe
+    one marker, and the data it hands the log is validated against the declaration.
+    """
+    appended: list[tuple[str, dict]] = []
+
+    class _Capture:
+        def append(self, entry_type: str, data: dict, **kwargs) -> None:
+            appended.append((entry_type, data))
+
+    writer = writer_mod.CrewLogWriter(
+        lambda unit: _Capture(), limits=writer_mod.WriterLimits(max_pending_count=0)
+    )
+
+    async def _refused() -> None:
+        for n in range(3):
+            job = writer_mod.WriteJob.append(lambda: None, "refused", nbytes=1000 + n)
+            assert writer.submit(SESSION, job) is False
+
+    asyncio.run(_refused())
+    assert writer.flush(timeout=5.0)
+    assert appended == [("write/dropped", {"dropped_count": 3, "dropped_bytes": 3003})]
+    validate_data("session", "write/dropped", appended[0][1])
 
 
 def test_the_failed_turn_closer_validates_without_credits_or_tokens():
@@ -955,6 +1031,32 @@ def test_the_failed_turn_closer_validates_without_credits_or_tokens():
     assert emit.flush(timeout=5.0)
     closer = [e for e in _entries()[1:] if e["type"] == "turn/completed"][-1]
     assert "credits" not in closer["data"] and "tokens" not in closer["data"]
+    validate_data("session", "turn/completed", closer["data"])
+
+
+def test_the_measured_turn_closer_validates_with_credits_and_no_tokens():
+    """A provider that billed credits but reported no token count.
+
+    The declared shape allows ``credits`` without ``tokens``: the parent token field
+    is optional, and the four-member requirement is checked only once the object is
+    there. The writer must therefore omit the block rather than write four zeros,
+    which the fold would count as a report.
+    """
+    emit.on_session_opened(SESSION, agent="kirocrew", owner="default")
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_turn_completed(
+        SESSION,
+        1,
+        credits=0.42,
+        duration_ms=1300,
+        stop_reason="end_turn",
+        model="c",
+        provider="kiro",
+    )
+    assert emit.flush(timeout=5.0)
+    closer = [e for e in _entries()[1:] if e["type"] == "turn/completed"][-1]
+    assert closer["data"]["credits"] == 0.42
+    assert "tokens" not in closer["data"]
     validate_data("session", "turn/completed", closer["data"])
 
 

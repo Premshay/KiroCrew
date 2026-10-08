@@ -29,24 +29,96 @@ MIN_RECHECK_DELAY_SECS = 0.05
 #: reserve) puts the mark back on the entry it appends. Never persisted.
 WINDOW_ENTRY_RECOVERING = "_recovering_row"
 
+#: A ``_queue`` entry's monotonic not-before time: a start with no durable row
+#: that did not fit the memory floor waits in the in-memory window, and the
+#: pump skips it until then -- the in-memory twin of a durable row's
+#: ``next_run_at``. Popped with ``_lane`` before the entry reaches ``spawn``.
+MEMORY_WAIT_UNTIL_KEY = "_memory_wait_until"
 
-def tombstone_terminal_state(cause: str) -> str | None:
-    """The terminal task state a tombstone cause proves, loaded on first use."""
+#: The memory cause the spawn gate records for a start the per-lane memory
+#: share holds back (``_MemoryWakeMixin.lane_share_holds``): another lane waits
+#: for memory and this start's lane already runs its share of dedicated
+#: children. A cause of its own, so the gate words the wait without a figure
+#: (no reading was taken) and the wake knows no host reading can release it.
+MEMORY_CAUSE_LANE_SHARE = "lane_share"
+
+#: How often the memory sampler runs a fit pass while a start waits for memory
+#: (seconds). It runs ONLY while one does (``_MemoryWakeMixin``), so a start
+#: held by memory another program frees is not left to its admit wait.
+MEMORY_SAMPLER_SECS = 5.0
+
+
+@dataclass
+class MemoryWait:
+    """One start this process holds back for memory, from its first deferral to its end.
+
+    ``start_gb`` is what the floor charges the start for itself (None: the
+    configured cost; 0 for a nested start that shares its parent's runtime),
+    ``price_gb`` what its row owes once admitted (None: the configured cost).
+    The fit pass rebuilds the start's bar from them. ``nested`` exempts it from
+    the per-lane share. ``since`` is monotonic.
+    """
+
+    lane: str
+    parent_session_key: str
+    since: float
+    start_gb: float | None
+    price_gb: float | None
+    nested: bool
+    durable: bool
+
+
+def outcome_task_state(outcome: str) -> str | None:
+    """The terminal task state of a run's recorded outcome (``SubagentInfo.outcome``).
+
+    ONE table for the live settle (``taskq_settle``) and the boot probe, so the
+    two cannot disagree about the same ending. Its keys are the outcome
+    vocabulary (``subagent_persistence._PANEL_OUTCOMES``);
+    ``test_taskq_reconcile.py`` pins that every outcome maps.
+    """
     from kiro_crew import taskq
 
     return {
+        "completed": taskq.DONE,
+        "stopped": taskq.CANCELLED,
+        "failed": taskq.FAILED,
+    }.get(outcome)
+
+
+def tombstone_terminal_state(cause: str, outcome: str = "") -> str | None:
+    """The terminal task state a tombstone proves, loaded on first use.
+
+    The ending the writer recorded (``outcome``) decides first, exactly as the
+    live settle decided it (:func:`outcome_task_state`); the coarser ``cause``
+    answers for a tombstone that recorded none. ``gateway_restart`` proves
+    nothing by itself, and is the one cause missing here
+    (``test_every_tombstone_cause_has_a_terminal_state`` pins that).
+    """
+    from kiro_crew import taskq
+    from kiro_crew.subagent import _NEUTRAL_REAP_REASONS
+
+    recorded = outcome_task_state(outcome)
+    if recorded is not None:
+        return recorded
+    if cause in _NEUTRAL_REAP_REASONS:
+        # A user stop and a parent end are deliberate stops, written by the
+        # same reap: the row they leave behind is cancelled, not a run to
+        # recover on the next boot. Read from the set that makes the live record
+        # neutral (``SubagentInfo.stop_is_neutral``), so the two cannot drift.
+        return taskq.CANCELLED
+    return {
         "delivered": taskq.DONE,
-        "user_stop": taskq.CANCELLED,
-        # A parent end and a stage cancel are deliberate stops like a user's,
-        # written by the same reap: the row they leave behind is cancelled, not
-        # a run to recover on the next boot.
-        "parent_end": taskq.CANCELLED,
+        # ``stage_cancel`` tombstones written by the retired chat Autopilot can
+        # still sit on disk, and they read as the deliberate stop they were.
         "stage_cancel": taskq.CANCELLED,
         "cancelled": taskq.CANCELLED,
         "error": taskq.FAILED,
         "timeout": taskq.FAILED,
         "turn_limit": taskq.FAILED,
         "child_escalation_limit": taskq.FAILED,
+        "reaped": taskq.FAILED,
+        "startup_timeout": taskq.FAILED,
+        "start_queue_saturated": taskq.FAILED,
     }.get(cause)
 
 
@@ -103,6 +175,25 @@ class PreparedSpawn:
 
 
 @dataclass(frozen=True)
+class MemoryReadPoint:
+    """``spawn_impl(_stop_before_memory_read=True)``: every policy gate passed
+    and the memory floor's bar (*min_gb*: the floor plus this start's price
+    plus what warming starts still owe) is known, but the host has not been
+    read. The reading walks cgroup files, so an event-loop caller takes it on
+    a worker thread and re-enters ``spawn(**params, _memory_reading=...)``.
+    The re-entry recomputes the bar on the loop and decides against that, so a
+    start admitted while the read ran is charged. It re-runs the policy gates
+    (a governance change made during the read must hold), on a row
+    ``spawn_async`` already committed (``_store_accepted``) too, whose refusal
+    fails that row. NOTHING is reserved here: no slot
+    and no row write. A batch member's submission is counted by this pass, as
+    on any first entry, and the re-entry does not count it again."""
+
+    min_gb: float
+    params: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ClaimPoint:
     """``spawn_impl(_stop_before_claim=True)``: every gate passed and the row
     is about to be claimed. The SLOT IS RESERVED at this point -- the running
@@ -111,13 +202,10 @@ class ClaimPoint:
     event-loop dispatcher takes the claim on the store's writer thread and
     re-enters with ``_claimed``, which CONSUMES the reservation (registration
     does not count the run a second time); every non-start exit of that
-    re-entry releases it (:meth:`SpawnAdmissionCoordinator.release_reservation`).
-    Boundary identity crosses the await so cancellation can be revalidated
-    immediately before registration instead of trusting a stale claim result."""
+    re-entry releases it (:meth:`SpawnAdmissionCoordinator.release_reservation`)."""
 
     agent_id: str
     parent_session_key: str = ""
-    boundary_owner: str = ""
 
 
 @dataclass(frozen=True)

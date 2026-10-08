@@ -13,13 +13,14 @@ from kiro_crew.dashboard.chat_utils import (
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
+        COMMANDS_OFF_META_KEY,
         STEER_POSSIBLY_DELIVERED_META,
         STEER_STATE_CONSUMED,
         STEER_STATE_REQUEUED,
-        TURN_ACTOR_META_KEY,
         DashboardState,
         _ChatSlot,
         _remove_queued_by_id,
+        _stamped_turn_actor,
         attachment_meta,
         crew_log_emit,
         find_written_steer_row,
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
         is_system_injection_item,
         logger,
         queued_text_for_display,
+        quote_meta,
         settle_consumed_steers,
     )
 
@@ -205,10 +207,10 @@ def _settle_consumed_steers(
 def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> None:
     """Degrade unconsumed mid-turn steers into ordinary queue cards.
 
-    Called from ``_run_chat``'s finally on every turn-exit path. A steer that
-    kiro-cli never confirmed via ``steering_consumed`` died with the turn
-    (stall-cancel, soft STOP, error, or a steer racing the turn's natural
-    end); without this it would vanish silently.
+    The first step of :func:`_hand_off_queue`, so it runs once on every turn
+    exit. A steer that kiro-cli never confirmed via ``steering_consumed`` died
+    with the turn (stall-cancel, soft STOP, error, or a steer racing the
+    turn's natural end); without this it would vanish silently.
 
     Requeues at the HEAD of the slot queue — steers were meant to be injected
     before any queued item ran — preserving their relative order, and
@@ -316,6 +318,11 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         # narrower channel authority a queued channel message carries. Absent means
         # not through a channel.
         _channel = bool(getattr(slot, "_steer_channel_origin", {}).pop(steer_msg, False))
+        if _channel:
+            # A channel steer that re-enters the queue runs as its own turn, so it
+            # takes the mark the hand-off's queued entry carries: the text is the
+            # sender's words, never a dashboard command to run on drain.
+            _meta[COMMANDS_OFF_META_KEY] = True
         _maybe_delivered: set[str] = getattr(slot, "_steer_possibly_delivered", set())
         # An RPC still in flight counts too: its frame may already be in the
         # pipe, and its verdict lands after this entry may have drained.
@@ -343,11 +350,18 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "queue_id": qid,
             }
-            # The requeued steer's attachment lists were folded into `_meta`
-            # above; the card drawn from this frame is what a cancel restores.
-            _push_attachments = attachment_meta(_meta)
-            if _push_attachments:
-                _push["meta"] = _push_attachments
+            # The requeued steer's attachment lists and quote were folded into
+            # `_meta` above; the card drawn from this frame is what a cancel
+            # restores, and a frame without the quote would show the raw
+            # blockquote as text until a reload.
+            _push_meta = {
+                **attachment_meta(_meta),
+                # Same rule the entry's text follows (`queue_entry_is_user_origin`):
+                # the human's own words stay as typed, anyone else's are redacted.
+                **quote_meta(_meta, user_origin=_requeue_user_origin and not _channel),
+            }
+            if _push_meta:
+                _push["meta"] = _push_meta
             state.broadcast_ws("queue_push", _push)
         except Exception:
             # Broadcast is best-effort — the message is already safely in the
@@ -416,8 +430,7 @@ def _actor_for_queue_items(items: "list[dict]") -> str:
         if actor:
             return actor
     for item in items:
-        meta = item.get("meta")
-        stamped = meta.get(TURN_ACTOR_META_KEY, "") if isinstance(meta, dict) else ""
+        stamped = _stamped_turn_actor(item)
         if isinstance(stamped, str) and stamped in crew_log_emit.ACTORS:
             return stamped
     return ""

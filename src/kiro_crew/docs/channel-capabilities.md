@@ -16,7 +16,7 @@ platform could support it.
 | Edits a message it already sent | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
 | Adds emoji reactions | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
 | Accepts a file you send | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
-| Sends a file back to you | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| Sends a file back to you | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
 | Native widget (card, inline keyboard) | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Threads a conversation | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Renders markdown tables natively | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
@@ -25,7 +25,7 @@ platform could support it.
 | Approval prompt waits | 120s | 300s | 300s | 300s | 300s | — | — | — | 300s | — |
 | Agent can message you first | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Dashboard link is two-way | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Answers a send with a message id | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ |
+| Answers a send with a message id | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
 | Parses `@everyone`-style mentions | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ## Reading the rows
@@ -35,6 +35,11 @@ Webex and WeCom cap in UTF-8 bytes rather than characters, so their character
 figure is the byte budget divided by four — the worst case for non-ASCII text.
 An ASCII-only reply on those channels fits far more than the character figure
 suggests.
+
+**Sends a file back to you** is what you receive from `file_send`. On WeCom the
+file arrives as a document (`send_document`), but an inline image reference in a
+reply is not uploaded: it keeps printing its path, so WeCom's `files_outbound`
+declaration stays off.
 
 **Tappable choices** is the total number of interactive options one prompt may
 present. Above the cap, the remainder degrades to a numbered list in the message
@@ -58,17 +63,12 @@ marker, so a Slack thread does continue its session.
 than a feature you use: it says which convention the channel follows when a send
 does not go out. Most platforms hand back an id, so an empty id there means
 refused or dropped, and a multi-part reply stops instead of posting the rest
-after a hole. WeCom's unprompted send and Feishu's reply carry no id at all, so
-on those two an empty id is the SUCCESS value and a real failure raises instead.
+after a hole. WeCom's unprompted send and Feishu's reply carry no id at all, and
+iMessage's bridge reports one only best-effort, so on those three an empty id is
+the SUCCESS value and a real failure raises instead.
 Kiro Crew reads the declaration wherever it has to judge delivery — a
 dashboard-addressed send, an owner DM, a quoted inbound copy — so a ❌ here is a
 different convention, not a missing capability.
-
-One caveat sits inside the ✅ column. **iMessage declares the strict reading, and
-its bridge does not keep it:** the bridge reports the message id as best-effort, so
-a delivered message can come back with no id and be recorded as undelivered. The
-cell reports what the channel declares, which is what the rest of Kiro Crew acts
-on; the bridge is the exception to it, and the two should agree.
 
 **Parses `@everyone`-style mentions** (`mention_grammars`) decides whether text
 the agent did not write gets a defang first: a zero-width space after every `@`

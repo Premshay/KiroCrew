@@ -12,11 +12,16 @@
  *    `[Subagent completion event]` envelopes, tool-call rows, reasoning
  *    bursts, and the say-nothing rows a quiet patrol ends on — is filtered at
  *    RENDER time by `filterCrewmateChat`. Nothing is deleted: the rows stay in
- *    the slot's transcript and the Work log reads them from there.
+ *    the slot's transcript and the Work log reads them from there. The one
+ *    exception is the turn IN FLIGHT: while the crewmate works, its tool calls
+ *    and thinking since the turn opened stay in, so the chat shows what it is
+ *    doing with the same rows the ordinary transcript draws. They fold away
+ *    again when the turn ends.
  *
- * 2. HOW A RUN LOOKS. Consecutive messages from the crewmate form a run,
- *    Slack-style: one avatar + name + time on the first message, one bubble per
- *    message, grouped corners on the run's (left) side. A run is ONE TURN's
+ * 2. HOW A RUN LOOKS. Consecutive messages from the crewmate form a run: one
+ *    bubble per message, grouped corners on the run's (left) side, and NO
+ *    author line (no avatar, name or time row) -- the DM header already names
+ *    the one speaker besides the user. A run is ONE TURN's
  *    bubbles (RFC screen 05): it breaks on a user message, on any other drawn
  *    row, and at a turn boundary the unfiltered transcript carries (a patrol
  *    wake or an envelope between two replies). `crewmateRunPosition`
@@ -29,21 +34,20 @@
 import { isSystemNoticeRow } from '../../pages/chat/CompactionCard'
 import { isWorkflowCompletionMessage } from '../../pages/chat/WorkflowCompletionCard'
 import { isSubagentCompletionMessage } from '../../pages/chat/subagentCompletion'
+import { REASONING_ROLES } from '../../pages/chat/groupDisplayItems'
+import { opensTurn } from '../../pages/chat/RecoveryCard'
 import type { ChatMessage } from '../../types'
 import { isHiddenInvisibleAssistantRow } from '../../utils/invisibleText'
 
 /** Where a message sits in a run of consecutive crewmate messages. */
 export type CrewmateRunPosition = 'single' | 'start' | 'cont' | 'end'
 
-/** Avatar edge on the author line, px. Matches the roster row's face size. */
-export const CREWMATE_AVATAR_PX = 28
-
 /** Rows that may sit between two of the crewmate's messages without ending the
  *  turn: the turn's own machinery (tool calls, thinking, the wire-only `done`)
  *  and state rows a run reads past. A user message, a patrol wake (`nudge`), an
  *  injected envelope (`inject`, `subagent`) or a cron notification opens a NEW
  *  turn, so the crewmate's next message opens a new run (RFC screen 05:
- *  "consecutive bubbles from one turn share the avatar"). */
+ *  "consecutive bubbles from one turn" group their corners). */
 const WITHIN_TURN_ROLES: ReadonlySet<string> = new Set([
   'tool', 'tool_call', 'tool_result', 'thinking', 'done', 'system', 'queued', 'permission', 'streaming',
 ])
@@ -57,6 +61,10 @@ const MACHINERY_ROLES: ReadonlySet<string> = new Set([
   'nudge', 'inject', 'subagent', 'tool', 'tool_call', 'tool_result', 'thinking', 'done',
 ])
 
+/** The live turn's progress rows: tool calls (the 🔧 line and its hidden
+ *  ✅ / 🚫 siblings, which the list reads for the denied flag) and thinking. */
+const LIVE_PROGRESS_ROLES: ReadonlySet<string> = new Set(['tool', ...REASONING_ROLES])
+
 /** The stop card travels under `system`; every other `system` row is state
  *  no surface draws. */
 function isStopCard(m: ChatMessage): boolean {
@@ -65,10 +73,14 @@ function isStopCard(m: ChatMessage): boolean {
 
 /** Rows that carry state, not a message, and never draw on any surface. A run
  *  reads THROUGH them: a resolved approval between two of the crewmate's
- *  messages does not split its avatar in two. The stop card is the exception
+ *  messages does not split its corner grouping in two. The stop card is the exception
  *  among `system` rows: it IS drawn (the user pressed Stop and sees the card),
  *  so it is a boundary like an error row, not state the run reads past. */
 function isRunTransparent(m: ChatMessage): boolean {
+  // A live turn's progress rows (kept only while the turn runs) are the turn's
+  // own machinery: the run, its corners and its footer read past them exactly
+  // as they do once the rows fold away, so nothing reshapes at turn end.
+  if (LIVE_PROGRESS_ROLES.has(m.role)) return true
   if (m.role === 'permission') return !!m.meta?.resolved
   if (isStopCard(m)) return false
   return m.role === 'system' || m.role === 'done' || m.role === 'queued'
@@ -107,10 +119,20 @@ export function isCrewmateChatRow(m: ChatMessage): boolean {
   return true
 }
 
-/** The rows a crewmate's chat draws, in transcript order. Same array identity
- *  back when nothing was dropped, so a memo on the result stays stable. */
-export function filterCrewmateChat(messages: ChatMessage[]): ChatMessage[] {
-  const kept = messages.filter(isCrewmateChatRow)
+/** The rows a crewmate's chat draws, in transcript order. With `live` (the
+ *  slot is running a turn) the progress rows after the newest turn opener are
+ *  kept too; the opener is the transcript's own `opensTurn`, so a steer sent
+ *  into the running turn does not restart it. Same array identity back when
+ *  nothing was dropped, so a memo on the result stays stable. */
+export function filterCrewmateChat(messages: ChatMessage[], live = false): ChatMessage[] {
+  let turnStart = messages.length
+  if (live) {
+    turnStart = 0
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (opensTurn(messages[i])) { turnStart = i + 1; break }
+    }
+  }
+  const kept = messages.filter((m, i) => isCrewmateChatRow(m) || (i >= turnStart && LIVE_PROGRESS_ROLES.has(m.role)))
   return kept.length === messages.length ? messages : kept
 }
 
@@ -177,7 +199,7 @@ export function crewmateRunPosition(
   return 'cont'
 }
 
-/** True for the message that carries the run's avatar, name and time. */
+/** True for the message that opens a run (its top-left corner is full). */
 export function opensCrewmateRun(pos: CrewmateRunPosition): boolean {
   return pos === 'single' || pos === 'start'
 }
@@ -196,20 +218,35 @@ const CORNERS: Record<CrewmateRunPosition, string> = {
   end: 'rounded-2xl rounded-tl-md',
 }
 
-/** Surface + padding + measure, every bubble alike. Tokens only (`bg-card`,
- *  `border-border`), so light and dark each pick their own palette. The
- *  markdown's outermost first/last block margins are zeroed so the bubble's own
- *  padding is the whole inset. */
+/** Surface + padding + measure, every bubble alike. A FILLED neutral gray, no
+ *  border: the iMessage pairing #17839 chose — the user's own bubble on the
+ *  right is the filled accent one, the crewmate's on the left the gray one, so
+ *  colour tells the two speakers apart before alignment does. The fill and its
+ *  token scope live under `.crewmate-bubble` in index.css: the fill is the
+ *  theme's `--bg-hover` (`--bg-elevated` and `--card` equal the page background
+ *  in kiro-light, highcontrast-light and everforest-light — contrast 1.00, the
+ *  bubble vanishes — while `--bg-hover` sits at least 1.09 above the page in
+ *  every shipped theme, the same step iMessage's gray takes), and inside the
+ *  bubble the surface tokens its contents paint with (`--bg-hover` for the
+ *  kiro-light code patch and every `hover:bg-bg-hover` control, `--bg-elevated`,
+ *  `--card`) are moved one step off that fill, or a patch painted in the fill's
+ *  own colour would disappear. Text is the page's own `--text`, which every
+ *  theme already keeps readable on `--bg-hover`. In forced-colors mode the fill
+ *  is taken away, so a border is drawn there and only there. The markdown's
+ *  outermost first/last block margins are zeroed so the bubble's own padding is
+ *  the whole inset. */
 const BUBBLE_BASE =
-  'bg-card border border-border px-3.5 py-1.5 max-w-[72ch] [&>.group>:first-child]:mt-0 [&>.group>:last-child]:mb-0'
+  'crewmate-bubble forced-colors:border px-3.5 py-1.5 max-w-[72ch] [&>.group>:first-child]:mt-0 [&>.group>:last-child]:mb-0'
 
 /** Classes for the crewmate's message bubble at `pos`. */
 export function crewmateBubbleClass(pos: CrewmateRunPosition): string {
   return `${BUBBLE_BASE} ${CORNERS[pos]}`
 }
 
-/** Vertical rhythm of a row: a run opens with a little air above its author
- *  line; bubbles inside a run sit close. */
+/** Vertical rhythm of a row. Bubbles inside a run sit close but never touch:
+ *  6px between two bordered surfaces reads as one speaker pausing, 2px read as
+ *  one bubble with a seam. A run opens with twice that, which is all that
+ *  separates two turns now that no author line does. */
 export function crewmateRowClass(pos: CrewmateRunPosition): string {
-  return opensCrewmateRun(pos) ? 'mt-1.5' : 'mt-0.5'
+  return opensCrewmateRun(pos) ? 'mt-3' : 'mt-1.5'
 }

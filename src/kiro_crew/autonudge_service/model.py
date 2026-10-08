@@ -28,6 +28,27 @@ from kiro_crew.monitoring.models import MonitorOutcome, MonitorState, retained_o
 #: a cap would bring back a watch with nothing to watch.
 MONITOR_TERMINAL_REASON = "monitor_terminal"
 
+#: ``stopped_reason`` for a loop whose own kill switch fired: the stop file at
+#: ``stop_sentinel_path`` existed when the timer woke. The file is how the agent
+#: declares the goal reached on a goal whose text carries ``{{STOP_FILE}}`` (the
+#: apps' patrols, ``/goal``, a custom goal; the popover's default text has the
+#: agent call ``autonudge_stop`` instead, and that call's removal of the row is
+#: unchanged here), so the record is KEPT and deactivated under this reason rather
+#: than removed -- a removed row left the goal popover on its empty form with
+#: nothing saying the goal was met.
+#: The stop file itself is left where it was written; the arm path unlinks it
+#: before a new loop is armed on the slot (``authorize_and_add_nudge``).
+STOP_SENTINEL_REASON = "stop_sentinel"
+
+#: The two FINISHED stops -- the agent created its stop file, or the watched
+#: subject merged or closed. Terminal in a way the bounds are not: there is nothing
+#: to resume, so a revival (``update(active=True)``) is refused whoever asks -- the
+#: popover's Play, ``monitor_update``, an app reconciler re-arming its loops -- and
+#: the only ways on are to clear the record or to arm a NEW loop, which may displace
+#: it (both are in ``_REPLACEABLE_LOOP_STOP_REASONS`` below). The popover renders
+#: both as Done.
+FINISHED_LOOP_REASONS = frozenset({STOP_SENTINEL_REASON, MONITOR_TERMINAL_REASON})
+
 
 _MIN_IDLE_SECS = 15
 _MAX_IDLE_SECS = 86400  # 24h
@@ -70,6 +91,33 @@ SESSION_START_FAILURE_REASON = "session_start_failures"
 # clears the streak, so a loop that recovers is never held back.
 _START_FAILURE_BACKOFF_AFTER = 3
 _START_FAILURE_STANDDOWN_AFTER = 5
+
+
+# Persisted reason for a loop stood down because its own delivered cycles kept
+# FAILING -- turns that reached a model session and dispatched but died (a
+# backend error after retries were spent, a persistent tool error, a prompt
+# timeout), the turn outcome ``error`` or ``timeout``. The three narrower bounds
+# each cover one deterministic sub-case: ``structural_terminal`` a malformed
+# payload the backend rejects by shape, ``approval_stalled`` an unanswered
+# approval, ``session_start_failures`` a cycle that never got a session at all.
+# A cycle that got a session, dispatched, and then errored is none of those, so
+# without this bound a loop firing every interval into a turn that always fails
+# spends its whole cycle cap producing nothing -- the exact waste
+# ``session_start_failures`` was built to end, for the broader class the three
+# narrow bounds leave uncovered. System-imposed like them (the remedy -- the
+# backend recovering, the tool being fixed -- is not something the loop can
+# arrange), so it is re-armable, and evidence-driven: only a DELIVERED cycle of
+# this loop's own that ended in a fault advances it, and a single landed turn on
+# the slot clears it, so a loop that recovers is never held back.
+CONSECUTIVE_FAILURE_REASON = "consecutive_failures"
+
+
+# Consecutive failed own-cycles before the loop stands down. Higher than the
+# start-failure stand-down because a failed turn is a broader, noisier signal
+# than a session that never started -- a couple of transient backend errors are
+# weather, five in a row with nothing landing between them is a loop that cannot
+# make progress and is only spending turns to keep failing.
+_CONSECUTIVE_FAILURE_STANDDOWN_AFTER = 5
 
 
 # Persisted reason for a loop stopped because its LAST delivered cycle ended on
@@ -124,7 +172,8 @@ _BUDGET_EXHAUSTED_REASONS = frozenset({CYCLE_CAP_REASON, RUNTIME_BUDGET_REASON})
 
 # System-imposed terminal bounds. Membership here gives a reason TWO properties:
 # (1) ``update`` refuses to overwrite an ALREADY-inactive loop with one of these
-# (the no-op branch in ``_update_locked``), so a stop these mark cannot clobber a
+# (the no-op branches in ``_update_unserialized`` read ``_KEPT_STOP_REASONS``,
+# which these are part of), so a stop these mark cannot clobber a
 # manual pause the user landed first -- e.g. a structural stop firing on an
 # in-flight cycle right after the user paused must NOT replace that pause and
 # make it directive-revivable; and (2) they are re-armable (folded into
@@ -134,6 +183,7 @@ _TERMINAL_BOUND_REASONS = _BUDGET_EXHAUSTED_REASONS | {
     APPROVAL_STALL_REASON,
     STRUCTURAL_TERMINAL_REASON,
     SESSION_START_FAILURE_REASON,
+    CONSECUTIVE_FAILURE_REASON,
 }
 
 
@@ -149,16 +199,36 @@ MANUAL_STOP_REASON = "manual"
 
 
 #: Stops the SYSTEM imposed on a legacy loop, which a directive re-arm may
-#: therefore displace: a lapsed approval, a spent bound, a finished subject, a
-#: dropped kill switch. Everything else — a manual pause (``"manual"``), a
+#: therefore displace: a lapsed approval, a spent bound, a finished subject (a
+#: merged or closed watch, or the loop's own stop file), a dropped kill switch.
+#: Everything else — a manual pause (``"manual"``), a
 #: research tombstone (``AUTONUDGE_STOP_REASON``, consumed by the auto_research
 #: watchdog to tell deliberate completion from crash cleanup), and any reason
 #: this version does not know — is evidence some consumer may read, so it fails
 #: CLOSED to preserved.
-_REPLACEABLE_LOOP_STOP_REASONS = _TERMINAL_BOUND_REASONS | {
-    MONITOR_TERMINAL_REASON,
-    SENTINEL_DROPPED_REASON,
-}
+_REPLACEABLE_LOOP_STOP_REASONS = (
+    _TERMINAL_BOUND_REASONS | FINISHED_LOOP_REASONS | {SENTINEL_DROPPED_REASON}
+)
+
+
+#: Stops a LATER deactivation must not overwrite. A reasonless pause (the goal
+#: popover's, pressed off a record that still read running) or a bound-tagged stop
+#: reaching a row one of these already stopped keeps the earlier reason: the record
+#: keeps why the loop ended, which the popover words its state by -- and for a
+#: finished loop the reason is also what refuses the revival, so ``manual`` stamped
+#: over it would hand Play back on a loop with nothing to resume.
+_KEPT_STOP_REASONS = _TERMINAL_BOUND_REASONS | FINISHED_LOOP_REASONS
+
+
+def reason_in(value: object, reasons: frozenset[str]) -> bool:
+    """Whether a STORED stop reason is one of ``reasons``.
+
+    A loop's ``stopped_reason`` is read back from the state file as written, so
+    a hand-edited or malformed value can be anything; a non-string matches no
+    reason rather than raising on the set lookup, which is how the resume path
+    reads it too.
+    """
+    return isinstance(value, str) and value in reasons
 
 
 def _stopped_row_is_replaceable(loop: "NudgeLoop") -> bool:
@@ -399,7 +469,9 @@ class NudgeLoop:
     # "manual" (user pause / any caller that didn't say otherwise),
     # "autonudge_stop" (deliberate directive), "cycle_cap",
     # "runtime_budget", or "approval_stalled" (set by _timer's terminal
-    # bounds).
+    # bounds), "stop_sentinel" (the stop file existed when _timer woke) or
+    # "monitor_terminal" (the watched subject merged or closed). "approval_stalled"
+    # is from before approval stalls became a hold; it is still read on old rows.
     # Persisted so revival logic can distinguish a manual pause from a bound
     # expiry — elapsed wall-clock keeps growing after a manual pause, so
     # WITHOUT this record a paused loop whose budget has since elapsed is
@@ -408,16 +480,22 @@ class NudgeLoop:
     stopped_reason: str = ""
     # Evidence that a cycle in this loop's session asked for tool approval and
     # nobody answered within the window. Set by ``notify_approval_stalled`` and
-    # consumed by ``_timer`` as a terminal condition on the NEXT wake, which is
-    # the whole point: the loop stops on proof that it could not act, never on a
-    # prediction that it might not be able to. A loop whose turns only touch
-    # auto-approved tools never reaches an interactive wait, so it can never be
-    # flagged here — that is what keeps a working read-only loop running instead
-    # of needing a "does this loop need approval?" guess.
-    # Persisted, because the condition that produced it (a lapsed grant) usually
-    # outlives a restart; cleared on every revival so a re-granted loop is not
-    # stopped by stale evidence.
+    # read by ``_timer`` as a HOLD on every later wake: the loop stays active but
+    # fires no cycle, so it spends neither its cycle cap nor (see
+    # ``approval_stalled_at``) its runtime budget while nobody is there to answer.
+    # It holds on proof that it could not act, never on a prediction that it
+    # might not be able to. A loop whose turns only touch auto-approved tools
+    # never reaches an interactive wait, so it can never be flagged here.
+    # Cleared by ``release_approval_hold`` once a person is back (an approval
+    # answered in the slot, a message typed into it, a manual fire), which
+    # resumes the loop with no re-arm by the user, and on every revival.
+    # Persisted, because the condition that produced it usually outlives a
+    # restart.
     approval_stalled: bool = False
+    # When the current hold began (0 = not held, or a legacy row). On release the
+    # held time is added to ``created_ts``, so a hold does not spend the runtime
+    # budget: a loop held overnight resumes with the budget it had left.
+    approval_stalled_at: float = 0.0
     # How many of this loop's cycles in a row ended without ever getting a model
     # session (``session/new`` timed out or otherwise failed). Raised by
     # ``notify_cycle_start_failed`` and zeroed by ``notify_cycle_landed``, both
@@ -428,6 +506,20 @@ class NudgeLoop:
     # that produces it routinely outlives a restart, and cleared on every revival
     # so a recovered loop is not stood down by stale evidence.
     consecutive_start_failures: int = 0
+    # How many of this loop's OWN delivered cycles in a row ended in a fault --
+    # a turn that reached a model session and dispatched but died (turn outcome
+    # ``error`` or ``timeout``). Raised by ``notify_cycle_failed`` and zeroed by
+    # ``notify_cycle_landed`` (any landed turn on the slot proves progress is
+    # possible), both driven by evidence from the slot's own turns. Consumed by
+    # ``_timer``: past ``_CONSECUTIVE_FAILURE_STANDDOWN_AFTER`` the loop stops
+    # with ``CONSECUTIVE_FAILURE_REASON``. Distinct from
+    # ``consecutive_start_failures`` because the two measure different failures
+    # with different remedies -- a cycle that never got a session versus one that
+    # ran and errored -- and a loop can hit either. Persisted, because the
+    # condition that produces it (a wedged backend, a broken tool) routinely
+    # outlives a restart, and cleared on every revival so a recovered loop is not
+    # stood down by stale evidence.
+    consecutive_failed_cycles: int = 0
     # Absolute wall-clock deadline for the next fire (0 = unset: the next arm
     # starts a fresh full countdown). This is what makes the countdown
     # deadline-preserving — user turns cancel the pending timer TASK but never
@@ -503,6 +595,14 @@ class NudgeLoop:
     # concurrency framework. Absent in a store written before this field ->
     # decodes to 0, and a first fire simply captures 0.
     config_generation: int = 0
+    # The gateway's default conductor patrol (``conductor_patrol.ensure_patrol``,
+    # armed when a conductor binds a worker and holds no loop). The one thing it
+    # changes: a create-only arm of a loop that is NOT a default patrol -- the
+    # conductor's own ``monitor_start`` -- displaces an ACTIVE default patrol
+    # instead of answering 409, so the agent's explicit arm always wins over the
+    # gateway's fallback. Persisted so the rule survives a restart. Only an
+    # explicit boolean True counts; anything else decodes to False.
+    default_patrol: bool = False
 
 
 def is_structured_monitor_loop(loop: NudgeLoop) -> bool:

@@ -51,6 +51,7 @@ from kiro_crew.artifacts import (
     USER_SELECTABLE_KINDS,
     ArtifactAlreadyExistsError,
     ArtifactComment,
+    ArtifactConflictError,
     ArtifactError,
     ArtifactNotFoundError,
     ArtifactReplacedError,
@@ -66,7 +67,10 @@ from kiro_crew.artifacts import (
 )
 from kiro_crew.constants import md_link_destination
 from kiro_crew.dashboard.chat_folders import generate_emoji_for_name
-from kiro_crew.dashboard.handlers._shared import _is_restricted_session
+from kiro_crew.dashboard.handlers._shared import (
+    _is_restricted_session,
+    require_owner_dashboard_request,
+)
 from kiro_crew.dashboard.state import _normalize_slot_key
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_with_identity, stat_identity
@@ -82,6 +86,7 @@ from kiro_crew.publish_provider import (
     PublishError,
     PublishUnavailableError,
     get_provider,
+    is_registered,
     list_providers,
 )
 from kiro_crew.security import (
@@ -135,6 +140,22 @@ def _json_response(data: Any, status: int = 200) -> web.Response:
 
 def _err(message: str, status: int = 400) -> web.Response:
     return web.json_response({"error": message}, status=status)
+
+
+async def _non_owner_refusal(request: web.Request, operation: str) -> web.Response | None:
+    """Refuse a signed-in dashboard caller who is not the owner; ``None`` admits.
+
+    Every state-changing artifact route calls this first, before it reads the
+    body or the store. Two callers are not dashboard subjects and keep their
+    own rules: an app token (``request["app"]`` set, bounded by its manifest
+    grant) and the loopback internal-secret transport the agent ``artifact_*``
+    tools, the CLI and app drivers use. That transport leaves ``app`` absent
+    and marks ``internal_auth``, so it is admitted on that mark rather than
+    refused by the owner check, which needs a present empty app claim.
+    """
+    if request.get("app") or request.get("internal_auth") is True:
+        return None
+    return await require_owner_dashboard_request(request, operation)
 
 
 def _notify_artifact_update(state: Any, slug: str, version: int, *, deleted: bool = False) -> None:
@@ -1311,6 +1332,9 @@ async def _promote_verdict(
 
 
 async def api_artifacts_create(request: web.Request) -> web.Response:
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifacts_create")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -1584,7 +1608,7 @@ async def api_artifact_detail(request: web.Request) -> web.Response:
     slug = request.match_info.get("slug", "")
     try:
         store = get_default_store()
-        art = store.get(slug)
+        art = await _run_off_loop(lambda: store.get(slug, assign_token=True))
     except ArtifactNotFoundError as exc:
         return _err(str(exc), status=404)
     except ArtifactValidationError as exc:
@@ -1691,6 +1715,9 @@ async def api_artifact_asset(request: web.Request) -> web.Response:
 
 
 async def api_artifact_update(request: web.Request) -> web.Response:
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_update")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -1798,6 +1825,7 @@ async def api_artifact_update(request: web.Request) -> web.Response:
                 event_type=event_type,
                 from_version=from_version,
                 snapshot=snapshot,
+                expected_token=body.get("expected_token"),
             )
         )
         # store.update() only loads content into the returned Artifact when
@@ -1825,6 +1853,24 @@ async def api_artifact_update(request: web.Request) -> web.Response:
             error=str(exc),
         )
         return _err(str(exc))
+    except ArtifactConflictError as exc:
+        # A stale content write: nothing was written. The body carries what the
+        # client needs to refetch and re-base.
+        _audit(
+            tool="artifact_update",
+            request=request,
+            outcome="denied",
+            error=str(exc),
+            extra={"slug": slug},
+        )
+        return web.json_response(
+            {
+                "error": str(exc),
+                "code": "artifact_conflict",
+                "current_token": exc.current_token,
+            },
+            status=409,
+        )
     except ArtifactError as exc:
         # Catches the base class fallback — store._write_text() raises
         # ArtifactError("refusing to write sensitive path: ...") which is
@@ -1932,6 +1978,9 @@ async def api_artifact_settle_blank(request: web.Request) -> web.Response:
 
     Responds ``{"outcome": "kept" | "saved" | "deleted"}``.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_settle_blank")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -2007,6 +2056,9 @@ async def api_artifact_settle_blank(request: web.Request) -> web.Response:
 
 
 async def api_artifact_delete(request: web.Request) -> web.Response:
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_delete")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -2021,7 +2073,7 @@ async def api_artifact_delete(request: web.Request) -> web.Response:
     # Capture the pre-delete version so the deleted-variant WS event carries the
     # last-known version.
     try:
-        _existing = get_default_store().get(slug)
+        _existing = await _run_off_loop(lambda: get_default_store().get(slug))
     except ArtifactError:
         # Best-effort version capture only — swallow both the missing-slug and
         # invalid-slug (ArtifactValidationError) siblings so an invalid slug still
@@ -2325,7 +2377,7 @@ async def api_artifact_events(request: web.Request) -> web.Response:
     """
     slug = request.match_info.get("slug", "")
     try:
-        art = get_default_store().get(slug)
+        art = await _run_off_loop(lambda: get_default_store().get(slug))
     except ArtifactNotFoundError as exc:
         return _err(str(exc), status=404)
     except ArtifactValidationError as exc:
@@ -2356,6 +2408,9 @@ async def api_artifact_record_event(request: web.Request) -> web.Response:
     mutation endpoints — a restricted session must not be able to flood
     an artifact's event log.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_record_event")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -2503,6 +2558,9 @@ async def api_artifact_publish(request: web.Request) -> web.Response:
     an artifact is auto-saved first by the frontend (POST /api/artifacts), so
     this endpoint is always slug-based.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_publish")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -2598,6 +2656,9 @@ async def api_artifact_update_sharing(request: web.Request) -> web.Response:
     Body: ``{visibility, shared_with[]}``. No re-upload. Returns the serialized
     artifact with the updated publication block.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_update_sharing")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -2657,6 +2718,9 @@ async def api_artifact_unpublish(request: web.Request) -> web.Response:
     publication block. Returns the serialized artifact (now with
     ``publication: null``).
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_unpublish")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -2691,6 +2755,9 @@ async def api_artifact_refresh_sharing(request: web.Request) -> web.Response:
     publication so the dashboard reflects truth. Gated like other mutations
     since it can update meta.json.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_refresh_sharing")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -2745,6 +2812,9 @@ async def api_artifact_reprobe_notice(request: web.Request) -> web.Response:
     only when the condition has actually cleared). Gated like other mutations
     since it can update meta.json.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_reprobe_notice")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -2790,6 +2860,9 @@ async def api_artifact_reprobe_notice(request: web.Request) -> web.Response:
 
 async def api_artifact_pull_latest(request: web.Request) -> web.Response:
     """POST /api/artifacts/{slug}/pull-latest — pull upstream into a fork."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_pull_latest")
+    if owner_denied is not None:
+        return owner_denied
 
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
@@ -2921,6 +2994,9 @@ async def api_artifact_overwrite_remote(request: web.Request) -> web.Response:
     HERE — on the resolved ``publication.provider`` — before any provider
     dispatch (same fail-closed gate as publish / update-sharing).
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_overwrite_remote")
+    if owner_denied is not None:
+        return owner_denied
     slug = request.match_info.get("slug", "")
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
@@ -2999,6 +3075,9 @@ async def api_artifact_overwrite_remote(request: web.Request) -> web.Response:
 
 async def api_artifact_relocate(request: web.Request) -> web.Response:
     """PATCH /api/artifacts/{slug}/relocate — update source_path."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_relocate")
+    if owner_denied is not None:
+        return owner_denied
 
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
@@ -3211,6 +3290,9 @@ _ARTIFACT_FOLDER_ICON_TASKS: set[asyncio.Task[None]] = set()
 
 async def api_artifact_folder_create(request: web.Request) -> web.Response:
     """POST /api/artifact-folders — create a folder. Body: {name, parent?|parent_id?}."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_folder_create")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -3274,6 +3356,9 @@ async def api_artifact_folder_create(request: web.Request) -> web.Response:
 
 async def api_artifact_folder_update(request: web.Request) -> web.Response:
     """PATCH /api/artifact-folders/{id} — rename / reparent / reorder / icon."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_folder_update")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -3452,6 +3537,9 @@ async def api_artifact_folder_delete(request: web.Request) -> web.Response:
     only this folder. ``delete_contents=true`` cascades the whole subtree,
     permanently deleting every descendant artifact.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_folder_delete")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -3633,6 +3721,9 @@ async def api_artifact_set_folder(request: web.Request) -> web.Response:
     Body accepts ``{folder}`` (id OR human path, mkdir -p) or ``{folder_id}``
     (id-only). ``""`` / ``"root"`` / null unfiles. Metadata-only — no version bump.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_set_folder")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -3719,6 +3810,9 @@ async def api_artifact_set_pinned(request: web.Request) -> web.Response:
 
     Body: ``{"pinned": true|false}``. Metadata-only — no version bump.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_set_pinned")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -3841,6 +3935,9 @@ async def api_artifact_materialize(request: web.Request) -> web.Response:
     """POST /api/artifacts/materialize — turn a session document path into a
     real, saved (pinned) file-backed artifact. Body: ``{"path": "..."}``.
     Idempotent by source_path."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_materialize")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -4062,6 +4159,9 @@ async def api_artifact_comments(request: web.Request) -> web.Response:
 
 async def api_artifact_post_comment(request: web.Request) -> web.Response:
     """POST /api/artifacts/{slug}/comments — create a new comment."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_post_comment")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -4222,6 +4322,9 @@ async def api_artifact_post_comment(request: web.Request) -> web.Response:
 
 async def api_artifact_reply_comment(request: web.Request) -> web.Response:
     """POST /api/artifacts/{slug}/comments/{id}/reply — reply to a thread."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_reply_comment")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -4347,6 +4450,9 @@ async def api_artifact_reply_comment(request: web.Request) -> web.Response:
 
 async def api_artifact_mark_review(request: web.Request) -> web.Response:
     """POST /api/artifacts/{slug}/comments/{id}/review — advance to REVIEW."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_mark_review")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -4416,6 +4522,9 @@ async def api_artifact_mark_review(request: web.Request) -> web.Response:
 
 async def api_artifact_resolve_comment(request: web.Request) -> web.Response:
     """POST /api/artifacts/{slug}/comments/{id}/resolve — human-only resolve."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_resolve_comment")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -4475,6 +4584,9 @@ async def api_artifact_reopen_comment(request: web.Request) -> web.Response:
     """POST /api/artifacts/{slug}/comments/{id}/reopen — reopen a resolved
     thread (set status back to open).
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_reopen_comment")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -4525,6 +4637,9 @@ async def api_artifact_delete_comment(request: web.Request) -> web.Response:
     Human dashboard deletes are unchanged (no reason required, provider
     cascade preserved).
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_delete_comment")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -4657,6 +4772,9 @@ async def api_artifact_edit_comment(request: web.Request) -> web.Response:
     Status (open/review/resolved) is untouched — that's what resolve/reopen/
     review are for. Authorship (``author`` / ``is_agent``) is preserved.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.artifact_edit_comment")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -4868,10 +4986,11 @@ async def api_remote_artifacts_browse(request: web.Request) -> web.Response:
     A non-empty ``q`` runs full-text ``search_remote`` (providers whose
     ``discovery_model().full_text_search`` is True); otherwise
     ``list_remote(scope)``. ``None`` from the provider means that discovery
-    primitive isn't supported (400). Gated like other reads-with-state. In the
-    public edition the registry is empty, so ``get_provider`` raises
-    ``PublishUnavailableError`` and every browse returns 404 — the surface is
-    inert until a companion registers a provider.
+    primitive isn't supported (400). Gated like other reads-with-state. A
+    provider name with nothing registered under it answers 404; in the public
+    edition the registry is empty, so every browse returns 404 — the surface is
+    inert until a companion registers a provider. A registered provider that
+    raises ``PublishUnavailableError`` answers 503.
     """
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
@@ -4886,12 +5005,12 @@ async def api_remote_artifacts_browse(request: web.Request) -> web.Response:
     scope = request.rel_url.query.get("scope", "mine")
     query = request.rel_url.query.get("q") or ""
     page_token = request.rel_url.query.get("pageToken")
+    if not is_registered(provider_name):
+        return _err(_redact_text(f"unknown publish provider: {provider_name!r}"), status=404)
     try:
         provider = get_provider(provider_name)
     except PublishUnavailableError as exc:
-        # No provider registered under this name — inert public edition or a
-        # companion misconfiguration. 503 (not 404), matching the clone/fork
-        # handlers: the surface exists, the provider tooling doesn't.
+        # A registered provider whose tooling is unavailable.
         return _err(_redact_text(str(exc)), status=503)
     except Exception as exc:
         return _err(_redact_text(str(exc)), status=502)
@@ -4962,6 +5081,9 @@ async def api_remote_artifacts_clone(request: web.Request) -> web.Response:
     therefore enforced HERE, before the clone binds the two copies (same
     fail-closed gate as publish). Fork (pull-only lineage) stays ungated.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.remote_artifacts_clone")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -5028,6 +5150,9 @@ async def api_remote_artifacts_fork(request: web.Request) -> web.Response:
     body) — provider-routed fork (independent copy with pull-only
     ``fork_metadata`` lineage). Ingress only — never arms a push — so no publish
     governance gate."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.remote_artifacts_fork")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit(
@@ -5107,9 +5232,10 @@ async def api_remote_artifact_get(request: web.Request) -> web.Response:
     copy of — the content source for the remote-detail view. Routes through the
     registered provider's ``fetch_content`` (``Capability.CONTENT_PULL``); the
     returned ``{content, content_type, title, owner, visibility, ...}`` is
-    redacted before it leaves the process. When no provider is registered (the
-    public default) ``get_provider`` raises and this returns a clear error, not a
-    500. Read-only, so no publish-governance gate.
+    redacted before it leaves the process. A provider name with nothing
+    registered under it (every name in the public default) answers 404; a
+    registered provider that fails answers 502. Read-only, so no
+    publish-governance gate.
     """
     provider_name = request.match_info["provider"]
     external_id = request.match_info["external_id"]
@@ -5123,6 +5249,16 @@ async def api_remote_artifact_get(request: web.Request) -> web.Response:
         )
         return _err("restricted session", status=403)
 
+    if not is_registered(provider_name):
+        error = _redact_text(f"unknown publish provider: {provider_name!r}")
+        _audit(
+            tool="remote_artifact_fetch",
+            request=request,
+            outcome="error",
+            error=error,
+            extra={"provider": provider_name, "external_id": external_id},
+        )
+        return _err(error, status=404)
     try:
         provider = get_provider(provider_name)
         if Capability.CONTENT_PULL not in provider.capabilities():
@@ -5314,6 +5450,9 @@ async def api_remote_artifact_comments(request: web.Request) -> web.Response:
 
 async def api_remote_artifact_post_comment(request: web.Request) -> web.Response:
     """POST /api/remote-artifacts/{provider}/{external_id}/comments — scope=shared."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.remote_artifact_post_comment")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit_remote_denied(
@@ -5407,6 +5546,9 @@ async def api_remote_artifact_post_comment(request: web.Request) -> web.Response
 
 async def api_remote_artifact_reply_comment(request: web.Request) -> web.Response:
     """POST /api/remote-artifacts/{provider}/{external_id}/comments/{id}/reply."""
+    owner_denied = await _non_owner_refusal(request, "artifacts.remote_artifact_reply_comment")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit_remote_denied(
@@ -5492,6 +5634,9 @@ async def api_remote_artifact_mark_review(request: web.Request) -> web.Response:
     user does not own this artifact locally, so the status change writes
     straight through to the source.
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.remote_artifact_mark_review")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit_remote_denied(
@@ -5563,6 +5708,9 @@ async def api_remote_artifact_delete_comment(request: web.Request) -> web.Respon
     Delete a shared-artifact comment on the provider (writes through to the
     source — the user has no local copy to mirror it in).
     """
+    owner_denied = await _non_owner_refusal(request, "artifacts.remote_artifact_delete_comment")
+    if owner_denied is not None:
+        return owner_denied
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
         _audit_remote_denied(

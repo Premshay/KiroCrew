@@ -15,6 +15,7 @@ import string
 import struct
 import sys
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -879,6 +880,54 @@ class TestTokenParamValueRedaction:
         result, _ = redact_credentials(text)
         assert result == "https://h.example/x?a=1&token=[REDACTED: credential]&b=2"
 
+    def test_template_placeholder_dollar_is_not_redacted(self) -> None:
+        """A JS/TS `${...}` placeholder after `token=` is code, not a value."""
+        for text in (
+            "const url = `${base}&token=${encodeURIComponent(jwt)}`;",
+            "https://h.example/x?token=${x}",
+        ):
+            result, warnings = redact_credentials(text)
+            assert result == text, text
+            assert warnings == [], text
+
+    def test_dollar_values_without_placeholder_still_redact(self) -> None:
+        """Only `${` is exempt: a `$`-led value or a lone trailing `$` is redacted."""
+        for value in ("$abc", "$"):
+            for tail in ("", "&b=2"):
+                result, warnings = redact_credentials(f"https://h/x?token={value}{tail}")
+                assert result == f"https://h/x?token=[REDACTED: credential]{tail}", (value, tail)
+                assert warnings == [f"Redacted token parameter value ({len(value)} chars)"]
+
+    def test_value_before_brace_still_redacts(self) -> None:
+        result, warnings = redact_credentials("https://h/x?token=abc${x}")
+        assert result == "https://h/x?token=[REDACTED: credential]{x}"
+        assert warnings == ["Redacted token parameter value (4 chars)"]
+
+    def test_stream_floor_cut_keeps_a_placeholder_whole(self) -> None:
+        """A forced 512-char floor cut never splits `$` from `{`: stream equals batch."""
+        from kiro_crew.security import StreamRedactor
+
+        for size in range(480, 501):
+            text = " &token=${" + "a" * size + " BEGIN RSA PRIVATE"
+            redactor = StreamRedactor()
+            streamed = redactor.feed(text) + redactor.flush()
+            assert streamed == redact_credentials(text)[0], size
+
+    def test_stream_matches_batch_at_every_chunk_cut_near_a_placeholder(self) -> None:
+        from kiro_crew.security import StreamRedactor
+
+        for text in (
+            "x &token=${jwt} y",
+            "x ?token=abc${x} y",
+            " &token=${" + "a" * 490 + " BEGIN RSA PRIVATE",
+        ):
+            expected = redact_credentials(text)[0]
+            at = text.index("${")
+            for cut in range(max(0, at - 12), min(len(text), at + 12) + 1):
+                redactor = StreamRedactor()
+                streamed = redactor.feed(text[:cut]) + redactor.feed(text[cut:]) + redactor.flush()
+                assert streamed == expected, (text[:20], cut)
+
     def test_entity_equals_does_not_capture_its_own_semicolon(self) -> None:
         """A present `;` is the reference's terminator, never the value.
 
@@ -1565,8 +1614,9 @@ class TestPathWindowsAreNotBareSecrets:
             "/Volumes/workplace/TRAM/QuickProp2/src/ATVTramQuickPropCDK/lib/config/consumerVpcs.ts",
             "/Volumes/workplace/CMS/A3P3/src/LPTCoreServiceCDK/lib/stacks/MainStack2.ts",
             "/opt/workplace/ATVDeviceRegistry2/src/ATVDeviceRegistryCDKv2/lib/Vpcs3.ts",
-            # The macOS per-user temp directory. `computer_use/render.py` documents
-            # this same mechanism destroying every screenshot note on macOS.
+            # A mixed-case stand-in for the macOS per-user temp directory, which
+            # the separator ceiling saves on every platform. The real shape is
+            # pinned by the macOS-host tests below.
             "/var/folders/6r/qKz9XyT3wLmNp7vB2cQ4hJ8000gn/T/screenshot.png",
             "/Users/Someone/Projects/DeepCamelCaseFolder/AnotherCamelFolder/SomeComponentName.ts",
             "/srv/build/src/main/java/com/Example/Service2/FooBarBazClas1/Handler9.java",
@@ -1602,6 +1652,496 @@ class TestPathWindowsAreNotBareSecrets:
         result, _ = redact_credentials(path)
         assert REDACTED_CREDENTIAL_TAG not in result
         assert result.startswith("/") and result.endswith(".ts")
+
+    # ── the macOS per-user directory, in its real shape ──
+
+    # ``confstr`` ids as macOS generates them: a 2-character bucket and a
+    # 30-character name of lowercase letters and digits with no vowel, ending in
+    # the encoded uid. The shape is what matters: a mixed-case or shorter
+    # stand-in clears the heuristic on its own and would pin nothing.
+    DARWIN_USER_DIR_IDS = (
+        ("zz", "pq7mtk933xwbn58cmrlt6hv40000gn"),
+        ("6r", "8b2dmqf94w3bb1m3dqx6h6h40000gn"),
+    )
+
+    @staticmethod
+    def _darwin_root(bucket: str, name: str) -> str:
+        return f"/var/folders/{bucket}/{name}/T"
+
+    @staticmethod
+    def _as_host(monkeypatch: pytest.MonkeyPatch, host_id: str | None) -> None:
+        """Make *host_id* the directory id the OS reports; None is "not macOS"."""
+        from kiro_crew.security import redaction as redaction_mod
+
+        monkeypatch.setattr(redaction_mod, "_host_darwin_user_dir_id", lambda: host_id)
+
+    @staticmethod
+    def _produced_spool_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+        """The spool-relative path ``ComputerUseService`` writes a screenshot to.
+
+        Produced by the real spooler rather than spelled here, so the directory
+        name and the ``shot-<ms>-<random>.jpeg`` file name are the shipped ones.
+        """
+        from kiro_crew.computer_use import service as service_mod
+        from kiro_crew.computer_use.types import AppRef, Snapshot
+
+        monkeypatch.setattr(service_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+        snap = Snapshot(
+            app=AppRef(name="A", pid=1, bundle_id="com.acme.a", window_id=7),
+            elements=(),
+            captured_at=0.0,
+            image_jpeg=b"\xff\xd8\xff\xd9",
+            image_width=1,
+            image_height=1,
+        )
+        produced = service_mod.ComputerUseService()._persist_image(snap).image_path
+        assert produced, "the spooler must have written the frame"
+        return Path(produced).relative_to(tmp_path).as_posix()
+
+    def test_the_darwin_fixtures_have_the_real_shape(self) -> None:
+        from kiro_crew.security import redaction as redaction_mod
+
+        for bucket, name in self.DARWIN_USER_DIR_IDS:
+            assert re.fullmatch(r"[a-z0-9]{2}", bucket)
+            assert re.fullmatch(r"[a-z0-9]{30}", name)
+            assert name.endswith("0000gn")
+            assert not set(name) & set("aeiou")
+            # And it is an id ``confstr`` could have answered with.
+            match = redaction_mod._DARWIN_USER_TEMP_DIR_RE.match(f"/var/folders/{bucket}/{name}/T/")
+            assert match and match.group("id") == f"{bucket}/{name}"
+
+    def test_the_produced_screenshot_path_survives_on_its_own_host(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reported symptom: the model echoes the path and the image renders.
+
+        Checked in every form the path reaches the redactor in: bare, resolved
+        through ``/private``, as the markdown image the agent prompt asks for,
+        and as the tool result's own ``Screenshot:`` line.
+        """
+        from kiro_crew.computer_use.types import SCREENSHOT_DIR_NAME
+
+        spooled = self._produced_spool_path(tmp_path, monkeypatch)
+        assert spooled.startswith(f"{SCREENSHOT_DIR_NAME}/shot-")
+        for bucket, name in self.DARWIN_USER_DIR_IDS:
+            self._as_host(monkeypatch, f"{bucket}/{name}")
+            path = f"{self._darwin_root(bucket, name)}/{spooled}"
+            for text in (
+                path,
+                f"/private{path}",
+                f"![screenshot]({path})",
+                f"Screenshot: {path}",
+            ):
+                assert redact_credentials(text) == (text, []), text
+
+    def test_the_cache_dir_and_an_underscore_bucket_survive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, name = self.DARWIN_USER_DIR_IDS[0]
+        for host_id, path in (
+            (f"zz/{name}", f"/var/folders/zz/{name}/C/com.apple.QuickLook.thumbnailcache/index"),
+            (f"_w/{name}", f"/var/folders/_w/{name}/T/kirocrew-computer-shots/shot-1.jpeg"),
+        ):
+            self._as_host(monkeypatch, host_id)
+            assert redact_credentials(path) == (path, []), path
+
+    @pytest.mark.parametrize(
+        "letter",
+        ["T", "C"],
+    )
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            # Shapes a real temp dir carries: an mkdtemp ``tmpXXXXXXXX`` dir (the
+            # 24-byte overlap floor the exemption is set to), a UUID subdir,
+            # macOS's TemporaryItems and a short CamelCase name.
+            "/tmpab12cd34/x.txt",
+            "/3F2504E0-4F89-11D3-9A0C-0305E82C3301/x",
+            "/TemporaryItems/x",
+            "/A1B2C3D4/x",
+        ],
+    )
+    def test_a_benign_temp_path_survives_on_its_host(
+        self, letter: str, tail: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Benign temp paths whose only key-shaped windows sit over the host id.
+
+        Each window on these overlaps the withheld id by at least the exempt
+        bound, so the exemption spares it and the whole path survives untouched.
+        """
+        for bucket, name in self.DARWIN_USER_DIR_IDS:
+            self._as_host(monkeypatch, f"{bucket}/{name}")
+            text = f"/var/folders/{bucket}/{name}/{letter}{tail}"
+            assert redact_credentials(text) == (text, []), text
+
+    def test_without_a_host_id_the_same_path_is_redacted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing is withheld off macOS, and the fixtures really trip the heuristic.
+
+        This is also what keeps the tests above from passing vacuously: these
+        ids are the shape the heuristic matches.
+        """
+        self._as_host(monkeypatch, None)
+        for bucket, name in self.DARWIN_USER_DIR_IDS:
+            path = f"{self._darwin_root(bucket, name)}/kirocrew-computer-shots/shot-1.jpeg"
+            result, warnings = redact_credentials(path)
+            assert result != path, path
+            assert warnings
+
+    def test_an_id_that_is_not_the_hosts_is_scanned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Only the id the OS reported is withheld, never any string of its shape.
+
+        In free text the id's bytes are the writer's to choose, and a chosen id
+        plus a few bytes after ``/T`` is a key-shaped window the split would give
+        up. Another id -- another user's, or one composed to carry a window -- is
+        therefore judged exactly as it would be with no exemption at all.
+        """
+        (host_bucket, host_name), (bucket, name) = self.DARWIN_USER_DIR_IDS
+        path = f"{self._darwin_root(bucket, name)}/kirocrew-computer-shots/shot-1.jpeg"
+        self._as_host(monkeypatch, None)
+        canonical = redact_credentials(path)
+        self._as_host(monkeypatch, f"{host_bucket}/{host_name}")
+        assert redact_credentials(path) == canonical
+        assert canonical[0] != path
+
+    @pytest.mark.parametrize(
+        "label,shape",
+        [
+            ("key as a file in the temp dir", "{root}/{key}"),
+            ("key with an extension", "{root}/{key}.txt"),
+            ("key deeper in the temp dir", "{root}/kirocrew-computer-shots/{key}"),
+            ("key in the markdown image form", "![shot]({root}/{key})"),
+            # No exemption applies: the glued key means ``T`` does not end its component.
+            ("key glued to the directory letter", "{root}{key}"),
+            # No exemption applies: with the key glued on, the prefix does not start a path.
+            ("key glued before the prefix", "{key}{root}/x"),
+            ("key before the prefix across a slash", "{key}/{root}/x"),
+        ],
+    )
+    def test_a_key_next_to_the_temp_dir_is_still_redacted(
+        self, label: str, shape: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bucket, name = self.DARWIN_USER_DIR_IDS[0]
+        self._as_host(monkeypatch, f"{bucket}/{name}")
+        root = self._darwin_root(bucket, name)
+        for key in (_AWS_EXAMPLE_KEY, _ALT_SLASH_KEY, _NO_SLASH_KEY):
+            result, warnings = redact_credentials(shape.format(root=root, key=key))
+            assert key not in result, f"{label}: key leaked"
+            assert warnings, label
+
+    def test_only_the_piece_holding_the_key_is_redacted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The id is withheld from the scan, so it is not what a hit replaces."""
+        bucket, name = self.DARWIN_USER_DIR_IDS[0]
+        self._as_host(monkeypatch, f"{bucket}/{name}")
+        result, _ = redact_credentials(f"{self._darwin_root(bucket, name)}/{_AWS_EXAMPLE_KEY}")
+        assert result == f"/var/folders/{bucket}/{name}{REDACTED_CREDENTIAL_TAG}"
+
+    @staticmethod
+    def _edge_key(name: str, shared: int) -> str:
+        """A 40-char ``_looks_like_secret_key`` key that reuses *shared* id bytes.
+
+        The key's first *shared* bytes are the host id ``name``'s last *shared*
+        bytes, then ``/T/``, so when it is glued right after ``{bucket}/{name}``
+        minus those bytes the id regex still matches and a key-shaped window
+        begins inside the id, sharing only those bytes in place. A seeded search
+        fills the rest until the heuristic accepts, which is deterministic.
+        """
+        from kiro_crew.security import redaction as redaction_mod
+
+        head = name[-shared:] + "/T/"
+        rng = random.Random(f"edge-key-{name}-{shared}")
+        alphabet = string.ascii_letters + string.digits
+        for _ in range(200_000):
+            key = head + "".join(rng.choice(alphabet) for _ in range(_SECRET_KEY_LEN - len(head)))
+            if redaction_mod._looks_like_secret_key(key):
+                return key
+        raise AssertionError("no key-shaped tail found")
+
+    @pytest.mark.parametrize("shared", [1, 3])
+    def test_a_key_sharing_the_ids_tail_is_still_redacted(
+        self, shared: int, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GPT 5.6's shape: a key reusing a few id bytes is below the exempt bound.
+
+        The window begins at the key's first byte, which is the id's last byte,
+        so it shares only ``shared`` bytes with the withheld id -- far under the
+        24-byte exemption -- and must still redact. ``shared=1`` is the reported
+        ``<last-id-byte>/T/`` case; ``shared=3`` pins that a three-byte overlap
+        is judged too.
+        """
+        from kiro_crew.security import redaction as redaction_mod
+
+        bucket, name = self.DARWIN_USER_DIR_IDS[0]
+        key = self._edge_key(name, shared)
+        assert redaction_mod._looks_like_secret_key(key)
+        # Glue the key where its leading reused bytes complete the id, so the id
+        # regex still matches ``{bucket}/{name}`` ending in ``/T``.
+        text = f"/var/folders/{bucket}/{name[:-shared]}" + key
+        self._as_host(monkeypatch, f"{bucket}/{name}")
+        assert redaction_mod._darwin_user_dir_ids(text), "the id must still be found"
+        result, warnings = redact_credentials(text)
+        assert key[len(name[-shared:]) :] not in result, "the key tail leaked"
+        assert warnings
+        assert result.startswith(f"/var/folders/{bucket}/{name}")
+
+    def test_a_key_under_the_temp_dir_is_judged_as_on_any_other_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Withholding the id never removes a verdict on a real key.
+
+        Every key -- including the separator-heavy ones the ceiling's accepted
+        residual lets through when glued into a run -- that is redacted under an
+        ordinary directory, where no exemption is near it, is still redacted
+        under the temp dir. The id exemption can only ADD survival for a window
+        that shares most of its bytes with the host id, never remove a verdict a
+        real key earns on its own.
+        """
+        bucket, name = self.DARWIN_USER_DIR_IDS[0]
+        self._as_host(monkeypatch, f"{bucket}/{name}")
+        root = self._darwin_root(bucket, name)
+        for key in (_AWS_EXAMPLE_KEY, _ALT_SLASH_KEY, _NO_SLASH_KEY, *self.SEPARATOR_HEAVY_KEYS):
+            under_temp = REDACTED_CREDENTIAL_TAG in redact_credentials(f"{root}/{key}")[0]
+            elsewhere = REDACTED_CREDENTIAL_TAG in redact_credentials(f"/srv/ci/tt/{key}")[0]
+            assert under_temp or not elsewhere, key
+
+    @pytest.mark.parametrize(
+        "label,path",
+        [
+            ("T not ending its component", "/var/folders/zz/{name}/Tevil{tail}"),
+            ("another directory letter", "/var/folders/zz/{name}/X{tail}"),
+            ("the prefix does not start a path", "/Users/x/var/folders/zz/{name}/T{tail}"),
+            ("a character glued before the prefix", "X/var/folders/zz/{name}/T{tail}"),
+            ("a doubled slash before the prefix", "/srv//var/folders/zz/{name}/T{tail}"),
+            ("a file URL", "file:///var/folders/zz/{name}/T{tail}"),
+        ],
+    )
+    def test_a_look_alike_gets_the_canonical_verdict(
+        self, label: str, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The host's id outside the path grammar is scanned whole.
+
+        Asserted as an identity with the no-host result, and each look-alike
+        trips the heuristic, so the identity cannot hold merely because nothing
+        was found.
+        """
+        _, name = self.DARWIN_USER_DIR_IDS[0]
+        text = path.format(name=name, tail="/kirocrew-computer-shots/shot-1.jpeg")
+        self._as_host(monkeypatch, None)
+        canonical = redact_credentials(text)
+        self._as_host(monkeypatch, f"zz/{name}")
+        assert redact_credentials(text) == canonical, label
+        assert canonical[0] != text, f"{label}: the look-alike must trip the heuristic"
+
+    @pytest.mark.parametrize(
+        "label,shape",
+        [
+            ("at the end of the text", "TMPDIR={root}"),
+            ("followed by a newline", "{root}\n"),
+            ("as a JSON string value", '{{"tmp": "{root}"}}'),
+            ("inside a PosixPath repr", "PosixPath('{root}')"),
+            ("as a call argument", "print({root})"),
+            ("followed by a space", "{root} x"),
+            # Pins the rule as a complement of the run alphabet, not a list of
+            # accepted delimiters: ``|`` is in neither.
+            ("followed by a pipe", "{root}|x"),
+            # The byte after the letter ends the run, so these are the bare root
+            # followed by another run, and the prefix and ``/T`` pieces are each
+            # shorter than one key.
+            ("T followed by an underscore", "{root}_evil/kirocrew-computer-shots/shot-1.jpeg"),
+            ("T followed by a hyphen", "{root}-evil/kirocrew-computer-shots/shot-1.jpeg"),
+            ("T followed by a dot", "{root}.evil/kirocrew-computer-shots/shot-1.jpeg"),
+        ],
+    )
+    def test_a_bare_temp_root_survives_whatever_ends_it(
+        self, label: str, shape: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A byte outside the run alphabet after the directory letter ends the run.
+
+        ``print(tempfile.gettempdir())``, a JSON dump and a ``PosixPath`` repr all
+        show the root followed by something other than ``/`` or the end of the
+        text, and each is the same two-byte ``/T`` piece once the id is withheld.
+        """
+        for bucket, name in self.DARWIN_USER_DIR_IDS:
+            self._as_host(monkeypatch, f"{bucket}/{name}")
+            text = shape.format(root=self._darwin_root(bucket, name))
+            assert redact_credentials(text) == (text, []), f"{label}: {text!r}"
+
+    @pytest.mark.parametrize(
+        "label,shape",
+        [
+            ("key in the next run after an underscored component", "{root}_evil/{key}"),
+            ("key glued after an underscore", "{root}_{key}"),
+        ],
+    )
+    def test_a_key_after_the_root_and_a_run_break_is_still_redacted(
+        self, label: str, shape: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ending the run at the letter gives up nothing past it: the key is its own run."""
+        bucket, name = self.DARWIN_USER_DIR_IDS[0]
+        self._as_host(monkeypatch, f"{bucket}/{name}")
+        root = self._darwin_root(bucket, name)
+        for key in (_AWS_EXAMPLE_KEY, _ALT_SLASH_KEY, _NO_SLASH_KEY):
+            result, warnings = redact_credentials(shape.format(root=root, key=key))
+            assert key not in result, f"{label}: key leaked"
+            assert result.startswith(root), f"{label}: the root itself must survive"
+            assert warnings, label
+
+    # ── the split is entered only for a run the whole-run scan would redact ──
+
+    def test_a_split_run_is_gated_on_its_whole(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Withholding the id can only remove redaction, never add it.
+
+        The tail piece is EXACTLY one key long and carries four separators, so
+        on its own it is a standalone token the fragment ceiling does not reach.
+        Scanned whole, the run is a fragment and every key-shaped window in it
+        holds four or more ``/``, so the ceiling spares it. The verdict with the
+        id withheld must be the no-host verdict, which is the base one.
+        """
+        _, name = self.DARWIN_USER_DIR_IDS[0]
+        # An underscored bucket, as in the cache-dir test above: ``_`` ends the run
+        # before the bucket letter, so the run is the letter, the name and the tail,
+        # and the withheld id reaches the run's start. The one piece left is the tail.
+        text = f"/var/folders/_w/{name}/T/kc/S/p0DXy4J2KQC3GfCAwFuLPZSVLmetMYXb"
+        tail = text[text.index("/T/") :]
+        assert len(tail) == 40 and tail.count("/") == 4
+        self._as_host(monkeypatch, None)
+        assert redact_credentials(text) == (text, [])
+        self._as_host(monkeypatch, f"_w/{name}")
+        assert redact_credentials(text) == (text, [])
+
+    def test_a_split_run_that_decodes_to_text_keeps_the_whole_run_verdict(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The encoded-text exclusion reads the whole run's alignment.
+
+        The run base64-decodes to printable text and is left to the decode-and-scan
+        pass. The tail piece begins at a different offset modulo four, so cut
+        loose it decodes to garbage and its windows read as key-shaped.
+        """
+        from kiro_crew.security import redaction as redaction_mod
+
+        bucket, name = self.DARWIN_USER_DIR_IDS[0]
+        head = f"{self._darwin_root(bucket, name)}/"
+        assert len(head) % 4 == 1
+        words = (
+            b"The quick brown fox jumps over the lazy dog. Pack my box with five dozen "
+            b"liquor jugs. How vexingly quick daft zebras jump! Sphinx of black quartz, "
+            b"judge my vow. Crazy Frederick bought many very exquisite opal jewels. "
+            b"Jinxed wizards pluck ivy from the big quilt."
+        )
+        # The block of four holding the head's last ``/`` also holds the first
+        # three tail characters, so those encode the first two words bytes at the
+        # whole run's alignment; the rest is plain base64 of the remainder.
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        first, second = words[0], words[1]
+        rest = words[2:]
+        rest = rest[: len(rest) - len(rest) % 3]
+        tail = (
+            alphabet[(first >> 4) & 0xF]
+            + alphabet[((first & 0xF) << 2) | (second >> 6)]
+            + alphabet[second & 0x3F]
+            + base64.b64encode(rest).decode()
+        )
+        text = head + tail
+        assert redaction_mod._decodes_to_printable_text(text)
+        assert redaction_mod._contains_bare_secret(text[text.index("/T/") :])
+        self._as_host(monkeypatch, None)
+        assert redact_credentials(text) == (text, [])
+        self._as_host(monkeypatch, f"{bucket}/{name}")
+        assert redact_credentials(text) == (text, [])
+
+    @pytest.mark.parametrize("key", [_AWS_EXAMPLE_KEY, _ALT_SLASH_KEY, _NO_SLASH_KEY])
+    @pytest.mark.parametrize("prefix", ["", "/private"])
+    def test_a_printable_piece_cannot_hide_a_key_in_a_nonprintable_run(
+        self, key: str, prefix: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A piece's printable decode must not replace the whole run's verdict."""
+        from kiro_crew.security import redaction as redaction_mod
+
+        bucket, name = self.DARWIN_USER_DIR_IDS[0]
+        self._as_host(monkeypatch, f"{bucket}/{name}")
+        # /T/A occupies one base64 quartet; the filler dominates its printable
+        # decode while the host-id prefix shifts the whole run's alignment.
+        filler = (
+            "A" + base64.b64encode(b"The quick brown fox jumps over the lazy dog. " * 9).decode()
+        )
+        text = f"{prefix}{self._darwin_root(bucket, name)}/{filler}{key}"
+        piece = text[text.index("/T/") :]
+        assert redaction_mod._BARE_SECRET_RUN_RE.fullmatch(text)
+        assert redaction_mod._looks_like_secret_key(key)
+        assert redaction_mod._decodes_to_printable_text(piece)
+        assert not redaction_mod._decodes_to_printable_text(text)
+        assert redaction_mod._contains_bare_secret(text)
+        result, warnings = redact_credentials(text)
+        assert key not in result
+        assert result.startswith(f"{prefix}/var/folders/{bucket}/{name}")
+        assert warnings
+
+    @pytest.mark.parametrize("key", [_AWS_EXAMPLE_KEY, _ALT_SLASH_KEY, _NO_SLASH_KEY])
+    def test_benign_filler_keeps_the_root_and_redacts_the_key(
+        self, key: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bucket, name = self.DARWIN_USER_DIR_IDS[0]
+        self._as_host(monkeypatch, f"{bucket}/{name}")
+        root = self._darwin_root(bucket, name)
+        result, warnings = redact_credentials(f"{root}/kirocrew-computer-shots/{key}")
+        assert key not in result
+        assert result.startswith(root)
+        assert warnings
+
+    def test_the_host_id_is_what_confstr_reports(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Asked once of the OS; a refusal or an off-grammar answer withholds nothing."""
+        from kiro_crew.security import redaction as redaction_mod
+
+        bucket, name = self.DARWIN_USER_DIR_IDS[0]
+        calls: list[int] = []
+
+        def answer(value: object) -> Callable[[int], str]:
+            def confstr(key: int) -> str:
+                calls.append(key)
+                if isinstance(value, Exception):
+                    raise value
+                return str(value)
+
+            return confstr
+
+        read = redaction_mod._host_darwin_user_dir_id
+        try:
+            with monkeypatch.context() as mp:
+                for reported, expected in (
+                    (f"/var/folders/{bucket}/{name}/T/", f"{bucket}/{name}"),
+                    (f"/private/var/folders/{bucket}/{name}/T/", f"{bucket}/{name}"),
+                    ("/tmp/", None),
+                    (f"/var/folders/{bucket}/{name}x/T/", None),
+                    (OSError(22, "Invalid argument"), None),
+                ):
+                    read.cache_clear()
+                    calls.clear()
+                    mp.setattr(redaction_mod.os, "confstr", answer(reported), raising=False)
+                    assert read() == expected, reported
+                    assert read() == expected
+                    assert calls == [redaction_mod._CS_DARWIN_USER_TEMP_DIR], "asked once"
+                # Windows: ``os.confstr`` does not exist, which must read as no host
+                # id rather than raise out of every redaction of a macOS path.
+                read.cache_clear()
+                mp.delattr(redaction_mod.os, "confstr", raising=False)
+                assert read() is None
+                assert redact_credentials("/var/folders/zz/x/T/a")[0] == "/var/folders/zz/x/T/a"
+        finally:
+            read.cache_clear()
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="reads the real macOS confstr")
+    def test_the_real_temp_dir_survives_on_macos(self) -> None:
+        from kiro_crew.security import redaction as redaction_mod
+
+        redaction_mod._host_darwin_user_dir_id.cache_clear()
+        host_id = redaction_mod._host_darwin_user_dir_id()
+        assert host_id is not None, "confstr(_CS_DARWIN_USER_TEMP_DIR) must report the id"
+        path = f"/var/folders/{host_id}/T/kirocrew-computer-shots/shot-1700000000000-ab12cd34.jpeg"
+        assert redact_credentials(f"![screenshot]({path})")[0] == f"![screenshot]({path})"
 
     # ── a standalone key is never subject to the ceiling ──
 
@@ -5451,7 +5991,7 @@ class TestIsSensitivePath:
     def test_unrelated_dotfile(self) -> None:
         assert is_sensitive_path("~/.bashrc") is False
 
-    # ── Symlink bypass (pentest AWS-345 / AWS-62) ──
+    # ── Symlink bypass ──
 
     def test_absolute_symlink_to_aws_credentials(self, tmp_path, monkeypatch) -> None:
         """A symlink whose target resolves into ~/.aws must be caught."""
@@ -6806,6 +7346,26 @@ class TestEnvDumpGrepAwsNarrowing:
         # dump under another name -- named for the same reason ``environ`` is.
         "typeset | grep AWS_SECRET",
         "typeset | grep AWS_",
+        # Every filter spelling, prefixed or not. The filter word is bounded on its
+        # left so prose ending in ``sed`` is not a filter, which is exactly the bound
+        # that would drop these if the spellings were not listed.
+        "env | egrep AWS_",
+        "env | fgrep AWS_",
+        "env | zgrep AWS_",
+        "env | zegrep AWS_SECRET",
+        "env | rgrep AWS_",
+        "env | ugrep AWS_",
+        "env | ggrep AWS_",
+        "env | pcre2grep AWS_",
+        "env | gawk /AWS_/",
+        "env | mawk /AWS_/",
+        "env | nawk /AWS_/",
+        "env | gsed -n /AWS_/p",
+        "env | /usr/bin/grep AWS_",
+        "env | /usr/bin/gawk /AWS_/",
+        "env | xargs grep AWS_",
+        "env | xargs -0 grep AWS_",
+        "env | busybox grep AWS_",
     )
 
     # What refusing to guess at statement boundaries costs. Every one of these was
@@ -6871,6 +7431,17 @@ class TestEnvDumpGrepAwsNarrowing:
         "grep -rn AWS_SECRET_ACCESS_KEY src/",
         "cat .github/workflows/ci.yml | grep AWS_",
         "docker inspect x | grep AWS_REGION",
+        # Prose and markdown that merely END a word in a filter name. ``used``,
+        # ``closed``, ``proposed`` and ``caused`` are not ``sed``, across lines and
+        # in either case.
+        "We set goals | then used AWS tools",
+        "We set goals | then used aws",
+        "set\n|\nused\nAWS",
+        "env vars | the outage caused aws alarms",
+        "set the table | closed the AWS ticket",
+        # ``rg`` is not a listed filter, so a resource-group column beside AWS is prose.
+        "| Set up | RG | AWS |",
+        "| Status | Item |\n|---|---|\n| Closed | env work |\n| Proposed | set up AWS |",
     )
 
     # ``printenv NAME`` prints a value directly -- its own catalog rule, no pipe.
@@ -7012,6 +7583,31 @@ class TestEnvDumpGrepAwsNarrowing:
     def test_benign_commands_pass_both_tiers(self, cmd: str) -> None:
         assert not self._keystone(cmd), cmd
         assert not self._catalog_matcher().match(cmd), cmd
+
+    # A markdown body handed to a non-shell MCP tool is scanned with the command
+    # rules, so prose that reads as a filter would refuse the whole call.
+    MARKDOWN_TOOL_BODY = (
+        "## Weekly briefing\n\n"
+        "We set the agenda for the env cleanup.\n\n"
+        "| Item | Status |\n"
+        "|------|--------|\n"
+        "| Closed | the old pipeline |\n"
+        "| Proposed | move to AWS Lambda |\n"
+        "| Used | aws cli v2 |\n"
+    )
+
+    def test_a_markdown_tool_body_passes_the_command_rules(self) -> None:
+        from kiro_crew.llm_helpers import _first_tool_input_denial
+
+        assert _first_tool_input_denial([self.MARKDOWN_TOOL_BODY], None, command_rules=True) is None
+
+    def test_a_dump_in_a_tool_argument_is_still_refused(self) -> None:
+        from kiro_crew.llm_helpers import _first_tool_input_denial
+        from kiro_crew.security import _ENV_CRED_DENIAL_REASON
+
+        denial = _first_tool_input_denial(["env | egrep AWS_SECRET"], None, command_rules=True)
+        assert denial is not None
+        assert _ENV_CRED_DENIAL_REASON in denial
 
     @pytest.mark.parametrize("cmd", PRINTENV_DENIED)
     def test_printenv_of_a_secret_is_denied(self, cmd: str) -> None:

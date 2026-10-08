@@ -11,6 +11,21 @@ from kiro_crew.safety_override import safety_override, yolo_policy_permits
 from kiro_crew.session_lifecycle import STOP_DECLINED_ESCALATION_SECS
 
 
+def _history_stem(slot: Any) -> str:
+    """The Older sessions key for *slot*: its transcript key folded to a filename stem.
+
+    ``slot_history_key`` names the transcript (``dashboard:<slot>``, the live
+    channel key, or the channel stem of an unbound channel-born slot) and
+    ``_safe_key`` folds it to the stem the history list lists it under, so the
+    two spellings of one session can never disagree.
+    """
+    # Imported here: chat_utils imports state, which imports this module.
+    from kiro_crew.dashboard.chat_utils import slot_history_key
+    from kiro_crew.history import _safe_key
+
+    return _safe_key(slot_history_key(slot))
+
+
 def stop_declined_armed(slot: Any, now: float | None = None) -> bool:
     """Whether a recent declined Stop makes the next press a force stop.
 
@@ -27,28 +42,11 @@ def stop_declined_armed(slot: Any, now: float | None = None) -> bool:
 
 
 def resolved_row_identity(slot: Any) -> str:
-    """The identity the sidebar renders this slot under.
+    """The identity the sidebar renders this slot under: its own local key.
 
-    A purely local session is its own key. A remote-bound one -- minted through
-    ``create_peer_slot`` or adopted from a peer row -- is ``<instance_id>:<peer_key>``,
-    the same identity the peer row carries before anything is bound to it.
-
-    That equality is the whole point. The sidebar keys rows on this value (React
-    key, ``layoutId``, ``data-session-row``, the hover-hold seats), so a binding
-    that preserves it re-renders ONE row where a fresh key would mount a second
-    element beside the row the user clicked and leave the browser to notice they
-    are the same conversation.
-
-    The invariant that buys, and the trap in it: for a remote-bound session this
-    identity is NOT the local slot key, and never becomes it. Read ``key`` when you
-    need the local slot -- switching sessions, loading a transcript, addressing the
-    slot on the wire. Splitting this string to recover that key yields the PEER's
-    key, which is routable only inside a request sent back through that instance.
+    A relay archive is a local row too, so it never shares an identity with the
+    peer crew's own row for the same conversation.
     """
-    instance_id = getattr(slot, "instance_id", "") or ""
-    remote_slot = getattr(slot, "remote_slot", "") or ""
-    if getattr(slot, "is_remote", False) and instance_id and remote_slot:
-        return f"{instance_id}:{remote_slot}"
     return str(getattr(slot, "key", "") or "")
 
 
@@ -407,24 +405,11 @@ class SlotProjection:
             "surface": slot.mode,
             "workspace": slot.workspace,
             "project": slot.project,
-            # Remote-execution binding. Shipped on every slot (not just remote
-            # ones) so the frontend can branch on a field that is always
-            # present: an absent key and "runs locally" would be the same
-            # reading, and a stale client would then render a peer session as
-            # local. The binding's third field, `remote_slot`, is still NOT
-            # projected: it is the PEER's slot key, routable only inside a
-            # request sent back through that instance, and shipping a routable
-            # peer key to a browser buys nothing.
-            #
-            # What the browser does need from it is the row's IDENTITY, so that
-            # is projected instead, already resolved. A remote-bound session --
-            # minted through `create_peer_slot` or adopted from a peer row --
-            # identifies as `<instance_id>:<peer_key>`, which is exactly the
-            # identity the peer row carried before it was bound. Same identity
-            # before and after means the sidebar re-renders ONE row rather than
-            # replacing the row the user clicked with a sibling, and it means a
-            # log line, a `data-session-row` selector and a trace all stay
-            # continuous across the adopt instead of splitting in two.
+            # Relay-archive marker. Shipped on every slot so the frontend can
+            # branch on a field that is always present: an absent key and "runs
+            # locally" would be the same reading. The binding's third field,
+            # `remote_slot`, is NOT projected: it is the PEER's slot key, and
+            # shipping it to a browser buys nothing.
             "executor": slot.executor,
             "instance_id": slot.instance_id,
             "row_identity": resolved_row_identity(slot),
@@ -441,7 +426,6 @@ class SlotProjection:
             # with the same window the stop route uses, so the button's hint and
             # the backend's answer cannot disagree.
             "stop_declined": stop_declined_armed(slot),
-            "orchestrating": slot._in_stage_execution,
             "queue_depth": slot.queue_depth,
             "stopping": slot._stopping,
             "pending_approval": pending_approval,
@@ -490,6 +474,12 @@ class SlotProjection:
             "memory_mode": slot.memory_mode,
             "forked_from": slot.forked_from,
             "linked_session_key": slot.linked_session_key,
+            # The transcript filename stem this slot's history lives under: the
+            # same key the Older sessions list gives this session, so a client
+            # that reopens a closed slot sends it verbatim and never derives it.
+            # Resolved by ``slot_history_key``, which knows the channel-origin
+            # provenance a client cannot read from the slot name.
+            "history_key": _history_stem(slot),
             "app": slot._app,
             "origin": slot._origin,
             # Creator attribution: the slot key of the session that asked for
@@ -500,4 +490,13 @@ class SlotProjection:
             # ``slots`` frames on it. A member caller is ownership-fenced to the
             # slots it created (``authorize_target``), so created == driven.
             "created_by": getattr(slot, "_created_by", ""),
+            # Whether THIS gateway process stamped ``created_by`` at mint, as
+            # opposed to rehydrating it from the transcript. The field above is
+            # restored from a metadata line an agent's file tools can edit, so on
+            # its own it is a claim; this says whether it is the gateway's own
+            # witness. Carried onto the row because the one reader that DECIDES
+            # on it -- the sidebar's lineage join -- gets rows and no slots, and
+            # a join that trusted the claim alone would nest a session under
+            # whoever a transcript happened to name.
+            "lineage_minted": bool(getattr(slot, "_lineage_minted", False)),
         }

@@ -1837,6 +1837,44 @@ class TestControllerDispatch:
         ), patch.object(svc_macos, "is_active", return_value=True):
             assert controller.is_service_active() is True
 
+    def test_service_alias_holder_routes_to_linux_on_systemd(self):
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        holder = svc_linux.AliasHolder("system", "other.service")
+        with patch(
+            "kiro_crew.service.controller.current_platform",
+            return_value=Platform.SYSTEMD,
+        ), patch.object(svc_linux, "alias_holder", return_value=holder) as mock_alias:
+            assert controller.service_alias_holder() is holder
+        mock_alias.assert_called_once()
+
+    def test_service_alias_holder_is_none_on_launchd(self):
+        """launchd has no alias concept for labels — macOS always answers None.
+        Patch `linux.alias_holder` and assert it is never reached: the platform
+        gate must short-circuit, not merely return what real linux would answer
+        on a host that happens to run our own unit (the M5 mutation)."""
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        with patch(
+            "kiro_crew.service.controller.current_platform",
+            return_value=Platform.LAUNCHD,
+        ), patch.object(svc_linux, "alias_holder") as mock_alias:
+            assert controller.service_alias_holder() is None
+        mock_alias.assert_not_called()
+
+    def test_service_alias_holder_is_none_on_unsupported(self):
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        with patch(
+            "kiro_crew.service.controller.current_platform",
+            return_value=Platform.UNSUPPORTED,
+        ), patch.object(svc_linux, "alias_holder") as mock_alias:
+            assert controller.service_alias_holder() is None
+        mock_alias.assert_not_called()
+
 
 class TestLinuxControlPaths:
     """Cover uninstall, stop, status, is_active, and the sudo helper paths."""
@@ -2401,6 +2439,105 @@ class TestLinuxServiceScopes:
         assert "user scope: stopped and disabled, but its unit file" in out
         assert str(fragment) in out and "daemon-reload" in out
         assert ["systemctl", "--user", "stop", _UNIT] in run.calls
+
+    # -- a rejected closing daemon-reload leaves the scope unfinished ---------
+
+    _REFUSED_RELOAD = subprocess.CompletedProcess(
+        [], 1, "", "Failed to reload daemon: Transport endpoint is not connected\n"
+    )
+
+    def test_a_rejected_user_daemon_reload_marks_the_scope_unfinished_and_exits_1(
+        self, tmp_path, capsys
+    ):
+        """The unit file is gone, but the manager refused the reload, so it still
+        holds the old definition: the scope is unfinished (exit 1), not removed,
+        and the headline never says `stopped and removed`."""
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        fragment = tmp_path / ".config" / "systemd" / "user" / _UNIT
+        fragment.parent.mkdir(parents=True)
+        fragment.write_text(_OURS_UNIT_TEXT, encoding="utf-8")
+        run = _fake_systemctl(
+            system=None,
+            user=_RUNNING,
+            user_fragment=str(fragment),
+            overrides={"daemon-reload": self._REFUSED_RELOAD},
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert not fragment.exists()
+        assert ["systemctl", "--user", "daemon-reload"] in run.calls
+        assert report.user == (
+            f"removed ({fragment}), but `systemctl --user daemon-reload` failed: "
+            "Failed to reload daemon: Transport endpoint is not connected; run it by hand"
+        )
+        assert report.unfinished == frozenset({"user"})
+        assert "user" not in report.removed
+        assert report.incomplete is True
+
+        fragment.write_text(_OURS_UNIT_TEXT, encoding="utf-8")
+        run = _fake_systemctl(
+            system=None,
+            user=_RUNNING,
+            user_fragment=str(fragment),
+            overrides={"daemon-reload": self._REFUSED_RELOAD},
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run), patch(
+            "kiro_crew.service.controller.current_platform", return_value=Platform.SYSTEMD
+        ), patch.object(svc_linux, "remove_apparmor_profile", return_value=MagicMock(message="")):
+            rc = controller.uninstall_service()
+
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "stopped and removed" not in out
+        assert "`systemctl --user daemon-reload` failed" in out
+
+    def test_a_rejected_system_daemon_reload_marks_the_scope_unfinished(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.service import linux as svc_linux
+
+        unit_path = tmp_path / "kirocrew.service"
+        unit_path.write_text("")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", unit_path)
+        monkeypatch.setattr(svc_linux, "_SYSTEMD_BOOTED_DIR", tmp_path)
+        run = _fake_systemctl(
+            system=_DEAD, user=None, overrides={"daemon-reload": self._REFUSED_RELOAD}
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert ["sudo", "systemctl", "daemon-reload"] in run.calls
+        assert report.system == (
+            f"removed ({unit_path}), but `sudo systemctl daemon-reload` failed: "
+            "Failed to reload daemon: Transport endpoint is not connected; run it by hand"
+        )
+        assert report.unfinished == frozenset({"system"})
+        assert "system" not in report.removed
+
+    def test_a_rejected_daemon_reload_after_a_stale_file_removal_is_unfinished(
+        self, tmp_path, monkeypatch
+    ):
+        """The not-loaded arm (`_remove_stale_owned`): the reload is the step that
+        makes the manager forget the file, so a refused one is unfinished too."""
+        from kiro_crew.service import linux as svc_linux
+
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir()
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        monkeypatch.setattr(svc_linux, "_SYSTEMD_BOOTED_DIR", tmp_path)
+        run = _fake_systemctl(
+            system=None, user=None, overrides={"daemon-reload": self._REFUSED_RELOAD}
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert report.system.startswith(f"removed ({system_unit}), but `sudo systemctl daemon-reload`")
+        assert report.unfinished == frozenset({"system"})
+        assert "system" not in report.removed
 
     # -- a teardown step the manager refuses never reaches the unit file ------
 
@@ -3938,6 +4075,70 @@ class TestLinuxServiceScopes:
         assert "only looks at the system unit" not in remedy
         assert "kirocrew service status|uninstall" in remedy
 
+    # -- alias_holder -------------------------------------------------------
+
+    def test_alias_holder_names_the_scope_and_target_of_a_system_scope_alias(self):
+        """`show kirocrew.service` on an alias answers for the resolved unit;
+        `alias_holder()` reports the scope and that unit's canonical Id so the
+        CLI can refuse before it signals the alias target's process."""
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=_RUNNING, user=None, system_id="other.service")
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            holder = svc_linux.alias_holder()
+
+        assert holder == svc_linux.AliasHolder("system", "other.service")
+        # The question is answerable without sudo, like status/is_active.
+        assert all("sudo" not in c for c in run.calls), run.calls
+
+    def test_alias_holder_names_the_user_scope_when_only_it_is_an_alias(self):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user=_RUNNING, user_id="other.service")
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            holder = svc_linux.alias_holder()
+
+        assert holder == svc_linux.AliasHolder("user", "other.service")
+
+    def test_alias_holder_prefers_the_system_scope_when_both_are_aliases(self):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(
+            system=_RUNNING, user=_RUNNING, system_id="sys.service", user_id="usr.service"
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            holder = svc_linux.alias_holder()
+
+        assert holder == svc_linux.AliasHolder("system", "sys.service")
+
+    def test_alias_holder_is_none_when_the_alias_target_is_stopped(self):
+        """An alias whose target is `inactive`/`failed` is not reported: there is
+        no supervised process, so a caller's SIGTERM would not land on another
+        unit, and refusing would misdirect — the `systemctl` remedy names a unit
+        that is already down while the real foreground gateway keeps running. The
+        guard is `is_alias and running`, so a down alias lets the fallback proceed."""
+        from kiro_crew.service import linux as svc_linux
+
+        for stopped in (_DEAD, {"ActiveState": "failed", "SubState": "failed"}):
+            run = _fake_systemctl(system=stopped, user=None, system_id="other.service")
+            with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+                assert svc_linux.alias_holder() is None, stopped
+
+    def test_alias_holder_is_none_for_our_own_unit(self):
+        """Our canonical name in both scopes is not an alias — nothing to refuse."""
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=_RUNNING, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            assert svc_linux.alias_holder() is None
+
+    def test_alias_holder_is_none_when_no_unit_is_installed(self):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            assert svc_linux.alias_holder() is None
+
 
 class TestMacOSControlPaths:
     """Cover uninstall, stop, status, is_active for macOS / launchd."""
@@ -4292,6 +4493,29 @@ class TestRestartCommandHint:
 
 
 class TestKirocrewBinOverride:
+    @pytest.mark.parametrize("source", ["which", "argv"])
+    def test_managed_tree_launch_path_is_persisted_through_the_stable_link(
+        self, source, monkeypatch, tmp_path
+    ):
+        from kiro_crew.platform import tree_liveness, wheel_engine
+
+        tree = tmp_path / "crew-venv-1.0"
+        binary = tree / "bin" / "kirocrew"
+        binary.parent.mkdir(parents=True)
+        binary.touch()
+        (tree / tree_liveness.TREE_MARKER).write_text("layout\n", encoding="utf-8")
+        stable = str(tmp_path / "crew-venv-current" / "bin" / "kirocrew")
+        rewrite = MagicMock(return_value=stable)
+        monkeypatch.setattr(wheel_engine, "stable_launch_path", rewrite)
+        monkeypatch.delenv("KIROCREW_SERVICE_BIN", raising=False)
+        monkeypatch.setattr(
+            common.shutil, "which", lambda _name: str(binary) if source == "which" else None
+        )
+        monkeypatch.setattr(common.sys, "argv", [str(binary)])
+
+        assert kirocrew_bin() == stable
+        rewrite.assert_called_once_with(str(binary.resolve()))
+
     def test_service_bin_override_wins_over_which(self, monkeypatch):
         monkeypatch.setenv("KIROCREW_SERVICE_BIN", "/opt/wrapper/kirocrew")
         with patch(

@@ -1,12 +1,15 @@
 """Parse JSON from a config file a person may have saved by hand.
 
 MCP configs (``~/.kiro/settings/mcp.json``, Kiro Crew's own ``mcp.json``, a
-project's ``.kiro/settings/mcp.json``, ``~/.mcp.json``) and the agent specs that
-carry ``mcpServers`` are edited by people, and Windows editors save UTF-8 "with
-BOM" by default. That file is valid UTF-8 whose first character is U+FEFF, which
-is not content, and ``json.loads`` refuses it ("Unexpected UTF-8 BOM"). Every
-reader of such a file parses through :func:`loads_user_json` so one leading mark
-is dropped the same way everywhere.
+project's ``.kiro/settings/mcp.json``, ``~/.mcp.json``), the agent specs that
+carry ``mcpServers``, Kiro Crew's ``agent.json`` overrides, ``~/.claude.json``
+and a project's Claude settings are edited by people, and Windows editors save
+UTF-8 "with BOM" by default. That file is valid UTF-8 whose first character is
+U+FEFF, which is not content, and ``json.loads`` refuses it ("Unexpected UTF-8
+BOM"). Every reader of such a file parses through :func:`loads_user_json` so one
+leading mark is dropped the same way everywhere. A reader that hands
+``json.loads`` the undecoded bytes needs nothing: its encoding detection already
+drops the mark.
 
 Only reading changes. Writers keep emitting ``json.dumps`` text, so a file read
 here and written back comes out as plain BOM-free UTF-8.
@@ -91,3 +94,34 @@ def load_user_json_object(path: Path) -> dict[str, Any]:
         logger.warning("Ignoring %s: top-level JSON is not an object", path)
         return {}
     return data
+
+
+#: Deepest container nesting an installed settings document may carry. The config
+#: readers walk a document recursively (``copy.deepcopy`` in the config cache, the
+#: overlay deep-merge), so one nested a few hundred levels deep parses fine and then
+#: raises ``RecursionError`` on every later load. Real settings documents nest under
+#: ten levels; this bound leaves ample room while staying far below the depth at which
+#: those recursive readers exhaust the interpreter's stack.
+MAX_DOCUMENT_NESTING = 64
+
+
+def exceeds_nesting(value: object, limit: int = MAX_DOCUMENT_NESTING) -> bool:
+    """Whether *value* nests dicts/lists more than *limit* levels deep.
+
+    Iterative, so measuring a hostile document cannot itself overflow the stack.
+    A scalar has depth 0; ``{}`` and ``[]`` have depth 1.
+    """
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children: Any = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        depth += 1
+        if depth > limit:
+            return True
+        stack.extend((child, depth) for child in children)
+    return False

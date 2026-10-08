@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
-import { Bot, FileDiff } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Bot } from 'lucide-react'
 import AppIcon from '../AppIcon'
 import ContextBar, { contextTip, contextColor, composeContextReadout, contextPctClamped, fmtTokens } from '../ContextBar'
 import ErrorNotice from '../ErrorNotice'
@@ -42,12 +41,9 @@ export function useShelfMeasure() {
     ro.observe(el)
     shelfRoRef.current = ro
   }, [])
-  // The labels no longer fit alongside the context bar, the model chip AND the
-  // working-tree badge, so collapse the chips (agent/project) to icon-only. The
-  // threshold is a phone width, not 340: a 390px phone leaves the shelf ~364px,
-  // which cleared 340 and overflowed -- the badge then painted over the context
-  // readout. 420 covers the phone range with the labels shed.
-  const shelfCompact = shelfWidth < 420
+  // Below ~340px the labels no longer fit comfortably alongside the context bar
+  // + model chip, so collapse the chips (agent/project) to icon-only.
+  const shelfCompact = shelfWidth < 340
   // A two-column split can leave under 200px per composer. The effort level on
   // the model chip is the only at-a-glance readout of what a turn runs at, so
   // it survives the compact collapse and drops only when even a short word has
@@ -59,28 +55,16 @@ export function useShelfMeasure() {
 /** The context popover: open state and its outside-click dismissal. */
 export function useContextPopover() {
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false)
-  // Where the trigger was when the panel opened. The panel is portalled, so it
-  // cannot anchor to its wrapper: an absolutely-positioned child of the shelf
-  // is clipped by any scroller around it, and tapping the readout then opened
-  // nothing. A viewport rect survives the portal.
-  const [ctxPopoverRect, setCtxPopoverRect] = useState<DOMRect | null>(null)
   const ctxWrapRef = useRef<HTMLDivElement>(null)
-  // The portalled panel is outside `ctxWrapRef` in the DOM, so the outside-click
-  // test has to know about it too -- otherwise a mousedown on the panel's own
-  // auto-compact slider reads as a click outside and closes it.
-  const ctxPanelRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!ctxPopoverOpen) return
     const handler = (e: MouseEvent) => {
-      const target = e.target as Node
-      const insideTrigger = !!ctxWrapRef.current?.contains(target)
-      const insidePanel = !!ctxPanelRef.current?.contains(target)
-      if (!insideTrigger && !insidePanel) setCtxPopoverOpen(false)
+      if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node)) setCtxPopoverOpen(false)
     }
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
   }, [ctxPopoverOpen])
-  return { ctxPopoverOpen, setCtxPopoverOpen, ctxPopoverRect, setCtxPopoverRect, ctxWrapRef, ctxPanelRef }
+  return { ctxPopoverOpen, setCtxPopoverOpen, ctxWrapRef }
 }
 
 /** App-contributed session controls (`contributes.sessionControls`). */
@@ -155,8 +139,9 @@ export function SessionControlChips({ sessionControls, shelfCompact, onSessionCo
 }
 
 /** The agent chip. Chrome type: an agent name is a label, not code. `font-mono`
- *  would pin `var(--mono)`, which Settings → Display → Font Family never
- *  writes, so it would make the shelf ignore the user's typeface. */
+ *  would pin `var(--mono)`, which Settings → Display → Font Family writes only
+ *  for OpenDyslexic, so for every other family it would make the shelf ignore
+ *  the user's typeface. */
 export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agentSource, isRunning, shelfCompact, onAgentClick }: {
   agentName: string
   agentLabel?: string
@@ -168,12 +153,12 @@ export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agen
 }) {
   return (
     <button
-      className={`inline-flex items-center gap-1.5 h-7 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
+      className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
       onClick={e => onAgentClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
       disabled={isRunning}
       // Inherited default: explain what the ` . default` marker means, on
       // hover (title) AND keyboard focus / screen readers (aria-label),
-      // because the marker alone reads as opaque (#8770 UX). No glyph, no
+      // because the marker alone reads as opaque. No glyph, no
       // layout change -- text on demand. A pinned chip keeps the plain
       // switch hint; it has nothing to explain.
       title={isRunning
@@ -195,7 +180,7 @@ export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agen
 
 /** The context-window readout and its popover (usage, model, the per-session
  *  auto-compact threshold). */
-export function ContextUsageControl({ contextPct, contextUsedTokens, contextWindowTokens, showContextPct, showContextTokens, shelfCompact, modelName, ctxPopoverOpen, setCtxPopoverOpen, ctxPopoverRect, setCtxPopoverRect, ctxWrapRef, ctxPanelRef, autoCompactThreshold }: {
+export function ContextUsageControl({ contextPct, contextUsedTokens, contextWindowTokens, showContextPct, showContextTokens, shelfCompact, modelName, ctxPopoverOpen, setCtxPopoverOpen, ctxWrapRef, autoCompactThreshold }: {
   contextPct: number
   contextUsedTokens?: number
   contextWindowTokens?: number
@@ -205,10 +190,7 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
   modelName?: string
   ctxPopoverOpen: boolean
   setCtxPopoverOpen: (update: (open: boolean) => boolean) => void
-  ctxPopoverRect: DOMRect | null
-  setCtxPopoverRect: (rect: DOMRect | null) => void
   ctxWrapRef: React.RefObject<HTMLDivElement>
-  ctxPanelRef: React.RefObject<HTMLDivElement>
   autoCompactThreshold: ReturnType<typeof useAutoCompactThreshold>
 }) {
   const { autoCompactQuery, autoCompact, autoCompactError, setAutoCompactError, pushAutoCompact } = autoCompactThreshold
@@ -217,51 +199,35 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
   const used = contextUsedTokens != null ? contextUsedTokens : (win ? Math.round((pct / 100) * win) : 0)
   const remaining = win ? Math.max(win - used, 0) : 0
   const approx = contextUsedTokens == null
-  const hasKnownWindow = win > 0
-  const hasMeasuredUsed = contextUsedTokens != null && contextUsedTokens > 0
-  // With no window there is no percentage to colour or plot; the readout
-  // degrades to a bare token count rather than asserting a 0% that was never
-  // measured.
-  const pctColor = hasKnownWindow ? contextColor(contextPct) : 'var(--text)'
-  const showPct = !!showContextPct && hasKnownWindow
-  const showTokens = !!showContextTokens && (hasKnownWindow || hasMeasuredUsed)
+  const pctColor = contextColor(contextPct)
+  const showAnyReadout = !!(showContextPct || showContextTokens)
   // Graceful degrade: on a narrow shelf, collapse to the percentage
   // alone (or tokens, if that's the only segment enabled) so the
   // readout never crowds out the agent/model controls.
   const readout = shelfCompact
-    ? composeContextReadout(contextPct, used, win, { approx, showPct, showTokens: showTokens && !showPct })
-    : composeContextReadout(contextPct, used, win, { approx, showPct, showTokens })
+    ? composeContextReadout(contextPct, used, win, { approx, showPct: showContextPct, showTokens: !!showContextTokens && !showContextPct })
+    : composeContextReadout(contextPct, used, win, { approx, showPct: showContextPct, showTokens: showContextTokens })
   return (
   <div ref={ctxWrapRef} className="relative flex items-center">
     <button
       className={`inline-flex items-center h-7 px-2.5 rounded-md transition-colors border-none cursor-pointer ${ctxPopoverOpen ? 'bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]' : 'bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]'}`}
-      onClick={e => {
-        setCtxPopoverRect(e.currentTarget.getBoundingClientRect())
-        setCtxPopoverOpen(o => !o)
-      }}
-      title={hasKnownWindow ? contextTip(contextPct) : i18nT('components.chatInput.context_usage')}
+      onClick={() => setCtxPopoverOpen(o => !o)}
+      title={contextTip(contextPct)}
       aria-label={i18nT('components.chatInput.context_usage')}
     >
-      <ContextBar pct={hasKnownWindow ? contextPct : 0} width={40} height={3} decorative={!hasKnownWindow} />
-      {!!readout && <span className="text-[11px] ml-1.5 tabular-nums whitespace-nowrap" style={{ color: pctColor }}>{readout}</span>}
+      <ContextBar pct={contextPct} width={40} height={3} />
+      {showAnyReadout && <span className="text-[11px] ml-1.5 tabular-nums whitespace-nowrap" style={{ color: pctColor }}>{readout}</span>}
     </button>
-    {ctxPopoverOpen && ctxPopoverRect && createPortal(
-      <div
-        ref={ctxPanelRef}
-        className="fixed z-[60] w-52 rounded-xl border border-border bg-bg-elevated shadow-xl p-3 animate-slide-up"
-        style={{
-          left: Math.max(8, Math.min(ctxPopoverRect.right - 208, window.innerWidth - 208 - 8)),
-          bottom: window.innerHeight - ctxPopoverRect.top + 4,
-        }}
-      >
+    {ctxPopoverOpen && (
+      <div className="absolute bottom-full right-0 mb-1 z-[60] w-52 rounded-xl border border-border bg-bg-elevated shadow-xl p-3 animate-slide-up">
                 <div className="flex items-center justify-between mb-2">
-                  <span className="text-[11px] font-semibold text-text">{hasKnownWindow ? i18nT('components.chatInput.context_window') : i18nT('components.chatInput.context_usage')}</span>
-                  <span className="text-[12px] font-mono font-bold" style={{ color: pctColor }}>{hasKnownWindow ? fmtPercent(contextPctClamped(contextPct) / 100) : fmtTokens(used)}</span>
+                  <span className="text-[11px] font-semibold text-text">{i18nT('components.chatInput.context_window')}</span>
+                  <span className="text-[12px] font-mono font-bold" style={{ color: pctColor }}>{fmtPercent(contextPctClamped(contextPct) / 100)}</span>
                 </div>
                 <div className="flex flex-col gap-1 text-[11px] font-mono">
                   <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.used')}</span><span className="text-text">{approx ? '~' : ''}{fmtTokens(used)}</span></div>
-                  {hasKnownWindow && <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.remaining')}</span><span className="text-text">{approx ? '~' : ''}{fmtTokens(remaining)}</span></div>}
-                  {hasKnownWindow && <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.total')}</span><span className="text-text">{fmtTokens(win)}</span></div>}
+                  <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.remaining')}</span><span className="text-text">{approx ? '~' : ''}{fmtTokens(remaining)}</span></div>
+                  <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.total')}</span><span className="text-text">{fmtTokens(win)}</span></div>
                 </div>
                 {modelName && (
                   <div className="mt-2 pt-2 border-t border-border flex justify-between text-[11px] font-mono">
@@ -324,64 +290,9 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
                     )}
                   </div>
                 )}
-        </div>,
-      document.body,
+        </div>
     )}
   </div>
-  )
-}
-
-/** Tooltip for the working-tree badge. Reuses the Git panel's catalog entry so
- *  the badge adds no i18n keys; the arrow segments are glyph+number only
- *  (script-neutral, plain concatenation -- a template literal here reads as an
- *  untranslated string to the i18n gate). Empty when the tree is clean and in
- *  sync, which is also what hides the badge. */
-export function useGitBadgeTitle(dirty?: number, truncated?: boolean, ahead?: number, behind?: number) {
-  return useMemo(() => {
-    const parts: string[] = []
-    if (dirty) {
-      // A capped listing makes the count a floor, so it is read as "500+" here
-      // and in the badge -- the same claim the Git panel's pill makes.
-      parts.push(i18nT(truncated ? 'components.gitPanel.uncommitted_capped' : 'components.gitPanel.uncommitted', { count: dirty }))
-    }
-    if (ahead) parts.push('\u2191' + String(ahead))
-    if (behind) parts.push('\u2193' + String(behind))
-    return parts.join(' \u00b7 ')
-  }, [dirty, truncated, ahead, behind])
-}
-
-/** Working-tree badge: dirty count (warn pill) plus ahead/behind arrows, the Git
- *  panel's own vocabulary. Renders only when there is signal, so a clean in-sync
- *  tree keeps the footer as it was. A passive READOUT, not a button: the shelf
- *  row already carries three actions (agent, picker, copy) and
- *  max-two-buttons-per-row forbids growing a 3+ row, exactly like the context
- *  readout. The Git panel stays one click away in the sidebar. NOT gated on
- *  shelfCompact: icon+digits have no text label to shed, and hiding the badge at
- *  narrow widths would remove the only tree-state signal. */
-export function GitTreeBadge({ title, dirty, truncated, ahead, behind }: {
-  title: string
-  dirty?: number
-  truncated?: boolean
-  ahead?: number
-  behind?: number
-}) {
-  return (
-    <span className="inline-flex items-center gap-1 h-7 shrink-0 text-[11px] font-mono px-1.5 text-muted" role="status" title={title} aria-label={title}>
-      {!!dirty && (
-        /* The icon makes the count read as "changed files" on a cold look -- a
-           bare warn number beside a branch name could be anything. */
-        <span className="inline-flex items-center gap-0.5 px-1 py-px rounded bg-warn/15 text-warn">
-          <FileDiff size={11} className="shrink-0" />
-          {truncated ? `${dirty}+` : dirty}
-        </span>
-      )}
-      {(!!ahead || !!behind) && (
-        <span>
-          {!!ahead && <>&#x2191;{ahead}</>}
-          {!!behind && <>{ahead ? ' ' : ''}&#x2193;{behind}</>}
-        </span>
-      )}
-    </span>
   )
 }
 
@@ -449,9 +360,7 @@ export function ModelChip({ modelName, modelIsJevRouted, modelIsInheritedDefault
     title={modelChipLabel}
     aria-label={modelChipLabel}
   >
-    {/* Fork: the cap follows the shelf, so a long model id cannot squeeze the
-        chips beside it on a phone. */}
-    <span className={`truncate ${shelfCompact ? 'max-w-[96px]' : 'max-w-[180px]'}`}>
+    <span className="truncate max-w-[180px]">
       {modelIsJevRouted ? i18nT('components.modelDropdownList.auto_jev') : modelName}
     </span>
     {/* Outside the truncating span: a long provider-prefixed id must

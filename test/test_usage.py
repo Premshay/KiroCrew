@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -66,15 +67,22 @@ class TestParseSessions:
             # ``s.refused_transcripts ?? 0`` would synthesise the promise of
             # completeness the payload never made.
             "refused_transcripts": 0,
+            # No session documents either, so the token estimate is a zero
+            # measurement in the same complete shape.
+            "estimated_tokens": {
+                "this_month": {"input": 0, "output": 0, "requests": 0},
+                "last_month": {"input": 0, "output": 0, "requests": 0},
+                "unreadable_sessions": 0,
+            },
         }
         assert sessions_dir.exists() == directory_exists
 
-    def test_iterdir_oserror(self, tmp_path):
+    def test_listing_oserror(self, tmp_path):
         d = tmp_path / "cli"
         d.mkdir()
         with (
             patch.object(usage_mod, "_SESSIONS_DIR", d),
-            patch("pathlib.Path.iterdir", side_effect=OSError("boom")),
+            patch("os.scandir", side_effect=OSError("boom")),
         ):
             result = _parse_sessions()
             assert "error" in result
@@ -84,7 +92,7 @@ class TestParseSessions:
             assert result["error"] == "cannot read sessions directory"
             assert result["code"] == "sessions_dir_unreadable"
 
-    def test_iterdir_oserror_keeps_the_whole_statistics_shape(self, tmp_path):
+    def test_listing_oserror_keeps_the_whole_statistics_shape(self, tmp_path):
         """An unreadable directory reports the reason WITHOUT changing the shape.
 
         Consumers read the period keys unconditionally --
@@ -107,7 +115,7 @@ class TestParseSessions:
         d.mkdir()
         with (
             patch.object(usage_mod, "_SESSIONS_DIR", d),
-            patch("pathlib.Path.iterdir", side_effect=OSError("boom")),
+            patch("os.scandir", side_effect=OSError("boom")),
         ):
             result = _parse_sessions()
 
@@ -465,6 +473,29 @@ class TestGetUsageCache:
 
 # ── api_kiro_usage ───────────────────────────────────────────────────────
 
+# The route waits ``_USAGE_SESSION_WAIT_SECONDS`` for the session scan, then answers
+# billing plus ``refreshing: True`` while the scan continues. How long a real scan
+# takes belongs to the host (an executor thread and a stat of a just-written file on a
+# loaded Windows runner exceed the budget), so a test about the SETTLED payload waits
+# on the scan task the route left running and asks again rather than racing the budget.
+# The backstop only turns a scan that never finishes into a named failure.
+_SCAN_BACKSTOP_SECONDS = 30.0
+
+
+async def _get_settled_usage(client: TestClient) -> tuple[int, dict]:
+    """GET /api/usage/kiro and return the answer the finished session scan gives."""
+    response = await client.get("/api/usage/kiro")
+    data = await response.json()
+    if data.get("refreshing"):
+        task = usage_mod._USAGE_SESSION_REFRESH_TASK
+        assert task is not None, f"refreshing answer with no refresh task: {data}"
+        done, _ = await asyncio.wait({task}, timeout=_SCAN_BACKSTOP_SECONDS)
+        assert done, f"session scan unfinished after the {_SCAN_BACKSTOP_SECONDS}s backstop"
+        response = await client.get("/api/usage/kiro")
+        data = await response.json()
+        assert data["refreshing"] is False, data
+    return response.status, data
+
 
 class TestApiKiroUsage:
     @pytest.fixture(autouse=True)
@@ -518,9 +549,8 @@ class TestApiKiroUsage:
             app = web.Application()
             app.router.add_get("/api/usage/kiro", api_kiro_usage)
             async with TestClient(TestServer(app)) as client:
-                resp = await client.get("/api/usage/kiro")
-                assert resp.status == 200
-                data = await resp.json()
+                status, data = await _get_settled_usage(client)
+                assert status == 200
                 assert "sessions" in data
                 assert "billing" in data
                 assert data["billing"]["credits_used"] == 10
@@ -584,9 +614,8 @@ class TestApiKiroUsage:
             app = web.Application()
             app.router.add_get("/api/usage/kiro", api_kiro_usage)
             async with TestClient(TestServer(app)) as client:
-                response = await client.get("/api/usage/kiro")
-                assert response.status == 200
-                data = await response.json()
+                status, data = await _get_settled_usage(client)
+                assert status == 200
                 assert "error" not in data
                 assert data["sessions"]["total_sessions"] == 0
                 for period in ("today", "this_week", "this_month"):
@@ -603,9 +632,8 @@ class TestApiKiroUsage:
                 _write_session(session_file, [{"kind": "Prompt"}])
                 usage_mod._CACHE_TS = time.time() - usage_mod._CACHE_TTL - 1
                 usage_mod._SESSIONS_CACHE_TS = time.time() - usage_mod._CACHE_TTL - 1
-                refreshed = await client.get("/api/usage/kiro")
-                assert refreshed.status == 200
-                updated = await refreshed.json()
+                status, updated = await _get_settled_usage(client)
+                assert status == 200
                 assert updated["sessions"]["total_sessions"] == 1
                 assert updated["sessions"]["total_messages"] == 1
                 assert updated["billing"] == data["billing"]
@@ -621,8 +649,7 @@ class TestApiKiroUsage:
             app = web.Application()
             app.router.add_get("/api/usage/kiro", api_kiro_usage)
             async with TestClient(TestServer(app)) as client:
-                resp = await client.get("/api/usage/kiro")
-                data = await resp.json()
+                _status, data = await _get_settled_usage(client)
                 assert "error" in data
                 # Cache should NOT be set
                 assert usage_mod._CACHE == {}
@@ -631,7 +658,7 @@ class TestApiKiroUsage:
     async def test_an_unreadable_directory_still_answers_the_full_shape(self, tmp_path):
         """The reason rides WITH the statistics, and billing is unaffected.
 
-        A file where the transcript directory should be makes ``iterdir()`` raise
+        A file where the transcript directory should be makes ``os.scandir()`` raise
         a real ``NotADirectoryError`` -- no mock -- which is the branch a
         roaming-profile or permission-denied home takes. The route answers 200
         because billing is a separate half of the payload, so the sessions half
@@ -647,9 +674,8 @@ class TestApiKiroUsage:
             app = web.Application()
             app.router.add_get("/api/usage/kiro", api_kiro_usage)
             async with TestClient(TestServer(app)) as client:
-                resp = await client.get("/api/usage/kiro")
-                assert resp.status == 200
-                data = await resp.json()
+                status, data = await _get_settled_usage(client)
+                assert status == 200
 
         assert data["error"] == "cannot read sessions directory"
         assert data["sessions"]["code"] == "sessions_dir_unreadable"

@@ -258,6 +258,12 @@ _NODE_MANAGER_GLOBS = (
     # fnm, both layouts: XDG default and legacy ``~/.fnm``.
     "{home}/.local/share/fnm/node-versions/*/installation/bin",
     "{home}/.fnm/node-versions/*/installation/bin",
+    # fnm's out-of-the-box location on macOS: fnm does NOT follow XDG there,
+    # it uses the Apple data dir (``~/Library/Application Support/fnm``). This
+    # is the default on a plain macOS install with no ``FNM_DIR``/``XDG_DATA_HOME``
+    # override, so a glob tried on every platform (it harmlessly drops out where
+    # the dir does not exist) is what keeps the probe from a false "no Node".
+    "{home}/Library/Application Support/fnm/node-versions/*/installation/bin",
     # The layout the retired nvm/fnm scan also globbed (``<ver>/bin`` directly
     # under the fnm root). Real fnm never produces it, but keeping the glob
     # makes the consolidated search a strict superset of what it replaced —
@@ -491,6 +497,30 @@ def node_bin_dirs() -> tuple[str, ...]:
     return tuple(out)
 
 
+# Homebrew's keg-only node formulae (``node@20``, ``node@22``) are never linked
+# into ``/opt/homebrew/bin``, so a global npm bin under one is invisible to the
+# ``_EXTRA_PATH_DIRS`` guess. ``node`` itself is linked, but its keg bin is
+# listed too so a ``brew unlink`` does not hide it.
+_HOMEBREW_NODE_KEG_ROOT = "/opt/homebrew/opt"
+
+
+def _homebrew_keg_node_bin_dirs() -> list[str]:
+    """Existing ``<keg>/bin`` dirs of Homebrew node kegs, ``node`` then newest ``node@N``."""
+    try:
+        kegs = [
+            k
+            for k in Path(_HOMEBREW_NODE_KEG_ROOT).glob("node*")
+            if k.name == "node" or k.name.startswith("node@")
+        ]
+        kegs.sort(
+            key=lambda k: (k.name == "node", _node_version_key(k.name.partition("@")[2])),
+            reverse=True,
+        )
+        return [str(k / "bin") for k in kegs if (k / "bin").is_dir()]
+    except OSError:
+        return []
+
+
 @functools.lru_cache(maxsize=1)
 def _node_all_bin_dirs(home: str, mise_data: str) -> tuple[str, ...]:
     """Cached body of :func:`node_all_bin_dirs`, keyed on its inputs.
@@ -502,7 +532,10 @@ def _node_all_bin_dirs(home: str, mise_data: str) -> tuple[str, ...]:
     """
     out: list[str] = []
     seen: set[str] = set()
-    for d in _manager_version_bin_dirs(home, mise_data, all_versions=True):
+    for d in (
+        *_manager_version_bin_dirs(home, mise_data, all_versions=True),
+        *_homebrew_keg_node_bin_dirs(),
+    ):
         d = os.path.normpath(d)
         # Only absolute entries may reach a spawned subprocess's PATH: a
         # relative one (possible via a relative MISE_DATA_DIR) would be
@@ -516,7 +549,10 @@ def _node_all_bin_dirs(home: str, mise_data: str) -> tuple[str, ...]:
 
 
 def node_all_bin_dirs() -> tuple[str, ...]:
-    """EVERY per-version manager bin dir (mise / asdf / nvm / fnm), all versions.
+    """EVERY per-version node bin dir: manager installs, then Homebrew node kegs.
+
+    Managers are mise / asdf / nvm / fnm, all versions; the kegs come from
+    :func:`_homebrew_keg_node_bin_dirs`.
 
     The broad MCP-binary search companion to :func:`node_bin_dirs`: a
     globally-installed MCP binary (``npm i -g``) lands in the bin dir of

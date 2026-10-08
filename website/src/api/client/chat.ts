@@ -37,7 +37,7 @@ function themeConsentSha(colorTheme?: string): string | null {
   return stored
 }
 
-export function createChatEndpoints({ post, put, del, patch, j, sessionKeyHeader: _sk, sendResponseAuthRecovery }: ClientTransport) {
+export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, sessionKeyHeader: _sk, sendResponseAuthRecovery }: ClientTransport) {
   const summaries = {
     /** Intent summary for the chat summary panel.
      *
@@ -92,31 +92,12 @@ export function createChatEndpoints({ post, put, del, patch, j, sessionKeyHeader
       if (before !== undefined) p.set('before', String(before))
       return fetch(chatSlotDetailPath(slot) + '?' + p, { signal }).then(j)
     },
-    /** Create a chat slot. `instance_id` binds the new session to a connected crew
-     *  for EXECUTION: it lives in this machine's list and history, and its turns run
-     *  over there. The backend opens the peer's slot first, so a peer that is
-     *  disconnected or on a different version fails the create rather than yielding
-     *  a session that cannot send.
-     *
-     *  `adopt_remote_slot` switches that same `instance_id` branch from MINT to
-     *  ADOPT: instead of the backend minting a fresh peer session to bind, it binds
-     *  the EXISTING one named here — the `key` of a row from
-     *  `GET /api/instances/{id}/chat-slots`. The new local slot is still fresh, so
-     *  the `remote_already_bound` guard does not fire, and the peer's transcript is
-     *  backfilled server-side. Requires `instance_id`; without it the backend
-     *  answers `400 adopt_needs_instance`. */
-    createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, instance_id?: string, adopt_remote_slot?: string, agent_kind?: 'member' | 'template') => {
-      // ADOPT deliberately resolves NO default memory mode. The adopted slot carries
-      // the PEER session's own `memory_mode` — that mode is the privacy boundary and
-      // the session it belongs to already chose it — so sending this machine's
-      // default would either be ignored or, worse, silently turn an incognito peer
-      // session into a persistent local transcript. An explicit `memory_mode`
-      // argument still wins, because a caller that names one means it.
-      const resolvedMemoryMode = memory_mode ?? (adopt_remote_slot
-        ? undefined
-        : await resolveDefaultMemoryMode(
-          () => fetch('/api/dashboard/config').then(j),
-        ))
+    /** Create a chat slot on this machine. A session on a connected crew is
+     *  created on that crew and opened through its window, never here. */
+    createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, agent_kind?: 'member' | 'template') => {
+      const resolvedMemoryMode = memory_mode ?? await resolveDefaultMemoryMode(
+        () => fetch('/api/dashboard/config').then(j),
+      )
       return post('/api/chat/slots', {
         ...(name ? { name } : {}),
         ...(agent ? { agent } : {}),
@@ -128,8 +109,6 @@ export function createChatEndpoints({ post, put, del, patch, j, sessionKeyHeader
         ...(title ? { title } : {}),
         ...(artifact ? { artifact } : {}),
         ...(folder_id ? { folder_id } : {}),
-        ...(instance_id ? { instance_id } : {}),
-        ...(adopt_remote_slot ? { adopt_remote_slot } : {}),
       }).then(j) as Promise<ChatSlot>
     },
     /** Inject silent background context into a slot — consumed on the next user
@@ -157,11 +136,12 @@ export function createChatEndpoints({ post, put, del, patch, j, sessionKeyHeader
     sideQueueCancel: (slot: string, queueId: string) => del('/api/chat/slots/' + encodeURIComponent(slot) + '/side/queue/' + encodeURIComponent(queueId), { client: TAB_ID }).then(j) as Promise<{ ok: boolean; content: string; depth: number }>,
     sideQueueEdit: (slot: string, queueId: string, content: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/side/queue/' + encodeURIComponent(queueId), { content }).then(j) as Promise<{ ok: boolean; depth: number }>,
     sideClose: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/close', {}).then(j) as Promise<{ ok: boolean; was_open: boolean }>,
+    sideStop: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/stop', {}).then(j) as Promise<{ ok: boolean }>,
     chatMode: (mode: string, slot?: string) => post('/api/chat/mode', { mode, slot: slot || '' }).then(j),
     generateTitle: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/generate-title').then(j),
     resolveNavLinks: (links: { url: string; context: string }[]) => post('/api/chat/nav/resolve-links', { links }).then(j) as Promise<{ summaries: string[] }>,
     renameSlot: (slot: string, title: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/title', { title }).then(j),
-    /** Tick or untick one row of the agent's checklist pill. Writes the dashboard's copy; the agent re-syncs on its next fresh session. */
+    /** Tick or untick one row of the agent's checklist pill. Writes the dashboard's copy; the agent learns of it on its next turn (a sync block on a warm turn, the recovery prompt on a fresh native session). */
     setTodoTask: (slot: string, id: string, text: string, completed: boolean) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/todo', { id, text, completed }).then(j),
     regenerateSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/regenerate').then(j),
     /** Pick an interrupted turn back up. NOT `/resume` — that path opens a history session into a tab. */

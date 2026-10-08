@@ -69,7 +69,7 @@ fleet manages. It is resolved in this order, first hit wins:
 | 2 | `dev_fleet.repo_path` in `config.json` / `config.local.json` | no — taken verbatim |
 | 3 | `KIROCREW_PROJECT_DIR` | yes |
 | 4 | the checkout this gateway is executing from (`src/kiro_crew` layout walk) | yes |
-| 5 | conventional clone locations under `$HOME` (`kirocrew`, `KiroCrew`, `kiro-crew` directly and under `Repos`, `repos`, `src`, `Projects`, `projects`, `dev`, `git`, `code`, `workplace`) | yes |
+| 5 | conventional clone locations under `$HOME`: a directory named `kirocrew` or `kiro-crew` (`_CHECKOUT_DIR_NAMES`) directly under `$HOME` or under one of `repos`, `src`, `projects`, `dev`, `git`, `code`, `workplace` (`_CHECKOUT_PARENT_DIRS`), every name matched case-insensitively | yes |
 
 Tier 5 matches directory names case-insensitively against each parent's own listing rather than joining the guessed spellings, so the resolved path is spelled the way the filesystem spells it. A blind join succeeds against a differently-cased directory on a case-insensitive filesystem (macOS) and yields a path that does not match the ones git reports for the same tree.
 
@@ -89,10 +89,16 @@ on rather than reported.
 
 Module import evaluates tiers 1, 3 and 4 — two env reads and a handful of stats — because
 the module is imported from the async route-registration path. Tier 2 (a config-file read)
-and tier 5 (up to 30 candidate directories x 3 markers) run only on the subprocess executor
+and tier 5 (2 names under 8 parents, each read from a directory listing) run only on the subprocess executor
 in `dev_fleet_startup()`. The startup result is then normalized through
 `_resolve_primary_checkout`, so a hint naming a linked worktree still manages the whole
 fleet.
+
+The agent pod routes run in the gateway process and do not run the managed backend's
+startup hook. Their shared operation wrapper calls `ensure_main_repo_discovered()` before
+it invokes a worktree operation. This lazy gateway entry point runs tiers 2 and 5 before
+`_repo()` can reject an empty import-time hint. It also preserves the unresolved retry
+and resolved single-flight behavior described below.
 
 The `/fleet` payload reports both the resolved `main_repo` and
 `main_repo_inferred`. The latter is true for tiers 3–5 and false for the two
@@ -197,7 +203,7 @@ verification. Route names below are relative to that prefix.
 | `/apps/dev-fleet/api/health` | Liveness + gateway **start identity**: `{status, start_id}`. `start_id` is the live unit's `ExecMainStartTimestampMonotonic` (launchd: job PID; foreground last resort: run-marker pid; `null` when unavailable); the dashboard polls it to detect the NEW process after a restart (see Action narration). Served on the proxied `/api/` namespace because the gateway only forwards `/apps/dev-fleet/api/*` to the backend. (The bare `/health` carries the same body but is HMAC-exempt and reached only by the gateway's own internal liveness poll.) |
 | `/apps/dev-fleet/api/fleet` | Lightweight worktree + pod list (polled every 12s), including `main_repo` and `main_repo_inferred`. `?fresh=1` forces cache bypass. Answers `{worktrees: [], needs_setup: true}` when no main checkout was found (see Main Checkout Discovery) and `{worktrees: [], error}` when a named checkout is unreadable. |
 | `/apps/dev-fleet/api/worktree?name=` | Lazy per-branch detail: PR, commits, disk usage |
-| `/apps/dev-fleet/api/pod/logs?name=&n=` | Pod journal tail (recent N lines, default 120) |
+| `/apps/dev-fleet/api/pod/logs?name=&n=` | Pod journal tail (recent N lines, default 120, clamped to 1..1000) |
 | `/apps/dev-fleet/api/run?id=` | Async run status + streamed output (last 60 lines), plus `cause` on a sync failure the gateway can name |
 | `/apps/dev-fleet/api/prune-candidates` | List worktrees eligible for pruning |
 | `/apps/dev-fleet/api/prune-status` | Live prune progress: per-item state machine (`items`) + backward-compatible top-level counters |
@@ -208,8 +214,8 @@ verification. Route names below are relative to that prefix.
 | Route | Body | Description |
 |-------|------|-------------|
 | `/apps/dev-fleet/api/sync` | — | Pull main + rebuild (single-flight; a concurrent call is refused **409**) |
-| `/apps/dev-fleet/api/worktree/remove` | `{name, force?}` | Remove a worktree (stops its pod and reclaims that pod's isolated HOME first) |
-| `/apps/dev-fleet/api/prune-run` | `{names[]}` | Batch-remove eligible worktrees |
+| `/apps/dev-fleet/api/worktree/remove` | `{name, force?, discard_untracked_paths?}` | Remove a worktree (stops its pod and reclaims that pod's isolated HOME first); `discard_untracked_paths` is a list of non-empty paths, else `400 invalid_discard_paths` |
+| `/apps/dev-fleet/api/prune-run` | `{names[], force_names?, discard_untracked_paths?}` | Batch-remove eligible worktrees. `force_names` is a list of names to force-remove (`400 invalid_force_names` otherwise); `discard_untracked_paths` maps a worktree name to its list of paths (`400 invalid_discard_paths` otherwise). The main checkout and the live or staged worktree are never forced |
 | `/apps/dev-fleet/api/pod/up` | `{name}` | Start isolated pod instance (re-verifies the unit is active) |
 | `/apps/dev-fleet/api/pod/down` | `{name}` | Stop pod instance (re-verifies the unit is gone before reporting success) |
 | `/apps/dev-fleet/api/pod/restart` | `{name}` | Stop then start pod |
@@ -218,17 +224,23 @@ verification. Route names below are relative to that prefix.
 | `/apps/dev-fleet/api/pod/provision/dismiss` | `{name, run_id}` | Forget a terminal provision failure when the run id still matches |
 | `/apps/dev-fleet/api/rebase` | `{name}` | Rebase worktree onto `{remote}/{base branch}` |
 
-Two routes are served by the **gateway process** rather than the backend, under the
+Six routes are served by the **gateway process** rather than the backend, under the
 in-gateway namespace `/api/apps/dev-fleet/` (`gateway_routes.py`, mounted by the
-`BUILTIN_NAMES` loop). Both are **dashboard-owner only** and refuse any app token:
+`BUILTIN_NAMES` loop). `restart-gateway` and `make-live` are **dashboard-owner only**
+and refuse any app token. `live-target` and the three `live-target/removal-lease`
+verbs admit ONLY Dev Fleet's own app token (`_principal_is_backend`); a dashboard
+human and any other app's token are refused:
 
 | Route | Body | Purpose |
 |---|---|---|
 | `POST /api/apps/dev-fleet/restart-gateway` | — | Restart the live gateway through its service-manager backend; returns the pre-restart `start_id` for the restart handshake |
-| `POST /api/apps/dev-fleet/make-live` | `{path, dry_run?, expected_staged?}` | Repoint the live gateway at another worktree (see Make Live); a real cutover returns `start_id` for the restart handshake |
+| `POST /api/apps/dev-fleet/make-live` | `{path, dry_run?, undo?, expected_staged?}` | Repoint the live gateway at another worktree (see Make Live); a real cutover returns `start_id` for the restart handshake |
 | `GET /api/apps/dev-fleet/live-target` | `?fresh=1` | The pointer-state read broker `{live, staged, staged_cancel_available, previous}` (`previous` is the pointer's validated one-level undo target, so the fleet's Undo banner needs no pointer read of its own) — admits ONLY Dev Fleet's own app token (how the sandboxed backend learns which row is live); a dashboard human and any other app's token are refused |
+| `POST /api/apps/dev-fleet/live-target/removal-lease` | `{path}` | Lease a worktree before `git worktree remove`, so a cutover or a gateway restart cannot land mid-deletion; answers `{ok, granted, token}`, refused while a cutover is in flight. The token is the capability to renew or release |
+| `PUT /api/apps/dev-fleet/live-target/removal-lease` | `{token}` | Renew the lease; `{ok, renewed}`, where `false` means it is gone and the holder must not start a mutation it has not started |
+| `DELETE /api/apps/dev-fleet/live-target/removal-lease` | `{token}` | Release the lease; idempotent, and a token that names no lease is a no-op |
 
-Why these two moved: they write the live-target pointer (or hold its cutover latch), and
+Why these routes run in the gateway: they write or read the live-target pointer (or hold its cutover latch), and
 that file is bind-masked from the sandboxed backend **and every child it spawns** — a
 nested sandbox is denied by design, so a worktree's `npm ci` lifecycle script runs in the
 backend's namespace. See *Make Live → Pointer file*.
@@ -362,14 +374,23 @@ in-gateway read and lease routes admit only Dev Fleet's own backend token.
 
 ## Prune Rules
 
-A worktree is eligible for automatic pruning if:
+`_prunable` answers one verdict `code` per worktree. Three classes are eligible:
 
-1. **PR merged** — GitHub PR state is `MERGED` AND `git cherry` shows 0 patch-unique
-   commits ahead of main AND the worktree is not dirty
-2. **Empty + stale** — zero own commits, not dirty, and older than 48 hours
+1. **PR merged** (`merged`) — GitHub PR state is `MERGED`, the worktree is not dirty,
+   and the branch head OID is contained in the PR head. `git cherry` is not consulted:
+   it never reports 0 for a squash merge.
+2. **PR closed unmerged** (`closed`) — the same head-containment check against the
+   closed PR's head, and not dirty. Nothing guarantees this content is on the base
+   branch, so the verdict carries `unmerged_commits` when the branch has commits the
+   base branch lacks, and the class is pruned through the MANUAL path only.
+3. **Empty + stale** (`empty`) — zero own commits, not dirty, and older than 48 hours.
 
-Worktrees NOT pruned: dirty, active (own commits > 0), fresh (< 48h), or merged-with-
-new-commits (unmerged follow-up work after the PR landed).
+Refusal codes: `merged_dirty`, `merged_unverified` (head or PR OID unknown),
+`merged_new_commits` (commits after the PR head), `closed_dirty`, `closed_unverified`,
+`closed_new_commits`, `fresh` (empty but younger than 48h), `active` (own commits),
+and `dirty_check_failed`. `merged_dirty`, `closed_dirty` and `active` can be overridden
+by discarding or forcing. The auto-prune reaper (`_auto_prune_once`) removes only
+`code == "merged"`; `closed` and `empty` stay manual.
 
 ### Parallel execution & per-item progress (issue #435)
 
@@ -388,7 +409,10 @@ at a time. The design separates the two cost classes:
   shared main-repo `.git` state (worktree admin dir + `packed-refs`). Concurrent git
   mutations would otherwise race on those lock files.
 - **Lock order: `_wt_lock(name)` → `_MAKE_LIVE_LOCK` → `_GIT_MUTATION_LOCK`.**
-  This order must never be reversed. Every removal first acquires the worktree lock,
+  This order must never be reversed. `_MAKE_LIVE_LOCK` is an `asyncio` lock, so it
+  serializes only within the backend process; the exclusion against the gateway's
+  `/make-live` cutover is the gateway-held removal lease (`live-target/removal-lease`)
+  the removal takes before deleting. Every removal first acquires the worktree lock,
   then acquires the make-live lock before the live/staged protection re-check and holds
   it through deletion. A concurrent rebase cannot claim the checkout after removal's
   initial fail-fast check, and a concurrent `/make-live` cannot stage the target between
@@ -461,13 +485,15 @@ worktree removal never blocks the gateway event loop.
 
 - `runtime.active_names(cfg)` — one point-in-time systemctl/launchctl listing per fleet build
   (blocking, offloaded via `run_in_executor`), shared by every worktree row
-- `runtime.derive_port(cfg, name)` — cksum-based port derivation (blocking, offloaded)
+- `runtime.derive_port(cfg, name)` — the pod's pinned `PORT=` when one is recorded, else a cksum-based derivation (blocking, offloaded)
 - `runtime.health(cfg, name, port, timeout)` — identity-gated HTTP probe (blocking,
   offloaded). Takes the pod's NAME, not just its port, because a derived port is
-  routinely held by another pod or by the live gateway: `port_owner` requires the
-  process a `127.0.0.1` connect reaches to be this pod's own `MainPID`, and a
-  responder that is provably somebody else's returns `HEALTH_FOREIGN` (`-2`)
-  instead of its HTTP status. The fleet row treats that as unhealthy, since the
+  routinely held by another pod or by the live gateway. `port_owner` proves
+  ownership from the pod's fresh gateway pid record matching the service manager's
+  `MainPID`; the listener lookup only corroborates it. When listeners can be read
+  and none of them is the pod's process, the responder is provably somebody
+  else's and the probe returns `HEALTH_FOREIGN` (`-2`) instead of its HTTP status.
+  A listener that cannot be attributed either way keeps the HTTP code. The fleet row treats that as unhealthy, since the
   frontend's `health >= 200` test already excludes a negative value. There is
   deliberately no bare-port variant to call — see `instances/run_marker`, which
   states the rule ("no caller can mistake reachability for identity")
@@ -515,7 +541,7 @@ they come from:
 | Owner | Owns |
 |---|---|
 | `runtime_ports` | `derive_port`, the recorded-claim scan and `allocate_port` |
-| `runtime_attestation` | `port_owner`: the gateway PID record against the service manager's `MainPID`, with listener corroboration |
+| `runtime_attestation` | `port_owner`: the gateway PID record against the service manager's `MainPID`, with listener corroboration (`OWNER_FOREIGN` only when listeners exist and none is the pod's) |
 | `runtime_client` | `health`, `published_credential`, `mint_token` and `pod_api`, each gated on that verdict |
 | `runtime_home` | fixture seeding, the OS home and runtime auth store, `cleanup_home`, `orphan_homes` |
 | `runtime_lifecycle` | `start_pod`, `stop_pod` (drain, reclaim, verify), `halt_pod` (stop only, HOME kept) and `install_backend` |
@@ -660,8 +686,9 @@ step needs before using them, so provisioning a **fresh** worktree (no
 
 - **venv (`ensure_venv`)** — builds with `python -m venv` + pip by default.
   When `KIROCREW_PROVISION_USE_UV` is truthy (opt-in; the default flip is
-  Phase 2 of the shared-dependency-cache RFC and waits on that document being
-  on main) and `_find_uv` locates `uv`
+  Phase 2 of [the shared-dependency-cache RFC](../../request-for-change/rfc-shared-dependency-cache.md),
+  whose entry conditions are that RFC accepted with a non-draft status and
+  Phase 1 exercised beyond the author's host) and `_find_uv` locates `uv`
   (`kiro_crew.env.resolve_uv`: `uv.find_uv_bin()` from the declared `uv` wheel
   first, then `PATH` — the one ladder pptx-maker's `resolve_uv` also consumes),
   it runs
@@ -690,8 +717,8 @@ step needs before using them, so provisioning a **fresh** worktree (no
   ≥ 25.1; if the command exits nonzero (older pip) it falls back to a
   runtime-only `pip install --editable <checkout>` and `_say`s a warning that
   dev tools were skipped — provisioning never hard-fails just because the dev
-  extras could not be installed. Design record: the "Shared Dependency Cache
-  for Worktrees" RFC under `docs/request-for-change/`, landing on its own PR.
+  extras could not be installed. Design record:
+  [Shared Dependency Cache for Worktrees](../../request-for-change/rfc-shared-dependency-cache.md).
 - **dist (`build_dist`)** — before `npm run build`, calls
   `ensure_node_modules(website)`: if `website/node_modules/.bin/tsc` is missing
   it runs `npm ci` (falling back to a NON-MUTATING `npm install
@@ -935,8 +962,8 @@ busy flag is per-worktree; the hazard is process-wide).
 
 `POST /apps/dev-fleet/api/sync` is single-flight: a second concurrent request is
 refused with **HTTP 409** (`{"ok": false, "error": "sync already running",
-"run_id": …}`) rather than launching a second ~90s fetch → merge → pip install →
-npm ci → npm build + stage. That refusal is a **state to act on, not a failure
+"run_id": …}`) rather than launching a second ~90s fetch → Verify dependencies → merge → pip
+install → npm ci → npm build + stage. That refusal is a **state to act on, not a failure
 to report**: the body names the run already in flight, and the client attaches
 its progress stepper to that run. A second press is a user who cannot see the
 sync, so reporting an error would leave them exactly where they started —
@@ -977,7 +1004,8 @@ normalizer.
 
 Sync progress is reported as **indeterminate** — a spinner, the current step
 label and elapsed time — and never as a percentage. The step index is a poor
-basis for one: the five steps differ in duration by more than an order of
+basis for one: the steps (six on a full sync, fewer when the frontend half is
+suppressed) differ in duration by more than an order of
 magnitude and shift with network and cache state, so a step-derived bar sits in
 one band for most of the run and then jumps, which reads as a stall. The
 spinner's `role="progressbar"` carries no `aria-valuenow`, which is the ARIA
@@ -991,6 +1019,13 @@ the STOCK SPA; staging that would silently replace the edition dashboard with
 upstream's. Skipping is what makes it safe, and it costs an edition nothing —
 the only artifact this path could produce for it is a bundle it must never
 serve.
+
+`_build_env()` forwards `NPM_CONFIG_REGISTRY` from the gateway's environment to
+the dependency preflight and `npm ci` only when its value is a bare `http` or
+`https` URL with no userinfo, query, fragment or whitespace
+(`_sanitized_npm_registry_env`). Any other value drops the key silently (fail
+closed), because URL syntax can carry a credential. Credential keys are never
+forwarded.
 
 **The frontend half is also suppressed on a backend-only sync — one whose
 incoming ref changes nothing under `website/`.** Both `npm ci` and `npm build +
@@ -1042,26 +1077,54 @@ as narrow as it cheaply can be without a lock — the cleanliness check and the
 tree-id read run back-to-back under the staging lock, and the preflight runs
 immediately before the merge.
 
-The final **npm build + stage** step builds the frontend and copies `website/dist` into
-`src/kiro_crew/static/dist` under the Dev Fleet backend's OWN interpreter, with
+The final **npm build + stage** step builds the frontend and stages `website/dist`
+as the served `src/kiro_crew/static/dist` under the Dev Fleet backend's OWN interpreter, with
 the target repo passed as an argument. Resolving the helper from the target
 instead would make the step's very existence contingent on the pulled revision
 already carrying it, so an older target would turn the whole Pull+Build into an
-ImportError. It is not cosmetic. On a source install `static/dist` is a *symlink*
-to `website/dist` (`ensure_dev_dist_symlink`), and aiohttp resolves a static
-route's directory once at registration — so a gateway started in that state is
-pinned to the Vite output directory for its whole life, and every `npm build`
-rewrites the tree it is serving. Staging leaves a real snapshot there, so from
-the gateway's **next start** onward a build cannot touch what it serves. It
-publishes the same bundle the build just wrote into `website/dist`, which keeps
-the pinned `/assets` route and the staged `index.html` on the same hashed
-chunks. The run script stops at the first non-zero step, so a build or staging
-failure fails the sync rather than silently leaving the symlink in place.
+ImportError. It is not cosmetic. On a source install `static/dist` is a *link*
+to `website/dist` (`ensure_dev_dist_symlink`), and the gateway resolves
+`static/dist` on every request — `index.html`, the PWA files, the stale-asset
+watchdog and every build route (`/assets`, `/sprites`, `/fonts`, `/vendor`,
+`/app-assets`), which are registered whether or not a build exists yet. App
+window entries are enumerated when the gateway starts and each is then resolved
+per request; a window entry first built after start needs a restart. So
+whatever `static/dist` names is what is served, on a running gateway too, and
+staging only ever switches it by re-pointing the link:
+
+- A stock build that publishes atomically is served through the dev link to
+  `website/dist`, kept if it is there and made otherwise, whatever occupied
+  `static/dist` before. No Vite build except `--watch` or one into a mount-point
+  outDir empties `website/dist` in place: every other build writes a scratch
+  sibling and publishes it by rename once it has succeeded
+  (`website/scripts/publish-dist.mjs` explains the mechanism), so on a source
+  install this step copies nothing.
+- Anything else — an edition bundle, an older target revision whose build still
+  writes `website/dist` in place — is copied into a fresh, never-rewritten
+  `static/.dist.<id>`, and `static/dist` is re-pointed at the copy. Before an
+  in-place build runs under the dev link, the served bundle is moved to such a
+  copy first, so the build cannot empty what is served. Each copy carries its
+  own `.gitignore` of `*`, so a target whose `.gitignore` predates these names
+  still reads clean.
+
+On POSIX the re-point is one `rename` of a link over a link. On Windows a
+junction cannot be renamed over another, so the old one is removed first; that
+touches no tree, so no open handle refuses it. The link's target is always
+absolute. Copies `static/dist` does not serve are swept under the staging lock, matched to
+the served one by file identity rather than path spelling, and nothing is swept
+while `static/dist` is a link that resolves nowhere. A `static/dist` that is still
+a real directory is renamed aside once when the first stage replaces it with the
+link; a gateway already running then, one whose build routes were resolved from
+that directory at start, answers 404 for the build until it restarts, and the
+stage log says to restart it. The same holds on every re-stage of an older target
+revision that builds in place: its gateway resolved the copy it started on, which
+the re-stage sweeps, so the stage log says to restart that gateway too. The run script stops at the first non-zero step,
+so a build or staging failure fails the sync rather than reporting success.
 
 ### Dependency preflight and the `node_modules` transaction
 
-`npm ci` deletes `node_modules` before it installs, so a registry refusal used to
-leave the checkout with an emptied tree, a stale bundle against new backend code,
+`npm ci` deletes `node_modules` before it installs, so without a guard a registry
+refusal leaves the checkout with an emptied tree, a stale bundle against new backend code,
 and no way back that did not need the registry that was unavailable. Two
 independent triggers recur: a private-registry token that expires on a clock, and
 a curated mirror that blocks a version the lockfile pins.
@@ -1322,21 +1385,32 @@ texts are dropped, and the last-line fallback skips marker lines too, so a forge
 marker can neither hide the notice nor be surfaced raw.
 
 The build and the copy are ONE step because they share ONE holder of the staging
-lock (`.dist.staging.lock`, next to `static/dist`). `npm run build` empties
-`website/dist` before repopulating it, so a peer flow — another sync, or the
-dashboard's own update — that held the lock only for the copy could still read a
-partially written tree. Inspecting the copy afterwards cannot substitute: a
+lock (`.dist.staging.lock`, next to `static/dist`). `npm run build` swaps a new
+tree into `website/dist`, so a peer flow — another sync, or the dashboard's own
+update — that held the lock only for the copy could copy half of each tree.
+Inspecting the copy afterwards cannot substitute: a
 bundle's lazy route chunks are referenced from inside the entry chunk, not from
 `index.html`, so most of the tree is invisible to any index-based check. `npm ci`
 stays a separate step since it does not touch `website/dist`.
 
-Not covered: a gateway process that started while `static/dist` was still a
-symlink to `website/dist` — the first staging sync, and equally any process
-booted after something re-created the symlink (a `git clean` re-running
-`ensure_dev_dist_symlink`). Such a process is pinned to `website/dist`, so its
-dashboard still 404s while Vite rewrites it; pairing Pull+Build with Restart
-Gateway is what closes it. A process that booted against a staged real
-directory is unaffected.
+Not covered: between publish's two renames `website/dist` is absent. The in-gap
+rename gets 1.5 s, under the stale-asset watchdog's 2 s re-check; if it misses
+on Windows, the old tree is renamed back with the full 60 s retry budget, and
+the tree stays absent until that rename lands. A request in the gap 404s (and
+is never cached). A gateway starting in the gap keeps the dangling link to this
+checkout's `website/dist` and serves the build once it lands; a stock
+checkout's gateway started before anything is built makes that link itself,
+where the platform can link a missing directory. A `vite build
+--watch`, and a `website/dist` that is a mount point, write in place as Vite
+always did; the stager does not tell a mount point apart, so such a build
+empties the tree the dev link serves. The install scripts (`install.sh`,
+`setup.sh`, `minimal_install.sh`) still `rm -rf` and copy `website/dist` into
+`static/dist`, and `install.sh` is also the documented update path (`git pull &&
+bash install.sh`), so under a running gateway requests 404 for the length of the
+copy and the dev link is replaced by a real copy until the next stage. Dev
+Fleet's build-pending badge compares `static/dist`'s mtime with the gateway's
+start, so a frontend-only `npm run build` served live through the dev link
+raises it too, although no restart is needed for that build.
 
 ## Make Live
 
@@ -1531,11 +1605,10 @@ choose the gateway's next image. Instead:
   still correct (both readers resolve it to "no live target" and start the
   installed build), only the wording is alarming. Delete
   `~/.kiro/crew/live_target.json` on the downgraded host to silence it.
-- **Foreground restart.** `ForegroundBackend` used to refuse from the backend
+- **Foreground restart.** `ForegroundBackend` refuses inside the backend
   (`backend_confined`: a replacement spawned inside the sandbox would inherit its
   confinement). In the gateway there is no confinement, so the last-resort
-  foreground restart is now *attempted* where the backend could only advise a
-  manual one — the same detached `kirocrew restart` the CLI's own restart uses.
+  foreground restart is *attempted* there — the same detached `kirocrew restart` the CLI's own restart uses.
 
 ### Live-worktree resolution
 
@@ -1547,13 +1620,15 @@ Reading the definition first would report that stale checkout as live.
 
 ### Request / Response
 
-Request body: `{path, dry_run?, undo?}` — `path` is a worktree path
+Request body: `{path, dry_run?, undo?, expected_staged?}` — `path` is a worktree path
 (validated against the discovered set, never an arbitrary path); `dry_run` (bool,
 default false) returns the plan without writing the pointer. `undo` (bool,
 default false) requires `path` to equal the pointer's validated
 `previous_checkout`; that binding is checked again under the Make Live lock, so
-a stale banner cannot reverse a newer cutover. `undo` and `expected_staged` are
-mutually exclusive.
+a stale banner cannot reverse a newer cutover. `expected_staged` names the
+staged checkout the caller saw: a request whose `path` is the running checkout
+then cancels exactly that stage, and refuses `stage_changed` when the stage or
+the live checkout moved. `undo` and `expected_staged` are mutually exclusive.
 
 - **dry_run success:** `{ok: true, dry_run: true, plan: {mechanism, pointer_path,
   exec, restart, target, [manual_restart]}}`
@@ -1565,10 +1640,15 @@ mutually exclusive.
 - **Undo success:** the same automatic/staged result shapes; the target becomes
   the prior checkout and `previous_checkout` is consumed before the restart is
   scheduled.
+- **staged cancel success:** `{ok: true, cancelled: true, target, plan, notice}` —
+  the running checkout is re-pinned as the live target and no restart is needed.
 - **refusal:** `{ok: false, code, error}` — `code` is one of the values below.
 
-The handler additionally returns HTTP 400 for a missing/non-string `path` or a
-non-boolean `dry_run`.
+The handler additionally returns HTTP 400 with `invalid_path` (a missing or
+non-string `path`), `invalid_dry_run`, `invalid_undo` (non-boolean),
+`invalid_expected_staged` (not a non-empty string without NUL bytes) or
+`undo_conflicts_with_expected_staged`, and HTTP 409 `repo_not_configured` when no
+main checkout is resolved.
 
 The `plan` object describes the cutover mechanism:
 
@@ -1598,6 +1678,9 @@ The `plan` object describes the cutover mechanism:
 | `write_failed` | writing the pointer file failed — rolled back to prior state |
 | `restart_failed` | the detached restart failed to launch — the pointer is rolled back before returning (response carries `rolled_back`) |
 | `busy` | another make-live cutover is already in progress — the mutation sequence is single-flighted, so a concurrent request is refused immediately (no queueing) rather than racing the in-flight pointer write/rollback |
+| `stage_changed` | `expected_staged` no longer matches: the staged cutover, or the live checkout, changed while the operator was confirming; refresh and retry |
+| `staged_cutover_pending` | a cutover to another checkout is already staged on a host Dev Fleet can restart, so a cancel by re-pointing here would leave the service definition naming the staged checkout; make the staged checkout live, or restart the gateway |
+| `wrong_process` | the cutover was called in the Dev Fleet backend rather than the gateway process |
 | `restart_pending` | a cutover has already been **successfully scheduled** in this gateway process — the restart is still pending, so a process-local latch refuses every further request (cutover **and** `dry_run`) until the pending restart replaces the process. The fresh gateway starts with the latch clear |
 
 On a `write_failed` / `restart_failed` refusal the response includes
@@ -1784,11 +1867,11 @@ Two different jobs live in that one dict, and they are worth keeping apart:
 
 `repository.BASE_BRANCH` is the resolved checkout's **own** default branch, not the
 literal `main`. It is resolved once per discovery attempt, in the order the answer is
-trustworthy, and from **one** remote only:
+trustworthy:
 
 | Tier | Source | Stated or guessed |
 |---|---|---|
-| 1 | the remote's **live** advertised `HEAD` (`ls-remote --symref` on `origin`, or the sole remote under any name) | **stated** |
+| 1 | the **live** advertised `HEAD` (`ls-remote --symref`) of the checkout's configured tracking remote, else `origin` or the sole remote, re-verified against the base branch's own remote when that differs (two passes, below) | **stated** |
 | 2 | the first of `_LOCAL_BASE_CANDIDATES` (`main`, `master`) that exists | guessed | <!-- wokeignore:rule=master -->
 | 3 | the branch the checkout is on | guessed |
 
@@ -1910,9 +1993,9 @@ things:
 | `_POD_IMPORTED` | the `kiro_crew.pod` modules imported, so its platform-neutral helpers are callable | the import succeeded (any platform) |
 | `_POD_AVAILABLE` | pods can actually **run** here | Linux with `systemctl` on PATH, or macOS with `launchctl` on PATH |
 
-Conflating the two used to report every worktree as "not built" on hosts without a runnable pod backend, since
-the `prov.has_venv` / `prov.has_dist` calls — plain filesystem checks — sat
-behind the pod-runnable gate. Build state is now computed on every platform.
+Build state (`prov.has_venv` / `prov.has_dist`, plain filesystem checks) is computed
+on every platform, outside the pod-runnable gate, so a host without a runnable pod
+backend still reports which worktrees are built.
 
 `GET /api/fleet` reports host support so the UI can explain itself rather than
 offering controls that fail:
@@ -1922,9 +2005,8 @@ offering controls that fail:
 | `pods_available` | `_POD_AVAILABLE` — whether pods can run on this host |
 | `pods_unavailable_reason` | the human-readable reason, or `null` when pods are available |
 
-Before this existed, the reason string was computed into `_POD_ERROR` and then
-**never read by anything** — a user on a host without a runnable pod backend saw
-pod controls that silently failed with no explanation.
+Without it, a user on a host without a runnable pod backend would see pod controls
+that fail with no explanation.
 
 Per-platform behavior:
 

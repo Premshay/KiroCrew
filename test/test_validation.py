@@ -17,6 +17,7 @@ from kiro_crew.validation import (
     SPAWN_RUN_SCHEMA,
     TASK_RUN_SCHEMA,
     FieldSpec,
+    JsonRpcEnvelopeError,
     McpTextContent,
     ValidationError,
     build_tool_response,
@@ -166,6 +167,49 @@ class TestSanitizeString:
         assert sanitize_string("\u200b\u200c\u200d") == ""
         # Beside real script they survive.
         assert sanitize_string("\u0645\u200c\u062e") == "\u0645\u200c\u062e"
+
+    def test_composes_across_stripped_format_char(self):
+        assert sanitize_string("cafe\u00ad\u0301") == "caf\u00e9"
+
+    @pytest.mark.parametrize("hidden", ["\u00ad", "\ufeff", "\u200b", "\u202e"])
+    @pytest.mark.parametrize(
+        "base,mark",
+        [("e", "\u0301"), ("a", "\u0308"), ("n", "\u0303"), ("c", "\u0327")],
+    )
+    def test_idempotent_with_hidden_char_before_combining_mark(self, hidden, base, mark):
+        once = sanitize_string(f"x{base}{hidden}{mark}y")
+        assert sanitize_string(once) == once
+        assert once == normalize_unicode(f"x{base}{mark}y")
+
+    @pytest.mark.parametrize("ascii_after_nfc", ["\u212a", "\u037e", "\u1fef"])
+    def test_shaping_mark_dropped_when_nfc_makes_neighbour_ascii(self, ascii_after_nfc):
+        once = sanitize_string(f"AKIA{ascii_after_nfc}\u200dIOSFODNN7EXAMPLE")
+        assert "\u200d" not in once
+        assert sanitize_string(once) == once
+
+    @pytest.mark.parametrize("raw", ["x\u200d\u00a0", "\u00a0\u200dAKIA", "AKIA\u200d\u3000"])
+    def test_shaping_mark_dropped_when_edge_trim_leaves_ascii_neighbour(self, raw):
+        once = sanitize_string(raw)
+        assert "\u200d" not in once
+        assert sanitize_string(once) == once
+
+    def test_shaping_mark_kept_beside_non_ascii_edge(self):
+        assert sanitize_string("\u0645\u200c \u00a0") == "\u0645\u200c"
+        assert sanitize_string("\u3000\u200d\U0001f468") == "\u200d\U0001f468"
+
+    def test_edge_runs_need_one_strip_pass(self, monkeypatch):
+        import kiro_crew.validation as validation
+
+        calls = []
+        real = validation.strip_hidden_unicode
+
+        def counting(text):
+            calls.append(len(text))
+            return real(text)
+
+        monkeypatch.setattr(validation, "strip_hidden_unicode", counting)
+        assert sanitize_string("a" + " \u200d\u00a0" * 2000) == "a"
+        assert len(calls) == 1
 
 
 class TestSanitizeJsonValues:
@@ -482,9 +526,23 @@ class TestValidateJsonrpcRequest:
         with pytest.raises(ValidationError, match="must be a string"):
             validate_jsonrpc_request({"method": 123})
 
-    def test_non_dict_params_defaults(self):
-        _, _, params = validate_jsonrpc_request({"method": "x", "params": "bad"})
-        assert params == {}
+    def test_absent_or_null_params_read_as_empty(self):
+        assert validate_jsonrpc_request({"method": "x"})[2] == {}
+        assert validate_jsonrpc_request({"method": "x", "params": None})[2] == {}
+
+    @pytest.mark.parametrize("params", ["bad", [1], 5, True])
+    def test_non_object_params_are_refused_with_the_id_to_answer(self, params):
+        """Read as ``{}``, a ``tools/call`` with list params was served as a
+        call that named no tool; the refusal carries the id it is owed to."""
+        with pytest.raises(JsonRpcEnvelopeError) as excinfo:
+            validate_jsonrpc_request({"id": 4, "method": "tools/call", "params": params})
+        assert (excinfo.value.req_id, excinfo.value.method) == (4, "tools/call")
+        assert excinfo.value.invalid_params is True
+
+    def test_a_malformed_envelope_carries_its_id(self):
+        with pytest.raises(JsonRpcEnvelopeError) as excinfo:
+            validate_jsonrpc_request({"id": 5, "method": 123})
+        assert excinfo.value.req_id == 5 and excinfo.value.invalid_params is False
 
 
 # ── Response Schema ──

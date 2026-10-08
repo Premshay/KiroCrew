@@ -12,11 +12,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 from kiro_crew.apps.registry_pipeline import _FACADE
-from kiro_crew.apps.registry_pipeline.caches import _external_registry_cache_path
+from kiro_crew.apps.registry_pipeline.caches import (
+    _external_registry_cache_identity,
+    _external_registry_cache_path,
+    _read_external_registry_cache,
+)
 from kiro_crew.apps.registry_pipeline.git_targets import (
     _PUBLIC_GIT_HOSTS,
     _clone_sandbox_mode,
@@ -26,6 +31,7 @@ from kiro_crew.apps.registry_pipeline.git_targets import (
     _is_ssh_git_url,
     _public_registry_name,
     _redact_url_userinfo,
+    _same_git_target,
     _strip_git_target_userinfo,
 )
 from kiro_crew.platform import PlatformCompositionError, current_context
@@ -59,6 +65,85 @@ _TRUST_OWNER = "owner"
 
 
 _REGISTRY_TRUST_TIERS: frozenset[str] = frozenset({_TRUST_INDEX, _TRUST_OWNER})
+
+
+#: Current on-disk schema version of ``registry_trust.json`` (see
+#: :func:`_granted_owner_repos`). Version 1 stores ``owner_trusted`` as a JSON
+#: LIST of credential-free repo URLs. An unknown-version or dict-shaped document is
+#: corrupt and reads as no grants.
+_REGISTRY_TRUST_VERSION = 1
+
+
+#: The schema is validated in ONE place,
+#: ``registry_trust._owner_trusted_repos_from_record`` (reached here through
+#: :func:`read_registry_trust_strict`), so the tolerant runtime read and the strict
+#: mutation read cannot disagree about what a valid store is.
+
+
+def _granted_owner_repos() -> frozenset[str]:
+    """Operator grants of ``owner`` trust, as a set of credential-free repo URLs.
+
+    Read from the keystone ``registry_trust.json`` (``config.registry_trust_path``).
+    The agent's own file tools cannot read it, and no sandboxed process can write
+    it (it is mounted read-only) — that is the whole reason the grant lives there
+    and not on the config row. A grant names a REPOSITORY, never a registry name:
+    ``config.json`` is agent-writable, so a grant keyed by name could be redirected
+    at any index by rewriting the row's ``repo``. Keyed by the URL the operator saw
+    when granting, a rewritten row simply stops matching and falls back to ``index``.
+
+    Delegates the parse and schema validation to :func:`read_registry_trust_strict`,
+    the ONE validator both readers share, then applies this reader's own tolerant
+    posture: a corrupt store (bad JSON, unknown version, wrong ``owner_trusted``
+    shape, or an alias-backed keystone) yields the empty set rather than raising
+    into the listing path, and a malformed entry is dropped. Every failure mode
+    here resolves to the credential-free posture; the strict reader raises for the
+    grant/revoke writers and the corrupt-store snapshot flag.
+    """
+    # ``registry_trust`` imports this package's facade at module scope, so the
+    # reverse import must wait until call time. Imported in-function, like the
+    # other cross-layer reads here: a module-scope import binds the name into this
+    # module's namespace, which the ``apps.registry`` facade would then re-export
+    # as a registry symbol it is not.
+    from kiro_crew.apps.registry_trust import (
+        RegistryTrustCorruptError,
+        read_registry_trust_strict,
+    )
+
+    try:
+        record = read_registry_trust_strict()
+    except RegistryTrustCorruptError:
+        # A corrupt or alias-backed keystone confers no grants where trust is read;
+        # the strict reader has already logged the alias case, and the snapshot
+        # surfaces corruption on the page that repairs it.
+        logger.warning("registry_trust.json is not a usable store; no registry grants in force")
+        return frozenset()
+    out: set[str] = set()
+    for repo in record.get("owner_trusted") or []:
+        if not isinstance(repo, str) or not repo:
+            continue
+        # A grant carrying credentials, or an unsupported target, is never a valid
+        # key: the operator granted a repository identity, and the identity the
+        # runtime compares is the credential-free one.
+        if _git_target_is_unsupported(repo) or _strip_git_target_userinfo(repo) != repo:
+            continue
+        out.add(repo)
+    return frozenset(out)
+
+
+def _operator_granted_owner(reg: Any) -> bool:
+    """True when the operator granted ``owner`` trust to *reg*'s repository."""
+    repo = getattr(reg, "repo", "")
+    if not isinstance(repo, str) or not repo:
+        return False
+    # A hand-edited grant on a plaintext transport is inert: ``owner`` clones with
+    # the machine's git identity, so honouring a grant on an ``http://`` / ``git://``
+    # / ``ext::`` repo would fetch app code over a transport anything on the path can
+    # substitute. The grant handler refuses these, and this is the matching read-side
+    # defence for a file edited outside it.
+    if not _is_supported_registry_transport(repo):
+        return False
+    public = _strip_git_target_userinfo(repo)
+    return any(_same_git_target(public, granted) for granted in _granted_owner_repos())
 
 
 #: Review tiers an ``ExternalRegistryConfig.review`` value may name.
@@ -349,50 +434,57 @@ def _effective_registries() -> list[Any]:
 def _registry_trust_tier(registry_name: str) -> str:
     """The trust tier in force for the registry identified by *registry_name*.
 
-    **Only a BUILD-PINNED registry can carry ``owner``.** A row in
-    ``config.json`` is read as ``index`` no matter what it declares, because
-    ``config.json`` is agent-writable — ``security.py`` says so in as many words,
-    with the check inline: ``is_sensitive_bash_command("echo x > …/config.json")``
+    ``owner`` comes from exactly two places, neither of them ``config.json``:
+
+    - **A BUILD-PINNED registry** declaring it. ``default_registries()`` ships in
+      the wheel, so that tier is a claim the build makes and the agent cannot forge.
+    - **An operator grant** in the keystone ``registry_trust.json`` naming the
+      config row's repository (see :func:`_granted_owner_repos`). The file sits
+      on the same read+write floor as ``denied_commands.json``, so the grant is a
+      decision only the operator can make, through the dashboard.
+
+    A row in ``config.json`` is read as ``index`` no matter what it declares,
+    because ``config.json`` is agent-writable — ``security.py`` says so in as many
+    words, with the check inline: ``is_sensitive_bash_command("echo x > …/config.json")``
     is ``None``. A tier read from there would therefore not be an operator's
     assertion at all; a prompt-injected shell could mint ``owner``, and the same
     write also adds its chosen host to ``_configured_registry_hosts()`` and lets
     it control the index that :func:`_owner_tier_confirmed` re-fetches. Every
     layer that decision passes through would be one the same write had already
-    satisfied. ``default_registries()`` ships in the wheel instead, so an
-    ``owner`` tier is a claim the build makes and the agent cannot forge.
+    satisfied. The grant closes that hole by keying on the REPOSITORY the operator
+    saw: rewriting the row's ``repo`` to an index the agent controls stops the
+    match, and the row is ``index`` again.
 
     *registry_name* is the ``_registry`` tag an index entry carries, which is the
     registry's ``name`` or (when unnamed) its ``repo``. Returns ``_TRUST_INDEX``
     for an unknown registry, an unrecognised tier, or any lookup failure — the
     caller uses this to decide whether to offer credentials, so every ambiguous
     answer must be the credential-free one.
+
+    The name is resolved to a row from one :func:`_effective_registries` snapshot
+    and the tier is read off THAT row object by :func:`_registry_trust_tier_of`,
+    so there is one tier function and a caller that already holds the row (see
+    ``indexes._owner_tier_confirmed``) can compute the same answer against the same
+    row it will fetch, without a second, independently-loaded resolution that a
+    concurrent config/cache rewrite could swing onto a different row.
     """
     if not registry_name:
         return _TRUST_INDEX
     try:
-        # Pinned AND in force. `_pinned_registries()` alone is not enough: a name
-        # contested between a pinned row and a config row is served by NEITHER
-        # (see `_effective_registries`), and reading the tier off the pinned list
-        # would keep granting `owner` for a registry whose apps are not being
-        # listed at all. So the row must survive the merge and be one the build
-        # pinned — config rows are read as `index` regardless.
-        pinned_keys = {_registry_identity_key(reg.name or reg.repo) for reg in _pinned_registries()}
+        # The row must survive the merge. A name contested between a pinned row
+        # and a config row is served by NEITHER (see `_effective_registries`), and
+        # reading a tier off either source list would keep granting `owner` for a
+        # registry whose apps are not being listed at all.
         wanted = _registry_identity_key(registry_name)
-        if wanted not in pinned_keys:
+        rows = _effective_registries()
+        reg = None
+        for candidate in rows:
+            if _registry_identity_key(candidate.name or candidate.repo) == wanted:
+                reg = candidate
+                break
+        if reg is None:
             return _TRUST_INDEX
-        for reg in _effective_registries():
-            if _registry_identity_key(reg.name or reg.repo) == wanted:
-                tier = getattr(reg, "trust", _TRUST_INDEX)
-                if isinstance(tier, str) and tier in _REGISTRY_TRUST_TIERS:
-                    return tier
-                if tier != _TRUST_INDEX:
-                    logger.warning(
-                        "Registry %r declares unknown trust %r — reading it as %r",
-                        _strip_git_target_userinfo(registry_name),
-                        tier,
-                        _TRUST_INDEX,
-                    )
-                return _TRUST_INDEX
+        return _registry_trust_tier_of(reg)
     except PlatformCompositionError:
         raise
     except Exception:
@@ -401,6 +493,68 @@ def _registry_trust_tier(registry_name: str) -> str:
             _strip_git_target_userinfo(registry_name),
             exc_info=True,
         )
+    return _TRUST_INDEX
+
+
+def _registry_trust_tier_of(reg: Any) -> str:
+    """The trust tier in force for *reg*, a row already selected from one snapshot.
+
+    The single tier function :func:`_registry_trust_tier` delegates to, so the tier
+    is always computed from a ROW OBJECT rather than re-resolved from a name. The
+    security value is for the install-path caller (:func:`indexes._owner_tier_confirmed`):
+    that caller loads :func:`_effective_registries` once, selects *reg* from it, and
+    passes the SAME object here and to the fresh-index fetch. config.json and the
+    index cache are both agent-writable, so a tier resolved from one load and clone
+    coordinates resolved from a second, independent load could be made to describe
+    different rows between the two reads — the row whose grant clears the tier need
+    not be the row whose fresh index confirms it. Reading the tier off the object the
+    fetch also uses removes the second load, so there is no window to swap.
+
+    Trust sources, neither of them the row's own ``trust`` field for a config row
+    (``config.json`` is agent-writable):
+
+    - **A BUILD-PINNED row** declaring it. ``default_registries()`` ships in the
+      wheel, so that tier is a claim the build makes and the agent cannot forge.
+      Membership is decided by the row's identity key against the pinned set.
+    - **An operator grant** in the keystone ``registry_trust.json`` naming the
+      config row's repository (see :func:`_operator_granted_owner` /
+      :func:`_granted_owner_repos`). A grant is inert when the row's repository is
+      also a pinned registry's: the pinned row states that repository's tier, so
+      honouring the grant would let a config row under a different name lift a
+      build-pinned target.
+
+    An unrecognised tier on a pinned row degrades to ``_TRUST_INDEX`` — the caller
+    offers credentials on this answer, so every ambiguous case is the credential-free
+    one. Raises only ``PlatformCompositionError``; the name-resolving wrapper catches
+    the rest.
+    """
+    wanted = _registry_identity_key(reg.name or reg.repo)
+    pinned = _pinned_registries()
+    pinned_keys = {_registry_identity_key(p.name or p.repo) for p in pinned}
+    if wanted in pinned_keys:
+        tier = getattr(reg, "trust", _TRUST_INDEX)
+        if isinstance(tier, str) and tier in _REGISTRY_TRUST_TIERS:
+            return tier
+        if tier != _TRUST_INDEX:
+            logger.warning(
+                "Registry %r declares unknown trust %r — reading it as %r",
+                _strip_git_target_userinfo(reg.name or reg.repo),
+                tier,
+                _TRUST_INDEX,
+            )
+        return _TRUST_INDEX
+    # A config row: its own `trust` field is never consulted (agent-writable);
+    # only an operator grant on its repository can lift it to `owner`. A grant
+    # is inert when the row's repository is also a pinned registry's: the
+    # pinned row states that repository's tier, so honouring the grant here
+    # would let a config row under a different name lift a build-pinned target.
+    row_repo = _strip_git_target_userinfo(getattr(reg, "repo", "") or "")
+    if row_repo and any(
+        _same_git_target(row_repo, _strip_git_target_userinfo(p.repo)) for p in pinned
+    ):
+        return _TRUST_INDEX
+    if _operator_granted_owner(reg):
+        return _TRUST_OWNER
     return _TRUST_INDEX
 
 
@@ -642,3 +796,219 @@ def _load_registry_file() -> list[dict[str, Any]]:
         rows.append(row)
         seen.add(row.get("name"))
     return rows
+
+
+#: Ceiling on how many ``repo``-key claims :func:`_repo_key_claims` will retain across
+#: all consulted sources in one call. Each configured external registry's cache is
+#: untrusted content and can list an unbounded number of entries; without a ceiling a
+#: single oversized cache would hold that whole list in memory for the duration of the
+#: call (and, for the prewarm, once per batch). Reaching the ceiling is treated as
+#: unresolvable — the fail-closed answer, ambiguous for every row — because a source
+#: that floods the claim list is exactly the case a credential grant must not trust.
+#: Generous against any real catalog (a store lists a handful of apps per registry)
+#: while bounding the footprint.
+_MAX_FOREIGN_CLAIMS = 5000
+
+#: Ceiling on one retained ``repo``-key string. A real git URL or bare name is well
+#: under this; a claim longer than this is a malformed or padded entry and makes the
+#: whole call unresolvable (fail closed), never a silent drop. A drop would be
+#: fail-open: ``_normalize_git_target`` strips trailing-slash padding, so a key padded
+#: past this cap could normalize to another registry's real URL and compare equal via
+#: ``_same_git_target`` -- dropping it undercounts the claimants and lets an
+#: owner-credentialed clone through on a key that is actually shared. Treated as an
+#: overflow instead, so a source that pads a claim gets the ambiguous-for-every-row
+#: answer a shared key must produce.
+_MAX_CLAIM_STRING_LEN = 2048
+
+
+#: Process-once guard for the claim-overflow warning. A set mutated in place, not a
+#: rebound flag: the facade's one namespace forbids a module-level ``global`` rebind,
+#: and ``_repo_key_claims`` runs on every blob request, so a plain per-call
+#: ``logger.warning`` would spam. Emptied only by process restart.
+_CLAIM_OVERFLOW_LOGGED: set[bool] = set()
+
+
+def _log_claim_overflow() -> None:
+    """Warn once per process that a source flooded the claim list past the ceiling."""
+    if True in _CLAIM_OVERFLOW_LOGGED:
+        return
+    _CLAIM_OVERFLOW_LOGGED.add(True)
+    logger.warning(
+        "A configured registry source declares more than %d repo-key claims; "
+        "treating provenance as unresolvable (ambiguous) for every row until it shrinks.",
+        _MAX_FOREIGN_CLAIMS,
+    )
+
+
+def _repo_key_claims(
+    *, strict: bool, except_registry: str | None = None
+) -> tuple[bool, list[list[str]]]:
+    """The ``repo`` keys each configured SOURCE publishes, grouped by source.
+
+    ONE counting core for the two credential gates that ask the same question of
+    the same source union — which configured sources publish a given ``repo`` key
+    — so they cannot drift apart. The blob proxy's per-request carve-out
+    (:func:`_repo_key_owner_count`) and the prewarm's per-batch provenance gate
+    (``store_art._prewarm_foreign_claims``) both read exactly this, differing only
+    in the ``strict`` flag and whether they exclude a registry they are attributing
+    to.
+
+    Walks the bundled registry file (one source, always first) plus every source in
+    :func:`_effective_registries`, reading each external registry's local sync cache
+    with ``ignore_ttl`` — never fetching, so it is safe on the per-request blob
+    worker thread. Returns ``(unresolvable, sources)`` where ``sources`` is one
+    ``repo``-key list per consulted source (bundled first) and ``unresolvable`` is
+    True when the claims cannot be established:
+
+    - ``strict=True`` (the prewarm's fail-closed reading): a sibling whose cache is
+      ABSENT or unreadable (``None``) could publish any key — an unfetched or GC'd
+      sibling — so it is not a proven non-claimant; the walk stops and reports
+      unresolvable. The caller then treats every key as ambiguous, because a
+      provenance that cannot be established must never buy an owner-credentialed
+      clone.
+    - ``strict=False`` (the blob proxy's counting reading): an absent cache is
+      simply skipped (contributes no source), because the proxy counts the sources
+      that DO declare the key and one unfetched sibling does not make an otherwise
+      single-owner key ambiguous on its own.
+
+    Either way, ANY read that raises reports unresolvable (fail closed).
+
+    The claim list is bounded, and both bounds are fail-closed: a retained ``repo``
+    string longer than :data:`_MAX_CLAIM_STRING_LEN`, or a total retained across all
+    sources that would exceed :data:`_MAX_FOREIGN_CLAIMS`, returns unresolvable — the
+    fail-closed answer, ambiguous for every row — logged once. An over-long string is
+    an overflow rather than a drop because ``_normalize_git_target`` strips
+    trailing-slash padding, so a padded key could compare equal to another registry's
+    real URL and a drop would undercount the claimants (fail-open). An untrusted
+    external cache can list an unbounded number of entries; the bound covers only the
+    RETAINED claim projection (the ``repo`` strings kept per call, and once per prewarm
+    batch) and stops a flood of claims from silently passing the single-owner gate. It
+    does not bound the cache read itself: ``_read_external_registry_cache`` (and
+    ``_load_registry_file``) parse each source's whole JSON list before the projection
+    is taken.
+
+    *except_registry* excludes the source whose :func:`_public_registry_name` equals
+    it — the prewarm's "every OTHER source" reading, so a registry is not counted as
+    a rival claimant of its own key. The blob proxy passes ``None`` and counts every
+    source, including the one an entry was served through.
+    """
+    try:
+        sources: list[list[str]] = []
+        retained = 0
+
+        def _bounded(repos: Iterable[str]) -> tuple[list[str], bool]:
+            """Stop at either cap while STREAMING *repos*, reporting overflow (fail closed).
+
+            *repos* is an ITERATOR, not a materialised list: a source's rows are pulled
+            one at a time and the cap is applied per element as it is read, so the moment
+            either cap trips the iteration STOPS and the source's remaining (unbounded)
+            ``repo`` strings are never copied into the retained projection. (The parsed
+            cache list itself is already in memory -- the caller's read materialises the
+            whole JSON list -- only the projection is bounded here.) Building the full
+            ``[e["repo"] for e in cached]`` list first and capping it afterwards defeated
+            the cap it was there to enforce -- an oversized cache's whole repo list was
+            materialised before a single element was checked.
+
+            Returns ``(kept, overflow)``: *kept* is the sub-list accumulated so far,
+            *overflow* is True when the running total reached :data:`_MAX_FOREIGN_CLAIMS`
+            OR a string longer than :data:`_MAX_CLAIM_STRING_LEN` was met. An over-long
+            string is NOT dropped: ``_normalize_git_target`` strips trailing-slash
+            padding, so a key padded past the cap could compare equal via
+            ``_same_git_target`` to another registry's real URL -- dropping it would
+            undercount the claimants and let an owner-credentialed clone through on a key
+            that is actually shared. It is treated as an OVERFLOW instead, so the whole
+            call is unresolvable (ambiguous for every row), which is the fail-closed
+            answer a padded claim must produce. A list, not a rebound counter, carries the
+            running total, since the facade's one namespace forbids a ``nonlocal`` rebind
+            -- but a nested closure cannot see a rebind anyway, so the caller updates
+            ``retained`` from the returned length instead.
+            """
+            kept: list[str] = []
+            for value in repos:
+                if len(value) > _MAX_CLAIM_STRING_LEN:
+                    # A padded/malformed key. It cannot be dropped: normalization would
+                    # strip the padding and it could then match a real URL, so a drop
+                    # is fail-open. Overflow instead -> the call is unresolvable, and
+                    # the iterator's remaining rows are never pulled.
+                    return kept, True
+                if retained + len(kept) >= _MAX_FOREIGN_CLAIMS:
+                    return kept, True
+                kept.append(value)
+            return kept, False
+
+        # A generator, so ``_bounded`` pulls a row at a time and stops at the cap; the
+        # bundled file's full repo list is never built up front.
+        bundled = (e["repo"] for e in _load_registry_file() if isinstance(e.get("repo"), str))
+        kept, overflow = _bounded(bundled)
+        sources.append(kept)
+        retained += len(kept)
+        if overflow:
+            _log_claim_overflow()
+            return True, []
+        for reg in _effective_registries():
+            if except_registry is not None and _public_registry_name(reg) == except_registry:
+                # The registry being attributed to; it is the claimant, not a rival.
+                continue
+            cached = _read_external_registry_cache(
+                _external_registry_cache_identity(reg), ignore_ttl=True
+            )
+            if cached is None:
+                if strict:
+                    # An absent/unreadable sibling could publish any key: fail closed.
+                    return True, sources
+                continue
+            # Same streaming shape as the bundled source: a generator ``_bounded``
+            # consumes one row at a time, so an oversized sibling cache stops at the
+            # cap instead of its whole repo list being materialised first.
+            declared = (
+                e["repo"] for e in cached if isinstance(e, dict) and isinstance(e.get("repo"), str)
+            )
+            kept, overflow = _bounded(declared)
+            sources.append(kept)
+            retained += len(kept)
+            if overflow:
+                _log_claim_overflow()
+                return True, []
+        return False, sources
+    except Exception:  # provenance unresolvable → caller treats as ambiguous, never grant
+        logger.debug("_repo_key_claims: read failed", exc_info=True)
+        return True, []
+
+
+def _repo_key_owner_count(repo: str) -> int:
+    """Count the configured registry SOURCES that publish an entry keyed on ``repo``.
+
+    The blob credential carve-out grants owner credentials only when
+    :func:`_owner_designated_repo_target` confirms the resolved entry's clone URL is
+    byte-identical to *its own* registry's configured ``repo``.  That predicate is
+    entry-scoped and sound for the entry it is handed — but the entry is SELECTED
+    by :func:`get_registry_app_by_repo`, which returns the FIRST source (bundled,
+    then each external/federated registry) whose entry ``repo`` key equals the
+    served ``repo``.  The selection is keyed on ``repo`` alone and provenance-blind.
+
+    So if two configured registries both publish the same ``repo`` key, a request
+    reachable through registry B can resolve to registry A's owner-designated
+    entry and clone A's private repo with A's credentials, serving A's private
+    image bytes to a caller who only had access to B — a cross-registry
+    confused-deputy read.  The grant is only honestly attributable to a single
+    owner when exactly ONE configured source claims the key.
+
+    This counts the DISTINCT sources (the bundled registry counts once; each
+    external registry counts once) whose entries carry ``entry["repo"] == repo``,
+    reading the SAME source union the prewarm gate reads via the shared
+    :func:`_repo_key_claims` core (``strict=False``: an absent sibling cache is not
+    counted; every source is consulted, none excluded).  A return of ``> 1`` means
+    the provenance is ambiguous and the caller must downgrade to anonymous+strict.
+    An unresolvable read (any raise) counts as ``2`` (treat-as-ambiguous): a
+    provenance we cannot establish must never buy a credential grant.
+    """
+    unresolvable, sources = _repo_key_claims(strict=False)
+    if unresolvable:
+        return 2  # provenance unresolvable → treat as ambiguous, never grant
+    count = 0
+    for source in sources:
+        if any(_same_git_target(claimed, repo) for claimed in source):
+            count += 1
+            if count > 1:
+                return count  # already ambiguous — no need to keep counting
+    return count

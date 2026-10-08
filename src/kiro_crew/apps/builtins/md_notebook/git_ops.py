@@ -17,6 +17,7 @@ persist it in ``.git/config`` and leak it into any error message that echoes
 the remote) and never passed as a command-line argument (which would expose it
 in the process table).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -31,6 +32,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Iterator, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.git_config_hooks import ConfigHookScanError, config_hook_disable_args
 from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 
 logger = logging.getLogger(__name__)
@@ -429,8 +431,21 @@ async def run_git(
         # git-remote-*) resolve from trusted system dirs, not an agent-writable
         # entry inherited from the gateway's PATH.
         env["PATH"] = TRUSTED_PATH
+    # A hook defined in config (`hook.<name>.command`, git 2.54+) is not reached by the
+    # `core.hooksPath` pin above, and its name is the vault's choice, so each one git can
+    # see is disabled by name. See `kiro_crew.git_config_hooks`.
+    try:
+        hook_off = await asyncio.to_thread(
+            config_hook_disable_args,
+            cwd if cwd is not None else os.getcwd(),
+            git=_git_bin(),
+            env=env,
+        )
+    except ConfigHookScanError as exc:
+        raise GitError(str(exc)) from exc
     proc = await asyncio.create_subprocess_exec(
         _git_bin(),
+        *hook_off,
         *args,
         cwd=cwd,
         env=env,
@@ -726,9 +741,7 @@ async def status(dir_: str, subfolder: Optional[str] = None) -> list[FileChange]
             i += 1
 
     # Untracked files are additions the diff above cannot see.
-    _, untracked, _ = await run_git(
-        ["ls-files", "--others", "--exclude-standard", "-z"], dir_
-    )
+    _, untracked, _ = await run_git(["ls-files", "--others", "--exclude-standard", "-z"], dir_)
     for rel in untracked.split("\0"):
         if rel:
             changes.append(FileChange(path=rel, kind="added"))
@@ -965,7 +978,9 @@ async def repo_supplied_driver(dir_: str) -> str:
                 # byte-exactly -- a U+FFFD from the display decode would miss
                 # an existing ``config.worktree`` and clear a scope git reads.
                 gd_code, gd_out, _ = await run_git(
-                    ["rev-parse", "--absolute-git-dir"], dir_, check=False,
+                    ["rev-parse", "--absolute-git-dir"],
+                    dir_,
+                    check=False,
                     errors="surrogateescape",
                 )
                 if await asyncio.to_thread(
@@ -1008,9 +1023,7 @@ async def repo_supplied_driver(dir_: str) -> str:
             # `remote.origin.url` still reads as the trusted URL — so the
             # trusted-remote check in sync() would not catch it. A vault has no
             # legitimate reason to set these, so refuse.
-            if k.startswith("url.") and (
-                k.endswith(".insteadof") or k.endswith(".pushinsteadof")
-            ):
+            if k.startswith("url.") and (k.endswith(".insteadof") or k.endswith(".pushinsteadof")):
                 return key.strip()
             # `core.worktree` redirects git's working tree. A blanket refusal
             # would break a legitimately-supported vault shape: git itself sets
@@ -1021,9 +1034,7 @@ async def repo_supplied_driver(dir_: str) -> str:
             # effective worktree rather than parsing the (relative-to-GIT_DIR)
             # value ourselves.
             if k == "core.worktree":
-                code2, top, _ = await run_git(
-                    ["rev-parse", "--show-toplevel"], dir_, check=False
-                )
+                code2, top, _ = await run_git(["rev-parse", "--show-toplevel"], dir_, check=False)
                 if code2 != 0:
                     return "core.worktree (unverifiable)"  # fail closed
                 try:
@@ -1258,7 +1269,9 @@ async def sync(
         # notes — reporting success here would tell the user their work is
         # backed up when it is only on this machine.
         logger.warning("md-notebook: push to origin/%s failed: %s", target, push_err.strip())
-        raise GitError(f"pulled and merged, but the push to {target} was rejected: {push_err.strip()}")
+        raise GitError(
+            f"pulled and merged, but the push to {target} was rejected: {push_err.strip()}"
+        )
     return {
         "pushed": True,
         "pulled": True,

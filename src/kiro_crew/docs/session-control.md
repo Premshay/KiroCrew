@@ -5,7 +5,7 @@ change its model, reload its agent process, and take another one under itself in
 the sidebar. The tools come from the
 `kirocrew-dashboard` MCP server, so an agent that does not mount that server
 never has them — exactly like any other MCP server. This page is the reference
-for all 29 of its tools, written for the agent that is about to use them.
+for all 30 of its tools, written for the agent that is about to use them.
 
 The server is defined in `src/kiro_crew/mcp_dashboard.py`. Two halves:
 
@@ -14,7 +14,7 @@ The server is defined in `src/kiro_crew/mcp_dashboard.py`. Two halves:
   `session_set_model`, `session_reload`, `session_close`, `session_revive`, `session_broadcast`,
   `session_status`, `session_adopt`, `session_release`. These reach another session.
 - **Sidebar shape** — `chat_folder_tree`, `chat_folder_create`,
-  `chat_folder_move`, `chat_folder_move_session`, `chat_folder_delete`,
+  `chat_folder_move`, `chat_folder_update`, `chat_folder_move_session`, `chat_folder_delete`,
   `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`,
   `chat_tag_column_list`, `chat_tag_column_create`, `chat_tag_column_move`,
   `chat_session_pin`. These organize what the person sees in the sidebar.
@@ -46,7 +46,7 @@ conductor: a session that can dispatch but cannot edit a file. Always pass
 |---|---|---|
 | `title` | no | Short sidebar name. Say what the session is FOR |
 | `agent` | no (but always pass it) | Agent to bind the session to |
-| `folder` | no | Sidebar folder id or `/`-separated path to file it into, atomically with creation. Missing path segments are created (`mkdir -p`) |
+| `folder` | no | Sidebar folder id or `/`-separated path to file it into, atomically with creation. Missing path segments are created (`mkdir -p`). The create is checked first, so a create that would be refused normally leaves no new empty folder behind (a race can still leave one) |
 | `model` | no | Model the session starts on, pinned as if the person picked it in the model dropdown (same guard; refused with `model_rejected` when the picker would refuse it). Omit for the agent's or global default |
 
 No argument is formally required. The new session **starts empty** — nothing runs
@@ -132,6 +132,11 @@ Three outcomes, and the reply tells you which one happened:
 A steer that cannot be injected **falls back to the queue** rather than being
 dropped, and the reply says that explicitly. `steer` is ignored on an idle
 target, because the message starts a turn either way.
+
+A queued message is checked again just before it runs. If the target gained a
+channel link or mirror in the meantime, the message is dropped instead of run,
+and your own transcript gets a notice saying so — unless your session was closed
+or replaced while it waited, when there is nowhere to write it.
 
 Use `steer=true` only when waiting would waste the work in flight — the target
 is heading the wrong way, or the thing it is grinding on is already done.
@@ -259,6 +264,12 @@ The two quality fields describe the durable sources independently:
 
 Neither field alone says the combined count is exact. A short list under an
 `incomplete` or `unreadable` value is not evidence that you created nothing.
+
+The roster holds at most **256** rows. Two counts say what was cut:
+`roster_omitted` is how many rows the 256-row cap dropped from the combined
+list, and `history_omitted` is how many the transcript scan itself left out.
+Both are `0` when nothing was cut. A call answers `caller_changed_mid_read` when
+your own session moved workspace during the read; call again.
 Read-only: it sends nothing and changes nothing.
 
 ### `session_read_message`
@@ -329,8 +340,9 @@ gains a channel link or is replaced in between is refused (`target_replaced`)
 rather than answered. An incognito session never has one. Read-only.
 
 Each goal carries the panel's state word (`in-progress`, `needs-you`, `done`,
-`dropped`), so work that finished without being verified reads `needs-you`
-rather than done.
+`dropped`). A completed goal reads `needs-you` only when its verification
+failed (`verified=false`); a completed goal never checked either way reads
+`done`.
 
 ### `session_adopt` and `session_release`
 
@@ -356,6 +368,7 @@ it had is kept in the record.
 | `tree_unavailable` | The session tree is not being recorded on this gateway, so there is nowhere to write the edge. Nothing moved, and the tool says so rather than reporting a success the sidebar will not show. |
 | `tree_not_ready` | The tree cannot be read whole right now — the gateway has not seeded it yet, or a unit's log could not be read. Retryable: a decision taken on a partial tree could admit the loop `would_cycle` exists to refuse, so it is refused instead of guessed. |
 | `tree_write_pending` | An earlier move of this same session is still being written. Retryable: read the tree first, because the earlier write may have landed. |
+| `tree_write_failed` | HTTP 500: the move could not be written to the crew log and the writer gave up, so the session tree is unchanged. Unlike `tree_write_pending`, nothing is still in flight. |
 
 `session_release` is the only way to undo an adoption. You may release a session
 you hold, and you may release YOURSELF — pass your own key — so a session whose
@@ -387,7 +400,8 @@ stop arriving after that window still escalates, so a genuine second decision
 keeps the capability.
 
 The reply distinguishes the two facts a stop can report: `nothing to stop` for a
-target that was never running, and `the earlier stop still stands` for one whose
+target that was not running — including one still marked running whose model
+session already holds no turn — and `the earlier stop still stands` for one whose
 cancel is still in flight.
 
 `session_close` is not a permanent delete — the conversation is archived and
@@ -445,7 +459,7 @@ To force the change, call `session_stop`, then retry once the target is idle.
 
 Also refused: `auto` and `Auto (Jev)` (`model_owner_only`), because with the Jev
 preview on a slot on `auto` hands each turn's model to Jev routing, which only the
-owner may arm; and a target bound to a remote crew (`remote_target_unsupported`).
+owner may arm; and a read-only relay archive (`relay_archive_read_only`).
 
 ### `session_reload`
 
@@ -467,8 +481,8 @@ Only an idle one: a turn running or starting, queued messages, or attached
 sub-agents refuse the call with `target_busy` ("session busy, not reloaded")
 and nothing is torn down. The tool never stops anything itself. You cannot
 reload yourself (`self_target`): the calling session is mid-turn, and a reload
-under a running turn would orphan it. A target bound to a remote crew is refused
-with `remote_target_unsupported`.
+under a running turn would orphan it. A read-only relay archive is refused
+with `relay_archive_read_only`.
 
 If the target gains a channel link or otherwise leaves your reach while its
 process is being reset, the call answers `target_changed_during_reload`: the
@@ -511,6 +525,19 @@ unaffected. A revive also spends the caller's create budget and per-caller slot
 cap (the revived slot is charged to the reviver for the cap while keeping its own
 creator) and the global slot cap.
 
+Refusals only a revive gives:
+
+| Code | Meaning |
+|---|---|
+| `member_thread_target` | The match is a crew member's thread, which is not addressable |
+| `folder_not_found` | The `folder` you named does not exist; nothing was revived |
+| `creator_slot_cap_reached` | HTTP 429: you already hold the per-caller live-session cap |
+| `resume_in_progress` | HTTP 409: the session is being resumed elsewhere. Try again |
+| `resume_conflict` | HTTP 409: the session is being deleted. Try again |
+| `resume_session_deleted` | HTTP 409: the session was deleted while it was being resumed |
+| `reopen_failed` | HTTP 503: the session could not be reopened. Try again |
+| `reopen_rollback_failed` | HTTP 503: the revive was refused but the session's closed mark could not be put back, so it may come back as open. Close it again from the History tab |
+
 ## Folders
 
 The sidebar tree the person organizes their sessions in.
@@ -518,8 +545,9 @@ The sidebar tree the person organizes their sessions in.
 | Tool | Arguments | What it does |
 |---|---|---|
 | `chat_folder_tree` | none | Every folder (id, human path, project dir, default agent) with the live sessions nested under it, plus an `(unfiled)` group. Listed in **sidebar order**, not alphabetically |
-| `chat_folder_create` | `name` (required), `parent` | Create a folder. `parent` is an id or a `/`-separated path; missing segments are created (`mkdir -p`). Omit or pass `root` for top level. Creating never moves anything |
+| `chat_folder_create` | `name` (required), `parent` | Create a folder. `parent` is an id or a `/`-separated path; missing segments are created (`mkdir -p`). Omit or pass `root` for top level. Creating never moves anything. An app agent or crew member may nest only under a folder it owns or the folder its own session is filed in. A same-name sibling it owns is reused; any other same-name sibling is refused `409 folder_name_exists` |
 | `chat_folder_move` | `folder` (required), `new_parent`, `before`, `after` | Reparent a folder and/or set its position among siblings. Moves everything inside it; cycle-guarded |
+| `chat_folder_update` | `folder` (required), `name`, `icon`, `color` | Rename a folder, set its emoji icon, or set its palette color. Cannot set `project_dir`, `default_agent` or `steering_dirs` |
 | `chat_folder_move_session` | `session` (required), `folder` | File another live session into a folder, or omit `folder` to unfile it to the top level |
 | `chat_folder_delete` | `folder` (required) | Delete an **empty** folder **this session created**. Refused for the person's folders, and while it holds a subfolder, a live session or an archived session |
 | `chat_folder_file_self` | `folder` | File **this** session — the caller — into a folder. Writes only its own placement |
@@ -534,6 +562,22 @@ it.
 A folder `name` cannot contain `/`: a folder named `A/B` renders identically to
 `B` inside `A` and becomes unaddressable by path. Names are capped at 100
 characters, checked after credential redaction.
+
+`chat_folder_update` renames a folder and sets its `icon` (one emoji) and
+`color` (a folder palette value); an empty string clears either back to the
+default. It refuses a name a sibling folder already has, since the two
+would be indistinguishable by path. It is metadata only. It cannot set
+`project_dir`, `default_agent` or `steering_dirs`, which it refuses as unknown
+fields: those settings reach
+every future session filed in the folder, changing its working directory, agent
+and memory boundary, or its standing instructions, so the person sets them in the
+folder settings. An app agent or crew member may update only a folder it created.
+Channel agents cannot call it, and neither can any agent in a session linked to a
+channel: a resumed `/sessions` pick, a channel mirror, a linked Slack thread, or a
+channel-born tab. A resumed conversation keeps the dashboard session's key, so
+the folder endpoint checks those links rather than the key, using the same
+predicate that gates creating peer sessions, and while one
+exists the person renames folders from the sidebar instead.
 
 `chat_folder_file_self` is the verb a conductor wants: file yourself in the
 goal's folder first, then create each worker with
@@ -587,8 +631,13 @@ whose protected identity is missing is refused `status_identity_unprotected` on
 add as well as strip, and adding a status tag that would leave the session with
 two mutually exclusive states is refused `status_tag_requires_set_state` (drive a
 workflow state through `chat_tag` `set_state`, which strips the peer). When the
-grants store is unavailable the refusal is `tag_grants_unavailable`. An ordinary
-label with no protected row is yours to apply; a freshly `chat_tag_create`d
+grants store is unavailable the refusal is `tag_grants_unavailable`. The same
+code refuses adding or removing an ordinary label with no grant row while grants
+are reduced after a boot quarantine (even once a reseed has been verified),
+because such a label may be a lost reservation. It also refuses removing a tag
+the session carries that is missing from a vocabulary the gateway could not
+fully read at boot. An ordinary
+label with no protected row is otherwise yours to apply; a freshly `chat_tag_create`d
 status tag stays rowless until the owner adopts it, so it may not be assignable
 until then.
 
@@ -652,7 +701,20 @@ gateway-issued key counts. Refusals you should expect, by code:
 | `caller_changed_mid_broadcast` | The calling session moved workspace while a broadcast was in flight, so its per-target report is withheld. The deliveries already happened — do not re-send |
 | `too_many_targets` | A broadcast reaches at most 50 sessions. Refused, never truncated — name a subset |
 | `target_required` | A broadcast was given a target list that names no session. Omit the list to reach everything you created |
-| `delivery_timeout` | One target exceeded its per-delivery bound, so the broadcast cancelled that call and continued. The row reflects the exact text's observed state: pending or queued means it may still run and must not be re-sent; absent from both means the hand-over was not reached and re-sending is safe; an unavailable original slot means the outcome is unknown and the row advises neither action. No case claims delivery or certain execution |
+| `delivery_timeout` | One target exceeded its per-delivery bound, so the broadcast cancelled that call and continued. Re-send only when the row says the steer await was never entered (the hand-over was not reached). Inside or after the steer await the outcome is unknown: do not re-send. Pending or queued text may still run: never re-send. An unavailable original slot means the outcome is unknown and the row advises neither action. No case claims delivery or certain execution |
+| `caller_unidentified` | The calling session could not be resolved from the connection, so nothing was done |
+| `caller_changed_mid_read` | session_status: the calling session moved workspace while its roster was read. Call again |
+| `linked_session_caller` / `mirrored_caller` | session_create from a channel-linked or channel-mirrored session. A Discord or Telegram owner DM is exempt; the refusal names which fact withheld the exemption. After a gateway restart, send one message in that DM first |
+| `memory_delegation_denied` | HTTP 403: session_create named a crew member's agent the caller may not bind (a cron, a fenced deputy, a peer member). Use a template agent, or ask the owner |
+| `model_owner_only` | HTTP 403: `auto` and **Auto (Jev)** can only be picked by the owner from the model picker |
+| `model_rejected` | The model id is missing, malformed, looks like a credential, or is one the target's backend would refuse |
+| `target_replaced` | HTTP 409: the target was replaced by another session under the same key while the call ran; nothing was changed. Try again |
+| `invalid_field_type` | An argument had the wrong type (for example a broadcast target list that is not a list of strings) |
+
+Two argument checks answer from the HTTP layer instead: `message_required` when
+`session_send` or `session_broadcast` gets an empty `message`, and
+`target_too_long` when a broadcast target name exceeds the length cap (pass a
+session key instead).
 
 `target` resolves three ways, all of them checked before any answer: the slot
 key (`chat-7`), the transcript name `list_sessions` prints
@@ -667,8 +729,9 @@ session-control tool refuses it: its identity would resolve to its parent slot,
 handing it the parent's authority. Drive sessions from a real session, not from
 inside a subagent.
 
-A **channel agent** (Slack, Telegram, and the rest) is blocked from every
-session tool by `CHANNEL_AGENT_BLOCKED_TOOLS` in `src/kiro_crew/channel.py`.
+An agent in a **Persistent Agent Channel** (the multi-agent channel in
+`src/kiro_crew/channel.py`) is blocked from every session tool by
+`CHANNEL_AGENT_BLOCKED_TOOLS`.
 Reading a dashboard transcript would pull a private conversation into a channel
 other humans can see, and sending would run channel text as a turn inside it.
 `chat_session_pin` is blocked there too, because it rearranges the person's
@@ -680,6 +743,15 @@ dispatch in the same way, because they rearrange the person's board.
 `session_broadcast` is blocked for that reason multiplied by the fleet, and
 `session_status` because its rows carry other sessions' titles — the names of the
 user's private work, in front of whoever is in the thread.
+
+A session linked to a messaging thread (Slack, Telegram, Discord and the rest)
+is refused when it calls `session_create`: `linked_session_caller`, or
+`mirrored_caller` when it mirrors to a channel. One exemption lets the owner run a conductor from a phone:
+a **Discord or Telegram 1:1 DM** with the channel's single configured owner may
+create sessions and drive the ones it created. A thread, group, or a
+DM whose mirror points anywhere else gets no exemption. Right after a gateway
+restart the DM's origin is not on record yet: send one message in the DM, then
+retry.
 
 ### Switches and ceilings
 

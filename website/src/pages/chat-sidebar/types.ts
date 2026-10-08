@@ -15,14 +15,8 @@ export interface Slot {
    * here, matching `Slot.key` -- and is null when the creator is not running or the
    * records formed a cycle. A row can therefore cite a creator it cannot nest under,
    * which is the orphan the conductor lane marks with a muted prefix.
-   *
-   * `hub_key` appears only on a PEER row (see `useInstanceSessions`): the hub stamps
-   * it when the creator is a peer slot this hub drives, and it names the LOCAL row
-   * that drives that creator. It is the one half of a citation that crosses origins
-   * on purpose -- resolved against local rows, so a worker a remote-executed lead
-   * opened on the peer nests under the lead's local row.
    */
-  parent?: { slot?: string; key?: string | null; hub_key?: string } | null
+  parent?: { slot?: string; key?: string | null } | null
   /** Present and true while the gateway's lineage projection is still seeding for the
    *  current store, which makes THIS frame's `parent` provisional rather than final.
    *  Absent on an ordinary frame, and absent when there is nothing to wait for (the
@@ -53,9 +47,9 @@ export interface Slot {
    *  peer row already carried. Preserving it across the bind is what makes the row
    *  the user clicked BECOME the session instead of a sibling appearing next to it.
    *
-   *  Absent on a peer row and on an older payload; `sessionRowIdentity` falls back
-   *  to `peer_id` + `key` for those. Never parse it to recover the local slot key —
-   *  read `key`. */
+   *  The server stamps it on peer rows too. Absent only on an older payload, where
+   *  `sessionRowIdentity` falls back to the bare `key`. Never parse it to recover
+   *  the local slot key — read `key`. */
   row_identity?: string
   peer_name?: string
   unread?: boolean
@@ -200,8 +194,8 @@ export interface RevealBlockingFilter {
   hides: (slot: Slot) => boolean
   clear: (slot: Slot) => void
 }
-/** One sidebar filter dimension, declared exactly once (in the component's
- *  `filterDimensions` memo) and consumed by the three sites that must agree on
+/** One sidebar filter dimension, declared exactly once (in the row model's
+ *  `buildSidebarRows`, `./rows`) and consumed by the three sites that must agree on
  *  which filters exist: `filteredSlots` (which rows render at all),
  *  `listNarrowed` (is anything filtering right now), and
  *  `revealBlockingFilters` (does THIS row fail an active filter). Every field

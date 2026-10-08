@@ -49,6 +49,8 @@ from kiro_crew.constants import (
     KIROCREW_SPAWNED_ENV,
     KIROCREW_SPAWNED_VALUE,
 )
+from kiro_crew.owner_only_files import ensure_directory as _ensure_directory
+from kiro_crew.owner_only_files import owner_only_opener_for as _owner_only_opener_for
 from kiro_crew.sandbox import (
     MD_NOTEBOOK_APP_NAME,
     RLIMIT_PROFILE_BUILD,
@@ -148,11 +150,8 @@ def _resolve_nvm_path(binary_name: str) -> str | None:
         return None
     nvm_dir = os.environ.get("NVM_DIR", os.path.expanduser("~/.nvm"))
     nvm_sh = os.path.join(nvm_dir, "nvm.sh")
-    # This resolver sources a POSIX shell script (nvm.sh). On Windows the branch
-    # normally never runs — nvm.sh is absent, so it exits at the guard below —
-    # and nothing in the log said whether it was reached or which arm it took.
-    # Each outcome now names itself so a Windows log shows the branch was skipped
-    # rather than leaving its absence to inference.
+    # Only POSIX reaches this point: Windows returned above. Each outcome below
+    # logs which arm it took, so a debug log shows whether nvm was found and used.
     if not os.path.isfile(nvm_sh):
         logger.debug("nvm resolver: no nvm.sh at %r; skipping nvm branch", nvm_sh)
         return None
@@ -499,7 +498,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
 
     # Prepare log directory (needed early for adopt path)
     log_dir = root / "data" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_directory(log_dir)  # 0700 inside the data home
     log_path = log_dir / "backend.log"
 
     # Check if the port is already in use by a healthy instance
@@ -1153,6 +1152,13 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         if not carveout_shadowed_by_foreign_mask(_cache_target):
             _visible = _visible + (_cache_target,)
     sandboxed_cmd, cleanup_path = wrap_argv(cmd, mode="standard", extra_visible_dirs=_visible)
+    # On Linux a non-null cleanup path is the namespace launcher script this process
+    # generated, whose main() forks once: the Popen root waits for the server child.
+    # IS_LINUX excludes the macOS seatbelt profile. A no-op wrap returns None, so an
+    # app's argv can never set this flag. Compute it before cgroup_scope_argv, which
+    # execs without adding a fork. A future Linux tier writing a cleanup artifact
+    # without forking must revisit this predicate.
+    _forking_sandbox_launcher = platform_compat.IS_LINUX and cleanup_path is not None
     if _cache_visible and list(sandboxed_cmd) == list(cmd):
         # The wrap was a no-op, so this host has no OS confinement at all: no sandbox backend,
         # or agent.sandbox='off' with the sandbox_allow_no_isolation opt-in. Said once,
@@ -1194,7 +1200,13 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         # why provisioning failed. ``errors="replace"`` keeps the write total
         # for any codepoint; the child's own output is appended as raw bytes
         # through the inherited fd and is not affected by this wrapper.
-        log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
+        log_fh = open(
+            log_path,
+            "w",
+            encoding="utf-8",
+            errors="replace",
+            opener=_owner_only_opener_for(log_path),  # 0600 inside the data home
+        )
         if provision_error:
             # Put the real cause at the top of the backend's own (user-visible)
             # log: the import error missing deps produce reads as an app bug,
@@ -1287,6 +1299,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         gateway_started=True,
         admitted_builtin=_admitted_builtin,
         spawn_instance=spawn_instance,
+        forking_sandbox_launcher=_forking_sandbox_launcher,
     )
 
     retired = False
@@ -1630,6 +1643,7 @@ if _typing.TYPE_CHECKING:
         health_reconcile_lock,
         list_app_processes,
         re,
+        running_spawned_backend_pids,
         spawned_backend_names,
         threading,
     )

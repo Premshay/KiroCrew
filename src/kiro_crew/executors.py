@@ -74,6 +74,7 @@ import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any, Awaitable, Callable, TypeVar
 
 from kiro_crew.subprocess_pool import SubprocessPoolExecutor
@@ -96,8 +97,11 @@ __all__ = [
     "path_probe_executor",
     "path_transfer_executor",
     "crew_log_executor",
+    "memory_preparation_executor",
     "governance_executor",
     "cron_gate_executor",
+    "tool_gate_executor",
+    "run_in_tool_gate_pool",
     "CronGateTimeout",
     "CronGateWorkTimeout",
     "run_in_cron_pool",
@@ -243,6 +247,25 @@ _CRON_GATE_HEADROOM = 0.75
 # execution's slice a floor instead of a race.
 _CRON_GATE_QUEUE_SHARE = 0.25
 
+# The tool-call security gate (``HookManager.on_tool_call``) awaited from a
+# coroutine.  Its path tier waits on the ``mc-pathres`` resolver child on the
+# calling thread for up to the resolve budget plus grace, the thread cannot be
+# interrupted once it starts, and the rate is set by agents (one call per tool
+# request across every live session).  On the loop's default executor a few
+# stalled resolutions would hold the threads the loop also uses for getaddrinfo
+# and every other ``to_thread`` caller, so the gate gets its own pool and its
+# calls queue only behind other gate calls.
+#
+# Four workers.  The resolver has :data:`_PATH_RESOLVE_WORKERS_DEFAULT` children,
+# and a gate thread beyond that count only waits inside the resolver, so a much
+# larger pool buys nothing during a stall; four leaves two workers serving
+# non-path verdicts and the degraded-mount fast refusals while both children are
+# wedged.  A healthy gate call costs milliseconds, so four is a ceiling on how
+# many calls can be stalled at once, not on throughput.  It also stays below the
+# default executor's smallest size (``min(32, cpu_count + 4)`` is at least 5), so
+# a full gate pool is never larger than the pool it is kept off.
+_MAX_TOOL_GATE_WORKERS = 4
+
 # Pillow work for the gateway's tool-result image budget is CPU-bound (a
 # decode plus up to seven LANCZOS resize+encode passes per oversized raster,
 # seconds each) and paced by whatever a brokered MCP server returns.  Two
@@ -366,6 +389,11 @@ _MAX_PATH_TRANSFER_WORKERS = 8
 # threads under, and the lock would serialize those writes without restoring
 # their order. Appends are small and fsync-bound, so one worker is also enough.
 _MAX_CREW_LOG_WORKERS = 1
+# ONE worker, and the count is the contract: ``wheel_apply.run_wheel_apply``
+# admits one managed-venv apply per process (a second answers busy before it is
+# submitted), and that apply holds the layout's exclusive update lock for its
+# whole run. Busy from ANOTHER process is the lock's answer, not this pool's.
+_MAX_UPDATE_WORKERS = 1
 
 _lock = threading.Lock()
 _pool: ThreadPoolExecutor | None = None
@@ -380,10 +408,12 @@ _image_pool: ThreadPoolExecutor | None = None
 _stt_pool: ThreadPoolExecutor | None = None
 _governance_pool: ThreadPoolExecutor | None = None
 _cron_gate_pool: ThreadPoolExecutor | None = None
+_tool_gate_pool: ThreadPoolExecutor | None = None
 _path_resolve_pool: SubprocessPoolExecutor | None = None
 _path_probe_pool: ThreadPoolExecutor | None = None
 _path_transfer_pool: ThreadPoolExecutor | None = None
 _crew_log_pool: ThreadPoolExecutor | None = None
+_update_pool: ThreadPoolExecutor | None = None
 
 
 def configure_default_executor() -> None:
@@ -680,6 +710,47 @@ def crew_log_executor() -> ThreadPoolExecutor:
     return _crew_log_pool
 
 
+def memory_preparation_executor() -> ThreadPoolExecutor:
+    """Return a NEW one-worker pool for one gateway's memory preparation pass.
+
+    Threads are named ``mc-memprep``. The caller owns the pool and shuts it
+    down once its one job has been submitted and awaited.
+
+    Memory preparation is the barrier that keeps chat admission closed after a
+    restart, and its work is short (about 1.5s on a large store). On the loop's
+    default executor that job waits behind every other boot task queued there
+    -- MCP probes, remote reconnects, app loading -- so admission stayed closed
+    for minutes of queueing. Its own thread starts it at once.
+
+    A fresh pool per pass rather than a process-wide singleton: a stopped
+    pass's worker cannot be cancelled and may still hold its thread, and a
+    shared single slot would queue the next gateway's pass behind it, which is
+    the same wait in a new place.
+    """
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="mc-memprep")
+
+
+def update_executor() -> ThreadPoolExecutor:
+    """Return the process-wide pool the managed-venv shadow apply runs on.
+
+    Threads are named ``mc-update``, and there is exactly ONE
+    (:data:`_MAX_UPDATE_WORKERS`). An apply downloads a wheel and builds a full
+    venv, which takes minutes, and a started ``run_in_executor`` future cannot
+    be cancelled, so on the loop's default executor it would hold a worker the
+    loop's own DNS resolution needs for that whole time.
+    """
+    global _update_pool
+    if _update_pool is None:
+        with _lock:
+            if _update_pool is None:
+                _update_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_UPDATE_WORKERS,
+                    thread_name_prefix="mc-update",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _update_pool
+
+
 def embed_executor() -> ThreadPoolExecutor:
     """Return the process-wide memory/embedding pool, creating it on first use.
 
@@ -742,6 +813,49 @@ def cron_gate_executor() -> ThreadPoolExecutor:
                 )
                 atexit.register(shutdown_maintenance_executor)
     return _cron_gate_pool
+
+
+def tool_gate_executor() -> ThreadPoolExecutor:
+    """Return the process-wide tool-call gate pool, creating it on first use.
+
+    Threads are named ``mc-toolgate``.  Separate from the loop's default executor
+    because a gate call can hold its worker for the full path-resolve budget on a
+    stalled mount, and the default executor also serves the loop's DNS lookups.
+    See :data:`_MAX_TOOL_GATE_WORKERS`.
+    """
+    global _tool_gate_pool
+    if _tool_gate_pool is None:
+        with _lock:
+            if _tool_gate_pool is None:
+                _tool_gate_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_TOOL_GATE_WORKERS,
+                    thread_name_prefix="mc-toolgate",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _tool_gate_pool
+
+
+async def run_in_tool_gate_pool(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+    """Await ``func(*args, **kwargs)`` on :func:`tool_gate_executor`.
+
+    The form of the tool gate a coroutine uses:
+    ``await run_in_tool_gate_pool(hooks.on_tool_call, title, **kwargs)``. The
+    gate's path tier resolves agent-supplied paths in the ``mc-pathres`` child
+    and waits for the answer on the CALLING thread, for up to the resolve budget
+    plus its grace. Called inline from a coroutine, that wait parks the whole
+    loop -- every other session's stream, the websockets and the stall watchdog.
+    On this pool the same synchronous call runs on a worker and the loop keeps
+    serving; the verdict, fail-closed refusal on a stall included, is unchanged.
+    The resolve deadline is armed on the thread that waits, so the hop is not
+    charged against the budget. Synchronous callers keep calling the gate inline.
+
+    Copies the caller's context onto the worker the way ``asyncio.to_thread``
+    does, so context variables the gate reads (``uncounted_gate`` among them)
+    see the caller's values.
+    """
+    loop = asyncio.get_running_loop()
+    call = functools.partial(copy_context().run, func, *args, **kwargs)
+    return await loop.run_in_executor(tool_gate_executor(), call)
 
 
 class CronQueueTimeout(asyncio.TimeoutError):
@@ -1098,9 +1212,10 @@ def shutdown_maintenance_executor() -> None:
     loop and shut down by asyncio when the loop closes.
     """
     global _pool, _subprocess_pool, _cron_pool, _discovery_pool, _embed_pool, _recall_pool
-    global _governance_pool, _image_pool, _cron_gate_pool, _stt_pool, _path_resolve_pool
+    global _governance_pool, _image_pool, _cron_gate_pool, _tool_gate_pool, _stt_pool
+    global _path_resolve_pool
     global _path_probe_pool, _path_transfer_pool
-    global _crew_log_pool, _kiro_spawn_pool, _mcp_probe_pool
+    global _crew_log_pool, _kiro_spawn_pool, _mcp_probe_pool, _update_pool
     with _lock:
         pool, _pool = _pool, None
         subprocess_pool, _subprocess_pool = _subprocess_pool, None
@@ -1113,11 +1228,13 @@ def shutdown_maintenance_executor() -> None:
         governance_pool, _governance_pool = _governance_pool, None
         image_pool, _image_pool = _image_pool, None
         cron_gate_pool, _cron_gate_pool = _cron_gate_pool, None
+        tool_gate_pool, _tool_gate_pool = _tool_gate_pool, None
         stt_pool, _stt_pool = _stt_pool, None
         path_resolve_pool, _path_resolve_pool = _path_resolve_pool, None
         path_probe_pool, _path_probe_pool = _path_probe_pool, None
         path_transfer_pool, _path_transfer_pool = _path_transfer_pool, None
         crew_log_pool, _crew_log_pool = _crew_log_pool, None
+        update_pool, _update_pool = _update_pool, None
     if pool is not None:
         pool.shutdown(wait=False, cancel_futures=True)
     if subprocess_pool is not None:
@@ -1140,6 +1257,8 @@ def shutdown_maintenance_executor() -> None:
         image_pool.shutdown(wait=False, cancel_futures=True)
     if cron_gate_pool is not None:
         cron_gate_pool.shutdown(wait=False, cancel_futures=True)
+    if tool_gate_pool is not None:
+        tool_gate_pool.shutdown(wait=False, cancel_futures=True)
     if stt_pool is not None:
         stt_pool.shutdown(wait=False, cancel_futures=True)
     if path_resolve_pool is not None:
@@ -1150,3 +1269,5 @@ def shutdown_maintenance_executor() -> None:
         path_transfer_pool.shutdown(wait=False, cancel_futures=True)
     if crew_log_pool is not None:
         crew_log_pool.shutdown(wait=False, cancel_futures=True)
+    if update_pool is not None:
+        update_pool.shutdown(wait=False, cancel_futures=True)

@@ -50,6 +50,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -91,6 +92,15 @@ _MAX_COMMAND_LEN = 4096
 #: cleared rather than grown once it reaches this.
 _CACHE_MAX = 64
 
+#: The ``@server/tool`` form an MCP tool is matched by on every backend Crew fires
+#: spec hooks for: ``hooks.pre_tool_match_names`` builds it from the trusted server
+#: name, the goose/opencode tables state it, and the KAS projection reads an ``@``
+#: matcher as MCP. The object form's character set has neither ``@`` nor ``/``, so
+#: on its own it drops the documented spelling of a guard Crew can serve. The server
+#: is one literal name, never a glob, which would widen the guard across servers; the
+#: tool keeps the object form's own set, ``*`` included (``@server/*``).
+_MCP_MATCHER_RE = re.compile(r"@[A-Za-z0-9_.\-]+/[A-Za-z0-9_.*\-]+")
+
 #: Per spec content: the hooks that run, and how many ``confirm: true`` documents
 #: were skipped (the session-start notice names the count).
 _cache: dict[tuple[str, str], tuple[tuple[ScriptHook, ...], int]] = {}
@@ -105,11 +115,22 @@ def _diagnostic(value: object) -> str:
 
 
 def _matcher_ok(matcher: object) -> bool:
-    """The object form's matcher rules: a string, length-capped, safe characters."""
-    # circular import: agent imports hooks, which this module imports at load time.
-    from kiro_crew.agent import _hook_matcher_ok
+    """The object form's matcher rules, plus an MCP tool's ``@server/tool`` form.
 
-    return _hook_matcher_ok(matcher)
+    Both are length-capped. The extra form is accepted here only: kiro-cli runs its
+    spec's ``hooks`` itself and never reaches this conversion, so the materialized
+    spec's rule stays as it is.
+    """
+    # circular import: agent imports hooks, which this module imports at load time.
+    from kiro_crew.agent import _MAX_MATCHER_LEN, _hook_matcher_ok
+
+    if _hook_matcher_ok(matcher):
+        return True
+    return (
+        isinstance(matcher, str)
+        and len(matcher) <= _MAX_MATCHER_LEN
+        and _MCP_MATCHER_RE.fullmatch(matcher) is not None
+    )
 
 
 def _matcher_names_a_kas_tool(matcher: str) -> bool:
@@ -121,7 +142,12 @@ def _matcher_names_a_kas_tool(matcher: str) -> bool:
     from kiro_crew.hooks import _tool_matches
 
     vocabulary = KAS_TOOL_MATCH_VOCABULARY | HARNESS_TOOL_MATCH_VOCABULARY
-    return matcher == "*" or any(_tool_matches(matcher, name) for name in vocabulary)
+    return (
+        matcher == "*"
+        # An MCP tool: the tables spell no MCP names, but the gate builds this form.
+        or _MCP_MATCHER_RE.fullmatch(matcher) is not None
+        or any(_tool_matches(matcher, name) for name in vocabulary)
+    )
 
 
 def spec_hook_tool_names(tool_id: str) -> tuple[str, ...] | None:
@@ -335,9 +361,12 @@ def _agent_spec(agent_id: str, project_dir: str | None = None) -> dict[str, Any]
 
     *project_dir* is the session's checkout on a backend that resolves its spec
     project-nearest first (goose, opencode; see ``overlay_project_scope``). There a
-    project spec of that name is the one the session runs, so its hooks are the
-    ones read, and a project spec that cannot be read raises. KAS reads the user
-    level alone, so it passes none.
+    project spec of that name is the one the session runs, but its hooks are
+    commands, so they are read only when the checkout is trusted to choose them
+    (``session_mcp.trusted_project_agent_spec``, the verdict that also gates its
+    ``mcpServers``). An untrusted one yields the user-level spec of that name, and
+    a project spec that cannot be read raises. KAS reads the user level alone, so
+    it passes none.
 
     A KAS mode switch can move a session to one of KAS's own built-in modes
     (``vibe``), which has no Crew spec: it carries no spec hooks, and the Hooks
@@ -348,11 +377,11 @@ def _agent_spec(agent_id: str, project_dir: str | None = None) -> dict[str, Any]
     # circular import: the ACP layer imports the config loader, which sits below
     # this module; resolved at call time like the other driver seams here.
     from kiro_crew.acp.kas_agents import agent_spec_absent, load_agent_spec
-    from kiro_crew.acp.session_mcp import project_agent_spec
+    from kiro_crew.acp.session_mcp import trusted_project_agent_spec
     from kiro_crew.config.paths import kiro_agents_dir
 
     if project_dir:
-        declared, spec = project_agent_spec(agent_id, project_dir)
+        declared, spec = trusted_project_agent_spec(agent_id, project_dir)
         if declared:
             if spec is None:
                 raise ValueError(f"the project spec for agent {agent_id!r} could not be read")

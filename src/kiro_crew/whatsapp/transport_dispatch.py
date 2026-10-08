@@ -26,6 +26,9 @@ from kiro_crew.messaging.approval import (
 from kiro_crew.messaging.commands import (
     compact_refusal_plain_text,
     compact_unsupported_backend,
+    context_recycle_warning,
+    recycle_backend,
+    recycle_warning_should_send,
 )
 from kiro_crew.messaging.conversation import (
     ConversationState,
@@ -369,7 +372,9 @@ class WhatsAppDispatcher:
             await provider.compact()
             # Failure and timeout come back as the result's ``type``, not as an
             # exception, so the receipt is read off it rather than assumed.
-            cr = await provider.wait_for_compaction()
+            cr = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
             if cr["type"] == "completed":
                 await self._say(scope, COMPACTED_TEXT)
             elif cr["type"] == "failed":
@@ -652,6 +657,14 @@ class WhatsAppDispatcher:
         pct = self.sessions.check_context_usage(session_key, provider)
         may_speak = not unprompted and not delivery_is_muted(self.sessions, session_key, "whatsapp")
         soft, hard = self._thresholds()
+        if recycle_backend(provider):
+            # Crew restarts this backend's session at the threshold; warn once
+            # before it, offering a fresh start instead of a compaction.
+            if recycle_warning_should_send(
+                self.sessions, self._conv, scope, session_key, pct, may_speak=may_speak
+            ):
+                await self._say(scope, context_recycle_warning())
+            return
         if pct >= soft:
             # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
@@ -667,7 +680,10 @@ class WhatsAppDispatcher:
             self._conv.clear_awaiting(scope)
             try:
                 await provider.compact()
-                kind = (await provider.wait_for_compaction())["type"]
+                result = await provider.wait_for_compaction(
+                    timeout=self.sessions.compact_wait_budget_secs()
+                )
+                kind = result["type"]
             except Exception:  # noqa: BLE001: the reply already landed
                 logger.debug("whatsapp: hard-threshold compaction failed", exc_info=True)
                 return

@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import kiro_crew.cron_script as cron_script
 from kiro_crew import platform_compat as pc
 from kiro_crew.cron_script import (
     _MAX_BAD_OUTPUT_HEAD,
     _MAX_SCRIPT_STDERR_TAIL,
     _REDACT_STRADDLE_MARGIN,
     Done,
+    McpToolError,
     Report,
     ScriptContext,
     Skip,
@@ -424,6 +428,9 @@ class TestCommandCronShellResolution:
         assert "/bin/sh" in output and "/usr/bin/sh" in output
         assert "+B" in output
         assert "script cron" in output
+        # The failed probe is cached for the gateway's lifetime, so fixing the
+        # shell alone is not enough: the refusal must name the restart.
+        assert "restart the gateway" in output
 
     def test_windows_refusal_keeps_its_by_design_reason(self, monkeypatch):
         """The Windows wording is unchanged: there the refusal IS the platform."""
@@ -1452,6 +1459,142 @@ class TestScriptContextCallTool:
                 ctx.call_tool("nonexistent", "tool", {})
 
 
+class TestScriptContextKeepsServers:
+    """One run's calls to a server share its process, and close() stops it."""
+
+    @pytest.fixture
+    def started(self, monkeypatch):
+        """Every fake server started, in order. ``fail_next`` is the error its next call raises."""
+        started = []
+
+        class FakeClient:
+            def __init__(self, server, session_key=""):
+                self.server, self.calls, self.closed = server, [], 0
+                self.running, self.fail_next = True, None
+                started.append(self)
+
+            def call_tool(self, name, arguments):
+                self.calls.append(name)
+                if self.fail_next is not None:
+                    failure, self.fail_next = self.fail_next, None
+                    raise failure
+                return f"{self.server}:{name}"
+
+            def is_running(self):
+                return self.running
+
+            def close(self):
+                self.closed += 1
+                self.running = False
+
+        monkeypatch.setattr("kiro_crew.cron_script.McpToolClient", FakeClient)
+        return started
+
+    @staticmethod
+    def _ctx():
+        return ScriptContext(job=SimpleNamespace(id="j1", message=""))
+
+    def test_calls_to_one_server_share_its_process(self, started):
+        ctx = self._ctx()
+        results = [ctx.call_tool("slack", tool, {}) for tool in "abc"]
+        assert results == ["slack:a", "slack:b", "slack:c"]
+        (server,) = started
+        assert (server.calls, server.closed) == (["a", "b", "c"], 0)
+        ctx.close()
+        assert server.closed == 1
+
+    def test_each_server_name_gets_its_own_process(self, started):
+        ctx = self._ctx()
+        for server, tool in (("slack", "a"), ("builder", "b"), ("slack", "c")):
+            ctx.call_tool(server, tool, {})
+        assert [(s.server, s.calls) for s in started] == [("slack", ["a", "c"]), ("builder", ["b"])]
+        ctx.close()
+        assert [s.closed for s in started] == [1, 1]
+
+    def test_a_call_without_an_answer_stops_its_server_and_the_next_call_starts_another(
+        self, started
+    ):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "a", {})
+        started[0].fail_next = RuntimeError("MCP server 'slack' disconnected")
+        with pytest.raises(RuntimeError, match="disconnected"):
+            ctx.call_tool("slack", "b", {})
+        assert started[0].closed == 1
+        assert ctx.call_tool("slack", "c", {}) == "slack:c"
+        assert [s.calls for s in started] == [["a", "b"], ["c"]]
+
+    def test_a_tool_error_keeps_its_server_for_the_next_call(self, started):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "a", {})
+        started[0].fail_next = McpToolError("MCP tool error: boom")
+        with pytest.raises(McpToolError, match="boom"):
+            ctx.call_tool("slack", "b", {})
+        assert started[0].closed == 0
+        assert ctx.call_tool("slack", "c", {}) == "slack:c"
+        (server,) = started
+        assert server.calls == ["a", "b", "c"]
+        ctx.close()
+        assert server.closed == 1
+
+    def test_a_kept_server_that_exited_is_replaced(self, started):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "a", {})
+        started[0].running = False
+        ctx.call_tool("slack", "b", {})
+        assert started[0].closed == 1, "an exited server's files are still cleaned up"
+        assert [s.calls for s in started] == [["a"], ["b"]]
+
+    def test_a_call_made_while_another_runs_starts_its_own_server(self, started):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "warm", {})
+        first = started[0]
+        answer = first.call_tool
+        entered, release = threading.Event(), threading.Event()
+
+        def held(name, arguments):
+            entered.set()
+            assert release.wait(5)
+            return answer(name, arguments)
+
+        first.call_tool = held
+        worker = threading.Thread(target=ctx.call_tool, args=("slack", "slow", {}))
+        worker.start()
+        try:
+            assert entered.wait(5)
+            assert ctx.call_tool("slack", "fast", {}) == "slack:fast"
+        finally:
+            release.set()
+            worker.join(5)
+        second = started[1]
+        assert second.calls == ["fast"]
+        assert first.closed == 1, "the call finishing last finds a kept server and stops its own"
+        ctx.close()
+        assert second.closed == 1
+
+    def test_nothing_is_kept_after_close(self, started):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "a", {})
+        ctx.close()
+        ctx.call_tool("slack", "b", {})
+        assert [s.closed for s in started] == [1, 1]
+        ctx.close()
+        assert [s.closed for s in started] == [1, 1]
+
+    def test_close_stops_every_kept_server_even_when_one_fails_to_stop(self, started):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "a", {})
+        ctx.call_tool("builder", "b", {})
+        stuck = started[0]
+
+        def refuse():
+            stuck.closed += 1
+            raise OSError("cannot stop")
+
+        stuck.close = refuse
+        ctx.close()
+        assert [s.closed for s in started] == [1, 1]
+
+
 class TestRunCommandSandboxedEdgeCases:
     """Additional edge case tests for run_command_sandboxed."""
 
@@ -1540,6 +1683,35 @@ def run(ctx):
             result = run_script_sandboxed(script_path + ":run", "test-job", "")
         assert result["status"] == "ok"
 
+    @pytest.mark.parametrize(
+        ("ending", "status"),
+        [("return", "ok"), ("raise Skip()", "skip"), ("raise ValueError('bad')", "error")],
+    )
+    def test_the_launcher_closes_the_context_however_the_script_ends(
+        self, tmp_path, monkeypatch, ending, status
+    ):
+        marker = tmp_path / "closed.txt"
+        script_path = self._write_script(
+            tmp_path,
+            f"""
+from pathlib import Path
+from kiro_crew.cron_script import Skip
+def run(ctx):
+    ctx.close = lambda: Path(ctx.message).write_text(str(Path.cwd()))
+    {ending}
+""",
+        )
+        original_popen_limited = cron_script.popen_limited
+        monkeypatch.setattr(
+            cron_script,
+            "popen_limited",
+            partial(original_popen_limited, cwd=tmp_path),
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job", str(marker))
+        assert result["status"] == status
+        assert marker.read_text() == str(tmp_path)
+
 
 class TestMcpToolClientProtocol:
     """Tests for McpToolClient JSON-RPC protocol internals."""
@@ -1582,8 +1754,8 @@ class TestMcpToolClientProtocol:
         client._proc = MagicMock()
         client._proc.stdout = MagicMock()
         client._proc.stdout.readline.side_effect = ["\n", "  \n", '{"id":1,"result":"ok"}\n']
-        msg = client._recv()
-        assert msg == {"id": 1, "result": "ok"}
+        # Each skipped line is one read, so _rpc's line cap counts it.
+        assert [client._recv() for _ in range(3)] == [{}, {}, {"id": 1, "result": "ok"}]
 
     def test_rpc_sends_and_receives(self):
         from kiro_crew.cron_script import McpToolClient
@@ -1608,8 +1780,9 @@ class TestMcpToolClientProtocol:
         client._proc.stdout = MagicMock()
         client._req_id = 0
         client._proc.stdout.readline.return_value = ""
-        with pytest.raises(RuntimeError, match="disconnected"):
+        with pytest.raises(RuntimeError, match="disconnected") as raised:
             client._rpc("tools/list")
+        assert not isinstance(raised.value, McpToolError)
 
     def test_call_tool_success(self):
         from kiro_crew.cron_script import McpToolClient
@@ -1646,7 +1819,7 @@ class TestMcpToolClientProtocol:
             )
             + "\n"
         )
-        with pytest.raises(RuntimeError, match="Invalid request"):
+        with pytest.raises(McpToolError, match="Invalid request"):
             client.call_tool("bad_tool", {})
 
     def test_call_tool_is_error_flag(self):
@@ -1670,7 +1843,7 @@ class TestMcpToolClientProtocol:
             )
             + "\n"
         )
-        with pytest.raises(RuntimeError, match="tool failed"):
+        with pytest.raises(McpToolError, match="tool failed"):
             client.call_tool("failing_tool", {})
 
     def test_call_tool_is_error_no_content(self):
@@ -1685,7 +1858,7 @@ class TestMcpToolClientProtocol:
             json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": []}})
             + "\n"
         )
-        with pytest.raises(RuntimeError, match="unknown error"):
+        with pytest.raises(McpToolError, match="unknown error"):
             client.call_tool("failing_tool", {})
 
     def test_close_with_sandbox_cleanup(self, tmp_path):
@@ -1778,6 +1951,8 @@ class TestScriptContextCallToolSuccess:
         ) as mock_sel:
             result = ctx.call_tool("server", "tool", {"key": "val"})
         assert result == "result text"
+        mock_client.close.assert_not_called()
+        ctx.close()
         mock_client.close.assert_called_once()
         mock_sel().log_tool_invocation.assert_called()
 

@@ -26,7 +26,7 @@ Files:
 | Module | Owns |
 |---|---|
 | `model.py` | `TaskRecord`, the state vocabulary (`STATES`), the one validated `TRANSITIONS` table, `check_transition`, side-effect classes, lease/backoff constants. |
-| `store.py` | `TaskStore`: open/journal selection, write-before-ack `accept`, atomic `claim`, generation-fenced writes, `cancel` (from anywhere non-terminal, or conditional on `only_from` / `generation`), `defer`, `task_events`, the window reads. `TaskStoreUnavailable`. Network-filesystem detection. |
+| `store.py` | `TaskStore`: open/journal selection, write-before-ack `accept`, atomic `claim`, generation-fenced writes, `cancel` (from anywhere non-terminal, or conditional on `only_from` / `generation`), `defer`, `expedite` (a deferral ended early, with no event) and `deferred_longer_than`, the owed-report reads (`finish(report_owed=)`, `mark_reported`, `owed_reports`), `task_events`, the window reads. `TaskStoreUnavailable`. Network-filesystem detection. |
 | `migrate.py` | Schema versioning (`SCHEMA_VERSION`, `apply_schema`) and the idempotent legacy import. |
 | `reconcile.py` | `reconcile_on_boot`: settle every row a dead incarnation still owned. |
 | `__init__.py` | `open_default_store(home)`: open, import, reconcile, in that order. |
@@ -64,6 +64,10 @@ CREATE TABLE tasks (
   wait_json TEXT,                 -- the WaitRecord while the row is in a WAITING state
   lane TEXT NOT NULL DEFAULT ''   -- fairness lane (root session key or 'system'); nested rows inherit the root's
 );
+CREATE INDEX tasks_dispatch ON tasks(state, next_run_at, root_id);
+CREATE INDEX tasks_kind_state ON tasks(kind, state, created_at);
+CREATE INDEX tasks_session ON tasks(session_key, state);
+CREATE UNIQUE INDEX tasks_idempotency ON tasks(idempotency_key);  -- NULLs never collide
 CREATE INDEX tasks_parent ON tasks(parent_id, state);  -- wake-by-child lookup
 CREATE INDEX tasks_lane ON tasks(lane, state, next_run_at, created_at);  -- per-lane dispatch heads
 CREATE TABLE task_events (task_id, seq, ts, kind, data_json, PRIMARY KEY(task_id, seq));
@@ -388,12 +392,20 @@ the guard's raise.
   `adapters.runner`) stays SYNCHRONOUS, because an
   `await` there can be interrupted before the write is submitted and a dropped
   terminal write leaves the row active for the next boot's reconciler;
-- `admission.taskq_cancel_queued`, reached from `_unqueue` on the Stop-all path,
-  has to cancel the row before a drain can claim it AND drop it from the window
-  before a stagger timer can start it — an await between those two is a race in
-  either order, so closing it is a restructure, not an offload. (Its OWN
-  read-then-cancel window is closed inside the store instead: § A cancel whose
-  PRECONDITION came from an earlier read.)
+- `admission.taskq_cancel_queued`, reached from a single `cancel`
+  (`cancel_impl`), has to cancel the row before a drain can claim it AND drop it from
+  the window before a stagger timer can start it — an await between those two is
+  a race in either order, so closing it is a restructure, not an offload. (Its
+  OWN read-then-cancel window is closed inside the store instead: § A cancel
+  whose PRECONDITION came from an earlier read.) Stop all is that restructure,
+  and no longer in this class: `taskq_post_cancel_queued` QUEUES one
+  writer-thread job for every row (`taskq_cancel_queued_each`) and only then
+  are the window entries dropped, both before the first await, so a refill or
+  a claim queued afterwards lands behind the cancels; a refill fetch queued
+  before it is fenced by the parent's `_stopping_parents` mark, which keeps
+  `_refill_apply` from windowing that parent's rows. An inline pump is not
+  ordered behind that thread, so there the job runs inline, as
+  `_post_store_write` does.
 
 **The DRAINED spawn's defer is offloaded, boolean and all.** Its write is on the
 pressure path, so a locked database once held chat and the heartbeat for the
@@ -449,6 +461,7 @@ on the loop) and the window refill (`taskq_refill_window_async`: `pending_lanes`
 / `fetch_dispatchable_fair` / `next_eligible_at` through `store.run`, the
 eviction and the append on the loop) BEFORE the sync pick-and-spawn half
 (`_drain_queue_sync_impl`, whose *refill* callable is then a no-op).
+Both refill variants retire any fetched row carrying `_stage_boundary_owner` (written by the retired chat Autopilot) before it can join the window: `_retire_legacy_stage_rows` cancels it on the writer thread and `_report_retired_stage_rows` announces it stopped-before-start with a non-user `_stop_origin`; a store outage mid-pass still reports every cancel already committed.
 
 **The pick's LANE question is resolved off the loop too.** A window entry that
 carries no `_lane` resolves its parent chain, and a parent with no live run is a
@@ -479,7 +492,7 @@ so a concurrent admission during the await sees the cap spent;
 `claim_and_start` awaits `store.run(taskq_claim)` and re-enters with
 `_claimed=`, which consumes the reservation instead of re-checking capacity.
 A pre-claim refusal releases it. Once the row is `admitted`, an unavailable
-boundary-generation check moves the claim into the process-local
+post-claim generation check moves the claim into the process-local
 `_retained_claims` map with its reservation still spent; one retry timer opens a
 later pump settlement pass, and that pass retries one retained generation before
 ordinary refill. The map is bounded by already-reserved capacity. A successful
@@ -556,7 +569,14 @@ loop-apply phase rather than dropping a whole coordinator into a thread:
   claimable. That refusal is deliberate, so it has to be AUDIBLE: `taskq_settle`
   reads `finish`'s boolean and, on a `False`, logs the row's actual state
   (`taskq_report_refused_settle`). Discarded, the closed edge became the quietest
-  possible outcome instead of the loud one it was closed to produce. Pinned
+  possible outcome instead of the loud one it was closed to produce. A refusal
+  whose row already holds the state the write asked for lost nothing (another
+  write settled it the same way first: a queued stop whose cancel did not land
+  re-posts it ahead of its settle, and the re-posted cancel wins), so that one
+  is logged at DEBUG. A
+  queued stop whose own cancel landed (Stop all, the stage Cancel, a parent-end
+  teardown, a single `cancel`) skips the write altogether
+  (`taskq_settle(row_settled=True)`) and keeps only the propagation. Pinned
   through `taskq_settle` itself and not only through that helper
   (`test_subagent_dependency_mark.py`): a pin on the helper alone is satisfied by a
   settle that never calls it.
@@ -675,9 +695,18 @@ makes cancel-vs-dispatch safe in either order: cancel first → the claim's
 `WHERE state IN (...)` fails; claim first → the next fenced write (`starting`)
 fails, and for the runner entries that refusal STOPS the start (§ The
 claim/start boundary). On the subagent path that write is posted, so its refusal
-reaches nobody: the ROW is the cancel the operator asked for and every later
-write of that run is fenced out as `stale_result`, but a run registered in the
-same tick still finishes in memory. Nothing is re-dispatched either way.
+reaches nobody. So the subagent claimer re-reads the row after its claim and
+before it registers (`claim_and_start`, subagent.md § `spawn` step 5): a cancel
+that landed before that re-read refuses the start there. The re-read is a read,
+not a compare-and-set, so a store-only cancel (no `_agents` record, such as an
+orphan cancel or reconcile) that commits after it answers and before the
+claimer resumes still registers a run that finishes in memory. Stop all's queued
+stop does not reach that window. Its batched cancel files the row in
+`_batched_stops` before the stop first awaits, and a claimer that finds it there
+waits for the batch's answer and re-reads behind the cancel. A single queued
+stop installs a loop record, which the claimer checks after the re-read. The ROW is the cancel the operator asked for
+and every later write of that run is fenced out as `stale_result`. Nothing is
+re-dispatched either way.
 
 #### A cancel whose PRECONDITION came from an earlier read
 
@@ -721,7 +750,7 @@ Callers:
 | Caller | `only_from` | Refusal means |
 |---|---|---|
 | `RunnerAdmission.cancel_wait` (operator, `/api/tasks/{id}`) | `PARKED` | the row went live or moved on: 409, and the live lever is `/cancel` |
-| `admission.taskq_cancel_queued` (Stop-all `_unqueue`) | `CLAIMABLE + admitted` | the drain started it: the caller falls through to the live reap |
+| `admission.taskq_cancel_queued` (a single `cancel`, `_unqueue`, and Stop all's `taskq_cancel_queued_each`) | `CLAIMABLE + admitted` | the drain started it: the caller falls through to the live reap. The cancel passes `only_from` but no `generation`: a claim, requeue or wake can bump only the generation while the row stays unstarted, and a generation fence dropped that stop as `stale_result` -- a `retry_wait` row is outside the boot reconciler's `ACTIVE` set and stays in the parent's queued count, so it was never recovered (#17158). `only_from` alone keeps a started row out of reach |
 | `RunnerAdmission._end_row_on_cancel` (unwinding `admit`) | `queued` | another admission owns the row; its own path settles it |
 | `adopt_orphaned_rows`' never-started sweep | `queued` | an `accept`/`admit` re-attached it while the sweep ran |
 
@@ -835,7 +864,8 @@ lanes). The adapter's in-memory queue
   after it, by accept order rather than `created_at`, which a stepped-back
   wall clock would misorder), so a row held only by the store does not
   outlive the conversation that queued it, and a row a successor under the
-  same key queued after the snapshot is never swept. See [subagent.md](subagent.md) § `cancel_for_teardown`.
+  same key queued after the snapshot is never swept. A read the store refuses
+  keeps the fence open and is retried by each reaper sweep until it lands. See [subagent.md](subagent.md) § `cancel_for_teardown`.
 - When a pass finds nothing and the window is empty, the pump arms one
   `call_later` at `next_eligible_at`: the earliest moment a row held only by
   time (deferred by `next_run_at`, or leased by `lease_expires_at`) becomes
@@ -895,18 +925,57 @@ the health sampler.
 
 ## Deferral (memory pressure)
 
-`defer(task_id, until, reason)` sets `next_run_at` on a claimable row and
-appends `deferred`; the state does not change and the row holds nothing. The
-subagent adapter calls it — instead of refusing — when
-`check_memory_available` or `cached_admission_check` says no, with
-`until = now + agent.admit_wait_secs`, and arms a pump wake-up for then. The
-caller receives a `queued` id. Only when there is no store (the feature is
-off, or the row is a legacy in-memory entry the store never saw) does pressure
-still refuse, exactly as before. `agent.admission_gate=false` still turns the
-posture tier off entirely. The macOS kernel memory-pressure hold is not a deferral: it
+`defer(task_id, *, wait, reason)` sets `next_run_at` on a claimable row to the
+event's own `ts` plus *wait*, from one clock read, so the park spans exactly
+*wait*, and appends `deferred` with that `until`; the state does not change and
+the row holds nothing. The subagent adapter calls it — instead of
+refusing — when the memory floor (`check_memory_available`) says no, with
+`wait = agent.admit_wait_secs`, and arms a pump wake-up for then. The caller
+receives a `queued` id. With no store (the feature is off) or no row to defer
+(an incognito or temporary spawn), the start waits in the in-memory window
+instead, not eligible until the same admit wait passes. A durable defer the
+store could not write (a `_queue` entry it never saw, or the store unavailable)
+is refused as a store failure
+(`task_store_unavailable`), never as a capacity verdict. Spawns do not read the posture tier
+(`cached_admission_check`); `agent.admission_gate=false` turns it off for cron.
+The macOS kernel memory-pressure hold is not a deferral: it
 is a capacity-style wait in the window (subagent.md), and the runner lane,
 cron and workflow `ctx.agent` gates deliberately do not read the kernel level;
 only the subagent gate acts on it.
+
+The wait is finite. `deferred_longer_than(kind, bound, *, exclude_ids, limit)`
+is the one read that measures it: waiting rows (any state `defer` parks:
+`queued`, `retry_wait`, `recovering`) still parked (`next_run_at` in the future) that have spent *bound* seconds parked in their current wait, oldest
+first. The current wait is the `deferred` events after the row's last `claimed`
+or `transition` event (the closers the queued listing applies); each one parks
+the row from its `ts` to its `until`, cut short by the next deferral or by now,
+and a gap between a lapsed deferral and the next one (the row eligible, waiting
+to be picked) is not counted. Every re-check appends one more `deferred` event,
+so a re-check never restarts the clock, and the newest event alone says nothing
+about how long the row has waited. `expedite(task_ids)` ends a deferral early
+(the subagent adapter's memory wake, [subagent.md](subagent.md) *Memory waits*):
+a still-parked waiting row's `next_run_at` becomes now, with no event. A row
+then claimed is never counted; one parked again before its old `until` is
+charged the gap up to that re-park, because the earlier span is cut at the next
+deferral, so at most what was left of the deferral counts (the wake brings
+forward only rows that now fit, so this is a re-check that lost a race). A row
+not waiting or not deferred is left alone. The subagent adapter fails each row it returns past
+`agent.subagent_queue_max_wait_secs` with a generation-fenced `finish` and
+reports `never started: waiting for memory`
+([subagent.md](subagent.md) § Durable task queue).
+
+That `finish` passes `report_owed=True`: the terminal `transition` event then
+carries `report_owed_by` (the writing incarnation) in the same transaction, so
+the report the commit still owes is durable. `mark_reported(task_id)` appends the
+`reported` event that clears it (the adapter calls it once the report has reached
+the parent, which for a wave member held for its digest is that digest's
+delivery; a report that timed out or failed is not cleared, nor one whose
+injection the gateway gave up on and swallowed), and `owed_reports(kind, *, limit, after)` names
+the terminal rows whose owing incarnation is NOT this one and that have no
+`reported` event after that transition, oldest terminal first (`updated_at`,
+then `id`): what a later start has to report. `after` is the `(updated_at, id)`
+of the previous page's last row, so a reader pages through every owed row
+without re-reading one whose clear has not landed yet.
 
 ## Journal mode and network filesystems
 
@@ -967,7 +1036,7 @@ rows this incarnation has since claimed are skipped.
 | Row | Verdict |
 |---|---|
 | terminal (incl. `cancelled`) | untouched — **cancelled never revives**, whatever the artifacts say |
-| `artifact_probe(row)` says `done` / `failed` / `cancelled` | that terminal (subagent probe: `tombstone.json` cause `delivered→done`, `user_stop`/`cancelled→cancelled`, `error`/`timeout`/`turn_limit`/`child_escalation_limit→failed`; `gateway_restart` says nothing) |
+| `artifact_probe(row)` says `done` / `failed` / `cancelled` | that terminal (subagent probe: a readable `tombstone.json` decides by its recorded `outcome`, through the same table as the live settle — `completed→done`, `stopped→cancelled`, `failed→failed`, so a `cancelled` tombstone recorded with `outcome: failed` settles `failed`, as the live settle did — then by its cause when it recorded none: `delivered→done`, `user_stop`/`parent_end`/`stage_cancel`/`cancelled→cancelled`, `error`/`timeout`/`turn_limit`/`child_escalation_limit`/`reaped`/`startup_timeout`/`start_queue_saturated→failed`; an unreadable one says nothing; with no tombstone, or cause `gateway_restart`, `done` when `subagent_persistence.result_is_whole` holds — the flag the orphan reconcile announces a finished run with — and nothing otherwise) |
 | `admitted` | `queued` — claimed, never started, no side effect. The verdict is blind on purpose (no class, no probe), and what makes it sound is the claim/start boundary above: on the RUNNER path no executor holds a row that has not left `admitted`, because the `starting` write is a fence and no handle exists until it commits. The subagent path posts its mark instead, so its residual — a row whose start mark was refused AND that never reached a later mark (§ The claim/start boundary) — is exactly the row this verdict is blind about, and closes only with a durable pre-start marker |
 | kind without a recovery adapter (today: everything but `subagent`) | state kept, lease dropped, `awaiting_adapter` event |
 | class `unknown` | `unknown_side_effect` |
@@ -1279,8 +1348,8 @@ Persistent executions retain write-before-ack and lease-fenced settlement.
 | `lane_for(session_key, source)` | `lanes.lane_key_for(session_key)` (the ONE lane-key policy) plus the runner's launch `source`: a `cron` / `hook` root is `system` whatever its key says. Stored on the row as `params.lane` and honoured by `_lane_in_tx`. |
 | `owner_of(task_id)` | `(owner, run_id)` for a runner row id (`taskrunner:<run>[:task<N>]` → the TaskRunner run; `workflow:<run>:agent<N>` → the workflow run); the `/api/tasks/{id}/cancel` adapter routes on it: a parked row ends through `cancel_wait`, a row whose runtime is live (`starting`, `running`) cancels its run (`TaskRunner.cancel` / `WorkflowService.cancel`) -- a step is one unit of its run. |
 | `RunnerLane(cap, mode=, pinned=)` | FIFO execution gate bounded by the LIVE effective cap. `cap` is a callable read on every decision (the factory passes `SubagentManager.max_concurrent`, already the controller's clamp under the user ceiling), so the lane always SEES the current cap — but reading it is not a wake. `pump()` is the raise EDGE, called from `SubagentManager._notify_cap_raised` through the `set_cap_raise_listener` handle the gateway installs, at BOTH the manager's raise sites (`set_effective_cap`, `apply_limits`). It has to be pushed: a waiter parked while the cap was `0` holds no slot, so no `release()` of its own will ever come, and `RunnerAdmission.tick` does not pump. `pump` grants exactly the FIFO prefix the new cap allows and nothing at all while the effective cap is still `0`, so a pause keeps pausing. `set_effective_cap(n \| None)` is the lane-local override (it pumps too); `mode=fixed` pins the bound at `pinned` (or the ceiling) whatever the controller says. Waiters hold a future, nothing else; no asyncio primitive exists at import or construction. `acquire(task_id, ancestors=)` books the slot to `task_id` (`holders`) and REFUSES rather than parks when the row's own ancestry holds every slot (§ A descendant is never parked behind its own ancestor) |
-| `RunnerAdmission(store, lane=, pressure=, admit_wait_secs=, clock=, sleep=, ladder=, coordinator=)` | `accept(kind, task_id, ...)` writes the row before returning it (a `TaskStoreUnavailable` is `RunnerAdmissionRefused`: nothing accepted); an existing claimable / waiting row is returned, not duplicated (that is how a resume re-attaches) with `params.accepted_by` re-stamped to THIS incarnation (`TaskStore.restamp_accepted_by`) so the queued-orphan sweep cannot cancel a row the returning `admit` is about to park on, a terminal one gets a `~N` suffix. `admit(task_id)` runs the subagent order minus the policy refusals: pressure (`resource_status.cached_admission_check` shape) → `store.defer` + wait, a lane slot, `store.claim` → `starting`; a row cancelled meanwhile raises `RunnerTaskCancelled`. The `starting` write is a FENCE, not a mark: no handle exists until it commits, and a refusal releases the slot, requeues the row and refuses the admission (§ The claim/start boundary). A CALLER cancel delivered while `admit` waits (the pressure sleep, the lane slot, a deferred row's re-check, the `starting` write) is `admit`'s OWN to clean up: the lane slot goes back and the row is ENDED `cancelled` before the `CancelledError` is re-raised, because nothing ran under it and these kinds have no dispatcher — a row left claimable there would hold a queue place for as long as the store lives. Only two rows are its to end: one this call claimed itself (the generation it took fences the write) and one still `queued` and unleased (cancelled `only_from=queued` under the generation that read returned, so an admission that claimed it in between keeps it). `retry_wait` / `recovering` are excluded — the first can carry the operator's persisted answer, the second an attempt count, and `accept` re-attaches both on resume. `yield_dependency` owns its cancel the same way (the awaiting coroutine is the wait's only wake path in this incarnation); `waiting_input` deliberately does not. `claim_only` claims a container row without a slot, under the same fence. With no store the lane is the whole admission (legacy behaviour, never a refused run) |
-| `Admitted` | the claimed row's handle: `running` / `progress` / `renew` / `settle` (`done` / `fail` / `cancel`, once; releases the slot), `recovering(reason, delay_secs)` (`running → recovering`, `next_run_at`, slot released) + `reclaim()` (a fresh claim = new generation; late writes are `stale_result`) |
+| `RunnerAdmission(store, lane=, pressure=, admit_wait_secs=, clock=, sleep=, ladder=, coordinator=)` | `accept(kind, task_id, ...)` writes the row before returning it (a `TaskStoreUnavailable` is `RunnerAdmissionRefused`: nothing accepted); an existing claimable / waiting row is returned, not duplicated (that is how a resume re-attaches) with `params.accepted_by` re-stamped to THIS incarnation (`TaskStore.restamp_accepted_by`) so the queued-orphan sweep cannot cancel a row the returning `admit` is about to park on, a terminal one gets a `~N` suffix. `admit(task_id)` runs the subagent order minus the policy refusals: pressure (`resource_status.cached_admission_check` shape) → `store.defer` + wait, a lane slot, `store.claim` → `starting`; a step that PARKED for its slot re-checks pressure at the grant and, refused, gives the slot back BEFORE the deferral's wait (a slot held through that sleep would block the lane for nothing) and defers again, because the lane does not pause on memory (the execution cap reads work evidence only, [adaptive-concurrency.md](adaptive-concurrency.md)) and the check it passed before parking is stale by then; a row cancelled meanwhile raises `RunnerTaskCancelled`. The `starting` write is a FENCE, not a mark: no handle exists until it commits, and a refusal releases the slot, requeues the row and refuses the admission (§ The claim/start boundary). A CALLER cancel delivered while `admit` waits (the pressure sleep, the lane slot, a deferred row's re-check, the `starting` write) is `admit`'s OWN to clean up: the lane slot goes back and the row is ENDED `cancelled` before the `CancelledError` is re-raised, because nothing ran under it and these kinds have no dispatcher — a row left claimable there would hold a queue place for as long as the store lives. Only two rows are its to end: one this call claimed itself (the generation it took fences the write) and one still `queued` and unleased (cancelled `only_from=queued` under the generation that read returned, so an admission that claimed it in between keeps it). `retry_wait` / `recovering` are excluded — the first can carry the operator's persisted answer, the second an attempt count, and `accept` re-attaches both on resume. `yield_dependency` owns its cancel the same way (the awaiting coroutine is the wait's only wake path in this incarnation); `waiting_input` deliberately does not. `claim_only` claims a container row without a slot, under the same fence. With no store the lane is the whole admission (legacy behaviour, never a refused run) |
+| `Admitted` | the claimed row's handle: `running` / `progress` / `renew` / `settle` (`done` / `fail` / `cancel`, once; releases the slot; a committed `done` of a lane-metered row calls `RunnerLane.note_done()`, which counts `settled_ok` — the completions the adaptive controller reads, exposed in `stats()` — so a fail, cancel or recovery never counts), `recovering(reason, delay_secs)` (`running → recovering`, `next_run_at`, slot released) + `reclaim()` (a fresh claim = new generation; late writes are `stale_result`) |
 | waits | `yield_dependency(handle, signal)`: coordinator `report` when one is attached (the scope's ONE schedule), else `WaitRecord.dependency` with `retry_at`; slot released, session resident; `tick()` / `signal(scope)` / the coordinator's `on_wake` resume it through capacity, and a `retry_wait`-parked row is re-claimed. Returns False when the wait ended terminal. `waiting_input(handle, tool_call_id)` ↔ `answer_input(task_id, text)` / `cancel_wait(task_id, generation=)`: the cancel is `only_from=PARKED` and, with a generation, fenced on it — False when the row is no longer the parked one the caller read, and then no wake is sent either |
 | `decide_recovery(handle, unit, reason)` | the ladder's L3 verdict for one stalled turn (`None` without a ladder); `recovered(unit)` clears it |
 | `adopt_orphaned_rows(store, kinds=, resume=)` | the recovery adapter for the kinds the boot reconciler stamps `awaiting_adapter`: `admitted → queued`; an unleased ACTIVE run row that `is_safe_retry` (`params.safe_retry`, or class `none` / `idempotent_key`) → `recovering` + `resume(rec)`; not safe → `unknown_side_effect` (never re-run blind); step rows (`parent_id` set) → `failed` when safe (the run's resume re-runs them from its checkpoint) else `unknown_side_effect`; rows this incarnation still leases are skipped. It ALSO settles the `queued` rows of its kinds that a previous incarnation accepted and never claimed → `cancelled` ("never started"), counted in `AdoptReport.cancelled`: nothing ran under such a row, so `unknown_side_effect` would be a lie, and a resume is a new row anyway. The owner test is `params.accepted_by` (the accepting `TaskStore.incarnation`), NOT the lease — a queued row has never been claimed and so has no lease, and a row this incarnation just accepted, or RE-accepted (`accept` re-stamps it), is waiting for a lane slot inside a live `admit`. The cancel itself is `only_from=queued` under the generation the scan read, because the re-stamp and the `admit` that follows it are two writes and a sweep beside a live gateway can run between them. `retry_wait` / `recovering` are left alone (persisted answer, attempt count, and `recovering` is ACTIVE so the reconciler already sees it). The `queued` scan PAGES until each kind is drained (`_ADOPT_SCAN_PAGE` is a page size, never a total): `queued` is the one claimable state no other sweep reaches, so a row this sweep stops short of stays accepted with no dispatcher and no reconciler, and one restart behind a large backlog would strand it permanently. Pinned by `test_taskq_runner_adapter.py::test_adopt_pages_past_its_scan_size_so_no_queued_row_is_stranded`, the only test in the suite a capped scan reds |
@@ -1567,8 +1636,8 @@ disabling it is observed by the next retry. Setting it false restores the in-mem
 `_queue` dispatch (`tasks.db` stays in place, unread). Setting
 `agent.adaptive_concurrency=false` stops the controller moving any cap;
 `agent.adaptive_concurrency_mode="fixed"` pins both actuators as plain semaphores
-(the execution cap at `min(agent.adaptive_initial, max_subagents)`, the daemon's
-spawn gate at `mcp_gateway.spawn_concurrency_initial`).
+(the execution cap at its ceiling, `max_subagents` or `subagent_auto_max`, the
+daemon's spawn gate at `mcp_gateway.spawn_concurrency_initial`).
 
 **What the three flags do NOT restore.** An operator who sets all three does not
 get pre-queue behaviour, because these are new bounds and new results that no
@@ -1578,7 +1647,8 @@ flag reverts:
   `mcp_gateway.spawn_concurrency_initial` (4 by default). Before this change a
   private/exclusive backend was bounded by nothing, so this is a NEW ceiling that
   the fixed mode pins rather than removes. `mcp_gateway.spawn_concurrency_max`
-  raises it; nothing returns it to unbounded.
+  (raised to the subagent ceiling when that is higher) bounds how far the
+  controller raises it; nothing returns it to unbounded.
 - `agent.session_start_concurrency` bounds concurrent `session/new` calls, and
   `agent.interactive_command_policy` decides what happens to a tool call that is
   waiting on a human at a terminal. Both are new, both are outside the set above,
@@ -1621,7 +1691,7 @@ startup), so later edits require restart. Fairness settings (`lane_weights`,
 - `test_taskq_store.py`: `apply_schema` is one shape at `SCHEMA_VERSION` (fresh file has `wait_json`, `lane`, both indexes) and a second apply changes nothing; a newer-stamped file is refused; ids only after commit; an injected write failure raises `TaskStoreUnavailable` and commits nothing (not even the batch's first row); duplicate id / idempotency key refuse; locked past busy timeout refuses rather than hangs; network FS → `delete` journal + warning; defer keeps `queued` but ineligible; a conditional `cancel` refuses a row that left `only_from` (`rejected_transition`, and the row's own owner still settles it) and one whose generation moved although the state is still acceptable (`stale_result`, and the same call under the row's real generation cancels), while the unconditional form still ends `starting` and `running`.
 - `test_taskq_claim_fencing.py`: two real threads on separate connections, 40 rows → each row won exactly once; stale generation `finish` is a no-op with a `stale_result` event; terminal never regresses; duplicate completion no-op; cancel before/after claim and during run all end `cancelled`.
 - `test_taskq_reconcile.py`: crash at queued / admitted / running / result-written-not-acked → nothing lost, terminals kept, `admitted→queued`, class-driven recovery, cancelled never revives, idempotent; legacy import fields and idempotency.
-- `test_taskq_admission_integration.py` + `test_subagent_scale.py::TestDurableQueueScale`: real admission + fake worker; 2000 submissions → 2000 rows before any id returned, window ≤ 64 throughout, 2000 unique `done`, depth 0; FIFO across the window boundary; store-only cancel never starts; a queued row the drain CLAIMED and started inside `taskq_cancel_queued`'s own read is not cancelled under the spawn (the caller falls through to the live reap); restart with a fresh manager re-dispatches queued rows; `task_queue_enabled=false` leaves no `tasks/` directory.
+- `test_taskq_admission_integration.py` + `test_subagent_scale.py::TestDurableQueueScale`: real admission + fake worker; 2000 submissions → 2000 rows before any id returned, window ≤ 64 throughout, 2000 unique `done`, depth 0; FIFO across the window boundary; store-only cancel never starts; a queued row the drain CLAIMED and started inside `taskq_cancel_queued`'s own read is not cancelled under the spawn (the caller falls through to the live reap); a `queued` or `retry_wait` row a concurrent claim moved to a new generation inside that read is still cancelled, with no `stale_result` refusal (`test_a_stop_whose_generation_moved_under_an_unstarted_row_still_cancels`); restart with a fresh manager re-dispatches queued rows; `task_queue_enabled=false` leaves no `tasks/` directory.
 - `test_overload_integration_glue.py` (the route's own cancel pins, real store + real `RunnerAdmission` + the real handler): `cancel_wait` over every state in `STATES` — each `PARKED` one cancels, each `EXECUTING` one is 409 `not_waiting`, each terminal one is 409 `terminal`, and the three sets are asserted to partition `STATES`; and the RACE — the handler's row read held open while a real `admit` claims that row and takes it `running`, after which the cancel is refused (409 `not_waiting`, row `running`) and the live worker's own `done` still commits with no `stale_result` event.
 - `test_fairness_lanes.py`: `lane_key_for` mapping; smooth WRR is round-robin at equal weights, spreads a weight-3 lane, ties go to the oldest head, FIFO inside a lane; accept derives root / `system` / inherited lanes and never guesses an orphan's; `fetch_dispatchable_fair` interleaves lanes (and is FIFO with one lane), `children_only` and `pending_lanes`; on the real manager: 200 rows from one session, one row from another and one cron root at cap 1 → the small lane and `system` each start within three grants while the big lane stays FIFO; `lane_weights` 3:1 gives 6:2 of eight grants; `lane_weights["system"]=2` gives 4:2 of six; the child reserve on a three-level tree at cap 2 (children and resumes take the last slot, roots wait, roots fill the cap again once nothing nested is pending); a waiting parent whose child runs reserves nothing; `child_reserve=0` disables the rule; an adaptive cap of 1 is lifted to 2 for the child while a parent waits, roots still see 1, and the lift ends with the wait; no lift for a non-adaptive cap; the lift never exceeds `max_subagents`; settings clamp; no checkpoint-pause flag exists (RFC Q3); `wait_resume_granted` is immediate for a run holding its slot, times out for a yielded one, and is released by the grant event (one event per wait); `GET /api/spawn/{id}/resume` reports, holds and releases on the grant; the MCP hold re-asks after each held request, releases on `granted`, on `known=False`, on an error payload and for a chat-turn parent, and names `resume_pending` only after it observed an ungranted slot at the deadline; `spawn_sub_agents` holds until the second answer says granted and still returns the children's results.
 - `test_taskq_waits.py`: each wait kind's record fields and round-trip; `model_text` alone refused; entry keeps the generation and the lease, is fenced, and refuses wait→wait; wake bumps the generation, clears the record and fences old callbacks; park ends residency into `retry_wait` re-claimable at `next_run_at`; cancel semantics per kind (tree children-first with done siblings untouched); deadline → `failed{wait_deadline}`; `signal` wakes one scope only.

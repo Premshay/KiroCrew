@@ -1919,34 +1919,37 @@ class TestReleaseAndSweep:
         ok, detail = manager.release_conversation("c1")
         assert not ok and detail.startswith("conversation_gone")
 
-    def test_sweep_expires_only_idle_past_ttl(self) -> None:
+    @pytest.mark.asyncio
+    async def test_sweep_expires_only_idle_past_ttl(self) -> None:
         sessions = _mock_sessions()
         manager = _manager(sessions)
         now = time.time()
         manager._conversations["subagent:old1"] = now - 7 * 3600  # expired
         manager._conversations["subagent:new1"] = now - 60  # fresh
         with patch("kiro_crew.subagent._cleanup_session_files_sync"):
-            manager._sweep_conversations(now)
+            await manager._sweep_conversations_async(now)
         assert "subagent:old1" not in manager._conversations
         assert "subagent:new1" in manager._conversations
 
-    def test_sweep_drops_malformed_registry_key(self) -> None:
+    @pytest.mark.asyncio
+    async def test_sweep_drops_malformed_registry_key(self) -> None:
         manager = _manager()
         now = time.time()
         manager._conversations["malformed"] = now - 7 * 3600
-        with patch.object(manager, "release_conversation") as release:
-            manager._sweep_conversations(now)
+        with patch.object(manager, "release_conversation_async", AsyncMock()) as release:
+            await manager._sweep_conversations_async(now)
         assert "malformed" not in manager._conversations
         release.assert_not_called()
 
-    def test_sweep_refreshes_busy_conversation(self) -> None:
+    @pytest.mark.asyncio
+    async def test_sweep_refreshes_busy_conversation(self) -> None:
         sessions = _mock_sessions()
         manager = _manager(sessions)
         now = time.time()
         manager._conversations["subagent:busy1"] = now - 7 * 3600
         live = SubagentInfo(id="busy1", task="t")  # not done
         manager._agents["busy1"] = live
-        manager._sweep_conversations(now)
+        await manager._sweep_conversations_async(now)
         assert manager._conversations["subagent:busy1"] == now  # refreshed
 
 
@@ -3713,16 +3716,16 @@ class TestSuccessorClaim:
 
     @staticmethod
     def _state_continuation_starting(m: SubagentManager, f: SubagentInfo) -> None:
-        assert m._claim_continuation(f.id, "x", "", "")[1] is None
+        assert m._claim_continuation(f.id, "x", "")[1] is None
 
     @staticmethod
     def _state_continued(m: SubagentManager, f: SubagentInfo) -> None:
-        assert m._claim_continuation(f.id, "x", "", "")[1] is None
+        assert m._claim_continuation(f.id, "x", "")[1] is None
         m._settle_continuation(f, SubagentInfo(id="cont0001", task="t"))
 
     @staticmethod
     def _state_continuation_start_failed(m: SubagentManager, f: SubagentInfo) -> None:
-        assert m._claim_continuation(f.id, "x", "", "")[1] is None
+        assert m._claim_continuation(f.id, "x", "")[1] is None
         m._settle_continuation(f, None)
 
     @staticmethod
@@ -3733,13 +3736,13 @@ class TestSuccessorClaim:
 
     @staticmethod
     def _state_continuation_start_raised(m: SubagentManager, f: SubagentInfo) -> None:
-        assert m._claim_continuation(f.id, "x", "", "")[1] is None
+        assert m._claim_continuation(f.id, "x", "")[1] is None
         m._settle_continuation(f, None, raised=True)
 
     @staticmethod
     def _state_continued_then_refused(m: SubagentManager, f: SubagentInfo) -> None:
         TestSuccessorClaim._state_continued(m, f)
-        assert m._claim_continuation(f.id, "x", "", "")[1] is None
+        assert m._claim_continuation(f.id, "x", "")[1] is None
         busy = SubagentInfo(id="x", task="t", done=True, error="conversation_busy: busy")
         m._settle_continuation(f, busy)
 
@@ -3787,7 +3790,7 @@ class TestSuccessorClaim:
             if op == "retry":
                 assert (manager.claim_retry(failed) == "") is retry_granted, op
             else:
-                refusal = manager._claim_continuation(failed.id, "x", "", "")[1]
+                refusal = manager._claim_continuation(failed.id, "x", "")[1]
                 assert (refusal is None) is continue_granted, op
                 if refusal is not None:
                     assert refusal.error.startswith("conversation_busy")
@@ -3838,7 +3841,7 @@ class TestSuccessorClaim:
         ):
             await manager.continue_conversation_async("fail1234", "x")
         assert manager.claim_retry(failed) == SUCCESSOR_UNKNOWN
-        assert manager._claim_continuation("fail1234", "x", "", "")[1] is None
+        assert manager._claim_continuation("fail1234", "x", "")[1] is None
 
     @pytest.mark.asyncio
     async def test_second_continuation_is_refused_while_the_first_is_starting(self) -> None:

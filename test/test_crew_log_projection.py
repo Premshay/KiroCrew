@@ -519,6 +519,69 @@ def test_usage_sums_every_token_dimension_and_its_total():
     }
 
 
+def test_usage_does_not_count_an_all_zero_tokens_block_as_reported():
+    """A block of four zeros is an absence written as a block.
+
+    Logs on disk carry it on every turn whose provider sent no counts, so the fold --
+    not only the writer -- has to know that a completed turn cannot have cost zero
+    tokens. The credits beside it were genuinely billed and stay counted, which is
+    the difference a reader sees: a real bill beside ``tokens_reported: 0``, and the
+    panel dashes the tokens instead of printing a measured ``0``.
+    """
+    handle = _log()
+    _opened(handle)
+    for turn in range(1, 5):
+        _turn(
+            handle,
+            turn,
+            credits=0.3725,
+            tokens={"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+        )
+    value = crew_log.fold_usage(_entries(handle))
+    assert value["turns"]["completed"] == 4
+    assert value["turns"]["credits_reported"] == 4
+    assert value["credits"] == 1.49
+    assert value["turns"]["tokens_reported"] == 0
+    assert value["tokens"]["total"] == 0
+
+
+def test_usage_counts_a_block_reported_once_any_dimension_is_above_zero():
+    """One measured dimension is a report; the rule is not "input above zero"."""
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, tokens={"input": 0, "output": 0, "cache_read": 7, "cache_write": 0})
+    _turn(handle, 2, tokens={"input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
+    _turn(handle, 3, tokens={"input": 5, "output": 1, "cache_read": 0, "cache_write": 0})
+    value = crew_log.fold_usage(_entries(handle))
+    assert value["turns"]["completed"] == 3
+    assert value["turns"]["tokens_reported"] == 2
+    assert value["tokens"]["total"] == 13
+    assert value["by_model"]["opus"] == {
+        "turns": 3,
+        "credits": 1.5,
+        "credits_reported": 3,
+        "tokens": 13,
+    }
+
+
+def test_usage_still_counts_a_recorded_zero_credit_charge_as_reported():
+    """Pins what the token rule deliberately leaves alone.
+
+    ``credits: 0.0`` on a closer is counted as a report, and the fold keeps doing so:
+    the writer omits an unbilled charge, but a zero already on disk cannot be told
+    from a turn a provider genuinely billed at nothing, and ``_bill_credits`` lets a
+    zero through on purpose. Tokens are different -- a completed turn cannot cost
+    zero of them -- which is why only ``tokens_reported`` carries the rule.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=0.0)
+    value = crew_log.fold_usage(_entries(handle))
+    assert value["turns"]["credits_reported"] == 1
+    assert value["credits_by_source"]["turn"]["reported"] == 1
+    assert value["credits"] == 0.0
+
+
 def test_usage_bills_injected_context_per_source():
     handle = _log()
     _opened(handle)
@@ -2861,7 +2924,7 @@ def test_usage_units_order_by_succession_not_wall_clock(monkeypatch):
     monkeypatch.setattr(crew_log, "session_units_for_slot", lambda slot: ("a", "b"))
     monkeypatch.setattr(crew_log, "unit_header_created_at", lambda kind, uid: created.get(uid))
     monkeypatch.setattr(crew_log, "unit_opened_previous", lambda kind, uid: previous.get(uid))
-    assert crew_log._usage_units_in_succession("chat-1") == ("a", "b")
+    assert crew_log.units_in_succession("chat-1") == ("a", "b")
 
 
 def test_usage_units_keep_disconnected_chains_contiguous(monkeypatch):
@@ -2887,7 +2950,7 @@ def test_usage_units_keep_disconnected_chains_contiguous(monkeypatch):
     monkeypatch.setattr(crew_log, "unit_opened_previous", lambda kind, uid: previous.get(uid))
     # A's run (root createdAt 100) precedes B's run (root createdAt 200); each run is
     # predecessor-first and unbroken.
-    assert crew_log._usage_units_in_succession("chat-1") == ("a0", "a1", "b0", "b1", "b2")
+    assert crew_log.units_in_succession("chat-1") == ("a0", "a1", "b0", "b1", "b2")
 
 
 def test_usage_units_unrelated_roots_without_a_clock_keep_store_order(monkeypatch):
@@ -2901,7 +2964,7 @@ def test_usage_units_unrelated_roots_without_a_clock_keep_store_order(monkeypatc
     monkeypatch.setattr(crew_log, "session_units_for_slot", lambda slot: ("older", "newer"))
     monkeypatch.setattr(crew_log, "unit_header_created_at", lambda kind, uid: None)
     monkeypatch.setattr(crew_log, "unit_opened_previous", lambda kind, uid: None)
-    assert crew_log._usage_units_in_succession("chat-1") == ("older", "newer")
+    assert crew_log.units_in_succession("chat-1") == ("older", "newer")
 
 
 def test_usage_units_single_unit_skips_the_chain_read(monkeypatch):
@@ -2912,10 +2975,37 @@ def test_usage_units_single_unit_skips_the_chain_read(monkeypatch):
         raise AssertionError("unit_opened_previous must not be read for a single unit")
 
     monkeypatch.setattr(crew_log, "unit_opened_previous", _boom)
-    assert crew_log._usage_units_in_succession("chat-1") == ("only",)
+    assert crew_log.units_in_succession("chat-1") == ("only",)
 
 
 def test_usage_fold_uses_the_succession_order(monkeypatch):
     """The usage fold's unit resolver routes through the durable-succession helper."""
-    monkeypatch.setattr(crew_log, "_usage_units_in_succession", lambda slot: ("x", "y"))
+    monkeypatch.setattr(crew_log, "units_in_succession", lambda slot: ("x", "y"))
     assert crew_log._slot_units_for_fold("chat-1", "usage") == ("x", "y")
+
+
+def test_agentic_fold_uses_the_succession_order(monkeypatch):
+    """The agentic fold's unit resolver routes through the durable-succession helper.
+
+    This fold keeps the LATEST value per field, so whichever unit is folded last wins
+    each cell. Under the header clock a backward step between two units of one slot
+    sorts the retired unit last, and its stale value would overwrite one the live
+    session wrote and the write path accepted -- silently, because both are well-formed.
+    """
+    monkeypatch.setattr(crew_log, "units_in_succession", lambda slot: ("x", "y"))
+    assert crew_log._slot_units_for_fold("chat-1", crew_log.DASHBOARD_FOLD_NAME) == ("x", "y")
+
+
+def test_agentic_fold_does_not_fall_through_to_the_header_clock(monkeypatch):
+    """The header fallthrough must not be what answers for this fold.
+
+    Asserted by making the fallthrough the ONLY thing that could answer: if the
+    resolver reached ``session_units_for_slot`` for the agentic fold it would return
+    the clock order below, which is the inversion the succession read exists to undo.
+    """
+    monkeypatch.setattr(crew_log, "session_units_for_slot", lambda slot: ("retired", "live"))
+    monkeypatch.setattr(crew_log, "units_in_succession", lambda slot: ("live", "retired"))
+    assert crew_log._slot_units_for_fold("chat-1", crew_log.DASHBOARD_FOLD_NAME) == (
+        "live",
+        "retired",
+    )

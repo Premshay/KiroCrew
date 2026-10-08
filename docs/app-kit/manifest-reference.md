@@ -36,6 +36,16 @@ The app manifest (`app.json`) declares your app's identity, resources, and requi
 These fields are admission metadata, not a replacement for declaring minimal
 permissions or setting `minKiroCrewVersion`.
 
+The signature covers `name`, `version`, `signer` and `permissions`, plus each of
+these groups when it is non-empty: `notifications`, `crons`, `contributes`,
+`setup`, `mcpServers`, `backend`, `ui`, `agents`, `skills`, `sops`,
+`dependencies` and `platform`. An empty group is left out of the signed bytes.
+
+A gateway computes the signed bytes from the groups it knows. A signed manifest
+that declares a group an older gateway does not sign fails verification there.
+It fails closed: the install is refused, not downgraded. Set
+`minKiroCrewVersion` on a signed app so that refusal names the version floor.
+
 ## Resources
 
 | Field | Type | Description |
@@ -117,7 +127,7 @@ installed against:
 | `agent` | string | Agent to run (optional, uses default if omitted) |
 | `agent_sequence` | string[] | Ordered agents to run |
 | `command` | string | Shell command executed without a model call; mutually exclusive with `script`. A present non-string value is rejected rather than treated as absent |
-| `script` | string | Synchronous Python callable (`file.py:function`) executed without a model call; mutually exclusive with `command`. A present non-string value is rejected rather than treated as absent |
+| `script` | string | Synchronous Python callable (`file.py:function`) executed without a model call; mutually exclusive with `command`. A present non-string value is rejected rather than treated as absent. The path resolves against the app's own bundle, must stay inside it, must name a `.py` file, and is stored as an absolute path; re-enable the app after its bundle moves |
 | `env` | object | String environment variables passed to the job |
 | `persistent_session` | boolean | Default `true`; retain one agent session across runs |
 | `silent` | boolean | Default `false`; suppress automatic result delivery |
@@ -126,11 +136,14 @@ installed against:
 | `skip_dates` | string[] | Calendar dates the job must not fire on, evaluated in `timezone`. Must be zero-padded `YYYY-MM-DD` — `2026-1-1` parses but never matches the padded fire-time rendering, so it is rejected at manifest validation rather than silently skipping nothing |
 | `enabled` | boolean | Default `true`. Must be a JSON boolean — any other type is rejected at manifest validation. When `false` the cron is registered **paused** (visible in the Schedule view, resumable) instead of firing on install/enable — for jobs that need user configuration first |
 
-> **Caveat:** disabling an app deletes its registered cron jobs, and re-enabling
-> the app re-registers them from the manifest. A cron shipped with
-> `"enabled": false` that a user later resumed will therefore be reset back to
-> the paused state after an app disable → re-enable cycle and must be resumed
-> again.
+> **Caveat:** disabling an app deletes its registered cron jobs when a cron
+> service is reachable, and re-enabling the app re-registers them from the
+> manifest. A cron shipped with `"enabled": false` that a user later resumed
+> will therefore be reset back to the paused state after an app disable →
+> re-enable cycle and must be resumed again. A job the disable could not remove
+> stays in the store but does not run while the app is disabled: each fire is
+> skipped and the run is marked as an error. It runs again once the app is
+> re-enabled.
 
 ## Frontend UI
 
@@ -327,14 +340,12 @@ still load. Commands from a disabled app do not appear at all.
 **If your app is SIGNED, set `minKiroCrewVersion`.** Contributions are covered by the
 admission signature -- a contributed prompt goes to an agent with tools and `autoSend`
 fires it, so leaving it unsigned would make your rows the one part of a signed app an
-attacker could rewrite with the signature still verifying. The consequence for you is
-that a signed manifest declaring `contributes` does not verify on a gateway older than
-this change, because that gateway computes the signed bytes without the
-`contributes` key. It fails CLOSED -- a refused install, not a silent downgrade -- but
-the error will not obviously point here, so declare the floor and the install refuses
+attacker could rewrite with the signature still verifying. A gateway that does not
+sign `contributes` computes the signed bytes without it, so a signed manifest
+declaring `contributes` fails CLOSED there (see [Admission metadata](#admission-metadata)).
+The error will not obviously point here, so declare the floor and the install refuses
 for a legible reason instead. Unsigned apps are unaffected, as are signed apps that
-contribute nothing: the key is only added to the payload when non-empty, so every
-signature issued before this existed still verifies.
+contribute nothing: the key is only added to the payload when non-empty.
 
 ### `contributes.sessionControls` — A Per-Chat Control in the Composer
 
@@ -409,6 +420,11 @@ in the dashboard, and one that would leave the app's own route prefix is refused
 before any request rather than sanitized -- so a control with an invalid
 `statusPath` is simply never polled. Polling fails closed: an app that is down is
 not retried, and an unrecognized payload is treated as `none`.
+
+**When the status is re-asked.** Once when the chat opens, again when the user
+closes the control's popover, and again each time a turn in that chat finishes.
+A change the app makes between turns (a cron job, another session) shows on the
+next of those moments, not before: there is no polling interval.
 
 The route base follows how the app serves its backend, and the dashboard derives
 it -- an app declaring `backend.entryPoint` runs its own process and is
@@ -821,9 +837,9 @@ packages at all.
 | `permissions.cron` | boolean | Can create cron jobs |
 | `permissions.memory` | string | Memory access: `""` (none), `"app-scoped"`, or `"shared"` |
 | `permissions.network` | boolean | Can make external network requests |
-| `permissions.sessionApproval` | boolean | Controls existing local user sessions: send messages (including generated response-option choices), approve or deny pending tool requests, and change approval modes within the limits below |
+| `permissions.sessionApproval` | boolean | Controls existing local user sessions: send messages (including generated response-option choices, but not a change to the session's agent binding, persona settings, or a harness slash command), approve or deny pending tool requests, and change approval modes within the limits below |
 | `permissions.spawn` | boolean | May start a background agent through the host's subagent manager (`ctx.spawn`) |
-| `permissions.jobs` | boolean | May run durable background work through `ctx.jobs` and the app-owned `_jobs/*` routes |
+| `permissions.jobs` | boolean | May run durable background work through `ctx.job` and the app-owned `_jobs/*` routes |
 | `permissions.exposeToApps` | string[] | App names (or `"*"`) allowed to request cross-app visibility into this app's slots/subagents |
 
 #### `permissions.spawn` — Background Agents
@@ -852,7 +868,10 @@ API: `apps/spawn_sdk.py` — `SpawnSDK`, `build_spawn_impl`, `build_done_probe`,
 > user-session calls, in addition to `permissions.api`. The app must be enabled.
 > The grant reaches existing local user-owned sessions only; cron, system, remote,
 > member-mode, and other apps' sessions are denied. Apps retain their pre-existing
-> access to their own slots. Mode changes must name a live allowed slot and are
+> access to their own slots. On the per-slot routes (`/api/chat/slots/{slot}/*`)
+> the grant reaches approving or denying a pending tool request only; every other
+> per-slot route answers an app `404 slot_not_found` unless the app owns the slot,
+> whatever `permissions.api` prefix it holds. Mode changes must name a live allowed slot and are
 > limited to Normal, Reads and Trust; YOLO is a process-global override and stays
 > dashboard-only. An update that newly adds the flag disables the app until the user
 > enables it again from the detail page, which shows why (this re-gate is specific
@@ -908,7 +927,6 @@ the endpoint; it does not import provider code.
   "setup": {
     "onInstall": "cd ui && npm install && npm run build",
     "onUninstall": "echo cleanup done",
-    "onUpdate": "cd ui && npm install && npm run build",
     "onEnable": "echo enabled",
     "onDisable": "echo disabled",
     "configSchema": {}
@@ -918,9 +936,9 @@ the endpoint; it does not import provider code.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `setup.onInstall` | string | `""` | Shell command run only during a registry install, after clone/build and before the installed copy is created |
+| `setup.onInstall` | string | `""` | Shell command run during a registry install **and again on every registry update** (an update re-enters the install transaction), after clone/build and before the installed copy is created. Not run for a local-path install. Make it idempotent |
 | `setup.onUninstall` | string | `""` | Shell command run before uninstall |
-| `setup.onUpdate` | string | `""` | Preserved in the manifest but currently not executed; do not rely on it |
+| `setup.onUpdate` | string | `""` | Declared and preserved in the manifest but **not executed** — no code path dispatches it. Put update-time work in an idempotent `onInstall`, which a registry update re-runs |
 | `setup.onEnable` | string | `""` | Shell command run when app is enabled |
 | `setup.onDisable` | string | `""` | Shell command run when app is disabled |
 | `setup.onEnableTimeout` | number | `30` | Timeout in seconds for `onEnable` script |
@@ -930,8 +948,13 @@ the endpoint; it does not import provider code.
 If `onEnable` fails (non-zero exit), the enable is rolled back — the app
 stays disabled and any registered resources are deregistered. `onDisable`
 failures are logged as warnings but do not block the disable operation. Local-path
-installs do not run `onInstall`; build first, then install. Lifecycle scripts always
-invoke `/bin/bash`; on native Windows without that executable they fail cleanly.
+installs do not run `onInstall`; build first, then install. The `onEnable`,
+`onDisable` and `onUninstall` hooks always invoke `/bin/bash`, so they are
+**not run on native Windows** (which has no `/bin/bash`): the runner refuses the
+hook before any process is started and reports a failure whose message names the
+unsupported platform, rather than letting the spawn fail opaquely and look like
+your script breaking. Write hooks for POSIX shells; do not rely on them running
+on a native-Windows host.
 
 **Exception — `platform.installMode: "client"` apps.** For a client app the
 script is **advisory**: a failure is reported on the response as
@@ -961,19 +984,22 @@ only one app is uninstalled.
     "managedBy": "gateway",
     "capabilities": {
       "mcp": [
-        { "id": "some-mcp-server", "source": "registry" }
+        { "id": "some-mcp-server" }
       ],
       "skills": [
-        { "id": "some-skill", "source": "registry" }
+        "some-skill"
       ],
       "agents": [
-        { "id": "some-agent", "source": "registry" }
+        { "id": "some-agent", "managedBy": "app" }
       ]
     },
     "commands": ["jq", "node", "python3"]
   }
 }
 ```
+
+Each capability entry is a string id or an object `{ id, managedBy }`. An
+entry's own `managedBy` overrides `dependencies.managedBy`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -1123,6 +1149,12 @@ For apps that run outside the dashboard (e.g. Electron apps), the top-level
 cloud/remote environment with no display, the endpoint returns the command for
 the user to run locally instead of executing it on the server.
 
+The launched process does not inherit the gateway's environment. It gets the
+scrubbed minimal allowlist, which carries no SSH agent, AWS secrets or model
+credentials. On top of that it gets these desktop-session variables when the
+gateway has them: `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`,
+`DBUS_SESSION_BUS_ADDRESS`, `XDG_SESSION_TYPE` and `XDG_CURRENT_DESKTOP`.
+
 ## Validation Rules
 
 - `name` must match `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` (kebab-case)
@@ -1141,7 +1173,8 @@ the user to run locally instead of executing it on the server.
   (`console`, `com10`, `null-app`) are fine. Refused on every platform: an app
   name is a persistent published identity, so it must mean the same thing on
   whichever host installs the app.
-- `version` must match semver (`X.Y.Z`)
+- `version` must start with `MAJOR.MINOR.PATCH`; a pre-release (`-`) or build
+  (`+`) suffix may follow it
 - Paths in `agents`, `skills`, `sops`, `ui.entry`, `ui.pages[].entryPoint`,
   `contributes.sessionControls[].entryPoint`, `contributes.panelTabs[].entry`, and
   `backend.entryPoint` must be relative and stay inside the app root: absolute paths

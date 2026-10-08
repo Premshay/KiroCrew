@@ -1,28 +1,48 @@
 ---
 title: Overload resilience — durable task queue, admission before allocation, adaptive concurrency, layered recovery
 status: partial
-revision: v6
+revision: v7
 author: bolichen
 created: 2026-09-12
-last-audited: 2026-09-12
-audited-at: 6f056722b
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr:
-implementation-prs: []
+implementation-prs: [10521, 15876, 16347, 16355, 17017]
 tracking-issues: ["#15244"]
 supersedes: [rfc-durable-run-coordinator.md]
 superseded-by: []
 ---
 # RFC: Overload resilience — durable task queue, admission before allocation, adaptive concurrency, layered recovery
 
-- Status: implemented on main in [#10521](https://github.com/kirodotdev/KiroCrew/pull/10521).
-  The shipped contracts are [`../system-specs/modules/taskq.md`](../system-specs/modules/taskq.md),
+- Status: partial. The core shipped in [#10521](https://github.com/kirodotdev/KiroCrew/pull/10521):
+  the durable task store, admission and host budgets, session-start collection,
+  adaptive controller, recovery and wait states, TaskRunner/workflow adapters,
+  API, and dashboard surface. Q9–Q11 shipped in #15876, #16347, #16355 and
+  #17017. Not built: the dedicated-runtime parent checkpoint-pause (excluded by
+  Q3), an interactive-chat reserve slot, the `taskrunner.auto_resume` gate, and
+  the PTY-driving controlled terminal (§14.6). The shipped contracts are
+  [`../system-specs/modules/taskq.md`](../system-specs/modules/taskq.md),
   [`../system-specs/modules/adaptive-concurrency.md`](../system-specs/modules/adaptive-concurrency.md),
-  and the linked module specifications they reference. The durable task store,
-  admission and host budgets, session-start collection, adaptive controller,
-  recovery and wait states, TaskRunner/workflow adapters, API, and dashboard
-  surface all shipped in that PR. The dedicated-runtime parent checkpoint-pause
-  remains explicitly excluded by decision Q3. The delivery plan below is retained
-  as the historical pre-merge record.
+  and the linked module specifications they reference. The delivery plan below
+  is the pre-merge record.
+- Names in this design versus code. Several sections below use design names
+  that the code does not carry. `taskq/` holds `store.py`, `model.py`,
+  `lanes.py`, `migrate.py`, `reconcile.py`, `waits.py`, `dependency.py` and
+  `adapters/`; there is no `taskq/state.py`, `scheduler.py`, `budget.py`,
+  `controller.py` or `recovery.py`. The shipped homes are:
+
+  | Design name | Shipped as |
+  |---|---|
+  | `HostBudget` | `mcp_gateway/host_budget.py` |
+  | gatewayd `SpawnGate` | `mcp_gateway/admission.py` |
+  | `SessionStartGate` | `acp/runtime_start.py` |
+  | controller / AIMD policy | `AdaptivePolicy` in `adaptive/policy.py`, `AdaptiveController` in `adaptive/controller.py` |
+  | recovery ladder | `RecoveryPolicy` in `recovery/policy.py`, `recovery/ladder.py` |
+  | lanes and fairness | `LaneScheduler` in `taskq/lanes.py` |
+  | `ExecutionCap`, `ReservationSet`, `to_public_state()` | design-only; no class or function by these names exists |
+
+  The Q1–Q11 requirements and the module specs above are the source of truth for
+  what each shipped piece does.
 - Author: bolichen (Bolin Chen). Requirements: the 2026-09-12 spec
   (`overload-resilience/SPEC.md` in the crew workspace); code investigation
   `subagents/081a6e0a`; GPT-6 review `subagents/99cae534` (verdict REDESIGN, its
@@ -228,6 +248,12 @@ rows and ~64 Python objects.
 
 ### 3.6 Compatibility with existing records
 
+Superseded by [`taskq.md` § Legacy import](../system-specs/modules/taskq.md):
+the shipped `migrate.import_legacy` imports non-tombstoned subagent folders and
+every `paused` TaskRunner run unconditionally (the run's transient
+`auto_approve` is dropped), imports no workflow runs, and reads no
+`taskrunner.auto_resume` key. The design as proposed:
+
 On first start with the store enabled, `taskq.migrate` imports: non-tombstoned subagent
 folders (today's orphan recovery input) → `retry_wait` or `failed` per the
 existing PID/result inference; TaskRunner `runs.json` `paused`/`planned` runs →
@@ -322,7 +348,8 @@ degrades to a per-session exec on every stub version.
 ### 4.4 Session-start gate with tracked ownership
 
 `SessionStartGate` (gateway process, `taskq/scheduler.py`): fixed semaphore
-`agent.session_start_concurrency` (default 2, separate from
+`agent.session_start_concurrency` (default `auto`: sized once at gateway start
+from cores and available memory, 2..16; separate from
 `_COLD_START_MAX_CONCURRENT`, which stays for runtime spawn+`initialize`).
 Acquired after `HostBudget`, before `AcpRuntime.create_session`. The gate is
 **not** adaptive — the adaptive loop is the gatewayd `SpawnGate` plus the
@@ -399,19 +426,20 @@ feed the controller.
 
 | Parameter | gatewayd `SpawnGate` | gateway `ExecutionCap` |
 |---|---|---|
-| initial / floor / ceiling | 4 / 1 / 8 | `min(user_max, 4)` / 1 / `user_max` |
-| decrease | ×0.5 floor 1 on **corroborated** pressure (host signal + ≥2 distinct keys slow/failing, or ENOMEM/EAGAIN) | ×0.5 floor 1 |
+| initial / floor / ceiling | 4 / 1 / 8 (ceiling raised to the subagent ceiling when lower, Q11) | `user_max` / 1 / `user_max` (Q11) |
+| decrease | ×0.5 floor 1 on **corroborated** pressure (host signal + ≥2 distinct keys slow/failing, or ENOMEM/EAGAIN) | ×0.5 floor 1 on ≥2 distinct work signals in one sample; loop lag and memory are not exec signals (Q11) |
 | increase | +1 after ≥20 successful inits AND ≥30s without pressure AND demand at the limit | ×2 per 5s clean window until this process meets corroborated pressure, then +1 per clean window; the success bar is `min(increase_successes, cap)` |
 | cooldown after decrease | 30s; pre-decrease successes discarded | 60s |
-| hysteresis | decrease at lag ≥ 250ms or mem ≤ `resource_critical_gb`; increase only below 100ms and ≥ `resource_pressure_gb` | same thresholds |
-| pause | mem ≤ critical for 2 samples, or dependency (gatewayd/provider) down | stop admitting; keep running work |
-| probe after pause | admit 1 task; require it to reach `running` before capacity returns to floor+1 | same |
+| hysteresis | decrease at lag ≥ 250ms or mem ≤ `resource_critical_gb`; increase only below 100ms and ≥ `resource_pressure_gb` | none on lag or memory: an increase needs a sample with no work signal (Q11) |
+| pause | mem ≤ critical for 2 samples, or dependency (gatewayd/provider) down | none: the exec track never pauses (Q11); running work is kept |
+| probe after pause | admit 1 task; require it to reach `running` before capacity returns to floor+1 | none (no pause to probe out of, Q11) |
 
 The gateway actuator is `SubagentManager.apply_limits(cfg, max_concurrent=effective)`
 (existing) plus equivalent hooks on `TaskRunner` and the workflow `WorkerPool`;
 `effective ≤ user max` always, and `apply_limits` never writes `config.json` — the
 user's value stays the ceiling. On a fresh gateway start `effective` begins at
-`min(user_max, 4)` and earns its way up (no full concurrency until work completes).
+`user_max` and is cut only on work evidence (Q11): attributable timeouts, slow or
+failing starts, fd or process exhaustion.
 Per-provider 429s multiply only that provider's lane share (§6), never the host
 cap.
 
@@ -432,9 +460,11 @@ pins a 32-core host with 96 GB free at the fresh-start cap for the life of the
 process, under a controller that sees only clean samples -- the loop exists so
 that many sessions can ask for many workers, be admitted up to the ceiling the
 user chose, and queue on real pressure rather than be refused for a guess. Memory
-over-commit is the one unrecoverable failure and is guarded live (the pressure
-line gates increases, the critical line cuts, the spawn gate defers cold starts
-that would breach `spawn_min_memory_gb` plus unobserved growth); CPU over-commit
+over-commit is the one unrecoverable failure and is guarded live, per start and
+on the spawn gate, not on the execution cap (Q11): the spawn floor queues every
+start that would not leave `spawn_min_memory_gb` free at its projected price,
+and on the gate the pressure line gates increases and the critical line cuts and
+pauses backend starts; CPU over-commit
 only slows work, which is the pressure the loop already backs off from, so CPU
 is not a sizing term for the auto ceiling either. Doubling is
 one-way per process: the first corroborated pressure or pause retires it and the
@@ -446,8 +476,9 @@ controller stays in congestion avoidance for that process lifetime.
   `created_at` (preserves same-session ordering). Across lanes, deficit round
   robin with equal quantum, so a 2000-task batch from one session cannot starve
   a 3-task session; a lane with `retry_wait` rows only is skipped.
-- **Reserved capacity.** `ExecutionCap` reserves 1 slot for interactive chat
-  turns and never charges control-plane work (cancel, status, health, reconcile)
+- **Reserved capacity.** (Designed, not built: only the subagent-lane
+  `child_reserve` ships, per Q3 and `taskq.md`.) `ExecutionCap` reserves 1 slot
+  for interactive chat turns and never charges control-plane work (cancel, status, health, reconcile)
   against any budget; those paths read the store and the in-memory window only.
 - **Parent waiting on children.** A parent entering `spawn_sub_agents` (or a
   workflow `parallel` barrier) transitions to `waiting_children` and **releases
@@ -455,7 +486,8 @@ controller stays in congestion avoidance for that process lifetime.
   is idle in a tool call, but resident). Children are dispatched from the
   parent's lane with a `child_reserve` of 1 slot that only depth>0 tasks may
   take, so a fleet of parents can never hold every slot. If residency budget is
-  exhausted by waiting parents, the scheduler applies checkpoint-pause: for a
+  exhausted by waiting parents, the scheduler applies checkpoint-pause (designed,
+  not built -- Q3): for a
   dedicated-runtime parent, close its runtime and mark the parent
   `waiting_children{resumable=true}`; on children completion the parent resumes
   via the existing continuable-session path (`spawn_continue` semantics). Shared-
@@ -492,7 +524,7 @@ now classed `compat`).
 
 | Budget | Runs during | Default | Source |
 |---|---|---|---|
-| queue wait | `queued`, `waiting_infra`, `retry_wait` | unbounded unless `deadline_at` | caller |
+| queue wait | `queued`, `waiting_infra`, `retry_wait` | unbounded unless `deadline_at`; a subagent spawn held on the memory floor (durable or in memory) 1800s of parked time → `failed` "never started: waiting for memory" (Q10) | caller; `agent.subagent_queue_max_wait_secs` |
 | admit wait | `admitted` waiting on steps 2–4 | 30s → back to `queued` | `agent.admit_wait_secs` |
 | start | `starting`, active only | 90s | `session_start_timeout_secs` |
 | start collect | `recovering` after start timeout | 300s | `agent.start_collect_timeout_secs` |
@@ -573,6 +605,10 @@ by id when it next runs (§10).
 
 ## 11. Test plan
 
+This section is the pre-merge test plan; some files it names were never created
+(`test_taskq_scale.py`, `test_taskq_controller.py`,
+`test_tool_interactive_policy.py`). §11.1 is the map of tests that landed.
+
 Unit tests use a fake harness (`test/fake_pool_mcp_server.py`, a fake
 `LLMProvider`, `freezegun`-style controlled clock via the existing monotonic
 injection), never a real `kiro-cli`. Transport tests that open `AF_UNIX` sockets
@@ -597,7 +633,7 @@ pass, and is not a product defect.
 | user operations under load | `test_session_health.py` (extend), `test_resource_status.py` (extend) | status/cancel/health respond < 1s with window full |
 | gatewayd gate | `test_mcp_gateway_pool_integ.py`, `test_mcp_gateway_exclusive_backend.py`, `test_mcp_gateway_stub_admission_fallback.py`, new `test_mcp_gateway_spawn_gate.py` (mirror `test_mcp_gateway_breaker.py`) | 30 private stubs, cap 4 → all `ready`, no fallback record, in-flight ≤ cap; permit settle idempotent; cancel at each boundary; unused prewarm neutral; old stub never sees `queued`; drain cancels waiters |
 
-Addendum scenarios (SPEC-ADDENDUM §10), all on the real scheduler and event
+Addendum scenarios (§14 of this RFC), all on the real scheduler and event
 paths with a fake dependency, fake harness and injected clock:
 
 | Addendum scenario | Test file | Assertion |
@@ -635,7 +671,7 @@ API).
 |---|---|
 | 2000-task burst | `test_taskq_admission_integration.py::test_2000_submissions_all_complete_window_never_exceeds_64` |
 | automatic down-scaling | `test_adaptive_policy.py`; defect D1 pinned by `test_overload_acceptance.py::test_d1_two_lifetime_gate_failures_must_not_pin_the_cap_forever` and `::test_spawn_gate_windowed_failures_let_the_cap_recover` |
-| recovery up-scaling | `test_overload_acceptance.py::test_spawn_gate_windowed_failures_let_the_cap_recover`; defect D1 pinned by `test_d1_two_lifetime_gate_failures_must_not_pin_the_cap_forever` (strict xfail) |
+| recovery up-scaling | `test_overload_acceptance.py::test_spawn_gate_windowed_failures_let_the_cap_recover`; defect D1 pinned by `test_d1_two_lifetime_gate_failures_must_not_pin_the_cap_forever` |
 | cross-process restart | `test_taskq_reconcile.py`, `test_taskq_admission_integration.py::test_queued_rows_survive_restart_and_redispatch`, `test_overload_acceptance.py::test_a12_gateway_restart_during_a_wait_rebuilds_identity_and_links` |
 | outage longer than the old stub budget | `test_stub_broker_reconnect.py`, `test_overload_acceptance.py::test_i12_many_waiting_tasks_and_normal_tasks_coexist_bounded`; defect D2 pinned by `test_dependency_coordinator.py::test_infra_scope_survives_more_probes_than_max_attempts` and `test_overload_acceptance.py::test_d2_gatewayd_outage_longer_than_a_minute_must_not_fail_the_scope` |
 | mixed entry points | `test_taskq_runner_adapter.py`, `test_taskrunner_taskq.py`, `test_workflows_agent_pool.py` (runner lanes bounded by the one effective cap) |
@@ -662,8 +698,8 @@ crew workspace; this section is the design-level summary of it.
 | Wave | Area | Scope | Size | Config (all `restart=True` unless noted) | Specs updated |
 |---|---|---|---|---|---|
 | 1 (slice 0, supervisor half superseded upstream) | — | The supervisor's "overload is not death" gate LANDED ON `main` as #10455's escalated probe: one further probe at `_LIVENESS_ESCALATED_TIMEOUT_SECS` (20s, a whole-round-trip bound) after the fast ping misses, answering either means alive, and the three-strike grace counts only cycles where neither answered. This branch's own answer to the same incident — a supervisor-side reader of the daemon's `is_serving` self-report (`mcp_gateway/self_report.py` + `GatewayManager._alive_but_overloaded`) — is therefore SUBTRACTED, not shipped: under fan-out the record is the strictly later and weaker signal, and it keeps vouching for a daemon whose accept path is dead. The record WRITER (`gatewayd._zombie_diagnostic`) pre-dates both and stays as a post-mortem log. Stub reconnect budget 600s stands. | small | — | mcp-gateway-daemon-lifecycle |
-| 1 | A `taskq` | `kiro_crew/taskq/` store + 13-state machine + lease/generation + migration + reconcile-first boot + network-FS detection; subagent entry writes-before-ack; memory pressure defers instead of refusing; `spawn_sub_agents` `still_running` | ~1.5k lines + tests | `agent.task_queue_enabled=true` (live), `agent.task_dispatch_window=64`, `agent.admit_wait_secs=30`, `agent.start_collect_timeout_secs=300`, `agent.task_store_journal_mode="auto"`, `taskrunner.auto_resume=false` | subagent, taskrunner, workflows, config, new `taskq.md` |
-| 1 | B `gateway-admission` | `HostBudget`; gatewayd `SpawnGate` with FIXED capacity and a `set_capacity()` seam; FIFO wait + `spawn_queue` capability + `queued` keepalive; `BackendPool.reserve` before spawn; rejection classes; fallback only for `compat`/`isolation`; prewarm through the gate; exactly-once permit settle; drain cancels waiters; all three stub paths queue-aware | ~1.2k lines + tests | `mcp_gateway.spawn_concurrency_initial=4`, `spawn_concurrency_min=1`, `spawn_concurrency_max=8`, `spawn_queue_wait_secs=600`, `initialize_timeout_secs=60` (constructor arg, not module setter) | mcp-gateway-daemon-lifecycle, mcp-gateway-backend-replacement, architecture/mcp, config |
+| 1 | A `taskq` | `kiro_crew/taskq/` store + state machine (15 states in `taskq/model.py` `STATES`, including `unknown_side_effect`) + lease/generation + migration + reconcile-first boot + network-FS detection; subagent entry writes-before-ack; memory pressure defers instead of refusing; `spawn_sub_agents` `still_running` | ~1.5k lines + tests | `agent.task_queue_enabled=true` (live), `agent.task_dispatch_window=64`, `agent.admit_wait_secs=30`, `agent.start_collect_timeout_secs=300`, `agent.task_store_journal_mode="auto"`, proposed `taskrunner.auto_resume=false` (not shipped) | subagent, taskrunner, workflows, config, new `taskq.md` |
+| 1 | B `gateway-admission` | `HostBudget`; gatewayd `SpawnGate` with FIXED capacity and a `set_capacity()` seam; FIFO wait + `spawn_queue` capability + `queued` keepalive; `BackendPool.reserve` before spawn; rejection classes; fallback only for `compat`/`isolation`; prewarm through the gate; exactly-once permit settle; drain cancels waiters; all three stub paths queue-aware | ~1.2k lines + tests | `mcp_gateway.spawn_concurrency_initial=4`, `spawn_concurrency_min=1`, `spawn_concurrency_max=8`, `spawn_queue_wait_secs=600`, `initialize_timeout_secs` (constructor arg, not module setter; shipped default 10) | mcp-gateway-daemon-lifecycle, mcp-gateway-backend-replacement, architecture/mcp, config |
 | 1 | C `rfc` | this document on the branch, §13 as decisions, index row | docs | — | request-for-change index |
 | 2 | D `SessionStartGate` | `SessionStartGate` + `StartCollector` + `AcpRuntime._pending_requests.adopt` with harness-parity tests for both backends | ~0.4k | `agent.session_start_concurrency=2` | acp-client, subagent |
 | 2 | E `AdaptivePolicy` | signals, AIMD, pause-and-probe, per-provider vs host; wired to `apply_limits` and `SpawnGate.set_capacity`; fault-injection harness fixes thresholds | ~0.6k | `agent.adaptive_concurrency=true` (live), `agent.adaptive_concurrency_mode="aimd"` (`"fixed"` reverses to a plain semaphore), `agent.adaptive_floor=1`, `agent.controller_sample_secs=5` | subagent, taskq, config |
@@ -673,7 +709,7 @@ crew workspace; this section is the design-level summary of it.
 | 2 | L `dependency-coordinator` | `taskq/dependency.py`: `DependencySignal`, per-scope `DependencyCoordinator`, GitHub/HTTP-429 adapter as the first sample (§14.4) | ~0.4k | `agent.dependency_max_attempts=20`, `agent.dependency_wake_per_tick=0` (0 = `effective` cap) | taskq, architecture/mcp |
 | 2/3 | M `status-protocol+interactive` | versioned `kirocrew/status` over ACP `session/update` and MCP `notifications/progress` with origin validation; interactive-command classifier → `waiting_input`; platform degradation declared in `acp/liveness.py` (§14.5, 14.6, 14.9) | ~0.5k | `agent.interactive_command_policy="cancel"` (today's non-lethal cancel of that call; `"wait"` keeps the turn open for real input); tool-stall recovery is bounded by the ladder constant `SESSION_RECOVERY_MAX_ATTEMPTS` (`recovery/ladder.py`, re-exported as `STOP_RECOVERY_MAX_RETRIES`), not a key | acp-client, taskq, session |
 | 3 | O `native-subagent boundary` | per-backend inventory (kiro-cli `use_subagent`, Claude), integrate the controllable ones, declared minimal recovery boundary for the rest with counting and tests (§14.8) | ~0.3k | — | subagent, harness-parity |
-| 3 | G fairness | lanes (`system` lane for cron/hook), `child_reserve` | ~0.4k | `agent.child_reserve_slots=1`, `agent.interactive_reserve_slots=1`, `agent.lane_weights={}` | taskq, subagent |
+| 3 | G fairness | lanes (`system` lane for cron/hook), `child_reserve` | ~0.4k | `agent.child_reserve` (see `taskq.md` § Configuration; no interactive reserve key ships), `agent.lane_weights={}` | taskq, subagent |
 | 3 | H adapters | TaskRunner and workflow entries on the store | ~0.4k | — | taskrunner, workflows |
 | 3 | I API/UI | `/api/tasks`, `to_public_state()`, dashboard states, doctor output | ~0.4k | — | taskq, dashboard |
 | 3 | J experiment | development-time 2000-task fake-harness run; its two findings landed as D1/D2 fixes with owner tests (§11.1); no script or report ships | tests only | — | taskq |
@@ -728,8 +764,7 @@ Question text is kept as asked; the decision below it is final for this PR.
   tables of `tasks.db`, or does this RFC supersede its store?
   **Decision:** this RFC supersedes that store. `runs`/`commands`/`outbox` become
   tables of `tasks.db`; the delivery outbox is `task_events(kind="deliver")`.
-  `rfc-durable-run-coordinator.md` gets `superseded-by: rfc-overload-resilience`
-  when this PR lands. Reversal: none by flag — a separate coordinator store would
+  `rfc-durable-run-coordinator.md` carries `superseded-by: rfc-overload-resilience`. Reversal: none by flag — a separate coordinator store would
   be a new RFC.
 - **Reverting to pre-queue behaviour.** `agent.task_queue_enabled=false`,
   `agent.adaptive_concurrency=false` and `agent.adaptive_concurrency_mode="fixed"`
@@ -744,6 +779,8 @@ Question text is kept as asked; the decision below it is final for this PR.
   fault-injection harness (wave J), not by external hosts. Reversal:
   `agent.adaptive_concurrency_mode="fixed"` turns both actuators into plain
   semaphores at `spawn_concurrency_initial` and `min(user_max, 4)`.
+  **Amended by Q11 (2026-10-05):** the execution actuator starts at
+  `user_max`, so `fixed` pins it there.
 - **Q3.** Checkpoint-pause for dedicated-runtime parents depends on continuable
   sessions surviving a runtime close; what if `session/load` fidelity is not
   there for a mid-tool-call parent?
@@ -774,7 +811,10 @@ Question text is kept as asked; the decision below it is final for this PR.
   (default `auto`) forces either mode.
 - **Q7 (integration).** Four keys the §12 table first proposed have no consumer
   in the shipped code and are NOT added: `agent.wait_deadline_secs` (the wait
-  bound is the per-task `deadline_at` plus `agent.dependency_wait_deadline_secs`),
+  bound is the per-task `deadline_at` plus `agent.dependency_wait_deadline_secs`;
+  a spawn waiting for memory is bounded separately, by
+  `agent.subagent_queue_max_wait_secs`, which arrived with its consumer under
+  Q10),
   `agent.keep_runtime_secs` (residency during a wait is bounded by the existing
   session idle reclaim), `agent.parent_failure_policy` (a per-call
   `on_child_failure` parameter, not a global), `agent.tool_stall_retries`
@@ -830,7 +870,8 @@ Question text is kept as asked; the decision below it is final for this PR.
   while never admitting a start that would leave the host below it?
   **Decision (owner direction, 2026-10-01):** the floor is the memory that must
   remain available AFTER a start, and its default is 2.0 GB. That is the one
-  capacity guarantee; when it does not hold, the spawn waits in the queue. A
+  capacity guarantee; when it does not hold, the spawn waits in the queue, for
+  at most `agent.subagent_queue_max_wait_secs` (Q10). A
   capacity verdict never refuses a spawn that has a queue to wait in (an
   in-memory legacy spawn that has none still refuses until it gains one);
   governance, cwd and memory-identity refusals stay refusals. Each start is
@@ -878,15 +919,17 @@ Question text is kept as asked; the decision below it is final for this PR.
   the floor's macOS reading takes the level as a second input, read through a
   `platform_compat` helper. A vetoed start waits in the queue, and that wait
   is finite under the owner's same-day max-wait direction, which covers every
-  start queued for memory, a vetoed one included: default 1800 s, set by a
-  live-reloadable key `agent.subagent_queue_max_wait_secs` that is not on main
-  yet; on expiry the start gets a delivered terminal "never started: waiting
-  for memory" and leaves its parent's queued count. The text that still
-  describes that wait as unbounded or deadline-only (Q7, Q9's floor rule, §8's
-  queue-wait row, §14.1 W1 and §14.9), and the max wait's own reversal, are
-  updated by the change that adds the key. Grounds: the level is the
-  kernel's own verdict and it lags, so it is a backstop beside the figure,
-  not a replacement for it.
+  start queued for memory, a vetoed one included: default 1800 s, set by the
+  live-reloadable key `agent.subagent_queue_max_wait_secs` (no restart mark);
+  on expiry the start gets a delivered terminal "never started: waiting for
+  memory" and leaves its parent's queued count. Q7, Q9's floor rule, §8's
+  queue-wait row, §14.1 W1 and §14.9 say so. The clock counts the time the
+  row spends parked by its deferrals, and a re-check does not restart it; a
+  row whose deferral lapsed and that now waits only for a slot is not bounded
+  by it, and that slot wait does not count when it is parked again. Reversal:
+  `agent.subagent_queue_max_wait_secs=0` waits without a bound. Grounds: the
+  level is the kernel's own verdict and it lags, so it is a backstop beside
+  the figure, not a replacement for it.
   **Implementation:** [#15876](https://github.com/kirodotdev/KiroCrew/pull/15876),
   whose spec calls the veto the *kernel memory-pressure hold*
   ([subagent.md § Memory guard](../system-specs/modules/subagent.md#memory-guard-what-must-remain-after-the-start)).
@@ -902,11 +945,84 @@ Question text is kept as asked; the decision below it is final for this PR.
     `memory_pressure`), not a store deferral, and no speculative pre-warm is
     admitted while the hold applies.
 
-  At its head `50050c28fc` #15876 bounds the hold with its own fixed
-  constant and carries neither the key nor the terminal above; that half is
-  to match the owner direction before it merges. Reversal:
+  #15876 landed bounding the hold with its own fixed constant, before the
+  key existed. The key arrived with the store deferrals' bound (#16347),
+  which points the hold's bound at it too, so a reload moves both and `0`
+  lifts both. Reversal:
   `agent.spawn_min_memory_gb=0` disables the floor, the reserve and the veto
   together.
+- **Q11 (2026-10-05, accepted).** §5.2 started the execution cap at
+  `min(user_max, 4)`, halved it on loop lag ≥ 250 ms or memory at the critical
+  line alone, and paused it under severe pressure, on top of an auto ceiling
+  sized from host memory, while Q9's floor already priced every start at what it
+  settles at. With more than two chats running subagents, one chat's wave held
+  the slots (or the halved cap) the next chat's starts waited for while memory
+  was still free (#16480, symptom b). Should a count still move on the signals
+  the floor already answers?
+  **Decision (owner direction, 2026-10-05, the fix for #16480 symptom b):** no.
+  The subagent execution track starts at its ceiling (`user_max`, or
+  `agent.subagent_auto_max` when `agent.max_subagents` is 0) and is cut only on
+  work evidence: two or more distinct work signals in one sample (attributable
+  timeouts, slow or failing starts, fd or process exhaustion), while a
+  provider's 429s scale only that provider's lane share, never the cap. Loop
+  lag alone and memory do not cut the subagent cap, and the execution track
+  never pauses. Memory is bounded per start by the floor (Q9, #16355); lag and
+  memory still cut or pause the spawn gate, whose ceiling is raised to the subagent ceiling so a wide fan-out is not
+  queued behind eight backend initializations. The auto ceiling is no longer
+  sized from host memory, except where the floor cannot bound starts: an
+  unreadable host falls back to 3, and a disabled floor
+  (`agent.spawn_min_memory_gb <= 0`) keeps the memory-sized figure.
+  `agent.adaptive_initial` is accepted and inert. Grounds: every bound removed
+  here was a count sitting under the per-start memory floor, so it held work
+  back only while memory was free, and the gateway's own loop lag says nothing
+  about whether a subagent's process is healthy. **Residual:** starts are priced
+  at their settled size, not at the busiest agent's peak, and nothing sheds
+  running work, so children admitted settled that later run builds or tests can
+  push the host below the floor ([subagent.md § Memory guard](../system-specs/modules/subagent.md#memory-guard-what-must-remain-after-the-start)
+  records this as accepted). Reversal: an explicit `agent.max_subagents` pins the
+  ceiling; `agent.adaptive_concurrency_mode="fixed"` pins the execution cap at
+  it; `agent.adaptive_concurrency=false` turns the controller off.
+  **Implementation:** [#17017](https://github.com/kirodotdev/KiroCrew/pull/17017),
+  whose spec is [adaptive-concurrency.md](../system-specs/modules/adaptive-concurrency.md).
+- **Q12 (2026-10-07, accepted).** With Q11's count bounds gone, memory is the
+  pool every chat's subagents share. Three gaps remained (#16480): a start the
+  floor deferred was re-checked only when its admit wait lapsed; §6's promise
+  that a big batch "cannot starve a 3-task session" held for picks but not for
+  memory, since one chat's wave could take every start that fit while another
+  chat waited; and a nested child that shares its parent's runtime waited at the
+  floor although its parent, often waiting on exactly that child, already held
+  its memory, so only the max wait (Q10) could end it. Should admission own the
+  wake and the share, and where does the nested child stand against Q9's floor?
+  **Decision (U5 (b) of the #16480 redesign):**
+  - **Event wake.** A memory wait is recorded per start. A run's terminal (its
+    end or its reap), a wait ending, and a sampler that runs only while a wait
+    exists each take one host reading and bring forward only the waits it now
+    admits; a wake that finds no room writes nothing. The admit wait stays as
+    the restart-safe backstop and the one re-check that writes.
+  - **Per-lane memory share** (extends §6 to memory). While another lane waits
+    below its `agent.lane_weights` share of running dedicated children, a root
+    start of a lane at or above its own share waits too. Nested starts and claim
+    re-entries are exempt, and the starved lane is never held, so it cannot
+    deadlock. It is not a count cap.
+  - **The shared nested child (D4).** A nested start whose runtime is shared is
+    checked against the floor with its own price at 0; its row keeps the shared
+    price, so the floor gives way by one shared start, not a fan-out. Q9's
+    guarantee becomes: admission never takes the host below the floor, except
+    by one shared nested start's price.
+
+  **Residual (accepted):** the share does not ask whether the starved lane's
+  start could fit now, and time a start spends held by the share counts toward
+  its max wait. So a held start that would fit can end `never started: waiting
+  for memory` behind a starved lane whose start cannot fit. The alternatives
+  were rejected: lifting the hold whenever the starved start does not fit lets
+  small starts take memory as it frees and starve a dedicated one, which is the
+  starvation the share exists to stop; and not counting held time leaves a held
+  start with no bound while the other lane keeps queueing starts that never fit.
+  Reversal: `agent.lane_weights` reweights the share; `agent.spawn_min_memory_gb=0`
+  turns the floor, the share and the D4 exception off together.
+  **Implementation:** [#17030](https://github.com/kirodotdev/KiroCrew/pull/17030),
+  whose spec is [subagent.md](../system-specs/modules/subagent.md) *Memory waits:
+  event wake and the per-lane share*.
 
 ## 14. Waits, yielding and nested recovery (owner addendum, 2026-09-12 15:12)
 
@@ -935,14 +1051,14 @@ Stored on the task row (`wait_json`) and appended to `task_events(kind="wait")`
 on entry and `kind="wake"` on exit. "Quota" below means the logical lane slot
 (`ExecutionCap`); "real resources" means `HostBudget` residency (procs, RSS,
 fds) that stays charged until the runtime is actually reclaimed — a counter is
-never decremented for a process that still exists (SPEC-ADDENDUM §2).
+never decremented for a process that still exists.
 
 | Kind | Wait | Who detects it | Where state is stored | Quotas released | Real resources still charged | Wake event | Termination on recovery failure |
 |---|---|---|---|---|---|---|---|
-| W1 | `queued` (capacity) | scheduler at accept | task row `state=queued` | none held | none | admission grants slot + budget | caller `deadline_at` → `failed{reason=deadline}`; store write failure → refused at accept |
+| W1 | `queued` (capacity) | scheduler at accept | task row `state=queued` | none held | none | admission grants slot + budget | caller `deadline_at` → `failed{reason=deadline}`; a memory deferral past `agent.subagent_queue_max_wait_secs` → `failed` "never started: waiting for memory", delivered (Q10); store write failure → refused at accept |
 | W2 | `waiting_dependency` (unavailable, 429, backoff) | dependency adapter emitting `DependencySignal` (§14.4); liveness oracle only corroborates | `WaitRecord{kind=at_time or signal, dependency_scope}` + `DependencyCoordinator` schedule (in-memory, rebuilt from rows on boot) | lane slot | runtime residency while the wait is short (the existing session idle reclaim bounds it); beyond that the runtime is idle-reclaimed and only the row remains | coordinator fires `retry_at` or a recovery signal for the scope; re-admission through §4.5 | attempts ≥ `dependency_max_attempts` or wait > `agent.dependency_wait_deadline_secs` (or the task's own `deadline_at`) → `failed{reason=dependency}`; `auth_failed`/`permanent_param_error` → `failed` immediately |
 | W3 | `waiting_children` | parent's blocking `spawn_sub_agents` / workflow barrier, via the execution layer (tool call id), never model text | `WaitRecord{kind=children, ids=[...]}`; children rows carry `parent_id` | lane slot | parent runtime residency (shared-runtime: a session handle; dedicated: full process) for the whole wait (checkpoint-pause, §6, is designed but not built -- Q3) | last awaited child reaches terminal; parent re-admitted through §4.5 | per-call `on_child_failure` (§14.3): `fail_fast` → parent `failed` when a child fails; `collect` → parent wakes with partial set; children cancelled on parent cancel |
-| W4 | `waiting_input` (interactive command, business choice, password) | tool layer: interactive-command classifier (§14.6) or oracle `STUCK_INPUT` (Linux only, §14.9) | `WaitRecord{kind=input}` + the pending tool call id | lane slot | runtime residency (the blocked process is kept; nothing is auto-answered) | user input via dashboard/channel, routed to the tool call; or user cancels that call | `agent.interactive_command_policy="cancel"` cancels the call at the no-progress budget; default `wait` holds until the user acts or `deadline_at` |
+| W4 | `waiting_input` (interactive command, business choice, password) | tool layer: interactive-command classifier (§14.6) or oracle `STUCK_INPUT` (Linux only, §14.9) | `WaitRecord{kind=input}` + the pending tool call id | lane slot | runtime residency (the blocked process is kept; nothing is auto-answered) | user input via dashboard/channel, routed to the tool call; or user cancels that call | `agent.interactive_command_policy="cancel"` cancels the call at the no-progress budget (the default); opt-in `wait` holds until the user acts or `deadline_at` |
 | W5 | `waiting_permission` | approval broker (existing) | `WaitRecord{kind=permission}` + approval id | lane slot (v2 of this RFC held it; v3 releases it) | runtime residency | approval decision | rejection → the tool call fails, task continues; `deadline_at` → `failed{reason=deadline}` |
 | W6 | `retry_wait` (transient infra failure) | recovery ladder (§7) | `WaitRecord{kind=at_time}` + `attempts`, `next_run_at` | lane slot and budget (runtime released) | none | `next_run_at` reached; re-admission | ladder caps → `failed`; side-effect class `unknown` → `unknown_side_effect` |
 | W7 | `recovering` | ladder layer L1–L4 | `WaitRecord{kind=signal, scope=layer}` | none (slot kept so the rebuild is not starved) | runtime residency being rebuilt | layer reports rebuilt; `StartCollector` settles | layer attempts exhausted → escalate or `failed` |
@@ -1049,28 +1165,25 @@ mapping is a table, not a rewrite of arbitrary flags. A call that still blocks i
 classified by evidence (`STUCK_INPUT` from the oracle on Linux; tool-layer
 prompt detection elsewhere): the scheduler first inspects existing output and
 side effects, then either (a) cancels that one call and lets the model continue
-with the partial output (`agent.interactive_command_policy="cancel"`), or (b)
-enters W4 and waits for real input (default `"wait"`). Never auto-answer `yes`;
+with the partial output (`agent.interactive_command_policy="cancel"`, the
+default), or (b) enters W4 and waits for real input (opt-in `"wait"`). Never auto-answer `yes`;
 never re-run a command whose side effects may have happened (class `unknown`,
 §9.6); a non-interactive retry stays inside the already-granted approval scope
 and the original parameters. This change ships only that classifier -- it
 yields the lane slot into `waiting_input` -- while the PTY-driving controlled
-terminal (Kiro Crew as the child's parent, answering the prompt over stdin)
-ships in a follow-up PR.
+terminal (Kiro Crew as the child's parent, answering the prompt over stdin) is
+not built.
 
 ### 14.7 Stop-reason → state classifier
 
-Verified on main: `subagent_manager/run.py` breaks out of the stream on
-`EVENT_COMPLETE` (`_complete_event = event`, L1697–1699) and the only later
-reader of that event is the token-usage record (L1762); no branch compares
-`event.stop_reason`, so a completion carrying `STOP_REASON_TOOL_STALL`
-(`"error: tool stall"`, `acp/types.py` L297) or `STOP_REASON_COMPACTION_FAILED`
-(L305) is recorded with `info.result = cleaned or "_No response._"` and reaches
-`_claim_finalize` as a success. `dashboard/chat_runner.py` does branch
-(`event.stop_reason == STOP_REASON_TOOL_STALL` at L10831, L11030, L11120) and
-runs its own continuation bounded by `slot._tool_stall_retries`. The reaper's
-`stalled` flag (`monitoring.py` L629–717) is UI-only and releases nothing.
-Wave N ships the regression test first, then one classifier used by every entry:
+Before this RFC, `subagent_manager/run.py` broke out of the stream on
+`EVENT_COMPLETE` and read that event only for the token-usage record; no branch
+compared `event.stop_reason`, so a completion carrying `STOP_REASON_TOOL_STALL`
+(`"error: tool stall"`) or `STOP_REASON_COMPACTION_FAILED` was recorded as a
+result and reached `_claim_finalize` as a success. `dashboard/chat_runner.py`
+branched on `STOP_REASON_TOOL_STALL` and ran its own continuation bounded by
+`slot._tool_stall_retries`. `subagent_manager/run.py` now imports and applies
+`acp.types.classify_stop_reason`, the one classifier below:
 
 | `stop_reason` (`acp/types.py`) | Meaning | Task state | Slot | Retry |
 |---|---|---|---|---|
@@ -1106,7 +1219,8 @@ session handle, never the runtime shared with unrelated sessions.
 
 Wait budgets are separate from the execution budget (§8): time in W1–W6 does
 not count toward `subagent_timeout_secs`; each wait kind has its own bound
-(`deadline_at`, `dependency_wait_deadline_secs`, coordinator caps, ladder caps). A blocking
+(`deadline_at`, `subagent_queue_max_wait_secs` for a W1 row deferred for memory,
+`dependency_wait_deadline_secs`, coordinator caps, ladder caps). A blocking
 `spawn_sub_agents` expiry returns `still_running` with ids and states (§8) and
 never marks the child failed.
 

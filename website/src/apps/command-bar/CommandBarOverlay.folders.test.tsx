@@ -68,11 +68,16 @@ vi.mock('../../hooks/useTheme', () => ({ useTheme: () => ({ cycle: vi.fn() }) })
 const listApps = vi.fn(async () => [])
 const chatFolders = vi.fn(async () => [] as unknown[])
 const kirocrewConfig = vi.fn(async () => ({}) as unknown)
+// The settings-search governance reads: the root must answer from cache, never fetch.
+const dashboardConfig = vi.fn(async () => ({}) as unknown)
+const tipsStatus = vi.fn(async () => ({}) as unknown)
 vi.mock('../../api/client', () => ({
   api: {
     listApps: (...a: unknown[]) => listApps(...(a as [])),
     chatFolders: (...a: unknown[]) => chatFolders(...(a as [])),
     kirocrewConfig: (...a: unknown[]) => kirocrewConfig(...(a as [])),
+    dashboardConfig: (...a: unknown[]) => dashboardConfig(...(a as [])),
+    tipsStatus: (...a: unknown[]) => tipsStatus(...(a as [])),
   },
 }))
 
@@ -267,6 +272,9 @@ describe('command bar — the root', () => {
     // The folder ORDER's settings read is a cache subscription too: the shell holds
     // that entry, and opening the bar must not refetch it.
     expect(kirocrewConfig).not.toHaveBeenCalled()
+    // Nor do the settings rows' governance reads, whatever their age.
+    expect(dashboardConfig).not.toHaveBeenCalled()
+    expect(tipsStatus).not.toHaveBeenCalled()
   })
 })
 
@@ -430,11 +438,12 @@ describe('command bar — folders view', () => {
     )
   })
 
-  it('refuses a STALE Enter, so a fast typist never reveals the wrong folder', async () => {
+  it('latches a debounce-window Enter and reveals the folder on the live rows', async () => {
     // This view ranks from the DEBOUNCED query like every other scoped one, so for one
-    // debounce interval after a keystroke its rows answer the previous query — and an
-    // Enter in that window acts on the row that was selected against it. Reported first
-    // in the crewmates view; the guard is on the activation path all four share.
+    // debounce interval after a keystroke its rows answer the previous query. An Enter
+    // in that window is held, never acting on the row selected against the old query,
+    // and fired once the rows answer what the reader typed. Reported first in the
+    // crewmates view; the latch is on the activation path all four share.
     await openFoldersView()
     type('sydney')
     await waitFor(() => expect(hasRow('Sydney Property')).toBe(true))
@@ -449,18 +458,11 @@ describe('command bar — folders view', () => {
       type: 'requestFolderReveal',
       folderId: 'f-syd',
     })
-    // Once the rows catch up, the same Enter reveals what was typed. BOTH halves are
-    // waited on: `Trading Desk` alone is in the unfiltered listing too, so it is already
-    // true before the debounce flushes, and `Sydney Property` alone is false during the
-    // blank frame while the new query fetches — where there is no row to press at all.
-    await waitFor(() => {
-      expect(hasRow('Trading Desk')).toBe(true)
-      expect(hasRow('Sydney Property')).toBe(false)
-    })
-    fireEvent.keyDown(input, { key: 'Enter' })
+    // The latched Enter reveals what was typed on its own, never the stale folder.
     await waitFor(() =>
       expect(dispatch).toHaveBeenCalledWith({ type: 'requestFolderReveal', folderId: 'f-trade' }),
     )
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'requestFolderReveal', folderId: 'f-syd' })
   })
 
   it('still opens the row a POINTER pressed inside that same window', async () => {

@@ -35,7 +35,9 @@ import { isTouchDevice } from '../../utils/isTouchDevice'
  *     composer on the page (or focus outside any pane in a view with no
  *     focused marker) the first match IS the right one.
  *
- * The probe is the stable `data-composer-input` hook, NOT the textarea's
+ * The probe is the stable `data-composer-input` hook, on either composer: the
+ * plain textarea or the Lexical contenteditable div (the Style Markdown While
+ * Typing setting renders the latter), NOT the textarea's
  * aria-label: the label is `i18nT('components.chatInput.message_input')` and
  * every catalog translates it, so a label-based selector matches in English
  * only and focus silently no-ops in the other eleven languages. The `data-`
@@ -45,9 +47,9 @@ import { isTouchDevice } from '../../utils/isTouchDevice'
  * Steps 1 and 2 are `focusedPane()` below, shared with the pending-approval
  * lookup so both chords agree about which pane they are in.
  */
-export function queryComposer(): HTMLTextAreaElement | null {
+export function queryComposer(): HTMLElement | null {
   const pane = focusedPane()
-  const scoped = pane?.querySelector<HTMLTextAreaElement>('textarea[data-composer-input]')
+  const scoped = pane?.querySelector<HTMLElement>('[data-composer-input]')
   if (scoped) return scoped
   /**
    * Document-wide fallback, EXCLUDING the side chat's own composer.
@@ -71,7 +73,7 @@ export function queryComposer(): HTMLTextAreaElement | null {
    * `[data-side-chat-input]` is the marker ChatPage already uses to find that
    * composer (`handleAsk`'s mount probe), not one invented here.
    */
-  const all = document.querySelectorAll<HTMLTextAreaElement>('textarea[data-composer-input]')
+  const all = document.querySelectorAll<HTMLElement>('[data-composer-input]')
   for (const ta of all) {
     if (!ta.closest('[data-side-chat-input]')) return ta
   }
@@ -132,7 +134,7 @@ export function requestComposerExpand(): boolean {
  * synchronous: when the composer is already there the callback runs before this
  * returns, so neither caller loses the ordering its own comment relies on.
  */
-export function queryComposerOrExpand(then: (ta: HTMLTextAreaElement) => void): void {
+export function queryComposerOrExpand(then: (ta: HTMLElement) => void): void {
   const ta = queryComposer()
   if (ta) { then(ta); return }
   if (!requestComposerExpand()) return
@@ -140,6 +142,25 @@ export function queryComposerOrExpand(then: (ta: HTMLTextAreaElement) => void): 
     const revealed = queryComposer()
     if (revealed) then(revealed)
   })
+}
+
+/**
+ * Focus a resolved composer with the caret AFTER its text.
+ *
+ * A textarea keeps its own selection, which a programmatic pre-fill leaves at
+ * the end, so `focus()` alone is right there. The Lexical composer (Style
+ * Markdown While Typing) is a contenteditable div that follows the DOM
+ * selection, and a bare `focus()` puts the caret at offset 0, so the next key
+ * would land in front of a pre-filled quote or `@`-mention. Collapse the
+ * selection to the end there, as the side chat's seed nudge already does.
+ */
+export function focusComposerElement(el: HTMLElement): void {
+  el.focus()
+  if (el instanceof HTMLTextAreaElement) return
+  const sel = window.getSelection()
+  if (!sel) return
+  sel.selectAllChildren(el)
+  sel.collapseToEnd()
 }
 
 /**
@@ -212,7 +233,7 @@ export function queryPendingApprovalAction(): HTMLElement | null {
 export function focusComposer(): void {
   requestAnimationFrame(() => {
     if (isTouchDevice()) return
-    queryComposerOrExpand(ta => ta.focus())
+    queryComposerOrExpand(focusComposerElement)
   })
 }
 
@@ -230,7 +251,7 @@ export function revealComposer(): void {
       if (isTouchDevice()) {
         if (typeof ta.scrollIntoView === 'function') ta.scrollIntoView({ block: 'nearest' })
       } else {
-        ta.focus()
+        focusComposerElement(ta)
       }
     })
   })
@@ -377,29 +398,64 @@ function focusOnceSwitchHasLanded(key: string, store: ActiveSlotStore): void {
     })
     return
   }
-  focusComposerNow()
+  focusComposerNow(key)
 }
 
 /** The one place both quick-search helpers put the caret: the sidebar's three
  *  rules (touch, a field the user holds, and -- through `queryComposer` -- a
  *  collapsed composer stays collapsed, reported missing with no expand
- *  requested), then the composer.
+ *  requested), then the composer the gesture is about.
  *
- *  Split view is skipped entirely. While a session-grid pane is mounted the
- *  page shows N composers, each bound to its own pane's slot, and the grid's
- *  focus model never follows `activeSlot` (see SessionGridView), so
- *  `queryComposer` would answer with the grid-focused pane's composer -- a
- *  session the gesture did not open, where the next Enter would send. A sidebar
- *  click leaves the split before it focuses; a quick-search open does not, so
- *  the honest answer here is no caret, exactly what the surfaces did before
- *  they said anything about focus. A lookup that resolves the pane bound to
- *  the opened key is the follow-up; nothing in the DOM names a pane's slot
- *  today. */
-export function focusComposerNow(): void {
+ *  `key` is the slot the gesture OPENED, when it opened one. It decides which
+ *  composer in split view: while a session-grid pane is mounted the page shows
+ *  N composers, each bound to its own pane's slot, and the grid's focus model
+ *  never follows `activeSlot` (see SessionGridView), so `queryComposer` would
+ *  answer with the grid-focused pane's composer -- a session the gesture did
+ *  not open, where the next Enter would send. `queryComposerForSlot` resolves
+ *  the pane bound to the opened key instead (#15937). No pane renders the
+ *  key, or the gesture named no key (the palette's dismiss fallback), and the
+ *  honest answer stays no caret: a sidebar click leaves the split before it
+ *  focuses, a quick-search open does not, and the store having switched does
+ *  not put the session on screen. Outside split view the single composer is
+ *  bound to the active slot, which the callers have already checked IS `key`. */
+export function focusComposerNow(key?: string): void {
   if (isTouchDevice()) return
-  if (document.querySelector('[data-chat-pane]')) return
   if (activeElementIsEditable()) return
-  queryComposer()?.focus()
+  const el = queryComposerForSlot(key)
+  if (el) focusComposerElement(el)
+}
+
+/**
+ * The composer that answers to `key` on this page, or null when none provably
+ * does.
+ *
+ * No pane mounted: the single-chat surface, whose one composer is bound to the
+ * active slot -- `queryComposer`'s document-wide answer, unchanged.
+ *
+ * Panes mounted: ONLY the pane whose `data-pane-slot` names `key`. The pane
+ * names its slot in the DOM for exactly this lookup (ChatPane's root carries
+ * `data-pane-slot` beside `data-chat-pane`), because nothing else there says
+ * which session a composer sends to: `data-chat-pane="focused"` says which pane
+ * the grid considers focused, and that is a different question with a
+ * different answer. Compared as attribute bytes rather than through an
+ * attribute selector, so a slot key never has to be CSS-escaped here.
+ *
+ * A pane bound to `key` is the only acceptable answer while panes are mounted:
+ * the grid-focused pane's composer would route the user's next Enter to a
+ * session the gesture did not open, and the first pane in document order is
+ * no better. Hence null, not a fallback, when no pane renders the key -- and
+ * null for an undefined `key`, since a gesture that opened nothing has no pane
+ * to claim.
+ */
+function queryComposerForSlot(key: string | undefined): HTMLElement | null {
+  const panes = document.querySelectorAll<HTMLElement>('[data-chat-pane]')
+  if (panes.length === 0) return queryComposer()
+  if (key === undefined) return null
+  for (const pane of panes) {
+    if (pane.getAttribute('data-pane-slot') !== key) continue
+    return pane.querySelector<HTMLElement>('[data-composer-input]')
+  }
+  return null
 }
 
 /**
@@ -420,10 +476,14 @@ export function focusComposerNow(): void {
  * its fulfilled reducer, at the moment this promise settles, so there is no
  * provisional window for a keystroke to land in, and the slot the reducer
  * entered IS the one the gesture named.
+ *
+ * `key` is the thunk's own payload field -- the slot the gateway resumed, which
+ * is the one the reducer entered -- and names the pane to focus in split view
+ * (#15937).
  */
-export function focusComposerForResumedSession(resumed: Promise<{ ok: boolean; surface?: string }>): void {
+export function focusComposerForResumedSession(resumed: Promise<{ ok: boolean; surface?: string; key: string }>): void {
   void resumed
-    .then(result => { if (result.ok && isChatPageSurface(result.surface)) requestAnimationFrame(focusComposerNow) })
+    .then(result => { if (result.ok && isChatPageSurface(result.surface)) requestAnimationFrame(() => focusComposerNow(result.key)) })
     .catch(() => {})
 }
 
@@ -464,7 +524,7 @@ const COMPOSER_RELEASE_TTL_MS = 1500
 export function releaseComposerForKeyboardSwitch(): void {
   composerReleaseArmedAt = Date.now()
   const ae = document.activeElement
-  if (ae instanceof HTMLTextAreaElement && ae.hasAttribute('data-composer-input')) ae.blur()
+  if (ae instanceof HTMLElement && ae.hasAttribute('data-composer-input')) ae.blur()
 }
 
 /** Consume the one-shot release. True = the autofocus effect must skip this transition. */

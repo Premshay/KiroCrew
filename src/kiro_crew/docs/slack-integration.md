@@ -62,10 +62,10 @@ Available to all allowed users (no `!` prefix needed):
 | `cron resume <id>` | Resume a paused cron job |
 | `spawn run "task"` | Spawn a background subagent |
 | `spawn list` | List running subagents |
-| `run <path>` | Run an autonomous task from a spec file |
-| `run status` | Check task runner status |
-| `run cancel` | Cancel the running task |
-| `sessions` | List recent dashboard sessions with resume buttons |
+| `task run <path>` | Run an autonomous task from a spec file (`project run` is an alias; a bare `run <path>` is not a command) |
+| `task run status` | Check task runner status |
+| `task run cancel` | Cancel the running task |
+| `sessions` | List recent dashboard sessions with resume buttons, newest by your last message; `slack.sessions_limit` rows (default 10, at most 17) |
 | `!compact` | Manually trigger context compaction |
 | `!incognito <msg>` | Send message in incognito mode (reads memory, blocks writes) |
 | `!temporary <msg>` | Send message in temporary mode (blocks both reads and writes) |
@@ -81,7 +81,7 @@ Available to all allowed users (no `!` prefix needed):
 | `/kirocrew config` | Edit the tracked-channel list (owner only); its user half is inert |
 | `/kirocrew users` | Always refuses — multi-user access is disabled |
 | `/kirocrew channels` | Manage tracked channels |
-| `/kirocrew sessions` | List recent sessions |
+| `/kirocrew sessions` | List recent sessions, ranked like `sessions` and capped by `slack.sessions_limit` (default 10, at most 17) |
 | `/kirocrew status` | Show runtime stats |
 | `/kirocrew restart` | Restart the gateway (owner only) |
 
@@ -106,8 +106,14 @@ in the thread where the agent is running.
 
 `!stop` is intercepted before the per-session semaphore in the Slack event
 handler, so it acts even when the agent is mid-tool-call or mid-stream.
-The active asyncio task is cancelled, the message queue for that session is
-cleared, the pending queue is dropped, and the session is reset. Three
+The active asyncio task is cancelled, your own queued messages for that
+session are dropped (including any not-yet-dispatched attachments), and the
+session is reset. For a `!stop` sent as a message in the thread, messages
+other members of the thread have queued stay queued and are answered in
+order once the turn stops: everybody in a thread shares its session, so that
+stop only withdraws what its caller sent. A stop that escalates to a hard
+stop, and **Kill Now**, still tear the session down with its whole queue,
+every member's messages included. Three
 answers, one per outcome: "⏹ Execution stopped." when the turn stopped
 cooperatively, "⛔ Execution stopped — session reset." when it had to be
 escalated to a hard stop, and "Nothing running." when no turn was active.
@@ -125,7 +131,7 @@ With `slack.reactions_enabled` on, the reaction on your message tracks the phase
 
 ## File attachments
 
-Slack ingests attachments on incoming messages and can upload local image references from completed replies. Outbound uploads are limited to 10 files, 10 MiB per file, and 25 MiB total per reply.
+Slack ingests attachments on incoming messages and can upload local image references from completed replies, including a scheduled cron's result posted to Slack: an `![alt](/abs/path.png)` the reply embeds is uploaded as a native image into the same thread, limited to files inside the session's workspace. Outbound uploads are limited to 10 files, 10 MiB per file, and 25 MiB total per reply. A reference that cannot be sent is named in a short note in the thread rather than dropped.
 
 ## DM Sessions
 
@@ -140,8 +146,40 @@ threaded reply joins that same conversation too — in a 1:1 DM a thread is usua
 a layout choice, not a new topic — while the answer still lands inside the thread
 you asked in. Group channels and group DMs are unaffected.
 
+The setting applies only on the default messaging transport
+(`messaging.use_transport`, on by default) and never in a DM set to `review` mode;
+there, each top-level DM message still starts its own thread session.
+
 Off by default, because turning it on routes your next DM to a different session
 than the previous one. Existing threads keep working either way.
+
+## Auto-connect new dashboard sessions
+
+Every dashboard session can be mirrored into a Slack thread from its session
+actions menu: the **Connect to Slack** rows offer your bot DM and each channel the
+bot can post in. Turn on **Connect new sessions to Slack automatically** at
+`/settings/channels/slack` (`slack.auto_link_sessions`) and the dashboard does that
+for you: the thread opens when a new session sends its first message, so you can
+follow and reply to it from Slack without clicking the row each time. A tab you
+open and abandon leaves nothing behind, because nothing is posted until the first
+message.
+
+The automatic thread always opens in your DM with the bot, which only you can
+read. To mirror a session into a channel instead, use the **Connect to Slack**
+rows in its session actions menu.
+
+Only sessions a person starts in the dashboard qualify. Sessions started by cron
+jobs, apps, sub-agents or another channel, incognito and temporary sessions, and
+sessions that already existed when the setting was turned on are left alone. A
+session connected this way behaves exactly like one connected by hand: pause
+replies to Slack, unlink it from Slack, or reply in the thread as usual. It stays where it is in the
+sidebar: the **File sessions in a folder** setting below applies only to
+conversations that start in Slack. If Slack is slow when the first message is
+sent, the thread still opens and picks up from the next message; if Slack cannot
+be reached, the session simply stays unconnected, and you can connect it from the
+session actions menu later.
+
+Off by default. Applies to the next new session with no restart.
 
 ## OPTIONS Buttons
 

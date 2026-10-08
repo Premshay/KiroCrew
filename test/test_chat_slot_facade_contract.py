@@ -45,7 +45,6 @@ _TO_DICT_KEYS = (
     "running",
     "compacting",
     "stop_declined",
-    "orchestrating",
     "queue_depth",
     "stopping",
     "pending_approval",
@@ -87,9 +86,11 @@ _TO_DICT_KEYS = (
     "memory_mode",
     "forked_from",
     "linked_session_key",
+    "history_key",
     "app",
     "origin",
     "created_by",
+    "lineage_minted",
 )
 
 

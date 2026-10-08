@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -311,6 +312,53 @@ class TestIdentityFingerprint:
             )
         con.close()
         assert kp.identity_fingerprint(db) == before
+
+    @staticmethod
+    def _set_oauth_flow(db: Path, flow: str) -> None:
+        con = sqlite3.connect(str(db))
+        with con:
+            for key, value in con.execute("SELECT key, value FROM auth_kv").fetchall():
+                blob = json.loads(value)
+                blob["oauth_flow"] = flow
+                con.execute("UPDATE auth_kv SET value=? WHERE key=?", (json.dumps(blob), key))
+        con.close()
+
+    def test_oauth_flow_casing_is_not_an_account_change(self, tmp_path: Path) -> None:
+        """kiro-cli's refreshers write the same flow as `PKCE` or `Pkce`.
+
+        A refresh that only re-spells the flow must not read as a new account,
+        or every refresh retires healthy sessions.
+        """
+
+        db = tmp_path / "data.sqlite3"
+        _write_store(db)
+        self._set_oauth_flow(db, "PKCE")
+        before = kp.identity_fingerprint(db)
+        self._set_oauth_flow(db, "Pkce")
+        assert kp.identity_fingerprint(db) == before
+        self._set_oauth_flow(db, "pkce")
+        assert kp.identity_fingerprint(db) == before
+
+    def test_an_oauth_flow_change_is_still_detected(self, tmp_path: Path) -> None:
+        """Case-folding must not hide a genuine change of sign-in flow."""
+
+        db = tmp_path / "data.sqlite3"
+        _write_store(db)
+        self._set_oauth_flow(db, "PKCE")
+        before = kp.identity_fingerprint(db)
+        self._set_oauth_flow(db, "device_code")
+        assert kp.identity_fingerprint(db) != before
+
+    def test_start_url_and_client_id_stay_case_sensitive(self, tmp_path: Path) -> None:
+        """Only the flow label is case-folded; identifiers keep exact comparison."""
+
+        db = tmp_path / "data.sqlite3"
+        _write_store(db, state_rows=False, client_id="client-registration-aaa")
+        before = kp.identity_fingerprint(db)
+        _write_store(db, state_rows=False, client_id="CLIENT-REGISTRATION-AAA")
+        assert kp.identity_fingerprint(db) != before
+        _write_store(db, state_rows=False, start_url="https://COMPANY.awsapps.com/start")
+        assert kp.identity_fingerprint(db) != before
 
     def test_an_unknown_blob_field_never_joins_the_fingerprint(self, tmp_path: Path) -> None:
         """Allowlist, not denylist: a field a future kiro-cli adds stays out.
@@ -830,10 +878,11 @@ class TestApiKeyIdentity:
         assert kp.identity_stamp_mismatch(f"s1{sep}k1{vault}v1", f"s1{sep}k1{vault}v2") is True
 
     def test_a_key_rotation_spares_a_key_stripping_child_only(self) -> None:
-        """KAS (and every foreign backend) has the key stripped at spawn, so a
-        key rotation alone must not un-spare it -- that would retire its idle
-        parent and cancel running children. A kiro-cli child IS handed the key,
-        so it keeps the whole-fingerprint spare."""
+        """A Crew-owned KAS relay (and every foreign backend) has the key
+        stripped at spawn, so a key rotation alone must not un-spare it -- that
+        would retire its idle parent and cancel running children. A kiro-cli
+        child and a cli-owned KAS relay ARE handed the key, so they keep the
+        whole-fingerprint spare."""
 
         from kiro_crew.acp.runtime import AcpRuntime
         from kiro_crew.providers.acp import AcpProvider
@@ -841,24 +890,33 @@ class TestApiKeyIdentity:
         sep, vault = kp._API_KEY_FINGERPRINT_SEP, kp._CREW_VAULT_FINGERPRINT_SEP
         stamp, rotated = f"s1{sep}k1{vault}v1", f"s1{sep}k2{vault}v1"
 
-        def holder(backend: object) -> SimpleNamespace:
+        def holder(backend: object, **runtime: object) -> SimpleNamespace:
             return SimpleNamespace(
-                spawn_identity=stamp, _runtime=SimpleNamespace(acp_backend=backend)
+                spawn_identity=stamp,
+                _runtime=SimpleNamespace(acp_backend=backend, **runtime),
             )
 
-        assert kp.spawned_under(holder("kas"), rotated) is True
+        crew_owned_kas = holder("kas", _kas_host_auth=True)
+        assert kp.spawned_under(crew_owned_kas, rotated) is True
         assert kp.spawned_under(holder("claude"), rotated) is True
         assert kp.spawned_under(holder(""), rotated) is False
+        # A cli-owned KAS relay authenticated with the key, so a rotation un-spares it.
+        assert kp.spawned_under(holder("kas", _kas_host_auth=False), rotated) is False
+        # A KAS holder whose auth owner cannot be read keeps the stricter spare.
+        assert kp.spawned_under(holder("kas"), rotated) is False
         # An unreadable backend keeps the stricter spare.
         assert kp.spawned_under(SimpleNamespace(spawn_identity=stamp), rotated) is False
         # A store or vault change still un-spares a key-stripping child.
-        assert kp.spawned_under(holder("kas"), f"s2{sep}k2{vault}v1") is False
-        assert kp.spawned_under(holder("kas"), f"s1{sep}k2{vault}v2") is False
+        assert kp.spawned_under(crew_owned_kas, f"s2{sep}k2{vault}v1") is False
+        assert kp.spawned_under(crew_owned_kas, f"s1{sep}k2{vault}v2") is False
 
-        # The backend is read off the real classes.
-        assert kp.receives_kiro_cli_api_key(AcpRuntime(acp_backend="kas")) is False
+        # The backend and auth owner are read off the real classes.
+        crew_owned = AcpRuntime(acp_backend="kas")
+        crew_owned._kas_host_auth = True
+        assert kp.receives_kiro_cli_api_key(crew_owned) is False
+        assert kp.receives_kiro_cli_api_key(AcpRuntime(acp_backend="kas")) is True
         assert kp.receives_kiro_cli_api_key(AcpRuntime()) is True
-        assert kp.receives_kiro_cli_api_key(AcpProvider(acp_backend="kas")) is False
+        assert kp.receives_kiro_cli_api_key(AcpProvider(acp_backend="kas")) is True
         assert kp.receives_kiro_cli_api_key(AcpProvider()) is True
 
 
@@ -1538,6 +1596,32 @@ class TestLatchNarrowingPolicy:
         assert sessions.calls == 2
 
     @pytest.mark.asyncio
+    async def test_an_incomplete_sweep_warns_and_names_what_it_waits_on(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """INFO sits below the default level, so the holdout was invisible."""
+
+        from kiro_crew.dashboard import chat_runner
+
+        db = kp.kiro_identity_store_path("linux", tmp_path, {})
+        _write_store(db)
+        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
+        service._stamp_probe(await service.current_identity_fingerprint())
+
+        _write_store(db, start_url="https://personal.awsapps.com/start")
+        sessions = self._Sessions(complete=False)
+        sessions.identity_sweep_waiting_on = ("channel:c1:m1 (channel member)",)  # type: ignore[attr-defined]
+        state = self._State(service, sessions)
+
+        with caplog.at_level(logging.INFO, logger="kiro_crew.dashboard.chat_runner"):
+            await chat_runner._retire_sessions_on_identity_change(state)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, caplog.text
+        assert "incomplete" in warnings[0].getMessage()
+        assert "channel:c1:m1 (channel member)" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
     async def test_a_complete_sweep_reconciles_once(self, tmp_path: Path) -> None:
         from kiro_crew.dashboard import chat_runner
 
@@ -2100,6 +2184,57 @@ class TestRetirementCoverage:
         assert bg.killed == 0
         assert smap._bg_runtime is bg
         assert complete is True
+
+    # -- Channel members ----------------------------------------------------
+    #
+    # A channel member holds its lease for the channel's whole life, so the
+    # semaphore test reads it as busy even while it only listens.
+
+    def _channel_member(self, smap, key: str, stamp: str):
+        provider = _FakeProvider("")
+        if stamp:
+            provider.spawn_identity = stamp  # type: ignore[attr-defined]
+        smap._sessions[key] = self._session(provider, busy=True)
+        assert smap.mark_lifecycle_lease(key), "precondition: the lease was not declared"
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_a_live_stamped_channel_member_does_not_block_completion(self) -> None:
+        smap = self._manager()
+        member = self._channel_member(smap, "channel:c1:m1", self.LIVE)
+
+        retired, complete = await smap.retire_kiro_identity_sessions(fingerprint=self.LIVE)
+
+        assert retired == []
+        assert complete is True
+        assert member.shutdown_calls == 0
+        assert not smap._sessions["channel:c1:m1"].retire_on_identity_change
+        assert smap.pending_identity_sweep_fingerprint == ""
+        assert smap.identity_sweep_waiting_on == ()
+
+    @pytest.mark.asyncio
+    async def test_an_old_account_channel_member_is_named_as_the_holdout(self) -> None:
+        smap = self._manager()
+        member = self._channel_member(smap, "channel:c1:m1", "cli-old")
+        busy = _FakeProvider("")
+        smap._sessions["chat-busy"] = self._session(busy, busy=True)
+
+        retired, complete = await smap.retire_kiro_identity_sessions(fingerprint=self.LIVE)
+
+        assert retired == []
+        assert complete is False
+        assert member.shutdown_calls == 0
+        assert smap.identity_sweep_waiting_on == (
+            "channel:c1:m1 (channel member)",
+            "chat-busy (busy)",
+        )
+
+        # Once the holdouts are gone the next sweep completes and clears the list.
+        del smap._sessions["channel:c1:m1"]
+        del smap._sessions["chat-busy"]
+        _, complete = await smap.retire_kiro_identity_sessions(fingerprint=self.LIVE)
+        assert complete is True
+        assert smap.identity_sweep_waiting_on == ()
 
     @pytest.mark.asyncio
     async def test_a_provider_mid_start_makes_the_sweep_incomplete(self) -> None:

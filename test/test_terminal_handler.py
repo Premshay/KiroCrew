@@ -618,8 +618,35 @@ class TestResolveCwd:
         assert terminal._resolve_cwd({"cwd": str(tmp_path)}, None) == str(tmp_path)
 
     def test_no_request_no_config_uses_home(self, tmp_path, monkeypatch):
+        # POSIX expanduser reads HOME; Windows reads USERPROFILE — set both so
+        # the test is platform agnostic.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         assert terminal._resolve_cwd({}, None) == str(tmp_path)
+
+    def test_windows_home_unset_falls_back_to_userprofile(self, tmp_path, monkeypatch):
+        # On Windows cmd/PowerShell HOME is unset and only USERPROFILE is set.
+        # expanduser("~") resolves the profile, so the default is the user's home
+        # rather than "/" (which Windows reads as the drive root).
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setattr(
+            terminal.os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p
+        )
+        assert terminal._resolve_cwd({}, None) == str(tmp_path)
+
+    def test_posix_home_set_still_opens_at_home(self, tmp_path, monkeypatch):
+        # With HOME set and no requested/configured cwd, the default is the home
+        # directory (resolved via expanduser).
+        monkeypatch.setattr(
+            terminal.os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p
+        )
+        assert terminal._resolve_cwd({}, None) == str(tmp_path)
+
+    def test_unresolvable_home_keeps_root_last_resort(self, monkeypatch):
+        # When no home can be resolved at all, expanduser returns the literal "~";
+        # the "/" last resort applies rather than returning "~".
+        monkeypatch.setattr(terminal.os.path, "expanduser", lambda p: p)
+        assert terminal._resolve_cwd({}, None) == "/"
 
 
 # ── _kill_session ──
@@ -1167,16 +1194,34 @@ class TestApiTerminalRedact:
     @pytest.mark.asyncio
     async def test_rejects_non_string_text(self):
         req = self._req({"text": 42})
-        with patch.object(terminal, "_is_enabled", return_value=True):
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_redact(req)
         assert resp.status == 400
+        mock_sel.return_value.log_api_access.assert_called_once_with(
+            caller="testuser",
+            operation="terminal.selection.redact",
+            outcome="denied",
+            source="dashboard",
+            resources="invalid_body",
+        )
 
     @pytest.mark.asyncio
     async def test_rejects_oversized_selection(self):
         req = self._req({"text": "x" * (terminal._REDACT_MAX_BYTES + 1)})
-        with patch.object(terminal, "_is_enabled", return_value=True):
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_redact(req)
         assert resp.status == 413
+        mock_sel.return_value.log_api_access.assert_called_once_with(
+            caller="testuser",
+            operation="terminal.selection.redact",
+            outcome="denied",
+            source="dashboard",
+            resources="selection_too_large",
+        )
 
     @pytest.mark.asyncio
     async def test_redacts_credentials_in_contiguous_text(self):
@@ -1184,20 +1229,40 @@ class TestApiTerminalRedact:
         # scanning would have split. The contiguous scan must catch it.
         secret = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
         req = self._req({"text": f"config dump:\n{secret}\ndone"})
-        with patch.object(terminal, "_is_enabled", return_value=True):
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_redact(req)
         assert resp.status == 200
         out = json.loads(resp.text)["text"]
         assert "wJalrXUtnFEMI" not in out
+        # The success path is the one that hands terminal output to a model,
+        # so it must leave an audit row too -- with no selection content.
+        mock_sel.return_value.log_api_access.assert_called_once_with(
+            caller="testuser",
+            operation="terminal.selection.redact",
+            outcome="ok",
+            source="dashboard",
+            resources="ok",
+        )
 
     @pytest.mark.asyncio
     async def test_fails_closed_on_redactor_error(self):
         req = self._req({"text": "hello"})
         with patch.object(terminal, "_is_enabled", return_value=True), \
-             patch.object(terminal, "redact_exfiltration_urls", side_effect=RuntimeError):
+             patch.object(terminal, "redact_exfiltration_urls", side_effect=RuntimeError), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_redact(req)
         assert resp.status == 500
         assert "hello" not in resp.text
+        mock_sel.return_value.log_api_access.assert_called_once_with(
+            caller="testuser",
+            operation="terminal.selection.redact",
+            outcome="error",
+            source="dashboard",
+            resources="redaction_failed",
+        )
 
 
 class TestSplitPathToken:
@@ -2508,6 +2573,13 @@ class TestApiTerminalDelete:
             mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_delete(req)
         assert resp.status == 404
+        mock_sel.return_value.log_api_access.assert_called_once_with(
+            caller="testuser",
+            operation="terminal.session.delete",
+            outcome="denied",
+            source="dashboard",
+            resources="unknown_session",
+        )
 
     @pytest.mark.asyncio
     async def test_opening_reservation_refusal_is_audited_without_releasing_it(self):
@@ -3646,6 +3718,45 @@ class TestApiTerminalWs:
         assert strip_spawn_shim(spawn.call_args.args) == spawn.call_args.args
         assert mock_logger.warning.called, "the degraded terminal must be reported"
         assert "controlling terminal" in str(mock_logger.warning.call_args)
+
+    @pytest.mark.asyncio
+    async def test_posix_spawn_failure_is_audited(self):
+        """The POSIX twin of the ConPTY spawn-failure audit: a shell that fails
+        to start records ``terminal.ws.open`` with ``outcome=error`` and a
+        ``pty_spawn_failed=`` reason before the error frame is sent."""
+        registry: dict = {}
+        req = _make_request(registry=registry, session_id="posix-fail")
+        req.query = MagicMock()
+        req.query.get = lambda *a, **k: None
+
+        ws = AsyncMock()
+        ws.closed = False
+        fds = os.pipe()
+        spawn = AsyncMock(side_effect=RuntimeError("spawn boom"))
+        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
+             patch.object(terminal.platform_compat, "IS_WINDOWS", False), \
+             patch.object(terminal._pty, "openpty", return_value=fds), \
+             patch.object(terminal.fcntl, "ioctl", lambda *a: None), \
+             patch.object(terminal.asyncio, "create_subprocess_exec", spawn), \
+             patch.object(terminal, "_get_config", return_value={"enabled": True}), \
+             patch.object(terminal.web, "WebSocketResponse", return_value=ws), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
+            resp = await terminal.api_terminal_ws(req)
+
+        assert resp is ws
+        assert "posix-fail" not in registry
+        calls = [
+            c.kwargs for c in mock_sel.return_value.log_api_access.call_args_list
+            if c.kwargs.get("operation") == "terminal.ws.open"
+        ]
+        assert calls == [{
+            "caller": "testuser",
+            "operation": "terminal.ws.open",
+            "outcome": "error",
+            "source": "dashboard",
+            "resources": "pty_spawn_failed=spawn boom",
+        }]
 
     @pytest.mark.asyncio
     async def test_windows_conpty_spawn_failure_sends_error(self, monkeypatch):

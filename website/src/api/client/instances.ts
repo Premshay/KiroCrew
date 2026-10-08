@@ -4,7 +4,7 @@
  * connected peer's federated session search, capabilities and live slots.
  */
 
-import type { RemoteCrewCapabilities } from '../../hooks/useRemoteCapabilities'
+import type { RemoteCrewCapabilities } from '../../types'
 import { toApiError } from '../apiError'
 import type { ClientTransport } from './transport'
 
@@ -132,7 +132,12 @@ export function filenameFromDisposition(disposition: string, fallback: string): 
   return (plain && plain[1].trim()) || fallback
 }
 
-export function createInstancesEndpoints({ get, post, del, patch, j, jInstancesDisabled, sessionKeyHeader: _sk }: ClientTransport) {
+/** The hub URL that proxies *path* to a connected peer's own API. */
+export function crewPeerUrl(instanceId: string, path: string): string {
+  return '/api/instances/' + encodeURIComponent(instanceId) + '/proxy/' + path
+}
+
+export function createInstancesEndpoints({ get, post, del, patch, j, jfetch: fetch, jInstancesDisabled, sessionKeyHeader: _sk }: ClientTransport) {
   const registryAndTransfer = {
     // Instances (multi-instance management) — owner-only, gated by instances.enabled.
     // listInstances throws ApiError(403) when the feature is disabled; callers
@@ -276,6 +281,14 @@ export function createInstancesEndpoints({ get, post, del, patch, j, jInstancesD
     // clear-all, session-restart, a memory read and a token-spending summarize.
     instanceChatSlots: (id: string) =>
       fetch('/api/instances/' + encodeURIComponent(id) + '/chat-slots').then(j),
+    // The crew chat window's wire: a call on a CONNECTED peer's own chat API,
+    // through the owner-only proxy. `path` is the peer path (`api/chat/...`,
+    // query included); the hub refuses anything outside `api/chat` and
+    // `api/stream`, and redacts every reply before it reaches the browser.
+    crewPeerGet: (instanceId: string, path: string) =>
+      get(crewPeerUrl(instanceId, path)).then(j),
+    crewPeerPost: (instanceId: string, path: string, body: object = {}) =>
+      post(crewPeerUrl(instanceId, path), body).then(j),
   }
 
   return { registryAndTransfer, peerReads }

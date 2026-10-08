@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
 
 from kiro_crew.config.paths import config_dir
+from kiro_crew.owner_only_files import mkdirs_owner_only, write_text_owner_only
 
 if TYPE_CHECKING:
     import importlib.metadata
@@ -359,7 +360,8 @@ _DEFAULT_POLICY_BODY: Dict[str, object] = {
         "Default permissive admission policy seeded by KiroCrew at first run. "
         "Deleting this file DISABLES plugin admission (fail-closed): "
         "load_admission_policy() then returns MODE_ENFORCE with an empty allowlist "
-        "and the dashboard governance indicator shows Disabled. To restrict "
+        "and the dashboard governance indicator shows Degraded (Disabled is the "
+        "state of this seeded permissive file). To restrict "
         "admission, set mode='enforce' and populate 'approved' / 'require_signature'. "
         "'require_policy_signature' additionally demands a VERIFIED signature on "
         "security_policy.json, keyed by its identity.issuer in 'trust_keys'."
@@ -386,7 +388,8 @@ def seed_default_policy() -> bool:
     misconfig = fail closed".  Guarded by a one-shot marker so that DELETING the
     policy afterward is never silently re-seeded — a later
     ``load_admission_policy`` then returns :func:`_fail_closed_policy` and the
-    governance health indicator flips to Disabled.
+    governance health indicator flips to Degraded (policy unverified).
+    Disabled is the state of the seeded permissive file itself.
 
     Never clobbers an existing policy file (a managed fleet may ship its own) and
     is skipped entirely when the ``KIROCREW_ADMISSION_POLICY`` env override is
@@ -404,20 +407,17 @@ def seed_default_policy() -> bool:
         wrote = False
         if not env_set and not default_path.exists():
             body_text = json.dumps(_DEFAULT_POLICY_BODY, indent=2) + "\n"
-            default_path.parent.mkdir(parents=True, exist_ok=True)
-            default_path.write_text(body_text, encoding="utf-8")
+            mkdirs_owner_only(default_path.parent)
+            write_text_owner_only(default_path, body_text)
             # Record the integrity baseline for the file we just wrote so a later
             # modification is detectable at load (advisory — see load below).
-            checksum_path.parent.mkdir(parents=True, exist_ok=True)
-            checksum_path.write_text(
-                hashlib.sha256(body_text.encode("utf-8")).hexdigest() + "\n",
-                encoding="utf-8",
+            mkdirs_owner_only(checksum_path.parent)
+            write_text_owner_only(
+                checksum_path, hashlib.sha256(body_text.encode("utf-8")).hexdigest() + "\n"
             )
             wrote = True
-        seed_marker.parent.mkdir(parents=True, exist_ok=True)
-        seed_marker.write_text(
-            datetime.now(tz=timezone.utc).isoformat() + "\n", encoding="utf-8"
-        )
+        mkdirs_owner_only(seed_marker.parent)
+        write_text_owner_only(seed_marker, datetime.now(tz=timezone.utc).isoformat() + "\n")
         return wrote
     except Exception:
         logger.warning("first-run: admission policy seed failed", exc_info=True)

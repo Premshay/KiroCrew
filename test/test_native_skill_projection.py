@@ -58,6 +58,14 @@ def _alias_is_live(directory, alias):
     return alias in live_aliases
 
 
+@pytest.fixture(autouse=True)
+def _prune_on_every_spawn(monkeypatch):
+    """These tests prepare views back to back and assert each one's prune; the
+    burst throttle is pinned by its own test."""
+    monkeypatch.setattr(projection, "_PER_SPAWN_PRUNE_MIN_INTERVAL_SECS", 0.0)
+    monkeypatch.setattr(projection, "_LAST_PER_SPAWN_PRUNE", {})
+
+
 @pytest.fixture
 def cyclic_gc_quiesced():
     """Keep a cyclic-GC pass (and any finalizer it runs) out of a deep JSON parse.
@@ -175,6 +183,85 @@ def test_transport_keeps_original_agent_identity_and_rejects_unprepared_modes():
         prepared.request("session/set_mode", {"modeId": "unknown"})
 
 
+def test_set_mode_activates_the_launched_agent_without_a_view_then_consumes_it():
+    """The launched agent's FIRST activation passes; it is then consumed; other
+    unprepared modes never pass.
+
+    The direct-client startup activates the agent with ``session/set_mode``. When
+    that agent has no prepared view, refusing its activation would strand a valid
+    startup, so the request path tolerates the modeId that equals the recorded
+    ``spawn_agent_name`` -- and only that one, and only ONCE. The first tolerated
+    activation consumes the exemption, so a later switch back to the same agent
+    takes the strict resolver and fails closed if its view is still absent -- no
+    reactivating a cached spec the strict resolver existed to refuse.
+    """
+    prepared = projection.NativeSkillProjection({"custom": "native-alias"})
+    prepared.spawn_agent_name = "kirocrew"
+    activated = prepared.request("session/set_mode", {"sessionId": "s", "modeId": "kirocrew"})
+    assert activated["modeId"] == "kirocrew"
+    # The exemption is spent: a second activation of the same agent fails closed.
+    assert prepared.spawn_agent_name == ""
+    with pytest.raises(ValueError, match="no prepared"):
+        prepared.request("session/set_mode", {"modeId": "kirocrew"})
+    # A prepared agent still maps to its alias.
+    assert prepared.request("session/set_mode", {"modeId": "custom"})["modeId"] == "native-alias"
+    # Any OTHER unprepared mode is still rejected, launched agent set or not.
+    with pytest.raises(ValueError, match="no prepared"):
+        prepared.request("session/set_mode", {"modeId": "some-other-agent"})
+
+
+def test_frame_advertises_the_launched_agent_mode_independently_of_the_request_exemption():
+    """A no-view launched agent's own mode stays in projected availableModes
+    whenever ``advertised_launch_name`` is set, independent of the request
+    exemption and NOT hidden after the initial set_mode is consumed.
+
+    The start reads availableModes BEFORE it sends set_mode. If the launched
+    agent has no prepared view, dropping its mode would advertise no mode the
+    process could activate and fail the start. Advertising keys on
+    ``advertised_launch_name`` -- a fixed launch fact set by BOTH the direct
+    client and the shared runtime -- not on ``spawn_agent_name``, which the
+    request path consumes and which the shared runtime leaves empty. So the
+    launch mode must survive even after the exemption is spent, and an
+    unprojected stranger is still never advertised.
+    """
+    prepared = projection.NativeSkillProjection(
+        {}, spawn_agent_name="kirocrew", advertised_launch_name="kirocrew"
+    )
+    kept = prepared.frame(
+        {"availableModes": [{"id": "kirocrew", "name": "kirocrew"}, {"id": "stranger"}]}
+    )
+    # The launched agent's mode survives; an unprojected stranger does not.
+    assert kept["availableModes"] == [{"id": "kirocrew", "name": "kirocrew"}]
+    # Consuming the request exemption does NOT hide the advertised launch mode:
+    # advertising is a fixed fact, not the one-shot request tolerance.
+    prepared.request("session/set_mode", {"modeId": "kirocrew"})
+    assert prepared.spawn_agent_name == ""
+    after = prepared.frame({"availableModes": [{"id": "kirocrew", "name": "kirocrew"}]})
+    assert after["availableModes"] == [{"id": "kirocrew", "name": "kirocrew"}]
+
+
+def test_frame_advertises_the_launch_mode_on_the_shared_runtime_with_empty_spawn_name():
+    """The shared runtime leaves ``spawn_agent_name`` empty (so request() stays
+    strict mid-session) but still sets ``advertised_launch_name``, so the no-view
+    launch agent's mode is advertised and the session open finds it.
+
+    This is the fail-closed-at-open bug the prior wiring had: keying advertising
+    on the empty ``spawn_agent_name`` dropped the shared runtime's launch mode
+    from availableModes, so ``_mode_available`` failed and the session was
+    terminated before activation.
+    """
+    prepared = projection.NativeSkillProjection({}, advertised_launch_name="kirocrew")
+    assert prepared.spawn_agent_name == ""
+    kept = prepared.frame(
+        {"availableModes": [{"id": "kirocrew", "name": "kirocrew"}, {"id": "stranger"}]}
+    )
+    assert kept["availableModes"] == [{"id": "kirocrew", "name": "kirocrew"}]
+    # A projection no spawn claimed (both fields empty) advertises neither.
+    unclaimed = projection.NativeSkillProjection({})
+    hidden = unclaimed.frame({"availableModes": [{"id": "kirocrew", "name": "kirocrew"}]})
+    assert hidden["availableModes"] == []
+
+
 @pytest.mark.parametrize(
     "command", ["/agent swap custom", {"command": "agent", "args": {"value": "swap custom"}}]
 )
@@ -203,6 +290,62 @@ def test_custom_agent_gets_only_the_scoped_search_capability(native_tree):
     assert view["allowedTools"] == []
     assert "kirocrew-core" in view["mcpServers"]
     assert "autoApprove" not in view["mcpServers"]["kirocrew-core"]
+
+
+@pytest.mark.parametrize(
+    ("resources", "expected"),
+    [(["skill://skills/a/SKILL.md"], False), (["file://RULES.md"], True)],
+)
+def test_zero_tool_confirmation_judges_the_view_kiro_loads(
+    native_tree, monkeypatch, resources, expected
+):
+    """The projection appends skill search to the view of a spec carrying a
+    ``skill://`` resource, so an empty authored ``tools`` list does not confirm
+    the ban for the alias kiro loads through ``--agent``. The view is captured
+    when the projection is prepared, so a later edit of the authored spec does
+    not change the answer."""
+    from kiro_crew.acp import client as acp_client
+
+    _home, agents, project = native_tree
+    spec = {"name": "custom", "tools": [], "resources": resources}
+    (agents / "custom.json").write_text(json.dumps(spec), encoding="utf-8")
+    client = acp_client.AcpClient(agent="custom", work_dir=project)
+    client._native_skill_projection = projection.prepare_native_skill_projection(
+        project, per_session_element=False
+    )
+    view = client._native_skill_projection.specs["custom"]
+    assert (view["tools"] == []) is expected
+    assert client.effective_spec_declares_zero_tools() is expected
+
+    (agents / "custom.json").write_text(json.dumps({**spec, "tools": ["read"]}), encoding="utf-8")
+    assert client.effective_spec_declares_zero_tools() is expected
+
+
+def test_rollback_switch_confirms_a_zero_tool_spec_through_the_authored_bracket(
+    native_tree, monkeypatch
+):
+    """With the projection switched off no view exists and the harness loads the
+    named spec itself, so the authored spec read before the spawn and again after
+    start is the confirmation; a view-only answer would leave the pool unstartable."""
+    from kiro_crew.acp import client as acp_client
+
+    _home, _agents, project = native_tree
+    project_agents = project / ".kiro" / "agents"
+    project_agents.mkdir(parents=True)
+    spec_path = project_agents / "custom.json"
+    spec_path.write_text(json.dumps({"name": "custom", "tools": []}), encoding="utf-8")
+    monkeypatch.setenv("KIROCREW_NATIVE_SKILL_PROJECTION", "0")
+    client = acp_client.AcpClient(agent="custom", work_dir=project)
+    client._native_skill_projection = projection.prepare_native_skill_projection(
+        project, per_session_element=False
+    )
+    assert client._native_skill_projection is None
+    before = client.authored_spec_declares_zero_tools()
+    assert before is True
+    assert client.effective_spec_declares_zero_tools(authored_before_spawn=before) is True
+
+    spec_path.write_text(json.dumps({"name": "custom", "tools": ["read"]}), encoding="utf-8")
+    assert client.effective_spec_declares_zero_tools(authored_before_spawn=before) is False
 
 
 def test_global_inheritance_preference_is_refreshed(native_tree):
@@ -251,6 +394,67 @@ def test_explicit_search_exclusion_fails_only_that_agent(native_tree):
     prepared = projection.prepare_native_skill_projection(project)
     with pytest.raises(ValueError, match="explicitly excluded"):
         prepared.agent("custom")
+
+
+def test_spawn_passes_through_a_no_view_name_when_no_spec_was_refused(native_tree, monkeypatch):
+    """With no refused spec, a genuinely-absent name spawns under its own name.
+
+    When discovery refuses nothing, an unprojected name is provably spec-less, so
+    ``spawn_agent`` returns the authored name rather than aborting an otherwise
+    valid spawn. Readable-but-unprojected files on disk (a dedup twin, a plain doc)
+    are not refusals and must not fail the spawn closed.
+    """
+    _home, agents, project = native_tree
+    monkeypatch.setattr(projection, "list_agents", lambda **kw: [])
+    # All readable, none projected (list_agents patched to []), none a refusal.
+    (agents / "foo.json").write_text(json.dumps({"name": "bar"}), encoding="utf-8")
+    (agents / "local-pkg-helper.json").write_text(json.dumps({"name": "helper"}), encoding="utf-8")
+
+    prepared = projection.prepare_native_skill_projection(project)
+
+    assert prepared.spawn_agent("genuinely-absent") == "genuinely-absent"
+    assert prepared.spawn_agent("bar") == "bar"
+
+
+def test_spawn_agent_keeps_the_authored_name_when_no_view_is_prepared():
+    """A spawn of an agent the projection never prepared uses its own name.
+
+    ``prepare_native_skill_projection`` returns a projection even when it mapped
+    no agents (a work_dir carrying no matching spec), so the spawn path asks
+    ``spawn_agent`` rather than the strict ``agent``: an unprojected agent keeps
+    its authored transport name -- the same answer a ``None`` projection gives --
+    instead of aborting the spawn. The strict ``agent`` still rejects it, because
+    that resolver guards ``session/set_mode``.
+    """
+    prepared = projection.NativeSkillProjection({"custom": "native-alias"})
+    assert prepared.spawn_agent("custom") == "native-alias"
+    assert prepared.spawn_agent("kirocrew") == "kirocrew"
+    with pytest.raises(ValueError, match="no prepared"):
+        prepared.agent("kirocrew")
+
+
+def test_spawn_agent_still_raises_an_authored_restriction():
+    """An authored refusal is a user-facing spawn refusal, not a silent skip.
+
+    A ``kirocrew-core`` exclusion or a disabled ``skill_search`` records an
+    ``errors`` entry naming the spec and the remedy; ``spawn_agent`` raises it so
+    the runtime can wrap it as ``AcpRuntimeError`` and the startup paths can
+    translate the sentence, exactly as the strict ``agent`` does.
+    """
+    prepared = projection.NativeSkillProjection(
+        {}, errors={"custom": "skill_search is explicitly excluded; ..."}
+    )
+    with pytest.raises(ValueError, match="explicitly excluded"):
+        prepared.spawn_agent("custom")
+
+
+def test_unknown_name_with_no_matching_spec_still_passes_through_on_spawn():
+    """A name that matches no alias or error is still an unprojected agent and
+    spawn keeps its own name -- a no-view launch agent spawns under its own name."""
+    prepared = projection.NativeSkillProjection({"custom": "native-alias"})
+    assert prepared.spawn_agent("unrelated") == "unrelated"
+    with pytest.raises(ValueError, match="no prepared"):
+        prepared.agent("unrelated")
 
 
 def test_unmapped_custom_agent_does_not_gain_tools_or_servers(native_tree):
@@ -375,6 +579,129 @@ def test_disabled_projection_does_not_enumerate_agents_or_create_settings(native
     assert projection.prepare_native_skill_projection(project) is None
     assert list(agents.iterdir()) == []
     assert not (project / ".kiro").exists()
+
+
+@pytest.fixture
+def _reset_ceiling_state(monkeypatch):
+    """Isolate the ceiling's process-global warn flag per test.
+
+    ``_CEILING_FALLBACK_WARNED`` is set once per process and never reset in
+    product code (one line per process is the point), so it would leak across
+    tests; each ceiling test starts with it clear.
+    """
+    monkeypatch.setattr(projection, "_CEILING_FALLBACK_WARNED", False)
+
+
+def _fill_agents_dir_with_views(agents: Path, count: int) -> None:
+    """Write *count* ``kirocrew-skill-view-*.json`` files directly in *agents*."""
+    for n in range(count):
+        name = f"{projection.NATIVE_SKILL_ALIAS_PREFIX}{n:024x}"
+        (agents / f"{name}.json").write_text(f'{{"name":"{name}"}}', encoding="utf-8")
+
+
+def test_below_the_ceiling_a_view_is_created(native_tree, monkeypatch, _reset_ceiling_state):
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    # One short of the ceiling: preparation still mints the view.
+    monkeypatch.setattr(projection, "SKILL_VIEW_PROJECTION_CEILING", 5)
+    _fill_agents_dir_with_views(agents, 4)
+    prepared = projection.prepare_native_skill_projection(project)
+    assert prepared is not None
+    alias = prepared.agent("custom")
+    assert (agents / f"{alias}.json").exists()
+    settings = json.loads((project / ".kiro/settings/cli.json").read_text(encoding="utf-8"))
+    assert settings["chat.disableInheritingDefaultResources"] is True
+
+
+def test_at_or_above_the_ceiling_falls_back_and_writes_no_view(
+    native_tree, monkeypatch, _reset_ceiling_state, caplog
+):
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    monkeypatch.setattr(projection, "SKILL_VIEW_PROJECTION_CEILING", 5)
+    # Exactly at the ceiling (>=): no new view, authored agent fallback.
+    _fill_agents_dir_with_views(agents, 5)
+
+    def _skill_views():
+        return sorted(
+            p.name
+            for p in agents.iterdir()
+            if p.name.startswith(projection.NATIVE_SKILL_ALIAS_PREFIX) and p.name.endswith(".json")
+        )
+
+    before = _skill_views()
+    with caplog.at_level(logging.WARNING, logger=projection.logger.name):
+        assert projection.prepare_native_skill_projection(project) is None
+    # No NEW skill-view file: these fillers are not reclaimable (plain specs), so
+    # the fallback's prune leaves them and mints nothing. The metadata/lock dirs
+    # the prune may create are not skill-view files, so they do not count.
+    assert _skill_views() == before
+    # Same code path as KIROCREW_NATIVE_SKILL_PROJECTION=0: no overlay written
+    # because no cli.json existed to roll back.
+    assert not (project / ".kiro").exists()
+    fallback = [r for r in caplog.records if "fall back to authored agents" in r.message]
+    assert fallback
+    # The warning says the count spans every home's views (the conductor's
+    # option-a choice) and points at the doctor's foreign-file remedy.
+    assert "regardless of which Kiro Crew home" in fallback[0].message
+    assert "doctor" in fallback[0].message
+
+
+def test_the_ceiling_fallback_warns_once_per_process(
+    native_tree, monkeypatch, _reset_ceiling_state, caplog
+):
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    monkeypatch.setattr(projection, "SKILL_VIEW_PROJECTION_CEILING", 3)
+    _fill_agents_dir_with_views(agents, 3)
+    with caplog.at_level(logging.WARNING, logger=projection.logger.name):
+        for _ in range(4):
+            assert projection.prepare_native_skill_projection(project) is None
+    fallback_warnings = [r for r in caplog.records if "fall back to authored agents" in r.message]
+    assert len(fallback_warnings) == 1
+    # The warning qualifies the fallback as spawn-time only: new spawns stop
+    # projecting, but a session already projecting keeps refreshing its own view.
+    assert "new spawns" in fallback_warnings[0].message
+
+
+def test_explicit_enabled_true_bypasses_the_ceiling(native_tree, monkeypatch, _reset_ceiling_state):
+    """A warm-runtime refresh (explicit ``enabled=True``) must still prepare a view.
+
+    The shared runtime re-prepares a live session's view with ``enabled=True`` at
+    set_mode, and treats a ``None`` return as fatal (it raises AcpRuntimeError and
+    refuses the start). The ceiling is a spawn-time admission decision only, so an
+    explicit ``enabled=True`` must never be converted into the authored-agent
+    fallback -- otherwise a backlog would abort every warm session.
+    """
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    monkeypatch.setattr(projection, "SKILL_VIEW_PROJECTION_CEILING", 3)
+    _fill_agents_dir_with_views(agents, 10)  # well over the ceiling
+    prepared = projection.prepare_native_skill_projection(project, enabled=True)
+    assert prepared is not None
+    assert (agents / f"{prepared.agent('custom')}.json").exists()
+
+
+def test_the_ceiling_fallback_still_prunes_so_the_backlog_can_drain(
+    native_tree, monkeypatch, _reset_ceiling_state
+):
+    """Above the ceiling, the fallback must still run the per-spawn prune.
+
+    The safety net sets enabled=False, but it must not switch off the very
+    reclaim that recovers from the backlog: this home's own stale aliases are
+    pruned on the fallback path, so the count can fall back under the ceiling
+    across spawns without a gateway restart (design-lane Watch item).
+    """
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    monkeypatch.setattr(projection, "SKILL_VIEW_PROJECTION_CEILING", 3)
+    # Reclaimable legacy aliases this home owns, aged past the reclaim floor.
+    backlog = [_legacy_alias(agents, digest=f"{n:024x}") for n in range(5)]
+    assert projection._count_projected_aliases(agents) >= 3  # over the ceiling
+    # Fallback path (no view minted), but the prune still runs under the lock.
+    assert projection.prepare_native_skill_projection(project) is None
+    reclaimed = [p for p in backlog if not p.exists()]
+    assert reclaimed, "the ceiling fallback did not prune this home's backlog"
 
 
 @pytest.mark.parametrize(
@@ -1318,6 +1645,109 @@ def test_projection_lock_covers_alias_publication_and_pruning(native_tree, monke
     assert _alias_file(agents, prepared).exists()
 
 
+def test_concurrent_threads_of_one_process_queue_instead_of_timing_out(tmp_path, monkeypatch):
+    """N starts in ONE gateway must not each race the file lock on its own clock.
+
+    Each holder keeps the lock 0.15 s and the file-lock ceiling is 0.3 s, so
+    eight threads racing the file lock directly exceed it; queued in-process,
+    each one's file-lock wait is near zero.
+    """
+    monkeypatch.setattr(projection, "_PROJECTION_LOCK_TIMEOUT_SECS", 0.3)
+    directory = tmp_path / "agents"
+    failures: list[BaseException] = []
+    start = threading.Barrier(8)
+
+    def hold() -> None:
+        start.wait()
+        try:
+            with projection._projection_alias_lock(directory):
+                time.sleep(0.15)
+        except OSError as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=hold) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads)
+    assert failures == []
+
+
+def test_in_process_wait_is_bounded_and_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(projection, "_IN_PROCESS_PROJECTION_WAIT_SECS", 0.1)
+    directory = tmp_path / "agents"
+    result: list[BaseException] = []
+
+    def contend() -> None:
+        try:
+            with projection._projection_alias_lock(directory):
+                pass
+        except OSError as exc:
+            result.append(exc)
+
+    with projection._projection_alias_lock(directory):
+        t = threading.Thread(target=contend)
+        t.start()
+        t.join(timeout=10)
+    assert len(result) == 1 and "inside this process" in str(result[0])
+    # The holder released both locks, so the next acquire succeeds at once.
+    with projection._projection_alias_lock(directory):
+        pass
+
+
+def test_a_failed_file_lock_releases_the_in_process_lock(tmp_path, monkeypatch):
+    directory = tmp_path / "agents"
+
+    @contextmanager
+    def refusing_file_lock(fd, **kwargs):
+        raise OSError("held elsewhere")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(projection.platform_compat, "file_lock", refusing_file_lock)
+    with pytest.raises(OSError, match="held elsewhere"):
+        projection._projection_alias_lock(directory)
+    local = projection._in_process_projection_lock(directory)
+    assert local.acquire(blocking=False)
+    local.release()
+
+
+def test_a_non_oserror_after_the_in_process_lock_releases_it(tmp_path, monkeypatch):
+    directory = tmp_path / "agents"
+
+    def broken_link_check(path):
+        raise ValueError("unexpected path shape")
+
+    monkeypatch.setattr(projection.platform_compat, "is_link_or_junction", broken_link_check)
+    with pytest.raises(ValueError, match="unexpected path shape"):
+        projection._projection_alias_lock(directory)
+    local = projection._in_process_projection_lock(directory)
+    assert local.acquire(blocking=False)
+    local.release()
+
+
+def test_a_burst_of_spawns_prunes_once_per_interval(native_tree, monkeypatch):
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    monkeypatch.setattr(projection, "_PER_SPAWN_PRUNE_MIN_INTERVAL_SECS", 60.0)
+    monkeypatch.setattr(projection, "_LAST_PER_SPAWN_PRUNE", {})
+    calls = 0
+    real_prune = projection._prune_stale_managed_aliases
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_prune(*args, **kwargs)
+
+    monkeypatch.setattr(projection, "_prune_stale_managed_aliases", counted)
+    for _ in range(3):
+        assert projection.prepare_native_skill_projection(project) is not None
+    assert calls == 1
+    monkeypatch.setattr(projection, "_PER_SPAWN_PRUNE_MIN_INTERVAL_SECS", 0.0)
+    assert projection.prepare_native_skill_projection(project) is not None
+    assert calls == 2
+
+
 @requires_symlinks
 def test_projection_lock_refuses_planted_symlink(native_tree):
     _home, agents, project = native_tree
@@ -1407,6 +1837,140 @@ def test_prune_never_touches_another_homes_alias(native_tree):
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
     projection.prepare_native_skill_projection(project)
     assert foreign.exists()
+
+
+@pytest.mark.skipif(
+    projection.platform_compat.IS_WINDOWS,
+    reason="the resolved-path match is POSIX-only; on Windows _same_crew_home does not resolve",
+)
+@requires_symlinks
+def test_same_crew_home_matches_across_symlinked_home_spellings(tmp_path):
+    """`/home/<u>` (a symlink) and `/local/home/<u>` are the one data home.
+
+    A sidecar recorded under one spelling and read under the other looked
+    foreign, so nothing ever reclaimed it. The comparison is by resolved path,
+    so both spellings -- in either role -- are the same home.
+    """
+    real = tmp_path / "local" / "home"
+    real.mkdir(parents=True)
+    linked = tmp_path / "home"
+    linked.symlink_to(real, target_is_directory=True)
+
+    recorded = (linked / ".kirocrew").as_posix()
+    current = (real / ".kirocrew").as_posix()
+    assert recorded != current, "the two spellings must be literally distinct for the test"
+
+    assert projection._same_crew_home(recorded, current)
+    assert projection._same_crew_home(current, recorded)
+
+
+def test_same_crew_home_keeps_a_genuinely_different_home_foreign(tmp_path):
+    """A real other home resolves to a different path and stays foreign."""
+    mine = tmp_path / "crew-mine"
+    mine.mkdir()
+    theirs = tmp_path / "crew-theirs"
+    theirs.mkdir()
+
+    assert not projection._same_crew_home(theirs.as_posix(), mine.as_posix())
+    # A non-string recorded value (a corrupt or absent record) is never a match.
+    assert not projection._same_crew_home(None, mine.as_posix())
+    assert not projection._same_crew_home(123, mine.as_posix())
+
+
+def test_same_crew_home_never_resolves_an_untrusted_path_on_windows(monkeypatch):
+    """On Windows the untrusted recorded path is never resolved, so no SMB touch.
+
+    ``os.path.realpath`` on Windows reaches the filesystem, so resolving an
+    attacker-planted value -- a bare ``\\\\host\\share`` OR a local ``C:\\link``
+    that is a directory junction to one -- could open the remote host and leak
+    SMB credentials. The converging property is "never resolve on Windows", not
+    a per-spelling screen, so no realpath call happens for any unequal value.
+    """
+    monkeypatch.setattr(projection.platform_compat, "IS_WINDOWS", True)
+    calls = []
+    real_realpath = projection.os.path.realpath
+
+    def _tracking(path):
+        calls.append(path)
+        return real_realpath(path)
+
+    monkeypatch.setattr(projection.os.path, "realpath", _tracking)
+
+    # A bare UNC spelling, a local path that could be a junction to UNC, and an
+    # ordinary differing local path: none is resolved, each stays foreign.
+    assert not projection._same_crew_home(r"\\attacker\share\.kirocrew", r"C:\Users\u\.kirocrew")
+    assert not projection._same_crew_home(r"C:\local-link\.kirocrew", r"C:\Users\u\.kirocrew")
+    assert not projection._same_crew_home(r"C:\other\.kirocrew", r"C:\Users\u\.kirocrew")
+    # A literally identical value still matches without resolving.
+    assert projection._same_crew_home(r"C:\Users\u\.kirocrew", r"C:\Users\u\.kirocrew")
+    assert calls == [], "no untrusted path may reach os.path.realpath on Windows"
+
+
+def test_same_crew_home_falls_back_to_literal_comparison_when_resolution_fails(monkeypatch):
+    """A realpath that raises leaves the old exact-string behaviour in place."""
+
+    def _boom(_path):
+        raise OSError("resolution failed")
+
+    monkeypatch.setattr(projection.os.path, "realpath", _boom)
+
+    # Identical strings still match without ever reaching realpath.
+    assert projection._same_crew_home("/home/u/.kirocrew", "/home/u/.kirocrew")
+    # Different strings cannot be proven equal once resolution is unavailable, so
+    # they stay foreign -- the pre-fix behaviour, which never widens this home.
+    assert not projection._same_crew_home("/home/u/.kirocrew", "/local/home/u/.kirocrew")
+
+
+@pytest.mark.skipif(
+    projection.platform_compat.IS_WINDOWS,
+    reason="the resolved-path match is POSIX-only; on Windows _same_crew_home does not resolve",
+)
+@requires_symlinks
+def test_prune_reclaims_an_alias_recorded_under_a_symlinked_home_spelling(
+    native_tree, monkeypatch, tmp_path
+):
+    """End to end: a dead alias whose sidecar names the other spelling drains.
+
+    Before the fix the sidecar's recorded home (the ``/home`` symlink spelling)
+    did not equal this process's resolved ``/local/home`` spelling, so the
+    reclaim treated it as another home's and left it forever.
+    """
+    _home, agents, _project = native_tree
+    real_home = tmp_path / "realhome" / "crew"
+    real_home.mkdir(parents=True)
+    linked_home = tmp_path / "linkhome"
+    (tmp_path / "linkhome").symlink_to(tmp_path / "realhome", target_is_directory=True)
+    linked_crew = linked_home / "crew"
+    assert linked_crew.as_posix() != real_home.as_posix()
+
+    # This process runs under the RESOLVED spelling.
+    monkeypatch.setattr(projection, "data_home", lambda: real_home)
+
+    # A dead alias (no agent file, no live lease) whose sidecar records the
+    # OTHER spelling of the same home.
+    alias = f"{projection.NATIVE_SKILL_ALIAS_PREFIX}aaaaaaaaaaaaaaaaaaaaaaaa"
+    alias_path = agents / f"{alias}.json"
+    alias_path.write_text(json.dumps({"name": alias}), encoding="utf-8")
+    metadata_dir = agents / projection._PROJECTION_METADATA_DIR_NAME
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    (metadata_dir / f"{alias}.json").write_text(
+        json.dumps(
+            {
+                projection._MANAGED_MARKER: projection._MANAGED_MARKER_VALUE,
+                projection._MANAGED_CREW_HOME: linked_crew.as_posix(),
+                projection._MANAGED_AGENT: "ghost",
+                projection._MANAGED_SOURCE: "/nonexistent/.kiro/agents/ghost.json",
+                projection._MANAGED_ALIAS_SHA256: hashlib.sha256(
+                    alias_path.read_bytes()
+                ).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    projection._prune_stale_managed_aliases(agents, real_home.absolute().as_posix(), keep=set())
+
+    assert not alias_path.exists(), "the same-home alias under the other spelling was not reclaimed"
 
 
 def test_prune_keeps_other_crew_homes_alias_after_its_work_dir_disappears(
@@ -3729,6 +4293,7 @@ async def test_set_mode_sends_the_fresh_alias_never_a_changed_spawn_one(
             runtime_module.AcpRuntime._adopted_skill_projection_generation
         )
         _adopt_skill_projection = runtime_module.AcpRuntime._adopt_skill_projection
+        _resolve_start_alias = runtime_module.AcpRuntime._resolve_start_alias
         _superseding_alias = runtime_module.AcpRuntime._superseding_alias
         _refuse_if_view_superseded = runtime_module.AcpRuntime._refuse_if_view_superseded
         _refuse_if_view_unverified = runtime_module.AcpRuntime._refuse_if_view_unverified
@@ -3738,6 +4303,10 @@ async def test_set_mode_sends_the_fresh_alias_never_a_changed_spawn_one(
         _unadopted_skill_projection_generation = (
             runtime_module.AcpRuntime._unadopted_skill_projection_generation
         )
+        # The launched agent is some OTHER agent, not "crew": "crew" is a prepared
+        # agent (it has an alias), so activating it must take the strict alias path
+        # this test asserts, not the launched-agent allowance.
+        _agent = "launcher"
 
         async def terminate_session(self, sid):
             terminated.append(sid)
@@ -4282,6 +4851,47 @@ def test_a_rotated_credential_names_a_new_alias_but_a_launch_nonce_does_not(
     assert projection.prepare_native_skill_projection(project).agent("custom") == first
     source.write_text(json.dumps(_credential_spec("t2", "n2")), encoding="utf-8")
     assert projection.prepare_native_skill_projection(project).agent("custom") != first
+
+
+def test_recognise_does_not_carry_the_launch_name_exemption():
+    """recognise()'s only callers are the SHARED RUNTIME, whose own contract is
+    that it must NEVER set spawn_agent_name (it activates the launch agent through
+    _activate_mode_bracketed instead; setting the field would make request()
+    tolerate the launch agent on a mid-session switch too, reactivating a cached
+    unprojected spec). So a refresh through recognise() must NOT propagate the
+    earlier projection's spawn_agent_name onto the fresh one -- only the direct
+    spawn caller sets it."""
+    earlier = projection.NativeSkillProjection({}, spawn_agent_name="kirocrew")
+    fresh = projection.NativeSkillProjection({})
+    assert fresh.spawn_agent_name == ""
+    fresh.recognise(earlier)
+    assert fresh.spawn_agent_name == ""
+
+    # A projection that already knows its own launch name is likewise untouched by
+    # recognise() -- the field is owned by the spawn caller, not this seam.
+    already = projection.NativeSkillProjection({}, spawn_agent_name="kirocrew")
+    already.recognise(projection.NativeSkillProjection({}, spawn_agent_name="other"))
+    assert already.spawn_agent_name == "kirocrew"
+
+
+def test_recognise_carries_advertised_launch_name_but_not_the_request_exemption():
+    """A projection refresh runs frame() on the fresh object, so the launch
+    identity's ADVERTISING must survive recognise() -- otherwise a no-view launch
+    agent's mode is dropped from availableModes after the refresh. This is carried
+    (advertising only), unlike ``spawn_agent_name`` (the mid-session request
+    tolerance), which recognise() must never propagate."""
+    earlier = projection.NativeSkillProjection(
+        {}, spawn_agent_name="kirocrew", advertised_launch_name="kirocrew"
+    )
+    fresh = projection.NativeSkillProjection({})
+    fresh.recognise(earlier)
+    # Advertising carried; the request exemption NOT carried.
+    assert fresh.advertised_launch_name == "kirocrew"
+    assert fresh.spawn_agent_name == ""
+    # A fresh projection that already recorded its own launch name is untouched.
+    already = projection.NativeSkillProjection({}, advertised_launch_name="own")
+    already.recognise(projection.NativeSkillProjection({}, advertised_launch_name="other"))
+    assert already.advertised_launch_name == "own"
 
 
 def test_recognise_admits_only_alias_names_and_registered_agent_names():

@@ -11,7 +11,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
-$MaxInstallSeconds = 120
+# A performance ceiling, deliberately tighter than the 300 s release smoke in
+# scripts/smoke-windows-install.ps1. 45 green main runs (2026-10-03..04) installed
+# in 39-98 s, median 60 s; 200 s is about twice the slowest, so a slow hosted
+# runner alone does not fail it while a real installer slowdown still does.
+$MaxInstallSeconds = 200
 # Healthy boot on the runner is ~12-24 s (observed 2026-09-29). /api/ready does not await
 # the Kiro CLI probe, but a tolerated probe timeout (_PROBE_TIMEOUT_SECS = 10 s in
 # src/kiro_crew/kiro_prerequisite.py) still slowed one boot from 12.8 s to 30.1 s on the
@@ -437,6 +441,16 @@ if ($uninstallProcess.ExitCode -ne 0) {
   throw "Silent uninstall exited with code $($uninstallProcess.ExitCode)."
 }
 
+# An NSIS uninstaller started without `_?=` copies itself to %TEMP% (Au_.exe /
+# Un_A.exe) and relaunches, so the process waited on above can exit while the
+# real uninstall is still running. Wait for that relaunched copy too (bounded at
+# 120 s), so the 30 s registration poll starts when the uninstall is done. A copy
+# that never exits still ends in the named failure below.
+$relaunchDeadline = [DateTime]::UtcNow.AddSeconds(120)
+while ([DateTime]::UtcNow -lt $relaunchDeadline -and @(Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^(Au_|Un_A)$' }).Count -ne 0) {
+  Start-Sleep -Milliseconds 250
+}
 $uninstallDeadline = [DateTime]::UtcNow.AddSeconds(30)
 do {
   $remainingRegistrations = @(Find-InstallerRegistrations $expectedDisplayName)
@@ -448,7 +462,7 @@ do {
   [DateTime]::UtcNow -lt $uninstallDeadline
 )
 if ($remainingRegistrations.Count -ne 0) {
-  throw "Silent uninstall left a $productName registration behind."
+  throw "Silent uninstall left a $productName registration behind: $(($remainingRegistrations | ForEach-Object { $_.PSPath }) -join '; ')"
 }
 if (Test-Path -LiteralPath $installLocation) {
   # NAME the residue. "The directory is still there" is not actionable: the

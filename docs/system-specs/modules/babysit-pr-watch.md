@@ -42,9 +42,29 @@ a different one, since a brief naming a blocker is an evidence scope and not a s
 declaration. A brief naming two or more pull requests leaves the instruction deciding,
 because a loop holds one monitor. Resolution can answer "no subject", in which case no
 probe is attached and the loop fires on its plain interval: an instruction naming a
-pull request only in a shorthand (`owner/name#123`, `PR #42`) carries no host and
-`#123` is equally an issue reference, and an instruction naming two at once is not
-resolved by preferring either. A loop that does resolve to one subject attaches
+pull request only in a shorthand (`owner/name#123`) carries no host and `#123` is
+equally an issue reference, and an instruction naming two at once is not resolved by
+preferring either. One source closes the bare-number gap: an instruction naming its
+pull request by number alone (`PR 14361`, `PR #14361`, `pull request 14361`) and
+nothing else takes the REPOSITORY from the loop's own session transcript, through
+`probes.targets.resolve_bare`. The transcript must name that exact number as a pull
+request -- a full `/pull/` URL or `owner/name#<number>` -- in exactly one repository;
+no repository, two repositories, or two numbers in the instruction leave the loop on
+its plain interval. Nothing is inferred from the project's git remote, and no host is
+pinned because the instruction named none. The transcript is read through the guarded
+`derive_messages` and only when the subject is decided (arm and retarget), by
+`subject.read_session_texts`, which the async arm and retarget paths run with
+`asyncio.to_thread` before taking the service lock and pass in as `session_texts`.
+The `monitor_start` handler reads it to shape its ack in the MCP server, but skips the
+read under the gateway's directive replay (`directive_capture_active()`), which runs
+on the event loop and discards the ack; inference itself never reads a transcript, so a bare number given no texts resolves
+nothing. A stored
+loop resolves the same instruction against its own monitor's target
+(`infer_subject(..., monitor_target=)`), so a tick reads no transcript and the binding
+cannot drift as the log grows. The judge's collector cannot re-read the
+transcript, so `parse_targets(..., watched=)` admits the gh-pr monitor's own subject
+for exactly this shape, and only when the instruction's number is the monitor's.
+A loop that does resolve to one subject attaches
 `PrWatchProbe`, which FETCHES that pull request every tick and hands the reading to
 the wake judge. A retarget that changes the subject advances `config_generation`, so a
 structural-terminal verdict recorded for the old subject cannot deactivate the new
@@ -101,8 +121,17 @@ does not. Behind the allowance, a restart spends the bypass with no claim to cha
 and then spends the debt on the tick after, so one owed delivery buys two turns. The
 retry the allowance exists for IS the debt's own fire.
 
+The judged baseline (`judge_pr_seen`) is committed only after the judge returns a
+verdict (`autonudge_service/gate.py` `_commit_judge_pr_seen`), so a turn spent without
+a verdict cannot move it. With no judge, a quiet tick delivers, except when the reading
+is whole and byte-identical to the previous one: no criterion about the subject can have
+become true while the subject did not change. PR bodies the judge compares are stashed in
+memory only, capped at `MAX_BODY_STASHES` (64) in `autonudge_judge.py`; a dropped stash
+makes the next reading partial, and a partial reading fires. Merged and closed map to a
+terminal outcome in the auto-nudge core, not in the fetcher.
+
 Every uncertain path -- no probe, no inferable target, a probe defect, a kernel that
-reached no verdict -- fires as before, because a wrongly-quiet tick is silence with
+reached no verdict -- fires, because a wrongly-quiet tick is silence with
 half-finished work behind it while a wrongly-spent tick costs what every tick costs
 today.
 
@@ -220,8 +249,8 @@ while the loop that fired it is still its own: the wake carries that loop's id,
 and `apply_session_directive` reads the row back before the authorizer runs. A
 row that is gone (a prompt-loop Stop removes it) or that a person stopped (a
 retained `USER_STOP` record, a manual pause, an empty reason) refuses the arm; a
-row that is active, or that its own cycle cap, runtime budget, terminal subject
-or dropped sentinel deactivated, admits it, and the create-only and
+row that is active, or that its own cycle cap, runtime budget, terminal subject,
+stop file or dropped sentinel deactivated, admits it, and the create-only and
 `replace_stopped` rules then decide as for any other arm. The self-arm tests in
 `test_autonudge_member_self_arm.py` and `test_monitor_directive_apply.py` pin
 the four answers. When the wake carries a loop id, its `monitor_update`,
@@ -240,9 +269,10 @@ stop already runs under the service lock and returns a row that carries a
 retained outcome untouched.
 
 `autonudge_stop` is deliberately non-confirming at tool-call time because the
-consumer applies it after the turn result is processed. The applier removes an
-ordinary monitor loop on the calling binding and reports an idempotent local
-miss. It never exposes a cross-session target; `test_autonudge_stop_auth.py`
+consumer applies it after the turn result is processed. The applier refuses
+with "Monitor NOT stopped" when a concurrent arm replaced the loop or the monitor
+service applied nothing (it is paused for maintenance); otherwise it removes the
+monitor loop on the calling binding, or reports an idempotent local miss. It never exposes a cross-session target; `test_autonudge_stop_auth.py`
 pins both the request wording and the local-binding behavior.
 
 ## PR fetcher
@@ -287,8 +317,9 @@ The reading itself:
   purpose: two copies of a counted read is how one of them ends up without the count
   check, and that one is a failing gate missing from a board reporting itself whole.
 * `_collapse` folds duplicate rows to one per identity, newest by start time, and
-  reports how many raw rows it folded. An unknown conclusion is reported as
-  `unknown`; a cancelled or stale row as `superseded`.
+  reports how many raw rows it folded. Rows land in the buckets `failing`, `pending`,
+  `passing`, `noise` and `unknown`: an unknown conclusion is `unknown`, and a cancelled
+  or stale row is `noise`.
 * The identity a row folds under is its WORKFLOW, not the app that posted it. Every
   GitHub Actions row carries one app slug, so the slug cannot separate two workflow
   files that each define a job of the same name, and folding those lets one
@@ -346,21 +377,14 @@ the degradation is a possible duplicate wake, not a crash-loop. If persistence
 fails while a coalescing window is open, `irq.run` reports immediately with a
 warning rather than delaying an observation into state it cannot recover.
 
-A `Tick.epoch` changes when the PR head changes. `irq.run` clears
-`REVISION` dedupe and coalescing state on that change, so failures on the new
-head can wake again. Conversation observations set `resets_on=ResetsOn.NEVER`, so
-a force-push does not replay an already-seen comment or review. These distinct
-key spaces are load-bearing: treating every signal as head-scoped loses
-conversation dedupe, while treating every signal as sticky hides failures on a
-new head.
-
-`irq.run` coalesces ordinary wake observations until the configured floor has
-elapsed and the check rollup settles, or until its hard wall elapses. The hard
-wall ensures a permanently pending check delays a wake instead of losing it.
-Sticky conversation observations can fire once the floor elapses even while
-checks remain pending; they do not become more informative by waiting for CI.
-`Severity.IMMEDIATE` and `Severity.TERMINAL` bypass the ordinary window. The
-coalescing and sticky-observation tests in `test_irq.py` pin these cases.
+The PR fetcher emits no observations, so for this watch the kernel supplies
+only two things: the epoch (`Tick.epoch` is the PR head, so dedupe memory resets
+on a new head) and the blind backstop below. The observation rules — `REVISION`
+versus `ResetsOn.NEVER` dedupe, coalescing until the floor and the check rollup
+settle, and the `Severity.IMMEDIATE`/`TERMINAL` bypass — are generic kernel
+behaviour owned by [agent-interrupt-controller](agent-interrupt-controller.md)
+and used by probes that do emit observations (the work-ledger probes); none of
+them acts on a PR watch.
 
 Dedupe is time-bounded. The kernel re-alerts a persistent condition after its
 window because a script cannot observe whether gateway delivery succeeded;
@@ -378,19 +402,11 @@ what reaches the kernel as a failed tick.
 
 ## Delivery and lifecycle
 
-Script cron execution maps `Skip` to no delivery, `Report` to a result while
-keeping the job, and `Done` to a result whose successful delivery removes the
-job. The script-cron branch in `slack.gateway._init_cron` delivers a result to
-the originating dashboard slot, queues it if that slot is busy, and rehydrates
-a closed slot from history when possible. If no slot is available, it sends a
-notification instead. This makes the arming session the normal wake target
-without claiming that headless delivery can start a session.
-
-The bundled script is a source asset, not a gateway import. Existing jobs must
-still resolve a registered copy under the configured cron directory through
-`cron_script.resolve_script_path`. The cron gateway revalidates and scans that
-current script body at fire time, then executes it through the script sandbox.
-The babysit skill no longer registers new script jobs.
+The PR watch is driven in-process by the gateway (`monitor_watch` or a
+`monitor_start` loop); no script asset ships for it and the babysit skill
+directory holds only its `SKILL.md`. A registered script job is refused by the
+probe and auto-paused, as described under "There is no script-cron driver"
+above, so script-cron `Skip`/`Report`/`Done` delivery is not this watch's path.
 
 ## Non-goals
 

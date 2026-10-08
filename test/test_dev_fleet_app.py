@@ -5981,8 +5981,8 @@ async def test_sync_never_stages_dist_on_an_edition_checkout(monkeypatch):
     monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: True)
     argvs = await _sync_step_argvs(monkeypatch)
     assert not any(_is_stage_step(a) for a in argvs)
-    # The BUILD is skipped too. vite builds with emptyOutDir, so on a source-tree
-    # install -- where static/dist is a symlink to website/dist -- the stock build
+    # The BUILD is skipped too. The build publishes into website/dist, so on a
+    # source-tree install -- where static/dist is a symlink to it -- the stock build
     # alone would replace the served edition dashboard, staging step or not.
     assert not any(Path(a[0]).name == "npm" for a in argvs)
     # The backend half of the sync is untouched: an edition still gets the pull
@@ -6018,7 +6018,12 @@ async def test_sync_build_steps_never_see_credential_helpers(monkeypatch):
     key = f"GIT_CONFIG_KEY_{base}"
 
     def _base(a):
-        return [Path(a[0]).name, *(a[1:2])]
+        # Skip leading `-c <value>` pairs (the config-hook disable + submodule-recursion
+        # pins) so the git SUBCOMMAND is matched, not the first pin flag.
+        i = 1
+        while i + 1 < len(a) and a[i] == "-c":
+            i += 2
+        return [Path(a[0]).name, *([a[i]] if i < len(a) else [])]
 
     fetch_envs = [e for a, e in captured if _base(a) == ["git", "fetch"]]
     build_envs = [
@@ -8332,17 +8337,20 @@ def test_manifest_declares_every_platform_the_app_runs_on():
     assert manifest["platform"]["os"] == ["macos", "linux", "windows"]
 
     # The pod requirement is carried in the UI copy, not the manifest gate. It
-    # must track reality: pods now run on Linux (systemd --user) AND macOS
-    # (launchd) — with no enforced resource ceiling on macOS — while Make Live
-    # stays Linux-only. The old copy ("pods need Linux systemd") became false
-    # the moment the launchd backend landed, and this test guards the manifest
-    # against lying in either direction.
+    # must track reality: pods run on Linux (systemd --user) AND macOS
+    # (launchd) — with no enforced resource ceiling on macOS — and Make Live
+    # stages its pointer on every platform, restarting automatically only under
+    # a systemd --user unit or a macOS LaunchAgent (``live._service_manager``).
+    # This test guards the manifest against lying in either direction.
     assert any(
         "launchd" in h and "Linux" in h for h in manifest["highlights"]
     ), "the highlight must state pods' per-platform reality (Linux systemd + macOS launchd)"
     assert any(
-        "Make Live is still Linux-only" in h for h in manifest["highlights"]
-    ), "Make Live remains Linux-only and the manifest copy must keep saying so"
+        "Make Live stages its pointer on every platform" in h
+        and "systemd --user" in h
+        and "LaunchAgent" in h
+        for h in manifest["highlights"]
+    ), "the manifest copy must state Make Live's per-platform restart reality"
 
 
 def test_declared_platforms_all_resolve_to_a_real_sys_platform():
@@ -8367,9 +8375,9 @@ def test_declared_platforms_all_resolve_to_a_real_sys_platform():
 async def test_sync_builds_and_stages_under_one_lock_holder(monkeypatch, tmp_path):
     """Pull+Build must build and stage inside ONE locked step.
 
-    Without a staging step the live gateway keeps serving through the symlink
-    ensure_dev_dist_symlink() points at ``website/dist``, so the build empties
-    and rewrites the assets it is serving. The step runs under the Dev Fleet
+    Without a staging step, an older target revision whose build still writes
+    ``website/dist`` in place would empty and rewrite the assets a live gateway
+    serves through the dev link ensure_dev_dist_symlink() makes. The step runs under the Dev Fleet
     backend's OWN interpreter with the target repo passed as an argument:
     resolving the helper from the target would make the step's existence
     contingent on the pulled revision carrying it, so an older target would turn
@@ -8416,8 +8424,8 @@ async def test_sync_builds_and_stages_under_one_lock_holder(monkeypatch, tmp_pat
         raise AssertionError(f"step not found in {argvs}")
 
     # Build and stage are ONE step so a single lock holder spans both: the build
-    # empties website/dist, and a peer flow staging concurrently would copy a
-    # partially written tree.
+    # swaps a new tree into website/dist, and a peer flow copying concurrently
+    # could copy half of each.
     stage_i = _index(lambda a: any("build_and_stage" in x for x in a))
     # THIS backend's interpreter, not the target checkout's: the logic is
     # revision-independent, while resolving it from the target would make the
@@ -10260,11 +10268,74 @@ async def test_gateway_pointer_flows_call_no_filesystem_primitive_on_the_loop_th
     loop_thread = threading.get_ident()
     on_loop: list[str] = []
 
+    # The trap stays a catch-all: it must still see EVERY product filesystem
+    # read on the loop thread, including ones outside ``tmp_path`` — the
+    # isolation fixture's data-home pointer (``read_previous_target`` /
+    # ``_staged_target``) and the running checkout's ``src/`` that steps 1–2
+    # reach before the cutover stub redirects them. The only calls that must not
+    # count are pytest's own lazy imports: under ``-n auto`` the first test in a
+    # worker to touch ``pygments`` / ``_pytest.assertion.rewrite`` / ``_pytest._io``
+    # triggers ``lstat``/``realpath`` walks over the interpreter and
+    # ``site-packages`` to resolve each module's ``__file__``; when that lands on
+    # the loop thread inside the trapped window a path-blind trap miscounts them
+    # as product work. So EXCLUDE (never allow-list): drop a call only when its
+    # path is under the interpreter prefixes or a ``site-packages``/
+    # ``dist-packages`` tree. Everything else — any product path, anywhere — is
+    # still recorded, so a regression that moves a real read onto the loop still
+    # fails the test.
+    #
+    # Classification is pure string work (``abspath``/``normpath``, no
+    # ``stat``/``lstat``/``realpath``), so it never re-enters one of the traps.
+    _real_fspath = os.fspath
+    _real_fsdecode = os.fsdecode
+
+    def _norm(p: str) -> str:
+        return os.path.normpath(os.path.abspath(p))
+
+    _interp_roots = {
+        _norm(p)
+        for p in (
+            sys.prefix,
+            sys.base_prefix,
+            sys.exec_prefix,
+            sys.base_exec_prefix,
+            # The stdlib location (dir holding ``os.py``); its ``__file__`` import
+            # walks are tool noise, not product reads.
+            os.path.dirname(os.__file__ or ""),
+        )
+        if p
+    }
+
+    def _is_tooling_path(resolved: str) -> bool:
+        parts = resolved.split(os.sep)
+        if "site-packages" in parts or "dist-packages" in parts:
+            return True
+        for root in _interp_roots:
+            if resolved == root or resolved.startswith(root + os.sep):
+                return True
+        return False
+
+    def _should_record(arg) -> bool:
+        if isinstance(arg, bytes):
+            try:
+                arg = _real_fsdecode(arg)
+            except Exception:
+                return True
+        if not isinstance(arg, (str, os.PathLike)):
+            # A file-descriptor (int) or anything unresolvable to a path: it is
+            # not an interpreter/tooling import walk, so count it conservatively.
+            return True
+        try:
+            resolved = _norm(_real_fspath(arg))
+        except Exception:
+            return True
+        return not _is_tooling_path(resolved)
+
     def _trap(module, name):
         real = getattr(module, name)
 
         def _wrapped(*args, **kwargs):
-            if threading.get_ident() == loop_thread:
+            if threading.get_ident() == loop_thread and args and _should_record(args[0]):
                 on_loop.append(f"{module.__name__}.{name}{args[:1]!r}")
             return real(*args, **kwargs)
 

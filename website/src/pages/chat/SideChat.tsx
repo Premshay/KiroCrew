@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { MessageCircleQuestionMark, RotateCcw } from 'lucide-react'
+import { Check, MessageCircleQuestionMark, RotateCcw, CornerUpRight } from 'lucide-react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { sideClose, sideOptimisticAppend, sideOptimisticRollback, sseSideQueue, sideReleaseConsumed, queueEditBroadcastAt } from '../../store/chatSlice'
+import { sideClose, sideOptimisticAppend, sideOptimisticRollback, sseSideQueue, sideReleaseConsumed, queueEditBroadcastAt, stageToMainComposer } from '../../store/chatSlice'
 import QueueStack from '../../components/QueueStack'
 import ChatMessageList from '../../app-sdk/ChatMessageList'
 import FollowUpBar from '../../components/FollowUpBar'
@@ -14,10 +14,13 @@ import ErrorNotice from '../../components/ErrorNotice'
 import { SlotProvider } from '../../providers/SlotContext'
 import { useConnected } from '../../hooks/useConnected'
 import { consumeSideChatSeed, readSideChatDraft, restoreSideChatDraft, writeSideChatDraft, writeSideChatPastes, useSideChatDraft } from '../../chat-core/composer/sideChatDrafts'
-import { type PasteBlock, expandAll as expandPasteTokens, pruneBlocks } from '../../utils/pasteTokens'
+import type { PasteBlock } from '../../utils/pasteTokens'
+import { buildOutgoingTurn, isEmptyTurn } from '../../chat-core/composer/outgoingTurn'
 import { mergeIntoDraft as appendToDraft } from '../../utils/chatDrafts'
+import { activeElementIsEditable } from '../../utils/editableTarget'
 import type { SideMessage, SideQueueEntry } from '../../store/chatSlice'
 import type { ChatMessage } from '../../types'
+import { searchableText } from '../../utils/searchableText'
 
 import { i18nT } from '../../i18n/t'
 import { fmtNumber } from '../../i18n/format'
@@ -28,6 +31,7 @@ const MAX_INPUT_H = 240
 // not a state, so leaving it until the next submit would let it sit beside a later
 // turn it has nothing to do with.
 const NOTICE_TTL_MS = 8_000
+const SEND_TO_MAIN_ACK_MS = 2_000
 // Stable fallbacks for a slot with no side buffer yet. An inline `?? []` allocates
 // a fresh array every render, so the transcript map, the queue cards and the
 // blocked-id set would all recompute on every render of an EMPTY panel — the one
@@ -68,6 +72,10 @@ function relativeTime(iso: string): string | null {  const diff = Date.now() - n
   if (diff < 24 * 3600_000) return `${Math.floor(diff / 3600_000)}h`
   return `${Math.floor(diff / (24 * 3600_000))}d`
 }
+
+/** How long the Select-to-Ask caret nudge waits for a composer that is still
+ *  lazy-loading (the Lexical editor) before it gives up on placing the caret. */
+const SEED_FOCUS_WAIT_MS = 5000
 
 export default function SideChat({ slot }: { slot: string }) {
   const connected = useConnected()
@@ -139,6 +147,40 @@ export default function SideChat({ slot }: { slot: string }) {
     [messages, lastIdx, isStreamingLast]
   )
 
+  // Stage exactly what the transcript renders: hidden widget bodies and protocol
+  // markers stay out of the composer, trailing whitespace is removed, and leading
+  // indentation remains intact for whitespace-sensitive Markdown.
+  const renderedLastAnswer = transcript[lastIdx]?.role === 'assistant'
+    ? searchableText(transcript[lastIdx])
+    : ''
+  const settledAnswer = renderedLastAnswer.trim() ? renderedLastAnswer : ''
+  const settledAnswerKey = settledAnswer
+    ? [slot, lastMsg?.run_id ?? '', lastMsg?.ts ?? '', lastIdx].join(' ')
+    : null
+  const [addedAnswerKey, setAddedAnswerKey] = useState<string | null>(null)
+  const sendToMainTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sendToMainDone = settledAnswerKey !== null && addedAnswerKey === settledAnswerKey
+
+  useEffect(() => () => {
+    if (sendToMainTimer.current !== null) clearTimeout(sendToMainTimer.current)
+  }, [])
+
+  // Stage the settled answer for the composer of THIS slot (append, never
+  // send). Keyed by `slot` because a Side Chat lives on more than one host —
+  // the dashboard ChatPage and a Crew Member's ChatPane — and only the host
+  // showing this slot must pick it up. The consuming host merges it against
+  // that slot's live draft; the user commits it there.
+  const sendToMain = useCallback(() => {
+    if (!settledAnswer || !settledAnswerKey || addedAnswerKey === settledAnswerKey) return
+    dispatch(stageToMainComposer({ slot, text: settledAnswer }))
+    if (sendToMainTimer.current !== null) clearTimeout(sendToMainTimer.current)
+    setAddedAnswerKey(settledAnswerKey)
+    sendToMainTimer.current = setTimeout(() => {
+      setAddedAnswerKey(current => current === settledAnswerKey ? null : current)
+      sendToMainTimer.current = null
+    }, SEND_TO_MAIN_ACK_MS)
+  }, [settledAnswer, settledAnswerKey, addedAnswerKey, slot, dispatch])
+
   /** Derived from the same helper the main chat uses, so "options only after the answer
    *  settles" and "a later user message clears them" behave identically. */
   const { followUpOptions } = useMemo(
@@ -207,7 +249,7 @@ export default function SideChat({ slot }: { slot: string }) {
   }, [])
 
   /** Wrapper around the native composer; the Select-to-Ask seed resolves the
-   *  textarea through it (`textarea[data-composer-input]`) instead of a
+   *  composer through it (`[data-composer-input]`, textarea or Lexical div) instead of a
    *  dedicated ref prop on ChatInput. */
   const composerWrapRef = useRef<HTMLDivElement | null>(null)
 
@@ -530,6 +572,22 @@ export default function SideChat({ slot }: { slot: string }) {
     },
   })
 
+  // Stop the in-flight side turn. ``/interrupt`` targets the slot's MAIN run, so
+  // a side turn — a separate background task — needs its own cancel. The
+  // backend broadcasts a terminal frame that clears streaming/pending, so the
+  // composer is wired to this rather than to an optimistic local flip: the
+  // server stays authoritative over run state exactly as it is for queue cards.
+  // No onError copy for the idempotent case: a stop that races the turn's own
+  // completion returns ``{ok: true}`` (not an error), and the terminal frame —
+  // or the turn ending on its own — is the real feedback either way.
+  const stopMutation = useMutation({
+    mutationFn: ({ slot: target }: { slot: string }) => api.sideStop(target),
+    // A rejected stop (transport failure, or the handler's own 404/409) must not
+    // be a silent dead end: the hung turn is still busy and this is its only
+    // escape hatch, so surface the failure through the file's ErrorNotice.
+    onError: () => setLocalError(i18nT('pages.chat.sideChat.stop_failed')),
+  })
+
   // Scroll follow lives in the virtualizer behind ChatMessageList; no
   // tail-keyed effect — its measurement sees every height change.
 
@@ -546,19 +604,51 @@ export default function SideChat({ slot }: { slot: string }) {
   // member switch and back — leaves focus where the user has it.
   useEffect(() => {
     if (!seedTick) return
-    const frame = requestAnimationFrame(() => {
-      const el = composerWrapRef.current?.querySelector<HTMLTextAreaElement>('textarea[data-composer-input]')
-      if (el) {
-        el.focus()
+    const place = (el: HTMLElement) => {
+      el.focus()
+      if (el instanceof HTMLTextAreaElement) {
         const len = el.value.length
         el.setSelectionRange(len, len)
-        // Scroll to the top so the START of a long quote is visible (focusing
-        // + caret-at-end scrolls to the bottom otherwise, hiding the quote).
-        el.scrollTop = 0
+      } else {
+        // The Lexical composer (Style Markdown While Typing) is a
+        // contenteditable div; it follows the DOM selection.
+        const sel = window.getSelection()
+        sel?.selectAllChildren(el)
+        sel?.collapseToEnd()
       }
+      // Scroll to the top so the START of a long quote is visible (focusing
+      // + caret-at-end scrolls to the bottom otherwise, hiding the quote).
+      el.scrollTop = 0
+    }
+    const find = () => composerWrapRef.current?.querySelector<HTMLElement>('[data-composer-input]') ?? null
+    let observer: MutationObserver | null = null
+    let timer = 0
+    const finish = (el: HTMLElement | null, late = false) => {
+      observer?.disconnect()
+      observer = null
+      window.clearTimeout(timer)
+      // A late mount (the lazy editor chunk resolved after the first frame)
+      // must not pull focus out of a field the user moved to in the meantime;
+      // the same guard `focusComposerNow` applies. The seed is still consumed.
+      if (el && !(late && activeElementIsEditable())) place(el)
       consumeSideChatSeed(slot)
+    }
+    const frame = requestAnimationFrame(() => {
+      const el = find()
+      const wrap = composerWrapRef.current
+      if (el || !wrap) { finish(el); return }
+      // The Lexical composer is lazy-loaded, so it can be missing for a
+      // while. Wait for it to mount, up to a cap, instead of consuming the
+      // seed against an empty wrapper and leaving the quote unfocused.
+      observer = new MutationObserver(() => { const found = find(); if (found) finish(found, true) })
+      observer.observe(wrap, { childList: true, subtree: true })
+      timer = window.setTimeout(() => finish(find(), true), SEED_FOCUS_WAIT_MS)
     })
-    return () => cancelAnimationFrame(frame)
+    return () => {
+      cancelAnimationFrame(frame)
+      observer?.disconnect()
+      window.clearTimeout(timer)
+    }
   }, [seedTick, slot])
 
   // Auto-grow of the input is the SDK hook's job — the `min-h-[52px]` class below
@@ -569,14 +659,14 @@ export default function SideChat({ slot }: { slot: string }) {
    *  arrive here as the override. */
   const send = useCallback((override?: string, steerRequested = false) => {
     const typed = (override ?? draft).trim()
-    if (!typed || sendMutation.isPending || !slot) return
+    if (isEmptyTurn({ text: typed }) || sendMutation.isPending || !slot) return
     // Collapsed pastes expand for the model here, on both the send and the
-    // steer branch (one path). The side transcript carries no per-message
-    // meta, so the bubble shows the expanded text as well — what the server
-    // stores and re-serves. Only a composer submit owns the composer's blocks:
-    // an override (a follow-up chip) supplies its own text and has none.
-    const blocks = override != null ? [] : pruneBlocks(typed, pasteBlocks)
-    const q = blocks.length ? expandPasteTokens(typed, blocks) : typed
+    // steer branch (one path): the side chat is the text-only channel of
+    // `buildOutgoingTurn`. The side transcript carries no per-message meta, so
+    // the bubble shows the expanded text as well — what the server stores and
+    // re-serves. Only a composer submit owns the composer's blocks: an
+    // override (a follow-up chip) supplies its own text and has none.
+    const { wire: q, pastes: blocks } = buildOutgoingTurn({ text: typed, pastes: override != null ? [] : pasteBlocks }, 'steer')
     if (exceedsByteLimit(q)) {
       // The limit is enforced in UTF-8 bytes (server contract), but a byte count is
       // not actionable to the user — report a character target instead, derived
@@ -626,6 +716,12 @@ export default function SideChat({ slot }: { slot: string }) {
     refreshMutation.mutate({ slot })
   }, [refreshMutation, slot])
 
+  // Fire-and-forget: the terminal frame the backend broadcasts drives the UI
+  // back to idle, so there is nothing to await here.
+  const handleStop = useCallback(() => {
+    stopMutation.mutate({ slot })
+  }, [stopMutation, slot])
+
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {showBanner && (
@@ -642,12 +738,15 @@ export default function SideChat({ slot }: { slot: string }) {
                   ? i18nT('pages.chat.sideChat.refresh_blocked_busy')
                   : undefined
             }
-            // Closing the sidecar clears the queue AND the steer ledger. A queued question,
-            // an undeliverable steer parked in that list, and an accepted steer still waiting
-            // to be consumed are all discarded — the last one is invisible here, which is why
-            // a running turn blocks too: its unconsumed steer only survives via the requeue
-            // that closing skips.
-            disabled={refreshMutation.isPending || queue.length > 0 || isBusy}
+            // Disabled WHILE a turn runs: a running turn can hold an accepted
+            // but unconsumed steer that has no queue card, so the empty-queue
+            // check cannot see it and a mid-turn Refresh would silently drop
+            // it. The hung-turn escape is the Stop control, which cancels the
+            // turn and settles the panel; once that clears (`is_complete` flips,
+            // `isBusy` falls), Refresh becomes reachable the ordinary way. So
+            // the steer-loss collateral never exists and Stop is the single
+            // in-flight escape.
+            disabled={isBusy || refreshMutation.isPending || queue.length > 0}
             className="flex items-center gap-1 text-[11px] font-medium text-accent hover:text-accent-hover disabled:opacity-50 bg-transparent border-none cursor-pointer disabled:cursor-not-allowed"
           >
             <RotateCcw size={11} className={refreshMutation.isPending ? 'animate-spin' : ''} />
@@ -707,6 +806,27 @@ export default function SideChat({ slot }: { slot: string }) {
           />
         </div>
       )}
+      {settledAnswer && (
+        <div className="shrink-0 px-2 pb-1">
+          {/* The read-only side chat can only PROPOSE; this hands the settled
+              answer to the main chat, where it can be acted on. */}
+          <button
+            type="button"
+            onClick={sendToMain}
+            aria-disabled={sendToMainDone}
+            title={i18nT('pages.chat.sideChat.send_to_main_tip')}
+            data-testid="side-chat-send-to-main"
+            className="flex items-center gap-1.5 text-[12px] font-medium text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer px-1 py-0.5"
+          >
+            {sendToMainDone
+              ? <Check size={13} aria-hidden />
+              : <CornerUpRight size={13} aria-hidden />}
+            {sendToMainDone
+              ? i18nT('pages.chat.sideChat.send_to_main_done')
+              : i18nT('pages.chat.sideChat.send_to_main')}
+          </button>
+        </div>
+      )}
       {followUpOptions.length > 0 && (
         <div className="shrink-0 px-2 pb-1">
           <FollowUpBar
@@ -748,6 +868,7 @@ export default function SideChat({ slot }: { slot: string }) {
             onSend={() => { void send() }}
             canSteer
             onSteer={() => { void send(undefined, true) }}
+            onStop={handleStop}
             isRunning={isBusy}
             placeholder={i18nT('pages.chat.sideChat.ask_a_side_question_2')}
             inputAriaLabel={i18nT('pages.chat.sideChat.ask_a_side_question')}

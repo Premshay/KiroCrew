@@ -19,20 +19,19 @@ It is written as the target, and the code does not yet match it everywhere, so
 every section carries its status. Read the status table before trusting a
 section as a description of what runs today.
 
-Verified against the provider-neutral feature layer at `52f33de15`.
-
 Two implementation specs sit under this one and describe what runs today:
-[agent-interrupt-controller.md](agent-interrupt-controller.md) for the kernel
-driving script-cron pollers, and [babysit-pr-watch.md](babysit-pr-watch.md) for
+[agent-interrupt-controller.md](agent-interrupt-controller.md) for the in-process
+`irq.Probe` kernel that `autonudge_service/gate.py` drives through `irq.poll` (the
+kernel path; no script-cron driver remains), and [babysit-pr-watch.md](babysit-pr-watch.md) for
 the pull-request watch built on it. Where either disagrees with a layer below,
 this spec states the target and that one states the present.
 
 | Layer | Status | Where it lives today |
 |---|---|---|
-| Subject and registry | `partial` | `monitoring/registry.py` owns kind/objective/capability data for four public pull-request kinds plus internal `gh-pr` and `github_workflow_run`; `probes/__init__.py` still has its separate dispatch branch, now for two cron-path kinds (`gh-pr`, `work-ledger`), and `work-ledger` has no registry row at all |
+| Subject and registry | `partial` | `monitoring/registry.py` owns kind/objective/capability data for four public pull-request kinds plus internal `gh-pr` and `github_workflow_run`; `probes/__init__.py` still has its separate dispatch branch, now for two kernel-path kinds (`gh-pr`, `work-ledger`), and `work-ledger` has no registry row at all |
 | Probe | `partial` | `monitoring.models.MonitorProbe` and `MonitorProbeResult` are provider-neutral and plural, and `monitoring/github_pull_request.py` batches its subjects into one GraphQL document per evidence kind; the other adapters loop internally and no driver assembles a batch, and the `irq.Probe` path remains separate |
-| Observation | `partial` | the `MonitorCondition` type and the `MonitorSeverity` / `MonitorResetsOn` vocabulary live in `monitoring/models.py`, all four pull-request kinds derive their named conditions in `monitoring/pull_request.py`, and `monitoring/decision.py` masks, ages and resets per condition; `irq.py` keeps its own copy of the vocabulary while the cron driver lives, and a subject's fingerprint is still derived from the canonical facts rather than from the conditions |
-| Decision | `partial` | `decide_monitor` is IO-free but state-mutating: it coalesces successive changes to one subject over time through a window on `MonitorState` (a floor and a head-change reset) and derives its dedup comparison so an unresolved change re-asserts on a re-alert interval. It writes the window fields on the staged state and READS the alert map; the caller stamps the alert map on a wake and persists the same staged state, so decide-and-persist is a required pairing. `irq.py` keeps its own multi-signal coalescing for the cron path |
+| Observation | `partial` | the `MonitorCondition` type and the `MonitorSeverity` / `MonitorResetsOn` vocabulary live in `monitoring/models.py`, all four pull-request kinds derive their named conditions in `monitoring/pull_request.py`, and `monitoring/decision.py` masks, ages and resets per condition; `irq.py` keeps its own copy of the vocabulary, and a subject's fingerprint is still derived from the canonical facts rather than from the conditions |
+| Decision | `partial` | `decide_monitor` is IO-free but state-mutating: it coalesces successive changes to one subject over time through a window on `MonitorState` (a floor and a head-change reset) and derives its dedup comparison so an unresolved change re-asserts on a re-alert interval. It writes the window fields on the staged state and READS the alert map; the caller stamps the alert map on a wake and persists the same staged state, so decide-and-persist is a required pairing. `irq.py` keeps its own multi-signal coalescing for the kernel path |
 | Persistence | `partial` | versioned in `monitoring/`; unversioned in `irq.py`, which also holds decision logic |
 | Driver | `implemented` | in-session timer of `AutoNudgeService` (`autonudge_service/firing.py`; probe gate `gate.py`, judge `judge_tick.py`), which reads the subject each tick and screens it with the wake judge |
 | Delivery | `implemented` | session directive keyed by the call's input digest, shared by both arming paths |
@@ -109,11 +108,11 @@ There is an extension point, and an author adding a kind today conforms to it
 rather than inventing it. `irq.Probe` is a base class whose docstring says
 "Domain half of a watch. Subclass and implement both methods": two required hooks
 raise `NotImplementedError`, and `tuning()` and `wake_suffix()` are optional
-overrides. `PrWatchProbe` in `probes/gh_pr.py` conforms, and a second cron-path
+overrides. `PrWatchProbe` in `probes/gh_pr.py` conforms, and a second kernel-path
 kind still subclasses `irq.Probe` and adds its branch to `build` in
 `probes/__init__.py`.
 
-That second cron-path kind now exists: `WorkLedgerProbe` in
+The second kernel-path kind is `WorkLedgerProbe` in
 `probes/work_ledger.py`, kind `work-ledger`, whose subject is a conductor's own
 work ledger rather than a pull request. It conforms as described -- the two
 required hooks plus both optional overrides, and one branch in `build`. It is
@@ -126,6 +125,37 @@ lands, `infer_monitor` stamps it with the borrowed pull-request `review_ready`
 objective, and the authorization audit record names that borrowed objective.
 Giving the kind its own objective (a registry row plus a per-kind stamp) is the
 next step and is not part of the change that made it reachable.
+
+A conductor does not have to remember that arm. When `work_ledger_record`
+`action=bind` commits and the conductor's slot holds no loop at all,
+`conductor_patrol.ensure_patrol` arms a default patrol on it: `watch:
+"work-ledger"`, gated, every 600 seconds, 300 cycles and 86400 seconds, which
+pass the goal-conductor skill's `patrol_budget.py check`. It goes through the
+same chokepoint as an agent's own `monitor_start`
+(`autonudge_authz.authorize_and_add_nudge`), create-only, as an OUTSIDE arm with
+no `initiator_slot_key`: the bind route knows the calling session but not the
+turn, so it cannot tell the session's own turn from a cron injection or a
+sub-agent sharing the slot. A crew/member conductor therefore refuses it. Any
+existing record -- active, approval-held, or stopped by a person -- is left
+alone, so a bind never stacks a second loop or revives a person's stop. The one
+re-arm is the gateway's own default patrol stopped by the system (its budget or
+cap ran out, the `_stopped_row_is_replaceable` allowlist): a new bind is new work,
+so it is replaced by a fresh default. A refusal is logged at WARNING and the bind
+still succeeds; the bind reply carries `patrol: armed | existing | refused |
+unsupported`, plus a `patrol_note` telling the conductor to arm its own
+`monitor_start` in the same turn whenever no `work-ledger` watch is active after
+the bind. The armed loop carries `default_patrol: true`, and that tag is the one
+exception to create-only: ANY create-only arm of a loop that is not itself a
+default patrol -- the conductor's own `monitor_start` or `monitor_watch`, and
+equally a person's dashboard create or a channel arm -- displaces an ACTIVE
+default patrol (prompt and structured add paths alike) instead
+of answering 409, even while its wake is in flight. That wake is not cancelled:
+its timer is unregistered, not cancelled, so a channel turn issuing the arm runs
+to its end. Its completion is then dropped (its record is gone), and the
+replacement starts its own cycle count. As a backstop, `work_ledger_read` flags every open item
+`unpatrolled` while the conductor holds no ACTIVE `work-ledger` watch, compact
+read included -- a loop watching something else reads no ledger, so it does not
+count. The Crew page board does not show the flag yet.
 
 The `monitoring/` package now has a different extension point:
 `models.MonitorProbe`, a structural Protocol with no behaviour inheritance, plus
@@ -142,7 +172,7 @@ is provider-neutral, not that the two stacks are already one.
 
 Retirement was downstream of layer 3 rather than of the coalescing window the
 pure decision engine gained, because that window folds successive changes to one
-subject over time, which is not the mechanism the cron path depends on. What that
+subject over time, which is not the mechanism the kernel path depends on. What that
 path uses are the two claims named in layers 3 and 4 below: the urgency claim
 both sides call `IMMEDIATE`, for a condition where waiting observes nothing
 further; and the per-condition `resets_on` distinction, which decides whether a
@@ -155,19 +185,19 @@ severity to raise.
 resets per condition: an `IMMEDIATE` condition bypasses the coalescing floor, and
 a head change drops the revision-scoped half of the dedupe memory while the
 sticky half survives. `test_monitor_conditions.py` pins both against the
-behaviour `test_irq.py` and `test_irq_port_baseline.py` pin on the cron path, each
+behaviour `test_irq.py` and `test_irq_port_baseline.py` pin on the kernel path, each
 with the differential that the same position without the claim behaves the other
 way.
 
 Two things still stand between that and deleting the extension point, and neither
-is a missing behaviour. The cron kernel keeps its own copy of the vocabulary --
+is a missing behaviour. The kernel keeps its own copy of the vocabulary --
 `irq.Severity` and `irq.ResetsOn`, whose two key-space characters are a persisted
-encoding -- because moving it while the cron driver is live would rewrite the
+encoding -- because moving it would rewrite the
 kernel's own storage format for no behavioural gain; the two copies cannot drift
 because `test_monitor_conditions.py` pins them member-for-member and pins the two
-key-space characters. And the cron path's plural batch assembly is a driver
+key-space characters. And the kernel path's plural batch assembly is a driver
 change, which is the consolidation's own step. Until that step an author adding a
-cron-path kind still subclasses `irq.Probe`.
+kernel-path kind still subclasses `irq.Probe`.
 
 ## Runtime bounds and activation evidence
 
@@ -198,6 +228,28 @@ stored one and is not re-checked. API creation caps the shipped runtime default
 to the ceiling and bound-checks only a budget the caller supplied.
 Explicit stops remain available.
 Quarantine remains inspectable even below the ordinary four-hour default.
+
+A prompt-path work-ledger watch is the one loop whose own bounds do not end it
+while its subject is live. When `_timer` finds the cycle cap or the runtime
+budget spent on a running loop that observes a work ledger
+(`_observes_work_ledger`) and that ledger still holds a non-terminal item
+(`probes.work_ledger.has_open_items`, positive evidence only: an unreadable
+ledger answers no), it raises the spent bound server-side instead of
+deactivating -- `max_cycles` to the count plus a quarter of the cap (at least
+10), `max_runtime_secs` to the loop's age plus a quarter of the budget (at least
+one hour), clamped to the ceiling -- logs it at WARNING and re-arms. The loop
+then ends only through the probe's terminal settlement (every item closed) or a
+user or agent stop. The runaway backstop is the same
+`monitoring.max_runtime_secs` ceiling, measured as the loop's age from
+`created_ts`: past it nothing is extended, the bound stops the loop as before,
+and the refusal is logged at WARNING.
+
+An unanswered tool approval HOLDS a prompt loop rather than stopping it: it
+stays active, fires nothing and spends neither bound, and it resumes on its own
+once a person answers an approval, types into the dashboard session or presses
+fire (`release_approval_hold`); a Slack or Discord message alone does not
+release it. `monitor_inspect` reports the hold as
+`paused_for_approval` on the loop reading.
 
 A tool's “requested” response proves receipt only. The gateway's applied notice
 and a subsequent `monitor_inspect` prove activation. Unmatched directive delivery
@@ -287,8 +339,8 @@ call's own argument, and a chunk is refused if it names two hosts. The
 other four adapters still loop internally and declare so in their own docstrings.
 What is missing is above the probe, not inside it: the in-session driver arms one
 `asyncio` task per loop in `autonudge_service/timers.py`, so a tick structurally sees one
-monitor, and the out-of-session poller runs one subject per cron job through
-`irq.Probe.observe`, which is singular. A batch therefore has no assembler; that
+monitor, and the kernel path's `irq.poll` (called from `autonudge_service/gate.py`)
+runs one subject per call through `irq.Probe.observe`, which is singular. A batch therefore has no assembler; that
 is a driver change, and it belongs with the consolidation rather than with the
 probe.
 
@@ -442,8 +494,10 @@ decide(entries, prior_state, budgets, now) -> Verdict
 
 This layer knows nothing about pull requests, hosts, or agents. That is
 verifiable rather than aspirational: `decide_monitor` in `monitoring/decision.py`
-names no host and reaches no IO, its only imports are the state and observation
-models, and its clock arrives as the `now` parameter. `test_monitor_decision.py`
+names no host and reaches no IO, and its clock arrives as the `now` parameter. It
+imports only `hashlib`, `json`, the monitoring models and
+`monitoring.github_provider_errors.is_unattempted_probe` (the shared "this skip made
+no API call" predicate). `test_monitor_decision.py`
 exercises it with no network and no filesystem, and that property is what makes it
 the skeleton the rest is merged into.
 
@@ -459,7 +513,7 @@ fail safe:
 5. **Floor**.
 
 The engine is **level-triggered**, not edge-triggered, on both paths. `irq.py`
-level-triggers on the live cron path: per-key `alerted` timestamps in its loaded
+level-triggers on the live kernel path: per-key `alerted` timestamps in its loaded
 state, `_dedupe_key` distinguishing `REVISION` from `NEVER` entries, a re-alert
 window defaulting to six hours through `DEFAULT_REALERT_SECS`, a coalescing
 window through `coalesce_secs`, and `Severity.IMMEDIATE` documented as bypassing
@@ -467,7 +521,7 @@ the delay but not the mask. `monitoring/decision.py` now level-triggers too: it
 re-asserts an unresolved actionable change once its re-alert interval has elapsed
 and coalesces a burst of successive changes to one subject, through a window on
 `MonitorState`. So re-assertion-after-a-window is available on both paths rather
-than only the cron one.
+than only the kernel one.
 
 Each key carries its own alert timestamp, and a key that is still true re-asserts
 once its window has elapsed. Edge triggering loses any condition that stayed true
@@ -561,8 +615,20 @@ Four things the shape decides, each for a reason worth keeping:
 Every stop, whichever writer decided it, is also reported once more after the
 store commits: `autonudge_stop_log` compares the loops active in the previous
 committed store with the new one, logs each loop that stopped at WARNING with its
-`stopped_reason`. That line in `gateway.log` is the kept record; grep it for
-`AutoNudge:`.
+`stopped_reason`, and appends the same record as one JSON line to
+`<data home>/logs/autonudge_stops.jsonl`. The log line is for reading live; grep
+`gateway.log` for `AutoNudge:`. Each gateway boot moves `gateway.log` to
+`gateway.log.prev`, keeping one copy, so the line is gone after two restarts. The JSONL file is the record that stays: it holds
+the same scrubbed fields, is size-rotated to one `.1` generation (about 2 MiB in
+total), and a failure to append costs that one record, never the store write.
+To see the last stops, newest last:
+
+```bash
+tail -n 20 ~/.kiro/crew/logs/autonudge_stops.jsonl
+```
+
+Each line carries `ts`, `loop_id`, `slot_key`, `kind`, `target`, `reason`,
+`detail`, `cycle_count`/`max_cycles` and `ran_secs`/`max_runtime_secs`.
 A removed legacy loop has no row to carry a reason, so `remove()` takes a
 `stop_reason` for that record alone. A new stop path needs nothing extra to be
 recorded; a new REMOVAL path should pass its reason.
@@ -746,9 +812,8 @@ enforced nowhere:
   reason: `gh pr view --json statusCheckRollup` exposes only the workflow's display name,
   none of the run fields the rule keys on. It differs in one bound only: a board past
   its page cap reads UNKNOWN rather than incomplete, because a partial read could keep a
-  displaced row whose successor sits on the page never fetched. (Issue #11832 recorded
-  the divergence this replaced: a label-keyed, `startedAt`-ordered collapse that
-  overwrote a live row of the same run.)
+  displaced row whose successor sits on the page never fetched. A label-keyed, `startedAt`-ordered collapse is not used, because it would
+  overwrite a live row of the same run.
   Identity is the workflow DEFINITION plus the check name
   (`checkSuite.workflowRun.workflow.databaseId`) and the RUN's triggering
   `checkSuite.workflowRun.event`, because one workflow file can declare several
@@ -808,11 +873,9 @@ enforced nowhere:
   green rows sitting under a still-pending aggregate must not conclude the round
   early. Worst-wins pending already answers it -- a pending aggregate is a
   pending row, so the monitor waits -- without letting a green one subtract a
-  failure. Both current implementations now follow this rule: the structured
-  provider reads the aggregate as an ordinary worst-wins row, and the skill's
-  status tool was brought onto the same rule by
-  [PR #10731](https://github.com/kirodotdev/KiroCrew/pull/10731), merged
-  2026-09-14.
+  failure. Both implementations follow this rule: the structured provider reads
+  the aggregate as an ordinary worst-wins row, and the skill's status tool applies
+  the same rule.
 - A stale reviewer stamp is an entry (`stale:<name>`), not a paragraph.
 - An un-dispositioned finding is an entry, so readiness cannot be declared over
   one.
@@ -839,7 +902,7 @@ enforced nowhere:
 The extensibility test is mechanical: adding a kind must not touch layers 4
 through 7.
 
-**What this looks like today, before consolidation lands.** On the cron path,
+**What this looks like before consolidation.** On the kernel path,
 subclass `irq.Probe`, implement its two required hooks, and add a branch for the
 kind to `build` in `probes/__init__.py`. On the structured path, register a
 `MonitorKind`, implement the plural `MonitorProbe` contract, and wire that
@@ -863,7 +926,7 @@ tree.
 A kind that cannot be added without editing layer 4 is a design defect in this
 spec, and should be reported as one rather than worked around with a branch.
 
-#### Reported: the second cron-path kind could not be added without a shared edit
+#### Reported: the second kernel-path kind could not be added without a shared edit
 
 `work-ledger` was added under the current-tree procedure above and did NOT satisfy
 criterion 1 of the acceptance test, so it is reported here rather than worked
@@ -876,7 +939,14 @@ terminal word as though it were every kind's.
 The fix keeps the decision engine free of kind names by moving the vocabulary to
 the probes: `probes.terminal_succeeded` tests a verdict's keys against the set of
 terminal keys that mean "finished well", and each probe contributes its own. The
-engine still asks one question and no kind appears in it.
+engine still asks one question and no kind appears in it. Two details sit beside
+that rule in `autonudge_service/gate.py`. A watch is terminal when its observation
+says so OR when the kernel's verdict is `irq.Outcome.TERMINAL` (the work-ledger
+probe exposes no observation and reports its terminal through the kernel), both in
+the tick and in `_terminal_still_holds`. And success reads `observation.merged`
+first: a pull request's terminal verdict keys are empty, so `gh-pr` success still
+comes from the observation, while `probes.terminal_succeeded` decides the keyed kinds
+such as `work-ledger`.
 
 Two lessons for the consolidation target. A terminal key is part of a kind's
 vocabulary and belongs in the registry row beside its objective, not in a shared

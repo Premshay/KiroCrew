@@ -15,15 +15,17 @@ The advisory surfaces carry no enforcement, no lease, no cross-session
 coordination. Two sessions can both read "ample" and both launch heavy work —
 the tradeoff of a cheap, zero-tuning guard. One narrow enforcement point sits
 on top: :func:`admission_check` gates *background* work admission (scheduled
-cron firings, new subagent spawns) while posture is CRITICAL, so the scheduler
-stops piling work onto a host that is about to freeze. Direct user chat turns
+cron firings, task-runner steps) while posture is CRITICAL, so the scheduler
+stops piling work onto a host that is about to freeze. Subagent spawns are not
+gated here: they admit on their own memory floor (``agent.spawn_min_memory_gb``). Direct user chat turns
 and the gateway's own operation are never gated, and the gate fails open on an
 unknown posture. (A hard, cross-session admission lease is a separate, heavier
 design.)
 
 The memory figure reuses :func:`kiro_crew.subagent._available_memory_gb`, the
-same cgroup-clamped, container-aware probe that auto-sizes the sub-agent cap, so
-the two never disagree. It is imported lazily to keep this module import-cheap
+same cgroup-clamped, container-aware probe behind the sub-agent cap's
+memory-readability check and the TaskRunner's memory-sized auto value, so the
+two never disagree. It is imported lazily to keep this module import-cheap
 and free of any import cycle (``context`` imports this; ``subagent`` is heavy).
 
 Alongside memory the probe reads one more ceiling: the agent slice's TASK count
@@ -598,13 +600,14 @@ def adaptive_exec_cap() -> int:
     """The execution cap IN FORCE in this process, or ``0`` when unknown.
 
     The number a caller sizing a fan-out needs: ``agent.max_subagents`` is a
-    ceiling the adaptive controller may be dispatching 1 at a time under. The
-    same registry read as :func:`adaptive_state` -- a dict lookup, no request --
-    so it is safe on every session-assembly path; outside the gateway it is 0
-    and the caller falls back to the configured ceiling, LABELLED as one. A
-    disabled controller leaves the user's max as the cap in force, so that is
-    what it reports; a paused dispatch (cap 0) reads as unknown, because "up to
-    0" is no fan-out guidance at all.
+    ceiling the adaptive controller may have cut after admitted work kept
+    failing. The same registry read as :func:`adaptive_state` -- a dict lookup,
+    no request -- so it is safe on every session-assembly path; outside the
+    gateway it is 0 and the caller falls back to the configured ceiling,
+    LABELLED as one. A disabled controller leaves the user's max as the cap in
+    force, so that is what it reports; a cap of 0 (which the controller no
+    longer produces) reads as unknown, because "up to 0" is no fan-out guidance
+    at all.
     """
     state = adaptive_state()
     if not state:
@@ -618,7 +621,7 @@ def adaptive_summary_lines(state: dict | None = None) -> list[str]:
     """Effective caps and controller state, for the ``resource_status`` tool.
 
     Empty when no controller runs here. Otherwise: the live execution cap
-    against the user's ceiling, the spawn-gate capacity, whether dispatch is
+    against the user's ceiling, the spawn-gate capacity and whether the gate is
     paused or probing, and the last decision's action and reason -- what the
     dashboard's resources popover and ``kirocrew doctor`` show as "effective
     concurrency vs user max and the current pressure reason". When the state
@@ -644,9 +647,10 @@ def adaptive_summary_lines(state: dict | None = None) -> list[str]:
     status = "paused" if state.get("paused") else "active"
     if state.get("probing"):
         status = "probing"
+    # The pause is the spawn gate's: the execution cap is never paused.
     lines.append(
         f"  Mode: {mode}   Execution cap: {exec_cap}/{ceiling}   "
-        f"MCP spawn gate: {gate_cap}/{gate_ceiling}   Dispatch: {status}"
+        f"MCP spawn gate: {gate_cap}/{gate_ceiling} ({status})"
     )
     # The growth regime: without it "4/64" reads as an unexplained throttle.
     # The cap climbs toward the user's ceiling on clean samples; a low one is
@@ -918,8 +922,8 @@ def admission_check(cfg: object | None = None) -> AdmissionDecision:
 
     The single enforcement point layered on the advisory posture tier: a
     CRITICAL posture refuses; every other posture — ample, tight, and unknown —
-    admits. Callers on the two gated paths (scheduled cron firings, new
-    subagent spawns) consult this once per admission decision; it reuses the
+    admits. Callers on the gated paths (scheduled cron firings, task-runner
+    steps) consult this once per admission decision; it reuses the
     same cheap :func:`probe` the advisory surfaces use (fingerprint-cached
     config, one memory read, and a handful of single-value cgroup reads for the
     slice's task figure) and never scans processes. The task figure is reported,
@@ -1027,9 +1031,9 @@ def prewarm_allowance(available_gb: float | None = None, cfg: object | None = No
         return PREWARM_MAX_LIVE
 
 
-# Cached-verdict layer for callers that must never block: the sync spawn path
-# runs on the gateway event loop, so it reads the last off-thread verdict
-# instead of probing inline. Freshness window sized to the posture's own rate
+# Cached-verdict layer for callers that must never block: an admission decided
+# on the gateway event loop reads the last off-thread verdict instead of
+# probing inline. Freshness window sized to the posture's own rate
 # of change (memory exhaustion develops over tens of seconds, not millis).
 _CACHED_TTL_SECS = 5.0
 _cached_decision: AdmissionDecision | None = None
@@ -1053,7 +1057,7 @@ def cached_admission_check() -> AdmissionDecision:
     one background refresh (non-blocking dedupe) and returns the previous
     verdict — or a fail-open admit before the first refresh completes. The
     caller's thread never performs config or procfs I/O, which is what keeps
-    the sync spawn path safe to call from the gateway event loop. The
+    it safe to call from the gateway event loop. The
     trade-off is bounded staleness (:data:`_CACHED_TTL_SECS` plus one refresh
     latency), acceptable because the gate is advisory pressure-shedding, not
     a correctness barrier.

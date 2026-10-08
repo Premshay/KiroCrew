@@ -37,7 +37,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -49,6 +49,7 @@ from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.env import sanitize_spec_env
 from kiro_crew.github_runner import prevalidated_gh_env
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
+from kiro_crew.json_line import parse_json_object_line
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.port_resolution import resolve_serving_port
@@ -71,6 +72,7 @@ from kiro_crew.security import (
     sensitive_path_refusal,
 )
 from kiro_crew.sel import sel
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # Env vars stripped from EVERY cron subprocess (command and script), regardless
 # of OS sandbox mode. The OS sandbox can fall back to backend "none" (e.g.
@@ -1104,8 +1106,10 @@ class ScriptContext:
     _port: int = 5476
     _secret: str = ""
     _session_token: str = ""
+    _kept_servers: KeptMcpServers = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        self._kept_servers = KeptMcpServers(session_key=f"cron:{self.job.id}")
         # The parent injects the port it minted the credential for. Preferring it
         # keeps credential and dial target from one resolution; KIROCREW_PORT is the
         # fallback for a directly-constructed context and is 5476 on a --port auto
@@ -1156,12 +1160,14 @@ class ScriptContext:
     # ── Dashboard sessions ──
     #
     # A dispatcher cron lists the folder it files sessions in, opens a session
-    # there and seeds it with its first message. Each call goes to a ``/api/chat``
-    # route the internal secret already serves, with the same credential
-    # ``notify()`` presents; see the class docstring for why no dashboard token
-    # is involved. A cron bound to a crew member is admitted to the folder calls
-    # and refused on ``open_session`` and ``send_to_session`` by the member
-    # chat-control gate, the same answer that gate gives any member caller.
+    # there, seeds it with its first message and sets the session's approval
+    # mode so unattended work does not wait on a prompt. Each call goes to a
+    # ``/api/chat`` route the internal secret already serves, with the same
+    # credential ``notify()`` presents; see the class docstring for why no
+    # dashboard token is involved. A cron bound to a crew member is admitted to
+    # the folder calls and refused on ``open_session``, ``send_to_session`` and
+    # ``set_session_mode`` by the member chat-control gate, the same answer that
+    # gate gives any member caller.
 
     def list_session_folders(self) -> list[dict]:
         """Return the dashboard's session folders (``GET /api/chat/folders``).
@@ -1208,6 +1214,7 @@ class ScriptContext:
             key: value
             for key, value in (
                 ("name", redact(name)),
+                ("title", redact(name)),
                 ("folder_id", folder_id),
                 ("agent", agent),
                 ("model", model),
@@ -1239,6 +1246,26 @@ class ScriptContext:
             raise RuntimeError(f"send_to_session() failed: {self._reason(result)}")
         return result
 
+    def set_session_mode(self, slot: str, mode: str) -> dict:
+        """Set the tool approval mode of *slot* (``POST /api/chat/mode``).
+
+        *mode* is ``"trust"`` (auto-approve every tool on that session) or
+        ``"trust_reads"`` (auto-approve read-only tools). Both are scoped to the
+        one session named and leave the process-global override alone. The
+        gateway refuses any other mode, ``yolo`` and ``normal`` included, with
+        ``mode_not_allowed``, a slot this cron did not open with ``not_creator``,
+        and the call itself with ``session_control_disabled`` while
+        ``agent.session_control`` is false; it audits each call and each refusal.
+        The mode is sent as given, so the gateway, not this method, is the one
+        place that rule lives. Returns the gateway's receipt, ``{"ok": True,
+        "mode": <mode>}``. Raises RuntimeError carrying the gateway's code if it
+        refuses or cannot be reached.
+        """
+        result = self._post("/api/chat/mode", {"slot": slot, "mode": mode})
+        if not isinstance(result, dict) or "error" in result:
+            raise RuntimeError(f"set_session_mode() failed: {self._reason(result)}")
+        return result
+
     @staticmethod
     def _reason(result: object) -> str:
         if isinstance(result, dict) and result.get("error"):
@@ -1246,7 +1273,13 @@ class ScriptContext:
         return f"unexpected response {json.dumps(result)[:200]}"
 
     def call_tool(self, server: str, tool: str, args: dict) -> str:
-        """Call an MCP tool by spawning the server subprocess directly.
+        """Call an MCP tool, starting the server subprocess on the first call to it.
+
+        The server lives for the run, not for one call: :class:`KeptMcpServers`
+        keeps a server that answered the call (with a result or a tool error)
+        for this run's next call to it, so a server that signs in to a service
+        when it starts signs in once per run rather than once per call.
+        :meth:`close` stops the kept servers.
 
         Args are scanned for credential/URL leakage before passing to the
         sandboxed MCP server subprocess.
@@ -1255,18 +1288,21 @@ class ScriptContext:
         args_str = json.dumps(args)
         args_str = redact(args_str)
         safe_args = json.loads(args_str)
-        client = None
         try:
-            client = McpToolClient(server, session_key=f"cron:{self.job.id}")
-            result = client.call_tool(tool, safe_args)
-            self._audit_tool_call(server, tool, "ok")
-            return result
+            result = self._kept_servers.call_tool(server, tool, safe_args)
         except Exception as exc:
             self._audit_tool_call(server, tool, "error", str(exc))
             raise
-        finally:
-            if client is not None:
-                client.close()
+        self._audit_tool_call(server, tool, "ok")
+        return result
+
+    def close(self) -> None:
+        """Stop every MCP server kept for reuse; later calls keep none.
+
+        The launcher calls this once the script function returns. It never
+        raises, because by then the run's result is already decided.
+        """
+        self._kept_servers.close()
 
     def _audit_tool_call(self, server: str, tool: str, outcome: str, error: str = "") -> None:
         """Log tool invocation for audit trail."""
@@ -1340,6 +1376,10 @@ class ScriptContext:
 
 
 # ── MCP Tool Bridge ──
+
+
+class McpToolError(RuntimeError):
+    """A tool call the MCP server answered with an error; the server is still usable."""
 
 
 class McpToolClient:
@@ -1428,7 +1468,9 @@ class McpToolClient:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=self._stderr_file,
-                text=True,
+                # errors="replace": a byte that is not UTF-8 costs its line
+                # (it does not parse) rather than raising out of readline.
+                **UTF8_TEXT,
                 env=proc_env,
             )
         except Exception:
@@ -1460,13 +1502,20 @@ class McpToolClient:
         self._proc.stdin.flush()
 
     def _recv(self) -> dict | None:
+        """The next line the server wrote as a JSON object, or ``None`` at EOF.
+
+        A line that is not one (a blank, banner or log line on stdout, a
+        scalar, a value nested past the decoder's ceiling) comes back as an
+        empty object, so it costs that line rather than the call, and every
+        line read counts toward ``_rpc``'s cap: a server that writes only
+        noise fails the call instead of holding it.
+        """
         assert self._proc.stdout is not None
-        while True:
-            line = self._proc.stdout.readline()
-            if not line:  # EOF
-                return None
-            if line.strip():
-                return json.loads(line)
+        line = self._proc.stdout.readline()
+        if not line:  # EOF
+            return None
+        msg = parse_json_object_line(line)
+        return {} if msg is None else msg
 
     def _stderr_tail(self, limit: int = 1024) -> str:
         """Return the last `limit` bytes of the subprocess's captured stderr.
@@ -1509,21 +1558,23 @@ class McpToolClient:
                 )
             if msg.get("id") == req_id:
                 return msg
-        raise RuntimeError(
-            f"MCP server '{name}' did not respond to '{method}' within 1000 messages"
-        )
+        raise RuntimeError(f"MCP server '{name}' did not respond to '{method}' within 1000 lines")
 
     def call_tool(self, name: str, arguments: dict) -> str:
         r = self._rpc("tools/call", {"name": name, "arguments": arguments})
         if "error" in r:
-            raise RuntimeError(f"MCP tool error: {r['error']}")
+            raise McpToolError(f"MCP tool error: {r['error']}")
         result = r.get("result", {})
         if result.get("isError"):
             content = result.get("content", [])
             err_text = content[0].get("text", "unknown error") if content else "unknown error"
-            raise RuntimeError(f"MCP tool error: {err_text}")
+            raise McpToolError(f"MCP tool error: {err_text}")
         content = result.get("content", [])
         return content[0].get("text", "") if content else ""
+
+    def is_running(self) -> bool:
+        """Whether the server process is still up and so can take another call."""
+        return self._proc.poll() is None
 
     def close(self) -> None:
         try:
@@ -1544,6 +1595,73 @@ class McpToolClient:
                 Path(stderr_file.name).unlink(missing_ok=True)
             if self._sandbox_cleanup:
                 Path(self._sandbox_cleanup).unlink(missing_ok=True)
+
+
+class KeptMcpServers:
+    """One MCP server per name, kept across the calls of a run.
+
+    A server is kept after a call it answered, with a result or with a tool
+    error, for the run's next call to the same server name. So a server that
+    signs in to a service when it starts signs in once per run rather than once
+    per call. A call that fails any other way (the server exited, stopped
+    answering, or wrote no answer) stops its server, and the next call starts a
+    fresh one. A kept server whose process has exited is replaced. A call made
+    while another call to the same server still holds the kept server starts a
+    server of its own, and once both finish only one is kept. :meth:`close`
+    stops every kept server and keeps none afterwards.
+    """
+
+    def __init__(self, session_key: str = ""):
+        self._session_key = session_key
+        self._kept_clients: dict[str, McpToolClient] = {}
+        self._kept_clients_lock = threading.Lock()
+        self._closed = False
+
+    def call_tool(self, server: str, tool: str, args: dict) -> str:
+        client = self._take_kept_client(server)
+        kept = False
+        try:
+            if client is None:
+                client = McpToolClient(server, session_key=self._session_key)
+            try:
+                result = client.call_tool(tool, args)
+            except McpToolError:
+                kept = self._keep_client(server, client)
+                raise
+            kept = self._keep_client(server, client)
+            return result
+        finally:
+            if client is not None and not kept:
+                client.close()
+
+    def close(self) -> None:
+        """Stop every kept server; never raises, and later calls keep none."""
+        with self._kept_clients_lock:
+            self._closed = True
+            clients = list(self._kept_clients.values())
+            self._kept_clients.clear()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                logger.debug("stopping a kept MCP server failed", exc_info=True)
+
+    def _take_kept_client(self, server: str) -> McpToolClient | None:
+        """The server kept from an earlier call, if its process is still running."""
+        with self._kept_clients_lock:
+            client = self._kept_clients.pop(server, None)
+        if client is not None and not client.is_running():
+            client.close()
+            return None
+        return client
+
+    def _keep_client(self, server: str, client: McpToolClient) -> bool:
+        """Keep ``client`` for the next call to ``server``; False when one is already kept."""
+        with self._kept_clients_lock:
+            if self._closed or server in self._kept_clients:
+                return False
+            self._kept_clients[server] = client
+            return True
 
 
 @lru_cache(maxsize=16)
@@ -2179,13 +2297,13 @@ def run_script_sandboxed(
     # Isolation also means ``kiro_crew`` may no longer be importable via an
     # inherited PYTHONPATH (dev checkouts), so the TRUSTED package parent —
     # computed here in the gateway from kiro_crew's own location, never from
-    # the environment — is seeded explicitly. ``-I`` only implies safe_path
-    # (no script-dir prepend) on Python 3.11+; on the 3.10 floor sys.path[0]
-    # is STILL the launcher's own directory. So the granted launcher lives in
-    # the private pinned dir (never the shared temp dir, where an agent can
+    # the environment — is seeded explicitly. The child runs sys.executable,
+    # which requires-python pins to 3.12+, where ``-I`` implies safe_path (no
+    # script-dir prepend). As defense in depth the granted launcher still lives
+    # in the private pinned dir (never the shared temp dir, where an agent can
     # park a json.py indefinitely) AND the prelude strips that directory by
-    # VALUE — a positional strip would drop a stdlib entry on 3.11+, where
-    # nothing was prepended. Both spellings are stripped because CPython
+    # VALUE — a positional strip would drop a stdlib entry, since nothing was
+    # prepended. Both spellings are stripped because CPython
     # realpaths the script dir when computing sys.path[0].
     _kiro_pkg_parent = str(Path(__file__).resolve().parent.parent)
     if stdin_payload is not None:
@@ -2215,7 +2333,7 @@ def run_script_sandboxed(
         # os.environ AFTER this process's execve — the kernel's
         # /proc/<pid>/environ snapshot is the STARTUP environment, so a
         # same-UID reader of that file never sees them. Ungranted runs get no
-        # payload and exec the live file as before.\n
+        # payload and exec the live file as before.
         f"_payload = json.loads(sys.stdin.readline()) if {bool(stdin_payload)!r} else None\n"
         "if _payload:\n"
         "    os.environ.update(_payload['secrets'])\n"
@@ -2265,11 +2383,13 @@ def run_script_sandboxed(
         "    print(json.dumps({'status': 'report', 'message': r.message}))\n"
         "except Exception as e:\n"
         "    print(json.dumps({'status': 'error', 'error': str(e)}))\n"
+        "finally:\n"
+        "    ctx.close()\n"
     )
 
-    # A granted launcher is born inside the private pinned dir: on Python
-    # 3.10 ``-I`` still makes the script's own directory sys.path[0], and the
-    # shared temp dir is somewhere an agent can leave a json.py waiting.
+    # A granted launcher is born inside the private pinned dir, as defense in
+    # depth beside ``-I``'s safe_path: the shared temp dir is somewhere an agent
+    # can leave a json.py waiting.
     # Ungranted runs keep the shared temp dir (their prelude strips it).
     fd, launcher_path = tempfile.mkstemp(
         suffix=".py", prefix="kirocrew_cron_", dir=pinned_dir if stdin_payload else None
@@ -2800,7 +2920,9 @@ def _no_command_shell_message() -> str:
         "command past what the storage-time vet gate checked). Neither passed on "
         "this host: the shell is missing, expands braces even with `+B`, or the "
         "OS sandbox refused to start the probe. Use a script cron or an LLM "
-        "`message` cron until that is fixed."
+        "`message` cron until that is fixed. The probe result is kept for the "
+        "life of the gateway process, so restart the gateway after fixing the "
+        "shell."
     )
 
 

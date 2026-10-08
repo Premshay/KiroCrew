@@ -47,7 +47,7 @@ CONTRACT = (
     / "kiro_crew"
     / "builtin_skills"
     / "kirocrew-dev"
-    / "prepare-pr"
+    / "kirocrew-prepare-pr"
     / "scripts"
     / "_review_contract.py"
 )
@@ -1480,7 +1480,7 @@ def test_the_required_status_actually_calls_the_gate() -> None:
     drifts silently.
     """
     step = _readiness_step("supersessions")
-    assert step["env"]["GATE"].endswith("prepare-pr/scripts/pr_status.py")
+    assert step["env"]["GATE"].endswith("kirocrew-prepare-pr/scripts/pr_status.py")
     assert "--supersession-gate" in step["run"]
     # The grammar must not gain a workflow-side copy: the step reads the gate's
     # JSON and parses no marker itself.
@@ -1735,3 +1735,159 @@ def test_the_gate_prints_parseable_json_and_exits_zero_on_unknown(capsys) -> Non
     # The stub was reached, so the refusal above is what produced the UNKNOWN --
     # not an argument-validation path that never attempted a read.
     assert calls and calls[0][0] == "gh", calls
+
+
+# ---- A human override adjudicates a superseded block (fork PRs) -------------
+# The override RECORD adjudicates a block whatever the lane's slot shows, so a
+# head whose lane re-sampled instead of writing the override note (a re-run that
+# could not read the record reviews normally) is not held either. The shape
+# pinned here: First Principles BLOCKS a fork head, a writer records
+# `/ai-review override first-principles <head>`, the lane's next sample returns
+# CONCERNS -- and readiness must not hold the head on the replaced BLOCK.
+
+FP_KEY = "first-principles-review"
+BLOCKED_AT = "2026-10-03T17:25:53Z"
+OVERRIDDEN_AT = "2026-10-04T08:07:21Z"
+REROLLED_AT = "2026-10-04T08:16:00Z"
+
+
+def _override_record(
+    target: str = "first-principles",
+    head: str = HEAD,
+    created_at: str = OVERRIDDEN_AT,
+    user: dict | None = None,
+    cid: int = 77,
+) -> dict:
+    """The handler's own record, byte for byte as its `printf` writes it."""
+    return {
+        "id": cid,
+        "node_id": "IC_override_{}".format(cid),
+        "created_at": created_at,
+        "user": user or {"type": "Bot", "login": "github-actions[bot]"},
+        "body": (
+            "<!-- ai-review-human-override target={} head={} actor=maintainer "
+            "source=5977964351 -->\n## Human judgment recorded\n".format(target, head)
+        ),
+    }
+
+
+def _fp_reroll_slot(blocked_at: str = BLOCKED_AT):
+    """FP's slot comment and history: a BLOCK at ``blocked_at``, then a CONCERNS re-roll."""
+    blocked = _design_body("FirstPrinciples-Verdict", "FIRST-PRINCIPLES", "BLOCK")
+    rerolled = _design_body("FirstPrinciples-Verdict", "FIRST-PRINCIPLES", "CONCERNS")
+    history = _two_stage(
+        [
+            (REROLLED_AT, "<!-- {} -->\n{}".format(FP_KEY, rerolled)),
+            (blocked_at, "<!-- {} -->\n{}".format(FP_KEY, blocked)),
+        ]
+    )
+    return _comment(FP_KEY, rerolled), history
+
+
+def _fork_fp_reroll(*records: dict, blocked_at: str = BLOCKED_AT) -> dict:
+    slot, history = _fp_reroll_slot(blocked_at)
+    return _contract().superseded_verdicts([*records, slot], HEAD, BINDINGS, history)
+
+
+def test_an_override_at_this_head_adjudicates_a_fork_lanes_replaced_block() -> None:
+    # Control: with no record this is exactly the dropped block the gate exists for.
+    bare = _fork_fp_reroll()
+    assert bare["ok"] is True, bare
+    assert bare["blocking_dropped"] == ["FIRST-PRINCIPLES"], bare
+
+    out = _fork_fp_reroll(_override_record())
+    assert out["ok"] is True, out
+    assert out["blocking_dropped"] == [], out
+    lane = out["lanes"][0]
+    # The replaced block is still REPORTED -- only the gate stops naming it.
+    assert lane["superseded"][0]["blocking"] is True, lane
+    assert lane["override_at"].startswith("2026-10-04T08:07:21"), lane
+
+    # `all` answers for every lane, this one included.
+    assert _fork_fp_reroll(_override_record(target="all"))["blocking_dropped"] == []
+
+
+def test_an_override_for_another_head_does_not_clear_this_one() -> None:
+    # A record for an earlier push, and one naming only a PREFIX of this head:
+    # the handler writes `.head.sha` in full, so nothing shorter is this head.
+    for head in (OTHER_HEAD, HEAD[:12]):
+        out = _fork_fp_reroll(_override_record(head=head))
+        assert out["blocking_dropped"] == ["FIRST-PRINCIPLES"], (head, out)
+        assert out["lanes"][0]["override_at"] == "", (head, out)
+
+
+def test_an_override_for_another_lane_does_not_clear_this_one() -> None:
+    for target in ("design", "gpt", "ux", "fable", "scope"):
+        out = _fork_fp_reroll(_override_record(target=target))
+        assert out["blocking_dropped"] == ["FIRST-PRINCIPLES"], (target, out)
+
+
+def test_only_the_trusted_workflow_identity_records_an_override() -> None:
+    forged = (
+        # A human posting the handler's exact bytes.
+        _override_record(user={"type": "User", "login": "maintainer"}),
+        # Another app: Bot type alone is spoofable.
+        _override_record(user={"type": "Bot", "login": "some-other-app[bot]"}),
+        # The trusted login without the Bot type.
+        _override_record(user={"type": "User", "login": "github-actions[bot]"}),
+    )
+    for record in forged:
+        out = _fork_fp_reroll(record)
+        assert out["blocking_dropped"] == ["FIRST-PRINCIPLES"], (record["user"], out)
+
+    # The marker quoted anywhere but the leading bytes of a trusted comment -- the
+    # shape a review body echoing the PR's own text would take.
+    quoted = _override_record()
+    quoted["body"] = "<!-- codex-ai-review -->\nthe author wrote:\n" + quoted["body"]
+    assert _fork_fp_reroll(quoted)["blocking_dropped"] == ["FIRST-PRINCIPLES"]
+
+
+def test_a_block_published_after_the_override_is_still_named() -> None:
+    # The record speaks to what was on the board when the writer decided. A block
+    # the re-roll raised AFTER it is one no human saw.
+    late = _fork_fp_reroll(_override_record(), blocked_at="2026-10-04T08:10:00Z")
+    assert late["blocking_dropped"] == ["FIRST-PRINCIPLES"], late
+
+    # Both clocks tick in whole seconds, so a block in the record's own second may
+    # have landed after it and is not covered.
+    tie = _fork_fp_reroll(_override_record(), blocked_at=OVERRIDDEN_AT)
+    assert tie["blocking_dropped"] == ["FIRST-PRINCIPLES"], tie
+
+    # A record whose time cannot be read cannot say which blocks it saw.
+    untimed = _fork_fp_reroll(_override_record(created_at=""))
+    assert untimed["blocking_dropped"] == ["FIRST-PRINCIPLES"], untimed
+
+    # A second, later record does cover the late block.
+    again = _fork_fp_reroll(
+        _override_record(),
+        _override_record(created_at="2026-10-04T09:00:00Z", cid=78),
+        blocked_at="2026-10-04T08:10:00Z",
+    )
+    assert again["blocking_dropped"] == [], again
+
+
+def test_the_readiness_gate_reads_the_override_record_end_to_end(capsys, monkeypatch) -> None:
+    """``--supersession-gate`` is what readiness runs; the record has to reach it.
+
+    The gate fetches trusted bot comments itself, so a record the fetch filtered
+    out would leave the pure-function tests above green while the required
+    status stayed red.
+    """
+    status = load_skill_script("supersession_gate_override_status", STATUS)
+    slot, history = _fp_reroll_slot()
+
+    def gate(comments: list[dict]) -> dict:
+        def runner(args, timeout=None):
+            if args[:2] == ["gh", "api"] and "/comments?" in args[2]:
+                return 0, json.dumps(comments), ""
+            return history(args)
+
+        monkeypatch.setattr(status, "bounded_run", runner)
+        argv = ["pr_status.py", "--supersession-gate", "--repo", "o/r", "--pr", "1"]
+        assert status.main(argv + ["--head", HEAD]) == 0
+        return json.loads(capsys.readouterr().out.strip())
+
+    assert gate([slot])["blocking_dropped"] == ["FIRST-PRINCIPLES"]
+    cleared = gate([_override_record(), slot])
+    assert cleared["ok"] is True, cleared
+    assert cleared["blocking_dropped"] == [], cleared

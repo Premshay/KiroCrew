@@ -13,7 +13,7 @@
  */
 import { memo, useId } from 'react'
 import { Bot, CheckCircle2, AlertCircle, Square, ChevronDown, CircleDashed } from 'lucide-react'
-import { PanelRightSolid } from '../../components/icons/panels'
+import { SidePanelGlyph } from '../../components/SidePanelGlyph'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import type { ChatMessage } from '../../types'
@@ -117,8 +117,8 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const parsed = parseSubagentCompletionMessage(message)
   const failed = parsed !== null && (parsed.kind === 'single' ? parsed.outcome === 'failed' : parsed.failed > 0)
-  // A restart orphan: the run was cut short but its result survived on disk, so
-  // it warns rather than alarming (failure) or reassuring (success).
+  // A run a gateway restart cut off mid-turn: a fragment of its output is on
+  // disk, so it warns rather than alarming (failure) or reassuring (success).
   const interrupted = parsed !== null && parsed.kind === 'single' && parsed.outcome === 'interrupted'
   // Anything that did not simply succeed opens expanded. The header can only say
   // THAT it failed or was cut short; the reason — an error, or where the orphaned
@@ -278,7 +278,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
               aria-label={i18nT('pages.chat.subagentCompletionCard.open_in_the_subagents_panel')}
               className="pi-morph flex items-center gap-1 text-[11px] leading-4 text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer px-1.5 py-1 rounded hover:bg-accent/10 transition-colors"
             >
-              <PanelRightSolid size={13} />
+              <SidePanelGlyph size={13} />
               <span className="hidden sm:inline">{i18nT('pages.chat.subagentCompletionCard.panel')}</span>
             </button>
           )}

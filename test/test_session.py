@@ -146,6 +146,58 @@ class TestSessionManager:
         await mgr.close_all()
 
     @pytest.mark.asyncio
+    async def test_first_turn_history_owed_reads_without_clearing(self, cfg):
+        """The FRESH first-turn debt is READ, not consumed, each turn.
+
+        A pre-output failure the transient path re-queues onto the same live
+        session reads it on the next turn too, so a read-and-clear here would let
+        the first (failing) turn spend the debt and the replay would still go out
+        bare. Only ``consume`` clears it, mirroring the replay lease.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr.release("thread1")
+
+        assert mgr.first_turn_history_owed_pending("thread1") is False, "unset by default"
+        assert mgr.mark_first_turn_history_owed("thread1") is True
+        assert mgr.first_turn_history_owed_pending("thread1") is True, "read 1 sees it"
+        assert mgr.first_turn_history_owed_pending("thread1") is True, "read 2 still sees it"
+        assert mgr.consume_first_turn_history_owed("thread1") is True, "consume clears it"
+        assert mgr.first_turn_history_owed_pending("thread1") is False, "cleared"
+        assert mgr.consume_first_turn_history_owed("thread1") is False, "already clear"
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_first_turn_history_owed_tolerates_an_unknown_key(self, cfg):
+        """A settle can fire for a session that has since been evicted; the
+        helpers answer the safe default and never raise."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        assert mgr.first_turn_history_owed_pending("never-existed") is False
+        assert mgr.mark_first_turn_history_owed("never-existed") is False
+        assert mgr.consume_first_turn_history_owed("never-existed") is False
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_first_turn_history_owed_is_independent_of_the_replay_lease(self, cfg):
+        """The two debts are separate fields: arming one leaves the other alone.
+
+        The replay lease also drives SID preservation in ``close_all``; keeping
+        the FRESH first-turn debt on its own field is what leaves that role
+        untouched.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr.release("thread1")
+
+        mgr.mark_first_turn_history_owed("thread1")
+        assert mgr.provider_switch_replay_pending("thread1") is False
+        mgr.consume_first_turn_history_owed("thread1")
+
+        mgr.mark_provider_switch_replay("thread1")
+        assert mgr.first_turn_history_owed_pending("thread1") is False
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
     async def test_compaction_marks_reinjection_without_any_callback(self, cfg):
         """The mark lives at the compaction chokepoint, not in one surface.
 
@@ -2771,7 +2823,8 @@ class TestResetWithPid:
         await mgr.get_or_create("k1")
         mgr.enqueue("k1", "ts2", "second", force=True, image_temp_paths=[str(img)])
 
-        await mgr.reset("k1")
+        # Only an ending reset drops the queue; a recycle parks it for a successor.
+        await mgr.reset("k1", ends_conversation=True)
 
         assert not img.exists()
 
@@ -7091,6 +7144,7 @@ class TestParentEndCancelsItsChildren:
             def __init__(self):
                 self._agents = {info.id: info}
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers = {info.id: watcher}
                 self._followup_watcher_parents = {info.id: parent}
@@ -7424,6 +7478,7 @@ class TestParentEndCancelsItsChildren:
                     "ordinary": _run("ordinary", awaiting=False, started=123.0),
                 }
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7494,6 +7549,7 @@ class TestParentEndCancelsItsChildren:
                     "delivered": _run("delivered", done=True, reported=True),
                 }
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7688,6 +7744,7 @@ class TestParentEndCancelsItsChildren:
                 self._admission = _Admission()
                 self._agents = {}
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7822,6 +7879,7 @@ class TestParentEndCancelsItsChildren:
                 self._admission = _Admission()
                 self._agents = {}
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7884,13 +7942,18 @@ class TestParentEndCancelsItsChildren:
                 # A live record is what makes the reap reachable: the drain started this
                 # row, so there is a task to stop rather than a row to unqueue.
                 self._agents = {
-                    # The fields cancel_for_teardown WRITES before the reap, on
-                    # a record shaped like the real one.
+                    # The fields cancel_for_teardown reads and WRITES before the
+                    # reap, on a record shaped like the real one.
                     "started-row": SimpleNamespace(
-                        id="started-row", done=False, _reap_reason="", _stop_origin=""
+                        id="started-row",
+                        done=False,
+                        _ending_claimed=False,
+                        _reap_reason="",
+                        _stop_origin="",
                     )
                 }
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7956,8 +8019,13 @@ class TestParentEndCancelsItsChildren:
             def __init__(self):
                 self._admission = _Admission()
                 # The lingering record: done, and still in ``_agents``.
-                self._agents = {"late-finisher": SimpleNamespace(id="late-finisher", done=True)}
+                self._agents = {
+                    "late-finisher": SimpleNamespace(
+                        id="late-finisher", done=True, _ending_claimed=False
+                    )
+                }
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -8207,6 +8275,7 @@ class TestParentEndCancelsItsChildren:
             def __init__(self):
                 self._agents = {"run-delivered": delivered}
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers = {"run-delivered": watcher}
 
@@ -8270,6 +8339,7 @@ class TestParentEndCancelsItsChildren:
                     )
                 }
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers = {"run-1": watcher}
 

@@ -239,6 +239,63 @@ class TestReexecPythonModule:
         assert "👻 restarted".encode() in result.stdout
 
 
+class TestCancelWheelAppliesInFlight:
+    """Every exit path cancels a managed-venv apply through ONE lookup, not a registry.
+
+    The apply module is found in ``sys.modules`` and never imported, so an exit
+    in a process that never loaded it costs nothing and imports nothing from a
+    tree an update may have changed.
+    """
+
+    _MODULE = "kiro_crew.platform.wheel_apply"
+
+    def _stub_module(self, monkeypatch, cancel) -> None:
+        stub = types.ModuleType(self._MODULE)
+        stub.cancel_wheel_applies = cancel  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, self._MODULE, stub)
+
+    def test_calls_the_loaded_module_with_the_reason(self, monkeypatch):
+        reasons: list[str] = []
+        self._stub_module(monkeypatch, reasons.append)
+
+        pc.cancel_wheel_applies_in_flight("shutdown")
+
+        assert reasons == ["shutdown"]
+
+    def test_does_nothing_and_imports_nothing_when_the_module_is_not_loaded(self, monkeypatch):
+        monkeypatch.delitem(sys.modules, self._MODULE, raising=False)
+
+        pc.cancel_wheel_applies_in_flight("exit")
+
+        assert self._MODULE not in sys.modules
+
+    @pytest.mark.parametrize("seam", ["reexec_launcher", "reexec_python_module", "hard_exit"])
+    def test_every_exit_path_cancels_first_and_survives_a_raising_cancel(
+        self, monkeypatch, tmp_path, seam, nonbundled_python_without_user_site
+    ):
+        """The cancel runs before the exec / ``os._exit``; one that raises never stops it."""
+        order: list[str] = []
+
+        def cancel(reason: str) -> None:
+            order.append(f"cancel:{reason}")
+            raise RuntimeError("the apply's cancel blew up")
+
+        self._stub_module(monkeypatch, cancel)
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(pc.os, "execv", lambda path, argv: order.append("execv"))
+        monkeypatch.setattr(pc.os, "_exit", lambda code: order.append(f"_exit:{code}"))
+
+        if seam == "hard_exit":
+            pc.hard_exit(3)
+            assert order == ["cancel:exit", "_exit:3"]
+        elif seam == "reexec_launcher":
+            pc.reexec_launcher(str(tmp_path / "kirocrew"), ["gateway"])
+            assert order == ["cancel:exec", "execv"]
+        else:
+            pc.reexec_python_module("kiro_crew", ["gateway"], executable=str(tmp_path / "python"))
+            assert order == ["cancel:exec", "execv"]
+
+
 class TestWindowsOnArm:
     """``is_windows_on_arm`` answers "will pip accept a win_amd64 wheel here?".
 
@@ -505,38 +562,21 @@ class TestProcessHelpers:
             # No /proc entry: unreadable, not "not a zombie".
             assert pc.pid_is_zombie(2_000_000_000) is None
 
-    def test_pid_is_zombie_reads_the_linux_stat_state_field(self, monkeypatch):
+    def test_pid_is_zombie_reads_the_linux_stat_state_field(self, monkeypatch, tmp_path):
         # The comm field is parenthesised and may itself contain spaces and
         # parentheses, so the state is the first field after the LAST ')'.
         tail = " ".join(str(i) for i in range(4, 24))
-        seen: list[str] = []
-
-        def _stat_path(text: str):
-            class _FakeStatPath:
-                def __init__(self, path):
-                    seen.append(str(path))
-
-                def read_text(self, *args, **kwargs):
-                    return text
-
-            return _FakeStatPath
-
+        real_path = pc.Path
         monkeypatch.setattr(pc.sys, "platform", "linux")
-        for state, expected in (("Z", True), ("X", True), ("S", False), ("R", False)):
-            monkeypatch.setattr(
-                pc, "Path", _stat_path(f"4242 (kiro (cli) worker) {state} 1 {tail}")
-            )
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+        monkeypatch.setattr(pc, "Path", lambda p: tmp_path if p == "/proc" else real_path(p))
+        (tmp_path / "4242").mkdir()
+        stat = tmp_path / "4242" / "stat"
+        for state, expected in (("Z", True), ("X", True), ("x", True), ("S", False), ("R", False)):
+            stat.write_bytes(f"4242 (kiro (cli) worker) {state} 1 {tail}".encode())
             assert pc.pid_is_zombie(4242) is expected, state
-        assert seen == ["/proc/4242/stat"] * 4
 
-        class _Unreadable:
-            def __init__(self, _p):
-                pass
-
-            def read_text(self, *args, **kwargs):
-                raise PermissionError("[Errno 13] Permission denied")
-
-        monkeypatch.setattr(pc, "Path", _Unreadable)
+        stat.unlink()
         assert pc.pid_is_zombie(4242) is None
 
     def test_kill_process_group_signals_the_captured_id_and_resolves_nothing(self, monkeypatch):
@@ -1394,6 +1434,16 @@ class TestPeakRssIsThisProcesss:
         monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", tmp_path / "gone")
         assert pc._posix_peak_rss_bytes() is None
 
+    def test_a_name_that_is_not_utf8_does_not_hide_the_peak(self, tmp_path, monkeypatch):
+        """The ``Name:`` line is this process's raw comm, which a strict read raises on."""
+        status = tmp_path / "status"
+        status.write_bytes(b"Name:\tkc-\xff\n" + self._STATUS.encode())
+        self._never_getrusage(monkeypatch)
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", status)
+        monkeypatch.setattr(pc, "_LINUX_PEAK_RSS_FLOOR", 0)
+        assert pc._posix_peak_rss_bytes() == 11432 * 1024
+
     @pytest.mark.skipif(
         not pc.IS_POSIX, reason="proc_rss_bytes's POSIX last resort; Windows reads Win32 counters"
     )
@@ -1900,29 +1950,49 @@ class TestFileLockContention:
             os.close(fd_contender)
 
     @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows on-loop single-shot acquire")
-    def test_windows_contended_lock_on_event_loop_fails_fast(self, tmp_path):
+    def test_windows_contended_lock_on_event_loop_fails_fast(self, tmp_path, monkeypatch):
         # On the asyncio event-loop thread a contended lock must NOT spin-sleep
         # (that freezes chat/heartbeat): _win_acquire_blocking is single-shot
         # there, so file_lock fails closed immediately instead of waiting out
-        # the timeout. Assert both the fast-fail AND that it took ~no time.
+        # the timeout. Pinned by what the acquire DID -- exactly one non-blocking
+        # attempt on the contender and no sleep -- which fails on a second
+        # attempt however fast the host is. A wall-clock bound would pass a short
+        # spin and fail a starved runner that made only the one attempt.
         import asyncio
+        import msvcrt
 
         lock = tmp_path / ".onloop.lock"
         fd_holder = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
         fd_contender = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+        test_thread = threading.get_ident()
+        attempts: list[int] = []
+
+        def locking(fd, mode, nbytes):
+            if fd == fd_contender:
+                attempts.append(mode)
+            return msvcrt.locking(fd, mode, nbytes)
+
+        def sleep(secs):
+            if threading.get_ident() != test_thread:
+                return time.sleep(secs)
+            # A poll on the loop thread: fail here rather than spin to the ceiling.
+            raise AssertionError(f"the on-loop acquire slept {secs}s between attempts")
+
+        # The lock owner reads both through this module at call time.
+        monkeypatch.setattr(
+            pc, "msvcrt", types.SimpleNamespace(**{**vars(msvcrt), "locking": locking})
+        )
+        monkeypatch.setattr(pc, "time", types.SimpleNamespace(**{**vars(time), "sleep": sleep}))
 
         async def _contend_on_loop():
             # Hold on THIS fd (non-blocking), then a second in-loop acquire on
             # the other fd must raise at once rather than sleep to the ceiling.
             assert pc.try_acquire_lock(fd_holder, exclusive=True) is True
-            start = time.monotonic()
             with pytest.raises(OSError):
                 with pc.file_lock(fd_contender, exclusive=True):
                     pass
-            elapsed = time.monotonic() - start
             pc.release_lock(fd_holder)
-            # Single-shot: nowhere near the multi-second timeout ceiling.
-            assert elapsed < 1.0, f"on-loop acquire spun for {elapsed:.2f}s"
+            assert attempts == [msvcrt.LK_NBLCK], f"on-loop acquire attempts: {attempts}"
 
         try:
             asyncio.run(_contend_on_loop())
@@ -2084,12 +2154,124 @@ class TestProcessArgvMatchesExact:
                 changed[-1] = changed[-1] + " "
                 assert pc.process_argv_matches_exact(child.pid, changed) is False
             else:
-                # Windows: element-exact argv equality is not verifiable (the
-                # raw command line carries shell quoting, not a vector) — the
-                # guard fails closed even for the true argv.
-                assert pc.process_argv_matches_exact(child.pid, argv) is False
+                # Windows: the live command line must equal list2cmdline(argv).
+                # The -c payload carries spaces and quotes, so real quoting runs.
+                assert pc.process_argv_matches_exact(child.pid, argv) is True
+                assert pc.process_argv_matches_exact(child.pid, argv[:-1]) is False
+                changed = list(argv)
+                changed[-1] = changed[-1] + " "
+                assert pc.process_argv_matches_exact(child.pid, changed) is False
         finally:
             self._reap(child)
+
+    # Shapes a Windows ssh forward argv can carry: a host or ProxyCommand with
+    # spaces, embedded double quotes, and backslashes before a quote or at the end.
+    _WINDOWS_ARGVS = [
+        [r"C:\Windows\System32\OpenSSH\ssh.exe", "-N", "-L", "7778:127.0.0.1:7777", "host"],
+        [r"C:\Program Files\OpenSSH\ssh.exe", "-N", "my host alias"],
+        [
+            r"C:\Windows\System32\OpenSSH\ssh.exe",
+            "-o",
+            'ProxyCommand=C:\\tools\\proxy.exe --name "bastion one" %h %p',
+            "h",
+        ],
+        ["ssh.exe", "-o", 'ProxyCommand=cmd /c "a\\" b', "trail\\"],
+        ["ssh.exe", ""],
+    ]
+
+    def _as_windows(self, monkeypatch, command_line):
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        seen: list[int] = []
+
+        def read(pid):
+            seen.append(pid)
+            if isinstance(command_line, BaseException):
+                raise command_line
+            return command_line
+
+        monkeypatch.setattr(pc, "process_command_line", read)
+        return seen
+
+    @pytest.mark.parametrize("argv", _WINDOWS_ARGVS)
+    def test_windows_matches_the_list2cmdline_string_exactly(self, monkeypatch, argv):
+        seen = self._as_windows(monkeypatch, subprocess.list2cmdline(argv))
+
+        assert pc.process_argv_matches_exact(4242, argv) is True
+        assert seen == [4242]
+
+    @pytest.mark.parametrize("argv", _WINDOWS_ARGVS)
+    def test_windows_naive_join_or_near_miss_does_not_match(self, monkeypatch, argv):
+        expected = subprocess.list2cmdline(argv)
+        for actual in {
+            " ".join(argv),
+            expected + " ",
+            expected + " -x",
+            subprocess.list2cmdline(argv[:-1]),
+            expected.replace("ssh", "SSH"),
+        } - {expected}:
+            self._as_windows(monkeypatch, actual)
+            assert pc.process_argv_matches_exact(4242, argv) is False, actual
+
+    @pytest.mark.parametrize("unreadable", ["", OSError("wmi down"), RuntimeError("boom")])
+    def test_windows_unreadable_command_line_answers_false(self, monkeypatch, unreadable):
+        self._as_windows(monkeypatch, unreadable)
+
+        assert pc.process_argv_matches_exact(4242, ["ssh.exe", "h"]) is False
+
+    def test_windows_rejects_bad_pid_before_any_read(self, monkeypatch):
+        seen = self._as_windows(monkeypatch, "ssh.exe h")
+
+        for bad in (0, 1, -5, True, "4242"):
+            assert pc.process_argv_matches_exact(bad, ["ssh.exe", "h"]) is False
+        assert pc.process_argv_matches_exact(4242, []) is False
+        assert seen == []
+
+    def test_argv_fingerprint_is_stable_and_tells_processes_apart(self):
+        """The same live process fingerprints the same every time; another
+        argv fingerprints differently; a pid nothing runs at answers None."""
+
+        def spawn(n):
+            if pc.IS_POSIX:
+                sleep_bin = shutil.which("sleep") or "/bin/sleep"
+                return subprocess.Popen([sleep_bin, str(300 + n)], start_new_session=True)
+            return self._spawn(f"kirocrew-argvsig-{n}")[0]
+
+        first = spawn(0)
+        try:
+            second = spawn(1)
+            try:
+                # Popen returns only after exec succeeded, so the argv is in place.
+                a = pc.process_argv_fingerprint(first.pid)
+                b = pc.process_argv_fingerprint(second.pid)
+                if pc.IS_POSIX:
+                    assert a is not None and len(a) == 64
+                    assert pc.process_argv_fingerprint(first.pid) == a
+                    assert b is not None and b != a
+                else:
+                    # Windows records no fingerprint: reclaim keeps the exact check.
+                    assert a is None and b is None
+            finally:
+                self._reap(second)
+        finally:
+            self._reap(first)
+        for bad in (0, 1, -5, True, "4242"):
+            assert pc.process_argv_fingerprint(bad) is None
+
+    def test_windows_records_no_argv_fingerprint(self, monkeypatch):
+        """Windows keeps the exact command-line check, so nothing is read."""
+        seen = self._as_windows(monkeypatch, "ssh.exe -N h")
+
+        assert pc.process_argv_fingerprint(4242) is None
+        assert seen == []
+
+    def test_cmd_shim_target_never_matches_on_windows(self, monkeypatch):
+        # A .cmd entrypoint runs under cmd.exe, whose command line differs.
+        argv = [r"C:\Program Files\Amazon\AWSCLIV2\aws.cmd", "ssm", "start-session"]
+        self._as_windows(
+            monkeypatch,
+            r'C:\WINDOWS\system32\cmd.exe /c ""C:\Program Files\Amazon\AWSCLIV2\aws.cmd" ssm start-session"',
+        )
+        assert pc.process_argv_matches_exact(4242, argv) is False
 
     def test_unconfirmable_identities_answer_false(self):
         # A pid that cannot exist, reserved pids, and an empty expectation all
@@ -2135,32 +2317,33 @@ class TestProcessStartTime:
         assert value is not None and value.isdigit()
         assert int(value) > 0
 
-    def test_linux_reads_the_starttime_field_past_a_parenthesised_comm(self, monkeypatch):
+    @staticmethod
+    def _fake_linux_proc(monkeypatch, tmp_path, stat: bytes) -> None:
+        """Serve *stat* as ``/proc/4242/stat`` on any host."""
+        (tmp_path / "4242").mkdir()
+        (tmp_path / "4242" / "stat").write_bytes(stat)
+        real_path = pc.Path
+        monkeypatch.setattr(pc.sys, "platform", "linux")
+        monkeypatch.setattr(pc, "IS_LINUX", True)
+        monkeypatch.setattr(pc, "Path", lambda p: tmp_path if p == "/proc" else real_path(p))
+
+    def test_linux_reads_the_starttime_field_past_a_parenthesised_comm(self, monkeypatch, tmp_path):
         """Splitting on the FIRST ')' would mis-index any comm containing one."""
 
         tail = " ".join(str(i) for i in range(4, 24))
-
-        class _FakeStatPath:
-            def __init__(self, _p):
-                pass
-
-            def read_text(self):
-                return f"4242 (my (odd) proc) S 1 {tail}"
-
-        monkeypatch.setattr(pc.sys, "platform", "linux")
-        monkeypatch.setattr(pc, "Path", _FakeStatPath)
+        self._fake_linux_proc(monkeypatch, tmp_path, f"4242 (my (odd) proc) S 1 {tail}".encode())
         assert pc.process_start_time(4242) == "21"
 
-    def test_a_malformed_stat_line_fails_safe(self, monkeypatch):
-        class _FakeStatPath:
-            def __init__(self, _p):
-                pass
+    def test_a_comm_that_is_not_utf8_still_has_a_start_time(self, monkeypatch, tmp_path):
+        """A name cut mid-character at 15 bytes: the identity is still readable."""
+        tail = " ".join(str(i) for i in range(4, 24))
+        comm = "run_データ処理.py".encode()[:15]
+        self._fake_linux_proc(monkeypatch, tmp_path, b"4242 (" + comm + b") S 1 " + tail.encode())
+        assert pc.process_start_time(4242) == "21"
+        assert pc.parent_pid(4242) == 1
 
-            def read_text(self):
-                return "no closing paren here"
-
-        monkeypatch.setattr(pc.sys, "platform", "linux")
-        monkeypatch.setattr(pc, "Path", _FakeStatPath)
+    def test_a_malformed_stat_line_fails_safe(self, monkeypatch, tmp_path):
+        self._fake_linux_proc(monkeypatch, tmp_path, b"no closing paren here")
         assert pc.process_start_time(4242) is None
 
     def test_the_bsd_leg_resolves_ps_through_trusted_system_bin(self, monkeypatch):
@@ -3750,6 +3933,208 @@ class TestWindowsHandleIdentityExitFiletimeRace:
         monkeypatch.setattr(pc.time, "sleep", lambda _s: None)
 
         assert pc._windows_process_handle_identity(5) == (self.FAKE_PID, 100, 888)
+
+
+class _RefusedProcessKernel32:
+    """kernel32 for ONE process object whose terminate is refused, on a virtual clock.
+
+    ``signals_at_ms`` is the instant after the refusal at which the object signals
+    (``None``: never). ``WaitForSingleObject`` answers as the kernel does for that
+    object: signalled when the instant falls inside the wait, otherwise a timeout once
+    the whole wait has elapsed. So what a caller sees depends on how long it asks to
+    wait, never on how fast this host runs. ``exit_code_after_refusal`` is what
+    ``GetExitCodeProcess`` answers once the terminate has been refused; the read
+    before it always answers STILL_ACTIVE. Every call after the refusal overwrites
+    the last error, as ctypes' saved copy is overwritten by every call.
+    """
+
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+    WAIT_FAILED = 0xFFFFFFFF
+
+    class _Export:
+        """A ctypes function pointer stand-in: ``argtypes``/``restype`` are assignable."""
+
+        argtypes: list = []
+        restype = None
+
+        def __init__(self, impl):
+            self._impl = impl
+
+        def __call__(self, *args):
+            return self._impl(*args)
+
+    def __init__(
+        self,
+        *,
+        signals_at_ms=None,
+        exit_code_after_refusal=259,
+        refusal=5,
+        reread_ok=True,
+        wait_fails=False,
+    ):
+        self.now_ms = 0
+        self.signals_at_ms = signals_at_ms
+        self.exit_code_after_refusal = exit_code_after_refusal
+        self.refusal = refusal
+        self.reread_ok = reread_ok
+        self.wait_fails = wait_fails
+        self.refused = False
+        self.last_error = 0
+        self.exit_code_reads = 0
+        self.waits: list[int] = []
+        self.GetExitCodeProcess = self._Export(self._get_exit_code)
+        self.TerminateProcess = self._Export(self._terminate)
+        self.WaitForSingleObject = self._Export(self._wait)
+
+    def _get_exit_code(self, _handle, out):
+        self.exit_code_reads += 1
+        if not self.refused:
+            out._obj.value = 259
+            return 1
+        self.last_error = 0
+        out._obj.value = self.exit_code_after_refusal
+        return 1 if self.reread_ok else 0
+
+    def _terminate(self, _handle, _code):
+        self.refused = True
+        self.last_error = self.refusal
+        return 0
+
+    def _wait(self, _handle, millis):
+        self.waits.append(int(millis))
+        self.last_error = 0
+        if self.wait_fails:
+            return self.WAIT_FAILED
+        if self.signals_at_ms is not None and self.signals_at_ms <= self.now_ms + millis:
+            self.now_ms = max(self.now_ms, self.signals_at_ms)
+            return self.WAIT_OBJECT_0
+        self.now_ms += millis
+        return self.WAIT_TIMEOUT
+
+
+class TestTerminateRefusedOnAnExitingMember:
+    """A drain member whose own exit has begun refuses ``TerminateProcess``.
+
+    The kernel answers a terminate aimed at a process already in its exit path with
+    ERROR_ACCESS_DENIED, the code a genuine refusal carries. That exit publishes the
+    exit code, then runs the process down, and only then signals the object, and the
+    refusal starts at the rundown. A console host leaving with its last client lands
+    there between the drain's liveness read and its terminate, so a zero-time look
+    at the object can still find it unsignalled.
+    """
+
+    @staticmethod
+    def _install(monkeypatch, kernel32):
+        """Route only this test thread's kernel32 and last error to *kernel32*."""
+        import ctypes
+
+        owner = threading.get_ident()
+        real_windll = getattr(ctypes, "WinDLL", None)
+        real_last_error = pc._windows_last_error
+
+        def windll(name, **kwargs):
+            if threading.get_ident() == owner:
+                return kernel32
+            if real_windll is None:
+                raise AttributeError("WinDLL")
+            return real_windll(name, **kwargs)
+
+        facade = types.SimpleNamespace(**{**vars(ctypes), "WinDLL": windll})
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "ctypes", facade)
+        monkeypatch.setattr(
+            pc,
+            "_windows_last_error",
+            lambda: kernel32.last_error if threading.get_ident() == owner else real_last_error(),
+        )
+
+    def test_a_published_exit_code_reads_as_exited_without_waiting(self, monkeypatch):
+        # The shard's interleaving: refused, exit code already published, object
+        # not yet signalled. The exit code settles it, so nothing waits.
+        kernel32 = _RefusedProcessKernel32(exit_code_after_refusal=1)
+        self._install(monkeypatch, kernel32)
+
+        assert pc.terminate_process_handle(9) is False
+        assert kernel32.waits == []
+
+    def test_a_member_whose_exit_code_is_259_reads_as_exited_once_it_signals(self, monkeypatch):
+        # Exit code 259 is indistinguishable from STILL_ACTIVE, so the signal
+        # decides: the object signals 50 ms after the refusal, inside the wait.
+        kernel32 = _RefusedProcessKernel32(signals_at_ms=50)
+        self._install(monkeypatch, kernel32)
+
+        assert pc.terminate_process_handle(9) is False
+        assert kernel32.waits == [pc._WINDOWS_TERMINATE_REFUSAL_WAIT_MS]
+
+    def test_a_refusal_of_a_live_process_still_raises_after_one_bounded_wait(self, monkeypatch):
+        kernel32 = _RefusedProcessKernel32()
+        self._install(monkeypatch, kernel32)
+
+        with pytest.raises(OSError, match="TerminateProcess failed") as raised:
+            pc.terminate_process_handle(9)
+
+        # The terminate's own error, not the last error the re-read and wait left.
+        assert raised.value.errno == 5
+        assert kernel32.waits == [pc._WINDOWS_TERMINATE_REFUSAL_WAIT_MS]
+        assert kernel32.now_ms == pc._WINDOWS_TERMINATE_REFUSAL_WAIT_MS
+        # Bounded well inside one drain pass, so a refusal never spends the pass.
+        assert pc._WINDOWS_TERMINATE_REFUSAL_WAIT_MS < pc._WINDOWS_TREE_REAP_TIMEOUT_SECS * 1000
+
+    def test_on_the_event_loop_a_refusal_is_never_waited_out(self, monkeypatch):
+        import asyncio
+
+        kernel32 = _RefusedProcessKernel32(signals_at_ms=50)
+        self._install(monkeypatch, kernel32)
+
+        async def terminate_on_the_loop():
+            return pc.terminate_process_handle(9)
+
+        with pytest.raises(OSError, match="TerminateProcess failed"):
+            asyncio.run(terminate_on_the_loop())
+        assert kernel32.waits == [0]
+
+    def test_on_the_event_loop_an_already_signalled_refusal_reads_as_exited(self, monkeypatch):
+        # The zero-time look still answers: an object already signalled is an exit.
+        import asyncio
+
+        kernel32 = _RefusedProcessKernel32(signals_at_ms=0)
+        self._install(monkeypatch, kernel32)
+
+        async def terminate_on_the_loop():
+            return pc.terminate_process_handle(9)
+
+        assert asyncio.run(terminate_on_the_loop()) is False
+        assert kernel32.waits == [0]
+
+    def test_any_other_refusal_raises_at_once(self, monkeypatch):
+        kernel32 = _RefusedProcessKernel32(signals_at_ms=0, refusal=6)  # ERROR_INVALID_HANDLE
+        self._install(monkeypatch, kernel32)
+
+        with pytest.raises(OSError, match="TerminateProcess failed") as raised:
+            pc.terminate_process_handle(9)
+
+        assert raised.value.errno == 6
+        assert kernel32.exit_code_reads == 1
+        assert kernel32.waits == []
+
+    def test_an_unreadable_exit_code_falls_back_to_the_signal(self, monkeypatch):
+        kernel32 = _RefusedProcessKernel32(
+            signals_at_ms=0, exit_code_after_refusal=1, reread_ok=False
+        )
+        self._install(monkeypatch, kernel32)
+
+        assert pc.terminate_process_handle(9) is False
+        assert kernel32.waits == [pc._WINDOWS_TERMINATE_REFUSAL_WAIT_MS]
+
+    def test_an_object_that_cannot_be_waited_on_still_raises(self, monkeypatch):
+        kernel32 = _RefusedProcessKernel32(wait_fails=True)
+        self._install(monkeypatch, kernel32)
+
+        with pytest.raises(OSError, match="TerminateProcess failed") as raised:
+            pc.terminate_process_handle(9)
+
+        assert raised.value.errno == 5
 
 
 class TestKillSubprocessPosix:
@@ -7171,6 +7556,10 @@ class TestKillAndReap:
 
         proc = mock.MagicMock()
         proc.pid = pid
+        # Default to a still-running child (asyncio has not recorded an exit),
+        # which is the case the group kill fires for. A reaped child
+        # (``returncode is not None``) is covered by its own test.
+        proc.returncode = None
         proc.kill = mock.MagicMock()
         proc.communicate = mock.AsyncMock(return_value=(b"", b""))
         proc.wait = mock.AsyncMock()
@@ -7306,6 +7695,7 @@ class TestKillAndReap:
 
         class Proc:
             pid = 4242
+            returncode = None  # a live child: the group kill fires
 
             def kill(self):
                 events.append("killed")
@@ -7331,6 +7721,47 @@ class TestKillAndReap:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert events == ["killed", "reap-started", "reaped"]
+
+    @pytest.mark.asyncio
+    async def test_skips_the_tree_kill_for_a_reaped_child(self) -> None:
+        """The recycled-pid guard: once asyncio has recorded the child's
+        exit (``returncode is not None``) the OS may hand that pid to an
+        unrelated process -- even another of our own gateway children, whose
+        parent pid would also be ours -- so a pid-addressed group SIGKILL could
+        reach a stranger's tree. The group kill must be skipped; only the
+        pid-scoped ``kill()`` (harmless on a dead handle) runs. The same-group
+        probe is pinned to ``False`` (its routine value) so the returncode
+        guard alone gates the branch."""
+        from unittest import mock
+
+        proc = self._proc(pid=4242)
+        proc.returncode = 0  # asyncio has already reaped this child
+        with (
+            mock.patch.object(pc, "_shares_own_process_group", lambda _pid: False),
+            mock.patch.object(pc, "kill_process_tree_async", mock.AsyncMock()) as tree,
+        ):
+            await pc.kill_and_reap(proc)
+        tree.assert_not_awaited()
+        proc.kill.assert_called_once()
+        proc.communicate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fires_the_tree_kill_for_a_live_child(self) -> None:
+        """The complement: a child asyncio has NOT reaped (``returncode is
+        None``) still owns its pid, so the group kill fires exactly as before.
+        This is the branch the recycled-pid guard must not disturb."""
+        from unittest import mock
+
+        proc = self._proc(pid=4242)
+        assert proc.returncode is None  # a live child
+        with (
+            mock.patch.object(pc, "_shares_own_process_group", lambda _pid: False),
+            mock.patch.object(pc, "kill_process_tree_async", mock.AsyncMock()) as tree,
+        ):
+            await pc.kill_and_reap(proc)
+        tree.assert_awaited_once()
+        assert tree.await_args.args == (4242, pc.SIGKILL)
+        proc.kill.assert_called_once()
 
 
 class TestPublishDirNoreplace:

@@ -60,7 +60,8 @@ CLI_BIN = "playwright-cli"
 # printed ``Listening on http://127.0.0.1:45613`` and
 # ``Listening on http://127.0.0.1:42963``, respectively. Each line was read only
 # after its listener had bound. ``@latest`` may change that wording; the parser
-# then fails closed and reports the installed version for diagnosis.
+# then fails closed and reports the installed version for diagnosis, and the
+# daily ``playwright-cli-banner.yml`` workflow catches the drift first.
 NPM_SPEC = "@playwright/cli@latest"
 
 # ``install --skills`` writes the command reference where an agent can read it.
@@ -175,7 +176,7 @@ class InstallScope:
             self._terminated = True
             children = list(self._children)
         for proc in children:
-            _kill_child_tree(proc)
+            platform_compat.kill_popen_tree(proc)
         return len(children)
 
 
@@ -204,35 +205,15 @@ def run_in_scope(scope: InstallScope, fn: Callable[..., Any], /, *args: Any, **k
 def kill_cli_process_tree(pid: int) -> None:
     """Signal *pid* and every descendant; never raises.
 
-    The one tree kill ``browser_cli`` issues. :mod:`kiro_crew.browser_cli.view`'s
-    reaper ends here on every platform. This installer's timeout and cancel path
-    (:func:`_kill_child_tree`) ends here only on Windows: on POSIX it signals the
-    child's process group directly with
-    :func:`platform_compat.kill_process_group`, which is not one of the
-    primitives the kill-attribution ratchet (``test_kill_chokepoint_ratchet.py``)
-    counts. So the package adds a single site to that ratchet rather than one per
-    caller.
+    The one pid-addressed tree kill ``browser_cli`` issues, for
+    :mod:`kiro_crew.browser_cli.view`'s reaper, which holds a pid rather than a
+    ``Popen``. This installer's timeout and cancel path holds the ``Popen`` and
+    uses :func:`platform_compat.kill_popen_tree` instead. So the package adds a
+    single site to the kill-attribution ratchet
+    (``test_kill_chokepoint_ratchet.py``) rather than one per caller.
     """
     with contextlib.suppress(Exception):
         platform_compat.kill_process_tree(pid)
-
-
-def _kill_child_tree(proc: subprocess.Popen[str]) -> None:
-    """Kill *proc* and its descendants; never raises.
-
-    The group is signalled only while *proc* is unreaped: its pid (which is also
-    its group id under ``start_new_session``) cannot be reused before
-    ``waitpid``, so the signal cannot land on an unrelated group. The direct
-    ``kill`` afterwards covers a platform where the tree walk failed.
-    """
-    if proc.returncode is None:
-        if platform_compat.IS_POSIX:
-            with contextlib.suppress(OSError, ValueError):
-                platform_compat.kill_process_group(proc.pid, platform_compat.SIGKILL)
-        else:
-            kill_cli_process_tree(proc.pid)
-    with contextlib.suppress(OSError):
-        proc.kill()
 
 
 def _collect_after_kill(proc: subprocess.Popen[str]) -> tuple[str, str]:
@@ -281,14 +262,14 @@ def _run(argv: list[str], timeout: float, *, cwd: str | None = None) -> tuple[in
     except OSError as exc:
         return 127, "", f"{exc}"
     if scope is not None and not scope._adopt(proc):
-        _kill_child_tree(proc)
+        platform_compat.kill_popen_tree(proc)
         _collect_after_kill(proc)
         return INTERRUPTED_RC, "", _INTERRUPTED_REASON
     try:
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            _kill_child_tree(proc)
+            platform_compat.kill_popen_tree(proc)
             _collect_after_kill(proc)
             return TIMEOUT_RC, "", f"timed out after {timeout:.0f}s: {' '.join(argv)}"
     finally:

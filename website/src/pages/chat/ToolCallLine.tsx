@@ -10,7 +10,7 @@ import { useLanguage } from '../../i18n/LanguageProvider'
 import { deriveShellSummary, pickToolLabel } from '../../utils/toolLabel'
 import { deriveToolCallTitle, relDisplayPath } from '../../utils/toolCallTitle'
 import { LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight, ChevronDown, AppWindow } from 'lucide-react'
-import { PanelRightSolid } from '../../components/icons/panels'
+import { SidePanelGlyph } from '../../components/SidePanelGlyph'
 import ErrorNotice from '../../components/ErrorNotice'
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
 import type { ChatMessage } from '../../types'
@@ -34,6 +34,7 @@ import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import { isRejectedDecision } from '../../utils/approvalDecision'
 import { selectToolRowIndex, lookupLogEntry, denySiblingContent } from './toolRowIndex'
 import type { ToolActivity } from '../../types'
+import { pathBasename } from '../../utils/pathBasename'
 
 // Stable empties for slots with no per-slot state yet. A fresh `[]` per
 // selector run would change identity every dispatch and defeat the
@@ -814,7 +815,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // icon, so the affordance names the file it opens — crucial in simplified /
   // purpose mode where the label is prose and no path is otherwise shown. The
   // full path stays in the button tooltip and the expanded details.
-  const basename = useMemo(() => (filePath ? (filePath.split('/').pop() || filePath) : null), [filePath])
+  const basename = useMemo(() => (filePath ? (pathBasename(filePath) || filePath) : null), [filePath])
   // When the chip is shown, strip the now-redundant path out of the visible
   // label. A derived `Read src/a.ts` → `Read` (the title carries the display
   // path, the chip the basename); purpose-mode prose contains no path substring
@@ -1068,7 +1069,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           aria-label={i18nT('pages.chat.toolCallLine.open_in_side_panel', { path: filePath })}
         >
           <span className="max-w-[240px] truncate">{basename}</span>
-          <PanelRightSolid size={12} className="shrink-0" />
+          <SidePanelGlyph size={12} className="shrink-0" />
         </button>
       )}
       </div>
@@ -1100,7 +1101,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           }}
         >
           <FileDiff size={12} className="shrink-0" aria-hidden />
-          {chipView.path && <span className="font-mono max-w-[240px] truncate">{chipView.path.split('/').pop()}</span>}
+          {chipView.path && <span className="font-mono max-w-[240px] truncate">{pathBasename(chipView.path)}</span>}
           <span className="tabular-nums">
             {chipView.removed > 0 && <span className="text-danger">{chipView.truncated ? '≥' : ''}-{chipView.removed}</span>}
             {chipView.removed > 0 && chipView.added > 0 && ' '}

@@ -36,8 +36,10 @@ import { errMessage } from '../../utils/thunkError'
 import ErrorNotice from '../../components/ErrorNotice'
 import { Highlighted } from '../../components/commandPalette/Highlighted'
 import { SETTINGS_REGISTRY } from '../../components/commandPalette/settingsRegistry.gen'
-import { localizedSettingLabel } from '../../components/commandPalette/settingsSearchCore'
+import { localizedSettingLabel, scoreSettingEntry, settingEntryOffered } from '../../components/commandPalette/settingsSearchCore'
+import { useSettingsSearchGovernance } from '../../components/commandPalette/useSettingsSearchGovernance'
 import { settingsRoute } from '../../components/commandPalette/settingsRoute'
+import type { SettingEntry } from '../../components/commandPalette/settingsTypes'
 import { settingsSubtitle } from '../../components/commandPalette/settingsTabLabel'
 import { usePaletteActions } from '../../components/commandPalette/paletteActions'
 import { appIcon } from '../../components/commandPalette/providers/appsProvider'
@@ -66,8 +68,8 @@ import { useTheme } from '../../hooks/useTheme'
 import { i18nT } from '../../i18n/t'
 import { useLanguage } from '../../i18n/LanguageProvider'
 
-import { loadUsage, recordUse, type UsageMap } from './frecency'
-import { rankRootRows, type RankedRow, type RootGroup, type RootRow, type RootRowKind, type RowStatus } from './rootIndex'
+import { SETTING_ROW_PREFIX, loadUsage, recordUse, type UsageMap } from './frecency'
+import { rankRootRows, type OwnMatch, type RankedRow, type RootGroup, type RootRow, type RootRowKind, type RowStatus } from './rootIndex'
 import {
   argumentIsValid,
   contributedCommands,
@@ -77,6 +79,7 @@ import {
 import { useImeGuard } from '../../hooks/useImeGuard'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_CREW } from '../../utils/previewFlags'
+import { invalidateFoldersWhenIdle } from '../../api/chatFoldersWrite'
 
 /**
  * Command Bar — the ⌘K launcher.
@@ -149,6 +152,20 @@ const DEBOUNCE_MS = 150
  * under Search Sessions.
  */
 const RECENT_SESSION_ROWS = 3
+
+/**
+ * A settings row's matcher: the settings scorer decides whether and how well it
+ * matches, and its tier says which field to draw the hit on.
+ */
+function settingRowMatch(query: string, entry: SettingEntry): OwnMatch | null {
+  const hit = scoreSettingEntry(query, entry)
+  if (!hit) return null
+  if (hit.tier === 'label') return { score: hit.score, indices: hit.indices, field: 'title' }
+  return {
+    score: hit.score, indices: [], field: hit.matchedKeyword ? 'keyword' : 'subtitle',
+    matchedKeyword: hit.matchedKeyword, discounted: hit.tier === 'corpus',
+  }
+}
 
 function groupLabel(group: RootGroup): string {
   switch (group) {
@@ -603,7 +620,31 @@ export default function CommandBarOverlay({
   const [previewClipped, setPreviewClipped] = useState(false)
 
   const [selected, setSelected] = useState(0)
+  /**
+   * A keyboard Enter that landed in the debounce window, held until the rows answer
+   * the query it was pressed against -- and no later one.
+   *
+   * A scoped view ranks from the DEBOUNCED query, so for one interval after a
+   * keystroke its rows answer the previous one. An Enter then names a row built from
+   * the old query, and this latch is the launcher's primary gesture -- type a name,
+   * confirm it -- waiting for the rows to catch up rather than being eaten. The latch
+   * remembers the exact query the reader confirmed and the row they had selected: it
+   * fires once, on the live rows, only when the live query is still that query, the
+   * selection is still that row, and the top of the list is a settled result. Any
+   * further input, any selection move, a pointer activation, Escape, leaving the
+   * scope, or closing the bar drops it instead -- a latch that outlived the reader's
+   * confirmation would open a query they never confirmed, or a row they moved off of.
+   * A read that fails with no cached rows leaves a retry row at the top, which is not
+   * a result, so the latch drops on that dead end; a refetch that fails while the
+   * confirmed query's rows are still cached fires those rows -- they answer the query
+   * the reader confirmed, exactly as a fresh Enter would. `null` when no Enter is
+   * pending.
+   */
+  const [pendingEnter, setPendingEnter] = useState<{ query: string; index: number; key: string } | null>(null)
   const [usage, setUsage] = useState<UsageMap>(() => loadUsage())
+  // The rows every other settings search withholds, withheld here too, from
+  // cached answers only: the root issues no request.
+  const settingsGovernance = useSettingsSearchGovernance({ fetch: false })
   const [actionError, setActionError] = useState<string | null>(null)
   /**
    * What the last copy did, held until the reader moves.
@@ -1209,8 +1250,12 @@ export default function CommandBarOverlay({
       })
     }
     for (const entry of SETTINGS_REGISTRY) {
+      if (!settingEntryOffered(entry, settingsGovernance)) continue
       rows.push({
-        id: `setting:${entry.id}`,
+        id: `${SETTING_ROW_PREFIX}${entry.id}`,
+        // Matched as the other settings searches match it: label, synonyms, then
+        // a description or tab that contains the query.
+        match: query => settingRowMatch(query, entry),
         // The shared resolver, not a bare labelKey lookup: resolving the key
         // alone drops the fan-out suffix ("Bot Token (Discord)" → "Bot
         // Token"), rendering per-channel rows as indistinguishable titles.
@@ -1227,7 +1272,7 @@ export default function CommandBarOverlay({
     // the tree without remounting it, which does not recompute a memo. Omitting it
     // would freeze these rows in whichever language the surface first resolved.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apps, commandById, crewPreview, cycleTheme, dispatch, liveSlots, navigate, resolved, simplifiedToolNames, slotStatusDetail, store, unreadSlots])
+  }, [apps, commandById, crewPreview, cycleTheme, dispatch, liveSlots, navigate, resolved, settingsGovernance, simplifiedToolNames, slotStatusDetail, store, unreadSlots])
 
   // The root ranks from the LIVE query, not the debounced one. Ranking is pure and
   // local, so there is nothing to throttle, and debouncing it would let a fast Enter
@@ -1352,8 +1397,8 @@ export default function CommandBarOverlay({
   } = useQuery({
     // Nested UNDER the corpus key, like the artifacts view above, because these rows
     // are DERIVED from `['chat-folders']` and every folder write ends in
-    // `invalidateQueries({ queryKey: ['chat-folders'] })` (`ChatSidebar` create,
-    // delete and update). React-Query matches that by key PREFIX, so a key outside
+    // `invalidateQueries({ queryKey: ['chat-folders'] })` (the create, delete and
+    // update mutations in `pages/chat-sidebar/folders.ts`). React-Query matches that by key PREFIX, so a key outside
     // the corpus namespace is a cache no folder write can reach — and this view is
     // unmounted whenever the bar is closed, so its one chance to re-derive is the
     // remount, which refetches nothing that is still fresh. A folder deleted in that
@@ -1393,7 +1438,7 @@ export default function CommandBarOverlay({
    * them is working leaves the count identical, and that is precisely the change that
    * has to reach the screen. Frames that change nothing about the roster's running
    * set — a token tick, another surface's slot — produce the same string and cost
-   * nothing. The catalog fetch stays cached under its own 60s key, so a re-derivation
+   * nothing. The catalog fetch stays cached under its own key (MATES_STALE_MS), so a re-derivation
    * is a local re-map, not a request.
    */
   const mateQuery = scope === 'mates' ? debounced.trim() : ''
@@ -1592,7 +1637,9 @@ export default function CommandBarOverlay({
                   // WebSocket push that would seed it is not guaranteed to arrive. Left
                   // uninvalidated, the sidebar can keep rendering a tree without the new
                   // folder and the next run reads the same stale list.
-                  () => queryClient.invalidateQueries({ queryKey: ['chat-folders'] }),
+                  // Through the idle gate so the refetch cannot land inside a
+                  // pending optimistic folder write in the sidebar.
+                  () => invalidateFoldersWhenIdle(queryClient),
                 )
               }
             } finally {
@@ -1810,6 +1857,20 @@ export default function CommandBarOverlay({
       (scope === 'folders' && (foldersFetching || folderRows === undefined)) ||
       (scope === 'mates' && (matesFetching || mateRows === undefined)))
 
+  /**
+   * The scoped read for the LIVE query is still in flight.
+   *
+   * Distinct from {@link scopeLoading}, which is about an empty list: this is true even
+   * while rows for the previous query are still on screen, which is the one frame a
+   * latched Enter must not fire on — the debounced query may already match what was
+   * typed while the rows answering it have not landed yet.
+   */
+  const scopeFetching =
+    (scope === 'sessions' && isFetching) ||
+    (scope === 'artifacts' && artifactsFetching) ||
+    (scope === 'folders' && foldersFetching) ||
+    (scope === 'mates' && matesFetching)
+
   useEffect(() => {
     if (selected >= rowCount) setSelected(Math.max(0, rowCount - 1))
   }, [rowCount, selected])
@@ -1838,7 +1899,26 @@ export default function CommandBarOverlay({
       // and the stale row's own label still showed the old query, so nothing warned
       // them. The `root` has no scope, so this is inert there, which is correct: it
       // ranks from the live query and has nothing stale to act on.
-      if (via === 'key' && scope && !rowsAnswerTheQuery) return
+      //
+      // The window does not EAT the Enter, it holds it: a keyboard confirm in here is
+      // latched and fired once the rows answer the query it was pressed against (see
+      // `pendingEnter` and the effect that drains it). The confirmed query and the
+      // selected row are captured here, so a later keystroke or arrow does not ride
+      // the same latch into a row the reader never confirmed. An arrowed row's own
+      // stable key is captured alongside its index, because a cached new query can
+      // swap its rows in under the same index with no empty frame, and the drain fires
+      // a non-top row only while its key still matches rather than whatever now sits at
+      // that number.
+      // Type-then-Enter is the
+      // launcher's primary gesture, and dropping it left a fast typist pressing Enter
+      // at a silent bar. A POINTER is never latched -- a click names the row it is on,
+      // which opens what it says -- and it also drops any armed latch, so a click that
+      // enters a scope without closing the bar cannot leave a keyboard confirm behind.
+      if (via === 'pointer') setPendingEnter(null)
+      if (via === 'key' && scope && !rowsAnswerTheQuery) {
+        setPendingEnter({ query: query.trim(), index, key: slot.key })
+        return
+      }
       switch (slot.tag) {
         case 'root':
           activateRoot(slot.row)
@@ -1907,6 +1987,77 @@ export default function CommandBarOverlay({
     },
     [activateRoot, enterScope, navigate, onClose, pendingRow, query, refetchArtifacts, refetchFolders, refetchMates, refetchSessions, rowsAnswerTheQuery, scope, seedNewSession, slots],
   )
+
+  /**
+   * Fire a latched Enter once the rows answer the confirmed query, or drop it.
+   *
+   * The latch is set when a keyboard Enter lands in the debounce window (above), and
+   * it carries the query the reader confirmed and the row they had selected. It drains
+   * here rather than in the key handler because the thing it waits for -- the rows
+   * catching up -- is an async settle, not a keystroke.
+   *
+   * It fires only when all of these still hold; otherwise it is dropped:
+   *  - the reader has not typed on: the live query still equals the confirmed one.
+   *    Typing another character confirms a different query, which this latch never
+   *    stood for, so it is dropped rather than committed.
+   *  - the selection has not moved: an arrow or a hover that moved `selected` after
+   *    the Enter means the reader is aiming elsewhere, so the stale row is not fired.
+   *  - the row at that index is still the one the reader confirmed, for a NON-top
+   *    selection: row 0 is the primary gesture (open the best match for the typed
+   *    query) and fires the live top row, but an arrowed row carries the key it was
+   *    picked at, so a cached new query that swaps rows under the old indices drops
+   *    the latch rather than open a stranger at that number.
+   *  - the view has settled on rows that answer that query, and the selected row is a
+   *    RESULT. A no-match drop row, an empty-roster row, or a failed-read retry wipes
+   *    the query or navigates away, which is not what a reader who typed a name and
+   *    pressed Enter asked for; the latch drops. Visible-stable, per the one
+   *    constraint the reporter named.
+   */
+  useEffect(() => {
+    if (!pendingEnter) return
+    if (!scope) {
+      setPendingEnter(null)
+      return
+    }
+    // The reader typed on, or moved the selection: the live gesture differs from the
+    // one that was confirmed.
+    if (query.trim() !== pendingEnter.query || selected !== pendingEnter.index) {
+      setPendingEnter(null)
+      return
+    }
+    // Still settling, or the rows still answer an older query: hold.
+    if (scopeLoading || scopeFetching || !rowsAnswerTheQuery) return
+    const row = slots[pendingEnter.index]
+    if (row?.tag !== 'result') {
+      // Settled on a dead end: nothing the gesture meant to open.
+      setPendingEnter(null)
+      return
+    }
+    // Row 0 is the primary gesture — "open the best match for what I typed" — so it
+    // fires the live top row even though its content swapped to answer the new query.
+    // A NON-top index means the reader arrowed onto one specific row, so the row now
+    // at that index must still be the one they picked: a cached new query swaps rows
+    // under the old indices with no empty frame, and firing a changed row there opens
+    // a stranger, the wrong-row hazard this latch exists to close.
+    if (pendingEnter.index !== 0 && row.key !== pendingEnter.key) {
+      setPendingEnter(null)
+      return
+    }
+    setPendingEnter(null)
+    activateIndex(pendingEnter.index, 'key')
+  }, [pendingEnter, scope, query, selected, scopeLoading, scopeFetching, rowsAnswerTheQuery, slots, activateIndex])
+
+  /**
+   * Drop the latch the moment the reader leaves the window any other way.
+   *
+   * Escape out of the scope and Backspace out of it both land on `scope === null`;
+   * closing the bar flips `open`. The drain effect above already refuses to fire
+   * without a scope, but clearing here as well keeps a stale latch from riding a
+   * reopen into the next visit.
+   */
+  useEffect(() => {
+    if (!open || !scope) setPendingEnter(null)
+  }, [open, scope])
 
   /**
    * Put the selected row's address on the clipboard.

@@ -755,11 +755,12 @@ def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
     kiro-cli process is an ``AcpRuntime``, which is deliberately
     session-UNBOUND (one process multiplexes N sessions, so it cannot carry a
     single session's key in its environment — ``acp/runtime.py`` injects none).
-    The gateway's per-call caller injection is therefore the ONLY identity
-    channel for that backend, and it exists only for servers listed in
-    ``mcp_gateway.stub_servers``. An unrouted server on kiro has no channel at
-    all, which is a topology gap an operator can close in one line — not a bug
-    in the calling session.
+    The gateway's per-call caller injection is therefore one identity channel
+    for that backend, and it exists only for servers listed in
+    ``mcp_gateway.stub_servers``. The signed per-session token and the verified
+    host-pid sidecar are independent of the gateway. A server that is not
+    routed through the gateway and has neither is a topology gap an operator can
+    close in one line — not a bug in the calling session.
 
     Returns "" when identity IS resolvable (the caller should not be refusing),
     so a caller can append this unconditionally.
@@ -856,6 +857,9 @@ REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
         "mcp_tools/messaging.py",
         "mcp_tools/sessions.py",
         "mcp_tools/skills.py",
+        # Not a tool module: the tool table's production caller, which every
+        # table-built server's strict checks route through.
+        "mcp_tools/table.py",
         "mcp_tools/workflows.py",
     }
 )
@@ -1356,9 +1360,9 @@ def _transport_failure(message: str, mark: bool) -> dict:
     ``transport_error`` means acceptance is undetermined — the request may have
     reached the gateway before the response failed (a read timeout after spawn
     acceptance, say), so the caller must not declare a definite rejection nor
-    retry on its own. Only spawn_run's batch reconcile consumes it, and it only
-    ever posts, so the flag stays opt-in per verb rather than becoming a new field
-    on every reply.
+    retry on its own. Its readers (spawn_run's batch reconcile, the cron tool
+    proxy, learn_add) all post, so the flag stays opt-in per verb rather than
+    becoming a new field on every reply.
     """
     out: dict[str, object] = {"error": message}
     if mark:
@@ -1592,9 +1596,10 @@ def _post(
         return {"error": _sk_err}
     if sk:
         headers["X-Session-Key"] = sk
-    # ``transport_error`` is consumed only by spawn_run's batch reconcile: it
-    # means acceptance is unknown, so that member must not be declared lost.
-    # Other _post callers should treat the payload as a normal error.
+    # ``transport_error`` means acceptance is unknown. A caller that reads it
+    # (spawn_run's batch reconcile, the cron tool proxy, learn_add) must not
+    # report a definite failure; other _post callers treat the payload as a
+    # normal error.
     return _send(
         path,
         data=data,

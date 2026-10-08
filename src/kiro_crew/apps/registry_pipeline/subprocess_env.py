@@ -25,10 +25,10 @@ from kiro_crew.sandbox import scrub_env
 # ``SystemRoot`` usually dies before ``main()`` (DLL and crypto init resolve
 # through it), and one without ``USERPROFILE`` cannot find a per-user config root
 # (for a TeX child, ``TEXMFHOME``). ``TMPDIR`` is the POSIX spelling only, so a
-# Windows child also had no writable temp dir. Same key set and same reason as
-# ``kiro_prerequisite._SAFE_ENV_KEYS``; kept in the allowlist shape so the
-# credential-scrubbing property is unchanged — these are location hints, not
-# secrets.
+# Windows child also had no writable temp dir. Matched through
+# ``platform_compat.env_key_allowed`` (see ``_is_safe_env_key``); kept in the
+# allowlist shape so the credential-scrubbing property is unchanged — these are
+# location hints, not secrets.
 _SAFE_ENV_KEYS = frozenset(
     {
         "HOME",
@@ -172,7 +172,13 @@ def anonymous_git_env(**extra: str) -> dict[str, str]:
 
     - **Automatic** browse/refresh clones (manifest + blob proxy) — always
       credential-free / anonymous (this function), because no per-repo owner
-      action gates them.
+      action gates them. The one browse-time clone that carries credentials is
+      not one of these: ``store_art._prewarm_owner_tier_store_assets`` runs on
+      the rows a FRESH fetch of a build-pinned ``owner``-tier index just
+      returned, in the same call, which is the authority the install path
+      re-fetches that index to obtain. It fills the manifest and blob caches
+      these two automatic paths then read; on a miss they still clone
+      anonymously.
     - **Index-originated installs** — an app whose registry entry came from an
       owner-configured *external* index (carries ``_registry``): the ``repo``
       URL is index-controlled, so the install clone is ALSO credential-free

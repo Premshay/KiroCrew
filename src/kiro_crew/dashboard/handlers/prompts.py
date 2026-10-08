@@ -2300,6 +2300,10 @@ async def api_skills(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "Invalid search limit.", "code": "invalid_limit"}, status=400
             )
+        # The skill_search tool reads through POST. The GET read stays for
+        # compatibility, and its reader may be a script or a person, so it
+        # does not count as a model load.
+        model_read = request.method == "POST"
 
         def search():
             slot = _named_slot(state, session_key)
@@ -2321,6 +2325,14 @@ async def api_skills(request: web.Request) -> web.Response:
                 )
                 if isinstance(outcome, SkillReadRefusal):
                     return {"matches": [], "next_offset": None, "refusal": outcome._asdict()}
+                if model_read and offset == 0:
+                    # An exact read hands the model the body it asked for, the
+                    # same delivery a `$name` token credits. A paged read is one
+                    # load, so only the page that starts at the body's first
+                    # line credits it. Search and list rows are candidates, not
+                    # a chosen load, so they credit nothing, even a confined
+                    # project row that carries its body.
+                    skills.credit_skill_reads([key])
                 match: dict[str, Any] = {
                     "key": key,
                     "name": key,
@@ -2996,11 +3008,11 @@ async def api_skill_pending_dismiss(request: web.Request) -> web.Response:
 async def api_skills_pending_dismiss_all(request: web.Request) -> web.Response:
     """POST /api/skills/-/pending/-/dismiss-all — dismiss pending candidates.
 
-    Accepts an optional JSON body ``{"slugs": ["slug1", ...]}``.  When present,
-    only those slugs are dismissed (the client passes the set it displayed to the
+    Requires a JSON body ``{"slugs": ["slug1", ...]}`` with a non-empty array.
+    Only those slugs are dismissed (the client passes the set it displayed to the
     user, so a candidate staged *after* the confirmation dialog is never silently
-    deleted).  When the body is absent or ``slugs`` is empty, ALL pending
-    candidates are dismissed (back-compat / fallback).
+    deleted). When the body is absent or ``slugs`` is missing or empty, the route
+    returns 400 ``slugs_required`` and dismisses nothing.
     """
     denied = _deny_non_owner_skill_operation(request, "skill_pending_dismiss_all")
     if denied is not None:

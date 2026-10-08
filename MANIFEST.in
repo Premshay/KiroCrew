@@ -26,6 +26,9 @@ include src/kiro_crew/model_tokens.json
 # Excluded from package_data globs and .gitignored, but it MUST ship so that a
 # `pip install .` / sdist install serves the dashboard with no npm/node present.
 recursive-include src/kiro_crew/static *
+# ...but not the immutable copies staging keeps beside it: static/dist links
+# to one of them and ships through the link.
+prune src/kiro_crew/static/.dist.*
 
 # --- Other package_data directories ------------------------------------------
 recursive-include src/kiro_crew/config *
@@ -43,6 +46,11 @@ recursive-include src/kiro_crew/dashboard_card_pages *.html
 # missing from the wheel built out of it, and a page that never shipped renders an
 # empty card with every gate green.
 recursive-include src/kiro_crew/dashboard_templates *.html
+# The run-time templates' manifests. The recursive include above already reaches their
+# pages; a template directory is its page AND its manifest, and `load_template` refuses
+# one without the other -- so without this line the sdist ships half-templates and the
+# registry discovers none of them.
+recursive-include src/kiro_crew/dashboard_templates/builtin *.json
 recursive-include src/kiro_crew/connections *.json
 recursive-include src/kiro_crew/data *.json
 recursive-include src/kiro_crew/decisions/local_servers *.py *.txt

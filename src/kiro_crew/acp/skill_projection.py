@@ -32,7 +32,7 @@ from typing import Any
 from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.acp import session_mcp
 from kiro_crew.agent_discovery import SCOPE_PROJECT, _read_agent_spec, list_agents
-from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX, SKILL_VIEW_PROJECTION_CEILING
 from kiro_crew.atomic_write import atomic_write, on_event_loop
 from kiro_crew.config.paths import data_home, kiro_agents_dir, kiro_home, project_agents_dir
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
@@ -133,6 +133,22 @@ _PROJECTION_METADATA_DIR_NAME = ".kirocrew-skill-projection-metadata"
 # jitter and short Windows rename retries without inheriting the generic five-minute
 # lock ceiling on the native startup path.
 _PROJECTION_LOCK_TIMEOUT_SECS = 2.0
+# Threads of THIS process queue on an in-process lock before the file lock, so
+# the file lock's ceiling above measures cross-process contention only. Without
+# it, N concurrent session starts in one gateway each race the file lock on
+# their own clock, and in a burst the later ones time out and start without
+# their skill view although no other process holds the lock. The in-process
+# wait is bounded well under the session/new budget; every caller runs off the
+# event loop.
+_IN_PROCESS_PROJECTION_WAIT_SECS = 30.0
+_IN_PROCESS_PROJECTION_LOCKS: dict[str, threading.Lock] = {}
+_IN_PROCESS_PROJECTION_LOCKS_GUARD = threading.Lock()
+# Queued starts pay for each other's locked sections one after another, and the
+# per-spawn prune walk is most of a section. Pruning only reclaims stale files,
+# so a burst gets one walk per this interval per agents directory; the boot
+# drain prunes on its own schedule and is unaffected.
+_PER_SPAWN_PRUNE_MIN_INTERVAL_SECS = 5.0
+_LAST_PER_SPAWN_PRUNE: dict[str, float] = {}
 # The share of that ceiling the prune walk must leave to the rest of its locked
 # section: the publication writes (two atomic writes per alias plus the settings
 # commit) and scheduler jitter. The lease scan's budget is taken out on its own.
@@ -166,6 +182,54 @@ _MANAGED_ALIAS_SHA256 = "x-kirocrew-alias-sha256"
 # alone does not. Sidecars written without this key carry only the byte digest
 # and are judged by it.
 _MANAGED_VIEW_SHA256 = "x-kirocrew-view-sha256"
+
+
+def _same_crew_home(recorded: object, current: str) -> bool:
+    """Whether a sidecar's recorded data home is THIS process's own data home.
+
+    The ONE ownership-home comparison. The recorded value is the string a
+    publisher stored (``data_home().absolute().as_posix()``) and *current* is the
+    same string for this process; the stored value and the alias name hash are
+    never touched, so no file is renamed or re-hashed by this.
+
+    The strings are compared by their RESOLVED paths rather than literally, but
+    ONLY on POSIX. One data home reaches disk under more than one spelling there:
+    on a cloud desktop ``/home/<u>`` is a symlink to ``/local/home/<u>``, so a
+    launch that uses the other spelling, a pod sharing ``~/.kiro``, or a moved
+    home records ownership under one spelling and reads it under another. Compared
+    literally those look like two homes and neither reclaim nor prune nor drain
+    ever cleans up the other's views; compared by realpath they are the one home
+    they are. ``os.path.realpath`` is best-effort and does not raise for an absent
+    path, but a symlink loop can raise ``OSError`` (and ``ValueError`` for an
+    embedded NUL); on any such failure this falls back to the exact literal
+    comparison -- never widening what counts as this home.
+
+    On Windows the resolution is NOT done at all. The two-spelling problem is a
+    POSIX ``/home`` -> ``/local/home`` phenomenon that does not arise on Windows,
+    while *recorded* is untrusted sidecar content, and ``os.path.realpath`` on
+    Windows reaches the filesystem: an attacker-planted value that IS or RESOLVES
+    THROUGH a UNC/junction target (a bare ``\\\\host\\share``, or a local
+    ``C:\\link`` that is a directory junction to one) would make resolution open
+    the remote host and leak SMB credentials. Enumerating those spellings one at
+    a time does not converge -- the property that does is "never resolve the
+    untrusted path on Windows", so Windows keeps the pre-fix literal comparison,
+    which touched the filesystem for neither side. A legitimate Windows home is
+    recorded and read under one spelling, so this loses no real match.
+    """
+    if not isinstance(recorded, str):
+        return False
+    if recorded == current:
+        return True
+    if platform_compat.IS_WINDOWS:
+        # Resolution here would be filesystem I/O on an untrusted path; the
+        # literal comparison above already failed, so the home stays foreign.
+        return False
+    try:
+        return os.path.realpath(recorded) == os.path.realpath(current)
+    except (OSError, ValueError):
+        return False
+
+
 # Ownership sidecars one prune may reclaim when their alias is already gone.
 # Metadata only -- no kiro-cli cost rides on it -- so a modest ceiling that the
 # boot drain multiplies by its batch count is enough to retire a backlog.
@@ -555,7 +619,9 @@ class _ViewLedgerWrites:
         views: dict[str, str] = {}
         for candidate in window:
             record, _path, _identity = _sidecar_record(self._directory, candidate.stem)
-            if record is None or record.get(_MANAGED_CREW_HOME) != self._crew_home_id:
+            if record is None or not _same_crew_home(
+                record.get(_MANAGED_CREW_HOME), self._crew_home_id
+            ):
                 continue
             agent_name = record.get(_MANAGED_AGENT)
             if _admissible_source_agent(agent_name):
@@ -627,6 +693,32 @@ class NativeSkillProjection:
     specs: dict[str, dict[str, Any]] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
     search_agents: set[str] = field(default_factory=set)
+    #: The agent a DIRECT CLIENT (one process / one session) was launched as,
+    #: recorded by that spawn caller after preparation. The process is already
+    #: running as it, so its first ``session/set_mode`` activation must be
+    #: tolerated even with no prepared view -- refusing it would strand a valid
+    #: startup. ``request()`` tolerates that FIRST activation and then clears this,
+    #: so a later mid-session switch back to the launch agent takes the strict
+    #: resolver and fails closed if its view has vanished. The SHARED RUNTIME does
+    #: NOT set this: it activates the launched agent through
+    #: ``_activate_mode_bracketed``, which allows ``self._agent`` at every session
+    #: start explicitly, and setting this would make ``request()`` tolerate the
+    #: launch agent on a mid-session switch too, reactivating a cached unprojected
+    #: spec. Every OTHER modeId is strict. Empty until set, which keeps the strict
+    #: answer for a projection no spawn claimed.
+    spawn_agent_name: str = ""
+    #: The launch identity's DECLARED name, recorded by EVERY spawn caller (both
+    #: the direct client and the shared runtime). ``frame`` keeps this agent's
+    #: mode in projected ``availableModes`` so the start -- which reads
+    #: ``availableModes`` before sending ``set_mode`` -- finds an activatable mode
+    #: even when the launch agent has no prepared view. This is kept SEPARATE from
+    #: ``spawn_agent_name`` on purpose: advertising the launch mode is safe for
+    #: both runtimes (it only decides what the start can see at session open),
+    #: whereas ``request()``'s mid-session tolerance must stay direct-client-only
+    #: (the shared runtime keeps strict resolution on a mid-session switch so a
+    #: vanished view fails closed). Never consumed; it describes a fixed launch
+    #: fact, not a one-shot exemption. Empty until a spawn claims the projection.
+    advertised_launch_name: str = ""
     _lease_finalizer: Any = field(default=None, repr=False, compare=False)
     # Aliases an EARLIER projection of this process published, alias -> agent. The
     # host may still hold them (every alias it loaded at spawn, say), so inbound
@@ -643,6 +735,18 @@ class NativeSkillProjection:
         Only alias-shaped names mapped to admissible agent names are kept, so the
         count bound bounds the memory too.
         """
+        # Carry the launch identity's ADVERTISING across a projection refresh: the
+        # shared runtime adopts a fresh projection mid-session, and frame() runs on
+        # that fresh object, so without this a no-view launch agent's mode would be
+        # dropped from availableModes again after the refresh. This is SAFE to carry
+        # (advertising only decides what a session open can see) and is kept
+        # distinct from ``spawn_agent_name``, which is deliberately NOT propagated
+        # here -- carrying that would make request() tolerate the launch agent on a
+        # mid-session switch on the shared runtime, reactivating a cached spec the
+        # strict resolver exists to refuse. A fresh projection that already recorded
+        # its own launch name keeps it.
+        if not self.advertised_launch_name and earlier.advertised_launch_name:
+            self.advertised_launch_name = earlier.advertised_launch_name
         dropped = 0
         for alias, name in (
             *((a, n) for n, a in earlier.aliases.items()),
@@ -684,9 +788,49 @@ class NativeSkillProjection:
             raise ValueError(f"Agent {name!r} has no prepared skill discovery view")
         return self.aliases[name]
 
+    def spawn_agent(self, name: str) -> str:
+        """Resolve the ``--agent`` transport name for a spawn, tolerating no view.
+
+        The strict :meth:`agent` guards ``session/set_mode``: a mid-session
+        switch to a mode this projection never prepared must be rejected, so an
+        agent cannot escape the scope it was launched under. Spawn selection asks
+        a softer question. An agent whose spec an authored restriction refused --
+        a ``kirocrew-core`` exclusion, a disabled ``skill_search`` -- is a
+        user-facing spawn refusal that still raises (the callers wrap it as
+        ``AcpRuntimeError`` and the startup paths translate the sentence). An
+        agent that simply has no prepared view -- its spec is not among the
+        projected agents, as in a work_dir that carries no such spec -- keeps its
+        authored transport name, the same answer a ``None`` projection gives: the
+        agent spawns under its own name rather than aborting an otherwise valid
+        spawn over a skill view it never asked for.
+        """
+        if is_skill_view_name(name) or name in self.aliases or name in self.errors:
+            return self.agent(name)
+        # The name is in no projected map: its spec is genuinely absent, so this is
+        # the no-view case and the agent spawns under its own authored name rather
+        # than aborting a spawn over a skill view it never asked for.
+        return name
+
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "session/set_mode":
-            return {**params, "modeId": self.agent(str(params.get("modeId", "")))}
+            mode_id = str(params.get("modeId", ""))
+            # The launched agent's own activation is tolerated even with no
+            # prepared view: the process is already running as it, so the initial
+            # ``set_mode`` that activates it must not be refused. ``spawn_agent``
+            # gives that name back unchanged; every other modeId takes the strict
+            # ``agent``, so a mid-session switch to a mode this projection never
+            # prepared is still rejected and an agent cannot escape its scope.
+            tolerated = bool(mode_id) and mode_id == self.spawn_agent_name
+            resolve = self.spawn_agent if tolerated else self.agent
+            translated = {**params, "modeId": resolve(mode_id)}
+            if tolerated:
+                # CONSUME the exemption once spent: it covers only the launched
+                # agent's FIRST activation. Cleared, a later set_mode back to the
+                # same agent takes the strict ``agent`` again -- so a view that has
+                # since vanished fails closed instead of reactivating a cached spec
+                # the strict resolver existed to refuse.
+                self.spawn_agent_name = ""
+            return translated
         if method == "_kiro.dev/commands/execute":
             command = params.get("command", "")
             if isinstance(command, dict):
@@ -726,6 +870,22 @@ class NativeSkillProjection:
                         name = reverse.get(mode_id) if isinstance(mode_id, str) else None
                         if name is None and mode_id in self.aliases:
                             name = mode_id
+                        # The launched agent's own mode stays listed even with no
+                        # prepared view: the start reads ``availableModes`` before
+                        # sending ``set_mode``, so dropping it would advertise no
+                        # mode the process could activate and fail the session open.
+                        # Keyed on ``advertised_launch_name`` -- set by BOTH the
+                        # direct client and the shared runtime -- not on
+                        # ``spawn_agent_name``, which the shared runtime leaves empty
+                        # to keep ``request()`` strict on a mid-session switch:
+                        # advertising the launch mode at open is safe for both,
+                        # whereas tolerating a mid-session re-activation is not.
+                        if (
+                            name is None
+                            and bool(mode_id)
+                            and mode_id == self.advertised_launch_name
+                        ):
+                            name = mode_id
                         if name is None or name in listed:
                             continue
                         listed.add(name)
@@ -763,9 +923,41 @@ def _active_aliases() -> set[str]:
     return {alias for projection in projections for alias in projection.aliases.values()}
 
 
+def _in_process_projection_lock(directory: Path) -> threading.Lock:
+    """The one in-process lock for *directory*'s alias publication and pruning."""
+    key = directory.absolute().as_posix()
+    with _IN_PROCESS_PROJECTION_LOCKS_GUARD:
+        lock = _IN_PROCESS_PROJECTION_LOCKS.get(key)
+        if lock is None:
+            lock = _IN_PROCESS_PROJECTION_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def _per_spawn_prune_due(directory: Path) -> bool:
+    """Whether this spawn runs the prune walk; call under the alias lock."""
+    key = directory.absolute().as_posix()
+    now = time.monotonic()
+    last = _LAST_PER_SPAWN_PRUNE.get(key)
+    if last is not None and 0.0 <= now - last < _PER_SPAWN_PRUNE_MIN_INTERVAL_SECS:
+        return False
+    _LAST_PER_SPAWN_PRUNE[key] = now
+    return True
+
+
 def _projection_alias_lock(directory: Path) -> ExitStack:
-    """Acquire the bounded cross-process lock for alias publication and pruning."""
+    """Acquire the bounded cross-process lock for alias publication and pruning.
+
+    Threads of this process first queue on :func:`_in_process_projection_lock`,
+    so only one of them at a time competes for the file lock.
+    """
     stack = ExitStack()
+    local = _in_process_projection_lock(directory)
+    if not local.acquire(timeout=_IN_PROCESS_PROJECTION_WAIT_SECS):
+        raise OSError(
+            "skill projection lock still busy inside this process after "
+            f"{_IN_PROCESS_PROJECTION_WAIT_SECS:g}s"
+        )
+    stack.callback(local.release)
     try:
         directory.mkdir(parents=True, exist_ok=True)
         lock_path = directory / _PROJECTION_LOCK_NAME
@@ -794,7 +986,9 @@ def _projection_alias_lock(directory: Path) -> ExitStack:
             or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
         ):
             raise OSError("skill projection lock changed while it was acquired")
-    except OSError:
+    except BaseException:
+        # Any failure, not only OSError: the stack holds the in-process lock, and
+        # a leaked one makes every later start in this process wait it out.
         stack.close()
         raise
     return stack
@@ -1733,7 +1927,11 @@ def _sweep_orphan_sidecars(
         if _path_exists(directory / f"{stem}.json"):
             continue
         record, path, identity = _sidecar_record(directory, stem)
-        if record is None or identity is None or record.get(_MANAGED_CREW_HOME) != crew_home_id:
+        if (
+            record is None
+            or identity is None
+            or not _same_crew_home(record.get(_MANAGED_CREW_HOME), crew_home_id)
+        ):
             continue
         doomed.append((stem, record, path, identity))
     # The sidecar is the last record of which agent a view with no alias was
@@ -2107,7 +2305,7 @@ def _reclaim_prune_candidate(
             # that is not provably ours) keeps the alias.
             if (
                 record is None
-                or record.get(_MANAGED_CREW_HOME) != crew_home_id
+                or not _same_crew_home(record.get(_MANAGED_CREW_HOME), crew_home_id)
                 or not _is_legacy_projected_view(path, raw)
             ):
                 return False
@@ -2161,7 +2359,7 @@ def _reclaim_prune_candidate(
             logger.debug("skill projection: legacy alias changed before removal: %s", path)
         return False
     metadata, metadata_path, metadata_identity, metadata_raw = managed
-    if metadata.get(_MANAGED_CREW_HOME) != crew_home_id:
+    if not _same_crew_home(metadata.get(_MANAGED_CREW_HOME), crew_home_id):
         return False
 
     # Re-open and revalidate the exact alias and ownership sidecar at
@@ -2187,7 +2385,7 @@ def _reclaim_prune_candidate(
         or current_metadata_path != metadata_path
         or current_metadata_identity != metadata_identity
         or current_metadata_raw != metadata_raw
-        or current_metadata.get(_MANAGED_CREW_HOME) != crew_home_id
+        or not _same_crew_home(current_metadata.get(_MANAGED_CREW_HOME), crew_home_id)
     ):
         return False
     recorded = ledger.retain(path.stem, current_metadata)
@@ -2330,7 +2528,7 @@ def census_projected_aliases(directory: Path) -> dict[str, int]:
         if (
             _managed_marker(metadata)
             and isinstance(metadata.get(_MANAGED_CREW_HOME), str)
-            and metadata[_MANAGED_CREW_HOME] != crew_home_id
+            and not _same_crew_home(metadata[_MANAGED_CREW_HOME], crew_home_id)
         ):
             counts["foreign_leased" if stem in named else "foreign_home"] += 1
     return counts
@@ -2538,7 +2736,7 @@ def _is_current_publication(
         if parsed is None or _canonical_json(parsed) != _canonical_json(json.loads(alias_raw)):
             return False
     managed = _managed_metadata_for_alias(directory, alias_path, existing)
-    return managed is not None and managed[0].get(_MANAGED_CREW_HOME) == crew_home_id
+    return managed is not None and _same_crew_home(managed[0].get(_MANAGED_CREW_HOME), crew_home_id)
 
 
 def _alias_identity(view: dict[str, Any]) -> dict[str, Any]:
@@ -2665,6 +2863,92 @@ def _env_identity(env: dict[Any, Any], volatile: frozenset[str]) -> dict[str, st
     }
 
 
+# The alias count at or above which preparation stops minting new views and
+# falls back to the authored agent, the same path ``KIROCREW_NATIVE_SKILL_PROJECTION=0``
+# takes. This is the ONE constant the doctor's backlog warning
+# (``doctor_checks.resources._SKILL_VIEW_BACKLOG_WARN``) reads, so the ceiling
+# the projection enforces and the count the doctor flags are the same number: a
+# host the doctor warns about is a host whose next spawn already fell back. It is
+# a safety net for a regression that reopens the leak the root-cause fixes closed
+# (a per-launch env value that mints a view per spawn, or one unreadable lease
+# that keeps the reclaim from draining anything), NOT the mechanism that keeps a
+# healthy host bounded -- the boot drain and per-spawn reclaim do that, far below
+# this number. Deliberately well above a healthy host's authored-agents x
+# workspaces so normal use never trips it.
+#
+# Defined in the ``agent_spec_format`` leaf (beside the alias prefix) and
+# imported at the top of this module, so the doctor can share the number without
+# importing the ACP layer: the agent-SDK import boundary is shrink-only and the
+# doctor is a baselined consumer. The enforcement below reads it unqualified.
+
+# One warning per process when the ceiling is in effect, not one per spawn: the
+# fallback fires on every subsequent start until the backlog drains, and a line
+# per spawn would bury the one that matters. The flag is set the first time the
+# ceiling is tripped in this process and never reset.
+_CEILING_FALLBACK_WARNED = False
+_CEILING_FALLBACK_WARNED_LOCK = threading.Lock()
+
+
+def _count_projected_aliases(directory: Path) -> int:
+    """Count ``kirocrew-skill-view-*.json`` files in *directory*, up to the ceiling.
+
+    One bounded ``os.scandir``. Counts regular files by name only -- no read, no
+    lease probe, no sidecar -- because the ceiling asks only "how many views are
+    on disk", which is what kiro-cli pays for at startup. The scan STOPS as soon
+    as the count reaches :data:`SKILL_VIEW_PROJECTION_CEILING`: the only caller
+    tests ``>= ceiling``, so an exact count past it buys nothing and every extra
+    entry is wasted work on the spawn path. No result cache sits in front of it:
+    on a healthy host it lists a near-empty directory in microseconds, and the
+    ceiling only engages when the directory is already backlogged, where the scan
+    is dwarfed by kiro-cli reading every one of those files at startup. A scan
+    that cannot read the directory counts zero: an unreadable agents directory is
+    not a backlog, and the publication writes below would raise on it anyway.
+    """
+    count = 0
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if count >= SKILL_VIEW_PROJECTION_CEILING:
+                    break
+                if (
+                    entry.name.startswith(NATIVE_SKILL_ALIAS_PREFIX)
+                    and entry.name.endswith(".json")
+                    and entry.is_file(follow_symlinks=False)
+                ):
+                    count += 1
+    except OSError:
+        logger.debug(
+            "skill projection: cannot scan %s to count views for the ceiling",
+            directory,
+            exc_info=True,
+        )
+        count = 0
+    return count
+
+
+def _warn_ceiling_fallback_once(directory: Path, count: int) -> None:
+    """Warn, at most once per process, that the view ceiling is now in effect."""
+    global _CEILING_FALLBACK_WARNED
+    with _CEILING_FALLBACK_WARNED_LOCK:
+        if _CEILING_FALLBACK_WARNED:
+            return
+        _CEILING_FALLBACK_WARNED = True
+    logger.warning(
+        "skill projection: %d (cap %d reached) kirocrew-skill-view-*.json file(s) in %s; "
+        "new spawns no longer create skill views and fall back to authored agents until the "
+        "count drops (sessions already projecting keep refreshing their own view). The count "
+        "is every such file in the directory -- kiro-cli reads them "
+        "all at startup regardless of which Kiro Crew home wrote them -- so a backlog another "
+        "home leaked trips this too, and this gateway cannot drain that home's files. Run "
+        "`kiro-crew doctor`: it names any foreign-home share and the remedy (stop every "
+        "gateway using this agents directory, then move the files out). A gateway restart "
+        "runs the boot drain for this home's own files.",
+        count,
+        SKILL_VIEW_PROJECTION_CEILING,
+        directory,
+    )
+
+
 def prepare_native_skill_projection(
     work_dir: Path, *, enabled: bool | None = None, per_session_element: bool = True
 ) -> NativeSkillProjection | None:
@@ -2689,9 +2973,68 @@ def prepare_native_skill_projection(
     """
     directory = kiro_agents_dir()
     crew_home_id = data_home().absolute().as_posix()
+    # Set only when the ceiling (not the env disable) is what turned projection
+    # off: that path still runs the bounded per-spawn prune before falling back,
+    # so this home's own backlog can drain BACK under the ceiling across spawns
+    # without a gateway restart. Without it the safety net would switch off the
+    # very reclaim that recovers from it, and the count could only fall at the
+    # next boot drain.
+    ceiling_tripped = False
     if enabled is None:
         enabled = os.environ.get("KIROCREW_NATIVE_SKILL_PROJECTION", "1") != "0"
+        # The ceiling is a spawn-time admission decision, applied ONLY on this
+        # ``enabled is None`` path -- the one that chooses whether to project at
+        # all. An explicit ``enabled=True`` is NOT a request to re-decide: the
+        # shared runtime's warm set_mode refresh passes it to re-prepare a view a
+        # live session already runs under, and there a ``None`` return is fatal
+        # (the runtime raises ``AcpRuntimeError`` and refuses the start rather
+        # than activate an unverified view). Intercepting that explicit True with
+        # the ceiling would convert a bounded backlog into a session abort for
+        # every warm shared-runtime session -- the opposite of a graceful
+        # fallback. So the ceiling never touches an explicit caller; it only
+        # declines to START projecting when nothing asked for it specifically.
+        if enabled:
+            view_count = _count_projected_aliases(directory)
+            if view_count >= SKILL_VIEW_PROJECTION_CEILING:
+                # The safety net: the agents directory already holds at least the
+                # ceiling of views, so minting more would deepen a backlog
+                # kiro-cli reads in full on every start. Fall back to the authored
+                # agent by taking the exact path ``enabled=False`` takes below --
+                # the overlay is rolled back and no view is written -- rather than
+                # a path of its own, so the two cannot diverge. An agent that
+                # already has a valid view does NOT get to keep reusing it above
+                # the ceiling on this path: no projection is prepared at all, so
+                # every agent of this spawn runs under its authored name until the
+                # backlog drains. That is deliberate -- it matches
+                # ``enabled=False`` exactly and needs no per-agent accounting on
+                # the hot path -- and the recorded choice in the PR. A healthy
+                # host never reaches here; see the ceiling constant. The fallback
+                # still prunes below (``ceiling_tripped``) so the count can fall
+                # back under the ceiling without a restart.
+                _warn_ceiling_fallback_once(directory, view_count)
+                enabled = False
+                ceiling_tripped = True
     if not enabled:
+        if ceiling_tripped:
+            # Drain this home's own stale aliases before falling back, so a
+            # backlog this gateway owns can fall under the ceiling across spawns
+            # rather than waiting for a restart's boot drain. Best-effort and
+            # bounded exactly like the normal per-spawn prune: it takes the alias
+            # lock, is skipped when another prune ran too recently
+            # (``_per_spawn_prune_due``), and never raises into the spawn. keep is
+            # empty because this spawn publishes no alias. A foreign home's files
+            # are not reclaimed here (by design -- see the warning), so a foreign
+            # backlog still falls back every spawn, which is the intended safe
+            # degraded mode.
+            try:
+                with _projection_alias_lock(directory):
+                    if _per_spawn_prune_due(directory):
+                        _prune_stale_managed_aliases(directory, crew_home_id, keep=set())
+            except OSError:
+                logger.debug(
+                    "skill projection: ceiling-fallback prune skipped; lock or I/O error",
+                    exc_info=True,
+                )
         if not (work_dir / ".kiro" / "settings" / "cli.json").exists():
             return None
         try:
@@ -2731,6 +3074,8 @@ def prepare_native_skill_projection(
         source = source_dir / agent.filename
         spec = _read_agent_spec(source, operation="native_skill_projection", source="acp")
         if spec is None:
+            # A spec ``list_agents`` yielded but the reader refuses here changed
+            # between the two reads; skip it, exactly as an absent spec is skipped.
             continue
         display_sizes[agent.name] = (_display_text_bytes(spec), source.absolute().as_posix())
         view = copy.deepcopy(spec)
@@ -2962,7 +3307,12 @@ def prepare_native_skill_projection(
                     local[_INHERIT_SOURCE] = preference_source
                     local[_INHERIT_SETTING] = True
                     atomic_write(locked_settings, json.dumps(local, indent=2))
-                    prepared = NativeSkillProjection(aliases, specs, errors, search_agents)
+                    prepared = NativeSkillProjection(
+                        aliases,
+                        specs,
+                        errors,
+                        search_agents,
+                    )
                     _remember_view_sources(aliases)
                     prepared._lease_finalizer = weakref.finalize(prepared, lease_stack.close)
                 except BaseException:
@@ -2979,6 +3329,7 @@ def prepare_native_skill_projection(
             )
             return None
         _register_active_projection(prepared)
-        _prune_stale_managed_aliases(directory, crew_home_id, keep=set(aliases.values()))
+        if _per_spawn_prune_due(directory):
+            _prune_stale_managed_aliases(directory, crew_home_id, keep=set(aliases.values()))
 
     return prepared
