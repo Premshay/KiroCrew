@@ -31,13 +31,13 @@ describe('acquireMicStream', () => {
     setPreferredMicId('airpods')
     const gum = mockGetUserMedia(() => Promise.resolve(STREAM))
     await acquireMicStream()
-    expect(gum).toHaveBeenCalledWith({ audio: { deviceId: { exact: 'airpods' } } })
+    expect(gum).toHaveBeenCalledWith({ audio: { deviceId: { exact: 'airpods' }, echoCancellation: true } })
   })
 
   it('asks for the plain default when no device is saved', async () => {
     const gum = mockGetUserMedia(() => Promise.resolve(STREAM))
     await acquireMicStream()
-    expect(gum).toHaveBeenCalledWith({ audio: true })
+    expect(gum).toHaveBeenCalledWith({ audio: { echoCancellation: true } })
   })
 
   it.each(['OverconstrainedError', 'NotFoundError', 'NotReadableError', 'AbortError'])(
@@ -52,7 +52,7 @@ describe('acquireMicStream', () => {
         JSON.stringify(c).includes('exact') ? Promise.reject(namedError(name)) : Promise.resolve(STREAM),
       )
       await expect(acquireMicStream()).resolves.toBe(STREAM)
-      expect(gum).toHaveBeenLastCalledWith({ audio: true })
+      expect(gum).toHaveBeenLastCalledWith({ audio: { echoCancellation: true } })
     },
   )
 
@@ -95,13 +95,13 @@ describe('acquireMicStream', () => {
     const gum = mockGetUserMedia(() => Promise.reject(namedError('NotReadableError')))
     await expect(acquireMicStream('busy-device')).rejects.toMatchObject({ name: 'NotReadableError' })
     expect(gum).toHaveBeenCalledTimes(1)
-    expect(gum).toHaveBeenCalledWith({ audio: { deviceId: { exact: 'busy-device' } } })
+    expect(gum).toHaveBeenCalledWith({ audio: { deviceId: { exact: 'busy-device' }, echoCancellation: true } })
   })
 
   it("an explicit '' means the system default", async () => {
     setPreferredMicId('airpods') // must be ignored: the explicit pick wins
     const gum = mockGetUserMedia(() => Promise.resolve(STREAM))
     await acquireMicStream('')
-    expect(gum).toHaveBeenCalledWith({ audio: true })
+    expect(gum).toHaveBeenCalledWith({ audio: { echoCancellation: true } })
   })
 })

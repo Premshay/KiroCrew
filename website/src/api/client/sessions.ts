@@ -58,7 +58,7 @@ export interface RestartBlockerResult {
   detail?: string
 }
 
-export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch }: ClientTransport) {
+export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, jCrewBoard }: ClientTransport) {
   const runtimes = {
     /** Who is blocking a coordinated reset. Read-only: it reports an already-open
      *  barrier and never opens one, so polling this cannot start requiring
@@ -160,7 +160,7 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch }: Cl
      * silently inherit MCP-only auth and 403 every call from here.
      */
     crewBoard: (conductor: string) =>
-      get(`/api/crew-board?conductor=${encodeURIComponent(conductor)}`).then(j) as Promise<WorkBoardResponse>,
+      get(`/api/crew-board?conductor=${encodeURIComponent(conductor)}`).then(jCrewBoard) as Promise<WorkBoardResponse>,
     /**
      * Act on one ORPHANED item. The worker session key is never sent and never
      * returned: the server resolves it from the store, which is what lets this call

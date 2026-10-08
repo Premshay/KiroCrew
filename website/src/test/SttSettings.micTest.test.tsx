@@ -108,7 +108,7 @@ beforeEach(async () => {
   ]
   gum = vi.fn(async (c: MediaStreamConstraints) => {
     const audio = c.audio as { deviceId?: { exact: string } } | true
-    const id = audio === true ? 'default' : audio.deviceId?.exact
+    const id = audio === true ? 'default' : audio.deviceId?.exact ?? 'default'
     return fakeStream(c, devices.find(d => d.deviceId === id)?.label ?? 'Unknown')
   })
   Object.defineProperty(navigator, 'mediaDevices', {
@@ -154,7 +154,7 @@ describe('MicTestStrip', () => {
     render(<MicTestStrip deviceId="webcam" />)
     fireEvent.click(screen.getByRole('button', { name: /test microphone/i }))
     await waitLive()
-    expect(gum).toHaveBeenCalledWith({ audio: { deviceId: { exact: 'webcam' } } })
+    expect(gum).toHaveBeenCalledWith({ audio: { deviceId: { exact: 'webcam' }, echoCancellation: true } })
     expect(await screen.findByText(/listening on webcam mic/i)).toBeTruthy()
     expect(liveTracks()).toBe(1)
     expect(openContexts()).toBe(1)
@@ -164,7 +164,7 @@ describe('MicTestStrip', () => {
     render(<MicTestStrip deviceId="" />)
     fireEvent.click(screen.getByRole('button', { name: /test microphone/i }))
     await waitLive()
-    expect(gum).toHaveBeenCalledWith({ audio: true })
+    expect(gum).toHaveBeenCalledWith({ audio: { echoCancellation: true } })
     // Safari and Firefox name no default device in the picker; the live track
     // does, so the test still says which microphone it is hearing. Chromium's
     // "Default - " prefix is stripped, so the strip and the picker agree.
@@ -188,7 +188,7 @@ describe('MicTestStrip', () => {
     fireEvent.click(screen.getByRole('button', { name: /test microphone/i }))
     await waitLive()
     rerender(<MicTestStrip deviceId="webcam" />)
-    await waitFor(() => expect(gum).toHaveBeenLastCalledWith({ audio: { deviceId: { exact: 'webcam' } } }))
+    await waitFor(() => expect(gum).toHaveBeenLastCalledWith({ audio: { deviceId: { exact: 'webcam' }, echoCancellation: true } }))
     await screen.findByText(/listening on webcam mic/i)
     expect(streams[0].tracks[0].readyState).toBe('ended')
     expect(liveTracks()).toBe(1)

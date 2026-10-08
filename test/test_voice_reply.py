@@ -435,11 +435,7 @@ class TestProviderConstants:
         assert PROVIDER_POLLY == "polly"
         assert PROVIDER_PIPER == "piper"
         assert PROVIDER_SYSTEM == "system"
-        # The host's built-in engine is the default because it is the only
-        # provider that needs nothing installed, so auto-speak works on a fresh
-        # machine. The paired assertion is the load-bearing one: whatever the
-        # default becomes, it must never be the paid cloud provider.
-        assert DEFAULT_PROVIDER == PROVIDER_SYSTEM
+        assert DEFAULT_PROVIDER == PROVIDER_PIPER
         assert DEFAULT_PROVIDER != PROVIDER_POLLY
         assert PROVIDER_POLLY in VALID_PROVIDERS
         assert PROVIDER_PIPER in VALID_PROVIDERS
