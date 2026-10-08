@@ -2,15 +2,18 @@ import { useCallback, useState } from 'react'
 
 import { api } from '../../../api/client'
 import { useAgents } from '../../../hooks/useAgents'
-import { useAvailableModels } from '../../../hooks/useAvailableModels'
+import { useAvailableModelsQuery } from '../../../hooks/useAvailableModels'
 import { useFilteredDropdown } from '../../../hooks/useFilteredDropdown'
 import type { AppDispatch } from '../../../store'
 import { triggerRefresh } from '../../../store/dashboardSlice'
+import type { ChatSlot } from '../../../types'
 
 interface SessionRostersOptions {
   activeSlot: string | null
   activeSlotProject: string | undefined
   refreshTrigger: number
+  slots: ChatSlot[]
+  pendingAgent: string
   dispatch: AppDispatch
 }
 
@@ -19,7 +22,7 @@ interface SessionRostersOptions {
  * session: this machine's catalog. Also the agent picker's filter state and its
  * "set as default" write.
  */
-export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, dispatch }: SessionRostersOptions) {
+export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, slots, pendingAgent, dispatch }: SessionRostersOptions) {
   const { agents: installedAgents, displayAgents, choices: catalogChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
   // What the chat sidebar tints its rows from: the last LOADED roster, so a
   // session switch (which empties `installedAgents` until the new slot's fetch
@@ -46,11 +49,15 @@ export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigge
   }, [dispatch])
   const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(effectiveAgents)
   const filteredAgents = filteredAgentsByName
-  const effectiveModels = useAvailableModels()
+  const modelPickerSlot = slots.find(slot => slot.key === activeSlot)
+  const modelPickerAgentName = modelPickerSlot?.runtime_agent || modelPickerSlot?.agent || pendingAgent || defaultAgent
+  const modelPickerAgent = installedAgents.find(agent => agent.name === modelPickerAgentName)
+  const localModelCatalog = useAvailableModelsQuery({ agent: modelPickerAgent })
+  const effectiveModels = localModelCatalog.data
   return {
     installedAgents, sidebarAgents, defaultAgent, effectiveAgents,
     defaultAgentFailed, toggleDefaultAgent,
     agentDropdown, setAgentDropdown, agentFilter, setAgentFilter, agentDropdownRef, agentInputRef, filteredAgents,
-    effectiveModels,
+    effectiveModels, localModelCatalog,
   }
 }

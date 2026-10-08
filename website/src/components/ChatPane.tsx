@@ -50,10 +50,10 @@ import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
-import { useAvailableModels } from '../hooks/useAvailableModels'
+import { useAvailableModelsQuery } from '../hooks/useAvailableModels'
 import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
 import { effortToCarry, filterInteractiveModels, legacyCodexEffort, modelWithoutEffort, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
-import { modelSupportsEffort, selectionCapabilitiesFailed } from '../lib/effort'
+import { effortSupportedForCrew, selectionCapabilitiesFailed } from '../lib/effort'
 import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
@@ -642,9 +642,11 @@ export default function ChatPane({
   // The pop-up lists the full catalog (a same-name member and template are
   // two rows); every other reader of the roster keeps the name-folded list.
   const agentDD = useFilteredDropdown(agentChoices)
-  const effectiveModels = useAvailableModels()
+  const modelPickerAgent = installedAgents.find(agent => agent.name === (paneSlot?.runtime_agent || paneAgentName))
+  const localModelCatalog = useAvailableModelsQuery({ agent: modelPickerAgent })
+  const effectiveModels = localModelCatalog.data
   const selectionCapabilitiesQ = useQuery({
-    queryKey: ['slot-selection-capabilities', slotKey],
+    queryKey: ['slot-selection-capabilities', slotKey, paneSlot?.runtime_agent || ''],
     queryFn: () => api.chatSlotSelectionCapabilities(slotKey),
     enabled: !!paneSlot && typeof api.chatSlotSelectionCapabilities === 'function',
     refetchInterval: query => query.state.data?.known || query.state.dataUpdateCount + query.state.errorUpdateCount >= 5 ? 30_000 : 2_000,
@@ -710,9 +712,9 @@ export default function ChatPane({
   const effortSupported = provider.capabilities.reasoningEffort && !selectionCapabilitiesFailed(selectionCapabilitiesQ) && (
     selectionCapabilities
       ? selectionCapabilities.effort_supported === true
-      : modelSupportsEffort(shownModel === 'auto' ? '' : shownModel)
+      : effortSupportedForCrew(localModelCatalog.effortLevels, shownModel === 'auto' ? '' : shownModel)
   )
-  const effortLevelsOverride = selectionCapabilities?.effort_levels
+  const effortLevelsOverride = selectionCapabilities?.effort_levels ?? localModelCatalog.effortLevels
   const readKirocrewConfig = useKirocrewConfigReader()
   const { data: defaultEffort = '' } = useQuery({
     queryKey: ['default-effort', provider.id],

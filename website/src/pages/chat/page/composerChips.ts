@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import { useMutation, useQuery, type QueryClient } from '@tanstack/react-query'
 
 import { api } from '../../../api/client'
@@ -6,7 +7,7 @@ import { filterInteractiveModels, legacyCodexEffort, modelWithoutEffort } from '
 import { useKirocrewConfigReader } from '../../../hooks/useKirocrewConfigReader'
 import { useSettingsDefaultModel } from '../../../hooks/useSettingsDefaultModel'
 import { i18nT } from '../../../i18n/t'
-import { modelSupportsEffort, selectionCapabilitiesFailed } from '../../../lib/effort'
+import { effortSupportedForCrew, selectionCapabilitiesFailed } from '../../../lib/effort'
 import { displayModel, modelChipMarker } from '../../../lib/model'
 import type { useProvider } from '../../../providers'
 import { useModelsDegraded } from '../../../providers/modelListHealth'
@@ -27,6 +28,7 @@ interface ComposerChipsOptions {
   /** The roster the picker offers. */
   availableModels: ModelInfo[]
   codexPairModels: boolean
+  crewEffortLevels?: string[]
   /** The slot's ACP capability answer, once known. */
   selectionCapabilities: Awaited<ReturnType<typeof api.chatSlotSelectionCapabilities>> | undefined
   selectionCapabilitiesQ: { isError: boolean; error?: unknown }
@@ -49,6 +51,7 @@ export function useComposerChips({
   provider,
   availableModels,
   codexPairModels,
+  crewEffortLevels,
   selectionCapabilities,
   selectionCapabilitiesQ,
   dispatch,
@@ -128,9 +131,9 @@ export function useComposerChips({
   const effortSupported = provider.capabilities.reasoningEffort && !selectionCapabilitiesFailed(selectionCapabilitiesQ) && (
     selectionCapabilities
       ? selectionCapabilities.effort_supported === true
-      : modelSupportsEffort(shownModel === 'auto' ? '' : shownModel)
+      : effortSupportedForCrew(crewEffortLevels, shownModel === 'auto' ? '' : shownModel)
   )
-  const effortLevelsOverride = selectionCapabilities?.effort_levels
+  const effortLevelsOverride = selectionCapabilities?.effort_levels ?? crewEffortLevels
   // The same answer WITHOUT that substitution, for the pin-to-agent row: that
   // row asks about the PIN, and it must stay disabled for a withheld one even
   // now that the chip names the model the session inherited instead.
@@ -199,10 +202,35 @@ export function useComposerChips({
   const projectBranch = projectGitError
     ? ''
     : projectGit?.branch || (projectGit?.detached ? projectGit.head || '' : '')
+  const { data: projectGitStatus, isError: projectGitStatusError } = useQuery({
+    queryKey: ['git-status', _slotProject],
+    queryFn: () => api.projectGitStatus(_slotProject),
+    enabled: !!_slotProject && !projectGitError && !!projectGit?.repo,
+    staleTime: 15_000,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
+    retry: false,
+  })
+  const gitBadge = !projectGitStatusError && projectGitStatus?.repo
+    ? {
+        dirty: projectGitStatus.files.length,
+        dirtyTruncated: projectGitStatus.truncated === true,
+        ahead: projectGitStatus.ahead ?? 0,
+        behind: projectGitStatus.behind ?? 0,
+      }
+    : undefined
+  const slotRunning = !!currentSlot?.running
+  const prevGitRunningRef = useRef(false)
+  useEffect(() => {
+    if (prevGitRunningRef.current && !slotRunning && _slotProject) {
+      queryClient.invalidateQueries({ queryKey: ['git-status', _slotProject] })
+    }
+    prevGitRunningRef.current = slotRunning
+  }, [slotRunning, _slotProject, queryClient])
   return {
     shownModel, _pinShownModel, chipDefault, modelMarker, effortSupported, effortLevelsOverride,
     _modelPinAgent, _modelPinActive, _modelPinPinned, pinModelToAgentMut,
     defaultEffort, effectiveEffort,
-    _slotProject, projectGit, projectGitError, projectBranch,
+    _slotProject, projectGit, projectGitError, projectBranch, gitBadge,
   }
 }

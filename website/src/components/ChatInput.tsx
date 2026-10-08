@@ -52,7 +52,7 @@ import { useComposerPickers } from './chat-input/pickers'
 import { ComposerPickerMenus } from './chat-input/PickerMenus'
 import { useDictationControls, useHoldToTalk } from './chat-input/voice'
 import { HandsFreeToggle, HoldToTalkBar, MicButton, VoiceCaptureStatus } from './chat-input/VoiceControls'
-import { AgentChip, ContextUsageControl, ModelChip, SessionControlChips, useContextPopover, useShelfMeasure } from './chat-input/ContextShelf'
+import { AgentChip, ContextUsageControl, GitTreeBadge, ModelChip, SessionControlChips, useContextPopover, useGitBadgeTitle, useShelfMeasure } from './chat-input/ContextShelf'
 import { useAutoCompactThreshold } from './chat-input/autoCompact'
 import { AttachMenu, usePlusMenu } from './chat-input/attach'
 import { BusySendControls, CompactingIndicator, useComposerSend } from './chat-input/busySend'
@@ -181,6 +181,10 @@ function ChatInput({
   project,
   projectBranch,
   projectDetached,
+  projectGitDirty,
+  projectGitDirtyTruncated,
+  projectGitAhead,
+  projectGitBehind,
   memoryMode,
   sentMessages,
   onEditLastRequest,
@@ -384,6 +388,7 @@ function ChatInput({
     ctxWrapRef,
     ctxPanelRef,
   } = useContextPopover()
+  const gitBadgeTitle = useGitBadgeTitle(projectGitDirty, projectGitDirtyTruncated, projectGitAhead, projectGitBehind)
   const plus = usePlusMenu({ pickers, value, onChange, composerControl })
   const { setPlusOpen, sketchOpen, setSketchOpen } = plus
   // Client-side `accept` is a UX hint only (input-validation guidance: server enforces type via
@@ -1407,6 +1412,9 @@ function ChatInput({
           </div>
           )}
           </div>
+          {!!projectBranch && !!gitBadgeTitle && (
+            <GitTreeBadge title={gitBadgeTitle} dirty={projectGitDirty} truncated={projectGitDirtyTruncated} ahead={projectGitAhead} behind={projectGitBehind} />
+          )}
           <div className="flex items-center shrink-0">
           {contextPct != null && (
             <ContextUsageControl contextPct={contextPct} contextUsedTokens={contextUsedTokens} contextWindowTokens={contextWindowTokens} showContextPct={showContextPct} showContextTokens={showContextTokens} shelfCompact={shelfCompact} modelName={modelName} ctxPopoverOpen={ctxPopoverOpen} setCtxPopoverOpen={setCtxPopoverOpen} ctxPopoverRect={ctxPopoverRect} setCtxPopoverRect={setCtxPopoverRect} ctxWrapRef={ctxWrapRef} ctxPanelRef={ctxPanelRef} autoCompactThreshold={autoCompactThreshold} />

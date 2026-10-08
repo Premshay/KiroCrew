@@ -27,6 +27,14 @@ applies. This format check does not establish entitlement or alter the separate
 
 ## Resolve, don't guess
 
+Both chat composers read the selected execution agent's account-scoped model
+catalog and advertised effort levels. Changing `runtime_agent` changes the
+selection-capability query key so the previous backend's answer cannot remain
+attached to the new selection. A live session's capabilities take precedence
+over catalog capabilities.
+The main composer warns about pending images when that catalog reports no image
+support, before the user sends the attachment.
+
 For a model chosen on the caller's behalf — background one-liners, tips, inherited or
 cold-start applies — route through
 `acp.client.resolve_usable_model(preferred, advertised)`. It answers with a served id,

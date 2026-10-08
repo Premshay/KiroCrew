@@ -882,10 +882,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     installedAgents, sidebarAgents, defaultAgent, effectiveAgents,
     defaultAgentFailed, toggleDefaultAgent,
     agentDropdown, setAgentDropdown, agentFilter, setAgentFilter, agentDropdownRef, agentInputRef, filteredAgents,
-    effectiveModels,
-  } = useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, dispatch })
+    effectiveModels, localModelCatalog,
+  } = useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, slots, pendingAgent, dispatch })
   const selectionCapabilitiesQ = useQuery({
-    queryKey: ['slot-selection-capabilities', activeSlot],
+    queryKey: ['slot-selection-capabilities', activeSlot, slots.find(slot => slot.key === activeSlot)?.runtime_agent || ''],
     queryFn: () => api.chatSlotSelectionCapabilities(activeSlot!),
     enabled: !!activeSlot && typeof api.chatSlotSelectionCapabilities === 'function',
     // A new ACP session may not exist when its slot first appears. Recheck
@@ -3049,7 +3049,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     shownModel, _pinShownModel, chipDefault, modelMarker, effortSupported, effortLevelsOverride,
     _modelPinAgent, _modelPinActive, _modelPinPinned, pinModelToAgentMut,
     defaultEffort, effectiveEffort,
-    _slotProject, projectGit, projectGitError, projectBranch,
+    _slotProject, projectGit, projectGitError, projectBranch, gitBadge,
   } = useComposerChips({
     currentSlot,
     defaultAgent,
@@ -3058,6 +3058,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     provider,
     availableModels,
     codexPairModels,
+    crewEffortLevels: localModelCatalog.effortLevels,
     selectionCapabilities,
     selectionCapabilitiesQ,
     dispatch,
@@ -5372,7 +5373,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     folderSuggestionDecline,
     activeTip,
     dismissTip,
-    showImageHint: false,
+    showImageHint: localModelCatalog.supportsImages === false && pendingFiles.some(path => IMG_EXT.test(path)),
   })
   const composerSessionControls = useSessionControlChips({ sessionControls, openSessionControl, activeSlot, sessionControlStatuses })
 
@@ -6429,6 +6430,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               clampDropOffset={clampOutOfTokens}
               project={currentSlot?.project || ''}
               projectBranch={projectBranch}
+              projectGitDirty={gitBadge?.dirty ?? 0}
+              projectGitDirtyTruncated={gitBadge?.dirtyTruncated ?? false}
+              projectGitAhead={gitBadge?.ahead ?? 0}
+              projectGitBehind={gitBadge?.behind ?? 0}
               projectDetached={!projectGitError && !!projectGit?.detached}
               isMac={isMac}
               onDrop={dropTargetProps.onDrop}

@@ -11,6 +11,10 @@ conventions around them (a11y, data fetching, typography) live in
 
 ## Page skeleton
 
+The chat composer shelf retains its Git working-tree badge beside the project
+and branch controls. Its counts share the Git panel's status query; failed reads
+hide the badge, and completion of a turn invalidates the cached counts.
+
 ### Dashboard in chat and Crew
 
 The task dashboard, the **All Dashboards** page (`/session-dashboards`) and the
