@@ -1,4 +1,5 @@
 import type { SessionRef } from '../../utils/sessionRefs'
+import type { MessageQuote } from '../../chat-core/composer/messageQuote'
 import type { ResizeInfo } from '../../utils/resizeImage'
 import type { SendMode } from '../../pages/chat/ChatSettings'
 import type { AutomationRecord } from '../../monitoring/automation'
@@ -44,8 +45,12 @@ export interface ChatInputProps {
    * message (`steer: "auto"`, `decisions/points/message_steer.py`). It rides this
    * callback rather than a second one because it is the same send down the same
    * route: only the flag differs, and a host that ignores the argument keeps
-   * today's behaviour, which is the steer this callback has always meant. */
-  onSteer?: (opts?: { auto?: boolean }) => void
+   * today's behaviour, which is the steer this callback has always meant.
+   *
+   * `text` is a follow-up chip's own text: steer exactly that, leaving the
+   * composer draft and its staging untouched (the rule an option send follows).
+   * A host that renders follow-up chips while busy must honour it. */
+  onSteer?: (opts?: { auto?: boolean; text?: string }) => void
   /** Whether the host may offer `Auto (Jev)` in the split button's mode picker:
    * the gateway reports the Decisions seam as permitted by governance AND
    * consented to. Defaults to false, so a surface that never asks cannot offer a
@@ -72,6 +77,11 @@ export interface ChatInputProps {
   onUploadFiles?: (files: File[]) => void
   /** Whether file actions are in progress */
   uploading?: boolean
+  /** An attachment for THIS composer is still on its way (upload or
+   *  screenshot). Holds every composer send (Send, Enter, steer, queue): a
+   *  message fired now would leave without the file, which would then land in
+   *  the emptied composer as a stray attachment. */
+  holdSend?: boolean
   /** Abort the upload in flight; turns the upload spinner into a cancel control */
   onCancelUpload?: () => void
   /** Pending file paths (images + non-images) for preview strip */
@@ -82,6 +92,14 @@ export interface ChatInputProps {
   resizedInfo?: Record<string, ResizeInfo>
   /** Remove a pending file by path */
   onRemoveFile?: (path: string) => void
+  /**
+   * Polite screen-reader announcement for a file chip the composer's own
+   * reconciliation un/restaged (a hand-edited or pasted `@mention`), which
+   * moves no focus. `text` is the localized message, `nonce` advances on every
+   * announcement so a repeated message still re-fires the `aria-live` region
+   * (which announces only on a text change). #14597.
+   */
+  attachmentAnnouncement?: { text: string; nonce: number }
   /** Remove a pending folder reference by its relative path (strips its composer token) */
   onRemoveDir?: (path: string) => void
   /** Session references staged by dragging a session onto the chat pane.
@@ -90,6 +108,13 @@ export interface ChatInputProps {
   pendingSessions?: SessionRef[]
   /** Unstage a session reference by its session key */
   onRemoveSessionRef?: (key: string) => void
+  /** A whole message staged as the quote of the next send (`messageQuote.ts`).
+   *  Drawn INSIDE the text area, above the caret, as a card with a remove
+   *  control -- part of what is being written, not a strip of chrome. The host
+   *  owns the state and folds it into the send; ChatInput only shows and
+   *  unstages it. A staged quote counts as a draft for the send button. */
+  pendingQuote?: MessageQuote | null
+  onRemoveQuote?: () => void
   /** Show macOS-only buttons (screenshot) */
   isMac?: boolean
   /** Drag-and-drop handler for the entire input bar */
@@ -307,10 +332,14 @@ export interface ChatInputProps {
   /** Select a follow-up option — handler toggles text in input (see ChatPage wiring).
    *  Third arg is `followUpSourceKey` as it was when the chip was CLICKED (the
    *  chip debounces, and the row can advance inside that window); `undefined`
-   *  when no `followUpSourceKey` is supplied. */
-  onFollowUpSelect?: (option: string, event: React.MouseEvent, sourceKeyAtClick?: string | null) => void
-  /** Immediate send (double-click / Send-now). Second arg is the click-time
-   *  row identity FollowUpBar already snapshots for onSelect. */
+   *  when no `followUpSourceKey` is supplied. Fourth arg sends an option the way
+   *  `onFollowUpSend` does after the composer's busy decision (steer or queue,
+   *  per the slot's busy-send mode): the host's quick-send uses it. */
+  onFollowUpSelect?: (option: string, event: React.MouseEvent, sourceKeyAtClick: string | null | undefined, sendNow: (text: string) => void) => void
+  /** A chip's immediate send (double-click / Send-now / quick send) when the
+   *  composer's busy decision does not steer it; a steered chip goes to
+   *  `onSteer` with its text. Second arg is the click-time row identity
+   *  FollowUpBar already snapshots for onSelect. */
   onFollowUpSend?: (text?: string, sourceKeyAtClick?: string | null) => void
   /** Quick Send enabled — clicking sends immediately */
   quickSend?: boolean
@@ -319,6 +348,9 @@ export interface ChatInputProps {
   /** Identity of the transcript row the follow-up options were derived from.
    *  Forwarded to FollowUpBar so a chip click carries the row it acted on. */
   followUpSourceKey?: string | null
+  /** `false` for a single-select `[OPTION:]` row (a pick replaces the previous
+   *  one). Forwarded to FollowUpBar for the chip tooltip. Defaults to `true`. */
+  followUpMulti?: boolean
   /** Labels whose follow-up dispatch is outstanding. Only a host that actually
    *  dispatches a chip passes this. */
   followUpPendingOptions?: ReadonlySet<string> | null
@@ -336,7 +368,8 @@ export interface ChatInputProps {
    *  Cmd/Ctrl+Shift+V still forces one raw paste when this is off. */
   showFullPastes?: boolean
   /** Opt into the first Lexical composer migration slice. Defaults off so the
-   *  established textarea path remains the production fallback until parity is complete. */
+   *  established textarea path remains the production fallback until parity is complete.
+   *  The Style Markdown While Typing setting also turns it on for that user. */
   lexicalComposer?: boolean
   /** Optional knowledge chip rendered above the input */
   knowledgeChip?: React.ReactNode

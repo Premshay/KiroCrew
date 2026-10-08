@@ -5,7 +5,7 @@ import type { ComposerHandle } from '../../../chat-core/composer/Composer'
 import { deriveFollowUpOptions } from '../../../app-sdk/protocol'
 import type { ComposerDraftStore } from '../../../chat-core/composer/draftStore'
 import type { pendingQuestionFor } from '../../../store/chatSlice'
-import { appendFollowUpOption, removeFollowUpOption, type OwnedSuffix } from '../../../lib/followUpToggle'
+import { appendFollowUpOption, removeFollowUpOption, selectSingleFollowUpOption, type OwnedSuffix } from '../../../lib/followUpToggle'
 import type { ChatMessage } from '../../../types'
 
 interface FollowUpChipsOptions {
@@ -42,7 +42,7 @@ export function useFollowUpChips({
   // Swapping chats (activeSlot change) → messages change → memo recomputes fresh.
   // A pending question card suppresses them: both would offer the same choices in
   // the same band, and only the card can answer the blocked tool call.
-  const { followUpOptions, followUpSourceKey } = useMemo(
+  const { followUpOptions, followUpSourceKey, followUpMulti } = useMemo(
     () => deriveFollowUpOptions(messages, isStreaming, !!pendingQuestion),
     [messages, isStreaming, pendingQuestion],
   )
@@ -82,7 +82,11 @@ export function useFollowUpChips({
     if (!prefillEditedRef.current) setPrefillEdited(true)
   }, [clearFollowUpOwnership, setInput, setPrefillEdited, composerRef])
   const followUpOptionsKey = followUpOptions.join('\x00')
-  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, activeSlot])
+  // A single-select offer is keyed on its source row too: a newer reply can repeat
+  // the same labels, and a single-select pick must not replace text the user picked
+  // from the older offer. Multi-select rows keep the label-only reset.
+  const singleSourceKey = followUpMulti ? null : followUpSourceKey
+  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, singleSourceKey, followUpMulti, activeSlot])
   const toggleFollowUpOption = (o: string) => {
     // Regular options: toggle. Click unpicked → append + mark; click
     // picked → try to remove text + unmark (if the user edited the
@@ -101,9 +105,12 @@ export function useFollowUpChips({
       setInput(r.value)
       setFollowUpPicked(next)
     } else {
-      const next = new Set(followUpPickedRef.current); next.add(o)
+      // `[OPTION:]` is single-select: the new pick replaces the previous one.
+      const next = followUpMulti ? new Set(followUpPickedRef.current) : new Set<string>(); next.add(o)
       followUpPickedRef.current = next
-      const r = appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+      const r = followUpMulti
+        ? appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+        : selectSingleFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
       followUpInsertedRef.current = r.owned
       inputRef.current = r.value
       setInput(r.value)
@@ -111,7 +118,7 @@ export function useFollowUpChips({
     }
   }
   return {
-    followUpOptions, followUpSourceKey,
+    followUpOptions, followUpSourceKey, followUpMulti,
     followUpPicked, followUpPickedRef, toggleFollowUpOption,
     composerRootChange, composerUserEdit,
   }

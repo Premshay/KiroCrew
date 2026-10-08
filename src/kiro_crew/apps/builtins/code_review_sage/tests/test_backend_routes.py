@@ -5,6 +5,7 @@ reflect current/last review status across navigation and gateway restarts. These
 tests lock in: atomic save/load round-trip, 0600 perms, and the restart-recovery
 rule that an orphaned ``running`` run is re-marked ``interrupted`` (its in-process
 driver thread cannot survive a restart)."""
+
 import asyncio
 import importlib.util
 import json
@@ -121,8 +122,11 @@ class TestRunsPersistence(unittest.TestCase):
         self.mod._RUNS = [{"run_id": "d4", "status": "done"}]
         asyncio.run(self.mod._save_runs())
 
-        self.assertEqual(outsider.read_text(encoding="utf-8"), "do not touch",
-                         "the planted symlink was followed and its target rewritten")
+        self.assertEqual(
+            outsider.read_text(encoding="utf-8"),
+            "do not touch",
+            "the planted symlink was followed and its target rewritten",
+        )
         self.assertIn("d4", runs.read_text(encoding="utf-8"))
 
     def test_the_predictable_tmp_name_is_never_used(self):
@@ -141,8 +145,11 @@ class TestRunsPersistence(unittest.TestCase):
         self.mod._RUNS = [{"run_id": "e5", "status": "done"}]
         asyncio.run(self.mod._save_runs())
 
-        self.assertEqual(squatter.read_text(encoding="utf-8"), "planted",
-                         "the write still targets the predictable <name>.tmp path")
+        self.assertEqual(
+            squatter.read_text(encoding="utf-8"),
+            "planted",
+            "the write still targets the predictable <name>.tmp path",
+        )
         self.assertIn("e5", runs.read_text(encoding="utf-8"))
 
     def test_the_lockdown_never_runs_on_the_event_loop(self):
@@ -171,18 +178,20 @@ class TestRunsPersistence(unittest.TestCase):
         asyncio.run(_drive())
         self.assertIn("write", seen, "_write_runs was never reached")
         self.assertNotEqual(
-            seen["write"], seen["loop"],
+            seen["write"],
+            seen["loop"],
             "_write_runs ran on the event-loop thread; the blocking file IO inside "
-            "it would stall the gateway")
+            "it would stall the gateway",
+        )
 
 
 class TestRecordReviewedDelivery(unittest.TestCase):
     """The reviewed-index write path:
-      * a PR is indexed as reviewed ONLY when the poster
-        actually delivered (posted_comments >= posting_expected), not merely when
-        the poster turn completed (post_ok). A failed gh post must not strand it.
-      * The entry is keyed by the collision-free reviewed key (github.com/o/r#n),
-        NOT the lossy change-id."""
+    * a PR is indexed as reviewed ONLY when the poster
+      actually delivered (posted_comments >= posting_expected), not merely when
+      the poster turn completed (post_ok). A failed gh post must not strand it.
+    * The entry is keyed by the collision-free reviewed key (github.com/o/r#n),
+      NOT the lossy change-id."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -204,17 +213,26 @@ class TestRecordReviewedDelivery(unittest.TestCase):
             "run_id": "R1",
             "changes": [url],
             "head_shas": {self.mod.review_driver.reviewed_key_for(url): "sha1"},
-            "summary": {"per_change": [{
-                "change_id": cid, "deep_reviewed": True, "post_ok": True,
-                "posted_comments": posted, "posting_expected": expected,
-            }]},
+            "summary": {
+                "per_change": [
+                    {
+                        "change_id": cid,
+                        "deep_reviewed": True,
+                        "post_ok": True,
+                        "posted_comments": posted,
+                        "posting_expected": expected,
+                    }
+                ]
+            },
         }
 
     def test_delivered_is_indexed_under_collision_free_key(self):
         captured = {}
         with unittest.mock.patch.object(
-                self.mod.results, "mark_reviewed",
-                side_effect=lambda entries, *a, **k: captured.update(entries)):
+            self.mod.results,
+            "mark_reviewed",
+            side_effect=lambda entries, *a, **k: captured.update(entries),
+        ):
             self.mod._record_reviewed(self._run(posted=2, expected=2))
         self.assertEqual(list(captured), ["github.com/acme/repo#1"])
         self.assertEqual(captured["github.com/acme/repo#1"]["head_sha"], "sha1")
@@ -222,8 +240,10 @@ class TestRecordReviewedDelivery(unittest.TestCase):
     def test_failed_post_is_not_indexed(self):
         called = []
         with unittest.mock.patch.object(
-                self.mod.results, "mark_reviewed",
-                side_effect=lambda entries, *a, **k: called.append(entries)):
+            self.mod.results,
+            "mark_reviewed",
+            side_effect=lambda entries, *a, **k: called.append(entries),
+        ):
             # post_ok True (turn ended) but nothing actually posted -> not reviewed.
             self.mod._record_reviewed(self._run(posted=0, expected=2))
         self.assertEqual(called, [])
@@ -255,7 +275,8 @@ class TestUnderLockRededup(unittest.TestCase):
         rkey = self.mod.review_driver.reviewed_key_for(url)
         run = {
             "run_id": run_id,
-            "changes": [url], "force": force,
+            "changes": [url],
+            "force": force,
             "head_shas": {rkey: "sha1"},
             "change_ids": [self.mod.review_driver.change_id_for(url)],
         }
@@ -305,11 +326,13 @@ class TestUnderLockRededup(unittest.TestCase):
         a = "https://github.com/acme/service-api/pull/1"
         b = "https://github.com/acme/service_api/pull/1"
         # Distinct reviewed keys, one staging stem: exactly the gap being closed.
-        self.assertNotEqual(self.mod.review_driver.reviewed_key_for(a),
-                            self.mod.review_driver.reviewed_key_for(b))
+        self.assertNotEqual(
+            self.mod.review_driver.reviewed_key_for(a), self.mod.review_driver.reviewed_key_for(b)
+        )
         self.assertEqual(
             self.mod.results.safe_change_id(self.mod.review_driver.change_id_for(a)),
-            self.mod.results.safe_change_id(self.mod.review_driver.change_id_for(b)))
+            self.mod.results.safe_change_id(self.mod.review_driver.change_id_for(b)),
+        )
 
         self.assertEqual(self.mod._claim_changes_under_lock(first, [a]), [a])
         self.assertEqual(self.mod._claim_changes_under_lock(second, [b]), [])
@@ -365,8 +388,7 @@ class TestUnderLockRededup(unittest.TestCase):
         kept = self.mod._claim_changes_under_lock(run, [url, url, url])
 
         self.assertEqual(kept, [url])
-        self.assertEqual(run["change_ids"],
-                         [self.mod.review_driver.change_id_for(url)])
+        self.assertEqual(run["change_ids"], [self.mod.review_driver.change_id_for(url)])
         # A caller's duplicate is not contention with another run, so it must not
         # be reported as one.
         self.assertNotIn("skipped_inflight", run)
@@ -380,8 +402,7 @@ class TestUnderLockRededup(unittest.TestCase):
         a = "https://github.com/o/r/pull/5"
         b = "https://github.com/o/r/pull/5/"
         run = {"run_id": "one", "head_shas": {}, "force": True}
-        if (self.mod.review_driver.reviewed_key_for(a)
-                != self.mod.review_driver.reviewed_key_for(b)):
+        if self.mod.review_driver.reviewed_key_for(a) != self.mod.review_driver.reviewed_key_for(b):
             self.skipTest("reviewed_key_for does not normalize a trailing slash")
 
         kept = self.mod._claim_changes_under_lock(run, [a, b])
@@ -436,8 +457,7 @@ class TestProgressCallback(unittest.TestCase):
         first = run["progress"]
         cb("CR-1", "done", {"posted": 2, "expected": 3})
         # Phase advanced, extras merged, and the dict object was REPLACED (CoW).
-        self.assertEqual(run["progress"]["CR-1"],
-                         {"phase": "done", "posted": 2, "expected": 3})
+        self.assertEqual(run["progress"]["CR-1"], {"phase": "done", "posted": 2, "expected": 3})
         self.assertIsNot(run["progress"], first)
 
     def test_independent_changes_coexist(self):
@@ -470,7 +490,7 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
         data = json.loads(resp.body)
         self.assertEqual(data["runs"][0]["run_id"], "r1")
         self.assertIn("pool", data)
-        self.assertGreaterEqual(data["pool"]["max"], 1)        # live occupancy present
+        self.assertGreaterEqual(data["pool"]["max"], 1)  # live occupancy present
         self.assertIn("starting_max", data["pool"])
 
     async def test_runs_includes_reviewer_model_and_effort(self):
@@ -480,7 +500,7 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reviewer", data)
         rv = data["reviewer"]
         self.assertTrue(rv and rv.get("agent"))
-        self.assertTrue(rv.get("model"))                       # resolved (tracks default)
+        self.assertTrue(rv.get("model"))  # resolved (tracks default)
         # effort is surfaced for the UI; with no user override it is the
         # documented default "" (inherit the model/provider default), otherwise
         # one of the concrete levels. Assert the contract, not a fixed level.
@@ -491,19 +511,22 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
         class _Req(OwnerRequest):
             async def json(self):
                 return {}
+
         resp = await self.mod._handle_review(_Req())
         self.assertEqual(resp.status, 400)
 
     async def test_review_starts_run_and_inits_progress(self):
         async def _noop(run, changes):
             return None
-        self.mod._run_review_bg = _noop      # don't run the real driver
+
+        self.mod._run_review_bg = _noop  # don't run the real driver
 
         _url = "https://github.com/kirodotdev/KiroCrew/pull/20"
 
         class _Req(OwnerRequest):
             async def json(self):
                 return {"links": _url}
+
         resp = await self.mod._handle_review(_Req())
         data = json.loads(resp.body)
         self.assertEqual(data["status"], "running")
@@ -517,7 +540,7 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
         # forever (regression guard for the raw-link-vs-change-id mismatch).
         self.assertEqual(run["change_ids"], [_rd.change_id_for(_url)])
         self.assertEqual(run["change_ids"], ["GH-kirodotdev-KiroCrew-20"])
-        await asyncio.sleep(0)               # let the no-op bg task drain
+        await asyncio.sleep(0)  # let the no-op bg task drain
 
 
 class TestNoBareLibNamespacePollution(unittest.TestCase):
@@ -533,16 +556,20 @@ class TestNoBareLibNamespacePollution(unittest.TestCase):
 
     def test_loading_backend_does_not_touch_bare_lib(self):
         foreign = types.ModuleType("lib")
-        foreign.MARKER = "FOREIGN"          # type: ignore[attr-defined]
+        foreign.MARKER = "FOREIGN"  # type: ignore[attr-defined]
         saved = sys.modules.get("lib")
         sys.modules["lib"] = foreign
         try:
-            _load_routes_module()           # executes `from sage_lib import ...`
-            self.assertIs(sys.modules.get("lib"), foreign,
-                          "backend import shadowed a foreign top-level `lib`")
+            _load_routes_module()  # executes `from sage_lib import ...`
+            self.assertIs(
+                sys.modules.get("lib"), foreign, "backend import shadowed a foreign top-level `lib`"
+            )
             self.assertEqual(sys.modules["lib"].MARKER, "FOREIGN")
-            self.assertIn("sage_lib", sys.modules,
-                          "backend must import its code under the namespaced `sage_lib`")
+            self.assertIn(
+                "sage_lib",
+                sys.modules,
+                "backend must import its code under the namespaced `sage_lib`",
+            )
         finally:
             if saved is not None:
                 sys.modules["lib"] = saved
@@ -575,6 +602,19 @@ class TestSettingsModelValidation(unittest.TestCase):
             review = self.mod._write_review_section({"model": known})
         self.assertEqual(review["model"], known)
 
+    def test_claude_runtime_id_is_offered_as_a_savable_canonical_key(self):
+        with unittest.mock.patch.object(
+            self.mod.review_pool,
+            "reviewer_info",
+            return_value={
+                "engine": "claude",
+                "models": ["global.anthropic.claude-opus-4-8[1m]"],
+            },
+        ):
+            self.assertEqual(self.mod._known_models(), ["opus-4.8-1m"])
+            review = self.mod._write_review_section({"model": "opus-4.8-1m"})
+        self.assertEqual(review["model"], "opus-4.8-1m")
+
     def test_unknown_model_rejected(self):
         with self.assertRaises(ValueError):
             self.mod._write_review_section({"model": "../../etc/passwd"})
@@ -582,16 +622,19 @@ class TestSettingsModelValidation(unittest.TestCase):
             self.mod._write_review_section({"model": "evil-model-9000"})
 
     def test_empty_model_clears_override(self):
-        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["runtime-only-model"]):
+        with unittest.mock.patch.object(
+            self.mod, "_known_models", return_value=["runtime-only-model"]
+        ):
             self.mod._write_review_section({"model": "runtime-only-model"})
             review = self.mod._write_review_section({"model": None})
         self.assertIsNone(review["model"])
 
     def test_agent_change_clears_model_override(self):
-        with unittest.mock.patch.object(
-            self.mod, "_known_models", return_value=["gpt-5.6-sol"]
-        ), unittest.mock.patch.object(
-            self.mod.review_pool, "is_known_review_agent", return_value=True
+        with (
+            unittest.mock.patch.object(self.mod, "_known_models", return_value=["gpt-5.6-sol"]),
+            unittest.mock.patch.object(
+                self.mod.review_pool, "is_known_review_agent", return_value=True
+            ),
         ):
             self.mod._write_review_section({"agent": "codex-seat", "model": "gpt-5.6-sol"})
             unchanged = self.mod._write_review_section({"agent": "codex-seat"})
@@ -633,8 +676,12 @@ class TestSettingsModelValidation(unittest.TestCase):
             self.assertTrue(release.wait(timeout=2))
             return real_valid(model)
 
-        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["runtime-only-model"]), \
-                unittest.mock.patch.object(self.mod, "_valid_model", side_effect=delayed_valid):
+        with (
+            unittest.mock.patch.object(
+                self.mod, "_known_models", return_value=["runtime-only-model"]
+            ),
+            unittest.mock.patch.object(self.mod, "_valid_model", side_effect=delayed_valid),
+        ):
             first = threading.Thread(
                 target=self.mod._write_review_section,
                 args=({"model": "runtime-only-model"},),
@@ -700,18 +747,21 @@ class TestSettingsAgentValidation(unittest.TestCase):
 
     def test_settings_get_exposes_the_agent_and_the_roster(self):
         async def _run():
-            with unittest.mock.patch.object(
-                self.mod.review_pool, "reviewer_info", return_value=None
-            ), unittest.mock.patch.object(
-                self.mod.review_pool, "known_review_agents",
-                return_value=["crew-deepseek-pro", "code-review-sage-reviewer"],
-            ), unittest.mock.patch.object(
-                self.mod.review_pool, "is_known_review_agent", return_value=True
+            with (
+                unittest.mock.patch.object(
+                    self.mod.review_pool, "reviewer_info", return_value=None
+                ),
+                unittest.mock.patch.object(
+                    self.mod.review_pool,
+                    "known_review_agents",
+                    return_value=["crew-deepseek-pro", "code-review-sage-reviewer"],
+                ),
+                unittest.mock.patch.object(
+                    self.mod.review_pool, "is_known_review_agent", return_value=True
+                ),
             ):
                 self.mod._write_review_section({"agent": "crew-deepseek-pro"})
-                resp = await self.mod._handle_settings(
-                    type("Req", (), {"method": "GET"})()
-                )
+                resp = await self.mod._handle_settings(type("Req", (), {"method": "GET"})())
             return json.loads(resp.text)
 
         body = asyncio.run(_run())
@@ -782,16 +832,19 @@ class TestLearningsEndpoint(unittest.IsolatedAsyncioTestCase):
     def _req(self, namespace=None):
         class _Req:
             query = {"namespace": namespace} if namespace else {}
+
         return _Req()
 
     async def test_returns_patterns_and_candidate(self):
         # A consolidated pattern (what reviews load) + a pending candidate.
         self.learning.consolidate_apply(
             "### Guard null tokens <!-- scope:common --> <!-- impact:high -->\n"
-            "Reject requests whose auth token is absent before touching state.\n")
+            "Reject requests whose auth token is absent before touching state.\n"
+        )
         self.learning.stage_learning(
-            {"title": "Bound list sizes", "guidance": "Cap unbounded growth.",
-             "impact": "medium"}, source="human_comment")
+            {"title": "Bound list sizes", "guidance": "Cap unbounded growth.", "impact": "medium"},
+            source="human_comment",
+        )
 
         resp = await self.mod._handle_learnings(self._req())
         data = json.loads(resp.body)
@@ -811,7 +864,9 @@ class TestLearningsEndpoint(unittest.IsolatedAsyncioTestCase):
         pattern = self.learning._normalize_pattern(
             {"title": "Legacy rule", "scope": "common", "guidance": "Keep it explicit."}
         )
-        self.learning.common_file().write_text("# Rules\n\n" + self.learning.render_pattern(pattern))
+        self.learning.common_file().write_text(
+            "# Rules\n\n" + self.learning.render_pattern(pattern)
+        )
         record_id = self.learning.list_rule_entries()[0]["record_id"]
 
         class _Req:
@@ -853,16 +908,14 @@ class TestConsolidateRedactsMergedContent:
         secret = "ghp_" + "A" * 36
         # Real pattern markdown (a "### " heading), so the pattern-shape
         # guard admits it and redaction is what this test exercises.
-        merged = (
-            "### Never hardcode a credential\n"
-            f"The reviewed diff hardcoded one: {secret}\n"
-        )
+        merged = "### Never hardcode a credential\n" f"The reviewed diff hardcoded one: {secret}\n"
         out = learning.consolidate_apply(merged, tmp_path, None)
         assert out["ok"], out
         written = Path(out["path"]).read_text(encoding="utf-8")
         assert secret not in written, "worker-authored credential persisted verbatim"
-        assert "Never hardcode a credential" in written, \
-            "redaction must not eat the legitimate content"
+        assert (
+            "Never hardcode a credential" in written
+        ), "redaction must not eat the legitimate content"
 
 
 class TestRecordsSurviveAnIncompletePost:
@@ -875,8 +928,11 @@ class TestRecordsSurviveAnIncompletePost:
 
     def _rec(self, **over):
         base = {
-            "result_recorded": True, "cancelled": False, "post_ok": True,
-            "posted_comments": 3, "posting_expected": 3,
+            "result_recorded": True,
+            "cancelled": False,
+            "post_ok": True,
+            "posted_comments": 3,
+            "posting_expected": 3,
         }
         base.update(over)
         return base
@@ -897,10 +953,15 @@ class TestRecordsSurviveAnIncompletePost:
     def test_nothing_to_deliver_does_not_block_the_cleanup(self):
 
         # A cancelled change and one that recorded no result have nothing to post.
-        assert _all_delivered([
-            self._rec(cancelled=True, post_ok=False, posted_comments=0),
-            self._rec(result_recorded=False, post_ok=False, posted_comments=0),
-        ]) is True
+        assert (
+            _all_delivered(
+                [
+                    self._rec(cancelled=True, post_ok=False, posted_comments=0),
+                    self._rec(result_recorded=False, post_ok=False, posted_comments=0),
+                ]
+            )
+            is True
+        )
 
     def test_missing_counters_are_not_read_as_delivered(self):
 
@@ -919,7 +980,8 @@ class TestConsolidateRejectsPatternlessOutput:
 
     def _seeded(self, tmp_path):
         first = learning.consolidate_apply(
-            "### Keep the guard\nReset it on every exit path.\n", tmp_path, None)
+            "### Keep the guard\nReset it on every exit path.\n", tmp_path, None
+        )
         assert first["ok"], first
         return learning, Path(first["path"])
 
@@ -928,8 +990,8 @@ class TestConsolidateRejectsPatternlessOutput:
         before = path.read_text(encoding="utf-8")
 
         out = learning.consolidate_apply(
-            "I reviewed the candidates and found nothing worth merging.\n",
-            tmp_path, None)
+            "I reviewed the candidates and found nothing worth merging.\n", tmp_path, None
+        )
 
         assert out["ok"] is False
         assert "no recognizable patterns" in out["error"]
@@ -939,8 +1001,8 @@ class TestConsolidateRejectsPatternlessOutput:
         # The guard must not refuse legitimate merges.
         learning, path = self._seeded(tmp_path)
         out = learning.consolidate_apply(
-            "### Authorize by confirming the owner\nDo not reject known-bad only.\n",
-            tmp_path, None)
+            "### Authorize by confirming the owner\nDo not reject known-bad only.\n", tmp_path, None
+        )
         assert out["ok"], out
         assert "Authorize by confirming the owner" in path.read_text(encoding="utf-8")
 
@@ -980,14 +1042,19 @@ class TestAdoptionRefusesAPlantedLink:
         shared = results.results_dir(tmp_path, None)
         shared.mkdir(parents=True, exist_ok=True)
         (shared / f"{results.safe_change_id('CR-2')}.json").write_text(
-            json.dumps({
-                "schema": "code-review-sage-result", "version": 1,
-                "change_id": "CR-2", "platform": "github",
-                "repo_identity": "github.com/o/r",
-                "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                           "criticality": "low"},
-                "counts": {"red": 0, "yellow": 1},
-            }), encoding="utf-8")
+            json.dumps(
+                {
+                    "schema": "code-review-sage-result",
+                    "version": 1,
+                    "change_id": "CR-2",
+                    "platform": "github",
+                    "repo_identity": "github.com/o/r",
+                    "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
+                    "counts": {"red": 0, "yellow": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
 
         assert results.adopt_from_shared("CR-2", tmp_path, "run-1") is True
         got = results.read_result("CR-2", tmp_path, "run-1")
@@ -1012,9 +1079,12 @@ class TestRetentionKeepsActiveRuns(unittest.IsolatedAsyncioTestCase):
         self.mod._RUNS[:] = []
 
     async def _record_many(self, statuses):
-        with unittest.mock.patch.object(self.mod, "_save_runs", _noop_save), \
-                unittest.mock.patch.object(self.mod.store, "remove_run_dir",
-                                  lambda rid, *a, **k: self.removed.append(rid)):
+        with (
+            unittest.mock.patch.object(self.mod, "_save_runs", _noop_save),
+            unittest.mock.patch.object(
+                self.mod.store, "remove_run_dir", lambda rid, *a, **k: self.removed.append(rid)
+            ),
+        ):
             for i, st in enumerate(statuses):
                 await self.mod._record({"run_id": f"run-{i}", "status": st})
 
@@ -1023,8 +1093,7 @@ class TestRetentionKeepsActiveRuns(unittest.IsolatedAsyncioTestCase):
         # Oldest is recorded first and ends up last, i.e. past the cap.
         await self._record_many(["running"] + ["done"] * cap)
 
-        self.assertNotIn("run-0", self.removed,
-                         "a running run's subtree was deleted")
+        self.assertNotIn("run-0", self.removed, "a running run's subtree was deleted")
         ids = [r["run_id"] for r in self.mod._RUNS]
         self.assertIn("run-0", ids, "a running run was dropped from the registry")
 
@@ -1034,42 +1103,44 @@ class TestRetentionKeepsActiveRuns(unittest.IsolatedAsyncioTestCase):
         # Evicting it deletes the subtree mid-delivery and loses the record of what
         # landed. The delete handler already refused this; retention did not.
         cap = self.mod._RUNS_MAX
-        with unittest.mock.patch.object(self.mod, "_save_runs", _noop_save), \
-                unittest.mock.patch.object(self.mod.store, "remove_run_dir",
-                                           lambda rid, *a, **k: self.removed.append(rid)):
-            await self.mod._record({"run_id": "run-0", "status": "done",
-                                    "posting": True})
+        with (
+            unittest.mock.patch.object(self.mod, "_save_runs", _noop_save),
+            unittest.mock.patch.object(
+                self.mod.store, "remove_run_dir", lambda rid, *a, **k: self.removed.append(rid)
+            ),
+        ):
+            await self.mod._record({"run_id": "run-0", "status": "done", "posting": True})
             for i in range(1, cap + 1):
                 await self.mod._record({"run_id": f"run-{i}", "status": "done"})
 
-        self.assertNotIn("run-0", self.removed,
-                         "a posting run's subtree was deleted mid-delivery")
+        self.assertNotIn("run-0", self.removed, "a posting run's subtree was deleted mid-delivery")
         self.assertIn("run-0", [r["run_id"] for r in self.mod._RUNS])
 
     async def test_the_same_run_is_evictable_once_posting_finishes(self):
         # The guard must not pin the run forever: once posting clears, it is
         # terminal and reclaimable on the next _record.
         cap = self.mod._RUNS_MAX
-        with unittest.mock.patch.object(self.mod, "_save_runs", _noop_save), \
-                unittest.mock.patch.object(self.mod.store, "remove_run_dir",
-                                           lambda rid, *a, **k: self.removed.append(rid)):
+        with (
+            unittest.mock.patch.object(self.mod, "_save_runs", _noop_save),
+            unittest.mock.patch.object(
+                self.mod.store, "remove_run_dir", lambda rid, *a, **k: self.removed.append(rid)
+            ),
+        ):
             done = {"run_id": "run-0", "status": "done", "posting": True}
             await self.mod._record(done)
             for i in range(1, cap + 1):
                 await self.mod._record({"run_id": f"run-{i}", "status": "done"})
             self.assertNotIn("run-0", self.removed)
-            done["posting"] = False          # delivery completed
+            done["posting"] = False  # delivery completed
             await self.mod._record({"run_id": "run-next", "status": "done"})
 
-        self.assertIn("run-0", self.removed,
-                      "retention stopped reclaiming a finished poster")
+        self.assertIn("run-0", self.removed, "retention stopped reclaiming a finished poster")
 
     async def test_a_terminal_run_past_the_cap_is_still_evicted(self):
         cap = self.mod._RUNS_MAX
         await self._record_many(["done"] + ["done"] * cap)
 
-        self.assertIn("run-0", self.removed,
-                      "retention stopped reclaiming finished runs")
+        self.assertIn("run-0", self.removed, "retention stopped reclaiming finished runs")
         self.assertLessEqual(len(self.mod._RUNS), cap)
 
 
@@ -1085,8 +1156,7 @@ class TestAdoptionValidatesBeforeItWrites:
     def _stage(self, tmp_path, change_id, body):
         shared = results.results_dir(tmp_path, None)
         shared.mkdir(parents=True, exist_ok=True)
-        (shared / f"{results.safe_change_id(change_id)}.json").write_text(
-            body, encoding="utf-8")
+        (shared / f"{results.safe_change_id(change_id)}.json").write_text(body, encoding="utf-8")
 
     def _good(self, cid="CR-1", yellow=1):
         """A record that satisfies the real contract (REQUIRED_TOP/PHASE1).
@@ -1096,14 +1166,18 @@ class TestAdoptionValidatesBeforeItWrites:
         in — the contract is what write_result has always enforced.
         """
         import json as _json
-        return _json.dumps({
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": cid, "platform": "github",
-            "repo_identity": "github.com/o/r",
-            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                       "criticality": "low"},
-            "counts": {"red": 0, "yellow": yellow},
-        })
+
+        return _json.dumps(
+            {
+                "schema": "code-review-sage-result",
+                "version": 1,
+                "change_id": cid,
+                "platform": "github",
+                "repo_identity": "github.com/o/r",
+                "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
+                "counts": {"red": 0, "yellow": yellow},
+            }
+        )
 
     def test_malformed_output_leaves_the_existing_record_intact(self, tmp_path):
         store.ensure_layout(tmp_path)
@@ -1128,25 +1202,36 @@ class TestAdoptionValidatesBeforeItWrites:
         # object belongs. The report reads it as rec.get("phase1", {}).get(...),
         # which raises on a list — the present-but-wrong-type case a default
         # cannot rescue, and the whole run fails.
-        bad = json.dumps({
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": "CR-1", "platform": "github",
-            "repo_identity": "github.com/o/r",
-            "phase1": [],
-        })
+        bad = json.dumps(
+            {
+                "schema": "code-review-sage-result",
+                "version": 1,
+                "change_id": "CR-1",
+                "platform": "github",
+                "repo_identity": "github.com/o/r",
+                "phase1": [],
+            }
+        )
         self._stage(tmp_path, "CR-1", bad)
         assert results.adopt_from_shared("CR-1", tmp_path, "run-1") is False
         assert results.read_result("CR-1", tmp_path, "run-1") is None
 
     def test_an_unknown_gate_verdict_is_refused(self, tmp_path):
         store.ensure_layout(tmp_path)
-        bad = json.dumps({
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": "CR-1", "platform": "github",
-            "repo_identity": "github.com/o/r",
-            "phase1": {"gate_verdict": "LOOKS_FINE", "design_risk": "low",
-                       "criticality": "low"},
-        })
+        bad = json.dumps(
+            {
+                "schema": "code-review-sage-result",
+                "version": 1,
+                "change_id": "CR-1",
+                "platform": "github",
+                "repo_identity": "github.com/o/r",
+                "phase1": {
+                    "gate_verdict": "LOOKS_FINE",
+                    "design_risk": "low",
+                    "criticality": "low",
+                },
+            }
+        )
         self._stage(tmp_path, "CR-1", bad)
         assert results.adopt_from_shared("CR-1", tmp_path, "run-1") is False
 
@@ -1181,11 +1266,12 @@ class TestPublishRefusesAPlantedDestinationLink:
 
     def _record(self, cid="CR-1"):
         return {
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": cid, "platform": "github",
+            "schema": "code-review-sage-result",
+            "version": 1,
+            "change_id": cid,
+            "platform": "github",
             "repo_identity": "github.com/o/r",
-            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                       "criticality": "low"},
+            "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
             "counts": {"red": 0, "yellow": 1},
         }
 
@@ -1218,7 +1304,8 @@ class TestPublishRefusesAPlantedDestinationLink:
         assert results.publish_to_shared("CR-2", tmp_path, "run-1") is True
         shared = results.results_dir(tmp_path, None)
         got = json.loads(
-            (shared / f"{results.safe_change_id('CR-2')}.json").read_text(encoding="utf-8"))
+            (shared / f"{results.safe_change_id('CR-2')}.json").read_text(encoding="utf-8")
+        )
         assert got["change_id"] == "CR-2"
 
     def test_no_temp_files_are_left_behind(self, tmp_path):
@@ -1251,10 +1338,17 @@ class TestRestartClearsAStrandedPostingFlag(unittest.TestCase):
         return d / "runs.json"
 
     def test_persisted_posting_flag_is_cleared_on_load(self):
-        path = self._write_runs([{
-            "run_id": "r1", "status": "done", "posting": True,
-            "posted_keys": {"c1": ["k1"]}, "posted_comments": 1,
-        }])
+        path = self._write_runs(
+            [
+                {
+                    "run_id": "r1",
+                    "status": "done",
+                    "posting": True,
+                    "posted_keys": {"c1": ["k1"]},
+                    "posted_comments": 1,
+                }
+            ]
+        )
         with unittest.mock.patch.object(self.routes, "_runs_file", lambda: path):
             self.routes._load_runs()
         run = self.routes._RUNS[0]
@@ -1301,15 +1395,16 @@ class TestGroupedPostAppliesKeysPerChange(unittest.TestCase):
         src = Path(self.routes.__file__).read_text(encoding="utf-8")
         # Every create_task in this module must keep a strong ref: the set exists
         # precisely because a dropped task strands the flag it was going to clear.
-        dispatches = [i for i in range(len(src))
-                      if src.startswith("asyncio.create_task(", i)]
+        dispatches = [i for i in range(len(src)) if src.startswith("asyncio.create_task(", i)]
         self.assertGreaterEqual(len(dispatches), 4, "expected the known dispatch sites")
         for i in dispatches:
-            window = src[i:i + 500]
-            self.assertIn("_TASKS.add(task)", window,
-                          f"create_task at offset {i} keeps no strong ref")
-            self.assertIn("_TASKS.discard", window,
-                          f"create_task at offset {i} never drops its ref")
+            window = src[i : i + 500]
+            self.assertIn(
+                "_TASKS.add(task)", window, f"create_task at offset {i} keeps no strong ref"
+            )
+            self.assertIn(
+                "_TASKS.discard", window, f"create_task at offset {i} never drops its ref"
+            )
 
 
 class TestPublishRefusesAPlantedSourceLink:
@@ -1355,7 +1450,7 @@ class TestPublishRefusesAPlantedSourceLink:
         src.parent.mkdir(parents=True, exist_ok=True)
         try:
             os.link(outside, src)
-        except OSError:                     # pragma: no cover - platform without links
+        except OSError:  # pragma: no cover - platform without links
             pytest.skip("hardlinks unavailable here")
 
         assert results.publish_to_shared("CR-10", tmp_path, "run-10") is False
@@ -1383,9 +1478,15 @@ class TestReportWritesRefusePlantedLinks:
         }
 
     @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
-    @pytest.mark.parametrize("name", [
-        "focus-report.html", "rows.json", "report.json", "index.json",
-    ])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "focus-report.html",
+            "rows.json",
+            "report.json",
+            "index.json",
+        ],
+    )
     def test_a_planted_link_is_replaced_not_followed(self, tmp_path, name):
 
         store.ensure_layout(tmp_path)
@@ -1435,11 +1536,12 @@ class TestAdoptionRejectsMalformedNestedShapes:
 
     def _record(self, **over):
         rec = {
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": "CR-1", "platform": "github",
+            "schema": "code-review-sage-result",
+            "version": 1,
+            "change_id": "CR-1",
+            "platform": "github",
             "repo_identity": "github.com/o/r",
-            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                       "criticality": "low"},
+            "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
             "counts": {"red": 0, "yellow": 0},
             "blast_radius": {"rating": "SMALL", "signals": {}},
             "findings": [],
@@ -1462,7 +1564,8 @@ class TestAdoptionRejectsMalformedNestedShapes:
 
     def test_a_non_object_finding_entry_is_rejected(self):
         errs = results.validate_result(
-            self._record(findings=[{"severity": "red"}, "not-an-object"]))
+            self._record(findings=[{"severity": "red"}, "not-an-object"])
+        )
         assert any("findings[1] must be an object" in e for e in errs), errs
 
     def test_absent_optional_shapes_are_still_valid(self):
@@ -1501,8 +1604,7 @@ class TestOrphanReapDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
             called.append("reaped")
             return 0
 
-        with unittest.mock.patch.object(
-                self.routes, "_reap_orphan_run_dirs", _reap):
+        with unittest.mock.patch.object(self.routes, "_reap_orphan_run_dirs", _reap):
             self.routes.register_routes(app)
         self.assertEqual(called, [], "the reap must not run during registration")
         # It is deferred, not dropped.
@@ -1523,8 +1625,10 @@ class TestOrphanReapDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(threads), 1, "the reap ran once")
         self.assertNotEqual(
-            threads[0], threading.current_thread().name,
-            "the reap must run on a worker thread, not the loop thread")
+            threads[0],
+            threading.current_thread().name,
+            "the reap must run on a worker thread, not the loop thread",
+        )
 
     async def test_a_failing_reap_never_breaks_startup(self):
         app = web.Application()
@@ -1535,7 +1639,7 @@ class TestOrphanReapDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
         with unittest.mock.patch.object(self.routes, "_reap_orphan_run_dirs", _boom):
             self.routes.register_routes(app)
             for hook in app.on_startup:
-                await hook(app)   # must not raise
+                await hook(app)  # must not raise
 
 
 class TestLayoutPassDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
@@ -1562,15 +1666,15 @@ class TestLayoutPassDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
         def _ensure() -> None:
             called.append("built")
 
-        with unittest.mock.patch.object(
-                self.routes.store, "ensure_layout", _ensure):
+        with unittest.mock.patch.object(self.routes.store, "ensure_layout", _ensure):
             self.routes.register_routes(app)
         self.assertEqual(called, [], "the layout pass must not run during registration")
         # Deferred, not dropped.
         self.assertIn(
             "_ensure_layout_on_startup",
             {getattr(h, "__name__", "") for h in app.on_startup},
-            "no layout startup hook was registered")
+            "no layout startup hook was registered",
+        )
 
     async def test_the_startup_hook_builds_the_layout_off_the_loop(self):
         app = web.Application()
@@ -1579,16 +1683,17 @@ class TestLayoutPassDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
         def _ensure() -> None:
             threads.append(threading.current_thread().name)
 
-        with unittest.mock.patch.object(
-                self.routes.store, "ensure_layout", _ensure):
+        with unittest.mock.patch.object(self.routes.store, "ensure_layout", _ensure):
             self.routes.register_routes(app)
             for hook in app.on_startup:
                 await hook(app)
 
         self.assertEqual(len(threads), 1, "the layout pass ran once")
         self.assertNotEqual(
-            threads[0], threading.current_thread().name,
-            "the layout pass must run on a worker thread, not the loop thread")
+            threads[0],
+            threading.current_thread().name,
+            "the layout pass must run on a worker thread, not the loop thread",
+        )
 
     async def test_a_failing_layout_never_breaks_startup(self):
         app = web.Application()
@@ -1596,15 +1701,15 @@ class TestLayoutPassDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
         def _boom() -> None:
             raise OSError("read-only filesystem")
 
-        with unittest.mock.patch.object(
-                self.routes.store, "ensure_layout", _boom):
+        with unittest.mock.patch.object(self.routes.store, "ensure_layout", _boom):
             self.routes.register_routes(app)
             for hook in app.on_startup:
-                await hook(app)   # must not raise
+                await hook(app)  # must not raise
 
         self.assertTrue(
             [r for r in app.router.routes() if r.resource is not None],
-            "the routes are registered even when the layout pass fails")
+            "the routes are registered even when the layout pass fails",
+        )
 
 
 class TestTheRunRegistryRefusesAPlantedLink(unittest.TestCase):
@@ -1632,15 +1737,16 @@ class TestTheRunRegistryRefusesAPlantedLink(unittest.TestCase):
             self.skipTest("planting the attack needs symlink creation")
         target = planted / "runs" / "runs.json"
 
-        with unittest.mock.patch.object(
-                self.routes, "_runs_file", lambda: target), \
-                unittest.mock.patch(
-                    "kiro_crew.config.paths.data_home", lambda: str(self.tmp)):
+        with (
+            unittest.mock.patch.object(self.routes, "_runs_file", lambda: target),
+            unittest.mock.patch("kiro_crew.config.paths.data_home", lambda: str(self.tmp)),
+        ):
             with self.assertRaises(OSError):
                 self.routes._write_runs("[]")
 
-        self.assertEqual(list(impostor.iterdir()), [],
-                         "the tree was built inside the link's target")
+        self.assertEqual(
+            list(impostor.iterdir()), [], "the tree was built inside the link's target"
+        )
 
 
 class TestAdoptionRequiresAnExactChangeIdentity:
@@ -1655,11 +1761,12 @@ class TestAdoptionRequiresAnExactChangeIdentity:
 
     def _record(self, cid):
         return {
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": cid, "platform": "github",
+            "schema": "code-review-sage-result",
+            "version": 1,
+            "change_id": cid,
+            "platform": "github",
             "repo_identity": "github.com/acme/service_api",
-            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                       "criticality": "low"},
+            "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
             "counts": {"red": 0, "yellow": 0},
             "findings": [],
         }
@@ -1669,14 +1776,15 @@ class TestAdoptionRequiresAnExactChangeIdentity:
 
         store.ensure_layout(tmp_path)
         want = "GH-acme-service_api-1"
-        other = "GH-acme-service/api-1"      # different change, same stem
+        other = "GH-acme-service/api-1"  # different change, same stem
         assert results.safe_change_id(other) == results.safe_change_id(want)
         assert other != want
 
         shared = results.results_dir(tmp_path, None)
         shared.mkdir(parents=True, exist_ok=True)
         (shared / f"{results.safe_change_id(want)}.json").write_text(
-            json.dumps(self._record(other)), encoding="utf-8")
+            json.dumps(self._record(other)), encoding="utf-8"
+        )
 
         assert results.adopt_from_shared(want, tmp_path, "run-x1") is False
 
@@ -1688,7 +1796,8 @@ class TestAdoptionRequiresAnExactChangeIdentity:
         shared = results.results_dir(tmp_path, None)
         shared.mkdir(parents=True, exist_ok=True)
         (shared / f"{results.safe_change_id(want)}.json").write_text(
-            json.dumps(self._record(want)), encoding="utf-8")
+            json.dumps(self._record(want)), encoding="utf-8"
+        )
 
         assert results.adopt_from_shared(want, tmp_path, "run-x2") is True
 
@@ -1704,12 +1813,14 @@ class TestCountValuesMustBeNumeric:
 
     def _record(self, counts):
         return {
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": "CR-1", "platform": "github",
+            "schema": "code-review-sage-result",
+            "version": 1,
+            "change_id": "CR-1",
+            "platform": "github",
             "repo_identity": "github.com/o/r",
-            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                       "criticality": "low"},
-            "counts": counts, "findings": [],
+            "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
+            "counts": counts,
+            "findings": [],
         }
 
     @pytest.mark.parametrize("bad", ["1", None, [1], {"n": 1}, True, False])
@@ -1723,15 +1834,13 @@ class TestCountValuesMustBeNumeric:
     def test_numeric_counts_pass(self, good):
         from sage_lib import results
 
-        assert results.validate_result(
-            self._record({"red": good, "yellow": 0})) == []
+        assert results.validate_result(self._record({"red": good, "yellow": 0})) == []
 
     def test_every_band_is_checked_not_just_red_and_yellow(self):
         """A new band must not reintroduce the gap."""
         from sage_lib import results
 
-        errs = results.validate_result(
-            self._record({"red": 0, "yellow": 0, "green": "many"}))
+        errs = results.validate_result(self._record({"red": 0, "yellow": 0, "green": "many"}))
         assert any("counts.green must be a number" in e for e in errs), errs
 
     def test_the_scoring_arithmetic_really_does_raise(self):
@@ -1748,8 +1857,7 @@ class TestCountValuesMustBeNumeric:
 
         store.ensure_layout(tmp_path)
         with pytest.raises(ValueError, match="counts.red must be a number"):
-            results.write_result(
-                self._record({"red": "1", "yellow": 0}), tmp_path, "run-c1")
+            results.write_result(self._record({"red": "1", "yellow": 0}), tmp_path, "run-c1")
 
 
 class TestReportsDirReadsDoNotFollowAPlant:
@@ -1775,15 +1883,14 @@ class TestReportsDirReadsDoNotFollowAPlant:
         from sage_lib import report
 
         link = self._plant(tmp_path, "focus-report.html", "TOP-SECRET-BODY")
-        assert link.is_file()          # the link resolves — it just must not be read
+        assert link.is_file()  # the link resolves — it just must not be read
         assert report.read_within_reports(link, tmp_path, "run-r1") is None
 
     @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_index_link_is_not_read(self, tmp_path):
         from sage_lib import report
 
-        link = self._plant(tmp_path, "index.json",
-                           json.dumps({"report_slug": "stolen"}))
+        link = self._plant(tmp_path, "index.json", json.dumps({"report_slug": "stolen"}))
         assert report.read_within_reports(link, tmp_path, "run-r1") is None
 
     def test_a_real_file_still_reads(self, tmp_path):
@@ -1811,7 +1918,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         idx = report.set_report_slug("s1", tmp_path, "run-r1")
         assert idx == {"report_slug": "s1"}, idx
         rd = report.reports_dir(tmp_path, "run-r1")
-        assert not (rd / "index.json").is_symlink()   # the plant was replaced
+        assert not (rd / "index.json").is_symlink()  # the plant was replaced
         assert "leak" not in (rd / "index.json").read_text(encoding="utf-8")
 
 
@@ -1834,13 +1941,16 @@ class TestRedactionReachesNestedValues:
     def _leaks(self, obj) -> bool:
         return self.SECRET in repr(obj)
 
-    @pytest.mark.parametrize("shape", [
-        {"evidence": {"k": SECRET}},                    # nested dict
-        {"refs": [SECRET]},                             # list
-        {"pairs": [{"k": SECRET}]},                     # list of dicts
-        {"deep": {"a": {"b": {"c": SECRET}}}},          # several levels down
-        {"observation": SECRET},                        # the flat case, still works
-    ])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            {"evidence": {"k": SECRET}},  # nested dict
+            {"refs": [SECRET]},  # list
+            {"pairs": [{"k": SECRET}]},  # list of dicts
+            {"deep": {"a": {"b": {"c": SECRET}}}},  # several levels down
+            {"observation": SECRET},  # the flat case, still works
+        ],
+    )
     def test_no_finding_shape_carries_a_secret_through(self, shape):
         from sage_lib import report
 
@@ -1852,7 +1962,8 @@ class TestRedactionReachesNestedValues:
         from sage_lib import report
 
         row = report._redact_row(
-            {"band": "red", "url": {"k": self.SECRET}, "platform": [self.SECRET]})
+            {"band": "red", "url": {"k": self.SECRET}, "platform": [self.SECRET]}
+        )
         assert not self._leaks(row["url"])
         assert not self._leaks(row["platform"])
 
@@ -1862,10 +1973,8 @@ class TestRedactionReachesNestedValues:
 
         f = report._redact_finding({"file": "a.py", "line": 7, "severity": "red"})
         assert f["line"] == 7
-        row = report._redact_row(
-            {"band": "yellow", "red": 2, "score": 41, "deep_reviewed": True})
-        assert row == {"band": "yellow", "red": 2, "score": 41,
-                       "deep_reviewed": True}
+        row = report._redact_row({"band": "yellow", "red": 2, "score": 41, "deep_reviewed": True})
+        assert row == {"band": "yellow", "red": 2, "score": 41, "deep_reviewed": True}
 
     def test_a_deep_payload_does_not_exhaust_the_stack(self):
         """Depth is worker-chosen, so the walk is bounded and still scrubs."""
@@ -1888,12 +1997,14 @@ class TestNonScalarFindingFieldsAreRefused:
 
     def _record(self, finding):
         return {
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": "CR-1", "platform": "github",
+            "schema": "code-review-sage-result",
+            "version": 1,
+            "change_id": "CR-1",
+            "platform": "github",
             "repo_identity": "github.com/o/r",
-            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                       "criticality": "low"},
-            "counts": {"red": 1, "yellow": 0}, "findings": [finding],
+            "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
+            "counts": {"red": 1, "yellow": 0},
+            "findings": [finding],
         }
 
     @pytest.mark.parametrize("bad", [{"k": "v"}, ["v"], (1, 2)])
@@ -1907,8 +2018,7 @@ class TestNonScalarFindingFieldsAreRefused:
     def test_prose_fields_pass(self, good):
         from sage_lib import results
 
-        assert results.validate_result(
-            self._record({"file": "a.py", "x": good})) == []
+        assert results.validate_result(self._record({"file": "a.py", "x": good})) == []
 
     @pytest.mark.parametrize("bad", [3, 3.5, True])
     def test_a_number_in_a_prose_field_is_rejected(self, bad):
@@ -1918,16 +2028,14 @@ class TestNonScalarFindingFieldsAreRefused:
         no report."""
         from sage_lib import results
 
-        errs = results.validate_result(
-            self._record({"file": "a.py", "snippet": bad}))
+        errs = results.validate_result(self._record({"file": "a.py", "snippet": bad}))
         assert any("findings[0].snippet must be a string" in e for e in errs), errs
 
     @pytest.mark.parametrize("good", [3, 3.5, None])
     def test_line_still_takes_a_number(self, good):
         from sage_lib import results
 
-        assert results.validate_result(
-            self._record({"file": "a.py", "line": good})) == []
+        assert results.validate_result(self._record({"file": "a.py", "line": good})) == []
 
     def test_write_result_refuses_the_record(self, tmp_path):
         from sage_lib import results, store
@@ -1935,8 +2043,8 @@ class TestNonScalarFindingFieldsAreRefused:
         store.ensure_layout(tmp_path)
         with pytest.raises(ValueError, match="must be a string"):
             results.write_result(
-                self._record({"file": "a.py", "evidence": {"k": "s"}}),
-                tmp_path, "run-n1")
+                self._record({"file": "a.py", "evidence": {"k": "s"}}), tmp_path, "run-n1"
+            )
 
 
 class TestResultReadsDoNotFollowAPlantedLink:
@@ -1979,18 +2087,19 @@ class TestResultReadsDoNotFollowAPlantedLink:
 
         store.ensure_layout(tmp_path)
         rec = {
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": "CR-2", "platform": "github",
+            "schema": "code-review-sage-result",
+            "version": 1,
+            "change_id": "CR-2",
+            "platform": "github",
             "repo_identity": "github.com/o/r",
-            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                       "criticality": "low"},
-            "counts": {"red": 0, "yellow": 0}, "findings": [],
+            "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
+            "counts": {"red": 0, "yellow": 0},
+            "findings": [],
         }
         results.write_result(rec, tmp_path, "ok-run")
         got = results.read_result("CR-2", tmp_path, "ok-run")
         assert got is not None and got["change_id"] == "CR-2"
-        assert [r["change_id"] for r in results.list_results(tmp_path, "ok-run")] \
-            == ["CR-2"]
+        assert [r["change_id"] for r in results.list_results(tmp_path, "ok-run")] == ["CR-2"]
 
     def test_a_non_object_record_is_refused(self, tmp_path):
         """Consumers index with .get(); a list or scalar must not reach them."""
@@ -1999,8 +2108,7 @@ class TestResultReadsDoNotFollowAPlantedLink:
         store.ensure_layout(tmp_path)
         rd = results.results_dir(tmp_path, "odd")
         rd.mkdir(parents=True, exist_ok=True)
-        (rd / f"{results.safe_change_id('CR-3')}.json").write_text(
-            "[1, 2, 3]", encoding="utf-8")
+        (rd / f"{results.safe_change_id('CR-3')}.json").write_text("[1, 2, 3]", encoding="utf-8")
         assert results.read_result("CR-3", tmp_path, "odd") is None
 
     def test_a_missing_record_is_still_none(self, tmp_path):
@@ -2016,8 +2124,7 @@ class TestResultReadsDoNotFollowAPlantedLink:
 
         store.ensure_layout(tmp_path)
         target = tmp_path / "fake-index.json"
-        target.write_text(json.dumps({"GH-o-r-1": {"head_sha": "x"}}),
-                          encoding="utf-8")
+        target.write_text(json.dumps({"GH-o-r-1": {"head_sha": "x"}}), encoding="utf-8")
         p = results.reviewed_path(tmp_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         if p.exists():
@@ -2043,7 +2150,7 @@ class TestNoFindingFieldIsExemptFromRedaction:
     still left alone: `_redact_deep` only touches strings.
     """
 
-    SECRET = "AKIA" + "1234567890EXAMPLE"   # split: see the sentinel note above
+    SECRET = "AKIA" + "1234567890EXAMPLE"  # split: see the sentinel note above
 
     def test_a_credential_in_line_is_redacted(self):
         from sage_lib import report
@@ -2066,7 +2173,8 @@ class TestNoFindingFieldIsExemptFromRedaction:
         src = inspect.getsource(report._redact_finding)
         assert "frozenset" not in src, (
             "a skip set reappeared in _redact_finding; an exemption is only safe "
-            "if something enforces its premise")
+            "if something enforces its premise"
+        )
 
 
 class TestFindingLineMustBeANumber:
@@ -2074,11 +2182,12 @@ class TestFindingLineMustBeANumber:
 
     def _record(self, line):
         return {
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": "CR-1", "platform": "github",
+            "schema": "code-review-sage-result",
+            "version": 1,
+            "change_id": "CR-1",
+            "platform": "github",
             "repo_identity": "github.com/o/r",
-            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                       "criticality": "low"},
+            "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
             "counts": {"red": 1, "yellow": 0},
             "findings": [{"file": "a.py", "line": line}],
         }
@@ -2125,22 +2234,30 @@ class TestNestedStringFieldsMustBeScalars:
 
     def _record(self, **over):
         r = {
-            "schema": "code-review-sage-result", "version": 1,
-            "change_id": "CR-1", "platform": "github",
+            "schema": "code-review-sage-result",
+            "version": 1,
+            "change_id": "CR-1",
+            "platform": "github",
             "repo_identity": "github.com/o/r",
-            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                       "criticality": "low"},
-            "blast_radius": {"rating": "SMALL",
-                             "signals": {"sensitive_hits": [], "loc_added": 0}},
-            "counts": {"red": 0, "yellow": 0}, "findings": [],
+            "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
+            "blast_radius": {"rating": "SMALL", "signals": {"sensitive_hits": [], "loc_added": 0}},
+            "counts": {"red": 0, "yellow": 0},
+            "findings": [],
         }
         r.update(over)
         return r
 
-    @pytest.mark.parametrize("field", [
-        "design_risk", "gate_verdict", "criticality", "band_override_reason",
-        "problem", "solution_assessment",
-    ])
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "design_risk",
+            "gate_verdict",
+            "criticality",
+            "band_override_reason",
+            "problem",
+            "solution_assessment",
+        ],
+    )
     @pytest.mark.parametrize("bad", [[], {}, ["x"]])
     def test_a_non_scalar_phase1_value_is_rejected(self, field, bad):
         from sage_lib import results
@@ -2153,8 +2270,7 @@ class TestNestedStringFieldsMustBeScalars:
     def test_a_non_string_rating_is_rejected(self):
         from sage_lib import results
 
-        errs = results.validate_result(
-            self._record(blast_radius={"rating": [], "signals": {}}))
+        errs = results.validate_result(self._record(blast_radius={"rating": [], "signals": {}}))
         assert any("blast_radius.rating must be a string" in e for e in errs), errs
 
     def test_blast_radius_signals_may_stay_nested(self):
@@ -2166,9 +2282,19 @@ class TestNestedStringFieldsMustBeScalars:
     def test_scalar_phase1_values_pass(self):
         from sage_lib import results
 
-        assert results.validate_result(self._record(
-            phase1={"gate_verdict": "PASS", "design_risk": "low",
-                    "criticality": "low", "design_headline": None})) == []
+        assert (
+            results.validate_result(
+                self._record(
+                    phase1={
+                        "gate_verdict": "PASS",
+                        "design_risk": "low",
+                        "criticality": "low",
+                        "design_headline": None,
+                    }
+                )
+            )
+            == []
+        )
 
     def test_the_validator_itself_does_not_crash_on_a_bad_verdict(self):
         """It REPORTS a malformed record; it must never raise on one.
@@ -2182,9 +2308,11 @@ class TestNestedStringFieldsMustBeScalars:
 
         bad_verdicts: list[typing.Any] = [[], {}, ["PASS"]]
         for bad in bad_verdicts:
-            errs = results.validate_result(self._record(
-                phase1={"gate_verdict": bad, "design_risk": "low",
-                        "criticality": "low"}))
+            errs = results.validate_result(
+                self._record(
+                    phase1={"gate_verdict": bad, "design_risk": "low", "criticality": "low"}
+                )
+            )
             assert any("phase1.gate_verdict must be a string" in e for e in errs), errs
 
     def test_the_scoring_lookup_really_does_raise(self):
@@ -2192,9 +2320,11 @@ class TestNestedStringFieldsMustBeScalars:
         from sage_lib import report
 
         with pytest.raises(TypeError):
-            report.focus_score(self._record(
-                phase1={"gate_verdict": "PASS", "design_risk": [],
-                        "criticality": "low"}))
+            report.focus_score(
+                self._record(
+                    phase1={"gate_verdict": "PASS", "design_risk": [], "criticality": "low"}
+                )
+            )
 
     def test_write_result_refuses_the_record(self, tmp_path):
         from sage_lib import results, store
@@ -2202,9 +2332,12 @@ class TestNestedStringFieldsMustBeScalars:
         store.ensure_layout(tmp_path)
         with pytest.raises(ValueError, match="phase1.design_risk must be a string"):
             results.write_result(
-                self._record(phase1={"gate_verdict": "PASS", "design_risk": [],
-                                     "criticality": "low"}),
-                tmp_path, "run-p35")
+                self._record(
+                    phase1={"gate_verdict": "PASS", "design_risk": [], "criticality": "low"}
+                ),
+                tmp_path,
+                "run-p35",
+            )
 
 
 class TestRetryRepairsTheReviewedIndex(unittest.TestCase):
@@ -2234,22 +2367,36 @@ class TestRetryRepairsTheReviewedIndex(unittest.TestCase):
         """A run whose initial auto-post failed: nothing delivered, not indexed."""
         url = "https://github.com/acme/repo/pull/1"
         cid = self.mod.review_driver.change_id_for(url)
-        return url, cid, {
-            "run_id": "R1",
-            "changes": [url],
-            "head_shas": {self.mod.review_driver.reviewed_key_for(url): "sha1"},
-            "summary": {"per_change": [{
-                "change_id": cid, "deep_reviewed": True, "result_recorded": True,
-                "post_ok": False, "posted_comments": 0, "posting_expected": 3,
-            }]},
-        }
+        return (
+            url,
+            cid,
+            {
+                "run_id": "R1",
+                "changes": [url],
+                "head_shas": {self.mod.review_driver.reviewed_key_for(url): "sha1"},
+                "summary": {
+                    "per_change": [
+                        {
+                            "change_id": cid,
+                            "deep_reviewed": True,
+                            "result_recorded": True,
+                            "post_ok": False,
+                            "posted_comments": 0,
+                            "posting_expected": 3,
+                        }
+                    ]
+                },
+            },
+        )
 
     def test_failed_post_is_not_indexed_before_the_retry(self):
         _url, _cid, run = self._run_after_failed_post()
         called = []
         with unittest.mock.patch.object(
-                self.mod.results, "mark_reviewed",
-                side_effect=lambda entries, *a, **k: called.append(entries)):
+            self.mod.results,
+            "mark_reviewed",
+            side_effect=lambda entries, *a, **k: called.append(entries),
+        ):
             self.mod._record_reviewed(run)
         self.assertEqual(called, [], "a failed post must not be indexed")
 
@@ -2261,16 +2408,21 @@ class TestRetryRepairsTheReviewedIndex(unittest.TestCase):
         undelivered and the verdict buttons stay withheld.
         """
         run: dict = {}
-        summary: dict = {"ok": True, "per_change": [
-            {"change_id": "GH-acme-repo-1", "post_ok": True,
-             "posted_keys": ["design", "sec-1"]},
-            {"change_id": "GH-acme-repo-2", "post_ok": True, "posted_keys": []},
-        ]}
+        summary: dict = {
+            "ok": True,
+            "per_change": [
+                {
+                    "change_id": "GH-acme-repo-1",
+                    "post_ok": True,
+                    "posted_keys": ["design", "sec-1"],
+                },
+                {"change_id": "GH-acme-repo-2", "post_ok": True, "posted_keys": []},
+            ],
+        }
         self.mod._collect_delivered(run, summary)
         # The change that delivered is recorded; the one that delivered nothing is
         # absent rather than present-and-empty, which reads as not-delivered.
-        self.assertEqual(run["posted_keys"],
-                         {"GH-acme-repo-1": ["design", "sec-1"]})
+        self.assertEqual(run["posted_keys"], {"GH-acme-repo-1": ["design", "sec-1"]})
         self.assertNotIn("GH-acme-repo-2", run["posted_keys"])
 
     def test_apply_post_outcome_records_which_findings_landed(self):
@@ -2282,8 +2434,13 @@ class TestRetryRepairsTheReviewedIndex(unittest.TestCase):
         rec: dict = {}
         self.mod.review_driver.apply_post_outcome(
             rec,
-            {"post_ok": True, "posted_comments": 2, "expected_units": 2,
-             "design_comment_posted": False, "posted_keys": ["design", "sec-1"]},
+            {
+                "post_ok": True,
+                "posted_comments": 2,
+                "expected_units": 2,
+                "design_comment_posted": False,
+                "posted_keys": ["design", "sec-1"],
+            },
         )
         self.assertEqual(rec["posted_keys"], ["design", "sec-1"])
 
@@ -2291,15 +2448,21 @@ class TestRetryRepairsTheReviewedIndex(unittest.TestCase):
         """A post result with no keys must not fabricate evidence."""
         rec: dict = {}
         self.mod.review_driver.apply_post_outcome(
-            rec, {"post_ok": False, "posted_comments": 0, "expected_units": 3})
+            rec, {"post_ok": False, "posted_comments": 0, "expected_units": 3}
+        )
         self.assertEqual(rec["posted_keys"], [])
 
     def test_successful_retry_repairs_the_record_and_indexes(self):
         _url, cid, run = self._run_after_failed_post()
         # What post_recorded returns for a retry that delivered every unit.
-        out = {"change_id": cid, "post_ok": True, "posted_comments": 3,
-               "expected_units": 3, "design_comment_posted": True,
-               "posted_keys": ["k1", "k2"]}
+        out = {
+            "change_id": cid,
+            "post_ok": True,
+            "posted_comments": 3,
+            "expected_units": 3,
+            "design_comment_posted": True,
+            "posted_keys": ["k1", "k2"],
+        }
         rec = run["summary"]["per_change"][0]
         self.mod.review_driver.apply_post_outcome(rec, out)
         self.assertTrue(rec["post_ok"])
@@ -2308,23 +2471,30 @@ class TestRetryRepairsTheReviewedIndex(unittest.TestCase):
 
         captured = {}
         with unittest.mock.patch.object(
-                self.mod.results, "mark_reviewed",
-                side_effect=lambda entries, *a, **k: captured.update(entries)):
+            self.mod.results,
+            "mark_reviewed",
+            side_effect=lambda entries, *a, **k: captured.update(entries),
+        ):
             self.mod._record_reviewed(run)
-        self.assertEqual(list(captured), ["github.com/acme/repo#1"],
-                         "a delivered retry must be indexed, or the PR is re-posted")
+        self.assertEqual(
+            list(captured),
+            ["github.com/acme/repo#1"],
+            "a delivered retry must be indexed, or the PR is re-posted",
+        )
 
     def test_retry_records_a_still_failing_post_as_undelivered(self):
         """A retry that fails again must NOT flip the record to delivered."""
         _url, cid, run = self._run_after_failed_post()
         rec = run["summary"]["per_change"][0]
         self.mod.review_driver.apply_post_outcome(
-            rec, {"change_id": cid, "post_ok": False, "posted_comments": 1,
-                  "expected_units": 3})
+            rec, {"change_id": cid, "post_ok": False, "posted_comments": 1, "expected_units": 3}
+        )
         called = []
         with unittest.mock.patch.object(
-                self.mod.results, "mark_reviewed",
-                side_effect=lambda entries, *a, **k: called.append(entries)):
+            self.mod.results,
+            "mark_reviewed",
+            side_effect=lambda entries, *a, **k: called.append(entries),
+        ):
             self.mod._record_reviewed(run)
         self.assertEqual(called, [])
 
@@ -2334,10 +2504,12 @@ class TestRetryRepairsTheReviewedIndex(unittest.TestCase):
             src = fh.read()
         task = src.split("async def _post_comments_bg", 1)[1]
         task = task.split("\nasync def ", 1)[0]
-        self.assertIn("apply_post_outcome", task,
-                      "the retry must repair per_change delivery evidence")
-        self.assertIn("_record_reviewed", task,
-                      "the retry must index the PR or it gets re-reviewed")
+        self.assertIn(
+            "apply_post_outcome", task, "the retry must repair per_change delivery evidence"
+        )
+        self.assertIn(
+            "_record_reviewed", task, "the retry must index the PR or it gets re-reviewed"
+        )
 
 
 class TestConsolidationCannotResurrectADeletedNamespace(unittest.IsolatedAsyncioTestCase):
@@ -2370,8 +2542,10 @@ class TestConsolidationCannotResurrectADeletedNamespace(unittest.IsolatedAsyncio
             os.environ["KIROCREW_HOME"] = self._old_home
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    _MD = ("### A learned rule <!-- scope:common --> <!-- impact:high -->"
-           " <!-- added:2026-01-01T00:00:00Z -->\nguidance here\n")
+    _MD = (
+        "### A learned rule <!-- scope:common --> <!-- impact:high -->"
+        " <!-- added:2026-01-01T00:00:00Z -->\nguidance here\n"
+    )
 
     def test_a_late_apply_would_resurrect_a_deleted_namespace(self):
         """The hazard, so the claim is not mistaken for ceremony.
@@ -2397,14 +2571,16 @@ class TestConsolidationCannotResurrectADeletedNamespace(unittest.IsolatedAsyncio
         # path does -- none of those refusals depend on the active list, so pruning
         # first would deactivate a namespace that then fails to delete.
         with unittest.mock.patch.object(
-                L, "delete_namespace",
-                return_value={"ok": False, "error": "does not exist"}):
+            L, "delete_namespace", return_value={"ok": False, "error": "does not exist"}
+        ):
             resp = await self._delete("keepme")
 
         self.assertEqual(resp.status, 400)
-        self.assertIn("keepme",
-                      mod._load_review_section().get("active_namespaces") or [],
-                      "a refused delete must not prune the active list")
+        self.assertIn(
+            "keepme",
+            mod._load_review_section().get("active_namespaces") or [],
+            "a refused delete must not prune the active list",
+        )
 
     async def test_delete_is_refused_while_a_consolidation_is_claimed(self):
         """Refuse with 409, and leave no partial side effect behind."""
@@ -2421,11 +2597,13 @@ class TestConsolidationCannotResurrectADeletedNamespace(unittest.IsolatedAsyncio
 
         self.assertEqual(resp.status, 409)
         self.assertIn("consolidation_in_progress", resp.text)
-        self.assertEqual(sorted(L.list_namespaces()), before,
-                         "a refused delete must not remove the namespace")
+        self.assertEqual(
+            sorted(L.list_namespaces()), before, "a refused delete must not remove the namespace"
+        )
         # And it must not have pruned the active list on its way out.
-        self.assertEqual(list(mod._load_review_section().get("active_namespaces") or []),
-                         active_before)
+        self.assertEqual(
+            list(mod._load_review_section().get("active_namespaces") or []), active_before
+        )
 
     async def test_delete_still_works_when_nothing_is_consolidating(self):
         """The guard must not wedge ordinary deletes shut."""
@@ -2447,20 +2625,22 @@ class TestConsolidationCannotResurrectADeletedNamespace(unittest.IsolatedAsyncio
             src = fh.read()
 
         handler = src.split("async def _handle_consolidate", 1)
-        if len(handler) == 1:            # tolerate a rename of the endpoint
+        if len(handler) == 1:  # tolerate a rename of the endpoint
             handler = src.split("_CONSOLIDATING.add(", 1)
         tail = handler[1]
         add_at = tail.find("_CONSOLIDATING.add(")
         task_at = tail.find("create_task(_consolidate_bg(")
         self.assertNotEqual(add_at, -1)
         self.assertNotEqual(task_at, -1)
-        self.assertLess(add_at, task_at,
-                        "the claim must be held before the worker is dispatched")
+        self.assertLess(add_at, task_at, "the claim must be held before the worker is dispatched")
 
         worker = src.split("async def _consolidate_bg", 1)[1].split("\nasync def ", 1)[0]
         self.assertIn("finally:", worker)
-        self.assertIn("_CONSOLIDATING.discard(", worker.split("finally:", 1)[1],
-                      "the worker must release the claim on every terminal path")
+        self.assertIn(
+            "_CONSOLIDATING.discard(",
+            worker.split("finally:", 1)[1],
+            "the worker must release the claim on every terminal path",
+        )
 
     def test_a_refused_delete_cannot_have_already_pruned(self):
         """The defect class: rejection must precede the side effect.
@@ -2487,8 +2667,11 @@ class TestConsolidationCannotResurrectADeletedNamespace(unittest.IsolatedAsyncio
         # No 409 may appear after the active-list write in the DELETE arm.
         write_at = delete_arm.find("_write_review_section")
         self.assertNotEqual(write_at, -1)
-        self.assertNotIn("409", delete_arm[write_at:],
-                         "a delete must not be refused after pruning the active list")
+        self.assertNotIn(
+            "409",
+            delete_arm[write_at:],
+            "a delete must not be refused after pruning the active list",
+        )
 
     async def _delete(self, ns):
         class _DeleteReq(OwnerRequest):
@@ -2518,10 +2701,15 @@ class TestPhase1ValuesMustBeStrings(unittest.TestCase):
         p1 = {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"}
         p1.update(phase1)
         return {
-            "schema": "code-review-sage-result", "version": 1, "platform": "github",
-            "repo_identity": "github.com/o/r", "change_id": "CR-1",
+            "schema": "code-review-sage-result",
+            "version": 1,
+            "platform": "github",
+            "repo_identity": "github.com/o/r",
+            "change_id": "CR-1",
             "blast_radius": {"rating": "SMALL", "signals": {}},
-            "counts": {"red": 0, "yellow": 0}, "findings": [], "phase1": p1,
+            "counts": {"red": 0, "yellow": 0},
+            "findings": [],
+            "phase1": p1,
         }
 
     def test_a_string_phase1_record_is_accepted(self):
@@ -2597,12 +2785,19 @@ class TestPersistedReportIsRedactedOnRead(unittest.TestCase):
     def test_planted_row_text_is_redacted(self):
         from sage_lib import report
 
-        self._plant({
-            "bands": {"red": 1, "yellow": 0, "green": 0},
-            "rows": [{"change_id": "CR-1", "band": "red",
-                      "why": f"leaked {self._SENTINEL} here",
-                      "design_headline": f"credential {self._SENTINEL}"}],
-        })
+        self._plant(
+            {
+                "bands": {"red": 1, "yellow": 0, "green": 0},
+                "rows": [
+                    {
+                        "change_id": "CR-1",
+                        "band": "red",
+                        "why": f"leaked {self._SENTINEL} here",
+                        "design_headline": f"credential {self._SENTINEL}",
+                    }
+                ],
+            }
+        )
         got = report.read_report(None, "run-a")
         self.assertNotIn(self._SENTINEL, json.dumps(got))
         self.assertIn("REDACTED", got["rows"][0]["why"])
@@ -2611,13 +2806,23 @@ class TestPersistedReportIsRedactedOnRead(unittest.TestCase):
         """Idempotence: redacting twice must not alter a legitimately built report."""
         from sage_lib import report
 
-        built = report.build_report([{
-            "change_id": "CR-2", "revision": "b" * 40,
-            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
-                       "criticality": "low", "design_headline": "a clean headline"},
-            "counts": {"red": 0, "yellow": 0}, "findings": [],
-            "blast_radius": {"rating": "SMALL"},
-        }])
+        built = report.build_report(
+            [
+                {
+                    "change_id": "CR-2",
+                    "revision": "b" * 40,
+                    "phase1": {
+                        "gate_verdict": "PASS",
+                        "design_risk": "low",
+                        "criticality": "low",
+                        "design_headline": "a clean headline",
+                    },
+                    "counts": {"red": 0, "yellow": 0},
+                    "findings": [],
+                    "blast_radius": {"rating": "SMALL"},
+                }
+            ]
+        )
         self._plant(built, run_id="run-b")
         got = report.read_report(None, "run-b")
         self.assertEqual(got["rows"], built.get("rows"))
@@ -2626,8 +2831,9 @@ class TestPersistedReportIsRedactedOnRead(unittest.TestCase):
         """Bands and total are arithmetic inputs the UI trusts."""
         from sage_lib import report
 
-        self._plant({"bands": {"red": "lots", "yellow": -3, "green": True},
-                     "rows": []}, run_id="run-c")
+        self._plant(
+            {"bands": {"red": "lots", "yellow": -3, "green": True}, "rows": []}, run_id="run-c"
+        )
         got = report.read_report(None, "run-c")
         self.assertEqual(got["bands"], {"red": 0, "yellow": 0, "green": 0})
         self.assertIsInstance(got["total"], int)
@@ -2636,9 +2842,13 @@ class TestPersistedReportIsRedactedOnRead(unittest.TestCase):
         """A row is a mapping by contract; anything else cannot be redacted."""
         from sage_lib import report
 
-        self._plant({"bands": {"red": 0, "yellow": 0, "green": 0},
-                     "rows": ["not-a-row", 7, {"change_id": "CR-3", "band": "green"}]},
-                    run_id="run-d")
+        self._plant(
+            {
+                "bands": {"red": 0, "yellow": 0, "green": 0},
+                "rows": ["not-a-row", 7, {"change_id": "CR-3", "band": "green"}],
+            },
+            run_id="run-d",
+        )
         got = report.read_report(None, "run-d")
         self.assertEqual([r["change_id"] for r in got["rows"]], ["CR-3"])
 
@@ -2691,22 +2901,23 @@ class TestPlantedReportMetadataCannotBreakTheEndpoint(unittest.TestCase):
                 rid = f"bands-{i}"
                 self._plant(rid, {"bands": bad, "rows": []})
                 got = report.read_report(None, rid)
-                self.assertEqual(got["bands"],
-                                 {"red": 0, "yellow": 0, "green": 0})
+                self.assertEqual(got["bands"], {"red": 0, "yellow": 0, "green": 0})
 
     def test_an_empty_list_bands_still_works(self):
         """Kept explicit: this case was already safe and must stay safe."""
         from sage_lib import report
 
         self._plant("bands-empty", {"bands": [], "rows": []})
-        self.assertEqual(report.read_report(None, "bands-empty")["bands"],
-                         {"red": 0, "yellow": 0, "green": 0})
+        self.assertEqual(
+            report.read_report(None, "bands-empty")["bands"], {"red": 0, "yellow": 0, "green": 0}
+        )
 
     def test_a_planted_slug_is_dropped(self):
         from sage_lib import report
 
-        self._plant("slug-bad", {"bands": {}, "rows": []},
-                    index={"report_slug": f"leaked {self._SENTINEL}"})
+        self._plant(
+            "slug-bad", {"bands": {}, "rows": []}, index={"report_slug": f"leaked {self._SENTINEL}"}
+        )
         got = report.read_report(None, "slug-bad")
         self.assertIsNone(got["report_slug"])
         self.assertNotIn(self._SENTINEL, json.dumps(got))
@@ -2716,15 +2927,13 @@ class TestPlantedReportMetadataCannotBreakTheEndpoint(unittest.TestCase):
 
         # Assembled so the path never appears as a literal in this file.
         traversal = "..%s..%setc%sshadow" % ("/", "/", "/")
-        self._plant("slug-trav", {"bands": {}, "rows": []},
-                    index={"report_slug": traversal})
+        self._plant("slug-trav", {"bands": {}, "rows": []}, index={"report_slug": traversal})
         self.assertIsNone(report.read_report(None, "slug-trav")["report_slug"])
 
     def test_a_non_string_slug_is_dropped(self):
         from sage_lib import report
 
-        self._plant("slug-num", {"bands": {}, "rows": []},
-                    index={"report_slug": 5})
+        self._plant("slug-num", {"bands": {}, "rows": []}, index={"report_slug": 5})
         self.assertIsNone(report.read_report(None, "slug-num")["report_slug"])
 
     def test_a_real_artifact_slug_survives(self):
@@ -2739,8 +2948,7 @@ class TestPlantedReportMetadataCannotBreakTheEndpoint(unittest.TestCase):
 
         slug = "focus-report-cr-1-abc123"
         self.assertTrue(_SLUG_RE.match(slug), "fixture must be a valid slug")
-        self._plant("slug-ok", {"bands": {}, "rows": []},
-                    index={"report_slug": slug})
+        self._plant("slug-ok", {"bands": {}, "rows": []}, index={"report_slug": slug})
         self.assertEqual(report.read_report(None, "slug-ok")["report_slug"], slug)
 
 
@@ -2780,15 +2988,17 @@ class TestNoRowFieldIsExemptFromRedaction(unittest.TestCase):
         rd = report.reports_dir(None, run_id)
         rd.mkdir(parents=True, exist_ok=True)
         (rd / "report.json").write_text(
-            json.dumps({"bands": {"red": 1, "yellow": 0, "green": 0},
-                        "rows": rows}), encoding="utf-8")
+            json.dumps({"bands": {"red": 1, "yellow": 0, "green": 0}, "rows": rows}),
+            encoding="utf-8",
+        )
 
     def test_a_credential_in_band_is_scrubbed(self):
         """The exemption's actual consequence, at the redactor itself."""
         from sage_lib import report
 
-        out = report._redact_row({"band": f"red {self._SENTINEL}",
-                                  "why": f"prose {self._SENTINEL}"})
+        out = report._redact_row(
+            {"band": f"red {self._SENTINEL}", "why": f"prose {self._SENTINEL}"}
+        )
         self.assertNotIn(self._SENTINEL, out["band"])
         self.assertNotIn(self._SENTINEL, out["why"])
 
@@ -2807,8 +3017,7 @@ class TestNoRowFieldIsExemptFromRedaction(unittest.TestCase):
     def test_a_planted_band_cannot_reach_the_dashboard(self):
         from sage_lib import report
 
-        self._plant("band-leak", [{"change_id": "CR-1",
-                                   "band": f"red {self._SENTINEL}"}])
+        self._plant("band-leak", [{"change_id": "CR-1", "band": f"red {self._SENTINEL}"}])
         got = report.read_report(None, "band-leak")
         self.assertNotIn(self._SENTINEL, json.dumps(got))
 
@@ -2816,11 +3025,14 @@ class TestNoRowFieldIsExemptFromRedaction(unittest.TestCase):
         """An ungroupable row cannot render, so it is not passed through."""
         from sage_lib import report
 
-        self._plant("band-vocab", [
-            {"change_id": "CR-1", "band": "purple"},
-            {"change_id": "CR-2", "band": None},
-            {"change_id": "CR-3", "band": "green"},
-        ])
+        self._plant(
+            "band-vocab",
+            [
+                {"change_id": "CR-1", "band": "purple"},
+                {"change_id": "CR-2", "band": None},
+                {"change_id": "CR-3", "band": "green"},
+            ],
+        )
         got = report.read_report(None, "band-vocab")
         self.assertEqual([r["change_id"] for r in got["rows"]], ["CR-3"])
 
@@ -2834,10 +3046,8 @@ class TestNoRowFieldIsExemptFromRedaction(unittest.TestCase):
         with open(self.mod_report_path(), encoding="utf-8") as fh:
             src = fh.read()
         body = src.split("def _redact_row", 1)[1].split("\ndef ", 1)[0]
-        self.assertIn("_redact_deep_map(row)", body,
-                      "_redact_row must pass no skip set")
-        self.assertNotIn("_STRUCTURAL_ROW_FIELDS", src,
-                         "the row skip set must stay gone")
+        self.assertIn("_redact_deep_map(row)", body, "_redact_row must pass no skip set")
+        self.assertNotIn("_STRUCTURAL_ROW_FIELDS", src, "the row skip set must stay gone")
 
     def mod_report_path(self):
         from sage_lib import report
@@ -2865,13 +3075,13 @@ class TestIndependentRunsUseTheBoundedPool:
             # Yield the GIL the way real work does, so an unserialized second body
             # would get in here.
             import time
+
             time.sleep(0.05)
             inside -= 1
             return {"ok": True, "changes": len(changes), "per_change": []}
 
         monkeypatch.setattr(mod.review_driver, "run_review", fake_run_review)
-        monkeypatch.setattr(mod, "_claim_changes_under_lock",
-                            lambda run, changes: list(changes))
+        monkeypatch.setattr(mod, "_claim_changes_under_lock", lambda run, changes: list(changes))
         monkeypatch.setattr(mod, "_record_reviewed", lambda run: None)
         monkeypatch.setattr(mod, "_make_progress", lambda run: None)
 
@@ -2883,12 +3093,16 @@ class TestIndependentRunsUseTheBoundedPool:
                 return None
 
         monkeypatch.setattr(mod.review_pool, "get_pool", lambda: _Pool())
-        monkeypatch.setattr(mod.review_pool, "make_sync_dispatch",
-                            lambda loop, pool, **_kw: (lambda *a, **k: {"ok": True}))
+        monkeypatch.setattr(
+            mod.review_pool,
+            "make_sync_dispatch",
+            lambda loop, pool, **_kw: (lambda *a, **k: {"ok": True}),
+        )
 
         runs = [{"run_id": f"run-{i}"} for i in range(3)]
-        await asyncio.gather(*(mod._run_review_bg(r, [f"https://x/pull/{i}"])
-                               for i, r in enumerate(runs)))
+        await asyncio.gather(
+            *(mod._run_review_bg(r, [f"https://x/pull/{i}"]) for i, r in enumerate(runs))
+        )
 
         assert overlapped, "independent run bodies should share the bounded pool"
 
@@ -2909,8 +3123,7 @@ class TestReviewersUsePoolConcurrency:
             return {"ok": True, "changes": len(changes), "per_change": []}
 
         monkeypatch.setattr(mod.review_driver, "run_review", fake_run_review)
-        monkeypatch.setattr(mod, "_claim_changes_under_lock",
-                            lambda run, changes: list(changes))
+        monkeypatch.setattr(mod, "_claim_changes_under_lock", lambda run, changes: list(changes))
         monkeypatch.setattr(mod, "_record_reviewed", lambda run: None)
         monkeypatch.setattr(mod, "_make_progress", lambda run: None)
 
@@ -2922,16 +3135,20 @@ class TestReviewersUsePoolConcurrency:
                 return None
 
         monkeypatch.setattr(mod.review_pool, "get_pool", lambda: _Pool())
-        monkeypatch.setattr(mod.review_pool, "make_sync_dispatch",
-                            lambda loop, pool, **_kw: (lambda *a, **k: {"ok": True}))
+        monkeypatch.setattr(
+            mod.review_pool,
+            "make_sync_dispatch",
+            lambda loop, pool, **_kw: (lambda *a, **k: {"ok": True}),
+        )
 
         runs = [{"run_id": f"run-{i}"} for i in range(3)]
-        await asyncio.gather(*(mod._run_review_bg(r, [f"https://x/pull/{i}"])
-                               for i, r in enumerate(runs)))
+        await asyncio.gather(
+            *(mod._run_review_bg(r, [f"https://x/pull/{i}"]) for i, r in enumerate(runs))
+        )
 
         assert seen.get("concurrency") == 1, (
-            "the backend must serialize result attribution; got "
-            f"{seen.get('concurrency')!r}")
+            "the backend must serialize result attribution; got " f"{seen.get('concurrency')!r}"
+        )
 
 
 class _FakeSessions:
@@ -3006,22 +3223,26 @@ class TestFollowupRoutes(unittest.IsolatedAsyncioTestCase):
 
     def _record(self, sid="sid-1", change="GH-o-r-42"):
         (self.sessions_dir / f"{sid}.json").write_text("{}", encoding="utf-8")
-        self.assertTrue(self.mod.followup.write_descriptor(
-            "run1", change, sid=sid, agent="sage-reviewer", cwd="/work"))
+        self.assertTrue(
+            self.mod.followup.write_descriptor(
+                "run1", change, sid=sid, agent="sage-reviewer", cwd="/work"
+            )
+        )
 
     async def test_state_reports_not_resumable_with_a_reason(self):
         resp = await self.mod._handle_chat_get(
-            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))
+            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"})
+        )
         data = json.loads(resp.body)
         self.assertFalse(data["resumable"])
-        self.assertEqual(data["reason"],
-                         self.mod.followup.ERR_NO_DESCRIPTOR)
+        self.assertEqual(data["reason"], self.mod.followup.ERR_NO_DESCRIPTOR)
         self.assertTrue(data["slot_key"])
 
     async def test_state_reports_resumable_once_recorded(self):
         self._record()
         resp = await self.mod._handle_chat_get(
-            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))
+            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"})
+        )
         data = json.loads(resp.body)
         self.assertTrue(data["resumable"])
         self.assertEqual(data["reason"], "")
@@ -3034,27 +3255,28 @@ class TestFollowupRoutes(unittest.IsolatedAsyncioTestCase):
         self._record()
         self.mod._RUNS = []
         resp = await self.mod._handle_followup_start(
-            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"})
+        )
         self.assertEqual(resp.status, 409)
-        self.assertEqual(json.loads(resp.body)["code"],
-                         self.mod.followup.ERR_RUN_GONE)
+        self.assertEqual(json.loads(resp.body)["code"], self.mod.followup.ERR_RUN_GONE)
 
     async def test_start_refuses_when_the_transcript_is_gone(self):
         self._record()
         (self.sessions_dir / "sid-1.json").unlink()
         self.mod._APP_STATE["state"] = _FakeState(_FakeSessions())
         resp = await self.mod._handle_followup_start(
-            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"})
+        )
         self.assertEqual(resp.status, 409)
-        self.assertEqual(json.loads(resp.body)["code"],
-                         self.mod.followup.ERR_TRANSCRIPT_GONE)
+        self.assertEqual(json.loads(resp.body)["code"], self.mod.followup.ERR_TRANSCRIPT_GONE)
 
     async def test_start_seeds_the_resume_and_returns_the_slot(self):
         self._record()
         sessions = _FakeSessions()
         self.mod._APP_STATE["state"] = _FakeState(sessions)
         resp = await self.mod._handle_followup_start(
-            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"})
+        )
         self.assertEqual(resp.status, 200)
         data = json.loads(resp.body)
         expected_key = self.mod.followup.slot_key("run1", "GH-o-r-42")
@@ -3066,9 +3288,7 @@ class TestFollowupRoutes(unittest.IsolatedAsyncioTestCase):
         # from, carrying the provider and cwd the review actually ran with: a
         # provider mismatch makes the dashboard DISCARD the session id, and the
         # cwd is what the reviewer's relative paths were written against.
-        self.assertEqual(
-            sessions.seeds,
-            [(f"dashboard:{expected_key}", "sid-1", "acp", "/work")])
+        self.assertEqual(sessions.seeds, [(f"dashboard:{expected_key}", "sid-1", "acp", "/work")])
 
     async def test_start_does_not_reseed_an_existing_conversation(self):
         """Re-seeding would point a follow-up conversation back at the review's
@@ -3078,7 +3298,8 @@ class TestFollowupRoutes(unittest.IsolatedAsyncioTestCase):
         sessions = _FakeSessions({f"dashboard:{key}": ("later-sid", "acp", "/w")})
         self.mod._APP_STATE["state"] = _FakeState(sessions)
         resp = await self.mod._handle_followup_start(
-            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"})
+        )
         self.assertEqual(resp.status, 200)
         self.assertEqual(sessions.seeds, [])
 
@@ -3090,16 +3311,17 @@ class TestFollowupRoutes(unittest.IsolatedAsyncioTestCase):
         sessions.drop_seeded = True
         self.mod._APP_STATE["state"] = _FakeState(sessions)
         resp = await self.mod._handle_followup_start(
-            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"})
+        )
         self.assertEqual(resp.status, 409)
-        self.assertEqual(json.loads(resp.body)["code"],
-                         self.mod.followup.ERR_TRANSCRIPT_GONE)
+        self.assertEqual(json.loads(resp.body)["code"], self.mod.followup.ERR_TRANSCRIPT_GONE)
 
     async def test_start_reports_unavailable_sessions_rather_than_pretending(self):
         self._record()
         self.mod._APP_STATE["state"] = _FakeState(None)
         resp = await self.mod._handle_followup_start(
-            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"})
+        )
         self.assertEqual(resp.status, 503)
 
     async def test_the_folder_is_adopted_not_duplicated(self):
@@ -3107,14 +3329,22 @@ class TestFollowupRoutes(unittest.IsolatedAsyncioTestCase):
         self._record(sid="sid-2", change="GH-o-r-43")
         state = _FakeState(_FakeSessions())
         self.mod._APP_STATE["state"] = state
-        first = json.loads((await self.mod._handle_followup_start(
-            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
-        second = json.loads((await self.mod._handle_followup_start(
-            _Req({"run_id": "run1", "change_id": "GH-o-r-43"}))).body)
+        first = json.loads(
+            (
+                await self.mod._handle_followup_start(
+                    _Req({"run_id": "run1", "change_id": "GH-o-r-42"})
+                )
+            ).body
+        )
+        second = json.loads(
+            (
+                await self.mod._handle_followup_start(
+                    _Req({"run_id": "run1", "change_id": "GH-o-r-43"})
+                )
+            ).body
+        )
         self.assertEqual(first["folder_id"], second["folder_id"])
-        self.assertEqual(
-            [f["name"] for f in state._folders],
-            [self.mod.followup.FOLDER_NAME])
+        self.assertEqual([f["name"] for f in state._folders], [self.mod.followup.FOLDER_NAME])
 
     async def test_a_disabled_app_answers_nothing(self):
         """Disabling an app withdraws its runtime, not just its UI — a request
@@ -3124,9 +3354,11 @@ class TestFollowupRoutes(unittest.IsolatedAsyncioTestCase):
         self.mod._APP_STATE["state"] = _FakeState(_FakeSessions())
         for resp in (
             await self.mod._handle_chat_get(
-                _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"})),
+                _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"})
+            ),
             await self.mod._handle_followup_start(
-                _Req({"run_id": "run1", "change_id": "GH-o-r-42"})),
+                _Req({"run_id": "run1", "change_id": "GH-o-r-42"})
+            ),
         ):
             self.assertEqual(resp.status, 403)
             self.assertEqual(json.loads(resp.body)["code"], "app_disabled")
@@ -3154,7 +3386,8 @@ class TestFollowupRunLiveAndReentry(unittest.IsolatedAsyncioTestCase):
         store.ensure_run_layout("run1")
         (self.sessions_dir / "sid-1.json").write_text("{}", encoding="utf-8")
         self.mod.followup.write_descriptor(
-            "run1", "GH-o-r-42", sid="sid-1", agent="sage-reviewer", cwd="/work")
+            "run1", "GH-o-r-42", sid="sid-1", agent="sage-reviewer", cwd="/work"
+        )
         self.sessions = _FakeSessions()
         self.state = _FakeState(self.sessions)
         self.mod._APP_STATE["state"] = self.state
@@ -3173,8 +3406,13 @@ class TestFollowupRunLiveAndReentry(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_running_run_is_not_offerable(self):
         self._run(status="running")
-        data = json.loads((await self.mod._handle_chat_get(
-            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        data = json.loads(
+            (
+                await self.mod._handle_chat_get(
+                    _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"})
+                )
+            ).body
+        )
         self.assertFalse(data["resumable"])
         self.assertEqual(data["reason"], self.mod.followup.ERR_RUN_LIVE)
 
@@ -3182,30 +3420,45 @@ class TestFollowupRunLiveAndReentry(unittest.IsolatedAsyncioTestCase):
         """Posting happens AFTER a terminal status, so the status check alone
         would let this through."""
         self._run(status="done", posting=True)
-        data = json.loads((await self.mod._handle_chat_get(
-            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        data = json.loads(
+            (
+                await self.mod._handle_chat_get(
+                    _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"})
+                )
+            ).body
+        )
         self.assertFalse(data["resumable"])
         self.assertEqual(data["reason"], self.mod.followup.ERR_RUN_LIVE)
 
     async def test_start_refuses_while_the_run_is_live(self):
         self._run(status="running")
         resp = await self.mod._handle_followup_start(
-            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"})
+        )
         self.assertEqual(resp.status, 409)
-        self.assertEqual(json.loads(resp.body)["code"],
-                         self.mod.followup.ERR_RUN_LIVE)
+        self.assertEqual(json.loads(resp.body)["code"], self.mod.followup.ERR_RUN_LIVE)
         self.assertEqual(self.sessions.seeds, [])
 
     async def test_a_finished_run_is_offerable(self):
         self._run(status="done")
-        data = json.loads((await self.mod._handle_chat_get(
-            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        data = json.loads(
+            (
+                await self.mod._handle_chat_get(
+                    _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"})
+                )
+            ).body
+        )
         self.assertTrue(data["resumable"])
         self.assertEqual(data["reason"], "")
 
     async def _open_flag(self):
-        data = json.loads((await self.mod._handle_chat_get(
-            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        data = json.loads(
+            (
+                await self.mod._handle_chat_get(
+                    _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"})
+                )
+            ).body
+        )
         return data["followup_open"]
 
     async def test_reentry_is_reported_once_a_session_exists(self):
@@ -3233,8 +3486,13 @@ class TestFollowupRunLiveAndReentry(unittest.IsolatedAsyncioTestCase):
         self._run(status="done")
         self.mod._APP_STATE["state"] = _FakeState(None)
         self.assertFalse(await self._open_flag())
-        data = json.loads((await self.mod._handle_chat_get(
-            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        data = json.loads(
+            (
+                await self.mod._handle_chat_get(
+                    _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"})
+                )
+            ).body
+        )
         self.assertTrue(data["resumable"])
 
 
@@ -3261,19 +3519,22 @@ class TestFailureStringMapping(unittest.TestCase):
             os.environ["KIROCREW_HOME"] = self._old_home
 
     def _mapped(self, reason: str) -> str:
-        return self.mod._first_change_error(
-            {"per_change": [{"skipped_reason": reason}]})
+        return self.mod._first_change_error({"per_change": [{"skipped_reason": reason}]})
 
     def test_every_reason_maps_to_its_own_sentence(self):
-        reasons = ("no_review_recorded", "review_record_incomplete",
-                   "runtime_unavailable", "review_failed")
+        reasons = (
+            "no_review_recorded",
+            "review_record_incomplete",
+            "runtime_unavailable",
+            "review_failed",
+        )
         rendered = {reason: self._mapped(reason) for reason in reasons}
         for reason, text in rendered.items():
-            self.assertNotEqual(text, reason,
-                                f"{reason} passed through unmapped")
+            self.assertNotEqual(text, reason, f"{reason} passed through unmapped")
             self.assertTrue(text, f"{reason} rendered empty")
-        self.assertEqual(len(set(rendered.values())), len(reasons),
-                         f"reasons share a sentence: {rendered}")
+        self.assertEqual(
+            len(set(rendered.values())), len(reasons), f"reasons share a sentence: {rendered}"
+        )
 
     def test_never_ran_and_found_nothing_read_apart(self):
         never_ran = self._mapped("runtime_unavailable")
@@ -3284,11 +3545,17 @@ class TestFailureStringMapping(unittest.TestCase):
     def test_specific_error_text_outranks_the_reason_mapping(self):
         # A record carrying the preflight's own message (which names the missing
         # runtime) surfaces that message verbatim rather than the generic map.
-        out = self.mod._first_change_error({"per_change": [{
-            "deep_error": "the reviewer cannot run: no kiro-cli executable was "
-                          "found on this host",
-            "skipped_reason": "runtime_unavailable",
-        }]})
+        out = self.mod._first_change_error(
+            {
+                "per_change": [
+                    {
+                        "deep_error": "the reviewer cannot run: no kiro-cli executable was "
+                        "found on this host",
+                        "skipped_reason": "runtime_unavailable",
+                    }
+                ]
+            }
+        )
         self.assertIn("kiro-cli", out)
 
 
@@ -3328,32 +3595,40 @@ class TestRuntimePreflightWiring(unittest.IsolatedAsyncioTestCase):
 
         def _refuse_dispatch(loop, pool, **kw):
             def dispatch(task, timeout=0, **kwargs):
-                raise AssertionError("a session was dispatched despite a "
-                                     "failed runtime preflight")
+                raise AssertionError(
+                    "a session was dispatched despite a " "failed runtime preflight"
+                )
+
             return dispatch
 
         async def _noop_async(*a, **k):
             return None
 
         url = "https://github.com/kirodotdev/KiroCrew/pull/33"
-        run: dict = {"run_id": "rp1", "status": "running", "changes": [url],
-                     "change_ids": [_rd.change_id_for(url)], "progress": {}}
+        run: dict = {
+            "run_id": "rp1",
+            "status": "running",
+            "changes": [url],
+            "change_ids": [_rd.change_id_for(url)],
+            "progress": {},
+        }
         self.mod._RUNS = [run]
-        with unittest.mock.patch.object(
-                self.mod.review_pool, "runtime_preflight",
-                lambda: "the reviewer cannot run: no kiro-cli executable was "
-                        "found on this host"), \
-                unittest.mock.patch.object(
-                    self.mod.review_pool, "get_pool", lambda: _FakePool()), \
-                unittest.mock.patch.object(
-                    self.mod.review_pool, "make_sync_dispatch",
-                    _refuse_dispatch), \
-                unittest.mock.patch.object(self.mod, "_save_runs", _noop_async), \
-                unittest.mock.patch.object(
-                    self.mod, "_notify_finished", _noop_async):
+        with (
+            unittest.mock.patch.object(
+                self.mod.review_pool,
+                "runtime_preflight",
+                lambda: "the reviewer cannot run: no kiro-cli executable was " "found on this host",
+            ),
+            unittest.mock.patch.object(self.mod.review_pool, "get_pool", lambda: _FakePool()),
+            unittest.mock.patch.object(
+                self.mod.review_pool, "make_sync_dispatch", _refuse_dispatch
+            ),
+            unittest.mock.patch.object(self.mod, "_save_runs", _noop_async),
+            unittest.mock.patch.object(self.mod, "_notify_finished", _noop_async),
+        ):
             await self.mod._run_review_bg(run, [url])
 
-        self.assertEqual(batch_calls, [])            # runtime never spawned
+        self.assertEqual(batch_calls, [])  # runtime never spawned
         self.assertEqual(run["status"], "error")
         self.assertIn("kiro-cli", run["error"])
         entry = run["progress"][_rd.change_id_for(url)]

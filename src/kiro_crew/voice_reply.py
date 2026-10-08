@@ -90,9 +90,7 @@ PROVIDER_POLLY = "polly"
 PROVIDER_PIPER = "piper"
 PROVIDER_POCKET = "pocket"
 PROVIDER_SYSTEM = "system"
-VALID_PROVIDERS = frozenset(
-    {PROVIDER_POLLY, PROVIDER_PIPER, PROVIDER_POCKET, PROVIDER_SYSTEM}
-)
+VALID_PROVIDERS = frozenset({PROVIDER_POLLY, PROVIDER_PIPER, PROVIDER_POCKET, PROVIDER_SYSTEM})
 # Local offline TTS (Piper) is the documented recommended default — it needs no
 # AWS credentials or network, and it is the best offline quality. ``system`` (the
 # host's built-in engine) needs nothing installed at all and is the fallback a
@@ -1113,7 +1111,9 @@ async def stream_pocket_speech(
         raise RuntimeError("Pocket stream timed out") from exc
     except SandboxUnavailableError as exc:
         logger.error("Pocket TTS refused by sandbox (%s): %s", exc.kind, exc)
-        raise RuntimeError("Pocket TTS is unavailable because its sandbox is not configured") from exc
+        raise RuntimeError(
+            "Pocket TTS is unavailable because its sandbox is not configured"
+        ) from exc
     finally:
         if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
@@ -1696,9 +1696,13 @@ async def streaming_voice_reply(
     # ── Redact LLM output before it crosses an external surface (audio) ──
     response_text, cred_warns, url_warns = redact_with_findings(response_text)
     if cred_warns:
-        logger.warning("stream_voice_chunks: redacted %d credential pattern(s) before TTS", len(cred_warns))
+        logger.warning(
+            "stream_voice_chunks: redacted %d credential pattern(s) before TTS", len(cred_warns)
+        )
     if url_warns:
-        logger.warning("stream_voice_chunks: redacted %d suspicious URL(s) before TTS", len(url_warns))
+        logger.warning(
+            "stream_voice_chunks: redacted %d suspicious URL(s) before TTS", len(url_warns)
+        )
 
     sentences = split_sentences(response_text)
     for i, sentence in enumerate(sentences):

@@ -64,6 +64,11 @@ __all__ = [
     "skill_view_alias_census",
     "skill_view_sidecar_dirs",
     "skill_view_source_agent",
+    "acp_model_config_options",
+    "build_acp_provider",
+    "is_acp_error",
+    "is_acp_prompt_busy",
+    "is_acp_timeout",
 ]
 
 
@@ -84,6 +89,41 @@ class EntitlementRevalidating(Exception):
     module level, and the agent-sdk-boundary gate refuses application code a new
     ACP-layer import. The ACP driver raises it from here.
     """
+
+
+def acp_model_config_options(config_options: object) -> list[dict[str, str]]:
+    """Normalize the backend model selector into SDK model rows."""
+    from kiro_crew.acp.client import acp_model_config_options as _impl
+
+    return _impl(config_options)
+
+
+def build_acp_provider(**kwargs: Any) -> Any:
+    """Construct the legacy ACP provider behind the SDK boundary."""
+    from kiro_crew.providers.acp import AcpProvider
+
+    return AcpProvider(**kwargs)
+
+
+def is_acp_error(exc: BaseException) -> bool:
+    """Whether *exc* belongs to the ACP transport error family."""
+    from kiro_crew.acp.client import AcpError
+
+    return isinstance(exc, AcpError)
+
+
+def is_acp_prompt_busy(exc: BaseException) -> bool:
+    """Whether *exc* reports an overlapping ACP prompt."""
+    from kiro_crew.acp.transport_errors import AcpPromptBusy
+
+    return isinstance(exc, AcpPromptBusy)
+
+
+def is_acp_timeout(exc: BaseException) -> bool:
+    """Whether *exc* is an ACP transport timeout."""
+    from kiro_crew.acp.client import AcpTimeoutError
+
+    return isinstance(exc, AcpTimeoutError)
 
 
 def finish_suspended_spawn(process: object, pid: int, *, label: str) -> bool:

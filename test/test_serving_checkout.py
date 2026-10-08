@@ -59,7 +59,9 @@ def test_scan_ignores_a_change_that_arrives_inside_the_cache_window(tmp_path: Pa
     assert serving_checkout.scan(force=True, now=now + 2, root=tmp_path) is not None
 
 
-def test_report_logs_once_per_changed_file(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_report_logs_once_per_changed_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     now = time.time()
     _write(tmp_path, "changed.py", mtime=now)
     serving_checkout.reset_for_tests(started_at=now - 60)

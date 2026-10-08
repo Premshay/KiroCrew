@@ -102,6 +102,7 @@ export interface RosterQuery {
 
 interface RosterRowLike {
   name: string; display_name?: string; starred?: boolean; source?: unknown; last_active_ts?: number
+  last_chat_ts?: number
   dashboard_created?: unknown; has_dm_message?: unknown; last_message?: unknown
 }
 
@@ -119,40 +120,16 @@ function matchesSearch(m: RosterRowLike, needle: string): boolean {
   return m.name.toLowerCase().includes(needle) || rowLabel(m).toLowerCase().includes(needle)
 }
 
-/** Whether the roster lists a row WITHOUT being asked for it. Listed when
- *  EITHER its Crewmates-page DM thread already holds a message (any origin:
- *  a user who chatted with it is using it), OR it was created on the
- *  dashboard (`source` kirocrew AND a member id -- covers a greeting that
- *  failed or never landed). The default crew is listed whatever its record
- *  says, as it always has been. Everything else -- an app's row, a
- *  sync-generated row, a legacy row, none of them chatted with -- is hidden
- *  until the search reaches it.
- *
- *  A thread's first message is also read from the row's live preview
- *  (`last_message`, pushed through the member projection), so a row the user
- *  just chatted with stays listed without waiting for a roster refetch. A row
- *  from an older gateway that carries NEITHER field is listed: hiding on an
- *  absent field would blank the roster on a mixed-version deploy.
- *
- *  `defaultAgent === null` means the default-crew lookup failed: every row is
- *  listed, since the rule cannot tell which row it must never hide. */
+/** Every registered crew belongs in the Crew Members roster. The source and
+ * activity controls narrow it only when the person explicitly asks them to. */
 export function listedByDefault(m: RosterRowLike, defaultAgent: string | null): boolean {
-  if (defaultAgent === null) return true
-  if (defaultAgent !== '' && m.name === defaultAgent) return true
-  if (m.dashboard_created === undefined && m.has_dm_message === undefined) return true
-  return (
-    m.has_dm_message === true ||
-    m.dashboard_created === true ||
-    // A star is the user marking the row as theirs: listed like a chatted one.
-    m.starred === true ||
-    (typeof m.last_message === 'string' && m.last_message.trim() !== '')
-  )
+  void m
+  void defaultAgent
+  return true
 }
 
 /** Whether the roster shows this row for `query`, before the star / origin /
- *  status filters: listed by default, or reached by a typed search. With a
- *  search typed the search decides alone — a hidden row it reaches shows, a
- *  listed row it misses does not. */
+ * status filters. A search narrows the complete roster. */
 export function rosterShows(
   m: RosterRowLike,
   query: Pick<RosterQuery, 'search' | 'defaultAgent' | 'chosen'>,
@@ -162,12 +139,7 @@ export function rosterShows(
   return listedByDefault(m, query.defaultAgent) || (!!query.chosen && m.name === query.chosen)
 }
 
-/** The rows the roster is ABOUT for `query`: every row listed by default plus
- *  any hidden row the typed search reaches. This is the population the header
- *  count, the "N of M" and the filter menu's tallies read, so a count never
- *  includes a row the user cannot get to -- and, as before, the search itself
- *  never SHRINKS the count (it is transient, not a filter), it can only add the
- *  hidden rows it surfaces. */
+/** The complete roster used for the header count and filter menu tallies. */
 export function rosterPopulation<M extends RosterRowLike>(
   members: readonly M[],
   query: Pick<RosterQuery, 'search' | 'defaultAgent' | 'chosen'>,
@@ -181,13 +153,20 @@ export function rosterPopulation<M extends RosterRowLike>(
   )
 }
 
-/** Most-recently-active first (like any IM member list); never-talked members
- *  fall to the bottom alphabetically. `name` is a plain locale-aware sort over
- *  the DISPLAYED label, since that is the text the user scans. */
+/** A row's place in the Recent order: the user's own last message
+ *  (`last_chat_ts`), never a background turn. An older gateway's row, which
+ *  has no such field, falls back to its `last_active_ts`. */
+export function chatRecency(m: RosterRowLike): number {
+  return (typeof m.last_chat_ts === 'number' ? m.last_chat_ts : m.last_active_ts) ?? 0
+}
+
+/** Most-recently-CHATTED first (like any IM member list); never-chatted
+ *  members fall to the bottom alphabetically. `name` is a plain locale-aware
+ *  sort over the DISPLAYED label, since that is the text the user scans. */
 export function sortRoster<M extends RosterRowLike>(members: readonly M[], sort: MemberSort): M[] {
   const out = [...members]
   if (sort === 'name') return out.sort((a, b) => compareText(rowLabel(a), rowLabel(b)))
-  return out.sort((a, b) => (b.last_active_ts ?? 0) - (a.last_active_ts ?? 0) || compareText(rowLabel(a), rowLabel(b)))
+  return out.sort((a, b) => chatRecency(b) - chatRecency(a) || compareText(rowLabel(a), rowLabel(b)))
 }
 
 /** True when `query` narrows the roster by something other than the typed

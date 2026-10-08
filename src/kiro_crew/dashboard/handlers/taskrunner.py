@@ -12,12 +12,14 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
+from kiro_crew.apps.manager import TASK_RUNNER_APP, TASK_RUNNER_DISABLED_MESSAGE, app_disabled
 from kiro_crew.constants import DENY_CAUSE_SURFACE_POLICY
 from kiro_crew.dashboard.handlers._shared import (
     read_bounded_json,
     require_owner_dashboard_request,
 )
 from kiro_crew.dashboard.request_priority import owner_start_priority
+from kiro_crew.dashboard.slot_ownership import TASK_REVIEW_SLOT_PREFIX, task_review_session_key
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.execution_context import ExecutionContext, bind_session_execution
 from kiro_crew.hooks import FileTooLargeError, validate_file_path
@@ -61,10 +63,14 @@ async def _task_result_slot(request: web.Request, state: DashboardState, task_id
     if execution is None:
         return state.get_or_create_slot()
     token = uuid.uuid4().hex
-    session_key = f"taskrunner:{task_id}:chat:{token}"
+    # Minted together: the slot ownership checkpoint reads this link as the tab's
+    # own session (``slot_ownership.own_session_key``), so its owner app keeps it.
+    session_key = task_review_session_key(task_id, token)
     await asyncio.to_thread(bind_session_execution, session_key, execution)
     slot = state.get_or_create_slot(
-        f"task-review-{token}", linked_session_key=session_key, memory_mode=execution.memory_mode
+        f"{TASK_REVIEW_SLOT_PREFIX}{token}",
+        linked_session_key=session_key,
+        memory_mode=execution.memory_mode,
     )
     slot.memory_store = execution.store.legacy_name
     slot.memory_mode = execution.memory_mode
@@ -176,6 +182,7 @@ async def api_taskrunner_status(request: web.Request) -> web.Response:
         return refusal
     visible_sources = {"text", "spec", "file", "chat", "dashboard", "mcp", "yaml"}
     data["runs"] = [r for r in data["runs"] if r.get("source") in visible_sources]
+    data["running"] = any(row.get("running") for row in data["runs"])
     for run in data["runs"]:
         if run.get("error"):
             run["error"] = redact_exfiltration_urls(run["error"])[0]
@@ -387,6 +394,14 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
                 {"error": "invalid spec path", "code": "invalid_spec_path"}, status=400
             )
         spec_path = validated
+
+    # Checked before the inline spec is written, so a refusal leaves nothing behind.
+    # Disabled in Library means no new runs: the run would have no page to
+    # watch or stop it from.
+    if await asyncio.to_thread(app_disabled, TASK_RUNNER_APP):
+        return web.json_response(
+            {"error": TASK_RUNNER_DISABLED_MESSAGE, "code": "app_disabled"}, status=409
+        )
 
     # Handle inline spec content
     created_spec: Path | None = None

@@ -56,6 +56,7 @@ def setup(monkeypatch):
 class TestPreferenceAdvisor:
     def test_consult_tool_uses_verified_identity_and_bounded_transport(self, monkeypatch):
         from unittest.mock import Mock
+
         from kiro_crew import mcp_core
         from kiro_crew.mcp_tools.ledger import preference_advice
 

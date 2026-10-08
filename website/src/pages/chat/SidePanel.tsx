@@ -6,9 +6,10 @@ import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_DASHBOARD } from '../../utils/previewFlags'
 import { usePointerDrag } from '../../hooks/usePointerDrag'
 import { useLongPressReorder } from '../../hooks/useLongPressReorder'
+import { useScrollEdges } from '../../hooks/useScrollEdges'
 import { Reorder } from 'framer-motion'
 import { FileText, Bot, Workflow, ScrollText, MessageCircleQuestionMark, TerminalSquare, GitCompare, GitPullRequest, GitBranch, History, Plus, MoreHorizontal, X, Hash, Pen, Columns2, Component, Globe, CircleDot, Folder, Folders, Link as LinkIcon, PanelRight, PanelBottom, Layers, ListTree, Pin } from 'lucide-react'
-import { PanelRightLight } from '../../components/icons/panels'
+import { SidePanelDockHost, SidePanelGlyph } from '../../components/SidePanelGlyph'
 import ActivityViewer from './ActivityViewer'
 // Loaded with its tab, not the shell: the panel (attention cards, tile lists,
 // the session card frame) is only mounted once a Dashboard tab exists.
@@ -353,14 +354,14 @@ interface SidePanelProps {
   onFileSave: (filePath: string, content: string) => Promise<void>
   /** Close the whole panel (hides the side column). ABSENT means the panel is
    *  permanent: no close control renders in the strip and Escape inside a view
-   *  does nothing. A host that docks the panel as a fixed column (the Crew
-   *  Members page) omits it; a host whose panel the user opens and dismisses
-   *  (ChatPage, and the same page's narrow-window overlay) passes it. */
+   *  does nothing. A host whose panel the user opens and dismisses passes it:
+   *  ChatPage, and the Crew Members page in both placements (docked, it hides
+   *  the column; as a narrow-window overlay, it dismisses the drawer). */
   onClose?: () => void
   /** HOST-OWNED tabs pinned AHEAD of the pinned views, in strip order:
    *  non-closable, not draggable, never in the + menu, and not stored in the
-   *  tab bucket — the host renders each body. The Crewmates page uses three
-   *  (Notes / Work log / Dashboard). Their ids must not collide with a
+   *  tab bucket — the host renders each body. The Crew Members page uses one
+   *  (Dashboard). Their ids must not collide with a
    *  `TabKind`, and the same ids must be handed to `usePanelTabs` as
    *  `leadingIds` so a fresh strip opens on the first one and focus can fall
    *  back to it. Always labelled: several icon-only chips would be unlabelled
@@ -646,6 +647,18 @@ export default function SidePanel({
   }, [onClose, activeId])
   const pinnedTabs = useMemo(() => visibleTabs.filter(t => (PINNED_VIEWS as string[]).includes(t.id)), [visibleTabs])
   const dynamicTabs = useMemo(() => visibleTabs.filter(t => !(PINNED_VIEWS as string[]).includes(t.id)), [visibleTabs])
+  // Edge cues for the dynamic session-tab group — the real overflow site when
+  // many sessions are open. It hides its scrollbar, so a gradient is the only
+  // signal that tabs continue past the clipped edge. remeasure on the tab
+  // lists (the scroller keeps its box as tabs open/close/reorder).
+  const [attachTabEdges, tabEdges, remeasureTabEdges] = useScrollEdges<HTMLUListElement>()
+  useEffect(() => { remeasureTabEdges() }, [dynamicTabs, pinnedTabs, remeasureTabEdges])
+  // The pinned group scrolls under the same scrollbar-none, and its own comment
+  // notes it overflows at 320px once a host prepends leading chips — so it
+  // needs the same cue. Separate hook: it is a different scroller, and the two
+  // groups clip independently. remeasure when the leading/pinned chips change.
+  const [attachFixedEdges, fixedEdges, remeasureFixedEdges] = useScrollEdges<HTMLDivElement>()
+  useEffect(() => { remeasureFixedEdges() }, [leadingTabs, pinnedTabs, remeasureFixedEdges])
   // Terminal opens a NEW tab (its own PTY session) starting in the chat's
   // working dir; every other menu item is a singleton view.
   // Spawn a terminal whose cwd is the chat's project directory. Shared with the
@@ -970,6 +983,7 @@ export default function SidePanel({
   effectiveRef.current = { width: effectiveWidth, height: effectiveHeight }
 
   return (
+    <SidePanelDockHost value={canDockBottom}>
     <div
       ref={rootRef}
       data-testid="side-panel-root"
@@ -1024,7 +1038,12 @@ export default function SidePanel({
             panel root's `overflow-hidden` edge, where nothing at that width
             brings them back. The chips inside stay `shrink-0`: they scroll,
             they never squeeze. */}
+        {/* Wrapper for the edge cues: the fades anchor to this non-scrolling
+            parent, not the scrolled group. min-w-0 keeps the scroller
+            shrinkable (the group must stay shrinkable per the comment above). */}
+        <div className="relative min-w-0 flex items-end">
         <div
+          ref={attachFixedEdges}
           className="flex items-end gap-2 min-w-0 overflow-x-auto scrollbar-none -mb-px"
           data-testid="side-panel-fixed-tabs"
         >
@@ -1057,6 +1076,14 @@ export default function SidePanel({
             <TabChip key={t.id} tab={t} active={t.id === activeId} closable={false} pinned onSelect={() => { void requestActive(t.id, activeId) }} onClose={() => {}} />
           ))}
         </div>
+        {/* from-bg-elevated matches the side-panel-strip surface. */}
+        {fixedEdges.left && (
+          <div aria-hidden="true" data-testid="side-panel-fixed-tabs-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-r from-bg-elevated to-transparent" />
+        )}
+        {fixedEdges.right && (
+          <div aria-hidden="true" data-testid="side-panel-fixed-tabs-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-l from-bg-elevated to-transparent" />
+        )}
+        </div>
         {/* Chrome's separator rule, extended to the pinned↔dynamic divider: a
             hairline adjacent to the ACTIVE chip goes transparent. The active
             chip's 8px corner piece travels across this 6px gap, and a divider
@@ -1076,7 +1103,13 @@ export default function SidePanel({
             }`}
           />
         )}
+        {/* Wrapper for the edge cues: the fades anchor to this non-scrolling
+            parent, not the scrolled group. min-w-0 keeps the scroller
+            shrinkable. The -mb-px (border overlap) stays on the group itself,
+            which the seam-hairline contract pins. */}
+        <div className="relative min-w-0 flex items-end">
         <Reorder.Group
+          ref={attachTabEdges}
           axis="x"
           values={dynamicTabs}
           onReorder={(next) => setOrder([...pinnedTabs, ...next])}
@@ -1098,6 +1131,14 @@ export default function SidePanel({
             />
           ))}
         </Reorder.Group>
+        {/* from-bg-elevated matches the side-panel-strip surface. */}
+        {tabEdges.left && (
+          <div aria-hidden="true" data-testid="side-panel-tabs-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-r from-bg-elevated to-transparent" />
+        )}
+        {tabEdges.right && (
+          <div aria-hidden="true" data-testid="side-panel-tabs-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-l from-bg-elevated to-transparent" />
+        )}
+        </div>
         {/* + menu — the shared shadcn/Radix dropdown, so this strip gets the
             same pill hover, portalled positioning, focus trap/restore, roving
             arrow-key focus and Escape handling as every other menu in the app
@@ -1195,7 +1236,7 @@ export default function SidePanel({
           title={i18nT('pages.chat.sidePanel.close_panel')}
           aria-label={i18nT('pages.chat.sidePanel.close_panel')}
         >
-          <PanelRightLight size={15} />
+          <SidePanelGlyph light size={15} />
         </button>
         )}
         </div>
@@ -1429,6 +1470,7 @@ export default function SidePanel({
         })}
       </div>
     </div>
+    </SidePanelDockHost>
   )
 }
 

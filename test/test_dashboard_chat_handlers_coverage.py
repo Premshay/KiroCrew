@@ -42,7 +42,11 @@ MOD = "kiro_crew.dashboard.chat_handlers"
 def _sel():
     """Neutralize the security event log (it otherwise opens the real store)."""
     fake = MagicMock()
-    with patch(f"{MOD}.sel", return_value=fake):
+    # The app-isolation denials are written by the shared per-slot decision.
+    with (
+        patch(f"{MOD}.sel", return_value=fake),
+        patch("kiro_crew.dashboard.slot_ownership.sel", return_value=fake),
+    ):
         yield fake
 
 
@@ -360,7 +364,9 @@ class TestTryLiveModelSwitch:
     @pytest.mark.asyncio
     async def test_model_unavailable_propagates_instead_of_resetting(self):
         provider = _acp()
-        provider.client.set_model = AsyncMock(side_effect=AcpModelUnavailable("nope"))
+        provider.client.set_model = AsyncMock(
+            side_effect=AcpModelUnavailable("nope", backend=ACP_BACKEND_KIRO)
+        )
         with pytest.raises(AcpModelUnavailable):
             await ch._try_live_model_switch("s1", _ChatSlot("s1"), provider, "opus-4.8-1m")
 
@@ -819,14 +825,22 @@ class TestSlotContextInject:
         assert status2 == 200
 
     @pytest.mark.asyncio
-    async def test_queue_is_fifo_evicted_at_the_shared_ceiling(self, _sel):
+    async def test_queue_refuses_at_the_shared_ceiling_instead_of_evicting(self, _sel):
+        """A full queue REFUSES the newest entry rather than evicting the oldest.
+
+        Evicting discarded an entry the caller already had a 200 for, with nothing
+        reporting the loss. The endpoint now answers 429 `context_not_queued`, which
+        the caller can retry after the next drain.
+        """
         slot = _ChatSlot("s1")
         slot._pending_context = [{"content": f"c{i}", "source": ""} for i in range(50)]
         assert len(slot._pending_context) == _MAX_PENDING_CONTEXT
         status, body = await self._post(_state(slot), "s1", {"content": "newest"})
-        assert (status, body) == (200, {"ok": True, "pending": _MAX_PENDING_CONTEXT})
-        assert slot._pending_context[0]["content"] == "c1"
-        assert slot._pending_context[-1]["content"] == "newest"
+        assert status == 429
+        assert body["code"] == "context_not_queued"
+        assert slot._pending_context[0]["content"] == "c0"
+        assert len(slot._pending_context) == _MAX_PENDING_CONTEXT
+        assert all(e["content"] != "newest" for e in slot._pending_context)
 
 
 # ── queue mutation routes ────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
-import { X, LoaderCircle } from 'lucide-react'
+import { X } from 'lucide-react'
 import { SplitGlyph } from './SplitGlyph'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
@@ -11,12 +11,12 @@ import type { ThreadHooks } from '../app-sdk/messageRenderers'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
-import { usePreferenceAdvisor } from '../pages/chat/usePreferenceAdvisor'
+import RuntimeSelector from './RuntimeSelector'
+import { busySteerFlag } from './chat-input/busySend'
 import { filterCrewmateChat } from './chat/crewmateBubbles'
 import type { CrewmateIdentity } from '../pages/chat/CrewmateMessage'
 import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
-import RuntimeSelector from './RuntimeSelector'
 import ChatDropOverlay, { useChatFileDrop } from './ChatDropOverlay'
 import PaneDim from './PaneDim'
 
@@ -34,11 +34,11 @@ import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { pinCandidateKey, usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
 import { useJevAutoSend } from '../pages/chat/useJevAutoSend'
+import { usePreferenceAdvisor } from '../pages/chat/usePreferenceAdvisor'
 import type { DisplayItem } from '../pages/chat/types'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from './AgentDropdownList'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
-import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
 import ModelDropdownList from './ModelDropdownList'
 import ReasoningEffortDropdown from './ReasoningEffortDropdown'
 import { ManageModelsFooter, MORE_BELOW_MASK } from './ModelEffortDropdown'
@@ -46,14 +46,13 @@ import { routeModelPickerKeys } from './modelPickerKeyRouting'
 import { settingsPath } from './settingsPath'
 import { SlotProvider } from '../providers/SlotContext'
 import { useProvider } from '../providers'
-import type { ModelInfo } from '../providers/types'
 import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
-import { useAvailableModels } from '../hooks/useAvailableModels'
+import { useAvailableModelsQuery } from '../hooks/useAvailableModels'
 import { effortToCarry, filterInteractiveModels, legacyCodexEffort, modelWithoutEffort, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
-import { modelSupportsEffort } from '../lib/effort'
+import { effortSupportedForCrew, selectionCapabilitiesFailed } from '../lib/effort'
 import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
@@ -61,21 +60,24 @@ import { useKirocrewConfigReader } from '../hooks/useKirocrewConfigReader'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useScrollEdgesY } from '../hooks/useScrollEdges'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { PANE_HYDRATE_LIMIT, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, loadOlderMessages, loadOlderSlotMessages, syncSlotRunningFromServer, setAgentSwitchNotice, stageToMainComposer, pendingQuestionFor } from '../store/chatSlice'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
-import { appendFollowUpOption, removeFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
+import { appendFollowUpOption, removeFollowUpOption, selectSingleFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
 import { scaleContentWidth } from '../pages/chat/contentWidth'
 import { tryQuickSend } from '../lib/quickSend'
 import { takePaneDraft, writePaneDraft, mergePaneDraft, subscribePaneDraft } from '../utils/chatPaneDrafts'
-import { type PasteBlock, type CarriedPastes, carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft, pruneBlocks, saveStoredPaste } from '../utils/pasteTokens'
+import { type PasteBlock, expandAll as expandPasteTokens, mergeCarriedDraft } from '../utils/pasteTokens'
 import { sendTurn, type SendReceiptStatus } from '../chat-core/transport/sendTurn'
 import { applySteerReceipt } from '../chat-core/transport/steerReceipt'
 import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
+import { useMessageQuote } from '../chat-core/composer/useMessageQuote'
+import { buildOutgoingTurn, isEmptyTurn } from '../chat-core/composer/outgoingTurn'
+import { storeSentPastes, useComposerPastes } from '../chat-core/composer/composerPastes'
 import FlyingQuote from './FlyingQuote'
 import { revealComposer } from '../pages/chat/composerFocus'
-import { triggerRefresh, updateSlot } from '../store/dashboardSlice'
+import { triggerRefresh, updateSlot, slotIsRemoteBound } from '../store/dashboardSlice'
 import { inFlightSlotSwitchOutcome, performSlotSwitch, stagedSlotSwitchTarget } from '../lib/slotSwitch'
 import { drainPendingChunks } from '../lib/pendingChunkDrain'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
@@ -83,11 +85,22 @@ import { api } from '../api/client'
 import { slotMessagesQueryKey } from '../api/slotMessagesQuery'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import { classifyDrop } from '../utils/dropClassify'
-import { parseDirTokens, prepareSendPayload, serializeDirTokens, spliceDirTokens, VIDEO_EXT } from '../utils/fileTokens'
+import { parseDirTokens, spliceDirTokens, VIDEO_EXT } from '../utils/fileTokens'
 import { Composer, type ComposerHandle, type ComposerVoiceOptions } from '../chat-core/composer/Composer'
-import { displayModel, modelChipMarker, modelLabel } from '../lib/model'
+import { displayModel, modelChipMarker } from '../lib/model'
 import { useSettingsDefaultModel } from '../hooks/useSettingsDefaultModel'
 import { slotApprovalMode } from '../utils/slotApprovalMode'
+import {
+  cancelComposerUploads,
+  holdComposerSend,
+  isComposerSendHeld,
+  registerComposerUpload,
+  finishComposerAttachment,
+  unregisterComposerUpload,
+  useComposerArrivals,
+  useComposerSendHeld,
+  useComposerUploadCancellable,
+} from '../utils/composerSendHolds'
 
 
 import { i18nT } from '../i18n/t'
@@ -239,11 +252,15 @@ export default function ChatPane({
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
   const pendingDirs = useMemo(() => parseDirTokens(input).map(t => t.rel), [input])
   // Collapsed paste blocks behind the `[ Paste #N · M lines ]` tokens in
-  // `input` — the sidecar ChatInput needs before it collapses a large paste
-  // into a chip at all (it stays raw text for a host that passes no
-  // `onPasteBlocksChange`). Pane-local like `input`, parked and restored WITH
-  // it (chatPaneDrafts), expanded at send, cleared with it.
-  const [pasteBlocks, setPasteBlocks] = useState<PasteBlock[]>([])
+  // `input`: the Paste atom, carried to ChatInput by the Composer root below
+  // (without it a large paste stays raw text). Pane-local like `input`, parked
+  // and restored WITH it (chatPaneDrafts), expanded at send, cleared with it.
+  // `read()` is the latest list ahead of a render, `install` swaps it on a
+  // rebind, and `carry` brings a refused payload's blocks back renumbered past
+  // the held ones -- synchronously, so two recoveries in one React batch
+  // compose instead of the second dropping the first's blocks.
+  const composerPastes = useComposerPastes()
+  const { blocks: pasteBlocks, set: setPasteBlocks, read: readPastes, install: installPastes, carry: carryIntoComposer } = composerPastes
   // Upload failures shown as a banner, keyed by the slot they were shown for.
   // A banner belongs to the conversation it happened in: rebinding the pane to
   // another slot must not carry A's banner over B's thread, and coming back to
@@ -273,32 +290,12 @@ export default function ChatPane({
   const slotKeyRef = useRef(slotKey)
   const inputRef = useRef(input)
   const pendingFilesRef = useRef(pendingFiles)
-  const pasteBlocksRef = useRef(pasteBlocks)
   // False once the pane is gone: a recovery or upload result that lands after
   // unmount has no composer to write to (a setState on an unmounted component
   // is a silent no-op), so it goes to the store instead.
   const mountedRef = useRef(false)
   inputRef.current = input
   pendingFilesRef.current = pendingFiles
-  pasteBlocksRef.current = pasteBlocks
-  /** Bring recovered paste blocks into the live composer: the blocks behind
-   *  the tokens in `text` are re-numbered past the ones held now, and the text
-   *  with its rewritten tokens is returned for the caller's text merge.
-   *
-   *  The ref is advanced HERE, synchronously, not left to the next render:
-   *  two recoveries can land in one React batch (two sends refused together),
-   *  and both would otherwise read the same stale block list, so the second
-   *  `setPasteBlocks` would drop the first recovery's blocks while both tokens
-   *  still land in the text — a chip with nothing behind it, and a retry that
-   *  sends one paste twice and the other not at all. With the ref advanced
-   *  per call, the second recovery carries on top of the first. */
-  const carryIntoComposer = useCallback((text: string, pastes: PasteBlock[]): CarriedPastes => {
-    const carried = carryPastes(text, pastes, pasteBlocksRef.current)
-    if (!pastes.length) return carried
-    pasteBlocksRef.current = carried.pastes
-    setPasteBlocks(carried.pastes)
-    return carried
-  }, [])
   // A LAYOUT effect, not a passive one: `slotKeyRef` and the park/take below
   // must move in the same commit as the `slotKey` prop. With a passive effect
   // there is a gap between the commit and the effect in which the ref still
@@ -314,16 +311,15 @@ export default function ChatPane({
     // the one copy — the store entry is cleared so a later park cannot
     // overwrite an arrival that came in between.
     if (prev !== slotKey) {
-      writePaneDraft(prev, { text: inputRef.current, files: pendingFilesRef.current, pastes: pasteBlocksRef.current })
+      writePaneDraft(prev, { text: inputRef.current, files: pendingFilesRef.current, pastes: readPastes() })
       slotKeyRef.current = slotKey
       const incoming = takePaneDraft(slotKey)
       setInput(incoming.text)
       setPendingFiles(incoming.files)
-      // Ref advanced with the state (see carryIntoComposer): a recovery for the
+      // Installed, not merely set (see `composerPastes` above): a recovery for the
       // incoming slot that lands in this same commit carries on top of ITS
       // parked blocks, not the outgoing slot's.
-      pasteBlocksRef.current = incoming.pastes
-      setPasteBlocks(incoming.pastes)
+      installPastes(incoming.pastes)
     } else {
       // First mount: pick up whatever this slot parked before (a page the user
       // left mid-draft, a recovery that landed while the pane was gone). The
@@ -353,18 +349,17 @@ export default function ChatPane({
     return () => {
       unsubscribe()
       mountedRef.current = false
-      writePaneDraft(slotKeyRef.current, { text: inputRef.current, files: pendingFilesRef.current, pastes: pasteBlocksRef.current })
+      writePaneDraft(slotKeyRef.current, { text: inputRef.current, files: pendingFilesRef.current, pastes: readPastes() })
     }
-  }, [slotKey, carryIntoComposer])
-  /** Stage uploaded attachment paths for the slot they were picked in. A slow
-   *  upload can resolve after the pane was rebound to another member; the
-   *  paths then belong to the ORIGINATING slot's parked draft, not to whoever
-   *  is on screen now. */
-  const stagePendingFiles = useCallback((paths: string[], forSlot: string) => {
-    if (!paths.length) return
-    if (!mountedRef.current || forSlot !== slotKeyRef.current) { mergePaneDraft(forSlot, '', paths); return }
-    setPendingFiles((prev) => [...prev, ...paths.filter(p => !prev.includes(p))])
-  }, [])
+  }, [slotKey, carryIntoComposer, readPastes, installPastes])
+  useComposerArrivals(slotKey, (paths, arrivalSlot) => {
+    if (arrivalSlot !== slotKeyRef.current) return false
+    setPendingFiles(previous => [
+      ...previous,
+      ...paths.filter(path => !previous.includes(path)),
+    ])
+    return true
+  })
   /** Report an upload failure to the slot whose files failed. On screen it is
    *  the banner. Anywhere else — the pane rebound to another slot, or gone —
    *  it goes into that slot's TRANSCRIPT as an error row, the same place a
@@ -410,6 +405,19 @@ export default function ChatPane({
 
   const allMessages = useAppSelector((s) => selectSlotMessages(s, slotKey))
   const activeSlot = useAppSelector((s) => s.chat.activeSlot)
+  // Consume a Side Chat → composer hand-off staged for THIS pane's slot. Keyed
+  // by slot so a member's hand-off merges into that member's own composer and
+  // is never picked up by the dashboard ChatPage (which guards on its active
+  // slot too). Merge into the live composer — never replace — mirroring the
+  // pane's own draft-recovery seam; the user sends when they choose.
+  const mainComposerAppend = useAppSelector((s) => s.chat.mainComposerAppend)
+  useEffect(() => {
+    if (!mainComposerAppend || mainComposerAppend.slot !== slotKey) return
+    const text = mainComposerAppend.text
+    dispatch(stageToMainComposer(null))
+    const carried = carryIntoComposer(text, [])
+    setInput((cur) => mergeCarriedDraft(cur, carried))
+  }, [mainComposerAppend, slotKey, dispatch, carryIntoComposer])
   const streamState = useAppSelector((s) => selectSlotStreamState(s, slotKey))
   const running = streamState !== 'idle'
   // Per-slot context-window usage for the input-bar ring (mirrors ChatPage; the
@@ -421,6 +429,31 @@ export default function ChatPane({
   // has_more freezes at mount while a later bounded warm can truncate the cache.
   const warmHasMore = useAppSelector((s) => s.chat.slotPaneHasMore?.[slotKey])
   const paneSlot = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey))
+  // Older history for the ACTIVE slot. That slot reads the store's main list,
+  // which `switchSlot` loads one bounded page of; the full chat page walks the
+  // rest with `loadOlderMessages`, and a pane showing the active slot (the
+  // crewmate DM on the Members page) must offer the same walk or it is stuck
+  // on the newest page -- a patroller's page filters down to a few bubbles.
+  // Gated on the cursor key exactly like the thunk, so a mid-switch cursor
+  // that still describes the previous chat never draws the bar.
+  const pagesActiveSlot = useAppSelector((s) => slotKey === s.chat.activeSlot && s.chat.slotCursorKey === slotKey)
+  const activeHasMore = useAppSelector((s) => s.chat.slotHasMore)
+  const loadingOlder = useAppSelector((s) => s.chat.loadingOlder)
+  const olderFailed = useAppSelector((s) => !!s.chat.slotOlderError)
+  const loadOlder = useCallback(() => {
+    if (store.getState().chat.loadingOlder) return
+    void dispatch(loadOlderMessages())
+  }, [dispatch])
+  // Older history for a BACKGROUND slot, from the pane's own cursor. The
+  // Members page never makes a DM the active slot, so this is the door a warm
+  // DM pane actually has; the active branch above covers the other case.
+  const paneCursor = useAppSelector((s) => s.chat.slotPaneNextBefore?.[slotKey] ?? 0)
+  const paneLoadingOlder = useAppSelector((s) => !!s.chat.slotPaneLoadingOlder?.[slotKey])
+  const paneOlderFailed = useAppSelector((s) => !!s.chat.slotPaneOlderError?.[slotKey])
+  const pagesPane = slotKey !== activeSlot && warmHasMore === true && paneCursor > 0
+  const loadOlderPane = useCallback(() => {
+    void dispatch(loadOlderSlotMessages(slotKey))
+  }, [dispatch, slotKey])
   // The composer is a `Composer` root around the ChatInput preset (chat-core
   // P3-b). Its Voice atom is what gives the pane a microphone: the pane wires no
   // voice props, only the two things the atom cannot know — the endpointer's
@@ -430,9 +463,9 @@ export default function ChatPane({
   // ownership). The pane's steer-not-queue rule (#8852) stays on `canSteer`
   // below until the Send atom exists.
   const composerRef = useRef<ComposerHandle>(null)
-  const doSendRef = useRef<((optionText?: string) => void) | null>(null)
+  const autoSubmitRef = useRef<(() => void) | null>(null)
   const composerVoiceOptions = useMemo<ComposerVoiceOptions>(() => ({
-    onAutoSubmit: () => { doSendRef.current?.() },
+    onAutoSubmit: () => { autoSubmitRef.current?.() },
   }), [])
   // Shared composer-busy rule (chatSlice.selectComposerBusy): main turn
   // streaming OR sub-agents running (dual signal). Drives the queue affordance
@@ -467,10 +500,13 @@ export default function ChatPane({
   // prop). Filtered HERE, above the list, so the run positions the assistant
   // rows compute from their neighbours see the drawn list, and so the pinned
   // prompt, the earlier-messages anchor and the empty hint all agree with what
-  // is on screen. Same array identity back when nothing is dropped.
+  // is on screen. Same array identity back when nothing is dropped. While a
+  // turn runs, its tool calls and thinking stay in, so the chat shows what the
+  // crewmate is doing (same liveness the footer reads).
+  const crewmateLive = running || !!paneSlot?.running
   const messages = useMemo(
-    () => (crewmate ? filterCrewmateChat(paneMessages) : paneMessages),
-    [crewmate, paneMessages],
+    () => (crewmate ? filterCrewmateChat(paneMessages, crewmateLive) : paneMessages),
+    [crewmate, paneMessages, crewmateLive],
   )
   // The unfiltered rows, handed to the row set for the one read that must see
   // what the filter dropped (the steer-chip decision reads the policy-block
@@ -499,7 +535,7 @@ export default function ChatPane({
   // for the same reason as ChatPage: both would offer the same choices, and
   // only the card can answer the blocked tool call.
   const pendingQuestion = useAppSelector((s) => pendingQuestionFor(s.chat.pendingQuestions, slotKey))
-  const { followUpOptions, followUpSourceKey } = useMemo(
+  const { followUpOptions, followUpSourceKey, followUpMulti } = useMemo(
     () => deriveFollowUpOptions(allMessages, busy, !!pendingQuestion),
     [allMessages, busy, pendingQuestion],
   )
@@ -529,7 +565,11 @@ export default function ChatPane({
     setInput(next)
   }, [])
   const followUpOptionsKey = followUpOptions.join('\x00')
-  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, slotKey])
+  // A single-select offer is keyed on its source row too: a newer reply can repeat
+  // the same labels, and a single-select pick must not replace text the user picked
+  // from the older offer. Multi-select rows keep the label-only reset.
+  const singleSourceKey = followUpMulti ? null : followUpSourceKey
+  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, singleSourceKey, followUpMulti, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
   // with the page and no extra request is made for a pane.
   const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean; preference_advisor_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: fetchDashboardConfig, staleTime: 30_000 })
@@ -588,16 +628,9 @@ export default function ChatPane({
   // the configured default (matching what dispatch runs) before the literal
   // 'default' placeholder.
   const paneAgentName = paneSlot?.agent || defaultAgent || 'default'
-  // A remote (peer-bound) pane resolves the PEER's default, never this machine's:
-  // feeding the local `defaultAgent` into the inherited-default label would mark
-  // a peer's agent-less session with the wrong roster's default (#8770 GPT
-  // review). Mirrors ChatPage's `effectiveDefaultAgent`; '' for a peer whose
-  // capabilities have not loaded, which yields no false marker.
-  const paneRemoteCrew = useRemoteCapabilities(paneSlot)
+  const paneRemoteBound = slotIsRemoteBound(paneSlot)
+  const paneEffectiveDefaultAgent = paneRemoteBound ? '' : defaultAgent
   const queryClient = useQueryClient()
-  const paneEffectiveDefaultAgent = paneRemoteCrew.isRemote
-    ? (paneRemoteCrew.capabilities?.default_agent || '')
-    : defaultAgent
   const navigate = useNavigate()
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Same contract as ChatPage: set-only, clearing lives on the Templates page.
@@ -610,16 +643,9 @@ export default function ChatPane({
   // The pop-up lists the full catalog (a same-name member and template are
   // two rows); every other reader of the roster keeps the name-folded list.
   const agentDD = useFilteredDropdown(agentChoices)
-  const modelPickerAgent = installedAgents.find((agent) => agent.name === (paneSlot?.runtime_agent || paneAgentName))
-  const localModels = useAvailableModels({ agent: modelPickerAgent })
-  const effectiveModels = useMemo<ModelInfo[]>(() => {
-    if (!paneRemoteCrew.isRemote) return localModels
-    return (paneRemoteCrew.capabilities?.models ?? []).map(model => ({
-      name: model.model_name,
-      description: model.description || model.display_name,
-      contextWindow: model.context_window || undefined,
-    }))
-  }, [paneRemoteCrew.isRemote, paneRemoteCrew.capabilities, localModels])
+  const modelPickerAgent = installedAgents.find(agent => agent.name === (paneSlot?.runtime_agent || paneAgentName))
+  const localModelCatalog = useAvailableModelsQuery({ agent: modelPickerAgent })
+  const effectiveModels = localModelCatalog.data
   const selectionCapabilitiesQ = useQuery({
     queryKey: ['slot-selection-capabilities', slotKey, paneSlot?.runtime_agent || ''],
     queryFn: () => api.chatSlotSelectionCapabilities(slotKey),
@@ -644,10 +670,7 @@ export default function ChatPane({
     queryFn: () => api.getDecisionsConsent(),
     retry: false,
   })
-  // Not offered for a remote-bound session, for the reason ChatPage states: its
-  // turns run on the peer and never reach the routing hook.
-  const jevRouteOn =
-    jevRouteOffered(dashCfg, jevConsentQ.data, !!paneSlot) && !paneRemoteCrew.isRemote
+  const jevRouteOn = jevRouteOffered(dashCfg, jevConsentQ.data, !!paneSlot)
   const jevRouteLabel = i18nT('pages.chatPage.model_auto_jev_description')
   const modelPickerModels = useMemo(
     () => withJevRoute(
@@ -661,16 +684,6 @@ export default function ChatPane({
     [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model, jevRouteOn, jevRouteLabel, codexPairModels],
   )
   const modelDD = useFilteredDropdown(modelPickerModels)
-  const preferenceAdvisor = usePreferenceAdvisor({
-    enabled: dashCfg?.preference_advisor_enabled === true,
-    slot: slotKey,
-    model: paneSlot?.model || '',
-    eligible: !!paneSlot && !paneSlot.messages && !paneSlot.running && !paneRemoteCrew.isRemote && (paneSlot.memory_mode ?? 'persistent') === 'persistent',
-    models: modelPickerModels.map(model => model.name),
-    readDraft: () => input,
-    applyModel: model => switchModel(model, true),
-    openModelPicker: trigger => { anchorModelBtn(trigger.getBoundingClientRect(), trigger); modelDD.setOpen(true) },
-  })
   const [attachModelList, modelListEdges, remeasureModelList] = useScrollEdgesY<HTMLDivElement>()
   // The filter box narrows `modelDD.filtered` without a scroll or a box
   // resize once the list sits at its max height, so re-measure on every
@@ -697,16 +710,12 @@ export default function ChatPane({
     paneSlot?.model_withheld,
     codexPairModels ? modelWithoutEffort(paneSlot?.served_model || '') : paneSlot?.served_model || '',
   )
-  // What the chip READS; `shownModel` stays the value the picker selects on.
-  const shownModelLabel = modelLabel(shownModel, availableModels)
-  const effortSupported = provider.capabilities.reasoningEffort && !selectionCapabilitiesQ.isError && (
+  const effortSupported = provider.capabilities.reasoningEffort && !selectionCapabilitiesFailed(selectionCapabilitiesQ) && (
     selectionCapabilities
       ? selectionCapabilities.effort_supported === true
-      : modelSupportsEffort(shownModel === 'auto' ? '' : shownModel)
+      : effortSupportedForCrew(localModelCatalog.effortLevels, shownModel === 'auto' ? '' : shownModel)
   )
-  const effortLevelsOverride = selectionCapabilities
-    ? selectionCapabilities.effort_levels
-    : paneRemoteCrew.isRemote ? (paneRemoteCrew.capabilities?.effort_levels ?? []) : undefined
+  const effortLevelsOverride = selectionCapabilities?.effort_levels ?? localModelCatalog.effortLevels
   const readKirocrewConfig = useKirocrewConfigReader()
   const { data: defaultEffort = '' } = useQuery({
     queryKey: ['default-effort', provider.id],
@@ -726,8 +735,7 @@ export default function ChatPane({
   )
   // `default` only for the Settings default (see ChatPage).
   const chipDefault = useSettingsDefaultModel(
-    paneSlot && !paneSlot.model ? paneAgentName : '',
-    paneRemoteCrew.isRemote,
+    paneSlot && !paneSlot.model && !paneRemoteBound ? paneAgentName : '',
     codexPairModels,
   )
   const modelMarker = modelChipMarker(
@@ -768,7 +776,7 @@ export default function ChatPane({
     staleTime: Infinity,
   })
   useEffect(() => {
-    if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running }))
+    if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running, nextBefore: slotDetail.next_before }))
   }, [slotDetail, slotKey, dispatch, hydrateLimit])
 
   // Scroll follow (auto-pin, release, jump pill) is owned by the virtualizer
@@ -790,10 +798,8 @@ export default function ChatPane({
       setSwitchError(msg)
     }
   }, [dispatch, slotKey])
-  const switchModel = useCallback(async (name: string, adviser = false) => {
+  const switchModel = useCallback(async (name: string) => {
     setSwitchError('')
-    const finishAdvicePick = adviser ? undefined : preferenceAdvisor.beginModelPick(name)
-    let appliedModel: string | undefined
     try {
       // A staged slider pick or a legacy pair level is carried; an effort
       // write already on the wire is waited for, not re-sent, and its
@@ -835,21 +841,14 @@ export default function ChatPane({
           // `model`: the gateway resolves the sentinel to `auto`, so the stored
           // model cannot tell a routed pick from a plain Auto one. Written on
           // every pick, because picking a concrete model is what clears it.
-          (value) => {
-            appliedModel = value
-            dispatch(updateSlot({
+          (value) => dispatch(updateSlot({
             key: slotKey,
             model: value,
             jev_route: name === JEV_ROUTE_MODEL,
-          }))
-          })
+          })))
       }, () => inFlightSlotSwitchOutcome('reasoning_effort', slotKey))
       queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', slotKey] })
-      finishAdvicePick?.(appliedModel)
-      return appliedModel
     } catch (e) {
-      finishAdvicePick?.()
-      if (adviser) throw e
       // Same failure surface as switchAgent above: the shared notice toast,
       // plus the in-pane notice (the toast alone would be the only report of
       // a write that did not persist).
@@ -860,7 +859,24 @@ export default function ChatPane({
       // eslint-disable-next-line no-console
       console.error('[ChatPane] switchModel failed', e)
     }
-  }, [codexPairModels, dispatch, paneSlot?.model, paneSlot?.reasoning_effort, queryClient, slotKey, preferenceAdvisor.beginModelPick])
+  }, [codexPairModels, dispatch, paneSlot?.model, paneSlot?.reasoning_effort, queryClient, slotKey])
+  const preferenceAdvisor = usePreferenceAdvisor({
+    enabled: dashCfg?.preference_advisor_enabled === true,
+    slot: slotKey,
+    model: paneSlot?.model || '',
+    eligible: !!paneSlot && !paneSlot.messages && !paneSlot.running &&
+      (paneSlot.memory_mode ?? 'persistent') === 'persistent',
+    models: modelPickerModels.map(model => model.name),
+    readDraft: () => inputRef.current,
+    applyModel: async model => {
+      await switchModel(model)
+      return model
+    },
+    openModelPicker: trigger => {
+      anchorModelBtn(trigger.getBoundingClientRect(), trigger)
+      modelDD.setOpen(true)
+    },
+  })
 
   // Roving-focus keyboard nav for the pickers (mirrors ChatPage / StyledSelect):
   // ArrowUp/Down across options, Enter/Space select, Escape/Tab close + return
@@ -895,25 +911,33 @@ export default function ChatPane({
   //
   // The variables carry the slot the files were picked in: the pane can be
   // rebound to another slot while the upload is in flight, and the result
-  // must follow the files' slot, not the screen: paths stage into that slot's
-  // live or parked composer, failures into that slot's banner (or, after
-  // unmount, its transcript) — see stagePendingFiles / reportUploadFailure.
+  // must follow the files' slot, not the screen: completed paths enter that
+  // slot's arrivals inbox, while failures reach its banner or transcript.
   //
-  // The variables also carry the request's own AbortController, so the
-  // composer's cancel control can abort it. The set holds EVERY live one: the
-  // disabled attach button is not the only entry point, since paste, a drop
-  // and a Sketch insert all reach `uploadFiles` ungated, so two requests can be
-  // in flight at once.
-  const uploadAbortsRef = useRef(new Set<AbortController>())
+  // The variables also carry the request's own AbortController. It is
+  // registered per slot in the shared composerSendHolds registry, not kept on
+  // this pane: the hold below outlives the pane, so a pane remounted mid-upload
+  // must be able to cancel a request it did not start, or a hung request leaves
+  // its Send dead. The registry holds EVERY live one, since paste, a drop and a
+  // Sketch insert all reach `uploadFiles` ungated and two can be in flight.
+  //
+  // Shared per-slot holds survive a pane remount. Mutation callbacks still
+  // release their hold after the pane that started the upload unmounts.
+  const sendHeld = useComposerSendHeld(slotKey)
+  const uploadCancellable = useComposerUploadCancellable(slotKey)
   const uploadMutation = useMutation({
+    // 'always', not the default 'online': an offline browser would PAUSE the
+    // mutation before mutationFn, so onSettled (the only release of the shared
+    // hold below) would never run and the slot's Send would stay dead. Running
+    // it lets the fetch fail fast and the hold clear through the usual path.
+    networkMode: 'always',
     mutationFn: ({ files, controller }: UploadVars) => api.uploadFiles(files, controller.signal),
     // api.uploadFiles does NOT throw on a server refusal (unsupported type,
     // signature mismatch, over-cap): it resolves with { paths: [], error }.
     // So a refusal lands here in onSuccess, not onError — surface res.error
     // (matching ChatPage) instead of silently doing nothing.
     onSuccess: (res, { forSlot }) => {
-      if (res.error) { reportUploadFailure(i18nT('pages.chatPage.upload_failed_error', { error: res.error }), forSlot); return }
-      if (res.paths?.length) stagePendingFiles(res.paths, forSlot)
+      if (res.error) reportUploadFailure(i18nT('pages.chatPage.upload_failed_error', { error: res.error }), forSlot)
     },
     // api.uploadFiles throws for three distinct reasons: a client-side image
     // resize failure, a session expiry, and a transport reject. The first two
@@ -929,13 +953,14 @@ export default function ChatPane({
         : message
       reportUploadFailure(i18nT('pages.chatPage.upload_failed_error', { error: reason }), forSlot)
     },
-    onSettled: (_data, _err, { controller }: UploadVars) => {
-      uploadAbortsRef.current.delete(controller)
+    onSettled: (data, _err, { controller, forSlot }: UploadVars) => {
+      unregisterComposerUpload(forSlot, controller)
+      finishComposerAttachment(forSlot, data && !data.error ? data.paths ?? [] : [])
     },
   })
-  /** Abort every composer upload in flight. */
+  /** Abort every upload in flight for this pane's slot, whichever host started it. */
   const cancelUpload = useCallback(() => {
-    uploadAbortsRef.current.forEach(controller => controller.abort())
+    cancelComposerUploads(slotKeyRef.current)
   }, [])
   const uploadFiles = useCallback((files: File[]) => {
     if (!files.length) return
@@ -952,8 +977,10 @@ export default function ChatPane({
     const big = files.find((f) => !VIDEO_EXT.test(f.name) && f.size > 50 * 1024 * 1024)
     if (big) { setUploadError(i18nT('pages.chatPage.file_too_large', { name: big.name })); return }
     const controller = new AbortController()
-    uploadAbortsRef.current.add(controller)
-    uploadMutation.mutate({ files, forSlot: slotKeyRef.current, controller })
+    const forSlot = slotKeyRef.current
+    holdComposerSend(forSlot)
+    registerComposerUpload(forSlot, controller)
+    uploadMutation.mutate({ files, forSlot, controller })
   }, [uploadMutation, setUploadError])
 
   // Classify BEFORE acting (issue #743): a dropped folder inserts its path
@@ -988,6 +1015,10 @@ export default function ChatPane({
    *  into THAT slot's parked draft (shown again when the user returns to it)
    *  instead of into the composer the user is now looking at, which belongs to
    *  someone else's conversation, or into a component that no longer exists. */
+  // A whole message staged as the quote of the next send (one at a time, dropped
+  // on a slot switch). Both send paths consume it; a failed send restages it.
+  const messageQuote = useMessageQuote({ slot: slotKey, revealComposer, assistantName: crewmate ? (crewmate.label || crewmate.name) : undefined })
+  const { consume: consumeQuote, recoverInto: recoverQuoteInto } = messageQuote
   const restoreIntoComposer = useCallback((text: string, files: string[] = [], pastes: PasteBlock[] = [], forSlot: string = slotKeyRef.current) => {
     if (!mountedRef.current || forSlot !== slotKeyRef.current) { mergePaneDraft(forSlot, text, files, pastes); return }
     // The paste blocks behind the payload's tokens come back with it, numbered
@@ -1044,7 +1075,21 @@ export default function ChatPane({
     // asks the server to skip the hold that parks a message behind them and
     // start a real turn instead of queueing. Same `/api/chat` flag as a steer.
     const text = (optionText || input).trim()
-    if (!text && !pendingFiles.length) return
+    // A staged quote alone is a sendable message. An option pill's send is its
+    // own text and leaves the stage untouched, as it leaves files and pastes.
+    // An attachment for this composer is still on its way: a composer send now
+    // would leave without it (see ChatInput's `holdSend`). Checked here as well
+    // as in the view because voice auto-submit reaches doSend directly. Checked
+    // before the quote is consumed, so a held send keeps the staged quote.
+    if (!optionText && isComposerSendHeld(slotKey)) {
+      // Voice auto-submit relies on this send to stop a streaming dictation
+      // (see `useComposerVoice.onEndpoint`); nothing re-fires when the hold
+      // clears, so end it here or later speech keeps appending to the draft.
+      composerRef.current?.voice()?.disarmForSend()
+      return
+    }
+    const sentQuote = optionText ? null : consumeQuote('').quote
+    if (isEmptyTurn({ text, files: pendingFiles, quote: sentQuote })) return
     // A send while STREAMING dictation is live ends the dictation, before the
     // composer is read and cleared (see useComposerVoice.disarmForSend).
     composerRef.current?.voice()?.disarmForSend()
@@ -1059,7 +1104,7 @@ export default function ChatPane({
       const advice = preferenceAdvisor.beforeSend(text)
       if (!(typeof advice === 'boolean' ? advice : await advice)) return
       if (slotKeyRef.current !== slotKey || inputRef.current.trim() !== text ||
-        pendingFilesRef.current !== pendingFiles || pasteBlocksRef.current !== pasteBlocks) return
+        pendingFilesRef.current !== pendingFiles || readPastes() !== pasteBlocks) return
     }
     // Staged text and files belong to the COMPOSER, so only a send that
     // consumes the composer may clear or carry them. An `optionText` send (the
@@ -1075,36 +1120,20 @@ export default function ChatPane({
       setPendingFiles([])
       setPasteBlocks([])
     }
-    // Attachments take the SAME wire/bubble serialization as ChatPage
-    // (prepareSendPayload, the single owner of attachment-marker knowledge):
-    // every image becomes a producer-form `![image](dest)` line on BOTH the
-    // wire text and the bubble, every other file an `[attached_file N] path`
-    // marker on the wire with the ORDERED non-image list on `meta.files`.
-    // Before this the pane shipped the typed text verbatim and parked every
-    // path (images included) on `meta.files` alone — a shape neither side
-    // reads: the agent's image extraction matches absolute paths in the
-    // PROMPT TEXT, and the bubble renders images only from their markdown.
-    // So a picture attached in a member DM or a split pane never rendered
-    // and never reached the model, while the same send from the main chat
-    // did both (#9433).
-    const { txt, displayTxt, filePaths } = prepareSendPayload(text, files)
-    // Folder tokens take the same wire/bubble split ChatPage uses: the wire
-    // text carries `[attached_dir N] path` markers the agent can resolve, the
-    // bubble keeps the `@path/` token for the chip, and `meta.dirs` indexes
-    // marker N to dirPaths[N-1] for lossless history replay. The pane has no
-    // project context, so tokens are absolute and serialize as-is. Runs AFTER
-    // the file pass: file tokens never end in `/`, so the rewrites are disjoint.
-    const { llm: dirLlm, dirPaths } = serializeDirTokens(txt, '')
-    // Collapsed pastes expand for the model only, AFTER the file and folder
-    // passes (a path inside pasted content is content, not an attachment —
-    // the same order ChatPage sends in). The bubble keeps the tokens plus the
-    // blocks on `meta.pastes` so it renders the paste as a clickable chip, and
-    // the side table (saveStoredPaste) re-collapses the server's expanded echo
-    // to that chip on history load. Blocks whose token the user deleted as
-    // text are pruned first so neither carries a block nothing points at.
-    const bubblePastes = pruneBlocks(displayTxt, blocks)
-    const llm = bubblePastes.length ? expandPasteTokens(dirLlm, bubblePastes) : dirLlm
-    if (bubblePastes.length) saveStoredPaste(llm, displayTxt, bubblePastes, filePaths)
+    // The same turn ChatPage sends (`buildOutgoingTurn`, the one owner of the
+    // order): every image a producer-form `![image](dest)` line on BOTH texts
+    // and every other file an `[attached_file N] path` marker on the wire with
+    // the ORDERED non-image list on `meta.files` (the agent's image extraction
+    // matches absolute paths in the PROMPT TEXT, and the bubble renders images
+    // only from their markdown); folder tokens as `[attached_dir N]`
+    // markers with `meta.dirs` (the pane has no project context, so tokens are
+    // absolute and serialize as-is); the live paste tokens expanded on the wire
+    // while the bubble keeps them plus `meta.pastes`, and the side table
+    // re-collapses the server's expanded echo to that chip on history load; the
+    // quoted message opening both texts.
+    const turn = buildOutgoingTurn({ text, files, pastes: blocks, quote: sentQuote }, 'send')
+    const { wire: llm, bubble: displayTxt, pastes: bubblePastes } = turn
+    storeSentPastes(turn.storedPaste)
     // sendId correlation (same contract as ChatPage): the wire text differs
     // from the bubble text whenever a folder token serialized, so the store's
     // content-equality fallback can never reconcile the server echo against
@@ -1115,13 +1144,8 @@ export default function ChatPane({
     // single-chat send). Skipped while busy (main turn streaming OR sub-agents
     // running). A real queue has its own card; an immediate dispatch supplies
     // the skipped row through its correlated user echo.
-    const meta = {
-      ...(filePaths.length ? { files: filePaths } : {}),
-      ...(dirPaths.length ? { dirs: dirPaths } : {}),
-      ...(bubblePastes.length ? { pastes: bubblePastes } : {}),
-      sendId,
-    }
-    const bubbleMinted = !busy && (text || files.length)
+    const meta = { ...turn.meta, sendId }
+    const bubbleMinted = !busy && (text || files.length || sentQuote)
     if (bubbleMinted) {
       dispatch(appendSlotMessage({
         slot: slotKey,
@@ -1179,7 +1203,9 @@ export default function ChatPane({
         restore: (status) => {
           if (optionText) return
           if (status === 'response-late' && bubbleMinted) return
-          restoreIntoComposer(text, files, bubblePastes, slotKey)
+          // The quote: back on the stage when this pane is still live and the
+          // stage is free, else in the restored text (a rebound pane parks it).
+          restoreIntoComposer(recoverQuoteInto(text, sentQuote, mountedRef.current && slotKey === slotKeyRef.current), files, bubblePastes, slotKey)
         },
         // Report ONLY -- the error row. The restore is `restore`'s job above;
         // handing the payload back here too would restore a `refused` twice.
@@ -1215,7 +1241,7 @@ export default function ChatPane({
         // conservative shape ChatPage's cancel restores through), so the token
         // string alone would be a dead chip that sends literally on retry —
         // the pasted text itself is the lossless form of what the user put in.
-        stashDemoted: (queueId) => { if (!optionText) queuedSendStash.set(queueId, { raw: bubblePastes.length ? expandPasteTokens(text, bubblePastes) : text, files, sent: llm }) },
+        stashDemoted: (queueId) => { if (!optionText) queuedSendStash.set(queueId, { raw: bubblePastes.length ? expandPasteTokens(text, bubblePastes) : text, files, sent: llm, ...(sentQuote ? { quote: sentQuote } : {}) }) },
       })
       // -- doSend's send-machinery tail (not steer-receipt policy) --
       // Blocking ask resolution, owned by doSend and run on every accepted
@@ -1224,10 +1250,7 @@ export default function ChatPane({
       if (!askAtSend) return
       void resolveAskAfterSend(receipt.body, askAtSend, dispatch)
     })
-  }, [input, pendingFiles, pasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure, scrollToBottom])
-  // The endpointer auto-submit (handed to the Voice atom above) reads the
-  // latest send through this ref.
-  doSendRef.current = text => { void doSend(text, undefined, 'voice') }
+  }, [input, pendingFiles, pasteBlocks, setPasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure, scrollToBottom, consumeQuote, recoverQuoteInto, preferenceAdvisor.beforeSend, readPastes])
 
   // Mid-turn steer: inject the composer content into the RUNNING turn instead
   // of queueing behind it. The pane's counterpart to ChatPage.steer, on the
@@ -1253,20 +1276,22 @@ export default function ChatPane({
     if (!running) { doSend(undefined, true); return }
     const raw = input.trim()
     const files = pendingFiles
+    const sentQuote = consumeQuote('').quote
     // A steer cannot restore what it cleared on an empty payload, so refuse a
-    // payload of nothing (mirrors ChatPage.steer's `!raw && !files.length`).
-    if (!raw && !files.length) return
+    // payload of nothing (the same `isEmptyTurn` ChatPage's steer asks).
+    // A staged quote alone is a payload.
+    if (isEmptyTurn({ text: raw, files, quote: sentQuote })) return
     // A steer while STREAMING dictation is live ends the dictation, like
     // doSend: this path clears the composer below, and a partial landing after
     // the clear would rebuild the sent text (see useComposerVoice.disarmForSend).
     // AFTER the empty-payload check, like doSend: an Enter on an empty composer
     // before the first partial lands sends nothing and must not end the capture.
     composerRef.current?.voice()?.disarmForSend()
-    const { txt: inlined, filePaths } = prepareSendPayload(raw, files)
-    // Same expansion as doSend; the steer channel is text-only and ChatPage's
-    // steer shows the expanded text in its bubble too, so this one does.
-    const steerPastes = pruneBlocks(inlined, pasteBlocks)
-    const txt = steerPastes.length ? expandPasteTokens(inlined, steerPastes) : inlined
+    // The text-only steer turn: files inlined, the live paste tokens expanded
+    // (ChatPage's steer shows the expanded text in its bubble too, so this one
+    // does), the quote opening the text.
+    const turn = buildOutgoingTurn({ text: raw, files, pastes: pasteBlocks, quote: sentQuote }, 'steer')
+    const { wire: txt, pastes: steerPastes } = turn
     const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     // `meta.files` is the ORDERED non-image list the `[attached_file N]`
     // tokens index into: the transcript chip resolves marker N to
@@ -1274,7 +1299,7 @@ export default function ChatPane({
     // path capture, which truncates a filename containing spaces. The steer
     // channel itself is text-only, but the echo reconciles by merging meta
     // onto this bubble, so the index rides the row from here.
-    const steerMeta = { sendId, ...(filePaths.length ? { files: filePaths } : {}) }
+    const steerMeta = { sendId, ...turn.meta }
     // Drain the per-frame chunk buffer first, same as ChatPage's steer(): a
     // pre-steer chunk still pending in useWebSocket's buffer would otherwise
     // flush BELOW this card (see lib/pendingChunkDrain.ts).
@@ -1303,7 +1328,7 @@ export default function ChatPane({
         echoReconciled: () => selectSendConfirmed(store.getState(), slotKey, sendId),
         // refused / response-late hand the payload back into this pane's
         // composer (raw text + files), addressed to the slot it was typed into.
-        restore: () => restoreIntoComposer(raw, files, steerPastes, slotKey),
+        restore: () => restoreIntoComposer(recoverQuoteInto(raw, sentQuote, mountedRef.current && slotKey === slotKeyRef.current), files, steerPastes, slotKey),
         reportFailure: (reason, status) => reportSendFailure(reason, status),
         // \u26A0 is NoticeCard's warn-tone selector (parseNotice).
         warnUnconfirmed: () => dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } })),
@@ -1318,10 +1343,10 @@ export default function ChatPane({
         // chip gone (#560).
         // Expanded for the same reason as doSend's stash: no blocks travel
         // with the card, so the token alone would restore as a dead chip.
-        stashDemoted: (queueId) => queuedSendStash.set(queueId, { raw: steerPastes.length ? expandPasteTokens(raw, steerPastes) : raw, files, sent: txt }),
+        stashDemoted: (queueId) => queuedSendStash.set(queueId, { raw: steerPastes.length ? expandPasteTokens(raw, steerPastes) : raw, files, sent: txt, ...(sentQuote ? { quote: sentQuote } : {}) }),
       })
     })
-  }, [running, doSend, input, pendingFiles, pasteBlocks, slotKey, dispatch, reportSendFailure, restoreIntoComposer])
+  }, [running, doSend, input, pendingFiles, pasteBlocks, setPasteBlocks, slotKey, dispatch, reportSendFailure, restoreIntoComposer, consumeQuote, recoverQuoteInto])
 
   // Stop mirrors ChatPage's press protocol (ChatPage.onStop): the first press
   // is the cooperative cancel, a second press while the slot reports
@@ -1366,6 +1391,17 @@ export default function ChatPane({
   }, [slotKey])
   const paneStopState: typeof serverStopState =
     optimisticSoftPending && !isEscalationState(serverStopState) ? 'soft_pending' : serverStopState
+  // The endpointer auto-submit (handed to the Voice atom above) is an Enter
+  // press: the composer's default busy decision with this pane's own composer
+  // inputs (never the flipped chord), so it steers where Send would steer.
+  autoSubmitRef.current = () => {
+    // An attachment still uploading holds the composer: doSend owns that hold
+    // (it ends the dictation and sends nothing) and doSteer has no copy of it.
+    if (isComposerSendHeld(slotKey)) { void doSend(undefined, undefined, 'voice'); return }
+    const flag = busySteerFlag({ slotKey, busy, turnRunning: running, stopState: paneStopState, jevAutoConsented, busyMode })
+    if (flag) doSteer(flag === 'auto' ? { auto: true } : undefined)
+    else void doSend(undefined, undefined, 'voice')
+  }
   // A press that fails on the wire must say so: a silently swallowed
   // rejection leaves exactly the dead-looking button this fix removes. The
   // notice clears on the next press, so a retry that succeeds retires it.
@@ -1480,7 +1516,7 @@ export default function ChatPane({
     // alias store -- restoreIntoComposer's own third parameter is its
     // paste-block list -- so the adapter pins the two-argument call and the
     // alias map is dropped here by construction rather than misread as pastes.
-    restoreDraft: (text, files) => restoreIntoComposer(text, files),
+    restoreDraft: (text, files, _aliases, quote) => restoreIntoComposer(recoverQuoteInto(text, quote ?? null), files),
   })
   // Split-view panes draw the SAME transcript rows as the single-chat surface,
   // through the SDK's row registry: the live ToolCallLine (purpose / input /
@@ -1551,6 +1587,14 @@ export default function ChatPane({
            name: classes here are styling and can churn without anyone
            auditing focus behaviour. */
         data-chat-pane={focused ? 'focused' : ''}
+        /* WHICH session this pane sends to, for a lookup that already knows
+           the slot it wants -- a quick-search open in split view
+           (`queryComposerForSlot` in pages/chat/composerFocus.ts, #15937).
+           `data-chat-pane` above answers a different question (is this the
+           grid-focused pane), and the grid's focus never follows
+           `activeSlot`, so without this nothing in the DOM could say which
+           pane renders the session the user just opened. */
+        data-pane-slot={slotKey}
         {...dropTargetProps}
         className={`relative flex flex-col h-full min-h-0 overflow-hidden bg-bg ${
           frameless
@@ -1683,6 +1727,7 @@ export default function ChatPane({
           onDisplayItems={onDisplayItems}
           hiddenRow={pinHiddenRow}
           onQuote={onQuote}
+          onQuoteMessage={messageQuote.quoteMessage}
           onAsk={onAsk}
           threads={threads}
           onFileOpen={onFileOpen}
@@ -1692,6 +1737,12 @@ export default function ChatPane({
             onScroll: onScrollPin,
             onAtBottomChange: setIsAtBottom,
             scrollerStyle: { paddingTop: 12, paddingBottom: 12, minHeight: 0 },
+            // handOff off: its navigation would discard this pane's unsaved draft.
+            earlier: pagesActiveSlot
+              ? { hasMore: activeHasMore, loading: loadingOlder, failed: olderFailed, onLoad: loadOlder, handOff: false }
+              : pagesPane
+                ? { hasMore: true, loading: paneLoadingOlder, failed: paneOlderFailed, onLoad: loadOlderPane, handOff: false }
+                : undefined,
             aboveRows: (
               <>
                 {slotDetailFailed && (
@@ -1740,8 +1791,10 @@ export default function ChatPane({
                   </div>
                 )}
                 {/* Suppressed on the active slot: that pane renders the store's full
-                    history, so the bound does not apply and the row would be false. */}
-                {warmHasMore && slotKey !== activeSlot && onOpenFull && (
+                    history, so the bound does not apply and the row would be false.
+                    Also suppressed while the pane can page itself: the bar above
+                    already loads the older rows in place. */}
+                {warmHasMore && slotKey !== activeSlot && !pagesPane && onOpenFull && (
                   <button
                     onClick={() => onOpenFull(slotKey, messages[0]?.ts, messages[0]?.meta?.mid as string | undefined)}
                     className="block w-full text-center text-accent text-[12px] underline py-2 bg-transparent border-none cursor-pointer hover:text-accent-hover transition-colors"
@@ -1914,7 +1967,6 @@ export default function ChatPane({
         />
 
         {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
-        {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
         <ErrorNotice
           className="mx-4 mt-2 mb-0 animate-rise"
           testId="chat-pane-upload-error"
@@ -1937,7 +1989,7 @@ export default function ChatPane({
           variant="inline"
           className="mx-4 mt-2"
           testId="chat-pane-effort-capabilities-error"
-          message={provider.capabilities.reasoningEffort && selectionCapabilitiesQ.isError
+          message={provider.capabilities.reasoningEffort && selectionCapabilitiesFailed(selectionCapabilitiesQ)
             ? i18nT('pages.chatPage.effort_options_unavailable') : ''}
         />
         {/* No hand-off: this pane holds an unsent draft; the reads retry in place. */}
@@ -1980,12 +2032,11 @@ export default function ChatPane({
           value={input}
           onChange={handleUserInput}
           voice={composerVoiceOptions}
+          pastes={composerPastes}
         >
         <ChatInput
           value={input}
           onChange={handleUserInput}
-          pasteBlocks={pasteBlocks}
-          onPasteBlocksChange={setPasteBlocks}
           onSend={doSend}
           terminalCommands={!paneSlot ? 'pending' : paneSlot.executor === 'remote' ? 'remote' : 'local'}
           isRunning={busy}
@@ -1996,6 +2047,9 @@ export default function ChatPane({
           // get the same mid-turn choice as the main chat, and a
           // `steer-only` host gets a plain send that steers.
           canSteer={busy}
+          // `doSteer` takes no `text`: the pane derives its chips from the same
+          // `busy` that gates the steer path, so a chip is never on screen while
+          // a send would steer, and the composer draft is the only steer payload.
           onSteer={doSteer}
           // AND a turn actually running: `busy` also covers a slot whose
           // sub-agents are still working, where the send starts a fresh turn and
@@ -2004,7 +2058,7 @@ export default function ChatPane({
           busyMode={busyMode}
           autoFocusKey={slotKey}
           agentName={paneAgentName}
-          backendControl={<RuntimeSelector slot={slotKey} value={paneSlot?.runtime_agent} running={running} remote={paneRemoteCrew.isRemote} />}
+          backendControl={<RuntimeSelector slot={slotKey} value={paneSlot?.runtime_agent} running={running} remote={paneRemoteBound} />}
           // The chip shows the inherited-default marker; `agentName` stays the
           // raw resolved alias for the skills query and switch title. Uses the
           // SLOT's stored agent (not `paneAgentName`, which has already
@@ -2013,7 +2067,7 @@ export default function ChatPane({
           agentLabel={agentOrDefaultLabel(paneSlot?.agent, paneEffectiveDefaultAgent)}
           agentIsInheritedDefault={!paneSlot?.agent && !!paneEffectiveDefaultAgent}
           agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
-          modelName={shownModelLabel}
+          modelName={shownModel}
           reasoningEffort={effectiveEffort}
           effortIsDefault={!paneSlot?.reasoning_effort && !legacyCodexEffort(paneSlot?.model || '', '', codexPairModels) && !!defaultEffort}
           // Effort is edited inside the model picker below; the chip only
@@ -2035,10 +2089,11 @@ export default function ChatPane({
           followUpLayout={chatConfig.followUpLayout}
           quickSend={dashCfg?.quick_send}
           followUpSourceKey={followUpSourceKey}
-          onFollowUpSelect={(o: string, e: React.MouseEvent) => {
+          followUpMulti={followUpMulti}
+          onFollowUpSelect={(o: string, e: React.MouseEvent, _key: string | null | undefined, sendNow: (text: string) => void) => {
             // One-click Quick Send takes the same gate as ChatPage: enabled +
             // no shift + not busy + not already in multi-select.
-            if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, busy, followUpPickedRef.current.size, (t: string) => doSend(t))) return
+            if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, busy, followUpPickedRef.current.size, sendNow)) return
             // Regular options: toggle. Click unpicked → append + mark; click
             // picked → try to remove the text + unmark (if the user edited the
             // text so it no longer matches, leave the text alone — the chip
@@ -2060,9 +2115,12 @@ export default function ChatPane({
               setInput(r.value)
               setFollowUpPicked(next)
             } else {
-              const next = new Set(followUpPickedRef.current); next.add(o)
+              // `[OPTION:]` is single-select: the new pick replaces the previous one.
+              const next = followUpMulti ? new Set(followUpPickedRef.current) : new Set<string>(); next.add(o)
               followUpPickedRef.current = next
-              const r = appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+              const r = followUpMulti
+                ? appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+                : selectSingleFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
               followUpInsertedRef.current = r.owned
               inputRef.current = r.value
               setInput(r.value)
@@ -2075,15 +2133,19 @@ export default function ChatPane({
           // addresses it by name rather than the product ("Message Kiro Crew…").
           placeholder={crewmate ? i18nT('components.chatInput.message_placeholder', { bot: crewmate.label || crewmate.name }) : undefined}
           onUploadFiles={uploadFiles}
-          onCancelUpload={cancelUpload}
+          onCancelUpload={uploadCancellable ? cancelUpload : undefined}
           pendingFiles={pendingFiles}
           pendingDirs={pendingDirs}
+          pendingQuote={messageQuote.pendingQuote}
+          onRemoveQuote={messageQuote.clearQuote}
           onRemoveFile={(p) => setPendingFiles((prev) => prev.filter((x) => x !== p))}
           onRemoveDir={rel => {
             const esc = `@${rel}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
             setInput(prev => prev.replace(new RegExp(`(^|\\s)${esc}(?: |(?=\\s)|$)`, 'g'), '$1'))
           }}
-          uploading={uploadMutation.isPending}
+          /* `isPending` tracks only the latest mutation; the counted hold keeps the spinner up until the last concurrent upload settles. Cancel is gated separately above. */
+          uploading={uploadMutation.isPending || sendHeld}
+          holdSend={sendHeld}
           onDrop={dropTargetProps.onDrop}
           onDragOver={dropTargetProps.onDragOver}
           onDragLeave={dropTargetProps.onDragLeave}
@@ -2184,24 +2246,9 @@ export default function ChatPane({
                 </Btn>
               </div>
             )}
-            {paneRemoteCrew.failed && (
-              <div className="flex shrink-0 items-center gap-2 px-1.5 py-1">
-                {/* No hand-off: this pane's composer may hold an unsent draft.
-                    Retry keeps the user in the owning chat. */}
-                <ErrorNotice
-                  className="min-w-0 flex-1"
-                  variant="inline"
-                  message={i18nT('components.modelEffortDropdown.models_failed')}
-                />
-                <Btn type="button" className="shrink-0" onClick={() => paneRemoteCrew.refetch()} disabled={paneRemoteCrew.retrying}>
-                  {paneRemoteCrew.retrying && <LoaderCircle className="lucide-inline animate-spin" aria-hidden />}
-                  {i18nT('pages.settings.chatPanel.retry')}
-                </Btn>
-              </div>
-            )}
             {/* Same bottom fade as ModelEffortDropdown's list (see MORE_BELOW_MASK). */}
             <div ref={attachModelList} role="listbox" aria-label={i18nT('components.chatPane.model_list')} className={`min-h-[96px] flex-1 overflow-y-auto max-h-[280px] ${modelListEdges.bottom ? MORE_BELOW_MASK : ''}`}>
-              <ModelDropdownList models={modelDD.filtered} activeModel={jevRouteShownModel(shownModel, paneSlot)} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
+              <ModelDropdownList models={modelDD.filtered} activeModel={jevRouteShownModel(shownModel, paneSlot)} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} />
             </div>
             {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
               modelDD.setOpen(false)

@@ -70,7 +70,7 @@ class _FakeBgSession:
         self.reject_tool = AsyncMock()
         self.destroy = AsyncMock()
 
-    async def prompt(self, _prompt):  # noqa: ANN001 - test double
+    async def prompt(self, _prompt, *, allow_image=True):  # noqa: ANN001 - test double
         if self._emit_tool_call:
             yield SimpleNamespace(kind=EVENT_TOOL_CALL, title="fs_read")
         if self._emit_permission:
@@ -292,7 +292,7 @@ class TestResolveContradictions:
                 self.reject_tool = AsyncMock()
                 self.destroy = destroyed
 
-            async def prompt(self, _prompt):  # noqa: ANN001 - test double
+            async def prompt(self, _prompt, *, allow_image=True):  # noqa: ANN001 - test double
                 import asyncio
                 await asyncio.sleep(10)
                 yield SimpleNamespace(kind=EVENT_COMPLETE)  # pragma: no cover
@@ -1083,9 +1083,10 @@ class TestWriteLessonAttachesNegativeToStoredRule:
 
     def test_an_unrelated_superset_cannot_discard_the_enrichment(self, tmp_path):
         """The generic dedup rules can refuse on an UNRELATED row -- a superset whose
-        text contains our rule. get_lessons() orders by md5 key, so whether that row
-        is scanned before ours is effectively random; resolving the exact match in its
-        own pass first is what makes the outcome independent of row order."""
+        text contains our rule. get_lessons() orders by updated_at DESC, then by md5
+        key within one stamp, so whether that row is scanned before ours is
+        effectively random; resolving the exact match in its own pass first is what
+        makes the outcome independent of row order."""
         store = self._store(tmp_path)
         try:
             # Store the exact rule AND a superset that contains it. The superset is

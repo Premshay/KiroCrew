@@ -65,9 +65,10 @@ def test_launch_arms_pending_delivery_with_stable_contract():
     assert len(assignment["worker_run_id"]) == 8
     assert len(assignment["worker_fingerprint"]) == 16
     assert len(assignment["contract_digest"]) == 64
-    assert assignment["contract_digest"] == __import__("hashlib").sha256(
-        contract.encode("utf-8")
-    ).hexdigest()
+    assert (
+        assignment["contract_digest"]
+        == __import__("hashlib").sha256(contract.encode("utf-8")).hexdigest()
+    )
     assert item["title"] in contract
     assert item["next_action"] in contract
     # Deterministic re-render under the same assignment: identical digest.
@@ -428,9 +429,7 @@ def test_worker_view_excludes_evaluator_internals():
     wi.record_launch_accepted(KEY, run_id)
     wi.record_launch_delivered(KEY, run_id)
     wi.worker_report_progress(f"subagent:{run_id}", item["id"], "working", "progress")
-    results = wi.evaluate_items(
-        KEY, [item["id"]], evaluator=lambda record: ("fail", "not yet")
-    )
+    results = wi.evaluate_items(KEY, [item["id"]], evaluator=lambda record: ("fail", "not yet"))
     assert results[0]["verdict"] == "fail"
     view = wi.worker_assigned_read(f"subagent:{run_id}", item["id"])
     assert "last_evaluation" not in view

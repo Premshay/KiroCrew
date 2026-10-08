@@ -21,7 +21,12 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew import name_grant, permission_floor
 from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
-from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage, classify_stop_reason
+from kiro_crew.acp.types import (
+    EVENT_COMPACTION_STATUS,
+    EVENT_STEER_CONSUMED,
+    TurnUsage,
+    classify_stop_reason,
+)
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling_on
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.constants import (
@@ -287,6 +292,22 @@ def acp_error_is_session_not_found(exc: BaseException) -> bool:
     HTTP 404 body, a dashboard lookup) must never reset a chat.
     """
     return isinstance(exc, AcpError) and "session not found" in str(exc).lower()
+
+
+TOOL_ACTIVITY_ATTR = "turn_tool_activity"
+
+
+def acp_error_after_tool_activity(exc: BaseException) -> bool:
+    """Return whether a failed turn had already emitted a tool call."""
+    return getattr(exc, TOOL_ACTIVITY_ATTR, False) is True
+
+
+SESSION_NOT_FOUND_RETRY_NOTICE = "⟳ The agent lost its session — reconnecting…"
+SESSION_NOT_FOUND_GIVE_UP_TEXT = "Could not reconnect the agent's session."
+SESSION_NOT_FOUND_NOT_REPLAYED_TEXT = (
+    "The agent lost its session after it had started working. It reconnects on the "
+    "next message; this one was not re-run, so its tools do not run twice."
+)
 
 
 def transient_retry_delay(attempt: int) -> float:
@@ -1719,7 +1740,7 @@ async def run_bg_oneliner(
         # Left in, the prompt builder re-inlines every still-readable file as an
         # image block: a session summary carried one per pasted screenshot, and
         # a text-only background model rejected the whole request on each pass.
-        async for event in session.prompt(strip_image_refs(prompt)):
+        async for event in session.prompt(strip_image_refs(prompt), allow_image=False):
             if event.kind == EVENT_TEXT_CHUNK:
                 if max_output_bytes is not None:
                     output_bytes += len(event.text.encode("utf-8"))
@@ -2418,6 +2439,7 @@ async def stream_and_collect(
     on_tool_approval: Callable[[LLMEvent], Awaitable[bool]] | None = None,
     on_steer_consumed: Callable[[str], None] | None = None,
     on_complete: Callable[[LLMEvent], None] | None = None,
+    on_compaction: Callable[[LLMEvent], None] | None = None,
     on_tool_gate: Callable[[str, bool, bool], None] | None = None,
     retry_transient: bool = True,
     max_turns: int | None = None,
@@ -2428,6 +2450,7 @@ async def stream_and_collect(
     app: str = "",
     model_fallback: bool = False,
     fallback_models: Sequence[str] = (),
+    allow_image: bool = True,
 ) -> str:
     """Stream a message through an LLM provider and collect the full response.
 
@@ -2452,6 +2475,8 @@ async def stream_and_collect(
             ``EVENT_COMPLETE``. It is not invoked when the stream exhausts or
             the caller cancels before that event. Raising from the callback is
             swallowed so observation cannot fail the completed turn.
+        on_compaction: Optional callback invoked for each compaction status event.
+        allow_image: ``False`` keeps path-like text from becoming image blocks.
         on_tool_gate: Optional callback invoked once per tool permission
             decision with ``(tool_title, approved, security_blocked)``. Lets a
             caller tell "the model did work" apart from "every tool the model
@@ -2555,7 +2580,12 @@ async def stream_and_collect(
         # baseline an attempt that was billed and then failed is invisible.
         attempt_stats_before = _billing_stats(provider)
         try:
-            async for event in provider.stream(message):
+            events = (
+                provider.stream(message)
+                if allow_image
+                else provider.stream(message, allow_image=False)
+            )
+            async for event in events:
                 if event.kind == EVENT_TEXT_CHUNK:
                     result_text += event.text
                     if on_chunk:
@@ -2629,6 +2659,12 @@ async def stream_and_collect(
                     )
                 elif event.kind == EVENT_STEER_CONSUMED:
                     consumed_this_attempt.append(event.text or "")
+                elif event.kind == EVENT_COMPACTION_STATUS:
+                    if on_compaction:
+                        try:
+                            on_compaction(event)
+                        except Exception:
+                            logger.debug("on_compaction callback failed", exc_info=True)
                 elif event.kind == EVENT_COMPLETE:
                     complete_event = event
                     if on_complete:
@@ -2886,6 +2922,7 @@ async def stream_and_collect_json(
     hooks: HookManager | None = None,
     retry_transient: bool = True,
     model_fallback: bool = False,
+    allow_image: bool = True,
 ) -> dict | None:
     """Stream a message and parse the response as JSON.
 
@@ -2899,6 +2936,7 @@ async def stream_and_collect_json(
         hooks=hooks,
         retry_transient=retry_transient,
         model_fallback=model_fallback,
+        allow_image=allow_image,
     )
     return parse_llm_json(text)
 

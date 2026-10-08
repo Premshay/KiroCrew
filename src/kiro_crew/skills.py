@@ -20,6 +20,7 @@ import asyncio
 import base64
 import csv
 import difflib
+import errno
 import functools
 import hashlib
 import hmac
@@ -113,7 +114,6 @@ from kiro_crew.skill_runtime.listing import (  # noqa: F401
     _fingerprint_mtime_and_size,
 )
 from kiro_crew.skill_runtime.read_credit import (  # noqa: F401
-    _mentions_skill_basename,
     _shell_segments_reading_content,
     _tool_read_path_candidates,
 )
@@ -123,6 +123,7 @@ from kiro_crew.skill_search_index import (  # noqa: F401
     SkillSearchIndex,
     body_fingerprint,
 )
+from kiro_crew.skill_usage import names_skill_file  # noqa: F401  (read_credit reads it via sk)
 from kiro_crew.skill_usage import SKILL_USAGE_FILENAME, SkillUsageLedger
 from kiro_crew.skills_script_validator import MAX_SCRIPT_BYTES, validate_scripts
 from kiro_crew.trigger_match import MIN_TRIGGER_OVERLAP, trigger_score, words_of
@@ -350,18 +351,23 @@ class SkillReadRefusal(NamedTuple):
     size_bytes: int | None = None  # the whole body, when the read measured it
     confined: bool = False  # ``capacity`` is the confined project body cap
     line: int | None = None  # over_capacity: the one line that fits no page
+    # outside_scope while the scope's catalog is still building: the key may yet
+    # resolve once the walk finishes, so the absence is not conclusive.
+    incomplete: bool = False
 
 
 class _ExactRead(NamedTuple):
     """One pass of the exact-key resolution chain, with its refusal classified.
 
     ``refusal`` is one of the three read reasons when ``content`` is ``None`` and
-    empty when a body was delivered.
+    empty when a body was delivered. ``incomplete`` marks an outside-scope miss
+    taken while the scope's catalog was still building.
     """
 
     content: str | None
     refusal: str
     confined: bool
+    incomplete: bool = False
 
 
 def _page_skill_body(
@@ -911,9 +917,9 @@ def _packaged_skill_names() -> frozenset[str]:
 #: any filesystem work when deciding whether a tool call touched a skill.
 _SKILL_FILE = "SKILL.md"
 
-#: Argument names under which file-reading tools carry their target. Covers the
-#: builtin read tool's ``path`` plus the spellings other tools use; a name that
-#: is absent simply yields no candidate.
+#: Argument names under which file-reading tools carry a flat target. A name
+#: that is absent simply yields no candidate. kiro-cli's own `read` batches its
+#: targets under ``operations`` instead (see ``_tool_read_path_candidates``).
 _TOOL_READ_PATH_KEYS = ("path", "file_path", "filePath", "paths", "files")
 
 #: A whitespace/quote-delimited token ending in the skill basename — how a skill
@@ -976,6 +982,48 @@ _PROJECT_DIR_OPEN_FLAGS = (
 )
 
 
+#: (base, refused component, errno) triples already warned about, so a project
+#: whose chain is refused is named once per process rather than on every catalog
+#: build. Bounded: past the cap the warning is still emitted, just not recorded.
+_CHAIN_REFUSALS_WARNED: set[tuple[str, str, int]] = set()
+_CHAIN_REFUSALS_WARNED_CAP = 256
+
+
+def _note_chain_refusal(base: Path, component: str, exc: OSError) -> None:
+    """Say which component of a project skills path the no-follow walk refused.
+
+    A missing component is the ordinary case (most projects have no
+    ``.kiro/skills``) and stays at DEBUG. Anything else -- a symlinked
+    directory (refused by ``O_NOFOLLOW``), a file where a directory was
+    expected, a permission denial -- means the operator's skills exist but will
+    never load, and the remedy is to inspect that one path, so it is a WARNING
+    naming it.
+    """
+    err = exc.errno or 0
+    if err == errno.ENOENT:
+        logger.debug("project skills path has no %r component: %s", component, base)
+        return
+    marker = (str(base), component, err)
+    if marker in _CHAIN_REFUSALS_WARNED:
+        return
+    if len(_CHAIN_REFUSALS_WARNED) < _CHAIN_REFUSALS_WARNED_CAP:
+        _CHAIN_REFUSALS_WARNED.add(marker)
+    # O_DIRECTORY | O_NOFOLLOW reports a symlink as ELOOP or ENOTDIR depending
+    # on the kernel, the same ENOTDIR a regular file gets, so name both.
+    if err in (errno.ELOOP, errno.ENOTDIR):
+        reason = "is a symlink or not a directory"
+    else:
+        reason = f"could not be opened ({exc.strerror or f'errno {err}'})"
+    logger.warning(
+        "project skills under %s are not loaded: path component %r %s; project "
+        "skills are walked without following links, so this component must be "
+        "a real, readable directory",
+        base,
+        component,
+        reason,
+    )
+
+
 def _open_project_dir_chain(base: Path) -> int | None:
     """Open every absolute path component through the prior no-follow handle."""
     if not skill_trust.project_skill_traversal_supported():
@@ -983,13 +1031,15 @@ def _open_project_dir_chain(base: Path) -> int | None:
     parts = Path(os.path.abspath(base)).parts
     try:
         fd = os.open(parts[0], _PROJECT_DIR_OPEN_FLAGS)
-    except OSError:
+    except OSError as exc:
+        _note_chain_refusal(base, parts[0], exc)
         return None
     for part in parts[1:]:
         try:
             next_fd = os.open(part, _PROJECT_DIR_OPEN_FLAGS, dir_fd=fd)
-        except OSError:
+        except OSError as exc:
             os.close(fd)
+            _note_chain_refusal(base, part, exc)
             return None
         os.close(fd)
         fd = next_fd
@@ -1187,7 +1237,9 @@ def _iter_skill_files(
 # installs makes this migration a permanent no-op and leaves the flat copy as
 # the only one the loader finds.
 _RELOCATED_SKILLS: dict[str, str] = {
-    "prepare-pr": "kirocrew-dev/prepare-pr",
+    "prepare-pr": "kirocrew-dev/kirocrew-prepare-pr",
+    # Renamed in place: the nested copy an earlier release installed.
+    "kirocrew-dev/prepare-pr": "kirocrew-dev/kirocrew-prepare-pr",
     "babysit": "kirocrew-dev/babysit",
     "kirocrew-worktree-dev": "kirocrew-dev/kirocrew-worktree-dev",
 }
@@ -1532,7 +1584,7 @@ class InstalledSkillCurrency:
 def _first_linked_skill_component(base: Path, name: str) -> Path | None:
     """First directory strictly BETWEEN *base* and ``base / name`` that is a link.
 
-    A skill name may be nested (``kirocrew-dev/prepare-pr``), so testing the
+    A skill name may be nested (``kirocrew-dev/kirocrew-prepare-pr``), so testing the
     leaf alone leaves the directories above it unscreened while every probe of
     the leaf still resolves through them. A link at ``<skills>/kirocrew-dev``
     then makes the fingerprint hash a tree outside the skills directory and
@@ -2102,6 +2154,21 @@ def _retire_verified_claim(claim: Path, dest_dir: Path, verified_fingerprint: st
     return True
 
 
+def _linked_component(base: Path, name: str) -> Path | None:
+    """The first directory of *name* under *base* that is a link or junction, if any.
+
+    *name* is a catalog key, so a nested one (``kirocrew-dev/x``) has a family
+    directory on the way. A link anywhere on that path points outside the skills
+    home, and the sync must not rename or remove anything through it.
+    """
+    parts = Path(name).parts
+    for i in range(len(parts)):
+        candidate = base.joinpath(*parts[: i + 1])
+        if is_link_or_junction(candidate):
+            return candidate
+    return None
+
+
 def _ensure_builtin_skills(base: Path) -> None:
     """Sync built-in skills: copy new/updated, remove known-stale ones.
 
@@ -2274,21 +2341,36 @@ def _ensure_builtin_skills(base: Path) -> None:
     # Deliberate consequence: installs that predate provenance recording keep
     # their stale builtin dirs until a human removes them, because there is no
     # packaged tree left to prove ownership against.
-    stale_builtins = {"learn", "subagent", "cron", "kirocrew-core"} - source_names
+    stale_builtins = {
+        "learn",
+        "subagent",
+        "cron",
+        "kirocrew-core",
+        # Not shipped: retire the installed copy.
+        "kirocrew-dev/kirocrew-codebase-refactor",
+    } - source_names
     if base.exists():
         for name in stale_builtins:
             stale = base / name
+            family = Path(name).parent
+            if family.parts and _linked_component(base, family.as_posix()) is not None:
+                # A nested name's family directory is a user-made link: its
+                # parked slot lives inside the link target too, so nothing on
+                # this path is claimed, disposed of or read.
+                logger.debug("Leaving %s in place: its family directory is a link", stale)
+                continue
             # Unlike update-path slots (rotated by the next update), nothing
             # ever ships for a stale name again, so its parked copy is
             # disposed of here on the sweep AFTER the one that parked it —
             # that is its full quiescent cycle. Ordered before the live-dir
             # handling below, which can park a fresh copy this same run.
-            slot = base / f".{name}.superseded"
+            slot = stale.with_name(f".{stale.name}.superseded")
             if not stale.is_dir() and os.path.lexists(slot):
                 _dispose_superseded_slot(slot, stale)
-            if is_link_or_junction(stale):
-                # The sync only ever creates real directories; a link here is
-                # user-made and its target must not even be read.
+            if _linked_component(base, name) is not None:
+                # The sync only ever creates real directories; a link on the
+                # way (a nested name's family directory included) is user-made
+                # and its target must not even be read.
                 logger.debug("Leaving link %s in place: user-made", stale)
                 continue
             if not stale.is_dir():
@@ -2325,6 +2407,19 @@ def _ensure_builtin_skills(base: Path) -> None:
         for old_name, new_name in _RELOCATED_SKILLS.items():
             old_skill_md = base / old_name / "SKILL.md"
             if old_skill_md.is_file() and (base / new_name / "SKILL.md").exists():
+                # A directory on the way to the old SKILL.md that is a link or
+                # junction points outside the skills home. Renaming through it
+                # would rename a file the operator linked in, so leave it alone.
+                linked = _linked_component(base, old_name)
+                if linked is not None:
+                    logger.warning(
+                        "Skill %s relocated to %s, but %s is a link; not "
+                        "quarantining through it (the linked copy is untouched)",
+                        old_name,
+                        new_name,
+                        linked,
+                    )
+                    continue
                 try:
                     # Never overwrite an earlier quarantine (a rollback or
                     # reinstall can recreate SKILL.md after a prior migration;
@@ -2664,6 +2759,9 @@ class SkillsLoader:
         # (canonical key, allowed) pairs already audited, so the enforcement
         # record is written on first use rather than once per message.
         self._audited_projects: set[tuple[str, bool]] = set()
+        # Whether the unsupported-platform warning has been considered, so it
+        # is logged at most once per loader rather than once per message.
+        self._project_skills_unsupported_warned = False
         # Extra skill paths from config (config injectable for testing)
         cfg = config or KiroCrewConfig.load()
         # The per-message trigger cap is resolved at USE from the live snapshot
@@ -2881,6 +2979,26 @@ class SkillsLoader:
             return ""
         key = skill_trust.canonical_key(project_dir)
         allowed = key is not None and skill_trust.is_key_trusted(key)
+        if (
+            not allowed
+            and not self._project_skills_unsupported_warned
+            and not skill_trust.project_skill_traversal_supported()
+        ):
+            # Without the no-follow directory-descriptor walk (Windows) the gate
+            # refuses every project before touching its path, so the operator
+            # otherwise sees no skills, no trust prompt and no reason. Name the
+            # platform limit, not a project: probing whether `.kiro/skills`
+            # exists would be the very path lookup the gate refuses to make.
+            # Once per loader, and silent when the operator switched it off.
+            self._project_skills_unsupported_warned = True
+            if skill_trust.project_skills_enabled():
+                logger.warning(
+                    "project skills (<project>/.kiro/skills) are not loaded on this "
+                    "platform: it lacks the no-follow directory-descriptor traversal "
+                    "the project-skill trust gate requires, so no project can be "
+                    "trusted here and no trust prompt is offered; global skills are "
+                    "unaffected"
+                )
         self._audit_project_skill_enforcement(project_dir, key, allowed)
         if not allowed:
             return ""
@@ -2922,7 +3040,12 @@ class SkillsLoader:
                 reason=(
                     "project skills admitted for a granted directory"
                     if allowed
-                    else "project skills withheld: no grant, or the feature is off"
+                    else (
+                        "project skills withheld: this platform lacks no-follow "
+                        "directory traversal"
+                        if not skill_trust.project_skill_traversal_supported()
+                        else "project skills withheld: no grant, or the feature is off"
+                    )
                 ),
                 critical=False,
             )
@@ -3047,7 +3170,7 @@ class SkillsLoader:
                     # agent, so report the effective forced-body behavior.
                     "inject_on_trigger": True,
                     "size_bytes": len(raw),
-                    "deliveries": self._delivery_count(name),
+                    **self._usage_fields(name),
                     "owned": False,
                 }
             )
@@ -3309,9 +3432,9 @@ class SkillsLoader:
         """
         return _read_credit.resolve_ledger_aliases(self)
 
-    def _delivery_count(self, key: str) -> int | None:
-        """Body deliveries recorded for *key*, or ``None`` when untracked."""
-        return _listing._delivery_count(self, key)
+    def _usage_fields(self, key: str) -> dict[str, int | float | None]:
+        """The listing's ``deliveries`` and ``last_used_at`` for *key*."""
+        return _listing._usage_fields(self, key)
 
     @staticmethod
     def _safe_name(name: str) -> bool:
@@ -5485,6 +5608,15 @@ class SkillsLoader:
         """
         return _delivery.split_triggered(self, names, project_dir)
 
+    def confined_triggered(
+        self, names: list[str], project_dir: str | Path | None = None
+    ) -> set[str]:
+        """Return the subset of *names* that are confined project skills.
+
+        Contract and rationale: ``skill_runtime.delivery.confined_triggered``.
+        """
+        return _delivery.confined_triggered(self, names, project_dir)
+
     def trigger_hint(self, names: list[str], project_dir: str | Path | None = None) -> str:
         """Return a pointer block naming *names* and where to read each one.
 
@@ -5735,7 +5867,7 @@ class SkillsLoader:
         if read.content is None:
             if read.confined and read.refusal == SKILL_READ_OVER_CAPACITY:
                 return SkillReadRefusal(read.refusal, PROJECT_SKILL_BODY_CAP, confined=True)
-            return SkillReadRefusal(read.refusal, bound)
+            return SkillReadRefusal(read.refusal, bound, incomplete=read.incomplete)
         return _page_skill_body(read.content, offset=offset, limit=limit, capacity=capacity)
 
     def _read_exact_key(
@@ -5781,7 +5913,11 @@ class SkillsLoader:
             elif entry is not None or reasons:
                 refusal = SKILL_READ_UNREADABLE
             else:
-                refusal = SKILL_READ_OUTSIDE_SCOPE
+                # While the first walk is unfinished the building-time resolver
+                # withholds the confined project tier by design, so a miss here
+                # cannot tell a correct project key from an absent one.
+                building = self.catalog_status(project_dir) == "building"
+                return _ExactRead(None, SKILL_READ_OUTSIDE_SCOPE, confined, building)
             return _ExactRead(None, refusal, confined)
         meta = self._parse_frontmatter_text(content)
         if meta.get("repo_scope") and not self._repo_scope_satisfied(

@@ -32,10 +32,12 @@ from kiro_crew.agent_sdk.backends import ACP_BACKEND_DEEPSEEK
 from kiro_crew.providers.mirrors.base import (
     AgentConfigMirror,
     Concern,
+)
+from kiro_crew.providers.mirrors.base import Disposition as _D
+from kiro_crew.providers.mirrors.base import (
     Ruling,
     SessionProjection,
 )
-from kiro_crew.providers.mirrors.base import Disposition as _D
 from kiro_crew.providers.mirrors.opencode import opencode_projection
 
 __all__ = ["DeepSeekMirror", "deepseek_projection"]

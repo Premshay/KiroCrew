@@ -157,7 +157,10 @@ def schemas() -> list[dict[str, Any]]:
             ),
             "inputSchema": {
                 "type": "object",
-                "properties": {"item_id": item_id, "candidate_id": {"type": "string", "maxLength": 64}},
+                "properties": {
+                    "item_id": item_id,
+                    "candidate_id": {"type": "string", "maxLength": 64},
+                },
                 "required": ["item_id", "candidate_id"],
             },
         },

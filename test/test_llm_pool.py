@@ -58,7 +58,7 @@ class TestCleanBinding:
 
 class TestRuntimeWorker:
     @pytest.mark.asyncio
-    async def test_codex_uses_runtime_provider_and_collects_text(self):
+    async def test_kas_uses_runtime_provider_and_collects_text(self):
         from kiro_crew.acp.types import AcpEvent
 
         provider = MagicMock()
@@ -67,6 +67,7 @@ class TestRuntimeWorker:
         provider.client = MagicMock()
         provider.client.ensure_ready = AsyncMock()
         provider.client._pid = None
+        provider.client._handle.consumed_agent_spec = {"tools": []}
         provider.is_alive.return_value = True
         provider.stream = None
 
@@ -77,7 +78,7 @@ class TestRuntimeWorker:
             yield AcpEvent(kind="text_chunk", text="[]}")
 
         provider.stream = stream
-        binding = {"acp_backend": "codex", "model": "test-model"}
+        binding = {"acp_backend": "kas", "model": "test-model"}
         worker = AcpWorker(sandbox_mode="auto")
         with (
             patch(
@@ -105,7 +106,7 @@ class TestRuntimeWorker:
         with (
             patch(
                 "kiro_crew.knowledge.llm_pool._resolve_client_binding",
-                return_value=({"acp_backend": "codex"}, ""),
+                return_value=({"acp_backend": "kas"}, ""),
             ),
             patch("kiro_crew.providers.acp.AcpProvider", return_value=provider),
             patch("kiro_crew.knowledge.llm_pool.AcpClient") as legacy,
@@ -115,6 +116,59 @@ class TestRuntimeWorker:
             legacy.assert_not_called()
         provider.shutdown.assert_awaited_once()
         assert not worker.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_codex_without_a_verified_zero_tool_ban_is_refused(self):
+        worker = AcpWorker(sandbox_mode="auto")
+        with (
+            patch(
+                "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+                return_value=({"acp_backend": "codex"}, ""),
+            ),
+            patch("kiro_crew.providers.acp.AcpProvider") as provider,
+        ):
+            with pytest.raises(RuntimeError, match="cannot enforce a zero-tool session"):
+                await worker.start()
+            provider.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runtime_with_a_nonempty_consumed_tool_list_is_closed(self):
+        provider = MagicMock()
+        provider.start = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.client._handle.consumed_agent_spec = {"tools": ["bash"]}
+        worker = AcpWorker(sandbox_mode="auto")
+        with (
+            patch(
+                "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+                return_value=({"acp_backend": "kas"}, ""),
+            ),
+            patch("kiro_crew.providers.acp.AcpProvider", return_value=provider),
+        ):
+            with pytest.raises(RuntimeError, match="did not confirm a zero-tool spec"):
+                await worker.start()
+        provider.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_kiro_refuses_a_spec_that_changed_during_startup(self):
+        client = AsyncMock()
+        client.authored_spec_declares_zero_tools = MagicMock(return_value=True)
+        client.effective_spec_declares_zero_tools = MagicMock(return_value=False)
+        worker = AcpWorker(sandbox_mode="auto")
+        with (
+            patch(
+                "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+                return_value=({}, ""),
+            ),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+        ):
+            with pytest.raises(RuntimeError, match="did not confirm a zero-tool spec"):
+                await worker.start()
+        client.authored_spec_declares_zero_tools.assert_called_once_with()
+        client.effective_spec_declares_zero_tools.assert_called_once_with(
+            authored_before_spawn=True
+        )
+        client.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("failure", ["timeout", "error", "cancel"])
@@ -279,6 +333,7 @@ class TestWorkerAppliesBinding:
             patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls,
         ):
             client_cls.return_value = AsyncMock()
+            client_cls.return_value.restrict_tools = MagicMock()
             await worker.start()
 
         kwargs = client_cls.call_args.kwargs
@@ -288,6 +343,7 @@ class TestWorkerAppliesBinding:
         assert kwargs["agent"] == "kirocrew-knowledge"
         assert kwargs["sandbox_mode"] == "off"
         assert kwargs["audit_source"] == "subagent"
+        client_cls.return_value.restrict_tools.assert_called_once_with([])
 
     @pytest.mark.asyncio
     async def test_binding_model_beats_the_agent_spec_pin(self):

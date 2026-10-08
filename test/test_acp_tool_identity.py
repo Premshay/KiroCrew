@@ -132,11 +132,7 @@ class TestClaudeCoreMcpIdentity:
     """Claude carries real MCP identity under adapter-owned ``claudeCode`` metadata."""
 
     def test_core_tool_is_recognized_without_kiro_metadata(self) -> None:
-        update = {
-            "_meta": {
-                "claudeCode": {"toolName": "mcp__kirocrew-core__session_checkpoint"}
-            }
-        }
+        update = {"_meta": {"claudeCode": {"toolName": "mcp__kirocrew-core__session_checkpoint"}}}
         assert trusted_mcp_identity(update) == (
             "session_checkpoint",
             "kirocrew-core",
@@ -144,9 +140,7 @@ class TestClaudeCoreMcpIdentity:
         )
 
     def test_other_claude_mcp_server_cannot_claim_core_authority(self) -> None:
-        update = {
-            "_meta": {"claudeCode": {"toolName": "mcp__third-party__session_checkpoint"}}
-        }
+        update = {"_meta": {"claudeCode": {"toolName": "mcp__third-party__session_checkpoint"}}}
         assert trusted_mcp_identity(update) == ("", "", False)
 
     def test_direct_client_preserves_claude_identity_on_the_tool_event(self) -> None:
@@ -167,11 +161,7 @@ class TestClaudeCoreMcpIdentity:
                     "title": "Record work state",
                     "kind": "other",
                     "rawInput": {"summary": "Needs an owner decision."},
-                    "_meta": {
-                        "claudeCode": {
-                            "toolName": "mcp__kirocrew-core__session_checkpoint"
-                        }
-                    },
+                    "_meta": {"claudeCode": {"toolName": "mcp__kirocrew-core__session_checkpoint"}},
                 }
             }
         )

@@ -193,6 +193,7 @@ class CleanupState:
     # at most once per ``PROBE_FAILURE_WARN_INTERVAL_SECS`` across all keys,
     # never once per candidate per tick.
     probe_failure_warned_at: float | None = None
+    scope_reap_failure_warned_at: float | None = None
     stuck_reported: dict[str, float] = field(default_factory=dict)
     last_pycache_gc: float | None = None
     active_dashboard_slots: set[str] | None = None
@@ -507,6 +508,7 @@ class SessionCleanup:
                 self._deps.reap_agent_scopes,
                 active_pids,
             )
+            self.state.scope_reap_failure_warned_at = None
             reclaimed = int(getattr(summary, "reclaimed", 0) or 0)
             if reclaimed:
                 self._deps.logger.info(
@@ -514,8 +516,7 @@ class SessionCleanup:
                     reclaimed,
                 )
         except Exception:
-            # Best-effort, like the orphan-MCP sweep: never promote severity.
-            self._deps.logger.debug("agent-scope reap hook failed", exc_info=True)
+            self._note_scope_reap_failure()
 
     def _sessions_on_pid(self, pid: int) -> list[str]:
         """The session keys whose provider is running on *pid*.
@@ -1015,6 +1016,20 @@ class SessionCleanup:
             "RSS reap is held until it answers again (details at debug; this "
             "warning repeats at most once per %.0fs)",
             key,
+            self.PROBE_FAILURE_WARN_INTERVAL_SECS,
+        )
+
+    def _note_scope_reap_failure(self) -> None:
+        """Log a scope-reap failure at a bounded warning rate."""
+        self._deps.logger.debug("agent-scope reap hook failed", exc_info=True)
+        now = self._deps.monotonic()
+        last = self.state.scope_reap_failure_warned_at
+        if last is not None and now - last < self.PROBE_FAILURE_WARN_INTERVAL_SECS:
+            return
+        self.state.scope_reap_failure_warned_at = now
+        self._deps.logger.warning(
+            "Agent-scope reap failed, so no abandoned scope was reclaimed this tick "
+            "(details at debug; this warning repeats at most once per %.0fs)",
             self.PROBE_FAILURE_WARN_INTERVAL_SECS,
         )
 
@@ -1577,6 +1592,10 @@ class SessionCleanup:
     def set_idle_expiry_guard(self, guard: Callable[[str], bool] | None) -> None:
         self.state.idle_expiry_guard = guard
 
+    def _idle_exempt_keys(self) -> frozenset[str]:
+        """Read the keys excluded from the idle clock on every sweep."""
+        return frozenset(self._owner._cfg.session.idle_exempt_keys)
+
     async def _expire_idle(self, timeout_secs: int) -> None:
         now = self._deps.monotonic()
         # The session object travels with its key: every judgement below is
@@ -1586,6 +1605,7 @@ class SessionCleanup:
         total_checked = 0
         persistent_keys = self._deps.get_persistent_keys()
         channel_prefix = self._deps.get_channel_prefix()
+        idle_exempt_keys = self._idle_exempt_keys()
         async with self._owner._lock:
             for key, session in self._owner._sessions.items():
                 if key in persistent_keys or key.startswith(channel_prefix):
@@ -1593,7 +1613,7 @@ class SessionCleanup:
                 total_checked += 1
                 if session.semaphore.locked():
                     continue
-                idle = now - _last_activity(session) > timeout_secs
+                idle = key not in idle_exempt_keys and now - _last_activity(session) > timeout_secs
                 guard = self.state.idle_expiry_guard
                 if idle and guard is not None:
                     try:

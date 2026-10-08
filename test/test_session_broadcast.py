@@ -19,6 +19,7 @@ fence tests below do by asserting the refusal comes back as a row.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -76,6 +77,47 @@ def _broadcast(state, caller, message="rebase first", mode="queue", targets=None
             **kw,
         )
     )
+
+
+#: The per-target allowance `_bound_expires_at_the_hang` patches in. A backstop for a
+#: hang that is never reached, never the trigger.
+_BOUND_BACKSTOP_SECS = 30.0
+
+
+def _bound_expires_at_the_hang(monkeypatch) -> Callable[[], None]:
+    """Make the per-target bound expire when the delivery reaches its hang.
+
+    A case that drives the REAL `send_to_target` up to a hang (the steer RPC, the
+    containment stop) is about WHERE the cancellation lands. A short wall-clock
+    allowance races the gate, audit and pre-warm work in front of that hang: on a
+    loaded runner the bound expires first, the cancellation lands before the
+    hand-over, and the case reads the wrong arm (`observation=not_handed_over`, no
+    `cancelled` audit row). So the allowance is a backstop, and the returned
+    `expire()` -- called by the hang right before it parks -- fires the real
+    `wait_for`'s own `asyncio.Timeout` at once. The product's timeout path runs
+    unchanged; only the moment it fires is chosen by the test instead of the clock.
+    """
+    bounds: list[asyncio.Timeout] = []
+    real_timeout = asyncio.timeouts.timeout
+
+    def _recording_timeout(delay):
+        bound = real_timeout(delay)
+        if delay is _BOUND_BACKSTOP_SECS:
+            bounds.append(bound)
+        return bound
+
+    monkeypatch.setattr(asyncio.timeouts, "timeout", _recording_timeout)
+    monkeypatch.setattr(sc, "BROADCAST_TARGET_ALLOWANCE_SECS", _BOUND_BACKSTOP_SECS)
+
+    def expire() -> None:
+        # Each bound fires once: a later call outside any broadcast (a test's own
+        # follow-up steer through the same fake) has no bound left to fire.
+        if bounds:
+            current = bounds[-1]
+            bounds.clear()
+            current.reschedule(asyncio.get_running_loop().time())
+
+    return expire
 
 
 class _Sends:
@@ -599,10 +641,12 @@ class TestATargetThatNeverAnswers:
 
         never = asyncio.Event()
         inner_exceptions: list[type[BaseException]] = []
+        expire = _bound_expires_at_the_hang(monkeypatch)
 
         async def _steer(_state, slot, _message, **_kwargs):
             if slot.key == "chat-3":
                 try:
+                    expire()
                     await never.wait()
                 except BaseException as exc:
                     inner_exceptions.append(type(exc))
@@ -612,7 +656,6 @@ class TestATargetThatNeverAnswers:
         audits: list[dict] = []
         monkeypatch.setattr("kiro_crew.dashboard.chat_delivery.steer_into_running_turn", _steer)
         monkeypatch.setattr(sc, "_audit", lambda **kwargs: audits.append(kwargs))
-        monkeypatch.setattr(sc, "BROADCAST_TARGET_ALLOWANCE_SECS", 0.05)
 
         out = await sc.broadcast_to_targets(
             state,
@@ -649,8 +692,10 @@ class TestATargetThatNeverAnswers:
         caller = _slot(state, "chat-1")
         target = _busy(_child(state, "chat-2", caller))
         never = asyncio.Event()
+        expire = _bound_expires_at_the_hang(monkeypatch)
 
         async def _stop_never_returns(*_args, **_kwargs):
+            expire()
             await never.wait()
 
         monkeypatch.setattr(
@@ -659,7 +704,6 @@ class TestATargetThatNeverAnswers:
         )
         monkeypatch.setattr(sc, "newly_held_constraints", lambda *_args: ["mirror_unverified"])
         monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.stop_slot_turn", _stop_never_returns)
-        monkeypatch.setattr(sc, "BROADCAST_TARGET_ALLOWANCE_SECS", 0.05)
 
         out = await sc.broadcast_to_targets(
             state,
@@ -926,13 +970,12 @@ class TestACallerSurfaceThatGoesStaleMidBroadcast:
     def test_a_mirror_bound_during_a_delivery_withholds_the_report(self, tmp_path, monkeypatch):
         state = _make_state(tmp_path)
         caller = _slot(state, "chat-1")
-        mirrored: dict[str, bool] = {"now": False}
 
         def _mirror_now():
-            mirrored["now"] = True
+            # In the store the post-delivery re-check reads.
+            state.sessions.set_mirror_link(_key(caller), "C0FFEE", "1758.0005")
 
         send = self._one_child_and_a_send(state, caller, _mirror_now)
-        monkeypatch.setattr(sc, "_has_channel_mirror", lambda _state, _slot: mirrored["now"])
         monkeypatch.setattr(sc, "send_to_target", send)
 
         with pytest.raises(sc.SessionControlError) as excinfo:
@@ -994,14 +1037,19 @@ class TestTheShieldedSteerDelivery:
     """
 
     @staticmethod
-    def _target_with_hanging_steer(state, caller, name="chat-2"):
-        """A busy child of *caller* whose steer RPC never returns, and its gate."""
+    def _target_with_hanging_steer(state, caller, expire, name="chat-2"):
+        """A busy child of *caller* whose steer RPC never returns, and its gate.
+
+        The RPC calls *expire* (from `_bound_expires_at_the_hang`) as it parks, so
+        the per-target bound lands inside the RPC rather than wherever the clock
+        happens to reach first."""
         slot = _busy(_child(state, name, caller))
         release = asyncio.Event()
         client = MagicMock()
         client.supports_steer = True
 
         async def _steer(_message):
+            expire()
             await release.wait()
             return True
 
@@ -1016,8 +1064,9 @@ class TestTheShieldedSteerDelivery:
         state = _make_state(tmp_path)
         state.broadcast_ws = MagicMock()
         caller = _slot(state, "chat-1")
-        target, release = self._target_with_hanging_steer(state, caller)
-        monkeypatch.setattr(sc, "BROADCAST_TARGET_ALLOWANCE_SECS", 0.05)
+        target, release = self._target_with_hanging_steer(
+            state, caller, _bound_expires_at_the_hang(monkeypatch)
+        )
 
         out = await sc.broadcast_to_targets(
             state,
@@ -1080,13 +1129,14 @@ class TestTheShieldedSteerDelivery:
         caller = _slot(state, "chat-1")
         target = _busy(_child(state, "chat-2", caller))
         release = asyncio.Event()
+        expire = _bound_expires_at_the_hang(monkeypatch)
 
         async def _steer(_state, _slot, _message, **_kwargs):
+            expire()
             await release.wait()
             return STEER_UNAVAILABLE
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_delivery.steer_into_running_turn", _steer)
-        monkeypatch.setattr(sc, "BROADCAST_TARGET_ALLOWANCE_SECS", 0.05)
         text = "stop, the fix already landed"
 
         out = await sc.broadcast_to_targets(
@@ -1136,8 +1186,9 @@ class TestTheShieldedSteerDelivery:
         state = _make_state(tmp_path)
         state.broadcast_ws = MagicMock()
         caller = _slot(state, "chat-1")
-        target, release = self._target_with_hanging_steer(state, caller)
-        monkeypatch.setattr(sc, "BROADCAST_TARGET_ALLOWANCE_SECS", 0.05)
+        target, release = self._target_with_hanging_steer(
+            state, caller, _bound_expires_at_the_hang(monkeypatch)
+        )
         text = "stop, the issue was already fixed"
 
         await sc.broadcast_to_targets(
@@ -1477,62 +1528,58 @@ class TestEndToEnd:
     stopped agreeing.
     """
 
-    def _wire(self, state, caller, monkeypatch):
-        """Point the MCP client's transport at the real aiohttp handlers."""
+    def _wire(self, state, caller):
+        """A tool context whose dashboard is the real aiohttp handlers."""
+        import json
 
-        def _post(path, payload, *, timeout=30, session_key=""):
+        from kiro_crew.mcp_tools.dashboard_client import InMemoryDashboardClient
+        from kiro_crew.mcp_tools.table import Caller, ToolContext
+
+        def _request(req, method):
             request = MagicMock()
             request.app = {"state": state}
-            request.path = path
-            request.method = "POST"
-            request.headers = {"X-Session-Key": session_key or _key(caller)}
+            request.path = req.path.split("?")[0]
+            request.method = method
+            request.headers = {"X-Session-Key": req.session_key or _key(caller)}
             request.query = {}
             request.get = lambda key, default=None: (
                 True if key in ("internal_auth", "peer_verified") else default
             )
 
             async def _json():
-                return payload
+                return req.body
 
             request.json = _json
-            import json
+            return request
 
-            resp = asyncio.run(handlers_sc.api_session_control_broadcast(request))
+        def _post(req):
+            resp = asyncio.run(handlers_sc.api_session_control_broadcast(_request(req, "POST")))
             assert isinstance(resp.body, (bytes, bytearray))
             return json.loads(resp.body.decode())
 
-        def _get(path, session_key=""):
-            request = MagicMock()
-            request.app = {"state": state}
-            request.path = path.split("?")[0]
-            request.method = "GET"
-            request.headers = {"X-Session-Key": session_key or _key(caller)}
-            request.query = {}
-            request.get = lambda key, default=None: (
-                True if key in ("internal_auth", "peer_verified") else default
-            )
-            import json
-
-            resp = asyncio.run(handlers_sc.api_session_control_status(request))
+        def _get(req):
+            resp = asyncio.run(handlers_sc.api_session_control_status(_request(req, "GET")))
             assert isinstance(resp.body, (bytes, bytearray))
             return json.loads(resp.body.decode())
 
-        monkeypatch.setattr("kiro_crew.mcp_dashboard._post", _post)
-        monkeypatch.setattr("kiro_crew.mcp_dashboard._get", _get)
-        monkeypatch.setattr(
-            "kiro_crew.mcp_core._resolve_session_key_strict", lambda *a, **k: _key(caller)
+        dash = InMemoryDashboardClient(
+            {
+                "POST /api/session-control/broadcast": _post,
+                "GET /api/session-control/status": _get,
+            }
         )
+        return ToolContext(dash, Caller.strict(_key(caller)))
 
     def test_a_queue_broadcast_lands_in_both_targets_transcripts(self, tmp_path, monkeypatch):
-        from kiro_crew.mcp_dashboard import _call_tool_inner
+        from kiro_crew.mcp_dashboard import TABLE
 
         state = _make_state(tmp_path)
         caller = _slot(state, "chat-1")
         a = _busy(_child(state, "chat-2", caller))
         b = _busy(_child(state, "chat-3", caller))
-        self._wire(state, caller, monkeypatch)
+        ctx = self._wire(state, caller)
 
-        out = _call_tool_inner("session_broadcast", {"message": "the base moved", "mode": "queue"})
+        out = TABLE.call("session_broadcast", {"message": "the base moved", "mode": "queue"}, ctx)
 
         assert "2/2" in out and "chat-2" in out and "chat-3" in out
         # Busy targets, so the message is QUEUED on each rather than run — which is
@@ -1548,16 +1595,17 @@ class TestEndToEnd:
         self, tmp_path, monkeypatch
     ):
         """Filtering to no targets must not widen into the default audience."""
-        from kiro_crew.mcp_dashboard import _call_tool_inner
+        from kiro_crew.mcp_dashboard import TABLE
 
         state = _make_state(tmp_path)
         caller = _slot(state, "chat-1")
         target = _busy(_child(state, "chat-2", caller))
-        self._wire(state, caller, monkeypatch)
+        ctx = self._wire(state, caller)
 
-        out = _call_tool_inner(
+        out = TABLE.call(
             "session_broadcast",
             {"message": "stand down", "mode": "queue", "targets": []},
+            ctx,
         )
 
         assert out.startswith("Error:")
@@ -1567,16 +1615,17 @@ class TestEndToEnd:
     def test_one_dead_target_does_not_cost_the_live_one_its_message(self, tmp_path, monkeypatch):
         """The partial-delivery contract, through every layer: the refused row
         reaches the model's prose AND the other target really got the message."""
-        from kiro_crew.mcp_dashboard import _call_tool_inner
+        from kiro_crew.mcp_dashboard import TABLE
 
         state = _make_state(tmp_path)
         caller = _slot(state, "chat-1")
         live = _busy(_child(state, "chat-2", caller))
-        self._wire(state, caller, monkeypatch)
+        ctx = self._wire(state, caller)
 
-        out = _call_tool_inner(
+        out = TABLE.call(
             "session_broadcast",
             {"message": "stand down", "mode": "queue", "targets": ["chat-2", "chat-404"]},
+            ctx,
         )
 
         assert "1/2" in out
@@ -1587,15 +1636,15 @@ class TestEndToEnd:
     def test_the_status_listing_reflects_what_the_broadcast_just_did(self, tmp_path, monkeypatch):
         """The two verbs are meant to be used together — broadcast, then patrol —
         so the roster must show the queue the broadcast created."""
-        from kiro_crew.mcp_dashboard import _call_tool_inner
+        from kiro_crew.mcp_dashboard import TABLE
 
         state = _make_state(tmp_path)
         caller = _slot(state, "chat-1")
         _busy(_child(state, "chat-2", caller))
-        self._wire(state, caller, monkeypatch)
+        ctx = self._wire(state, caller)
 
-        _call_tool_inner("session_broadcast", {"message": "rebase", "mode": "queue"})
-        out = _call_tool_inner("session_status", {})
+        TABLE.call("session_broadcast", {"message": "rebase", "mode": "queue"}, ctx)
+        out = TABLE.call("session_status", {}, ctx)
 
         assert "chat-2" in out
         # Busy with a message waiting behind the running turn.

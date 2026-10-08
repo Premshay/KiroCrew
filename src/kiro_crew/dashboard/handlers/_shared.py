@@ -42,6 +42,7 @@ from kiro_crew.dashboard.token_auth import (
     _b64url_decode,
     required_peer_key_unverified,
 )
+from kiro_crew.history import TRANSCRIPT_HEADER_MAX_BYTES, memory_mode_from_header_line
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import is_channel_session_key
@@ -441,7 +442,7 @@ async def read_bounded_json(
     header puts the preflight back. In-tree callers are unaffected: every client
     that sends a body already sets ``application/json`` (the frontend
     ``post``/``put``/``patch``/``del`` helpers, ``mcp_core``, ``cron_script``,
-    ``cli_*``, ``pod.runtime``, ``remote_relay``), and the bodiless requests
+    ``cli_*``, ``pod.runtime``), and the bodiless requests
     (``app_lifecycle_client``, ``cron_trigger``) are not checked.
 
     ONE caller opts OUT, and must: ``POST /api/messaging/teams``, where
@@ -991,11 +992,47 @@ async def internal_memory_scope(
     )
 
 
-#: The two chat routes a script cron opens and seeds sessions on. Session control
-#: is what ``agent.session_control`` switches off, and these are its writes.
+#: The three chat routes a script cron opens, seeds and sets the approval mode of
+#: its sessions on. Session control is what ``agent.session_control`` switches
+#: off, and these are its writes.
 _CRON_SESSION_CONTROL_PATHS = frozenset(
-    {"/api/chat", "/api/chat/", "/api/chat/slots", "/api/chat/slots/"}
+    {
+        "/api/chat",
+        "/api/chat/",
+        "/api/chat/slots",
+        "/api/chat/slots/",
+        "/api/chat/mode",
+        "/api/chat/mode/",
+    }
 )
+
+
+async def _audit_cron_chat_denial(request: web.Request, error: str, resources: str = "") -> None:
+    """Record a cron's refused chat-route call, best-effort, off the loop.
+
+    One shape for every refusal the cron gate on these routes makes, so the
+    switch, the creator fence and the mode rule read alike in the log. The SEL
+    write can touch the disk, so it runs in a thread, and its failure is logged
+    rather than raised: an audit that cannot be written must not turn a
+    refusal into an admission.
+    """
+
+    def _write() -> None:
+        from kiro_crew.sel import sel as _sel
+
+        _sel().log_api_access(
+            caller="internal",
+            operation="chat.control",
+            outcome="denied",
+            source="session_control",
+            resources=resources or request.path,
+            error=error,
+        )
+
+    try:
+        await asyncio.to_thread(_write)
+    except Exception:
+        logger.debug("SEL audit for a refused cron chat call (%s) failed", error, exc_info=True)
 
 
 async def _cron_session_control_refusal(request: web.Request) -> web.Response | None:
@@ -1005,7 +1042,7 @@ async def _cron_session_control_refusal(request: web.Request) -> web.Response | 
     every internal chat-route call passes after the internal secret validates.
     Only a ``cron:`` key is checked, because the switch gates a cron caller the
     same way the session-control routes do. Owner and member callers keep their
-    own gates. Only the two routes a script cron writes to are checked. The
+    own gates. Only the three routes a script cron writes to are checked. The
     folder routes are not session control.
     """
     if request.method != "POST" or request.path not in _CRON_SESSION_CONTROL_PATHS:
@@ -1018,23 +1055,7 @@ async def _cron_session_control_refusal(request: web.Request) -> web.Response | 
     if await asyncio.to_thread(session_control_enabled):
         return None
     message = "session control is disabled in config (agent.session_control)"
-
-    def _write() -> None:
-        from kiro_crew.sel import sel as _sel
-
-        _sel().log_api_access(
-            caller="internal",
-            operation="chat.control",
-            outcome="denied",
-            source="session_control",
-            resources=request.path,
-            error="session_control_disabled",
-        )
-
-    try:
-        await asyncio.to_thread(_write)
-    except Exception:
-        logger.debug("SEL audit for a switched-off cron chat call failed", exc_info=True)
+    await _audit_cron_chat_denial(request, "session_control_disabled")
     return web.json_response({"error": message, "code": "session_control_disabled"}, status=403)
 
 
@@ -1056,14 +1077,15 @@ async def cron_slot_creator(request: web.Request) -> str:
     return session
 
 
-async def cron_creator_refusal(
+async def cron_creator_admission(
     request: web.Request, state: Any, slot_name: str | None, cron_creator: str
-) -> web.Response | None:
-    """The creator fence for a ``cron:`` caller on the two chat routes, or ``None``.
+) -> tuple[web.Response | None, bool, dict[str, Any]]:
+    """Judge a ``cron:`` caller and return its refusal and persisted snapshot.
 
-    A script cron opens a slot with ``POST /api/chat/slots`` and seeds it with
-    ``POST /api/chat``. Both routes mint a fresh slot under any key that is not
-    live, and both act on whatever live slot a key names. This mirrors
+    A script cron opens a slot with ``POST /api/chat/slots``, seeds it with
+    ``POST /api/chat`` and sets its approval mode with ``POST /api/chat/mode``.
+    The first two mint a fresh slot under any key that is not live, and all three
+    act on whatever live slot a key names. This mirrors
     session-control's ``_created_by_other`` fence, so a cron reaches only slots
     it created: a live slot is judged on its ``_created_by``, and a key with no
     live slot is judged on the ``created_by`` its persisted metadata line
@@ -1075,68 +1097,117 @@ async def cron_creator_refusal(
 
     The persisted read runs off the loop. The live slot is judged again after
     that read, so a slot opened while it ran is judged as live. The caller
-    therefore makes its mint decision with no await after this returns.
+    therefore makes its mint decision with no await after this returns. The
+    mode route mints nothing and calls this only once its slot is live, so for
+    it the whole judgement is the synchronous ``_created_by`` read.
+    The persisted flag and metadata describe the same read used for the creator
+    verdict, so the create caller restores a closed session's saved title
+    without a second store lookup.
     """
     if not cron_creator or not slot_name:
-        return None
+        return None, False, {}
     key = _normalize_slot_key(str(slot_name))
     if not key:
-        return None
+        return None, False, {}
     from kiro_crew.dashboard.session_control import _created_by_other
 
+    persisted = False
+    persisted_meta: dict[str, Any] = {}
     slot = state._slots.get(key)
     if slot is None:
         log = getattr(state, "conversation_log", None)
         if log is None:
-            return None
+            return None, False, {}
         from kiro_crew.dashboard.chat_utils import slot_transcript_key
 
         history_key = slot_transcript_key(key)
 
-        def _persisted_creator() -> str | None:
+        def _persisted_slot() -> tuple[bool, dict[str, Any]]:
             if not log.has_log(history_key):
-                return None
-            meta = log.get_metadata(history_key)
-            return str(meta.get("created_by") or "")
+                return False, {}
+            return True, log.get_metadata(history_key)
 
         try:
-            persisted = await asyncio.to_thread(_persisted_creator)
+            persisted, persisted_meta = await asyncio.to_thread(_persisted_slot)
         except Exception:
             logger.debug("persisted creator of slot %s unreadable", key, exc_info=True)
             refused = True
         else:
-            refused = persisted is not None and _created_by_other(
-                SimpleNamespace(_created_by=persisted), cron_creator
+            refused = persisted and _created_by_other(
+                SimpleNamespace(_created_by=str(persisted_meta.get("created_by") or "")),
+                cron_creator,
             )
         slot = state._slots.get(key)
         if slot is None and not refused:
-            return None
+            return None, persisted, persisted_meta
     if slot is not None and not _created_by_other(slot, cron_creator):
-        return None
-
-    def _write() -> None:
-        from kiro_crew.sel import sel as _sel
-
-        _sel().log_api_access(
-            caller="internal",
-            operation="chat.control",
-            outcome="denied",
-            source="session_control",
-            resources=f"{request.path} slot={key}",
-            error="not_creator",
-        )
-
-    try:
-        await asyncio.to_thread(_write)
-    except Exception:
-        logger.debug("SEL audit for a cron chat call on another's slot failed", exc_info=True)
-    return web.json_response(
-        {
-            "error": "a scheduled run can only control sessions it created itself",
-            "code": "not_creator",
-        },
-        status=403,
+        return None, persisted, persisted_meta
+    await _audit_cron_chat_denial(request, "not_creator", f"{request.path} slot={key}")
+    return (
+        web.json_response(
+            {
+                "error": "a scheduled run can only control sessions it created itself",
+                "code": "not_creator",
+            },
+            status=403,
+        ),
+        persisted,
+        persisted_meta,
     )
+
+
+#: Approval modes that grant auto-approval to the SLOT they name, as opposed to
+#: the process-global YOLO grant. ``api_chat_mode`` reads it to keep a slot-scoped
+#: grant from revoking the global one, and :func:`cron_mode_refusal` reads it as
+#: the whole allowlist for a ``cron:`` caller: both are creation-time postures for
+#: one unattended session, while ``yolo`` is the global grant and ``normal`` is the
+#: off-switch at any scope, so a cron gets neither. A tuple, not a set: membership
+#: is tested against a request-supplied value, and tuple ``in`` compares by
+#: equality rather than hashing, so a non-string body value such as a list
+#: answers False instead of raising.
+_SLOT_SCOPED_TRUST_MODES = ("trust", "trust_reads")
+
+
+async def cron_mode_refusal(
+    request: web.Request, cron_creator: str, mode: object, slot_name: object
+) -> web.Response | None:
+    """The mode rule for a ``cron:`` caller on ``POST /api/chat/mode``, or ``None``.
+
+    ``ScriptContext.set_session_mode`` is the cron path to that route. A cron
+    sets ``trust`` or ``trust_reads``, and nothing else, on the one slot it
+    names: any other mode answers 403 ``mode_not_allowed`` and an unnamed slot
+    answers 400 ``slot_required``, each audited. The mode is judged first, so a
+    cron asking for ``yolo`` is refused as a cron before the request reaches
+    governance or the safety override, and whatever the slot. A mode that is not
+    a string at all, a list say, is refused the same way rather than raising. The
+    creator fence, :func:`cron_creator_admission`, is the handler's job once the
+    slot resolves. Like the other two checks, this keys on the attested key the
+    caller presents.
+    """
+    if not cron_creator:
+        return None
+    where = f"{request.path} slot={slot_name or ''} mode={mode!r}"
+    if mode not in _SLOT_SCOPED_TRUST_MODES:
+        await _audit_cron_chat_denial(request, "mode_not_allowed", where)
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "a scheduled run can set only trust or trust_reads on a session it created",
+                "code": "mode_not_allowed",
+            },
+            status=403,
+        )
+    if not slot_name:
+        await _audit_cron_chat_denial(request, "slot_required", where)
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "a scheduled run must name the session it created",
+                "code": "slot_required",
+            },
+            status=400,
+        )
+    return None
 
 
 async def private_chat_route_refusal(request: web.Request) -> web.Response | None:
@@ -2176,8 +2247,13 @@ def _declared_app_skill_dirs(resolved: Path) -> list[Path]:
     mutable installed metadata. Empty — admitting nothing — when *resolved* names
     no app, the app declares no skills, or its manifest cannot be read.
     """
-    app_name = ""
-    for root in _trusted_skill_roots():
+    from kiro_crew.apps.execution import shipped_builtin_app_name_at
+
+    # A shipped builtin is found by the package root it resolves into: its
+    # directory name need not match its manifest name.
+    app_name = shipped_builtin_app_name_at(resolved) or ""
+    roots = [] if app_name else _trusted_skill_roots()
+    for root in roots:
         try:
             rel = resolved.relative_to(root)
         except ValueError:
@@ -3209,10 +3285,9 @@ def _blocks_reads_session(state: DashboardState, request: "Any") -> bool:
     return False
 
 
-# Byte ceiling for the session-metadata head read. The metadata line is a small
-# JSON object (a few hundred bytes); 64 KiB is generous headroom while keeping an
-# enormous or adversarial first line from being pulled into memory.
-_METADATA_HEAD_MAX_BYTES = 64 * 1024
+# Byte ceiling for the session-metadata head read, shared with the whole-install
+# export so both read the same amount of a first line before judging it.
+_METADATA_HEAD_MAX_BYTES = TRANSCRIPT_HEADER_MAX_BYTES
 
 
 def _persisted_session_paths(slot_name: str) -> list["Path"]:
@@ -3362,28 +3437,9 @@ def _read_memory_mode(path: "Path") -> str | None:
     except OSError:
         return None
     first, _sep, _rest = head.partition(b"\n")
-    try:
-        d = json.loads(first.decode("utf-8", "replace"))
-    except ValueError:
-        return None
-    if not isinstance(d, dict) or d.get("_type") != "metadata":
-        return None
-    mode = d.get("memory_mode")
-    if mode is None:
-        # Valid header, field absent -> legacy persistent session.
-        return "persistent"
-    if not isinstance(mode, str):
-        return None
-    # Allowlist, not normalize-and-hope: an unrecognised value must read as
-    # unknown so the caller fails closed. Case/whitespace matter because the
-    # comparison downstream is set membership — `"incognito "` would lower() to
-    # itself, miss INCOGNITO_MEMORY_MODES, and be treated as unrestricted. The
-    # API validates this field on the way in, but a hand-edited or partially
-    # written transcript is not bound by that.
-    normalized = mode.strip().lower()
-    if normalized not in VALID_MEMORY_MODES:
-        return None
-    return normalized
+    # The shared header parse (allowlisted, fails closed on anything it does not
+    # recognise) -- the same one the whole-install export and import apply.
+    return memory_mode_from_header_line(first)
 
 
 async def require_owner_dashboard_request(

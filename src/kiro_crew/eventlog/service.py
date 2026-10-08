@@ -27,9 +27,9 @@ import stat
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import fsync_dir
@@ -43,7 +43,9 @@ from kiro_crew.projection import EMPTY_WATERMARK, DirectoryCheckpointStore, Proj
 
 logger = logging.getLogger(__name__)
 
-Broadcast = Callable[[str, object], None]
+#: The dashboard's fan-out signature: its payload is ``websocket_hub.WsPayload``,
+#: spelled out here because this layer does not import the dashboard.
+Broadcast = Callable[[str, Mapping[str, Any]], None]
 
 #: Events a prime must have folded past its savepoint before a new one is written.
 #: A savepoint is allowed to LAG -- resuming from an older one replays more tail and
@@ -86,14 +88,26 @@ def _redact_projection_value(value: object) -> object:
     reads use, recursively, so a credential- or presigned-URL-shaped value an
     operator planted in an activity ``project`` (or any nested string) cannot
     reach the browser through the live projection push.
+
+    The string branch also applies the URL-secret-parameter layer
+    (``external_text.redact_url_secret_params``) that the sibling roster/agents
+    egress chain (``external_text.redact_external_text``, via ``_roster_mask``)
+    carries, so the two chains agree by construction. That layer catches a short
+    URL-embedded credential such as ``https://h.example/v1?api_key=abc123`` -- a
+    query under the exfiltration pass's length floor whose value is not
+    credential-shaped -- which the exfiltration and credential passes leave
+    untouched. Both the roster projection block (``GET /api/members``) and the
+    live member-projection WS push fold this function, and the roster ROW masks
+    the same leaf, so projection and row render it the same way.
     """
+    from kiro_crew.external_text import redact_url_secret_params
     from kiro_crew.security.exfil import redact_exfiltration_urls
     from kiro_crew.security.redaction import redact_credentials
 
     if isinstance(value, str):
         text, _ = redact_exfiltration_urls(value)
         text, _ = redact_credentials(text)
-        return text
+        return redact_url_secret_params(text)
     if isinstance(value, dict):
         # Redact keys too, not just values: a contributed projection key is
         # app-authored (`<app>/<name>`) and a nested data key can be arbitrary
@@ -350,19 +364,12 @@ def _remove_legacy_activity(slug: str) -> bool:
 LEGACY_PROVENANCE_KEY = "legacy_unverified"
 """Marks an activity record imported from the pre-fold legacy file.
 
-The event log is fenced, ordered and append-only, and a reader is entitled to
-treat what is in it as having been written through those guarantees. Rows folded
-in from the legacy activity file were NOT: that file is agent-writable and is read
-on the first ``ensure`` for a member, so anything able to write it before the fold
-chooses what the fold imports. Without a marker those rows become
-indistinguishable from records this service itself appended, which presents
-unauthenticated content with the ledger's own authority.
-
-The marker does not drop them -- they are that member's real history as far as
-anyone can tell, and discarding them would lose activity the dashboard has always
-shown. It records that their provenance is the file, not this log, so a consumer
-that needs the stronger claim can tell the two apart. :func:`_activity_key`
-strips it, so adding it changes no row's migration identity.
+The legacy activity file is agent-writable and is read on every ``ensure`` for a
+member until the fenced completion marker exists, so rows folded in from it carry
+this key: their provenance is the file, not this log. They are kept, not dropped.
+:func:`_activity_key` strips the key, so adding it changes no row's migration
+identity. The full rationale is ``docs/system-specs/modules/member-event-log.md``
+section 8.
 """
 
 

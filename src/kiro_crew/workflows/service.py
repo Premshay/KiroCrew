@@ -985,7 +985,9 @@ class WorkflowService:
             if author_model:
                 advertised = provider_advertised_ids(provider)
                 if model_is_unusable(author_model, advertised):
-                    raise AcpModelUnavailable(author_model, advertised)
+                    raise AcpModelUnavailable(
+                        author_model, advertised, backend=getattr(provider, "backend", "")
+                    )
                 selected = resolve_pin_spelling(author_model, advertised) or author_model
                 set_model = resolve_substitute_set_model(provider)
                 if set_model is None:

@@ -19,6 +19,7 @@ them.
 | shared components, a11y, URL sanitization, data fetching, the stack, adding a dependency | [frontend-conventions](docs/frontend-conventions.md) |
 | any user-facing string, date, number, or sort order | [i18n-catalog](docs/i18n-catalog.md) + [i18n gates](../docs/ci/i18n-gates.md) |
 | `src/extensions.ts`, edition composition, registries | [extension-seams](docs/extension-seams.md) |
+| `src/api/` — `client.ts`, `api/client/*.ts`, adding an API method | [extension-seams](docs/extension-seams.md) (the transport seam and the method ratchets) |
 | tests (vitest, MSW, Playwright, Electron), or a test that fails only in CI | [testing](docs/testing.md) |
 | the Electron desktop shell | [electron/README.md](electron/README.md) |
 | anything backend, or a whole-system question | [`../AGENTS.md`](../AGENTS.md) |
@@ -91,6 +92,15 @@ the `internal-content-scan` check.
   the UX Review lane (lens 13) — a hard swap with no stated reason is a BLOCK.
 - **Styling uses design tokens** (`var(--bg)`, `var(--text)`, …), never a literal
   color.
+- **Frontend tests are deterministic.** No promise-sleep barrier and no
+  `page.waitForTimeout` barrier; `Date` pinned with `vi.setSystemTime`; fake timers
+  restored in an `afterEach` or `onTestFinished`, which still run when the test times
+  out; wait for every value you read whose content comes from a different async source
+  than the one you awaited. Enforced on new and
+  changed test lines by `AUTOSDE.yaml` (`frontend-tests-are-deterministic`). A
+  Playwright spec that passes only on a retry is flaky: fix it, never raise `retries`.
+  Detail in
+  [testing § Determinism](docs/testing.md#determinism-establish-the-state-you-assert-on).
 - **Typography:** no `text-xs`, and no text below 10px.
 - **Accessibility:** use `<Clickable>` rather than `<div onClick>`; give every
   icon-only button an `aria-label`; use `<Btn>` / `<SendBtn>` rather than a raw

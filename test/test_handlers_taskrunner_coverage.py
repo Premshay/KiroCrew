@@ -175,6 +175,24 @@ def _body(resp: web.Response) -> Any:
 
 class TestStatus:
     @pytest.mark.asyncio
+    async def test_running_describes_only_visible_runs(self, tmp_path: Path) -> None:
+        """A hidden cron run must not make an idle visible result look active."""
+        runner = _runner(tmp_path)
+        runner.status.return_value = {
+            "running": True,
+            "runs": [
+                {"source": "dashboard", "running": False},
+                {"source": "cron", "running": True},
+            ],
+        }
+
+        resp = await api_taskrunner_status(_request(_state(runner), "GET"))
+
+        data = _body(resp)
+        assert data["runs"] == [{"source": "dashboard", "running": False}]
+        assert data["running"] is False
+
+    @pytest.mark.asyncio
     async def test_unavailable_when_no_runner(self) -> None:
         resp = await api_taskrunner_status(_request(_state(None), "GET"))
         assert resp.status == 200
@@ -241,6 +259,36 @@ class TestStatus:
 
 
 class TestStart:
+    @pytest.mark.asyncio
+    async def test_disabled_task_runner_app_refuses_start(self, tmp_path: Path) -> None:
+        # Disabled in Library means no new runs: the run would have no page.
+        runner = _runner(tmp_path)
+        with patch(
+            "kiro_crew.apps.manager._read_installed",
+            return_value=SimpleNamespace(enabled=False),
+        ) as read:
+            resp = await api_taskrunner_start(
+                _request(_state(runner), json_body={"spec": "__inline__:# t"})
+            )
+        assert resp.status == 409
+        assert _body(resp)["code"] == "app_disabled"
+        assert "Task Runner is disabled" in _body(resp)["error"]
+        read.assert_called_once_with("projects")
+        runner.start_background.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("meta", [None, SimpleNamespace(enabled=True)])
+    async def test_enabled_or_unregistered_app_still_starts(
+        self, tmp_path: Path, meta: Any
+    ) -> None:
+        runner = _runner(tmp_path)
+        with patch("kiro_crew.apps.manager._read_installed", return_value=meta):
+            resp = await api_taskrunner_start(
+                _request(_state(runner), json_body={"spec": "__inline__:# t"})
+            )
+        assert resp.status == 200
+        runner.start_background.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_no_runner_is_400(self) -> None:
         resp = await api_taskrunner_start(_request(_state(None), json_body={"spec": "x"}))

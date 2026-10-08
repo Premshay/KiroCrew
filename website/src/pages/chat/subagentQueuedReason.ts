@@ -22,12 +22,14 @@ import backendPhrases from '../../lib/backendPhrases.json'
 /** The gate's kinds. `concurrency_limit` clears on its own within seconds; the
  *  others can wait possibly for hours. `memory_pressure` is the macOS kernel's
  *  pressure verdict and carries no GB figures: the free-memory figure cleared
- *  the floor, so numbers would contradict it. */
+ *  the floor, so numbers would contradict it. The memory posture tier is not a
+ *  spawn wait: spawns admit on the floor alone. Nor is a paused execution cap:
+ *  the adaptive controller no longer pauses it, so an older gateway's
+ *  `adaptive_cap_zero` label falls back to the default text like any unknown
+ *  kind. */
 const KINDS = [
   'concurrency_limit',
   'low_memory',
-  'posture_critical',
-  'adaptive_cap_zero',
   'memory_pressure',
 ] as const
 
@@ -35,8 +37,8 @@ export type SubagentQueuedReasonKind = (typeof KINDS)[number]
 
 export type SubagentQueuedReason = {
   reason: SubagentQueuedReasonKind
-  /** Reclaimable host memory the gate measured, in GB (`low_memory` and
-   *  `posture_critical` only; `memory_pressure` carries no figures). */
+  /** Reclaimable host memory the gate measured, in GB (`low_memory` only;
+   *  `memory_pressure` carries no figures). */
   available_gb?: number
   /** The bar that measurement fell short of, in GB (`low_memory` only). */
   required_gb?: number
@@ -93,12 +95,6 @@ export function queuedWaitText(reason: SubagentQueuedReason | undefined): string
           available: gb(reason.available_gb),
         })
         : i18nT('pages.chat.subagentQueued.low_memory_no_figures')
-    case 'posture_critical':
-      return reason.available_gb !== undefined
-        ? i18nT('pages.chat.subagentQueued.posture_critical', { available: gb(reason.available_gb) })
-        : i18nT('pages.chat.subagentQueued.posture_critical_no_figures')
-    case 'adaptive_cap_zero':
-      return i18nT('pages.chat.subagentQueued.adaptive_cap_zero')
     case 'memory_pressure':
       return i18nT('pages.chat.subagentQueued.memory_pressure')
     default:
@@ -121,4 +117,12 @@ export const NEVER_STARTED_PREFIX = backendPhrases.neverStartedPrefix
 /** Whether a terminal run's error says it never started. */
 export function isNeverStarted(error: string | undefined): boolean {
   return typeof error === 'string' && error.startsWith(NEVER_STARTED_PREFIX)
+}
+
+/** Whether the wait is on host memory: the gate deferred the start until enough
+ *  memory is free (by its own measurement or the macOS pressure verdict), rather
+ *  than holding it behind the concurrency cap. The adaptive pause is left out
+ *  because its own sentence names overload as well. */
+export function isMemoryWait(reason: SubagentQueuedReason | undefined): boolean {
+  return reason?.reason === 'low_memory' || reason?.reason === 'memory_pressure'
 }

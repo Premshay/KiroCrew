@@ -80,7 +80,8 @@ _LIMIT_MARKS = (
 # "try again at 4:46 PM."  /  "try again at Sep 24th, 2026 12:03 AM."  (local wall clock)
 _AT_CLOCK = re.compile(r"try again at (\d{1,2}):(\d{2}) ?(AM|PM)", re.I)
 _AT_DATE = re.compile(
-    r"try again at ([A-Z][a-z]{2}) (\d{1,2})(?:st|nd|rd|th)?, (\d{4}) (\d{1,2}):(\d{2}) ?(AM|PM)", re.I
+    r"try again at ([A-Z][a-z]{2}) (\d{1,2})(?:st|nd|rd|th)?, (\d{4}) (\d{1,2}):(\d{2}) ?(AM|PM)",
+    re.I,
 )
 _MONTHS = {m: i for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
 _MODEL = re.compile(r"usage limit for ([A-Za-z0-9.\-]+?)\.?(?:\s|$)")
@@ -130,11 +131,17 @@ def reset_time(detail: str, died: float, window_s: int) -> float:
     if m:
         mon, day, year, h, mi, ampm = m.groups()
         h, mi = _to_24h(int(h), int(mi), ampm)
-        return _dt.datetime(int(year), _MONTHS[mon.title()], int(day), h, mi).astimezone().timestamp()
+        return (
+            _dt.datetime(int(year), _MONTHS[mon.title()], int(day), h, mi).astimezone().timestamp()
+        )
     m = _AT_CLOCK.search(detail)
     if m:
         h, mi = _to_24h(int(m.group(1)), int(m.group(2)), m.group(3))
-        t = _dt.datetime.fromtimestamp(died).astimezone().replace(hour=h, minute=mi, second=0, microsecond=0)
+        t = (
+            _dt.datetime.fromtimestamp(died)
+            .astimezone()
+            .replace(hour=h, minute=mi, second=0, microsecond=0)
+        )
         if t.timestamp() < died - 60:
             t += _dt.timedelta(days=1)
         return t.timestamp()
@@ -159,7 +166,9 @@ def limit_hit(row: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def vendor_health(rows: list[Mapping[str, Any]], now: float | None = None) -> dict[str, dict[str, Any]]:
+def vendor_health(
+    rows: list[Mapping[str, Any]], now: float | None = None
+) -> dict[str, dict[str, Any]]:
     """Per vendor: ``out`` when its LAST event was a limit hit and the reset has not passed.
 
     A delivery after the hit clears it whatever the named reset said. ``probe_after``
@@ -167,7 +176,14 @@ def vendor_health(rows: list[Mapping[str, Any]], now: float | None = None) -> di
     """
     now = time.time() if now is None else now
     out: dict[str, dict[str, Any]] = {
-        v: {"out": False, "until": None, "probe_after": None, "models": [], "last_hit": None, "last_delivery": None}
+        v: {
+            "out": False,
+            "until": None,
+            "probe_after": None,
+            "models": [],
+            "last_hit": None,
+            "last_delivery": None,
+        }
         for v in VENDORS
     }
     for r in rows:
@@ -184,7 +200,10 @@ def vendor_health(rows: list[Mapping[str, Any]], now: float | None = None) -> di
                 s["last_hit"] = h["from"]
                 s["until"] = h["until"]
                 s["models"] = [h["model"]] if h["model"] else []
-        elif r.get("cause") in ("delivered", "result_available") or r.get("recovery_action") == "delivered":
+        elif (
+            r.get("cause") in ("delivered", "result_available")
+            or r.get("recovery_action") == "delivered"
+        ):
             s["last_delivery"] = max(s["last_delivery"] or 0, t)
     for s in out.values():
         hit = s["last_hit"]
@@ -245,13 +264,19 @@ def tier_map(config: Any | None = None) -> dict[str, dict[str, list[str]]]:
             ids = tiers.get(tier)
             if isinstance(ids, str):
                 ids = [ids]
-            out[vendor][tier] = [str(i).strip() for i in (ids or []) if isinstance(i, str) and str(i).strip()]
+            out[vendor][tier] = [
+                str(i).strip() for i in (ids or []) if isinstance(i, str) and str(i).strip()
+            ]
     return out
 
 
 #: The provider namespace each vendor's adapter advertises its models under
 #: (``model_registry.advertised_models``), i.e. ``provider_models.json``.
-ADVERTISED_NAMESPACE: dict[str, str] = {"claude": "claude_code", "codex": "codex", "deepseek": "deepseek"}
+ADVERTISED_NAMESPACE: dict[str, str] = {
+    "claude": "claude_code",
+    "codex": "codex",
+    "deepseek": "deepseek",
+}
 
 #: Which model FAMILIES are each tier, per vendor -- the operator's taxonomy
 #: (POLICY.md "Spawn routing policy"), not model ids: the ids come from what the
@@ -334,12 +359,16 @@ def effective_tiers(vendor: str, config: Any | None = None) -> dict[str, list[st
     return {tier: list(pinned.get(tier) or derived.get(tier) or []) for tier in TIERS}
 
 
-def candidates_for(vendor: str, mapping: Mapping[str, Mapping[str, list[str]]]) -> list[dict[str, str]]:
+def candidates_for(
+    vendor: str, mapping: Mapping[str, Mapping[str, list[str]]]
+) -> list[dict[str, str]]:
     """The offered options: one per pinned model id of *vendor*, keyed ``vendor/tier/i``."""
     out = []
     for tier in TIERS:
         for i, model in enumerate(mapping.get(vendor, {}).get(tier, [])):
-            out.append({"key": f"{vendor}/{tier}/{i}", "vendor": vendor, "tier": tier, "model": model})
+            out.append(
+                {"key": f"{vendor}/{tier}/{i}", "vendor": vendor, "tier": tier, "model": model}
+            )
     return out
 
 
@@ -373,14 +402,20 @@ def build_state(
         "parent_model": parent_model,
         "candidates": [dict(c) for c in cands],
         "health": {
-            v: {"out": bool(s.get("out")), "until": s.get("until"), "probe_after": s.get("probe_after")}
+            v: {
+                "out": bool(s.get("out")),
+                "until": s.get("until"),
+                "probe_after": s.get("probe_after"),
+            }
             for v, s in health.items()
             if s.get("out")
         },
     }
 
 
-def read_choice(answers: Any, cands: list[dict[str, str]]) -> tuple[dict[str, str] | None, float | None, Any]:
+def read_choice(
+    answers: Any, cands: list[dict[str, str]]
+) -> tuple[dict[str, str] | None, float | None, Any]:
     """(candidate, p, provider note) for the answered key, or ``(None, None, None)``."""
     if not isinstance(answers, dict):
         return None, None, None
@@ -419,14 +454,20 @@ async def routed_spawn(
         if not cands:
             return None
         health = await asyncio.to_thread(cached_health)
-        state = build_state(brief, agent=agent, vendor=vendor, parent_model=parent_model, cands=cands, health=health)
+        state = build_state(
+            brief, agent=agent, vendor=vendor, parent_model=parent_model, cands=cands, health=health
+        )
         answers = await core.decide(
             POINT,
             state,
             questions(cands),
             session_key=session_key,
             config=config,
-            extra={"route_id": route_id, "vendor": vendor, "vendor_out": bool(health.get(vendor, {}).get("out"))},
+            extra={
+                "route_id": route_id,
+                "vendor": vendor,
+                "vendor_out": bool(health.get(vendor, {}).get("out")),
+            },
         )
     except asyncio.CancelledError:
         raise

@@ -52,6 +52,7 @@ from kiro_crew.memory_stores import (
     owned_store_path,
     resolve_store_path,
 )
+from kiro_crew.owner_only_files import owner_only_opener, prepare_owner_only_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,10 @@ def backup_store(db_path: Path, *, now: datetime | None = None) -> Path | None:
 
     require_memory_ready(named_store_of_db(db_path))
     if member_memory_backup.is_member_store(db_path):
+        # The DIRECTORY, not the database file: a member store is declared in config
+        # before it is ever created, and one present but incomplete must still raise.
+        if not db_path.parent.exists():
+            return None
         try:
             return member_memory_backup.backup_store(db_path, now=now)
         except Exception as exc:
@@ -175,6 +180,9 @@ def backup_store(db_path: Path, *, now: datetime | None = None) -> Path | None:
     try:
         # Read-only URI so a backup can never be the thing that writes to the store.
         src = sqlite3.connect(_read_only_uri(db_path), uri=True)
+        # Created 0600 before SQLite opens it, so the populated copy is never
+        # readable by others, not even before the restrict_to_owner below.
+        prepare_owner_only_sqlite(partial)
         dst = sqlite3.connect(str(partial))
         src.backup(dst)
         # The copy inherits the live store's WAL header, so every later open of it --
@@ -451,11 +459,12 @@ def restore_from_backup(backup: Path, store: str = DEFAULT_MEMORY_STORE) -> Path
         raise ValueError(f"{target} is not a memory store file")
     out = backup_dir_for(target)
     platform_compat.make_owner_only_dir(out)
-    with (out / ".restore.lock").open("a+b") as lock:
+    with open(out / ".restore.lock", "a+b", opener=owner_only_opener) as lock:
         with platform_compat.file_lock(lock.fileno(), required=True, wait=False):
             if (out / _V1_PENDING).exists():
                 raise ValueError("A restore is already pending; restart or cancel it first")
             stage = out / ("restore-" + uuid4().hex + ".db")
+            prepare_owner_only_sqlite(stage)  # 0600 before the copy lands in it
             try:
                 with (
                     closing(sqlite3.connect(_read_only_uri(backup), uri=True)) as src,

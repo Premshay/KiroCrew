@@ -140,6 +140,12 @@ class SessionProjection:
     that keeps a narrowed server MOUNTED because its transport honours the restriction
     another way -- claude re-expresses it as ``permissions.deny`` rules.
     """
+    unhonoured_servers: frozenset[str] = frozenset()
+    """Mounted servers whose per-tool restrictions this projection cannot enforce."""
+    harness_deny_rules: tuple[str, ...] = ()
+    """Harness-native deny rules that the client must seed for this session."""
+    zero_tools: bool = False
+    """Whether the source spec explicitly exposes no tools."""
     agent_spec: dict[str, Any] | None = None
     """The exact parsed spec this projection consumed; absent when withheld."""
 

@@ -507,7 +507,7 @@ def _wait_for_raising(exc: BaseException):
     return _wait_for
 
 
-def _fake_proc(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> "MagicMock":
+def _fake_proc(returncode: int | None = 0, stdout: bytes = b"", stderr: bytes = b"") -> "MagicMock":
     """Build a mock subprocess the production code can actually read.
 
     ``_read_bounded_output`` drains ``proc.stdout``/``proc.stderr`` itself rather
@@ -632,7 +632,7 @@ class TestCommandProviderNoShellAndTimeout:
     @pytest.mark.asyncio
     async def test_check_timeout_kills_proc(self, _fake_process_tree) -> None:
         p = CommandProvider(check_command="sleep 100", apply_command="echo ok")
-        proc = _fake_proc(returncode=0)
+        proc = _fake_proc(returncode=None)  # a child that timed out has not exited
         with (
             patch(
                 "kiro_crew.platform.update_provider._shell_exec_args",
@@ -678,7 +678,7 @@ class TestCommandProviderNoShellAndTimeout:
     @pytest.mark.asyncio
     async def test_apply_timeout_kills_proc(self, _fake_process_tree) -> None:
         p = CommandProvider(check_command="echo hi", apply_command="sleep 100")
-        proc = _fake_proc(returncode=0)
+        proc = _fake_proc(returncode=None)  # a child that timed out has not exited
         with (
             patch(
                 "kiro_crew.platform.update_provider._shell_exec_args",
@@ -906,6 +906,9 @@ class TestCancellationKillsUpdaterChild:
         pipes those survivors hold."""
         proc = MagicMock()
         proc.pid = _UNALLOCATABLE_PID
+        # A child being killed on cancellation has NOT exited, so asyncio has
+        # recorded no exit code; the group tree kill fires for a live child.
+        proc.returncode = None
         proc.kill = MagicMock()
         proc.communicate = AsyncMock(return_value=(b"", b""))
         proc.stdout = _stream(b"")
@@ -1565,6 +1568,92 @@ class TestOutputIsBounded:
         out, _err = await _read_bounded_output(proc, timeout=60, want_stdout=True)
         assert len(out) == _MAX_CAPTURED_OUTPUT
         assert proc.returncode == 0
+
+    @pytest.mark.asyncio
+    async def test_a_child_that_closes_its_stdio_is_still_timed_out(self) -> None:
+        """Closing both pipes ends the drain at once; the bound must cover the exit.
+
+        Driven through a task the test bounds itself, so a regression fails by
+        name instead of hanging.
+        """
+        from kiro_crew.platform.update_provider import _read_bounded_output
+
+        proc = _fake_proc()  # EOF on both streams at once
+
+        async def _never_exits() -> int:
+            await asyncio.Event().wait()
+            return 0
+
+        proc.wait = _never_exits
+        task = asyncio.ensure_future(_read_bounded_output(proc, timeout=0.05, want_stdout=False))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=5.0)
+            assert done, "the bound did not cover proc.wait(): the read never returned"
+            with pytest.raises(asyncio.TimeoutError):
+                task.result()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+class TestOneApplyRunIsBounded:
+    """governance.md promises operators one apply run may take 600 s, its exit included."""
+
+    @pytest.mark.asyncio
+    async def test_the_apply_waits_at_most_600_seconds(self) -> None:
+        from kiro_crew.platform import update_provider
+
+        bounds = []
+
+        async def _bounded(_proc, *, timeout, want_stdout):
+            bounds.append(timeout)
+            return b"", b""
+
+        with (
+            patch(
+                "kiro_crew.platform.update_provider._shell_exec_args",
+                return_value=["/bin/sh", "-c", "true"],
+            ),
+            patch(
+                "kiro_crew.platform.update_provider.trusted_system_path",
+                return_value="/usr/bin:/bin",
+            ),
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_fake_proc())),
+            patch.object(update_provider, "_read_bounded_output", _bounded),
+        ):
+            assert await CommandProvider(apply_command="true").apply() is True
+
+        assert bounds == [600]
+
+
+class TestApplyOwnsTheBundleGap:
+    """While the policy command runs it can rewrite the install, so it owns a gap."""
+
+    @pytest.mark.asyncio
+    async def test_the_command_runs_as_an_owning_update_step(self) -> None:
+        from kiro_crew import update_ownership
+
+        seen = []
+
+        async def _spawn(*_a, **_k):
+            seen.append(update_ownership.current_owner())
+            return _fake_proc(returncode=0)
+
+        with (
+            patch(
+                "kiro_crew.platform.update_provider._shell_exec_args",
+                return_value=["/bin/sh", "-c", "true"],
+            ),
+            patch(
+                "kiro_crew.platform.update_provider.trusted_system_path",
+                return_value="/usr/bin:/bin",
+            ),
+            patch("asyncio.create_subprocess_exec", _spawn),
+        ):
+            assert await CommandProvider(apply_command="true").apply() is True
+
+        assert seen == ["the policy apply command"]
+        assert update_ownership.current_owner() is None
 
 
 class TestInstallerNeverLandsOnDisk:

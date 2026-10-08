@@ -12,6 +12,7 @@ import pytest
 
 from conftest import make_dir_link, requires_symlinks
 from kiro_crew import context as context_module
+from kiro_crew import member_essential_context as _mec
 from kiro_crew import pinned_fs
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, PROVIDER_CLAUDE_CODE
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
@@ -1201,6 +1202,160 @@ def test_glob_leaf_link_cannot_silently_drop_a_declared_guide(env):
         )
 
 
+def _link_global_steering(env, tmp_path) -> Path:
+    """Make ``~/.kiro/steering/context/style.md`` a link into an outside repo."""
+    repo = tmp_path / "steering-repo"
+    repo.mkdir()
+    (repo / "style.md").write_text("LINKED_STEERING_BODY", encoding="utf-8")
+    context = Path.home() / ".kiro" / "steering" / "context"
+    context.mkdir(parents=True, exist_ok=True)
+    (Path.home() / ".kiro" / "steering" / "plain.md").write_text(
+        "PLAIN_STEERING_BODY", encoding="utf-8"
+    )
+    link = context / "style.md"
+    link.symlink_to(repo / "style.md")
+    return link
+
+
+@requires_symlinks
+def test_linked_global_steering_file_is_named_instead_of_refusing_the_turn(env, tmp_path):
+    """A steering link left out of the snapshot does not stop the member.
+
+    Global steering is read because it exists, like a project's ``AGENTS.md``,
+    so a link there is left out unread and named in-band; the regular steering
+    file beside it still loads.
+    """
+    link = _link_global_steering(env, tmp_path)
+    message = _member_message(env)
+    assert "LINKED_STEERING_BODY" not in message
+    assert "PLAIN_STEERING_BODY" in message
+    assert f"[Essential source: {_mec.ESSENTIAL_LINKED_SKIP_SOURCE}]" in message
+    assert str(link) in message
+    # kiro-cli may load the link natively, so the note must not tell the model to
+    # disregard it or ask the user to restructure a working setup.
+    assert "may still load linked steering natively" in message
+    note = _mec._skipped_linked_note([link])
+    assert note is not None and "Do not assume" not in note[1]
+
+
+@requires_symlinks
+def test_linked_global_steering_directory_is_named_not_enumerated(env, tmp_path):
+    repo = tmp_path / "steering-repo"
+    repo.mkdir()
+    (repo / "inner.md").write_text("LINKED_DIR_BODY", encoding="utf-8")
+    steering = Path.home() / ".kiro" / "steering"
+    steering.mkdir(parents=True, exist_ok=True)
+    make_dir_link(steering / "shared", repo)
+    message = _member_message(env)
+    assert "LINKED_DIR_BODY" not in message
+    assert str(steering / "shared") in message
+
+
+@requires_symlinks
+def test_linked_non_steering_entry_is_not_named(env, tmp_path):
+    """A link the glob would never have read (not ``*.md``) is not reported."""
+    steering = Path.home() / ".kiro" / "steering"
+    steering.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "notes.txt"
+    target.write_text("NOT_STEERING", encoding="utf-8")
+    (steering / "README.txt").symlink_to(target)
+    linked: list[Path] = []
+    _mec._matches(Path.home(), ".kiro/steering/**/*.md", linked=linked)
+    assert linked == []
+
+
+@requires_symlinks
+def test_linked_steering_entry_is_screened_before_its_target_is_probed(env, tmp_path, monkeypatch):
+    """A link whose target the path gate refuses is named without a following probe.
+
+    ``entry.is_dir()`` follows the link; on Windows a UNC target would be an
+    outbound SMB probe, so the gate must run first and short-circuit it.
+    """
+    from kiro_crew import member_essential_context as mec
+
+    steering = Path.home() / ".kiro" / "steering"
+    steering.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "remote-share"
+    target.mkdir()
+    link = steering / "shared"
+    link.symlink_to(target, target_is_directory=True)
+    real_validate = mec.validate_file_path
+    monkeypatch.setattr(
+        mec,
+        "validate_file_path",
+        lambda p, *a, **k: None if Path(p) == link else real_validate(p, *a, **k),
+    )
+    probed: list[str] = []
+    real_is_dir = os.DirEntry.is_dir
+
+    def _spy(entry, *, follow_symlinks=True):
+        if follow_symlinks and Path(entry.path) == link:
+            probed.append(entry.path)
+        return real_is_dir(entry, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(mec.os, "scandir", _wrap_scandir(os.scandir, _spy))
+    linked: list[Path] = []
+    mec._matches(Path.home(), ".kiro/steering/**/*.md", linked=linked)
+    assert linked == [link]
+    assert probed == []
+
+
+def _wrap_scandir(real_scandir, is_dir):
+    """``os.scandir`` whose entries route ``is_dir`` through *is_dir*."""
+
+    class _Entry:
+        def __init__(self, entry):
+            self._entry = entry
+            self.name = entry.name
+            self.path = entry.path
+
+        def is_dir(self, *, follow_symlinks=True):
+            return is_dir(self._entry, follow_symlinks=follow_symlinks)
+
+        def __getattr__(self, attr):
+            return getattr(self._entry, attr)
+
+    class _Iter:
+        """Usable as a context manager and as a plain iterator, like ``os.scandir``."""
+
+        def __init__(self, path):
+            self._it = real_scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._it.close()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return _Entry(next(self._it))
+
+        def close(self):
+            self._it.close()
+
+    return _Iter
+
+
+@requires_symlinks
+def test_kiro_launch_documents_leaves_a_linked_global_steering_file_out(env, tmp_path):
+    """The spawn-time native list must not refuse the session start either."""
+    link = _link_global_steering(env, tmp_path)
+    sources = dict(_mec.kiro_launch_documents("writer-template", str(env.project)))
+    assert str(link) not in sources
+    assert "PLAIN_STEERING_BODY" in sources.values()
+
+
+@requires_symlinks
+def test_declared_glob_still_refuses_a_linked_steering_file(env, tmp_path):
+    """Only the implicit scan skips links; a template that declares them still refuses."""
+    _link_global_steering(env, tmp_path)
+    with pytest.raises(MemberEssentialContextError, match="linked document"):
+        _mec._matches(Path.home(), ".kiro/steering/**/*.md")
+
+
 @pytest.mark.parametrize("field, value", [("prompt", 42), ("resources", "file://guide.md")])
 def test_malformed_declared_template_fields_refuse_explicitly(env, field, value):
     spec = env.project / ".kiro" / "agents" / "writer-template.json"
@@ -1581,6 +1736,161 @@ def test_workspace_glob_excludes_managed_subtrees_before_scanning(env, monkeypat
     assert "WORKSPACE_CHILD_GUIDE" in message
     assert "MANAGED_CONTENT_MUST_NOT_LOAD" not in message
     assert "You are writer." in message
+    # The prune stays; it names only a prefix collision, never the real store.
+    note_label = "[Essential source: essential-context#managed-skipped:writer-template]"
+    if leaf == "memory_index":
+        assert note_label in message
+        assert str(managed) in message
+    else:
+        assert note_label not in message
+        assert str(managed) not in message
+
+
+def test_plain_workspace_glob_over_real_managed_store_adds_no_note(env, caplog):
+    """A broad glob walking past the workspace's own memory/lessons store is
+    routine: no note, no warning, only a debug line."""
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+    )
+
+    project = config_dir() / "workspace"
+    for name in ("memory", "lessons", ".lessons"):
+        (project / name).mkdir(parents=True, exist_ok=True)
+        (project / name / "AGENTS.md").write_text("MANAGED", encoding="utf-8")
+    for name in ("memory.db", "memory.db-wal", "memory_index.db-shm", "lessons.jsonl"):
+        (project / name).write_text("", encoding="utf-8")
+    (project / "guides").mkdir(exist_ok=True)
+    (project / "guides" / "AGENTS.md").write_text("WORKSPACE_CHILD_GUIDE", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    _write_template(agents, "writer-template", ["file://*/AGENTS.md", "file://*", "file://**/*.md"])
+    with caplog.at_level("DEBUG", logger="kiro_crew.member_essential_context"):
+        documents = documents_for_member("writer-template", str(project))
+    assert not any(s.startswith(ESSENTIAL_MANAGED_SKIP_SOURCE) for s, _ in documents)
+    assert "WORKSPACE_CHILD_GUIDE" in "\n".join(body for _, body in documents)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("pruned" in r.getMessage() for r in caplog.records if r.levelname == "DEBUG")
+
+
+def _write_template(agents: Path, name: str, resources: list[str]) -> None:
+    (agents / f"{name}.json").write_text(
+        json.dumps({"name": name, "resources": resources}), encoding="utf-8"
+    )
+
+
+def test_two_templates_skipping_different_entries_still_build(env):
+    """An owner and an execution template whose globs skip different
+    prefix-colliding entries each get their own note, so merging them
+    does not trip the changed-during-preparation guard."""
+    from kiro_crew.config import config_dir
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "memory-notes.md").write_text("PREFIX_A", encoding="utf-8")
+    (project / "lessons-notes.md").write_text("PREFIX_B", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    _write_template(agents, "writer-template", ["file://memory*.md"])
+    _write_template(agents, "runner-template", ["file://lessons*.md"])
+    message = env.builder._build_v2_essentials(
+        env.store,
+        member=env.member,
+        project=str(project),
+        execution_template="runner-template",
+    )
+    assert "essential-context#managed-skipped:writer-template" in message
+    assert "essential-context#managed-skipped:runner-template" in message
+    assert str(project / "memory-notes.md") in message
+    assert str(project / "lessons-notes.md") in message
+    assert "PREFIX_A" not in message
+    assert "PREFIX_B" not in message
+
+
+def test_native_reads_carry_no_skip_note(env):
+    """The note is not a host-native source: a native-only read and the
+    launch documents leave it out, so wire dedup cannot strip its body."""
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+        kiro_launch_documents,
+    )
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "memory-notes.md").write_text("PREFIX_A", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    _write_template(agents, "writer-template", ["file://*.md"])
+    for documents in (
+        documents_for_member("writer-template", str(project), native_only=True),
+        kiro_launch_documents("writer-template", str(project)),
+    ):
+        assert not any(s.startswith(ESSENTIAL_MANAGED_SKIP_SOURCE) for s, _ in documents)
+    full = dict(documents_for_member("writer-template", str(project)))
+    assert f"{ESSENTIAL_MANAGED_SKIP_SOURCE}:writer-template" in full
+
+
+def test_workspace_glob_names_each_prefix_colliding_entry_it_skips(env, caplog):
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+    )
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "memory-notes").mkdir()
+    (project / "memory-notes" / "guide.md").write_text("PREFIX_DIR_CONTENT", encoding="utf-8")
+    (project / "lessons-archive.md").write_text("PREFIX_FILE_CONTENT", encoding="utf-8")
+    (project / "plain.md").write_text("PLAIN_GUIDE", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": ["file://*.md", "file://*/guide.md"]}),
+        encoding="utf-8",
+    )
+    core: set[str] = set()
+    with caplog.at_level("WARNING", logger="kiro_crew.member_essential_context"):
+        documents = documents_for_member("writer-template", str(project), core_sources_out=core)
+    bodies = dict(documents)
+    joined = "\n".join(bodies.values())
+    assert "PLAIN_GUIDE" in joined
+    assert "PREFIX_DIR_CONTENT" not in joined
+    assert "PREFIX_FILE_CONTENT" not in joined
+    note = bodies[f"{ESSENTIAL_MANAGED_SKIP_SOURCE}:writer-template"]
+    assert "entries matched a declared resource pattern" in note
+    assert str(project / "memory-notes") in note
+    assert str(project / "lessons-archive.md") in note
+    # A size-limited envelope must not drop the note silently.
+    assert f"{ESSENTIAL_MANAGED_SKIP_SOURCE}:writer-template" in core
+    logged = [r.getMessage() for r in caplog.records]
+    assert any("memory-notes" in line for line in logged)
+    assert any("lessons-archive.md" in line for line in logged)
+
+
+def test_workspace_glob_without_prefix_collision_adds_no_skip_note(env):
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+    )
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "plain.md").write_text("PLAIN_GUIDE", encoding="utf-8")
+    # A managed-named file the pattern could never return is not reported.
+    (project / "memory_index.db").write_text("", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": ["file://*/AGENTS.md"]}),
+        encoding="utf-8",
+    )
+    documents = documents_for_member("writer-template", str(project))
+    assert not any(s.startswith(ESSENTIAL_MANAGED_SKIP_SOURCE) for s, _ in documents)
 
 
 @pytest.mark.parametrize("resource", ["memory/AGENTS.md", "memory/*.md", "memory/**/AGENTS.md"])

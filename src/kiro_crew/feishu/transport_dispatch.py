@@ -40,6 +40,9 @@ from kiro_crew.messaging.commands import (
     COMPACT_TIMED_OUT_REPLY_ZH,
     compact_unsupported_backend,
     compact_unsupported_reply_zh,
+    context_recycle_warning_zh,
+    recycle_backend,
+    recycle_warning_should_send,
 )
 from kiro_crew.messaging.conversation import (
     ConversationState,
@@ -361,7 +364,9 @@ class FeishuDispatcher:
             await provider.compact()
             # Failure and timeout come back as the result's ``type``, not as an
             # exception, so the receipt is read off it rather than assumed.
-            cr = await provider.wait_for_compaction()
+            cr = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
             if cr["type"] == "completed":
                 await self.client.send_reply(inbound.message_id, "🗜️ 已压缩上下文。")
             elif cr["type"] == "failed":
@@ -461,6 +466,12 @@ class FeishuDispatcher:
         route = self._route(inbound)
         pct = self.sessions.check_context_usage(session_key, provider)
         soft, hard = self._thresholds()
+        if recycle_backend(provider):
+            # Crew restarts this backend's session at the threshold; warn once
+            # before it, offering a fresh start instead of a compaction.
+            if recycle_warning_should_send(self.sessions, self._conv, route, session_key, pct):
+                await self.client.send_reply(inbound.message_id, context_recycle_warning_zh())
+            return
         if pct >= soft:
             # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
@@ -475,7 +486,9 @@ class FeishuDispatcher:
                 await provider.compact()
                 # A failed or timed-out compaction is a RETURNED result, not an
                 # exception, so the notice is posted only for a completed one.
-                cr = await provider.wait_for_compaction()
+                cr = await provider.wait_for_compaction(
+                    timeout=self.sessions.compact_wait_budget_secs()
+                )
                 if cr["type"] == "completed":
                     await self.client.send_reply(
                         inbound.message_id, "🗜️ 上下文接近上限，已自动压缩。"

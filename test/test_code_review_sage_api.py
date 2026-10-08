@@ -74,9 +74,7 @@ def test_handler_refuses_before_it_reaches_the_app(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(apps.mcp_core, "_get", _explode)
     monkeypatch.setattr(apps.mcp_core, "_post", _explode)
-    out = apps.code_review_sage_api(
-        "code_review_sage_api", {"method": "GET", "path": "/settings"}
-    )
+    out = apps.code_review_sage_api("code_review_sage_api", {"method": "GET", "path": "/settings"})
     assert out.startswith("Error:")
     assert "/settings" in out
 

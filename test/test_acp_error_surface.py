@@ -605,7 +605,7 @@ class TestTransientMarkerCoupling:
             ) is served
 
 
-class TestConnectionErrorClassification:
+class TestConnectionErrorPrecedence:
     """Connection failures are transient, while credential failures win precedence."""
 
     @pytest.mark.parametrize(
@@ -741,6 +741,7 @@ class TestConnectionErrorClassification:
         from kiro_crew.llm_helpers import is_transient_backend_error
 
         assert is_transient_backend_error("Error: read ECONNRESET")
+
 
 class TestMalformedRequestReachesTheHandlePath:
     """The shared-runtime path must surface the structural-rejection guidance

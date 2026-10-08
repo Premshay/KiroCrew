@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from skill_script_helpers import load_skill_script
 
 from kiro_crew.deploy import engine, handlers
 from kiro_crew.deploy import profiles as profiles_mod
@@ -1026,6 +1027,22 @@ def test_deploy_manifest_includes_engine_arch_fields(monkeypatch, tmp_path):
 
 # --- F1: reaper engine-arch happy path + retry path --------------------------
 
+_REAPER_LAMBDA_INDEX = (
+    Path(__file__).resolve().parent.parent
+    / "src/kiro_crew/deploy/skills/artifact-deploy/scripts/reaper_lambda/index.py"
+)
+
+
+def _load_reaper(module_name):
+    """A private copy of the reaper Lambda, built against the boto3 stubs in place now.
+
+    Never imported as the top-level name ``index``: registering it there leaves a
+    module bound to this test's boto3 MagicMock for whatever imports ``index`` next in
+    the worker, and evicting the name first drops whichever ``index`` was there.
+    """
+    return load_skill_script(module_name, _REAPER_LAMBDA_INDEX)
+
+
 def test_reaper_engine_arch_happy_path(monkeypatch):
     """F1: reaper reaps engine-arch deploy (distribution disabled → deleted → bucket emptied)."""
     import sys
@@ -1042,14 +1059,7 @@ def test_reaper_engine_arch_happy_path(monkeypatch):
     monkeypatch.setenv("BUCKET", "shared-bucket")
     monkeypatch.setenv("DIST_ID", "ESHARED")
 
-    reaper_path = str(Path(__file__).resolve().parent.parent /
-                      "src/kiro_crew/deploy/skills/artifact-deploy/scripts/reaper_lambda")
-    monkeypatch.syspath_prepend(reaper_path)
-
-    # Force reimport
-    if "index" in sys.modules:
-        del sys.modules["index"]
-    import index as reaper_mod
+    reaper_mod = _load_reaper("reaper_lambda_index_happy_path")
 
     mock_s3 = MagicMock()
     mock_cf = MagicMock()
@@ -1122,13 +1132,7 @@ def test_reaper_engine_arch_distribution_not_disabled_retries(monkeypatch):
     monkeypatch.setenv("BUCKET", "shared-bucket")
     monkeypatch.setenv("DIST_ID", "ESHARED")
 
-    reaper_path = str(Path(__file__).resolve().parent.parent /
-                      "src/kiro_crew/deploy/skills/artifact-deploy/scripts/reaper_lambda")
-    monkeypatch.syspath_prepend(reaper_path)
-
-    if "index" in sys.modules:
-        del sys.modules["index"]
-    import index as reaper_mod
+    reaper_mod = _load_reaper("reaper_lambda_index_not_disabled")
 
     mock_s3 = MagicMock()
     mock_cf = MagicMock()
@@ -1898,6 +1902,47 @@ def test_reaper_remediation_survives_an_unresolvable_skills_root(monkeypatch):
     monkeypatch.setattr(skills_mod, "skills_dir", boom)
     cmd = handlers._reaper_remediation("p", "r")
     assert cmd == "install-reaper.sh --profile p --region r"
+
+
+def test_base_remediation_names_the_template_by_absolute_path(monkeypatch, tmp_path):
+    import kiro_crew.skills as skills_mod
+
+    fake_skills = tmp_path / "skills"
+    monkeypatch.setattr(skills_mod, "skills_dir", lambda: fake_skills)
+    cmd = handlers._base_remediation("myprofile", "us-west-2")
+    template = str(fake_skills / "artifact-deploy" / "templates" / "base-stack.yaml")
+    assert f"--template-file {template} " in cmd
+    assert cmd.endswith("install-reaper.sh --profile myprofile --region us-west-2")
+
+
+def test_base_remediation_survives_an_unresolvable_skills_root(monkeypatch):
+    import kiro_crew.skills as skills_mod
+
+    def boom():
+        raise RuntimeError("no skills root")
+
+    monkeypatch.setattr(skills_mod, "skills_dir", boom)
+    cmd = handlers._base_remediation("", "")
+    assert cmd == (
+        "aws cloudformation deploy --stack-name kirocrew-deploy-base "
+        "--template-file templates/base-stack.yaml --no-fail-on-empty-changeset "
+        "--tags kirocrew:managed=true && install-reaper.sh")
+
+
+def test_base_remediation_matches_deploy_sh_base_step():
+    """The 409 hint repeats deploy.sh's base-stack step; keep the two in sync."""
+    import re
+
+    script = (Path(handlers.__file__).parent / "skills" / "artifact-deploy"
+              / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    block = script.split('"${AWS[@]}" cloudformation deploy', 1)[1].split("\n\n", 1)[0]
+    script_flags = re.findall(r"--[a-z-]+", block)
+    hint = handlers._base_remediation("", "").split(" && ")[0]
+    hint_flags = re.findall(r"--[a-z-]+", hint)
+    assert hint_flags == script_flags
+    assert "'kirocrew:managed=true'" in block and "kirocrew:managed=true" in hint
+    assert '--template-file "$TEMPLATE"' in block
+    assert 'TEMPLATE="$SCRIPT_DIR/../templates/base-stack.yaml"' in script
 
 
 def test_finite_ttl_without_base_stack_returns_a_keyed_409(monkeypatch, webapp_tree):

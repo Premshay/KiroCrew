@@ -245,8 +245,10 @@ class TestStretchTail:
         client._claude_dispatch_depth = 1
         notification = JsonRpcMessage(
             method="_claude/sdkMessage",
-            params={"sessionId": "sess-1",
-                    "message": {"type": "user", "origin": {"kind": "task-notification"}}},
+            params={
+                "sessionId": "sess-1",
+                "message": {"type": "user", "origin": {"kind": "task-notification"}},
+            },
         )
 
         await client._route_claude_frame(notification)

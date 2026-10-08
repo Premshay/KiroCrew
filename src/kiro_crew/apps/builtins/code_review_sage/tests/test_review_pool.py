@@ -4,6 +4,7 @@ The ``AcpRuntime``/``AcpSessionHandle`` layer is faked so the executor's
 concurrency, batch lifecycle, per-task session isolation, tool auto-approval,
 and SEL audit are exercised without spawning a real kiro-cli process.
 """
+
 import asyncio
 import json
 import tempfile
@@ -46,9 +47,7 @@ class FakeHandle:
         self.session_id = session_id
         self.served_model = str(runtime.kw.get("model") or "")
         self.config_options = []
-        self.available_models = [
-            {"modelId": "runtime-only-model", "name": "Runtime Only Model"}
-        ]
+        self.available_models = [{"modelId": "runtime-only-model", "name": "Runtime Only Model"}]
         self._script = script or []
         self._gate = gate
         self.approvals: list = []
@@ -86,7 +85,7 @@ class FakeRuntime:
         self.spawned = False
         self.killed = False
         self.sessions: dict = {}
-        self._session_queues: dict = {}   # read by holder.stats()
+        self._session_queues: dict = {}  # read by holder.stats()
         self.active = 0
         self.max_active = 0
         self._seq = 0
@@ -120,6 +119,7 @@ class FakeRuntime:
         async def _destroy():
             self._session_queues.pop(sid, None)
             await _orig()
+
         h.destroy = _destroy  # type: ignore[method-assign]
         return h
 
@@ -133,6 +133,7 @@ def _install_fake_runtime(test, script=None, gate=None):
         r.script = script or []
         r.gate = gate
         return r
+
     orig = rp.AcpRuntime
     rp.AcpRuntime = factory  # type: ignore[assignment]
     test.addCleanup(lambda: setattr(rp, "AcpRuntime", orig))
@@ -156,7 +157,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_lazy_no_runtime_until_used(self):
         _install_fake_runtime(self)
         ReviewPool(work_dir=_work_dir(self))
-        self.assertEqual(FakeRuntime.instances, [])   # nothing spawned on construction
+        self.assertEqual(FakeRuntime.instances, [])  # nothing spawned on construction
 
     async def test_runtime_receives_review_agent_binding_without_losing_isolation(self):
         captured: dict = {}
@@ -190,6 +191,22 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["acp_backend"], "claude")
         self.assertEqual(captured["extra_env"], {"ANTHROPIC_MODEL": "fast"})
 
+    async def test_claude_review_override_uses_claude_provider_id(self):
+        _install_fake_runtime(self)
+        with (
+            unittest.mock.patch.object(
+                rp, "runtime_client_binding", return_value={"acp_backend": "claude"}
+            ),
+            unittest.mock.patch.object(rp, "_reviewer_model", return_value="opus-4.8-1m"),
+        ):
+            pool = ReviewPool(work_dir=_work_dir(self))
+            await pool.begin_batch()
+            self.assertEqual(
+                FakeRuntime.instances[-1].kw["model"],
+                "global.anthropic.claude-opus-4-8[1m]",
+            )
+            await pool.end_batch()
+
     async def test_begin_batch_spawns_one_runtime_shared_across_sends(self):
         _install_fake_runtime(self, script=[_ev(rp.EVENT_TEXT_CHUNK, text="hi")])
         pool = ReviewPool(work_dir=_work_dir(self))
@@ -206,8 +223,11 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
 
     async def test_runtime_receives_the_resolved_reviewer_model(self):
         _install_fake_runtime(self)
-        with unittest.mock.patch.object(rp, "reviewer_info", return_value={
-                "model": "gpt-5.3-codex", "effort": "", "agent": "reviewer"}):
+        with unittest.mock.patch.object(
+            rp,
+            "reviewer_info",
+            return_value={"model": "gpt-5.3-codex", "effort": "", "agent": "reviewer"},
+        ):
             pool = ReviewPool(work_dir="/tmp/x")
             await pool.begin_batch()
         self.assertEqual(FakeRuntime.instances[0].kw["model"], "gpt-5.3-codex")
@@ -221,8 +241,11 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         advertised ids do not include it."""
         for placeholder in ("auto", "default"):
             _install_fake_runtime(self)
-            with unittest.mock.patch.object(rp, "reviewer_info", return_value={
-                    "model": placeholder, "effort": "", "agent": "reviewer"}):
+            with unittest.mock.patch.object(
+                rp,
+                "reviewer_info",
+                return_value={"model": placeholder, "effort": "", "agent": "reviewer"},
+            ):
                 pool = ReviewPool(work_dir="/tmp/x")
                 await pool.begin_batch()
             self.assertIsNone(FakeRuntime.instances[0].kw["model"], placeholder)
@@ -231,26 +254,37 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_records_the_backend_reported_session_model(self):
         _install_fake_runtime(self)
         resolved: list[dict] = []
-        with unittest.mock.patch.object(rp, "reviewer_info", return_value={
-                "model": "gpt-5.3-codex", "effort": "", "agent": "reviewer"}):
+        with unittest.mock.patch.object(
+            rp,
+            "reviewer_info",
+            return_value={"model": "gpt-5.3-codex", "effort": "", "agent": "reviewer"},
+        ):
             pool = ReviewPool(work_dir="/tmp/x")
             await pool.begin_batch()
             await pool.send("task", on_resolution=resolved.append)
-        self.assertEqual(resolved, [{
-            "engine": "kiro-cli", "provider": "acp", "agent": pool._agent,
-            "resolved_model": "gpt-5.3-codex", "model_resolution": "reported",
-        }])
+        self.assertEqual(
+            resolved,
+            [
+                {
+                    "engine": "kiro-cli",
+                    "provider": "acp",
+                    "agent": pool._agent,
+                    "resolved_model": "gpt-5.3-codex",
+                    "model_resolution": "reported",
+                }
+            ],
+        )
         await pool.end_batch()
 
     async def test_end_batch_kills_runtime_only_when_drained(self):
         _install_fake_runtime(self)
         pool = ReviewPool(work_dir=_work_dir(self))
-        await pool.begin_batch()          # batches 0->1 spawns
-        await pool.begin_batch()          # batches 1->2 (overlapping run)
+        await pool.begin_batch()  # batches 0->1 spawns
+        await pool.begin_batch()  # batches 1->2 (overlapping run)
         rt = FakeRuntime.instances[0]
-        await pool.end_batch()            # batches 2->1: NOT killed
+        await pool.end_batch()  # batches 2->1: NOT killed
         self.assertFalse(rt.killed)
-        await pool.end_batch()            # batches 1->0: killed
+        await pool.end_batch()  # batches 1->0: killed
         self.assertTrue(rt.killed)
 
     async def test_new_batch_after_drain_spawns_fresh_runtime(self):
@@ -259,7 +293,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         await pool.begin_batch()
         await pool.end_batch()
         await pool.begin_batch()
-        self.assertEqual(len(FakeRuntime.instances), 2)   # a fresh runtime per batch
+        self.assertEqual(len(FakeRuntime.instances), 2)  # a fresh runtime per batch
         await pool.end_batch()
 
     async def test_changed_review_agent_applies_to_the_next_batch(self):
@@ -267,8 +301,9 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         must reach the next spawn, not stay pinned to the constructor's pick."""
         _install_fake_runtime(self)
         agent = ["crew-old"]
-        with unittest.mock.patch.object(rp, "_resolve_review_agent",
-                                        side_effect=lambda preferred=None: preferred or agent[0]):
+        with unittest.mock.patch.object(
+            rp, "_resolve_review_agent", side_effect=lambda preferred=None: preferred or agent[0]
+        ):
             pool = ReviewPool(work_dir=_work_dir(self))
             await pool.begin_batch()
             await pool.end_batch()
@@ -281,24 +316,28 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_agent_change_waits_for_overlapping_batches_to_drain(self):
         _install_fake_runtime(self)
         agent = ["crew-old"]
-        with unittest.mock.patch.object(rp, "_resolve_review_agent",
-                                        side_effect=lambda preferred=None: preferred or agent[0]):
+        with unittest.mock.patch.object(
+            rp, "_resolve_review_agent", side_effect=lambda preferred=None: preferred or agent[0]
+        ):
             pool = ReviewPool(work_dir=_work_dir(self))
             await pool.begin_batch()
             agent[0] = "crew-new"
-            await pool.begin_batch()          # overlapping run keeps the live runtime
+            await pool.begin_batch()  # overlapping run keeps the live runtime
             self.assertEqual(len(FakeRuntime.instances), 1)
             self.assertEqual(pool._agent, "crew-old")
             await pool.end_batch()
             await pool.end_batch()
-            await pool.begin_batch()          # drained -> the new agent lands
+            await pool.begin_batch()  # drained -> the new agent lands
         self.assertEqual(FakeRuntime.instances[-1].agent, "crew-new")
         await pool.end_batch()
 
     async def test_explicit_agent_is_not_replaced_by_config(self):
         _install_fake_runtime(self)
-        with unittest.mock.patch.object(rp, "_resolve_review_agent",
-                                        side_effect=lambda preferred=None: preferred or "crew-config"):
+        with unittest.mock.patch.object(
+            rp,
+            "_resolve_review_agent",
+            side_effect=lambda preferred=None: preferred or "crew-config",
+        ):
             pool = ReviewPool(agent="crew-pinned", work_dir=_work_dir(self))
             await pool.begin_batch()
             await pool.end_batch()
@@ -315,7 +354,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
             rt = FakeRuntime.instances[0]
             # exactly one session was created, and it was destroyed (no leak)
             self.assertEqual(rt._seq, 1)
-            self.assertEqual(rt._session_queues, {})          # destroyed -> unregistered
+            self.assertEqual(rt._session_queues, {})  # destroyed -> unregistered
             self.assertEqual(rp._runtime_model_snapshot(pool._agent), ["runtime-only-model"])
             await pool.end_batch()
 
@@ -339,14 +378,15 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await pool.send("t")
         rt = FakeRuntime.instances[0]
-        self.assertEqual(rt._session_queues, {})   # session destroyed despite the raise
+        self.assertEqual(rt._session_queues, {})  # session destroyed despite the raise
         await pool.end_batch()
 
     async def test_tool_stall_stop_reason_is_abnormal(self):
         # STOP_REASON_TOOL_STALL ("error: tool stall") must be classified abnormal
         # and surface as a failure (matched explicitly, not just by prefix).
         _install_fake_runtime(
-            self, script=[_ev(rp.EVENT_COMPLETE, stop_reason=rp.STOP_REASON_TOOL_STALL)])
+            self, script=[_ev(rp.EVENT_COMPLETE, stop_reason=rp.STOP_REASON_TOOL_STALL)]
+        )
         pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
         with self.assertRaises(RuntimeError):
@@ -362,19 +402,21 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
             r = FakeRuntime(agent=agent, work_dir=work_dir)
             calls["n"] += 1
             if calls["n"] == 1:
+
                 async def _boom(start_priority=None):
                     raise RuntimeError("spawn boom")
 
                 r.spawn = _boom  # type: ignore[assignment]
             return r
+
         orig = rp.AcpRuntime
         rp.AcpRuntime = factory  # type: ignore[assignment]
         self.addCleanup(lambda: setattr(rp, "AcpRuntime", orig))
         FakeRuntime.instances = []
         pool = ReviewPool(work_dir=_work_dir(self))
         with self.assertRaises(RuntimeError):
-            await pool.begin_batch()                 # spawn fails
-        self.assertEqual(pool._holder._batches, 0)   # counter not leaked
+            await pool.begin_batch()  # spawn fails
+        self.assertEqual(pool._holder._batches, 0)  # counter not leaked
         # a subsequent batch spawns cleanly and drains to 0 (runtime killed)
         await pool.begin_batch()
         await pool.end_batch()
@@ -391,11 +433,11 @@ class TestConcurrency(unittest.IsolatedAsyncioTestCase):
         tasks = [asyncio.create_task(pool.send(f"t{i}")) for i in range(4)]
         await asyncio.sleep(0.05)
         rt = FakeRuntime.instances[0]
-        self.assertEqual(rt.active, 2)             # only 2 in flight at once
+        self.assertEqual(rt.active, 2)  # only 2 in flight at once
         self.assertLessEqual(rt.max_active, 2)
         gate.set()
         await asyncio.gather(*tasks)
-        self.assertLessEqual(rt.max_active, 2)     # never exceeded the cap
+        self.assertLessEqual(rt.max_active, 2)  # never exceeded the cap
         await pool.end_batch()
 
     async def test_effective_max_concurrent_clamped(self):
@@ -473,9 +515,11 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
             )
         ]
         _install_fake_runtime(self, script=script)
-        with unittest.mock.patch.object(rp, "refusal_for", lambda *_a, **_kw: "policy"), \
-                unittest.mock.patch.object(rp, "_sel", lambda: _FakeSel()), \
-                unittest.mock.patch.object(FakeHandle, "reject_tool", _reject):
+        with (
+            unittest.mock.patch.object(rp, "refusal_for", lambda *_a, **_kw: "policy"),
+            unittest.mock.patch.object(rp, "_sel", lambda: _FakeSel()),
+            unittest.mock.patch.object(FakeHandle, "reject_tool", _reject),
+        ):
             pool = ReviewPool(work_dir=_work_dir(self))
             await pool.begin_batch()
             with self.assertRaisesRegex(RuntimeError, "wire closed"):
@@ -493,11 +537,13 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
             def log_tool_invocation(self, **kw):
                 calls.append(kw)
 
-        script = [_ev(rp.EVENT_TOOL_CALL, title="shell", tool_kind="execute"),
-                  _ev(rp.EVENT_TEXT_CHUNK, text="ok")]
+        script = [
+            _ev(rp.EVENT_TOOL_CALL, title="shell", tool_kind="execute"),
+            _ev(rp.EVENT_TEXT_CHUNK, text="ok"),
+        ]
         _install_fake_runtime(self, script=script)
         orig_sel = rp._sel
-        rp._sel = lambda: _FakeSel()          # type: ignore[assignment]
+        rp._sel = lambda: _FakeSel()  # type: ignore[assignment]
         self.addCleanup(lambda: setattr(rp, "_sel", orig_sel))
         pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
@@ -517,12 +563,13 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
             def log_tool_invocation(self, **kw):
                 calls.append(kw)
 
-        script = [_ev(rp.EVENT_PERMISSION_REQUEST, request_id="r1",
-                      title="shell", tool_kind="execute"),
-                  _ev(rp.EVENT_TEXT_CHUNK, text="ok")]
+        script = [
+            _ev(rp.EVENT_PERMISSION_REQUEST, request_id="r1", title="shell", tool_kind="execute"),
+            _ev(rp.EVENT_TEXT_CHUNK, text="ok"),
+        ]
         _install_fake_runtime(self, script=script)
         orig_sel = rp._sel
-        rp._sel = lambda: _FakeSel()          # type: ignore[assignment]
+        rp._sel = lambda: _FakeSel()  # type: ignore[assignment]
         self.addCleanup(lambda: setattr(rp, "_sel", orig_sel))
         pool = ReviewPool(work_dir=_work_dir(self))
         await pool.begin_batch()
@@ -583,6 +630,7 @@ class TestSyncDispatchBridge(unittest.TestCase):
             r = FakeRuntime(agent=agent, work_dir=work_dir)
             r.script = [_ev(rp.EVENT_TEXT_CHUNK, text="hello")]
             return r
+
         orig = rp.AcpRuntime
         rp.AcpRuntime = factory  # type: ignore[assignment]
         try:
@@ -604,8 +652,10 @@ class TestSyncDispatchBridge(unittest.TestCase):
 
             async def _boom(cwd=None, agent=None):
                 raise RuntimeError("boom")
-            r.create_session = _boom   # type: ignore[assignment]
+
+            r.create_session = _boom  # type: ignore[assignment]
             return r
+
         orig = rp.AcpRuntime
         rp.AcpRuntime = factory  # type: ignore[assignment]
         try:
@@ -622,8 +672,7 @@ class TestSyncDispatchBridge(unittest.TestCase):
 # ── Reviewer identity resolution ─────────────────────────────────────────────
 class TestReviewAgentResolution(unittest.TestCase):
     def test_fallback_to_kirocrew_when_dedicated_missing(self):
-        self.assertEqual(
-            _resolve_review_agent("definitely-not-installed-xyz"), "kirocrew")
+        self.assertEqual(_resolve_review_agent("definitely-not-installed-xyz"), "kirocrew")
 
     def test_review_work_dir_is_app_root(self):
         wd = _review_work_dir()
@@ -645,57 +694,82 @@ class TestReviewAgentSelection(unittest.TestCase):
         return agents_dir
 
     def test_settings_agent_wins_when_known(self):
-        with unittest.mock.patch.object(
-            rp, "_get_review_settings", return_value={"agent": "crew-deepseek-pro"}
-        ), unittest.mock.patch.object(rp, "is_known_review_agent", return_value=True):
+        with (
+            unittest.mock.patch.object(
+                rp, "_get_review_settings", return_value={"agent": "crew-deepseek-pro"}
+            ),
+            unittest.mock.patch.object(rp, "is_known_review_agent", return_value=True),
+        ):
             self.assertEqual(_resolve_review_agent(), "crew-deepseek-pro")
 
     def test_unknown_settings_agent_falls_back_to_the_dedicated_reviewer(self):
         agents_dir = self._agents_dir([rp.REVIEW_AGENT])
-        with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir), \
-                unittest.mock.patch.object(
-                    rp, "_get_review_settings", return_value={"agent": "not-an-agent"}
-                ), \
-                unittest.mock.patch.object(rp, "is_known_review_agent", return_value=False):
+        with (
+            unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir),
+            unittest.mock.patch.object(
+                rp, "_get_review_settings", return_value={"agent": "not-an-agent"}
+            ),
+            unittest.mock.patch.object(rp, "is_known_review_agent", return_value=False),
+        ):
             self.assertEqual(_resolve_review_agent(), rp.REVIEW_AGENT)
 
     def test_explicit_preferred_beats_the_settings_agent(self):
         agents_dir = self._agents_dir(["explicit-reviewer"])
-        with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir), \
-                unittest.mock.patch.object(
-                    rp, "_get_review_settings", return_value={"agent": "crew-deepseek-pro"}
-                ), \
-                unittest.mock.patch.object(rp, "is_known_review_agent", return_value=True):
+        with (
+            unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir),
+            unittest.mock.patch.object(
+                rp, "_get_review_settings", return_value={"agent": "crew-deepseek-pro"}
+            ),
+            unittest.mock.patch.object(rp, "is_known_review_agent", return_value=True),
+        ):
             self.assertEqual(_resolve_review_agent("explicit-reviewer"), "explicit-reviewer")
 
     def test_settings_agent_without_a_spec_resolves_via_the_configured_crews(self):
         # crew-deepseek-pro has no spec file; it is admitted through the config
         # crews list, exactly like the engine-mapped crews the picker offers.
         agents_dir = self._agents_dir([])
-        fake_cfg = type("FakeCfg", (), {
-            "load": classmethod(lambda cls: type("C", (), {
-                "agents": {"crew-deepseek-pro": {}, "default": {}}
-            })())
-        })
-        with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir), \
-                unittest.mock.patch("kiro_crew.config.loader.KiroCrewConfig", fake_cfg):
+        fake_cfg = type(
+            "FakeCfg",
+            (),
+            {
+                "load": classmethod(
+                    lambda cls: type(
+                        "C", (), {"agents": {"crew-deepseek-pro": {}, "default": {}}}
+                    )()
+                )
+            },
+        )
+        with (
+            unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir),
+            unittest.mock.patch("kiro_crew.config.loader.KiroCrewConfig", fake_cfg),
+        ):
             self.assertTrue(rp.is_known_review_agent("crew-deepseek-pro"))
             self.assertFalse(rp.is_known_review_agent("crew-codex"))
 
     def test_agent_token_rules_reject_injection_shapes(self):
         for bad in ("", "a" * 65, "../etc", "crew deepseek", "crew@x"):
-            with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=self._agents_dir([])):
+            with unittest.mock.patch.object(
+                rp, "kiro_agents_dir", return_value=self._agents_dir([])
+            ):
                 self.assertFalse(rp.is_known_review_agent(bad), bad)
 
     def test_known_review_agents_merges_specs_and_crews(self):
         agents_dir = self._agents_dir(["spec-a", "spec-b"])
-        fake_cfg = type("FakeCfg", (), {
-            "load": classmethod(lambda cls: type("C", (), {
-                "agents": {"crew-deepseek-pro": {}, "default": {}}
-            })())
-        })
-        with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir), \
-                unittest.mock.patch("kiro_crew.config.loader.KiroCrewConfig", fake_cfg):
+        fake_cfg = type(
+            "FakeCfg",
+            (),
+            {
+                "load": classmethod(
+                    lambda cls: type(
+                        "C", (), {"agents": {"crew-deepseek-pro": {}, "default": {}}}
+                    )()
+                )
+            },
+        )
+        with (
+            unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir),
+            unittest.mock.patch("kiro_crew.config.loader.KiroCrewConfig", fake_cfg),
+        ):
             names = rp.known_review_agents()
         for expected in ("spec-a", "spec-b", "crew-deepseek-pro", "default"):
             self.assertIn(expected, names)
@@ -704,18 +778,27 @@ class TestReviewAgentSelection(unittest.TestCase):
     def _roster_with_edition(self, policies: dict, bindings: dict):
         """known_review_agents() under an edition that describes *policies*."""
         agents_dir = self._agents_dir(["crew-headless", "plain-spec"])
-        fake_cfg = type("FakeCfg", (), {
-            "load": classmethod(lambda cls: type("C", (), {
-                "agents": {"crew-headless-atlas": {}, "crew-bound": {}}
-            })())
-        })
+        fake_cfg = type(
+            "FakeCfg",
+            (),
+            {
+                "load": classmethod(
+                    lambda cls: type(
+                        "C", (), {"agents": {"crew-headless-atlas": {}, "crew-bound": {}}}
+                    )()
+                )
+            },
+        )
         providers = type("P", (), {"agent_runtime_policy": lambda self, n: policies.get(n)})()
         ctx = type("Ctx", (), {"providers": providers})()
-        with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir), \
-                unittest.mock.patch("kiro_crew.config.loader.KiroCrewConfig", fake_cfg), \
-                unittest.mock.patch("kiro_crew.platform.context.current_context", return_value=ctx), \
-                unittest.mock.patch.object(rp, "runtime_client_binding",
-                                           side_effect=lambda n: bindings.get(n, {})):
+        with (
+            unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir),
+            unittest.mock.patch("kiro_crew.config.loader.KiroCrewConfig", fake_cfg),
+            unittest.mock.patch("kiro_crew.platform.context.current_context", return_value=ctx),
+            unittest.mock.patch.object(
+                rp, "runtime_client_binding", side_effect=lambda n: bindings.get(n, {})
+            ),
+        ):
             return rp.known_review_agents(), rp.is_known_review_agent("crew-headless-atlas")
 
     def test_seats_mapped_to_a_runtime_sage_cannot_drive_are_refused(self):
@@ -723,40 +806,51 @@ class TestReviewAgentSelection(unittest.TestCase):
         fall back to kiro-cli and fail, or run a same-named spec on the wrong engine."""
         headless = {"runtime": "Headless", "model": "selectable"}
         names, known = self._roster_with_edition(
-            policies={"crew-headless": headless, "crew-headless-atlas": headless,
-                      "crew-bound": {"runtime": "ACP"}},
+            policies={
+                "crew-headless": headless,
+                "crew-headless-atlas": headless,
+                "crew-bound": {"runtime": "ACP"},
+            },
             bindings={"crew-bound": {"acp_backend": "claude"}},
         )
-        self.assertNotIn("crew-headless", names)          # same-named spec exists
-        self.assertNotIn("crew-headless-atlas", names)    # config crew, no spec
+        self.assertNotIn("crew-headless", names)  # same-named spec exists
+        self.assertNotIn("crew-headless-atlas", names)  # config crew, no spec
         self.assertFalse(known)
-        self.assertIn("crew-bound", names)                # mapped AND bound
-        self.assertIn("plain-spec", names)                # edition says nothing
+        self.assertIn("crew-bound", names)  # mapped AND bound
+        self.assertIn("plain-spec", names)  # edition says nothing
 
     def test_an_edition_that_describes_no_agents_refuses_none(self):
         names, known = self._roster_with_edition(policies={}, bindings={})
         self.assertEqual(
-            names, ["crew-bound", "crew-headless", "crew-headless-atlas", "plain-spec"])
+            names, ["crew-bound", "crew-headless", "crew-headless-atlas", "plain-spec"]
+        )
         self.assertTrue(known)
 
     def test_reviewer_info_reports_the_bound_engine_and_agent_source(self):
-        with unittest.mock.patch.object(
-            rp, "_resolve_review_agent", return_value="crew-deepseek-pro"
-        ), unittest.mock.patch.object(
-            rp, "_get_review_settings",
-            return_value={"agent": "crew-deepseek-pro", "model": None, "effort": ""},
-        ), unittest.mock.patch.object(
-            rp, "runtime_client_binding", return_value={"acp_backend": "deepseek"}
-        ), unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True):
+        with (
+            unittest.mock.patch.object(
+                rp, "_resolve_review_agent", return_value="crew-deepseek-pro"
+            ),
+            unittest.mock.patch.object(
+                rp,
+                "_get_review_settings",
+                return_value={"agent": "crew-deepseek-pro", "model": None, "effort": ""},
+            ),
+            unittest.mock.patch.object(
+                rp, "runtime_client_binding", return_value={"acp_backend": "deepseek"}
+            ),
+            unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True),
+        ):
             info = reviewer_info()
         self.assertEqual(info["engine"], "deepseek")
         self.assertEqual(info["agent_source"], "config")
         self.assertEqual(info["agent"], "crew-deepseek-pro")
 
     def test_reviewer_info_default_engine_is_kiro_cli(self):
-        with unittest.mock.patch.object(
-            rp, "runtime_client_binding", return_value={}
-        ), unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True):
+        with (
+            unittest.mock.patch.object(rp, "runtime_client_binding", return_value={}),
+            unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True),
+        ):
             info = reviewer_info()
         self.assertEqual(info["engine"], "kiro-cli")
         self.assertEqual(info["agent_source"], "default")
@@ -776,26 +870,30 @@ class TestReviewEffort(unittest.TestCase):
             cli = Path(tmp) / ".kiro" / "settings" / "cli.json"
             self.assertTrue(cli.is_file(), "overlay cli.json not written")
             data = json.loads(cli.read_text(encoding="utf-8"))
-            effort = (data["chat.modelDefaults"]["claude-sonnet-4.6"]
-                      ["output_config"]["effort"])
+            effort = data["chat.modelDefaults"]["claude-sonnet-4.6"]["output_config"]["effort"]
             self.assertEqual(effort, REVIEW_EFFORT)
 
     def test_write_effort_overlay_is_merge_safe(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = Path(tmp) / ".kiro" / "settings"
             settings.mkdir(parents=True)
-            (settings / "cli.json").write_text(json.dumps({
-                "chat.modelDefaults": {"other-model": {"output_config": {"effort": "low"}}},
-                "unrelated.key": 42,
-            }), encoding="utf-8")
+            (settings / "cli.json").write_text(
+                json.dumps(
+                    {
+                        "chat.modelDefaults": {"other-model": {"output_config": {"effort": "low"}}},
+                        "unrelated.key": 42,
+                    }
+                ),
+                encoding="utf-8",
+            )
             _write_effort_overlay(tmp, "claude-sonnet-4.6", "high")
             data = json.loads((settings / "cli.json").read_text(encoding="utf-8"))
             self.assertEqual(
-                data["chat.modelDefaults"]["claude-sonnet-4.6"]["output_config"]["effort"],
-                "high")
+                data["chat.modelDefaults"]["claude-sonnet-4.6"]["output_config"]["effort"], "high"
+            )
             self.assertEqual(
-                data["chat.modelDefaults"]["other-model"]["output_config"]["effort"],
-                "low")
+                data["chat.modelDefaults"]["other-model"]["output_config"]["effort"], "low"
+            )
             self.assertEqual(data["unrelated.key"], 42)
 
     def test_write_effort_overlay_never_raises(self):
@@ -823,8 +921,11 @@ class TestReviewEffort(unittest.TestCase):
 
             _write_effort_overlay(tmp, "claude-sonnet-4.6", "high")
 
-            self.assertEqual(victim.read_text(encoding="utf-8"), "keep me\n",
-                             "the aliased file was written through")
+            self.assertEqual(
+                victim.read_text(encoding="utf-8"),
+                "keep me\n",
+                "the aliased file was written through",
+            )
             self.assertFalse(cli.is_symlink(), "the link survived the publish")
 
     def test_a_planted_link_at_the_overlay_name_contributes_no_keys(self):
@@ -851,13 +952,13 @@ class TestReviewEffort(unittest.TestCase):
             _write_effort_overlay(tmp, "claude-sonnet-4.6", "high")
 
             published = json.loads(cli.read_text(encoding="utf-8"))
-            self.assertNotIn("borrowed_key", published,
-                             "the aliased document's keys were republished")
+            self.assertNotIn(
+                "borrowed_key", published, "the aliased document's keys were republished"
+            )
             self.assertEqual(list(published), ["chat.modelDefaults"])
 
     def test_reviewer_model_falls_back_to_default(self):
-        self.assertEqual(
-            _reviewer_model("definitely-not-installed-xyz"), _DEFAULT_REVIEW_MODEL)
+        self.assertEqual(_reviewer_model("definitely-not-installed-xyz"), _DEFAULT_REVIEW_MODEL)
 
     def test_reviewer_info_reports_agent_model_and_effort(self):
         info = reviewer_info()
@@ -879,14 +980,17 @@ class TestRuntimePreflight(unittest.TestCase):
     """
 
     def test_available_runtime_returns_empty(self):
-        with unittest.mock.patch.object(rp, "AcpRuntime", object()), \
-                unittest.mock.patch.object(rp, "resolve_kiro_cli",
-                                           lambda: "/usr/local/bin/kiro-cli"):
+        with (
+            unittest.mock.patch.object(rp, "AcpRuntime", object()),
+            unittest.mock.patch.object(rp, "resolve_kiro_cli", lambda: "/usr/local/bin/kiro-cli"),
+        ):
             self.assertEqual(rp.runtime_preflight(), "")
 
     def test_missing_cli_names_the_runtime(self):
-        with unittest.mock.patch.object(rp, "AcpRuntime", object()), \
-                unittest.mock.patch.object(rp, "resolve_kiro_cli", lambda: None):
+        with (
+            unittest.mock.patch.object(rp, "AcpRuntime", object()),
+            unittest.mock.patch.object(rp, "resolve_kiro_cli", lambda: None),
+        ):
             msg = rp.runtime_preflight()
             self.assertIn("kiro-cli", msg)
 
@@ -905,27 +1009,37 @@ class TestRuntimePreflight(unittest.TestCase):
             calls.append("resolve")
             return "/bin/kiro-cli"
 
-        with unittest.mock.patch.object(rp, "AcpRuntime", object()), \
-                unittest.mock.patch.object(rp, "resolve_kiro_cli", _resolver):
+        with (
+            unittest.mock.patch.object(rp, "AcpRuntime", object()),
+            unittest.mock.patch.object(rp, "resolve_kiro_cli", _resolver),
+        ):
             rp.runtime_preflight()
         self.assertEqual(calls, ["resolve"])
+
+
 class TestRuntimeModelSnapshots(unittest.TestCase):
     def test_reviewer_info_exposes_only_its_own_runtime_snapshot(self):
-        with unittest.mock.patch.object(rp, "_resolve_review_agent", return_value="reviewer"), \
-                unittest.mock.patch.object(rp, "_get_review_settings", return_value={"model": None, "effort": ""}), \
-                unittest.mock.patch.dict(
-                    rp._RUNTIME_MODEL_SNAPSHOTS,
-                    {"reviewer": ("gpt-5.6-sol",), "other": ("claude-opus-5",)},
-                    clear=True,
-                ):
+        with (
+            unittest.mock.patch.object(rp, "_resolve_review_agent", return_value="reviewer"),
+            unittest.mock.patch.object(
+                rp, "_get_review_settings", return_value={"model": None, "effort": ""}
+            ),
+            unittest.mock.patch.dict(
+                rp._RUNTIME_MODEL_SNAPSHOTS,
+                {"reviewer": ("gpt-5.6-sol",), "other": ("claude-opus-5",)},
+                clear=True,
+            ),
+        ):
             info = reviewer_info()
 
         self.assertEqual(info["models"], ["gpt-5.6-sol"])
         self.assertTrue(info["model_override_supported"])
 
     def test_missing_snapshot_suppresses_the_override_catalog(self):
-        with unittest.mock.patch.object(rp, "_resolve_review_agent", return_value="reviewer"), \
-                unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True):
+        with (
+            unittest.mock.patch.object(rp, "_resolve_review_agent", return_value="reviewer"),
+            unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True),
+        ):
             info = reviewer_info()
 
         self.assertEqual(info["models"], [])

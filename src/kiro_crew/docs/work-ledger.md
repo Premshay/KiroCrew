@@ -111,6 +111,18 @@ ledger is purged (see "Cleaning up finished ledgers"). A conductor may dispatch 
 conductor only once — depth is capped at 2, so a second-level conductor's own
 children are workers. A worker holds one open item at a time.
 
+## Other refusals
+
+With the crew log on, a write can still be refused. Each answer carries a `code`:
+
+| Code | What happened | What to do |
+|---|---|---|
+| `503 crew_log_unrecorded` | The store took the write but the crew log did not confirm it, so the write is undone and counts as not done. If the undo itself fails, the board turns `cache_dirty`. | Retry the write. For a `create` whose answer carries an `item_id`, do not repeat the `create`; read the board first. |
+| `409 cache_dirty` | An undo failed, so the board's files may not match the record. Reads and writes of the board (`work_ledger_read`, `work_ledger_record`, `work_brief`, `work_report`) are refused until it is repaired. | Run `work_ledger_rebuild`. To keep the files as they stand instead, remove the marker file the message names. |
+| `400 work_entry_too_large` | The write does not fit one crew-log line. | Shorten the fields you sent. |
+| `400 work_item_too_large` | The item predates the record and, written whole, does not fit one line; usually its acceptance is too large. | The conductor shrinks it with `work_ledger_record action=accept` and a smaller acceptance. |
+| `409 crew_log_incomplete` | `work_ledger_rebuild` refused: the crew log cannot rebuild this board completely (an unreadable unit, or a goal the log never recorded). | Follow the message: repair those units, or record the goal again, then rebuild. |
+
 ## Dispatch order: create, bind, seed
 
 The conductor mints the item, attaches the session, and only then sends the seed
@@ -152,9 +164,18 @@ separate values and not one "stuck". A build the worker does not control is
 `blocked`; a choice only the conductor can make is `question`.
 
 Reports belong at real milestones, not on a timer.
-`summary` is capped at 500 characters and is **refused rather than truncated**
-when longer, so a report that lands is a report that landed whole. Evidence goes in `artifacts` as
-pointers — a branch, a commit, a path, a pull request number.
+`summary` is capped at 500 characters.
+A longer one is **cut to the cap, not refused**: the stored value carries a note
+saying how many characters were dropped, and `work_report`'s reply repeats it
+with the length the caller sent, so a worker learns it overran in the same
+round-trip that accepted the report instead of spending another one rewriting
+it. Evidence goes in `artifacts` as pointers — a branch, a commit, a path, a
+pull request number. A `done` with no `artifacts` and no `pr` is refused
+`done_without_evidence`; a check that could not run is still an artifact when
+it says so, e.g. `{"tests": "not run: harness unavailable"}`.
+`artifacts`, `pr` and `status` are still refused when they
+are wrong or oversized: a truncated pointer is a broken pointer, while prose cut
+at the cap still reads.
 
 ## Why `done` is a claim
 
@@ -179,9 +200,13 @@ are evaluated, because a world-state check can return a genuine `pass` on
 unfinished work — a stub written before the real content, a pull request green
 before the last commit.
 
-A conductor stops when every item is accepted, when one item has failed
-acceptance three times, when the round or time budget is spent, or when a
-decision arrives that no acceptance condition can settle.
+A conductor stops patrolling only when every item is terminal (accepted,
+rejected or abandoned), or when the user says stop, in words or through a round
+or time budget they set. An item that fails acceptance three times is closed
+`rejected` and the rest keep going. A decision that needs a person parks only
+that item: the conductor asks about it and keeps patrolling the others. With no
+budget from the user, a goal holds at most 20 items, and two rounds in a row
+with nothing accepted also stop new dispatches until the user answers.
 
 ## Not the same as the session ledger, or subagents
 
@@ -229,11 +254,20 @@ An explicit model pick on the worker file is the one thing carried across.
 permission to say it is blocked will not say it, and an unattended dispatch is
 exactly the case the ledger exists for.
 
-## No dashboard page
+## Crew board
 
-Like the session ledger, the work ledger is **storage the agents read and
-write**, not a view you browse. To see where a goal stands, ask the conductor
-session — it answers from the record.
+The work ledger is storage the agents read and write, and the dashboard shows it
+read-only. A session that owns a work ledger has **Crew board** in its session
+actions menu; other sessions do not show the entry. It opens
+`/crew-board?conductor=<session key>`, which lists the goal, the round and the
+items: those needing your decision first, then open work, then finished items.
+Each row shows what the worker reported and how the conductor ruled.
+
+An item whose conductor session is gone is marked orphaned, because nothing reads
+its reports any more. For such an item the board offers **Stop current turn**,
+which cancels the worker's running turn and keeps its session, branch and
+reports. There is no take-over. To ask where a goal stands, you can still ask the
+conductor session — it answers from the record.
 
 ## Cleaning up finished ledgers
 

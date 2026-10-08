@@ -1356,9 +1356,7 @@ class TestRemoveIfUnclaimed:
         mgr.bump_attachment("fresh")
 
         assert mgr._attachment_generations["fresh"] == 1
-        assert (
-            len(mgr._attachment_generations) == subagent_mod._MAX_ATTACHMENT_GENERATIONS + 1
-        )
+        assert len(mgr._attachment_generations) == subagent_mod._MAX_ATTACHMENT_GENERATIONS + 1
 
     def test_forget_attachment_generation_is_idempotent(self):
         from kiro_crew.subagent import SubagentManager

@@ -21,6 +21,7 @@ imports it, and a patch of it belongs on that owner.
 from __future__ import annotations
 
 import argparse
+import filecmp
 import importlib
 import json
 import os
@@ -93,8 +94,10 @@ from kiro_crew.snapshot_archive import (  # noqa: F401 - facade re-exports
     _terminal_safe,
 )
 from kiro_crew.snapshot_components import (  # noqa: F401 - facade re-exports
+    _CONFIG_SETTINGS_DOCUMENTS,
     _CORE_FILE_COMPONENTS,
     _DERIVED_INDEXES,
+    _FLAT_DOCUMENT_VALIDATORS,
     _HOST_LOCAL_PATHS,
     _JSON_OBJECT_LISTS,
     _LOCKED_DOCUMENT_TREES,
@@ -149,6 +152,7 @@ from kiro_crew.snapshot_merge import (  # noqa: F401 - facade re-exports
     _validate_identifier,
 )
 from kiro_crew.snapshot_restore import (  # noqa: F401 - facade re-exports
+    _OWNER_ONLY_SETTINGS_FILES,
     NamedStoresInUse,
     RollbackIncomplete,
     SourceComponentUnsound,
@@ -164,6 +168,7 @@ from kiro_crew.snapshot_restore import (  # noqa: F401 - facade re-exports
     _install_locked_document,
     _lock_down_restored,
     _refuse_corrupt_source_databases,
+    _refuse_dropped_entries,
     _refuse_unless_json_object,
     _refuse_unless_sound,
     _refuse_unless_valid_tree_document,
@@ -970,6 +975,13 @@ def _build_snapshot(
     return outfile
 
 
+#: Exit status of `kirocrew snapshot --strict` when the bundle was written but omits
+#: entries it was asked to carry. Distinct from 1 (no usable bundle) so a caller can
+#: tell "written but incomplete" apart from "failed". Without `--strict` such a run
+#: still exits 0, because existing callers treat any non-zero exit as a failed backup.
+EXIT_INCOMPLETE = 3
+
+
 def snapshot_main(
     argv: list[str] | None = None, *, parsed: argparse.Namespace | None = None
 ) -> int:
@@ -994,6 +1006,14 @@ def snapshot_main(
         )
         p.add_argument("--components", default=None)
         p.add_argument("--purpose", default=Purpose.BACKUP.value)
+        p.add_argument(
+            "--strict",
+            action="store_true",
+            help=(
+                "Exit 3 instead of 0 when the bundle was written but omits entries it "
+                "was asked to carry (see MANIFEST.json 'skipped'). The bundle is kept."
+            ),
+        )
         p.add_argument("--to", default=None, help=argparse.SUPPRESS)
         parsed = p.parse_args(argv)
     args = parsed
@@ -1140,9 +1160,9 @@ def snapshot_main(
         # read like a crash and bury the sentence saying what to do about it.
         #
         # It is also a PERMISSION decision, so it belongs in the SEL log next to
-        # `state_restore_rejected`. Review's point: the refusals this change introduced
-        # returned without auditing, so the one outcome a reviewer would most want a
-        # record of -- staging declined on an unsupported platform -- left no trace.
+        # `state_restore_rejected`. Without the audit, the one outcome a reviewer would
+        # most want a record of -- staging declined on an unsupported platform -- would
+        # leave no trace.
         _audit("snapshot_rejected", f"reason=unpinnable_staging detail={exc}")
         print(f"❌ {exc}")
         return 1
@@ -1189,10 +1209,10 @@ def snapshot_main(
 
     _audit("snapshot_created", f"{outfile} ({human})")
 
-    # Prune. This runs even when the upload failed, because --keep is a promise about
-    # local disk and a persistently failing destination must not turn a daily backup
-    # into an unbounded pile of bundles -- the disk fills, and then the snapshot that
-    # would have worked cannot be written either.
+    # Prune. --keep is a promise about local disk, so retention runs after every
+    # successful bundle unless the omission guard below holds it: a daily backup must
+    # not turn into an unbounded pile of bundles -- the disk fills, and then the
+    # snapshot that would have worked cannot be written either.
     snaps = sorted(
         out.glob("kirocrew-snapshot-*.tar.gz"), key=lambda x: x.stat().st_mtime, reverse=True
     )
@@ -1235,6 +1255,11 @@ def snapshot_main(
 
     remaining = len(list(out.glob("kirocrew-snapshot-*.tar.gz")))
     print(f"📦 Snapshots in {out}: {remaining} (keep={args.keep})")
+    # Opt-in only. The same predicate that held the prune decides the exit, so a caller
+    # never has to re-classify `skipped` reasons itself.
+    if omitted and getattr(args, "strict", False):
+        print(f"⚠️  --strict: exiting {EXIT_INCOMPLETE} because this bundle is incomplete.")
+        return EXIT_INCOMPLETE
     return 0
 
 
@@ -1267,10 +1292,10 @@ def _copy_notifications(src_path: Path, dst_path: Path) -> None:
     do it.
 
     The alternative -- a ctypes ``CreateFileW`` with ``FILE_FLAG_OPEN_REPARSE_POINT`` --
-    is declined, and not by me: ``eval/bench/safepath.py`` records that it "is no longer
-    worth considering here: it would buy the same property exclusive creation already
-    has, at the price of security code that cannot be exercised on the machine this
-    harness is developed on", and ``skill_trust.py`` records that Python "does not expose
+    is declined elsewhere in this repo: ``kiro_crew/eval/bench/safepath.py`` records that
+    it "is not worth considering here: it would buy the same property exclusive creation
+    already has, at the price of security code that cannot be exercised on the machine
+    this harness is developed on", and ``skill_trust.py`` records that Python "does not expose
     an equivalent handle-relative, no-reparse walk on Windows". Both decline the capable
     route, which means this repo has already chosen less capability on that platform over
     a hand-rolled walk. Refusing extends those two decisions; falling back contradicts
@@ -1279,13 +1304,13 @@ def _copy_notifications(src_path: Path, dst_path: Path) -> None:
     The cost is not symmetric, which is what makes the trade easy. Refusing loses
     notification HISTORY on one platform for one operation -- the records remain in the
     snapshot and nothing is destroyed. Falling back can put attacker-chosen bytes, a
-    credentials file among them, into a location the agent then reads. And this PR exists
-    because snapshot restore installed unvalidated bytes: a remaining path that installs
-    attacker-chosen bytes is the same defect, closed everywhere except where it is
-    hardest.
+    credentials file among them, into a location the agent then reads. Snapshot restore
+    validates what it installs so that it never installs unvalidated bytes: a remaining
+    path that installs attacker-chosen bytes is that same defect, closed everywhere
+    except where it is hardest.
 
     The refusal is LOUD and the callers report the skip. A silent skip would be the same
-    class of bug as the one being fixed, so the message names the platform, the missing
+    class of bug as installing unvalidated bytes, so the message names the platform, the missing
     primitive, and what was not imported.
     """
     if not getattr(os, "O_NOFOLLOW", 0):
@@ -1405,12 +1430,63 @@ def _do_merge(
             print("  ⚠️  crons: merge skipped (see warning above) — no jobs imported")
 
     if _want(components, "config"):
+        # Merge never overwrites, and for this component that usually means NOTHING is
+        # restored: every running install already has a config.json. So each bundle file
+        # kept that way is named, the way a kept named store is, and the tick is printed
+        # only when no bundle file was left behind -- a bare "✅ config" over a restore
+        # that took none of the bundle's settings read as "my settings came back".
+        kept_config: list[str] = []
         for f in CORE_FILES["config"]:
             s, d = snap / f, mc / f
-            if s.is_file() and not d.is_file():
-                shutil.copy2(str(s), str(d))
-                print(f"  {f}: restored (was missing)")
-        print("  ✅ config")
+            if not s.is_file():
+                continue
+            if os.path.lexists(d) and (d.is_symlink() or not d.is_file()):
+                # A link, directory or other non-file at the name: not a settings file
+                # to keep, and not a name to write through or read from. Refused BEFORE
+                # the comparison below, which would otherwise read a linked target --
+                # possibly a credential file outside the data home. Left as it is.
+                kept_config.append(f)
+                print(f"  ↩️  {f}: not restored; the existing entry is not a regular file.")
+                continue
+            if d.is_file() and filecmp.cmp(s, d, shallow=False):
+                continue  # the same bytes: nothing of the bundle's was left behind
+            if f == "config.local.json" and not d.is_file():
+                # Never installed by a merge: the overlay outranks config.json at load, so
+                # a bundle's copy dropped in raw would set every key it names -- sandbox,
+                # approval, channel tokens -- past the receiving install's own config.json
+                # with none of the dashboard Merge's filtering. Replace takes it.
+                kept_config.append(f)
+                print(
+                    f"  ↩️  {f}: not applied; a merge never installs the bundle's config "
+                    "overlay, which would outrank this install's config.json. To take it, "
+                    "re-run with --mode replace --components config."
+                )
+                continue
+            if not os.path.lexists(d):
+                # Missing means NOTHING at the name -- `is_file()` is also false for a
+                # dangling link, which `shutil.copy2` would follow and so write the
+                # bundle's file wherever it points, outside the data home. The pinned
+                # copy creates the destination O_CREAT|O_EXCL|O_NOFOLLOW, so a link
+                # planted after this check is refused too, never followed.
+                if pinned_fs.copy_file_pinned(
+                    str(s), str(d), skip_existing=True, on_skip=_report_skip
+                ):
+                    _lock_down_restored(d, "config")
+                    print(f"  {f}: restored (was missing)")
+                continue
+            if f not in _CONFIG_SETTINGS_DOCUMENTS:
+                # Host runtime state (`session_map.json`, the project and workspace
+                # pointers), not a setting: this host's copy is the right one, and a
+                # replace would install the source host's paths, which need not exist.
+                continue
+            kept_config.append(f)
+            print(
+                f"  ↩️  {f}: kept the existing file; the bundle's copy was NOT merged "
+                "into it. To take the bundle's settings instead, re-run with "
+                "--mode replace --components config."
+            )
+        if not kept_config:
+            print("  ✅ config")
 
     if _want(components, "notifications"):
         sn, dn = snap / "notifications.jsonl", mc / "notifications.jsonl"

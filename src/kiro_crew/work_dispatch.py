@@ -130,7 +130,9 @@ def _audit(
         logger.warning("work-dispatch audit failed for %s", operation, exc_info=True)
 
 
-def _audit_caller(session_key: str, operation: str, outcome: str, item: dict[str, Any] | None = None) -> None:
+def _audit_caller(
+    session_key: str, operation: str, outcome: str, item: dict[str, Any] | None = None
+) -> None:
     _audit(
         ledger_key(session_key),
         operation,
@@ -159,9 +161,7 @@ def _classify_rejection(message: str) -> str:
     return "worker_launch_refused"
 
 
-async def launch(
-    session_key: str, item_id: str, candidate_id: str, manager: Any
-) -> dict[str, Any]:
+async def launch(session_key: str, item_id: str, candidate_id: str, manager: Any) -> dict[str, Any]:
     """Arm the assignment, ask the governed manager to launch, record the receipt."""
     candidate = _resolve_candidate(candidate_id)
     if candidate is None:
@@ -209,18 +209,16 @@ async def launch(
         )
     except Exception as exc:
         failure_code = _classify_rejection(str(exc))
-        await asyncio.to_thread(
-            work_items.record_launch_failed, session_key, run_id, failure_code
-        )
+        await asyncio.to_thread(work_items.record_launch_failed, session_key, run_id, failure_code)
         _audit_caller(session_key, "work_item.launch", "dispatch_delivery_failed", item)
         raise WorkDispatchError(
             "the subagent manager rejected the launch", code=failure_code, status=502
         ) from exc
     if info is None or info.error:
-        failure_code = _classify_rejection(str(info.error if info is not None else "no run was returned"))
-        await asyncio.to_thread(
-            work_items.record_launch_failed, session_key, run_id, failure_code
+        failure_code = _classify_rejection(
+            str(info.error if info is not None else "no run was returned")
         )
+        await asyncio.to_thread(work_items.record_launch_failed, session_key, run_id, failure_code)
         item = await asyncio.to_thread(work_items.read_item, session_key, item_id)
         _audit_caller(session_key, "work_item.launch", "dispatch_delivery_failed", item)
         return {"code": "dispatch_delivery_failed", "item": item}
@@ -318,18 +316,16 @@ async def dispatch_retry(session_key: str, item_id: str, manager: Any) -> dict[s
         )
     except Exception as exc:
         failure_code = _classify_rejection(str(exc))
-        await asyncio.to_thread(
-            work_items.record_launch_failed, session_key, run_id, failure_code
-        )
+        await asyncio.to_thread(work_items.record_launch_failed, session_key, run_id, failure_code)
         _audit_caller(session_key, "work_item.dispatch_retry", "dispatch_delivery_failed", item)
         raise WorkDispatchError(
             "the subagent manager rejected the retry", code=failure_code, status=502
         ) from exc
     if info is None or info.error:
-        failure_code = _classify_rejection(str(info.error if info is not None else "no run was returned"))
-        await asyncio.to_thread(
-            work_items.record_launch_failed, session_key, run_id, failure_code
+        failure_code = _classify_rejection(
+            str(info.error if info is not None else "no run was returned")
         )
+        await asyncio.to_thread(work_items.record_launch_failed, session_key, run_id, failure_code)
         item = await asyncio.to_thread(work_items.read_item, session_key, item_id)
         _audit_caller(session_key, "work_item.dispatch_retry", "dispatch_delivery_failed", item)
         return {"code": "dispatch_delivery_failed", "item": item}
@@ -352,7 +348,9 @@ async def revoke_assignment(session_key: str, item_id: str, manager: Any) -> dic
                 worker_may_still_run = True
                 state = "running"
             else:
-                _audit_caller(session_key, "work_item.revoke_assignment", "queued_cancel_unavailable", item)
+                _audit_caller(
+                    session_key, "work_item.revoke_assignment", "queued_cancel_unavailable", item
+                )
                 raise WorkDispatchError(
                     "the queued worker cannot be cancelled until manager state is available",
                     code="queued_cancel_unavailable",
@@ -386,7 +384,9 @@ async def revoke_assignment(session_key: str, item_id: str, manager: Any) -> dic
         if state == "queued":
             cancel = getattr(manager, "cancel", None)
             if not callable(cancel):
-                _audit_caller(session_key, "work_item.revoke_assignment", "queued_cancel_unavailable", item)
+                _audit_caller(
+                    session_key, "work_item.revoke_assignment", "queued_cancel_unavailable", item
+                )
                 raise WorkDispatchError(
                     "the queued worker cannot be cancelled until manager cancellation is available",
                     code="queued_cancel_unavailable",
@@ -396,14 +396,18 @@ async def revoke_assignment(session_key: str, item_id: str, manager: Any) -> dic
                 cancelled = await cancel(run_id)
             except Exception as exc:
                 logger.warning("cancel of queued run %s failed", run_id, exc_info=True)
-                _audit_caller(session_key, "work_item.revoke_assignment", "queued_cancel_unavailable", item)
+                _audit_caller(
+                    session_key, "work_item.revoke_assignment", "queued_cancel_unavailable", item
+                )
                 raise WorkDispatchError(
                     "the queued worker cancellation was unavailable; retry revocation",
                     code="queued_cancel_unavailable",
                     status=503,
                 ) from exc
             if cancelled is not True:
-                _audit_caller(session_key, "work_item.revoke_assignment", "queued_cancel_failed", item)
+                _audit_caller(
+                    session_key, "work_item.revoke_assignment", "queued_cancel_failed", item
+                )
                 raise WorkDispatchError(
                     "the queued worker was not cancelled; retry revocation",
                     code="queued_cancel_failed",
@@ -470,6 +474,4 @@ async def on_subagent_event(etype: str, info: Any, extra: Any) -> None:
             "child run ended: " + (outcome or "ended"),
         )
     except Exception:
-        logger.warning(
-            "work-dispatch receipt handling failed for %s", etype, exc_info=True
-        )
+        logger.warning("work-dispatch receipt handling failed for %s", etype, exc_info=True)

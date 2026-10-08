@@ -46,11 +46,11 @@ def runtime_state(monkeypatch):
                     "backend": (
                         "claude"
                         if name == "claude-engine"
-                        else "codex"
-                        if name == "codex-engine"
-                        else "deepseek"
-                        if name == "deepseek-engine"
-                        else "antigravity_headless"
+                        else (
+                            "codex"
+                            if name == "codex-engine"
+                            else "deepseek" if name == "deepseek-engine" else "antigravity_headless"
+                        )
                     ),
                     "priority": 0 if name == "claude-engine" else 1,
                 }

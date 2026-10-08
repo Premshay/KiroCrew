@@ -16,8 +16,8 @@ from windows_sim import builtin_open_sharing_violation
 from kiro_crew import history, history_search
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.history import (
-    _HISTORY_LAG_THRESHOLD,
     _CONSOLIDATION_THRESHOLD,
+    _HISTORY_LAG_THRESHOLD,
     _METADATA_CACHE_MAX,
     _SESSION_KEEP_LINES,
     _SESSION_MAX_BYTES,
@@ -527,7 +527,10 @@ class TestCanonicalKey:
         assert ConversationLog._canonical_key("dashboard_chat-1-100") == "dashboard_chat-1-100"
 
     def test_double_prefix_collapsed(self):
-        assert ConversationLog._canonical_key("dashboard_dashboard_chat-1-100") == "dashboard_chat-1-100"
+        assert (
+            ConversationLog._canonical_key("dashboard_dashboard_chat-1-100")
+            == "dashboard_chat-1-100"
+        )
 
     def test_triple_prefix_collapsed(self):
         assert ConversationLog._canonical_key("dashboard_dashboard_dashboard_x") == "dashboard_x"
@@ -787,6 +790,7 @@ class TestSearchSessions:
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "title-match.jsonl", (1000, 1000))
         os.utime(tmp_path / "content-only.jsonl", (2000, 2000))
         log = ConversationLog(base_dir=tmp_path)
@@ -811,6 +815,7 @@ class TestSearchSessions:
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "many.jsonl", (1000, 1000))
         os.utime(tmp_path / "few.jsonl", (2000, 2000))
         log = ConversationLog(base_dir=tmp_path)
@@ -834,6 +839,7 @@ class TestSearchSessions:
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "short.jsonl", (1000, 1000))
         os.utime(tmp_path / "long.jsonl", (2000, 2000))
         log = ConversationLog(base_dir=tmp_path)
@@ -856,21 +862,19 @@ class TestSearchSessions:
         newest-first-on-tie invariant isn't satisfied trivially.
         """
         (tmp_path / "older.jsonl").write_text(
-            '{"_type": "metadata", "title": "t"}\n'
-            '{"role": "user", "content": "apollo"}\n',
+            '{"_type": "metadata", "title": "t"}\n' '{"role": "user", "content": "apollo"}\n',
             encoding="utf-8",
         )
         (tmp_path / "middle-title.jsonl").write_text(
-            '{"_type": "metadata", "title": "apollo"}\n'
-            '{"role": "user", "content": "x"}\n',
+            '{"_type": "metadata", "title": "apollo"}\n' '{"role": "user", "content": "x"}\n',
             encoding="utf-8",
         )
         (tmp_path / "newer.jsonl").write_text(
-            '{"_type": "metadata", "title": "t"}\n'
-            '{"role": "user", "content": "apollo"}\n',
+            '{"_type": "metadata", "title": "t"}\n' '{"role": "user", "content": "apollo"}\n',
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "older.jsonl", (1000, 1000))
         os.utime(tmp_path / "middle-title.jsonl", (1500, 1500))
         os.utime(tmp_path / "newer.jsonl", (2000, 2000))
@@ -896,6 +900,7 @@ class TestSearchSessions:
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "strong.jsonl", (1000, 1000))
         os.utime(tmp_path / "weak.jsonl", (2000, 2000))
         log = ConversationLog(base_dir=tmp_path)
@@ -925,6 +930,7 @@ class TestSearchSessions:
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "title-only.jsonl", (1000, 1000))
         os.utime(tmp_path / "heavy-content.jsonl", (2000, 2000))
         log = ConversationLog(base_dir=tmp_path)
@@ -1032,7 +1038,9 @@ class TestSearchSessions:
         The short session is written NEWER so recency favors it.
         """
         long_lines = [
-            json.dumps({"role": "assistant", "content": f"bucket policy for s3 step {i}: " + "x" * 400})
+            json.dumps(
+                {"role": "assistant", "content": f"bucket policy for s3 step {i}: " + "x" * 400}
+            )
             for i in range(200)
         ]
         (tmp_path / "long-substantive.jsonl").write_text(
@@ -1092,6 +1100,7 @@ class TestSearchSessions:
         # HFS+) can give all three files the same mtime, making the
         # list_sessions() order non-deterministic without this.
         import os
+
         os.utime(tmp_path / "old-strong.jsonl", (1000, 1000))
         os.utime(tmp_path / "new-weak-1.jsonl", (2000, 2000))
         os.utime(tmp_path / "new-weak-2.jsonl", (3000, 3000))
@@ -1296,7 +1305,7 @@ class TestSearchQueryTokens:
         assert texts == ["beta", "alpha", "gamma"]
 
     def test_deduped_query_still_gets_phrase_treatment(self, tmp_path):
-        """"a a" dedups to ONE token but its phrase is still two words.
+        """ "a a" dedups to ONE token but its phrase is still two words.
 
         Keyed off `tokens != [phrase]` rather than `len(tokens) > 1`, so the
         session matched on the single token still resolves a snippet instead of
@@ -1332,7 +1341,7 @@ class TestCjkSearch:
         (tmp_path / f"{key}.jsonl").write_text(line + "\n", encoding="utf-8")
 
     def test_spaceless_multiword_cjk_query_matches_separated_words(self, tmp_path):
-        """"内存泄漏" must find a session whose words appear apart.
+        """ "内存泄漏" must find a session whose words appear apart.
 
         Regression: the whole run was one required substring, so only a
         transcript containing the literal string "内存泄漏" could match — the
@@ -1404,7 +1413,7 @@ class TestCjkSearch:
         assert [s["key"] for s in log.search_sessions(query)] == ["longhit"]
 
     def test_mixed_script_token_splits_at_script_boundary(self, tmp_path):
-        """"kirocrew部署" matches a doc where the ASCII and CJK parts sit apart."""
+        """ "kirocrew部署" matches a doc where the ASCII and CJK parts sit apart."""
         self._write_cjk_session(tmp_path, "hit", "kirocrew 的部署流程记录")
         log = ConversationLog(base_dir=tmp_path)
 
@@ -1820,7 +1829,7 @@ class TestForgeReferenceSearch:
 
     @pytest.mark.parametrize("query", ["4411 !4411", "!4411 4411"])
     def test_a_cross_family_repeat_does_not_score_a_required_spelling(self, query):
-        """"4411 !4411" gates the GitLab family; the hint must not re-score it.
+        """ "4411 !4411" gates the GitLab family; the hint must not re-score it.
 
         The bare number's ranking hint is keyed on the GitHub spelling, so the
         by-key sweep leaves it alone — but its alts carry BOTH families, and the
@@ -1831,9 +1840,7 @@ class TestForgeReferenceSearch:
         """
         needles, _, _ = history.parse_search_query(query)
 
-        required_spellings = {
-            s for n in needles if n.required for s in (n.text, *n.alts)
-        }
+        required_spellings = {s for n in needles if n.required for s in (n.text, *n.alts)}
         hints = [n for n in needles if not n.required]
         assert hints, "the hint must survive on its remaining family"
         for hint in hints:
@@ -1923,7 +1930,7 @@ class TestForgeReferenceSearch:
         assert log.search_sessions("!12", 10) == []
 
     def test_naming_one_item_twice_never_narrows_it(self, tmp_path):
-        """"#42 issue 42" must find everything either spelling finds alone.
+        """ "#42 issue 42" must find everything either spelling finds alone.
 
         Skipping outright in the dedup path keeps `issue` required and throws
         away the bare-digit spelling the sigil-free occurrence contributes
@@ -2030,7 +2037,7 @@ class TestForgeReferenceSearch:
         assert {s["key"] for s in log.search_sessions("!12", 10)} == {"the_mr"}
 
     def test_merge_number_is_not_a_reference_at_all(self, tmp_path):
-        """"merge 1234" is prose: "merge" names no type, so the words stay literal.
+        """ "merge 1234" is prose: "merge" names no type, so the words stay literal.
 
         Reading it as a reference would drop "merge" from the gate and pull in
         every session mentioning 1234. The ranking hint still surfaces the pull
@@ -2048,7 +2055,7 @@ class TestForgeReferenceSearch:
         assert keys[0] == "gh_pr", keys
 
     def test_chain_only_words_do_not_make_a_reference(self):
-        """"requests 12" is prose about requests, not item 12."""
+        """ "requests 12" is prose about requests, not item 12."""
         needles, _, _ = history.parse_search_query("requests 12")
 
         assert [n.text for n in needles if n.required] == ["requests", "12"]
@@ -2117,7 +2124,7 @@ class TestForgeReferenceSearch:
         assert required == sorted(still_required), query
 
     def test_a_chain_only_word_before_a_sigil_stays_in_the_gate(self, tmp_path):
-        """"merge #12": the word is a search term the user typed, not a type name.
+        """ "merge #12": the word is a search term the user typed, not a type name.
 
         Dropping it would return every session mentioning #12. This is the same
         rule the bare-digit branch applies — only a run that NAMES a type is
@@ -2192,7 +2199,7 @@ class TestForgeReferenceSearch:
         assert {s["key"] for s in log.search_sessions("#4411", 10)} == {"no_slash"}
 
     def test_merge_request_two_word_form_is_the_gitlab_family(self, tmp_path):
-        """"merge request 12" IS GitLab, and reaches the number through two words.
+        """ "merge request 12" IS GitLab, and reaches the number through two words.
 
         It ranks the merge request first rather than excluding the issue: the
         query typed bare digits, so the digits stay a spelling (recall) and a
@@ -2294,9 +2301,7 @@ class TestProviderSearchRefSeam:
     def test_a_provider_reference_with_a_short_spelling_is_saturated(self):
         """A provider reference saturates when any spelling is short."""
         history_search.register_search_ref_resolver(
-            lambda token: ("x5", ("items/x5", "5"))
-            if token.casefold() == "x5"
-            else None
+            lambda token: ("x5", ("items/x5", "5")) if token.casefold() == "x5" else None
         )
 
         assert self._needle("X5").saturate_body is True
@@ -2541,9 +2546,9 @@ class TestProviderSearchRefSeam:
         with caplog.at_level(logging.DEBUG, logger=history_search.logger.name):
             history.parse_search_query("ref-987654321")
 
-        assert any(
-            "malformed" in r.message or "invalid" in r.message for r in caplog.records
-        ), [r.message for r in caplog.records]
+        assert any("malformed" in r.message or "invalid" in r.message for r in caplog.records), [
+            r.message for r in caplog.records
+        ]
 
     def test_a_non_iterable_alts_answer_is_logged_not_silent(self, caplog):
         """The sibling shape rejection: `alts` a bare string is equally silent."""
@@ -2555,9 +2560,9 @@ class TestProviderSearchRefSeam:
         with caplog.at_level(logging.DEBUG, logger=history_search.logger.name):
             history.parse_search_query("ref-987654321")
 
-        assert any(
-            "malformed" in r.message or "invalid" in r.message for r in caplog.records
-        ), [r.message for r in caplog.records]
+        assert any("malformed" in r.message or "invalid" in r.message for r in caplog.records), [
+            r.message for r in caplog.records
+        ]
 
     def test_a_malformed_alt_is_logged_not_silent(self, caplog):
         """The per-alt shape rejection, the third case the docstring's claim covers.
@@ -2818,9 +2823,7 @@ class TestArchive:
         removed = _cleanup_old_archives(base=tmp_path)
         assert removed == 0
 
-    def test_cleanup_throttled_explicit_negative_skips_config_load(
-        self, tmp_path, monkeypatch
-    ):
+    def test_cleanup_throttled_explicit_negative_skips_config_load(self, tmp_path, monkeypatch):
         """Explicit negative disables without touching config, even when throttled."""
         import time
 
@@ -2888,10 +2891,20 @@ class TestArchive:
         """First line of archive is a JSON metadata row; remaining lines are original message jsonl."""
         from kiro_crew.history import _archive_lines
 
-        p = _archive_lines("k", ['{"role":"user","content":"a"}\n', '{"role":"assistant","content":"b"}\n'], reason="rotate", base=tmp_path)
+        p = _archive_lines(
+            "k",
+            ['{"role":"user","content":"a"}\n', '{"role":"assistant","content":"b"}\n'],
+            reason="rotate",
+            base=tmp_path,
+        )
         lines = p.read_text(encoding="utf-8").splitlines()
         header = json.loads(lines[0])
-        assert header == {"_type": "archive", "reason": "rotate", "archived_at": header["archived_at"], "count": 2}
+        assert header == {
+            "_type": "archive",
+            "reason": "rotate",
+            "archived_at": header["archived_at"],
+            "count": 2,
+        }
         assert json.loads(lines[1])["role"] == "user"
         assert json.loads(lines[2])["role"] == "assistant"
 
@@ -3072,7 +3085,9 @@ class TestArchiveOnlyDropped:
         from kiro_crew.history import _safe_key
 
         path = tmp_path / f"{_safe_key('t1')}.jsonl"
-        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln and '"_type"' not in ln]
+        lines = [
+            ln for ln in path.read_text(encoding="utf-8").splitlines() if ln and '"_type"' not in ln
+        ]
         assert len(lines) == 3
         kept = [json.loads(lines[1]), json.loads(lines[2])]  # B, C
         log.rewrite_session("t1", kept)
@@ -3080,9 +3095,9 @@ class TestArchiveOnlyDropped:
         assert len(archives) == 1
         archived = archives[0].read_text(encoding="utf-8")
         # Only the dropped message A should be in the archive (not B or C).
-        assert "\"content\": \"A\"" in archived
-        assert "\"content\": \"B\"" not in archived
-        assert "\"content\": \"C\"" not in archived
+        assert '"content": "A"' in archived
+        assert '"content": "B"' not in archived
+        assert '"content": "C"' not in archived
         header = json.loads(archived.splitlines()[0])
         assert header["count"] == 1
 
@@ -3182,7 +3197,9 @@ class TestConsolidationToolPolicy:
         )
         response = {"content": [{"type": "text", "text": '{"history_entry": "done"}'}]}
 
-        with patch("kiro_crew.history_consolidation._post_consolidation_request", return_value=response) as post:
+        with patch(
+            "kiro_crew.history_consolidation._post_consolidation_request", return_value=response
+        ) as post:
             result = await consolidator._call_llm("summarize this")
 
         assert result == {"history_entry": "done"}
@@ -3205,7 +3222,9 @@ class TestConsolidationToolPolicy:
             def read(self) -> bytes:
                 return b'{"content": []}'
 
-        with patch("kiro_crew.history_consolidation.urllib.request.urlopen", return_value=_Response()) as open_url:
+        with patch(
+            "kiro_crew.history_consolidation.urllib.request.urlopen", return_value=_Response()
+        ) as open_url:
             history._post_consolidation_request(
                 "http://router.example/v1/messages", "consolidate", "", "summarize", 30
             )
@@ -3226,7 +3245,9 @@ class TestConsolidationToolPolicy:
         )
         refusal = history._ConsolidationLaneUnavailable("fleet_lane_busy", 60.0)
 
-        with patch("kiro_crew.history_consolidation._post_consolidation_request", side_effect=refusal):
+        with patch(
+            "kiro_crew.history_consolidation._post_consolidation_request", side_effect=refusal
+        ):
             outcome = await consolidator.consolidate_now("session")
 
         meta = log.get_metadata("session")
@@ -3266,7 +3287,10 @@ class TestConsolidationToolPolicy:
             assert await first == {"history_entry": "done"}
 
         assert second is None
-        assert consolidator._last_llm_error == "another direct consolidation request is already in progress"
+        assert (
+            consolidator._last_llm_error
+            == "another direct consolidation request is already in progress"
+        )
         assert post.call_count == 1
 
 
@@ -3358,11 +3382,9 @@ class TestConsolidationChunkAdmission:
     """Bounded history passes must preserve message boundaries and the offset."""
 
     @pytest.mark.asyncio
-    async def test_history_commits_one_message_aligned_chunk_at_a_time(
-        self, tmp_path, monkeypatch
-    ):
-        from kiro_crew.memory import MemoryStore
+    async def test_history_commits_one_message_aligned_chunk_at_a_time(self, tmp_path, monkeypatch):
         import kiro_crew.history_consolidation as consolidation_mod
+        from kiro_crew.memory import MemoryStore
 
         log = ConversationLog(base_dir=tmp_path / "sessions")
         log.init()
@@ -3400,8 +3422,8 @@ class TestConsolidationChunkAdmission:
 
     @pytest.mark.asyncio
     async def test_oversized_message_defers_without_advancing_offset(self, tmp_path, monkeypatch):
-        from kiro_crew.memory import MemoryStore
         import kiro_crew.history_consolidation as consolidation_mod
+        from kiro_crew.memory import MemoryStore
 
         log = ConversationLog(base_dir=tmp_path / "sessions")
         log.init()
@@ -3443,9 +3465,7 @@ class TestConsolidationDoesNotBlockLoop:
         write_thread_id: dict[str, int] = {}
 
         log = MagicMock()
-        log.snapshot_for_consolidation.return_value = (
-            [{"role": "user", "content": "hi"}], 1, 0
-        )
+        log.snapshot_for_consolidation.return_value = ([{"role": "user", "content": "hi"}], 1, 0)
         log.get_metadata.return_value = {}
         # A fresh span is eligible; _consolidate's inner gate reads this.
         log.get_metadata_status.return_value = ({}, True)
@@ -3459,16 +3479,21 @@ class TestConsolidationDoesNotBlockLoop:
         vector_store.get_all_semantic.return_value = []
 
         c = HistoryConsolidator(
-            log=log, memory=memory, sessions=None,
-            vector_store=vector_store, migrated=True,
+            log=log,
+            memory=memory,
+            sessions=None,
+            vector_store=vector_store,
+            migrated=True,
         )
 
         def _fake_write(result, key, vector_store=None, **_):
             # Simulate the blocking embed call; record the executing thread.
             write_thread_id["id"] = threading.get_ident()
 
-        with patch.object(c, "_call_llm", new_callable=AsyncMock) as llm, \
-                patch.object(c, "_write_structured_memory", side_effect=_fake_write):
+        with (
+            patch.object(c, "_call_llm", new_callable=AsyncMock) as llm,
+            patch.object(c, "_write_structured_memory", side_effect=_fake_write),
+        ):
             llm.return_value = {"episodic": [{"text": "x" * 20}]}
             await c._consolidate("k", include_history=False)
 
@@ -3493,9 +3518,7 @@ class TestConsolidationDoesNotBlockLoop:
         save_thread_id: dict[str, int] = {}
 
         log = MagicMock()
-        log.snapshot_for_consolidation.return_value = (
-            [{"role": "user", "content": "hi"}], 1, 0
-        )
+        log.snapshot_for_consolidation.return_value = ([{"role": "user", "content": "hi"}], 1, 0)
         log.get_metadata.return_value = {}
         # A fresh span is eligible; _consolidate's inner gate reads this.
         log.get_metadata_status.return_value = ({}, True)
@@ -3510,8 +3533,11 @@ class TestConsolidationDoesNotBlockLoop:
         vector_store.write_lesson.return_value = True
 
         c = HistoryConsolidator(
-            log=log, memory=memory, sessions=None,
-            vector_store=vector_store, migrated=True,
+            log=log,
+            memory=memory,
+            sessions=None,
+            vector_store=vector_store,
+            migrated=True,
         )
 
         original_save = c._save_lessons
@@ -3520,9 +3546,11 @@ class TestConsolidationDoesNotBlockLoop:
             save_thread_id["id"] = threading.get_ident()
             original_save(raw)
 
-        with patch.object(c, "_call_llm", new_callable=AsyncMock) as llm, \
-                patch.object(c, "_write_structured_memory"), \
-                patch.object(c, "_save_lessons", side_effect=_instrumented_save):
+        with (
+            patch.object(c, "_call_llm", new_callable=AsyncMock) as llm,
+            patch.object(c, "_write_structured_memory"),
+            patch.object(c, "_save_lessons", side_effect=_instrumented_save),
+        ):
             llm.return_value = {
                 "lessons": [{"rule": "always check return codes", "category": "tool"}],
             }
@@ -3545,8 +3573,11 @@ class TestConsolidationDoesNotBlockLoop:
         vector_store.write_lesson.return_value = True
 
         c = HistoryConsolidator(
-            log=MagicMock(), memory=MagicMock(), sessions=None,
-            vector_store=vector_store, migrated=True,
+            log=MagicMock(),
+            memory=MagicMock(),
+            sessions=None,
+            vector_store=vector_store,
+            migrated=True,
         )
         oversized = [
             {"rule": f"lesson number {i}", "category": "tool"}
@@ -3570,12 +3601,14 @@ class TestStopEventContextInjection:
         log.append("sess1", "user", "hello")
         log.append("sess1", "assistant", "hi")
         # Append a resolved stop_event as a system message
-        stop_data = json.dumps({
-            "kind": "stop_event",
-            "id": "stop-abc",
-            "state": "stopped",
-            "outcome": "soft",
-        })
+        stop_data = json.dumps(
+            {
+                "kind": "stop_event",
+                "id": "stop-abc",
+                "state": "stopped",
+                "outcome": "soft",
+            }
+        )
         log.append("sess1", "system", stop_data)
 
         result = _build_stop_event_notes(log, "sess1")
@@ -3589,18 +3622,18 @@ class TestStopEventContextInjection:
 
         log = ConversationLog(base_dir=tmp_path)
         for i in range(5):
-            stop_data = json.dumps({
-                "kind": "stop_event",
-                "id": f"stop-{i}",
-                "state": "stopped",
-                "outcome": "soft",
-            })
+            stop_data = json.dumps(
+                {
+                    "kind": "stop_event",
+                    "id": f"stop-{i}",
+                    "state": "stopped",
+                    "outcome": "soft",
+                }
+            )
             log.append("sess1", "system", stop_data)
 
         result = _build_stop_event_notes(log, "sess1")
-        count = result.count(
-            "[User stopped the previous turn mid-execution.]"
-        )
+        count = result.count("[User stopped the previous turn mid-execution.]")
         assert count == 3
 
     def test_context_injection_ignores_stopping_state(self, tmp_path):
@@ -3610,12 +3643,14 @@ class TestStopEventContextInjection:
         from kiro_crew.context import _build_stop_event_notes
 
         log = ConversationLog(base_dir=tmp_path)
-        stop_data = json.dumps({
-            "kind": "stop_event",
-            "id": "stop-abc",
-            "state": "stopping",
-            "outcome": None,
-        })
+        stop_data = json.dumps(
+            {
+                "kind": "stop_event",
+                "id": "stop-abc",
+                "state": "stopping",
+                "outcome": None,
+            }
+        )
         log.append("sess1", "system", stop_data)
 
         result = _build_stop_event_notes(log, "sess1")
@@ -3640,18 +3675,22 @@ class TestCancelledTurnPreambleInstruction:
         log = ConversationLog(base_dir=tmp_path)
         log.append("sess1", "user", "please refactor the parser")
         log.append("sess1", "assistant", "Starting on the parser")
-        log.append("sess1", "system", json.dumps({
-            "kind": "stop_event",
-            "id": "stop-abc",
-            "state": "stopped",
-            "outcome": "soft",
-        }))
+        log.append(
+            "sess1",
+            "system",
+            json.dumps(
+                {
+                    "kind": "stop_event",
+                    "id": "stop-abc",
+                    "state": "stopped",
+                    "outcome": "soft",
+                }
+            ),
+        )
 
         result = build_cancelled_turn_preamble(log, "sess1")
         # Markers parsed by context_blocks.py stay byte-identical.
-        assert result.startswith(
-            "[PREVIOUS TURN WAS CANCELLED BY THE USER \u2014 context restore]"
-        )
+        assert result.startswith("[PREVIOUS TURN WAS CANCELLED BY THE USER \u2014 context restore]")
         assert result.endswith("[END PREVIOUS TURN]")
         # The instruction forbids a standalone acknowledgment and directs
         # the model to the current request instead.
@@ -4032,13 +4071,25 @@ class TestProcessAutoSkillsIntegration:
         # Seed with REAL dashboard-format messages (no "tools" field anywhere)
         conv_log.append("dashboard:chat-schema", "user", "find info on grading services")
         conv_log.append("dashboard:chat-schema", "assistant", "Let me look that up.")
-        conv_log.append("dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/ReadInternalWebsites")
-        conv_log.append("dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/ReadInternalWebsites")
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/ReadInternalWebsites"
+        )
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/ReadInternalWebsites"
+        )
         conv_log.append("dashboard:chat-schema", "assistant", "Now checking sub-pages.")
-        conv_log.append("dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/ReadInternalWebsites")
-        conv_log.append("dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/ReadInternalWebsites")
-        conv_log.append("dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/InternalCodeSearch")
-        conv_log.append("dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/InternalCodeSearch")
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/ReadInternalWebsites"
+        )
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/ReadInternalWebsites"
+        )
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/InternalCodeSearch"
+        )
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/InternalCodeSearch"
+        )
         conv_log.append("dashboard:chat-schema", "assistant", "Here's the full list.")
 
         async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
@@ -4083,7 +4134,10 @@ class TestProcessAutoSkillsIntegration:
 
         for i in range(6):
             conv_log.append(
-                "dashboard:chat-stage", "assistant", f"step {i}", tools=["Running: grep foo bar.txt"]
+                "dashboard:chat-stage",
+                "assistant",
+                f"step {i}",
+                tools=["Running: grep foo bar.txt"],
             )
 
         async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
@@ -4117,8 +4171,11 @@ class TestProcessAutoSkillsIntegration:
         mem.init()
         skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
         consolidator = HistoryConsolidator(
-            log=conv_log, memory=mem, skills_loader=skills,
-            auto_skills_enabled=True, auto_min_tool_calls=2,
+            log=conv_log,
+            memory=mem,
+            skills_loader=skills,
+            auto_skills_enabled=True,
+            auto_min_tool_calls=2,
             approval_required=False,  # auto-approve prose — but scripts still gate
             generate_scripts=True,
         )
@@ -4133,7 +4190,9 @@ class TestProcessAutoSkillsIntegration:
                     "description": "run a fixed sequence",
                     "triggers": "seq",
                     "procedure_md": "## Steps\n1. run\n",
-                    "scripts": [{"filename": "run.py", "language": "python", "content": "print('go')\n"}],
+                    "scripts": [
+                        {"filename": "run.py", "language": "python", "content": "print('go')\n"}
+                    ],
                 },
             }
 
@@ -4157,8 +4216,12 @@ class TestProcessAutoSkillsIntegration:
         mem.init()
         skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
         consolidator = HistoryConsolidator(
-            log=conv_log, memory=mem, skills_loader=skills,
-            auto_skills_enabled=True, auto_min_tool_calls=2, generate_scripts=True,
+            log=conv_log,
+            memory=mem,
+            skills_loader=skills,
+            auto_skills_enabled=True,
+            auto_min_tool_calls=2,
+            generate_scripts=True,
         )
         for i in range(3):
             conv_log.append("dashboard:chat-bad", "assistant", f"s{i}", tools=["fs_read"])
@@ -4171,8 +4234,13 @@ class TestProcessAutoSkillsIntegration:
                     "description": "does a thing",
                     "triggers": "thing",
                     "procedure_md": "## Steps\n1. run\n",
-                    "scripts": [{"filename": "wipe.py", "language": "python",
-                                 "content": "import os\nos.system('rm -rf /')\n"}],
+                    "scripts": [
+                        {
+                            "filename": "wipe.py",
+                            "language": "python",
+                            "content": "import os\nos.system('rm -rf /')\n",
+                        }
+                    ],
                 },
             }
 
@@ -4242,7 +4310,8 @@ class TestAutoSkillSELAudit:
 
         # Expect at least one audit entry with outcome=rejected and reason=not_auto_namespace
         namespace_rejections = [
-            r for r in recorded
+            r
+            for r in recorded
             if r.get("outcome") == "rejected"
             and r.get("metadata", {}).get("reason") == "not_auto_namespace"
         ]
@@ -4300,7 +4369,8 @@ class TestAutoSkillSELAudit:
                 await consolidator._consolidate("dashboard:chat-bad-slug", include_history=True)
 
         create_rejections = [
-            r for r in recorded
+            r
+            for r in recorded
             if r.get("tool_name") == "auto_skill_create"
             and r.get("outcome") == "rejected"
             and r.get("metadata", {}).get("reason") == "creation_failed"
@@ -4364,7 +4434,8 @@ class TestAutoSkillSELAuditCompleteness:
                 await consolidator._consolidate("dashboard:chat-empty", include_history=True)
 
         empty_rejections = [
-            r for r in recorded
+            r
+            for r in recorded
             if r.get("tool_name") == "auto_skill_create"
             and r.get("outcome") == "rejected"
             and r.get("metadata", {}).get("reason") == "empty_after_redaction"
@@ -4426,12 +4497,11 @@ class TestAutoSkillSELAuditCompleteness:
         with patch.object(consolidator, "_call_llm", side_effect=fake_llm):
             with patch("kiro_crew.history.sel") as mock_sel:
                 mock_sel.return_value.log_tool_invocation = fake_log
-                await consolidator._consolidate(
-                    "dashboard:chat-refine-empty", include_history=True
-                )
+                await consolidator._consolidate("dashboard:chat-refine-empty", include_history=True)
 
         empty_rejections = [
-            r for r in recorded
+            r
+            for r in recorded
             if r.get("tool_name") == "auto_skill_refine"
             and r.get("outcome") == "rejected"
             and r.get("metadata", {}).get("reason") == "empty_after_redaction"
@@ -4500,7 +4570,8 @@ class TestAutoSkillSELAuditCompleteness:
                 await consolidator._consolidate("dashboard:chat-oversize", include_history=True)
 
         update_rejections = [
-            r for r in recorded
+            r
+            for r in recorded
             if r.get("tool_name") == "auto_skill_refine"
             and r.get("outcome") == "rejected"
             and r.get("metadata", {}).get("reason") == "update_failed"
@@ -4592,8 +4663,7 @@ class TestConsolidationPromptJsonShape:
         # The yes-bias that caused the over-generation must be gone.
         for banned in ("lean toward returning it", "a miss is lost for good"):
             assert banned not in prompt, (
-                f"the prompt must not bias the model toward proposing a skill: "
-                f"found {banned!r}"
+                f"the prompt must not bias the model toward proposing a skill: " f"found {banned!r}"
             )
 
         # Recurrence must be the actual gate, stated as a test the model applies.
@@ -4620,8 +4690,7 @@ class TestConsolidationPromptJsonShape:
         # Uncertainty must resolve to null, and the reason must be stated in
         # terms of the real cost (human review attention), not a free lunch.
         assert "Prefer null when uncertain" in prompt, (
-            "the prompt must resolve uncertainty to null rather than to a "
-            "speculative candidate"
+            "the prompt must resolve uncertainty to null rather than to a " "speculative candidate"
         )
 
 
@@ -5025,7 +5094,12 @@ class TestConsolidateSession:
 
         consolidator = HistoryConsolidator(log=conv_log, memory=mem)
         # Seed a session with a sensitive tool call
-        conv_log.append("dashboard:chat-sensitive", "assistant", "reading secrets", tools=["cat .aws/credentials"])
+        conv_log.append(
+            "dashboard:chat-sensitive",
+            "assistant",
+            "reading secrets",
+            tools=["cat .aws/credentials"],
+        )
 
         consolidator.consolidate_session("dashboard:chat-sensitive")
         # No tasks created — sensitive session skipped
@@ -5045,7 +5119,9 @@ class TestConsolidateSession:
         consolidator = HistoryConsolidator(log=conv_log, memory=mem)
         conv_log.append("dashboard:chat-fail", "user", "hello")
 
-        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock, side_effect=RuntimeError("boom")):
+        with patch.object(
+            consolidator, "_consolidate", new_callable=AsyncMock, side_effect=RuntimeError("boom")
+        ):
             consolidator.consolidate_session("dashboard:chat-fail")
             await asyncio.sleep(0.1)
             for t in list(consolidator._tasks):
@@ -5068,7 +5144,9 @@ class TestConsolidateSession:
         mem.init()
 
         consolidator = HistoryConsolidator(log=conv_log, memory=mem)
-        conv_log.append("dashboard:chat-sens2", "assistant", "read .ssh/id_rsa", tools=["cat .ssh/id_rsa"])
+        conv_log.append(
+            "dashboard:chat-sens2", "assistant", "read .ssh/id_rsa", tools=["cat .ssh/id_rsa"]
+        )
 
         with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock_consolidate:
             await consolidator.consolidate_now("dashboard:chat-sens2")
@@ -5885,7 +5963,9 @@ async def test_dedupe_candidate_uses_judge_when_configured(tmp_path):
         provenance=AutoSkillProvenance(session_key="s", created_at="2026-01-01T00:00:00+00:00"),
     )
     c = HistoryConsolidator(
-        log=MagicMock(), memory=MagicMock(), skills_loader=skills,
+        log=MagicMock(),
+        memory=MagicMock(),
+        skills_loader=skills,
         judge_model="claude-haiku-4.5",
     )
     c._event_loop = asyncio.get_running_loop()
@@ -5914,8 +5994,12 @@ async def test_all_invalid_scripts_are_rejected_when_approval_disabled(tmp_path)
     mem.init()
     skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
     consolidator = HistoryConsolidator(
-        log=conv_log, memory=mem, skills_loader=skills,
-        auto_skills_enabled=True, approval_required=False, auto_min_tool_calls=5,
+        log=conv_log,
+        memory=mem,
+        skills_loader=skills,
+        auto_skills_enabled=True,
+        approval_required=False,
+        auto_min_tool_calls=5,
         generate_scripts=True,
     )
     for i in range(6):
@@ -5929,7 +6013,9 @@ async def test_all_invalid_scripts_are_rejected_when_approval_disabled(tmp_path)
                 "description": "does a scripted thing",
                 "triggers": "t1, t2",
                 "procedure_md": "## Steps\n\nrun it",
-                "scripts": [{"filename": "run.py", "content": "import os\nos.system('rm -rf /')\n"}],
+                "scripts": [
+                    {"filename": "run.py", "content": "import os\nos.system('rm -rf /')\n"}
+                ],
             },
         }
 
@@ -5964,9 +6050,9 @@ class TestMetadataReadSurvivesATransientSharingViolation:
             meta = log.get_metadata("s1")
 
         assert seen["n"] >= 1, "the simulator never intercepted the open"
-        assert meta.get("agent") == "my-agent", (
-            f"a single transient sharing violation was reported as absence: {meta!r}"
-        )
+        assert (
+            meta.get("agent") == "my-agent"
+        ), f"a single transient sharing violation was reported as absence: {meta!r}"
 
     def test_the_retry_never_sleeps_on_the_event_loop(self, tmp_path):
         """The retry delay must not run on the loop.
@@ -6014,9 +6100,7 @@ class TestMetadataReadSurvivesATransientSharingViolation:
         assert slept, "no retry pause off the event loop"
         assert meta.get("agent") == "my-agent"
 
-    def test_a_persistent_violation_still_reports_absence_but_warns(
-        self, tmp_path, caplog
-    ):
+    def test_a_persistent_violation_still_reports_absence_but_warns(self, tmp_path, caplog):
         """Fail closed after the retries, but leave a traceable warning rather
         than a confident empty dict."""
         log = ConversationLog(base_dir=tmp_path)
@@ -6058,9 +6142,7 @@ class TestAppendIfAbsentOffLoop:
         # No running loop: the append already happened, so there is nothing to
         # await and None is the correct answer, not a lost future.
         log = MagicMock()
-        assert history.append_if_absent_off_loop(
-            log, "dashboard:s1", "assistant", "body"
-        ) is None
+        assert history.append_if_absent_off_loop(log, "dashboard:s1", "assistant", "body") is None
         log.append_if_absent.assert_called_once()
 
 
@@ -6612,9 +6694,9 @@ class TestConsolidationEmbedBreaker:
 
             row = store.get_semantic("project.alpha.status")
             assert row is not None and row["embedding"] is None
-            assert store.has_pending_embeddings(), (
-                "a deferred row the repair sweep cannot see is a vector lost forever"
-            )
+            assert (
+                store.has_pending_embeddings()
+            ), "a deferred row the repair sweep cannot see is a vector lost forever"
             # The returned count is episodic-only, so the repaired row itself is
             # the evidence the semantic sub-sweep ran.
             store.backfill_missing_embeddings(pace=False)
@@ -6759,9 +6841,7 @@ class TestConsolidationLessonScope:
         lesson_store = LessonStore(base_dir=tmp_path)
         c = self._jsonl_consolidator(lesson_store)
 
-        c._save_lessons(
-            [{"rule": "Scoped to an absolute path", "repo_scope": "/etc/passwd"}]
-        )
+        c._save_lessons([{"rule": "Scoped to an absolute path", "repo_scope": "/etc/passwd"}])
 
         assert lesson_store.load_all() == []
 
@@ -6773,9 +6853,7 @@ class TestConsolidationLessonScope:
         lesson_store = LessonStore(base_dir=tmp_path)
         c = self._jsonl_consolidator(lesson_store)
 
-        c._save_lessons(
-            [{"rule": "Scoped to a list, somehow", "repo_scope": ["src/kiro_crew"]}]
-        )
+        c._save_lessons([{"rule": "Scoped to a list, somehow", "repo_scope": ["src/kiro_crew"]}])
 
         assert lesson_store.load_all() == []
 

@@ -87,6 +87,7 @@ from kiro_crew.acp.client import (
 )
 from kiro_crew.acp.liveness import (
     EVIDENCE_ESTABLISHED_FLAT,
+    EVIDENCE_MCP_SUBTREE_ACTIVE,
     EVIDENCE_PLATFORM_LIMITED,
     EVIDENCE_REMOTE_FLAT,
     EVIDENCE_SHELL_CHILD_ABSENT,
@@ -96,6 +97,7 @@ from kiro_crew.acp.liveness import (
     VERDICT_STUCK_INPUT,
     VERDICT_UNKNOWN,
     VERDICT_WORKING,
+    InFlightToolTracker,
     InteractiveClassification,
     LivenessOracle,
     ToolCallState,
@@ -672,6 +674,16 @@ def models_from_config_options(resp: dict[str, Any], backend: str) -> dict[str, 
     """
     if backend not in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION:
         return None
+    return model_select_envelope(resp)
+
+
+def model_select_envelope(resp: dict[str, Any]) -> dict[str, Any] | None:
+    """The ``model`` select of a session response as a ``models`` envelope, ungated.
+
+    The shape walk behind :func:`models_from_config_options`, without its
+    membership gate, for a caller that asks the select one narrow question rather
+    than adopting it as the session's advertised list.
+    """
     for opt in resp.get("configOptions") or []:
         if not isinstance(opt, dict) or opt.get("id") != "model" or opt.get("type") != "select":
             continue
@@ -1007,6 +1019,7 @@ class AcpSessionHandle:
         watchdog: WatchdogSettings | None = None,
         crew_agent: str = "",
         session_key: str = "",
+        bound_cwd: str = "",
     ) -> None:
         self._session_id = session_id
         self._session_notices = SessionNoticeState()
@@ -1055,8 +1068,16 @@ class AcpSessionHandle:
         # the prompt about to go out, so no steer is sent until it is set.
         self._prompt_written: bool = False
         self.native_context_documents: dict[str, str] = {}
+        # Whether THIS session's array carries the member session-control entry.
+        # Set by the composer that decided it (create and load alike), and read
+        # by the context builder so the member operating-mode block is injected
+        # only when the session actually holds the tools that block teaches.
+        self.member_dispatch_mounted: bool = False
         self._queue = queue
         self._runtime = runtime
+        # The directory THIS session was opened against, which on a shared runtime is
+        # not the runtime's own: sessions for different projects live on one process.
+        self._bound_cwd = bound_cwd
         # When True, destroy() skips the transcript unlink (subagent
         # continuability: the transcript is spawn_continue's resume material).
         self.keep_transcript = False
@@ -1092,20 +1113,15 @@ class AcpSessionHandle:
         # submitting a second job, so a wedged walk cannot stack blocked workers
         # in the shared subprocess_executor().
         self._consult_future: asyncio.Future[tuple[str, str]] | None = None
-        # Parallel calls can finish in either order; retain each attribution
-        # until its terminal result so the oracle never inspects a finished call.
-        self._active_tool_calls: dict[
-            str, tuple[ToolCallState, InteractiveClassification | None]
-        ] = {}
-        self._inflight_tool: ToolCallState | None = None
-        # Pre-dispatch interactive classification of the in-flight SHELL tool
-        # (``classify_interactive_command``); ``None`` when no shell tool is in
-        # flight. Read by the tool branch's window policy and by the post-stall
-        # classifier; never by the oracle.
-        self._inflight_interactive: InteractiveClassification | None = None
-        # toolCallId of the in-flight tool ("" when none): ``ToolCallState`` does
-        # not carry the id, and the ``waiting_input`` status must name the call.
-        self._inflight_tool_call_id = ""
+        # The in-flight tool hand-off rule, shared with the sub-agent reaper
+        # (``InFlightToolTracker``): parallel calls can finish in either order,
+        # so each attribution is retained by toolCallId until its terminal result
+        # and the judged call falls back to the newest remaining one. The
+        # pre-dispatch interactive classification of a shell call rides as the
+        # tracker's aux payload (``None`` for a non-shell tool). ``ToolCallState``
+        # does not carry the id, and the ``waiting_input`` status must name the
+        # call, so the tracker keeps it too (``_inflight_tool_call_id`` below).
+        self._tool_tracker = InFlightToolTracker()
         # toolCallIds that streamed output (a non-final tool_call_update with
         # content) this turn. A command that already produced output may have
         # already acted, so a non-interactive retry of it is never ``safe_retry``.
@@ -1190,6 +1206,13 @@ class AcpSessionHandle:
         # a yield in prompt().
         self._parked_total: float = 0.0
         self._parked_since: float | None = None
+        # Last /api/session-keepalive touch addressed to THIS session (monotonic,
+        # 0.0 for none), and `_parked_total` when it landed. Written by
+        # note_keepalive(); folded into the tool-idle clock in _dispatch_events.
+        # Never reset per turn: a touch from an earlier turn is older than this
+        # turn's own frames, so the fold can never pick it up.
+        self._keepalive_ts: float = 0.0
+        self._keepalive_parked: float = 0.0
         # Monotonic timestamp of a `failed` compaction status seen this turn
         # (None otherwise). Arms the post-failure budget in _dispatch_events,
         # which ends an abandoned turn instead of draining to the ceiling.
@@ -1339,6 +1362,12 @@ class AcpSessionHandle:
         self.model_pin_partial: str = ""
         self._config_options: list[dict[str, Any]] = []
         self._available_models: list[dict[str, str]] = []
+        # Read by KAS only: the listed id a session born on an unlisted ``auto`` moves to,
+        # or "". One answer read from the ``model`` select, never the list itself:
+        # nobody has shown that list to be the account's complete served set, so
+        # it must not become the entitlement list the picker and the explicit-pick
+        # guard narrow by.
+        self._kas_auto_fallback: str = ""
         # Read-path revalidation bookkeeping (see maybe_refresh_available_models).
         # The session-init snapshot is one unconfirmed answer captured at one
         # instant, and the read path (the dashboard picker filter) has no
@@ -1479,7 +1508,9 @@ class AcpSessionHandle:
 
     # ── Prompt ──
 
-    async def prompt(self, message: str, timeout: float | None = None) -> AsyncIterator[AcpEvent]:
+    async def prompt(
+        self, message: str, timeout: float | None = None, *, allow_image: bool = True
+    ) -> AsyncIterator[AcpEvent]:
         """Send session/prompt and yield AcpEvent objects until the turn completes.
 
         Dispatches events from the per-session queue with the same logic as
@@ -1489,6 +1520,10 @@ class AcpSessionHandle:
         ``timeout=None`` (every dashboard turn) resolves from
         ``agent.chat_turn_timeout_secs`` so the transport wait follows a raised
         turn ceiling instead of cutting the turn at the 2h default underneath it.
+
+        ``allow_image=False`` sends the message as text only: no path in it is
+        read or inlined, whatever the agent advertises. For a prompt that is
+        text ABOUT a session, where a path is quoted history, not an attachment.
         """
 
         async def _build() -> tuple[str, dict[str, Any]]:
@@ -1499,7 +1534,7 @@ class AcpSessionHandle:
             prompt_blocks = await asyncio.to_thread(
                 build_prompt_blocks,
                 message,
-                allow_image=self._runtime.supports_image_prompt,
+                allow_image=allow_image and self._runtime.supports_image_prompt,
             )
             # Content-free outbound STRUCTURE diagnostics: one
             # line per turn build recording block counts, per-type counts, and
@@ -1649,10 +1684,7 @@ class AcpSessionHandle:
         # A new turn starts with no infrastructure verdict carried over.
         self.last_infra_error = None
         self._tool_dispatched = False
-        self._active_tool_calls.clear()
-        self._inflight_tool = None
-        self._inflight_interactive = None
-        self._inflight_tool_call_id = ""
+        self._tool_tracker.clear()
         self._tool_output_seen.clear()
         self._status_rejected.clear()
         self._input_wait_emitted = False
@@ -2501,8 +2533,16 @@ class AcpSessionHandle:
         ``session/new`` assigned). So this path never puts an unserved model on
         the wire, exactly like the interactive ``_wire_model_id``
         reset-to-default. Explicit user picks raise instead, upstream in
-        ``AcpSessionProvider.set_model`` / ``AcpClient.set_model``.
+        ``AcpSessionProvider.set_model`` / ``AcpClient.set_model``; on a harness in
+        ``ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION`` the adapter can still refuse a
+        pick that passed those guards, and that refusal is recorded in
+        ``model_pin_refused`` for the caller to read back
+        (``chat_handlers._try_live_model_switch`` does).
         """
+        # Each call describes only itself: a refusal recorded by an earlier call
+        # must not survive a later one, or a read-after-call reports a pick that
+        # landed (or inherited the default) as refused.
+        self.model_pin_refused = ""
         # Backend-aware: on a ``<model>[<effort>]`` pair-id harness the advertised
         # list is the picker's vocabulary while the ``model`` config option's is
         # the BARE id, so a bare pin misses the list yet is exactly what the wire
@@ -2645,6 +2685,7 @@ class AcpSessionHandle:
             raise AcpModelUnavailable(
                 _rejected_log,
                 advertised_ids,
+                backend=self._runtime.acp_backend,
                 # Only a pair-id harness earns the adapter-mismatch wording: on
                 # those the advertised list IS the entitlement, so refusing
                 # something on it is the adapter contradicting itself. Elsewhere an
@@ -3093,6 +3134,25 @@ class AcpSessionHandle:
     def last_steer_monotonic(self) -> float:
         """Monotonic time of the last steer written to the backend (0.0 if none)."""
         return self._last_steer_monotonic
+
+    def note_keepalive(self) -> None:
+        """Record a ``/api/session-keepalive`` touch addressed to this session.
+
+        A blocking MCP tool on this session (``wait``, ``spawn_sub_agents``)
+        sends no frame while it runs, so this is the only sign it is alive.
+        The runtime's ``_last_activity`` is process-wide and the tool-idle clock
+        deliberately ignores it (a co-tenant's traffic must not defer this
+        session's stall), so the touch is stamped here, where the clock reads it.
+        """
+        now = time.monotonic()
+        since = self._parked_since
+        self._keepalive_ts = now
+        # The park baseline at the touch, including a park still in progress:
+        # a touch can land while the consumer holds an event, and
+        # `_parked_total` banks a park only when it ends.
+        self._keepalive_parked = self._parked_total + (
+            max(0.0, now - since) if since is not None else 0.0
+        )
 
     @property
     def supports_steer(self) -> bool:
@@ -3657,6 +3717,18 @@ class AcpSessionHandle:
         if isinstance(config_options, list):
             self._config_options = config_options
             self._sync_effort_levels()
+            # Read the whole select once and keep only its answer, so a long list
+            # is never truncated and never stored. Only the KAS arm of
+            # ``ensure_served_default`` reads it.
+            select = model_select_envelope(resp) or {}
+            ids = [
+                m["modelId"]
+                for m in select.get("availableModels", [])
+                if isinstance(m.get("modelId"), str)
+            ]
+            self._kas_auto_fallback = (
+                pick_served_default("auto", ids) if select.get("currentModelId") == "auto" else ""
+            )
         # Where this host's model list lives is asked in ONE place
         # (``session_models_envelope``): a host in
         # ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` advertises no ``models`` object
@@ -3715,14 +3787,16 @@ class AcpSessionHandle:
         be handed ``"auto"`` at birth — and then every prompt on this session
         dies with "your account does not have access to model 'auto'".
 
-        Only the kiro backend: its advertised ids are exactly the ids
-        ``session/set_model`` accepts, so "absent from the advertised list"
-        genuinely means unusable there.
+        The kiro backend judges any current id: its advertised ids are exactly
+        the ids ``session/set_model`` accepts, so "absent from the advertised
+        list" genuinely means unusable there. KAS judges only an ``auto``
+        default, against its ``model`` select (see the branch below).
 
         Routed through :meth:`set_model` rather than a second wire call, so the
         KAS-vs-``session/set_model`` verb choice and the window/meter rebase
-        stay in one place; the id handed to it is already an advertised one, so
-        its own ``resolve_usable_model`` passes it straight through.
+        stay in one place. On kiro the id handed to it is an advertised one; on
+        KAS it comes from the host's own select and passes because KAS
+        advertises no list. Either way ``resolve_usable_model`` lets it through.
 
         ``_model`` is restored afterwards. That field is the session's INTENT
         (``""``/``"auto"`` mean "inherit"), and it is what the warm-pool
@@ -3748,6 +3822,36 @@ class AcpSessionHandle:
             intent = self._model
             try:
                 await self.set_model(fallback)
+            finally:
+                self._model = intent
+        elif self._runtime.acp_backend == ACP_BACKEND_KAS:
+            # KAS defaults a new session to ``auto`` and lists its models only in
+            # the ``model`` select. That list answers ONE question here: is the
+            # ``auto`` this session sits on missing from it? A listed id is served,
+            # so moving to one is safe even if the list is incomplete. A concrete
+            # current model is never judged against it, since a partial list would
+            # move a session off a model the account can run.
+            fallback = self._kas_auto_fallback
+            if not fallback:
+                return
+            logger.warning(
+                "KAS session %s defaults to auto, which its model select does not list; "
+                "switching to %s",
+                self._session_id,
+                fallback,
+            )
+            intent = self._model
+            try:
+                await self.set_model(fallback)
+            except (AcpError, AcpRequestTimeout) as exc:
+                # session/new already succeeded; a refused switch must not fail
+                # the session start. Stay on the backend default, the substitute
+                # path's own contract.
+                logger.warning(
+                    "KAS session %s could not switch off auto: %s",
+                    self._session_id,
+                    redact_log_via_context(str(exc)),
+                )
             finally:
                 self._model = intent
 
@@ -4347,11 +4451,12 @@ class AcpSessionHandle:
                     # stderr: AcpRuntime's stderr drain only rings the
                     # _stderr_lines buffer, so a kiro-cli reasoning burst on
                     # stderr does not move this clock); the tool clock keys off
-                    # this session's OWN queue frames only (keepalive and
-                    # progress frames for the session reset last_own_data_ts, so
-                    # a legitimately-streaming tool keeps the watchdog
-                    # satisfied, while a co-tenant's ownerless fanned-out frame
-                    # does not defer it).
+                    # this session's OWN queue frames and keepalive touches only
+                    # (progress frames for the session reset last_own_data_ts,
+                    # and note_keepalive() stamps the touch the folding below
+                    # reads, so a legitimately-streaming or keepalive-pinging
+                    # tool keeps the watchdog satisfied, while a co-tenant's
+                    # ownerless fanned-out frame or keepalive does not defer it).
                     if self._cancelled:
                         continue
                     wd = self._watchdog
@@ -4379,11 +4484,19 @@ class AcpSessionHandle:
                         # branch QUICKER to cancel a live turn — the one
                         # direction a clock change here must never take by
                         # accident.
+                        #
+                        # A keepalive touch for THIS session counts as an own
+                        # frame: a blocking MCP tool (wait, spawn_sub_agents)
+                        # sends none while it runs and pings this instead. Its
+                        # park baseline is the one taken when the touch landed.
+                        if self._keepalive_ts > last_own_data_ts:
+                            last_own_data_ts = self._keepalive_ts
+                            parked_at_own_data = self._keepalive_parked
                         _own_parked = max(0.0, self._parked_total - parked_at_own_data)
                         _tool_idle = max(0.0, (now - last_own_data_ts) - _own_parked)
                         if _tool_idle <= wd.check_after_secs:
                             continue
-                        # F2 — TOCTOU guard: two complementary signals cover
+                        # TOCTOU guard: two complementary signals cover
                         # the two delivery paths for a frame that arrives DURING
                         # the oracle await (up to 10 s in an executor, event
                         # loop yielded).
@@ -4402,6 +4515,7 @@ class AcpSessionHandle:
                         # either delivery path.
                         _ingress_before = self._ingress_seq
                         _q_depth_before = self._queue.qsize()
+                        _keepalive_before = self._keepalive_ts
                         verdict, evidence = await self._consult_oracle_offloaded(model_wait=False)
                         # TOCTOU recheck — activity on either path prevents the cancel.
                         if (
@@ -4422,33 +4536,49 @@ class AcpSessionHandle:
                             last_own_data_ts = last_data_ts
                             parked_at_own_data = self._parked_total
                             continue
+                        if self._keepalive_ts > _keepalive_before:
+                            # A keepalive for THIS session landed during the
+                            # await: the same activity-in-flight rule as the
+                            # frames above, attributed to this session, so it
+                            # moves only the tool clock, to the touch's stamp.
+                            last_own_data_ts = self._keepalive_ts
+                            parked_at_own_data = self._keepalive_parked
+                            continue
                         if verdict == VERDICT_WORKING:
                             # Stamped after the consult returns: the probe
                             # observed the tool at the end of its await, so
                             # the pre-consult clock would shorten the window.
                             tool_moved_ts = time.monotonic()
-                            self._log_working_deferral(_tool_idle, evidence, timeout)
-                            continue
+                            if not self._working_tool_bound_reached(evidence, _tool_idle):
+                                self._log_working_deferral(_tool_idle, evidence, timeout)
+                                continue
+                            # Opaque-MCP WORKING past the hard cap: fall
+                            # through to the same session-scoped recovery
+                            # an UNKNOWN past the cap gets below.
                         # UNKNOWN acts at the suspect window. The suspect
                         # default (90 min) is BUILD-scale forbearance — an LLM-shaped
                         # stall (flat subtree whose only live evidence is an
                         # established backend socket: a model turn riding inside
                         # a tool, e.g. kiro-cli use_subagent) narrows to the
                         # model-silent budget, because its longest legitimate
-                        # silent gap is minutes, not hours. Keyed STRICTLY on
-                        # the oracle's evidence TAGS — established_flat, or
-                        # shell_child_absent for a shell command with no process
-                        # to its name. Untagged evidence (a quiet build's
-                        # unmatched-but-live tree, a quiet MCP tool) keeps the
-                        # full window.
-                        # F3 — hard cap: watchdog_tool_stall_hard_cap_secs is
+                        # silent gap is minutes, not hours. Every narrowing below
+                        # is keyed STRICTLY on an oracle evidence TAG:
+                        # established_flat; shell_child_absent, a shell command
+                        # with no process to its name; platform_limited, only
+                        # when the tool layer classified the command
+                        # prompt-shaped; remote_flat, only while
+                        # remote_flat_probe_secs is on. Evidence matching none
+                        # of them (a quiet build's unmatched-but-live tree, for
+                        # one) keeps the full window.
+                        # Hard cap: watchdog_tool_stall_hard_cap_secs is
                         # the absolute ceiling for UNKNOWN forbearance. Apply
                         # min(suspect_window, hard_cap) so the configured cap
                         # always bounds the effective window. WORKING deferred
-                        # unconditionally above; DEAD/STUCK_INPUT act
-                        # immediately regardless of the window.
-                        # WORKING was already deferred above; the action below
-                        # is the existing non-lethal tool-stall recovery.
+                        # above, except an opaque-MCP reading past the hard
+                        # cap; DEAD/STUCK_INPUT act immediately regardless of
+                        # the window.
+                        # The action below is the non-lethal tool-stall
+                        # recovery.
                         _suspect = wd.tool_stall_suspect_secs
                         _full_suspect = min(_suspect, wd.tool_stall_hard_cap_secs)
                         # Idle measure the chosen window is compared against. Only
@@ -4543,12 +4673,18 @@ class AcpSessionHandle:
                             # task's deadline — is the bound. Never a cancel,
                             # never an auto-answer.
                             continue
+                        if verdict == VERDICT_WORKING:
+                            _cancel_window = "working_cap"
+                        elif _narrowed:
+                            _cancel_window = "narrowed"
+                        else:
+                            _cancel_window = "standard"
                         self._emit_watchdog_metric(
                             "cancel",
                             verdict,
                             evidence,
                             _tool_idle,
-                            window="narrowed" if _narrowed else "standard",
+                            window=_cancel_window,
                         )
                         async for ev in self._end_stalled_tool(
                             verdict, evidence, _tool_idle, status=_input_wait
@@ -5184,6 +5320,51 @@ class AcpSessionHandle:
             for _m in _buffered:
                 self._queue.put_nowait(_m)
 
+    # ── In-flight tool state (delegated to the shared tracker) ──
+    # These read-only views keep the call sites that read the judged tool
+    # unchanged while the hand-off rule lives in ``InFlightToolTracker``. The
+    # dispatch / terminal / prompt-start writes go through the tracker directly
+    # (see ``_dispatch_events`` and ``prompt``).
+
+    @property
+    def _inflight_tool(self) -> ToolCallState | None:
+        """The :class:`ToolCallState` a stall verdict is read against."""
+        return self._tool_tracker.current
+
+    @_inflight_tool.setter
+    def _inflight_tool(self, value: ToolCallState | None) -> None:
+        # A direct set stages one call (the single-slot shape the watchdog tests
+        # use to force the oracle path): ``None`` clears, otherwise it becomes the
+        # judged call under the empty-id slot. The normal dispatch path writes
+        # through ``_tool_tracker.dispatch`` with the real toolCallId.
+        if value is None:
+            self._tool_tracker.clear()
+        else:
+            self._tool_tracker.dispatch("", value)
+
+    @property
+    def _active_tool_calls(
+        self,
+    ) -> dict[str, tuple[ToolCallState, "InteractiveClassification | None"]]:
+        """Live ``{toolCallId: (state, interactive)}`` map, backed by the shared
+        tracker. Read-only by convention — the hand-off goes through the tracker
+        (see ``_dispatch_events`` and ``prompt``)."""
+        return self._tool_tracker.active_calls  # type: ignore[return-value]
+
+    @property
+    def _inflight_interactive(self) -> "InteractiveClassification | None":
+        """Pre-dispatch interactive classification of the in-flight SHELL tool
+        (``None`` when no shell tool is in flight). Carried as the tracker's aux
+        payload. Read by the tool branch's window policy and the post-stall
+        classifier; never by the oracle."""
+        aux = self._tool_tracker.current_aux
+        return aux  # type: ignore[return-value]
+
+    @property
+    def _inflight_tool_call_id(self) -> str:
+        """toolCallId of the in-flight tool ("" when none)."""
+        return self._tool_tracker.current_id
+
     def _retire_liveness_state(self) -> None:
         """Release the tracked consult and swap in a fresh, configured oracle.
 
@@ -5303,6 +5484,25 @@ class AcpSessionHandle:
         pending = len(starts) if isinstance(starts, dict) else 0
         return len(queues) + (inits if isinstance(inits, int) else 0) + pending
 
+    def _working_tool_bound_reached(self, evidence: str, tool_idle: float) -> bool:
+        """Whether a tool-branch WORKING reading has run out of forbearance.
+
+        Only the opaque-MCP reading is bounded. It says some process in the
+        runtime's tree moved, which a warm sibling MCP server does too, so a
+        call whose result frame was lost would otherwise hold the turn to its
+        deadline. The bound is ``watchdog.tool_stall_hard_cap_secs``, the same
+        ceiling an UNKNOWN reading gets, measured on the session's own frame
+        clock. A matched shell child, the declared-duration ``wait`` verdict
+        and a kirocrew-core tool that pings the session keepalive
+        (:meth:`ToolCallState.is_trusted_keepalive_tool`) keep deferring.
+        """
+        if not evidence.startswith(EVIDENCE_MCP_SUBTREE_ACTIVE):
+            return False
+        tool = self._inflight_tool
+        if tool is not None and tool.is_trusted_keepalive_tool():
+            return False
+        return tool_idle > self._watchdog.tool_stall_hard_cap_secs
+
     def _log_working_deferral(self, idle: float, evidence: str, turn_timeout: float) -> None:
         """Evidence trail for a WORKING deferral, rate-limited to one line per
         interval so a 40-minute build doesn't spam the journal.
@@ -5349,9 +5549,11 @@ class AcpSessionHandle:
         bucketed by :func:`_watchdog_evidence_class`; ``window`` is one of:
         "standard" (default), "narrowed" (a tool-branch tag reduces the
         build-scale suspect window — established_flat to the model-silent budget,
-        shell_child_absent to the ordinary silence window), or "extended"
-        (model-wait established_flat extends the 600s stale window to the
-        model-silent probe window for a non-streamed server-side think).
+        shell_child_absent and a prompt-shaped command's platform_limited to the
+        ordinary silence window, remote_flat to the opt-in remote-call budget),
+        "extended" (model-wait established_flat extends the 600s stale window to the
+        model-silent probe window for a non-streamed server-side think), or
+        "working_cap" (an opaque-MCP WORKING reading ran past the hard cap).
         ``agent_override`` is the per-agent-override BOOLEAN from the settings
         snapshot — deliberately NOT the agent name (per-agent joins happen via
         the always-on token row store, not OTel attrs). Failures never reach
@@ -6560,7 +6762,7 @@ class AcpSessionHandle:
             filtered_events.append(ev)
             if ev.kind == EVENT_TEXT_CHUNK:
                 self.last_prompt_stats.text_chunks += 1
-                self._stale_eligible = not self._active_tool_calls
+                self._stale_eligible = not self._tool_tracker.any_active
                 self._prompt_or_tool_seen = True
             elif ev.kind == EVENT_TOOL_CALL:
                 self._stale_eligible = False
@@ -6584,8 +6786,6 @@ class AcpSessionHandle:
                     if ev.is_shell
                     else None
                 )
-                self._inflight_interactive = interactive
-                self._inflight_tool_call_id = ev.tool_call_id or ""
                 self._input_wait_emitted = False
                 if interactive is not None and interactive.risk != INTERACTIVE_NONE:
                     logger.info(
@@ -6605,7 +6805,7 @@ class AcpSessionHandle:
                 # flag. A new dispatch retires the oracle so its tracked child
                 # and counter samples never bleed across tools — including from a
                 # walk still running against the previous tool's command.
-                self._inflight_tool = ToolCallState(
+                inflight_tool = ToolCallState(
                     title=ev.title,
                     command=ev.tool_input,
                     dispatch_ts=time.monotonic(),
@@ -6619,10 +6819,11 @@ class AcpSessionHandle:
                     mcp_server_name=(ev.mcp_server_name if ev.mcp_identity_trusted else ""),
                     interactive_risk=(interactive.risk if interactive else INTERACTIVE_NONE),
                 )
-                self._active_tool_calls[self._inflight_tool_call_id] = (
-                    self._inflight_tool,
-                    interactive,
-                )
+                # The shared hand-off rule stores the call by id and makes it the
+                # judged one (the interactive classification rides as the aux
+                # payload, read back via ``_inflight_interactive``). A dispatch
+                # always changes the judged call, so retire the oracle.
+                self._tool_tracker.dispatch(ev.tool_call_id or "", inflight_tool, interactive)
                 self._retire_liveness_state()
             elif ev.kind == EVENT_TOOL_RESULT:
                 if not ev.tool_final and ev.tool_call_id:
@@ -6630,19 +6831,15 @@ class AcpSessionHandle:
                     # later non-interactive retry of it is not a safe replay.
                     self._tool_output_seen.add(ev.tool_call_id)
                 if ev.tool_status in TERMINAL_TOOL_STATUSES:
-                    self._active_tool_calls.pop(ev.tool_call_id or "", None)
-                    self._tool_dispatched = bool(self._active_tool_calls)
-                    self._stale_eligible = not self._active_tool_calls
-                    if self._inflight_tool_call_id not in self._active_tool_calls:
-                        if self._active_tool_calls:
-                            self._inflight_tool_call_id = next(reversed(self._active_tool_calls))
-                            self._inflight_tool, self._inflight_interactive = (
-                                self._active_tool_calls[self._inflight_tool_call_id]
-                            )
-                        else:
-                            self._inflight_tool = None
-                            self._inflight_interactive = None
-                            self._inflight_tool_call_id = ""
+                    # The shared hand-off rule drops the finished call and, when
+                    # it was the judged one, re-points to the newest remaining
+                    # dispatch (or clears). It returns whether the judged call
+                    # changed — only then is the oracle retired and the input
+                    # wait reset.
+                    judged_changed = self._tool_tracker.result(ev.tool_call_id or "", terminal=True)
+                    self._tool_dispatched = self._tool_tracker.any_active
+                    self._stale_eligible = not self._tool_tracker.any_active
+                    if judged_changed:
                         self._input_wait_emitted = False
                         self._retire_liveness_state()
                 # L1 of the recovery ladder: classify the result text ONCE, at

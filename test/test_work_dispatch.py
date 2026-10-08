@@ -249,7 +249,6 @@ def test_retry_of_unknown_run_resubmits_the_same_run_id(manager):
 def test_retry_of_queued_run_is_noop_without_duplicate_spawn(manager):
     item = _setup()
     _launch(manager, item)
-    run_id = wi.read_item(KEY, item["id"])["assignment"]["worker_run_id"]
     # The gateway died between manager acceptance and the acceptance receipt.
     _crash_back_to_pending(wi.ASSIGNMENT_PENDING_DELIVERY)
 
@@ -469,7 +468,6 @@ def test_fast_recon_allows_only_one_live_assignment_per_coordinator(manager):
 def test_event_hook_ignores_unrelated_subagents(manager):
     item = _setup()
     _launch(manager, item)
-    run_id = wi.read_item(KEY, item["id"])["assignment"]["worker_run_id"]
 
     # An unrelated child must not deliver this item's contract.
     asyncio.run(manager.fire("subagent_spawn", "01234567"))

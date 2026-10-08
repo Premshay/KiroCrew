@@ -24,9 +24,8 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from kiro_crew.apps.manager import is_app_enabled
-from kiro_crew.platform.app_execution import authenticated_app_execution
-
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+from kiro_crew.platform.app_execution import authenticated_app_execution
 from kiro_crew.security import redact
 
 from ..profiles.github_repo.pr_recipe import GitHubPRRecipe

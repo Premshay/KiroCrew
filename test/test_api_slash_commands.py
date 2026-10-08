@@ -132,6 +132,7 @@ class TestApiSlashCommands:
         assert "/tangent" not in names
         assert "/quit" not in names
 
+
 class TestAdvertisedCommands:
     """The Claude backend forwards the CLI's own registry; the menu shows it.
 

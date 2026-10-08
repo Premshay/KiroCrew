@@ -494,7 +494,11 @@ def import_bundle(appearances: Any, payload: Any) -> dict[str, Any]:
             art += 1
         else:
             return {"ok": False, "error": f"Unsupported file in bundle: {safe}"}
-        if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+        try:
+            size = len(content.encode("utf-8"))
+        except UnicodeEncodeError:
+            return {"ok": False, "error": f"Unsupported file in bundle: {safe}"}
+        if size > MAX_FILE_BYTES:
             return {"ok": False, "error": f"File too large in bundle: {safe}"}
         clean[safe] = content
 

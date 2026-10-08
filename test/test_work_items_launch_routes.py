@@ -100,7 +100,11 @@ def routes(monkeypatch):
 
 async def _create_item(routes) -> dict:
     opened = await routes.api_work_cycle_open(
-        _request("POST", "/api/work-items/cycle/open", body={"goal": "route cycle", "next_action": "launch"})
+        _request(
+            "POST",
+            "/api/work-items/cycle/open",
+            body={"goal": "route cycle", "next_action": "launch"},
+        )
     )
     assert opened.status == 200
     created = await routes.api_work_item_create(
@@ -451,5 +455,7 @@ def test_mcp_worker_tools_refuse_unverified_identity(monkeypatch):
     monkeypatch.setattr(mcp_core, "_get", transport)
     monkeypatch.setattr(mcp_core, "_post", transport)
     assert "could not be verified" in work_items.work_item_assigned_list("x", {})
-    assert "could not be verified" in work_items.work_item_launch("x", {"item_id": "wi_1", "candidate_id": "cd"})
+    assert "could not be verified" in work_items.work_item_launch(
+        "x", {"item_id": "wi_1", "candidate_id": "cd"}
+    )
     transport.assert_not_called()

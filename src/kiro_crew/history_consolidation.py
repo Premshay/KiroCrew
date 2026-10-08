@@ -74,6 +74,8 @@ _CONSOLIDATION_THRESHOLD = 30
 # durable-offset threshold is its safety net; preferences can keep updating
 # without silently leaving the transcript unprocessed forever.
 _HISTORY_LAG_THRESHOLD = 300
+_SEEDED_PER_SWEEP = 3
+_SEED_MAX_AGE_SECS = 7 * 86400
 # A consolidation turn produces a compact structured record. Bound a stalled
 # provider so its dedicated background session cannot block later maintenance.
 _CONSOLIDATION_TURN_TIMEOUT_S = 3 * 60
@@ -601,6 +603,8 @@ def _consolidation_chunk(messages: list[dict]) -> list[dict]:
 def _prompt_rows(messages: list[dict]) -> list[dict]:
     """*messages* without display-only rows, which no consolidation prompt carries."""
     return [m for m in messages if m.get("role") not in DISPLAY_ONLY_ROLES]
+
+
 _PLACEHOLDER_BODIES = frozenset(
     {
         "unchanged",
@@ -972,9 +976,13 @@ class HistoryConsolidator:
         self._event_loop: "asyncio.AbstractEventLoop | None" = None
         self._last_lifecycle: float = 0.0
         self._running: set[str] = set()
+        self.on_abandoned: Callable[[str, int, str], None] | None = None
         self._tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         # Track last activity per session for idle-based history consolidation
         self._last_activity: dict[str, float] = {}
+        self._activity_seeded = False
+        self._seeded_keys: set[str] = set()
+        self._seed_task: asyncio.Task[None] | None = None
         self._history_consolidated: dict[str, float] = {}  # key → last history consolidation time
         self._direct_request_lock = asyncio.Lock()
         # Separate offset for prefs-only consolidation (doesn't advance main offset)
@@ -1135,6 +1143,21 @@ class HistoryConsolidator:
             self._logger.warning(
                 "Could not mark abandoned consolidation for %s", key, exc_info=True
             )
+            return
+        if self.on_abandoned is not None:
+            try:
+                self.on_abandoned(key, span.prompted - span.offset, reason)
+            except Exception:
+                self._logger.warning(
+                    "Could not report abandoned consolidation for %s", key, exc_info=True
+                )
+
+    def _busy(self, key: str) -> bool:
+        """Treat canonical and legacy names of one transcript as one running task."""
+        from kiro_crew.history import transcript_lock_stems
+
+        stems = set(transcript_lock_stems(key))
+        return any(stems.intersection(transcript_lock_stems(running)) for running in self._running)
 
     async def _note_environment_failure(
         self,
@@ -1179,14 +1202,74 @@ class HistoryConsolidator:
             max(0.0, retry_at - _time.time()),
         )
 
+    def _scan_unconsolidated_transcripts(self) -> dict[str, float]:
+        """Map each transcript's LIVE session key to its file mtime, for unconsolidated tails.
+
+        Blocking file IO: run off the event loop. The live key, never the filename
+        stem: ``_consolidate`` keys its member-memory receipt on the session key,
+        so a stem would miss a receipt committed before the restart and publish
+        the span twice. A stem whose live key cannot be recovered exactly (the
+        ``:`` fold is not reversible) is skipped. Only persistent transcripts qualify: ``_consolidate`` refuses every other
+        mode, and a refusal sets no throttle, so a private one would be
+        re-dispatched on every sweep. A thread's privacy can live only in the
+        session map (its header stamp may have failed), so a map-flagged
+        transcript is skipped too, and with no map to ask nothing is seeded.
+        """
+        from kiro_crew.messaging.privacy_mode import conv_state_map  # deferred like its own
+
+        found: dict[str, float] = {}
+        session_map = conv_state_map(self._sessions)
+        if session_map is None:
+            return found
+        private = {self._log._path(key).stem for key in session_map.privacy_flagged_entries()}
+        for path in sorted(self._log._dir.glob("*.jsonl")):
+            if path.is_symlink() or path.stem.startswith(("memory-consolidation", "subagent_")):
+                continue
+            if path.stem in private:
+                continue
+            stem = path.stem
+            key = (
+                "dashboard:" + stem[len("dashboard_") :]
+                if stem.startswith("dashboard_")
+                else session_map.channel_key_for_stem(stem)
+            )
+            try:
+                if not key or self._log._path(key).name != path.name:
+                    continue
+                mtime = path.stat().st_mtime
+                if mtime < _time.time() - _SEED_MAX_AGE_SECS:
+                    continue
+                mode = self._log.get_metadata(key).get("memory_mode") or "persistent"
+                if mode == "persistent" and self._log.unconsolidated_count(key) > 0:
+                    found[key] = mtime
+            except Exception:
+                _HISTORY_LOGGER.debug("idle seed skipped %s", path.name, exc_info=True)
+        return found
+
+    async def _seed_last_activity(self) -> None:
+        """Seed ``_last_activity`` once from disk; a live key always wins."""
+        from kiro_crew.history import _safe_key  # circular: history re-exports this module
+
+        try:
+            found = await asyncio.to_thread(self._scan_unconsolidated_transcripts)
+        except Exception:
+            _HISTORY_LOGGER.warning("idle seed scan failed", exc_info=True)
+            return
+        tracked = {_safe_key(key) for key in self._last_activity}
+        for key, mtime in found.items():
+            if _safe_key(key) not in tracked:
+                self._last_activity[key] = mtime
+                self._seeded_keys.add(key)
+
     def maybe_consolidate(self, key: str) -> None:
         """Fire memory consolidation for volume, including a large history backlog."""
         if not self._auto_consolidation_enabled:
             return
         self._last_activity[key] = _time.time()
+        self._seeded_keys.discard(key)
         if _persistence_disabled():
             return
-        if key in self._running:
+        if self._busy(key):
             return
         total = len(self._log._read_messages(key))
         prefs_off = self._prefs_offset.get(key, 0)
@@ -1247,22 +1330,33 @@ class HistoryConsolidator:
         """Check all tracked sessions for idle-based history consolidation."""
         if not self._auto_consolidation_enabled or _persistence_disabled():
             return
+        if not self._activity_seeded:
+            with contextlib.suppress(RuntimeError):
+                self._seed_task = asyncio.get_running_loop().create_task(self._seed_last_activity())
+                self._activity_seeded = True
         now = _time.time()
+        seeded_budget = _SEEDED_PER_SWEEP
         for key, last in list(self._last_activity.items()):
             if now - last < self._history_idle_secs:
                 continue
-            total, unconsolidated = self._log.consolidation_counts(key)
+            seeded = key in self._seeded_keys
+            if seeded:
+                if seeded_budget < 1:
+                    continue
+                seeded_budget -= 1
+                self._last_activity[key] = self._last_activity.pop(key)
+            total, unconsolidated = (0, 1) if seeded else self._log.consolidation_counts(key)
             if (
                 unconsolidated < 1
                 or now - self._history_consolidated.get(key, 0) < self._history_idle_secs
-                or key in self._running
+                or self._busy(key)
                 # Durable backoff, checked last so it only costs a metadata read
                 # once the cheap conditions pass. The in-memory throttle above is
                 # set only when the task ends without an exception and is lost on
                 # restart, so it alone cannot stop a repeatedly failing span from
                 # re-billing an LLM turn every tick. *total* comes from the read
                 # above, so the check adds no transcript read on the loop.
-                or not self.retry_eligible(key, now, message_count=total)
+                or (not seeded and not self.retry_eligible(key, now, message_count=total))
             ):
                 continue
             self._running.add(key)
@@ -1293,6 +1387,10 @@ class HistoryConsolidator:
                         and outcome.complete
                     ):
                         self._history_consolidated[k] = ts
+                    elif k in self._seeded_keys and (
+                        outcome is _CONSOLIDATION_REFUSED or not outcome.completed
+                    ):
+                        self._history_consolidated[k] = ts
 
             t.add_done_callback(_on_idle_done)
 
@@ -1310,7 +1408,7 @@ class HistoryConsolidator:
         """
         if not self._auto_consolidation_enabled:
             return
-        if key in self._running:
+        if self._busy(key):
             return
         if _persistence_disabled():
             return
@@ -1394,14 +1492,20 @@ class HistoryConsolidator:
             messages = await asyncio.to_thread(self._log._read_messages, key)
             if _session_touched_sensitive(messages):
                 return ConsolidationOutcome(
-                    "skipped", detail="sensitive session", old_offset=old_offset,
-                    new_offset=last_offset, complete=False,
+                    "skipped",
+                    detail="sensitive session",
+                    old_offset=old_offset,
+                    new_offset=last_offset,
+                    complete=False,
                 )
             outcome = await self._consolidate(key, include_history=True)
             if isinstance(outcome, _ConsolidationRefusedSentinel):
                 return ConsolidationOutcome(
-                    "skipped", detail="session memory policy refuses consolidation",
-                    old_offset=old_offset, new_offset=last_offset, complete=False,
+                    "skipped",
+                    detail="session memory policy refuses consolidation",
+                    old_offset=old_offset,
+                    new_offset=last_offset,
+                    complete=False,
                 )
             if not outcome.completed:
                 return outcome
@@ -1415,9 +1519,7 @@ class HistoryConsolidator:
                     "consolidated", old_offset=old_offset, new_offset=last_offset, complete=False
                 )
             remaining = after
-        return ConsolidationOutcome(
-            "consolidated", old_offset=old_offset, new_offset=last_offset
-        )
+        return ConsolidationOutcome("consolidated", old_offset=old_offset, new_offset=last_offset)
 
     async def _consolidate(
         self, key: str, include_history: bool = True
@@ -1509,6 +1611,9 @@ class HistoryConsolidator:
             # editor. Freeze the submitted evidence before awaiting the model.
             unconsolidated = copy.deepcopy(unconsolidated)
             if not unconsolidated:
+                if key in self._seeded_keys:
+                    self._seeded_keys.discard(key)
+                    self._last_activity.pop(key, None)
                 return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
             # Display-only rows (``notice``) are text drawn for the person
             # reading the transcript, not conversation: the Slack thread-parent
@@ -3774,12 +3879,12 @@ class HistoryConsolidator:
                         agent=self._consolidation_agent,
                         crew_log_kind="memory_consolidation",
                         crew_log_session_key=session_key,
-                        # A private V2 store gets its own generated, bound and
-                        # retired session from background_turn; everything else
-                        # shares the dedicated consolidation key, reset per turn.
                         memory_store=memory_store,
-                        session_key="" if memory_store else _CONSOLIDATE_SESSION_KEY,
+                        session_key=_CONSOLIDATE_SESSION_KEY if not memory_store else None,
                         reset_conversation=not bool(memory_store),
+                        # A private V2 store gets its own generated, bound and
+                        # retired session; shared consolidation reuses its key
+                        # but resets the native conversation before every pass.
                     )
                 )
             except Exception as exc:
@@ -3798,13 +3903,14 @@ class HistoryConsolidator:
             # kirocrew-core/cron toolset — without REJECT_ALL a background
             # consolidation turn could fire side-effecting tools (send_message,
             # learn_add, spawn_run). REJECT_ALL keeps both providers tool-free.
-            turn_task = asyncio.create_task(
+            turn_task = asyncio.ensure_future(
                 _facade_stream_and_collect_json(
                     client,
                     prompt,
                     approval_policy=ToolApprovalPolicy.REJECT_ALL,
                     retry_transient=False,
                     model_fallback=True,
+                    allow_image=False,
                 )
             )
             try:

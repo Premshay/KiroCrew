@@ -26,8 +26,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_DEEPSEEK,
 )
-from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.providers.mirrors import claude_code as claude_mirror
 from kiro_crew.providers.mirrors import registry as mirrors_registry
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
@@ -368,6 +368,10 @@ class TestMounting:
         project-only agent find nothing, so the ``tools`` allowlist never ran and the
         control plane mounted unrestricted -- a restriction the user declared, lost.
         Withholding what the spec does not name is the whole point of the allowlist.
+
+        The checkout's own ``mcpServers`` never reach a mirrored session (see
+        ``_project_mcp_trusted``), so ``proj`` is withheld too -- but the allowlist
+        still governs what is left, which is the restriction this pins.
         """
         _write_project_spec(
             tmp_path,
@@ -375,7 +379,7 @@ class TestMounting:
             tools=["@proj"],
         )
         names = _by_name(session_mcp.session_mcp_servers("kirocrew", work_dir=tmp_path))
-        assert "proj" in names
+        assert "proj" not in names
         # tools names only @proj, and the control plane is not exempt from it.
         assert "kirocrew-core" not in names
         assert "kirocrew-cron" not in names
@@ -393,8 +397,12 @@ class TestMounting:
         )
         assert "proj" not in _by_name(session_mcp.session_mcp_servers("kirocrew"))
 
-    def test_the_project_spec_wins_over_a_user_level_one(self, tmp_path, agents_dir):
-        """Project-nearest, the way a nearer config layer normally wins."""
+    def test_the_user_level_spec_wins_over_an_untrusted_project_one(self, tmp_path, agents_dir):
+        """A checkout cannot choose a mirrored session's servers, nor displace the user's.
+
+        The plain resolution is still project-nearest -- the unresolved-ref
+        diagnostic, which runs on kiro-cli's path too, reads the project spec.
+        """
         _write_spec(agents_dir, servers={"user": {"command": "/bin/user"}}, tools=["@user"])
         _write_project_spec(
             tmp_path,
@@ -402,11 +410,18 @@ class TestMounting:
             tools=["@proj"],
         )
         names = _by_name(session_mcp.session_mcp_servers("kirocrew", work_dir=tmp_path))
-        assert "proj" in names
-        assert "user" not in names
+        assert "proj" not in names
+        assert "user" in names
+        snapshot = session_mcp.agent_spec_snapshot("kirocrew", work_dir=tmp_path)
+        assert snapshot is not None
+        assert "proj" in snapshot["mcpServers"]
 
-    def test_a_project_only_agents_disabled_tools_reach_the_deny_rules(self, tmp_path, agents_dir):
-        """``disabledTools`` is a RESTRICTION, so the same resolution gap dropped it."""
+    def test_deny_rules_follow_the_same_resolution_as_the_array(self, tmp_path, agents_dir):
+        """Claude's deny rules and the array read ONE answer for a checkout's spec.
+
+        The project's servers never launch, but its ``disabledTools`` are a
+        restriction and survive; a user-level spec of the same name adds its own.
+        """
         _write_project_spec(
             tmp_path,
             servers={"proj": {"command": "/bin/proj", "disabledTools": ["danger"]}},
@@ -415,8 +430,15 @@ class TestMounting:
         assert session_mcp.session_mcp_deny_rules("kirocrew", work_dir=tmp_path) == [
             "mcp__proj__danger"
         ]
-        # And without the checkout it is silently lost -- the defect, pinned.
-        assert session_mcp.session_mcp_deny_rules("kirocrew") == []
+        _write_spec(
+            agents_dir,
+            servers={"user": {"command": "/bin/user", "disabledTools": ["risky"]}},
+            tools=["@user"],
+        )
+        assert session_mcp.session_mcp_deny_rules("kirocrew", work_dir=tmp_path) == [
+            "mcp__proj__danger",
+            "mcp__user__risky",
+        ]
 
     def test_disabled_tools_is_the_structured_form_and_exempts_no_server(self, agents_dir):
         """``(server, tool)`` pairs, the control plane included.
@@ -500,9 +522,9 @@ class TestMounting:
         reads: list[str] = []
         real = session_mcp._agent_spec_and_snapshot_for
 
-        def counting(agent, work_dir=None):
+        def counting(agent, work_dir=None, **kwargs):
             reads.append(agent)
-            return real(agent, work_dir)
+            return real(agent, work_dir, **kwargs)
 
         monkeypatch.setattr(session_mcp, "_agent_spec_and_snapshot_for", counting)
         # Explicit None: no spec, nothing read, control plane only, nothing switched off.
@@ -525,9 +547,9 @@ class TestMounting:
         real = session_mcp._agent_spec_and_snapshot_for
         calls = {"n": 0}
 
-        def flapping(agent, work_dir=None):
+        def flapping(agent, work_dir=None, **kwargs):
             calls["n"] += 1
-            return (None, None) if calls["n"] == 1 else real(agent, work_dir)
+            return (None, None) if calls["n"] == 1 else real(agent, work_dir, **kwargs)
 
         monkeypatch.setattr(session_mcp, "_agent_spec_and_snapshot_for", flapping)
         projection = session_mcp.session_mcp_projection("kirocrew")
@@ -591,6 +613,33 @@ class TestDenyRules:
         (agents_dir / "kirocrew.json").write_text("{not json", encoding="utf-8")
         assert session_mcp.session_mcp_deny_rules("kirocrew") == []
         assert session_mcp.session_mcp_deny_rules(None) == []
+
+
+class TestZeroTools:
+    """``SessionMcpProjection.zero_tools`` -- an explicit empty ``tools`` list,
+    not a missing key, which means "no restriction stated" and must NOT trip
+    ``AcpClient._deny_zero_tools``."""
+
+    def test_an_explicit_empty_list_is_zero_tools(self, agents_dir):
+        _write_spec(agents_dir, servers={}, tools=[])
+        assert session_mcp.session_mcp_projection("kirocrew").zero_tools is True
+
+    def test_a_missing_tools_key_is_not_zero_tools(self, agents_dir):
+        _write_spec(agents_dir, servers={}, tools=None)
+        assert session_mcp.session_mcp_projection("kirocrew").zero_tools is False
+
+    def test_a_populated_tools_list_is_not_zero_tools(self, agents_dir):
+        _write_spec(agents_dir, servers={"srv": {"command": "/s"}}, tools=["@srv"])
+        assert session_mcp.session_mcp_projection("kirocrew").zero_tools is False
+
+    def test_no_agent_is_not_zero_tools(self):
+        assert session_mcp.session_mcp_projection(None).zero_tools is False
+
+    def test_a_non_list_tools_value_is_not_zero_tools(self, agents_dir):
+        (agents_dir / "kirocrew.json").write_text(
+            json.dumps({"name": "kirocrew", "tools": "none"}), encoding="utf-8"
+        )
+        assert session_mcp.session_mcp_projection("kirocrew").zero_tools is False
 
 
 class TestControlPlane:
@@ -1267,9 +1316,7 @@ class TestClientSeam:
         await client._new_session_following_substitution()
 
         assert len(sent) == 2
-        assert sent[0]["_meta"]["claudeCode"]["options"] == {
-            "settingSources": ["project", "local"]
-        }
+        assert sent[0]["_meta"]["claudeCode"]["options"] == {"settingSources": ["project", "local"]}
         retry = sent[1]
         assert "foo" in _by_name(retry["mcpServers"])
         options = retry["_meta"]["claudeCode"]["options"]
@@ -1286,9 +1333,7 @@ class TestClientSeam:
         client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
         params = await self._session_new_params(client, tmp_path, monkeypatch)
         assert "foo" in _by_name(params["mcpServers"])
-        assert params["_meta"]["claudeCode"]["options"] == {
-            "settingSources": ["project", "local"]
-        }
+        assert params["_meta"]["claudeCode"]["options"] == {"settingSources": ["project", "local"]}
 
     @staticmethod
     def _pin_harness(client, monkeypatch, *, fail=False):
@@ -1577,17 +1622,60 @@ class TestClientSeam:
             await client._initialize_session()
         assert killed == [True]
 
-    def test_the_spawn_arm_reads_the_version_before_the_seed_and_the_warm(self):
-        """Floor first, then the writer, then the warm: the array is never rebuilt."""
-        import inspect
+    def test_the_spawn_arm_reads_the_version_before_the_seed_and_the_warm(
+        self, tmp_path, monkeypatch
+    ):
+        """Floor first, then the writer, then the warm: the array is never rebuilt.
 
-        source = inspect.getsource(client_mod.AcpClient._spawn)
-        read = source.index("_claude_adapter_installed_version")
-        seed = source.index("await asyncio.to_thread(self._write_claude_local_settings)")
-        warm = source.index(
-            "self._session_mcp_cache = await asyncio.to_thread(self._resolve_session_mcp_servers)"
+        Driven through the claude adapter's own launch: the writer must already see
+        the installed adapter version (it applies the ``settingSources`` floor with
+        it), and the session's MCP array is resolved once, after the writer decided
+        whether Crew authored the settings file.
+        """
+        from kiro_crew.acp.harness import SpawnContext
+        from kiro_crew.acp.harness import claude as claude_mod
+        from kiro_crew.acp.harness import process_adapter_for
+        from kiro_crew.agent_sdk.drivers.acp import forget_cached_resolution
+
+        steps: list[tuple[str, str]] = []
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+
+        def _version(argv):
+            steps.append(("read", ""))
+            return "0.84.0"
+
+        def _write(self):
+            steps.append(("seed", self._claude_adapter_disk_version))
+
+        def _resolve(self):
+            steps.append(("warm", ""))
+            return []
+
+        forget_cached_resolution(ACP_BACKEND_CLAUDE)
+        monkeypatch.setattr(
+            claude_mod, "_resolve_claude_acp_bin", lambda: (["/opt/bin/claude-agent-acp"], "")
         )
-        assert read < seed < warm
+        monkeypatch.setattr(claude_mod, "_claude_adapter_installed_version", _version)
+        monkeypatch.setattr(AcpClient, "_write_claude_local_settings", _write)
+        monkeypatch.setattr(AcpClient, "_resolve_session_mcp_servers", _resolve)
+        try:
+            asyncio.run(
+                process_adapter_for(ACP_BACKEND_CLAUDE).resolve_spawn(
+                    SpawnContext(
+                        agent="kirocrew",
+                        work_dir=tmp_path,
+                        model=None,
+                        environ={},
+                        home=tmp_path,
+                        session=client,
+                    )
+                )
+            )
+        finally:
+            forget_cached_resolution(ACP_BACKEND_CLAUDE)
+
+        assert steps == [("read", ""), ("seed", "0.84.0"), ("warm", "")]
+        assert client._session_mcp_cache == []
 
     def test_the_installed_version_is_read_from_the_adapters_own_manifest(self, tmp_path):
         pkg = tmp_path / "node_modules" / "@agentclientprotocol" / "claude-agent-acp"
@@ -1936,6 +2024,82 @@ class TestClientSeam:
         elsewhere = AcpClient(work_dir=tmp_path / "plain", agent="kirocrew")
         elsewhere._mcp_gateway_overlay = overlay
         assert [e["name"] for e in elsewhere._pooled_broker_stubs()] == ["pooled"]
+
+
+class TestWithholdWarningNamesTheCause:
+    """The withhold warning gives no wrong fix, and each cause is logged once.
+
+    Removing the file is not always the fix: an old adapter needs an upgrade, a
+    file with hooks needs them taken out, and a sibling session's seed comes
+    straight back. So the mirror's line names no single remedy and points at the
+    client's own line, which is where each cause and its fix are written.
+    """
+
+    _STALE_REMEDY = "Removing or renaming the project's .claude/settings.local.json"
+
+    @staticmethod
+    def _withhold_lines(caplog):
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == claude_mirror.__name__ and "withholding the whole" in r.getMessage()
+        ]
+
+    def test_the_line_names_no_stale_remedy(self, agents_dir, caplog):
+        _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
+        with caplog.at_level("WARNING", logger=claude_mirror.__name__):
+            projection = ClaudeCodeMirror().session_projection(
+                "kirocrew", permission_surface_owned=False
+            )
+        assert projection.params == {"mcpServers": []}
+        [line] = self._withhold_lines(caplog)
+        assert self._STALE_REMEDY not in line
+        assert "a permissions.allow entry there" not in line
+        assert "log lines for that file name the cause" in line
+
+    @pytest.mark.parametrize("cause", ["old-adapter", "permission-mode", "hooks", "link"])
+    def test_each_client_refusal_logs_its_cause_at_warning(
+        self, tmp_path, agents_dir, caplog, monkeypatch, cause
+    ):
+        _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
+        local = tmp_path / ".claude" / "settings.local.json"
+        local.parent.mkdir(parents=True)
+        local.write_text(json.dumps({"permissions": {}}), encoding="utf-8")
+        kw: dict = {}
+        if cause == "link":
+            # The usability check is what reads a link; stand it in so the case
+            # runs on every host, including one that cannot create symlinks.
+            monkeypatch.setattr(client_mod, "_claude_settings_usable", lambda _p: False)
+        if cause == "hooks":
+            hook = {"type": "command", "command": "./block.sh"}
+            (local.parent / "settings.json").write_text(
+                json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [hook]}]}}),
+                encoding="utf-8",
+            )
+        if cause == "permission-mode":
+            kw["permission_mode"] = "auto"
+        client = AcpClient(
+            work_dir=tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE, **kw
+        )
+        if cause == "old-adapter":
+            client._claude_adapter_disk_version = "0.83.0"
+        with caplog.at_level("WARNING"):
+            client._write_claude_local_settings()
+            assert client._session_mcp_servers() == []
+        client_lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == client_mod.__name__ and r.levelname == "WARNING"
+        ]
+        expected = {
+            "old-adapter": "Upgrade with 'npm i -g ",
+            "permission-mode": "requested permission mode 'auto'",
+            "hooks": "sets hooks or sandbox settings",
+            "link": "is a symlink or resolves to a sensitive path",
+        }[cause]
+        assert any(expected in line for line in client_lines)
+        [line] = self._withhold_lines(caplog)
+        assert self._STALE_REMEDY not in line
 
 
 class TestPooledStubsOnTheClaudeMirror:

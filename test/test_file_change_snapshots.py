@@ -21,13 +21,23 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
+from turn_harness import Raise, SlotSpec, TurnRecord, TurnScript, run_turn
 
 from conftest import requires_symlinks
+from kiro_crew.acp.types import (
+    EVENT_CLEAR_STATUS,
+    EVENT_COMPLETE,
+    EVENT_TEXT_CHUNK,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_CALL_UPDATE,
+    EVENT_TOOL_RESULT,
+    STOP_REASON_END_TURN,
+    AcpEvent,
+)
 from kiro_crew.dashboard.chat_runner import (
     _MAX_SNAPSHOT,
     _MAX_SNAPSHOT_PATH_CHARS,
@@ -276,7 +286,12 @@ class TestSnapshotWriteTarget:
         # File doesn't exist yet — chip should still surface with empty before.
         target = tmp_path / "new.txt"
         out = _snapshot_write_target({"command": "create", "path": str(target)})
-        assert out == {"path": str(target), "content": "", "truncated": False}
+        assert out == {
+            "path": str(target),
+            "canonical_path": os.path.realpath(str(target)),
+            "content": "",
+            "truncated": False,
+        }
 
     def test_str_replace_on_existing_file_captures_content(self, tmp_path: Path):
         f = tmp_path / "code.py"
@@ -421,12 +436,38 @@ class TestFlushFileChanges:
         assert "file_changes" not in slot.messages[0].get("meta", {})
         assert slot.messages[-1]["content"] == ""
 
-    def test_the_mid_turn_clear_resets_the_boundary_id_beside_the_text(self):
-        # The clear branch restarts the turn's row bookkeeping. Capturing the
-        # start id there must be ADDED next to the accumulator reset, not put in
-        # its place: without `assistant_text = ""` the text streamed before the
-        # clear survives it and the terminal flush re-appends what the user
-        # just deleted.
+    @pytest.mark.asyncio
+    async def test_a_mid_turn_clear_drops_the_text_streamed_before_it(self):
+        """Through the real ``_run_chat``: a confirmed ``/clear`` mid-turn restarts
+        the turn's text, so the reply that lands is only what streamed after it --
+        never the pre-clear draft re-appended and persisted over what the user just
+        deleted."""
+        record = await run_turn(
+            TurnScript(
+                events=[
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="PRE-CLEAR draft "),
+                    AcpEvent(kind=EVENT_CLEAR_STATUS),
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="post"),
+                    AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+                ]
+            ),
+            slot=SlotSpec(rows=[("user", "earlier"), ("assistant", "earlier answer")]),
+        )
+        assert record.stop_reason == STOP_REASON_END_TURN
+        assert not any("PRE-CLEAR" in str(row.get("content")) for row in record.history_rows)
+        assert [row["content"] for row in record.rows("assistant")][-1] == "post"
+
+    def test_the_mid_turn_clear_restarts_the_turns_start_row_id(self):
+        """Kept as a source pin: the reset it guards changes nothing observable.
+
+        The clear arm resets ``_turn_start_mid`` beside the text. Without it the
+        flush would look for the pre-clear tail row's id in a window that no
+        longer holds it -- and fall back to the whole window, exactly as the reset
+        value does, so every turn renders the same chips either way (an
+        equivalent mutant; ``test_a_mid_turn_clear_drops_the_text_streamed_before_it``
+        covers the reset that IS observable). What is left is code intent, so it
+        stays a narrow AST check, counted in ``test_source_pin_budget.py``.
+        """
         tree = ast.parse(inspect.getsource(_run_chat))
         [clear] = [
             node
@@ -445,7 +486,7 @@ class TestFlushFileChanges:
             for target in stmt.targets
             if isinstance(target, ast.Name)
         }
-        assert {"assistant_text", "_turn_start_mid"} <= resets, resets
+        assert "_turn_start_mid" in resets, resets
 
     @pytest.mark.parametrize(
         ("before_length", "after_length"),
@@ -1622,6 +1663,25 @@ class TestTurnSnapshotAccumulator:
         assert _record_turn_snapshot(slot, {"path": "/a.py", "content": ""}) is None
         assert _record_turn_snapshot(slot, {"path": "/a.py", "content": "x"}) is None
 
+    def test_two_spellings_of_one_path_keep_the_first_before(self) -> None:
+        """``/work/f`` then ``/work/./f`` then ``/work/f`` is one file. Keyed by
+        the raw path these would be two entries and a revisit under the first
+        spelling would move the ORIGINAL behind the alias, so the flush (first
+        entry per canonical key) would persist the alias's before and lose the
+        true original. Keyed by canonical path they are one entry whose first
+        before-snapshot survives every revisit."""
+        slot = _make_slot_with_assistant_message()
+        canon = "/work/f"
+        _record_turn_snapshot(slot, {"path": "/work/f", "canonical_path": canon, "content": "zero"})
+        _record_turn_snapshot(
+            slot, {"path": "/work/./f", "canonical_path": canon, "content": "one"}
+        )
+        _record_turn_snapshot(
+            slot, {"path": "/work/f", "canonical_path": canon, "content": "three"}
+        )
+        assert len(slot._file_changes) == 1
+        assert slot._file_changes[0]["content"] == "zero"
+
 
 # ── the per-side bound after redaction ──────────────────────────────────────
 
@@ -1708,67 +1768,69 @@ class TestRedactedSideBound:
 # ── omitted files on the persisted snapshot ────────────────────────────────
 
 
-@pytest.fixture
-def snapshot_turn():
-    """Execute the runner's actual admission and flush statements.
-
-    Extracting these statements avoids starting an ACP session or duplicating
-    the admission code. Both event sites and both exit sites must exist, and a
-    mutation to either executes in the test.
-    """
-    tree = ast.parse(inspect.getsource(_run_chat))
-    [runner] = tree.body
-    admissions = sorted(
-        (
-            node
-            for node in ast.walk(runner)
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Name)
-            and node.test.id in {"_file_snapshot", "_file_snapshot_upd"}
-        ),
-        key=lambda node: node.lineno,
-    )
-    flushes = sorted(
-        (
-            node
-            for node in ast.walk(runner)
-            if isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "_flush_file_changes"
-        ),
-        key=lambda node: node.lineno,
-    )
-    assert len(admissions) == len(flushes) == 2
-
-    def run(nodes, env):
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<snapshot-turn>", "exec"), env)  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected -- runs the PRODUCTION admission statements lifted out of this repo's own source by AST, never external input; a hand-copied duplicate of them is exactly what this test exists to rule out  # noqa: E501  # fmt: skip
-
-    def start(slot):
-        # The flush sites read the runner's turn boundary; the harness has no
-        # turn, so it scopes to the whole slot the way a turn started on an
-        # empty slot would.
-        env = {
-            **_run_chat.__globals__,
-            "slot": slot,
-            "_turn_msg_boundary": 0,
-            "_turn_start_mid": "",
-        }
-
-        def record(path, key="call", site=0, content="before\n"):
-            env["event"] = SimpleNamespace(tool_call_id=key)
-            env["_file_snapshot" if site == 0 else "_file_snapshot_upd"] = {
-                "path": path,
-                "content": content,
-                "truncated": False,
-            }
-            run([admissions[site]], env)
-
-        return SimpleNamespace(
-            record=record, flush=lambda site=0: run([flushes[site]], env), env=env
+def _write_call(index: int, path: Path, before: str) -> list[AcpEvent]:
+    """A write announced with its arguments on the TOOL_CALL itself."""
+    return [
+        AcpEvent(
+            kind=EVENT_TOOL_CALL,
+            tool_call_id=f"call-{index}",
+            tool_name="fs_write",
+            tool_kind="edit",
+            title="Write",
+            raw_tool_params={"command": "create", "path": str(path)},
+            diff_old_text=before,
+            diff_path=str(path),
         )
+    ]
 
-    return start
+
+def _write_update(index: int, path: Path, before: str) -> list[AcpEvent]:
+    """A write whose arguments arrive only on a later TOOL_CALL_UPDATE."""
+    return [
+        AcpEvent(
+            kind=EVENT_TOOL_CALL,
+            tool_call_id=f"call-{index}",
+            tool_name="fs_write",
+            tool_kind="edit",
+            title="Write",
+        ),
+        AcpEvent(
+            kind=EVENT_TOOL_CALL_UPDATE,
+            tool_call_id=f"call-{index}",
+            raw_tool_params={"command": "create", "path": str(path)},
+            diff_old_text=before,
+            diff_path=str(path),
+        ),
+    ]
+
+
+_WRITES = {"call": _write_call, "update": _write_update}
+_LANDS = [
+    AcpEvent(kind=EVENT_TEXT_CHUNK, text="done"),
+    AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+]
+#: An exit that never lands: no reply, so the finally's flush is the only one
+#: and its chips ride a content-less anchor.
+_DIES = [Raise(RuntimeError("boom"))]
+
+
+def _files(directory: Path, count: int, *, disk: str = "after\n") -> list[Path]:
+    paths = [directory / f"f{index}.py" for index in range(count)]
+    for path in paths:
+        path.write_text(disk, encoding="utf-8")
+    return paths
+
+
+async def _snapshot_turn(*events: AcpEvent | Raise, seeded: bool = True) -> TurnRecord:
+    """One real turn; *seeded* gives the slot an earlier exchange to stay clean."""
+    rows = [("user", "earlier"), ("assistant", "earlier answer")] if seeded else []
+    return await run_turn(TurnScript(events=list(events)), slot=SlotSpec(rows=rows))
+
+
+def _persisted_meta(record: TurnRecord, content: str) -> dict:
+    """The meta of the last PERSISTED assistant row whose text is *content*."""
+    [*_, row] = [row for row in record.rows("assistant") if row["content"] == content]
+    return row.get("meta") or {}
 
 
 class TestOmittedSnapshotFiles:
@@ -1810,93 +1872,142 @@ class TestOmittedSnapshotFiles:
         # Count index traversal work, not elapsed time or constructor calls.
         assert visited <= dropped
 
-    @pytest.mark.parametrize("site", [0, 1], ids=["call", "update"])
-    def test_a_turn_past_the_row_cap_keeps_the_files_it_wrote_last(self, snapshot_turn, site):
-        slot = _make_slot_with_assistant_message()
-        turn = snapshot_turn(slot)
-        extra = 50
-        total = _MAX_TURN_SNAPSHOT_ENTRIES + extra
-        for index in range(total):
-            turn.record(f"/f{index}.py", f"call-{index}", site)
-        assert len(slot._file_changes) == total
-        turn.flush(site)
-        meta = slot.messages[-1]["meta"]
-        assert {fc["path"] for fc in meta["file_changes"]} == {
-            f"/f{index}.py" for index in range(extra, total)
-        }
-        assert meta["file_changes_omitted_files"] == extra
-        assert type(meta["file_changes_omitted_files"]) is int
-        # The success path's finally flush must not change the count.
-        turn.flush(1)
-        assert slot.messages[-1]["meta"]["file_changes_omitted_files"] == extra
-
-    def test_repeating_a_path_adds_no_row_and_keeps_the_first_before(
-        self, snapshot_turn, short_tmp_dir
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("site", ["call", "update"])
+    async def test_a_turn_past_the_row_cap_keeps_the_files_it_wrote_last(
+        self, monkeypatch, short_tmp_dir, site
     ):
-        slot = _make_slot_with_assistant_message()
-        turn = snapshot_turn(slot)
-        target = short_tmp_dir / "same.py"
-        target.write_text("last\n")
-        turn.record(str(target), "a", 0, content="first\n")
-        turn.record(str(target), "a", 1, content="second\n")
-        turn.record(str(target), "b", 0, content="third\n")
-        assert len(slot._file_changes) == 1
-        turn.flush()
-        [stored] = slot.messages[-1]["meta"]["file_changes"]
+        # Through the real turn; a cap of 3 instead of 200 keeps the script short.
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_ENTRIES", 3)
+        paths = _files(short_tmp_dir, 5)
+        writes = [
+            event
+            for index, path in enumerate(paths)
+            for event in _WRITES[site](index, path, "before\n")
+        ]
+        record = await _snapshot_turn(*writes, *_LANDS)
+        assert record.stop_reason == STOP_REASON_END_TURN
+        # The landed turn runs the success flush, then the finally flush: the
+        # persisted count is what both left.
+        meta = _persisted_meta(record, "done")
+        assert {fc["path"] for fc in meta["file_changes"]} == {str(path) for path in paths[2:]}
+        assert meta["file_changes_omitted_files"] == 2
+        assert type(meta["file_changes_omitted_files"]) is int
+
+    @pytest.mark.asyncio
+    async def test_repeating_a_path_adds_no_row_and_keeps_the_first_before(self, short_tmp_dir):
+        [target] = _files(short_tmp_dir, 1, disk="last\n")
+        record = await _snapshot_turn(
+            *_write_call(0, target, "first\n"),
+            AcpEvent(
+                kind=EVENT_TOOL_CALL_UPDATE,
+                tool_call_id="call-0",
+                raw_tool_params={"command": "create", "path": str(target)},
+                diff_old_text="second\n",
+                diff_path=str(target),
+            ),
+            *_write_call(1, target, "third\n"),
+            *_LANDS,
+        )
+        meta = _persisted_meta(record, "done")
+        [stored] = meta["file_changes"]
         assert stored["before"] == "first\n"
         assert stored["after"] == "last\n"
-        assert "file_changes_omitted_files" not in slot.messages[-1]["meta"]
-
-    def test_row_cap_and_path_budget_drops_are_counted_as_files(self, snapshot_turn, monkeypatch):
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_ENTRIES", 2)
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_CHARS", 0)
-        slot = _ChatSlot("stopped")
-        turn = snapshot_turn(slot)
-        for index in range(3):
-            turn.record(f"/f{index}.py", f"call-{index}")
-            turn.record(f"/f{index}.py", f"call-{index}-again", site=1)
-        turn.flush(1)
-        meta = slot.messages[-1]["meta"]
-        assert [fc["path"] for fc in meta["file_changes"]] == ["/f2.py"]
-        assert meta["file_changes_omitted_files"] == 2
-        assert slot._dirty
-
-    def test_the_count_is_absent_when_nothing_was_omitted(self, snapshot_turn):
-        slot = _make_slot_with_assistant_message()
-        turn = snapshot_turn(slot)
-        turn.record("/a.py")
-        turn.record("/b.py", site=1)
-        turn.flush()
-        meta = slot.messages[-1]["meta"]
-        assert len(meta["file_changes"]) == 2
         assert "file_changes_omitted_files" not in meta
 
-    def test_demoted_files_keep_their_path_and_are_not_counted(self, snapshot_turn, monkeypatch):
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("site", ["call", "update"])
+    async def test_a_rewritten_path_moves_to_the_end_and_keeps_its_first_before(
+        self, short_tmp_dir, site
+    ):
+        # P, then Q, then P again through the SAME site: the chips follow the
+        # order the files were last written, and P keeps the content it had
+        # before the turn first touched it.
+        p_path, q_path = short_tmp_dir / "p.py", short_tmp_dir / "q.py"
+        p_path.write_text("P-after\n", encoding="utf-8")
+        q_path.write_text("Q-after\n", encoding="utf-8")
+        write = _WRITES[site]
+        record = await _snapshot_turn(
+            *write(0, p_path, "P1\n"),
+            *write(1, q_path, "Q1\n"),
+            *write(2, p_path, "P2\n"),
+            *_LANDS,
+        )
+        meta = _persisted_meta(record, "done")
+        assert [fc["path"] for fc in meta["file_changes"]] == [str(q_path), str(p_path)]
+        assert meta["file_changes"][1]["before"] == "P1\n"
+
+    @pytest.mark.asyncio
+    async def test_row_cap_and_path_budget_drops_are_counted_as_files(
+        self, monkeypatch, short_tmp_dir
+    ):
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_ENTRIES", 2)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_CHARS", 0)
+        paths = _files(short_tmp_dir, 3)
+        writes = [
+            event
+            for index, path in enumerate(paths)
+            for event in (
+                *_write_call(index, path, "before\n"),
+                AcpEvent(
+                    kind=EVENT_TOOL_CALL_UPDATE,
+                    tool_call_id=f"call-{index}",
+                    raw_tool_params={"command": "create", "path": str(path)},
+                    diff_old_text="before\n",
+                    diff_path=str(path),
+                ),
+            )
+        ]
+        # A turn that never lands: only the finally's flush runs, and only the
+        # forced save after it makes the anchor durable.
+        record = await _snapshot_turn(*writes, *_DIES, seeded=False)
+        meta = _persisted_meta(record, "")
+        assert [fc["path"] for fc in meta["file_changes"]] == [str(paths[2])]
+        assert meta["file_changes_omitted_files"] == 2
+
+    @pytest.mark.asyncio
+    async def test_the_count_is_absent_when_nothing_was_omitted(self, short_tmp_dir):
+        a_path, b_path = _files(short_tmp_dir, 2)
+        record = await _snapshot_turn(
+            *_write_call(0, a_path, "before\n"), *_write_update(1, b_path, "before\n"), *_LANDS
+        )
+        meta = _persisted_meta(record, "done")
+        assert {fc["path"] for fc in meta["file_changes"]} == {str(a_path), str(b_path)}
+        assert "file_changes_omitted_files" not in meta
+
+    @pytest.mark.asyncio
+    async def test_demoted_files_keep_their_path_and_are_not_counted(
+        self, monkeypatch, short_tmp_dir
+    ):
         # A demoted file stays on the message as a path, so it is not omitted.
-        # The synthetic-message branch carries no zero count either.
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_CHARS", 20)
-        slot = _ChatSlot("stopped")
-        turn = snapshot_turn(slot)
-        for index in range(3):
-            turn.record(f"/f{index}.py", f"call-{index}", content="x" * 50)
-        turn.flush()
-        meta = slot.messages[-1]["meta"]
+        # The synthetic anchor of a turn with no reply carries no zero count.
+        paths = _files(short_tmp_dir, 3)
+        # Room for two paths beside the protected entry, none of their content.
+        budget = 2 * len(str(paths[0])) + 5
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_CHARS", budget)
+        writes = [e for i, path in enumerate(paths) for e in _write_call(i, path, "x" * 4096)]
+        record = await _snapshot_turn(*writes, *_DIES, seeded=False)
+        meta = _persisted_meta(record, "")
         assert len(meta["file_changes"]) == 3
         assert sum(bool(fc.get("content_omitted")) for fc in meta["file_changes"]) == 2
         assert "file_changes_omitted_files" not in meta
 
-    def test_the_count_is_dropped_files_only_beside_a_demoted_one(self, snapshot_turn, monkeypatch):
-        # Room for one path beside the protected entry: /f1.py is demoted to its
-        # path, /f0.py is dropped, and only the dropped one is counted.
-        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_CHARS", 10)
-        slot = _make_slot_with_assistant_message()
-        turn = snapshot_turn(slot)
-        for index in range(3):
-            turn.record(f"/f{index}.py", f"call-{index}", content="x" * 50)
-        turn.flush()
-        meta = slot.messages[-1]["meta"]
-        assert sorted(fc["path"] for fc in meta["file_changes"]) == ["/f1.py", "/f2.py"]
+    @pytest.mark.asyncio
+    async def test_the_count_is_dropped_files_only_beside_a_demoted_one(
+        self, monkeypatch, short_tmp_dir
+    ):
+        # Room for one path beside the protected entry: f1 is demoted to its
+        # path, f0 is dropped, and only the dropped one is counted.
+        paths = _files(short_tmp_dir, 3)
+        budget = len(str(paths[0])) + 5
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._MAX_TURN_SNAPSHOT_CHARS", budget)
+        writes = [e for i, path in enumerate(paths) for e in _write_call(i, path, "x" * 4096)]
+        record = await _snapshot_turn(*writes, *_LANDS)
+        meta = _persisted_meta(record, "done")
+        assert sorted(fc["path"] for fc in meta["file_changes"]) == [str(paths[1]), str(paths[2])]
         assert meta["file_changes_omitted_files"] == 1
+        # The earlier exchange's reply is not this turn's anchor.
+        assert "file_changes" not in _persisted_meta(record, "earlier answer")
 
     def test_a_flush_without_drops_clears_an_earlier_count_on_its_message(self, monkeypatch):
         slot = _make_slot_with_assistant_message()
@@ -1945,3 +2056,369 @@ class TestOmittedSnapshotFiles:
             f"the total character bound is therefore {_MAX_TURN_SNAPSHOT_CHARS:,} plus that "
             "entry's two snapshot sides, truncation markers and path."
         ) in snapshots
+
+
+class TestPendingStrReplaceResolution:
+    """An undecidable strReplace snapshot is settled at flush time.
+
+    ``newStr ⊂ oldStr`` (drop a line next to a kept one) and ``oldStr ⊂
+    newStr`` (add a line next to a kept one) leave the disk file valid as
+    BOTH states at snapshot time, whichever side of the write the snapshot
+    lands on. A fragment-only before would render the chip as ``-1 +N``. Only
+    the PRE-write hypothesis is settled: the turn-end file is compared to the
+    forward substitution, and a match yields the content actually captured from
+    disk at snapshot time. A resolved before is therefore never synthesised
+    from the turn-end state, so a refused write (file unchanged), a later write,
+    or a concurrent restore cannot make it fabricate — it simply fails the
+    comparison and keeps the fragment.
+    """
+
+    PARAMS = {
+        "command": "strReplace",
+        "oldStr": "export A=0\nexport B=1\n",
+        "newStr": "export B=1\n",
+    }
+    BEFORE = "line 1\nexport A=0\nexport B=1\n"
+    AFTER = "line 1\nexport B=1\n"
+
+    def _snapshot(self, path: Path, on_disk: str, slot: _ChatSlot) -> dict:
+        path.write_text(on_disk)
+        snap = _snapshot_write_target(
+            {**self.PARAMS, "path": str(path)},
+            diff_old_text=self.PARAMS["oldStr"],
+            diff_path=str(path),
+        )
+        assert snap is not None
+        slot._file_changes = [snap]
+        return snap
+
+    def _flush(self, slot: _ChatSlot, path: Path, on_disk_at_flush: str) -> dict:
+        path.write_text(on_disk_at_flush)
+        _flush_file_changes(slot)
+        return slot.messages[-1]["meta"]["file_changes"][0]
+
+    def test_snapshot_taken_before_the_write_resolves_to_disk_content(self, short_tmp_dir: Path):
+        f = short_tmp_dir / "rc"
+        slot = _make_slot_with_assistant_message()
+        snap = self._snapshot(f, self.BEFORE, slot)
+        # Undecidable at snapshot time: fragment now, two hypotheses pending.
+        assert snap["content"] == self.PARAMS["oldStr"]
+        assert snap["pending_str_replace"]["if_post_write"].content == self.BEFORE
+        assert snap["pending_str_replace"]["if_pre_write"].content == self.AFTER
+        assert "before_if_post" not in snap["pending_str_replace"]
+        # Turn-end disk == if_pre_write (the forward substitution): the snapshot
+        # was pre-write, so the before is the captured disk content.
+        entry = self._flush(slot, f, self.AFTER)
+        assert entry["before"] == self.BEFORE
+        assert entry["after"] == self.AFTER
+
+    def test_unchanged_file_keeps_the_fragment(self, short_tmp_dir: Path):
+        """A refused/failed/cancelled write (or a snapshot taken before a
+        permission-gated write that is then denied) leaves the file equal to
+        the snapshot content (== if_post_write != if_pre_write), so the
+        pre-write comparison does not fire and the fragment stands — no
+        completion gate needed."""
+        f = short_tmp_dir / "rc"
+        slot = _make_slot_with_assistant_message()
+        self._snapshot(f, self.BEFORE, slot)
+        entry = self._flush(slot, f, self.BEFORE)
+        assert entry["before"] == self.PARAMS["oldStr"]
+        assert entry["after"] == self.BEFORE
+
+    def test_file_changed_again_keeps_the_fragment(self, short_tmp_dir: Path):
+        f = short_tmp_dir / "rc"
+        slot = _make_slot_with_assistant_message()
+        self._snapshot(f, self.BEFORE, slot)
+        entry = self._flush(slot, f, "something else entirely\n")
+        assert entry["before"] == self.PARAMS["oldStr"]
+
+    def test_pending_payload_never_reaches_message_meta(self, short_tmp_dir: Path):
+        f = short_tmp_dir / "rc"
+        slot = _make_slot_with_assistant_message()
+        self._snapshot(f, self.BEFORE, slot)
+        entry = self._flush(slot, f, self.AFTER)
+        assert set(entry) == {"path", "before", "after"}
+
+    def test_append_style_edit_keeps_the_fragment(self, short_tmp_dir: Path):
+        """oldStr ⊂ newStr (the mirror shape): here the POST-write disk state is
+        the one valid as both, so settling it would need a reverse substitution
+        against the turn-end disk — the one branch a shell or cross-slot restore
+        could turn into a fabrication. Only the pre-write hypothesis is settled,
+        so this direction keeps the fragment rather than resolving."""
+        f = short_tmp_dir / "cfg"
+        after = "head\nvalue = 1  # tuned\ntail\n"
+        f.write_text(after)
+        params = {
+            "command": "strReplace",
+            "path": str(f),
+            "oldStr": "value = 1",
+            "newStr": "value = 1  # tuned",
+        }
+        snap = _snapshot_write_target(params, diff_old_text="value = 1", diff_path=str(f))
+        assert snap is not None and "pending_str_replace" in snap
+        assert "before_if_post" not in snap["pending_str_replace"]
+        slot = _make_slot_with_assistant_message()
+        slot._file_changes = [snap]
+        entry = self._flush(slot, f, after)
+        assert entry["before"] == "value = 1"
+        assert entry["after"] == after
+
+    def test_decided_snapshot_carries_no_pending(self, short_tmp_dir: Path):
+        """A provable state (newStr absent → pre-write) needs no deferral."""
+        f = short_tmp_dir / "plain"
+        f.write_text("OLD\n")
+        snap = _snapshot_write_target(
+            {"command": "strReplace", "path": str(f), "oldStr": "OLD", "newStr": "NEW"},
+            diff_old_text="OLD",
+            diff_path=str(f),
+        )
+        assert snap is not None
+        assert "pending_str_replace" not in snap
+        assert snap["content"] == "OLD\n"
+
+    def test_restore_to_snapshot_content_never_fabricates_a_before(self, short_tmp_dir: Path):
+        """The payload carries no reverse substitution and the post-write branch
+        is not settled, so a turn-end file equal to the snapshot content —
+        however it got there (a shell `git checkout`, a concurrent write from
+        another session, a refused write) — keeps the fragment instead of
+        fabricating a full-file before that was never on disk."""
+        f = short_tmp_dir / "rc"
+        slot = _make_slot_with_assistant_message()
+        snap = self._snapshot(f, self.BEFORE, slot)
+        assert "before_if_post" not in snap["pending_str_replace"]
+        entry = self._flush(slot, f, self.BEFORE)
+        assert entry["before"] == self.PARAMS["oldStr"]
+        assert entry["after"] == self.BEFORE
+
+    def test_second_identical_edit_by_another_writer_keeps_the_fragment(self, short_tmp_dir: Path):
+        """buluoray's wrong-before case, closed by the writer-id gate. The
+        snapshot is undecidable (disk valid as both pre- and post-write), so it
+        is deferred. A SECOND identical forward substitution in the same turn —
+        a DIFFERENT tool call — would, under content-only resolution, let a
+        turn-end file equal to ``if_pre_write`` settle to ``if_post_write`` (the
+        after-first-edit content) as the before, under-reporting with no flag.
+        Because the two writes carry different ``tool_call_id``s,
+        ``_record_turn_snapshot`` drops the deferred ``pending_str_replace`` at
+        record time, so the flush keeps the fragment instead of a wrong
+        before."""
+        f = short_tmp_dir / "rc"
+        f.write_text(self.BEFORE)
+        slot = _make_slot_with_assistant_message()
+        first = _snapshot_write_target(
+            {**self.PARAMS, "path": str(f)},
+            diff_old_text=self.PARAMS["oldStr"],
+            diff_path=str(f),
+        )
+        assert first is not None and "pending_str_replace" in first
+        _record_turn_snapshot(slot, first, "writer-A")
+        # Second identical substitution by a DIFFERENT tool call.
+        second = _snapshot_write_target(
+            {**self.PARAMS, "path": str(f)},
+            diff_old_text=self.PARAMS["oldStr"],
+            diff_path=str(f),
+        )
+        assert second is not None
+        _record_turn_snapshot(slot, second, "writer-B")
+        # The gate must have dropped the deferral on the held entry.
+        assert len(slot._file_changes) == 1
+        assert "pending_str_replace" not in slot._file_changes[0]
+        # Turn-end disk equals if_pre_write (the forward substitution): without
+        # the gate this would wrongly resolve; with it, the fragment stands.
+        f.write_text(self.AFTER)
+        _flush_file_changes(slot)
+        entry = slot.messages[-1]["meta"]["file_changes"][0]
+        assert entry["before"] == self.PARAMS["oldStr"]
+        assert entry["before"] != self.BEFORE
+
+    def test_second_identical_edit_by_the_same_writer_still_resolves(self, short_tmp_dir: Path):
+        """The gate is scoped to a CHANGE of writer: a single tool call whose
+        snapshot is recorded twice (same ``tool_call_id``) keeps the deferral
+        resolvable, so the ordinary single-writer resolution is unaffected."""
+        f = short_tmp_dir / "rc"
+        f.write_text(self.BEFORE)
+        slot = _make_slot_with_assistant_message()
+        snap = _snapshot_write_target(
+            {**self.PARAMS, "path": str(f)},
+            diff_old_text=self.PARAMS["oldStr"],
+            diff_path=str(f),
+        )
+        assert snap is not None and "pending_str_replace" in snap
+        _record_turn_snapshot(slot, snap, "writer-A")
+        _record_turn_snapshot(slot, dict(snap), "writer-A")
+        assert len(slot._file_changes) == 1
+        assert "pending_str_replace" in slot._file_changes[0]
+        f.write_text(self.AFTER)
+        _flush_file_changes(slot)
+        entry = slot.messages[-1]["meta"]["file_changes"][0]
+        assert entry["before"] == self.BEFORE
+        assert entry["after"] == self.AFTER
+
+    def test_shell_activity_in_the_turn_keeps_the_fragment(self, short_tmp_dir: Path):
+        """GPT 6.1's wrong-before case: a shell command editing the file after a
+        post-write snapshot is never seen by the write-tool gate (a shell does
+        not pass through ``_record_turn_snapshot``), so it cannot be gated per
+        path. When a shell ran this turn, ``_flush_file_changes`` skips pending
+        resolution entirely (``turn_had_shell``) and keeps the fragment, rather
+        than trusting a turn-end read a shell could have shaped into a false
+        pre-write match. Compare ``test_...resolves...``: identical setup, the
+        only difference is the shell flag."""
+        f = short_tmp_dir / "rc"
+        f.write_text(self.BEFORE)
+        slot = _make_slot_with_assistant_message()
+        snap = self._snapshot(f, self.BEFORE, slot)
+        assert "pending_str_replace" in snap
+        # Turn-end disk equals if_pre_write, which WOULD resolve — but a shell
+        # ran this turn, so resolution is skipped and the fragment stands.
+        f.write_text(self.AFTER)
+        _flush_file_changes(slot, turn_had_shell=True)
+        entry = slot.messages[-1]["meta"]["file_changes"][0]
+        assert entry["before"] == self.PARAMS["oldStr"]
+        assert entry["after"] == self.AFTER
+        # Control: without the shell flag the same setup resolves, proving the
+        # flag is what keeps the fragment (not some other mismatch).
+        f.write_text(self.BEFORE)
+        slot2 = _make_slot_with_assistant_message()
+        self._snapshot(f, self.BEFORE, slot2)
+        f.write_text(self.AFTER)
+        _flush_file_changes(slot2, turn_had_shell=False)
+        assert slot2.messages[-1]["meta"]["file_changes"][0]["before"] == self.BEFORE
+
+    def test_alias_spelling_in_the_same_turn_stays_one_resolvable_entry(self, short_tmp_dir: Path):
+        """The deferred-resolution path is itself why the canonical bucket is
+        in scope. An undecidable strReplace deferred under one spelling, then a
+        second write to the SAME file under an alias spelling in the same turn,
+        must stay ONE entry: the flush reads one turn-end ``after`` per bucket
+        and resolves the deferred snapshot against it. Keyed by the raw path the
+        two spellings would split into two cards — the deferred one resolving
+        against a bucket the alias write never updated — so the alias-split is
+        reachable precisely for this fix's undecidable shape. Keyed by
+        ``canonical_path`` they are one entry whose pre-write hypothesis settles
+        against the real turn-end content."""
+        f = short_tmp_dir / "rc"
+        f.write_text(self.BEFORE)
+        canon = os.path.realpath(str(f))
+        slot = _make_slot_with_assistant_message()
+        # First write: the undecidable strReplace, snapshotted under /dir/rc.
+        snap = _snapshot_write_target(
+            {**self.PARAMS, "path": str(f)},
+            diff_old_text=self.PARAMS["oldStr"],
+            diff_path=str(f),
+        )
+        assert snap is not None
+        assert snap["canonical_path"] == canon
+        assert "pending_str_replace" in snap
+        _record_turn_snapshot(slot, snap, "writer-1")
+        # Second write to the same file under the alias spelling /dir/./rc:
+        # same canonical path, so it rides the first bucket rather than opening
+        # a second card. Same known writer id, so the gate keeps the deferral
+        # resolvable (the single-known-writer case).
+        alias = f.parent / "." / f.name
+        alias_snap = _snapshot_write_target(
+            {"command": "insert", "path": str(alias)},
+            diff_old_text=self.AFTER,
+            diff_path=str(alias),
+        )
+        assert alias_snap is not None
+        assert alias_snap["canonical_path"] == canon
+        _record_turn_snapshot(slot, alias_snap, "writer-1")
+        assert len(slot._file_changes) == 1, "two spellings of one file split the deferral"
+        # Turn-end disk is the forward substitution: the deferred snapshot was
+        # pre-write, so the one card resolves to the captured disk content.
+        f.write_text(self.AFTER)
+        _flush_file_changes(slot)
+        entries = slot.messages[-1]["meta"]["file_changes"]
+        assert len(entries) == 1
+        assert entries[0]["before"] == self.BEFORE
+        assert entries[0]["after"] == self.AFTER
+        assert "pending_str_replace" not in entries[0]
+
+
+class TestPendingStrReplaceThroughTheTurnLoop:
+    """The deferred-resolution call sites wired through the real ``_run_chat``.
+
+    The unit tests above drive the helpers directly; these prove the turn loop
+    snapshots a write and the flush resolves it, running end to end without
+    error, and that the chip still surfaces. The harness streams events without
+    touching disk between
+    them, so a turn's file is static across the snapshot and the flush; a static
+    disk never satisfies the pre-write branch (that needs the turn-end file to
+    equal the forward substitution of the snapshot content), so these turns keep
+    the fragment. The resolution itself is proven in the unit class above, which
+    can set the pre- and post-write disk states independently.
+    """
+
+    AFTER = "head\nvalue = 1  # tuned\ntail\n"
+    PARAMS = {
+        "command": "strReplace",
+        "oldStr": "value = 1",
+        "newStr": "value = 1  # tuned",
+    }
+
+    def _file_change(self, record: TurnRecord) -> dict:
+        changes = [
+            row["meta"]["file_changes"]
+            for row in record.rows("assistant")
+            if (row.get("meta") or {}).get("file_changes")
+        ]
+        assert changes, "no file_changes meta persisted"
+        assert len(changes[-1]) == 1
+        return changes[-1][0]
+
+    @pytest.mark.asyncio
+    async def test_bind_and_settle_run_and_the_chip_surfaces(self, short_tmp_dir: Path):
+        """A completed ambiguous strReplace is snapshotted on tool_call and
+        resolved at flush; the chip surfaces and never carries the internal
+        pending payload. Static disk, so the fragment stands."""
+        f = short_tmp_dir / "cfg"
+        f.write_text(self.AFTER)
+        record = await _snapshot_turn(
+            AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="call-sr",
+                tool_name="fs_write",
+                tool_kind="edit",
+                title="Write",
+                raw_tool_params={**self.PARAMS, "path": str(f)},
+                diff_old_text=self.PARAMS["oldStr"],
+                diff_path=str(f),
+            ),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="call-sr",
+                tool_output="ok",
+                tool_final=True,
+                tool_status="completed",
+            ),
+            *_LANDS,
+        )
+        assert record.stop_reason == STOP_REASON_END_TURN
+        entry = self._file_change(record)
+        assert entry["before"] == self.PARAMS["oldStr"]
+        assert "pending_str_replace" not in entry
+
+    @pytest.mark.asyncio
+    async def test_refused_result_keeps_the_fragment(self, short_tmp_dir: Path):
+        f = short_tmp_dir / "cfg"
+        f.write_text(self.AFTER)
+        record = await _snapshot_turn(
+            AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="call-sr",
+                tool_name="fs_write",
+                tool_kind="edit",
+                title="Write",
+                raw_tool_params={**self.PARAMS, "path": str(f)},
+                diff_old_text=self.PARAMS["oldStr"],
+                diff_path=str(f),
+            ),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="call-sr",
+                tool_output="refused",
+                tool_status="refused",
+            ),
+            *_LANDS,
+        )
+        assert record.stop_reason == STOP_REASON_END_TURN
+        entry = self._file_change(record)
+        assert entry["before"] == self.PARAMS["oldStr"]

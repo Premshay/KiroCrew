@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest'
 
 import {
   countByFilter, listedByDefault, matchesStatus, narrowRoster, parseSort, parseStatusFilters, queryNarrows,
-  rosterPopulation, rosterShows, sortRoster,
+  chatRecency, rosterPopulation, rosterShows, sortRoster,
   type MemberSignals, type RosterQuery,
 } from './rosterFilter'
 
@@ -120,7 +120,7 @@ const MIXED = [
 ]
 const byName = (n: string) => MIXED.find((m) => m.name === n)!
 const WITH_DEFAULT: RosterQuery = { ...EMPTY_QUERY, defaultAgent: 'default' }
-const LISTED = ['default', 'radar', 'oncall', 'app-used', 'older-gateway']
+const LISTED = MIXED.map((m) => m.name)
 
 describe('listedByDefault / rosterShows', () => {
   it('lists a dashboard-created row with no message, and any row whose DM thread holds one', () => {
@@ -130,15 +130,14 @@ describe('listedByDefault / rosterShows', () => {
     expect(listedByDefault(byName('default'), 'default')).toBe(true)
     expect(listedByDefault(byName('older-gateway'), 'default')).toBe(true)
   })
-  it('hides app-stamped, sync and legacy-kirocrew rows with no message', () => {
-    expect(listedByDefault(byName('app-bot'), 'default')).toBe(false)
-    expect(listedByDefault(byName('pkg-tool'), 'default')).toBe(false)
-    expect(listedByDefault(byName('legacy-aim'), 'default')).toBe(false)
-    // The default crew is exempt by NAME only.
-    expect(listedByDefault(byName('default'), '')).toBe(false)
+  it('lists imported crews before they have a direct chat', () => {
+    expect(listedByDefault(byName('app-bot'), 'default')).toBe(true)
+    expect(listedByDefault(byName('pkg-tool'), 'default')).toBe(true)
+    expect(listedByDefault(byName('legacy-aim'), 'default')).toBe(true)
+    expect(listedByDefault(byName('default'), '')).toBe(true)
   })
   it('a starred row is listed like a chatted one, so starring a row reached through the search keeps it', () => {
-    expect(listedByDefault(byName('app-bot'), 'default')).toBe(false)
+    expect(listedByDefault(byName('app-bot'), 'default')).toBe(true)
     expect(listedByDefault({ ...byName('app-bot'), starred: true }, 'default')).toBe(true)
   })
   it('a FAILED default-crew lookup (null) lists every row, so the default is never hidden by a read error', () => {
@@ -146,7 +145,7 @@ describe('listedByDefault / rosterShows', () => {
   })
   it('a live preview counts as a message, so a just-chatted row stays listed before a refetch', () => {
     expect(listedByDefault({ ...byName('app-bot'), last_message: 'hi' }, 'default')).toBe(true)
-    expect(listedByDefault({ ...byName('app-bot'), last_message: '  ' }, 'default')).toBe(false)
+    expect(listedByDefault({ ...byName('app-bot'), last_message: '  ' }, 'default')).toBe(true)
   })
   it('a typed search decides alone: it reaches hidden rows and skips listed ones it misses', () => {
     expect(rosterShows(byName('legacy-aim'), { search: 'aim', defaultAgent: 'default' })).toBe(true)
@@ -161,19 +160,18 @@ describe('rosterPopulation', () => {
   it('is the default-listed rows with no search', () => {
     expect(names(rosterPopulation(MIXED, WITH_DEFAULT))).toEqual(LISTED)
   })
-  it('a search only ADDS the hidden rows it reaches; it never shrinks the population', () => {
+  it('keeps the complete population while a search is active', () => {
     expect(names(rosterPopulation(MIXED, { ...WITH_DEFAULT, search: 'pkg' }))).toEqual([
-      'default', 'radar', 'oncall', 'pkg-tool', 'app-used', 'older-gateway',
+      ...LISTED,
     ])
     expect(names(rosterPopulation(MIXED, { ...WITH_DEFAULT, search: 'zzz' }))).toEqual(LISTED)
   })
 })
 
-describe('narrowRoster hides unlisted rows', () => {
-  it('drops them with no search, whatever the other filters say', () => {
+describe('narrowRoster', () => {
+  it('keeps every registered crew until an explicit filter narrows it', () => {
     expect(names(narrowRoster(MIXED, WITH_DEFAULT, () => IDLE))).toEqual(LISTED)
-    // `source: package` alone would keep pkg-tool and app-bot; the hide rule wins.
-    expect(names(narrowRoster(MIXED, { ...WITH_DEFAULT, source: 'package' }, () => IDLE))).toEqual(['app-used', 'older-gateway'])
+    expect(names(narrowRoster(MIXED, { ...WITH_DEFAULT, source: 'package' }, () => IDLE))).toEqual(['pkg-tool', 'app-bot', 'app-used', 'older-gateway'])
   })
   it('lets the search reach them, still AND-ed with the other filters', () => {
     expect(names(narrowRoster(MIXED, { ...WITH_DEFAULT, search: 'pkg' }, () => IDLE))).toEqual(['pkg-tool'])
@@ -225,5 +223,31 @@ describe('storage parsers reject junk', () => {
     expect(parseSort(null)).toBe('recent')
     expect(parseSort('name')).toBe('name')
     expect(parseSort('date-desc')).toBe('recent')
+  })
+})
+
+describe('last_chat_ts: roster ordering', () => {
+  // What a current gateway ships: every row carries the user's own last send.
+  const CHAT = [
+    { name: 'bg-only', source: 'kirocrew', dashboard_created: true, has_dm_message: true, last_message: 'patrol note', last_active_ts: 900, last_chat_ts: 0 },
+    { name: 'default', source: 'builtin', has_dm_message: false, last_active_ts: 50, last_chat_ts: 0 },
+    { name: 'app-bot', source: 'radar-app', has_dm_message: false, last_active_ts: 800, last_chat_ts: 0 },
+    { name: 'old-chat', source: 'package', has_dm_message: false, last_active_ts: 5, last_chat_ts: 100 },
+    { name: 'new-chat', source: 'kirocrew', has_dm_message: true, last_active_ts: 1, last_chat_ts: 300 },
+  ]
+  it('lists every registered row regardless of its direct-chat history', () => {
+    const listed = CHAT.filter((m) => listedByDefault(m, 'default')).map((m) => m.name)
+    expect(listed).toEqual(['bg-only', 'default', 'app-bot', 'old-chat', 'new-chat'])
+  })
+  it('does not depend on a default-crew lookup', () => {
+    expect(CHAT.filter((m) => listedByDefault(m, null)).map((m) => m.name)).toEqual(['bg-only', 'default', 'app-bot', 'old-chat', 'new-chat'])
+  })
+  it('still lists a starred row', () => {
+    expect(listedByDefault({ ...CHAT[0], starred: true }, 'default')).toBe(true)
+  })
+  it('orders Recent by the user\'s last send, not by background activity', () => {
+    expect(sortRoster(CHAT, 'recent').map((m) => m.name)).toEqual(['new-chat', 'old-chat', 'app-bot', 'bg-only', 'default'])
+    expect(chatRecency({ name: 'x', last_active_ts: 7 })).toBe(7)
+    expect(chatRecency({ name: 'x', last_active_ts: 7, last_chat_ts: 0 })).toBe(0)
   })
 })

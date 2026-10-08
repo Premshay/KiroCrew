@@ -80,6 +80,7 @@ def post_compaction_parts(
     is_cc: bool,
     private_owner: bool,
     blocks_reads: bool,
+    minimal_context: bool,
     context_groups: frozenset[str] | None,
     workspace: str | None,
     memory_store: str | None,
@@ -124,8 +125,12 @@ def post_compaction_parts(
     # as the session-start build: this path restores a block that build
     # withheld, so reading the caller scope alone would hand back the
     # activity index the operator's inject_memory setting excluded.
-    if not blocks_reads and _inclusion._group_included(
-        ctx._config_scoped_groups(context_groups), _inclusion.CONTEXT_GROUP_MEMORY
+    if (
+        not minimal_context
+        and not blocks_reads
+        and _inclusion._group_included(
+            ctx._config_scoped_groups(context_groups), _inclusion.CONTEXT_GROUP_MEMORY
+        )
     ):
         memory = builder.get_memory_for(workspace, memory_store)
         parts.append(ctx._neutralize_structural_markers(memory.activity_index()))
@@ -133,7 +138,7 @@ def post_compaction_parts(
             "[Memory tools] Call memory_recall with specific keywords for prior facts and tasks.\n"
         )
     _inject, _globs = ctx._skills_injection_plan(agent, is_cc=is_cc, project_dir=project)
-    if _inject:
+    if _inject and not minimal_context:
         _cfg = ctx.KiroCrewConfig.load()
         lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))
         caps = ctx._resolve_caps(model_window)

@@ -24,10 +24,8 @@ from kiro_crew.validation import (
     WORK_ITEM_ASSIGNED_HANDOFF_ROUTE_SCHEMA,
     WORK_ITEM_ASSIGNED_PROGRESS_ROUTE_SCHEMA,
     WORK_ITEM_CREATE_SCHEMA,
-    WORK_ITEM_DISPATCH_RETRY_ROUTE_SCHEMA,
     WORK_ITEM_EVALUATE_SCHEMA,
     WORK_ITEM_LAUNCH_ROUTE_SCHEMA,
-    WORK_ITEM_REVOKE_ROUTE_SCHEMA,
     WORK_ITEM_TRANSITION_ROUTE_SCHEMA,
     WORK_ITEM_UPDATE_ROUTE_SCHEMA,
     ValidationError,
@@ -119,9 +117,7 @@ def _manager(request: web.Request) -> tuple[Any | None, web.Response | None]:
     return manager, None
 
 
-async def _worker(
-    request: web.Request, operation: str
-) -> tuple[str | None, web.Response | None]:
+async def _worker(request: web.Request, operation: str) -> tuple[str | None, web.Response | None]:
     """Strict worker gate: only a manager-attributed ``subagent:<run-id>`` key.
 
     The coordinator recognition cascade cannot see subagent runs, so this
@@ -142,7 +138,10 @@ async def _worker(
         except Exception:
             logger.warning("worker-gate audit failed for %s", operation, exc_info=True)
         return None, web.json_response(
-            {"error": "worker identity is invalid for this route", "code": "worker_identity_invalid"},
+            {
+                "error": "worker identity is invalid for this route",
+                "code": "worker_identity_invalid",
+            },
             status=403,
         )
     return sk, None
@@ -241,7 +240,10 @@ async def api_work_item_launch_candidates(request: web.Request) -> web.Response:
     except Exception:
         logger.warning("launch-candidate roster failed", exc_info=True)
         return web.json_response(
-            {"error": "the launch-candidate roster is unavailable", "code": "subagent_manager_unavailable"},
+            {
+                "error": "the launch-candidate roster is unavailable",
+                "code": "subagent_manager_unavailable",
+            },
             status=503,
         )
     return web.json_response({"ok": True, "result": {"candidates": candidates}})

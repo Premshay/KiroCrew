@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
 from aiohttp import web
@@ -38,6 +38,11 @@ class WebSocketHubOwner(Protocol):
 
 
 Redactor = Callable[[str], tuple[str, Any]]
+
+#: The ``data`` of a fan-out frame. A mapping, not ``object``: an unawaited async
+#: payload builder hands the fan-out a coroutine ``json.dumps`` cannot serialize,
+#: and with ``object`` that mistake type-checked at every call site.
+WsPayload = Mapping[str, Any]
 
 
 class WebSocketHub:
@@ -166,6 +171,30 @@ class WebSocketHub:
                     pending.add(slug)
                 return False
         if ws.get("_is_dashboard_user", False):
+            # The per-member event log is the owner's view of the crew, the
+            # boundary the ``/api/members`` reads apply. A non-owner dashboard
+            # session (a Telegram, Teams or Webex allowlist link) is a dashboard
+            # user too, so the owner set decides: ``register_ws`` fills it from
+            # ``is_owner_dashboard_request``.
+            from kiro_crew.dashboard.ws_event_scope import MEMBER_LOG_EVENTS
+
+            if msg_type in MEMBER_LOG_EVENTS and ws not in (
+                getattr(self._owner, "_owner_ws_clients", None) or set()
+            ):
+                try:
+                    from kiro_crew.dashboard.ws_event_scope import (
+                        DASHBOARD_USER_AUDITEE,
+                        _audit_deny,
+                    )
+
+                    _audit_deny(DASHBOARD_USER_AUDITEE, msg_type, "owner_only")
+                except Exception:
+                    self._log.debug(
+                        "state: SEL audit for non-owner deny %s failed",
+                        msg_type,
+                        exc_info=True,
+                    )
+                return False
             # Granted, and the grant is a permission decision like any other:
             # ``AUTOSDE.yaml`` wants an SEL record for it, not only for the
             # refusals below. Recorded HERE, at the chokepoint every dashboard
@@ -388,7 +417,7 @@ class WebSocketHub:
             remove(ws)
         return sent
 
-    def broadcast_ws(self, msg_type: str, data: object) -> None:
+    def broadcast_ws(self, msg_type: str, data: WsPayload) -> None:
         """Send a typed message to every authorized WS client."""
         if not self._owner._ws_clients:
             return
@@ -396,7 +425,7 @@ class WebSocketHub:
         send_all = self._owner_method("_send_ws_all", self._send_ws_all)
         send_all(msg_type, data, msg)
 
-    async def deliver_ws_owners(self, msg_type: str, data: object) -> int:
+    async def deliver_ws_owners(self, msg_type: str, data: WsPayload) -> int:
         """Await owner-only sends and return the number that completed."""
         targets = [ws for ws in list(self._owner._owner_ws_clients) if not ws.closed]
         if not targets:
@@ -419,7 +448,7 @@ class WebSocketHub:
                 remove(ws)
         return delivered
 
-    def broadcast_ws_owners(self, msg_type: str, data: object) -> None:
+    def broadcast_ws_owners(self, msg_type: str, data: WsPayload) -> None:
         """Send a typed message only to owner-authorized clients."""
         if not getattr(self._owner, "_owner_ws_clients", None):
             return
@@ -555,9 +584,16 @@ class WebSocketHub:
         if not slugs:
             return
         try:
+            from kiro_crew.dashboard.ws_event_scope import DASHBOARD_USER_AUDITEE, _audit_allow
             from kiro_crew.eventlog import types as eventlog_types
             from kiro_crew.eventlog.service import get_service
 
+            # These frames bypass ``_ws_client_allowed``, which records the grant
+            # for broadcast frames, so the replay records its own.
+            try:
+                _audit_allow(DASHBOARD_USER_AUDITEE, eventlog_types.WS_MEMBER_PROJECTION)
+            except Exception:
+                self._log.debug("members_subscribed: replay grant audit failed", exc_info=True)
             service = get_service()
             for slug in sorted(slugs):
                 snap = await asyncio.to_thread(service.redacted_snapshot, slug)
@@ -599,7 +635,7 @@ class WebSocketHub:
     def unsubscribe_subagents(self, ws: web.WebSocketResponse) -> None:
         self._owner._ws_subagent_subscribers.discard(ws)
 
-    def broadcast_ws_subagent_subscribers(self, msg_type: str, data: object) -> None:
+    def broadcast_ws_subagent_subscribers(self, msg_type: str, data: WsPayload) -> None:
         """Fan out heavy subagent data only to subscribed, authorized clients."""
         if not self._owner._ws_subagent_subscribers:
             return

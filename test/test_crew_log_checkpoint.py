@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import itertools
 import json
-import time
 from typing import Any
 
 import pytest
@@ -208,7 +208,7 @@ def _state_digest(state: dict[str, Any]) -> str:
 #: number retires savepoints written under the shape before it and the shape changed once.
 _FOLD_STATE_PINS: dict[str, tuple[str, int]] = {
     "status": ("929af8634f6d6a5f", 4),
-    "usage": ("d59ec4857f0f69ba", 13),
+    "usage": ("502f1d8eda19fb9f", 15),
     "timeline": ("4f461179faff39a3", 5),
     "tools": ("008b36fed498d32b", 4),
     "approvals": ("c9db629215cc2620", 4),
@@ -387,21 +387,26 @@ def _drop_the_log(unit_id: str = SESSION) -> None:
 def _recreate_distinctly(turns: int, unit_id: str = SESSION) -> CrewLog:
     """Replace the unit's log with a new one of *turns* turns, distinguishably.
 
-    The pause is the load-bearing part. A log's identity combines its header's
-    ``created_at`` -- stamped in epoch MILLISECONDS -- with the file's device and
-    inode, so a log deleted and recreated inside one millisecond onto a recycled
-    inode is indistinguishable from the original. Recreating immediately in a
-    scratch directory hits exactly that: the same millisecond is likely and the
-    just-freed inode is commonly handed straight back, which made these tests pass
-    or fail with the run's timing. Waiting past a millisecond tick makes the
-    identity differ by construction, so what the test measures is the guard rather
-    than the clock. The narrow collision itself is a property of the identity these
-    tests do not own.
+    A log's identity combines its header's ``created_at`` -- stamped in epoch
+    MILLISECONDS -- with the file's device and inode, so a log deleted and recreated
+    inside one clock tick onto a recycled inode is indistinguishable from the
+    original. Recreating immediately in a scratch directory hits exactly that: the
+    same tick is likely and the just-freed inode is commonly handed straight back,
+    which made these tests pass or fail with the run's timing. A pause cannot be
+    sized to cross a tick everywhere -- ``time.time`` steps about 15.6 ms on Windows
+    CPython through 3.12 -- so the new log's stamps are SET instead, counting up from
+    one past the dropped log's own: the identity differs by construction, and what
+    the test measures is the guard rather than the clock. The narrow collision
+    itself is a property of the identity these tests do not own.
     """
-    time.sleep(0.003)
+    dropped = store.unit_header_created_at(lg.KIND_SESSION, unit_id)
+    assert dropped is not None, "there is no log to recreate"
     _drop_the_log(unit_id)
-    fresh = _log(unit_id)
-    _grow(fresh, turns)
+    stamps = itertools.count(dropped + 1)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store, "now_ms", lambda: next(stamps))
+        fresh = _log(unit_id)
+        _grow(fresh, turns)
     return fresh
 
 

@@ -6,7 +6,8 @@ import json
 
 import pytest
 
-from kiro_crew import session_ledger, work_items as wi
+from kiro_crew import session_ledger
+from kiro_crew import work_items as wi
 
 
 @pytest.fixture(autouse=True)

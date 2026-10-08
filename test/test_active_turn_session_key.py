@@ -146,6 +146,9 @@ class TestTheKeyDoesNotOutliveItsTurn:
     async def test_cleared_after_a_normal_completion(self, tmp_path) -> None:
         state, slot, client = _state_and_slot(tmp_path)
         _stream_empty(client)
+        # Pre-spent, so the empty reply ends the cycle instead of dispatching a
+        # retry turn that would hold its own key by the time this one returns.
+        slot._empty_response_retries = 2
 
         await _run_chat(state, slot, "test message")
 
@@ -217,7 +220,7 @@ class TestOneTurnCannotRetireAnother:
         slot.queue_append("second message")
         observed: dict[str, str] = {}
 
-        async def _fake_start(st, sl) -> bool:
+        async def _fake_start(st, sl, **_kwargs) -> bool:
             observed["at_dispatch"] = sl._active_turn_session_key
             # Stand in for the successor publishing its own identity.
             sl._active_turn_session_key = "dashboard:successor"

@@ -42,6 +42,7 @@ from kiro_crew.acp.harness import (
 )
 from kiro_crew.acp.harness import kas as kas_mod
 from kiro_crew.acp.harness._common import KIRO_FAMILY_ALIASES
+from kiro_crew.acp.harness.deepseek import DeepseekLaunch
 from kiro_crew.acp.kas_transport import METHOD_KAS_AUTH_GET_ACCESS_TOKEN
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
@@ -372,10 +373,10 @@ async def test_a_missing_binary_aborts_the_spawn(monkeypatch, tmp_path, backend)
     # the cache is emptied too: a hit would answer with a real earlier verdict and
     # the patch would never be reached.
     monkeypatch.setattr(client_mod, "_self_served_bin_caches", {})
-    monkeypatch.setattr(
-        client_mod, "_resolve_self_served_bin", lambda _backend: (None, "/nowhere")
-    )
-    with pytest.raises(AcpRuntimeError, match="not found"):
+    monkeypatch.setattr(client_mod, "_resolve_self_served_bin", lambda _backend: (None, "/nowhere"))
+    from kiro_crew.acp.transport_errors import AcpError
+
+    with pytest.raises((AcpRuntimeError, AcpError), match="not found"):
         await harness_for(backend).resolve_spawn(_ctx(tmp_path))
 
 
@@ -406,9 +407,9 @@ def test_every_client_helper_a_harness_calls_exists():
                 continue
             if node.value.id in aliases and not hasattr(client_mod, node.attr):
                 missing.append(f"{path.name}: client_mod.{node.attr}")
-    assert not missing, (
-        "a harness calls a helper the client module no longer defines: " + ", ".join(missing)
-    )
+    assert (
+        not missing
+    ), "a harness calls a helper the client module no longer defines: " + ", ".join(missing)
 
 
 def test_kiro_injects_the_api_key_and_kas_strips_it(monkeypatch):
@@ -819,22 +820,9 @@ def test_codex_is_made_to_ask_by_a_session_write():
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_no_host_is_left_unverified(backend):
-    """``UNVERIFIED`` refuses, so a host resolving to it cannot start a session --
-    with one operator-owned exception.
-
-    Every host on the SELECTABLE switch must be routed. DeepSeek is not on the
-    switch: its routing is UNVERIFIED, its seat is reachable only through an
-    engine map entry the operator owns, and both transports (client and runtime
-    harness) start it with the same documented posture -- no credential mask, and
-    the harness's own workspace-write sandbox deciding its tool calls. Registering
-    it on the shared runtime does not change that: the exception is the engine
-    map's accepted state, not something this registration grants.
-    """
+    """Every registered host has an enforced routing."""
     from kiro_crew import acp_tool_gate
 
-    if backend == ACP_BACKEND_DEEPSEEK:
-        assert acp_tool_gate.routing_for(backend) is acp_tool_gate.Routing.UNVERIFIED
-        return
     assert acp_tool_gate.routing_for(backend) is not acp_tool_gate.Routing.UNVERIFIED
 
 
@@ -996,7 +984,10 @@ def test_no_harness_holds_state_beyond_its_backend_id(backend):
     object it happened to hold, which is the coupling this layer removes.
     """
     harness = harness_for(backend)
-    assert vars(harness) == {}
+    if backend == ACP_BACKEND_DEEPSEEK:
+        assert isinstance(vars(harness).get("_launch"), DeepseekLaunch)
+    else:
+        assert vars(harness) == {}
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -1190,12 +1181,12 @@ def test_the_spawn_mask_reaches_the_sandbox():
     """
     import inspect as _inspect
 
-    from kiro_crew.acp.runtime import AcpRuntime
+    from kiro_crew.acp import launch as launch_mod
 
-    source = _inspect.getsource(AcpRuntime._spawn_admitted)
+    source = _inspect.getsource(launch_mod.launch)
     call = source.split("wrap_argv_async(")[1].split(")")[0]
-    assert "extra_hidden_dirs=plan.extra_hidden_dirs" in call
-    assert "extra_expose_files=plan.extra_expose_files" in call
+    assert "extra_hidden_dirs=request.extra_hidden_dirs" in call
+    assert "extra_expose_files=request.extra_expose_files" in call
 
 
 def test_an_enforced_host_may_not_spawn_without_a_mask():
@@ -1227,6 +1218,8 @@ def test_an_enforced_host_may_not_spawn_without_a_mask():
     for backend, harness_cls in _HARNESSES.items():
         routing = acp_tool_gate.routing_for(backend)
         source = _inspect.getsource(harness_cls.resolve_spawn)
+        if backend == ACP_BACKEND_DEEPSEEK:
+            source += _inspect.getsource(DeepseekLaunch.resolve_spawn)
         if routing in (acp_tool_gate.Routing.AGENT_SPEC, acp_tool_gate.Routing.UNVERIFIED):
             # Asks by construction, or the operator-owned no-mask seat: no mask
             # needed, and none claimed.
@@ -1333,6 +1326,8 @@ def test_an_enforced_host_must_consult_the_sandbox_tier():
         if routing in (acp_tool_gate.Routing.AGENT_SPEC, acp_tool_gate.Routing.UNVERIFIED):
             continue
         source = inspect.getsource(harness_cls.resolve_spawn)
+        if backend == ACP_BACKEND_DEEPSEEK:
+            source += inspect.getsource(DeepseekLaunch.resolve_spawn)
         assert "sandbox_mode" in source, (
             f"{backend} carries a credential mask, so its harness must consult "
             f"ctx.sandbox_mode and refuse where the mask would be dropped"

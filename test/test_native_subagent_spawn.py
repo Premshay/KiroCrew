@@ -12,6 +12,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from kiro_crew.acp.types import (
+    EVENT_SUBAGENT_ACTIVITY,
+    AcpEvent,
+    ProviderChildActivity,
+)
 from kiro_crew.dashboard.chat_runner import (
     _append_native_output,
     _native_crew_should_auto_approve,
@@ -27,11 +32,6 @@ from kiro_crew.dashboard.state import (
     NATIVE_SUBAGENT_TERMINAL_KEEP,
     DashboardState,
     native_subagent_output_tail,
-)
-from kiro_crew.acp.types import (
-    EVENT_SUBAGENT_ACTIVITY,
-    AcpEvent,
-    ProviderChildActivity,
 )
 
 
@@ -1093,7 +1093,8 @@ class TestRetainTerminalNative:
     def test_bounded_to_keep_most_recent(self):
         now = time.time()
         tracker = {
-            f"s{i}": self._done(f"s{i}", now - (100 - i)) for i in range(NATIVE_SUBAGENT_TERMINAL_KEEP + 5)
+            f"s{i}": self._done(f"s{i}", now - (100 - i))
+            for i in range(NATIVE_SUBAGENT_TERMINAL_KEEP + 5)
         }
         retained = _retain_terminal_native(tracker, now=now)
         assert len(retained) == NATIVE_SUBAGENT_TERMINAL_KEEP

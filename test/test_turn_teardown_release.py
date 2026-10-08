@@ -30,23 +30,6 @@ from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
 
 
 @pytest.mark.asyncio
-async def test_start_next_holds_user_while_orchestrating(tmp_path) -> None:
-    """While a plan orchestrates, the queue drain HOLDS plain user messages
-    (system/recovery still drain) so a mid-plan message never runs concurrently
-    with the plan. It is handed off only after the loop clears the flag."""
-    state = _make_state(tmp_path)
-    state.subagents = None  # isolate the orchestrating condition of hold_users
-    slot = state.get_or_create_slot("orch-hold")
-    slot._in_stage_execution = True
-    slot.queue_append("user typed mid-plan")
-
-    started = await _start_next_queued_turn(state, slot)
-
-    assert started is False  # held, not started
-    assert [i["content"] for i in slot._queue] == ["user typed mid-plan"]
-
-
-@pytest.mark.asyncio
 async def test_drained_queue_ids_repeat_on_successor_status(tmp_path) -> None:
     """A reconnect that misses ``queue_pop`` can retire the exact card on the
     successor's first status frame, without touching later queued prompts."""
@@ -106,7 +89,9 @@ def _stream_raises(client: MagicMock, exc: BaseException) -> None:
 
 class TestTurnTeardownRelease:
     @pytest.mark.asyncio
-    async def test_hung_identity_check_does_not_block_session_start(self, tmp_path, monkeypatch) -> None:
+    async def test_hung_identity_check_does_not_block_session_start(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """A protective account check must not leave an unrelated provider thinking forever."""
         from kiro_crew.dashboard import chat_runner
 

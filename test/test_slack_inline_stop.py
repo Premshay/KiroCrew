@@ -369,3 +369,45 @@ class TestHandleSessionEnd:
         mock_orch.slack.update_message.assert_called_once()
         call_args = mock_orch.slack.update_message.call_args
         assert "ended" in call_args[1]["text"]
+
+
+# ---------------------------------------------------------------------------
+# handle_message — inline stop button post is best-effort
+# ---------------------------------------------------------------------------
+
+
+class TestWorkingBlockPostFailure:
+    @pytest.mark.asyncio
+    async def test_threaded_turn_runs_when_working_block_post_fails(self):
+        """A failed stop-button post in a thread still runs the turn and
+        never tries to delete a working block that was never posted."""
+        import importlib
+
+        from conftest import MockSlackClient
+        from kiro_crew.providers.base import LLMEvent
+        from kiro_crew.slack.handler import handle_message
+
+        handler_tests = importlib.import_module("test_slack_handler")
+
+        class _WorkingBlockFailsSlack(MockSlackClient):
+            async def post_blocks(self, channel, blocks, text, thread_ts=None):
+                if text == "Working…":
+                    self.actions.append(("blocks_failed", {"text": text}))
+                    raise RuntimeError("slack 503")
+                return await super().post_blocks(channel, blocks, text, thread_ts)
+
+        slack = _WorkingBlockFailsSlack()
+        provider = handler_tests.FakeProvider(
+            [LLMEvent(kind="text_chunk", text="the answer is 42")]
+        )
+        sessions = handler_tests.FakeSessionManager(provider)
+
+        await handle_message(slack, sessions, "C1", "hi", "thread1", "msg1", "U1")
+
+        assert ("blocks_failed", {"text": "Working…"}) in slack.actions
+        assert sessions.keys_seen == ["thread1"]
+        rendered = [a[1].get("text", "") for a in slack.actions if a[0] in ("update", "post")]
+        assert any("the answer is 42" in r for r in rendered), slack.actions
+        posted = {a[1]["ts"] for a in slack.actions if a[0] in ("post", "blocks")}
+        deleted = {a[1]["ts"] for a in slack.actions if a[0] == "delete"}
+        assert deleted <= posted, "deleted a message that was never posted"

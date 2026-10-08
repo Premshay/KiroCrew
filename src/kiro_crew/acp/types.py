@@ -58,6 +58,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEER_ADVERTISED,
     ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
@@ -131,6 +132,9 @@ METHOD_PROMPT = "session/prompt"
 METHOD_CANCEL = "session/cancel"
 METHOD_REQUEST_PERMISSION = "session/request_permission"
 METHOD_SESSION_UPDATE = "session/update"
+METHOD_STEER = "_session/steer"
+METHOD_CLAUDE_STEER = "_session/steering"
+CLAUDE_STEER_IDLE_BEHAVIOR = "promptRequired"
 METHOD_METADATA = "_kiro.dev/metadata"
 METHOD_COMMANDS_EXECUTE = "_kiro.dev/commands/execute"
 METHOD_SESSION_LOAD = "session/load"
@@ -194,14 +198,6 @@ METHOD_KAS_OPEN_EXTERNAL_URL = "_kiro/openExternalUrl"
 METHOD_SUBAGENT_LIST_UPDATE = "_kiro.dev/subagent/list_update"
 METHOD_KIRO_SESSION_UPDATE = "_kiro.dev/session/update"
 METHOD_SET_CONFIG_OPTION = "session/set_config_option"
-# kiro-cli / KAS mid-turn steering. Claude uses METHOD_CLAUDE_STEER below with
-# a different request shape, so these methods must remain distinct.
-METHOD_STEER = "_session/steer"
-# claude-agent-acp's steering endpoint is distinct from kiro-cli's METHOD_STEER.
-# On an idle session it must decline the request so Crew can retain and visibly
-# requeue the directive rather than letting the adapter start an untracked turn.
-METHOD_CLAUDE_STEER = "_session/steering"
-CLAUDE_STEER_IDLE_BEHAVIOR = "promptRequired"
 #: ``configId`` under which KAS exposes the session model. KAS implements no
 #: ``session/set_model``, so this is the only way to switch a model on it.
 MODEL_CONFIG_ID = "model"
@@ -259,31 +255,17 @@ TODO_ID_MAX = 64
 ACP_CLIENT_CAPABILITIES: dict = {
     "fs": {"readTextFile": False, "writeTextFile": False},
     "terminal": False,
-    # Claude forwards nested Task/Agent updates only when the client opts in.
     "_meta": {"subagent-transcript": True},
 }
 
-# `session.compaction` switches an adapter from its legacy compaction reporting to
-# native `compaction_update` frames, so it goes only to the backends whose adapters
-# emit those frames AND whose sessions translate them (`_codex_compaction_event`,
-# gated on `ACP_BACKENDS_INLINE_COMPACTION`). Observed live: codex-acp 2.0.0 and
-# claude-agent-acp 0.84.0. kiro-cli and KAS keep the shared set byte-identical --
-# the rule above again: add a key for a backend in the change that handles it.
 ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION: dict = {
     **ACP_CLIENT_CAPABILITIES,
     "session": {"compaction": {}},
 }
-# `session.notices` moves an adapter's provider notices out of the transcript into
-# `notice` session updates, so it goes only to the backends whose adapters emit
-# them: codex-acp 2.0.0 and claude-agent-acp 0.84.0 (a live Claude hook message
-# arrived as `{"sessionUpdate": "notice", "severity": "info", "title": ...}`).
-# kiro-cli, KAS and every other backend keep the shared set byte-identical -- the
-# rule above again: add a key for a backend in the change that handles it.
 ACP_CLIENT_CAPABILITIES_SESSION_NOTICES: dict = {
     **ACP_CLIENT_CAPABILITIES,
     "session": {"notices": {}},
 }
-
 ACP_CLIENT_CAPABILITIES_NATIVE_UPDATES: dict = {
     **ACP_CLIENT_CAPABILITIES,
     "session": {"compaction": {}, "notices": {}},
@@ -291,7 +273,7 @@ ACP_CLIENT_CAPABILITIES_NATIVE_UPDATES: dict = {
 
 
 def acp_client_capabilities(backend: str | None) -> dict:
-    """The ``clientCapabilities`` the standalone transport sends for ``backend``."""
+    """Return the client capabilities negotiated for one ACP backend."""
     if backend in ACP_BACKENDS_NATIVE_COMPACTION and backend in ACP_BACKENDS_SESSION_NOTICES:
         return ACP_CLIENT_CAPABILITIES_NATIVE_UPDATES
     if backend in ACP_BACKENDS_NATIVE_COMPACTION:
@@ -300,6 +282,17 @@ def acp_client_capabilities(backend: str | None) -> dict:
         return ACP_CLIENT_CAPABILITIES_SESSION_NOTICES
     return ACP_CLIENT_CAPABILITIES
 
+
+# The variable kiro-cli reads to name the application driving it, and the name
+# Crew gives. kiro-cli puts it on the user-agent of EVERY request it sends to its
+# own model backend (``clientApp/<value>``), which is the only place a
+# backend-side record can tell a Crew-driven request apart. ``clientInfo.name``
+# in ``initialize`` does not reach there: kiro-cli keeps that in its telemetry and
+# on the ``AWS_EXECUTION_ENV`` of the tools it spawns, never on its own requests.
+# ``acp.client.CLIENT_NAME`` (``clientInfo.name``) is this same constant, so one
+# filter string (``clientApp/kirocrew``, ``acp-client/kirocrew``) finds Crew on both.
+KIRO_CLI_CLIENT_APPLICATION_ENV = "KIRO_CLI_CLIENT_APPLICATION"
+KIRO_CLI_CLIENT_APPLICATION = "kirocrew"
 
 # ── ACP Backend Identifiers ──
 # DEFINED in :mod:`kiro_crew.acp_backends` and re-exported from the import block
@@ -324,12 +317,6 @@ def acp_client_capabilities(backend: str | None) -> dict:
 # for the same reason the backend identifiers do: a consumer outside this package
 # must be able to ask a capability question without importing ``kiro_crew.acp``,
 # whose ``__init__`` pulls in the client and runtime.
-
-# claude-agent-acp and dsh-acp advertise their steering extensions at initialize.
-# Keep the connection-level confirmation separate from the transport-level steer
-# set: an older adapter may have the same backend identity but no working
-# steering RPC.
-ACP_BACKENDS_STEER_ADVERTISED = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_DEEPSEEK})
 
 # ── Provider labels ──
 # The backend identity key persisted in the session map. It indexes three
@@ -715,8 +702,6 @@ class TurnUsage:
     output_tokens: int = 0
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
-    thinking_tokens: int = 0
-    total_tokens: int = 0
     cost_usd: float = 0.0
     credits: float = 0.0
     num_turns: int = 0
@@ -927,9 +912,7 @@ class AcpEvent:
     #: layer: a consumer that re-parsed the text would be re-deciding a protocol
     #: question it does not own.
     control_notice: bool = False
-    #: True for a completed native context-compaction tool update. This remains
-    #: distinct from a text control notice because recovery must wait for the
-    #: tool's final status before resetting the session context.
+    #: True for a completed native context-compaction tool update.
     is_context_compaction: bool = False
     #: True when this event was SYNTHESIZED by the client rather than read off a
     #: backend frame. Only the claude compaction terminal sets it: an automatic

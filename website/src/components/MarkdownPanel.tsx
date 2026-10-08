@@ -15,6 +15,9 @@ import Clickable from './Clickable'
 import { CommentList, formatCommentsMessage, type InlineComment } from './CommentOverlay'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useFileMenuItems, visibleFileMenuItems, invokeFileMenuItem, FileMenuItemIcon, FileMenuItemLabel } from '../apps/fileMenuContributions'
+import { FILE_EXPLORER_APP, FILE_EXPLORER_ROUTE, fileExplorerDeepLink } from '../apps/file-explorer/deepLink'
+import { useInstalledApps } from '../hooks/panelTabRegistry'
+import { appNavTarget } from '../appNav'
 import SelectionToolbar, { type SelectionAction, type SelectionComposer } from './SelectionToolbar'
 import MarkdownOutlineRail from './MarkdownToc'
 import { useFileWatch } from '../hooks/useFileWatch'
@@ -27,11 +30,11 @@ import { findBestOccurrence } from '../hooks/useMarkdownCommentHighlights'
 import { detectFileType, BinaryFileCard } from './FileRenderers'
 import { ContentRenderer, MD_EXTS, extOf, langFor, wrapCode } from './ContentRenderer'
 import { api } from '../api/client'
-import { fileReadUrl, downloadFileToDisk, downloadFileName } from '../utils/fileReadUrl'
+import { fileReadUrl, downloadFileToDisk, downloadFileName, isAbsolutePath } from '../utils/fileReadUrl'
 import { downloadBlob } from '../utils/download'
 import { fetchFileRead, fileReadQueryKey, isPartialRead } from '../utils/fileReadQuery'
 import { documentBodyEpochNow } from '../hooks/usePanelTabs'
-import { loadCommentDrafts, saveCommentDrafts, setCommentsForFile } from '../utils/commentDrafts'
+import { dropDeliveredComments, loadCommentDrafts, persistFileComments } from '../utils/commentDrafts'
 import { copyToClipboard } from '../utils/clipboard'
 import { WINDOWS_ABS_PATH_RE } from '../utils/urlTransform'
 import { anchorFromRange } from '../utils/selectionAnchor'
@@ -315,7 +318,10 @@ interface Props {
   onSave: (filePath: string, content: string) => Promise<void>
   onClose: () => void
   liveWatch?: boolean
-  onSubmitComments?: (message: string) => void
+  /** Hands the comment batch to chat. Returning (or resolving) `false`, or
+   *  throwing, means the send was refused and the batch stays pending; any
+   *  other result counts as delivered and clears it. */
+  onSubmitComments?: (message: string) => void | boolean | Promise<void | boolean>
   /** Gateway connection flag. Gates the batch comment submit (mirrors
    *  ChatInput's Send gating) so pending comments can't be composed and
    *  cleared while the chat send path would silently refuse the message.
@@ -375,6 +381,7 @@ import { i18nT } from '../i18n/t'
 import { useDocumentImeLatch, useImeGuard } from '../hooks/useImeGuard'
 import { useScrollMemory } from '../hooks/useScrollMemory'
 import FilePathMenu, { revealOrOpen, useRevealLabel, useCanOpenFile } from './FilePathMenu'
+import { pathBasename } from '../utils/pathBasename'
 
 /**
  * File types that render through a dedicated viewer instead of a text editor.
@@ -440,11 +447,11 @@ const HINT_KEY = 'kirocrew:comment-hint-dismissed'
 /** How often a visible tab whose file is gone asks the disk whether it is
  *  back: `api_file_watch`'s own poll cadence (1 s), so a recreated file lands
  *  as fast as a change would through the stream the tab cannot hold meanwhile. */
-const MISSING_FILE_RETRY_MS = 1_000
+export const MISSING_FILE_RETRY_MS = 1_000
 /** The ceiling the retry backs off to: each attempt doubles the wait, so a
  *  file that stays gone costs one GET (and one SEL `not_found` record) every
  *  30 s, not every second, until the tab is hidden or the file is back. */
-const MISSING_FILE_RETRY_MAX_MS = 30_000
+export const MISSING_FILE_RETRY_MAX_MS = 30_000
 
 /** Report a failure to the panel, which renders it through the shared
  *  ErrorNotice (replacing the blocking `alert()` these paths used to raise). */
@@ -520,9 +527,27 @@ function FileArtifactActionButton({ state }: { state: ReturnType<typeof useFileA
 /**
  * Row-2 icon: knowledge library toggle. Hidden by the caller
  * when the file's extension isn't supported (or the library is
- * unconfigured). When already added, renders as a static badge.
+ * unconfigured). When already added, renders as a green badge — removable
+ * (real button) when the source is a per-file local_file, inert otherwise.
  */
 function KnowledgeToggleIconButton({ state }: { state: ReturnType<typeof useFileKnowledgeState> }) {
+  // A per-file local_file source is one this panel created, so the toggle
+  // flips both ways: clicking the green badge removes it again. Folder and
+  // other wider sources keep the inert badge — they are owned by the
+  // Knowledge page's own delete flows, not this file panel.
+  if (state.alreadyAdded && state.sourceType === 'local_file' && state.sourceId) {
+    return (
+      <button
+        className="p-1.5 rounded-md border border-border/40 text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all disabled:opacity-50 inline-flex items-center"
+        onClick={() => state.remove()}
+        disabled={state.removing}
+        title={i18nT('components.markdownPanel.remove_from_knowledge_library')}
+        aria-label={i18nT('components.markdownPanel.remove_from_knowledge_library')}
+      >
+        <BookOpen size={14} style={{ color: 'var(--ok)' }} />
+      </button>
+    )
+  }
   if (state.alreadyAdded) {
     return (
       <span
@@ -564,6 +589,31 @@ function KnowledgeToggleIconButton({ state }: { state: ReturnType<typeof useFile
 // content. Without it a long app-contributed label sets the row's width and spills past
 // the cap instead of being clipped by it.
 const menuRowCls = 'flex items-center gap-2 w-full min-w-0 overflow-hidden px-3 py-1.5 text-[13px] text-text cursor-pointer border-none bg-transparent text-left whitespace-nowrap hover:bg-bg-hover focus-visible:bg-bg-hover focus:outline-hidden'
+
+/**
+ * The Files app as a destination for the file under the ⋯ menu, or `null` when
+ * there is none to offer.
+ *
+ * Eligibility, route and label come from the same `appNavTarget` derivation the
+ * left rail and the command palette use, so this row cannot offer an app those
+ * two hide: the Files app ships `defaultEnabled: false`, and a disabled app has
+ * nowhere to go. Narrower than theirs in one way — the row needs the NATIVE
+ * page (`FILE_EXPLORER_ROUTE`), because only `FileExplorerPage` reads the
+ * `?path=` the link carries. An orphaned app (routed to its migration page) or
+ * one an edition re-homes under AppHost would swallow the param and land the
+ * reader on a page that opened nothing, so neither gets a row.
+ *
+ * Costs no request: `useInstalledApps` observes the shell's own `['apps']`
+ * query, which the sidebar fetches on every dashboard load.
+ */
+function useFilesAppTarget(): { label: string } | null {
+  const { apps } = useInstalledApps()
+  return useMemo(() => {
+    const app = apps.find(a => a.name === FILE_EXPLORER_APP)
+    const target = app ? appNavTarget(app) : null
+    return target?.route === FILE_EXPLORER_ROUTE ? { label: target.label } : null
+  }, [apps])
+}
 
 export function OverflowMenu({ filePath, content, onError, onRefresh, refreshDisabled, refreshTitle, onFullscreen, fullscreen, onSnapshot, snapshotting, wordWrap, onToggleWordWrap, lineNums, onToggleLineNums, collapseUnchanged, onToggleCollapseUnchanged, diffSplit, onToggleDiffSplit, onDownload }: {
   filePath: string; content: string
@@ -631,6 +681,12 @@ export function OverflowMenu({ filePath, content, onError, onRefresh, refreshDis
   // Platform-aware reveal label from the shared owner (FilePathMenu) so this
   // overflow and FileViewer's overflow name the identical action identically.
   const revealLabel = useRevealLabel()
+  // "Open in Files": the in-dashboard destination, gated on the app being
+  // enabled and natively routed (see useFilesAppTarget) and on the path being
+  // absolute — the Files backend has no project directory to resolve a relative
+  // path against, so for one of those the row would only promise an error.
+  const filesApp = useFilesAppTarget()
+  const openInFiles = filesApp && isAbsolutePath(filePath) ? filesApp : null
   const knowledge = useFileKnowledgeState(filePath, onError)
   const artifact = useFileArtifactState(filePath, content, onError)
   const contribItems = useFileMenuItems('file-overflow')
@@ -730,9 +786,15 @@ export function OverflowMenu({ filePath, content, onError, onRefresh, refreshDis
           )}
           {canAddToKnowledge && (
             knowledge.alreadyAdded ? (
-              <span className="flex items-center gap-2 w-full px-3 py-1.5 text-[13px] text-muted">
-                <BookOpen size={14} className="lucide-inline" /> {i18nT('components.markdownPanel.in_library')} <Check size={14} className="lucide-inline" />
-              </span>
+              knowledge.sourceType === 'local_file' && knowledge.sourceId ? (
+                <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { knowledge.remove(undefined, { onSuccess: delayedClose }) }} disabled={knowledge.removing}>
+                  <BookOpen size={14} className="lucide-inline" /> {i18nT('components.markdownPanel.remove_from_knowledge_library')}
+                </button>
+              ) : (
+                <span className="flex items-center gap-2 w-full px-3 py-1.5 text-[13px] text-muted">
+                  <BookOpen size={14} className="lucide-inline" /> {i18nT('components.markdownPanel.in_library')} <Check size={14} className="lucide-inline" />
+                </span>
+              )
             ) : (
               <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => knowledge.add(undefined, { onSuccess: delayedClose })} disabled={knowledge.adding}>
                 {knowledge.added ? <><BookOpen size={14} className="lucide-inline" style={{color: 'var(--ok)'}} /> {knowledge.addResult === 'exists' ? i18nT('components.markdownPanel.already_in_library') : i18nT('components.markdownPanel.added')}</> : knowledge.adding ? i18nT('components.markdownPanel.adding_2') : <><BookOpen size={14} className="lucide-inline" /> {i18nT('components.markdownPanel.add_to_knowledge')}</>}
@@ -740,14 +802,21 @@ export function OverflowMenu({ filePath, content, onError, onRefresh, refreshDis
             )
           )}
           <div className="h-px bg-border my-1 mx-2" />
-          {/* File-location group: hand the file to the desktop, then the
+          {/* File-location group: hand the file to another surface — the Files
+              app inside the dashboard first, then the desktop — then the
               clipboard/download fallbacks for hosts that have no desktop.
               Iconless like its neighbours — the group reads as a list of
-              destinations, and two glyphs among five would look arbitrary.
-              Open uses the shared canOpen gate (directLocal + non-Windows);
-              Reveal uses directLocal alone — a remote session cannot usefully
-              drive Finder on the gateway, so it sees the fallbacks only. Same
-              gates the shared FilePathMenu applies. */}
+              destinations, and two glyphs among six would look arbitrary.
+              Open in Files needs the app enabled at its native route plus an
+              absolute path (openInFiles); Open uses the shared canOpen gate
+              (directLocal + non-Windows); Reveal uses directLocal alone — a
+              remote session cannot usefully drive Finder on the gateway, so it
+              sees the fallbacks only. Same gates the shared FilePathMenu applies. */}
+          {openInFiles && (
+            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { navigate(fileExplorerDeepLink(filePath)); setOpen(false) }}>
+              {i18nT('components.markdownPanel.open_in_app', { app: openInFiles.label })}
+            </button>
+          )}
           {canOpen && (
             <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'open', { onError }); setOpen(false) }}>
               {i18nT('components.markdownPanel.open_with_default_app')}
@@ -815,15 +884,68 @@ function useFileKnowledgeState(filePath: string, onError: ReportError) {
       if (!r.ok) throw new Error(i18nT('components.markdownPanel.knowledge_status_failed'))
       const cfg = await r.json()
       const sr = await fetch(`/api/knowledge/sources?uri=${encodeURIComponent(filePath)}`)
-      const sources = sr.ok ? await sr.json() : []
-      return { ...cfg, alreadyAdded: sources.length > 0 }
+      // A failed sources read must not resolve to `[]`: that would read as "not
+      // added" and hide the Remove affordance (and offer Add) for a file that
+      // may already be in the library. Reject like the config read above does,
+      // so the panel's query-error notice renders instead of a wrong state.
+      if (!sr.ok) throw new Error(i18nT('components.markdownPanel.knowledge_status_failed'))
+      const sources: { id?: string; source_type?: string }[] = await sr.json()
+      // sourceId + sourceType back the Remove affordance: only a per-file
+      // local_file source (one the panel itself can create) is removable here —
+      // folder/wider sources belong to the Knowledge page's own delete flows.
+      // A file can match more than one source (e.g. a folder source AND a
+      // local_file source), so look for the removable local_file among all
+      // matches rather than trusting whichever the backend returned first.
+      const localFile = sources.find((s) => s.source_type === 'local_file')
+      return {
+        ...cfg,
+        alreadyAdded: sources.length > 0,
+        sourceId: localFile?.id ?? null,
+        sourceType: localFile?.source_type ?? null,
+      }
     },
   })
   const formats: string[] | null = data?.enabled ? data.supported_formats : null
   const alreadyAdded = data?.alreadyAdded ?? false
+  const sourceId = data?.sourceId ?? null
+  const sourceType = data?.sourceType ?? null
+  // After a remove, the add mutation's `isSuccess` ("added") can still be true
+  // from an earlier add this session, which would paint the Add button that
+  // comes back green ("in library") for a file that was just removed. Hold the
+  // add mutation's reset in a ref so the remove's onSuccess (declared first)
+  // can clear that stale success.
+  const resetAddRef = useRef<() => void>(() => {})
+  const { mutate: remove, isPending: removing } = useMutation({
+    mutationFn: async () => {
+      // Encode the id as a single path segment: a source id originates from an
+      // imported bundle and is otherwise only validated as a non-empty string,
+      // so an id like `../../../sessions` would otherwise resolve to a
+      // different route and land an irreversible DELETE on it.
+      const res = await fetch(`/api/knowledge/sources/${encodeURIComponent(sourceId)}`, { method: 'DELETE' })
+      // 404 just means the source is already gone — removing an absent thing
+      // is success, so the panel falls back to the Add affordance instead of
+      // reporting a failure dressed as an error.
+      if (res.status === 404) return 'gone' as const
+      if (!res.ok) {
+        // The backend's failure bodies ("not found" / "internal server error")
+        // are raw English diagnostics; the panel reports the localized string
+        // instead so the error notice reads consistently in every locale.
+        await res.json().catch(() => null)
+        throw new Error(i18nT('components.markdownPanel.failed_to_remove_source'))
+      }
+      return 'removed' as const
+    },
+    onSuccess: () => {
+      // Clear any stale add-success so the returning Add button is not drawn
+      // green for a file we just removed.
+      resetAddRef.current()
+      queryClient.invalidateQueries({ queryKey: ['knowledge-config', filePath] })
+    },
+    onError: (err) => onError((err as Error).message),
+  })
   const { mutate: add, isPending: adding, isSuccess: added, data: addResult, reset } = useMutation({
     mutationFn: async () => {
-      const name = filePath.split('/').pop() || filePath
+      const name = pathBasename(filePath) || filePath
       const res = await fetch('/api/knowledge/sources', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -841,7 +963,10 @@ function useFileKnowledgeState(filePath: string, onError: ReportError) {
     },
     onError: (err) => onError((err as Error).message),
   })
-  return { formats, alreadyAdded, add, adding, added, addResult, reset, queryError }
+  // Keep the ref pointed at the live add-reset so the remove's onSuccess
+  // (declared above the add mutation) can clear a stale add-success.
+  resetAddRef.current = reset
+  return { formats, alreadyAdded, sourceId, sourceType, add, adding, added, addResult, reset, remove, removing, queryError }
 }
 
 /**
@@ -868,7 +993,7 @@ function useFileArtifactState(filePath: string, content: string, onError: Report
   const existing = data ?? null
   const { mutate: add, isPending: adding, isSuccess: added, reset: resetAdd } = useMutation({
     mutationFn: async () => {
-      const name = filePath.split('/').pop() || filePath
+      const name = pathBasename(filePath) || filePath
       const ext = '.' + (filePath.split('.').pop() || '').toLowerCase()
       const kind: 'markdown' | 'json' | 'svg' | 'html' | 'text' =
         ext === '.md' || ext === '.markdown' || ext === '.mdx' ? 'markdown'
@@ -950,7 +1075,7 @@ function useFileArtifactState(filePath: string, content: string, onError: Report
       }
       // Not yet an artifact — create (file-backed), then pin. createArtifact
       // dedups on source_path server-side, so this stays idempotent.
-      const name = filePath.split('/').pop() || filePath
+      const name = pathBasename(filePath) || filePath
       const ext = '.' + (filePath.split('.').pop() || '').toLowerCase()
       const kind: 'markdown' | 'json' | 'svg' | 'html' | 'text' =
         ext === '.md' || ext === '.markdown' || ext === '.mdx' ? 'markdown'
@@ -1056,13 +1181,14 @@ function DiffViewBlock({ diffMode, fileName, originalContent, content, lineNums,
 
 /** Shared comment overlay — the pending-comment list. (The input itself lives
  *  in `SelectionToolbar`'s composer, which opens on selection.) */
-const CommentOverlayBlock = memo(function CommentOverlayBlock({ onSubmitComments, comments, editComment, removeComment, submitAllComments, connected = true }: {
+const CommentOverlayBlock = memo(function CommentOverlayBlock({ onSubmitComments, comments, editComment, removeComment, submitAllComments, connected = true, onEditingChange }: {
   onSubmitComments?: (message: string) => void; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; connected?: boolean
+  onEditingChange?: (id: string, editing: boolean) => void
 }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   if (!onSubmitComments) return null
   return (
-    <CommentList comments={comments} onEdit={editComment} onRemove={removeComment} onSubmitAll={submitAllComments} enableExtraPrompt connected={connected} />
+    <CommentList comments={comments} onEdit={editComment} onRemove={removeComment} onSubmitAll={submitAllComments} enableExtraPrompt connected={connected} onEditingChange={onEditingChange} />
   )
 })
 
@@ -1217,7 +1343,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // instead of yanking focus and aborting the composition
   // (`useDialogFocusTrap` is the reference consumer of the same seam).
   const fsImeLatch = useDocumentImeLatch(fullscreen)
-  const fileName = filePath.split('/').pop() || filePath
+  const fileName = pathBasename(filePath) || filePath
   // Artifact + knowledge state power the header star/knowledge toggles and
   // the ⋯ menu's Snapshot entry (same query cache as the OverflowMenu's own
   // hooks, so states stay coherent).
@@ -1396,15 +1522,45 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // the module-global highlight names away from the visible panel.
   useEffect(() => { if (!active) closeFind() }, [active, closeFind])
 
-  // Capture-phase Cmd+F: fires before ChatPage's bubble-phase chat-find. We
-  // only steal the key in markdown preview when this panel is the active
-  // region; otherwise we let it bubble (chat-find) or let the editor handle it.
+  // Capture-phase Cmd+F: fires before ChatPage's bubble-phase chat-find.
+  //
+  // Four side-panel surfaces compete for the chord, and this handler is the one
+  // component that already knows which surface is on screen (`editing`,
+  // `diffMode`, `isMarkdown`) AND whether the user is looking at it
+  // (`findActiveRef`). So it is where the routing decision belongs:
+  //
+  //   • markdown preview — open our own in-document find (TreeWalker + CSS
+  //     Highlight API over `previewRef`), stealing the key from chat-find.
+  //   • edit mode — Pierre's editor binds the chord on its own content element
+  //     and preventDefault()s it, and #6397's `defaultPrevented` guard in
+  //     useMessageSearch already stops chat-find from stacking a second pane.
+  //     Nothing to do here; bail so the editor keeps ownership.
+  //   • code preview and read-only diff — there is no in-document find for
+  //     these yet (code preview is windowed behind Pierre's <Virtualizer> so a
+  //     DOM TreeWalker would silently under-report off-screen matches, and the
+  //     diff renders outside `previewRef`; a real find for either is an open
+  //     design question — see #6383). But chat-find answering the chord with
+  //     the conversation is strictly worse than not answering, so we YIELD the
+  //     key away from chat-find without opening anything. We only stop the
+  //     event reaching chat-find's bubble-phase listener; we deliberately do
+  //     NOT preventDefault(), so a native browser find bar (where one exists)
+  //     still opens over the file, which is honest about what is on screen.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!hasCommandModifier(e) || e.key.toLowerCase() !== 'f') return
       if (!active) return                                   // hidden tab: never claim the key
-      if (editing || diffMode || !isMarkdown) return       // editor owns it; non-markdown skip
+      if (editing) return                                   // editor owns it (#6397)
       if (!findActiveRef.current) return                    // cursor is in chat → let chat-find handle
+      if (diffMode || !isMarkdown) {
+        // Code preview / read-only diff: no in-document find to open, but keep
+        // chat-find from answering with the wrong content. Stopping the event
+        // in the capture phase prevents chat-find's bubble-phase listener from
+        // running at all; leaving the default action lets a native find bar
+        // (browser) open over the file.
+        e.stopImmediatePropagation()
+        return
+      }
+      // Markdown preview: open our own in-document find.
       e.preventDefault()
       e.stopImmediatePropagation()                          // beat ChatPage's bubble-phase chat-find
       setFindOpen(true)
@@ -2068,16 +2224,47 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   }, [])
 
   /**
-   * Compose + hand off the pending comment batch, then clear it. Bails while
-   * the gateway is offline: the downstream send path silently refuses
-   * messages in that state, so clearing here would destroy the user's
-   * comments with no error. The Submit All button is disabled offline too —
-   * this is the behavioral backstop.
+   * Compose + hand off the pending comment batch, and clear it only once the
+   * send reports delivery. A refused send (`false`, a rejection or a throw)
+   * keeps the batch so Submit All can offer it again. Only comments still
+   * exactly as sent are removed, so one added or edited while the send was
+   * pending survives. Bails while the gateway is offline; the Submit All
+   * button is disabled offline too — this is the behavioral backstop.
    */
+  const submitInFlightRef = useRef(false)
+  // Rows with an inline edit open: their typed text lives only in the row
+  // until it is saved, so delivery must not remove them.
+  const editingIdsRef = useRef(new Set<string>())
+  const trackRowEditing = useCallback((id: string, editing: boolean) => {
+    if (editing) editingIdsRef.current.add(id)
+    else editingIdsRef.current.delete(id)
+  }, [])
   const submitAllComments = useCallback((extraPrompt?: string) => {
-    if (!connected || !onSubmitComments || comments.length === 0) return
-    onSubmitComments(formatCommentsMessage(filePath, comments, displayContent, extraPrompt))
-    setComments([])
+    if (!connected || !onSubmitComments || comments.length === 0 || submitInFlightRef.current) return
+    const sentFile = filePath
+    const sent = new Map(comments.map(c => [c.id, c]))
+    const unchanged = (c: InlineComment) => {
+      const s = sent.get(c.id)
+      return !!s && s.text === c.text && s.anchor === c.anchor && !editingIdsRef.current.has(c.id)
+    }
+    let verdict: void | boolean | Promise<void | boolean>
+    try {
+      verdict = onSubmitComments(formatCommentsMessage(filePath, comments, displayContent, extraPrompt))
+    } catch {
+      verdict = false
+    }
+    submitInFlightRef.current = true
+    Promise.resolve(verdict)
+      .then(delivered => {
+        if (delivered === false) return
+        // Saved here rather than left to the persistence effect: the panel
+        // may have unmounted or moved to another file while the send was
+        // pending, and then no effect saves the sent file.
+        dropDeliveredComments(draftsRef.current, sentFile, unchanged)
+        if (prevFilePathRef.current === sentFile) setComments(prev => prev.filter(c => !unchanged(c)))
+      })
+      .catch(() => { /* undelivered — keep the batch pending */ })
+      .finally(() => { submitInFlightRef.current = false })
   }, [connected, onSubmitComments, comments, filePath, displayContent])
 
   const dismissHint = useCallback(() => {
@@ -2094,8 +2281,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // place avoids duplicate writes from StrictMode double-invoked updaters and
   // eliminates persistComments from callback dep arrays.
   useEffect(() => {
-    setCommentsForFile(draftsRef.current, filePath, comments)
-    saveCommentDrafts(draftsRef.current)
+    persistFileComments(draftsRef.current, filePath, comments)
   }, [comments, filePath])
 
   // ── Inline comment anchor highlights (CSS Custom Highlight API) ─────────
@@ -2683,7 +2869,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           carry an open composer — and the anchor it resolved against the OLD
           file — over to the new one. Remount drops it and fires onClose. */}
       {!fullscreen && !editing && <SelectionToolbar key={filePath} containerRef={sidePanelScrollRef} actions={selectionActions} composer={selectionComposer} suspended={!active} />}
-      {!fullscreen && <CommentOverlayBlock onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} />}
+      {!fullscreen && <CommentOverlayBlock onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} onEditingChange={trackRowEditing} />}
     </DetailPanel>
     {fullscreen && createPortal(
       // The onKeyDown here implements a focus trap for the modal dialog; a
@@ -2749,7 +2935,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           {isMarkdown && !editing && <MarkdownOutlineRail containerRef={fullscreenBodyRef} />}
         </div>
         {!editing && <SelectionToolbar key={filePath} containerRef={fullscreenBodyRef} actions={selectionActions} composer={selectionComposer} suspended={!active} />}
-        <CommentOverlayBlock onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} />
+        <CommentOverlayBlock onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} onEditingChange={trackRowEditing} />
         {/* Footer */}
         <Clickable className="shrink-0 flex items-center px-3 h-6 text-[11px] text-muted font-mono truncate cursor-pointer hover:text-text transition-colors" title={i18nT('components.markdownPanel.click_to_copy_path')} onClick={() => copyToClipboard(filePath)}>{filePath}</Clickable>
       </div>,

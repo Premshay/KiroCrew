@@ -30,11 +30,11 @@ import pytest
 from chat_test_helpers import _make_ready_kiro_prerequisite
 
 from kiro_crew.acp.types import (
-    EVENT_TOOL_CALL_UPDATE,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
+    EVENT_TOOL_CALL_UPDATE,
 )
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat_persistence import _build_message_entry_uncached

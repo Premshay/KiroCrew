@@ -141,9 +141,9 @@ from kiro_crew.acp.harness.base import (
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
-    acp_client_capabilities,
     METHOD_SESSION_CLOSE,
     METHOD_SESSION_UPDATE,
+    acp_client_capabilities,
 )
 from kiro_crew.providers.mirrors.codex import drop_unadvertised_transports
 from kiro_crew.sandbox import detect_backend
@@ -286,9 +286,12 @@ class CodexHarness(MembershipHarness):
         # CODEX_SQLITE_HOME (the runtime's per-process scratch dir). Only the
         # databases move: config, auth and the thread rollouts stay in CODEX_HOME,
         # and a thread resumes from its rollout (measured on codex 0.159), so
-        # spawn_continue still works across runtimes. A fresh home rebuilds its
-        # index on first start -- an accepted cost. An operator who set the
-        # variable chose that location; it reaches the child as set.
+        # spawn_continue still works across runtimes. The scratch dir dies with
+        # the process, so EVERY runtime start rebuilds codex's index from the
+        # rollouts in CODEX_HOME, and that cost grows with the user's history
+        # (about a minute for a few thousand threads). An operator who set the
+        # variable chose that location; it reaches the child as set, which is
+        # the workaround for a large history.
         return SpawnPlan(
             argv=list(argv),
             rss_depth=self.CORE_RSS_DEPTH + wrapper_generations,
@@ -298,7 +301,13 @@ class CodexHarness(MembershipHarness):
             private_state_env=None if ctx.environ.get(_SQLITE_HOME_ENV) else _SQLITE_HOME_ENV,
         )
 
-    def apply_spawn_env(self, env: dict[str, str], *, spawned_binary: str | None = None) -> None:
+    def apply_spawn_env(
+        self,
+        env: dict[str, str],
+        *,
+        spawned_binary: str | None = None,
+        cli_owned_auth: bool = False,
+    ) -> None:
         """Take kiro-cli's API key OUT of the child's environment.
 
         A foreign adapter must never receive it, and removing it is the positive

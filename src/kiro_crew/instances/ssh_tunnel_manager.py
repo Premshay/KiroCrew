@@ -345,17 +345,74 @@ def _reclaim_identity_key() -> bytes | None:
     return hmac.new(raw, _RECLAIM_SIG_DOMAIN, hashlib.sha256).digest()
 
 
-def _forwarder_identity_sig(key: bytes, instance_id: str, pid: int, start: str, port: int) -> str:
+def _forwarder_orphan_state(pid: int, forwarder_start: str) -> tuple[bool, int]:
+    """Return ``(orphaned, parent_pid)`` for a recorded forwarder child.
+
+    "Orphaned" means the gateway that spawned *pid* has exited, so
+    nothing will ever reap it. Blocking (process-table reads), so callers run it
+    off the event loop.
+
+    POSIX: the kernel re-parents an orphan when its parent dies, so the test is
+    ``get_ppid == 1``. A live gateway's forwarder still names that gateway, and a
+    subreaper host names the subreaper, so both read as not orphaned and the
+    reclaim fails closed.
+
+    Windows never re-parents: the parent pid stays whatever it was at spawn, dead
+    or alive, and the number can be handed to a new process later. So the
+    recorded parent counts as gone when either:
+
+    * nothing runs at that pid (and its start time cannot be read either); or
+    * the process now at that pid started AFTER the forwarder, so it cannot be
+      the process that spawned it (pid reuse).
+
+    A parent that is alive and started before the forwarder -- this gateway or a
+    second one on the same box -- is refused. So is every case the order cannot
+    be settled: an unreadable parent pid, a parent that exists but whose start
+    time is unreadable, or equal or unparsable start tokens.
+    """
+    ppid = platform_compat.get_ppid(pid)
+    if not platform_compat.IS_WINDOWS:
+        return ppid == 1, ppid
+    if ppid <= 0:
+        return False, ppid
+    parent_start = platform_compat.process_start_time(ppid)
+    if parent_start is None:
+        return not platform_compat.pid_exists(ppid), ppid
+    return platform_compat.created_after(parent_start, forwarder_start), ppid
+
+
+def _forwarder_identity_sig(
+    key: bytes,
+    instance_id: str,
+    pid: int,
+    start: str,
+    port: int,
+    argv_sig: str = "",
+    transport: str = "",
+) -> str:
     """MAC over one instance's recorded forwarder identity.
 
     Binds the identity to the INSTANCE as well as to the process attributes,
     so a valid record cannot be replayed under another instance id, and any
-    edit to pid, start time, or port invalidates it. NUL joints keep field
-    boundaries unambiguous (no recorded field can contain a NUL: the id and
-    port are charset/range-validated and the start value is a single
-    ``/proc``/``ps``/FILETIME token).
+    edit to pid, start time, port, or argv fingerprint invalidates it. NUL
+    joints keep field boundaries unambiguous (no recorded field can contain a
+    NUL: the id and port are charset/range-validated, the start value is a
+    single ``/proc``/``ps``/FILETIME token, and the fingerprint is hex).
+
+    An empty *argv_sig* signs the four-field message older gateways wrote, so
+    their records still verify. A non-empty one adds two fields, the fingerprint
+    and the *transport* the child was spawned with (``"ssh"`` or ``"ssm"``).
+    The transport decides whether reclaim signals the pid or its whole process
+    group, and with a fingerprint there is no rebuilt argv left to tie that
+    choice to the spawned child, so it is signed: a record whose transport was
+    switched since spawn fails verification. The messages differ in field
+    count, so deleting the fingerprint from a record signed with it fails
+    verification instead of falling back to the older check.
     """
-    msg = "\0".join((instance_id, str(pid), start, str(port))).encode("utf-8")
+    fields = [instance_id, str(pid), start, str(port)]
+    if argv_sig:
+        fields += [argv_sig, transport]
+    msg = "\0".join(fields).encode("utf-8")
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
@@ -800,6 +857,11 @@ class _SshTunnel:
             local_port=local_port,
             remote_port=remote_port,
         )
+
+    @property
+    def transport(self) -> str:
+        """The child's transport, ``"ssh"`` or ``"ssm"``."""
+        return self._transport
 
     def _build_argv(self) -> list[str]:
         """Build the transport-specific supervised child argv."""
@@ -1367,7 +1429,10 @@ class _SshTunnel:
                 self._monitor_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._monitor_task
-            await self._finish_stdout_drain(timeout=0.5)
+            # Deliberate teardown: timeout=0 cancels the drain without awaiting
+            # EOF (the buffer is kept). On a stop WE initiated there is no AWS
+            # close cause to name, so paying the drain's timeout buys nothing.
+            await self._finish_stdout_drain(timeout=0)
             await self._terminate()
         except Exception:
             self.status.state = previous
@@ -1441,6 +1506,7 @@ def _verify_and_reclaim_forwarder(
     port: int,
     tree: bool,
     audit_resources: str,
+    expected_argv_sig: str = "",
 ) -> str:
     """Verify a recorded forwarder's identity, then SIGTERM/SIGKILL-reclaim it.
 
@@ -1450,7 +1516,10 @@ def _verify_and_reclaim_forwarder(
     window at in-process microseconds, the same residual the repo's other
     pid-reuse guards accept.
 
-    Identity is pid + start time + exact argv, checked in that order, and the
+    Identity is pid + start time + argv, checked in that order. The argv half
+    is the fingerprint recorded at spawn (*expected_argv_sig*) compared with the
+    live one, or, for a record without a fingerprint, *expected_argv* compared
+    element for element. The
     start-time comparison is RE-RUN before the destructive SIGKILL: the grace
     window is exactly the interval in which the pid can exit and be recycled,
     and ``pid_exists`` polling cannot observe an exit that is immediately
@@ -1490,6 +1559,11 @@ def _verify_and_reclaim_forwarder(
         # that tie. A mid-death target whose argv is already unreadable reads
         # as not-held and merely withholds the escalation (TERM was already
         # delivered to the verified process).
+        if expected_argv_sig:
+            observed = platform_compat.process_argv_fingerprint(pid)
+            return observed is not None and hmac.compare_digest(
+                observed.encode("ascii"), expected_argv_sig.encode("utf-8")
+            )
         return platform_compat.process_argv_matches_exact(pid, list(expected_argv))
 
     def _alive() -> bool:
@@ -1508,7 +1582,12 @@ def _verify_and_reclaim_forwarder(
         if tree and _SshTunnel._signal_group(pid, sig):
             return
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError, ValueError):
-            platform_compat.kill_pid(pid, sig)
+            # Pinned on the recorded start time. POSIX delegates straight to
+            # ``kill_pid``. On Windows the command-line read in ``_identity_holds``
+            # is a WMI query that takes about a second, so the start time is
+            # checked AGAIN under an open process handle right at the kill: the
+            # pid taskkill resolves cannot be a recycled one.
+            platform_compat.kill_pid_pinned(pid, expected_start, sig)
 
     def _wait_gone(grace_secs: float) -> bool:
         deadline = time.monotonic() + grace_secs
@@ -1529,6 +1608,12 @@ def _verify_and_reclaim_forwarder(
         except Exception as exc:  # noqa: BLE001 — audit must never break reclaim
             logger.debug("SEL audit failed for forwarder_orphan_reclaim: %s", exc)
 
+    if tree and platform_compat.IS_WINDOWS:
+        # The SSM group signal on Windows is an unpinned ``taskkill /T``, and a
+        # pinned pid signal would end only the ``aws`` wrapper: the plugin child
+        # keeps the port, and with the wrapper gone nothing recorded points at it
+        # any more, so the leak could never be reclaimed. Signal nothing.
+        return "windows_group_unsupported"
     if not _identity_holds():
         return "identity_mismatch"
     _deliver(platform_compat.SIGTERM)
@@ -1890,8 +1975,10 @@ class SshTunnelManager:
         """Build the registry hints that record *tunnel*'s live forwarder child.
 
         The recorded identity is ``forwarder_pid`` + ``forwarder_start`` + the
-        ``local_port`` that child is bound to, authenticated by
-        ``forwarder_sig`` — a MAC over all three plus the instance id. Every
+        ``local_port`` that child is bound to, plus ``forwarder_argv_sig`` (the
+        fingerprint of the argv the kernel reports for it right now),
+        authenticated by ``forwarder_sig`` — a MAC over all of them plus the
+        instance id. Every
         field is read from the LIVE tunnel, so the set describes one process
         rather than a mix of one process and another's port: a pid recorded
         against a port it was not signed with leaves the signature failing
@@ -1927,20 +2014,34 @@ class SshTunnelManager:
         local_port = tunnel.status.local_port
         forwarder_start = ""
         forwarder_sig = ""
+        forwarder_argv_sig = ""
         if forwarder_pid > 0:
             started = await asyncio.to_thread(platform_compat.process_start_time, forwarder_pid)
             forwarder_start = started or ""
         if forwarder_pid > 0 and forwarder_start:
+            # The argv as the kernel shows it NOW, so reclaim compares like with
+            # like. Unreadable records "" and reclaim keeps the rebuilt-argv check.
+            observed = await asyncio.to_thread(
+                platform_compat.process_argv_fingerprint, forwarder_pid
+            )
+            forwarder_argv_sig = observed or ""
             key = await asyncio.to_thread(_reclaim_identity_key)
             if key is not None:
                 forwarder_sig = _forwarder_identity_sig(
-                    key, instance_id, forwarder_pid, forwarder_start, local_port
+                    key,
+                    instance_id,
+                    forwarder_pid,
+                    forwarder_start,
+                    local_port,
+                    forwarder_argv_sig,
+                    tunnel.transport,
                 )
         return {
             "local_port": local_port,
             "forwarder_pid": forwarder_pid,
             "forwarder_start": forwarder_start,
             "forwarder_sig": forwarder_sig,
+            "forwarder_argv_sig": forwarder_argv_sig,
             "was_connected": True,
         }
 
@@ -2121,13 +2222,16 @@ class SshTunnelManager:
         replace — so a record written or re-pointed by anything but this
         gateway fails verification outright. Behind the MAC, defense in depth
         from kernel-owned facts: the candidate must be a genuine ORPHAN — not
-        a pid this manager currently supervises, and reparented to init
-        (``get_ppid == 1``), which no live gateway's forwarder is. Then the
+        a pid this manager currently supervises, and whose spawning gateway is
+        gone (:func:`_forwarder_orphan_state`: reparented to init on POSIX; on
+        Windows, a recorded parent that is dead or was replaced by a later
+        process), which no live gateway's forwarder is. Then the
         recorded pid is trusted only behind a STRICT identity check, both
         halves recorded at spawn: the pid's start time must equal the recorded
         ``forwarder_start``, AND its full argv must exactly equal the forward
         command line this manager would construct for the recorded port (host
-        and all). Anything less — either hint missing, process gone,
+        and all) — or, when the record carries ``forwarder_argv_sig``, the
+        live argv's fingerprint must equal that signed spawn-time one. Anything less — either hint missing, process gone,
         attributes unreadable, or any element differing — means the identity
         cannot be confirmed: the process is left alone and connect falls
         through to normal allocation. The start-time half is what defeats pid
@@ -2136,11 +2240,14 @@ class SshTunnelManager:
         the worker. Best-effort: a failed reclaim never fails the connect, it
         only leaves the leak for the next attempt.
 
-        A rebuilt-vs-recorded argv can also drift apart without any foul play
-        (an edited compression/host setting, or an ``aws`` entrypoint the
-        kernel rewrites through a shebang) — that misses the reclaim, never
-        mis-kills, and is logged below so the miss is visible instead of
-        silent.
+        The fingerprint is what survives drift: a rebuilt command line can
+        differ from the spawned one without any foul play (an edited
+        compression/host setting, or an ``aws`` entrypoint the kernel rewrites
+        through a shebang), but the kernel's own view of the child is the same
+        at spawn and at reclaim. Only a record without a fingerprint (written
+        before the field existed, or whose argv could not be read at spawn)
+        still falls back to the rebuild, where such drift misses the reclaim,
+        never mis-kills, and is logged below.
 
         Runs under the manager lock (its caller ``connect`` holds it); every
         blocking step — the port probe and the verify-and-signal worker — is
@@ -2150,6 +2257,7 @@ class SshTunnelManager:
         port = inst.local_port
         start = inst.forwarder_start
         sig = inst.forwarder_sig
+        argv_sig = inst.forwarder_argv_sig
         if pid <= 1 or port <= 0 or not start or not sig:
             return  # identity not (fully) recorded — nothing we may touch
         # FAIL CLOSED on a port whose chained credential is still valid: leave the
@@ -2189,7 +2297,13 @@ class SshTunnelManager:
         # TypeError for non-ASCII. Any malformed field IS a verification
         # failure, never a crash on the connect path.
         try:
-            expected_sig = _forwarder_identity_sig(key, inst.id, pid, start, port)
+            # The transport this connect would signal with: when it differs from
+            # the spawn-time one, the signed message differs and the reclaim is
+            # refused, so a group signal is never sent to a pid-scoped child.
+            transport = "ssm" if params.forwards_over_ssm else "ssh"
+            expected_sig = _forwarder_identity_sig(
+                key, inst.id, pid, start, port, argv_sig, transport
+            )
             sig_ok = hmac.compare_digest(sig.encode("utf-8"), expected_sig.encode("utf-8"))
         except (TypeError, ValueError, UnicodeError):
             sig_ok = False
@@ -2203,7 +2317,7 @@ class SshTunnelManager:
             return
         # Defense in depth behind the MAC, from gateway-/kernel-owned facts: a
         # pid this manager is CURRENTLY supervising is never a leak candidate,
-        # and a genuine hard-kill orphan has been reparented to init — a
+        # and a genuine hard-kill orphan has lost its spawning gateway — a
         # forwarder whose parent is still alive belongs to a running gateway
         # (this one or another), so it is refused no matter what the registry
         # says. Subreaper hosts read as non-orphaned and merely miss the
@@ -2211,11 +2325,26 @@ class SshTunnelManager:
         live_pids = {t.pid for t in self._tunnels.values() if t.pid}
         if pid in live_pids:
             return
-        if await asyncio.to_thread(platform_compat.get_ppid, pid) != 1:
+        orphaned, ppid = await asyncio.to_thread(_forwarder_orphan_state, pid, start)
+        if not orphaned:
+            logger.info(
+                "Not reclaiming recorded %s forwarder pid %d for %s: its parent "
+                "pid %d still reads as its live spawner (or the parent could not "
+                "be confirmed gone); port %d is left to it",
+                params.method,
+                pid,
+                inst.id,
+                ppid,
+                port,
+            )
             return
         if await asyncio.to_thread(_is_port_free, port):
             return  # nothing holds the recorded port — nothing leaked to reclaim
-        if params.forwards_over_ssm:
+        # A signed spawn-time fingerprint is the argv half on its own; only a
+        # record without one rebuilds the command line to compare against.
+        if argv_sig:
+            expected: list[str] = []
+        elif params.forwards_over_ssm:
             expected = _build_ssm_tunnel_argv(
                 params.ssm_target,
                 port,
@@ -2251,10 +2380,21 @@ class SshTunnelManager:
             port,
             params.forwards_over_ssm,
             f"instance={inst.id} pid={pid} port={port} transport={params.method}",
+            argv_sig,
         )
         if outcome == "reclaimed":
             logger.info(
                 "Reclaimed leaked %s forwarder pid %d for %s (released port %d)",
+                params.method,
+                pid,
+                inst.id,
+                port,
+            )
+        elif outcome == "windows_group_unsupported":
+            logger.info(
+                "Not reclaiming leaked %s forwarder pid %d for %s: on Windows its "
+                "plugin child cannot be ended through a start-time-pinned signal; "
+                "port %d stays excluded from allocation",
                 params.method,
                 pid,
                 inst.id,
@@ -3758,6 +3898,7 @@ class SshTunnelManager:
             "forwarder_pid": _NO_FORWARDER_PID,
             "forwarder_start": "",
             "forwarder_sig": "",
+            "forwarder_argv_sig": "",
         }
         if not keep_intent:
             hints["was_connected"] = False

@@ -37,7 +37,9 @@ from contextlib import contextmanager  # noqa: F401 - kept bound on the facade
 from dataclasses import dataclass  # noqa: F401 - kept bound on the facade
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
+
+import kiro_crew.agent as _agent_module
 
 # Bindings below that only the ``context_assembly`` owners read stay bound here:
 # callers rebind them on this module, and the owners read them through it at call
@@ -143,6 +145,7 @@ from kiro_crew.context_assembly.markers import (  # noqa: F401
 from kiro_crew.context_assembly.member import (  # noqa: F401
     _MEMBER_BRIEFING_ITEM,
     _MEMBER_BRIEFING_ITEM_UNAVAILABLE,
+    _MEMBER_DASHBOARD_ITEM,
     _MEMBER_HOW_YOU_WORK,
     _MEMBER_HOW_YOU_WORK_COMMON,
     _fit_folder_steering_into_envelope,
@@ -240,6 +243,7 @@ from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.sel import sel
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.skills import PROJECT_SKILL_BODY_CAP, SkillsLoader
 
@@ -250,6 +254,9 @@ if TYPE_CHECKING:
     from kiro_crew.vector_memory import VectorMemoryStore
 
 logger = logging.getLogger(__name__)
+
+# The value type of a per-session prompt-token reading (`ContextBuilder._session_reading`).
+_ReadingT = TypeVar("_ReadingT")
 
 # Lazy caches of per-target stores. The key is NOT a bare name: a memory store
 # and a workspace are two namespaces, and a single key cannot hold both. A crew
@@ -802,6 +809,23 @@ def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None) -> bool:
     except Exception:
         logger.debug("member backend capability check failed", exc_info=True)
         return False
+
+
+def _member_dispatch_held(mounted: bool | None, cfg: "KiroCrewConfig | None" = None) -> bool:
+    """Whether this member session actually holds the ``session_*`` tools.
+
+    *mounted* is the live session's own answer (``member_dispatch_mounted`` on
+    the context provider), recorded by the composer that built its MCP array. It
+    wins whenever it exists: the configured backend can be dispatch-capable while
+    THIS session withheld the mount (the dashboard server switched off, a
+    per-tool restriction on a withhold-only backend, a permission surface Crew
+    does not own, an unresolved entry), and teaching the block then would send
+    the member after tools it never received. ``None`` means no session evidence
+    reached the build, and only then does the configured capability decide.
+    """
+    if mounted is not None:
+        return mounted
+    return _member_backend_can_dispatch(cfg)
 
 
 # A fresh V1 prompt can query semantic, episodic, and lesson memory in order.
@@ -1671,6 +1695,29 @@ class ContextBuilder:
     # readings of it are held at once.
     _MAX_SUBAGENTS_TOKEN = "{{MAX_SUBAGENTS}}"
     _CAP_FIGURE_SESSIONS = 512
+    # Bounds for the sent-skill-body record. The session count matches the
+    # `_cap_figures` bound (one record per live session; the oldest evicts past
+    # it), and the per-session entry count bounds the inner dict so one session
+    # matching an unbounded set of distinct skills cannot grow without limit.
+    # Both evict oldest-first, and an eviction only costs a re-inject on the next
+    # match (the fail-safe direction), never a silent miss.
+    _SENT_SKILL_BODY_SESSIONS = _CAP_FIGURE_SESSIONS
+    _SENT_SKILL_BODY_ENTRIES = 64
+    # One shared bound for every name list the ``skill_delivery`` audit row
+    # persists (bodies / pointers / demoted). A single turn can match at most
+    # ``max_triggered`` skills, but that is operator-configurable, so cap the
+    # audit explicitly rather than trust the matcher's bound: a row never grows
+    # past this many names per field, and an ``*_omitted`` count records how
+    # many were dropped so the audit stays honest about what it truncated.
+    _SKILL_DELIVERY_AUDIT_NAMES = 64
+    # Per-name character budget for the audit row: a name is a skill key or a
+    # 64-hex digest, so this is generous, but it caps the BYTES a single name
+    # contributes -- without it the count cap alone lets one arbitrarily long
+    # name grow the row unboundedly, which the count cap was meant to prevent.
+    _SKILL_DELIVERY_AUDIT_NAME_LEN = 128
+    # The Computer Use section's slot. Its reading is held per session under the
+    # same bound as the cap figure; see `_session_computer_use_gate`.
+    _COMPUTER_USE_TOKEN = "{{COMPUTER_USE_BLOCK}}"
 
     @staticmethod
     def get_memory_for(
@@ -1820,6 +1867,10 @@ class ContextBuilder:
         # read-evict-insert transaction is guarded.
         self._cap_figures: dict[str, str] = {}
         self._cap_figures_lock = threading.Lock()
+        # The same, for the Computer Use spec-gate reading; see
+        # `_session_computer_use_gate`.
+        self._computer_use_gates: dict[str, bool] = {}
+        self._computer_use_gates_lock = threading.Lock()
         # Captured for the Jev decision point at `skills.select`. Production
         # reaches `build_message` only through `run_in_embed_pool`, a thread
         # executor with no running loop, so the point cannot obtain one where it
@@ -1842,6 +1893,44 @@ class ContextBuilder:
         # and bounded; see `_ShownLessons`.
         self._lessons_shown: OrderedDict[str, _ShownLessons] = OrderedDict()
         self._lessons_shown_lock = threading.Lock()
+        # Per-session record of triggered-skill BODIES injected, so a later match
+        # in the same provider window sends the cheap pointer line instead of the
+        # whole body again. Recorded at build time and keyed by a fixed-size
+        # digest of the session key (`_cap_memo_key`) -> {skill_key_digest:
+        # body_sha256}, both keys digested so the caps govern bytes, not just
+        # entries: `_SENT_SKILL_BODY_SESSIONS` bounds how many sessions are held,
+        # `_SENT_SKILL_BODY_ENTRIES` bounds the
+        # skills held per session, and both evict oldest-first. The hash lets an
+        # edited skill re-inject. One builder serves every session and runs on a
+        # thread executor, so the read-check-write is guarded, like `_cap_figures`.
+        # The record fails SAFE in both directions: a rare turn that never lands
+        # demotes the skill to its POINTER next turn (the agent still learns the
+        # skill applies), not to silence; and the record drops for a session whose
+        # provider window cannot hold the bodies — a fresh session and the first
+        # turn after a compaction — tracked alongside the agent last seen so an
+        # agent switch on the same key also resets.
+        #
+        # The record is written at build time so the dedup holds at every
+        # `build_message` caller with no per-caller wiring. A build-time write
+        # can name a body a turn never delivered (a provider error or cancel
+        # after the prompt was built), so each build also stashes the prior
+        # value of every entry it touched into `_sent_skill_bodies_undo`, keyed
+        # by the same digest. A caller whose turn does not land calls
+        # `rollback_skill_bodies(session_key)` at its turn `finally` — the same
+        # seam that re-arms the post-compaction flag — to restore that prior
+        # state, so the record never outlives the provider copy it names. Turns
+        # on one session key are serialized by the per-session turn permit, so
+        # the single last-build undo entry per session is not raced. A caller
+        # that never rolls back keeps the fail-safe above (a pointer next turn,
+        # never silence), so the rollback is a refinement, not a correctness
+        # dependency.
+        self._sent_skill_bodies: dict[str, dict[str, str]] = {}
+        self._sent_skill_agents: dict[str, str | None] = {}
+        # session_key_digest -> {skill_key_digest: prior body_sha256 | None},
+        # the single most recent build's undo entry for that session; None means
+        # the entry did not exist before this build (rollback removes it).
+        self._sent_skill_bodies_undo: dict[str, dict[str, str | None]] = {}
+        self._sent_skill_bodies_lock = threading.Lock()
         if bot_name:
             self._bot_name = bot_name
         else:
@@ -1914,6 +2003,188 @@ class ContextBuilder:
             context_groups=context_groups,
         )
 
+    def _dedup_triggered_bodies(
+        self,
+        session_key: str | None,
+        agent: str | None,
+        reset: bool,
+        candidates: list[tuple[str, str]],
+    ) -> set[str]:
+        """Return the subset of *candidates* to DEMOTE from body to pointer.
+
+        *candidates* is ``[(skill_key, body_sha256), ...]`` for the skills whose
+        body this turn would inject. A skill is demoted when the SAME body hash
+        was already recorded in this session — the provider replays native
+        history, so a second identical copy adds nothing. A skill whose hash
+        differs (an edited skill) is not demoted, so the new body arrives. The
+        record is written at build time and read on the next match, so the dedup
+        holds at EVERY ``build_message`` caller with no per-caller wiring. The
+        check-and-record is one guarded transaction.
+
+        *reset* True (a fresh session, or the first turn after a compaction, or
+        an agent switch on this key) drops the prior record first: those are the
+        turns whose provider window cannot hold the earlier bodies, so
+        everything sends again. A missing ``session_key`` (CLI, tests) keeps no
+        record and demotes nothing.
+
+        Fails SAFE in both directions. A rare turn that builds but never lands
+        records its body, so the next turn demotes it to the POINTER line — the
+        agent still learns the skill applies, which is today's behaviour for an
+        ``inject_on_trigger: false`` skill, not silence. And a missed reset
+        likewise demotes to a pointer, never to nothing.
+
+        Each build stashes the prior value of every entry it writes into
+        ``_sent_skill_bodies_undo[key]`` so a caller whose turn never lands can
+        call :meth:`rollback_skill_bodies` and undo this build's writes — the
+        record then does not outlive the provider copy it names. Only fresh
+        records and hash changes are captured; a demote touches an entry to the
+        LRU end without changing its value, so it needs no undo.
+        """
+        if not session_key:
+            return set()
+        key = self._cap_memo_key(session_key)
+        # Store a fixed-size digest of the agent, not the raw agent name: the
+        # caller supplies `agent` at whatever length it likes and this entry
+        # leaves `_sent_skill_agents` only by eviction, so an oversized name
+        # would stay retained -- the same "cap the count AND the stored field"
+        # reason `_cap_memo_key` digests the session key. `None` (no agent) must
+        # stay distinct from any digest, so it is carried through unchanged.
+        agent_key = None if agent is None else self._cap_memo_key(agent)
+        demote: set[str] = set()
+        undo: dict[str, str | None] = {}
+        with self._sent_skill_bodies_lock:
+            if reset or self._sent_skill_agents.get(key) != agent_key:
+                self._sent_skill_bodies.pop(key, None)
+            # A reset (or agent switch) drops the record, so this build starts
+            # the session's history fresh; its own writes are the only thing a
+            # rollback of THIS turn should undo, so start the undo log empty.
+            self._sent_skill_bodies_undo.pop(key, None)
+            # Move this session to the END of the LRU maps (pop + reinsert the
+            # SAME record object) so eviction drops the least-recently-touched
+            # session -- the insertion-ordered shape `_cap_figures` uses.
+            sent = self._sent_skill_bodies.pop(key, {})
+            self._sent_skill_bodies[key] = sent
+            self._sent_skill_agents.pop(key, None)
+            self._sent_skill_agents[key] = agent_key
+            for skill_key, digest in candidates:
+                # Store under a fixed-size digest of the skill key, not the key
+                # itself: a skill key reaches here from the caller at whatever
+                # length it likes and an inner entry leaves the record only by
+                # eviction, so an oversized key would stay retained. Digesting it
+                # makes `_SENT_SKILL_BODY_ENTRIES` govern bytes as well as count,
+                # the same reason `_cap_memo_key` digests the session key.
+                skey = self._cap_memo_key(skill_key)
+                if sent.get(skey) == digest:
+                    demote.add(skill_key)
+                    # Touch so the per-session cap keeps the still-matching skill.
+                    sent[skey] = sent.pop(skey)
+                else:
+                    # Capture the prior value once (None if the entry is new) so
+                    # a rollback restores exactly what stood before this build.
+                    if skey not in undo:
+                        undo[skey] = sent.get(skey)
+                    sent.pop(skey, None)
+                    sent[skey] = digest
+            # Bound the inner dict AND the session map with the SAME cap that
+            # admits entries, so what is retained equals what was admitted. A
+            # session that matches more than `_SENT_SKILL_BODY_ENTRIES` distinct
+            # skills over its life, or more than `_SENT_SKILL_BODY_SESSIONS`
+            # sessions live at once, drops its oldest record — and a dropped
+            # entry re-injects that body on its next match. That is fail-safe (a
+            # re-sent body, never a dropped skill) but it silently narrows dedup
+            # coverage, so report each forced eviction rather than evicting
+            # quietly: an operator watching a session matching an unusually wide
+            # skill set can see the record is at its bound.
+            while len(sent) > self._SENT_SKILL_BODY_ENTRIES:
+                dropped = next(iter(sent))
+                sent.pop(dropped, None)
+                logger.debug(
+                    "skill-body dedup: per-session entry cap %d reached for "
+                    "session=%s; oldest skill record evicted, its body "
+                    "re-injects on next match",
+                    self._SENT_SKILL_BODY_ENTRIES,
+                    key,
+                )
+            while len(self._sent_skill_bodies) > self._SENT_SKILL_BODY_SESSIONS:
+                oldest = next(iter(self._sent_skill_bodies))
+                self._sent_skill_bodies.pop(oldest, None)
+                self._sent_skill_agents.pop(oldest, None)
+                self._sent_skill_bodies_undo.pop(oldest, None)
+                logger.debug(
+                    "skill-body dedup: session cap %d reached; oldest session "
+                    "record evicted, its bodies re-inject on next match",
+                    self._SENT_SKILL_BODY_SESSIONS,
+                )
+            # Keep only THIS build's undo entry for the session, and only for
+            # keys that survived the cap above: an eviction drops a key from
+            # `sent`, so retaining its undo row would hold a row the per-session
+            # count already refused — the undo map must obey the same bound as
+            # the record it reverses. A landed turn never rolls back and the
+            # next build overwrites this entry; a dropped undo row only means an
+            # evicted body re-injects on its next match, which is already the
+            # eviction's fail-safe.
+            undo = {skey: prior for skey, prior in undo.items() if skey in sent}
+            if undo:
+                self._sent_skill_bodies_undo[key] = undo
+            else:
+                self._sent_skill_bodies_undo.pop(key, None)
+        return demote
+
+    def rollback_skill_bodies(self, session_key: str | None) -> None:
+        """Undo the current turn's skill-body dedup writes for *session_key*.
+
+        Call at a turn's ``finally`` when the turn did NOT land (a provider
+        error, a cancel, a driver fault): the prompt that carried the freshly
+        recorded bodies never reached the provider window, so the build-time
+        record names bodies the model never received. Restoring the pre-build
+        values makes the next turn re-inject them as full bodies rather than
+        demote them to pointers.
+
+        Acts on an undo entry only. A landed build clears its own undo entry
+        through :meth:`commit_skill_bodies`, and turns on one session key are
+        serialized, so an armed undo entry belongs to the current turn's own
+        un-settled build — a turn that built no context (a slash command, an
+        early return) finds nothing armed and is a no-op. Idempotent and
+        best-effort: a missing key or record is a no-op, and it never raises so
+        the turn's own outcome stands. A caller that skips it keeps the fail-safe
+        (the next turn demotes to a pointer, not silence).
+        """
+        if not session_key:
+            return
+        key = self._cap_memo_key(session_key)
+        with self._sent_skill_bodies_lock:
+            undo = self._sent_skill_bodies_undo.pop(key, None)
+            if not undo:
+                return
+            sent = self._sent_skill_bodies.get(key)
+            if sent is None:
+                # The record was evicted or reset since the build; nothing of
+                # this build survives to undo.
+                return
+            for skey, prior in undo.items():
+                if prior is None:
+                    sent.pop(skey, None)
+                else:
+                    sent[skey] = prior
+
+    def commit_skill_bodies(self, session_key: str | None) -> None:
+        """Discard the current turn's rollback state after its turn LANDED.
+
+        Call at a turn's ``finally`` when the turn landed. The build-time record
+        stays (the bodies reached the provider window), but the undo entry that
+        would let a rollback erase them is dropped, so a later turn that never
+        lands cannot roll back a build that already succeeded. Without this a
+        landed build's undo stays armed until the next build, and the next
+        non-landing turn's ``finally`` would roll back the earlier LANDED build,
+        wrongly re-injecting bodies the window already holds. Idempotent and
+        best-effort: a missing key or no armed entry is a no-op; never raises.
+        """
+        if not session_key:
+            return
+        key = self._cap_memo_key(session_key)
+        with self._sent_skill_bodies_lock:
+            self._sent_skill_bodies_undo.pop(key, None)
+
     def _substitute_bot_name(self, prompt: str) -> str:
         """Replace {bot_name} placeholder in prompt text.
 
@@ -1935,13 +2206,16 @@ class ContextBuilder:
     def _live_cap_figure() -> str:
         """The concurrent sub-agent cap in force, as a prompt spells it.
 
-        ``agent.max_subagents`` is a ceiling the adaptive controller may be
-        dispatching 1 at a time under, so the figure is the cap IN FORCE -- a
-        registry read (``resource_status.adaptive_exec_cap``) this
-        gateway-process path can afford. When no controller runs here (the CLI,
-        tests) the configured ceiling is used and labelled as one. Both readings
-        are derived from live host conditions, which is why a session holds one
-        of them: see :meth:`_session_cap_figure`.
+        ``agent.max_subagents`` (or ``agent.subagent_auto_max`` when it is 0) is
+        a ceiling the adaptive controller may have cut after admitted work kept
+        failing, so the figure is the cap IN FORCE -- a registry read
+        (``resource_status.adaptive_exec_cap``) this gateway-process path can
+        afford. When no controller runs here (the CLI, tests) the configured
+        ceiling is used and labelled as one. ``resolve_max_subagents`` never
+        answers 0, so a figure is always defined; "several" is left only for a
+        config that cannot be read. The live reading moves with the
+        controller, which is why a session holds one: see
+        :meth:`_session_cap_figure`.
         """
         cap = resource_status.adaptive_exec_cap()
         if cap > 0:
@@ -1968,8 +2242,15 @@ class ContextBuilder:
         an entry leaves the memo only by eviction, never when its session closes,
         so an oversized key would stay retained. Digesting it makes every
         retained key the same size and the cap govern bytes as well as entries.
+
+        ``surrogatepass`` on the encode so a key carrying a surrogate — a skill
+        directory name the filesystem layer round-tripped through ``os.fsdecode``
+        because its bytes were not valid UTF-8 — hashes to a stable digest
+        instead of raising ``UnicodeEncodeError`` and aborting the turn. The
+        digest only has to be stable per input, not reversible, so passing the
+        surrogate bytes straight through is correct.
         """
-        return hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+        return hashlib.sha256(session_key.encode("utf-8", "surrogatepass")).hexdigest()
 
     def _session_cap_figure(self, session_key: str, *, refresh: bool) -> str:
         """One session's reading of the delegation cap, taken once.
@@ -2001,22 +2282,87 @@ class ContextBuilder:
         would read it back. The figure is therefore returned as a local, and the
         lookup, eviction and insertion are held under one lock.
         """
-        memo = self._cap_figures
+        return self._session_reading(
+            self._cap_figures,
+            self._cap_figures_lock,
+            session_key,
+            self._live_cap_figure,
+            refresh=refresh,
+        )
+
+    def _session_reading(
+        self,
+        memo: dict[str, _ReadingT],
+        lock: threading.Lock,
+        session_key: str,
+        live: Callable[[], _ReadingT],
+        *,
+        refresh: bool,
+    ) -> _ReadingT:
+        """One session's reading of a host-derived prompt token, from *memo*.
+
+        The transaction :meth:`_session_cap_figure` describes, for any token whose
+        value a session must hold still: a session start (``refresh``) takes a
+        *live* reading, every later render reuses it, and the lookup, eviction and
+        insertion run under *lock* with the reading handed back as a local.
+        """
         key = self._cap_memo_key(session_key)
-        with self._cap_figures_lock:
+        with lock:
             if not refresh:
                 cached = memo.get(key)
                 if cached is not None:
                     memo[key] = memo.pop(key)
                     return cached
-            figure = self._live_cap_figure()
+            reading = live()
             if key not in memo and len(memo) >= self._CAP_FIGURE_SESSIONS:
                 memo.pop(next(iter(memo)), None)
-            memo[key] = figure
-            return figure
+            memo[key] = reading
+            return reading
 
     @staticmethod
-    def _resolve_prompt_templates(prompt: str, session_key: str, cap_figure: str = "") -> str:
+    def _live_computer_use_gate() -> bool:
+        """Whether the agent spec mounts ``kirocrew-computer`` on this host now.
+
+        The spec gate itself (``agent._computer_use_spec_gate``), not a second
+        reading of the keystone, so the section a prompt carries and the server the
+        spec emits answer from one predicate. It fails closed, and so does this: a
+        failure to reach it yields the short pointer, never a section describing
+        tools the session may not have.
+        """
+        try:
+            # Through the module object, so a substituted gate is the one called.
+            return bool(_agent_module._computer_use_spec_gate())
+        except Exception:
+            logger.debug(
+                "computer-use spec gate unreadable; prompt gets the pointer", exc_info=True
+            )
+            return False
+
+    def _session_computer_use_gate(self, session_key: str, *, refresh: bool) -> bool:
+        """One session's reading of the Computer Use spec gate, per backend.
+
+        The block has to match the tools the session's CURRENT backend mounted,
+        and a backend loads its MCP servers from the spec when it spawns. So the
+        reading is taken when one spawns -- at session start, and again when a
+        resume (``session/load``) starts a new backend for the same session -- and
+        a compaction's re-render reuses it. Between those points the keystone can
+        still move: the dashboard's switch rebuilds the spec and resets every
+        session, which ends in a resume, while any other writer leaves the running
+        backend as it was. A live reading at compaction would follow the second
+        kind of move to tools the session does not have.
+        """
+        return self._session_reading(
+            self._computer_use_gates,
+            self._computer_use_gates_lock,
+            session_key,
+            self._live_computer_use_gate,
+            refresh=refresh,
+        )
+
+    @staticmethod
+    def _resolve_prompt_templates(
+        prompt: str, session_key: str, cap_figure: str = "", *, computer_use: bool | None = None
+    ) -> str:
         """Resolve conditional template blocks in prompt text.
 
         Dashboard sessions get a short widget pointer; Slack/CLI get it stripped.
@@ -2024,11 +2370,23 @@ class ContextBuilder:
         the model can actually fan out to: ``cap_figure`` when the caller holds
         that session's reading, otherwise a live one. Resolved for every
         transport (not just dashboard), before the widget-block branch.
+        ``{{COMPUTER_USE_BLOCK}}`` is the full Computer Use section only when the
+        agent spec mounts ``kirocrew-computer`` (``computer_use`` when the caller
+        holds that session's reading, otherwise a live one), and a short pointer
+        to the setting when it does not.
         """
         if ContextBuilder._MAX_SUBAGENTS_TOKEN in prompt:
             prompt = prompt.replace(
                 ContextBuilder._MAX_SUBAGENTS_TOKEN,
                 cap_figure or ContextBuilder._live_cap_figure(),
+            )
+
+        if ContextBuilder._COMPUTER_USE_TOKEN in prompt:
+            mounted = (
+                ContextBuilder._live_computer_use_gate() if computer_use is None else computer_use
+            )
+            prompt = prompt.replace(
+                ContextBuilder._COMPUTER_USE_TOKEN, _sections.computer_use_block(mounted)
             )
 
         cfg = KiroCrewConfig.load()
@@ -2188,6 +2546,7 @@ class ContextBuilder:
         execution_context: Any = None,
         steering_dirs: tuple[str, ...] = (),
         _v2_essentials: str | None = None,
+        member_dispatch_mounted: bool | None = None,
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -2378,7 +2737,7 @@ class ContextBuilder:
         # deliberately silent there.
         effective_groups = _config_scoped_groups(context_groups, _cfg)
 
-        if mode == _member_mode and _member_backend_can_dispatch(_cfg):
+        if mode == _member_mode and _member_dispatch_held(member_dispatch_mounted, _cfg):
             append_required(_member.operating_mode_block(agent_label))
 
         # Legacy member-DM identity. Private V2 has already derived its owner
@@ -2749,7 +3108,14 @@ class ContextBuilder:
             if self._MAX_SUBAGENTS_TOKEN in agent_prompt
             else ""
         )
-        agent_prompt = self._resolve_prompt_templates(agent_prompt, session_key or "", cap_figure)
+        computer_use = (
+            self._session_computer_use_gate(session_key or "", refresh=session_start)
+            if self._COMPUTER_USE_TOKEN in agent_prompt
+            else None
+        )
+        agent_prompt = self._resolve_prompt_templates(
+            agent_prompt, session_key or "", cap_figure, computer_use=computer_use
+        )
         return self._substitute_bot_name(agent_prompt)
 
     def build_message(
@@ -2792,6 +3158,7 @@ class ContextBuilder:
         execution_context: Any = None,
         context_provider: "ContextPromptProvider | None" = None,
         steering_dirs: tuple[str, ...] = (),
+        skill_bodies_session: str | None = None,
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -2820,6 +3187,12 @@ class ContextBuilder:
         every existing caller unpacks; the list is caller-owned, so concurrent
         turns cannot interfere.
 
+        Pass *skill_bodies_session* when the turn runs on a provider session but
+        is built without that session's *session_key*: the record of skill
+        bodies the session already holds is kept under it, and nothing else in
+        the prompt changes. The heartbeat does this, because a session key would
+        also change the rest of its prompt. It defaults to *session_key*.
+
         Returns:
             (full_message, hook_result) — hook_result may be a reply/modify/inject.
         """
@@ -2840,8 +3213,12 @@ class ContextBuilder:
             blocks_reads or self._session_memory_modes.get(session_key or "") == "temporary"
         )
         native_documents: dict[str, str] = {}
+        # None = no session evidence; build_session_context then falls back to
+        # the configured member backend's capability.
+        member_dispatch_mounted: bool | None = None
         context_provider = context_provider_of(context_provider)
         if context_provider is not None:
+            member_dispatch_mounted = context_provider.member_dispatch_mounted
             candidate_delivery = context_provider.essential_delivery
             if isinstance(candidate_delivery, EssentialDelivery):
                 delivery = candidate_delivery
@@ -2931,7 +3308,10 @@ class ContextBuilder:
                 is_new_session=is_new_session,
                 resumed=resumed,
                 minimal_context=minimal_context,
-                needs_reinjection=needs_reinjection,
+                # A minimal session start never carried the member section
+                # (MINIMAL), so a minimal warm turn keeps the WARM rules gate
+                # rather than receiving the section after a compaction.
+                needs_reinjection=needs_reinjection and not minimal_context,
             ),
         )
         if _member_turn.enforce_rules_gate:
@@ -2960,6 +3340,12 @@ class ContextBuilder:
             # leave a resumed member session running on a stale
             # [PERMANENT RULES] snapshot with nothing failing.
             slim_resume = _member_turn.lifecycle is MemberLifecycle.SLIM_RESUME
+            if slim_resume and session_key:
+                # A resume runs on a backend spawned from the spec as it is now, and
+                # switching Computer Use rebuilds that spec and resets every session.
+                # Re-take the reading here so a later compaction restores the block
+                # for the tools this backend has.
+                self._session_computer_use_gate(session_key, refresh=True)
             # Agent prompt goes BEFORE session context wrapper
             # so the LLM treats it as its identity, not background info.
             agent_prompt = (
@@ -3005,6 +3391,7 @@ class ContextBuilder:
                     execution_context=execution_context,
                     steering_dirs=steering_dirs,
                     _v2_essentials=_essentials,
+                    member_dispatch_mounted=member_dispatch_mounted,
                 )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in
@@ -3160,6 +3547,7 @@ class ContextBuilder:
                     is_cc=is_cc,
                     private_owner=bool(_private_owner),
                     blocks_reads=blocks_reads,
+                    minimal_context=minimal_context,
                     context_groups=context_groups,
                     workspace=workspace,
                     memory_store=memory_store,
@@ -3277,6 +3665,35 @@ class ContextBuilder:
             )
         )
 
+        # Reset the per-session skill-body record on the turn that OWNS a
+        # window-rebuild flag, whether or not a skill matches this turn. The
+        # flag (a fresh session, or the first turn after a compaction) is
+        # one-shot: the provider window it names does not hold the earlier
+        # bodies. If the reset rode only the skill-match branch below, a flag
+        # consumed on a no-match turn (or a custom/minimal turn that skips
+        # skills entirely) is lost, and a later matching turn demotes a body the
+        # rebuilt window never received. Clearing the record here, under the
+        # same lock, keeps that impossible.
+        #
+        # The flag is armed by a fresh session (is_new_session), by Kiro Crew's
+        # own session_compaction, and by every turn loop that consumes it when
+        # the BACKEND reports a completed compaction of its own window during the
+        # turn (kiro-cli's _kiro.dev/compaction completing, the claude/codex
+        # twins): the dashboard runner as the status arrives, the other loops
+        # through rearm_reinjection(compacted=...) as the turn settles.
+        #
+        # SOFT FAILURE (known, bounded): a turn path that never consumes the flag
+        # does not arm it either -- the Slack thread's auto-nudge turn
+        # (gateway._fire_slack_nudge) is one -- so when the backend compacts under
+        # such a turn the record still names bodies the rebuilt backend window does not
+        # hold, and the next match of such a skill demotes it to its POINTER
+        # line, not to silence: the agent still learns the skill applies and can
+        # re-read it, it just does not get the body re-pasted that turn. Long
+        # monitor loops are where backend self-compaction is most likely.
+        skill_bodies_session = skill_bodies_session or session_key
+        if skill_bodies_session and (is_new_session or needs_reinjection):
+            self._dedup_triggered_bodies(skill_bodies_session, agent, reset=True, candidates=[])
+
         # Triggered skills (on-demand, any message) — skip for custom agents.
         # A match injects the skill's full body by DEFAULT, unchanged. A skill
         # unconfined skill that declares itself an offer rather than a mandate
@@ -3359,6 +3776,11 @@ class ContextBuilder:
                     ", ".join(enforced) or "-",
                     ", ".join(pointer_only) or "-",
                 )
+                # (skill_key, stripped_body, body_sha256) for each enforced
+                # skill whose body loaded — collected first so the per-session
+                # dedup decision runs once, as a single guarded transaction,
+                # rather than per skill inside the emit loop.
+                loadable: list[tuple[str, str, str]] = []
                 for name in enforced:
                     # project_dir, not project-blind: get_triggered_skills and
                     # split_triggered above are both project-aware, so a trusted
@@ -3369,18 +3791,99 @@ class ContextBuilder:
                     content = self.skills.load_skill(name, project)
                     if content:
                         stripped = self.skills.strip_frontmatter(content)
-                        safe_name = _neutralize_structural_markers(name)
-                        safe_name = safe_name.replace("\r", " ").replace("\n", " ")
-                        safe_stripped = _neutralize_structural_markers(stripped)
-                        parts.append(f"[Skill: {safe_name}]\n{safe_stripped}\n[End of skill]\n\n")
-                        # Record use only when the body is actually delivered --
-                        # a trigger match that never reaches the prompt (false
-                        # positive, pointer-only, or undelivered) must not earn
-                        # ranking weight in the lazy-load hotness ledger.
-                        self.skills._record_use(name)
-                hint = self.skills.trigger_hint(pointer_only, project)
+                        # Key the session record by the body actually about to
+                        # be injected, so an edited skill (new hash) re-injects
+                        # while an unchanged one demotes to its pointer.
+                        digest = hashlib.sha256(stripped.encode("utf-8")).hexdigest()
+                        loadable.append((name, stripped, digest))
+                # One guarded transaction: decide which loadable bodies were
+                # already sent in this session (demote those to a pointer) and
+                # record the rest as sent. `is_new_session`/`needs_reinjection`
+                # are the turns whose provider window cannot hold the prior
+                # bodies, so they reset the record and everything re-injects.
+                # Confined project skills are never demotion candidates: they
+                # have no pointer form (trigger_hint omits them), so demoting
+                # one would drop it from the prompt entirely instead of falling
+                # back to a pointer -- they always re-inject their body.
+                confined = self.skills.confined_triggered(
+                    [name for name, _stripped, _digest in loadable], project
+                )
+                demote = self._dedup_triggered_bodies(
+                    skill_bodies_session,
+                    agent,
+                    reset=is_new_session or needs_reinjection,
+                    candidates=[
+                        (name, digest)
+                        for name, _stripped, digest in loadable
+                        if name not in confined
+                    ],
+                )
+                demoted: list[str] = []
+                for name, stripped, _digest in loadable:
+                    if name in demote:
+                        # Already in the window this session. Fall through to
+                        # the pointer line rather than the body, and do NOT
+                        # record use — a demoted match delivered no body.
+                        demoted.append(name)
+                        continue
+                    safe_name = _neutralize_structural_markers(name)
+                    safe_name = safe_name.replace("\r", " ").replace("\n", " ")
+                    safe_stripped = _neutralize_structural_markers(stripped)
+                    parts.append(f"[Skill: {safe_name}]\n{safe_stripped}\n[End of skill]\n\n")
+                    # Record use only when the body is actually delivered --
+                    # a trigger match that never reaches the prompt (false
+                    # positive, pointer-only, demoted, or undelivered) must not
+                    # earn ranking weight in the lazy-load hotness ledger.
+                    self.skills._record_use(name)
+                # A demoted body still tells the agent the skill applies: hand
+                # it the same pointer line an `inject_on_trigger: false` skill
+                # gets, preserving match order (enforced before opted-out).
+                hint = self.skills.trigger_hint(demoted + pointer_only, project)
                 if hint:
                     parts.append(_neutralize_structural_markers(hint))
+                # Correct the delivery audit. The matcher's single `skill_trigger`
+                # row records the FRONTMATTER-level split (bodies vs opted-out
+                # pointers) it computes at match time -- but that runs before this
+                # dedup, so a body demoted here is still named as a delivered body
+                # in that row. Emit a delivery-truth row naming what the prompt
+                # ACTUALLY carries, so an auditor reconstructing "was this
+                # procedure in the prompt?" is not told a demoted body was sent.
+                # Only when a demotion diverged from the matcher's claim -- the
+                # common no-demotion turn keeps its one row and pays nothing here.
+                if demoted:
+                    delivered_bodies = [
+                        name for name, _stripped, _digest in loadable if name not in demote
+                    ]
+                    pointers = demoted + pointer_only
+                    cap = self._SKILL_DELIVERY_AUDIT_NAMES
+                    name_len = self._SKILL_DELIVERY_AUDIT_NAME_LEN
+
+                    def _capped(names: list[str]) -> tuple[str, int]:
+                        # Bound both the count AND the bytes the audit row keeps:
+                        # join at most ``cap`` names, truncate each kept name to
+                        # ``name_len`` chars so no single name grows the row
+                        # unboundedly, and report how many names were dropped so
+                        # a truncated row is never mistaken for a complete one.
+                        kept = [n[:name_len] for n in names[:cap]]
+                        return ",".join(kept), max(0, len(names) - cap)
+
+                    bodies_s, bodies_omitted = _capped(delivered_bodies)
+                    pointers_s, pointers_omitted = _capped(pointers)
+                    demoted_s, demoted_omitted = _capped(demoted)
+                    sel().log_tool_invocation(
+                        session_key="skills",
+                        tool_name="skill_delivery",
+                        tool_kind="permission",
+                        outcome="triggered",
+                        metadata={
+                            "bodies": bodies_s,
+                            "pointers": pointers_s,
+                            "demoted": demoted_s,
+                            "bodies_omitted": str(bodies_omitted),
+                            "pointers_omitted": str(pointers_omitted),
+                            "demoted_omitted": str(demoted_omitted),
+                        },
+                    )
 
         # Per-message lessons (``memory.inject_lessons_per_turn``, off by
         # default): stored lessons that match this follow-up message and were

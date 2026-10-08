@@ -24,11 +24,12 @@ import AppIcon from '../components/AppIcon'
 import TrustAppModal, {
   APP_EXECUTION_DENIED, DESKTOP_BUILD_STEP_UNSUPPORTED, isTrustDeniedError, useTrustGate,
 } from '../components/appstore/TrustAppModal'
-import { isRegistrySourced, sanitizeStargazersCount, type RegistryApp } from '../components/appstore/types'
+import { isRegistrySourced, normalizeRegistryApp, type RegistryApp } from '../components/appstore/types'
 import AppSource from '../components/appstore/AppSource'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
 import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM, usePinchZoom } from '../hooks/usePinchZoom'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import ErrorNotice from '../components/ErrorNotice'
 import { useConfirm } from '../components/ConfirmDialog'
 import { findReport, recordError } from '../utils/errorReport'
@@ -134,6 +135,10 @@ interface RegistryEntry extends Partial<AppInfo> {
   updateAvailable?: boolean
 }
 
+/** A registry entry after `normalizeRegistryApp`: its display fields are always
+ *  strings (fallbacks filled) and its star count is sanitized. */
+type NormalizedRegistryEntry = RegistryEntry & Pick<AppInfo, 'displayName' | 'description' | 'version' | 'author'>
+
 interface AppManifest {
   displayName?: string
   description?: string
@@ -221,6 +226,7 @@ const DRAG_SLOP = 6
 
 export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: string[]; fallbacks?: string[] }) {
   const [selected, setSelected] = useState<number | null>(null)
+  const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
   // Both lists are TYPED string[] but can arrive as arbitrary JSON at
   // runtime: the registry-only branch spreads the raw (third-party) registry
   // row into the view model, so a malformed row declaring `screenshots: {}`
@@ -238,6 +244,10 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
   // stay default-inert (the contract #6865 locked for AppIcon).
   const screensKey = screenList.join('\n')
   const fallbacksKey = fallbackList.join('\n')
+  // The scroller keeps its box while its thumbnails change (list refetch, a
+  // thumbnail resolving or going terminal), so only this remeasure refreshes
+  // the edge cue; per-image onLoad covers late width settling. The remeasure
+  // effect itself lives below, after the failure latches it depends on.
   // Re-arm the latches during render rather than in a passive effect. An image
   // rendered for a new generation can fail BEFORE an effect would run, and the
   // effect's reset would then erase that real failure and re-show the dead URL.
@@ -274,6 +284,14 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
     && failures.fallbacksKey === fallbacksKey
     ? failures.fallback
     : NO_SCREENSHOT_FAILURES
+
+  // Refresh the edge cue when the thumbnail set changes. A thumbnail going
+  // terminal UNMOUNTS its button (resolvedAt -> ''), shrinking scrollWidth
+  // with no onLoad, no box resize and — at scrollLeft 0 — no scroll event, so
+  // the failure-latch sizes are a dep alongside screensKey: an unmount that
+  // makes the strip fit must clear a now-stale right-edge fade.
+  const failedCount = primaryFailed.size + fallbackFailed.size
+  useEffect(() => { remeasure() }, [screensKey, failedCount, remeasure])
 
   // ── screenshot magnification (issue #6162) ────────────────────────────────
   // This lightbox is the third full-viewport magnify overlay, bound by the same
@@ -410,7 +428,11 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
     <>
       <div className="mb-6">
         <div className="text-[12px] text-muted uppercase tracking-wider mb-3">{i18nT('pages.appDetailPage.screenshots')}</div>
-        <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-none">
+        {/* The wrapper exists for the edge cues: absolutely-positioned children
+            of the scroller travel with the scrolled content, so the fades
+            anchor to this non-scrolling parent instead. */}
+        <div className="relative">
+        <div ref={attachEdges} className="flex gap-3 overflow-x-auto pb-2 scrollbar-none">
           {screenList.map((_, i) => {
             // Second chance per thumbnail; a terminal index unmounts its
             // button entirely — the old display:none shape left an invisible,
@@ -440,10 +462,21 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
                       previous, screensKey, fallbacksKey, i, tier,
                     ))
                   }}
+                  onLoad={() => remeasure()}
                 />
               </button>
             )
           })}
+        </div>
+        {/* Edge cues: this scroller hides its scrollbar (scrollbar-none), so a
+            gradient is the only signal that thumbnails continue past the
+            clipped edge. from-bg matches the page surface. */}
+        {edges.left && (
+          <div aria-hidden="true" data-testid="app-screenshots-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-r from-bg to-transparent" />
+        )}
+        {edges.right && (
+          <div aria-hidden="true" data-testid="app-screenshots-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-l from-bg to-transparent" />
+        )}
         </div>
       </div>
 
@@ -731,11 +764,24 @@ export default function AppDetailPage() {
       // failure here is held rather than swallowed: an INSTALLED app can still
       // render from its manifest, but the reader is told the catalog was not
       // reachable; an app that is not installed cannot be resolved without it.
-      let registryList: RegistryEntry[] = []
+      //
+      // Rows are normalized ONCE here, at the fetch site, by the same
+      // `normalizeRegistryApp` the browse list uses -- so every branch below
+      // reads coerced display fields and a sanitized star count instead of
+      // re-defending them field by field. The RAW rows are kept beside them for
+      // one reader only: `mergeBuiltinRow` is row-first, and normalize fills a
+      // missing `displayName` with the slug, which would then beat the
+      // manifest's own name. The merge already accepts a loose row and fills
+      // its own gaps, so it is handed the row as the server sent it.
+      let rawRegistryList: RegistryEntry[] = []
+      let registryList: NormalizedRegistryEntry[] = []
       let sideFailure: unknown = null
       try {
         const registryData = await api.listRegistry()
-        registryList = (registryData.apps || []) as RegistryEntry[]
+        rawRegistryList = (registryData.apps || []) as RegistryEntry[]
+        registryList = rawRegistryList.map(
+          (r) => normalizeRegistryApp(r as RegistryApp) as NormalizedRegistryEntry,
+        )
       } catch (e: unknown) {
         sideFailure = e
       }
@@ -748,6 +794,7 @@ export default function AppDetailPage() {
         sideFailure ??= e
       }
       const registryEntry = registryList.find((r) => r.name === name)
+      const rawRegistryEntry = rawRegistryList.find((r) => r.name === name)
 
       if (installed) {
         const m = installed.manifest || {}
@@ -758,9 +805,9 @@ export default function AppDetailPage() {
         // "Kiro Crew · Developer Tools" in the list and "kirocrew · Productivity"
         // one click later. The catalog is the store's inventory on both surfaces
         // or on neither.
-        if (registryEntry && isBuiltinServerRow(registryEntry)) {
+        if (rawRegistryEntry && registryEntry && isBuiltinServerRow(registryEntry)) {
           setApp({
-            ...mergeBuiltinRow(registryEntry, { ...m, version: installed.version }),
+            ...mergeBuiltinRow(rawRegistryEntry, { ...m, version: installed.version }),
             name: installed.name,
             installed: true,
             installedVersion: installed.version,
@@ -885,7 +932,7 @@ export default function AppDetailPage() {
             // fallback identifier is a separate decision from resolving art.
             repo: registryEntry?.repo || '',
             trustRepository: installed.trustRepository,
-            stargazersCount: sanitizeStargazersCount(registryEntry?.stargazersCount),
+            stargazersCount: registryEntry?.stargazersCount,
             installed: true,
             installedVersion: installed.version,
             enabled: installed.enabled,
@@ -902,19 +949,9 @@ export default function AppDetailPage() {
         }
       } else if (registryEntry) {
         setApp({
+          // Already normalized at the fetch site: display fields are strings
+          // with their fallbacks filled and the star count is sanitized.
           ...registryEntry,
-          // Required AppInfo fields — registry entries normally carry these, but
-          // fall back so the object always satisfies AppInfo.
-          name: registryEntry.name,
-          displayName: registryEntry.displayName || registryEntry.name,
-          description: registryEntry.description || '',
-          version: registryEntry.version || '0.0.0',
-          author: registryEntry.author || '',
-          // The spread above copies the RAW listRegistry payload, which never
-          // went through normalizeRegistryApp — sanitize the display-only star
-          // count explicitly so a hostile/older gateway cannot render NaN/-1
-          // or a layout-breaking 1e308 here (the list path is already covered).
-          stargazersCount: sanitizeStargazersCount(registryEntry.stargazersCount),
           // Preserve install status from registry (set by detectInstalled)
           installed: registryEntry.installed ?? false,
           platform: registryEntry.platform,

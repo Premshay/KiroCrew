@@ -62,8 +62,10 @@ const isTool = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
   !isSpawnRunItem(it) && !isMcpAppItem(it, appToolCallIds) && !isDiffCardItem(it)
 const isHiddenTool = (it: TurnItem) => it.kind === 'single' && it.msg.role === 'tool' && !it.msg.content.startsWith('🔧')
 const isConclusion = (it: TurnItem) => it.kind === 'single' && (it.msg.role === 'assistant' || it.msg.role === 'streaming' || it.msg.role === 'file')
+const WORKING_NARRATION_RE = /^(?:Let me\b|Working through\b)/i
 const isAssistantReply = (it: TurnItem) =>
-  it.kind === 'single' && (it.msg.role === 'assistant' || it.msg.role === 'streaming')
+  it.kind === 'single' && (it.msg.role === 'assistant' || it.msg.role === 'streaming') &&
+  !WORKING_NARRATION_RE.test(it.msg.content.trim())
 /**
  * "Always visible" items — must render inline regardless of TurnBlock collapse state.
  * mcp_oauth: user must always see the Authorize button to act on it.
@@ -128,6 +130,11 @@ const isHandBack = (it: TurnItem) =>
 const isKeepVisible = (it: TurnItem) =>
   it.kind === 'single' && isConclusion(it) && hasKeepVisibleMarker(it.msg.content)
 
+const isToolRefusalRecovery = (it: TurnItem) =>
+  it.kind === 'single' && it.msg.role === 'inject' &&
+  it.msg.meta?.injectKind === 'recovery' &&
+  it.msg.content.startsWith('[Tool refusal — automatic recovery]')
+
 /**
  * READ-ONLY COMPAT for transcripts written by the retired Crew Mode: a
  * forwarded topic result, a meta render, or a question back to the user. That
@@ -183,7 +190,9 @@ function splitSegments(items: TurnItem[], appToolCallIds: ReadonlySet<string>, o
   const segs: Seg[] = []
   for (let i = 0; i < items.length; i++) {
     const it = items[i]
-    if (isAssistantReply(it) || isVisibleInline(it, appToolCallIds)) {
+    const followsAnswer = i > 0 && isAssistantReply(items[i - 1])
+    if (isAssistantReply(it) || isVisibleInline(it, appToolCallIds) ||
+        (followsAnswer && isToolRefusalRecovery(it))) {
       segs.push({ type: 'visible', it, idx: offset + i })
     } else {
       const last = segs[segs.length - 1]

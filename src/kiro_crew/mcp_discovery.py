@@ -45,6 +45,7 @@ from kiro_crew.env import (
 )
 from kiro_crew.executors import mcp_probe_executor
 from kiro_crew.hooks import safe_read_file
+from kiro_crew.json_line import parse_json_object_line
 from kiro_crew.mcp_cleanup import (
     invalid_disabled_flag,
     mcp_entry_is_muted,
@@ -1399,10 +1400,20 @@ def _managed_tools_in_process(name: str) -> list[str] | None:
     ``agent.sandbox_allow_unsandboxed_exec`` opt-in for a read-only listing, or
     exempt an agent-writable package from the sandbox. This needs neither.
 
+    This caller keeps only NAMES, so it prefers a module's ``_list_tool_names()``
+    when it offers one: a names-only read that never assembles descriptions, so a
+    description reaching for a live value (a directory scan, a config read) never
+    runs here. That is what replaced the per-builder ``get_running_loop`` skips —
+    the names-only path simply does not reach those reads, rather than each
+    builder detecting this caller and opting out. A module without the names-only
+    entry point falls back to extracting names from its full ``_list_tools()``;
+    among the managed set only ``kirocrew-core`` carries live-valued
+    descriptions, and it provides ``_list_tool_names()``.
+
     Imported lazily: these modules pull in the validation/artifacts graph, which
-    cannot be imported at this module's import time (circular). ``_list_tools`` is
-    a pure read of schemas plus config — no I/O of its own, no side effects, and
-    cheap enough for a discovery cycle.
+    cannot be imported at this module's import time (circular). The names-only
+    read is a pure read of the static tool set — no I/O of its own, no side
+    effects, and cheap enough for a discovery cycle.
 
     Returns ``None`` when *name* is not managed or the read fails, so the caller
     falls back to the ordinary spawn-and-handshake path rather than reporting a
@@ -1415,6 +1426,12 @@ def _managed_tools_in_process(name: str) -> list[str] | None:
         return None
     try:
         module = importlib.import_module(module_name)
+        names_only = getattr(module, "_list_tool_names", None)
+        if callable(names_only):
+            tool_names = names_only()
+            if isinstance(tool_names, list):
+                return [n for n in tool_names if isinstance(n, str) and n]
+            return None
         tools = module._list_tools()
     except Exception:
         logger.debug("in-process tool read failed for %s; will probe", name, exc_info=True)
@@ -1819,12 +1836,9 @@ async def _read_jsonrpc_response(resp: aiohttp.ClientResponse) -> dict:
             if line.startswith("data:"):
                 payload = line[len("data:") :].strip()
                 if payload:
-                    try:
-                        parsed = json.loads(payload)
-                        if isinstance(parsed, dict) and "id" in parsed:
-                            last = parsed
-                    except json.JSONDecodeError:
-                        pass
+                    parsed = parse_json_object_line(payload)
+                    if parsed is not None and "id" in parsed:
+                        last = parsed
         return last
     return await resp.json()
 
@@ -2163,7 +2177,7 @@ async def _probe_remote(
 
 
 # Cap on how many *non-JSON banner* lines to skip while waiting for the
-# JSON-RPC handshake. Only undecodable banner/log lines count toward this cap;
+# JSON-RPC handshake. Only lines that are not JSON count toward this cap;
 # blank lines and well-formed JSON-RPC notifications are bounded by the shared
 # timeout budget alone (so a chatty-but-spec-compliant server that emits many
 # notifications before its response is not mis-capped). A well-behaved server
@@ -2187,7 +2201,7 @@ async def _read_stdio_jsonrpc_response(
     This consumes lines within one overall ``timeout`` budget, skipping blank
     lines, non-JSON lines, and JSON-RPC *notifications* (objects without an
     ``id``), and returns the first JSON object that carries an ``id`` (a
-    response). Only non-JSON *banner* lines count toward ``_MAX_BANNER_LINES``;
+    response). Only lines that are not JSON count toward ``_MAX_BANNER_LINES``;
     blanks and notifications are bounded by the timeout alone. Returns ``None``
     on EOF or once more than ``_MAX_BANNER_LINES`` banner lines have arrived
     (the flood case is logged). Raises ``asyncio.TimeoutError`` if the deadline
@@ -2224,9 +2238,10 @@ async def _read_stdio_jsonrpc_response(
             continue  # blank line — bounded by the timeout budget, not the cap
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
-            # Non-JSON banner/log line (e.g. `aim` self-update). Only these
-            # count toward the flood cap.
+        except (ValueError, RecursionError):
+            # Not JSON: a banner/log line (e.g. `aim` self-update), or a value
+            # nested past the decoder's ceiling. Only these count toward the
+            # flood cap.
             banner_lines += 1
             if not first_banner:
                 first_banner = text[:120]
@@ -2241,8 +2256,9 @@ async def _read_stdio_jsonrpc_response(
                 return None
             continue
         # A JSON-RPC response always carries "id"; skip notifications (objects
-        # with "method" and no "id") and non-object payloads. These do NOT
-        # count toward the banner cap — the timeout budget bounds them.
+        # with "method" and no "id") and non-object payloads (a progress
+        # counter, a list). These do NOT count toward the banner cap — the
+        # timeout budget bounds them.
         if isinstance(parsed, dict) and "id" in parsed:
             return parsed
 
@@ -2989,7 +3005,21 @@ async def probe_server(
                     await asyncio.to_thread(
                         platform_compat.kill_process_tree, probe_pid, platform_compat.SIGKILL
                     )
-                except (ProcessLookupError, OSError):
+                except ProcessLookupError:
+                    # The probe already exited before this post-probe reap, so
+                    # ``taskkill /T /F`` returned rc=128 and kill_process_tree
+                    # mapped it to ProcessLookupError (the Windows analog of the
+                    # POSIX ESRCH silently absorbed above). Nothing leaked — a
+                    # traceback here makes a routine cleanup race look identical
+                    # to a genuine reap failure, so log it without one.
+                    logger.debug(
+                        "Probe tree already gone for %s (pid %s)",
+                        server.name,
+                        probe_pid,
+                    )
+                except OSError:
+                    # A genuine cleanup failure (taskkill access-denied,
+                    # spawn error, etc.) keeps its traceback-bearing diagnostic.
                     logger.debug(
                         "Probe tree reap failed for %s (pid %s)",
                         server.name,

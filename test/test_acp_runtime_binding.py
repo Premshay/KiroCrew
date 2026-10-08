@@ -106,7 +106,7 @@ async def test_claude_runtime_uses_bound_session_set_model(monkeypatch):
             METHOD_SESSION_NEW,
             {"cwd": "/tmp", "mcpServers": [], "_meta": {"claudeCode": {"options": {}}}},
             timeout=90.0,
-    )
+        )
     set_model.assert_awaited_once_with("fast")
     set_option.assert_not_awaited()
 
@@ -147,8 +147,12 @@ async def test_claude_runtime_spawn_uses_claude_adapter_protocol(monkeypatch, tm
         return None
 
     monkeypatch.delenv("CLAUDE_CODE_EXECUTABLE", raising=False)
-    monkeypatch.setattr("kiro_crew.acp.runtime._resolve_claude_acp_bin", lambda: ["claude-agent-acp"])
-    monkeypatch.setattr("kiro_crew.acp.runtime._resolve_claude_code_executable", lambda: "/usr/bin/claude")
+    monkeypatch.setattr(
+        "kiro_crew.acp.runtime._resolve_claude_acp_bin", lambda: ["claude-agent-acp"]
+    )
+    monkeypatch.setattr(
+        "kiro_crew.acp.runtime._resolve_claude_code_executable", lambda: "/usr/bin/claude"
+    )
     monkeypatch.setattr("kiro_crew.acp.runtime.wrap_argv", wrap)
     monkeypatch.setattr("kiro_crew.acp.runtime.cgroup_scope_argv", lambda argv: argv)
     monkeypatch.setattr("kiro_crew.acp.runtime.create_subprocess_limited", create_process)

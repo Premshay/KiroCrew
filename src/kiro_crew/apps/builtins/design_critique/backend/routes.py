@@ -45,6 +45,7 @@ from kiro_crew import link_unfurl, platform_compat, sandbox
 from kiro_crew.apps.manager import app_data_dir, is_app_enabled
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.security import (
     DENIED_ROOT_PARTS,
     is_sensitive_path,
@@ -327,7 +328,11 @@ def _claude_design_url(value: object) -> str:
     if not url:
         return ""
     parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.netloc != "claude.ai" or not parsed.path.startswith("/design/"):
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "claude.ai"
+        or not parsed.path.startswith("/design/")
+    ):
         raise ValueError("invalid_claude_design_url")
     return url
 
@@ -360,8 +365,14 @@ def _design_round_prompt(payload: dict[str, Any], report: dict[str, Any]) -> str
         fix = _redact_text(finding.get("fix")).strip()[:360]
         if title:
             finding_lines.append(f"- {title}" + (f": {fix}" if fix else ""))
-    paths_block = "\n".join(f"- {path}" for path in paths) or "- No file paths supplied; ask before assuming implementation details."
-    findings_block = "\n".join(finding_lines) or "- No critique findings were attached; use the stated target and constraints."
+    paths_block = (
+        "\n".join(f"- {path}" for path in paths)
+        or "- No file paths supplied; ask before assuming implementation details."
+    )
+    findings_block = (
+        "\n".join(finding_lines)
+        or "- No critique findings were attached; use the stated target and constraints."
+    )
     return "\n".join(
         [
             "# Claude Design round",
@@ -465,7 +476,9 @@ def _update_design_round(round_id: str, payload: dict[str, Any]) -> dict[str, An
 
 def _list_design_rounds() -> list[dict[str, Any]]:
     with _DESIGN_ROUNDS_LOCK:
-        return [dict(round_record) for round_record in _read_design_rounds_locked()[:_DESIGN_ROUNDS_MAX]]
+        return [
+            dict(round_record) for round_record in _read_design_rounds_locked()[:_DESIGN_ROUNDS_MAX]
+        ]
 
 
 def _require_enabled(handler: Callable[..., Any]) -> Callable[..., Any]:
@@ -629,6 +642,7 @@ def _register_persistence_routes(app: web.Application) -> None:
     app.router.add_patch(
         "/api/apps/design-critique/design-rounds/{round_id}", _handle_update_design_round
     )
+
 
 # Resolved from the installed package, in-process — never via a `python3 -c
 # "import kiro_crew"` SHELL command, which the gateway's own security filter
@@ -1213,6 +1227,22 @@ def _require_enabled(handler):
     return _wrapped
 
 
+async def _owner_gate(request: web.Request, operation: str) -> web.Response | None:
+    """Owner gate for the host-touching POSTs (discover, render).
+
+    Both start host work: a git clone, a route scan over a host directory, a
+    headless Chromium run, PNGs written under the owner's data home. So a
+    dashboard caller must be the owner, and gets the shared 403 ``owner_only``
+    otherwise. A request with no app claim is judged the same way, so a
+    missing claim fails closed. An app token passes here: the token
+    middleware has already confirmed it holds this path, as its own namespace
+    or through a manifest ``permissions.api`` grant.
+    """
+    if not request.get("app"):
+        return await require_owner_dashboard_request(request, operation)
+    return None
+
+
 async def _json_object(
     request: web.Request,
 ) -> tuple[dict[str, Any] | None, web.Response | None]:
@@ -1668,6 +1698,9 @@ async def _discover_repo_job(value: str, vetted: list[str], git_bin: str) -> dic
 
 
 async def _handle_discover(request: web.Request) -> web.Response:
+    owner_denied = await _owner_gate(request, "design_critique.discover")
+    if owner_denied is not None:
+        return owner_denied
     body, err = await _json_object(request)
     if body is None:
         return err or _bad_request("invalid JSON", "invalid_json")
@@ -1948,6 +1981,9 @@ async def _render_capture_job(
 
 
 async def _handle_render(request: web.Request) -> web.Response:
+    owner_denied = await _owner_gate(request, "design_critique.render")
+    if owner_denied is not None:
+        return owner_denied
     body, err = await _json_object(request)
     if body is None:
         return err or _bad_request("invalid JSON", "invalid_json")

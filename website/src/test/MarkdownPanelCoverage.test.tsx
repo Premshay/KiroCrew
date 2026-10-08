@@ -84,6 +84,12 @@ interface FetchOpts {
   knowledgeEnabled?: boolean
   knowledgeAdded?: boolean
   knowledgePostStatus?: number
+  knowledgeSourceType?: string
+  /** Explicit multi-source list for the GET; overrides knowledgeAdded/Type. */
+  knowledgeSources?: { id: number; source_type: string }[]
+  /** When false, the sources GET resolves non-ok (HTTP 500). */
+  knowledgeSourcesOk?: boolean
+  knowledgeDeleteStatus?: number
   fileReadOk?: boolean
   fileReadText?: string
   /** Hold the /api/file-read answer until the returned release is called. */
@@ -105,7 +111,18 @@ function installFetch() {
         const status = fetchOpts.knowledgePostStatus ?? 201
         return { ok: status < 400, status, json: async () => (status >= 400 ? { error: 'library refused' } : { id: 1 }) }
       }
-      return { ok: true, json: async () => (fetchOpts.knowledgeAdded ? [{ id: 1 }] : []) }
+      if (init?.method === 'DELETE') {
+        const status = fetchOpts.knowledgeDeleteStatus ?? 200
+        return { ok: status < 400, status, json: async () => (status >= 400 ? { error: 'library refused the removal' } : {}) }
+      }
+      const type = fetchOpts.knowledgeSourceType ?? 'local_file'
+      if (fetchOpts.knowledgeSourcesOk === false) {
+        return { ok: false, status: 500, json: async () => ({ error: 'sources read failed' }) }
+      }
+      if (fetchOpts.knowledgeSources) {
+        return { ok: true, json: async () => fetchOpts.knowledgeSources }
+      }
+      return { ok: true, json: async () => (fetchOpts.knowledgeAdded ? [{ id: 1, source_type: type }] : []) }
     }
     if (url.startsWith('/api/file-download')) {
       if (fetchOpts.downloadThrows) throw new Error('network down')
@@ -323,7 +340,7 @@ interface MountOpts {
   onClose?: () => void
   onContentChange?: (c: string) => void
   onDiffModeChange?: (d: boolean) => void
-  onSubmitComments?: (m: string) => void
+  onSubmitComments?: (m: string) => void | boolean | Promise<void | boolean>
   /** Omit the key entirely to let the auto-diff heuristic decide. */
   initialDiffMode?: boolean
 }
@@ -1147,13 +1164,277 @@ describe('MarkdownPanel — knowledge library toggle', () => {
     expect(window.alert).not.toHaveBeenCalled()
   })
 
-  it('renders an inert badge for a file already in the library', async () => {
+  it('turns the badge into a Remove button for an added local_file source', async () => {
     fetchOpts.knowledgeEnabled = true
     fetchOpts.knowledgeAdded = true
     mountPanel()
+    const remove = await screen.findByLabelText(/Remove from Knowledge Library/)
+    expect(screen.queryByLabelText('Add to Knowledge Library')).toBeNull()
+    fireEvent.click(remove)
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/knowledge/sources/1', expect.objectContaining({ method: 'DELETE' })))
+    // The invalidation refetches the same query key the status check used,
+    // which is what flips the panel back to the Add affordance.
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/knowledge/sources?uri=%2Ftmp%2Fnotes.md'))
+  })
+
+  it('treats an already-gone source (404) as a successful removal', async () => {
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeAdded = true
+    fetchOpts.knowledgeDeleteStatus = 404
+    mountPanel()
+    fireEvent.click(await screen.findByLabelText(/Remove from Knowledge Library/))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/knowledge/sources/1', expect.objectContaining({ method: 'DELETE' })))
+    expect(screen.queryByTestId('markdown-panel-action-error')).toBeNull()
+  })
+
+  it('surfaces a failed removal through the panel error notice', async () => {
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeAdded = true
+    fetchOpts.knowledgeDeleteStatus = 500
+    mountPanel()
+    fireEvent.click(await screen.findByLabelText(/Remove from Knowledge Library/))
+    // The backend's raw English body ("library refused the removal") is
+    // intentionally swallowed: the notice shows the localized string instead.
+    expect(await screen.findByTestId('markdown-panel-action-error')).toHaveTextContent('Couldn’t remove the source.')
+  })
+
+  it('keeps the inert badge for a non-local_file (folder) source', async () => {
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeAdded = true
+    fetchOpts.knowledgeSourceType = 'folder'
+    mountPanel()
     const badge = await screen.findByLabelText('In Knowledge Library')
     expect(badge.tagName).toBe('SPAN')
+    expect(screen.queryByLabelText(/Remove from Knowledge Library/)).toBeNull()
     expect(screen.queryByLabelText('Add to Knowledge Library')).toBeNull()
+  })
+
+  it('finds the removable local_file even when a folder source is listed first', async () => {
+    // A file can match more than one source. The removable affordance must key
+    // off the local_file among all matches, not whichever row came back first,
+    // so a leading folder source must not mask it (and the DELETE must target
+    // the local_file's id, not the folder's).
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeSources = [
+      { id: 9, source_type: 'folder' },
+      { id: 1, source_type: 'local_file' },
+    ]
+    mountPanel()
+    const remove = await screen.findByLabelText(/Remove from Knowledge Library/)
+    expect(screen.queryByLabelText('Add to Knowledge Library')).toBeNull()
+    fireEvent.click(remove)
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/knowledge/sources/1', expect.objectContaining({ method: 'DELETE' })))
+  })
+
+  it('URL-encodes the source id so a traversal id cannot redirect the delete', async () => {
+    // Source ids come from imported bundles and are only validated as a
+    // non-empty string, so an id like "../../../sessions" would otherwise
+    // resolve to a different route. The id must be sent as a single, encoded
+    // path segment.
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeSources = [{ id: '../../../sessions' as unknown as number, source_type: 'local_file' }]
+    mountPanel()
+    fireEvent.click(await screen.findByLabelText(/Remove from Knowledge Library/))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      '/api/knowledge/sources/' + encodeURIComponent('../../../sessions'),
+      expect.objectContaining({ method: 'DELETE' }),
+    ))
+    expect(fetch).not.toHaveBeenCalledWith('/api/knowledge/sources/../../../sessions', expect.anything())
+  })
+
+  it('surfaces an error (not an empty library) when the sources read fails', async () => {
+    // A failed sources GET must not resolve to [] and read as "not added":
+    // that would offer Add and hide the Remove for a file that may already be
+    // indexed. The panel must render its knowledge query-error notice instead.
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeSourcesOk = false
+    mountPanel()
+    expect(await screen.findByTestId('markdown-panel-knowledge-error')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Add to Knowledge Library')).toBeNull()
+    expect(screen.queryByLabelText(/Remove from Knowledge Library/)).toBeNull()
+  })
+
+  it('offers the Remove row in the overflow menu for an added local_file source', async () => {
+    fetchOpts.knowledgeEnabled = true
+    fetchOpts.knowledgeAdded = true
+    mountPanel()
+    openPanelMenu()
+    fireEvent.click(await screen.findByText(/Remove from Knowledge Library/))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/knowledge/sources/1', expect.objectContaining({ method: 'DELETE' })))
+  })
+})
+
+describe('MarkdownPanel — Submit All keeps comments until the send is delivered', () => {
+  const FILE = '/tmp/notes.md'
+  const BODY = 'alpha beta gamma\n'
+
+  function seedDraft() {
+    localStorage.setItem('mc-comment-drafts', JSON.stringify({
+      [FILE]: [{ id: 'c1', anchor: 'beta', text: 'needs a citation' }],
+    }))
+  }
+
+  function storedComments(): unknown {
+    return JSON.parse(localStorage.getItem('mc-comment-drafts') ?? '{}')[FILE]
+  }
+
+  it('keeps the batch when the send resolves false', async () => {
+    seedDraft()
+    const onSubmitComments = vi.fn(async () => false)
+    mountPanel({ filePath: FILE, content: BODY, onSubmitComments })
+    await screen.findByText('needs a citation')
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    expect(onSubmitComments).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('needs a citation')).toBeInTheDocument()
+    expect(storedComments()).toHaveLength(1)
+  })
+
+  it('keeps the batch when the send rejects', async () => {
+    seedDraft()
+    const onSubmitComments = vi.fn(async () => { throw new Error('refused') })
+    mountPanel({ filePath: FILE, content: BODY, onSubmitComments })
+    await screen.findByText('needs a citation')
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    expect(screen.getByText('needs a citation')).toBeInTheDocument()
+    expect(storedComments()).toHaveLength(1)
+  })
+
+  it('does not clear while the send is still pending, then clears on delivery', async () => {
+    seedDraft()
+    let deliver!: (ok: boolean) => void
+    const onSubmitComments = vi.fn(() => new Promise<boolean>(resolve => { deliver = resolve }))
+    mountPanel({ filePath: FILE, content: BODY, onSubmitComments })
+    await screen.findByText('needs a citation')
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    expect(screen.getByText('needs a citation')).toBeInTheDocument()
+    // A second click while the first send is pending does not send twice.
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    expect(onSubmitComments).toHaveBeenCalledTimes(1)
+    await act(async () => { deliver(true) })
+    await waitFor(() => expect(screen.queryByText('needs a citation')).not.toBeInTheDocument())
+    expect(storedComments()).toBeUndefined()
+  })
+
+  it('keeps a comment edited while the send was pending', async () => {
+    seedDraft()
+    let deliver!: (ok: boolean) => void
+    const onSubmitComments = vi.fn(() => new Promise<boolean>(resolve => { deliver = resolve }))
+    mountPanel({ filePath: FILE, content: BODY, onSubmitComments })
+    const row = (await screen.findByText('needs a citation')).closest('[data-comment-id]') as HTMLElement
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    fireEvent.click(within(row).getByLabelText('Edit'))
+    const input = within(row).getByDisplayValue('needs a citation')
+    fireEvent.change(input, { target: { value: 'needs two citations' } })
+    fireEvent.click(within(row).getByLabelText('Save'))
+    await screen.findByText('needs two citations')
+    await act(async () => { deliver(true) })
+    expect(screen.getByText('needs two citations')).toBeInTheDocument()
+    expect(storedComments()).toEqual([expect.objectContaining({ id: 'c1', text: 'needs two citations' })])
+  })
+
+  it('drops delivered comments that arrive after the panel moved to another file', async () => {
+    seedDraft()
+    let deliver!: (ok: boolean) => void
+    const onSubmitComments = vi.fn(() => new Promise<boolean>(resolve => { deliver = resolve }))
+    const { rerender, props } = mountPanel({ filePath: FILE, content: BODY, onSubmitComments })
+    await screen.findByText('needs a citation')
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    rerender(<MarkdownPanel embedded {...props} filePath="/tmp/b.md" />)
+    await act(async () => { deliver(true) })
+    rerender(<MarkdownPanel embedded {...props} filePath={FILE} />)
+    await waitFor(() => expect(storedComments()).toBeUndefined())
+    expect(screen.queryByText('needs a citation')).not.toBeInTheDocument()
+  })
+
+  it('keeps another panel\'s saved draft when a delivery lands', async () => {
+    seedDraft()
+    let deliver!: (ok: boolean) => void
+    const onSubmitComments = vi.fn(() => new Promise<boolean>(resolve => { deliver = resolve }))
+    mountPanel({ filePath: FILE, content: BODY, onSubmitComments })
+    await screen.findByText('needs a citation')
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    // Another open panel saves a comment on a different file meanwhile.
+    const stored = JSON.parse(localStorage.getItem('mc-comment-drafts') ?? '{}')
+    stored['/tmp/other.md'] = [{ id: 'o1', anchor: 'x', text: 'other file note' }]
+    localStorage.setItem('mc-comment-drafts', JSON.stringify(stored))
+    await act(async () => { deliver(true) })
+    await waitFor(() => expect(screen.queryByText('needs a citation')).not.toBeInTheDocument())
+    const after = JSON.parse(localStorage.getItem('mc-comment-drafts') ?? '{}')
+    expect(after['/tmp/other.md']).toEqual([expect.objectContaining({ id: 'o1', text: 'other file note' })])
+    expect(after[FILE]).toBeUndefined()
+  })
+
+  it('clears saved drafts for a delivery that lands after the panel closed', async () => {
+    seedDraft()
+    let deliver!: (ok: boolean) => void
+    const onSubmitComments = vi.fn(() => new Promise<boolean>(resolve => { deliver = resolve }))
+    const { unmount } = mountPanel({ filePath: FILE, content: BODY, onSubmitComments })
+    await screen.findByText('needs a citation')
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    unmount()
+    await act(async () => { deliver(true) })
+    expect(storedComments()).toBeUndefined()
+  })
+
+  it('keeps a comment whose edit is still open when the send is delivered', async () => {
+    seedDraft()
+    let deliver!: (ok: boolean) => void
+    const onSubmitComments = vi.fn(() => new Promise<boolean>(resolve => { deliver = resolve }))
+    mountPanel({ filePath: FILE, content: BODY, onSubmitComments })
+    const row = (await screen.findByText('needs a citation')).closest('[data-comment-id]') as HTMLElement
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    fireEvent.click(within(row).getByLabelText('Edit'))
+    fireEvent.change(within(row).getByDisplayValue('needs a citation'), { target: { value: 'still typing' } })
+    await act(async () => { deliver(true) })
+    expect(screen.getByDisplayValue('still typing')).toBeInTheDocument()
+    expect(storedComments()).toEqual([expect.objectContaining({ id: 'c1' })])
+  })
+
+  it('keeps a newer draft saved by a reopened panel when the old send is delivered', async () => {
+    seedDraft()
+    let deliver!: (ok: boolean) => void
+    const onSubmitComments = vi.fn(() => new Promise<boolean>(resolve => { deliver = resolve }))
+    const { unmount } = mountPanel({ filePath: FILE, content: BODY, onSubmitComments })
+    await screen.findByText('needs a citation')
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    unmount()
+    // The file is reopened and a new comment is saved while the send is pending.
+    localStorage.setItem('mc-comment-drafts', JSON.stringify({
+      [FILE]: [
+        { id: 'c1', anchor: 'beta', text: 'needs a citation' },
+        { id: 'c2', anchor: 'gamma', text: 'added after reopening' },
+      ],
+    }))
+    await act(async () => { deliver(true) })
+    expect(storedComments()).toEqual([expect.objectContaining({ id: 'c2', text: 'added after reopening' })])
+  })
+
+  it('keeps drafts held only in memory when storage lost them', async () => {
+    localStorage.setItem('mc-comment-drafts', JSON.stringify({
+      [FILE]: [{ id: 'c1', anchor: 'beta', text: 'needs a citation' }],
+      '/tmp/b.md': [{ id: 'b1', anchor: 'alpha', text: 'only in memory' }],
+    }))
+    let deliver!: (ok: boolean) => void
+    const onSubmitComments = vi.fn(() => new Promise<boolean>(resolve => { deliver = resolve }))
+    const { rerender, props } = mountPanel({ filePath: FILE, content: BODY, onSubmitComments })
+    await screen.findByText('needs a citation')
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    // A write that never landed: storage no longer holds file B's draft.
+    localStorage.setItem('mc-comment-drafts', JSON.stringify({
+      [FILE]: [{ id: 'c1', anchor: 'beta', text: 'needs a citation' }],
+    }))
+    await act(async () => { deliver(true) })
+    await waitFor(() => expect(screen.queryByText('needs a citation')).not.toBeInTheDocument())
+    rerender(<MarkdownPanel embedded {...props} filePath="/tmp/b.md" />)
+    expect(await screen.findByText('only in memory')).toBeInTheDocument()
+  })
+
+  it('clears the batch for a host that returns no verdict', async () => {
+    seedDraft()
+    mountPanel({ filePath: FILE, content: BODY, onSubmitComments: vi.fn() })
+    await screen.findByText('needs a citation')
+    await act(async () => { fireEvent.click(screen.getByText(/Submit All/)) })
+    await waitFor(() => expect(screen.queryByText('needs a citation')).not.toBeInTheDocument())
   })
 })
 

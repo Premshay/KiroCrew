@@ -14,13 +14,14 @@ import os
 import shutil
 import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
-
-if TYPE_CHECKING:
-    from kiro_crew.providers.acp import AcpProvider
+from typing import Any, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.agent_sdk import build_acp_provider, is_acp_timeout
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
     effort_config_option_id,
     effort_config_option_value,
@@ -43,10 +44,9 @@ from kiro_crew.sandbox import (
 )
 
 try:
-    from kiro_crew.acp.client import AcpClient, AcpTimeoutError
+    from kiro_crew.acp.client import AcpClient
 except ImportError:
     AcpClient = None  # type: ignore[assignment,misc]
-    AcpTimeoutError = ()  # type: ignore[assignment,misc]
 
 # Sweep-protection shield for AcpClient-backed workers. These are direct,
 # long-lived AcpClient sessions (not SessionMap sessions / warm-pool providers),
@@ -414,7 +414,7 @@ class AcpWorker(Worker):
         effort: Optional[str] = None,
     ) -> None:
         self._client: Optional[AcpClient] = None
-        self._provider: Optional[AcpProvider] = None
+        self._provider: Optional[Any] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
         self._sandbox_mode = sandbox_mode
@@ -451,6 +451,18 @@ class AcpWorker(Worker):
             else await asyncio.to_thread(_get_sandbox_mode)
         )
         binding, unbound_registry = await asyncio.to_thread(_resolve_client_binding)
+        backend = binding.get("acp_backend", ACP_BACKEND_KIRO)
+        # Claude can enforce an explicit native empty tool list even though its
+        # saved agent spec cannot enforce one by itself.
+        if not (capabilities_for(backend).honors_zero_tool_ban or backend == ACP_BACKEND_CLAUDE):
+            raise RuntimeError(
+                f"Knowledge worker backend {backend!r} cannot enforce a zero-tool session"
+            )
+        if (
+            backend not in ACP_BACKENDS_ACP_RUNTIME
+            and not capabilities_for(backend).acp_client_spawnable
+        ):
+            raise RuntimeError(f"Knowledge worker backend {backend!r} cannot start an ACP client")
         if unbound_registry:
             logger.warning(
                 "AcpWorker: %s supplies a provider factory but no client binding for "
@@ -464,10 +476,9 @@ class AcpWorker(Worker):
             AGENT_NAME,
             sorted(binding) or "none",
         )
-        if binding.get("acp_backend") in ACP_BACKENDS_ACP_RUNTIME:
-            from kiro_crew.providers.acp import AcpProvider
-
-            self._provider = AcpProvider(
+        authored_before_spawn = False
+        if backend == ACP_BACKEND_KAS:
+            self._provider = build_acp_provider(
                 agent=AGENT_NAME,
                 sandbox_mode=sandbox_mode,
                 **binding,
@@ -478,6 +489,12 @@ class AcpWorker(Worker):
                 await self.shutdown()
                 raise
             self._client = self._provider.client
+            spec = getattr(getattr(self._client, "_handle", None), "consumed_agent_spec", None)
+            if not isinstance(spec, dict) or spec.get("tools") != []:
+                await self.shutdown()
+                raise RuntimeError(
+                    f"Knowledge worker backend {backend!r} did not confirm a zero-tool spec"
+                )
             logger.info(
                 "AcpWorker: runtime backend=%s served_model=%s",
                 self._client.backend,
@@ -490,8 +507,27 @@ class AcpWorker(Worker):
                 audit_source="subagent",
                 **binding,
             )
+            if backend == ACP_BACKEND_CLAUDE:
+                self._client.restrict_tools([])
+            elif backend == ACP_BACKEND_KIRO:
+                authored_before_spawn = await asyncio.to_thread(
+                    self._client.authored_spec_declares_zero_tools
+                )
         self._effective_effort = None
         await self._client.ensure_ready()
+        if self._provider is None and capabilities_for(backend).honors_zero_tool_ban:
+            if backend == ACP_BACKEND_KIRO:
+                confirmed = await asyncio.to_thread(
+                    self._client.effective_spec_declares_zero_tools,
+                    authored_before_spawn=authored_before_spawn,
+                )
+            else:
+                confirmed = self._client.spec_zero_tools
+            if not confirmed:
+                await self.shutdown()
+                raise RuntimeError(
+                    f"Knowledge worker backend {backend!r} did not confirm a zero-tool spec"
+                )
         await self._apply_effort()
         # Shield the live worker PID from the periodic orphan sweep for as long
         # as it runs. Paired with unregister in shutdown() and on respawn above.
@@ -531,6 +567,9 @@ class AcpWorker(Worker):
         try:
             backend = getattr(client, "backend", "")
             via_config_option = capabilities_for(backend).effort_via_config_option
+            if not via_config_option and not capabilities_for(backend).effort_via_slash_command:
+                logger.warning("AcpWorker: effort change unsupported by backend=%s", backend)
+                return
             # Resolved per backend, like every other effort site: writing the
             # wrong spelling draws "unknown config option", and the except
             # below turns that into "using provider default" without saying
@@ -587,11 +626,15 @@ class AcpWorker(Worker):
         assert self._client is not None
         try:
             if self._provider is not None:
-                from kiro_crew.llm_helpers import stream_and_collect
+                from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
 
                 return await asyncio.wait_for(
                     stream_and_collect(
-                        self._provider, prompt, agent=AGENT_NAME, retry_transient=False
+                        self._provider,
+                        prompt,
+                        agent=AGENT_NAME,
+                        approval_policy=ToolApprovalPolicy.REJECT_ALL,
+                        retry_transient=False,
                     ),
                     timeout,
                 )
@@ -857,6 +900,7 @@ class LLMPool:
         effort_key: Optional[str] = None,
         fallback_effort: str = "",
         config_pool_size_key: Optional[str] = None,
+        use_config_pool_size: Optional[bool] = None,
     ):
         self._pool_size = pool_size
         self._effort = _normalize_effort(effort)
@@ -867,11 +911,20 @@ class LLMPool:
         # override for tests / pure construction.
         self._effort_key = effort_key
         self._fallback_effort = fallback_effort
-        # Config keys override ``pool_size`` ONLY for the workload that owns
-        # them: extraction binds ``config_pool_size_key="extraction_pool_size"``
-        # while the fetch pool passes nothing, so knowledge.extraction_pool_size
-        # cannot silently resize it (or the auto_research pool).
-        self._config_pool_size_key = config_pool_size_key
+        # A default-width pool retains the former config-driven behavior, while
+        # an explicit non-default width stays fixed unless it binds a config key.
+        # This keeps the compatibility flag from resizing the one-worker fetch
+        # and auto-research pools that predate ``config_pool_size_key``.
+        self._use_config_pool_size = (
+            pool_size == DEFAULT_POOL_SIZE or config_pool_size_key is not None
+            if use_config_pool_size is None
+            else use_config_pool_size
+        )
+        self._config_pool_size_key = (
+            config_pool_size_key
+            if config_pool_size_key is not None
+            else ("extraction_pool_size" if self._use_config_pool_size else None)
+        )
         self._semaphore = asyncio.Semaphore(pool_size)
         self._workers: list[Worker] = []
         self._available: asyncio.Queue[int] = asyncio.Queue()
@@ -1006,8 +1059,7 @@ class LLMPool:
             self._timeout_floor = _get_timeout_floor(config, bound=bool(binding))
             if self._timeout_floor:
                 logger.info(
-                    "LLMPool: bound to an edition engine — prompt timeouts "
-                    "floored at %.0fs",
+                    "LLMPool: bound to an edition engine — prompt timeouts " "floored at %.0fs",
                     self._timeout_floor,
                 )
             try:
@@ -1211,9 +1263,7 @@ class LLMPool:
         idx, worker = await self.acquire()
         try:
             # After acquire: start() has run, so the bound floor is resolved.
-            return await worker.send_message(
-                prompt, timeout=max(timeout, self._timeout_floor)
-            )
+            return await worker.send_message(prompt, timeout=max(timeout, self._timeout_floor))
         finally:
             try:
                 await self._maybe_recycle(idx, worker)
@@ -1292,7 +1342,7 @@ class LLMPool:
                     prompt, timeout=max(timeout, self._timeout_floor)
                 )
             except Exception as e:
-                if self._timeout_floor > 0 and isinstance(e, AcpTimeoutError):
+                if self._timeout_floor > 0 and is_acp_timeout(e):
                     if not floor_hit:
                         floor_hit.append(e)
                         logger.warning(

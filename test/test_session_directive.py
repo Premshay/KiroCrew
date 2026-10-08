@@ -197,12 +197,7 @@ def test_directive_tool_for(server, tool, expected):
 
 
 def test_directive_tool_for_rejects_unproven_identity():
-    assert (
-        sd.directive_tool_for(
-            sd.CORE_MCP_SERVER, "session_checkpoint", trusted=False
-        )
-        == ""
-    )
+    assert sd.directive_tool_for(sd.CORE_MCP_SERVER, "session_checkpoint", trusted=False) == ""
 
 
 def test_subagent_isolation_intent():

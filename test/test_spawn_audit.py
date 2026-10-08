@@ -251,8 +251,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/auto_improvement/tests/test_environment.py::sandbox_run",
         "apps/builtins/auto_improvement/tests/test_environment.py::authenticated_run",
         "apps/builtins/auto_improvement/tests/test_environment.py::test_runner_forwards_literal_argv_and_exact_linked_checkout",
-
-
         # The spawn primitive for three fixed-argv kiro-cli one-shots
         # (`chat --list-models`, `whoami`, the `/usage` scrape). Every caller has
         # already wrapped the argv with sandbox.wrap_argv and cgroup_scope_argv
@@ -302,7 +300,8 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # session work dir rather than anything the agent names in a turn. The only
         # variable input is the child's ``OPENCODE_CONFIG_CONTENT``, which this core
         # composes from its own permission-setting table (see
-        # ``AcpClient._opencode_routing_config``); the agent supplies nothing to it.
+        # ``acp/harness/opencode.py::_opencode_routing_config``); the agent supplies
+        # nothing to it.
         # Stdout is read and nothing else: the JSON document is parsed for one key,
         # the harness's resolved ``permission``, which decides whether the session
         # may start at all.
@@ -319,7 +318,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # Called from a worker thread, never the event loop --
         # ``test_the_routing_read_back_runs_off_the_event_loop`` in
         # ``test/test_acp_opencode_backend.py`` pins that.
-        "acp/client.py::_verify_opencode_routing",
+        "acp/harness/opencode.py::_verify_opencode_routing",
         # The pi gate read-back, the same shape as the opencode one above. ONE fixed
         # argv -- Kiro Crew's own gate launcher (a file this core wrote into the
         # sandbox run directory, execing the resolved ``pi`` binary) plus the three
@@ -336,22 +335,22 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # is the agent itself loading extensions out of the operator's own
         # directories. Called from a worker thread, never the event loop --
         # ``test/test_acp_pi_backend.py`` pins that.
-        "acp/client.py::_verify_pi_gate",
+        "acp/harness/pi.py::_verify_pi_gate",
         # The DeepSeek Harness gate read-back, the same shape as the pi one above:
         # the argv is the SESSION'S own argv already wrapped by ``wrap_argv_async``
-        # before it reaches this method, so the sandbox and credential mask are
+        # before it reaches this function, so the sandbox and credential mask are
         # applied by the caller rather than here. Nothing in it is agent-influenced
         # -- the harness binary comes from its ``ACP_BACKEND_LAUNCH`` row, the sealed
         # plugin and its patch from the owner-only gate-artifact directory, and the
-        # marker path from the probe's OWN private scratch window (allocated in the
-        # arm, passed as ``extra_private_dirs``, removed in its ``finally``) -- the
+        # marker path from the probe's OWN private scratch window (allocated by the
+        # adapter, passed as ``extra_private_dirs``, removed in its ``finally``) -- the
         # one argument the child writes, and it lands nowhere the child could plant
         # something a later session loads. stdin is a pipe that carries nothing and
         # is closed once the plugin publishes its marker (EOF is the profile's own
         # shutdown). The env adds only the operator's configured key NAMES under
         # canary values, never the key. Called from a worker thread, never the
         # event loop.
-        "acp/client.py::_verify_deepseek_gate",
+        "acp/harness/deepseek.py::_verify_deepseek_gate",
         # The subprocess-pool child interpreter: ONE fixed argv, ``sys.executable -I -S
         # -c <leaf source>``, where the source is the text of a module-relative
         # constant script (the sensitive-path resolver's
@@ -379,34 +378,26 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # ``pdfplumber`` commits a page's whole character list before any caller
         # can measure it, so the memory bound has to sit one process down.
         "pdf_extract.py::extract_pdf_segments",
-        # The shadow-venv update engine's spawns. None is agent-influenced and
-        # none can route through sandboxed_spawn_argv, because the engine's whole
-        # job is to build the NEXT gateway install outside the agent sandbox.
-        # Manifest-signature verification runs the openssl binary resolved via
-        # trusted_system_bin (never PATH) and writes NO verification input to any
-        # agent-reachable path: _check_key_fingerprint pipes the embedded public
-        # key to `openssl pkey -pubin -outform DER` on stdin and reads the DER on
-        # stdout (no file); _verify_over_fds hands `openssl dgst -verify` the key
-        # and signature over anonymous pipe FDs the gateway created and the
-        # payload on stdin (no file); _verify_over_nofollow_files is the Windows
-        # fallback only (no `/dev/fd`), staging into a gateway-private temp dir
-        # with every file opened `O_CREAT|O_EXCL|O_NOFOLLOW` so a pre-planted
-        # symlink is refused, never followed. The remaining spawns: _run spawns
-        # `sys.executable -m venv <tree>` and `<shadow python> -m pip install
-        # <wheel>` where the tree name is composed from the SIGNED manifest's
-        # validated version string and the wheel path from the same workdir;
-        # build_shadow_venv's best-effort pip self-upgrade in the shadow tree;
-        # verify_shadow_venv's `-I` isolated import probe against the shadow
-        # interpreter. The update flow is reachable only from the CLI on the
-        # operator's terminal or the gateway's approve endpoint behind the OQ7
-        # host-local step-up — the agent's own bash path is closed by the
+        # The shadow-venv update engine's one spawn seam. Nothing it runs is
+        # agent-influenced, and none of it can route through sandboxed_spawn_argv,
+        # because the engine's whole job is to build the NEXT gateway install
+        # outside the agent sandbox. _spawn_build_child runs, in its own session
+        # (inside the gateway with the trusted-PATH scrubbed environment, under
+        # `kirocrew update` with the operator's own shell environment; interpreter
+        # children run -I either way): the openssl binary
+        # resolved via trusted_system_bin (never PATH), which reads the pinned key
+        # on stdin and the key and signature over anonymous pipe FDs (no file is
+        # staged by name; the Windows fallback opens each one
+        # O_CREAT|O_EXCL|O_NOFOLLOW), `sys.executable -I -m venv <tree>`, the shadow
+        # interpreter's `-I -m pip` refresh, install and `pip check`, and the `-I`
+        # import probe. The tree name is composed from the SIGNED manifest's
+        # validated version string and the wheel path from the same workdir. The
+        # update flow is reachable only from the CLI on the operator's terminal,
+        # the gateway's approve endpoint behind the OQ7 host-local step-up, and the
+        # gateway's own update coordinator (auto_update or a policy floor, against
+        # the check's own verdict) — the agent's own bash path is closed by the
         # self-update denied rule.
-        "platform/wheel_engine.py::_run",
-        "platform/wheel_engine.py::_check_key_fingerprint",
-        "platform/wheel_engine.py::_verify_over_fds",
-        "platform/wheel_engine.py::_verify_over_nofollow_files",
-        "platform/wheel_engine.py::build_shadow_venv",
-        "platform/wheel_engine.py::verify_shadow_venv",
+        "platform/wheel_engine.py::_spawn_build_child",
         # The userns probe child: ONE fixed argv, `sys.executable -I -S -c <shim>`,
         # no shell, no cwd, stdin/stdout are the two handshake pipes. Nothing is
         # agent-influenced -- the shim is a module-level string constant and takes
@@ -1008,6 +999,12 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # unisolated `python -c` would let a decoy on the caller's
         # PYTHONPATH/CWD answer for the interpreter under test.
         "dep_sync.py::_probe_interpreter",
+        # The stale-asset watchdog's relaunch probe: `<python> -X utf8 -c "import
+        # kiro_crew.cli, kiro_crew.cli_server"` from `/`, a fixed literal. The interpreter is the one
+        # the service manager's own loaded command names, run under that unit's
+        # environment, which the supervisor's relaunch would execute anyway; it
+        # is unisolated on purpose, because the relaunch is.
+        "dep_sync.py::_probe_relaunch_import",
         "dep_sync.py::sync",
         "dep_sync.py::sync_or_reinstall",
         # _git_blob_text is the pre-mutation interpreter-floor gate's one read:
@@ -1468,7 +1465,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # exchanges two frames with a daemon that is already running; no child
         # process is created and there is no argv to sandbox. Same classification
         # as the other ``asyncio.run`` sites in this list.
-        "mcp_gateway/daemon_control.py::_ping",
+        "mcp_gateway/daemon_control.py::_ping_detailed",
         "mcp_gateway/gatewayd.py::main",
         "mcp_gateway/manager.py::_spawn_once",
         "mcp_gateway/stub.py::main",
@@ -1639,7 +1636,8 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "service/apparmor.py::parser_version",
         "service/apparmor.py::validate",
         "service/linux.py::_current_group",
-        # Read-only diagnostic: `loginctl show-user <user> -p Linger --value`, a
+        # Read-only diagnostic: `loginctl show-user <user> -p Linger`, with
+        # `Linger=` parsed from the Key=value output (no `--value`), a
         # fixed argv whose only variable is the service account name taken from
         # $USER/$LOGNAME (never agent-supplied). Same class as
         # service/linux.py::_current_group — an identity/state query the install
@@ -1663,14 +1661,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # list-argv element, shell is never enabled, and no cwd is passed.
         "session_scope_reap.py::_scope_active_enter_us",
         "session_scope_reap.py::_systemctl_stop",
+        # The stale-asset watchdog's re-entry check reads the gateway's own unit:
+        # `systemctl [--user] show -p <fixed properties> kirocrew.service`, a fixed
+        # argv with no agent input, bounded by a timeout. The binary comes only from
+        # platform_compat.trusted_system_bin("systemctl"); a miss is inconclusive
+        # and spawns nothing, so neither PATH nor an agent can choose it.
+        "gateway_restart.py::_systemd_show",
         "slack/gateway.py::_auto_apply_update",
-        # Wheel/cli.sh auto-update: runs the signed installer command
-        # (composed locally from a validated channel name and https-pinned
-        # artifact base, never from feed data). The child is the cli.sh
-        # installer, which performs its own RSA-SHA256 signature verification.
-        # NOT sandbox-routed because the installer must write to the managed
-        # venv and symlink ~/.local/bin/kirocrew.
-        "slack/gateway.py::_auto_apply_wheel_update",
         # Pluggable update provider: CommandProvider runs operator-configured
         # shell commands from security_policy.json or config.json (sensitive
         # home dirs the agent cannot write). The check command probes for a

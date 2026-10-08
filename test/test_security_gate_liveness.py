@@ -157,12 +157,44 @@ def _url_payload_command(n: int) -> str:
 #: note names a dotless target refused while a hosts file over 64 KiB is still read
 #: in the background, so a caller retries it rather than treating it as settled.
 #:
+#: Raised again, from 28,401, for the containment gate's ``pre_resolved`` keyword:
+#: one keyword on ``path_contains_sensitive``, forwarded to the two helpers that
+#: already take it, plus the preconditions it carries written on the keyword
+#: itself. The claim is ``is_sensitive_resolved_path``'s, unchanged: the caller
+#: holds the canonical spelling and is off the event loop, so the anchors resolve
+#: inline. No new entry point, no target, no matching rule and no threshold moved.
+#:
 #: The number IS the package's measured total, carrying no spare room: a ratchet with
 #: headroom admits exactly the unreviewed growth it exists to catch, so the next line
 #: added here fails this gate and has to be re-pinned deliberately, with its reason
 #: written above. The guards that detect a monolith growing back are the per-file cap
 #: and the facade's share below, and both must stay untouched.
-_PACKAGE_LINE_BUDGET = 28_401
+#:
+#: Raised for the ``registry_trust.json`` leaf added to ``_CREW_SECRET_LEAVES`` in
+#: ``paths.py``: the operator's grants of ``owner`` trust to a hand-configured app
+#: registry live in a keystone file on the same read+write floor as
+#: ``denied_commands.json``, so the leaf and its two-line reason are three lines the gate
+#: cannot avoid.
+#:
+#: Raised for the read-only bash gate's refusal of variable-assigning expansions
+#: (`$[...]`, an `=` after `${`): one pattern alternative plus its reason comment.
+#:
+#: Raised for six stdout-only filters on the read-only bash allowlist (`tr`, `nl`,
+#: `rev`, `comm`, `od`, `column`) and their reason comment.
+#:
+#: Raised for pass 3's macOS per-user directory exemption in ``redaction``:
+#: withholding this host's own ``confstr`` id from the bare-secret scan, so a macOS
+#: temp path (a computer-use screenshot among them) is not read as a key, costs the
+#: id lookup, its grammar, the per-id pattern, the reason only the host's own id is
+#: safe to withhold, and window classification with whole-run context that exempts
+#: only windows sharing ≥ 24 bytes with that id while every other positive window
+#: redacts each piece it touches. One mechanism, no new pass.
+#:
+#: Raised again, from 28,551, for the Windows alias fold in ``paths.py``: one lexical
+#: helper strips a local-drive namespace prefix and a default-stream suffix, and
+#: ``_candidate_forms`` resolves the folded spelling while keeping the raw one as a
+#: candidate. No target, no matching rule and no threshold moved.
+_PACKAGE_LINE_BUDGET = 28_572
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

@@ -75,6 +75,7 @@ BASE_NAMES = frozenset(
         "Any",
         "CHAT_TYPE_DIRECT",
         "CHAT_TYPE_FORUM",
+        "CHAT_TYPE_PRIVATE_TOPIC",
         "ChannelLink",
         "ConversationOwnershipConflict",
         "ConversationState",
@@ -161,6 +162,7 @@ BASE_NAMES = frozenset(
         "compact_unsupported_backend",
         "compact_unsupported_reply",
         "consume_reinjection",
+        "context_recycle_warning",
         "cron_command_reply",
         "dataclass",
         "delivery_is_muted",
@@ -200,6 +202,8 @@ BASE_NAMES = frozenset(
         "rearm_reinjection",
         "rebind_conversation_location",
         "receipt_address_key",
+        "recycle_backend",
+        "recycle_warning_should_send",
         "redact",
         "redact_local_paths",
         "refused_resume_is_restricted",
@@ -207,6 +211,7 @@ BASE_NAMES = frozenset(
         "release_conversation_location",
         "requested_model_sid",
         "reserve_new_generation",
+        "rollback_skill_bodies",
         "run_in_embed_pool",
         "run_yolo_command",
         "runtime_death",
@@ -276,7 +281,7 @@ MOVED_MEMBERS = {
         "_reply_markdown",
         "_require_direct_chat",
     ),
-    "midturn": ("_handle_busy",),
+    "midturn": ("_handle_busy", "_handle_resumed_busy"),
     "pickers": (
         "_agent_choices",
         "_apply_agent",
@@ -413,6 +418,7 @@ BASE_MEMBERS = {
         "thread: 'int | None' = None) -> 'None'",
     ),
     "_installed_agent_names": ("staticmethod", "() -> 'list[str]'"),
+    "_is_private_route": ("staticmethod", "(route: 'tuple[str, str]') -> 'bool'"),
     "_live_cfg": ("function", "(self) -> \"'KiroCrewConfig'\""),
     "_maybe_notice": (
         "function",
@@ -520,8 +526,9 @@ BASE_MEMBERS = {
 }
 
 #: Members the composition added: the turn engine ``handle_message`` hands an admitted
-#: message to. Anything else new on the class is unexplained surface.
-ADDED_MEMBERS = frozenset({"_run_turn"})
+#: message to, and the midturn owner's hand-off of a message into a busy RESUMED
+#: dashboard session. Anything else new on the class is unexplained surface.
+ADDED_MEMBERS = frozenset({"_run_turn", "_handle_resumed_busy"})
 
 
 def _owner(stem: str) -> ModuleType:

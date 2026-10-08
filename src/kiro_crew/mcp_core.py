@@ -65,7 +65,7 @@ from kiro_crew.mcp_shared import (
     spawned_without_gateway_identity,
 )
 from kiro_crew.mcp_tool_titles import with_titles
-from kiro_crew.mcp_tools import build_tool_list, dispatch
+from kiro_crew.mcp_tools import build_tool_list, build_tool_names, dispatch
 from kiro_crew.members import record_activity
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import is_legacy_slack_key, legacy_key
@@ -89,6 +89,7 @@ from kiro_crew.skills import SkillsLoader
 from kiro_crew.trigger_match import rank_triggered
 from kiro_crew.validation import (
     MCP_CORE_SCHEMAS,
+    coerce_mcp_tool_args,
     validate_tool_args,
 )
 
@@ -494,6 +495,21 @@ def _list_tools() -> list[dict[str, Any]]:
     return with_titles(CORE_MCP_SERVER, build_tool_list())
 
 
+def _list_tool_names() -> list[str]:
+    """Tool NAMES only, without assembling descriptions.
+
+    The names-only read path ``mcp_discovery._managed_tools_in_process`` prefers
+    when it keeps only names. It returns exactly the names ``_list_tools`` would,
+    in the same order, but ``build_tool_names`` takes the ``names_only`` path so
+    the two descriptions that reach for a live value (the sub-agent cap and
+    agents-directory scan in ``mcp_tools.spawn``, the config reads in
+    ``mcp_tools.control``) are never performed. ``with_titles`` is intentionally
+    not applied: it only decorates descriptions, which a names-only caller
+    discards.
+    """
+    return build_tool_names()
+
+
 def _internal_secret() -> str:
     """Credential for the gateway this client will dial, paired to its port.
 
@@ -755,11 +771,12 @@ def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
     kiro-cli process is an ``AcpRuntime``, which is deliberately
     session-UNBOUND (one process multiplexes N sessions, so it cannot carry a
     single session's key in its environment — ``acp/runtime.py`` injects none).
-    The gateway's per-call caller injection is therefore the ONLY identity
-    channel for that backend, and it exists only for servers listed in
-    ``mcp_gateway.stub_servers``. An unrouted server on kiro has no channel at
-    all, which is a topology gap an operator can close in one line — not a bug
-    in the calling session.
+    The gateway's per-call caller injection is therefore one identity channel
+    for that backend, and it exists only for servers listed in
+    ``mcp_gateway.stub_servers``. The signed per-session token and the verified
+    host-pid sidecar are independent of the gateway. A server that is not
+    routed through the gateway and has neither is a topology gap an operator can
+    close in one line — not a bug in the calling session.
 
     Returns "" when identity IS resolvable (the caller should not be refusing),
     so a caller can append this unconditionally.
@@ -856,6 +873,9 @@ REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
         "mcp_tools/messaging.py",
         "mcp_tools/sessions.py",
         "mcp_tools/skills.py",
+        # Not a tool module: the tool table's production caller, which every
+        # table-built server's strict checks route through.
+        "mcp_tools/table.py",
         "mcp_tools/workflows.py",
     }
 )
@@ -1356,9 +1376,9 @@ def _transport_failure(message: str, mark: bool) -> dict:
     ``transport_error`` means acceptance is undetermined — the request may have
     reached the gateway before the response failed (a read timeout after spawn
     acceptance, say), so the caller must not declare a definite rejection nor
-    retry on its own. Only spawn_run's batch reconcile consumes it, and it only
-    ever posts, so the flag stays opt-in per verb rather than becoming a new field
-    on every reply.
+    retry on its own. Its readers (spawn_run's batch reconcile, the cron tool
+    proxy, learn_add) all post, so the flag stays opt-in per verb rather than
+    becoming a new field on every reply.
     """
     out: dict[str, object] = {"error": message}
     if mark:
@@ -1592,9 +1612,10 @@ def _post(
         return {"error": _sk_err}
     if sk:
         headers["X-Session-Key"] = sk
-    # ``transport_error`` is consumed only by spawn_run's batch reconcile: it
-    # means acceptance is unknown, so that member must not be declared lost.
-    # Other _post callers should treat the payload as a normal error.
+    # ``transport_error`` means acceptance is unknown. A caller that reads it
+    # (spawn_run's batch reconcile, the cron tool proxy, learn_add) must not
+    # report a definite failure; other _post callers treat the payload as a
+    # normal error.
     return _send(
         path,
         data=data,
@@ -1928,7 +1949,12 @@ def _validate_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Validate tool arguments against schema. Returns cleaned args."""
     schema = MCP_CORE_SCHEMAS.get(name)
     if schema:
-        return validate_tool_args(args, schema)
+        # Repair an int that an upstream deferred-schema runtime re-typed from a
+        # numeric-looking string ("42" -> 42) back to its string form on a
+        # string field, BEFORE validation. This lives at the MCP entry point —
+        # not in the shared validate_field — so the dashboard HTTP endpoints
+        # keep their original contract (see coerce_mcp_tool_args).
+        return validate_tool_args(coerce_mcp_tool_args(args, schema), schema)
     return args  # tools without schemas pass through
 
 

@@ -6,21 +6,13 @@ import type { SettingEntry } from './settingsTypes'
 export const SETTINGS_REGISTRY: SettingEntry[] = 
 [
   {
-    "id": "about.auto-update-on-restart",
-    "label": "Auto-update on restart",
-    "labelKey": "pages.settings.aboutPanel.auto_update_on_restart",
+    "id": "about.install-app-updates-automatically",
+    "label": "Install app updates automatically",
+    "labelKey": "pages.settings.aboutPanel.install_app_updates_automatically",
+    "description": "Downloads new versions in the background and installs them the next time you quit the app.",
     "tab": "about",
     "type": "toggle",
     "occurrence": 1
-  },
-  {
-    "id": "about.update-notifications",
-    "labelKey": "pages.settings.aboutPanel.notify_when_an_update_is_available",
-    "tab": "about",
-    "type": "toggle",
-    "occurrence": 1,
-    "configKey": "auto_update",
-    "label": "Notify when an update is available"
   },
   {
     "id": "about.update-channel",
@@ -29,6 +21,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "type": "buttonGroup",
     "occurrence": 1,
     "label": "Update channel"
+  },
+  {
+    "id": "about.update-the-gateway-automatically",
+    "label": "Update the gateway automatically",
+    "labelKey": "pages.settings.aboutPanel.automatic_updates",
+    "description": "Installs a new release once no work is running and restarts the gateway, on installs that can update themselves.",
+    "tab": "about",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "auto_update"
   },
   {
     "id": "browser.attach-token",
@@ -65,7 +67,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Allowed enterprise orgs (Slack)",
     "labelKey": "pages.settings.slackPanel.allowed_enterprise_orgs",
     "labelSuffix": "Slack",
-    "description": "Enterprise Grid org IDs to allow (starts with E or T). Leave empty to allow all orgs.",
+    "description": "Enterprise Grid org or workspace IDs to allow (starts with E or T). On Enterprise Grid, list the org's E… ID and each workspace's T… ID: messages are checked by workspace, so a list with only the E… ID denies every message. Leave empty to allow all orgs.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -212,6 +214,20 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "params": {
       "channel": "teams"
     }
+  },
+  {
+    "id": "channels.connect-new-sessions-to-slack-automatically-slack",
+    "label": "Connect new sessions to Slack automatically (Slack)",
+    "labelKey": "pages.settings.slackPanel.auto_link_sessions",
+    "labelSuffix": "Slack",
+    "description": "Every new dashboard session gets a Slack thread on its first message, in your private direct message with the bot. Sessions started by cron, apps or sub-agents, sessions that began in Slack or another messaging app, and incognito or temporary sessions are left alone. A session connected this way does not count as a Slack session for the folder setting below: it stays where it is in the sidebar, and only conversations that start in Slack are filed.",
+    "tab": "channels",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "slack"
+    },
+    "configKey": "slack.auto_link_sessions"
   },
   {
     "id": "channels.enable-imessage-channel-imessage",
@@ -870,7 +886,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.completion-event-truncation",
     "label": "Completion Event Truncation",
     "labelKey": "pages.settings.chatPanel.completion_event_truncation",
-    "description": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default, matches legacy behavior). Tail preserves the final summary. Both keeps a slice from each end with a marker between them.",
+    "description": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default). Tail preserves the final summary. Both keeps a slice from each end with a marker between them.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -962,6 +978,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1,
     "params": {
       "sub": "aboutyou"
+    }
+  },
+  {
+    "id": "chat.dim-inactive-panes",
+    "label": "Dim Inactive Panes",
+    "labelKey": "pages.settings.chatPanel.dim_inactive_panes",
+    "description": "In split view, fade every pane that does not have keyboard focus. When off, all panes stay at full brightness and the accent border marks the focused one.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
     }
   },
   {
@@ -1173,7 +1201,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.response-verbosity",
     "label": "Response Verbosity",
     "labelKey": "pages.settings.chatPanel.response_verbosity",
-    "description": "How terse the agent's prose is. Ultra-concise keeps the whole reply short: answer first, bullets over paragraphs, no filler. Code, commands, and error strings stay verbatim at every level; security warnings always appear but stay brief, and multi-step instructions stay complete. Answer-only goes further and drops explanation entirely: one sentence at most, and detail only when you ask for it — or when a decision is consequential enough (security, exposure, data loss, spend, anything hard to undo) that you need the reasoning to choose correctly.",
+    "description": "How terse the agent's prose is. Concise trims filler and narration. Answer only gives just the answer in the plainest words, with detail when you ask. At every level, code, commands and error strings stay verbatim, security warnings still appear, and multi-step instructions stay complete.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1361,6 +1389,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "chat.style-markdown-while-typing",
+    "label": "Style Markdown While Typing",
+    "labelKey": "pages.settings.chatPanel.inline_markdown_input",
+    "description": "Show bold, italic, strikethrough and inline code in the message input as you type. Turning it on also switches the message input to a rich-text editor that is still in beta; turn this off to go back to the plain input. The markdown markers stay visible and the message you send is unchanged.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "composer"
+    }
+  },
+  {
     "id": "chat.subagent-effort",
     "label": "Subagent Effort",
     "labelKey": "pages.settings.chatPanel.subagent_effort",
@@ -1436,7 +1476,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.what-enter-does-while-the-agent-is-working",
     "label": "What Enter does while the agent is working",
     "labelKey": "pages.settings.chatPanel.what_enter_does_while_the_agent_is_working",
-    "description": "Steer interrupts the current turn; Queue waits for it.",
+    "description": "Steer adds your message to the current turn without stopping it; Queue waits for the turn to finish.",
     "tab": "chat",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -1596,6 +1636,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "developer.automatic-cards-for-all-sessions",
+    "label": "Automatic cards for all sessions",
+    "labelKey": "commandCenter.automatic_cards",
+    "description": "Summaries of each session’s recent work and next steps.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "dashboard.dynamic_dashboard_cards"
+  },
+  {
     "id": "developer.chat-on-a-crew",
     "label": "Chat on a crew",
     "labelKey": "pages.developer.featurePreviewsTab.chat_on_a_crew",
@@ -1680,7 +1730,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.remote-crew-sessions",
     "label": "Remote crew sessions",
     "labelKey": "pages.developer.featurePreviewsTab.remote_instance_sessions",
-    "description": "Merge a connected remote crew's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished.",
+    "description": "Merge a connected remote crew's live sessions into the Sessions list, each marked with a server badge. A remote crew is another machine you have connected, not your agents. Functional, but not finished.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -1698,7 +1748,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.run-a-local-gateway",
     "label": "Run a local gateway",
     "labelKey": "pages.settings.developerPanel.run_a_local_gateway",
-    "description": "Start a gateway on this machine. Turn it off to use Kiro Crew as a client only, connecting to the gateway you have configured instead of running one here. Takes effect next time you open the app.",
+    "description": "Start a gateway on this machine. Leave it on unless this app's port already reaches a crew on another machine, or the app cannot connect the next time it opens, which is when this takes effect. That needs the crew saved for this port with “Set Remote Host…” in the Connection menu, plus a tunnel: tick “Keep an SSH tunnel to this crew open” there (macOS and Linux) or keep your own SSH tunnel running. Settings → Remote Crew connections stop when this is off, so they do not count.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -1732,6 +1782,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "sub": "terminal"
     },
     "configKey": "dashboard.terminal.completion.enabled"
+  },
+  {
+    "id": "display.cursor-style",
+    "label": "Cursor style",
+    "labelKey": "pages.settings.displayPanel.terminal_cursor_style",
+    "description": "Shape of the terminal cursor. Bar and underline leave the character under it visible.",
+    "tab": "display",
+    "type": "buttonGroup",
+    "occurrence": 1,
+    "params": {
+      "sub": "terminal"
+    }
   },
   {
     "id": "display.custom-font",
@@ -2561,6 +2623,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "type": "toggle",
     "occurrence": 1,
     "configKey": "stt.polish"
+  },
+  {
+    "id": "voice.use-a-key-to-start-dictation",
+    "label": "Use a key to start dictation",
+    "labelKey": "pages.settings.sttSettings.ptt_enabled",
+    "description": "Turn this off to stop a key from starting dictation — you can still dictate from the microphone button.",
+    "tab": "voice",
+    "type": "toggle",
+    "occurrence": 1
   },
   {
     "id": "voice.voice",

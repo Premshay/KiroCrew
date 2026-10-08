@@ -6,10 +6,10 @@ import { changeApprovalMode, updateSlot } from '../../store/dashboardSlice'
 import { createSlot, setAgentSwitchNotice } from '../../store/chatSlice'
 import { pendingSlotSwitch, pendingSlotSwitchTarget, performSlotSwitch } from '../../lib/slotSwitch'
 import { performAgentSlotSwitch } from '../../lib/agentSwitch'
-import { queryComposerOrExpand } from '../../pages/chat/composerFocus'
+import { focusComposerElement, queryComposerOrExpand } from '../../pages/chat/composerFocus'
 import { agentSwitchFailureMessage } from '../../utils/agentSwitchFeedback'
 import { api } from '../../api/client'
-import { toggleTerminalByChord } from '../../lib/terminalChordFocus'
+import { newTerminalByChord, toggleTerminalByChord } from '../../lib/terminalChordFocus'
 import { focusPopout as focusTerminalPopout } from '../../utils/terminalPopout'
 import { useKeyboardShortcuts } from '../../hooks/useKeyboardShortcuts'
 import { useInstanceShortcuts } from '../../hooks/useInstanceShortcuts'
@@ -60,7 +60,7 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
       // left collapsed is asked back instead of swallowing the caret: creating a
       // session IS a typing intent, and the alternative is a new chat whose
       // first keystroke goes nowhere.
-      requestAnimationFrame(() => queryComposerOrExpand(ta => ta.focus()))
+      requestAnimationFrame(() => queryComposerOrExpand(focusComposerElement))
     },
   })
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
@@ -258,6 +258,12 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
     // the key.
     onToggleTerminal: terminalEnabled && !isPopout && !isEmbed
       ? () => { if (terminalPoppedOut) focusTerminalPopout(); else toggleTerminalByChord(activeSlotProject) }
+      : undefined,
+    // VS Code's Create New Terminal: open the docked panel if needed and add a
+    // tab in the active session's project. Same gating as the toggle above, and
+    // a popped-out panel is focused rather than grown from out of sight.
+    onNewTerminal: terminalEnabled && !isPopout && !isEmbed
+      ? () => { if (terminalPoppedOut) focusTerminalPopout(); else newTerminalByChord(activeSlotProject) }
       : undefined,
   })
   // Cmd+1..9 (⌘ mac / Ctrl win-linux) switches instance panes: 1=Local,

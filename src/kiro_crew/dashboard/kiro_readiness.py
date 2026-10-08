@@ -183,8 +183,8 @@ def _warn_refused_once(path: str) -> None:
     It must ALSO not be visible 570 times an hour. A signed-out gateway with an open
     dashboard polls ``/api/models`` every 8s and ``/api/sessions/usage`` every 30s,
     and every one of those refuses HERE — the sibling branches that log in
-    ``api_models`` sit BELOW this gate (``agents.py:1014`` onward vs the gate at
-    ``:942``) and are never reached in that state, so one line per refused request is
+    ``api_models`` (``dashboard/handlers/agents.py``) sit BELOW its call to this gate
+    and are never reached in that state, so one line per refused request is
     not "the same order of magnitude as its siblings" — it is 570 lines/hour against
     their none. The dashboard log ring is ``deque(maxlen=1000)``
     (``handlers/updates.py:1381``), which that rate churns end to end every ~1.8

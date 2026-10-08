@@ -62,9 +62,9 @@ class TestCheckpointDirectiveDispatch:
         assert "AT MOST ONCE PER TURN" in descriptor["description"]
         assert schema["properties"]["goal"]["maxLength"] == 240
         assert schema["properties"]["next_action"]["maxLength"] == 160
-        assert "Include it whenever work remains" in schema["properties"]["next_action"][
-            "description"
-        ]
+        assert (
+            "Include it whenever work remains" in schema["properties"]["next_action"]["description"]
+        )
         assert schema["properties"]["main_items"]["maxItems"] == 4
         assert schema["properties"]["progress"]["additionalProperties"] is False
         assert schema["properties"]["attention"]["additionalProperties"] is False
@@ -91,7 +91,9 @@ class TestCheckpointDirectiveDispatch:
             == ""
         )
 
-    def test_second_checkpoint_in_a_turn_is_recorded_but_told_once_is_enough(self, monkeypatch) -> None:
+    def test_second_checkpoint_in_a_turn_is_recorded_but_told_once_is_enough(
+        self, monkeypatch
+    ) -> None:
         checkpoint = _checkpoint()
         post = MagicMock(
             return_value={"ok": True, "session_checkpoint": checkpoint, "calls_this_turn": 2}
@@ -144,7 +146,9 @@ class TestCheckpointDirectiveDispatch:
         assert "outcome is indeterminate" in result
         assert "do not retry automatically" in result
 
-    def test_reports_checkpoint_persistence_failure_as_pending_durability(self, monkeypatch) -> None:
+    def test_reports_checkpoint_persistence_failure_as_pending_durability(
+        self, monkeypatch
+    ) -> None:
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
         monkeypatch.setattr(
             mcp_core,
@@ -321,7 +325,9 @@ class TestCheckpointSlotProjection:
         update_without_goal.pop("goal")
         slot.set_session_checkpoint(update_without_goal)
         assert slot.session_checkpoint_payload()["goal"] == "Explain work state."
-        slot.set_session_checkpoint(_checkpoint(goal="", summary="Third state.", milestone="Cleared."))
+        slot.set_session_checkpoint(
+            _checkpoint(goal="", summary="Third state.", milestone="Cleared.")
+        )
         assert slot.session_checkpoint_payload()["goal"] == ""
 
     def test_checkpoint_next_action_clears_when_a_later_checkpoint_omits_it(self) -> None:
@@ -381,7 +387,9 @@ class TestCheckpointSlotProjection:
 
     def test_checkpoint_milestone_also_updates_the_redacted_timeline(self) -> None:
         slot = _ChatSlot("checkpoint")
-        slot.set_session_checkpoint(_checkpoint(milestone="Recorded AKIAIOSFODNN7EXAMPLE in a draft."))
+        slot.set_session_checkpoint(
+            _checkpoint(milestone="Recorded AKIAIOSFODNN7EXAMPLE in a draft.")
+        )
 
         timeline = slot.session_timeline_payload()
         assert timeline[0]["source"] == "checkpoint"
@@ -406,28 +414,35 @@ class TestCheckpointSlotProjection:
 
     def test_timeline_keeps_bounded_operator_digest_metadata(self) -> None:
         slot = _ChatSlot("checkpoint")
-        assert slot.append_session_timeline(
-            "Approval needed: git.",
-            "attention",
-            kind="attention",
-            priority=95,
-            consequence="Awaiting your approval.",
-        ) is True
+        assert (
+            slot.append_session_timeline(
+                "Approval needed: git.",
+                "attention",
+                kind="attention",
+                priority=95,
+                consequence="Awaiting your approval.",
+            )
+            is True
+        )
         assert slot.session_timeline_payload()[0]["priority"] == 95
         assert slot.session_timeline_payload()[0]["consequence"] == "Awaiting your approval."
-        slot.restore_session_timeline([
-            {"text": "Malformed priority.", "source": "terminal", "priority": "high"},
-        ])
+        slot.restore_session_timeline(
+            [
+                {"text": "Malformed priority.", "source": "terminal", "priority": "high"},
+            ]
+        )
 
         timeline = slot.session_timeline_payload()
-        assert timeline == [{
-            "text": "Malformed priority.",
-            "source": "terminal",
-            "timestamp": "",
-            "kind": "terminal",
-            "priority": 90,
-            "consequence": "",
-        }]
+        assert timeline == [
+            {
+                "text": "Malformed priority.",
+                "source": "terminal",
+                "timestamp": "",
+                "kind": "terminal",
+                "priority": 90,
+                "consequence": "",
+            }
+        ]
 
     def test_timeline_retains_high_signal_entries_over_lifecycle_noise(self) -> None:
         slot = _ChatSlot("checkpoint")
@@ -465,7 +480,9 @@ class TestCheckpointSlotProjection:
 
     def test_restore_migrates_legacy_checkpoint_trail_when_no_timeline_exists(self) -> None:
         slot = _ChatSlot("checkpoint")
-        slot.restore_session_checkpoint(_checkpoint(trail=["Planned the slice.", "Ran focused tests."]))
+        slot.restore_session_checkpoint(
+            _checkpoint(trail=["Planned the slice.", "Ran focused tests."])
+        )
 
         assert [entry["text"] for entry in slot.session_timeline_payload()] == [
             "Planned the slice.",
@@ -525,9 +542,7 @@ class TestCheckpointInternalEndpoint:
         request.headers = {"X-Session-Key": "dashboard:consumer"}
         request.json = AsyncMock(return_value=_checkpoint())
         failed_save = AsyncMock(side_effect=OSError("disk full"))
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_persistence.save_slot_off_loop", failed_save
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", failed_save)
 
         response = await api_session_checkpoint(request)
 
@@ -567,7 +582,9 @@ class TestCheckpointInternalEndpoint:
         assert json.loads(response.text)["code"] == "checkpoint_slot_not_found"
 
     @pytest.mark.asyncio
-    async def test_requires_a_post_barrier_checkpoint_before_acknowledgement(self, tmp_path) -> None:
+    async def test_requires_a_post_barrier_checkpoint_before_acknowledgement(
+        self, tmp_path
+    ) -> None:
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("consumer")
         state.sessions.restart_barrier_snapshot = AsyncMock(
@@ -598,7 +615,9 @@ class TestCheckpointInternalEndpoint:
 
 class TestReturnHandoff:
     @pytest.mark.asyncio
-    async def test_queues_and_records_a_handoff_for_an_active_loop(self, tmp_path, monkeypatch) -> None:
+    async def test_queues_and_records_a_handoff_for_an_active_loop(
+        self, tmp_path, monkeypatch
+    ) -> None:
         state = _make_state(tmp_path)
         state.push_slots_update = MagicMock()
         slot = state.get_or_create_slot("loop")
@@ -620,7 +639,10 @@ class TestReturnHandoff:
         assert json.loads(response.text) == {"ok": True, "pending": 1}
         save.assert_awaited_once_with(state, slot, force=True)
         assert "[End of background context]\n" in drain_pending_context(slot)
-        assert slot.session_timeline_payload()[-1]["text"] == "Human handoff delivered to the next turn."
+        assert (
+            slot.session_timeline_payload()[-1]["text"]
+            == "Human handoff delivered to the next turn."
+        )
 
     def test_expired_handoff_records_non_delivery(self) -> None:
         slot = _ChatSlot("loop")
@@ -635,10 +657,14 @@ class TestReturnHandoff:
         )
 
         assert drain_pending_context(slot) == ""
-        assert slot.session_timeline_payload()[-1]["text"] == "Human handoff expired before delivery."
+        assert (
+            slot.session_timeline_payload()[-1]["text"] == "Human handoff expired before delivery."
+        )
 
     @pytest.mark.asyncio
-    async def test_refuses_a_handoff_when_the_loop_is_not_active(self, tmp_path, monkeypatch) -> None:
+    async def test_refuses_a_handoff_when_the_loop_is_not_active(
+        self, tmp_path, monkeypatch
+    ) -> None:
         state = _make_state(tmp_path)
         state.get_or_create_slot("loop")
         monkeypatch.setattr(
@@ -733,7 +759,10 @@ class TestCheckpointPersistence:
         }
 
     def test_covered_freshness_survives_recent_session_restore(self, tmp_path, monkeypatch) -> None:
-        from kiro_crew.dashboard.chat_persistence import _save_slot_to_history, restore_recent_sessions
+        from kiro_crew.dashboard.chat_persistence import (
+            _save_slot_to_history,
+            restore_recent_sessions,
+        )
 
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)

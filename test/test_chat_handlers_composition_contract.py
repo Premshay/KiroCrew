@@ -38,7 +38,7 @@ from chat_test_helpers import _make_state
 from source_corpus import repo_files_named, repo_root
 
 import kiro_crew.dashboard.chat_handlers as ch
-from kiro_crew.dashboard import chat_api
+from kiro_crew.dashboard import chat_api, slot_ownership
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 _FACADE = ch.__name__
@@ -46,18 +46,19 @@ _FACADE_PATH = Path(ch.__file__).resolve()
 
 #: Every module-level name ``chat_handlers`` bound at the base the split was cut
 #: from: what it defined and what it imported, private names included, because tests
-#: and production read private names off it too.
+#: and production read private names off it too. The per-slot app ownership helpers
+#: that ``slot_ownership`` holds instead are not all in it.
 _BASE_NAMES = frozenset("""
-        ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS ADOPT_PEER_MODE_UNKNOWN ADOPT_TARGET_UNKNOWN
+        ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
         ARTIFACT_SLUG_RE AUTOCOMPACT_PCT_MAX AUTOCOMPACT_PCT_MIN AcpModelUnavailable AcpProvider
-        AdoptBackfill AdoptTargetUnknown Any Awaitable COLOR_HEX_RE Callable
+        Any Awaitable COLOR_HEX_RE Callable
         ClientConnectionResetError DashboardState DeferredHoldFull DeferredHoldRebound
         HUMAN_TURN_META_KEY JEV_ROUTE_MODEL KiroCrewConfig LLMProvider MAX_COLOR_INDEX
         MAX_DEFERRED_NOTES MAX_DEFERRED_NOTE_CHARS MODEL_NAMESPACE_ACP MemoryStartupUnavailable
-        NamedTuple OversizedRecord Path RESERVED_ROW_META_KEYS RemoteTurnError ResumeOutcome
+        NamedTuple OversizedRecord Path RESERVED_ROW_META_KEYS ResumeOutcome
         ResumeRefusal SESSION_RELOAD_KIND SESSION_START_FAILED_KIND SLOT_DETAIL_MAX_LIMIT
         STEER_AUTO STEER_REQUEUED STEER_STEERED SUGGEST_FOLLOWUP_SCHEMA SYNTHETIC_RECOVERY_KIND
-        SelectionChange SlotCloseError SlotOrigin SplitlinesBoundaryRecord TURN_ACTOR_META_KEY
+        SelectionChange SlotCloseError SplitlinesBoundaryRecord TURN_ACTOR_META_KEY
         TYPE_CHECKING TranscriptRevisionChanged UnknownMemoryStore ValidationError
         _CREATABLE_MODES _ChatSlot _CommitToken _DEFERRED_PLAIN_CREATE_KNOWN_KEYS
         _DurablePrefixMismatch _FLUSH_SNAPSHOT_RETRIES _FOLLOWUP_TEXT_FIELDS
@@ -68,17 +69,17 @@ _BASE_NAMES = frozenset("""
         _SLOT_SCOPED_TRUST_MODES _SOURCE_CTRL_RE _STRUCTURED_CONTENT_MAX_CHARS
         _STRUCTURED_CONTENT_PLACEHOLDER _TEARDOWN_INCOMPLETE_WARNING _TRANSIENT_ROLES
         _TURN_OPENER_ROLES _TURN_OPENING_INJECT_KINDS _UNOWED_WINDOW_ROLES _UNPINNED _UNSET
-        _app_cancel_denied _app_may_send_to_slot _app_slot_is_local_user_session
-        _append_unflushed_tail _append_unflushed_tail_from_offset _apply_remote_pick
-        _apply_remote_pick_locked _apply_source_link_unlink _attach_variants
+        _app_cancel_denied _app_may_send_to_slot
+        _append_unflushed_tail _append_unflushed_tail_from_offset
+        _apply_source_link_unlink _attach_variants
         _audit_source_link_unlink _autocompact_txn_lock _autocompact_txn_locks
         _await_guarded_history_write _bounded_slot_page _broadcast_context_reset
         _broadcast_expired_oauth_banners _build_pending_context_entry _build_stream_chunk
-        _bump_slot_tags_revision _cancel_target _check_slot_app_ownership _close_slot
+        _bump_slot_tags_revision _cancel_target _close_slot
         _coerce_requested_mode _collapse_wire_rows _compaction_in_flight
         _configured_backend_for_slot _context_reading _context_snapshot_fields
         _context_snapshot_fields_inner _context_usage_payload _deny_app_yolo _deny_approval_mode
-        _deny_cross_app_slot_access _deny_trust_pattern _discard_held_note
+        _deny_trust_pattern _discard_held_note
         _durable_prefix_counter _edit_queued_by_id _emit_agent_assignment _end_trust_scope
         _end_trust_scopes _enqueue_pending_context _finite_number _generate_state
         _get_pattern_from_pending _has_conversation _has_validated_effort_marker
@@ -111,7 +112,7 @@ _BASE_NAMES = frozenset("""
         _tighten_replacement_to_restricted_original _try_live_model_switch
         _unblock_pending_waits _unhide_folder _validate_autocompact_pct _validate_content
         _validate_max_age _validate_source _wake_conductor_for_closed_worker _wire_model_id
-        _workspace_name_for_dir adopted_slot_for annotations api_chat api_chat_mode
+        _workspace_name_for_dir annotations api_chat api_chat_mode
         api_chat_slot_agent api_chat_slot_approve api_chat_slot_autocompact api_chat_slot_color
         api_chat_slot_context api_chat_slot_continue api_chat_slot_create api_chat_slot_delete
         api_chat_slot_detail api_chat_slot_end_wait api_chat_slot_followup
@@ -122,34 +123,33 @@ _BASE_NAMES = frozenset("""
         api_chat_slot_source_link_unlink api_chat_slot_source_links api_chat_slot_stop
         api_chat_slot_summary api_chat_slot_summary_generate api_chat_slot_workspace
         api_chat_slots api_chat_slots_cleanup api_chat_slots_model api_recent_projects
-        app_permissions apply_adopted_backfill approval_mode_permitted asyncio attachment_meta
+        approval_mode_permitted asyncio attachment_meta
         base_consent_pattern base_trust_patterns cached_project_agent_names canonical_key
         cap_effort_capability_levels capabilities_of carry_provenance channel_slot_name
         chat_message_frame close_slot compaction_in_flight config_dir context_entry_expired
-        contextlib count_user_turns_in_records create_peer_slot datetime
+        contextlib count_user_turns_in_records datetime
         decided_message_handling default_project_dir deny_non_dashboard_caller
-        deny_non_owner_remote_operation deny_session_approval_caller drained_to_thread
-        durable_row_count effective_session_key ensure_version_parity exact_trust_pattern
-        fetch_adopted_backfill forward_peer_selection forward_peer_stop generate_session_summary
+        deny_session_approval_caller drained_to_thread
+        durable_row_count effective_session_key exact_trust_pattern
+        generate_session_summary
         get_reasoning_effort_ordered get_reasoning_effort_values history_corpus_unreadable
         is_channel_session_key is_claude_code is_incognito_transcript is_owner_dashboard_request
         is_registered_agent_name is_sensitive_path is_stop_event_row is_system_notice
         is_turn_interrupted islice json logger logging math maybe_auto_tag members_mod
         model_registry normalize_send_id normalize_theme_consent_sha note_crew_log_class
-        note_hold_durable note_slot_closed os owner_start_priority parse_cls_meta peer_is_connected
-        peer_row_metadata
+        note_hold_durable note_slot_closed os owner_start_priority parse_cls_meta
         persist_deferred_notes_sync pick_epoch_host pin_private_agent_store
         published_autocompact_pct queue_entry_is_user_origin queue_entry_view
-        queue_for_next_turn queued_text_for_display re read_bounded_json
+        queue_for_next_turn queued_text_for_display read_bounded_json
         read_cached_intent_summary record_agent_selection redact_credentials
-        redact_exfiltration_urls redact_peer_text register_reasoning_effort_values
-        relay_remote_turn release_prewarmed_session reload_slot_session remote_bound_refusal
-        remote_mirror request_slot_origin resolve_adopt_target resolve_agent_bindings
+        redact_exfiltration_urls register_reasoning_effort_values
+        release_prewarmed_session reload_slot_session
+        request_slot_origin resolve_agent_bindings
         resolve_folder_project_dir_off_loop resolve_session_agent_bindings resolved_row_identity
         restore_agent_selection restore_replacement_if_handover_did_not_land
         resume_slot_from_history row_mid safety_override save_slot_off_loop schedule_eager_spawn
         sel session_agent_selection_name session_start_failure_streak slot_history_key
-        slot_switch_session_lock spawn_guarded_turn stage_boundary_for start_queue_persist
+        slot_switch_session_lock spawn_guarded_turn start_queue_persist
         steer_into_running_turn steer_is_auto stop_declined_armed stop_slot_turn
         subagents_attached_async tags_write_lock tempfile tighten_live_slot_memory_mode time
         timezone uuid validate_folder_tag_ids validate_tool_args
@@ -178,6 +178,9 @@ _BASE_ROUTES = (
     ("GET", "/api/chat/slots/{slot}/source-links", "api_chat_slot_source_links"),
     ("GET", "/api/chat/slots/{slot}/summary", "api_chat_slot_summary"),
     ("GET", "/api/recent-projects", "api_recent_projects"),
+    ("GET", "/api/favorite-projects", "api_favorite_projects"),
+    ("POST", "/api/favorite-projects", "api_favorite_project_add"),
+    ("DELETE", "/api/favorite-projects", "api_favorite_project_remove"),
     ("PATCH", "/api/chat/slots/{slot}/color", "api_chat_slot_color"),
     ("PATCH", "/api/chat/slots/{slot}/queue/{queue_id}", "api_chat_slot_queue_edit"),
     ("POST", "/api/chat", "api_chat"),
@@ -226,7 +229,7 @@ _RUNNER_SEAMS = (
 def test_every_name_the_handlers_bound_at_the_base_still_resolves() -> None:
     """Callers, the ``dashboard.chat`` facade and tests read private names off the
     handlers module as well as public ones, so every module-level binding survives."""
-    assert len(_BASE_NAMES) > 380
+    assert len(_BASE_NAMES) > 350
     assert sorted(name for name in _BASE_NAMES if not hasattr(ch, name)) == []
 
 
@@ -234,7 +237,7 @@ def test_a_fresh_interpreter_sees_every_base_public_name(tmp_path: Path) -> None
     """The public names resolve in a process that imports nothing else first, and the
     ``dashboard.chat`` re-exports are the facade's own objects there too."""
     public = sorted(name for name in _BASE_NAMES if not name.startswith("_"))
-    assert len(public) > 200
+    assert len(public) > 180
     script = """
         import sys
         import kiro_crew.dashboard.chat_handlers as ch
@@ -315,14 +318,14 @@ def _app_with(state, *routes_: tuple[str, str, object], app_claim: str = "") -> 
 
 
 @pytest.mark.asyncio
-async def test_deleting_a_missing_slot_answers_a_bare_not_found(tmp_path) -> None:
-    """The tab-close client reads any 404 as "already gone"; the body carries no code."""
+async def test_deleting_a_missing_slot_answers_the_uniform_not_found(tmp_path) -> None:
+    """The tab-close client reads any 404 as "already gone"; the body is the uniform one."""
     state = _make_state(tmp_path)
     app = _app_with(state, ("DELETE", "/api/chat/slots/{slot}", ch.api_chat_slot_delete))
     async with TestClient(TestServer(app)) as client:
         resp = await client.delete("/api/chat/slots/nope")
         assert resp.status == 404
-        assert await resp.json() == {"error": "not found"}
+        assert await resp.json() == {"error": "not found", "code": "slot_not_found"}
 
 
 @pytest.mark.parametrize("owner", ["other-app", ""], ids=["foreign", "unscoped"])
@@ -331,10 +334,9 @@ async def test_an_app_cannot_delete_a_slot_it_does_not_own(
     tmp_path, monkeypatch, owner: str
 ) -> None:
     """A slot an app does not own reads exactly like a missing one, and the true
-    reason goes to the audit log instead. An unscoped slot fails the ownership test
-    first, so it is audited with the same reason as a foreign one."""
+    reason goes to the audit log instead, recorded by the ownership decision."""
     audit = MagicMock()
-    monkeypatch.setattr(ch, "sel", lambda: audit)
+    monkeypatch.setattr(slot_ownership, "sel", lambda: audit)
     state = _make_state(tmp_path)
     slot = state.get_or_create_slot("s1")
     slot._app = owner
@@ -344,7 +346,7 @@ async def test_an_app_cannot_delete_a_slot_it_does_not_own(
     async with TestClient(TestServer(app)) as client:
         resp = await client.delete("/api/chat/slots/s1")
         assert resp.status == 404
-        assert await resp.json() == {"error": "not found"}
+        assert await resp.json() == {"error": "not found", "code": "slot_not_found"}
     assert state._slots.get("s1") is slot
     audit.log_api_access.assert_called_once_with(
         caller="my-app",
@@ -352,7 +354,7 @@ async def test_an_app_cannot_delete_a_slot_it_does_not_own(
         outcome="denied",
         source="app_isolation",
         resources="slot=s1",
-        error="app does not own this slot",
+        error="app does not own this slot" if owner else "app cannot access unscoped slots",
     )
 
 
@@ -1382,9 +1384,9 @@ def test_no_owner_captures_a_name_tests_rebind_on_the_facade() -> None:
 
 #: Constructs repository guards read in ``dashboard/chat_handlers.py`` by path or
 #: through the facade's module source: the agent-SDK boundary's three baselined
-#: imports, the approval-mode writers, the remote peer gate and pick chokepoint, the
+#: imports, the approval-mode writers, the
 #: queue-clear the session-control doc counts, the app-actor turn kwargs, the
-#: hold-branch persist, the remote-down refusal text, the stop chokepoints, the
+#: hold-branch persist, the stop chokepoints, the
 #: synthesis boundary the frontend mirrors, the permission-resolution sites with
 #: their dirty flags, and the approval-resolved broadcasts. An owner that grew one
 #: would move it out of such a guard's sight, so each stays in the facade.
@@ -1393,12 +1395,9 @@ _STAYS_IN_THE_FACADE = (
     r"(?m)^from kiro_crew\.providers\.acp import AcpProvider$",
     r"(?m)^from kiro_crew\.providers\.base import LLMProvider$",
     r"safety_override\(\)\.activate",
-    r"deny_non_owner_remote_operation\(",
-    r"_apply_remote_pick\(\s*request",
     r"\._queue\.clear\(\)",
     r'_turn_kwargs\["_turn_actor"\]',
     r"warn_if_not_durable\(slot\._queue, qid, slot\.key\)",
-    r"reconnecting to the crew running this session",
     r"(?m)^def _unblock_pending_waits\(",
     r"(?m)^async def _reset_slot_session\(",
     r"(?m)^def _orphan_in_current_turn\(",
@@ -1416,17 +1415,12 @@ def test_a_construct_a_guard_reads_in_the_facade_stays_there(pattern: str) -> No
 
 
 #: Calls guards check through the facade's own module source or file only: the
-#: peer sinks the remote owner gate sweeps, the turn dispatch the turn-ceiling
-#: scan counts, and the gate, pick and permission-resolution sites beside them.
+#: turn dispatch the turn-ceiling scan counts, and the permission-resolution
+#: sites beside it.
 #: The facade makes each call and no owner may, so a moved caller cannot slip past
 #: a guard that never reads ``chat_api``.
 _FACADE_ONLY_CALLS = frozenset(
     {
-        "relay_remote_turn",
-        "forward_peer_stop",
-        "forward_peer_selection",
-        "deny_non_owner_remote_operation",
-        "_apply_remote_pick",
         "_run_chat",
         "spawn_guarded_turn",
         "_mark_permission_resolved",

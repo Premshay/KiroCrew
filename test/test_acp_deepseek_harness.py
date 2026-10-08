@@ -1,29 +1,18 @@
-"""DeepseekHarness: the seam answers for the dsh ACP host.
+"""DeepseekHarness delegates shared-runtime launches to the verified gate adapter.
 
-The deepseek host is the operator-owned UNVERIFIED seat: no credential mask on
-either transport, the host's own workspace-write sandbox deciding tool calls,
-and reachable only through an engine map entry. What is pinned here is that the
-runtime harness answers every seam exactly like the client transport already
-serves the same seat -- same argv, same permission-mode pin, same no-mask
-posture -- so a review worker started through either transport sees one
-environment.
-
-A real dsh cannot stand in for the full exchange here for the same reason the
-codex suite uses a fake peer: a live probe is only taken as far as the transport
-allows. The live-runtime probe lives in the operator's own verification, not in
-this file. The seam-level contract every harness answers is parametrised in
-``test_acp_harness_contract.py``; deepseek is included there.
+The adapter's gate read-back is covered by the dedicated DeepSeek backend suite;
+these tests pin the shared wrapper's context and plan handoff without booting dsh.
 """
 
 from __future__ import annotations
 
-import asyncio
+import dataclasses
+from unittest.mock import AsyncMock
 
 import pytest
 
-from kiro_crew.acp import client as client_mod
 from kiro_crew.acp.harness import harness_for
-from kiro_crew.acp.harness.base import SpawnContext, TeardownPolicy
+from kiro_crew.acp.harness.base import SpawnContext, SpawnPlan, TeardownPolicy
 from kiro_crew.acp.types import (
     ACP_BACKEND_DEEPSEEK,
     ACP_CLIENT_CAPABILITIES,
@@ -41,35 +30,34 @@ def _ctx(tmp_path, *, model: str | None = None) -> SpawnContext:
     )
 
 
-def _pin_binary(monkeypatch, value):
-    """Pin the resolver AND empty its cache: the client caches the first real
-    resolution, so a patch aimed at the resolver alone is unreachable. The real
-    resolver takes the backend, so the zero-argument fixtures are adapted here
-    rather than at every call site."""
-    monkeypatch.setattr(client_mod, "_self_served_bin_caches", {})
-    monkeypatch.setattr(client_mod, "_resolve_self_served_bin", lambda _backend: value())
-
-
 # ── Seam 1: spawn ──
 
 
 @pytest.mark.asyncio
-async def test_spawn_argv_is_the_binary_plus_the_profile_selector(monkeypatch, tmp_path):
-    _pin_binary(monkeypatch, lambda: ("/bin/dsh", "/s"))
-    plan = await harness_for(ACP_BACKEND_DEEPSEEK).resolve_spawn(_ctx(tmp_path))
-    assert plan.argv == ["/bin/dsh", "--profile", "acp"]
-    # No credential mask on either transport: the UNVERIFIED seat's documented
-    # posture is the harness's own sandbox deciding tool calls.
-    assert plan.extra_hidden_dirs == ()
-    assert plan.extra_expose_files == ()
+async def test_spawn_uses_the_verified_plan_and_runtime_environment(monkeypatch, tmp_path):
+    harness = harness_for(ACP_BACKEND_DEEPSEEK)
+    verified = SpawnPlan(
+        ["/bin/dsh", "--profile", "acp", "--patch", "/sealed/patch"],
+        extra_hidden_dirs=("/masked-home",),
+    )
+    resolve = AsyncMock(return_value=verified)
+    monkeypatch.setattr(harness._launch, "resolve_spawn", resolve)
+    ctx = _ctx(tmp_path)
+    ctx = dataclasses.replace(ctx, extra_env={"DSH_HOME": str(tmp_path / "dsh")})
+    plan = await harness.resolve_spawn(ctx)
+    assert plan.argv == verified.argv
+    assert plan.extra_hidden_dirs == verified.extra_hidden_dirs
+    passed = resolve.await_args.args[0]
+    assert passed.session._extra_env == {"DSH_HOME": str(tmp_path / "dsh")}
+    assert passed.session._spawn_work_dir == str(tmp_path)
 
 
 @pytest.mark.asyncio
 async def test_the_model_rides_the_plan_not_argv(monkeypatch, tmp_path):
-    _pin_binary(monkeypatch, lambda: ("/bin/dsh", "/s"))
-    plan = await harness_for(ACP_BACKEND_DEEPSEEK).resolve_spawn(
-        _ctx(tmp_path, model="deepseek-v4-pro")
-    )
+    harness = harness_for(ACP_BACKEND_DEEPSEEK)
+    resolve = AsyncMock(return_value=SpawnPlan(["/bin/dsh", "--profile", "acp"]))
+    monkeypatch.setattr(harness._launch, "resolve_spawn", resolve)
+    plan = await harness.resolve_spawn(_ctx(tmp_path, model="deepseek-v4-pro"))
     assert "--model" not in plan.argv
     assert plan.session_model == "deepseek-v4-pro"
 
@@ -114,9 +102,7 @@ async def test_session_extras_are_empty(tmp_path):
 
 def test_the_mcp_array_passes_through_unchanged():
     requested = [{"name": "a", "command": "x"}]
-    out = harness_for(ACP_BACKEND_DEEPSEEK).session_mcp_servers(
-        requested, agent_capabilities={}
-    )
+    out = harness_for(ACP_BACKEND_DEEPSEEK).session_mcp_servers(requested, agent_capabilities={})
     assert out is requested
 
 

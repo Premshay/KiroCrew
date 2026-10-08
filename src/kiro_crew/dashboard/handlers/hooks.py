@@ -25,7 +25,7 @@ from kiro_crew.agent_discovery import _read_agent_spec, list_agents
 from kiro_crew.config.loader import KiroCrewConfig, data_home
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.execution_context import ExecutionContext, clear_session_execution
-from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.executors import run_in_embed_pool, run_in_tool_gate_pool
 from kiro_crew.permission_floor import (
     OUTCOME_PENDING_APPROVAL,
     OUTCOME_REJECTED_TRANSPORT_FLOOR,
@@ -1178,8 +1178,14 @@ async def _run_hook_inner(
     agent: str | None,
     *,
     execution_context: ExecutionContext | None = None,
+    on_client: Callable[[Any], None] | None = None,
 ) -> str:
-    """Inner agent turn — called within timeout wrapper."""
+    """Inner agent turn — called within timeout wrapper.
+
+    ``on_client`` receives the session's provider as soon as it exists, so the
+    caller can still read that session's MCP report when this coroutine is
+    cancelled by the timeout or raises.
+    """
     from dataclasses import replace
 
     from kiro_crew import name_grant
@@ -1228,6 +1234,8 @@ async def _run_hook_inner(
         agent = execution.template_id or None
     memory_store = await session_store_for_turn(state.context_builder, session_key)
     client, is_new, resumed = await state.sessions.get_or_create(session_key, agent=agent)
+    if on_client is not None:
+        on_client(client)
     full_message = message
     # The ContextBuilder prompt is the only text on this path that legitimately
     # MINTS structural boundary markers, so it is the one text the scrub below
@@ -1283,7 +1291,8 @@ async def _run_hook_inner(
             hooks_gate = getattr(state.context_builder, "hooks", None)
             if hooks_gate is not None:
                 try:
-                    decision = hooks_gate.on_tool_call(
+                    decision = await run_in_tool_gate_pool(
+                        hooks_gate.on_tool_call,
                         event.title,
                         session_key=session_key,
                         agent=agent or "",
@@ -1445,6 +1454,24 @@ async def _run_hook_inner(
     return result_text
 
 
+def _hook_mcp_problems(client: Any) -> str:
+    """One line naming the MCP servers this webhook session could not use, or "".
+
+    A webhook run's session is ephemeral and headless, so a server that failed to
+    start in it is otherwise visible only as missing tools. The line goes to the
+    operator (run history and the delivered result), never back into a prompt, so
+    the sanitized failure reasons are kept. Never worth failing a run over.
+    """
+    if client is None:
+        return ""
+    try:
+        report = client.mcp_session_report()
+        return report.problem_summary() if report is not None else ""
+    except Exception:
+        logger.debug("webhook MCP session report unreadable", exc_info=True)
+        return ""
+
+
 async def _run_hook_agent(
     state: DashboardState,
     session_key: str,
@@ -1470,6 +1497,8 @@ async def _run_hook_agent(
     result_text = ""
     outcome = "completed"
     detail = ""
+    clients: list[Any] = []
+    mcp_problems = ""
     try:
         # Loading the persisted context (written by the register_hook MCP tool)
         # is INSIDE the try because the caller's permit and the in-flight claim
@@ -1499,7 +1528,12 @@ async def _run_hook_agent(
 
         result_text = await asyncio.wait_for(
             _run_hook_inner(
-                state, session_key, message, agent, execution_context=execution_context
+                state,
+                session_key,
+                message,
+                agent,
+                execution_context=execution_context,
+                on_client=clients.append,
             ),
             timeout=timeout_secs,
         )
@@ -1516,6 +1550,16 @@ async def _run_hook_agent(
         logger.exception("Hook agent failed for %s", session_key)
         await state.sessions.record_failure(session_key)
     finally:
+        # Read before release/reset: the report lives on the session being torn
+        # down. Here rather than in the inner turn so a timeout or crash still
+        # says which servers never started.
+        mcp_problems = _hook_mcp_problems(clients[0] if clients else None)
+        if mcp_problems:
+            logger.warning(
+                "Hook agent %s: MCP servers unusable in this run — %s",
+                session_key,
+                mcp_problems,
+            )
         try:
             state.sessions.release(session_key)
         except Exception:
@@ -1549,6 +1593,9 @@ async def _run_hook_agent(
     # history — the only place an operator can check — named a destination that
     # received nothing.
     destinations: list[str] = []
+    mcp_notice = f"MCP servers unusable in this run: {mcp_problems}" if mcp_problems else ""
+    if mcp_notice:
+        result_text = f"{result_text}\n\n{mcp_notice}" if result_text else mcp_notice
     if result_text:
         # Sanitize before delivery.
         result_text, _ = redact_exfiltration_urls(result_text)
@@ -1587,6 +1634,8 @@ async def _run_hook_agent(
             detail = "Delivered to " + " + ".join(destinations)
         else:
             detail = "Delivery failed for every destination"
+    if mcp_notice:
+        detail = f"{mcp_notice} | {detail}" if detail else mcp_notice
     await asyncio.to_thread(
         webhooks.run_store().record,
         outcome=outcome,
@@ -1887,8 +1936,8 @@ async def api_webhook_token_create(request: web.Request) -> web.Response:
     through :func:`_verify_hook_token`, and that route's own comment states what
     the credential buys: a real agent turn with full tool access. Minting one is
     therefore at least as privileged as the agent writes
-    ``handlers/agents.py::api_kirocrew_agents_create`` reserves for the owner, so
-    this route applies the same predicate and returns the same 403 shape.
+    ``dashboard/agent_admin/crew_records.py::api_kirocrew_agents_create`` reserves for the
+    owner, so this route applies the same predicate and returns the same 403 shape.
 
     The caller it stops is a real principal, not a hypothetical one: an
     allow-listed messaging user running ``!dashboard`` holds an ordinary

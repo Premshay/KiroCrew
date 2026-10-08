@@ -635,6 +635,14 @@ class TestAcpSessionProviderClientCompat:
         provider = AcpSessionProvider(handle, runtime)
         assert provider.get_valid_effort_levels() == ["low", "high"]
 
+    def test_effort_config_option_id(self):
+        """The shared-runtime facade exposes the selector AcpProvider needs."""
+        handle = _make_handle()
+        handle.effort_config_option_id = MagicMock(return_value="reasoning_effort")
+        provider = AcpSessionProvider(handle, _make_runtime())
+        assert provider.effort_config_option_id() == "reasoning_effort"
+        handle.effort_config_option_id.assert_called_once_with()
+
     def test_supports_config_option(self):
         """supports_config_option delegates to handle."""
         handle = _make_handle()

@@ -93,8 +93,10 @@ const SOFT_STOP_DEFAULT = 10.0
 type CompletionKeepMode = 'head' | 'tail' | 'both'
 const COMPLETION_KEEP_OPTIONS: CompletionKeepMode[] = ['head', 'tail', 'both']
 
-type VerbosityLevel = 'default' | 'concise' | 'ultra' | 'answer_only'
-const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'ultra', 'answer_only']
+type VerbosityLevel = 'default' | 'concise' | 'answer_only'
+const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'answer_only']
+/** Retired levels and the level each now means; mirrors the backend's alias map. */
+const LEGACY_VERBOSITY: Record<string, VerbosityLevel> = { ultra: 'answer_only' }
 
 const MEMORY_MODE_OPTIONS: MemoryMode[] = ['persistent', 'incognito', 'temporary']
 const DEFAULT_MEMORY_MODE_PATH = 'dashboardConfig.default_memory_mode'
@@ -126,6 +128,7 @@ function asMemoryMode(value: unknown): MemoryMode {
  * whole Chat settings page down rather than degrading one row.
  */
 function asVerbosity(value: unknown): VerbosityLevel {
+  if (typeof value === 'string' && Object.prototype.hasOwnProperty.call(LEGACY_VERBOSITY, value)) return LEGACY_VERBOSITY[value]
   return VERBOSITY_OPTIONS.includes(value as VerbosityLevel)
     ? (value as VerbosityLevel)
     : 'default'
@@ -469,6 +472,23 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
   // user believing that setting persisted. The ref records which config path
   // produced the current banner; null = not a picker failure.
   const saveErrorPathRef = useRef<string | null>(null)
+  // The save-error banner sits at the top of the panel, above the scroll. A
+  // chat-setting toggle lower down that fails to save snaps back AND raises the
+  // banner, but the user may see only the snap-back and read it as a broken
+  // control (UX Review). So each chat-save failure bumps this tick, and the
+  // effect below scrolls the banner into view and moves focus to it — the
+  // notice is `role="alert"`, so focusing it also re-announces it. A monotonic
+  // counter (not a boolean) re-fires on a SECOND identical failure, which the
+  // unchanged `saveError` string alone would not.
+  const saveErrorBannerRef = useRef<HTMLDivElement | null>(null)
+  const [chatSaveFailTick, setChatSaveFailTick] = useState(0)
+  useEffect(() => {
+    if (chatSaveFailTick === 0) return
+    const el = saveErrorBannerRef.current
+    if (!el) return
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el.focus()
+  }, [chatSaveFailTick])
   // Outlives the Transcript page, which the rail unmounts on a switch.
   const linkPatternsDraft = useRef<LinkPatternsDraft | null>(null)
   const setSaveError = (msg: string) => {
@@ -505,7 +525,7 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
   // second toggle during a save carries the first one's value forward.
   const dashCfg = overlay.shown(
     'dashboardConfig',
-    dashQ.data ?? { restore_sessions: false, restore_window_minutes: 30, merge_queued_messages: false, default_memory_mode: 'persistent' as const, widget_density: 'more' as const, verbosity: 'default' as const, quick_send: false, session_grid: false, tail_fork_enabled: false, link_previews: false, link_patterns: [], mcp_app_panel: false, auto_open_git_panel: false, session_card_source_links: true, folder_suggestions_enabled: true, use_builtin_browser: true, model_picker_hidden_models: [] },
+    dashQ.data ?? { restore_sessions: false, restore_window_minutes: 30, merge_queued_messages: false, default_memory_mode: 'persistent' as const, widget_density: 'more' as const, verbosity: 'answer_only' as const, quick_send: false, session_grid: false, tail_fork_enabled: false, link_previews: false, link_patterns: [], mcp_app_panel: false, auto_open_git_panel: false, session_card_source_links: true, folder_suggestions_enabled: true, use_builtin_browser: true, model_picker_hidden_models: [] },
   )
   const shownDefaultMemoryMode = overlay.shown(
     DEFAULT_MEMORY_MODE_PATH,
@@ -1103,7 +1123,21 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
   const setChat = useCallback(<K extends keyof ChatConfig>(k: K, v: ChatConfig[K]) => {
     setChatCfg(prev => {
       const next = { ...prev, [k]: v }
-      saveChatConfig(next)
+      // `saveChatConfig` returns false when the write (or its dirty marker) could
+      // not be persisted and it rolled back, so nothing was stored (GPT 6.1 F1,
+      // errors-use-error-notice). Surface that through the shared ErrorNotice
+      // banner and keep the PRIOR value on screen, rather than displaying the
+      // un-persisted value as if it saved — a reload would discard it. On
+      // success, clear any stale save banner this panel raised.
+      if (!saveChatConfig(next)) {
+        rawSetSaveError(i18nT('pages.settings.chatPanel.failed_to_save_chat_setting'))
+        saveErrorPathRef.current = null
+        // Bump the tick so the effect scrolls the banner into view and focuses
+        // it: a toggle below the fold otherwise just snaps back silently.
+        setChatSaveFailTick(t => t + 1)
+        return prev
+      }
+      if (saveErrorPathRef.current === null) rawSetSaveError('')
       return next
     })
   }, [])
@@ -1143,7 +1177,14 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
           this panel's live drafts. A hand-off click blurs the field, which STARTS
           a save — and if that save fails after the navigation has unmounted the
           panel, the typed value is gone with nothing left on screen to say so. */}
-      <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" />
+      {/* Wrapped so a chat-setting save failure can scroll the banner into
+          view and move focus to it (UX Review): a toggle below the fold
+          otherwise just snaps back with the notice stranded off-screen.
+          tabIndex=-1 makes the wrapper programmatically focusable without
+          adding a Tab stop. */}
+      <div ref={saveErrorBannerRef} tabIndex={-1} className="outline-none">
+        <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" />
+      </div>
       {dashQ.isError && (
         <div className="mb-4 flex flex-wrap items-center gap-3">
           {/* No hand-off: the rest of the panel — and its `localRoleOther` /
@@ -1540,6 +1581,7 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
           <SettingsToggle label={i18nT('pages.settings.chatPanel.quick_send')} hint={i18nT('pages.settings.chatPanel.click_a_suggested_reply_to_send_it_instantly', { mod: isMac ? '⇧' : 'Shift' })} checked={dashCfg.quick_send} onChange={v => setDash({ quick_send: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.merge_queued_messages')} hint={i18nT('pages.settings.chatPanel.combine_follow_up_messages_into_a_single_labeled')} checked={dashCfg.merge_queued_messages} onChange={v => setDash({ merge_queued_messages: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.spellcheck_input')} hint={i18nT('pages.settings.chatPanel.spellcheck_input_desc')} checked={chatCfg.spellcheck} onChange={v => setChat('spellcheck', v)} />
+          <SettingsToggle label={i18nT('pages.settings.chatPanel.inline_markdown_input')} hint={i18nT('pages.settings.chatPanel.inline_markdown_input_desc')} checked={chatCfg.inlineMarkdown} onChange={v => setChat('inlineMarkdown', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_pasted_text_in_full')} description={i18nT('pages.settings.chatPanel.show_pasted_text_in_full_desc', { chord: platformShortcut('Cmd+Shift+V') })} checked={chatCfg.showFullPastes} onChange={v => setChat('showFullPastes', v)} />
           <SettingsButtonGroup label={i18nT('pages.settings.chatPanel.follow_up_bar_layout')} hint={i18nT('pages.settings.chatPanel.multiline_wraps_suggestions_onto_multiple_rows_s')} value={chatCfg.followUpLayout} options={[{ value: "multiline", label: i18nT('pages.settings.chatPanel.multiline') }, { value: "scroll", label: i18nT('pages.settings.chatPanel.single_line') }]} onChange={v => setChat('followUpLayout', v as ChatConfig['followUpLayout'])} />
           <SettingsInput
@@ -1617,7 +1659,7 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
           <SettingsToggle label={i18nT('pages.settings.chatPanel.link_previews')} description={i18nT('pages.settings.chatPanel.show_a_favicon_and_page_title_instead_of_the_raw')} checked={dashCfg.link_previews} onChange={v => setDash({ link_previews: v })} disabled={dashDisabled} />
           <LinkPatternsEditor label={i18nT('pages.settings.chatPanel.link_patterns')} hint={i18nT('pages.settings.chatPanel.link_patterns_desc', { placeholder: '{match}' })} configKey="dashboard.link_patterns" rules={dashCfg.link_patterns ?? []} onSave={next => dashMut.mutateAsync({ link_patterns: next })} disabled={dashDisabled} draft={linkPatternsDraft} />
           <SettingsSelect label={i18nT('pages.settings.chatPanel.widget_density')} hint={i18nT('pages.settings.chatPanel.how_aggressively_the_agent_uses_inline_widgets_f')} value={dashCfg.widget_density ?? 'more'} options={['more', 'less']} optionLabels={[i18nT('pages.settings.chatPanel.more_encourage_widgets'), i18nT('pages.settings.chatPanel.less_only_when_needed')]} onChange={v => setDash({ widget_density: v as 'more' | 'less' })} disabled={dashDisabled} />
-          <SettingsSelect label={i18nT('pages.settings.chatPanel.response_verbosity')} hint={i18nT('pages.settings.chatPanel.how_terse_the_agent_s_prose_is_ultra_concise_cap')} value={asVerbosity(dashCfg.verbosity)} options={VERBOSITY_OPTIONS} optionLabels={[i18nT('pages.settings.chatPanel.default_normal_length'), i18nT('pages.settings.chatPanel.concise_trim_filler'), i18nT('pages.settings.chatPanel.ultra_concise_3_sentences'), i18nT('pages.settings.chatPanel.answer_only_details_on_request')]} onChange={v => setDash({ verbosity: v as VerbosityLevel })} disabled={dashDisabled} />
+          <SettingsSelect label={i18nT('pages.settings.chatPanel.response_verbosity')} hint={i18nT('pages.settings.chatPanel.response_verbosity_hint')} value={asVerbosity(dashCfg.verbosity)} options={VERBOSITY_OPTIONS} optionLabels={[i18nT('pages.settings.chatPanel.default_normal_length'), i18nT('pages.settings.chatPanel.concise_trim_filler'), i18nT('pages.settings.chatPanel.answer_only_details_on_request')]} onChange={v => setDash({ verbosity: v as VerbosityLevel })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_context_percentage')} hint={i18nT('pages.settings.chatPanel.display_usage_percentage_next_to_the_context_pro')} checked={chatCfg.showContextPct} onChange={v => setChat('showContextPct', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_token_usage')} hint={i18nT('pages.settings.chatPanel.display_used_and_total_tokens_next_to_the_contex')} checked={chatCfg.showContextTokens} onChange={v => setChat('showContextTokens', v)} />
         </SettingsCard>
@@ -1703,6 +1745,7 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
           return (
         <SettingsCard>
           <SettingsToggle label={i18nT('pages.settings.chatPanel.split_view_session_grid')} description={i18nT('pages.settings.chatPanel.opt_in_split_the_chat_into_resizable_session_pan', { mod: isMac ? '⌘' : 'Ctrl' })} checked={dashCfg.session_grid} onChange={v => setDash({ session_grid: v })} disabled={dashDisabled} />
+          <SettingsToggle label={i18nT('pages.settings.chatPanel.dim_inactive_panes')} description={i18nT('pages.settings.chatPanel.dim_inactive_panes_desc')} checked={chatCfg.dimInactivePanes} onChange={v => setChat('dimInactivePanes', v)} disabled={dashDisabled || !dashCfg.session_grid} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.history_expanded')} hint={i18nT('pages.settings.chatPanel.expand_history_sidebar_by_default')} checked={chatCfg.historyExpanded} onChange={v => setChat('historyExpanded', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.confirm_before_closing_session')} hint={i18nT('pages.settings.chatPanel.show_a_confirmation_dialog_when_closing_a_sessio')} checked={chatCfg.confirmCloseSession} onChange={v => setChat('confirmCloseSession', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.compact_empty_folders')} hint={i18nT('pages.settings.chatPanel.a_folder_with_no_chats_takes_one_row_instead_of')} checked={chatCfg.hideEmptyFolderBody} onChange={v => setChat('hideEmptyFolderBody', v)} />

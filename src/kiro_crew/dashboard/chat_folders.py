@@ -21,6 +21,11 @@ from kiro_crew.dashboard.chat_tags import tags_write_lock, validate_folder_tag_i
 from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
 from kiro_crew.dashboard.create_rate_limit import FOLDER_CREATE, allow_create
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.slot_ownership import (
+    audit_app_slot_denial,
+    deny_app_slot_access,
+    slot_not_found,
+)
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.token_auth import (
     KNOWN_INTERNAL_CALLERS,
@@ -36,6 +41,7 @@ from kiro_crew.folder_steering import crosses_memory_silo, memory_silo_fence
 from kiro_crew.hooks import is_unc_shape, unc_probe_allowed, validate_file_path
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.sandbox import voice_runtime_workspace_conflict
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -171,7 +177,7 @@ def _validate_folder_tags(state: DashboardState, raw: Any) -> tuple[list[str] | 
 
 
 async def generate_emoji_for_name(state: DashboardState, name: str) -> str:
-    """Ask the cheapest model for ONE emoji representing a folder ``name``.
+    """Ask the background session for ONE emoji representing a folder ``name``.
 
     Shared by chat folders and artifact-library folders. Serialized via a
     module-level lock so concurrent folder creations don't interleave streams
@@ -184,8 +190,9 @@ async def generate_emoji_for_name(state: DashboardState, name: str) -> str:
         "No text, no explanation, just the single emoji character."
     )
 
-    # Folder icon is a trivial single-emoji task — run on the cheapest model via
-    # the shared background one-liner helper (best-effort, 30s bound, denials
+    # Folder icon is a trivial single-emoji task — run on the session's governed
+    # default model (``_FOLDER_ICON_MODEL`` is "auto") via the shared background
+    # one-liner helper (best-effort, 30s bound, denials
     # SEL-logged). The lock serializes icon generation across folders.
     async with _folder_icon_lock:
         try:
@@ -1615,6 +1622,44 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
     return web.json_response(folder, status=201)
 
 
+def _caller_reaches_a_channel(request: web.Request, caller_key: str) -> bool:
+    """Whether a channel can deliver turns into the session behind *caller_key*.
+
+    The mirror and Slack-thread reading is the work-ledger gate's own
+    ``_reaches_a_channel``, called rather than re-composed, so both gates
+    resolve the caller's slot the same way and give one answer per session.
+    It fails closed on an unreadable store.
+
+    Two clauses sit on top of it, because the ledger reaches them elsewhere:
+    a ``channel:`` key (an agent spawned for a channel thread, which
+    ``is_channel_session_key`` does not name) and a channel-born slot
+    (``session_control._channel_link_of``). The ledger's entry gate covers a
+    channel-born caller through ``_caller_admission``; this endpoint has no
+    such gate, so it reads the slot's link here, on the slot found by the
+    ledger's normalisation of the key (``session_ledger.ledger_key``).
+    """
+    # Imported here: session_control (and the handlers that import it) import
+    # this module at load.
+    from kiro_crew import session_ledger
+    from kiro_crew.dashboard import session_control
+    from kiro_crew.dashboard.handlers.work_ledger import _reaches_a_channel
+
+    sk = (caller_key or "").strip()
+    if not sk:
+        return False
+    if sk.startswith("channel:") or is_channel_session_key(sk):
+        return True
+    if _reaches_a_channel(request, sk):
+        return True
+    state: DashboardState = request.app["state"]
+    key = session_ledger.ledger_key(sk)
+    for candidate in (sk, key, f"dashboard_{key}"):
+        slot = state.get_slot(candidate)
+        if slot is not None and session_control._channel_link_of(slot):
+            return True
+    return False
+
+
 async def api_chat_folder_update(request: web.Request) -> web.Response:
     """PATCH /api/chat/folders/{id} — rename or reorder a folder."""
     state: DashboardState = request.app["state"]
@@ -1796,14 +1841,46 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
     # persisted name — never from a pre-lock snapshot a concurrent write may
     # have superseded.
     committed_name: list[str] = []
+    origin_source, origin_caller = _audit_origin(request)
+    refuse_duplicate_name = origin_source != "dashboard"
     # A person editing anything beyond layout claims the folder: its agent mark
     # goes, and chat_folder_delete refuses it from then on. ``regenerate_icon``
     # is not in ``changes`` (the icon lands later, from the generator), so it
     # is counted here by name. A person moving a folder INTO another also
     # claims that destination, the same as nesting a new folder under it.
-    by_person = _audit_origin(request)[0] == "dashboard"
+    by_person = origin_source == "dashboard"
     claims_for_person = by_person and (regenerate_icon or bool(set(changes) - _LAYOUT_ONLY_FIELDS))
     claims_parent_for_person = by_person and reparenting and bool(new_parent)
+    # An agent rename or restyle from a session a channel can drive is refused
+    # here, not only in the MCP tool: a conversation resumed from a channel into
+    # a dashboard session keeps that session's ``dashboard:`` key, so no check on
+    # the key can tell the channel's turns from the person's. Reachability is
+    # state this endpoint holds (``_caller_reaches_a_channel``). Moves and
+    # reorders go through chat_folder_move, whose channel rule is its own.
+    caller_key = request.headers.get("X-Session-Key", "").strip()
+    if (
+        origin_source != "dashboard"
+        and ({"name", "icon", "color"} & changes.keys() or regenerate_icon)
+        and _caller_reaches_a_channel(request, caller_key)
+    ):
+        sel().log_api_access(
+            caller=request_app or origin_caller,
+            operation="chat.folder_update",
+            outcome="denied",
+            source="channel_containment",
+            resources=fid,
+            error="agent rename from a session a channel can drive",
+        )
+        return web.json_response(
+            {
+                "error": (
+                    "this session can receive turns from a channel conversation, so "
+                    "an agent cannot rename or restyle folders from it"
+                ),
+                "code": "channel_reachable_caller",
+            },
+            status=403,
+        )
 
     def _apply(folders: list[dict[str, Any]]) -> tuple[bool, str]:
         target = next((f for f in folders if f["id"] == fid), None)
@@ -1835,6 +1912,23 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
             # renders exactly as a reparent does. Checked for a move to the top
             # level too -- "" is still a move.
             return False, "foreign_descendant"
+        if refuse_duplicate_name and "name" in changes:
+            # Same rule and same place as create_folder_record's: an agent never
+            # makes a same-name sibling, because the two then share one path and
+            # neither can be addressed by it. Decided here, under the lock, over
+            # the whole tree -- a crew member's own GET is filtered, so a check
+            # against what the caller can read would miss a folder it cannot
+            # see. The folder's own row is excluded, so re-casing its own name
+            # is allowed. The browser keeps a person's freedom to name two alike.
+            final_parent = new_parent if reparenting else str(target.get("parent_id") or "")
+            folded = str(changes["name"]).strip().casefold()
+            if any(
+                str(f.get("id")) != fid
+                and str(f.get("parent_id") or "") == final_parent
+                and str(f.get("name") or "").strip().casefold() == folded
+                for f in folders
+            ):
+                return False, "name_exists"
         target.update(changes)
         if claims_for_person:
             target.pop(CREATED_BY_SESSION, None)
@@ -1915,6 +2009,22 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
                 "code": "folder_not_owned",
             },
             status=403,
+        )
+    if err == "name_exists":
+        sel().log_api_access(
+            caller=request_app or origin_caller,
+            operation="chat.folder_update",
+            outcome="denied",
+            source="duplicate_name",
+            resources=fid,
+            error="agent rename would duplicate a sibling folder name",
+        )
+        return web.json_response(
+            {
+                "error": "a sibling folder already has that name",
+                "code": "folder_name_exists",
+            },
+            status=409,
         )
     if err == "parent_not_found":
         # The parent was deleted while this request waited for the lock.
@@ -2563,20 +2673,10 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     if (refusal := member_slot_write_refused(state, request, slot, "chat.slot_folder")) is not None:
         return refusal
     request_app = _effective_request_app(state, request)
-    if request_app and getattr(slot, "_app", "") != request_app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_folder",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error=(
-                "app cannot access unscoped slots"
-                if not getattr(slot, "_app", "")
-                else "app does not own this slot"
-            ),
-        )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    if (
+        denied := deny_app_slot_access(request_app, slot, slot.key, "chat.slot_folder")
+    ) is not None:
+        return denied
     # Capture the transcript key the ownership decision above just covered,
     # BEFORE the body-parse await: ``linked_session_key`` is rebound on
     # already-live slots with no ``running`` gate (cron completions, workflow
@@ -2590,15 +2690,10 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     # owner's session. Both must resolve to the caller's app (same rule as
     # ``chat_tags.api_chat_slot_tags``), same indistinguishable 404.
     if not app_owns_transcript(state._slots, request_app, authorized_history_key):
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_folder",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app does not own this slot's transcript",
+        audit_app_slot_denial(
+            request_app, "chat.slot_folder", slot.key, "app does not own this slot's transcript"
         )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     try:
         body = await request.json()
     except Exception:
@@ -2738,20 +2833,8 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     if (refusal := member_slot_write_refused(state, request, slot, "chat.slot_pin")) is not None:
         return refusal
     request_app = _effective_request_app(state, request)
-    if request_app and getattr(slot, "_app", "") != request_app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_pin",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error=(
-                "app cannot access unscoped slots"
-                if not getattr(slot, "_app", "")
-                else "app does not own this slot"
-            ),
-        )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    if (denied := deny_app_slot_access(request_app, slot, slot.key, "chat.slot_pin")) is not None:
+        return denied
     # Capture the transcript key the lookup above just covered, BEFORE the
     # body-parse await — the same rebind window api_chat_slot_folder
     # documents. The re-check below and the save's expected_history_key pin
@@ -2759,15 +2842,10 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     # against.
     authorized_history_key = slot_history_key(slot)
     if not app_owns_transcript(state._slots, request_app, authorized_history_key):
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_pin",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app does not own this slot's transcript",
+        audit_app_slot_denial(
+            request_app, "chat.slot_pin", slot.key, "app does not own this slot's transcript"
         )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     try:
         body = await request.json()
     except Exception:
@@ -2884,33 +2962,16 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     if (refusal := refuse_unattributable_caller(state, request, "chat.slot_mode")) is not None:
         return refusal
     request_app = request.get("app", "")
-    if request_app and getattr(slot, "_app", "") != request_app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_mode",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error=(
-                "app cannot access unscoped slots"
-                if not getattr(slot, "_app", "")
-                else "app does not own this slot"
-            ),
-        )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    if (denied := deny_app_slot_access(request_app, slot, slot.key, "chat.slot_mode")) is not None:
+        return denied
     # ``_app`` says who owns the slot OBJECT; the write persists into the
     # TRANSCRIPT ``authorized_history_key`` names. Same rule as the folder and
     # tag writes, same indistinguishable 404.
     if not app_owns_transcript(state._slots, request_app, authorized_history_key):
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_mode",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app does not own this slot's transcript",
+        audit_app_slot_denial(
+            request_app, "chat.slot_mode", slot.key, "app does not own this slot's transcript"
         )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     try:
         body = await request.json()
     except Exception:
@@ -2930,12 +2991,8 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
             {"error": "member thread mode is locked", "code": "member_mode_locked"},
             status=409,
         )
-    # A crew-bound (remote) session runs PLAIN chat only — the same rule
-    # api_chat_slot_create enforces at birth, applied here to the post-create
-    # switch that would otherwise reopen it. A non-plain mode would run
-    # its tools and filesystem work on THIS machine, not on the peer the
-    # session is bound to. Keyed on ``executor`` rather than
-    # ``is_remote`` so even a half-bound slot can never be switched into one.
+    # A relay archive is read-only: a non-plain mode would run its tools and
+    # filesystem work on THIS machine for a chat a peer crew ran.
     if slot.executor == "remote" and mode:
         return web.json_response(
             {

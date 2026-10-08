@@ -1,4 +1,5 @@
 """Snapshot-safe confirmation contracts for Sage consolidation previews."""
+
 from __future__ import annotations
 
 import json
@@ -32,7 +33,9 @@ class TestConsolidationPreviews(unittest.TestCase):
             learning.stage_learning(_pattern(title), "fix_introduce", self.root)
         return learning.list_candidate(self.root)
 
-    def _proposal(self, candidates: list[dict], ruleset: str | None = None, action: str = "merge") -> dict:
+    def _proposal(
+        self, candidates: list[dict], ruleset: str | None = None, action: str = "merge"
+    ) -> dict:
         rendered = ruleset or (
             "# Rules\n\n"
             + learning.render_pattern(learning._normalize_pattern(_pattern("Merged rule")))
@@ -61,7 +64,10 @@ class TestConsolidationPreviews(unittest.TestCase):
         preview = self._preview([candidates[0]])
 
         self.assertEqual(preview["selected_candidate_ids"], [candidates[0]["id"]])
-        self.assertEqual(preview["candidate_snapshot_digest"], learning._sha256_json(preview["candidate_snapshot"]))
+        self.assertEqual(
+            preview["candidate_snapshot_digest"],
+            learning._sha256_json(preview["candidate_snapshot"]),
+        )
         self.assertEqual(learning.common_file(self.root).read_bytes(), active_before)
         self.assertEqual(learning.candidate_file(self.root).read_bytes(), candidate_before)
         listed = learning.list_consolidation_previews(root=self.root)
@@ -78,7 +84,8 @@ class TestConsolidationPreviews(unittest.TestCase):
 
         self.assertTrue(applied["ok"])
         self.assertEqual(
-            [item["title"] for item in learning.list_candidate(self.root)], ["Unselected", "Concurrent"]
+            [item["title"] for item in learning.list_candidate(self.root)],
+            ["Unselected", "Concurrent"],
         )
         self.assertEqual(
             [item["title"] for item in learning.list_patterns(root=self.root)], ["Merged rule"]
@@ -118,7 +125,9 @@ class TestConsolidationPreviews(unittest.TestCase):
 
         fresh = self._preview(candidates)
         learning.common_file(self.root).write_text("# Changed\n", encoding="utf-8")
-        stale = learning.apply_consolidation_preview(fresh["preview_id"], confirmed=True, root=self.root)
+        stale = learning.apply_consolidation_preview(
+            fresh["preview_id"], confirmed=True, root=self.root
+        )
         self.assertEqual(stale["code"], "preview_stale")
         self.assertEqual(learning.candidate_count(self.root), 1)
 
@@ -143,14 +152,17 @@ class TestConsolidationPreviews(unittest.TestCase):
             )
         preview = self._preview(candidates)
         self.assertEqual(
-            learning.apply_consolidation_preview(preview["preview_id"], confirmed=False, root=self.root)["code"],
+            learning.apply_consolidation_preview(
+                preview["preview_id"], confirmed=False, root=self.root
+            )["code"],
             "confirmation_required",
         )
         self.assertEqual(learning.candidate_count(self.root), 1)
 
     def test_failed_candidate_write_rolls_back_the_live_ruleset(self) -> None:
         learning.common_file(self.root).write_text(
-            "# Existing\n\n" + learning.render_pattern(learning._normalize_pattern(_pattern("Existing"))),
+            "# Existing\n\n"
+            + learning.render_pattern(learning._normalize_pattern(_pattern("Existing"))),
             encoding="utf-8",
         )
         candidates = self._stage("Rollback")
@@ -228,7 +240,11 @@ class TestConsolidationPreviews(unittest.TestCase):
             "lifecycle": "candidate",
             "origin": {"source": "fix_introduce", "reference": "review-1"},
             "repository_identity": None,
-            "timestamps": {"created_at": "2026-01-01T00:00:00Z", "updated_at": None, "archived_at": None},
+            "timestamps": {
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": None,
+                "archived_at": None,
+            },
             "recurrence": {
                 "count": 2,
                 "evidence": [
@@ -239,7 +255,11 @@ class TestConsolidationPreviews(unittest.TestCase):
             "legacy": False,
         }
         learning._write_learning_records(
-            {"schema": learning.LEARNING_RECORDS_SCHEMA, "version": learning.LEARNING_RECORDS_VERSION, "records": [record]},
+            {
+                "schema": learning.LEARNING_RECORDS_SCHEMA,
+                "version": learning.LEARNING_RECORDS_VERSION,
+                "records": [record],
+            },
             self.root,
             None,
         )

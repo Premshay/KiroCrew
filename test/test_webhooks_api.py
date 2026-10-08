@@ -1179,6 +1179,24 @@ class TestVerifyHookToken:
         assert H._verify_hook_token(_bearer("cfg-secret")) == "legacy"
         assert H._verify_hook_token(_bearer("wrong")) is None
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("header", ["Authorization", "x-kirocrew-token"])
+    @pytest.mark.parametrize("candidate", ["é", "\udcff", "\ud800"])
+    async def test_non_ascii_request_credential_is_unauthorized(
+        self, wired, monkeypatch, header: str, candidate: str
+    ) -> None:
+        """Every request-fed token shape fails closed at the bearer gate."""
+        webhooks.token_store().create("active source")
+        monkeypatch.setattr(H, "_legacy_hook_token", lambda: "configured-secret")
+        value = f"Bearer {candidate}" if header == "Authorization" else candidate
+
+        request = MagicMock(headers={header: value}, remote="test-client")
+
+        resp = await H.api_hooks_agent(request)
+
+        assert resp.status == 401
+        assert await _payload(resp) == {"error": "unauthorized", "code": "unauthorized"}
+
     def test_legacy_reader_tolerates_non_dict_config(self, monkeypatch):
         cfg = MagicMock()
         cfg.hooks = ["not", "a", "dict"]
@@ -1798,7 +1816,7 @@ class TestTokenMintIsOwnerOnly:
     ``_verify_hook_token`` accepts the bearer this route returns on
     ``POST /api/hooks/agent``, which runs a real agent turn with full tool
     access, so the mint is owner-gated exactly like the closest guarded sibling
-    (``handlers/agents.py::api_kirocrew_agents_create`` ->
+    (``dashboard/agent_admin/crew_records.py::api_kirocrew_agents_create`` ->
     ``handlers/_shared.require_owner_dashboard_request``). These tests hold both
     directions: the callers that legitimately mint today keep minting, and the
     non-owner dashboard session that ordinary token auth admits does not.

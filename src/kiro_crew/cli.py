@@ -69,6 +69,7 @@ from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.log_redaction import install_log_redaction
 from kiro_crew.memory import MemoryStore
+from kiro_crew.owner_only_files import owner_only_opener
 from kiro_crew.platform import (
     PlatformCompositionError,
     boot_platform,
@@ -852,7 +853,10 @@ def _knowledge_evaluate(args) -> None:
         print("error: could not read the private golden set or write its report")
         return
     sel().log_tool_invocation(
-        session_key="cli", source="cli", tool_name="knowledge.evaluate", outcome="completed",
+        session_key="cli",
+        source="cli",
+        tool_name="knowledge.evaluate",
+        outcome="completed",
         metadata={"golden_set": golden.name, "case_count": len(golden.cases)},
     )
     print(report_summary(report))
@@ -1007,7 +1011,9 @@ def _redirect_fds_to(path: Path, fds: tuple[int, ...] = (1, 2)) -> None:
     except OSError:
         pass  # a broken std stream must not abort gateway boot
     try:
-        raw_fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        # 0o600: this is gateway.log, which is owner-only like the rest of the data
+        # home (kiro_crew.owner_only_files). Only applies when this creates it.
+        raw_fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     except OSError:
         return
     try:
@@ -1026,7 +1032,85 @@ _LOG_FATAL_ERRNOS = frozenset({errno.ENOSYS, errno.EPERM, errno.EACCES, errno.ER
 _LOG_ERROR_STREAK_LIMIT = 3
 
 
-class _FdTrackingRotatingFileHandler(RotatingFileHandler):
+def _open_owner_only(handler: logging.FileHandler):  # type: ignore[no-untyped-def]
+    """Open *handler*'s log file the way ``FileHandler._open`` does, but ``0600``.
+
+    The stdlib opens the log with the builtin ``open``, so ``gateway.log`` -- and
+    the fresh file every rollover creates -- would come out at the umask default
+    (``0644``), readable by any local account that can reach the data home. The
+    log carries prompts, tool calls and paths, so it follows the data home's
+    owner-only policy. Only the creation mode changes; an existing file keeps its
+    mode (the startup sweep tightens one an older version created).
+    """
+    # The stdlib's own handle on ``open`` (it survives interpreter teardown),
+    # read through getattr because typeshed does not declare it.
+    open_func = getattr(handler, "_builtin_open", open)
+    return open_func(
+        handler.baseFilename,
+        handler.mode,
+        encoding=handler.encoding,
+        errors=handler.errors,
+        opener=owner_only_opener,
+    )
+
+
+class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler whose log files are created ``0600`` (see
+    :func:`_open_owner_only`)."""
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        return _open_owner_only(self)
+
+
+class _AppendOnlyLogFileHandler(logging.FileHandler):
+    """Appends each record to ``gateway.log`` and closes the file again.
+
+    Every process that is not the gateway (the ``mcp-*`` stdio servers,
+    ``kirocrew chat``, short CLI verbs) writes through this handler. It never
+    rotates and holds no open handle between records. Windows refuses to rename
+    a file while any other process has it open, so a child that kept its own
+    handle on ``gateway.log`` for its whole lifetime made every one of the
+    gateway's size rollovers fail, and the gateway's file log then dropped
+    every later record until restart. The gateway is the only rotator, and the
+    only window in which a child can block a rename is the write of one record.
+
+    The constructor opens the file once and closes it, so a log path the
+    process may not write (a sandbox deny) still raises at setup, where
+    ``_setup_cli_logging`` falls back to console-only logging.
+    """
+
+    def __init__(self, filename: Path, encoding: str = "utf-8") -> None:
+        super().__init__(filename, mode="a", encoding=encoding)
+        self._close_stream()
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        return _open_owner_only(self)
+
+    def _close_stream(self) -> None:
+        stream, self.stream = self.stream, None  # type: ignore[assignment]
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass  # the record was already written or reported
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # ``Handler.handle`` holds the handler lock around emit, so the
+        # open/write/close below is atomic with respect to this handler.
+        # ``FileHandler.emit`` opens the file outside its own error handling,
+        # so a failed open is routed to ``handleError`` here instead of
+        # raising into the code that logged.
+        try:
+            super().emit(record)
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
+        finally:
+            self._close_stream()
+
+
+class _FdTrackingRotatingFileHandler(_OwnerOnlyRotatingFileHandler):
     """RotatingFileHandler that re-points raw fds 1/2 after each rollover.
 
     In detached mode ``_redirect_fds_to`` aims the process's raw
@@ -1257,6 +1341,10 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     handler and the queue handler carry no level of their own, so a runtime
     ``agent.log_level`` change (``handlers/updates.py::apply_log_level``) that
     moves the logger reaches ``gateway.log`` with nothing else to update.
+
+    Only the ``gateway`` command rotates ``gateway.log``. Every other process
+    writes through ``_AppendOnlyLogFileHandler``, which never rotates and holds
+    no handle between records, so it cannot block the gateway's rename on Windows.
     """
     if verbose >= 2:
         level = logging.DEBUG
@@ -1303,20 +1391,30 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     # swallows it, but it spams "--- Logging error ---" tracebacks and drops the
     # line). ensure_utf8_console() only fixes the console streams, not this file
     # handler.
+    boot_rotation_error: OSError | None = None
     if command == "gateway":
         prev_log = log_file.with_suffix(".log.prev")
         if log_file.exists() and log_file.stat().st_size > 0:
             try:
                 log_file.replace(prev_log)
-            except OSError:
-                pass  # race or permission — keep going
+            except OSError as exc:
+                # Keep going on the old file; reported once the handler exists.
+                boot_rotation_error = exc
         if detached:
             _redirect_fds_to(log_file)
     # Detached mode uses the fd-tracking subclass: a size-based rollover
     # renames gateway.log, and without re-pointing, the redirected raw fds
     # would follow the renamed inode through .1 → .2 → .3 → unlink, losing
     # later raw stderr from all retained logs.
-    handler_cls = _FdTrackingRotatingFileHandler if detached else RotatingFileHandler
+    #
+    # Only the gateway rotates gateway.log. Every other process appends one
+    # record at a time and holds no handle in between, because on Windows a
+    # handle held by any other process makes the gateway's rename fail.
+    rotates = detached or command == "gateway"
+    if detached:
+        rotating_cls: type[RotatingFileHandler] = _FdTrackingRotatingFileHandler
+    else:
+        rotating_cls = _OwnerOnlyRotatingFileHandler
     # Seatbelt/sandbox children (e.g. ``kirocrew mcp-core`` under a sandboxed
     # agent profile) inherit a deny on ``gateway.log``. For those, opening the
     # file handler must not abort the process: the console handler
@@ -1329,7 +1427,11 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     # soft-failing here would boot a long-lived gateway with no persistent log
     # AND no destination for the warning saying so. Let the OSError propagate.
     try:
-        fh = handler_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        fh: logging.FileHandler
+        if rotates:
+            fh = rotating_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        else:
+            fh = _AppendOnlyLogFileHandler(log_file, encoding="utf-8")
     except OSError as exc:
         if detached:
             raise
@@ -1403,6 +1505,12 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     else:
         target_logger.addHandler(fh)
 
+    if boot_rotation_error is not None:
+        logging.getLogger("kiro_crew").warning(
+            "could not move %s aside at boot (%s); appending to the previous run's log",
+            log_file,
+            boot_rotation_error,
+        )
     # Install secret redaction filter — scrubs Bearer tokens from all kiro_crew
     # log output before it reaches any handler. The filter also accepts literal
     # secret values to redact, but none are passed here: wiring resolved vault
@@ -1781,9 +1889,10 @@ Examples:
         "add",
         help="Add a cron job",
         description="Add a cron job. The job is persisted in one locked write and its id is "
-        "printed on stdout; any refusal exits non-zero (2 for a flag-combination error, 1 for "
-        "a validation, security or store refusal), so an installer can register a job "
-        "headlessly and detect a refused one.",
+        "printed on stdout; any refusal exits non-zero (2 for an argparse usage error such "
+        "as two mutually exclusive flags, 1 for every refusal the command itself raises: "
+        "a missing schedule, a validation, security or store refusal), so an installer "
+        "can register a job headlessly and detect a refused one.",
         epilog="""
 Examples:
   kirocrew cron add "standup" "post the standup" --cron "0 9 * * MON-FRI" --timezone Europe/Paris
@@ -1918,6 +2027,16 @@ Examples:
         default="",
         help='Tool approval mode ("auto" to auto-approve all tools)',
     )
+    cron_add.add_argument(
+        "--managed-by",
+        dest="managed_by",
+        default=None,
+        metavar="KEY",
+        help="Install-time owner key for an external installer (e.g. "
+        "'mysystem:owner/asset-name'). Unique across the store: a second add with the "
+        "same key is refused. Re-install with 'cron remove --managed-by KEY' and then "
+        "add again.",
+    )
     cron_update = cron_sub.add_parser("update", help="Update a cron job")
     cron_update.add_argument("job_id", help="Job ID to update")
     cron_update.add_argument("--name", help="New job name")
@@ -1946,7 +2065,15 @@ Examples:
         help='Tool approval mode ("auto" to auto-approve, "default" to reset)',
     )
     cron_rm = cron_sub.add_parser("remove", help="Remove a cron job")
-    cron_rm.add_argument("job_id", help="Job ID to remove")
+    cron_rm_target = cron_rm.add_mutually_exclusive_group(required=True)
+    cron_rm_target.add_argument("job_id", nargs="?", default=None, help="Job ID to remove")
+    cron_rm_target.add_argument(
+        "--managed-by",
+        dest="managed_by",
+        default=None,
+        metavar="KEY",
+        help="Remove the job registered with 'cron add --managed-by KEY'",
+    )
     cron_pause = cron_sub.add_parser("pause", help="Pause a cron job")
     cron_pause.add_argument("job_id", help="Job ID to pause")
     cron_resume = cron_sub.add_parser("resume", help="Resume a cron job")
@@ -2057,6 +2184,14 @@ Examples:
         help="Directory to write the snapshot into (default: the data home's snapshots dir)",
     )
     snap_parser.add_argument("--keep", type=int, default=7, help="Keep N most recent snapshots")
+    snap_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Exit 3 instead of 0 when the bundle was written but omits entries it was "
+            "asked to carry (see MANIFEST.json 'skipped'). The bundle is kept."
+        ),
+    )
     snap_parser.add_argument(
         "--list", action="store_true", dest="list_snapshots", help="List existing snapshots"
     )
@@ -2259,7 +2394,8 @@ Examples:
         "evaluate", help="Measure private Knowledge Library retrieval against a golden set"
     )
     kn_eval.add_argument(
-        "--golden", default="golden-v1.json",
+        "--golden",
+        default="golden-v1.json",
         help="Golden-set filename under workspace/knowledge/evals (default: golden-v1.json)",
     )
     kn_eval.add_argument("--limit", type=int, default=5, help="Results per query (default: 5)")
@@ -3321,7 +3457,8 @@ Examples:
   kirocrew config defaults --adopt      # Take the current defaults for all of them
   kirocrew config defaults --keep session.autocompact_pct   # Affirm one as intentional
 
-The dashboard port is set with the KIROCREW_PORT env var, not a config key.
+The dashboard port comes from the port in dashboard.url; the KIROCREW_PORT
+env var overrides it.
 """,
         formatter_class=_fmt,
     )
@@ -3335,7 +3472,7 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     cfg_set.add_argument(
         "--local",
         action="store_true",
-        help="Save to config.local.json (persists across upgrades)",
+        help="Save to config.local.json, the overlay whose values win over config.json",
     )
     cfg_sub.add_parser("edit", help="Open config in $EDITOR")
     cfg_defaults = cfg_sub.add_parser(
@@ -3365,6 +3502,24 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     cli_help.hide_internal_commands(sub)
 
     args = parser.parse_args()
+
+    # The mcp-* stdio servers run one per agent session, so a gateway hosts
+    # dozens. If any import reaches numpy, OpenBLAS/OpenMP start one spinning
+    # thread per core. Cap both at one before anything below imports the
+    # server; an operator's own value wins. Set in-process rather than in the
+    # managed MCP spec env so every spec writer and builtin app server gets it.
+    if (args.command or "").startswith("mcp-"):
+        for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"):
+            os.environ.setdefault(_var, "1")
+
+    # MCP servers and CLI commands hold their managed-venv tree for the process
+    # lifetime, so another process's update cannot prune it underneath them.
+    # The gateway takes the same hold off-loop AFTER readiness, before updates;
+    # even the no-op stat must stay off its boot path.
+    if args.command != "gateway":
+        from kiro_crew.platform.tree_liveness import hold_running_tree_lock
+
+        hold_running_tree_lock()
 
     # Direct agent-bearing CLI commands do not construct the long-lived
     # prerequisite service. Pin an explicit override before the jail gate or

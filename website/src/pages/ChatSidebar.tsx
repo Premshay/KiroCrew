@@ -1,7 +1,7 @@
-import { useState, useRef, useEffect, memo, useMemo, useCallback, useId, Fragment } from 'react'
+import { useState, useRef, useEffect, memo, useMemo, useCallback, useId, useContext, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 import { LayoutGroup, AnimatePresence, motion } from 'framer-motion'
-import { Plus, X, Pin, Monitor, ArrowUpDown, Eye, EyeOff, VenetianMask, Ghost, FolderPlus, FolderX, MessageSquare, MessageSquarePlus, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, CornerDownRight, GripVertical, Check, GitFork, List, ListTree, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Server, Pause, Play } from 'lucide-react'
+import { Plus, X, Pin, Monitor, ArrowUpDown, Eye, EyeOff, VenetianMask, Ghost, FolderPlus, FolderX, MessageSquare, MessageSquarePlus, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, CornerDownRight, GripVertical, Check, GitFork, List, ListTree, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Server, Pause, Play, Hourglass } from 'lucide-react'
 import GithubLogo from '../components/icons/GithubLogo'
 import GitlabLogo from '../components/icons/GitlabLogo'
 import { FolderBody } from '../components/FolderBody'
@@ -13,7 +13,7 @@ import FolderGlyph from '../components/FolderGlyph'
 import { DndContext, DragOverlay, MeasuringStrategy } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { usePreviewFlag } from '../hooks/usePreviewFlag'
 import { PREVIEW_DASHBOARD } from '../utils/previewFlags'
 import { shallowEqual, useStore } from 'react-redux'
@@ -23,17 +23,17 @@ import { useConnected } from '../hooks/useConnected'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent } from '../components/ui/dropdown-menu'
 import { ContextMenu, ContextMenuTrigger, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent } from '../components/ui/context-menu'
 import { offlineProps } from '../utils/offline'
-import { switchSlot, createSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, selectSidebarWorkflowActive, selectAutomationForSlot } from '../store/chatSlice'
+import { switchSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, selectSidebarWorkflowActive, selectAutomationForSlot } from '../store/chatSlice'
 import { slotIsRemoteBound } from '../store/dashboardSlice'
 import { IS_MAC } from '../hooks/useKeyboardShortcuts'
 import { api, SEARCH_MIN_CHARS } from '../api/client'
+import { isInstancesDisabledError } from '../utils/instancesDisabled'
 import { errMessage } from '../utils/thunkError'
-import { findReport } from '../utils/errorReport'
 import { computeRecentRank, recencyTintShadow, clampTintCount } from '../utils/recencyTint'
 import { folderOffersHide } from '../utils/folderVisibility'
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
 import { highlightText } from '../utils/highlightText'
-import { isChatPageSurface, slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
+import { slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
 import { toolStatusLabel, type ToolStatusDetail } from '../utils/toolStatusLabel'
 import { sessionRefBlockReason } from '../utils/sessionRefs'
 import { SearchInput, Input, Btn, IconButton, IconButtonGroup } from '../components/ui'
@@ -45,10 +45,14 @@ import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useDndSensors } from '../hooks/useDndSensors'
 import { useSessionPalette } from '../hooks/useSessionPalette'
 import { ancestorsOf, descendantsOf, orphanCitation } from '../lib/sessionLineage'
+import { partitionBulkSwitch } from '../lib/bulkModelSwitch'
+import { isEmbeddedPane } from '../lib/embedded'
 import { useReducedMotion } from '../hooks/useReducedMotion'
 import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
 import { useLanguage } from '../i18n/LanguageProvider'
 import { useSessionActions } from '../hooks/useSessionActions'
+import { useCloseSessionTree } from '../hooks/useCloseSessionTree'
+import { sidebarRowBackgroundOnly, sidebarRowRunning } from '../lib/sessionCloseTree'
 import { useChatPopouts } from '../hooks/useChatPopouts'
 import { platformShortcut } from '../utils/platform'
 import { useImeGuard } from '../hooks/useImeGuard'
@@ -71,9 +75,9 @@ import { DndActiveProbe, DndDraggable, DndDroppable } from '../components/dnd'
 import { FOLDER_SORT_MODES, collectFolderSubtreeIds, folderHasCreatedStamp, folderNameText, type FolderSortMode } from '../utils/folderTree'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { sanitizeLlmOutput } from '../utils/sanitize'
-import type { PaletteBoost } from '../utils/sessionColors'
 import type { ChatFolder, ChatTag, SessionLink } from '../types'
 import { SESSION_LANES, hasLiveSessionWork } from './chat/sessionLane'
+import { isMemoryWait, queuedWaitText } from './chat/subagentQueuedReason'
 import {
   type RecentUnit,
   RECENT_WINDOW_PRESETS,
@@ -82,8 +86,8 @@ import {
 import { loadChatConfig, saveChatConfig } from './chat/ChatSettings'
 import { focusSiblingSessionRow } from './chat/sessionRowNav'
 import { SessionRowWindowContext, SessionRowWindowScroller, WindowedSessionRow, useSessionRowWindowRoot } from './chat/sessionRowWindow'
-import { compareBySort, fmtRelativeTime, lastActivityEpoch, readSessionSortKey, SESSION_SORT_STORAGE_KEY, slotActivityTs } from './chat/sessionOrder'
-import { STALE_COLLAPSE_PRESETS_MS, splitStaleSlots } from './staleCollapse'
+import { compareBySort, fmtRelativeTime, readSessionSortKey, SESSION_SORT_STORAGE_KEY, slotActivityTs } from './chat/sessionOrder'
+import { STALE_COLLAPSE_PRESETS_MS } from './staleCollapse'
 import type { StaleSplit } from './staleCollapse'
 import type { SortKey } from './chat/sessionOrder'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
@@ -93,19 +97,24 @@ import MonitorRadar from '../components/MonitorRadar'
 import { i18nT } from '../i18n/t'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { useLaneScrollMemory } from '../hooks/useLaneScrollMemory'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import { compareText, fmtDateFields, fmtList } from '../i18n/format'
 import { sidebarCollision } from './chat-sidebar/dnd/collision'
 export { sidebarCollision, isFolderNestBand } from './chat-sidebar/dnd/collision'
 export { boardSidebarWidth } from './chat-sidebar/board'
 import { ChatPaneDropZone, RootDropHint, BoardUnfileDropStrip, SortableFolderBlock, SortableSubfolderBlock, SortableColumnFolder, FolderDragGhost, SessionDragGhost } from './chat-sidebar/dnd/targets'
-import type { Slot, SourceLinkState, SidebarSourceLink, HistoryItem, AgentInfo, SessionFilterKey, RevealBlockingFilter, FilterDimension } from './chat-sidebar/types'
-import { HIDDEN_FOLDERS_LS_KEY, FOLDERS_SHELVED_LS_KEY, FLAT_VIEW_LS_KEY } from './chat-sidebar/persistence'
+import type { Slot, SourceLinkState, SidebarSourceLink, HistoryItem, AgentInfo, SessionFilterKey } from './chat-sidebar/types'
+import { FOLDERS_SHELVED_LS_KEY, FLAT_VIEW_LS_KEY } from './chat-sidebar/persistence'
 import { SESSION_FILTERS, useSessionFilterState, useSessionStatusFilters } from './chat-sidebar/filters'
 import { useDebouncedSessionSearch, useSearchMatches } from './chat-sidebar/search'
-import { isPeerRow, sessionRowIdentity, historyRowIdentity, localSlotFolder, isLocallyPinned, compareLocalPinnedThenSort } from './chat-sidebar/rowIdentity'
+import { openCrewWindow, useCrewWindow } from './chat/crew-window/crewWindowStore'
+import { sessionRowIdentity, historyRowIdentity } from './chat-sidebar/rowIdentity'
+import { buildSidebarRows, chipLabel, sameRowView, type ConductorRowView, type RowScene, type RowShell, type SessionRowView, type SidebarRows } from './chat-sidebar/rows'
 import { useSessionSources } from './chat-sidebar/sessionSources'
+import { CrewGroupSection, CrewOfflineContext, LocalGroupHeader, useCollapsedCrews } from './chat-sidebar/CrewGroups'
+import { crewOf, type CrewGroup } from '../hooks/useInstanceSessions'
 import { useSessionRename, useFolderRename } from './chat-sidebar/rename'
-import { useSidebarLane, useFlatLane, useLaneCycle } from './chat-sidebar/lanes'
+import { useSidebarLane, useLaneCycle, renderedLane } from './chat-sidebar/lanes'
 import { useHistoryPane } from './chat-sidebar/history'
 import { usePinnedSessionOrder, usePinnedOrderAuthority, usePinnedKeyboardReorder } from './chat-sidebar/pinnedOrder'
 import { useStaleCollapse, useStaleMoveWatcher, useStaleNarrowBridge } from './chat-sidebar/stale'
@@ -119,6 +128,7 @@ import { useLineageAvailable, useConductorLane, citedCreatorOf } from './chat-si
 import { useShortcutOrder } from './chat-sidebar/shortcuts'
 import { useFolderDropOps, useSidebarMoveUndo, useSidebarDragHandlers, useNativeSessionDrag } from './chat-sidebar/dnd/useSidebarDrag'
 import { useSidebarReveal } from './chat-sidebar/reveal'
+import { useHoldPinnedHeaderOnCollapse } from './chat-sidebar/stickyCollapse'
 import { useFolderChatCreate, useSessionCreate } from './chat-sidebar/create'
 
 /**
@@ -148,7 +158,7 @@ import { useFolderChatCreate, useSessionCreate } from './chat-sidebar/create'
  *  position instead of springing there.
  *
  *  `orderStamp` exists so a displaced row re-renders and framer measures it
- *  (see SessionRowProps). Stamped as a plain ordinal, a New Chat landing at the
+ *  (see `RowPlacement.orderStamp` in ./chat-sidebar/rows). Stamped as a plain ordinal, a New Chat landing at the
  *  top of a 160-session sidebar shifts every ordinal by one and voids all 160
  *  memo boundaries in one commit — 160 row bodies, 160 layout measurements and
  *  a group-wide spring — for a change whose visible effect is a handful of rows
@@ -243,6 +253,9 @@ function DisclosureChevron({ open, size, className = '' }: { open: boolean; size
   return <ChevronRight size={size} className={`shrink-0 transition-transform duration-200 ${open ? 'rotate-90' : ''} ${className}`.trimEnd()} />
 }
 
+/** Stable empty group list for the board, which groups nothing. */
+const NO_CREW_GROUPS: CrewGroup[] = []
+
 /** Lifecycle states after which a pull request can never merge, so its CI
  * rollup carries no actionable information and the lifecycle glyph is the only
  * meaningful signal. Named ONCE here because the vocabulary is shared by three
@@ -325,18 +338,6 @@ function chipStatusGlyph(
   if (link.ci === 'running') return 'running'
   if (link.ci === 'passed') return 'passed'
   return null
-}
-
-/** What the chip prints. The serializer decides it; this only covers its
- * absence, which means a bundle newer than the gateway it is talking to.
- *
- * Deliberately DUMB -- `#N` for anything, with no provider branch. Reaching for
- * the provider's real convention here would reinstate the second
- * implementation this change exists to delete, and a fallback that is a
- * near-copy of the real rule is the kind that drifts silently. `#N` is
- * recognisably the object and recognisably generic. */
-function chipLabel(link: SidebarSourceLink): string {
-  return link.label ?? `#${link.number}`
 }
 
 /** The provider's mark for a chip, or a neutral link glyph for a provider this
@@ -516,6 +517,12 @@ function SessionSourceChips({ slotKey, links, total, connected, isActive, onOpen
     // The row is a click-to-switch button; never let a chip click reach it,
     // whichever branch we take below.
     e.stopPropagation()
+    // A pointer click focuses the anchor, and the row's action strip is
+    // revealed on focus-within, so a focused chip would pin that strip visible
+    // after the pointer leaves the row. Drop focus on pointer clicks only
+    // (`detail` counts clicks; keyboard activation reports 0) so Enter on a
+    // focused chip leaves focus where a keyboard user expects it.
+    if (e.detail > 0) e.currentTarget.blur()
     if (!onOpenSource || !connected || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
     if (!isActive) onActivateSlot()
     if (!onOpenSource(slotKey, { url: link.url, kind: link.kind ?? 'change' })) return
@@ -782,176 +789,135 @@ export const FOLDER_BODY_CLS = `relative border-l border-border mb-1 ml-1 pl-[3p
  *  nesting level costs 2 + 8 + 1 + 5 = 16px. */
 export const BOARD_FOLDER_BODY_CLS = `relative border-l border-border ml-2 pl-[5px] ${FOLDER_ROW_PAD_CLS}`
 
-/** Test seam: reports every SessionRow body execution. The memo boundary
- *  below is a behavioral contract — one slot's background event re-renders one
- *  row — but render counts are unobservable from the DOM, so the pinning test
- *  counts them here. Null outside tests, where the call is one field read. */
-export const sessionRowRenderProbe: { current: ((slotKey: string) => void) | null } = { current: null }
-
-interface SessionRowProps {
-  slot: Slot
-  /** Render-order stamp: increments per row in paint order across the whole
-   *  sidebar, clamped at SIDEBAR_DISPLACEMENT_WINDOW. A row whose on-screen
-   *  position moves (rows above it added, removed or reordered) gets a changed
-   *  stamp and re-renders — framer's layout="position" spring only measures a
-   *  component that re-renders, so without this the memo boundary would
-   *  swallow the re-render and displaced rows would snap into place instead
-   *  of animating. Rows above the change keep their stamp and still bail out;
-   *  so do rows past the window, which snap by design. */
-  orderStamp: number
-  /** True only inside the first SIDEBAR_DISPLACEMENT_WINDOW paint positions;
-   *  false outside that window, under prefers-reduced-motion, or in staticRows.
-   *  The shell derives the gate so layout spring, layoutId registration, and
-   *  entrance animation switch together for each row. */
-  rowAnimEnabled: boolean
-  showDivider: boolean
-  scope: string
-  navScope: string
-  holdContainer: string
-  /** The conductor lane's three additions, and ONLY when that lane renders the row.
-   *
-   *  They are passed INTO the row rather than wrapped around it. A wrapper that put
-   *  the chevron and the counts beside the card narrowed the card itself: its title
-   *  truncated early, its own divider (inset to the content x) stopped short of the
-   *  row, and the counts landed in the column the top line keeps for the timestamp.
-   *  Handed in here, the row is byte-identical to the flat lane's plus the indent,
-   *  the chevron, and a count cluster sitting immediately left of the time --
-   *  which is what `ChatSidebar.laneCardParity.test.tsx` holds it to. */
-  conductor?: ConductorRowExtras
-  isActive: boolean
-  connected: boolean
-  isOut: boolean
-  isPinned: boolean
-  isUnread: boolean
-  /** Widened running signal (runningSet): own turn OR live workflow OR loop. */
-  isRunning: boolean
-  recent: number | undefined
-  recentTintCount: number
-  subagentCount: number
-  subagentApprovalCount: number
-  /** Jump label while the chat-jump modifier is held; undefined hides the badge. */
-  digitBadge: string | undefined
-  /** This slot is being renamed (any render instance) — disables drag. */
-  isRenaming: boolean
-  /** …and the inline edit is pinned to THIS render instance (renameScope). */
-  renamingHere: boolean
-  /** Live rename draft. Empty for every row but the one being renamed, so a
-   *  keystroke re-renders one row instead of invalidating all of them. */
-  renameValue: string
-  revealFlash: 'flash' | 'fade' | null
-  dragInFlight: boolean
-  activeDraggedKey: string | null
-  activeDraggedPinnedIndex: number
-  /** A board card drags with native HTML5 DnD, outside every DndContext, so the
-   *  shell learns of that drag only from the row: called with the slot key at
-   *  `dragstart`. The end is read at the window (see `useNativeSessionDrag`). */
-  onNativeDragStart?: (key: string) => void
-  /** The one end the window cannot hear: the row unmounting while its own
-   *  native drag is still in flight (its lane changed under it), after which
-   *  the browser's `dragend` lands on a detached node. */
-  onNativeDragEnd?: () => void
-  pinnedOrderIndex: number
-  pinnedReorderEnabled: boolean
-  onPinnedKeyboardReorder: (key: string, container: string, delta: -1 | 1, row: HTMLElement) => void
-  defaultAgent: string
-  mode?: string
-  /** Show the single ⋯ menu instead of the hover-revealed action cluster: a
-   *  phone-width viewport, or any touch screen, where the cluster would sit
-   *  permanently over the row's timestamp and pin. */
-  isMobile: boolean
-  colorMode: string
-  installedAgents: AgentInfo[]
-  tagById: Record<string, ChatTag>
-  paletteColors: string[]
-  boost: PaletteBoost
-  boostFor: (hex: string) => PaletteBoost
+/** What a session row can DO: every callback and ref it needs, built ONCE in the
+ *  shell and handed to every row, so the row's memo compares one stable reference
+ *  here and its data through `sameRowView`. */
+interface SessionRowActions {
   renameInputRef: React.MutableRefObject<HTMLTextAreaElement | null>
   onRenameStart: (key: string, scope: string, title: string, fromMenu: boolean) => void
   onRenameChange: (value: string) => void
   onRenameCommit: (key: string, value: string) => void
   onRenameCancel: () => void
   onDuplicate: (key: string) => void
+  /** The row's ✕. In the nesting conductor lane this is the tree close, so a card
+   *  with sessions under it closes its subtree (see `useCloseSessionTree`). */
   onCloseSession: (key: string) => void
   onMenuCloseAutoFocus: (e: Event) => void
   onSelectSlot?: (key: string) => void
-  /** This row's session is LIVE and LOCAL but belongs to another page (a crew
-   *  member's own DM thread, `surface: 'member'`), and the chat pane cannot show
-   *  it. Set, it replaces activation: click / Enter go HERE instead of
-   *  `switchSlot`, and every local-only affordance (rename, close, fork, drag,
-   *  the row menu) is withheld exactly as it is for a peer row, because the
-   *  slot's lifecycle is owned elsewhere. The conductor lane sets it on a
-   *  creator it admits only as an ANCHOR, so the workers that creator opened
-   *  have something to hang from. */
-  onOpenElsewhere?: () => void
-  /** ADOPT a row whose session lives on a remote instance: create a local slot
-   *  bound to that peer session and switch to it. Distinct from `onSelectSlot`
-   *  because there is no local slot to switch to YET — this is what makes one. */
-  onAdoptPeerSession?: (instanceId: string, remoteSlot: string, rowIdentity: string) => void
-  /** An adopt for THIS row is in flight. The peer's transcript is backfilled
-   *  server-side before the response, so the round-trip is long enough that a row
-   *  with no feedback reads as a dead click. */
-  adoptPending?: boolean
-  /** Why the last adopt of THIS row failed, already resolved to display text.
-   *  Empty renders nothing. */
-  adoptError?: string
   onOpenSlotInNewTab?: (key: string, opts?: { background?: boolean }) => void
   onOpenSource?: (slotKey: string, link: { url: string; kind: 'change' | 'issue' }) => boolean
+  /** Open a row whose session lives on a remote instance as a window onto the
+   *  peer's own slot. Distinct from `onSelectSlot` because the session has no
+   *  local slot: the peer owns it. */
+  onOpenPeerSession: (instanceId: string, remoteSlot: string) => void
+  /** A board card drags with native HTML5 DnD, outside every DndContext, so the
+   *  shell learns of that drag only from the row: called with the slot key at
+   *  `dragstart`. The end is read at the window (see `useNativeSessionDrag`). */
+  onNativeDragStart: (key: string) => void
+  /** The one end the window cannot hear: the row unmounting while its own
+   *  native drag is still in flight (its lane changed under it), after which
+   *  the browser's `dragend` lands on a detached node. */
+  onNativeDragEnd: () => void
+  onPinnedKeyboardReorder: (key: string, container: string, delta: -1 | 1, row: HTMLElement) => void
+  /** Go where a row whose session belongs to another page lives
+   *  (`view.opensElsewhere`): click and Enter land here instead of `switchSlot`. */
+  openElsewhere: (path: string) => void
+  /** The conductor lane's chevron: open or close the sessions this row opened. */
+  toggleConductor: (identity: string) => void
 }
 
-/** Display text for a FAILED peer-session adopt, preferring the backend's own
- * machine-readable `code` over its prose.
- *
- * Why the code has to be recovered from the error journal rather than read off
- * the error: the adopt goes through `dispatch(createSlot(...)).unwrap()`, and RTK
- * serializes a thrown error down to its string fields — so `ApiError.status` and
- * `ApiError.body` are GONE by the time this runs, and `parseErrorCode(err.body)`
- * (the pattern every non-thunk call site uses) reads `undefined`. `apiFailure`
- * journals the status and the code keyed by the message that DOES survive, which
- * is what `findReport` looks back up. See `utils/thunkError`'s module doc.
- *
- * `adopt_target_unknown` gets copy that names the crew, because its backend
- * sentence does not; anything else shows the backend's own sentence (`apiFailure`
- * already unwrapped it out of the `{error, code}` envelope), and a fixed sentence
- * is the floor — a failed click must never render nothing, which is the defect
- * this exists to fix.
- *
- * `remote_bind_failed` deliberately has NO case of its own. The backend collapses
- * every refusal on the bind leg to that one code — a dead tunnel, but also a
- * version-parity refusal ("This crew runs Kiro Crew 0.6.0 but this machine runs
- * 0.7.0 …") — and only its sentence tells them apart. A fixed "could not reach"
- * string here would render a healthy, reachable crew as unreachable and hide the
- * one line that tells the user which end to update. The sentence is always present
- * for a journaled code: `findReport` matches on a non-empty message, so a code
- * with no message is unreachable and a fallback for it would be dead code. */
-function adoptFailureText(err: unknown, crewName: string): string {
-  const message = errMessage(err)
-  switch (findReport(message)?.code) {
-    // The peer no longer lists that session (closed there, or never adoptable).
-    case 'adopt_target_unknown':
-      return i18nT('pages.chatSidebar.adopt_target_unknown', { name: crewName })
-    default:
-      return message || i18nT('pages.chatSidebar.adopt_failed')
-  }
+interface SessionRowProps {
+  /** Everything the row renders from, already masked for its origin by the row
+   *  model (./chat-sidebar/rows): a peer row's view carries no local state. */
+  view: SessionRowView
+  actions: SessionRowActions
 }
 
 /** One sidebar session row behind a memo boundary, so the 200+ row bodies do
- *  not re-execute when unrelated sidebar state moves. Every prop is either a
- *  primitive the shell derives per slot or a shell-stable reference (memoized
- *  lookups, useCallback handlers, refs) — an unstable prop silently voids the
- *  memo, which is what ChatSidebar.rowMemo.test.tsx pins. The slot's LIVE
+ *  not re-execute when unrelated sidebar state moves. The row takes its whole
+ *  data as one `view` the row model builds per placement, compared field by
+ *  field (`sameRowView`), and its callbacks as one `actions` object the shell
+ *  builds once; ChatSidebar.rowMemo.test.tsx pins the boundary. The slot's LIVE
  *  per-slot state (status line, goal loop, queued sub-agents, workflow runs)
  *  is subscribed to HERE, slot-scoped, so a background event re-renders only
  *  the row it belongs to. */
-const SessionRow = memo(function SessionRow({
-  slot: s, showDivider, scope, navScope, holdContainer, conductor, isActive, connected, isOut, isPinned, isUnread, isRunning,
-  recent, recentTintCount, subagentCount, subagentApprovalCount, digitBadge,
-  isRenaming, renamingHere, renameValue, revealFlash, dragInFlight, activeDraggedKey, activeDraggedPinnedIndex, onNativeDragStart, onNativeDragEnd, pinnedOrderIndex, pinnedReorderEnabled, onPinnedKeyboardReorder, rowAnimEnabled,
-  defaultAgent, mode, isMobile, colorMode, installedAgents, tagById, paletteColors, boost, boostFor,
-  renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
-  onDuplicate, onCloseSession, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onAdoptPeerSession, adoptPending, adoptError,
-  onOpenElsewhere,
-}: SessionRowProps) {
-  sessionRowRenderProbe.current?.(s.key)
+/** The ONE notice for a failed ['instances'] read issued by the rows'
+ *  runs-elsewhere chips, mounted only where InstanceTabBar is not: an embedded pane (the bar never
+ *  polls there) and a top-level /embed/* route (that layout has no top bar).
+ *  Everywhere else the bar shows the same failure, so a second notice would
+ *  duplicate it. Both surfaces stay silent on exactly one denial, decided by
+ *  the shared `isInstancesDisabledError`: the gateway's own `instances_disabled`
+ *  403 (the feature is simply off). The route's other 403s (non-owner,
+ *  Slack-origin) are real authorization failures and show on both. */
+function RemoteCrewNamesError() {
+  const { pathname } = useLocation()
+  const topBarAbsent = isEmbeddedPane() || pathname.startsWith('/embed/')
+  // Same key and fetcher as the chips, so this observer adds no request.
+  const { error } = useQuery({
+    queryKey: ['instances'],
+    queryFn: () => api.listInstances(),
+    enabled: topBarAbsent,
+  })
+  if (!topBarAbsent || !error || isInstancesDisabledError(error)) return null
+  return (
+    <div className="mx-2 mt-2 shrink-0">
+      <ErrorNotice
+        variant="inline"
+        className="flex-wrap w-full"
+        message={errMessage(error) || i18nT('components.instanceTabBar.instances_load_failed')}
+        askAgent
+        testId="remote-crew-names-error"
+      />
+    </div>
+  )
+}
+
+const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) {
+  const {
+    slot: s, showDivider, scope, navScope, holdContainer, isActive, isOut, isPinned, isUnread, isRunning,
+    recent, subagentCount, subagentApprovalCount, digitBadge,
+    isRenaming, renamingHere, renameValue, revealFlash, pinnedOrderIndex, pinnedReorderEnabled, rowAnimEnabled,
+    opensElsewhere, peerId, peerName,
+  } = view
+  const conductor = view.conductor
+  // A card with sessions under it in the nesting conductor lane closes its whole
+  // subtree, so its ✕ and row menu say how many: the row model's `subtreeCount`
+  // is taken over the lane's kept rows, the same rows the close plans over.
+  // When the press would refuse (this card or a session under it is running),
+  // the ✕ and the menu say so first: muted, "Can't close: N running", and still
+  // pressable, because the press opens the notice that lists who is running.
+  const closeBlockedCount = conductor && conductor.subtreeCount > 0 && conductor.subtreeRunning > 0 ? conductor.subtreeRunning : undefined
+  const closeSessionCount = !closeBlockedCount && conductor && conductor.subtreeCount > 0 ? conductor.subtreeCount + 1 : undefined
+  const closeSessionLabel = closeBlockedCount
+    ? i18nT('pages.chatSidebar.close_blocked', { count: closeBlockedCount })
+    : conductor && conductor.subtreeCount > 0
+      ? i18nT('pages.chatSidebar.close_session_tree', { count: conductor.subtreeCount, total: conductor.subtreeCount + 1 })
+      : undefined
+  // The row menu splits the same reach over two lines: the action, then a muted
+  // line that wraps, so a phone's narrow menu never cuts the sentence off.
+  const closeMenuLabel = closeBlockedCount
+    ? closeSessionLabel
+    : conductor && conductor.subtreeCount > 0
+      ? i18nT('pages.chatSidebar.close_all', { count: conductor.subtreeCount + 1 })
+      : undefined
+  const closeMenuHint = !closeBlockedCount && conductor && conductor.subtreeCount > 0
+    ? i18nT('pages.chatSidebar.close_session_tree_hint', { count: conductor.subtreeCount })
+    : undefined
+  const {
+    connected, mode, isMobile, colorMode, defaultAgent, installedAgents, tagById, paletteColors, boost, boostFor,
+    recentTintCount, dragInFlight, activeDraggedKey, activeDraggedPinnedIndex,
+  } = view.shell
+  const {
+    onNativeDragStart, onNativeDragEnd, onPinnedKeyboardReorder,
+    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
+    onDuplicate, onCloseSession, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onOpenPeerSession,
+    openElsewhere, toggleConductor,
+  } = actions
+  // A LOCAL row whose surface this page does not render goes where it lives: click
+  // and Enter land here instead of `switchSlot`, and every local-only affordance
+  // (rename, close, fork, drag, the row menu) is withheld exactly as it is for a peer
+  // row, because the slot's lifecycle is owned elsewhere.
+  const onOpenElsewhere = opensElsewhere != null ? () => openElsewhere(opensElsewhere) : undefined
   // Peer ownership, present only on a row sourced from a connected remote
   // instance. Every local-only affordance below is gated on its ABSENCE rather
   // than disabled: a control that looks actionable and silently does nothing is
@@ -960,19 +926,23 @@ const SessionRow = memo(function SessionRow({
   //
   // `peerId`, NOT the `instance_id` that `remoteCrewName` below reads: these two
   // sit in one scope and mean opposite things. This one says the session is not
-  // ours; that one says the session IS ours and dispatches elsewhere.
-  const peerId = s.peer_id
+  // ours; that one says the session IS ours and dispatches elsewhere. It and
+  // `peerName` come from the row model's origin check, set on a peer view only.
+  //
   // The affordance gate proper. A peer row and a row that opens elsewhere are
   // withheld the SAME set -- rename, close, fork, drag, the row menu -- for the
   // same reason: this sidebar does not own the slot's lifecycle. They differ only
-  // in what a click does (adopt vs. navigate), which the handlers below decide.
+  // in what a click does (open a window vs. navigate), which the handlers below decide.
   const foreignRow = !!peerId || onOpenElsewhere != null
-  const peerName = s.peer_name || s.peer_id
-  const rowIdentity = sessionRowIdentity(s)
-  // Remote and local gateways do not share a slot-key namespace. Deterministic
-  // member/channel keys can be byte-identical, so a remote row must never use
-  // its raw peer key to read slot-scoped LOCAL state.
-  const localSlotKey = peerId ? '' : s.key
+  // Inside a crew group the header already names the machine, so the row
+  // drops its own crew chip.
+  const inCrewGroup = scope.startsWith('crew:')
+  const inOfflineCrewGroup = useContext(CrewOfflineContext) && inCrewGroup
+  const rowIdentity = view.identity
+  // The row model resolved the origin once: `localKey` is '' for a peer row, so a
+  // peer row never reads slot-scoped LOCAL state under its raw key (the gateways do
+  // not share a key namespace, and deterministic keys can be byte-identical).
+  const localSlotKey = view.localKey
   // memo() bails out of the provider-level repaint, so the row subscribes to
   // catalog loads directly (same contract as the ChatSidebar shell) — its
   // i18nT strings must re-translate even when no prop moves.
@@ -998,7 +968,7 @@ const SessionRow = memo(function SessionRow({
   // status/loop/queue/run leaves this row's subscription value untouched and
   // the row does not re-render. Hoisting any of these to the shell as a
   // whole-map read re-renders every row per event — the regression the memo
-  // test's render probe exists to catch.
+  // test's per-row render count exists to catch.
   // `localSlotKey`, not `s.key`: a peer-owned row must not read slot-scoped LOCAL
   // state under its own key, because the two gateways do not share a key
   // namespace and a collision would show another session's status here.
@@ -1009,6 +979,7 @@ const SessionRow = memo(function SessionRow({
   const goalLoop = automation?.kind === 'legacy_goal_loop' ? automation : undefined
   const monitor = automation?.kind === 'structured_monitor' ? automation : null
   const queuedForSlot = useAppSelector(st => st.chat.subagentQueued?.[localSlotKey] || 0)
+  const queuedReason = useAppSelector(st => st.chat.subagentQueuedReason?.[localSlotKey])
   // {count, name, phase} of this slot's running workflow fan-out, or undefined.
   // shallowEqual because the map is rebuilt per run event; the primitives only
   // change when THIS slot's runs do.
@@ -1178,6 +1149,14 @@ const SessionRow = memo(function SessionRow({
         ? i18nT('pages.chatSidebar.running_queued', { started: subagentStarted, queued: subagentQueuedCount })
         : i18nT('pages.chat.subagentRunCard.agent_running', { count: subagentStarted })
     const subagentApprovalLabel = i18nT('pages.chatSidebar.sub_agent_needs_approval', { count: subagentAwaiting })
+    // Children accepted but not started, with none started: the session is
+    // WAITING on them, not working, so the row says so without the running
+    // pulse. A memory wait names memory; a cap wait keeps the queued count.
+    const subagentsOnlyQueued = subagentQueuedCount > 0 && subagentStarted === 0 && subagentAwaiting === 0
+    const subagentWaitingLabel = isMemoryWait(queuedReason)
+      ? i18nT('pages.chatSidebar.waiting_for_memory')
+      : subagentLabel
+    const subagentWaitingTitle = queuedWaitText(queuedReason) ?? subagentLabel
     // Live dynamic-workflow activity for THIS slot (slot-scoped subscription
     // above). The label mirrors what the sidebar-wide map used to precompute:
     // one run shows its sanitized name · phase, a fan-out shows a count.
@@ -1224,7 +1203,8 @@ const SessionRow = memo(function SessionRow({
     const snapshotLiveWorkLabel = i18nT('pages.chatSidebar.filter_running')
     const liveWorkSupersedesInterruption = hasLiveSessionWork(s, {
       workflowActive: !!wfActive,
-      detailedSubagentsRunning: subagentCount > 0,
+      // Started children only: a queued child has not superseded anything.
+      detailedSubagentsRunning: subagentCount - subagentQueuedCount > 0,
     })
     const goalLoopStalled = !!goalLoop && !!s.interrupted && !liveWorkSupersedesInterruption
     // An armed loop whose NEWEST reply is an explicit `[OPTIONS:]` ask. The
@@ -1287,60 +1267,6 @@ const SessionRow = memo(function SessionRow({
     //
     // The tail is `last_message`, and the `unread` dot rides on it (below).
     const rowState = ([
-      {
-        // ADOPT feedback, on the row the user just clicked. It sits at the TOP
-        // because it describes THEIR in-flight action, not the session's own
-        // state, and it lives INSIDE this resolver rather than beside it: the
-        // resolver renders exactly one secondary line (`session-row-fixed-height`
-        // in website/AUTOSDE.yaml — "ONE status line, and only one"), so a running
-        // peer row that is also adopting would otherwise render two lines and grow
-        // the row.
-        //
-        // Through `ErrorNotice`, not a hand-rolled tinted div: the shared surface
-        // carries `role="alert"` and recovers the endpoint/status/code from the
-        // error journal. `askAgent` is OFF — the hand-off navigates away, and this
-        // row sits beside a composer that may hold a draft.
-        // `messageClassName="truncate"` is what keeps this to ONE line. The
-        // resolver already guarantees one status ENTRY, but `ErrorNotice` wraps a
-        // long message by default (`overflowWrap: anywhere`), so a localized
-        // failure string was still able to grow the row past its fixed height --
-        // the same `session-row-fixed-height` rule, reached from the other side.
-        // Truncating rather than dropping the component: `errors-use-error-notice`
-        // requires an error to BE an `ErrorNotice`, so the two rules together
-        // leave exactly this shape. `messageTooltip` carries the whole sentence:
-        // the row is one line wide, and the server's reason ("This crew runs Kiro
-        // Crew 0.6.0 but this machine runs 0.7.0 …") puts the actionable half past
-        // the clip. `truncate` + `title` is the shape `session-row-fixed-height`
-        // itself prescribes for a field that does not fit.
-        key: 'peer_adopt_error',
-        when: !!peerId && !adoptPending && !!adoptError,
-        build: () => (
-          <>
-            {/* No hand-off: the adjacent composer may contain an unsaved draft. */}
-            <ErrorNotice
-              message={adoptError || ''}
-              messageTooltip={adoptError || undefined}
-              variant="inline"
-              messageClassName="truncate"
-              testId="session-peer-adopt-error"
-            />
-          </>
-        ),
-      },
-      {
-        // A peer-row click is a network round-trip that includes a server-side
-        // transcript backfill, so it is slow enough that silence reads as a dead
-        // click. Several peer rows can be adopting independently, which is why
-        // this is per-row and not a page-level banner.
-        key: 'peer_adopt_pending',
-        when: !!peerId && !!adoptPending,
-        build: () => (
-          <div className={ROW_STATUS_LINE_MUTED_CLS} data-testid="session-peer-adopt-pending">
-            <Loader2 size={10} className="animate-spin shrink-0 text-accent" aria-hidden="true" />
-            <span className="truncate min-w-0">{i18nT('pages.chatSidebar.opening_session_locally')}</span>
-          </div>
-        ),
-      },
       {
         // Pending approval outranks running (mirrors the Board's inferLane,
         // which returns its approval lane before the running check), so an owed
@@ -1475,7 +1401,7 @@ const SessionRow = memo(function SessionRow({
         build: () => {
           // A crew-bound row must not name Resume: the composer offers no such
           // control there (`selectContinuable` mirrors the server's
-          // `remote_action_unsupported` refusal), so the instruction would point
+          // `relay_archive_read_only` refusal), so the instruction would point
           // at a button that is not on screen. The interruption is still real and
           // still needs the marker — only the instruction is dropped.
           //
@@ -1511,10 +1437,23 @@ const SessionRow = memo(function SessionRow({
         ),
       },
       {
-        // A spawned subagent is still running (or queued behind the concurrency
-        // cap) — surface it even if the parent turn has ended (`s.running` is
-        // false while it waits for completion events), so the sidebar shows
-        // live activity instead of a stale last message.
+        // Every child is still queued: a static badge, never the running pulse,
+        // because nothing has started. The tooltip carries the wait's own
+        // sentence (how much memory is short, or the concurrency limit).
+        key: 'subagents_waiting',
+        when: subagentsOnlyQueued,
+        build: () => (
+          <div className={ROW_STATUS_LINE_MUTED_CLS} title={subagentWaitingTitle} data-testid="session-subagents-waiting">
+            <Hourglass size={ROW_ICON_PX} className="shrink-0" aria-hidden />
+            <span className="truncate">{subagentWaitingLabel}</span>
+          </div>
+        ),
+      },
+      {
+        // A spawned subagent is still running (with or without more queued
+        // behind it) — surface it even if the parent turn has ended
+        // (`s.running` is false while it waits for completion events), so the
+        // sidebar shows live activity instead of a stale last message.
         key: 'subagents',
         when: subagentCount > 0,
         build: () => (
@@ -1594,10 +1533,15 @@ const SessionRow = memo(function SessionRow({
         // opened locally the local slot wins the identity dedupe, `peerId` is
         // gone, and the line goes with it.
         key: 'peer_not_open_here',
-        when: !!peerId && !adoptPending,
+        when: !!peerId,
         build: () => (
           <div className={ROW_STATUS_LINE_MUTED_CLS} data-testid="session-peer-not-open-here">
-            <span className="truncate min-w-0">{i18nT('pages.chatSidebar.not_open_here_yet', { name: peerName || '' })}</span>
+            {/* Inside a crew group the header already names the machine. */}
+            <span className="truncate min-w-0">{inOfflineCrewGroup
+              ? i18nT('pages.chatSidebar.crew_row_offline')
+              : inCrewGroup
+              ? i18nT('pages.chatSidebar.crew_row_open_here')
+              : i18nT('pages.chatSidebar.not_open_here_yet', { name: peerName || '' })}</span>
           </div>
         ),
       },
@@ -1622,7 +1566,7 @@ const SessionRow = memo(function SessionRow({
       // `recent` status chip (`SESSION_FILTERS`) and the connection-status dot (InstancesPanel's
       // `bg-ok`) already use, not the brand/interactive color. A theme where
       // the two hues differ can then keep the status cue distinct from
-      // ordinary accent chrome (#10479).
+      // ordinary accent chrome.
       ? <span className="w-2 h-2 rounded-full shrink-0" style={{ background: 'var(--ok)' }}
         role="img" aria-label={i18nT('pages.chatSidebar.agent_finished_your_turn')}
         title={i18nT('pages.chatSidebar.agent_finished_your_turn')} />
@@ -1679,10 +1623,21 @@ const SessionRow = memo(function SessionRow({
       mode,
       onRename: () => onRenameStart(rowKey, scope, rowTitle && rowTitle !== rowKey ? rowTitle : '', true),
       onOpenInNewTab: onOpenSlotInNewTab ? () => onOpenSlotInNewTab(rowKey) : undefined,
+      // The same close the row's ✕ performs, also scoped to the conductor lane:
+      // `treeClose` resolves to `closeSessionTree` there and `sessionActions.close`
+      // everywhere else, so the menu never silently collapses a subtree that is
+      // not visible in the current lane.
+      onClose: onCloseSession,
+      // When the conductor lane shows a card with nested sessions, the menu's
+      // Close item does what the ✕ does: close the whole subtree. Give it the
+      // same scoped label so the user knows what the press reaches.
+      closeLabel: closeMenuLabel,
+      closeHint: closeMenuHint,
+      closeMuted: closeBlockedCount != null,
       // A row menu opens from inside this panel, where the folder-order banner
       // (when there is one) sits over the tree -- the menu need not repeat it.
       sidebarOnScreen: true,
-    }), [rowKey, mode, onRenameStart, scope, rowTitle, onOpenSlotInNewTab])
+    }), [rowKey, mode, onRenameStart, scope, rowTitle, onOpenSlotInNewTab, onCloseSession, closeMenuLabel, closeMenuHint, closeBlockedCount])
     const rowActions = useMemo(() => (void langGen, !renamingHere && !foreignRow ? (isMobile ? (
       <div className="absolute top-1/2 -translate-y-1/2 right-1.5 flex items-center gap-0.5">
         <DropdownMenu>
@@ -1705,11 +1660,33 @@ const SessionRow = memo(function SessionRow({
           </DropdownMenuContent>
         </DropdownMenu>
         <IconButton variant="accent" title={i18nT('pages.chatSidebar.duplicate')} aria-label={i18nT('pages.chatSidebar.duplicate')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onDuplicate(rowKey) }}><GitFork size={12} /></IconButton>
-        <IconButton variant="danger" title={i18nT('pages.chatSidebar.close')} aria-label={i18nT('pages.chatSidebar.close_session')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onCloseSession(rowKey) }}><X size={12} /></IconButton>
+        <IconButton variant={closeBlockedCount ? 'default' : 'danger'} title={closeSessionLabel ?? i18nT('pages.chatSidebar.close')} aria-label={closeSessionLabel ?? i18nT('pages.chatSidebar.close_session')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onCloseSession(rowKey) }} className={closeBlockedCount ? 'flex shrink-0 items-center gap-0.5 whitespace-nowrap opacity-60' : closeSessionCount ? 'flex shrink-0 items-center gap-0.5 whitespace-nowrap' : undefined} data-testid={closeBlockedCount ? 'row-close-blocked' : closeSessionCount ? 'row-close-tree' : undefined} aria-describedby={closeSessionCount ? `row-close-hint-${rowKey}` : undefined}>
+          <X size={12} />
+          {closeBlockedCount ? (
+            <span aria-hidden="true" className="text-[11px] font-semibold leading-none tabular-nums" data-testid="row-close-blocked-label">
+              {i18nT('pages.chatSidebar.close_blocked_short', { count: closeBlockedCount })}
+            </span>
+          ) : null}
+          {/* The reach, on the button itself: it reads "Close 5" whenever it is
+              shown. A bare count read as an unread or alert badge, and the word
+              alone hid that the press reaches more than this one session.
+              Decorative for a screen reader, which already hears the full label. */}
+          {closeSessionCount ? (
+            <span className="flex items-baseline gap-1 text-[11px] font-semibold leading-none tabular-nums">
+              <span aria-hidden="true" data-testid="row-close-word">{i18nT('pages.chatSidebar.close')}</span>
+              <span aria-hidden="true" data-testid="row-close-count">{closeSessionCount}</span>
+              {/* What the number counts, for a screen reader: read as the
+                  button's description after its full label. */}
+              <span id={`row-close-hint-${rowKey}`} className="sr-only" data-testid="row-close-hint">
+                {i18nT('pages.chatSidebar.close_count_hint', { count: closeSessionCount })}
+              </span>
+            </span>
+          ) : null}
+        </IconButton>
       </IconButtonGroup>
     )) : null
     // `langGen` (read with `void` above) because the labels are i18nT strings, which re-translate on a catalog load.
-    ), [renamingHere, foreignRow, isMobile, rowMenuProps, onMenuCloseAutoFocus, onDuplicate, onCloseSession, rowKey, langGen])
+    ), [renamingHere, foreignRow, isMobile, rowMenuProps, onMenuCloseAutoFocus, onDuplicate, onCloseSession, closeSessionLabel, closeSessionCount, closeBlockedCount, rowKey, langGen])
     const rowContextMenuContent = useMemo(() => (void langGen, !foreignRow ? (
       <ContextMenuContent className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
         <SessionActionsMenu variant="context" {...rowMenuProps} />
@@ -1789,9 +1766,6 @@ const SessionRow = memo(function SessionRow({
           data-session-container={holdContainer}
           aria-current={isActive ? 'true' : undefined}
           aria-disabled={!connected}
-          // An adopt in flight is a pending state ON THIS ROW, so a screen reader
-          // hears "busy" rather than nothing while the peer transcript backfills.
-          aria-busy={peerId && adoptPending ? 'true' : undefined}
           aria-keyshortcuts={dndRow && pinnedReorderEnabled && isPinned ? 'Alt+ArrowUp Alt+ArrowDown' : undefined}
           onKeyDown={e => {
             if (dndRow && pinnedReorderEnabled && isPinned && e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey
@@ -1837,7 +1811,7 @@ const SessionRow = memo(function SessionRow({
             if ((e.target as HTMLElement) !== e.currentTarget) return // don't hijack inner buttons
             e.preventDefault()
             if (!connected) return
-            if (peerId) { onAdoptPeerSession?.(peerId, s.key, rowIdentity); return }
+            if (peerId) { onOpenPeerSession?.(peerId, s.key); return }
             if (onOpenElsewhere) { onOpenElsewhere(); return }
             dispatch(switchSlot({ key: s.key, announceOnMissing: true }))
             onSelectSlot?.(s.key)
@@ -1883,15 +1857,13 @@ const SessionRow = memo(function SessionRow({
             // /forking still works — those are local ops (or short-circuit) that
             // don't depend on gateway state.
             if (!connected) return
-            // A peer-owned row has no local slot yet, so `switchSlot` would
-            // resolve nothing and clear the transcript. ADOPT it instead: create a
-            // local slot bound to that peer session, backfill its transcript, and
-            // switch to THAT — the click opens the session the row names, in the
-            // local pane, which is what every other row's click means. (The
-            // federated Older-Sessions rows still switch panes; a history row has
-            // no live peer slot to bind.) A remote-EXECUTED local slot falls
-            // through to `switchSlot` below, because its transcript IS here.
-            if (peerId) { onAdoptPeerSession?.(peerId, s.key, rowIdentity); return }
+            // A peer-owned row has no local slot, so `switchSlot` would resolve
+            // nothing and clear the transcript. It opens as a window onto the
+            // peer's own slot instead (CrewChatWindow). (The federated
+            // Older-Sessions rows still switch panes; a history row has no live
+            // peer slot.) A remote-EXECUTED local slot falls through to
+            // `switchSlot` below, because its transcript IS here.
+            if (peerId) { onOpenPeerSession?.(peerId, s.key); return }
             // A row whose session belongs to another page: the pane cannot show
             // it, so `switchSlot` would land on a transcript the surface filter
             // hides and leave the user on the previous one. Go where it lives.
@@ -1975,7 +1947,7 @@ const SessionRow = memo(function SessionRow({
               // Both stopped, like the row's other inner controls: this button owns the
               // press, and the row's own click would otherwise switch session as well.
               onMouseDown={e => e.stopPropagation()}
-              onClick={e => { e.stopPropagation(); conductor.onToggle() }}
+              onClick={e => { e.stopPropagation(); toggleConductor(rowIdentity) }}
               title={conductor.expanded
                 ? i18nT('pages.chatSidebar.collapse_sessions_this_one_opened')
                 : i18nT('pages.chatSidebar.expand_sessions_this_one_opened')}
@@ -2022,7 +1994,7 @@ const SessionRow = memo(function SessionRow({
                 *  feature sees a pill with a word in it and cannot tell what a row
                 *  WITHOUT one means either, so the text names both halves: whose
                 *  session it is, and that clicking opens it here. */}
-              {peerId && (
+              {peerId && !inCrewGroup && (
                 <RemoteCrewChip
                   name={peerName || ''}
                   label={i18nT('pages.chatSidebar.on_instance', { name: peerName || '' })}
@@ -2143,7 +2115,7 @@ const SessionRow = memo(function SessionRow({
                *  is first on a federated search row: it qualifies the whole row,
                *  so a user scanning the list should meet it before the per-session
                *  flags that only make sense once you know where the session is. */}
-              {s.executor === 'remote' && (
+              {s.executor === 'remote' && !inCrewGroup && (
                 <RemoteCrewChip
                   name={remoteCrewName}
                   label={i18nT('pages.chatSidebar.on_instance', { name: remoteCrewName })}
@@ -2183,10 +2155,12 @@ const SessionRow = memo(function SessionRow({
                 secondary line down by a full line box on some rows, which is what
                 made the list read as ragged. The full string stays reachable
                 through the `title` attribute, and the rename box below is the one
-                place it is shown in full. */}
+                place it is shown in full. On a touch screen the row's buttons stay
+                shown, so a card with "Close 5" reserves room for it and the title
+                truncates first, never the control. */}
             <div
               data-session-title
-              className={`${ROW_TITLE_CLS} font-semibold text-text ${renamingHere ? '' : 'truncate'}`}
+              className={`${ROW_TITLE_CLS} font-semibold text-text ${renamingHere ? '' : 'truncate'}${(closeSessionCount || closeBlockedCount) && !isMobile ? ' [@media(hover:none)]:pr-24' : ''}`}
               title={s.title && s.title !== s.key ? s.title : s.key}
             >
               {/* No separate fork glyph: forked titles already carry the
@@ -2196,7 +2170,7 @@ const SessionRow = memo(function SessionRow({
                   onRename handler) so users can edit or drop it when they rename.
                   A separate ↳ glyph also double-stacked into "↳↳ Fork of …". */}
               {renamingHere ? (
-                <textarea ref={renameInputRef} rows={1} className={`w-full bg-transparent border border-accent rounded px-1 py-0 ${ROW_TITLE_CLS} text-text-strong outline-hidden select-text resize-none block overflow-hidden focus-ring`} value={renameValue} onChange={e => onRenameChange(e.target.value)} {...ime.bindEnter<HTMLTextAreaElement>({ onEnter: () => { (document.activeElement as HTMLTextAreaElement)?.blur() }, onEscape: onRenameCancel, onBlur: () => onRenameCommit(s.key, renameValue) })} onMouseDown={e => e.stopPropagation()} />
+                <textarea ref={renameInputRef} rows={1} className={`w-full bg-bg-elevated border border-accent rounded px-1 py-0 ${ROW_TITLE_CLS} text-text-strong outline-hidden select-text resize-none block overflow-hidden focus-ring`} value={renameValue} onChange={e => onRenameChange(e.target.value)} {...ime.bindEnter<HTMLTextAreaElement>({ onEnter: () => { (document.activeElement as HTMLTextAreaElement)?.blur() }, onEscape: onRenameCancel, onBlur: () => onRenameCommit(s.key, renameValue) })} onMouseDown={e => e.stopPropagation()} />
               ) : (s.title && s.title !== s.key ? s.title : s.key)}
             </div>
             {/* Secondary line: one ordered resolver decides both the words and the
@@ -2267,7 +2241,7 @@ const SessionRow = memo(function SessionRow({
         )}
       </DndDroppable>
     )
-})
+}, (a, b) => a.actions === b.actions && sameRowView(a.view, b.view))
 
 interface ChatSidebarProps {
   slots: Slot[]
@@ -2277,9 +2251,18 @@ interface ChatSidebarProps {
   historyHasMore: boolean
   defaultAgent: string
   installedAgents: AgentInfo[]
+  /** What row and history labels are TINTED from (agent colour, inherited
+   *  session colour). The host passes the last loaded roster so a session
+   *  switch, which empties `installedAgents` until the new fetch lands, does
+   *  not flash every label to muted and back. Display only: pickers such as
+   *  FolderConfigModal keep reading the scoped `installedAgents`. Defaults to it. */
+  rowAgents?: AgentInfo[]
   mode?: string
   onWidthChange?: (w: number) => void
   onDragChange?: (dragging: boolean) => void
+  /** The host stretches the sidebar to its own width (the mobile drawer, the
+   *  sessions embed), so its paint reserves no chat pane beside it. */
+  fillsHost?: boolean
   /** Optional callback fired when the user explicitly clicks a slot.
    *  When provided, this fires AFTER the switchSlot dispatch so consumers
    *  can react to user-driven selection (e.g. to navigate the URL). */
@@ -2335,6 +2318,9 @@ interface ChatSidebarProps {
    *  not a live slot, because the composer stages it until send. Never fired for
    *  incognito/temporary sessions or for the already-active session. */
   onDropSessionRef?: (ref: { key: string; title: string; messages?: number }) => void
+  /** Where a crew row's window opens, for a host with no chat pane of its
+   *  own (embed/sessions). Omit to open it over this page's pane. */
+  onOpenPeerSession?: (instanceId: string, key: string) => void
 }
 
 /** Sort options, in menu order. The label lives in `SORT_LABEL_KEY`. */
@@ -2374,38 +2360,7 @@ export const FOLDER_SORT_LABEL_KEY: Record<FolderSortMode, string> = {
  *  as a number instead, which keeps the information without the geometry. */
 const CONDUCTOR_MAX_INDENT_DEPTH = 6
 
-/** What the conductor lane adds to a session row, and nothing more.
- *
- *  Every field is a fact the LANE knows and the row cannot: how deep this row sits,
- *  how many sessions it opened, whether those are hidden right now, and what its
- *  subtree is asking for while they are. The row renders them; it derives none of
- *  them, so the flat lane's row and this one stay the same component with the same
- *  data. */
-interface ConductorRowExtras {
-  /** 0 for a root. Indents the row; capped at `CONDUCTOR_MAX_INDENT_DEPTH`. */
-  depth: number
-  /** Direct children. 0 renders no chevron and no count. */
-  childCount: number
-  expanded: boolean
-  onToggle: () => void
-  /** The collapsed subtree's asks, or null while it is open -- an open conductor's
-   *  children show their own, and both at once would count a session twice. */
-  aggregate: { needsYou: number; running: number } | null
-  /** The creator this row cites but could not nest under, because it has closed. */
-  orphanOf: string | null
-  /** The creator this row cites while the lane is NOT nesting it -- search flattens
-   *  every match to one level, so a child would otherwise be indistinguishable from a
-   *  session nobody opened. Distinct from `orphanOf`: that creator is gone, this one
-   *  is present and simply not above this row right now, and the two must not share a
-   *  tooltip that claims the session closed. */
-  citesParent?: string | null
-  /** True when this row is on screen only to hold its workers together: the active
-   *  filter does not admit it, but something in its subtree needs it as the row the
-   *  nesting hangs from. Dimmed, because it is context rather than a match. */
-  anchorOnly?: boolean
-}
-
-import { SIDEBAR_MIN, SIDEBAR_MAX } from './chat/sidebarWidth'
+import { SIDEBAR_MIN } from './chat/sidebarWidth'
 export { SIDEBAR_MIN, SIDEBAR_MAX } from './chat/sidebarWidth'
 
 /**
@@ -2414,12 +2369,14 @@ export { SIDEBAR_MIN, SIDEBAR_MAX } from './chat/sidebarWidth'
  *
  * Owner hooks are called where their block used to sit, so React runs their effects in
  * the order the sidebar has always run them; ChatSidebar.ownerComposition.test.ts pins
- * that call order. SessionRow, the row and folder render closures, the filter-dimension
- * registry, the peer-session adopt, the idle-session cleanup, the bulk model switch and
- * the JSX stay in this file: source pins read them here (the switchSlot call-site
- * count, list-shell parity, the bulk switcher, the filter registry, the restyle
- * ratchet), and the render closures stamp rows in paint order. The owner table and
- * the pin list are in docs/system-specs/modules/history.md.
+ * that call order. Which rows pass the filters, their order, their lane and folder, and
+ * what each one shows come from the row model (./chat-sidebar/rows), which reads local
+ * key-indexed state for the rows it builds only after its one origin check. SessionRow,
+ * the row and folder render closures, the idle-session cleanup, the bulk model switch
+ * and the JSX stay in this file: source pins read them here (the switchSlot call-site
+ * count, list-shell parity, the bulk switcher, the restyle ratchet), and the render
+ * closures stamp rows in paint order. The owner table and the pin list are in
+ * docs/system-specs/modules/history.md.
  */
 function ChatSidebar({
   // Bound as `localSlots`, NOT `slots`. This component now holds TWO
@@ -2431,7 +2388,7 @@ function ChatSidebar({
   // only the binding is scoped, which forces every call site inside this file
   // to say which collection it means.
   slots: localSlots, activeSlot, unreadSlots, history, historyHasMore,
-  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, onOpenSlotInNewTab, onOpenSource, collapsible,
+  defaultAgent, installedAgents, rowAgents, mode, onWidthChange, onDragChange, fillsHost, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onOpenPeerSession, collapsible,
   chatDropTarget, onDropSessionRef, staticRows,
 }: ChatSidebarProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
@@ -2447,6 +2404,11 @@ function ChatSidebar({
 
   // Sidebar-only state
   const [seedError, setSeedError] = useState('')
+  // The board/list toggle also persists a chat-config field (`tagColumnsEnabled`)
+  // via `saveChatConfig`, which returns false and rolls back when storage cannot
+  // hold the write (GPT 6.1, errors-use-error-notice). That reuses the seedError
+  // notice slot below, but with a save-specific title — this flag picks it.
+  const [toggleSaveFailed, setToggleSaveFailed] = useState(false)
   // Shared failure line for the board's column mutations (delete / reorder /
   // add-after / card drop) — one state, because they all edit the same strip and
   // a second banner per verb would stack. Server-side inputs only, so a failed
@@ -2485,101 +2447,24 @@ function ChatSidebar({
   )
   const {
     historySearchResults, instancesList, instanceSessions, remoteSessionsError, allRows, allLiveSlots,
-    selectInstance,
+    selectInstance, crewGroups,
   } = useSessionSources({ historyFilter, slotTitleDigest, localSlots })
-  // Adopt state, keyed by ROW IDENTITY (`<peerId>:<key>`) rather than raw slot
-  // key: a peer key can be byte-identical to a local one, and to another peer's,
-  // so a raw-key map would show one row's failure on another row. Two separate
-  // maps because they are two different facts and both can be true of different
-  // rows at once.
-  const [adoptPending, setAdoptPending] = useState<Record<string, boolean>>({})
-  const [adoptErrors, setAdoptErrors] = useState<Record<string, string>>({})
-  // Read inside the click handler to refuse a SECOND adopt of a row already in
-  // flight. The backend is idempotent (a repeat pair returns the same local
-  // slot), so this is not a correctness guard — it is what stops an impatient
-  // double-click spending two round-trips and two transcript backfills.
-  const adoptPendingRef = useRef(adoptPending)
-  adoptPendingRef.current = adoptPending
-  // The active slot AT COMPLETION time. `activeSlot` closed over by the mutation
-  // body is the value from the render that started the adopt, which is precisely
-  // the stale one — the question this answers is whether the user has moved since.
-  const activeSlotRef = useRef(activeSlot)
-  activeSlotRef.current = activeSlot
-  const adoptPeerSessionMutation = useMutation({
-    mutationFn: async ({ instanceId, remoteSlot }: { instanceId: string; remoteSlot: string; identity: string }) => {
-      // ADOPT, not mint: `adoptRemoteSlot` names the peer session that already
-      // exists, so the local slot this creates binds to it instead of to a fresh
-      // one. Modelled on `createRemoteChatMutation` — same `createSlot` thunk,
-      // same stay-local stance, and deliberately NO `selectInstance`: staying put
-      // is the whole point, because the session now opens HERE.
-      //
-      // `activate: false` so ONE piece of code decides whether the view moves.
-      // `createSlot.fulfilled` already refuses to activate when the user
-      // navigated elsewhere during the round-trip, but this path needs its own
-      // `switchSlot` (that is what loads the transcript, not just what sets
-      // `activeSlot`) — and an unconditional one overrode exactly the decision
-      // that guard had just made. Duplicating the comparison here instead would
-      // race it: on the guard's success path the reducer moves `activeSlot` to
-      // the new key, so a check against the pre-adopt origin cannot tell "the
-      // user moved" from "the reducer moved". Opting out of reducer activation
-      // removes that ambiguity: `activeSlot` can now only differ because the
-      // USER moved.
-      const origin = activeSlotRef.current
-      const created = await dispatch(
-        createSlot({ instanceId, adoptRemoteSlot: remoteSlot, activate: false }),
-      ).unwrap()
-      // The adopt round-trip is a real network call to the peer and can span
-      // seconds over a tunnel, so switching sessions while it spins is an
-      // ordinary thing to do — not a race worth ignoring.
-      if (activeSlotRef.current === origin) {
-        // Plain dispatch rather than `.unwrap()`: the adopt SUCCEEDED, so a slow
-        // or failing transcript fetch is `switchSlot`'s own error to report on
-        // the pane, not a reason to tell the row its adopt failed.
-        dispatch(switchSlot({ key: created.key, announceOnMissing: true }))
-        onSelectSlot?.(created.key)
-      }
-      return created
-    },
-    onSuccess: (_data, variables) => {
-      // Drop the cached peer listing for THIS crew. The backend stops listing an
-      // adopted session, but that only takes effect on the next fetch — until
-      // then the cached peer row co-exists with the freshly created local slot in
-      // `allRows` ([...localSlots, ...instanceSessions.rows], which does not
-      // dedupe), so the user sees the session they just opened twice. Scoped to
-      // the one crew rather than the whole query family: the other crews' rows did
-      // not change, and refetching them would spend a tunnel round-trip each.
-      void queryClient.invalidateQueries({ queryKey: ['instance-slots', variables.instanceId] })
-    },
-    onSettled: (_data, _err, variables) => {
-      setAdoptPending(prev => {
-        if (!prev[variables.identity]) return prev
-        const next = { ...prev }
-        delete next[variables.identity]
-        return next
-      })
-    },
-    onError: (err: unknown, variables) => {
-      // The crew's DISPLAY name, resolved here rather than threaded up from the
-      // row: `useMutation` reads its callbacks fresh each render, so closing over
-      // `instancesList` is safe where closing over it in the stable
-      // `adoptPeerSession` callback below would not be.
-      const crewName = instancesList.find(i => i.id === variables.instanceId)?.name || variables.instanceId
-      setAdoptErrors(prev => ({ ...prev, [variables.identity]: adoptFailureText(err, crewName) }))
-    },
-  })
-  const adoptMutateRef = useRef(adoptPeerSessionMutation.mutate)
-  adoptMutateRef.current = adoptPeerSessionMutation.mutate
-  // Stable for the life of the component, because it is a prop of every memoized
-  // SessionRow — the same reasoning as the `selectInstanceRef` indirection this
-  // replaced: react-query's mutation object takes a fresh identity every render,
-  // so closing over it directly would re-render EVERY row on every shell commit
-  // (the regression `ChatSidebar.rowMemo.test.tsx` exists to catch). The ref is
-  // rewritten each render and read inside a never-changing callback.
-  const adoptPeerSession = useCallback((instanceId: string, remoteSlot: string, identity: string) => {
-    if (adoptPendingRef.current[identity]) return
-    setAdoptPending(prev => ({ ...prev, [identity]: true }))
-    setAdoptErrors(prev => (prev[identity] ? { ...prev, [identity]: '' } : prev))
-    adoptMutateRef.current({ instanceId, remoteSlot, identity })
+  // Whether any row renders a runs-elsewhere chip, i.e. whether this sidebar
+  // issues the ['instances'] read that RemoteCrewNamesError reports on.
+  const hasRemoteExecutedRow = useMemo(
+    () => allRows.some(r => r.executor === 'remote' && !!r.instance_id),
+    [allRows],
+  )
+  // Opening a crew row is local and instant: the window reads the peer's slot
+  // itself, so nothing is created here and there is nothing to wait on.
+  const crewWindow = useCrewWindow()
+  const onOpenPeerSessionRef = useRef(onOpenPeerSession)
+  onOpenPeerSessionRef.current = onOpenPeerSession
+  const openPeerSession = useCallback((instanceId: string, remoteSlot: string) => {
+    // A host with no chat pane of its own (the embedded Sessions list) says
+    // where the window opens; otherwise it opens over this page's pane.
+    if (onOpenPeerSessionRef.current) onOpenPeerSessionRef.current(instanceId, remoteSlot)
+    else openCrewWindow({ instanceId, key: remoteSlot })
   }, [])
   // Connected crews, for the "New chat on crew" entry. `warm` is the authority
   // on which peers hold a live tunnel (it holds the loopback port + minted
@@ -2642,15 +2527,16 @@ function ChatSidebar({
   const conductorView = lane === 'conductor'
   const {
     activeFilters, filtersPaused, setAllFiltersPaused, clearAllFilters,
-    filterHiddenFolders, setFilterHiddenFolders, toggleFolderFilter,
+    filterHiddenFolders, setFilterHiddenFolders, toggleFolderFilter, unhideFolderChain,
     showAllFolders, filterTagIds, toggleTagFilter, clearTagFilter, foldersShelved, setFoldersShelved,
     toggleFoldersShelved, toggleFilter, disableFilter, enableFilter,
+    hiddenFilters, toggleHideFilter, clearHiddenFilters,
   } = useSessionFilterState()
   const {
-    slotsLoaded, workflowActiveSet, automationRunningSet, subagentCounts, subagentApprovalCounts, unreadSet,
+    slotsLoaded, workflowActiveSet, automationRunningSet, subagentCounts, subagentStartedCounts, subagentApprovalCounts, unreadSet,
     recentWindowMs, recentAmountDraft, setRecentAmountDraft, recentUnitDraft, selectRecentPreset,
-    commitRecentAmount, changeRecentUnit, runningSet, _derivedLookup, filterCounts,
-  } = useSessionStatusFilters({ unreadSlots, activeFilters, filtersPaused, enableFilter, localSlots, allRows, disableFilter })
+    commitRecentAmount, changeRecentUnit, runningSet, recentSet,
+  } = useSessionStatusFilters({ unreadSlots, activeFilters, filtersPaused, enableFilter, localSlots, disableFilter })
   const creatingSlot = useAppSelector(s => s.chat.creatingSlot)
   const connected = useConnected()
   const {
@@ -2716,13 +2602,21 @@ function ChatSidebar({
     () => (bulkModelOptions.some(m => m.name === bulkModel) ? bulkModel : ''),
     [bulkModelOptions, bulkModel],
   )
-  const bulkRunningCount = useMemo(() => localSlots.filter(s => s.running).length, [localSlots])
-  // Count only slots that would actually change: model differs from the target
-  // (the backend leaves already-on-target slots as `unchanged`), minus running
-  // slots when skipping. Keeps the "Switch N" label + disable guard honest.
-  const bulkAffectedCount = useMemo(() => {
-    return localSlots.filter(s => (s.model ?? '') !== bulkModelPick && (!bulkSkipRunning || !s.running)).length
-  }, [localSlots, bulkModelPick, bulkSkipRunning])
+  // Count only slots that would actually change. Every slot left out lands in
+  // a named bucket the panel renders (see partitionBulkSwitch), so the
+  // "Switch N" label can be reconciled with the rows on screen.
+  const bulkPartition = useMemo(
+    () => partitionBulkSwitch(localSlots, bulkModelPick, bulkSkipRunning),
+    [localSlots, bulkModelPick, bulkSkipRunning],
+  )
+  const bulkAffectedCount = bulkPartition.affected
+  // Running sessions the switch could still touch. Before a pick every running
+  // session counts; after one, a running session already on the pick is in the
+  // "already use this model" line instead, so it is not counted twice.
+  const bulkRunningCount = useMemo(
+    () => (bulkModelPick ? bulkPartition.runningOffTarget : localSlots.filter(s => s.running).length),
+    [bulkModelPick, bulkPartition, localSlots],
+  )
   const bulkModelMutation = useMutation({
     // 'auto' goes on the wire verbatim (not collapsed to ''): '' doubles as the
     // "never chosen" state that every reader re-resolves to the agent template's
@@ -2774,18 +2668,7 @@ function ChatSidebar({
     staleCollapseMs, setStaleCollapseMs, staleExpanded, setStaleExpanded, setStaleRecentlyMoved,
     isStaleExempt,
   } = useStaleCollapse({ pinned, activeSlot, runningSet, subagentCounts, unreadSet })
-  // The active-row highlight, masked for peer ownership. `activeSlot` names a
-  // LOCAL session and a peer row can carry a byte-identical key, so the raw
-  // comparison would light up a second row belonging to another machine — and
-  // clicking it opens that machine's dashboard, not the highlighted chat.
-  // Hoisted to ONE definition because five lanes ask the question (list folders,
-  // fresh children, flat, board root, board columns) and each also asks it of the
-  // NEXT row to decide dividers; a lane that forgot the mask would be a bug
-  // nobody notices until two rows glow at once.
-  const isActiveRow = useCallback(
-    (s: Slot | null | undefined): boolean => !!s && !isPeerRow(s) && activeSlot === s.key,
-    [activeSlot],
-  )
+
   // The two halves render either side of the expander, so a held row crossing it
   // leaves the sub-list the anchor was measured against. Freeze the side instead.
   const holdStaleSide = (split: StaleSplit<Slot>): StaleSplit<Slot> => {
@@ -2816,23 +2699,10 @@ function ChatSidebar({
     return pin.staleSide ? { fresh: rest, stale: seated } : { fresh: seated, stale: rest }
   }
 
-  const splitStale = (list: Slot[]): StaleSplit<Slot> => {
-    // Inert while the list is narrowed: a search or status chip must reach
-    // every match (the same invariant that sends the folder filter inert
-    // while searching), so the collapse may never become a fourth hiding
-    // dimension on top of an active one. Also inert under non-date sorts —
-    // only newest-first ordering makes the stale set a truthful contiguous
-    // tail, so an expander under name/created sort would hide rows from the
-    // middle of the visible ordering.
-    const active = !listNarrowed && sortKey === 'date-desc'
-    return holdStaleSide(splitStaleSlots(
-      list,
-      active ? staleCollapseMs : 0,
-      Date.now(),
-      s => lastActivityEpoch(s) * 1000,
-      isStaleExempt,
-    ))
-  }
+  // The row model's dormant split (inert while narrowed or under a non-date sort),
+  // then the hover hold on top of it.
+  const splitStale = (list: Slot[]): StaleSplit<Slot> =>
+    holdStaleSide(sidebarRows.staleSplit(list, { collapseMs: staleCollapseMs, isExempt: isStaleExempt }))
   const renderStaleSection = (containerId: string, staleSlots: Slot[], depth: number, containerName?: string): React.ReactNode => {
     if (staleSlots.length === 0) return null
     const open = staleExpanded.has(containerId)
@@ -2925,10 +2795,6 @@ function ChatSidebar({
     folderEditInputRef, editingId, setEditingId, editScope, setEditScope, editName, setEditName,
   } = useFolderRename({ renamingSlot, suppressMenuRestoreRef })
 
-  const {
-    sidebarWidth, sidebarWidthRef, sidebarResize, nudgeSidebar, widenForBoard, restorePreBoardWidth,
-  } = useSidebarResize({ onWidthChange, onDragChange })
-
   // Folders via React Query. `isSuccess` gates the stale-collapse move
   // watcher below: before folder data has actually ARRIVED `folders` is the
   // [] default, so every filed slot would read as "just moved" the moment
@@ -2944,6 +2810,18 @@ function ChatSidebar({
     rawColumns, tagColumnsSettled, columnsFailed, columnsError, refetchColumns, tagColumnsEnabled,
     hideEmptyFolderBody, orderedColumns,
   } = useBoardColumns()
+  // After the columns: only board view may widen the sidebar past SIDEBAR_MAX.
+  const {
+    paintedSidebarWidth, rootStyle, sidebarMax, paintedWidthRef, sidebarResize, nudgeSidebar, widenForBoard, restorePreBoardWidth,
+  } = useSidebarResize({ onWidthChange, onDragChange, fillsHost, boardActive: orderedColumns.length > 0 })
+  // Which edges of the board's lane strip hide lanes. A window too narrow for
+  // every lane clips the strip at the sidebar's edge, and an overlay scrollbar
+  // leaves no standing sign that more lanes sit past it, so the strip paints an
+  // edge cue from these (the session tab strip's cue width). The box
+  // observer covers a resize; a lane added or removed changes only the
+  // content, so the column count re-measures it.
+  const [attachStripEdges, stripEdges, remeasureStripEdges] = useScrollEdges<HTMLDivElement>()
+  useEffect(() => { remeasureStripEdges() }, [orderedColumns.length, remeasureStripEdges])
   usePinnedOrderAuthority({ orderState: pinnedOrderState, slotsLoaded, tagColumnsSettled, orderedColumns })
   const {
     columnEditId, setColumnEditId, popoverPos, columnPopoverRef, columnPopoverImeLatch, closeColumnPopover,
@@ -2952,10 +2830,10 @@ function ChatSidebar({
   const {
     updateColumnMutation, deleteColumnMutation, reorderColumnsMutation, addColumnAfterMutation,
     dropSlotMutation, missingLanes, seedStateLanesMutation,
-  } = useBoardColumnMutations({ queryClient, setBoardError, orderedColumns, rawColumns, sidebarWidthRef, widenForBoard, setSeedError })
+  } = useBoardColumnMutations({ queryClient, setBoardError, orderedColumns, rawColumns, paintedWidthRef, widenForBoard, setSeedError })
   const {
     columnMatches,
-  } = useColumnMatches({ subagentCounts, subagentApprovalCounts, workflowActiveSet, automationRunningSet })
+  } = useColumnMatches({ subagentStartedCounts, subagentApprovalCounts, workflowActiveSet, automationRunningSet })
 
   const {
     slotFolders, foldersWithActiveSubtree, setRevealForcedVisible, isFolderHidden, filterHiddenSubtree,
@@ -2967,131 +2845,14 @@ function ChatSidebar({
     searchRanked, folderNameMatchIds,
   } = useSearchMatches({ slotFilter, slotSearchRanks, folders, isFolderHidden })
 
-  /**
-   * THE single declaration of every filter dimension. `filteredSlots`,
-   * `listNarrowed`, and `revealBlockingFilters` all derive from this list, so
-   * adding a dimension is one entry here — the required fields force a
-   * decision per consumer, and THOSE THREE consumers cannot drift because
-   * none of them enumerates dimensions itself any more. The guard's limit:
-   * this declaration cannot see filtering done at the render sites (the
-   * folder dimension works that way), so a dimension that acts there must
-   * still answer `narrows` for real — writing `null` while narrowing the
-   * visible list at a render site re-creates the under-count this exists to
-   * prevent.
-   *
-   * The consumers legitimately answer different questions, and the per-field
-   * differences below are deliberate, not drift:
-   * - the folder dimension filters no rows (`filtersRow: null` — it drops
-   *   whole folder blocks/lanes at the render sites) and never narrows
-   *   (`narrows: null` — see the field docs on `FilterDimension`);
-   * - tags narrow by the RESOLVED `activeTagIds` but hide by the raw
-   *   `filterTagIds`, so a reveal arriving while the tag vocabulary is still
-   *   loading (when nothing is filtered yet) still clears the tag filter
-   *   instead of leaving the row to be re-hidden mid-flight.
-   *
-   * Bundling every consumer's state into one memo couples them: a change to
-   * reveal-only state (`filterTagIds`, `filterHiddenSubtree`, `folders`)
-   * re-derives `filteredSlots` — one extra filter+sort with content-identical
-   * rows. Accepted: no effect keys on `filteredSlots`, and its downstream
-   * memos already depend on that state themselves.
-   */
-  const filterDimensions = useMemo<FilterDimension[]>(() => {
-    // A paused filter keeps its chip but narrows nothing, so the whole status
-    // dimension goes inert while the pause is on.
-    const activeFilterDefs = filtersPaused ? [] : SESSION_FILTERS.filter(filterDef => activeFilters.has(filterDef.key))
-    return [
-      {
-        // Tags. Unlike the folder filter this does NOT go inert while
-        // searching: it is a session property, so it behaves like the
-        // Unread/Pinned status chips.
-        filtersRow: slot => activeTagIds.size === 0 || (slot.tags ?? []).some(id => activeTagIds.has(id)),
-        narrows: () => activeTagIds.size > 0,
-        // Raw `filterTagIds`, not resolved `activeTagIds`, and not behind
-        // `excluded`: mid-flight nothing is filtered, so the row is re-hidden.
-        hides: slot => filterTagIds.size > 0 && !(slot.tags ?? []).some(id => filterTagIds.has(id)),
-        clear: () => clearTagFilter(),
-      },
-      {
-        // Text search: title + source links, never key/agent (rows the backend
-        // excluded) — a badge id is a card-visible PROPERTY, like tags above.
-        filtersRow: slot => {
-          if (!slotFilter) return true
-          const q = slotFilter.toLowerCase()
-          // The slot's own CONTAINER matched by name: the query named the folder,
-          // so everything filed in it is what was asked for. Checked before the
-          // per-slot fields because it is the cheapest test and, for a folder
-          // search, the only one that can pass. `localSlotFolder`, not a raw
-          // `slotFolders` lookup, for the same reason the folder row's own count
-          // uses it: a peer row is never in a local folder, and a colliding key
-          // would otherwise pull a session this machine does not own into it.
-          const container = localSlotFolder(slot, slotFolders)
-          if (folderNameMatchIds && container && folderNameMatchIds.has(container)) return true
-          const titleMatch = (slot.title || '').toLowerCase().includes(q)
-          // Both id spellings match by PREFIX, so progressive typing works while an
-          // interior run of the digits — an accident, not an id — does not.
-          const sourceMatch = (slot.source_links ?? []).some(link =>
-            String(link.number).startsWith(q)
-            || chipLabel(link).toLowerCase().startsWith(q))
-          // `searchRanked` keys are LOCAL slot keys, so a remote row whose key
-          // happens to collide with a ranked local one must not ride in on it —
-          // remote rows match on their own visible fields only. Same guard as
-          // the rank comparator in `filteredSlots`.
-          if (searchRanked) return (!isPeerRow(slot) && searchRanked.has(slot.key)) || titleMatch || sourceMatch
-          return sourceMatch
-            || ((slot.title || '') + slot.key + (slot.agent || '')).toLowerCase().includes(q)
-        },
-        narrows: () => Boolean(slotFilter),
-        hides: (slot, excluded) => Boolean(slotFilter) && excluded(slot),
-        clear: () => setSlotFilter(''),
-      },
-      {
-        // Status chips (SESSION_FILTERS). Active chips OR together: a row
-        // passes when any active chip's predicate matches it. `activeFilterDefs`
-        // is empty while the filters are paused, so every row passes and the
-        // dimension neither narrows nor hides.
-        filtersRow: slot => activeFilterDefs.length === 0 || activeFilterDefs.some(filterDef => _derivedLookup[filterDef.key](slot)),
-        narrows: () => activeFilterDefs.length > 0,
-        hides: (slot, excluded) => activeFilterDefs.length > 0 && excluded(slot),
-        // Persisted inside the hook: a remount re-reads the stored '1' (or '2')
-        // and would silently restore the filter that hides this row.
-        clear: () => clearAllFilters(),
-      },
-      {
-        // Folder filter. It filters no rows and never narrows (see the memo
-        // doc above). The folder-EXPANSION step lives outside the reveal
-        // registry on purpose: it runs whether or not this filter was hiding
-        // anything.
-        filtersRow: null,
-        narrows: null,
-        hides: slot => {
-          const folderId = localSlotFolder(slot, slotFolders)
-          return !!folderId && filterHiddenSubtree.has(folderId)
-        },
-        clear: slot => {
-          // Un-hide the target's ancestor chain (persisted, mirroring
-          // toggleFolderFilter). Cycle-guarded like filterHiddenSubtree.
-          setFilterHiddenFolders(prev => {
-            const next = new Set(prev)
-            const visited = new Set<string>()
-            let curId = localSlotFolder(slot, slotFolders)
-            while (curId && !visited.has(curId)) {
-              visited.add(curId)
-              next.delete(curId)
-              const cid = curId
-              curId = folders.find(f => f.id === cid)?.parent_id
-            }
-            safeSetItem(HIDDEN_FOLDERS_LS_KEY, JSON.stringify([...next]))
-            return next
-          })
-        },
-      },
-    ]
-  }, [activeFilters, filtersPaused, activeTagIds, filterTagIds, clearTagFilter, slotFilter, folderNameMatchIds, searchRanked, _derivedLookup, filterHiddenSubtree, folders, slotFolders, clearAllFilters, setFilterHiddenFolders])
+  // The folder filter goes inert while searching, in BOTH views: a query must
+  // reach every match, so an unchecked folder can never become a search dead
+  // end. Everything that consults the filter routes through this flag.
+  const folderFilterActive = slotFilter.trim() === '' && filterHiddenFolders.size > 0
 
-  // State and in the memo deps on purpose, not a ref: a frozen run caches its
-  // stale list against new deps, so clearing a ref would invalidate nothing.
+  // While a drag is in flight the row model keeps the filtered list it had when the
+  // drag started, so the lanes hold still under the pointer.
   const [dragFrozen, setDragFrozen] = useState(false)
-  const frozenSlotsRef = useRef<Slot[]>([])
   // Layout-projection budget: every enrolled session row belongs to one
   // LayoutGroup, and Framer measures getBoundingClientRect for each enrolled
   // node on a commit. renderSessionRow therefore enrolls only the first
@@ -3102,80 +2863,77 @@ function ChatSidebar({
   // directly and re-renders on change.
   const reduceMotion = useReducedMotion()
 
-  /**
-   * The one order every session lane uses. Extracted so the conductor lane can sort
-   * the FULL row set the same way `filteredSlots` sorts the narrowed one: that lane
-   * builds its tree from every row, and a comparator of its own would make the two
-   * lanes disagree about the same two sessions for no reason a user could see.
-   */
-  const laneOrder = useCallback((a: Slot, b: Slot) => searchRanked
-    ? ((!isPeerRow(a) ? searchRanked.get(a.key) : undefined) ?? Infinity)
-      - ((!isPeerRow(b) ? searchRanked.get(b.key) : undefined) ?? Infinity)
-    : compareLocalPinnedThenSort(a, b, sortKey, pinned, pinnedRank),
-    [searchRanked, sortKey, pinned, pinnedRank])
-
-  const filteredSlots = useMemo(() => {
-    if (dragFrozen) return frozenSlotsRef.current
-    // Live sessions from connected remote instances join the LIVE list, not the
-    // history drawer: `api/chat/slots` returns the peer's OPEN sessions, and
-    // filing those under "Older Sessions" (empty state: "closed tabs appear
-    // here") stated the wrong thing about them. Merged ahead of the filter and
-    // the sort so a remote row is narrowed and ordered by exactly the same rules
-    // as a local one.
-    //
-    // Remote rows remain filterable by their own title/activity/running data,
-    // but local key-indexed state (folders, pins, unread, search ranks) is read
-    // only after the origin check. A deterministic peer key can equal a local
-    // key, so absence of peer metadata is not a sufficient isolation boundary.
-    // Board columns enforce their separate local-only contract below.
-    const next = allRows
-      // Derived from filterDimensions — the single declaration above — so this
-      // site cannot hold a filter dimension the other consumers miss.
-      .filter(slot => filterDimensions.every(d => d.filtersRow === null || d.filtersRow(slot)))
-      // Active content search: order by the backend's relevance ranking instead
-      // of the sidebar sort (mirrors the Older Sessions lane and the command
-      // palette). Pinning stays a reachability promise for browsing, not a
-      // ranking hint inside explicit search results.
-      .sort(laneOrder)
-    frozenSlotsRef.current = next
-    return next
-  },
-    [allRows, filterDimensions, laneOrder, dragFrozen]
-  )
+  // The reveal's ways to drop the search and a row's folder hide (the hidden ancestor
+  // chain, walked over the current folders). The tag and status clears are stable
+  // owner callbacks.
+  const clearSearch = useCallback(() => setSlotFilter(''), [])
+  const clearFolderHide = useCallback((folderId: string | undefined) => unhideFolderChain(folderId, folders),
+    [unhideFolderChain, folders])
+  // Per-machine groups (preview): a row a crew owns, or a local slot whose turns
+  // run on it, leaves the Local lanes and renders under that crew's group, in the
+  // same filtered order. The board keeps every row in its columns, so it groups
+  // nothing.
+  const shownCrewGroups = orderedColumns.length > 0 ? NO_CREW_GROUPS : crewGroups
+  // The row model (./chat-sidebar/rows): which rows pass the filters, the one lane
+  // order, the lanes' and folders' populations, the reveal registry and the chip
+  // counts. Live sessions from connected remote instances are merged in ahead of the
+  // filter and the sort, so a remote row is narrowed and ordered by exactly the same
+  // rules as a local one, while local key-indexed state is read only after the
+  // model's origin check. Rebuilt every render from the previous result: each
+  // memoized output keeps its identity while the inputs it reads hold still; the
+  // result, its `lanes`, `staleSplit` and `views` are fresh per build.
+  const previousRowsRef = useRef<SidebarRows | null>(null)
+  const sidebarRows = buildSidebarRows({
+    rows: allRows,
+    local: {
+      folderOf: slotFolders, pinned, pinnedRank, unread: unreadSet, running: runningSet, recent: recentSet,
+      searchRanks: searchRanked,
+    },
+    filters: {
+      tags: { resolved: activeTagIds, raw: filterTagIds },
+      search: { text: slotFilter, folderMatches: folderNameMatchIds },
+      status: { active: activeFilters, hidden: hiddenFilters, paused: filtersPaused, recentWindowMs },
+      folders: { hiddenSubtree: filterHiddenSubtree, active: folderFilterActive },
+    },
+    clears: { tags: clearTagFilter, search: clearSearch, status: clearAllFilters, folder: clearFolderHide, hides: clearHiddenFilters },
+    crewGroups: shownCrewGroups,
+    sortKey,
+    clock: Date.now,
+    frozen: dragFrozen,
+  }, previousRowsRef.current)
+  previousRowsRef.current = sidebarRows
+  const { listNarrowed, revealBlockingFilters, laneOrder, isRowFolderHidden, isRowStatusHidden } = sidebarRows
+  // `laneSlots` is the Local lanes' rows: `filteredSlots` minus every row a crew
+  // group holds. `shownCrewRows` is each crew group's rows, the folder hide applied.
+  const {
+    main: laneSlots, crew: shownCrewRows, crewRowCount: shownCrewRowCount,
+    flat: flatSlots, ungrouped: ungroupedSlots, boardPeerCount,
+  } = sidebarRows.lanes
+  const filterCounts = sidebarRows.statusCounts
+  const [collapsedCrews, toggleCrewCollapsed, expandCrew] = useCollapsedCrews()
 
   const { hoverPinRef, heldDisplacedRef, releaseHoverPin, heldLane, onRootPointerOver } = useHoverHold()
 
-  // Which lane the sidebar is actually rendering. Mirrors the render branches
-  // below exactly: the tag-column board wins when columns exist — flat view
-  // does not replace it, it applies INSIDE each lane (folders skipped, the
-  // lane's rows render flat; see the column body). Otherwise flat wins when
-  // there are folders to flatten, otherwise the folder tree. The folder
-  // filter applies to the flat lane and the tree, NOT to the board.
-  const boardLaneActive = orderedColumns.length > 0
-  // Counted off `filteredSlots`, the same list the board filters, so the notice
-  // reports what the CURRENT filters would have shown — not every peer row that
-  // exists. Peer OWNERSHIP only: a local slot that merely EXECUTES on a peer is
-  // a board citizen like any other and is not counted here.
-  const peerRowsHiddenFromBoard = useMemo(
-    () => filteredSlots.filter(isPeerRow).length,
-    [filteredSlots],
-  )
-  const flatLaneActive = !boardLaneActive && flatView && folders.length > 0
-
   const { lineageAvailable } = useLineageAvailable({ allRows })
-  // Gated on `lineageAvailable` as well as the board, and the reason is the toggle:
+  // Which lane the sidebar is actually rendering (see `renderedLane`). The tag-column
+  // board wins when columns exist — flat view does not replace it, it applies INSIDE
+  // each column (folders skipped, the column's rows render flat). The conductor lane
+  // is gated on `lineageAvailable` as well as the board, and the reason is the toggle:
   // it renders only when more than one lane is available, so with a persisted
   // conductor preference, no edges and no folders the cycle holds `tree` alone, the
   // button is not drawn at all, and an ungated lane would render a layout the user has
-  // no control to leave. Falling back is the safe direction -- the lane returns by
-  // itself the moment any row carries a creator again.
-  const conductorLaneActive = !boardLaneActive && conductorView && lineageAvailable
+  // no control to leave. The folder filter applies to the flat lane and the tree, NOT
+  // to the board.
+  const shownLane = renderedLane({ lane, boardColumns: orderedColumns.length, folders: folders.length, lineageAvailable })
+  const boardLaneActive = shownLane === 'board' || shownLane === 'board-flat'
+  const flatLaneActive = shownLane === 'flat'
+  const conductorLaneActive = shownLane === 'conductor'
   // Whether any folder ROW is on screen to drag: the tree, and the board unless
   // flat view empties its columns of folders (`relevantFolders`). The flat lane
   // explodes chats out of their folders and the conductor lane nests by lineage.
   // Gates only the copy about DRAGGING (the menu's reorder note) -- the folder
   // order itself is read and offered in every lane.
-  const folderRowsDrawn = boardLaneActive ? !flatView : !flatLaneActive && !conductorLaneActive
+  const folderRowsDrawn = shownLane === 'tree' || shownLane === 'board'
 
   // Scroll memory for the session lane. Collapsing the sessions sidebar (or
   // closing the mobile drawer) UNMOUNTS ChatSidebar — OverlayDrawer gates its
@@ -3203,57 +2961,51 @@ function ChatSidebar({
     laneScrollRef,
   )
 
-  useHoverPinLiveness({ hoverPinRef, releaseHoverPin, filteredSlots, boardLaneActive, flatLaneActive, conductorLaneActive, orderedColumns })
+  useHoverPinLiveness({ hoverPinRef, releaseHoverPin, filteredSlots: laneSlots, boardLaneActive, flatLaneActive, conductorLaneActive, orderedColumns })
 
-  // The folder filter goes inert while searching, in BOTH views: a query must
-  // reach every match, so an unchecked folder can never become a search dead
-  // end. Everything that consults the filter routes through this flag.
-  const folderFilterActive = slotFilter.trim() === '' && filterHiddenFolders.size > 0
-
-  // Is the list narrowed at all? Derived from filterDimensions: a dimension
-  // participates through its required `narrows` field, so this site cannot
-  // silently miss one (a missed dimension used to strand the folder lane's
-  // folders as empty "New chat in <name>" shells).
-  const listNarrowed = filterDimensions.some(d => d.narrows !== null && d.narrows())
-
-  useStaleNarrowBridge({ listNarrowed, filteredSlots, staleCollapseMs, sortKey, isStaleExempt, setStaleExpanded, slotFolders })
+  useStaleNarrowBridge({ listNarrowed, filteredSlots: laneSlots, staleCollapseMs, sortKey, isStaleExempt, setStaleExpanded, slotFolders })
   // Reduced motion disables every row. Otherwise renderSessionRow enrolls only
   // the first SIDEBAR_DISPLACEMENT_WINDOW paint positions in layout projection,
   // bounding Framer's measurement set without a total-list-size cliff.
-  const rowAnimEnabled = !reduceMotion
-
-  /** Every filter that can hide a reveal target, derived from
-   *  `filterDimensions`: the reveal effect iterates this list instead of
-   *  naming the dimensions by hand. Deliberately NOT `listNarrowed` above —
-   *  that asks "is anything filtering?", this asks "does THIS row fail a
-   *  filter?", and each dimension answers the two questions separately
-   *  (`narrows` vs `hides`) in its one declaration. */
-  const revealBlockingFilters = useMemo<RevealBlockingFilter[]>(() => {
-    // Search and status defer to list membership: both rank against backend
-    // state (relevance, unread) that a single row cannot answer for alone.
-    const excluded = (slot: Slot) => {
-      const identity = sessionRowIdentity(slot)
-      return !filteredSlots.some(s => sessionRowIdentity(s) === identity)
-    }
-    return filterDimensions.map(d => ({
-      hides: (slot: Slot) => d.hides(slot, excluded),
-      clear: d.clear,
-    }))
-  }, [filterDimensions, filteredSlots])
+  // `rowAnimEnabled` itself is derived below the pinned-header hold, which
+  // also turns it off (see `instantCloseId`).
 
   const {
     isFolderFilteredOut, revealedContainers, toggleReveal, hiddenByContainer, allHiddenFolders,
     hiddenFolderCount,
   } = useFolderFilterReveal({ folderFilterActive, filterHiddenFolders, folders, isFolderHidden, folderCompare, boardLaneActive })
-
-  const {
-    isRowFolderHidden, flatSlots,
-  } = useFlatLane({ folderFilterActive, slotFolders, filterHiddenSubtree, filteredSlots })
-
   const {
     citedCreatorExists, conductorRows, conductorMatching, lineage, conductorExpanded, toggleConductorExpanded,
     expandConductorAncestors,
-  } = useConductorLane({ conductorLaneActive, allRows, allLiveSlots, isRowFolderHidden, laneOrder, flatSlots })
+  } = useConductorLane({ conductorLaneActive, allRows, allLiveSlots, isRowFolderHidden, isRowStatusHidden, laneOrder, flatSlots })
+  // The rows the conductor lane may show, by identity: every match, plus each
+  // ancestor a match needs to hang from. The lane draws exactly these, the ✕
+  // label counts exactly these, and the tree close plans over exactly these, so
+  // a press can never reach a worker the filter or a hidden folder kept off screen.
+  const conductorKept = useMemo(() => {
+    const kept = new Set<string>()
+    if (!lineage) return kept
+    const onLane = new Set(conductorRows.map(s => sessionRowIdentity(s)))
+    for (const id of conductorMatching) {
+      if (!onLane.has(id)) continue
+      kept.add(id)
+      for (const up of ancestorsOf(id, lineage.parentOf)) kept.add(up)
+    }
+    return kept
+  }, [lineage, conductorRows, conductorMatching])
+  const conductorSearching = slotFilter.trim() !== ''
+  const treeCloseRows = useMemo(
+    () => localSlots.filter(s => conductorKept.has(sessionRowIdentity(s))),
+    [localSlots, conductorKept],
+  )
+  // Reveal opens the crew group holding the target, then the lane's own ancestors.
+  // Looked up in `allRows`: the reveal may be clearing the filter that hides it.
+  const expandRevealAncestors = useCallback((identity: string) => {
+    const row = allRows.find(s => sessionRowIdentity(s) === identity)
+    const crew = row ? crewOf(row) : undefined
+    if (crew && shownCrewRows.has(crew)) expandCrew(crew)
+    expandConductorAncestors(identity)
+  }, [allRows, shownCrewRows, expandCrew, expandConductorAncestors])
 
   const {
     availableLanes, nextLane, laneSwitchLabel, cycleLane,
@@ -3264,11 +3016,24 @@ function ChatSidebar({
 
   const {
     folderFilterRows,
-  } = useFolderFilterRows({ filteredSlots, slotFolders, folders, folderCompare, filterHiddenFolders, filterHiddenSubtree })
+  } = useFolderFilterRows({ folderTree: sidebarRows.folderTree, folders, folderCompare, filterHiddenFolders, filterHiddenSubtree })
 
   const {
     createFolderMutation, deleteFolderMutation, updateFolderMutation, toggleCollapse,
   } = useFolderMutations({ queryClient, setFolderActionError, folders })
+  // The list view's toggle. Its folder headers are sticky, so a collapse also
+  // moves the lane to keep a pinned header where it is painted, in the commit
+  // that hides the body (see stickyCollapse.ts); `from` is the pressed control,
+  // inside the folder block.
+  const { armHold, disarm: disarmHold, instantCloseId } = useHoldPinnedHeaderOnCollapse(laneScrollRef, folders)
+  // A collapse from a pinned header takes the reduced-motion path for its one
+  // commit (`instantCloseId`, see stickyCollapse.ts).
+  const rowAnimEnabled = !reduceMotion && instantCloseId === null
+  const toggleListFolderCollapse = (folder: ChatFolder, from: HTMLElement) => {
+    if (folder.collapsed) disarmHold()
+    else armHold(folder.id, from.closest<HTMLElement>('[data-folder-drop]'))
+    toggleCollapse(folder.id)
+  }
 
   const { clearBoardCollapse, boardFolderCollapsed, toggleColumnCollapse } = useBoardFolderCollapse()
 
@@ -3283,6 +3048,15 @@ function ChatSidebar({
   const [activeDrag, setActiveDrag] = useState<{ type: string; id: string } | null>(null)
   // Its native counterpart: the board card in flight, which no DndContext sees.
   const { nativeSessionDrag, startNativeSessionDrag, endNativeSessionDrag } = useNativeSessionDrag()
+  // The derived lane a session card hovers right now. Such a lane refuses the
+  // drop, and its header's hover title is out of sight mid-drag, so the lane
+  // says why in a visible line instead. It shows only while `nativeSessionDrag`
+  // is set, so the card drag's own end hides it; a new drag starts it clean.
+  const [derivedHintCol, setDerivedHintCol] = useState<string | null>(null)
+  const startBoardCardDrag = useCallback((key: string) => {
+    setDerivedHintCol(null)
+    startNativeSessionDrag(key)
+  }, [startNativeSessionDrag])
   const {
     reorderFolders, moveFolderTo,
   } = useFolderDropOps({ folderReorderable, queryClient, setFolderActionError, updateFolderMutation })
@@ -3290,7 +3064,7 @@ function ChatSidebar({
 
   const {
     revealFlash,
-  } = useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealBlockingFilters, staleCollapseMs, sortKey, isStaleExempt, slotFolders, setStaleExpanded, expandFolderAncestors, expandConductorAncestors, folders, setSlotFilter, setFilterHiddenFolders, setRevealForcedVisible, setFlatView })
+  } = useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealBlockingFilters, staleCollapseMs, sortKey, isStaleExempt, slotFolders, setStaleExpanded, expandFolderAncestors, expandConductorAncestors: expandRevealAncestors, folders, setSlotFilter, setFilterHiddenFolders, setRevealForcedVisible, setFlatView })
   const renameCommit = useCallback((id: string, name: string) => {
     if (name.trim()) updateFolderMutation.mutate({ id, body: { name: name.trim() } })
     setEditingId(null)
@@ -3303,6 +3077,34 @@ function ChatSidebar({
   // each behaviour has one definition. Rename + Tags stay local (they drive this
   // component's inline-edit + tag-popover state).
   const sessionActions = useSessionActions(mode)
+  // The row ✕ closes the card AND the sessions nested under it, so on a lead it can
+  // end several workers' turns at once. `useCloseSessionTree` owns that: it plans the
+  // subtree from the same lineage edges this lane nests by, asks before destroying
+  // work still in flight, and falls back to `sessionActions.close` verbatim for a card
+  // with nothing under it. `runningSet` is passed as the predicate so the
+  // dialog marks exactly the rows the lane draws as running.
+  // Passed plain, not memoized: the hook reads its inputs through a ref so that
+  // `closeSessionTree` keeps one identity for the sidebar's life, which is what
+  // lets it ride into each row's memoized menu props without busting the row memo.
+  // `subagentCounts[s.key] > 0`: a worker whose own turn has ended while its
+  // background subagent is still working looks idle to `runningSet`, but it has
+  // active work that the tree close would silently cancel. Include it in the
+  // guard so those workers block the cascade the same way a running turn does.
+  const { closeSessionTree, closeTreeDialog, closeTreeError, closeTreeNotice } = useCloseSessionTree({
+    rows: treeCloseRows,
+    allRows: localSlots,
+    isRunning: (s: Slot) => sidebarRowRunning(s, runningSet, subagentCounts),
+    isBackgroundOnly: (s: Slot) => sidebarRowBackgroundOnly(s, runningSet, subagentCounts),
+    closeOne: sessionActions.close,
+    // The still-running notice links each running session to itself, opened the
+    // same way a press on its row opens it, so the person can stop it there.
+    openOne: (key: string) => { dispatch(switchSlot({ key, announceOnMissing: true })); onSelectSlot?.(key) },
+  })
+  // The tree-close guard is scoped to the conductor lane while it nests: tree
+  // nesting is only visible there. In the flat, folder and board lanes, and in the
+  // conductor lane while a search flattens it, the user sees no nested structure,
+  // so pressing ✕ on a session closes exactly that one session.
+  const treeClose = conductorLaneActive && !conductorSearching ? closeSessionTree : sessionActions.close
   // Which sessions are currently open in a popped-out window (shared singleton).
   const { poppedOut } = useChatPopouts()
   const {
@@ -3316,7 +3118,7 @@ function ChatSidebar({
   const {
     crewPreview, openCrewMembers, remoteCrewChatPreview,
     createChatMutation, createRemoteChatMutation, createEphemeralChatMutation,
-  } = useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode, onOpenSlotInNewTab, setRemoteCrewError, setNewChatMenuOpen })
+  } = useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode, onOpenSlotInNewTab, setRemoteCrewError, setNewChatMenuOpen, onOpenPeerSession })
   // A conductor-lane member anchor opens on the Members page (see renderSessionRow).
   const navigate = useNavigate()
   // The Dynamic Dashboard is a Feature Preview (Settings > Developer): the
@@ -3329,13 +3131,13 @@ function ChatSidebar({
 
   // ── Session row (reference-style: color palette, memory_mode, rename on right-click) ──
   // Does any descendant (direct or nested) of `folderId` contain a slot from `slots`?
-  function descendantMatch(fs: ChatFolder[], folderId: string, slots: Slot[], slotFolderMap: Record<string, string>, visited = new Set<string>()): boolean {
+  function descendantMatch(fs: ChatFolder[], folderId: string, slots: Slot[], visited = new Set<string>()): boolean {
     if (visited.has(folderId)) return false // cycle guard
     visited.add(folderId)
     for (const child of fs) {
       if (child.parent_id !== folderId) continue
-      if (slots.some(s => localSlotFolder(s, slotFolderMap) === child.id)) return true
-      if (descendantMatch(fs, child.id, slots, slotFolderMap, visited)) return true
+      if (slots.some(s => sidebarRows.folderOf(s) === child.id)) return true
+      if (descendantMatch(fs, child.id, slots, visited)) return true
     }
     return false
   }
@@ -3344,7 +3146,7 @@ function ChatSidebar({
   // Always render the folder header (even with 0 matches) so users can see + drop into it.
   const renderColumnFolder = (folder: ChatFolder, columnId: string, colSlotKeys: Set<string>, dragHandleProps?: React.HTMLAttributes<HTMLElement>, forceCollapsed?: boolean): React.ReactNode => {
     const childFolders = folders.filter(f => f.parent_id === folder.id).sort(folderCompare)
-    const { rows: childSlots, navScope: folderLaneScope, container: folderHoldContainer } = heldLane(filteredSlots.filter(s => colSlotKeys.has(sessionRowIdentity(s)) && localSlotFolder(s, slotFolders) === folder.id), columnId, `board:${columnId}:folder:${folder.id}`)
+    const { rows: childSlots, navScope: folderLaneScope, container: folderHoldContainer } = heldLane(sidebarRows.folderTree.rowsIn(folder.id).filter(s => colSlotKeys.has(sessionRowIdentity(s))), columnId, `board:${columnId}:folder:${folder.id}`)
     // A nested folder the person unchecked drops out of the recursion, so neither its
     // header nor anything under it renders. Checking the folder's OWN id is enough:
     // dropping it here takes its descendants with it, the same way the tree's block
@@ -3369,12 +3171,11 @@ function ChatSidebar({
       ? (revealFlash.fading ? 'fade' : 'flash')
       : null
     const count = childSlots.length + deepChildren.filter(cf => {
-      const cfSlots = filteredSlots.filter(s => colSlotKeys.has(sessionRowIdentity(s)) && localSlotFolder(s, slotFolders) === cf.id)
+      const cfSlots = sidebarRows.folderTree.rowsIn(cf.id).filter(s => colSlotKeys.has(sessionRowIdentity(s)))
       return cfSlots.length > 0 || descendantMatch(
         folders,
         cf.id,
-        filteredSlots.filter(s => colSlotKeys.has(sessionRowIdentity(s))),
-        slotFolders,
+        laneSlots.filter(s => colSlotKeys.has(sessionRowIdentity(s))),
       )
     }).length
     // Board-view folders become sortable only when a drag handle is supplied
@@ -3616,97 +3417,114 @@ function ChatSidebar({
     )
   }
 
-  // scope namespaces the Framer layoutId per render location. A multi-tag slot
-  // can render in several columns at once; same layoutId in one LayoutGroup
-  // collides (Framer paints one, hides the rest). Distinct scope = distinct id.
-  // Paint-order stamp threaded through every row this render — see
-  // SessionRowProps.orderStamp for why the memo boundary needs it.
   const {
     startsAutomaticSection, reorderPinnedByKeyboard,
   } = usePinnedKeyboardReorder({ searchRanked, pinned, pinnedOrder, slotFolders, reorderPinned })
 
+  // A row whose session belongs to another page (a crew member's own DM thread,
+  // admitted to the conductor lane as a creator anchor) opens where it lives. Read
+  // through a ref so the row actions stay ONE stable object across route changes.
+  const navigateRef = useRef(navigate)
+  navigateRef.current = navigate
+  const openElsewhere = useCallback((path: string) => { navigateRef.current(path) }, [])
+  // What every session row can do, built once: the row's memo compares this one
+  // reference, so none of these may take a new identity per render.
+  const rowActions = useMemo(() => ({
+    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
+    onDuplicate: sessionActions.duplicate, onCloseSession: treeClose,
+    onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource,
+    onOpenPeerSession: openPeerSession,
+    onNativeDragStart: startBoardCardDrag, onNativeDragEnd: endNativeSessionDrag,
+    onPinnedKeyboardReorder: reorderPinnedByKeyboard,
+    openElsewhere, toggleConductor: toggleConductorExpanded,
+  }), [
+    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
+    sessionActions.duplicate, treeClose, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab,
+    onOpenSource, openPeerSession, startBoardCardDrag, endNativeSessionDrag, reorderPinnedByKeyboard,
+    openElsewhere, toggleConductorExpanded,
+  ])
+  // The values every row shows the same way, ONE object per change of any of them:
+  // each view holds it by reference, so it re-renders every row exactly when one of
+  // these moves. The drag members are reduced to primitives first, so a drag-over
+  // that rebuilds `activeDrag` with the same session leaves the rows alone.
+  const dragInFlight = !!activeDrag
+  const activeDraggedKey = activeDrag?.type === 'session' ? activeDrag.id : null
+  const activeDraggedPinnedIndex = activeDraggedKey !== null ? (pinnedRank.get(activeDraggedKey) ?? -1) : -1
+  const tintAgents = rowAgents ?? installedAgents
+  const rowShell: RowShell = useMemo(() => ({
+    connected, mode, defaultAgent, installedAgents: tintAgents, tagById, paletteColors, boost, boostFor, colorMode, recentTintCount,
+    // A session row on any touch screen (an iPad too) gets the single ⋯ menu,
+    // not the overlay cluster.
+    isMobile: isMobile || isTouchDevice,
+    dragInFlight, activeDraggedKey, activeDraggedPinnedIndex,
+  }), [
+    connected, mode, defaultAgent, tintAgents, tagById, paletteColors, boost, boostFor, colorMode, recentTintCount,
+    isMobile, isTouchDevice, dragInFlight, activeDraggedKey, activeDraggedPinnedIndex,
+  ])
+  // What this render shows rows with. The row model reads the local-only members
+  // for a local row alone.
+  const rowScene: RowScene = {
+    activeSlot, crewWindow, shell: rowShell,
+    local: {
+      recentRank, subagentCounts, subagentApprovalCounts, poppedOut,
+      digits: digitModifierHeld ? shortcutDigitByKey : null,
+      renaming: { key: renamingSlot, scope: renameScope, value: renameValue },
+      revealFlash, nativeDragKey: nativeSessionDrag,
+    },
+    drag: activeDrag,
+  }
+  const rowViews = sidebarRows.views(rowScene)
+  // The active-row highlight. `activeSlot` names a LOCAL session and a peer row can
+  // carry a byte-identical key, so the row model lights a peer row only for the crew
+  // window open on its own (crew, key) pair, and a local row only while no crew
+  // window is open; five lanes ask it (list folders, fresh children, flat, board
+  // root, board columns), each also of the NEXT row to decide dividers.
+  const isActiveRow = rowViews.isActive
+
+  // scope namespaces the Framer layoutId per render location. A multi-tag slot
+  // can render in several columns at once; same layoutId in one LayoutGroup
+  // collides (Framer paints one, hides the rest). Distinct scope = distinct id.
+  // Paint-order stamp threaded through every row this render — see
+  // RowPlacement.orderStamp for why the memo boundary needs it.
   let sessionRowOrderStamp = 0
-  const renderSessionRow = (s: Slot, _indent: number, showDivider: boolean, scope = 'list', navScope = scope, holdContainer = navScope, conductor?: ConductorRowExtras) => {
-    // Every per-slot lookup below is keyed by LOCAL slot key, and a peer key can
-    // be byte-identical to a local one, so each is masked on `isPeer` rather than
-    // trusted to miss. Note this is peer OWNERSHIP: a remote-EXECUTED local slot
-    // is `false` here and keeps its unread dot, digit shortcut and pin rank.
-    const isPeer = isPeerRow(s)
-    const rowIdentity = sessionRowIdentity(s)
-    const renamingHere = !isPeer && renamingSlot === s.key && renameScope === scope
-    // A LOCAL row whose surface this page does not render -- today a crew member's
-    // own DM thread, admitted to the conductor lane as a creator anchor (see
-    // `creatorAnchors`). `ChatPage` filters these out of `localSlots`, so the only
-    // way one reaches this renderer is through that lane, and the only place its
-    // conversation can be opened is the Members page. Same predicate the page
-    // filters by, so the two cannot disagree about which rows belong here.
-    const openElsewhere = !isPeer && !isChatPageSurface(s.surface ?? s.mode)
-      ? () => navigate(s.mode === 'member' && s.agent
-        ? `/members?member=${encodeURIComponent(s.agent)}`
-        : '/members')
-      : undefined
+  const renderSessionRow = (s: Slot, _indent: number, showDivider: boolean, scope = 'list', navScope = scope, holdContainer = navScope, conductor?: ConductorRowView) => {
     // Clamped, not raw: rows past the window share a stamp and bail out of a
     // displacement above them (see SIDEBAR_DISPLACEMENT_WINDOW).
     const orderStamp = Math.min(sessionRowOrderStamp++, SIDEBAR_DISPLACEMENT_WINDOW)
-    const isActive = isActiveRow(s)
-    const revealing = !isPeer && revealFlash?.kind === 'session' && revealFlash.key === s.key
+    const view = rowViews.view(s, {
+      scope, navScope, holdContainer, showDivider, orderStamp, conductor,
+      // staticRows (the compositor drawer) folds into the one row-animation
+      // gate: projection under a WAAPI-driven ancestor mis-attributes the
+      // panel's motion to the rows, so the drawer disables row animation
+      // wholesale. Outside it, enroll only the first two-viewport paint
+      // window: every later row shares the clamped stamp and snaps, keeping
+      // Framer's projection registry bounded at every total list size.
+      rowAnimEnabled: rowAnimEnabled && orderStamp < SIDEBAR_DISPLACEMENT_WINDOW && !staticRows,
+    })
     // Windowed: far from the viewport the row renders as a cheap stub (see
     // pages/chat/sessionRowWindow). Each window root (the lane, or one board
     // column) mounts its own first rows at once so the initial paint shows real
-    // rows; the active, renaming, dragged and revealed rows never stub, because
-    // each holds state a remount would drop.
+    // rows; the row model's `windowOf` names the rows that never stub.
+    const { title, keepMounted } = rowViews.windowOf(s)
     return (
-      <WindowedSessionRow key={rowIdentity} rowId={rowIdentity} slotKey={s.key} navScope={navScope} holdContainer={holdContainer}
-        title={s.title && s.title !== s.key ? s.title : s.key}
-        keepMounted={isActive || revealing || (!isPeer && renamingSlot === s.key) || (activeDrag?.type === 'session' && activeDrag.id === s.key) || (!isPeer && nativeSessionDrag === s.key)}>
-      <SessionRow slot={s} orderStamp={orderStamp}
-        onAdoptPeerSession={adoptPeerSession}
-        adoptPending={isPeer && !!adoptPending[rowIdentity]}
-        adoptError={isPeer ? (adoptErrors[rowIdentity] || '') : ''}
-        showDivider={showDivider} scope={scope} navScope={navScope} holdContainer={holdContainer} conductor={conductor}
-        isActive={isActive} connected={connected} isOut={!isPeer && poppedOut.has(s.key)}
-        isPinned={!isPeer && pinned.has(s.key)} isUnread={!isPeer && unreadSet.has(s.key)}
-        isRunning={isPeer ? s.running === true : runningSet.has(s.key)}
-        recent={isPeer ? undefined : recentRank.get(s.key)} recentTintCount={recentTintCount}
-        subagentCount={isPeer ? 0 : (subagentCounts[s.key] || 0)} subagentApprovalCount={isPeer ? 0 : (subagentApprovalCounts[s.key] || 0)}
-        digitBadge={!isPeer && digitModifierHeld ? shortcutDigitByKey.get(s.key) : undefined}
-        isRenaming={!isPeer && renamingSlot === s.key} renamingHere={renamingHere}
-        renameValue={renamingHere ? renameValue : ''}
-        revealFlash={!isPeer && revealFlash?.kind === 'session' && revealFlash.key === s.key ? (revealFlash.fading ? 'fade' : 'flash') : null}
-        dragInFlight={!!activeDrag}
-        activeDraggedKey={activeDrag?.type === 'session' ? activeDrag.id : null}
-        activeDraggedPinnedIndex={activeDrag?.type === 'session' ? (pinnedRank.get(activeDrag.id) ?? -1) : -1}
-        onNativeDragStart={startNativeSessionDrag}
-        onNativeDragEnd={endNativeSessionDrag}
-        // `pinnedRank` is a local-pin ordering, so a peer row reports -1 (outside
-        // the pinned band) and refuses keyboard reorder — the same stance as its
-        // `isPinned={false}`. Without the mask a key collision would hand a peer
-        // row a rank inside the local band and let ↑/↓ rewrite local pin order
-        // from a row that is not part of it.
-        pinnedOrderIndex={isPeer ? -1 : (pinnedRank.get(s.key) ?? -1)}
-        pinnedReorderEnabled={!searchRanked && !isPeer}
-        onPinnedKeyboardReorder={reorderPinnedByKeyboard}
-        // staticRows (the compositor drawer) folds into the one row-animation
-        // gate: projection under a WAAPI-driven ancestor mis-attributes the
-        // panel's motion to the rows, so the drawer disables row animation
-        // wholesale. Outside it, enroll only the first two-viewport paint
-        // window: every later row shares the clamped stamp and snaps, keeping
-        // Framer's projection registry bounded at every total list size.
-        rowAnimEnabled={rowAnimEnabled && orderStamp < SIDEBAR_DISPLACEMENT_WINDOW && !staticRows}
-        defaultAgent={defaultAgent} mode={mode} isMobile={isMobile || isTouchDevice} colorMode={colorMode}
-        installedAgents={installedAgents} tagById={tagById}
-        paletteColors={paletteColors} boost={boost} boostFor={boostFor}
-        renameInputRef={renameInputRef}
-        onRenameStart={onRenameStart} onRenameChange={onRenameChange}
-        onRenameCommit={onRenameCommit} onRenameCancel={onRenameCancel}
-        onDuplicate={sessionActions.duplicate} onCloseSession={sessionActions.close}
-        onMenuCloseAutoFocus={onMenuCloseAutoFocus} onSelectSlot={onSelectSlot}
-        onOpenElsewhere={openElsewhere}
-        onOpenSlotInNewTab={onOpenSlotInNewTab} onOpenSource={onOpenSource}
-      />
+      <WindowedSessionRow key={view.identity} rowId={view.identity} slotKey={s.key} navScope={navScope} holdContainer={holdContainer}
+        title={title} keepMounted={keepMounted}>
+        <SessionRow view={view} actions={rowActions} />
       </WindowedSessionRow>
     )
   }
+
+  // The per-machine group chrome each list lane draws: `Local` above the lane's
+  // own rows, the crew groups below them. Both are null with no crew group.
+  const localGroupHeader = shownCrewGroups.length > 0 ? <LocalGroupHeader /> : null
+  const renderCrewGroups = (): React.ReactNode => shownCrewGroups.map(g => (
+    <CrewGroupSection key={g.id} group={g} rows={shownCrewRows.get(g.id) ?? []}
+      collapsed={collapsedCrews.has(g.id)} onToggle={toggleCrewCollapsed} hideWhenEmpty={listNarrowed}
+      chevron={<DisclosureChevron open={!collapsedCrews.has(g.id)} size={11} />}
+      renderRows={(rows, scope) => rows.map((s, i) => renderSessionRow(
+        s, 0, i < rows.length - 1 && !isActiveRow(s) && !isActiveRow(rows[i + 1]), scope,
+      ))} />
+  ))
 
   // ── Folder row: matches session-row width (full width minus drawer padding) ──
   // Recursively check if a folder or any descendant contains an unread slot.
@@ -3816,7 +3634,7 @@ function ChatSidebar({
   const narrowedSubtreeShowsSomething = (folder: ChatFolder, visited = new Set<string>()): boolean => {
     if (visited.has(folder.id)) return false
     visited.add(folder.id)
-    if (filteredSlots.some(s => localSlotFolder(s, slotFolders) === folder.id)) return true
+    if (sidebarRows.folderTree.rowsIn(folder.id).length > 0) return true
     if (folderNameMatchIds?.has(folder.id)) return true
     if (folderCreateError?.folderId === folder.id) return true
     if (hiddenByContainer.get(folder.id)?.length) return true
@@ -3925,10 +3743,10 @@ function ChatSidebar({
     // what this row holds either, and counting it printed a number the body below
     // could not account for.
     const childFolders = drawableChildFolders(folder)
-    // `localSlotFolder`, not a raw `slotFolders` lookup: a peer row is never in a
-    // folder, and a peer key colliding with a local one would otherwise count a
-    // session this machine does not own toward the folder it does.
-    const childSlots = filteredSlots.filter(s => localSlotFolder(s, slotFolders) === folder.id)
+    // The row model's folder index: a peer row is never in a folder, so a peer key
+    // colliding with a local one cannot count a session this machine does not own
+    // toward the folder it does.
+    const childSlots = sidebarRows.folderTree.rowsIn(folder.id)
     const count = childSlots.length + childFolders.length
     const collapsed = !!folder.collapsed
     // One derivation, not two: `renderFolderBlock` decides the body from the nodes
@@ -3977,12 +3795,10 @@ function ChatSidebar({
         {...(draggable ? dragHandleProps : {})}
         // `pl-[3px]` (3px), with no inline left-pad override. Deliberately LESS than
         // the session rows' pad, so the glyph outdents into the row gutter while the
-        // folder name lands on its sessions' text. Historically this equalled the
-        // row pad so a nested folder read as a peer of the sessions filed beside it
-        // rather than sitting a couple of px to their
-        // left. The pad is therefore NOT free: #3903 raised it to 18px to open a
-        // gutter for an absolutely-positioned unread dot, which broke guide 3. That
-        // dot is back inline on the right, where it does not compete for the pad.
+        // folder name lands on its sessions' text. The pad is NOT free: the guides
+        // below fix it, so nothing else may claim it. That is why the unread dot
+        // sits inline on the right, not in an absolutely-positioned left gutter
+        // (a gutter wide enough for it would break guide 3).
         //
         // With H = this header's box left, D = `FOLDER_BODY_INSET_PX` 2 — the
         // nested body's own left inset, applied by `FolderBody` so its collapse
@@ -4016,10 +3832,8 @@ function ChatSidebar({
         // content 255; depth 1 glyph 258, name and all three text lines 264;
         // depth 2 name/content 274; depth 3 content 284.
         //
-        // Four revisions have broken these guides by computing from class names
-        // without D: #1211 (changed 9/17/7 at once), #3766 (status gutter in flow,
-        // +18px to the content column), #3903 (name 1px past content, nested glyph
-        // 2px short), and a `px-2` attempt during this fix. Re-measure with
+        // Computing these guides from class names without D breaks them (moving
+        // the name past the content, or leaving a nested glyph short). Re-measure with
         // `website/scripts/capture-folder-glyph.mjs` under MEASURE=1 — never
         // re-derive on paper.
         // A row with no body does not light up on hover. The highlight is this
@@ -4076,7 +3890,7 @@ function ChatSidebar({
                 type: 'button' as const,
                 'aria-expanded': !collapsed,
                 'aria-label': collapsed ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name }),
-                onClick: () => toggleCollapse(folder.id),
+                onClick: (e: React.MouseEvent<HTMLElement>) => toggleListFolderCollapse(folder, e.currentTarget),
               })}>
               {/* An inert row's glyph says "inactive" by WEIGHT, not by shape. The
                *  closed shape is this product's "collapsed, click to expand"
@@ -4120,23 +3934,20 @@ function ChatSidebar({
               )}
               {folder.project_dir && <span className="text-[10px] text-accent/60 shrink-0" title={folder.project_dir}><Link2 size={9} /></span>}
               {/* Unread dot on the RIGHT, inline before the count — a state marker
-               *  reading after the text, not a gutter marker. #3903 moved it into an
-               *  absolute LEFT gutter, which forced the header's pad to 18px; that
-               *  pad is load-bearing for the alignment guides (it must equal the
-               *  session row's), so the dot goes back where it does not compete with
-               *  it. Only when collapsed: an expanded folder's child rows carry
-               *  their own markers. */}
+               *  reading after the text, not a gutter marker. The header's left pad
+               *  is load-bearing for the alignment guides, so the dot stays where it
+               *  does not compete with it. Only when collapsed: an expanded folder's
+               *  child rows carry their own markers. */}
               {hasUnread && collapsed && (
                 // Carries the same accessible name as a session row's unread
                 // marker, and the SAME i18n key: a colour-only dot is invisible to
                 // a screen reader and indistinguishable from decoration, and this
-                // one sits beside a count where that reads as styling. The session
-                // row's gutter marker has had `role="img"` + a label since #3766;
-                // this one had neither.
+                // one sits beside a count where that reads as styling. Like the
+                // session row's marker, it is `role="img"` with that label.
                 // `--ok` for the same reason as the session row's dot: it is the
                 // SAME unread state rolled up, so it reads the same semantic
                 // status token rather than the brand accent, matching the
-                // `recent` filter and the connection-status dot (#10479).
+                // `recent` filter and the connection-status dot.
                 <span className="w-2 h-2 rounded-full shrink-0" style={{ background: 'var(--ok)' }}
                   role="img"
                   aria-label={i18nT('pages.chatSidebar.agent_finished_your_turn')}
@@ -4226,7 +4037,7 @@ function ChatSidebar({
   const renderFolderBlock = (folder: ChatFolder, depth: number, visited = new Set<string>(), dragHandleProps?: React.HTMLAttributes<HTMLElement>, forceCollapsed = false): React.ReactNode[] => {
     if (depth > 10 || visited.has(folder.id)) return []
     visited.add(folder.id)
-    const childSlots = filteredSlots.filter(s => localSlotFolder(s, slotFolders) === folder.id)
+    const childSlots = sidebarRows.folderTree.rowsIn(folder.id)
     const childNodes: React.ReactNode[] = []
     // Nested subfolders are sortables, exactly as root folders are: dragging one
     // either re-orders it among its siblings (drop on a sibling's edges or body)
@@ -4316,7 +4127,7 @@ function ChatSidebar({
     const emptyBody = hideEmptyFolderBody && childNodes.length === 0
     const wrapped = childNodes.length > 0 ? (
       <div key={`folder-children-${folder.id}`} className={FOLDER_BODY_CLS}>
-        <FolderRail name={folder.name} id={folder.id} onToggle={() => toggleCollapse(folder.id)} />
+        <FolderRail name={folder.name} id={folder.id} onToggle={e => toggleListFolderCollapse(folder, e.currentTarget)} />
         {childNodes}
       </div>
     ) : emptyBody || listNarrowed ? null : (
@@ -4356,7 +4167,7 @@ function ChatSidebar({
           <div ref={setNodeRef} data-folder-drop={folder.id} style={{ '--folder-pin-stack': `calc(var(--folder-row-sticky-h) * ${depth + 1})` } as React.CSSProperties} className={`rounded-md transition-all mb-0.5${isOver ? ' ring-1 ring-accent' : ''}`}>
             {renderFolderHeader(folder, dragHandleProps, emptyBody, depth)}
             {renderFolderCreateError(folder.id)}
-            {wrapped && <FolderBody key={`folder-body-${folder.id}`} padding={FOLDER_BODY_OPEN_PADDING} open={!folder.collapsed && !forceCollapsed}>{wrapped}</FolderBody>}
+            {wrapped && <FolderBody key={`folder-body-${folder.id}`} padding={FOLDER_BODY_OPEN_PADDING} open={!folder.collapsed && !forceCollapsed} instantClose={instantCloseId === folder.id}>{wrapped}</FolderBody>}
           </div>
         )}
       </DndDroppable>,
@@ -4364,8 +4175,8 @@ function ChatSidebar({
   }
 
   const {
-    rootFolders, visibleRootFolders, rootFolderIds, ungroupedSlots,
-  } = useRootFolderLanes({ folders, folderCompare, isFolderHidden, isFolderFilteredOut, filteredSlots, slotFolders })
+    rootFolders, visibleRootFolders, rootFolderIds,
+  } = useRootFolderLanes({ folders, folderCompare, isFolderHidden, isFolderFilteredOut })
   // True while actively dragging a session that currently lives in a folder.
   // Used to reveal the empty-state drop placeholder inside the "No folder"
   // group so there's always a reachable ungroup target.
@@ -4425,12 +4236,12 @@ function ChatSidebar({
   // Narrow-sidebar header responsiveness: below ~256px the full "New chat"
   // label no longer fits next to the label + kebab, so collapse the create
   // button to icon-only; below ~200px also drop the "Sessions" label.
-  const compactHeader = sidebarWidth < 256
-  const tinyHeader = sidebarWidth < 200
+  const compactHeader = paintedSidebarWidth < 256
+  const tinyHeader = paintedSidebarWidth < 200
 
   return (
     // stable theming hook 'sidebar' — see website/docs/theming-contract.md
-    <div ref={sidebarRootRef} onPointerOver={onRootPointerOver} onPointerLeave={releaseHoverPin} className={`${LIST_SHELL_CLS} flex flex-col shrink-0 relative h-full`} style={{ width: sidebarWidth }}>
+    <div ref={sidebarRootRef} onPointerOver={onRootPointerOver} onPointerLeave={releaseHoverPin} className={`${LIST_SHELL_CLS} flex flex-col shrink-0 relative h-full`} style={rootStyle}>
       {/* Drag handle — the shared column grip (components/ResizeHandle), so
           this edge looks and behaves exactly like the Crew Members roster's and
           the app workspaces'. Positioned absolutely on the card's right border
@@ -4442,9 +4253,9 @@ function ChatSidebar({
         handleProps={sidebarResize}
         label={i18nT('pages.chatSidebar.resize_sidebar')}
         onNudge={nudgeSidebar}
-        value={sidebarWidth}
+        value={paintedSidebarWidth}
         min={SIDEBAR_MIN}
-        max={SIDEBAR_MAX}
+        max={sidebarMax}
         inset={12}
         // z-40: above the floating search dock (ListDock, z-30). Once a filter
         // chip or a notice mounts, the dock's opaque shelf spans the card's full
@@ -4479,7 +4290,18 @@ function ChatSidebar({
                 const isActive = tagColumnsEnabled && rawColumns.length > 0
                 const next = !isActive
                 const cfg = loadChatConfig()
-                saveChatConfig({ ...cfg, tagColumnsEnabled: next })
+                // The toggle persists `tagColumnsEnabled` through saveChatConfig,
+                // which returns false and rolls back when the write (or its dirty
+                // marker) cannot be stored. Surface that failure and STOP before
+                // clearing the error, seeding lanes or restoring widths — none of
+                // which should happen for a preference that was not saved (GPT 6.1
+                // F1, errors-use-error-notice).
+                if (!saveChatConfig({ ...cfg, tagColumnsEnabled: next })) {
+                  setToggleSaveFailed(true)
+                  setSeedError(i18nT('pages.chatSidebar.failed_to_save_board_toggle'))
+                  return
+                }
+                setToggleSaveFailed(false)
                 setSeedError('')
                 if (!next) {
                   // Leaving board view: give back the width the user chose before
@@ -4921,6 +4743,14 @@ function ChatSidebar({
               <span id={bulkSkipRunningLabelId}>{i18nT('pages.chatSidebar.skip')} {i18nT('pages.chatSidebar.running_session', { count: bulkRunningCount })}</span>
             </label>
           )}
+          {/* The bucket the Switch count leaves out with no other surface:
+              sessions already on the pick. Without it a lower count, or a
+              disabled "Switch 0 sessions", cannot be reconciled with the rows. */}
+          {bulkModelPick && bulkPartition.onTarget > 0 && (
+            <div data-testid="bulk-model-on-target" role="status" className="text-[12px] text-muted mb-2">
+              {i18nT('pages.chatSidebar.already_on_model', { count: bulkPartition.onTarget })}
+            </div>
+          )}
           {/* No hand-off: the chosen bulkModel/skipRunning selection is unsaved,
               and the navigation would discard it. Its own line, above the
               Cancel/Switch pair: a third control in that row would break
@@ -5039,6 +4869,7 @@ function ChatSidebar({
                 <FilterMenuLabel>{i18nT('pages.chatSidebar.filter')}</FilterMenuLabel>
                 {SESSION_FILTERS.map(filterDef => {
                   const active = activeFilters.has(filterDef.key)
+                  const hidden = hiddenFilters.has(filterDef.key)
                   const slotCount = filterCounts[filterDef.key] ?? 0
                   const isRecent = filterDef.key === 'recent'
                   if (isRecent) {
@@ -5173,17 +5004,72 @@ function ChatSidebar({
                       </DropdownMenuSub>
                     )
                   }
-                  return (
+                  const filterLabel = i18nT(FILTER_LABEL_KEY[filterDef.key])
+                  const canHide = !!filterDef.hideStorageKey
+                  const showRow = (
                     <DropdownMenuItem
                       key={filterDef.key}
                       title={i18nT(FILTER_DESCRIPTION_KEY[filterDef.key])}
                       // Keep the menu open so multiple filters can be toggled.
                       onSelect={e => { e.preventDefault(); toggleFilter(filterDef.key) }}
+                      className={canHide ? 'flex-1 min-w-0' : undefined}
                     >
                       {filterDef.icon(active)}
-                      <span className="flex-1 truncate">{i18nT(FILTER_LABEL_KEY[filterDef.key])}{slotCount > 0 ? ` (${slotCount})` : ''}</span>
+                      <span className="flex-1 truncate">{filterLabel}{slotCount > 0 ? ` (${slotCount})` : ''}</span>
                       {active && <Check size={14} className="text-accent shrink-0" />}
                     </DropdownMenuItem>
+                  )
+                  if (!canHide) return showRow
+                  // Two menu items drawn as one row, not a button nested in one: a
+                  // focusable control inside a menuitem is skipped by the menu's
+                  // roving focus and read as part of the row's name. The second
+                  // item sits where the check mark would go and is offered only
+                  // while show-only is OFF: with it on, the row carries its check
+                  // like every other filter row, so a click anywhere on it, the
+                  // check included, turns show-only off as it always did, and going
+                  // from show-only straight to a hide is two clicks on purpose.
+                  // While the chip is hiding the item draws the lit hide icon;
+                  // otherwise the icon appears on row hover or focus, and always on
+                  // touch screens, which have no hover. The wrapper stays in place
+                  // either way so the row is not remounted, which would drop the
+                  // menu's focus from it, when show-only flips. The styling sits on
+                  // the wrapper and the icon slot, not on the menu primitives.
+                  // The wrapper fades with the same `transition-colors` the menu
+                  // items carry: an instant wrapper over fading items leaves the
+                  // eye item's own padded focus box behind for a beat when the
+                  // pointer leaves the row.
+                  const hideLabel = hidden
+                    ? i18nT('pages.chatSidebar.filter_unhide_named', { filter: filterLabel })
+                    : i18nT('pages.chatSidebar.filter_hide_named', { filter: filterLabel })
+                  return (
+                    <div
+                      key={filterDef.key}
+                      role="group"
+                      className="group/filter flex items-center rounded-md transition-colors hover:bg-bg-hover focus-within:bg-bg-hover"
+                    >
+                      {showRow}
+                      {!active && (
+                        <DropdownMenuItem
+                          aria-label={hideLabel}
+                          title={hideLabel}
+                          onSelect={e => { e.preventDefault(); toggleHideFilter(filterDef.key) }}
+                          className="group/hide shrink-0"
+                          data-testid={`filter-hide-${filterDef.key}`}
+                          data-filter-hidden={hidden ? 'true' : undefined}
+                        >
+                          <span
+                            className={hidden
+                              ? 'inline-flex size-3.5 items-center justify-center rounded bg-accent-subtle text-accent ring-4 ring-accent-subtle'
+                              : 'inline-flex size-3.5 items-center justify-center text-muted group-focus/hide:text-text'}
+                          >
+                            <EyeOff
+                              size={12}
+                              className={hidden ? undefined : 'opacity-0 group-hover/filter:opacity-100 group-focus-within/filter:opacity-100 [@media(hover:none)]:opacity-100'}
+                            />
+                          </span>
+                        </DropdownMenuItem>
+                      )}
+                    </div>
                   )
                 })}
                 {/* Lift every active status filter at once, for a look at the
@@ -5555,6 +5441,35 @@ function ChatSidebar({
           })}
         </div>
       )}
+      {/* The hides, as ONE aggregate chip in their own row, for the same reason as
+          the tag chip: the row above holds the base branch's filter chips and must
+          not grow, and a chip per hidden status would add up to three more buttons
+          to it. Neutral like every clear-several pill (`FilterChip` doc): the one
+          click drops every hide at once. Counts ride inside the label the way the
+          roster's chip carries its own, and the accessible name says what the
+          click does. After the include chips so the strip reads what is kept,
+          then what is dropped. */}
+      {hiddenFilters.size > 0 && (
+        <div className="px-3 pb-1">
+          <FilterChip
+            aggregate
+            label={i18nT('pages.chatSidebar.hiding_named_filter', {
+              filter: fmtList(
+                SESSION_FILTERS.filter(filterDef => hiddenFilters.has(filterDef.key)).map(filterDef => {
+                  const slotCount = filterCounts[filterDef.key] ?? 0
+                  return `${i18nT(FILTER_LABEL_KEY[filterDef.key])}${slotCount > 0 ? ` (${slotCount})` : ''}`
+                }),
+                { type: 'unit', style: 'short' },
+              ),
+            })}
+            clearLabel={i18nT('pages.chatSidebar.filter_unhide_named', {
+              filter: fmtList(SESSION_FILTERS.filter(filterDef => hiddenFilters.has(filterDef.key)).map(filterDef => i18nT(FILTER_LABEL_KEY[filterDef.key]))),
+            })}
+            onClear={clearHiddenFilters}
+            testId="hidden-filter-chip"
+          />
+        </div>
+      )}
       {seedError && (
         /* Outside the layout branches on purpose. A TOTAL seed failure leaves
          * zero columns, so the board branch never renders — a banner inside it
@@ -5564,23 +5479,33 @@ function ChatSidebar({
          * Retry is a separate button, not the notice itself. */
         <div className="mx-2 mt-2 flex flex-col gap-1 shrink-0">
           <ErrorNotice
-            title={i18nT('pages.chatSidebar.lane_seed_failed')}
+            title={toggleSaveFailed ? undefined : i18nT('pages.chatSidebar.lane_seed_failed')}
             message={seedError}
             askAgent
-            onDismiss={() => setSeedError('')}
+            onDismiss={() => { setSeedError(''); setToggleSaveFailed(false) }}
             testId="lane-seed-error"
           />
-          <div>
-            <Btn
-              type="button"
-              className="text-[12px] px-2 py-0.5"
-              onClick={() => { setSeedError(''); seedStateLanesMutation.mutate() }}
-            >
-              {i18nT('pages.chatSidebar.lane_seed_retry')}
-            </Btn>
-          </div>
+          {/* The Retry button seeds state lanes — the recovery for a SEED
+           * failure. It must not show under a toggle-SAVE failure: there its
+           * "Try again" label would promise to retry the save but instead seed
+           * lanes into a board the user never switched to (UX Review). The
+           * save-failure copy already carries its own next step. */}
+          {!toggleSaveFailed && (
+            <div>
+              <Btn
+                type="button"
+                className="text-[12px] px-2 py-0.5"
+                onClick={() => { setSeedError(''); seedStateLanesMutation.mutate() }}
+              >
+                {i18nT('pages.chatSidebar.lane_seed_retry')}
+              </Btn>
+            </div>
+          )}
         </div>
       )}
+      {/* Yields to the preview's instance-sessions banner, which already reports
+       *  a failed ['instances'] read when the preview flag is on. */}
+      {hasRemoteExecutedRow && !remoteSessionsError && <RemoteCrewNamesError />}
       {/* Read failures for the two lists this pane is built from. Same placement
        *  rationale as the seed banner: a failed folders query means no folder
        *  tree, a failed columns query means no board, so neither branch can host
@@ -5627,6 +5552,12 @@ function ChatSidebar({
         className="mx-2 mt-2 shrink-0"
         testId="folder-action-error"
       />
+      {/* A confirmed subtree close that the server refused per session. It sits in
+       *  this same band because it is the same kind of fact: a write on the rows
+       *  below failed, the list already agrees with what did happen, and the row
+       *  staying put is the only other trace the person would get. */}
+      {closeTreeError}
+      {closeTreeNotice}
       {/* The folder order (dashboard.folder_sort) could not be read AND there is
        *  no body to fall back on: the tree is drawn in the stored order meanwhile
        *  and sibling drags are withdrawn, so the person is told why the order they
@@ -5767,10 +5698,11 @@ function ChatSidebar({
           <SessionRowWindowContext.Provider value={laneRowWindow.rowWindow}>
           <motion.div ref={setLaneScrollEl} onScroll={laneScrollMemory.onScroll} layoutScroll={rowAnimEnabled} className={`${LIST_BODY_CLS} flex flex-col`} style={{ scrollbarWidth: 'none' }} data-testid="conductor-view-lane">
             {folderCreateError && renderFolderCreateError(folderCreateError.folderId, folderCreateError.columnId)}
+            {localGroupHeader}
             {(() => {
               const tree = lineage
               if (!tree) return null
-              const searching = slotFilter.trim() !== ''
+              const searching = conductorSearching
               // Keyed by identity, exactly as `lineage` is: a raw-key map would let a
               // federated peer row overwrite the local row it collides with, so one
               // session would vanish and the other would render twice.
@@ -5780,12 +5712,7 @@ function ChatSidebar({
               // did not admit it -- so it renders dimmed and still carries its chevron.
               // Without it a filtered-out conductor's workers each resolved no parent
               // and scattered to the top level, which is what switching on Unread did.
-              const kept = new Set<string>()
-              for (const id of conductorMatching) {
-                if (!byKey.has(id)) continue
-                kept.add(id)
-                for (const up of ancestorsOf(id, tree.parentOf)) kept.add(up)
-              }
+              const kept = conductorKept
               const keptKids = (key: string) =>
                 (tree.children.get(key) ?? []).filter(k => kept.has(k))
               const rows: Array<{ id: string; slot: Slot; depth: number; childCount: number; expanded: boolean; orphanOf: string | null; citesParent?: string | null; anchorOnly: boolean; aggregate: { needsYou: number; running: number } | null }> = []
@@ -5800,8 +5727,7 @@ function ChatSidebar({
               // a live workflow, or a loop -- so a workflow-active child is counted the
               // way its own row is drawn, and a subagent awaiting approval is an ask
               // even though the slot itself carries no `pending_approval`.
-              const isRunning = (s: Slot) =>
-                isPeerRow(s) ? s.running === true : runningSet.has(s.key)
+              const isRunning = sidebarRows.isRunning
               const wantsUser = (s: Slot) =>
                 !!(
                   s.pending_approval
@@ -5870,15 +5796,27 @@ function ChatSidebar({
                   <Fragment key={row.id}>
                     {/* NO WRAPPER. The row is rendered exactly as the flat lane renders
                      *  it, and the lane's three additions are handed INTO it (see
-                     *  `ConductorRowExtras`). Wrapping the card in a flex column with
-                     *  the chevron and counts beside it narrowed the card: its title
-                     *  truncated early, its own divider stopped short of the row, and
-                     *  the counts took the column the top line keeps for the time. */}
+                     *  `ConductorRowView`, and the chevron's `toggleConductor` action).
+                     *  Wrapping the card in a flex column with the chevron and counts
+                     *  beside it narrowed the card: its title truncated early, its own
+                     *  divider stopped short of the row, and the counts took the column
+                     *  the top line keeps for the time. */}
                     {renderSessionRow(row.slot, row.depth, showDivider, 'conductor', 'conductor', 'conductor', {
                       depth: row.depth,
                       childCount: row.childCount,
+                      // Every descendant under this card -- what the ✕ label quotes.
+                      // Zero while searching: the lane is flat then and the ✕ closes one session.
+                      subtreeCount: searching ? 0 : descendantsOf(row.id, tree.children).filter(k => kept.has(k)).length,
+                      // What the press would find running, by the close's own predicate,
+                      // so the ✕ says "Can't close" before the press instead of after.
+                      // Only a card with sessions under it: a leaf keeps the plain single close.
+                      subtreeRunning: (() => {
+                        if (searching) return 0
+                        const under = descendantsOf(row.id, tree.children).filter(k => kept.has(k))
+                        if (under.length === 0) return 0
+                        return [row.id, ...under].filter(k => { const s = byKey.get(k); return s != null && sidebarRowRunning(s, runningSet, subagentCounts) }).length
+                      })(),
                       expanded: row.expanded,
-                      onToggle: () => toggleConductorExpanded(row.id),
                       aggregate: row.aggregate,
                       orphanOf: row.orphanOf,
                       citesParent: row.citesParent ?? null,
@@ -5888,7 +5826,7 @@ function ChatSidebar({
                 )
               })
             })()}
-            {flatSlots.length === 0 && (
+            {flatSlots.length === 0 && shownCrewRowCount === 0 && (
               <div className="px-3 py-4 text-[12px] text-muted">{i18nT('pages.chatSidebar.no_sessions_match')}</div>
             )}
             {flatSlots.length > 0 && lineage != null && lineage.children.size === 0 && allHiddenFolders.length === 0 && (
@@ -5906,6 +5844,7 @@ function ChatSidebar({
             )}
             {renderHiddenReveal('conductor', allHiddenFolders, 0)}
             {renderOlderSessionsHint('conductor')}
+            {renderCrewGroups()}
           </motion.div>
           </SessionRowWindowContext.Provider>
         ) : flatLaneActive ? (
@@ -5944,6 +5883,7 @@ function ChatSidebar({
                *  notice at the top of the lane so a failed folder create is
                *  never console-only in this layout. */}
               {folderCreateError && renderFolderCreateError(folderCreateError.folderId, folderCreateError.columnId)}
+              {localGroupHeader}
               {(() => {
                 // Date segments (Today / Yesterday / Last 7 Days / …) between
                 // rows — resurrects the 9bb0f71 active-list pattern: only for
@@ -5952,7 +5892,7 @@ function ChatSidebar({
                 // without segments since pinning overrides date order.
                 const isDateSort = sortKey === 'date-desc' || sortKey === 'date-asc'
                 // Hoisted above the hold so the pixel anchor can count header heights.
-                const baseSeg = (s: Slot) => (isDateSort && !isLocallyPinned(s, pinned) ? dateSegment(slotActivityTs(s)) : '')
+                const baseSeg = (s: Slot) => (isDateSort && !sidebarRows.isPinned(s) ? dateSegment(slotActivityTs(s)) : '')
                 const { rows: flatRows, navScope: flatLaneScope, container: flatHoldContainer } = heldLane(flatSlots, 'flat', 'flat', baseSeg)
                 // Reads the flag holdHovered just set for THIS lane, so the header
                 // rule and the hold cannot disagree about the row being displaced.
@@ -5986,13 +5926,14 @@ function ChatSidebar({
                   )
                 })
               })()}
-              {flatSlots.length === 0 && (
+              {flatSlots.length === 0 && shownCrewRowCount === 0 && (
                 <div className="px-3 py-4 text-[12px] text-muted">{i18nT('pages.chatSidebar.no_sessions_match')}</div>
               )}
               {/* Flat view has no containers to anchor to — every hide, top-level
                *  or nested, collapses into this one row at the bottom of the lane. */}
               {renderHiddenReveal('flat', allHiddenFolders, 0)}
               {renderOlderSessionsHint('flat')}
+              {renderCrewGroups()}
             </motion.div>
             </SessionRowWindowContext.Provider>
             {dragOverlay}
@@ -6036,6 +5977,7 @@ function ChatSidebar({
               <DndDroppable id="root-lane" data={{ type: 'folder-drop', folderId: null }}>
                 {({ setNodeRef }) => (
                   <div ref={setNodeRef} className="flex flex-col flex-1 min-h-0">
+                    {localGroupHeader}
                     <SortableContext items={rootFolderIds} strategy={verticalListSortingStrategy}>
                       {visibleRootFolders.map(f => <SortableFolderBlock key={f.id} folder={f} subtree={[...(folderSubtrees.get(f.id) ?? collectFolderSubtreeIds(folders, f.id))]} siblings={rootFolderIds} reorderable={folderReorderable} dragWithheld={folderDragWithheld} renderFolderBlock={renderFolderBlock} />)}
                     </SortableContext>
@@ -6044,7 +5986,7 @@ function ChatSidebar({
                      *  footer row" shape — the nested case is what needs depth. */}
                     {renderHiddenReveal('root', hiddenByContainer.get('root') ?? [], 0)}
                     {/* Every folder block and the ungrouped bucket read
-                        filteredSlots, so an empty one means nothing can render
+                        laneSlots, so an empty one means nothing can render
                         below — say so rather than leaving a blank lane.
                         A folder-NAME search is the case where the plain wording
                         lies: the matched folder rows are rendered directly above
@@ -6060,7 +6002,7 @@ function ChatSidebar({
                         list, and a sentence claiming it matched is the same
                         contradiction with the roles reversed. It claims only that
                         a folder name matched; the marks say which row. */}
-                    {filteredSlots.length === 0 && listNarrowed && (
+                    {laneSlots.length === 0 && shownCrewRowCount === 0 && listNarrowed && (
                       <div className="px-3 py-4 text-[12px] text-muted">{i18nT(folderNameMatchIds ? 'pages.chatSidebar.no_sessions_match_folders' : 'pages.chatSidebar.no_sessions_match')}</div>
                     )}
                     {/* Ungrouped sessions live in a headerless droppable bucket
@@ -6068,7 +6010,7 @@ function ChatSidebar({
                      *  folders, so the whole empty lower area is a drop target —
                      *  dropping a session here ungroups it. The ring only lights up
                      *  while dragging a foldered session (when ungrouping applies). */}
-                    {(rootFolders.length > 0 || ungroupedSlots.length > 0) && (
+                    {(rootFolders.length > 0 || ungroupedSlots.length > 0 || shownCrewGroups.length > 0) && (
                       <DndDroppable id="root-group" data={{ type: 'folder-drop', folderId: null }}>
                         {({ setNodeRef: setRootGroupRef, isOver }) => (
                           <div ref={setRootGroupRef} className={`flex flex-col flex-1 min-h-0 rounded-md transition-all ${isOver && (draggingFolderedSession || draggingNestedFolder) ? 'ring-1 ring-accent' : ''}`}>
@@ -6101,6 +6043,7 @@ function ChatSidebar({
                                   {/* After the dormant expander, so it stays the
                                    *  lane's last line even when rows are folded. */}
                                   {renderOlderSessionsHint('root')}
+                                  {renderCrewGroups()}
                                 </>
                               )
                             })()}
@@ -6150,11 +6093,11 @@ function ChatSidebar({
             *  Board columns remain local-slot containers because their tags,
             *  lanes and drop actions are local mutations. Every filtered peer
             *  row is therefore omitted here and represented by this exact count. */}
-          {peerRowsHiddenFromBoard > 0 && (
+          {boardPeerCount > 0 && (
             <div className="mx-2 mt-2 px-2 py-1.5 rounded-md bg-info-subtle border border-info/40 text-info text-[11px] flex items-center gap-1.5">
               <Server size={11} aria-hidden="true" className="shrink-0" />
               <span className="min-w-0">
-                {i18nT('pages.chatSidebar.remote_sessions_not_shown_in_board_view', { count: peerRowsHiddenFromBoard })}
+                {i18nT('pages.chatSidebar.remote_sessions_not_shown_in_board_view', { count: boardPeerCount })}
               </span>
             </div>
           )}
@@ -6210,15 +6153,16 @@ function ChatSidebar({
               </span>
             </button>
           )}
-          <div className="flex-1 overflow-x-auto overflow-y-hidden flex gap-2 p-2" data-testid="column-strip">
+          <div className="relative flex-1 min-h-0 flex flex-col">
+          <div ref={attachStripEdges} className="flex-1 overflow-x-auto overflow-y-hidden flex gap-2 p-2" data-testid="column-strip">
             {orderedColumns.map((col, colIdx) => {
-              // `isRowFolderHidden` here rather than at the render sites below, because
-              // this one population feeds all of them: the flat-board rows, every folder
-              // block's body through `colSlotKeys`, each block's aggregate count, and the
-              // "no sessions" notice. The board lane has no reveal row (a column has no
-              // folder header for one to hang from), so the hide is absolute here and the
+              // The board pool already leaves out every row the folder filter conceals,
+              // and this one population feeds every render site below: the flat-board
+              // rows, every folder block's body through `colSlotKeys`, each block's
+              // aggregate count, and the "no sessions" notice. The board lane has no
+              // reveal row (a column has no folder header for one to hang from), so the
               // way back is re-checking the folder in the filter menu.
-              const colSlots = filteredSlots.filter(s => !isPeerRow(s) && columnMatches(col, s) && !isRowFolderHidden(s))
+              const colSlots = sidebarRows.lanes.board.filter(s => columnMatches(col, s))
               const colTags = col.tag_ids.map(tid => tagById[tid]).filter(Boolean) as ChatTag[]
               const laneDef = col.source === 'state' ? SESSION_LANES.find(l => l.key === col.state_key) : undefined
               // Only a single-status-tag column can accept a card: dropping onto a
@@ -6229,11 +6173,21 @@ function ChatSidebar({
                 // card drop); mouse-only drag handlers, so scope-disable the rule.
                 // eslint-disable-next-line jsx-a11y/no-static-element-interactions
                 <div key={col.id} data-testid={`column-${col.id}`} className="flex flex-col flex-1 min-w-0 bg-card border border-border rounded-md overflow-hidden" style={{ minWidth: orderedColumns.length > 1 ? '220px' : undefined }}
+                  // Clear first, on the way down: a folder block or unfile strip
+                  // inside the lane takes the card and stops the dragover, so only
+                  // a dragover that reaches the lane itself shows the hint again.
+                  onDragOverCapture={laneDef ? () => setDerivedHintCol(c => (c === col.id ? null : c)) : undefined}
                   onDragOver={e => {
                     const types = e.dataTransfer.types
                     // Accept column reorder on the entire column surface
                     if (types.includes('application/mc-column')) {
                       e.preventDefault()
+                      return
+                    }
+                    // A derived lane leaves the drop refused (no preventDefault)
+                    // and shows why.
+                    if (laneDef && types.includes('text/plain')) {
+                      setDerivedHintCol(col.id)
                       return
                     }
                     // Accept session-card drop only on status lanes
@@ -6242,9 +6196,14 @@ function ChatSidebar({
                       e.currentTarget.classList.add('ring-1', 'ring-accent')
                     }
                   }}
-                  onDragLeave={e => { e.currentTarget.classList.remove('ring-1', 'ring-accent') }}
+                  onDragLeave={e => {
+                    e.currentTarget.classList.remove('ring-1', 'ring-accent')
+                    // Moving onto a child also fires dragleave; only leaving the lane clears.
+                    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDerivedHintCol(c => (c === col.id ? null : c))
+                  }}
                   onDrop={e => {
                     e.currentTarget.classList.remove('ring-1', 'ring-accent')
+                    setDerivedHintCol(null)
                     // Column reorder takes priority
                     const draggedCol = e.dataTransfer.getData('application/mc-column')
                     if (draggedCol && draggedCol !== col.id) {
@@ -6259,7 +6218,7 @@ function ChatSidebar({
                     const k = e.dataTransfer.getData('text/plain')
                     if (k) dropSlotMutation.mutate({ slot: k, columnId: col.id })
                   }}>
-                  <div className="flex items-center gap-1 p-2 border-b border-border bg-bg-elevated">
+                  <div className="relative flex items-center gap-1 p-2 border-b border-border bg-bg-elevated">
                     {/* Reorder handle: mouse-only drag source for column reordering. */}
                     {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
                     <span draggable
@@ -6320,6 +6279,14 @@ function ChatSidebar({
                       aria-label={i18nT('pages.chatSidebar.delete_column')}
                       onClick={() => { if (confirm(i18nT('pages.chatSidebar.delete_this_column'))) deleteColumnMutation.mutate(col.id) }}
                     ><X size={12} /></button>
+                    {/* Overlays the top of the card list, so the cards under the
+                      * pointer do not move while it shows. */}
+                    {nativeSessionDrag !== null && derivedHintCol === col.id && (
+                      <span role="status" aria-live="polite" data-testid={`column-derived-hint-${col.id}`}
+                        className="absolute top-full left-0 right-0 z-10 pointer-events-none px-2 py-1 text-[11px] text-muted border-b border-border bg-bg-elevated">
+                        {i18nT('pages.chatSidebar.lane_derived_hint')}
+                      </span>
+                    )}
                   </div>
                   {/* Column filter popover — portaled to <body> so the column's
                       overflow-hidden ancestor cannot clip it; viewport-anchored
@@ -6427,7 +6394,7 @@ function ChatSidebar({
                       const { rows: ungrouped, navScope: colLaneScope, container: colHoldContainer } = heldLane(flatView
                         ? colSlots
                         : colSlots.filter(s => {
-                            const folderId = localSlotFolder(s, slotFolders)
+                            const folderId = sidebarRows.folderOf(s)
                             return !folderId || !folders.find(f => f.id === folderId)
                           }), col.id, `board:${col.id}:ungrouped`)
                       // In flat view folders never render, so an empty lane is
@@ -6499,6 +6466,26 @@ function ChatSidebar({
               )
             })}
           </div>
+          {/* Edge cues: lanes continue past a clipped edge of the strip. Each is
+            *  a 24 px band, the session tab strip's width, so the lane controls it
+            *  overlaps stay legible and clickable. It fades from the foreground
+            *  colour at low alpha, not from the page background as the tab
+            *  strip's does: the lanes are cards, and in light theme the card and
+            *  the page background are both near white, so a fade from bg over a
+            *  card shows nothing. The foreground contrasts with the card in every
+            *  theme. It is inset to the strip's padding, the cards' own vertical
+            *  extent, so it shades the clipped lane and not the page gutter above
+            *  and below it. It is fade-only, as the other scroll strips' cues are: the
+            *  strip scrolls natively, and an arrow here would look like the
+            *  follow-up bar's scroll buttons while a click on it fell through to the
+            *  row underneath. */}
+          {stripEdges.left && (
+            <div aria-hidden="true" data-testid="column-strip-cue-left" className="pointer-events-none absolute left-0 top-2 bottom-2 w-6 z-10 bg-gradient-to-r from-text-strong/15 to-transparent" />
+          )}
+          {stripEdges.right && (
+            <div aria-hidden="true" data-testid="column-strip-cue-right" className="pointer-events-none absolute right-0 top-2 bottom-2 w-6 z-10 bg-gradient-to-l from-text-strong/15 to-transparent" />
+          )}
+          </div>
           </div>
         )}
       </LayoutGroup>
@@ -6519,7 +6506,7 @@ function ChatSidebar({
             paused={undoBar.paused}
             /* Same width ladder as the header's compact/tiny steps: below this the
                prefix + shortcut would eat the row and truncate the destination. */
-            compact={sidebarWidth < 220} />
+            compact={paintedSidebarWidth < 220} />
         )}
         {folderMove?.live && (
           <MoveUndoBar key={folderMove.id} moved={folderMove}
@@ -6527,7 +6514,7 @@ function ChatSidebar({
             onHoldChange={folderUndoBar.onHoldChange}
             remainingMs={folderUndoBar.remainingMs}
             paused={folderUndoBar.paused}
-            compact={sidebarWidth < 220} />
+            compact={paintedSidebarWidth < 220} />
         )}
       </AnimatePresence>
 
@@ -6685,7 +6672,7 @@ function ChatSidebar({
                 // Derive agent color the same way renderSessionRow does so history rows
                 // match the session-row visual language (agent name tinted by source).
                 const agentColorFor = (agentName: string): string => {
-                  const meta = installedAgents.find(a => a.name === agentName)
+                  const meta = tintAgents.find(a => a.name === agentName)
                   if (meta?.source === 'package') return 'text-[var(--aim)]'
                   if (meta?.source === 'builtin') return 'text-muted'
                   return 'text-muted'
@@ -6851,6 +6838,11 @@ function ChatSidebar({
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* The close-tree confirm, one instance for the whole sidebar: a press lands
+       *  on one row at a time, and the hook already answers an earlier ask "no"
+       *  when a second arrives. */}
+      {closeTreeDialog}
 
       {/* One folder create/settings modal for the whole sidebar. Rendered here
        *  rather than per-row so a folder shown in several board columns can only

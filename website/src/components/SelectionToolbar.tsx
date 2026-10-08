@@ -6,6 +6,7 @@ import { copyToClipboard } from '../utils/clipboard'
 import { isTouchDevice } from '../utils/isTouchDevice'
 import { containedSelectionRange } from '../utils/selectionContainment'
 import { useImeGuard } from '../hooks/useImeGuard'
+import { measureAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 import ErrorNotice from './ErrorNotice'
 import { i18nT } from '../i18n/t'
 import { isEditableTarget } from '../utils/editableTarget'
@@ -1290,10 +1291,10 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
   }, [autoFocus, inputRef])
 
   const autoGrow = useCallback((el: HTMLTextAreaElement) => {
-    el.style.height = 'auto'
-    const next = Math.min(el.scrollHeight, COMPOSER_MAX_INPUT_H)
-    el.style.height = next + 'px'
-    el.style.overflowY = el.scrollHeight > COMPOSER_MAX_INPUT_H ? 'auto' : 'hidden'
+    // The shared measure counts the border, which scrollHeight leaves out, so
+    // the box keeps its resting height on the first keystroke and a draft at
+    // the cap scrolls instead of clipping its last line.
+    measureAutoGrowTextarea(el, COMPOSER_MAX_INPUT_H)
     onGrow()
   }, [onGrow])
 
@@ -1307,7 +1308,10 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
   const iconBtn = 'flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-accent hover:bg-bg-hover transition-colors cursor-pointer bg-transparent border-none'
 
   const controls = (
-    <div className={`flex items-center gap-1 shrink-0 ${stacked ? 'justify-between' : ''}`}>
+    // In a row the controls are as tall as a ONE-line input (1px border, 6px
+    // padding, 20px line, top and bottom), so they center on it and stay
+    // level with its first line when a long draft grows the box downward.
+    <div className={`flex items-center gap-1 shrink-0 ${stacked ? 'justify-between' : 'h-[34px]'}`}>
       <button
         type="button"
         className="flex items-center gap-1.5 h-7 px-2.5 rounded-md text-[12px] font-medium text-accent hover:bg-bg-hover transition-colors cursor-pointer bg-transparent border-none whitespace-nowrap disabled:opacity-40 disabled:cursor-default"

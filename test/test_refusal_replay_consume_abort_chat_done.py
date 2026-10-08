@@ -1,11 +1,13 @@
 """A content-filter retry cancelled at its consume seam hands the floor back.
 
-The replay's consume gate (``_refusal_replay_vetoed_at_consume``) re-checks a
-Stop, a session rebind and a newer message before the queued retry runs. When it
-cancels, the turn ends without a provider call, so its ``chat_done`` frame is
-the only thing that tells the browser the turn is over. That frame must carry
-the awaited :func:`chat_done_payload` dict: a bare coroutine is not a JSON
-payload, and it is never awaited.
+The replay's consume gate (``_replay_vetoed_at_consume`` for the content-filter
+family) re-checks a Stop, a session rebind and a newer message before the queued
+retry runs. When it
+cancels, the turn ends without a provider call. The gate only decides; the turn's
+exit guard runs its tail, which hands the floor to a newer message or sends the
+cycle's one ``chat_done``. That frame must carry the awaited
+:func:`chat_done_payload` dict: a bare coroutine is not a JSON payload, and it is
+never awaited.
 """
 
 from __future__ import annotations
@@ -19,6 +21,10 @@ from chat_test_helpers import _make_state
 
 from kiro_crew.dashboard import chat_runner as cr
 from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.recovery_replays import ReplayFamily
+
+_CF = ReplayFamily.CONTENT_FILTER
+_CF_REPLAY = frozenset({_CF})
 
 
 def _state(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -33,16 +39,19 @@ def _state(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     return state
 
 
-def _arm_recorded_replay(slot: Any) -> None:
-    """The record the drain leaves for a queued refusal retry."""
+def _arm_recorded_replay(slot: Any, session_key: str = "") -> None:
+    """The record a refusal swap leaves for its queued retry."""
     slot._refusal_fallback_primary = "fable-5"
     slot._refusal_fallback_candidate = "opus-test"
     slot._refusal_fallback_attempted = True
-    slot._refusal_retry_text = "retry me"
-    slot._refusal_replay_queue_id = "q-retry"
-    slot._refusal_fallback_session_key = effective_session_key(slot)
-    slot._refusal_replay_stop_gen = getattr(slot, "_stop_generation", 0)
-    slot._refusal_replay_session_stop_gen = 0
+    slot._refusal_fallback_session_key = session_key or effective_session_key(slot)
+    slot.replays.arm(
+        _CF,
+        entry_id="q-retry",
+        session_key=slot._refusal_fallback_session_key,
+        stop_gen=getattr(slot, "_stop_generation", 0),
+        session_stop_gen=0,
+    )
 
 
 def _stopped(slot: Any) -> None:
@@ -50,7 +59,8 @@ def _stopped(slot: Any) -> None:
 
 
 def _rebound(slot: Any) -> None:
-    slot._refusal_fallback_session_key = "dash:old-session"
+    # The swap ran under another session than the one the slot is bound to now.
+    _arm_recorded_replay(slot, session_key="dash:old-session")
 
 
 def _superseded(slot: Any) -> None:
@@ -81,21 +91,42 @@ async def _assert_one_done_frame(state: Any, slot: Any) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("abort", "reason"), _ABORTS)
-async def test_a_cancelled_replay_broadcasts_the_awaited_done_payload(
+async def test_a_cancelled_replay_is_decided_without_a_broadcast(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch, abort: Any, reason: str
 ) -> None:
+    """The gate decides and explains; the exit guard's tail sends the frame."""
     state = _state(tmp_path, monkeypatch)
     slot = state.get_or_create_slot("s1")
     _arm_recorded_replay(slot)
     abort(slot)
 
-    assert await cr._refusal_replay_vetoed_at_consume(state, slot) is True
+    assert await cr._replay_vetoed_at_consume(state, slot, _CF_REPLAY, "after_allowances") is True
+
+    assert _chat_done_payloads(state) == []
+    notices = [m["content"] for m in slot.messages if m.get("role") == "notice"]
+    assert notices == ["ℹ️ Content-filter retry cancelled — " + reason]
+    assert not slot.replays.armed(_CF)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("abort", "reason"), _ABORTS[:2])
+async def test_run_chat_ends_a_cancelled_replay_with_the_awaited_done_payload(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, abort: Any, reason: str
+) -> None:
+    state = _state(tmp_path, monkeypatch)
+    slot = state.get_or_create_slot("s1")
+    client = AsyncMock()
+    state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+    _arm_recorded_replay(slot)
+    abort(slot)
+
+    await cr._run_chat(state, slot, "retry me", _replay=_CF_REPLAY)
 
     await _assert_one_done_frame(state, slot)
     notices = [m["content"] for m in slot.messages if m.get("role") == "notice"]
     assert notices == ["ℹ️ Content-filter retry cancelled — " + reason]
-    assert slot._refusal_retry_text == ""
-    assert slot._refusal_replay_queue_id == ""
+    state.sessions.get_or_create.assert_not_awaited()
+    client.stream.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -106,36 +137,19 @@ async def test_a_replay_that_may_run_broadcasts_nothing(
     slot = state.get_or_create_slot("s1")
     _arm_recorded_replay(slot)
 
-    assert await cr._refusal_replay_vetoed_at_consume(state, slot) is False
+    assert await cr._replay_vetoed_at_consume(state, slot, _CF_REPLAY, "after_allowances") is False
 
     assert _chat_done_payloads(state) == []
-    assert slot._refusal_retry_text == "retry me"
+    # An accepted retry keeps its record until the turn settles its episode.
+    assert slot.replays.armed(_CF)
 
 
 @pytest.mark.asyncio
-async def test_run_chat_ends_a_stopped_replay_with_the_awaited_done_payload(
-    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    state = _state(tmp_path, monkeypatch)
-    slot = state.get_or_create_slot("s1")
-    client = AsyncMock()
-    state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-    _arm_recorded_replay(slot)
-    _stopped(slot)
-
-    await cr._run_chat(state, slot, "retry me", _refusal_replay=True)
-
-    await _assert_one_done_frame(state, slot)
-    state.sessions.get_or_create.assert_not_awaited()
-    client.stream.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_a_replay_superseded_while_preparing_ends_with_the_awaited_done_payload(
+async def test_a_replay_superseded_while_preparing_hands_the_floor_to_the_newer_message(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A newer message queued during session acquisition outranks the replay at
-    the dispatch check, and that turn end sends the same awaited frame."""
+    the dispatch check, and the turn's tail starts that message next."""
     state = _state(tmp_path, monkeypatch)
     slot = state.get_or_create_slot("s1")
     client = AsyncMock()
@@ -152,11 +166,19 @@ async def test_a_replay_superseded_while_preparing_ends_with_the_awaited_done_pa
 
     state.sessions.get_or_create = AsyncMock(side_effect=_acquire)
     _arm_recorded_replay(slot)
+    started: list[list[str]] = []
 
-    await cr._run_chat(state, slot, "retry me", _refusal_replay=True)
+    async def _start_next(_state: Any, _slot: Any, **_kwargs: Any) -> bool:
+        started.append([str(q.get("content")) for q in _slot._queue])
+        return True
+
+    monkeypatch.setattr(cr, "_start_next_queued_turn", _start_next)
+
+    await cr._run_chat(state, slot, "retry me", _replay=_CF_REPLAY)
 
     state.sessions.get_or_create.assert_awaited()
-    await _assert_one_done_frame(state, slot)
+    assert started == [["a newer message"]]
+    assert _chat_done_payloads(state) == []
     notices = [m["content"] for m in slot.messages if m.get("role") == "notice"]
     assert notices == ["ℹ️ Content-filter retry cancelled — your newer message runs instead."]
     client.stream.assert_not_called()

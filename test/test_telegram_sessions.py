@@ -10,8 +10,23 @@ from unittest.mock import AsyncMock
 
 import pytest
 from chat_test_helpers import _make_state
+from off_loop_helpers import off_loop
 from test_telegram import FakeClient, FakeCtx, FakeProvider, _origin
 
+from kiro_crew.dashboard.channel_handoff import (
+    HANDOFF_QUEUED,
+    HANDOFF_REFUSED,
+    HANDOFF_STEERED,
+    QUEUED_BY_CLOSE,
+    RAN_ON_SUCCESSOR,
+    REFUSED_ATTACHMENTS,
+    REFUSED_IDLE,
+    REFUSED_MOVED,
+    REFUSED_NO_SLOT,
+    REFUSED_QUEUE_FULL,
+    REFUSED_UNSAVED_CLOSE,
+    ResumedBusyOutcome,
+)
 from kiro_crew.history import ConversationLog, transcript_stem
 from kiro_crew.messaging import auto_title
 from kiro_crew.messaging.link import UNBIND_REASON_UNSPECIFIED, ChannelLink
@@ -273,14 +288,24 @@ def _config() -> Any:
 
 
 def _log(tmp_path: Any, *, agent: str = "") -> ConversationLog:
-    from kiro_crew.history import allow_on_loop_persist
+    """A conversation log holding one titled dashboard session.
 
+    The seeding writes run on a worker thread, as the dashboard's own writers do.
+    Nearly every caller is an ``async`` test, and on the event-loop thread
+    ``replace_with_retry`` re-raises a Windows sharing violation on its first
+    attempt rather than sleep the loop, so a scanner briefly holding the fresh
+    temp file would fail the setup itself with WinError 5. Off the loop the
+    bounded retry applies.
+    """
     log = ConversationLog(base_dir=tmp_path / "sessions")
-    with allow_on_loop_persist():
+
+    def _seed() -> None:
         log.append("dashboard:chat-1", "assistant", "prior work")
         log.set_title("dashboard:chat-1", "Launch plan")
         if agent:
             log.update_metadata("dashboard:chat-1", {"agent": agent})
+
+    off_loop(_seed)
     return log
 
 
@@ -355,6 +380,90 @@ async def _bind(
     await dispatcher.handle_message(_dm("/sessions"))
     data, message_id = _picker_button(client)
     await dispatcher.on_callback(_callback(data, message_id=message_id))
+
+
+def _private_topic(text: str, thread: int, *, chat_id: int = 7, user_id: int = 7):
+    """A message in a forum Topic INSIDE a 1:1 private chat.
+
+    Telegram carries ``message_thread_id`` in a private chat once direct-message
+    topics are on; the chat is still ``private`` and its chat_id still equals the
+    user id. The threadless General topic carries no ``thread_id`` and routes as
+    an ordinary DM.
+    """
+    return TelegramInboundMessage(
+        channel_type="telegram",
+        user_id=str(user_id),
+        conversation_id=str(chat_id),
+        text=text,
+        chat_type="private",
+        thread_id=str(thread),
+    )
+
+
+class TestTelegramPrivateChatTopicRouting:
+    """Each forum Topic in a private DM is its own session, keyed by
+    ``(chat_id, thread)`` the way a supergroup Topic already is -- while staying
+    'private' for the DM-only audience guards."""
+
+    def test_threadless_private_dm_keeps_the_pre_topic_identity(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        route = dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=None)
+        assert route == ("direct", "7")
+        assert dispatcher._route_thread(route) is None
+        # Byte-identical to the pre-forum DM key: users who never enable topics
+        # see no change.
+        assert dispatcher._session_key(route) == "telegram:kirocrew:direct:7"
+
+    def test_a_private_topic_folds_chat_id_and_thread(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        route = dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=11)
+        assert route == ("direct_topic", "7:11")
+        assert dispatcher._route_thread(route) == 11
+        assert dispatcher._session_key(route) == "telegram:kirocrew:direct_topic:7:11"
+
+    def test_two_private_topics_resolve_to_distinct_sessions(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        a = dispatcher._session_key(
+            dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=11)
+        )
+        b = dispatcher._session_key(
+            dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=12)
+        )
+        general = dispatcher._session_key(
+            dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=None)
+        )
+        assert len({a, b, general}) == 3
+
+    def test_private_topic_is_private_for_audience_guards(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        topic = dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=11)
+        general = dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=None)
+        group = dispatcher._route_key(chat_type="supergroup", user_id=7, chat_id=-100, thread=11)
+        # A private topic is a 1:1 DM: it keeps /kirocrew dashboard and the
+        # host-wide listings; a supergroup Topic (group-readable) does not.
+        assert dispatcher._is_private_route(topic) is True
+        assert dispatcher._is_private_route(general) is True
+        assert dispatcher._is_private_route(group) is False
+
+    def test_private_topic_does_not_collapse_under_unified_dm_scope(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        dispatcher.cfg.messaging.dm_scope = "unified"
+        general = dispatcher._session_key(
+            dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=None)
+        )
+        topic = dispatcher._session_key(
+            dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=11)
+        )
+        # The threadless DM collapses into the shared unified bucket; the topic
+        # keeps its own full bucket, or the fix would be a no-op.
+        assert general.startswith("unified:")
+        assert topic == "telegram:kirocrew:direct_topic:7:11"
+
+    @pytest.mark.asyncio
+    async def test_a_private_topic_turn_runs_under_its_own_session(self, tmp_path: Any) -> None:
+        dispatcher, _, sessions, _ = _dispatcher(tmp_path)
+        await dispatcher.handle_message(_private_topic("in topic 11", thread=11))
+        assert sessions.last_key == "telegram:kirocrew:direct_topic:7:11"
 
 
 class TestTelegramSessionPicker:
@@ -1119,19 +1228,158 @@ class TestTelegramInboundResumeRouting:
         assert settlements == [1]
 
     @pytest.mark.asyncio
-    async def test_busy_resumed_session_refuses_without_queue_or_steer(self, tmp_path: Any) -> None:
+    async def test_busy_resumed_session_hands_off_to_a_running_dashboard_turn(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """The dashboard holds the resumed session's turn: the message goes to the slot's
+        own machinery (steer or queue there), never to this chat's queue, and the chat is
+        told. Base refused it ("busy with a turn started elsewhere")."""
+        from kiro_crew.dashboard import channel_handoff
+
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        dispatcher._session_resume.route = AsyncMock(
+            return_value=RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+        sessions.busy = True
+        handed: list[tuple[str, str, str, bool, dict[str, Any]]] = []
+
+        async def _hand(state, session_key, text, *, mode, has_attachments, **recipient):
+            handed.append((session_key, text, mode, has_attachments, recipient))
+            return channel_handoff.ResumedBusyOutcome(channel_handoff.HANDOFF_QUEUED)
+
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+
+        await dispatcher.handle_message(_dm("and the weather?"))
+
+        # The chat rides along so a later drop notice can be addressed to it, with
+        # the user this dispatcher admitted.
+        assert handed == [
+            (
+                "dashboard:chat-1",
+                "and the weather?",
+                "steer",
+                False,
+                {"channel_type": "telegram", "conversation_id": "7", "principal": "7"},
+            )
+        ]
+        assert sessions.provider.steered == []
+        assert sessions.queued == []
+        assert sessions.last_key == ""
+        assert any("Queued for that session" in text for text, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_queued_command_reaches_the_hand_off_as_its_bare_words(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """``/queue /clear`` loses its directive before the hand-off and skips this
+        dispatcher's command intercept, so the words "/clear" alone reach the slot's
+        queue -- where the hand-off stamps them as turn content, never as the
+        dashboard command."""
+        from kiro_crew.dashboard import channel_handoff
+
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        dispatcher._session_resume.route = AsyncMock(
+            return_value=RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+        sessions.busy = True
+        handed: list[tuple[str, str]] = []
+
+        async def _hand(state, session_key, text, *, mode, has_attachments, **recipient):
+            handed.append((text, mode))
+            return channel_handoff.ResumedBusyOutcome(channel_handoff.HANDOFF_QUEUED)
+
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+
+        await dispatcher.handle_message(_dm("/queue /clear"))
+
+        assert handed == [("/clear", "queue")]
+        assert sessions.queued == []
+
+    @pytest.mark.parametrize(
+        ("outcome", "told"),
+        [
+            (ResumedBusyOutcome(HANDOFF_STEERED), "Steering that session"),
+            (ResumedBusyOutcome(HANDOFF_QUEUED), "Queued for that session"),
+            (
+                ResumedBusyOutcome(HANDOFF_QUEUED, QUEUED_BY_CLOSE),
+                "closed while your message was in flight",
+            ),
+            (ResumedBusyOutcome(HANDOFF_QUEUED, RAN_ON_SUCCESSOR), "Delivered to that session"),
+            (
+                ResumedBusyOutcome(HANDOFF_REFUSED, REFUSED_IDLE),
+                "busy with a turn started elsewhere",
+            ),
+            (ResumedBusyOutcome(HANDOFF_REFUSED, REFUSED_QUEUE_FULL), "queue is full"),
+            (ResumedBusyOutcome(HANDOFF_REFUSED, REFUSED_ATTACHMENTS), "attachments cannot wait"),
+            (
+                ResumedBusyOutcome(HANDOFF_REFUSED, REFUSED_MOVED),
+                "changed while your message was in flight",
+            ),
+            (
+                ResumedBusyOutcome(HANDOFF_REFUSED, REFUSED_UNSAVED_CLOSE),
+                "had not been saved with it yet",
+            ),
+        ],
+        ids=lambda v: v if isinstance(v, str) else f"{v.kind}:{v.reason or '-'}",
+    )
+    @pytest.mark.asyncio
+    async def test_every_hand_off_outcome_is_told_to_the_chat(
+        self, tmp_path: Any, monkeypatch: Any, outcome: ResumedBusyOutcome, told: str
+    ) -> None:
+        from kiro_crew.dashboard import channel_handoff
+
         dispatcher, client, sessions, _ = _dispatcher(tmp_path)
         dispatcher._session_resume.route = AsyncMock(
             return_value=RoutingDecision(resumed_key="dashboard:chat-1")
         )
         sessions.busy = True
 
-        await dispatcher.handle_message(_dm("continue"))
+        async def _hand(*a: Any, **k: Any) -> ResumedBusyOutcome:
+            return outcome
 
-        assert any("busy" in text.lower() for text, _ in client.sent)
-        assert sessions.queued == []
-        assert sessions.provider.steered == []
-        assert sessions.last_key == ""
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+
+        await dispatcher.handle_message(_dm("and the weather?"))
+
+        assert [text for text, _ in client.sent if told in text], client.sent
+        assert sessions.queued == [] and sessions.last_key == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", [REFUSED_IDLE, REFUSED_NO_SLOT])
+    @pytest.mark.parametrize("unlinked_meanwhile", [False, True], ids=["bound", "unlinked"])
+    async def test_a_free_lease_with_no_dashboard_turn_runs_as_a_fresh_turn(
+        self, tmp_path: Any, monkeypatch: Any, reason: str, unlinked_meanwhile: bool
+    ) -> None:
+        """The turn ended between this dispatcher's busy check and the hand-off's own
+        read (an idle slot, or no open tab): nothing holds the lease any more, so
+        the message runs instead of being refused. A lease still held (the chat's
+        own turn on the resumed key) keeps the refusal -- the REFUSED_IDLE row of
+        the table above.
+
+        The fresh turn runs under the key resolved at admission, never through a
+        second binding resolution: updates are concurrent tasks and ``/unlink`` is
+        exempt from the busy gate, so a binding that changed in the window
+        (``unlinked``) must not reroute the message into the native session."""
+        from kiro_crew.dashboard import channel_handoff
+
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        route = AsyncMock(return_value=RoutingDecision(resumed_key="dashboard:chat-1"))
+        dispatcher._session_resume.route = route
+        sessions.busy = True
+
+        async def _hand(*a: Any, **k: Any) -> ResumedBusyOutcome:
+            sessions.busy = False  # the turn ended while the hand-off was scheduled
+            if unlinked_meanwhile:
+                route.return_value = RoutingDecision()  # a concurrent /unlink landed
+            return ResumedBusyOutcome(HANDOFF_REFUSED, reason)
+
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+
+        await dispatcher.handle_message(_dm("and the weather?"))
+
+        assert sessions.last_key == "dashboard:chat-1", "the message did not run there"
+        route.assert_awaited_once()
+        assert not any("busy with a turn started elsewhere" in text for text, _ in client.sent)
 
     @pytest.mark.asyncio
     async def test_queue_drain_keeps_native_affinity_after_a_later_bind(
@@ -1382,11 +1630,15 @@ class TestTelegramResumeIntegration:
         owner = TelegramTransport(_Client(), allowed_user_ids={7})
         assert owner.may_resume_from("7", None) is True
         assert owner.may_resume_from("8", None) is False
+        # A threaded link never resumes a dashboard session: the one caller
+        # (chat_mirror) only ever passes a threadless Telegram target, so inbound
+        # resume stays scoped to the sole owner's threadless General DM.
         assert owner.may_resume_from("7", "11") is False
 
         shared = TelegramTransport(_Client(), allowed_user_ids={7, 8})
         assert shared.may_resume_from("7", None) is False
         assert shared.may_resume_from("8", None) is False
+        assert shared.may_resume_from("7", "11") is False
 
 
 class TestTelegramRestrictedResumedSession:
@@ -1691,9 +1943,10 @@ class TestTelegramRestrictedResumedSession:
 class TestResumedRefusalsCharacterization:
     """The refusals a RESUMED dashboard session gets, byte for byte, and their order.
 
-    Telegram's busy branch refuses a resumed session outright (it does not route the
-    message into the dashboard slot the way Discord does), and a privacy modifier on
-    a resumed session is refused before the busy check is even asked.
+    Telegram's busy branch hands a resumed session's message to the dashboard slot's
+    own machinery (as Discord does); with no dashboard attached the slot cannot take
+    it, so the refusal below is what the hand-off answers. A privacy modifier on a
+    resumed session is refused before the busy check is even asked.
     """
 
     _BUSY = (

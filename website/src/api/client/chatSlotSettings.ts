@@ -14,7 +14,7 @@ import type { ClientTransport } from './transport'
  *  explain. Rationale in the CR description. */
 export const SLASH_COMMANDS_TIMEOUT_MS = 15_000
 
-export function createChatSlotSettingsEndpoints({ post, j }: ClientTransport) {
+export function createChatSlotSettingsEndpoints({ post, j, jfetch: fetch }: ClientTransport) {
   const selection = {
     chatSlotRuntimes: (slot: string) =>
       fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/runtime').then(j) as Promise<{

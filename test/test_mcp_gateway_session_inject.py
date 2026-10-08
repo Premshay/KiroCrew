@@ -87,15 +87,17 @@ def test_unpooled_server_env_is_never_transmitted(tmp_path):
 
 
 def test_explicit_profile_injects_only_enabled_named_servers(tmp_path):
-    overlay = _write_overlay(tmp_path, "kirocrew", {
-        "context7": _stub(),
-        "browser": {"command": "browser-mcp", "args": ["serve"]},
-        "disabled": {"command": "disabled-mcp", "disabled": True},
-    })
-
-    servers = explicit_session_servers(
-        overlay, "kirocrew", {"context7", "disabled"}, "channel-1"
+    overlay = _write_overlay(
+        tmp_path,
+        "kirocrew",
+        {
+            "context7": _stub(),
+            "browser": {"command": "browser-mcp", "args": ["serve"]},
+            "disabled": {"command": "disabled-mcp", "disabled": True},
+        },
     )
+
+    servers = explicit_session_servers(overlay, "kirocrew", {"context7", "disabled"}, "channel-1")
 
     assert [entry["name"] for entry in servers] == ["context7"]
     assert expand_stub_flags(servers[0]["args"])[-2:] == ["--channel-id", "channel-1"]

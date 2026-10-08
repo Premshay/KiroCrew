@@ -250,6 +250,7 @@ WATCHED_WORKFLOWS: tuple[str, ...] = (
     "pr-scope.yml",
     "release.yml",
     "screenshot-evidence.yml",
+    "sensitive-change-review.yml",
 )
 # Put the workflows that carry routine pull-request traffic ahead of release
 # and audit workflows when looking for recent fleet starts.
@@ -373,6 +374,16 @@ SUPERSEDED_WITHOUT_SUCCESSOR = -2
 SUPERSEDED_SUCCESSOR_UNIDENTIFIED = -3
 # The watchdog's own workflow, never watched: its comment names the fleet label.
 WATCHDOG_WORKFLOW = "ci-runner-watchdog.yml"
+
+# The event that KICKS a tick between scheduled ones: `fast-gate.yml` completing
+# (`workflow_run`, declared in `ci-runner-watchdog.yml`). GitHub's `schedule` is
+# best-effort and was measured at ~100 minutes between `*/10` ticks on a quiet
+# Sunday, so an orphan that aged past the threshold just after one tick waited
+# ninety minutes for the next while `main` sat red behind it. A completed Fast
+# Gate is the cheapest heartbeat the repository already emits -- one per head,
+# PR and `main` alike -- and a kicked tick is identical to a scheduled one except
+# for the debounce in `kick_is_redundant`, which keeps the schedule's quota shape.
+KICK_EVENT = "workflow_run"
 # A rate-limited call whose window resets within this many seconds, and inside
 # the tick's remaining budget, is waited out and retried once; a further-off
 # reset aborts the gather instead of burning budget on a sleep.
@@ -412,6 +423,14 @@ REPO_LISTING_MAX_PAGES = 10
 # with an orphan past result 1000 and report a clean sweep. `_iter_repo_runs`
 # therefore compares what it yielded against the first page's `total_count`.
 REPO_LISTING_RESULT_CEILING = 1000
+# Past that ceiling an actionable listing is NARROWED, not paged deeper: the next
+# window lists the same status with `created=<=<oldest created_at read so far>`,
+# so it starts where the previous one stopped. Measured: `status=queued` held up to
+# 1024 runs while the ceiling serves 1000, so two windows reach the whole set and
+# three leave room for growth. Each window costs up to REPO_LISTING_MAX_PAGES reads
+# against the shared installation quota, and only a window that hit the ceiling
+# opens another, so a tick under the ceiling pays nothing extra.
+REPO_LISTING_MAX_WINDOWS = 3
 # The candidate statuses a heal can ever act on. `pending` is excluded: those runs
 # are held by their concurrency group, have no jobs, and `classify_run` maps a
 # jobless run to WAITING_ON_GROUP, never ORPHANED. So a `pending` listing that
@@ -1548,9 +1567,13 @@ def _iter_repo_runs(
     truncated: list[str] | None = None,
     get: Callable[[str], Any] | None = None,
     log: Callable[[str], None] = print,
+    created_at_most: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield runs of EVERY workflow with the given status, newest first, across at
     most ``max_pages`` pages of ``PAGE_SIZE``.
+
+    ``created_at_most`` narrows the listing to runs created at or before that
+    instant (``created=<=…``); see ``_iter_actionable_runs``.
 
     ``GET /repos/{repo}/actions/runs?status=…`` is repo-wide: one paginated call
     returns runs of every workflow, so a single call chain per status covers the
@@ -1584,7 +1607,10 @@ def _iter_repo_runs(
         # The page size never changes between pages: ``page`` is an offset in
         # units of ``per_page``, so a smaller page would re-read the head of the
         # listing and never reach the runs it was meant to fetch.
-        query = urllib.parse.urlencode({"status": status, "per_page": PAGE_SIZE, "page": page})
+        params: dict[str, Any] = {"status": status, "per_page": PAGE_SIZE, "page": page}
+        if created_at_most is not None:
+            params["created"] = f"<={created_at_most}"
+        query = urllib.parse.urlencode(params)
         payload = fetch(f"repos/{repo}/actions/runs?{query}")
         batch = (payload or {}).get("workflow_runs") or []
         if total is None:
@@ -1665,6 +1691,54 @@ def list_runs(api: Api, repo: str, workflow: str, *, status: str, cap: int) -> l
     return sorted(runs, key=lambda run: run["created_at"])
 
 
+def _iter_actionable_runs(
+    api: Api,
+    repo: str,
+    *,
+    status: str,
+    truncated: list[str],
+    get: Callable[[str], Any] | None = None,
+    log: Callable[[str], None] = print,
+) -> Iterator[dict[str, Any]]:
+    """Yield every run of an ACTIONABLE status, reading past the result ceiling.
+
+    One listing stops at ``REPO_LISTING_RESULT_CEILING``, and the unread tail is the
+    oldest runs -- where an orphan sits. So when a window ends at the ceiling (or
+    its page cap), the next window lists the same status created at or before the
+    oldest run already read. ``<=`` rather than ``<`` so runs that share that
+    second are not skipped; the caller drops the repeats by id.
+
+    Truncation is recorded only for the LAST window, and only when it still hit a
+    nameable cause: the window cap ran out, or a full window made no progress
+    (every run in it shares one ``created_at``), so narrowing cannot reach further.
+    """
+    upper: str | None = None
+    for window in range(1, REPO_LISTING_MAX_WINDOWS + 1):
+        sink: list[str] = []
+        oldest: str | None = None
+        for run in _iter_repo_runs(
+            api,
+            repo,
+            status=status,
+            max_pages=REPO_LISTING_MAX_PAGES,
+            truncated=sink,
+            get=get,
+            log=log,
+            created_at_most=upper,
+        ):
+            created = _safe_text(run.get("created_at"))
+            if created and (oldest is None or created < oldest):
+                oldest = created
+            yield run
+        if not sink:
+            return
+        if oldest is None or oldest == upper or window == REPO_LISTING_MAX_WINDOWS:
+            truncated.extend(f"{message} after {window} created window(s)" for message in sink)
+            return
+        log(f"{status} run listing: narrowing to runs created at or before {oldest}")
+        upper = oldest
+
+
 def gather_all_candidate_runs(
     api: Api,
     repo: str,
@@ -1687,8 +1761,9 @@ def gather_all_candidate_runs(
     the runs being hunted; the page cap bounds the listing cost, and the global
     per-tick heal cap still bounds how many runs are acted on.
 
-    The third element names each ACTIONABLE status whose listing did not reach its
-    own ``total_count``. It is a tick-level failure rather than a note, because the
+    An actionable status is read through ``_iter_actionable_runs``, which narrows
+    by created window past the result ceiling. The third element names each
+    ACTIONABLE status whose listing still did not reach its own ``total_count``. It is a tick-level failure rather than a note, because the
     unread tail is where an orphan sits: see ``OUTCOME_LISTING_TRUNCATED``. A
     ``pending`` shortfall is logged and not recorded, because nothing in that status
     is ever healed -- and `pending` is exactly what grows during the saturation this
@@ -1699,15 +1774,15 @@ def gather_all_candidate_runs(
     seen: dict[int, dict[str, Any]] = {}
     try:
         for status in CANDIDATE_STATUSES:
-            for run in _iter_repo_runs(
-                api,
-                repo,
-                status=status,
-                max_pages=REPO_LISTING_MAX_PAGES,
-                truncated=(truncated if status in ACTIONABLE_CANDIDATE_STATUSES else None),
-                get=get,
-                log=log,
-            ):
+            if status in ACTIONABLE_CANDIDATE_STATUSES:
+                runs = _iter_actionable_runs(
+                    api, repo, status=status, truncated=truncated, get=get, log=log
+                )
+            else:
+                runs = _iter_repo_runs(
+                    api, repo, status=status, max_pages=REPO_LISTING_MAX_PAGES, get=get, log=log
+                )
+            for run in runs:
                 if _is_watched(run):
                     seen.setdefault(int(run["id"]), run)
     except ApiError as exc:
@@ -3767,11 +3842,20 @@ def run_watchdog(
             return None
         return None if hold is None else (*hold, None)
 
-    outcomes = {
-        verdict.run_id: OUTCOME_HUMAN_REQUIRED
-        for verdict in verdicts
-        if verdict.verdict == HEAL_EXEMPT
-    }
+    outcomes: dict[int, str] = {}
+    for verdict in verdicts:
+        if verdict.verdict != HEAL_EXEMPT:
+            continue
+        outcomes[verdict.run_id] = OUTCOME_HUMAN_REQUIRED
+        # A failed outcome, so the tick goes red: FAILED_OUTCOMES promises the log
+        # then names the run and the command to type. Without this line a red tick
+        # carries only the plain verdict line, and every tick stays red with no
+        # `::error::` saying which run a human has to recover.
+        log(
+            f"::error::{_label(verdict)} needs a human: {verdict.detail} Recover it by hand "
+            f"(`gh run cancel {verdict.run_id}`, then `gh run rerun {verdict.run_id}` if its "
+            f"verdict is still needed)."
+        )
     outcomes.update(
         heal_runs(
             api,
@@ -3835,6 +3919,113 @@ def run_watchdog(
     return verdicts, outcomes
 
 
+def kick_is_redundant(
+    api: Api,
+    repo: str,
+    *,
+    now: datetime,
+    self_run_id: int,
+    interval: timedelta,
+    log: Callable[[str], None] = print,
+) -> str | None:
+    """Whether a KICKED tick should stand down because a tick already covers this moment.
+
+    One read of this workflow's own recent runs. A tick other than this one that
+    STARTED (`in_progress` or `completed`, any conclusion) within ``interval`` of
+    now means the schedule, or an earlier kick, has classified the fleet within the
+    cadence the schedule promises; this kick adds nothing but its full read cost.
+    Only started ticks count: a `queued`/`pending`/`waiting` sibling is the kick
+    that arrived behind this one and is held by the concurrency group -- counting
+    it would make the two stand down for each other and nobody run.
+
+    Returns the reason to skip, or None to run the full tick. A failed read runs
+    the tick (None): the schedule runs it unconditionally, and starving on a
+    transient error would re-create the gap the kick exists to fill. The caller
+    decides what a rate limit here means for the tick.
+    """
+    page = api.get(f"{_runs_path(repo, WATCHDOG_WORKFLOW)}?per_page=10")
+    newest: datetime | None = None
+    for run in page.get("workflow_runs", []) if isinstance(page, dict) else []:
+        try:
+            if int(run.get("id", 0)) == self_run_id:
+                continue
+            status = run.get("status")
+            if status not in ("in_progress", "completed"):
+                continue
+            # A `cancelled` row never ran a tick: it is a kick the concurrency
+            # group evicted while queued, or a kick that stood down and cancelled
+            # itself (`stand_down`). Counting either as a tick would let a chain of
+            # kicks less than one interval apart stand down for each other, each
+            # seeing the one before, while no full tick ran since the last cron.
+            if status == "completed" and run.get("conclusion") in ("cancelled", "skipped"):
+                continue
+            started = parse_timestamp(run.get("run_started_at") or run["created_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if newest is None or started > newest:
+            newest = started
+    if newest is None:
+        return None
+    age = now - newest
+    if timedelta(0) <= age < interval:
+        return (
+            f"a tick started {_fmt_delta(age)} ago, inside the {_fmt_delta(interval)} "
+            f"schedule interval; this kick adds nothing and stands down"
+        )
+    log(f"the newest other tick started {_fmt_delta(age)} ago; the schedule is late, running")
+    return None
+
+
+# How long a stood-down kick waits for its own cancel to land before giving up
+# and exiting on its own. The cancel is what marks the row `cancelled` so later
+# kicks do not count it as a tick; a row that completes `success` first is
+# indistinguishable from a full tick in the listing.
+STAND_DOWN_CANCEL_WAIT_SECONDS = 60.0
+
+
+def stand_down(
+    api: Api,
+    repo: str,
+    *,
+    self_run_id: int,
+    reason: str,
+    summary_path: str = "",
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    log: Callable[[str], None] = print,
+) -> None:
+    """Record why a kicked tick is not running, then cancel this run so the row reads `cancelled`.
+
+    The listing `kick_is_redundant` reads cannot tell a kick that stood down from a
+    kick that ran: both are `completed`. The one field this run can set on its own
+    row from inside is its conclusion, by cancelling itself (one POST). The runner
+    then stops this step; the wait below is for that stop, bounded so a cancel the
+    API accepted but never delivered cannot hang the job. A cancel that is refused
+    is logged and the run completes `success` -- it then counts as one tick for one
+    interval, which is the degraded case, not a wrong heal.
+    """
+    log(f"kicked tick: {reason}")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as handle:
+            handle.write(f"## CI runner watchdog\n\nKicked tick stood down: {reason}.\n")
+    if self_run_id <= 0:
+        log(
+            "kicked tick: no GITHUB_RUN_ID, so this row cannot be cancelled and will count as a tick"
+        )
+        return
+    try:
+        api.post(f"repos/{repo}/actions/runs/{self_run_id}/cancel")
+    except ApiError as exc:
+        log(
+            f"kicked tick: self-cancel refused ({exc}); this row will count as a tick for one interval"
+        )
+        return
+    deadline = clock() + STAND_DOWN_CANCEL_WAIT_SECONDS
+    while clock() < deadline:
+        sleep(5.0)
+    log("kicked tick: the self-cancel was accepted but has not stopped this step; exiting")
+
+
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
@@ -3863,6 +4054,33 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     api = GitHubApi(token, os.environ.get("GITHUB_API_URL", "https://api.github.com"))
     policy = Policy(repo=args.repo, now=datetime.now(timezone.utc), dry_run=args.dry_run)
+    if os.environ.get("GITHUB_EVENT_NAME", "") == KICK_EVENT:
+        try:
+            self_run_id = int(os.environ.get("GITHUB_RUN_ID", "0") or 0)
+        except ValueError:
+            self_run_id = 0
+        try:
+            reason = kick_is_redundant(
+                api,
+                args.repo,
+                now=policy.now,
+                self_run_id=self_run_id,
+                interval=policy.schedule_interval,
+            )
+        except ApiError as exc:
+            # The one read that decides the debounce failed. A rate limit means the
+            # full tick would abort red on its first listing for nothing; anything
+            # else is the schedule's own posture, which runs unconditionally.
+            if exc.rate_limited:
+                reason = f"the debounce read was rate limited ({exc})"
+            else:
+                print(f"kicked tick: the debounce read failed ({exc}); running the full tick")
+                reason = None
+        if reason is not None:
+            stand_down(
+                api, args.repo, self_run_id=self_run_id, reason=reason, summary_path=args.summary
+            )
+            return 0
     verdicts, outcomes = run_watchdog(api, policy)
     summary = render_summary(verdicts, outcomes, policy)
     # Its own footprint against the quota whose exhaustion started all this. Logged
@@ -3889,8 +4107,9 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "::error::a live run listing did not reach its own total_count, so the oldest live "
             "runs were never classified and an orphan among them was not seen. The page cap is "
-            "already the API's reachable window, so the remedy is to NARROW the listing (by "
-            "created window, branch or event) rather than to page deeper"
+            "already the API's reachable window and the listing already narrows by created "
+            "window up to REPO_LISTING_MAX_WINDOWS, so the remedy is more windows or a narrower "
+            "split (branch or event) rather than paging deeper"
         )
     return 1 if FAILED_OUTCOMES & set(outcomes.values()) else 0
 

@@ -294,9 +294,7 @@ def _normalize_assignment(raw: Any) -> dict[str, Any] | None:
         raise WorkItemStoreCorrupt("work-item assignment fingerprint is invalid")
     if raw["worker_run_id"] and not _RUN_ID_RE.fullmatch(raw["worker_run_id"]):
         raise WorkItemStoreCorrupt("work-item assignment run ID is invalid")
-    if raw["candidate_fingerprint"] and not _FINGERPRINT_RE.fullmatch(
-        raw["candidate_fingerprint"]
-    ):
+    if raw["candidate_fingerprint"] and not _FINGERPRINT_RE.fullmatch(raw["candidate_fingerprint"]):
         raise WorkItemStoreCorrupt("work-item assignment candidate is invalid")
     attempt = raw.get("attempt")
     if (
@@ -355,9 +353,7 @@ def _normalize_handoff(raw: Any) -> dict[str, Any] | None:
     if not raw["outcome"].strip() or not raw["next_action"].strip():
         raise WorkItemStoreCorrupt("worker handoff is missing required text")
     if bool(raw["blocker"].strip()) != bool(raw["release_condition"].strip()):
-        raise WorkItemStoreCorrupt(
-            "worker handoff blocker and release condition are unpaired"
-        )
+        raise WorkItemStoreCorrupt("worker handoff blocker and release condition are unpaired")
     return {
         "outcome": raw["outcome"],
         "canonical_ref": raw["canonical_ref"],
@@ -724,9 +720,7 @@ def _find_item(cycle: dict[str, Any], item_id: str) -> dict[str, Any]:
     raise WorkItemNotFound(f"work item {item_id!r} was not found")
 
 
-def _append_event(
-    item: dict[str, Any], *, kind: str, text: str, now: str, actor: str = ""
-) -> None:
+def _append_event(item: dict[str, Any], *, kind: str, text: str, now: str, actor: str = "") -> None:
     if kind not in _EVENT_KINDS:
         raise WorkItemError("work-item event kind is not supported")
     item["events"] = (
@@ -1096,9 +1090,8 @@ def launch_item(
     """
     if candidate_fingerprint and not _FINGERPRINT_RE.fullmatch(candidate_fingerprint):
         raise WorkItemError("the launch candidate fingerprint is invalid")
-    if (
+    if exclusive_candidate_fingerprint and not _FINGERPRINT_RE.fullmatch(
         exclusive_candidate_fingerprint
-        and not _FINGERPRINT_RE.fullmatch(exclusive_candidate_fingerprint)
     ):
         raise WorkItemError("the exclusive launch candidate fingerprint is invalid")
     contract_limit = _contract_byte_limit(contract_max_bytes)
@@ -1530,9 +1523,7 @@ def worker_assigned_read(worker_key: str, item_id: str) -> dict[str, Any]:
     return _worker_view(item)
 
 
-def worker_report_progress(
-    worker_key: str, item_id: str, text: str, kind: str
-) -> dict[str, Any]:
+def worker_report_progress(worker_key: str, item_id: str, text: str, kind: str) -> dict[str, Any]:
     """Append one worker progress or blocker note under its worker fingerprint."""
     if kind not in {"progress", "blocker"}:
         raise WorkItemError("progress kind must be progress or blocker")

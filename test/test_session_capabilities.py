@@ -1096,9 +1096,7 @@ async def test_execution_override_reaches_allocation_without_member_model(world)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resume", [False, True])
 @pytest.mark.parametrize("fault", [None, "withheld", "changed", "wire", "state"])
-async def test_saved_projection_requires_consumed_matching_spec(
-    world, monkeypatch, resume, fault
-):
+async def test_saved_projection_requires_consumed_matching_spec(world, monkeypatch, resume, fault):
     from kiro_crew.acp.client import AcpError
     from kiro_crew.providers.acp import AcpProvider
     from kiro_crew.session_capabilities import loaded_stamp, prepare_runtime, verify_saved
@@ -1106,7 +1104,9 @@ async def test_saved_projection_requires_consumed_matching_spec(
     service, cfg, _, _, project, _, _ = world
     await asyncio.to_thread(save, service, enroll=True)
     prepared = await asyncio.to_thread(prepare_runtime, "A", "A", str(project))
-    provider = AcpProvider(work_dir=project, agent=prepared.template, acp_backend=ACP_BACKEND_CLAUDE)
+    provider = AcpProvider(
+        work_dir=project, agent=prepared.template, acp_backend=ACP_BACKEND_CLAUDE
+    )
     client = provider.client
     client.member_context = True
     client._process = MagicMock(returncode=None)
@@ -1238,9 +1238,7 @@ def test_codex_member_template_not_reported_from_dead_runtime(monkeypatch):
     assert provider.loaded_capability_template == ""
 
 
-def test_deepseek_member_confirms_on_the_spec_its_array_was_built_from(
-    tmp_path, monkeypatch
-):
+def test_deepseek_member_confirms_on_the_spec_its_array_was_built_from(tmp_path, monkeypatch):
     """deepseek confirms on the AcpClient path like claude. The mirror must hand back
     the spec it parsed: a projection that drops it leaves nothing to confirm, and every
     deepseek member session would be refused."""

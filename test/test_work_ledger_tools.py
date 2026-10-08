@@ -437,7 +437,9 @@ async def test_item_closed_is_409_for_both_halves():
         CONDUCTOR_A, {"action": "close", "item_id": ids["item_a"], "state": "accepted"}
     )
     assert status == 200
-    status, body = await _report(WORKER_A, {"status": "done", "summary": "too late"})
+    status, body = await _report(
+        WORKER_A, {"status": "done", "summary": "too late", "artifacts": {"commit": "abc1234"}}
+    )
     assert status == 409
     assert body["code"] == wl.CODE_ITEM_CLOSED
     status, body = await _record(
@@ -496,13 +498,57 @@ async def test_item_store_full_is_409(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_field_too_long_is_400_and_names_the_field():
+    """``artifacts`` carries pointers a conductor follows, so it refuses rather than cut."""
     await two_by_two()
     status, body = await _report(
-        WORKER_A, {"status": "progress", "summary": "x" * (wl.MAX_SUMMARY_CHARS + 1)}
+        WORKER_A,
+        {
+            "status": "progress",
+            "summary": "ok",
+            "artifacts": {"k": "v" * (wl.MAX_ARTIFACT_VALUE_CHARS + 1)},
+        },
     )
     assert status == 400
-    assert body["code"] == wl.CODE_FIELD_TOO_LONG
-    assert "summary" in body["error"]
+    assert "artifacts" in body["error"]
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_summary_is_clamped_through_the_route_and_the_store_says_so():
+    """Prose over the cap costs no round-trip, and the stored value announces the cut.
+
+    The whole path: route validation, the store write, and the stamp read back off
+    the item the conductor reads. ``summary`` is the one field cut rather than
+    refused, because a model composing prose cannot measure it before it calls.
+    """
+    ids = await two_by_two()
+    sent = wl.MAX_SUMMARY_CHARS + 30
+
+    status, body = await _report(WORKER_A, {"status": "progress", "summary": "w" * sent})
+    assert status == 200, body
+
+    item = wl.read_work_item(CONDUCTOR_A, ids["item_a"])
+    assert item is not None
+    assert len(item.summary) <= wl.MAX_SUMMARY_CHARS
+    reported = validation.clamp_report(item.summary)
+    assert reported is not None
+    before, kept = reported
+    assert before == sent
+    assert item.summary.startswith("w" * kept)
+
+
+@pytest.mark.asyncio
+async def test_a_summary_exactly_at_the_cap_reaches_the_store_byte_identical():
+    """The boundary the clamp must not disturb."""
+    ids = await two_by_two()
+    exact = "b" * wl.MAX_SUMMARY_CHARS
+
+    status, body = await _report(WORKER_A, {"status": "progress", "summary": exact})
+    assert status == 200, body
+
+    item = wl.read_work_item(CONDUCTOR_A, ids["item_a"])
+    assert item is not None
+    assert item.summary == exact
+    assert validation.clamp_report(item.summary) is None
 
 
 @pytest.mark.asyncio
@@ -662,7 +708,9 @@ async def test_each_batch_entry_carries_the_items_status_unfiltered():
     assert entry["status"] == "progress"
     assert entry["accept"] == {"kind": "human_approval"}
 
-    status, _ = await _report(WORKER_A, {"status": "done", "summary": "met"})
+    status, _ = await _report(
+        WORKER_A, {"status": "done", "summary": "met", "artifacts": {"commit": "abc1234"}}
+    )
     assert status == 200
     _, body = await _read(CONDUCTOR_A)
     entry = next(e for e in body["accept_batch"]["items"] if e["id"] == ids["item_a"])
@@ -675,7 +723,9 @@ async def test_a_done_item_waiting_on_the_conductor_is_not_stale():
     next move is the conductor's or a human's, so the flag must not point back at the
     reader — a quiet ``done`` item is silent because it is finished."""
     ids = await two_by_two()
-    status, _ = await _report(WORKER_A, {"status": "done", "summary": "opened the pr"})
+    status, _ = await _report(
+        WORKER_A, {"status": "done", "summary": "opened the pr", "artifacts": {"commit": "abc1234"}}
+    )
     assert status == 200
     item = wl.read_work_item(CONDUCTOR_A, ids["item_a"])
     assert item is not None
@@ -1231,7 +1281,11 @@ def test_every_route_is_registered_lazily_on_the_app():
 
     from kiro_crew.dashboard import server
 
-    src = inspect.getsource(server)
+    # server.py and the server_runtime owners it composes; the MCP route table
+    # lives in one of them.
+    owners = sorted((Path(server.__file__).parent / "server_runtime").glob("[!_]*.py"))
+    assert owners, "expected the server_runtime owners beside server.py"
+    src = inspect.getsource(server) + "".join(p.read_text(encoding="utf-8") for p in owners)
     for method, path, handler in (
         ("add_get", "/api/work-ledger", "api_work_ledger_get"),
         ("add_post", "/api/work-ledger/record", "api_work_ledger_record"),
@@ -1624,3 +1678,43 @@ def test_the_schema_ceiling_restates_the_route_caps():
     assert state.allowed == wl.ITEM_STATES
     item_id = next(f for f in validation.WORK_LEDGER_READ_SCHEMA.fields if f.name == "item_id")
     assert item_id.pattern is not None and item_id.pattern.pattern == wl._ITEM_ID_RE.pattern
+
+
+# ── a done names its evidence ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_done_with_no_evidence_is_refused_and_writes_nothing():
+    ids = await two_by_two()
+    before = wl.item_path(CONDUCTOR_A, ids["item_a"]).read_bytes()
+    status, body = await _report(WORKER_A, {"status": "done", "summary": "all tests pass"})
+    assert status == 400
+    assert body["code"] == "done_without_evidence"
+    assert body["field"] == "artifacts"
+    assert "not run" in body["error"]
+    assert wl.item_path(CONDUCTOR_A, ids["item_a"]).read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"artifacts": {"tests": "pytest test/test_x.py exit=0"}},
+        {"artifacts": {"tests": "not run: harness unavailable"}},
+        {"pr": 42},
+    ],
+)
+async def test_a_done_with_one_pointer_is_recorded(evidence):
+    ids = await two_by_two()
+    status, body = await _report(WORKER_A, {"status": "done", "summary": "met", **evidence})
+    assert status == 200, body
+    item = wl.read_work_item(CONDUCTOR_A, ids["item_a"])
+    assert item is not None and item.status == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_value", ["progress", "blocked", "question"])
+async def test_only_done_needs_evidence(status_value):
+    await two_by_two()
+    status, body = await _report(WORKER_A, {"status": status_value, "summary": "still going"})
+    assert status == 200, body

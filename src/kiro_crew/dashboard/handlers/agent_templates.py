@@ -697,7 +697,7 @@ async def api_agent_template_delete(request: web.Request) -> web.Response:
 
     The reference check and the unlink are ONE critical section, off the loop,
     under every lock the reference stores' writers take -- the shape
-    ``_unlink_copy_unless_referenced`` in ``handlers.agents`` established:
+    ``_unlink_copy_unless_referenced`` in ``dashboard/agent_admin/template_lineage.py`` established:
 
     * the folder store lock (``state.hold_folders``), held across the whole
       section, so no folder pin can commit between the check and the unlink;

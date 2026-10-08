@@ -32,6 +32,7 @@ from kiro_crew.agent_files import (
     LEDGER_CONDUCTOR_AGENT_FILENAME,
     OWNED_KIRO_AGENT_FILES,
     PIPELINE_CONDUCTOR_AGENT_FILENAME,
+    SECURITY_CONDUCTOR_AGENT_FILENAME,
     WORKER_AGENT_FILENAME,
 )
 from kiro_crew.agent_sdk.drivers.acp import derived_agent_permissions
@@ -96,11 +97,12 @@ def _accepting_kiro_cli(monkeypatch):
 
 @pytest.fixture()
 def specs(tmp_path, monkeypatch) -> dict[str, dict[str, Any]]:
-    """Install the four related specs into a throwaway agents dir and read them back."""
+    """Install the five related specs into a throwaway agents dir and read them back."""
     monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
     agent._install_worker_agent()
     agent._install_conductor_agent()
     agent._install_pipeline_conductor_agent()
+    agent._install_security_conductor_agent()
     agent._install_ledger_conductor_agent()
     return {
         name: json.loads((tmp_path / name).read_text(encoding="utf-8"))
@@ -108,6 +110,7 @@ def specs(tmp_path, monkeypatch) -> dict[str, dict[str, Any]]:
             WORKER_AGENT_FILENAME,
             CONDUCTOR_AGENT_FILENAME,
             PIPELINE_CONDUCTOR_AGENT_FILENAME,
+            SECURITY_CONDUCTOR_AGENT_FILENAME,
             LEDGER_CONDUCTOR_AGENT_FILENAME,
         )
     }
@@ -347,23 +350,22 @@ def test_a_ledger_conductor_mounts_the_server_and_grants_only_its_own_half(specs
     assert "@kirocrew-work" not in allowed
 
 
-def test_a_conductor_with_another_procedure_does_not_mount_the_server(specs):
-    """The pipeline conductor mounted this server briefly, and the mount is retracted.
-
-    The tools alone do not describe the procedure they came with: the ledger flow
-    binds before it seeds and reads a record instead of a transcript, so mounting
-    them on an agent that ships a different procedure hands its users a procedure
-    they did not choose. Asserted negatively, on every surface a mount can survive
-    on, so it cannot return unnoticed — the KAS rule especially, since nothing
-    reads ``allowedTools`` on that backend.
-    """
-    spec = specs[PIPELINE_CONDUCTOR_AGENT_FILENAME]
-    assert "@kirocrew-work" not in spec["tools"]
-    assert "kirocrew-work" not in spec["mcpServers"]
-    assert not [ref for ref in spec["allowedTools"] if "kirocrew-work" in ref]
-    assert not [m for m in spec["permissions"]["rules"][0]["match"] if "kirocrew-work" in m]
-    for token in ("work_ledger", "work_brief", "work_report", "kirocrew-work"):
-        assert token not in spec["prompt"], token
+@pytest.mark.parametrize(
+    "filename", [PIPELINE_CONDUCTOR_AGENT_FILENAME, SECURITY_CONDUCTOR_AGENT_FILENAME]
+)
+def test_a_conductor_with_its_own_store_mounts_the_base_half(specs, filename):
+    """The pipeline and security conductors get the work server from the shared
+    conductor base: the two conductor verbs auto-approved on ``allowedTools`` and on
+    the KAS rule, and the worker half left gated. ``work_brief`` is not theirs:
+    neither procedure is dispatched as a ledger item's worker."""
+    spec = specs[filename]
+    assert "@kirocrew-work" in spec["tools"]
+    assert spec["mcpServers"]["kirocrew-work"]["args"][-1] == "mcp-work"
+    work = [ref for ref in spec["allowedTools"] if "kirocrew-work" in ref]
+    assert work == ["@kirocrew-work/work_ledger_read", "@kirocrew-work/work_ledger_record"]
+    match = spec["permissions"]["rules"][0]["match"]
+    assert "kirocrew-work/work_ledger_record" in match
+    assert "kirocrew-work/work_report" not in match
 
 
 @pytest.mark.parametrize(
@@ -1985,17 +1987,30 @@ def test_the_spawn_gate_is_called_exactly_once_per_spawn():
 def test_the_harness_spawn_seam_is_reached_only_through_the_gated_owner():
     """What licenses the kiro harness not gating: its spawn seam has exactly one caller in
     the product, and that caller gates. A second caller would be an ungated spawn path,
-    which is the hole the enumeration test's exemption would otherwise hide."""
+    which is the hole the enumeration test's exemption would otherwise hide.
+
+    The client resolves the plans of the hosts it launches one process per session for
+    through the same method name, on a ``ProcessAdapter``. That call cannot reach a
+    harness: the registry it reads holds no ``HarnessAdapter`` and has no entry for
+    kiro-cli, whose client launch keeps its own gated arm. So exactly two call sites
+    exist, and only the runtime's can reach the kiro harness's seam.
+    """
+    from kiro_crew.acp.harness import _PROCESS_ADAPTERS, HarnessAdapter, process_adapter_for
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_ACP_RUNTIME
+
     invocations: list[str] = []
     for path, source in _package_sources():
         for lineno, line in enumerate(source.splitlines(), 1):
             if "resolve_spawn(" not in line or "def resolve_spawn(" in line:
                 continue
             invocations.append(f"{path.name}:{lineno}")
-    assert (
-        len(invocations) == 1
-    ), f"the spawn seam is invoked from more than one place: {invocations}"
-    assert invocations[0].startswith("runtime.py:"), invocations
+    assert sorted(name.split(":")[0] for name in invocations) == [
+        "client.py",
+        "runtime.py",
+    ], f"the spawn seam is invoked from an unexpected place: {invocations}"
+    assert not any(issubclass(cls, HarnessAdapter) for cls in _PROCESS_ADAPTERS.values())
+    for backend in ACP_BACKENDS_ACP_RUNTIME:
+        assert process_adapter_for(backend) is None
 
 
 def test_a_re_derive_during_the_hosts_own_pre_spawn_work_does_not_kill_the_session(
@@ -2692,19 +2707,32 @@ def test_the_identity_fast_path_re_stats_after_reading_the_sidecar(tmp_path, mon
     assert agent._derived_spec_matches_default("kirocrew-worker") is False
 
 
-def test_the_client_closes_the_bracket_after_the_handshake():
+def test_the_client_closes_the_bracket_after_the_handshake(tmp_path):
     """The second subprocess spawner, and the same placement rule: the AcpClient captures
     the snapshot in ``_spawn`` and must re-verify it in ``_initialize_session`` after the
     ``initialize`` response and BEFORE any session is created, so a session is never
     built on a spec nobody verified."""
     import inspect
+    from unittest.mock import patch
+
+    import acp_launch_capture as capture_mod
 
     from kiro_crew.acp import client
+    from kiro_crew.acp_backends import ACP_BACKEND_KIRO
 
-    spawn_src = inspect.getsource(client.AcpClient._spawn)
-    assert (
-        "self._derived_spec_snapshot = derived_snapshot" in spawn_src
-    ), "the capture half must stay in _spawn -- it is the window's opening edge"
+    # The capture half, observed on a real kiro-cli launch: what the gate returned
+    # is what the spawn left on the client for the handshake to verify.
+    snapshot = object()
+    left: list[object] = []
+    capture_mod.capture(
+        ACP_BACKEND_KIRO,
+        tmp_path,
+        extra_patches=(patch.object(client, "require_fresh_derived_spec", return_value=snapshot),),
+        observe=lambda spawned: left.append(spawned._derived_spec_snapshot),
+    )
+    assert left == [
+        snapshot
+    ], "the capture half must stay in _spawn -- it is the window's opening edge"
 
     src = inspect.getsource(client.AcpClient._initialize_session)
     assert (

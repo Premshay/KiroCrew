@@ -52,9 +52,9 @@ OWNER_DIR = FACADE_PATH.with_name("slot_persistence")
 OWNER_MODULES = frozenset(
     {
         "message_entries",
+        "metadata_codec",
         "metadata_line",
         "restore_inputs",
-        "restored_metadata",
         "transcript_merge",
         "turn_marker",
         "write_guards",
@@ -308,7 +308,6 @@ _FACADE_IMPORTS: dict[str, tuple[str, str | None]] = {
     "transcript_sort_key": ("kiro_crew.history", "transcript_sort_key"),
     "union_deferred_notes": ("kiro_crew.dashboard.slot_buffers", "union_deferred_notes"),
     "update_metadata_off_loop": ("kiro_crew.history", "update_metadata_off_loop"),
-    "uuid": ("uuid", None),
     "with_bounded_redaction_records": (
         "kiro_crew.dashboard.chat_utils",
         "with_bounded_redaction_records",
@@ -317,6 +316,7 @@ _FACADE_IMPORTS: dict[str, tuple[str, str | None]] = {
 
 #: The defined names that moved, and the owner each one lives in.
 _MOVED: dict[str, str] = {
+    "COLOR_HEX_RE": "metadata_codec",
     "_FLUSH_SNAPSHOT_RETRIES": "write_guards",
     "_LOCAL_TURN_PROMPT_MAX_ATTACHMENTS": "turn_marker",
     "_LOCAL_TURN_PROMPT_MAX_BYTES": "turn_marker",
@@ -327,6 +327,7 @@ _MOVED: dict[str, str] = {
     "_PENDING_MEMORY_MODE_LOCK": "metadata_line",
     "_RESTART_INTERRUPTION_KIND": "turn_marker",
     "_RESTART_INTERRUPTION_MSG": "turn_marker",
+    "_RETIRED_MODES": "metadata_codec",
     "_approx_window_payload_bytes": "message_entries",
     "_archive_dropped_lines": "transcript_merge",
     "_attach_variants": "message_entries",
@@ -350,22 +351,23 @@ _MOVED: dict[str, str] = {
     "_queue_snapshot_is_stale": "write_guards",
     "_read_mcp_app_claims": "restore_inputs",
     "_read_open_slots_keys": "restore_inputs",
-    "_rebase_rehydrated_refresh_mark": "restored_metadata",
+    "_rebase_rehydrated_refresh_mark": "metadata_codec",
     "_recent_session_slot_name": "restore_inputs",
     "_reconcile_local_turn_marker": "turn_marker",
     "_reconcile_mcp_app_claims": "restore_inputs",
     "_record_pending_memory_mode": "metadata_line",
     "_recover_mcp_app_claims": "restore_inputs",
-    "_rehydrate_slot_title": "restored_metadata",
-    "_rehydrate_title_low_signal": "restored_metadata",
-    "_rehydrate_title_origin": "restored_metadata",
-    "_rehydrate_title_refresh_mark": "restored_metadata",
-    "_restore_dismissed_source_links": "restored_metadata",
+    "_rehydrate_slot_title": "metadata_codec",
+    "_rehydrate_title_low_signal": "metadata_codec",
+    "_rehydrate_title_origin": "metadata_codec",
+    "_rehydrate_title_refresh_mark": "metadata_codec",
+    "_restore_dismissed_source_links": "metadata_codec",
     "_restored_agent_name": "restore_inputs",
+    "_restored_mode": "metadata_codec",
     "_sanitize_open_slot_key": "restore_inputs",
     "_stable_durable_queue": "write_guards",
     "_tighten_carried_execution": "metadata_line",
-    "_validate_autocompact_pct": "restored_metadata",
+    "_validate_autocompact_pct": "metadata_codec",
     "_window_holds_row": "turn_marker",
     "local_turn_prompt_within_bounds": "turn_marker",
     "pending_slot_memory_mode": "metadata_line",
@@ -377,7 +379,7 @@ _MOVED: dict[str, str] = {
 #: The signature of every function the facade defined, as it was at that base.
 _SIGNATURES: dict[str, str] = {
     "_apply_recent_session": "(state: 'DashboardState', key: 'str', slot_name: 'str', session: 'dict', meta: 'dict', messages: 'list[dict]', *, conv_log: \"'ConversationLog'\", kiro_model_map: 'dict[str, str]', restore_cfg: \"'KiroCrewConfig | None'\", member_identity: 'tuple[str, str] | None' = ('', '__unresolved__'), agent: 'str | None' = None, effort_marker: 'bool' = False) -> 'None'",
-    "_apply_restored_open_slot": "(state: 'DashboardState', key: 'str', *, meta: 'dict', readable: 'bool', messages: 'list[dict] | None', model_map: 'dict[str, str] | None', unrestored: 'set[str]', member_identity: 'tuple[str, str] | None' = ('', '__unresolved__'), agent: 'str | None' = None, effort_marker: 'bool' = False, conv_log: 'ConversationLog | None' = None, started: 'float | None' = None) -> 'int'",
+    "_apply_restored_open_slot": "(state: 'DashboardState', key: 'str', *, meta: 'dict', readable: 'bool', messages: 'list[dict] | None', model_map: 'dict[str, str] | None', unrestored: 'set[str]', member_identity: 'tuple[str, str] | None' = ('', '__unresolved__'), agent: 'str | None' = None, effort_marker: 'bool' = False, conv_log: 'ConversationLog | None' = None, started: 'float | None' = None, preserve_remote_only: 'bool' = False) -> 'int'",
     "_approx_window_payload_bytes": "(window: 'list[dict]') -> 'int'",
     "_archive_dropped_lines": "(state: 'DashboardState', history_key: 'str', old_lines: 'list[str]', new_lines: 'list[str]') -> 'None'",
     "_attach_variants": "(slot: '_ChatSlot', m: 'dict') -> 'None'",
@@ -1301,7 +1303,7 @@ def test_the_golden_bytes_are_sensitive_to_the_line_fold(tmp_path, monkeypatch, 
 _GOLDEN: dict[str, dict] = {
     "full_save": {
         "file": (
-            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "memory_mode": "persistent", "title": "Golden", "title_origin": "auto", "title_refresh_mark": 3, "title_low_signal": false, "agent": "writer", "model": "model-x", "autocompact_pct": 55.0, "mode": "focus", "project": "/srv/project", "folder_id": "folder-1", "pinned": true, "color_index": 2, "color_hex": "#aabbcc", "tags": ["tag-1"], "last_user_at": "2026-01-02T03:04:06", "tab_id": "tab-golden-full"}\n'
+            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "memory_mode": "persistent", "title": "Golden", "title_origin": "auto", "title_refresh_mark": 3, "title_low_signal": false, "agent": "writer", "model": "model-x", "autocompact_pct": 55.0, "mode": "focus", "project": "/srv/project", "folder_id": "folder-1", "checkpoint_freshness": {"activity_generation": 0, "covered_generation": 0, "overdue": false}, "pinned": true, "color_index": 2, "color_hex": "#aabbcc", "tags": ["tag-1"], "last_user_at": "2026-01-02T03:04:06", "tab_id": "tab-golden-full"}\n'
             '{"role": "user", "content": "hello", "ts": "2026-01-02T03:04:06", "source_thread": "dashboard", "source_user": "dashboard", "meta": {"mid": "m-1", "human": true}}\n'
             '{"role": "assistant", "content": "the key is [REDACTED: credential]", "ts": "2026-01-02T03:04:07", "source_thread": "dashboard", "source_user": "dashboard", "meta": {"mid": "m-2"}}\n'
             '{"role": "system", "content": "a notice", "ts": "2026-01-02T03:04:08", "source_thread": "dashboard", "source_user": "dashboard", "meta": {"mid": "m-3"}}\n'
@@ -1311,13 +1313,13 @@ _GOLDEN: dict[str, dict] = {
     },
     "empty_window_merge": {
         "file": (
-            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "title": "New", "rotation_generation": 4, "other_layer": "kept", "folder_id": "folder-2", "tags": ["a", "b"], "pinned": false, "mode": "", "artifact": "", "reasoning_effort": "", "color_index": null, "color_hex": "", "color_theme": "", "memory_mode": "persistent", "model": "", "queued_prompts": [], "autocompact_pct": null, "title_low_signal": false, "workspace": "default", "memory_store": "", "agent_kind": "", "project": "", "turn_in_flight_generation": 0, "turn_in_flight_prompt": null, "tab_id": "tab-golden-empty", "closed": true, "closed_at": 1767225600.0, "dismissed_source_links": [], "deferred_notes": []}\n'
+            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "title": "New", "rotation_generation": 4, "other_layer": "kept", "folder_id": "folder-2", "tags": ["a", "b"], "pinned": false, "mode": "", "artifact": "", "reasoning_effort": "", "color_index": null, "color_hex": "", "color_theme": "", "memory_mode": "persistent", "model": "", "queued_prompts": [], "autocompact_pct": null, "title_low_signal": false, "workspace": "default", "memory_store": "", "agent_kind": "", "runtime_agent": "", "project": "", "declared_goal": "", "session_checkpoint": null, "checkpoint_freshness": {"activity_generation": 0, "covered_generation": 0, "overdue": false}, "session_timeline": [], "peer_channel_inbox": [], "post_restart_continuation": "", "turn_in_flight_generation": 0, "turn_in_flight_prompt": null, "tab_id": "tab-golden-empty", "closed": true, "closed_at": 1767225600.0, "dismissed_source_links": [], "deferred_notes": []}\n'
         ),
         "ok": True,
     },
     "foreign_append": {
         "file": (
-            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "memory_mode": "persistent", "model": "", "autocompact_pct": null, "tab_id": "tab-golden-foreign"}\n'
+            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "memory_mode": "persistent", "model": "", "autocompact_pct": null, "checkpoint_freshness": {"activity_generation": 0, "covered_generation": 0, "overdue": false}, "tab_id": "tab-golden-foreign"}\n'
             '{"role": "user", "content": "first", "ts": "2026-01-02T03:04:06", "source_thread": "dashboard", "source_user": "dashboard", "meta": {"mid": "m-1"}}\n'
             '{"role": "assistant", "content": "from cron", "ts": "2026-01-02T03:04:07", "source_thread": "cron"}\n'
             '{"role": "assistant", "content": "second", "ts": "2026-01-02T03:04:08", "source_thread": "dashboard", "source_user": "dashboard", "meta": {"mid": "m-2"}}\n'
@@ -1332,7 +1334,7 @@ _GOLDEN: dict[str, dict] = {
     },
     "rows_only_handover": {
         "file": (
-            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "title": "Theirs", "tab_id": "tab-replacement", "folder_id": "their-folder", "memory_mode": "persistent"}\n'
+            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "checkpoint_freshness": {"activity_generation": 0, "covered_generation": 0, "overdue": false}, "title": "Theirs", "tab_id": "tab-replacement", "folder_id": "their-folder", "memory_mode": "persistent"}\n'
             '{"role": "user", "content": "unsaved tail", "ts": "2026-01-02T03:04:06", "source_thread": "dashboard", "source_user": "dashboard", "meta": {"mid": "m-1"}}\n'
         ),
         "ok": True,
@@ -1344,7 +1346,7 @@ _GOLDEN: dict[str, dict] = {
             ]
         ],
         "file": (
-            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "memory_mode": "persistent", "model": "", "autocompact_pct": null, "tab_id": "tab-golden-rewrite", "rotation_generation": 1}\n'
+            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "memory_mode": "persistent", "model": "", "autocompact_pct": null, "checkpoint_freshness": {"activity_generation": 0, "covered_generation": 0, "overdue": false}, "tab_id": "tab-golden-rewrite", "rotation_generation": 1}\n'
             '{"role": "user", "content": "q1", "ts": "2026-01-02T03:04:06", "source_thread": "dashboard", "source_user": "dashboard", "meta": {"mid": "m-1"}}\n'
             '{"role": "assistant", "content": "a1", "ts": "2026-01-02T03:04:07", "source_thread": "dashboard", "source_user": "dashboard", "meta": {"mid": "m-2"}}\n'
         ),

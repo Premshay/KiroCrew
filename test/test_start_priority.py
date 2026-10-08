@@ -858,7 +858,14 @@ def _priority_args(path: str, function: str, callee: str) -> list[str]:
         ("dashboard/stt_stream.py", "_classify", "run_bg_oneliner", "StartPriority.FOREGROUND"),
         # The dashboard runner hands every start the turn's own priority.
         ("dashboard/chat_runner.py", "_run_chat", "run_bg_oneliner", "_turn_priority"),
-        ("dashboard/chat_runner.py", "_run_chat", "schedule_eager_spawn", "_turn_priority"),
+        # The turn's eager respawn runs in its tail, from the priority the turn
+        # recorded in its outcome.
+        (
+            "dashboard/chat_runner.py",
+            "_end_turn_tail",
+            "schedule_eager_spawn",
+            "outcome.start_priority",
+        ),
         # A turn's own background work passes the priority it was given.
         ("dashboard/handlers/side.py", "_run_side_turn", "get_or_create", "start_priority"),
         ("dashboard/chat_threads.py", "_run_thread_turn", "get_or_create", "start_priority"),
@@ -964,9 +971,11 @@ def test_the_focus_prefetch_and_reload_arm_background_eager_spawns(path, functio
     assert _priority_args(path, function, "schedule_eager_spawn") == []
 
 
-def test_drive_turn_starts_the_session_at_the_turns_priority():
-    assert _priority_args("messaging/dispatch.py", "drive_turn", "get_or_create") == [
-        "turn.start_priority"
+def test_the_channel_pipeline_starts_the_session_at_the_askers_priority():
+    # Both claims: a monitor wake's non-waiting one and an inbound turn's.
+    assert _priority_args("messaging/dispatch.py", "_run", "get_or_create") == [
+        "asker.start_priority",
+        "asker.start_priority",
     ]
 
 
@@ -1011,7 +1020,7 @@ def test_every_transport_marks_what_it_receives_as_a_persons(transport):
         ("weixin/transport_dispatch.py", "ChannelTurn", 1),
         ("wecom/transport_dispatch.py", "ChannelTurn", 1),
         ("whatsapp/transport_dispatch.py", "ChannelTurn", 1),
-        ("discord/transport_dispatch.py", "get_or_create", 2),
+        ("discord/transport_dispatch.py", "Asker", 1),
         ("telegram/transport_dispatch.py", "get_or_create", 1),
     ],
 )
@@ -1182,3 +1191,57 @@ def test_a_recovery_respawn_starts_with_an_empty_queue_total():
     assert reset_fields and all(
         queue_total and mark for queue_total, mark in reset_fields
     ), "every site that (re)stamps _exec_started must clear the paused-clock fields"
+
+
+# --------------------------------------------------------------------------- #
+# widen_to: a bound sized after it was built
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_widen_to_hands_the_new_permits_to_queued_waiters() -> None:
+    sem = PrioritySemaphore(2, foreground_reserve=1)
+    await sem.acquire(StartPriority.BACKGROUND)
+    queued = [asyncio.ensure_future(sem.acquire(StartPriority.BACKGROUND)) for _ in range(3)]
+    await asyncio.sleep(0)
+    assert not any(t.done() for t in queued)  # background cap is 1
+
+    sem.widen_to(4)
+    await asyncio.sleep(0)
+
+    assert sum(t.done() for t in queued) == 2
+    assert sem.limit == 4
+    assert sem._background_cap == 3  # the reserve is still one permit
+    assert sem.locked(StartPriority.BACKGROUND)
+    assert not sem.locked(StartPriority.FOREGROUND)
+    for t in queued:
+        t.cancel()
+    await asyncio.gather(*queued, return_exceptions=True)
+
+
+def test_widen_to_never_shrinks() -> None:
+    sem = PrioritySemaphore(5)
+    sem.widen_to(3)
+    sem.widen_to(5)
+    assert sem.limit == 5
+    assert sem._value == 5
+
+
+@pytest.mark.asyncio
+async def test_a_pending_drain_waits_for_the_widened_total() -> None:
+    sem = PrioritySemaphore(2)
+    await sem.acquire(StartPriority.BACKGROUND)
+    entered = asyncio.Event()
+    leave = asyncio.Event()
+    task = asyncio.ensure_future(_drain_until(sem, entered, leave))
+    await asyncio.sleep(0)
+    sem.widen_to(4)
+    await asyncio.sleep(0)
+    assert not entered.is_set()  # the holder is still inside
+    assert sem._drain_held == 3
+    sem.release(StartPriority.BACKGROUND)
+    await asyncio.wait_for(entered.wait(), 5)
+    assert sem._drain_held == 4
+    leave.set()
+    await asyncio.wait_for(task, 5)
+    assert sem._value == 4

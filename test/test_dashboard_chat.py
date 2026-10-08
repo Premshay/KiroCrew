@@ -30,6 +30,7 @@ from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO, TurnUsage
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.config.loader import KiroCrewConfig, ResolvedBindings
 from kiro_crew.dashboard.chat_runner import _tool_call_ws_payload
+from kiro_crew.dashboard.recovery_replays import ReplayFamily
 from kiro_crew.dashboard.state import (
     _MAX_SLOT_MESSAGES,
     _MAX_SOURCE_LINKS_PER_SLOT,
@@ -37,6 +38,26 @@ from kiro_crew.dashboard.state import (
     _ChatSlot,
 )
 from kiro_crew.history import ConversationLog
+
+
+def _arm_refusal_replay(
+    slot: _ChatSlot,
+    entry_id: str,
+    *,
+    session_key: str = "",
+    session_stop_gen: int = 0,
+) -> None:
+    if not session_key:
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        session_key = slot._refusal_fallback_session_key or effective_session_key(slot)
+    slot.replays.arm(
+        ReplayFamily.CONTENT_FILTER,
+        entry_id=entry_id,
+        session_key=session_key,
+        stop_gen=slot._stop_generation,
+        session_stop_gen=session_stop_gen,
+    )
 
 
 def _arm_inner_client_handlers(inner):
@@ -5690,7 +5711,7 @@ class TestTitleGenerationSessionLeak:
         mock_client = MagicMock()
         mock_client.destroy = AsyncMock()
 
-        async def _exploding_prompt(prompt):
+        async def _exploding_prompt(prompt, *, allow_image=True):
             raise RuntimeError("throttle / ACP error")
             yield  # noqa: unreachable — makes this an async generator
 
@@ -5720,7 +5741,7 @@ class TestTitleGenerationSessionLeak:
         mock_client.reject_tool = AsyncMock()
         mock_client.destroy = AsyncMock()
 
-        async def _prompt(prompt):
+        async def _prompt(prompt, *, allow_image=True):
             yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="My Title")
             yield LLMEvent(kind=EVENT_PERMISSION_REQUEST, request_id="req-1")
             yield LLMEvent(kind=EVENT_COMPLETE)
@@ -5744,7 +5765,7 @@ class TestTitleGenerationSessionLeak:
         mock_client = MagicMock()
         mock_client.destroy = AsyncMock()
 
-        async def _prompt(prompt):
+        async def _prompt(prompt, *, allow_image=True):
             yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="Good")
             yield LLMEvent(kind=EVENT_COMPLETE)
             yield LLMEvent(kind=EVENT_TEXT_CHUNK, text=" SHOULD NOT APPEAR")
@@ -7084,6 +7105,8 @@ class TestRunChatCompactDeferredWait:
         client = self._make_mock_client([LLMEvent(kind=EVENT_COMPLETE)])
         client.manual_compact_unsupported_backend = "codex"
         state.sessions._sessions = {"dashboard:s1": SimpleNamespace(provider=client)}
+        state.sessions.get_provider = lambda _key: client
+        state.sessions.is_provider_alive = AsyncMock(return_value=True)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
 
         from kiro_crew.dashboard.chat import _run_chat
@@ -11510,7 +11533,7 @@ class TestRunChatRefusalFallback:
         )
         # Still exactly one swap (no retry loop), replay record consumed.
         client.set_model.assert_awaited_once_with("opus-test")
-        assert slot._refusal_retry_text == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
         assert not slot._queue
 
     @pytest.mark.asyncio
@@ -11964,7 +11987,7 @@ class TestRunChatRefusalFallback:
         assert len(cards) == 1, "the terminal card must render when the retry is refused"
         # No replay was recorded or announced — the follow-up owns the next
         # turn instead of being jumped by a re-send of the refused message.
-        assert slot._refusal_retry_text == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
         assert not any("retrying once on" in m.get("content", "") for m in slot.messages)
 
     @pytest.mark.asyncio
@@ -12002,7 +12025,7 @@ class TestRunChatRefusalFallback:
             for m in slot.messages
         )
         # No replay was recorded or announced ahead of the follow-up.
-        assert slot._refusal_retry_text == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
         assert not any("retrying once on" in m.get("content", "") for m in slot.messages)
 
     @pytest.mark.asyncio
@@ -12042,7 +12065,7 @@ class TestRunChatRefusalFallback:
         assert slot._refusal_fallback_primary == ""
         assert slot._refusal_fallback_attempted is False
         # No replay recorded or announced: the stopped request must not rerun.
-        assert slot._refusal_retry_text == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
         assert not any("retrying once on" in m.get("content", "") for m in slot.messages)
 
     @pytest.mark.asyncio
@@ -12197,7 +12220,7 @@ class TestRunChatRefusalFallback:
         client.set_model.assert_not_awaited()
         assert slot._refusal_fallback_attempted is False
         assert slot._refusal_fallback_primary == ""
-        assert slot._refusal_retry_text == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
         assert any(
             m.get("role") == "error" and "Response declined by the model." in m.get("content", "")
             for m in slot.messages
@@ -12421,10 +12444,7 @@ class TestRunChatRefusalFallback:
         state = self._make_state_for_run_chat(tmp_path, monkeypatch)
         slot = state.get_or_create_slot("s1")
         qid = slot.queue_insert(0, "retry me", kind=SYNTHETIC_RECOVERY_KIND)
-        slot._refusal_retry_text = "retry me"
-        slot._refusal_replay_queue_id = qid
-        slot._refusal_replay_stop_gen = slot._stop_generation
-        slot._refusal_replay_session_stop_gen = 0
+        _arm_refusal_replay(slot, qid)
         # The Stop that landed while the replay waited.
         slot._stop_generation += 1
         _dispatched = MagicMock()
@@ -12433,8 +12453,8 @@ class TestRunChatRefusalFallback:
         assert await _start_next_queued_turn(state, slot) is False
         _dispatched.assert_not_called()
         assert all(q.get("id") != qid for q in slot._queue)
-        assert slot._refusal_replay_queue_id == ""
-        assert slot._refusal_retry_text == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
         assert any(
             "Content-filter retry cancelled" in m.get("content", "")
             for m in slot.messages
@@ -12454,10 +12474,7 @@ class TestRunChatRefusalFallback:
         state = self._make_state_for_run_chat(tmp_path, monkeypatch)
         slot = state.get_or_create_slot("s1")
         qid = slot.queue_insert(0, "retry me", kind=SYNTHETIC_RECOVERY_KIND)
-        slot._refusal_retry_text = "retry me"
-        slot._refusal_replay_queue_id = qid
-        slot._refusal_replay_stop_gen = slot._stop_generation
-        slot._refusal_replay_session_stop_gen = 0
+        _arm_refusal_replay(slot, qid)
         # The correction the refusal card asked for, queued while the replay waited.
         slot.queue_insert(1, "actually, do this instead")
 
@@ -12478,7 +12495,7 @@ class TestRunChatRefusalFallback:
             "actually, do this instead"
         ], "the correction must dispatch, never the purged replay"
         assert all(q.get("id") != qid for q in slot._queue)
-        assert slot._refusal_retry_text == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
 
     @pytest.mark.asyncio
     async def test_replay_carries_original_turn_attachments(self, tmp_path, monkeypatch):
@@ -12596,10 +12613,7 @@ class TestRunChatRefusalFallback:
             kind=SYNTHETIC_RECOVERY_KIND,
             meta=session_control.containment_meta(state, slot),
         )
-        slot._refusal_retry_text = "retry me"
-        slot._refusal_replay_queue_id = qid
-        slot._refusal_replay_stop_gen = slot._stop_generation
-        slot._refusal_replay_session_stop_gen = 0
+        _arm_refusal_replay(slot, qid)
         # The relink that landed while the replay waited.
         slot.linked_session_key = "session-b"
         _dispatched = MagicMock()
@@ -12608,8 +12622,8 @@ class TestRunChatRefusalFallback:
         assert await _start_next_queued_turn(state, slot) is False
         _dispatched.assert_not_called()
         assert all(q.get("id") != qid for q in slot._queue)
-        assert slot._refusal_replay_queue_id == ""
-        assert slot._refusal_retry_text == "", (
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER), (
             "the dispatch-gate record must die with the replay — a later "
             "identical message on session-b is a genuine turn, not a retry"
         )
@@ -12633,8 +12647,7 @@ class TestRunChatRefusalFallback:
         slot = state.get_or_create_slot("s1")
         # Episode state as the swap left it — but the replay entry itself is
         # absent (the admission sweep dropped it on a containment change).
-        slot._refusal_retry_text = "retry me"
-        slot._refusal_replay_queue_id = "qid-swept-away"
+        _arm_refusal_replay(slot, "qid-swept-away")
         slot._refusal_fallback_attempted = True
         # The user's identical resend queued behind the (now gone) replay.
         slot.queue_insert(
@@ -12646,8 +12659,8 @@ class TestRunChatRefusalFallback:
         monkeypatch.setattr(chat_runner, "_run_chat", _dispatched)
 
         await _start_next_queued_turn(state, slot)
-        assert slot._refusal_replay_queue_id == ""
-        assert slot._refusal_retry_text == "", (
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER), (
             "the dispatch-gate record must die with the swept replay — the "
             "identical resend is a genuine turn, not a mistaken retry"
         )
@@ -12797,15 +12810,12 @@ class TestRunChatRefusalFallback:
         slot._refusal_fallback_primary = "fable-5"
         slot._refusal_fallback_candidate = "opus-test"
         slot._refusal_fallback_attempted = True
-        slot._refusal_retry_text = "retry me"
         slot._refusal_fallback_session_key = effective_session_key(slot)
-        # Snapshot taken at enqueue…
-        slot._refusal_replay_stop_gen = getattr(slot, "_stop_generation", 0)
-        slot._refusal_replay_session_stop_gen = 0
+        _arm_refusal_replay(slot, "qid-consumed")
         # …then a Stop pressed AND resolved in the spawn→consume window.
         slot._stop_generation = getattr(slot, "_stop_generation", 0) + 1
 
-        await _run_chat(state, slot, "retry me", _refusal_replay=True)
+        await _run_chat(state, slot, "retry me", _replay=frozenset({ReplayFamily.CONTENT_FILTER}))
 
         cancelled = [
             m
@@ -12816,8 +12826,8 @@ class TestRunChatRefusalFallback:
         ]
         assert len(cancelled) == 1, f"expected the consume-time abort notice, got {slot.messages}"
         client.set_model.assert_not_awaited()
-        assert slot._refusal_retry_text == ""
-        assert slot._refusal_replay_queue_id == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
         assert slot._refusal_fallback_attempted is True, "allowance stays spent on abort"
 
     @pytest.mark.asyncio
@@ -12835,13 +12845,11 @@ class TestRunChatRefusalFallback:
         slot._refusal_fallback_primary = "fable-5"
         slot._refusal_fallback_candidate = "opus-test"
         slot._refusal_fallback_attempted = True
-        slot._refusal_retry_text = "retry me"
         # The binding the swap recorded differs from the slot's live binding.
         slot._refusal_fallback_session_key = "dash:old-session"
-        slot._refusal_replay_stop_gen = getattr(slot, "_stop_generation", 0)
-        slot._refusal_replay_session_stop_gen = 0
+        _arm_refusal_replay(slot, "qid-consumed")
 
-        await _run_chat(state, slot, "retry me", _refusal_replay=True)
+        await _run_chat(state, slot, "retry me", _replay=frozenset({ReplayFamily.CONTENT_FILTER}))
 
         cancelled = [
             m
@@ -12852,7 +12860,7 @@ class TestRunChatRefusalFallback:
         ]
         assert len(cancelled) == 1, f"expected the rebind abort notice, got {slot.messages}"
         client.set_model.assert_not_awaited()
-        assert slot._refusal_retry_text == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
 
     @pytest.mark.asyncio
     async def test_synthetic_recovery_dispatch_does_not_rearm(self, tmp_path, monkeypatch):
@@ -12965,7 +12973,7 @@ class TestRunChatRefusalFallback:
 
         # Keep the requeued entry IN the queue: the post-turn drain would
         # otherwise dequeue and spawn it immediately, racing the assertions.
-        async def _no_drain(_state, _slot) -> bool:
+        async def _no_drain(_state, _slot, **_kwargs) -> bool:
             return False
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner._start_next_queued_turn", _no_drain)
@@ -12976,20 +12984,18 @@ class TestRunChatRefusalFallback:
         slot._refusal_fallback_primary = "fable-5"
         slot._refusal_fallback_candidate = "opus-test"
         slot._refusal_fallback_attempted = True
-        slot._refusal_retry_text = "retry me"
         slot._refusal_fallback_session_key = effective_session_key(slot)
-        slot._refusal_replay_stop_gen = getattr(slot, "_stop_generation", 0)
-        slot._refusal_replay_session_stop_gen = 0
+        _arm_refusal_replay(slot, "qid-consumed")
 
-        await _run_chat(state, slot, "retry me", _refusal_replay=True)
+        await _run_chat(state, slot, "retry me", _replay=frozenset({ReplayFamily.CONTENT_FILTER}))
 
         requeued = [q for q in slot._queue if q.get("content") == "retry me"]
         assert requeued, f"expected the verbatim recovery requeue, queue={slot._queue}"
-        assert slot._refusal_replay_queue_id == requeued[0]["id"], (
+        assert slot.replays.entry_id(ReplayFamily.CONTENT_FILTER) == requeued[0]["id"], (
             "the requeued entry must carry the refusal-replay identity so the "
             "drain applies the refusal-specific validation at dispatch"
         )
-        assert slot._refusal_replay_stop_gen == getattr(slot, "_stop_generation", 0)
+        assert slot.replays._records[ReplayFamily.CONTENT_FILTER].stop_gen == slot._stop_generation
 
     @pytest.mark.asyncio
     async def test_swap_during_throttle_fallback_records_true_primary(self, tmp_path, monkeypatch):
@@ -13059,12 +13065,10 @@ class TestRunChatRefusalFallback:
         slot._refusal_fallback_primary = "fable-5"
         slot._refusal_fallback_candidate = "opus-test"
         slot._refusal_fallback_attempted = True
-        slot._refusal_retry_text = "retry me"
         slot._refusal_fallback_session_key = effective_session_key(slot)
-        slot._refusal_replay_stop_gen = getattr(slot, "_stop_generation", 0)
-        slot._refusal_replay_session_stop_gen = 0
+        _arm_refusal_replay(slot, "qid-consumed")
 
-        await _run_chat(state, slot, "retry me", _refusal_replay=True)
+        await _run_chat(state, slot, "retry me", _replay=frozenset({ReplayFamily.CONTENT_FILTER}))
 
         cancelled = [
             m
@@ -13073,7 +13077,7 @@ class TestRunChatRefusalFallback:
             and "Content-filter retry cancelled" in m.get("content", "")
         ]
         assert len(cancelled) == 1, f"expected the pre-stream abort notice, got {slot.messages}"
-        assert slot._refusal_replay_queue_id == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
         assert not any(
             m.get("role") == "assistant" for m in slot.messages
         ), "the stale replay must never reach the model"
@@ -17332,7 +17336,7 @@ class TestForkSlot:
         from unittest.mock import MagicMock
 
         mock_sel = MagicMock()
-        monkeypatch.setattr("kiro_crew.dashboard.chat_fork.sel", lambda: mock_sel)
+        monkeypatch.setattr("kiro_crew.dashboard.slot_ownership.sel", lambda: mock_sel)
 
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("src", app="app-B")
@@ -19688,7 +19692,13 @@ class TestEmptyResponseRetry:
             directive_user_origin=True,
         )
         slot._promise_only_retries = 1
-        slot._promise_only_stop_gen = slot._stop_generation
+        slot.replays.arm(
+            ReplayFamily.CONTINUATION,
+            entry_id="",
+            session_key=f"dashboard:{slot.key}",
+            stop_gen=slot._stop_generation,
+            session_stop_gen=0,
+        )
 
         if intervention == "stop":
             slot._stop_generation += 1
@@ -19728,10 +19738,9 @@ class TestEmptyResponseRetry:
 
         A Stop issued on a linked channel surface moves only the session-scoped
         count (the slot's own ``_stop_generation`` never ticks), and the
-        dispatch-point purge compares that count against its value AT ENQUEUE
-        (``_promise_only_session_stop_gen``). Without the arm's snapshot the
-        purge's ``getattr`` default reads the CURRENT count, the comparison is
-        always equal, and the replay dispatches over the user's Stop.
+        dispatch-point purge compares that count against the recovery ledger's
+        enqueue-time snapshot. Without the snapshot, the replay could dispatch
+        over the user's Stop.
         """
         from kiro_crew.acp.types import STOP_REASON_END_TURN
         from kiro_crew.dashboard.chat_runner import _start_next_queued_turn
@@ -19805,10 +19814,6 @@ class TestEmptyResponseRetry:
 
         replay = next(item for item in slot._queue if item.get("content") == request)
         assert replay["kind"] == FALSE_TOOL_BLOCKER_REPLAY_KIND
-        # The arm must snapshot the ENQUEUE-time session count, exactly as the
-        # sibling recovery arms do.
-        assert slot._promise_only_session_stop_gen == 5
-
         # A channel-side Stop lands while the replay waits: only the session
         # count moves. The dispatch-point purge must drop the replay.
         stop_counts[session_key] = 6
@@ -21422,7 +21427,7 @@ class TestRunChatTransientRetry:
         assert any("Image-history recovery cancelled" in m["content"] for m in slot.messages)
         # The aborted episode refunds the shared one-shot.
         assert slot._poisoned_reset_used is False
-        assert slot._image_recovery_queue_id == ""
+        assert not slot.replays.armed(ReplayFamily.IMAGE_HISTORY)
 
     @pytest.mark.asyncio
     async def test_stop_after_image_recovery_dispatch_aborts_before_provider(
@@ -21451,10 +21456,13 @@ class TestRunChatTransientRetry:
         session_key = effective_session_key(slot)
         state.sessions.stop_generation = lambda key: 4
         slot._poisoned_reset_used = True
-        slot._image_recovery_queue_id = "image-recovery-qid"
-        slot._image_recovery_session_key = session_key
-        slot._image_recovery_stop_gen = 7
-        slot._image_recovery_session_stop_gen = 4
+        slot.replays.arm(
+            ReplayFamily.IMAGE_HISTORY,
+            entry_id="image-recovery-qid",
+            session_key=session_key,
+            stop_gen=7,
+            session_stop_gen=4,
+        )
         # The Stop lands after the drain's validation and task spawn.
         slot._stop_generation = 8
 
@@ -21462,13 +21470,12 @@ class TestRunChatTransientRetry:
             state,
             slot,
             "continue the destructive step",
-            _image_recovery=True,
+            _replay=frozenset({ReplayFamily.IMAGE_HISTORY}),
             _synthetic_recovery_turn=True,
         )
 
         assert provider_calls == 0
-        assert slot._image_recovery_queue_id == ""
-        assert slot._image_recovery_session_key == ""
+        assert not slot.replays.armed(ReplayFamily.IMAGE_HISTORY)
         assert slot._poisoned_reset_used is False
         assert any(
             m.get("role") == "notice" and "Image-history recovery cancelled" in m.get("content", "")
@@ -24072,11 +24079,11 @@ class TestSlotModelLiveSwitch:
 
     @pytest.mark.asyncio
     async def test_unavailable_model_is_4xx_and_keeps_the_session(self, tmp_path):
-        """An entitlement refusal must NOT take the reset fallback.
+        """An unavailable model must not take the reset fallback.
 
         The generic ``except Exception`` here treats
         every set_model failure as "the call didn't land" and recovers with a
-        reset. For a model the account cannot use that recovery is wrong twice
+        reset. For a model the session cannot use that recovery is wrong twice
         over — it destroys the live conversation AND cold-starts on a different
         model, while the handler still answers ok:True. The slot must also keep
         its previous model, or the picker asserts a model that was refused.
@@ -24087,7 +24094,7 @@ class TestSlotModelLiveSwitch:
         state.sessions.reset = AsyncMock()
         provider = self._provider()
         provider.client.set_model = AsyncMock(
-            side_effect=AcpModelUnavailable("claude-opus-4.8", ["gpt-5.6-sol"])
+            side_effect=AcpModelUnavailable("claude-opus-4.8", ["gpt-5.6-sol"], backend="kiro")
         )
         state.sessions.get_provider = MagicMock(return_value=provider)
         state.get_or_create_slot("a", model="gpt-5.6-sol")
@@ -24098,7 +24105,7 @@ class TestSlotModelLiveSwitch:
             body = await resp.json()
 
         assert resp.status == 400
-        assert "not available on your account" in body["error"]
+        assert "not among the models this kiro session advertises" in body["error"]
         # Names what the account CAN use.
         assert "gpt-5.6-sol" in body["error"]
         # The conversation survives — no reset fallback.
@@ -24120,7 +24127,7 @@ class TestSlotModelLiveSwitch:
         state.sessions.reset = AsyncMock()
         provider = self._provider()
         provider.client.set_model = AsyncMock(
-            side_effect=AcpModelUnavailable("claude-opus-4.8", ["gpt-5.6-sol"])
+            side_effect=AcpModelUnavailable("claude-opus-4.8", ["gpt-5.6-sol"], backend="kiro")
         )
         state.sessions.get_provider = MagicMock(return_value=provider)
         slot = state.get_or_create_slot("a", model="gpt-5.6-sol")
@@ -24157,7 +24164,7 @@ class TestSlotModelLiveSwitch:
                 # The SLOW, ultimately-refused pick: park inside the locked
                 # transaction, then refuse.
                 await release_slow.wait()
-                raise AcpModelUnavailable("claude-opus-4.8", ["gpt-5.6-sol"])
+                raise AcpModelUnavailable("claude-opus-4.8", ["gpt-5.6-sol"], backend="kiro")
             return None
 
         provider.client.set_model = AsyncMock(side_effect=_set_model)
@@ -24212,7 +24219,7 @@ class TestSlotModelLiveSwitch:
                 await release_first.wait()
             else:
                 await release_second.wait()
-            raise AcpModelUnavailable(target, ["gpt-5.6-sol"])
+            raise AcpModelUnavailable(target, ["gpt-5.6-sol"], backend="kiro")
 
         provider.client.set_model = AsyncMock(side_effect=_set_model)
         state.sessions.get_provider = MagicMock(return_value=provider)

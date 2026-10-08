@@ -32,15 +32,18 @@ AcpError (base, acp/transport_errors.py) — carries `transient`, the retry verd
 ├── AcpSandboxInitFailed   — an OS sandbox refused to initialize; non-retryable
 ├── AcpToolGateUnroutable  — tool calls would bypass the PreToolUse gate;
 │                            non-retryable, wraps acp_tool_gate.ToolGateUnroutable
-├── PiGateExtensionTampered — the shipped Pi gate extension failed its digest check
+├── PiGateExtensionTampered — a shipped gate extension (Pi or DeepSeek) failed its digest check
 ├── AcpModelUnavailable    — requested model not entitled; non-retryable
 └── AcpPromptBusy          — a prompt is already in flight on this session
 
 AcpRuntimeError (base, acp/session_handle.py)
 ├── AcpRuntimeDead            — the underlying process has died
 ├── AcpRequestTimeout         — a request's response missed its budget
-│   └── AcpSessionStartTimeout — `session/new` timed out while a collector owns
-│                                the possible late result (acp/runtime.py)
+│   ├── AcpSessionStartTimeout — `session/new` timed out while a collector owns
+│   │                            the possible late result (acp/runtime.py)
+│   └── AcpRuntimeOverloaded  — `initialize` went unanswered while the agents
+│                                slice was throttled; transient=False, because
+│                                the remedy is freeing agent memory, not a retry
 └── AcpWorkspaceBindingError  — descriptor-bound runtime cannot serve another cwd
     └── AcpToolSurfaceBindingError — a shared runtime cannot safely serve the
                                      requested tool surface (acp/runtime.py)
@@ -73,6 +76,7 @@ instead of the row simply disappearing.
 | Config load | Invalid JSON → log warning, return defaults |
 | Skill index (`list_skills`) | One global SKILL.md that is not UTF-8 or cannot be opened → one warning naming the file, that row dropped, every other row listed. Never a failed listing: the index feeds every chat turn and `GET /api/skills`. Rationale: [memory-skills-hooks](../modules/memory-skills-hooks.md) |
 | Process spawn | Backend-specific executable resolver, including trusted-path checks where required; clear error if missing |
+| Notes git subprocess (`md_notebook/git_ops.py`) | A non-zero exit reports git's last 3 stderr lines PLUS the first transport-caused line when one sits outside that tail. git ends every fetch/push failure with the same access-rights boilerplate and prints an SSH diagnosis first, so a tail alone reports a permission problem the operator does not have (a host reachable only via `~/.ssh/config` never resolved at all). The extra line widens what the message reports; it does not decide whether the command failed. |
 | asyncio loop callback | A Windows Proactor reset repeated by its `connection_lost` close callback is warning-only; task-level connection resets and other exceptions remain ERRORs with crash breadcrumbs |
 
 ## Dashboard Error Codes
@@ -107,6 +111,17 @@ keeps the draft dirty until the page unmounts, so a second ask was a second live
 confirm — one whose "keep my draft" cancelled a hand-off the first ask had
 already accepted. An ungated caller still asks through the navigator.
 
+A failed run is a hand-off source too, not only a failed request (#7403). An
+expanded `failure` or `timeout` row in a scheduled job's history (`LogEntry`)
+renders `AskAgentButton` with a report built by `utils/cronRunReport.prompt.ts`:
+job name and id, run id, trigger, start time, the row's summary, and the TAIL of
+the run's trace (scrubbed by `redactSecrets` before the cut, capped at
+`MAX_TRACE_TAIL`), so the agent receives the reason a run failed, which a run
+reports at the end. The job and run ids let the agent read more history itself.
+`cancelled` and `success` rows offer nothing. The hand-off goes to the ordinary
+chat with no per-job "debug agent" setting: the agent that opens is the one the
+user would otherwise paste the log into, and a history row holds no draft.
+
 ## Backend Error Classification
 
 `acp/transport_errors.py` (re-exported by `acp/client.py`) rewrites raw JSON-RPC
@@ -137,6 +152,12 @@ never drift. Notable terminal (non-retryable) classes:
   backend through the prompt transport everywhere, even on Slack, which also
   offers `!compact` as its own alias. The same rule governs the sibling
   prompt-busy branch, which for the same reason now names no command at all.
+- **Lost backend session**: when `acp_error_is_session_not_found` matches, the
+  turn resets the session binding and queues ONE `SYNTHETIC_RECOVERY_KIND` retry
+  with a reconnect notice, armed as `ReplayFamily.SESSION_NOT_FOUND`. A Stop that
+  already resolved suppresses it; the drain and consume seams veto it on a later
+  Stop, a queued follow-up or steer, or a rebind (with a cancel notice), refunding
+  the one-shot. A second loss on the same turn ends with the give-up text.
 - **Unsupported image history**: Kiro's `IMAGE_FORMAT_UNSUPPORTED` /
   `ImageValidationError` is terminal and structural. The exception also carries
   the narrower `image_format_unsupported` tag. A current attachment is left in
@@ -158,7 +179,15 @@ never drift. Notable terminal (non-retryable) classes:
   session-scoped stop generations at enqueue, and the queue drain drops the entry
   (refunding the shared one-shot) when either counter moved, when user input
   queued behind it, or when the slot was rebound to another session — the same
-  guard the model-access and refusal replays carry.
+  rule (`RecoveryReplays.revalidate`, `dashboard/recovery_replays.py`) the
+  model-access and refusal replays
+  carry, re-checked at the turn's consume seam. One requeue is exempt, decided
+  at the requeue: a verbatim requeue of a sub-agent completion the model never
+  consumed is a result the parent is still owed, so it is queued again as the
+  completion it is (`SUBAGENT_COMPLETION_KIND`), with no recovery record, and
+  runs ahead of a newer user message instead of being suppressed or cancelled
+  by a soft Stop. A hard kill discards it, and runner-written text queued for
+  the completion (a continuation, a retry prompt) is never exempt.
 - **Oversized request**: kiro-cli's own refusal, `This message is too large to
   send, and it contains no text that can be shortened. Remove or reduce the
   attached content and try again.` It is emitted when the context overflowed

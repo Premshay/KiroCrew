@@ -43,7 +43,7 @@ from typing import Any
 
 from aiohttp import web
 
-from kiro_crew import hooks
+from kiro_crew import hooks, model_registry
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
@@ -591,11 +591,10 @@ def _first_change_failure(summary: dict) -> tuple[str, str]:
             val = str(rec.get(key) or "").strip()
             if val:
                 sentence = {
-                    "no_review_recorded": "the reviewer finished but wrote no "
-                                          "findings record",
+                    "no_review_recorded": "the reviewer finished but wrote no " "findings record",
                     "review_record_incomplete": "the reviewer wrote a findings "
-                                                "record but never completed the "
-                                                "review",
+                    "record but never completed the "
+                    "review",
                     # Reason-level fallback only: a preflight-failed record
                     # carries the specific runtime message in its error fields,
                     # which the key order above prefers, and the run-level error
@@ -603,7 +602,7 @@ def _first_change_failure(summary: dict) -> tuple[str, str]:
                     # the reason itself always renders as a cause, never as a
                     # bare enum value.
                     "runtime_unavailable": "the reviewer never ran: its agent "
-                                           "runtime is unavailable on this host",
+                    "runtime is unavailable on this host",
                     "review_failed": "the review turn failed",
                 }.get(val, val)
                 return sentence, str(rec.get("skipped_reason") or "").strip()
@@ -1604,7 +1603,8 @@ async def _handle_review_queue(request: web.Request) -> web.Response:
     except discovery.GhError as exc:
         logger.warning("review queue failed: %s", exc)
         return web.json_response(
-            {"code": "provider_unavailable", "error": "upstream service error"}, status=502)
+            {"code": "provider_unavailable", "error": "upstream service error"}, status=502
+        )
     # The same change id the repo list carries: the detail pane scopes posting by
     # it, and an empty one would publish every change of a multi-PR run.
     for row in rows:
@@ -1734,10 +1734,24 @@ async def _handle_repos(request: web.Request) -> web.Response:
 
 
 def _known_models() -> list[str]:
-    """Models this review pool's resolved runtime accepts as overrides."""
+    """Safe override keys for the reviewer's latest runtime model snapshot."""
     try:
-        return list(review_pool.reviewer_info().get("models") or [])
-    except Exception:  # pragma: no cover - defensive
+        reviewer = review_pool.reviewer_info()
+        engine = reviewer.get("engine")
+        models: list[str] = []
+        for raw in reviewer.get("models") or []:
+            if not isinstance(raw, str):
+                continue
+            model = (
+                model_registry.from_provider_id(raw, "claude_code") if engine == "claude" else raw
+            )
+            if not model or len(model) > 64 or not all(c.isalnum() or c in "._-" for c in model):
+                continue
+            if model not in models:
+                models.append(model)
+        return models
+    except Exception:
+        logger.warning("Could not enumerate review models", exc_info=True)
         return []
 
 
@@ -1849,7 +1863,8 @@ def _write_review_section(patch: dict) -> dict:
                     binding["repository"]["host"],
                     binding["repository"]["owner"],
                     binding["repository"]["repository"],
-                ) not in allowed_repositories
+                )
+                not in allowed_repositories
             )
             if unavailable:
                 raise ValueError(
@@ -1876,7 +1891,8 @@ def _write_review_section(patch: dict) -> dict:
 
 async def _handle_settings(request: web.Request) -> web.Response:
     """GET  -> {settings, models, agents, efforts, namespaces}
-    PUT  body {agent?, model?, effort?, active_namespaces?, namespace_bindings?} -> {ok, settings}."""
+    PUT  body {agent?, model?, effort?, active_namespaces?, namespace_bindings?} -> {ok, settings}.
+    """
     if request.method == "GET":
         # All of this is synchronous file IO (config read + namespaces dir walk +
         # reviewer_info file read) — offload to a thread so it never blocks the
@@ -2008,7 +2024,8 @@ async def _handle_namespaces(request: web.Request) -> web.Response:
             return web.json_response({"namespaces": [], "active": ["default"]})
 
     owner_denied = await require_owner_dashboard_request(
-        request, "code_review_sage.namespaces_write")
+        request, "code_review_sage.namespaces_write"
+    )
     if owner_denied is not None:
         return owner_denied
     try:
@@ -2209,9 +2226,7 @@ async def _handle_learning_rule_lifecycle(request: web.Request) -> web.Response:
         )
     except ValueError as exc:
         await _audit("denied")
-        return web.json_response(
-            {"code": "invalid_lifecycle", "error": str(exc)}, status=400
-        )
+        return web.json_response({"code": "invalid_lifecycle", "error": str(exc)}, status=400)
     await _audit("success")
     return web.json_response({"ok": True, "record": result["record"]})
 
@@ -2891,6 +2906,7 @@ async def _followup_sweep_loop() -> None:
 
 def register_routes(app: web.Application) -> None:
     """Register the deterministic review routes on the gateway app."""
+
     # Self-heal: ensure the data layout (dirs + config.json with resolved_paths)
     # exists at startup. Without this, the UI gets {} from the generic config
     # endpoint and shows a perpetual "Initializing…" message because it needs
@@ -2911,8 +2927,7 @@ def register_routes(app: web.Application) -> None:
         try:
             await asyncio.to_thread(store.ensure_layout)
         except Exception:  # pragma: no cover - never break gateway startup
-            logger.warning(
-                "code-review-sage: ensure_layout failed at startup", exc_info=True)
+            logger.warning("code-review-sage: ensure_layout failed at startup", exc_info=True)
 
     app.on_startup.append(_ensure_layout_on_startup)
     _load_runs()  # restore durable job status (mark orphaned 'running' as 'interrupted')

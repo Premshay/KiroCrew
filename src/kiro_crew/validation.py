@@ -32,6 +32,17 @@ from typing import Any
 # here would close the ``artifacts -> hooks -> webhooks -> validation`` cycle).
 from kiro_crew.artifact_store.rules import MAX_TAG_LEN as ARTIFACT_TAG_MAX
 from kiro_crew.artifact_store.rules import normalize_tag as _normalize_artifact_tag
+from kiro_crew.checkpoint_contract import (
+    SESSION_CHECKPOINT_ATTENTION_KEY_MAX,
+    SESSION_CHECKPOINT_GOAL_MAX,
+    SESSION_CHECKPOINT_MAIN_ITEM_MAX,
+    SESSION_CHECKPOINT_MAIN_ITEMS_MAX,
+    SESSION_CHECKPOINT_MILESTONE_MAX,
+    SESSION_CHECKPOINT_NEXT_ACTION_MAX,
+    SESSION_CHECKPOINT_PROGRESS_LABEL_MAX,
+    SESSION_CHECKPOINT_SUMMARY_MAX,
+    SESSION_RESTART_CONTINUATION_MAX,
+)
 
 # Computer-use tool names and their argument bounds. Safe to import at module
 # scope: ``computer_use.types`` is deliberately dependency-free (it imports
@@ -156,17 +167,6 @@ MAX_ACP_SESSION_ID_LEN = 128
 # than the validated surfaces.
 MAX_CRON_MESSAGE = 50_000
 MAX_RESPONSE_LEN = 100_000  # truncate tool responses
-
-SESSION_CHECKPOINT_SUMMARY_MAX = 360
-SESSION_CHECKPOINT_GOAL_MAX = 240
-SESSION_CHECKPOINT_NEXT_ACTION_MAX = 160
-SESSION_CHECKPOINT_MAIN_ITEMS_MAX = 4
-SESSION_CHECKPOINT_MAIN_ITEM_MAX = 160
-SESSION_CHECKPOINT_MILESTONE_MAX = 220
-SESSION_CHECKPOINT_TRAIL_MAX = 7
-SESSION_CHECKPOINT_PROGRESS_LABEL_MAX = 160
-SESSION_CHECKPOINT_ATTENTION_KEY_MAX = 120
-SESSION_RESTART_CONTINUATION_MAX = 2_000
 
 # Allowed categories for lessons
 ALLOWED_LESSON_CATEGORIES = frozenset({"tool", "preference", "knowledge"})
@@ -479,6 +479,19 @@ class ValidationError(Exception):
 #: short so it costs almost none of the field's budget.
 _CLAMP_NOTE = " [... truncated, dropped {n} chars]"
 
+#: Reads :data:`_CLAMP_NOTE` back off a clamped value. Derived from that
+#: constant so the stamp and its reader cannot drift apart.
+_CLAMP_NOTE_RE = re.compile(re.escape(_CLAMP_NOTE).replace(r"\{n\}", r"(\d+)") + r"\Z")
+
+
+def clamp_report(value: str) -> tuple[int, int] | None:
+    """Return ``(before, kept)`` for a value stamped by ``clamp_to_max_len``."""
+    match = _CLAMP_NOTE_RE.search(value)
+    if not match:
+        return None
+    kept = len(value) - (match.end() - match.start())
+    return kept + int(match.group(1)), kept
+
 
 @dataclass
 class FieldSpec:
@@ -546,6 +559,138 @@ def clamp_to_max_len(value: str, max_len: int) -> str:
         return value[:max_len]
     head = value[:keep].rstrip()
     return head + _CLAMP_NOTE.format(n=len(value) - len(head))
+
+
+# An int above this magnitude cannot be a value a numeric-looking string
+# argument was meant to carry: JavaScript numbers (and JSON parsers that back
+# them with IEEE-754 doubles) only represent integers exactly up to 2**53, so a
+# larger int that reached a string field was either never a round-trippable id
+# (it already lost precision upstream) or is an outright wrong value. The PR
+# rejects a float on a string field for exactly this reason — a value that
+# cannot be the author's original text is a louder, safer failure than a
+# silently-wrong coercion — and this applies the same bound to the int case.
+_MAX_EXACT_INT = 2**53
+
+
+def _coerce_number_to_string_for_string_field(value: Any, spec: FieldSpec) -> Any:
+    """Repair an integer that reached a string field as a number.
+
+    Some agent runtimes defer a tool's schema and load it on demand; a few of
+    those, when they later marshal the model's ``arguments``, re-type a
+    top-level argument whose VALUE looks like a number (``"42"``) into a JSON
+    number — even though the loaded tool schema declared that field a string.
+    By the time the call reaches a validator the type has already been lost
+    upstream, so a field that says ``str`` sees an ``int`` and the call is
+    rejected when the author clearly meant a string.
+
+    This repair belongs ONLY at the MCP tool-call entry points (where that
+    upstream re-typing happens), NOT in the shared ``validate_field`` — the
+    dashboard HTTP endpoints also validate through that function and never see
+    the re-typing, so coercing there would silently change their contract and
+    let an int slip through a field a caller reads from the raw body.
+
+    This is a NARROW, EXACT repair, not a general coercion:
+
+    * It fires ONLY for a field whose declared type is EXACTLY ``str`` (not a
+      tuple like ``(int, float)`` that legitimately accepts a number) — a field
+      that wanted a number keeps getting one.
+    * It converts an ``int`` to its string form and NOTHING else: a ``str``
+      stays a ``str``, a ``bool`` (an ``int`` subclass) is left for the normal
+      type check to reject, and a ``float`` / list / dict / ``None`` is
+      untouched.
+    * An ``int`` whose magnitude exceeds ``2**53`` is REFUSED (``ValidationError``)
+      rather than coerced: past that bound it is a precision-loss or
+      outright-wrong id, the same hazard this repair declines to paper over for
+      floats.
+
+    A ``float`` is DELIBERATELY not converted. ``str(float)`` is the shortest
+    round-tripping form, which is NOT the author's original text whenever that
+    text carried a digit the float cannot distinguish: ``"1790284307.156620"``
+    becomes the float ``1790284307.15662`` and then ``"1790284307.15662"`` — a
+    DIFFERENT, still-schema-valid value (it still matches a ``^\\d+\\.\\d+$``
+    timestamp pattern), so a Slack reply would silently go to the wrong thread
+    instead of failing loudly. For a value the author meant as a string, a loud
+    ``expected str`` is strictly safer than a silently-wrong one, so a float on
+    a string field is left to the ordinary type error. Only ``int`` round-trips
+    exactly (``str(42) == "42"``, within the exact-integer bound), so only
+    ``int`` is repaired here.
+    """
+    if spec.type is not str:
+        return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if abs(value) > _MAX_EXACT_INT:
+            raise ValidationError(
+                spec.name,
+                f"integer {value} exceeds the exact-integer bound ({_MAX_EXACT_INT}); "
+                "a numeric id this large cannot be a precise string value",
+            )
+        return str(value)
+    return value
+
+
+def coerce_mcp_tool_args(args: dict[str, Any], schema: ToolSchema) -> dict[str, Any]:
+    """Return ``args`` with int-on-string-field values repaired, for MCP entry points.
+
+    Apply this at an MCP tool-call entry point (``mcp_core._validate_args`` and
+    the other MCP servers' equivalents) BEFORE :func:`validate_tool_args`. It
+    walks the schema's string-typed fields and runs the narrow int->str repair
+    (see :func:`_coerce_number_to_string_for_string_field`) on each present
+    argument, leaving every other value — and every argument the schema does
+    not name — untouched. An out-of-range int raises ``ValidationError`` here,
+    so the entry point rejects it exactly as the schema's own checks would.
+
+    This is intentionally NOT part of :func:`validate_field`: the dashboard HTTP
+    endpoints validate through the same function and must keep their original
+    contract, so the repair lives only where the upstream re-typing occurs.
+    """
+    if not isinstance(args, dict):
+        return args
+    repaired = dict(args)
+    for spec in schema.fields:
+        if spec.name in repaired:
+            repaired[spec.name] = _coerce_number_to_string_for_string_field(
+                repaired[spec.name], spec
+            )
+    return repaired
+
+
+def coerce_mcp_tool_args_json_schema(args: dict[str, Any], input_schema: Any) -> dict[str, Any]:
+    """JSON-Schema counterpart of :func:`coerce_mcp_tool_args`, for MCP servers
+    that validate through :func:`validate_mcp_tool_arguments`.
+
+    Repair a top-level argument an upstream deferred-schema runtime re-typed
+    from a numeric-looking string ("42" -> 42) back to its string form, BEFORE
+    validation, for a property the inputSchema types EXACTLY ``"string"``. The
+    same narrow rules as the ``FieldSpec`` path apply: only an ``int`` is
+    coerced, a ``bool`` and a ``float`` are left for the type check, and an int
+    beyond the exact-integer bound raises ``ValidationError``.
+
+    Only top-level properties are considered — the re-typing hits top-level
+    arguments, and walking nested subschemas would risk changing values the
+    schema never typed as string.
+    """
+    if not isinstance(args, dict) or not isinstance(input_schema, dict):
+        return args
+    props = input_schema.get("properties")
+    if not isinstance(props, dict):
+        return args
+    repaired = dict(args)
+    for key, value in args.items():
+        sub = props.get(key)
+        if isinstance(sub, dict) and sub.get("type") == "string":
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                if abs(value) > _MAX_EXACT_INT:
+                    raise ValidationError(
+                        key,
+                        f"integer {value} exceeds the exact-integer bound ({_MAX_EXACT_INT}); "
+                        "a numeric id this large cannot be a precise string value",
+                    )
+                repaired[key] = str(value)
+    return repaired
 
 
 def validate_field(value: Any, spec: FieldSpec) -> Any:
@@ -1074,14 +1219,7 @@ def strip_hidden_unicode(text: str) -> str:
     # Testing against the raw input let a stripped character vouch for a mark
     # (``AKIA<ZWSP><ZWJ>IOSF…``: the ZWSP is removed, but the ZWJ saw it as a
     # non-ASCII neighbour and stayed, leaving the credential unredactable).
-    kept: list[str] = []
-    for ch in text:
-        if (
-            ch in _ALLOWED_CONTROL
-            or ch in _ALLOWED_FORMAT
-            or unicodedata.category(ch) not in _HIDDEN_CATEGORIES
-        ):
-            kept.append(ch)
+    kept = _drop_hidden_except_marks(text)
     # Pass 2: a shaping mark survives only if the nearest surviving
     # NON-MARK character on one side is non-ASCII. Skipping over adjacent
     # marks is what stops a run of them from vouching for each other —
@@ -1106,16 +1244,48 @@ def strip_hidden_unicode(text: str) -> str:
     return "".join(out)
 
 
+def _drop_hidden_except_marks(text: str) -> list[str]:
+    """Drop hidden characters while preserving shaping marks for neighbour checks."""
+    return [
+        ch
+        for ch in text
+        if ch in _ALLOWED_CONTROL
+        or ch in _ALLOWED_FORMAT
+        or unicodedata.category(ch) not in _HIDDEN_CATEGORIES
+    ]
+
+
 def normalize_unicode(text: str) -> str:
     """NFC-normalize Unicode text to canonical form."""
     return unicodedata.normalize("NFC", text)
 
 
 def sanitize_string(text: str) -> str:
-    """Full sanitization pipeline: normalize → strip hidden chars → strip edges."""
-    text = normalize_unicode(text)
-    text = strip_hidden_unicode(text)
-    return text.strip()
+    """Drop hidden characters, normalize, then trim unpaired edge marks."""
+    text = normalize_unicode("".join(_drop_hidden_except_marks(text)))
+    return _trim_edges(strip_hidden_unicode(text))
+
+
+def _trim_edges(text: str) -> str:
+    """Trim whitespace and shaping marks that would be stranded at an edge."""
+
+    def trimmable(ch: str) -> bool:
+        return ch.isspace() or ch in _ALLOWED_FORMAT
+
+    start, end = 0, len(text)
+    while start < end and trimmable(text[start]):
+        start += 1
+    while end > start and trimmable(text[end - 1]):
+        end -= 1
+    if start == end:
+        return ""
+    if not text[start].isascii():
+        while start > 0 and text[start - 1] in _ALLOWED_FORMAT:
+            start -= 1
+    if not text[end - 1].isascii():
+        while end < len(text) and text[end] in _ALLOWED_FORMAT:
+            end += 1
+    return text[start:end]
 
 
 def sanitize_json_values(value: Any) -> Any:
@@ -1160,6 +1330,24 @@ def sanitize_response(text: str, max_len: int = MAX_RESPONSE_LEN) -> str:
 # ── JSON-RPC Envelope Validation ──
 
 
+JSONRPC_PARSE_ERROR = -32700
+JSONRPC_INVALID_REQUEST = -32600
+JSONRPC_INVALID_PARAMS = -32602
+JSONRPC_INTERNAL_ERROR = -32603
+
+
+class JsonRpcEnvelopeError(ValidationError):
+    """A malformed JSON-RPC object and the response identity it retained."""
+
+    def __init__(
+        self, field: str, message: str, *, req_id: Any, method: Any, invalid_params: bool
+    ) -> None:
+        super().__init__(field, message)
+        self.req_id = req_id
+        self.method = method
+        self.invalid_params = invalid_params
+
+
 def validate_jsonrpc_request(req: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
     """Validate a JSON-RPC 2.0 request envelope.
 
@@ -1167,17 +1355,28 @@ def validate_jsonrpc_request(req: dict[str, Any]) -> tuple[str, Any, dict[str, A
     """
     if not isinstance(req, dict):
         raise ValidationError("request", "must be a JSON object")
-    if req.get("jsonrpc") not in ("2.0", None):
-        raise ValidationError("jsonrpc", "must be '2.0'")
-
-    method = req.get("method")
-    if method is not None and not isinstance(method, str):
-        raise ValidationError("method", "must be a string")
-
     req_id = req.get("id")
-    params = req.get("params", {})
-    if not isinstance(params, dict):
+    method = req.get("method")
+    if req.get("jsonrpc") not in ("2.0", None):
+        raise JsonRpcEnvelopeError(
+            "jsonrpc", "must be '2.0'", req_id=req_id, method=method, invalid_params=False
+        )
+    if method is not None and not isinstance(method, str):
+        raise JsonRpcEnvelopeError(
+            "method", "must be a string", req_id=req_id, method=method, invalid_params=False
+        )
+
+    params = req.get("params")
+    if params is None:
         params = {}
+    elif not isinstance(params, dict):
+        raise JsonRpcEnvelopeError(
+            "params",
+            f"must be an object, not {type(params).__name__}",
+            req_id=req_id,
+            method=method,
+            invalid_params=True,
+        )
 
     return method or "", req_id, params
 
@@ -2382,6 +2581,11 @@ _ARTIFACT_KIND_RE = re.compile(r"^(widget|html|markdown|svg|json|text|image|weba
 # must be alphanumeric so a value can never be parsed as a CLI flag, and the
 # charset covers real model ids, including provider-qualified effort variants.
 MODEL_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._\[\]-]{0,127}$")
+# Adapter catalogs use qualified model IDs with provider separators, aliases,
+# and effort brackets. Keep the picker list bounded while accepting that
+# catalog vocabulary.
+MODEL_PICKER_HIDDEN_MODEL_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/~\[\]@-]{0,254}$")
+MODEL_PICKER_HIDDEN_MODELS_MAX = 2048
 _ARTIFACT_SOURCE_RE = re.compile(r"^(chat|cron|subagent|manual|import)$")
 # Single source of truth: the MCP save/update field cap MUST equal the store's
 # own content cap, else the tool path rejects content the store would accept
@@ -3070,8 +3274,7 @@ def code_review_sage_call_allowed(method: object, path: object) -> bool:
     if (method, path) in CODE_REVIEW_SAGE_ALLOWED_CALLS:
         return True
     return any(
-        method == allowed_method and rx.match(path)
-        for allowed_method, rx in _CRS_DYNAMIC_CALLS
+        method == allowed_method and rx.match(path) for allowed_method, rx in _CRS_DYNAMIC_CALLS
     )
 
 
@@ -3095,6 +3298,21 @@ CODE_REVIEW_SAGE_API_SCHEMA = ToolSchema(
         FieldSpec("body_json", str, max_len=_CRS_MAX_BODY, default=""),
     ],
     custom_validator=_validate_crs_api,
+)
+
+# Design Tweak thread progress. The tool exposes only forward progress; the app
+# owns the rest of the thread lifecycle.
+_DESIGN_TWEAK_ALLOWED_STATUSES = frozenset({"done"})
+_DESIGN_TWEAK_MAX_TEXT = 2_048
+
+DESIGN_TWEAK_UPDATE_THREAD_SCHEMA = ToolSchema(
+    tool_name="design_tweak_update_thread",
+    fields=[
+        FieldSpec("request_id", str, required=True, max_len=200),
+        FieldSpec("comment_id", str, max_len=200, default=""),
+        FieldSpec("text", str, max_len=_DESIGN_TWEAK_MAX_TEXT, default=""),
+        FieldSpec("status", str, allowed=_DESIGN_TWEAK_ALLOWED_STATUSES, default=""),
+    ],
 )
 
 # Dev Fleet pod lifecycle (agent surface). A pod name is a git worktree basename,
@@ -4227,6 +4445,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "issue_radar_record_investigation": ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
     "ops_mission_control_api": OPS_MISSION_CONTROL_API_SCHEMA,
     "code_review_sage_api": CODE_REVIEW_SAGE_API_SCHEMA,
+    "design_tweak_update_thread": DESIGN_TWEAK_UPDATE_THREAD_SCHEMA,
     "pod_up": POD_UP_SCHEMA,
     "pod_down": POD_DOWN_SCHEMA,
     "pod_status": POD_STATUS_SCHEMA,
@@ -4606,11 +4825,9 @@ WORK_REPORT_SCHEMA = ToolSchema(
     tool_name="work_report",
     fields=[
         FieldSpec("status", str, required=True, allowed=_WORK_STATUSES),
-        # NOT ``clamp_to_max``: a truncated summary the worker believes landed
-        # whole is a silent data loss the worker cannot detect, and the conductor
-        # reads this field to decide. Refusing names the cap so the worker retries
-        # with a shorter one.
-        FieldSpec("summary", str, required=True, max_len=500),
+        # This is explanatory prose. The clamp stamps the stored text with the
+        # dropped length, so both the worker and conductor can see the cut.
+        FieldSpec("summary", str, required=True, max_len=500, clamp_to_max=True),
         FieldSpec("artifacts", dict),
         FieldSpec("pr", int, min_val=1, max_val=1_000_000_000),
     ],
@@ -4710,9 +4927,46 @@ PANEL_PUBLISH_SCHEMA = ToolSchema(
 # would pass it through unvalidated.
 PANEL_TEMPLATES_SCHEMA = ToolSchema(tool_name="panel_templates")
 
+DASHBOARD_FIELDS_SCHEMA = ToolSchema(tool_name="dashboard_fields")
+
+DASHBOARD_WRITE_SCHEMA = ToolSchema(
+    tool_name="dashboard_write",
+    fields=[
+        FieldSpec("field", str, required=True, max_len=64),
+        FieldSpec("value", (bool, int, float, str, list, dict), required=True),
+    ],
+)
+
+DASHBOARD_TEMPLATES_SCHEMA = ToolSchema(
+    tool_name="dashboard_templates",
+    fields=[FieldSpec("query", str, max_len=200)],
+)
+
+DASHBOARD_PREVIEW_SCHEMA = ToolSchema(
+    tool_name="dashboard_preview",
+    fields=[
+        FieldSpec("template_id", str, max_len=64),
+        FieldSpec("manifest", dict),
+        FieldSpec("html", str, max_len=64 * 1024),
+    ],
+)
+
+DASHBOARD_APPLY_SCHEMA = ToolSchema(tool_name="dashboard_apply")
+
+DASHBOARD_ROLLBACK_SCHEMA = ToolSchema(
+    tool_name="dashboard_rollback",
+    fields=[FieldSpec("to_version", int, required=True, min_val=1)],
+)
+
 MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
     "panel_publish": PANEL_PUBLISH_SCHEMA,
     "panel_templates": PANEL_TEMPLATES_SCHEMA,
+    "dashboard_fields": DASHBOARD_FIELDS_SCHEMA,
+    "dashboard_write": DASHBOARD_WRITE_SCHEMA,
+    "dashboard_templates": DASHBOARD_TEMPLATES_SCHEMA,
+    "dashboard_preview": DASHBOARD_PREVIEW_SCHEMA,
+    "dashboard_apply": DASHBOARD_APPLY_SCHEMA,
+    "dashboard_rollback": DASHBOARD_ROLLBACK_SCHEMA,
 }
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {

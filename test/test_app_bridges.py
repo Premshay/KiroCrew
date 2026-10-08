@@ -3912,6 +3912,10 @@ class TestAppEventBusIsActuallyWired:
         from kiro_crew.dashboard.state import DashboardState
 
         src = inspect.getsource(server_mod)
+        # The app backend waves hand it over from a server_runtime owner.
+        owners = sorted((Path(server_mod.__file__).parent / "server_runtime").glob("[!_]*.py"))
+        assert owners, "expected the server_runtime owners beside server.py"
+        src += "".join(path.read_text(encoding="utf-8") for path in owners)
         # Whatever the gateway hands to the hooks system must exist on the state.
         for attr in re.findall(r"broadcast_fn=state\.([A-Za-z_][A-Za-z0-9_]*)", src):
             assert hasattr(DashboardState, attr), (
@@ -3971,6 +3975,26 @@ class TestNeutralizeEntryShape:
         assert entry["command"] == "srv", "spec must be copied, not a bare deny"
         assert entry["disabledTools"] == ["t1", "t2"]
         assert "@some-server" not in out["tools"]
+
+    def test_neutralize_drops_per_tool_grants(self, monkeypatch):
+        from kiro_crew.apps import bridges
+
+        monkeypatch.setattr(bridges, "_global_mcp_specs", lambda: {"some-server": {"command": "srv"}})
+        agent = {
+            "name": "a",
+            "tools": ["@some-server"],
+            "allowedTools": [
+                "@some-server",
+                "@some-server/t1",
+                "@some-server/t1",
+                "@some-server-2/t1",
+            ],
+            "mcpServers": {},
+        }
+        out = bridges._apply_agent_mcp_policy(
+            agent, "a", {"agents": {"a": {"neutralize": {"some-server": ["t1"]}}}}
+        )
+        assert out["allowedTools"] == ["@some-server-2/t1"]
 
     def test_server_without_a_global_spec_is_skipped_not_emitted_bare(self, monkeypatch):
         from kiro_crew.apps import bridges

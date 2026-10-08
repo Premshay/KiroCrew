@@ -89,7 +89,9 @@ def test_design_round_compiles_grounded_prompt_and_harvest_evidence(tmp_path, mo
             "claude_design_url": "https://claude.ai/design/p/atlas-project",
             "handoff_path": "docs/design/handoffs/review-queue",
             "review_run_id": "review-1",
-            "report": {"findings": [{"title": "Status is unclear", "fix": "Show the active state."}]},
+            "report": {
+                "findings": [{"title": "Status is unclear", "fix": "Show the active state."}]
+            },
         }
     )
     updated = routes._update_design_round(

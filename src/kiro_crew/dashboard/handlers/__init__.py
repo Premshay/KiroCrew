@@ -429,28 +429,6 @@ from kiro_crew.dashboard.handlers.session_ledger import (  # noqa: E402, F401
     api_session_ledger_record,
 )
 
-# ── Coordinator work items (handlers/work_items.py) ──
-from kiro_crew.dashboard.handlers.work_items import (  # noqa: E402, F401
-    api_work_cycle_archive_list,
-    api_work_cycle_archive_read,
-    api_work_cycle_close,
-    api_work_cycle_open,
-    api_work_item_assigned_list,
-    api_work_item_assigned_read,
-    api_work_item_create,
-    api_work_item_dispatch_retry,
-    api_work_item_evaluate,
-    api_work_item_launch,
-    api_work_item_launch_candidates,
-    api_work_item_read,
-    api_work_item_report_progress,
-    api_work_item_revoke_assignment,
-    api_work_item_submit_handoff,
-    api_work_item_transition,
-    api_work_item_update,
-    api_work_items_list,
-)
-
 # ── Sessions (extracted to handlers/sessions.py) ──
 from kiro_crew.dashboard.handlers.session_storage import (  # noqa: E402, F401
     api_session_inventory,
@@ -501,6 +479,7 @@ from kiro_crew.dashboard.handlers.side import (  # noqa: E402, F401
     api_side_open,
     api_side_queue_cancel,
     api_side_queue_edit,
+    api_side_stop,
     api_side_turn,
 )
 
@@ -562,6 +541,28 @@ from kiro_crew.dashboard.handlers.teams import (  # noqa: E402, F401
     api_teams_delete,
     api_teams_list,
     api_teams_update,
+)
+
+# ── Coordinator work items (handlers/work_items.py) ──
+from kiro_crew.dashboard.handlers.work_items import (  # noqa: E402, F401
+    api_work_cycle_archive_list,
+    api_work_cycle_archive_read,
+    api_work_cycle_close,
+    api_work_cycle_open,
+    api_work_item_assigned_list,
+    api_work_item_assigned_read,
+    api_work_item_create,
+    api_work_item_dispatch_retry,
+    api_work_item_evaluate,
+    api_work_item_launch,
+    api_work_item_launch_candidates,
+    api_work_item_read,
+    api_work_item_report_progress,
+    api_work_item_revoke_assignment,
+    api_work_item_submit_handoff,
+    api_work_item_transition,
+    api_work_item_update,
+    api_work_items_list,
 )
 
 # ── MCP Apps message/call endpoints (handlers/mcp_apps.py) ──
@@ -1068,11 +1069,6 @@ from kiro_crew.dashboard.handlers.decisions import (  # noqa: E402, F401
     api_decisions_provider_get,
     api_decisions_provider_put,
 )
-from kiro_crew.dashboard.handlers.preference_advisor import (  # noqa: E402, F401
-    api_preference_advice,
-    api_preference_consult,
-    api_preference_feedback,
-)
 
 # Flagged-file delivery consent — owner-gated, and the ONLY writer of
 # ``file_delivery_consent.json``. Recording is arm (owner POST) + approve
@@ -1102,6 +1098,11 @@ from kiro_crew.dashboard.handlers.portability import (  # noqa: E402, F401
     api_portability_import,
     api_portability_preview,
 )
+from kiro_crew.dashboard.handlers.preference_advisor import (  # noqa: E402, F401
+    api_preference_advice,
+    api_preference_consult,
+    api_preference_feedback,
+)
 from kiro_crew.dashboard.handlers.security import (  # noqa: E402, F401
     api_denied_command_builtin_toggle,
     api_denied_command_user_add,
@@ -1114,4 +1115,7 @@ from kiro_crew.dashboard.handlers.security import (  # noqa: E402, F401
     api_trusted_app_revoke,
     api_trusted_apps_allow_all,
     api_trusted_apps_list,
+    api_trusted_registries_list,
+    api_trusted_registry_grant,
+    api_trusted_registry_revoke,
 )

@@ -135,6 +135,49 @@ class TestAuthorizeUpload:
                     payload_kind=backup.KIND_SNAPSHOT,
                 )
 
+    def test_profile_region_and_account_are_checked_against_one_grant_read(self):
+        # The stored grant can change between two reads. The first record matches
+        # this profile and region but names another account; the second names this
+        # account under another profile. Neither record allows the upload, so the
+        # gate must judge one record, not a half of each.
+        from kiro_crew import aws_consent
+
+        records = [
+            aws_consent.Grant(
+                service=aws_consent.SERVICE_S3,
+                profile="p",
+                region="us-west-2",
+                account="999988887777",
+                arn="",
+                granted_at="",
+            ),
+            aws_consent.Grant(
+                service=aws_consent.SERVICE_S3,
+                profile="other",
+                region="eu-west-1",
+                account=ACCOUNT,
+                arn="",
+                granted_at="",
+            ),
+        ]
+        with (
+            mock.patch(
+                "kiro_crew.deploy.engine._checked",
+                return_value=json.dumps({"Account": ACCOUNT}),
+            ),
+            mock.patch("kiro_crew.apps.manager.is_app_enabled", return_value=True),
+            mock.patch("kiro_crew.aws_consent.read_grant", side_effect=records) as read,
+        ):
+            with pytest.raises(RuntimeError, match="does not name this account"):
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
+        assert read.call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # run_snapshot_backup / run_sessions_backup — the whole push path
@@ -354,7 +397,16 @@ class TestRunSessionsBackup:
         pushed: dict[str, str] = {}
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             if key.endswith(backup.LABEL_OBJECT_NAME):
                 # The label sidecar rides along on the same push path; it is not
@@ -502,7 +554,16 @@ class TestSessionsArchiveLayerBGate:
         captured: dict[str, Any] = {}
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             if key.endswith(backup.LABEL_OBJECT_NAME):
                 return
@@ -799,7 +860,16 @@ class TestSessionsArchiveLayerBGate:
         uploaded: dict[str, int] = {}
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             if key.endswith(backup.LABEL_OBJECT_NAME):
                 return None
@@ -1665,7 +1735,16 @@ class TestSessionsArchiveLayerBGate:
         uploaded: list[str] = []
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             uploaded.append(key)
 
@@ -1824,7 +1903,16 @@ class TestSessionsArchiveLayerBGate:
             return answer["free"]
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             # Keyed by which object is being written. The label is uploaded after
             # the lock is released, on purpose -- a caption must not hold the
@@ -1895,7 +1983,16 @@ class TestSessionsArchiveLayerBGate:
             return answer["free"]
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             # Keyed the same way as the sibling: the label is uploaded after the
             # block, so reading "the last put" would pass with any lock at all.
@@ -1958,7 +2055,16 @@ class TestSessionsArchiveLayerBGate:
             return answer["free"]
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             which = "label" if key.endswith(backup.LABEL_OBJECT_NAME) else "archive"
             seen[which] = _file_lock_is_free_to_another_thread()
@@ -2007,7 +2113,16 @@ class TestSessionsArchiveLayerBGate:
             return not thread.is_alive() and answer.get("done", False)
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             if key.endswith(backup.LABEL_OBJECT_NAME):
                 return
@@ -2074,7 +2189,16 @@ class TestSessionsArchiveLayerBGate:
                 parked.set()
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             if key.endswith(backup.LABEL_OBJECT_NAME):
                 return
@@ -5687,6 +5811,30 @@ class TestRecordedVersionRecovery:
         # And the reported length describes them. Measured on the first read, this
         # would report the overwriting object's size.
         assert result["bytes"] == len(RECOVERED_BYTES)
+
+    def test_a_recovered_restore_says_so_in_its_reply(self):
+        # The overwrite is the operator's to know about: it outlives this restore,
+        # and the next upload to the key can be overwritten the same way. The reply
+        # is the only surface the dashboard reads, so it carries the fact.
+        key = self._recorded(RECOVERED_FINGERPRINT, "v-ours")
+        result, _asked = self._download(
+            key, current=b"somebody elses archive", by_version=RECOVERED_BYTES
+        )
+        assert result["recovered"] is True
+
+    def test_a_restore_that_needed_no_recovery_does_not_claim_one(self):
+        key = self._recorded(ARCHIVE_FINGERPRINT, "v-current")
+        result, asked = self._download(key, current=ARCHIVE_BYTES)
+        assert asked == [""]
+        assert result["recovered"] is False
+
+    def test_an_overridden_overwrite_is_not_reported_as_recovered(self):
+        # Under the override the current bytes are handed back unverified, so no
+        # recorded version was fetched and the reply must not say one was.
+        key = self._recorded(RECOVERED_FINGERPRINT, "v-ours")
+        result, asked = self._download(key, current=b"somebody elses archive", foreign_ok=True)
+        assert asked == [""]
+        assert result["recovered"] is False
 
     def test_a_recorded_version_that_is_gone_returns_the_existing_refusal(self):
         key = self._recorded(RECOVERED_FINGERPRINT, "v-ours")

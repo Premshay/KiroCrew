@@ -42,8 +42,10 @@ from kiro_crew.acp.liveness import (
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_OPENCODE,
     JSONRPC_METHOD_NOT_FOUND,
     AcpPromptStats,
+    JsonRpcMessage,
 )
 from kiro_crew.agent_sdk import host_auth
 
@@ -286,6 +288,340 @@ class TestAcpClientToolAudit:
         start = time.monotonic()
         await client._maybe_audit_tool_call(self._ev())  # must not raise / hang
         assert time.monotonic() - start < 4  # returned via timeout, not the 5s sleep
+
+
+class TestAcpClientZeroTools:
+    """``_deny_zero_tools`` -- the one refusal not scoped to MCP calls.
+
+    Unit-level: sets ``_spec_zero_tools`` directly rather than driving the full
+    mirror/projection pipeline (covered separately by
+    ``test_acp_session_mcp.py::TestZeroTools`` and the provider-mirror tests),
+    since the fact this refusal reacts to is a single boolean on the client.
+    """
+
+    @staticmethod
+    def _permission_request(request_id: int = 1) -> "acp_client.JsonRpcMessage":
+        return JsonRpcMessage(
+            id=request_id,
+            method="session/request_permission",
+            params={
+                "sessionId": "s-1",
+                "toolCall": {
+                    "toolCallId": "c1",
+                    "kind": "execute",
+                    "status": "pending",
+                    "title": "Bash",
+                },
+                "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+                ],
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_refuses_when_the_spec_declares_zero_tools(self, monkeypatch):
+        audited: list[dict] = []
+
+        class _Sel:
+            def log_tool_invocation(self, **kw):
+                audited.append(kw)
+
+        monkeypatch.setattr(acp_client, "sel_module", types.SimpleNamespace(sel=lambda: _Sel()))
+        client = AcpClient()
+        client._spec_zero_tools = True
+        sent: list[tuple] = []
+
+        async def _send(request_id, payload):
+            sent.append((request_id, payload))
+
+        client._send_response = _send  # type: ignore[method-assign]
+        event = client._build_permission_event(self._permission_request())
+        assert event is not None
+        assert await client._deny_zero_tools(event) is True
+        assert sent, "no rejection was sent for a zero-tool session"
+        assert audited and audited[0]["outcome"] == "denied"
+        assert audited[0]["metadata"]["reason"] == "spec_zero_tools"
+        assert audited[0]["tool_kind"] == "native"
+
+    @pytest.mark.asyncio
+    async def test_a_session_with_tools_is_untouched(self):
+        client = AcpClient()
+        assert client._spec_zero_tools is False
+        event = client._build_permission_event(self._permission_request())
+        assert event is not None
+        assert await client._deny_zero_tools(event) is False
+
+    def test_zero_tools_forces_the_session_to_judge_requests(self):
+        client = AcpClient()
+        assert client._judges_permission_requests is False
+        client._spec_zero_tools = True
+        assert client._judges_permission_requests is True
+
+    @pytest.mark.asyncio
+    async def test_opencode_still_refuses_when_the_spec_declares_zero_tools(self, monkeypatch):
+        monkeypatch.setattr(
+            acp_client,
+            "sel_module",
+            types.SimpleNamespace(
+                sel=lambda: types.SimpleNamespace(log_tool_invocation=lambda **k: None)
+            ),
+        )
+        client = AcpClient(acp_backend=ACP_BACKEND_OPENCODE)
+        client._spec_zero_tools = True
+        client._send_response = AsyncMock()  # type: ignore[method-assign]
+        event = client._build_permission_event(self._permission_request())
+        assert event is not None
+        assert await client._deny_zero_tools(event) is True
+
+    @pytest.mark.asyncio
+    async def test_a_backend_that_does_not_honour_the_ban_is_not_refused(self):
+        """claude's routing is not enforced, so the refusal is not applied there and
+        a zero-tool spec does not force the session to judge requests."""
+        client = AcpClient(acp_backend=ACP_BACKEND_CLAUDE)
+        client._spec_zero_tools = True
+        event = client._build_permission_event(self._permission_request())
+        assert event is not None
+        assert await client._deny_zero_tools(event) is False
+        assert client._judges_permission_requests is False
+
+    def test_spec_zero_tools_property_mirrors_the_private_flag(self):
+        client = AcpClient()
+        assert client.spec_zero_tools is False
+        client._spec_zero_tools = True
+        assert client.spec_zero_tools is True
+
+    @pytest.mark.asyncio
+    async def test_the_auto_approve_site_refuses_before_approving(self, monkeypatch):
+        """``_handle_permission`` must refuse a zero-tool session's own native
+        tool call, not just an MCP one -- the whole gap this refusal closes."""
+        monkeypatch.setattr(
+            acp_client,
+            "sel_module",
+            types.SimpleNamespace(
+                sel=lambda: types.SimpleNamespace(log_tool_invocation=lambda **k: None)
+            ),
+        )
+        client = AcpClient()
+        client._spec_zero_tools = True
+        sent: list[tuple] = []
+
+        async def _send(request_id, payload):
+            sent.append((request_id, payload))
+
+        client._send_response = _send  # type: ignore[method-assign]
+        await client._handle_permission(self._permission_request())
+        assert sent, "the auto-approve path approved a call on a zero-tool session"
+
+
+class TestEffectiveSpecDeclaresZeroTools:
+    """``effective_spec_declares_zero_tools`` judges the projected view the harness
+    consumed through ``--agent`` when one exists, which needs no mirror, so a
+    native-routed backend can be checked; with none, it needs the authored spec to
+    declare an empty list both before the spawn and after start."""
+
+    @staticmethod
+    def _client_with_projection(specs, errors=None) -> AcpClient:
+        from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+        client = AcpClient(agent="kirocrew-knowledge")
+        client._native_skill_projection = NativeSkillProjection(
+            {"kirocrew-knowledge": "kirocrew-view-abc"} if specs else {}, specs, errors or {}
+        )
+        return client
+
+    def test_an_empty_projected_view_is_confirmed(self):
+        client = self._client_with_projection(
+            {"kirocrew-knowledge": {"name": "kirocrew-view-abc", "tools": []}},
+        )
+        assert client.effective_spec_declares_zero_tools() is True
+
+    def test_a_projected_view_carrying_a_tool_is_not_confirmed(self):
+        client = self._client_with_projection(
+            {
+                "kirocrew-knowledge": {
+                    "name": "kirocrew-view-abc",
+                    "tools": ["@kirocrew-core/skill_search"],
+                }
+            },
+        )
+        assert client.effective_spec_declares_zero_tools() is False
+
+    def test_a_projected_view_without_a_tools_list_is_not_confirmed(self):
+        client = self._client_with_projection({"kirocrew-knowledge": {"name": "kirocrew-view-abc"}})
+        assert client.effective_spec_declares_zero_tools() is False
+
+    def test_a_non_list_tools_value_is_not_confirmed(self):
+        client = self._client_with_projection(
+            {"kirocrew-knowledge": {"name": "kirocrew-view-abc", "tools": "none"}}
+        )
+        assert client.effective_spec_declares_zero_tools() is False
+
+    def test_a_projection_with_an_error_for_the_agent_is_not_confirmed(self):
+        client = self._client_with_projection(
+            {}, errors={"kirocrew-knowledge": "skill_search is disabled"}
+        )
+        assert client.effective_spec_declares_zero_tools() is False
+
+    def test_a_projection_with_no_view_for_the_agent_is_not_confirmed(self):
+        client = self._client_with_projection(
+            {"another-agent": {"name": "kirocrew-view-def", "tools": []}}
+        )
+        assert client.effective_spec_declares_zero_tools() is False
+
+    def test_no_projection_without_a_pre_spawn_read_is_not_confirmed(self, monkeypatch):
+        """No pre-spawn confirmation means the bracket is not met, whatever the
+        authored spec says now; the post-start read is not even needed."""
+        client = AcpClient(agent="kirocrew-knowledge")
+        client._native_skill_projection = None
+        monkeypatch.setattr(acp_client, "agent_spec_snapshot", lambda *_a, **_k: {"tools": []})
+        assert client.effective_spec_declares_zero_tools() is False
+        assert client.effective_spec_declares_zero_tools(authored_before_spawn=False) is False
+
+    def test_a_client_that_never_prepared_a_projection_uses_the_bracket(self, monkeypatch):
+        client = AcpClient(agent="kirocrew-knowledge")
+        assert not hasattr(client, "_native_skill_projection")
+        monkeypatch.setattr(acp_client, "agent_spec_snapshot", lambda *_a, **_k: {"tools": []})
+        assert client.effective_spec_declares_zero_tools() is False
+        assert client.effective_spec_declares_zero_tools(authored_before_spawn=True) is True
+
+    def test_no_projection_with_both_reads_empty_is_confirmed(self, monkeypatch):
+        client = AcpClient(agent="kirocrew-knowledge")
+        client._native_skill_projection = None
+        monkeypatch.setattr(acp_client, "agent_spec_snapshot", lambda *_a, **_k: {"tools": []})
+        assert client.effective_spec_declares_zero_tools(authored_before_spawn=True) is True
+
+    def test_no_projection_with_a_spec_changed_after_the_pre_spawn_read_is_not_confirmed(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        agents = tmp_path / "project" / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        spec_path = agents / "kirocrew-knowledge.json"
+        spec_path.write_text(json.dumps({"name": "kirocrew-knowledge", "tools": []}))
+        client = AcpClient(agent="kirocrew-knowledge", work_dir=tmp_path / "project")
+        client._native_skill_projection = None
+        before = client.authored_spec_declares_zero_tools()
+        assert before is True
+        spec_path.write_text(json.dumps({"name": "kirocrew-knowledge", "tools": ["@builtin"]}))
+        assert client.effective_spec_declares_zero_tools(authored_before_spawn=before) is False
+
+    @pytest.mark.parametrize(
+        "snapshot",
+        [None, {}, {"name": "x"}, {"tools": "none"}, {"tools": ["@builtin"]}, ["tools"]],
+    )
+    def test_no_projection_with_an_unconfirming_authored_spec_is_not_confirmed(
+        self, monkeypatch, snapshot
+    ):
+        client = AcpClient(agent="kirocrew-knowledge")
+        client._native_skill_projection = None
+        monkeypatch.setattr(acp_client, "agent_spec_snapshot", lambda *_a, **_k: snapshot)
+        assert client.effective_spec_declares_zero_tools(authored_before_spawn=True) is False
+
+    def test_a_projected_view_with_tools_ignores_the_authored_spec(self, monkeypatch):
+        client = self._client_with_projection(
+            {"kirocrew-knowledge": {"name": "v", "tools": ["@builtin"]}}
+        )
+        monkeypatch.setattr(acp_client, "agent_spec_snapshot", lambda *_a, **_k: {"tools": []})
+        assert client.effective_spec_declares_zero_tools(authored_before_spawn=True) is False
+
+    def test_a_zero_tool_projected_view_ignores_the_authored_spec(self, monkeypatch):
+        client = self._client_with_projection({"kirocrew-knowledge": {"name": "v", "tools": []}})
+        monkeypatch.setattr(
+            acp_client, "agent_spec_snapshot", lambda *_a, **_k: {"tools": ["@builtin"]}
+        )
+        assert client.effective_spec_declares_zero_tools(authored_before_spawn=False) is True
+        assert client.effective_spec_declares_zero_tools(authored_before_spawn=True) is True
+
+    def test_no_spec_file_is_read_when_a_projection_exists(self, tmp_path, monkeypatch):
+        """With a projection the answer rests on the captured view alone: a resolver
+        that raises and an authored spec carrying tools on disk leave a zero-tool
+        view confirmed."""
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        project_agents = tmp_path / "project" / ".kiro" / "agents"
+        project_agents.mkdir(parents=True)
+        (project_agents / "kirocrew-knowledge.json").write_text(
+            json.dumps({"name": "kirocrew-knowledge", "tools": ["@builtin"]})
+        )
+
+        def _boom(*_args, **_kwargs):
+            raise AssertionError("the confirmation re-read an authored spec")
+
+        monkeypatch.setattr(acp_client, "agent_spec_snapshot", _boom)
+        client = self._client_with_projection(
+            {"kirocrew-knowledge": {"name": "kirocrew-view-abc", "tools": []}}
+        )
+        assert client.effective_spec_declares_zero_tools() is True
+        assert client.effective_spec_declares_zero_tools(authored_before_spawn=True) is True
+
+
+class TestAuthoredSpecDeclaresZeroTools:
+    """``authored_spec_declares_zero_tools`` reads the spec the harness resolves
+    ``--agent`` to, project checkout first, and fails closed."""
+
+    @staticmethod
+    def _client(work_dir=None) -> AcpClient:
+        return AcpClient(agent="kirocrew-knowledge", work_dir=work_dir)
+
+    @pytest.mark.parametrize(
+        ("snapshot", "expected"),
+        [
+            ({"tools": []}, True),
+            ({"tools": ["@builtin"]}, False),
+            ({"name": "x"}, False),
+            ({"tools": None}, False),
+            ({"tools": "none"}, False),
+            ({"tools": {}}, False),
+            (None, False),
+            (["tools"], False),
+        ],
+    )
+    def test_the_snapshot_decides(self, monkeypatch, snapshot, expected):
+        monkeypatch.setattr(acp_client, "agent_spec_snapshot", lambda *_a, **_k: snapshot)
+        assert self._client().authored_spec_declares_zero_tools() is expected
+
+    def test_a_resolver_failure_is_not_confirmed_and_is_logged(self, monkeypatch, caplog):
+        def _boom(*_args, **_kwargs):
+            raise OSError("unreadable")
+
+        monkeypatch.setattr(acp_client, "agent_spec_snapshot", _boom)
+        with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+            assert self._client().authored_spec_declares_zero_tools() is False
+        assert any("unreadable" in r.getMessage() for r in caplog.records)
+
+    def test_the_resolver_receives_the_agent_and_work_dir(self, tmp_path, monkeypatch):
+        seen: dict = {}
+
+        def _snap(agent, *, work_dir=None):
+            seen.update(agent=agent, work_dir=work_dir)
+            return {"tools": []}
+
+        monkeypatch.setattr(acp_client, "agent_spec_snapshot", _snap)
+        assert self._client(tmp_path).authored_spec_declares_zero_tools() is True
+        assert seen == {"agent": "kirocrew-knowledge", "work_dir": tmp_path}
+
+    def test_the_project_spec_wins_over_the_user_level_one(self, tmp_path, monkeypatch):
+        """Project-nearest, as the harness resolves ``--agent``: a project spec
+        carrying tools is judged even though the user-level one is empty."""
+        from kiro_crew import agent as agent_mod
+        from kiro_crew.acp import session_mcp
+
+        user_agents = tmp_path / "agents"
+        user_agents.mkdir()
+        monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", user_agents)
+        monkeypatch.setattr(session_mcp, "ensure_agent_materialized", lambda _a: True)
+        (user_agents / "kirocrew-knowledge.json").write_text(
+            json.dumps({"name": "kirocrew-knowledge", "tools": []})
+        )
+        project = tmp_path / "project"
+        project_agents = project / ".kiro" / "agents"
+        project_agents.mkdir(parents=True)
+        (project_agents / "kirocrew-knowledge.json").write_text(
+            json.dumps({"name": "kirocrew-knowledge", "tools": ["@builtin"]})
+        )
+        assert self._client(project).authored_spec_declares_zero_tools() is False
+        (project_agents / "kirocrew-knowledge.json").unlink()
+        assert self._client(project).authored_spec_declares_zero_tools() is True
 
 
 class TestAcpClientToolHooks:
@@ -1025,11 +1361,14 @@ class TestAcpClientBackendSelection:
 
     @pytest.fixture(autouse=True)
     def _reset_claude_cache(self):
-        import kiro_crew.acp.client as _mod
+        # Through the gateway's own reset seam rather than by writing the cache: the
+        # resolver is injected per test, so each must resolve afresh, and none may
+        # leave its answer for the next.
+        from kiro_crew.agent_sdk.drivers.acp import forget_cached_resolution
 
-        _mod._claude_acp_argv_cache = _mod._UNRESOLVED
+        forget_cached_resolution(ACP_BACKEND_CLAUDE)
         yield
-        _mod._claude_acp_argv_cache = _mod._UNRESOLVED
+        forget_cached_resolution(ACP_BACKEND_CLAUDE)
 
     @pytest.fixture(autouse=True)
     def _no_cgroup_scope(self):
@@ -1306,8 +1645,7 @@ class TestClaudeAutonomousReader:
         overlay = tmp_path / "overlay"
         overlay.mkdir()
         (overlay / "kirocrew.json").write_text(
-            '{"name":"kirocrew","mcpServers":{"context7":'
-            '{"command":"context7","args":[]}}}',
+            '{"name":"kirocrew","mcpServers":{"context7":' '{"command":"context7","args":[]}}}',
             encoding="utf-8",
         )
         client = AcpClient(
@@ -1367,8 +1705,7 @@ class TestClaudeAutonomousReader:
         overlay = tmp_path / "overlay"
         overlay.mkdir()
         (overlay / "kirocrew.json").write_text(
-            '{"name":"kirocrew","mcpServers":{"context7":'
-            '{"command":"context7","args":[]}}}',
+            '{"name":"kirocrew","mcpServers":{"context7":' '{"command":"context7","args":[]}}}',
             encoding="utf-8",
         )
         client = AcpClient(
@@ -1378,18 +1715,23 @@ class TestClaudeAutonomousReader:
             mcp_gateway_overlay=overlay,
         )
         monkeypatch.setattr(client, "_session_capability_mcp_servers", lambda: [])
+        monkeypatch.setattr(client, "_translated_session_mcp_servers", lambda: [])
+        monkeypatch.setattr(
+            client,
+            "_claude_explicit_session_mcp_servers",
+            lambda: [{"name": "context7", "command": "context7", "args": [], "env": []}],
+        )
+        client._session_mcp_withheld = False
         monkeypatch.setattr(
             client,
             "_pooled_mcp_servers",
             lambda: [{"name": "context7", "command": "context7", "args": [], "env": []}],
         )
 
-        assert [entry["name"] for entry in await client._session_mcp_servers()] == ["context7"]
+        assert [entry["name"] for entry in client._session_mcp_servers()] == ["context7"]
 
     @staticmethod
     def _sdk_message(message: dict) -> "JsonRpcMessage":
-        from kiro_crew.acp.types import JsonRpcMessage
-
         return JsonRpcMessage(
             method=acp_client._CLAUDE_SDK_MESSAGE_METHOD, params={"message": message}
         )
@@ -5271,7 +5613,7 @@ class TestInitializeSession:
 
     @pytest.mark.asyncio
     async def test_new_session_injects_core_session_capabilities(self, tmp_path):
-        client = self._make_client(tmp_path)
+        client = self._make_client(tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
         sent: list[tuple[str, dict]] = []
 
         async def send(method, params):
@@ -5307,8 +5649,8 @@ class TestInitializeSession:
 
     @pytest.mark.asyncio
     async def test_session_resume_success(self, tmp_path):
-        """session/load succeeds when file exists and kiro-cli supports it."""
-        client = self._make_client(tmp_path)
+        """session/load succeeds when the backend supports it and the file exists."""
+        client = self._make_client(tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
         client._resume_session_id = "old-sess"
         sent: list[tuple[str, dict]] = []
 
@@ -5340,7 +5682,9 @@ class TestInitializeSession:
             assert client._session_id == "old-sess"
             assert client._resumed is True
             load_params = next(params for method, params in sent if method == "session/load")
-            core = next(server for server in load_params["mcpServers"] if server["name"] == "kirocrew-core")
+            core = next(
+                server for server in load_params["mcpServers"] if server["name"] == "kirocrew-core"
+            )
             assert core["args"][-1] == "mcp-core"
         finally:
             session_file.unlink(missing_ok=True)
@@ -13465,16 +13809,20 @@ class TestLocalLaneAdmission503:
     def test_router_admission_503_is_transient(self):
         from kiro_crew.acp.client import _is_transient_raw_error
 
-        assert _is_transient_raw_error(
-            {"data": 'API Error: 503 {"error":"no available lane"}'}
-        ) is True
+        assert (
+            _is_transient_raw_error({"data": 'API Error: 503 {"error":"no available lane"}'})
+            is True
+        )
 
     def test_usage_limit_still_beats_admission_wording(self):
         from kiro_crew.acp.client import _is_transient_raw_error
 
-        assert _is_transient_raw_error(
-            {"data": "Monthly usage limit has been reached; too many requests"}
-        ) is False
+        assert (
+            _is_transient_raw_error(
+                {"data": "Monthly usage limit has been reached; too many requests"}
+            )
+            is False
+        )
 
 
 class TestNewConversation:
@@ -13510,7 +13858,10 @@ class TestNewConversation:
 
         assert client._session_id == "sess-new"
         assert sent[0][0] == "session/new"
-        assert next(params for method, params in sent if method == "session/set_mode")["sessionId"] == "sess-new"
+        assert (
+            next(params for method, params in sent if method == "session/set_mode")["sessionId"]
+            == "sess-new"
+        )
         client._apply_startup_model.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -14245,9 +14596,7 @@ class TestImagePromptCapability:
         assert "self._prompt_capabilities" in source
 
     @pytest.mark.asyncio
-    async def test_send_prompt_withholds_images_when_not_advertised(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_send_prompt_withholds_images_when_not_advertised(self, tmp_path, monkeypatch):
         seen = {}
 
         def _fake_build(message, *, allow_image=True, **kwargs):
@@ -14333,8 +14682,7 @@ class TestImagePromptCapability:
             calls.append(params["prompt"])
             if len(calls) == 1:
                 raise acp_client.AcpError(
-                    "Invalid params: inline image prompts were not advertised"
-                    " by this connection"
+                    "Invalid params: inline image prompts were not advertised" " by this connection"
                 )
             return 2
 
@@ -14914,3 +15262,26 @@ class TestCreateRaceLoserPoll:
         assert loser._claude_settings_authored is False
         assert loser._permission_surface_governed is False
         assert path.read_text(encoding="utf-8") == winners_payload
+
+
+def test_resolve_spawn_agent_argv_converts_a_refusal_to_acperror(tmp_path):
+    """A projection ``errors`` entry (an unreadable/excluded spec) makes
+    ``spawn_agent`` raise a bare ``ValueError``. Raised raw out of ``_spawn`` it
+    would escape ``ensure_ready``'s transport ladder uncaught, skipping cleanup;
+    the helper must convert it to ``AcpError`` (which the ladder catches) while
+    keeping the actionable message, and pass a resolvable name straight through."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    client = AcpClient(work_dir=tmp_path, agent="ghost")
+    client._native_skill_projection = NativeSkillProjection(
+        aliases={}, errors={"ghost": "its spec could not be read"}
+    )
+    with pytest.raises(AcpError) as excinfo:
+        client._resolve_spawn_agent_argv()
+    assert "its spec could not be read" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+    # A resolvable launch name passes through unchanged (no raise).
+    client._agent = "fine"
+    client._native_skill_projection = NativeSkillProjection(aliases={})
+    assert client._resolve_spawn_agent_argv() == "fine"

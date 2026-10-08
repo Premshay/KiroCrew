@@ -28,10 +28,11 @@
  * thread, so the UI does not announce it — there is no unpinned state to
  * contrast against.
  *
- * Which crewmate is open rides the URL (`?member=<name>`), and the last one
- * opened is remembered per browser: a visit that names no one lands on the
- * remembered crewmate if it is still on the roster, else on the most recently
- * USED chat (greatest `last_active_ts`). That is the conversation the user
+ * Which crewmate is open rides the URL (`?member=<name>`). A visit that names
+ * no one lands on the crewmate the user last CHATTED with (`last_chat_ts`, a
+ * server record, so it survives a gateway restart), else on the one last
+ * opened in this browser if it is still on the roster, else on the most
+ * recently USED chat (greatest `last_active_ts`). That is the conversation the user
  * most plausibly came back for, and it is a property of the user's own
  * history, not of the list order: #11763 rejected priming the user on
  * whichever row the SORT floated to the top, and that still holds — the
@@ -96,7 +97,7 @@ import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { usePersistedString } from '../../hooks/usePersistedString'
 import { findReport, type ErrorReport } from '../../utils/errorReport'
 import { useAppDispatch, useAppSelector } from '../../store'
-import { selectSlotStreamState, selectSlotToolLog } from '../../store/chatSlice'
+import { selectSidebarAutomationRunningKeys, selectSlotStreamState, selectSlotToolLog } from '../../store/chatSlice'
 import { toolStatusLabel, type ToolStatusDetail } from '../../utils/toolStatusLabel'
 import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
 import { useLanguage } from '../../i18n/LanguageProvider'
@@ -105,7 +106,9 @@ import { emitSlotRead, flushSlotRead } from '../../lib/slotReadRelay'
 import { setViewedThreadSlot, clearViewedThreadSlot } from '../../lib/viewedThread'
 import CrewAvatar from '../../components/CrewAvatar'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
+import CrewLoopIndicator from '../../components/crew/CrewLoopIndicator'
 import Glass from '../../components/Glass'
+import { Badge } from '../../components/ui'
 import { resolvePillActivity, type PillActivityKind } from './pillActivity'
 import ChatPane from '../../components/ChatPane'
 import type { ThreadHooks } from '../../app-sdk/messageRenderers'
@@ -116,6 +119,8 @@ import CrewProfilePanel, { type ProfileTab } from './CrewProfilePanel'
 import { createPortal } from 'react-dom'
 import { useCrewmateThreadsFlag } from '../../hooks/useCrewmateThreadsFlag'
 import { CrewDashboardFrame } from './CrewWebview'
+import CrewDashboardTab from './CrewDashboardTab'
+import { mergePaneDraft } from '../../utils/chatPaneDrafts'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useConfirm } from '../../components/ConfirmDialog'
@@ -160,6 +165,7 @@ import { safeGetItem, safeSetItem } from '../../utils/safeStorage'
 import { useMemberProjection, useMemberRosterViews } from '../../state/useMemberProjection'
 import type { RosterView } from '../../state/memberProjectionTypes'
 import type { CrewmateIdentity } from '../chat/CrewmateMessage'
+import { SidePanelDockHost } from '../../components/SidePanelGlyph'
 
 /** Creating a crewmate happens IN this page: the header "+" and the empty-state
  *  hero open `NewCrewmateDialog`, which performs the same `POST /api/agents`
@@ -201,6 +207,8 @@ export function resolveDefaultMember(
   remembered: string | null,
   ordered: readonly MemberRosterRow[],
 ): MemberRosterRow | undefined {
+  const chatted = lastChattedMember(ordered)
+  if (chatted) return chatted
   if (remembered && remembered !== 'default') {
     const hit = ordered.find((m) => m.name === remembered)
     if (hit) return hit
@@ -209,6 +217,21 @@ export function resolveDefaultMember(
   for (const m of ordered) {
     if (m.name === 'default') continue
     if (!best || (m.last_active_ts ?? 0) > (best.last_active_ts ?? 0)) best = m
+  }
+  return best
+}
+
+/** The crewmate the user last sent a message to (`last_chat_ts`, recorded by
+ *  the server, so it survives a gateway restart and a new browser alike), in
+ *  its DM or in a normal chat. It outranks this browser's remembered pick: the
+ *  page reopens the conversation the user last HAD, not the row they last
+ *  clicked. The built-in `default` assistant is not a crewmate. Strict `>` so
+ *  a tie keeps the first in `rows`. */
+export function lastChattedMember(rows: readonly MemberRosterRow[]): MemberRosterRow | undefined {
+  let best: MemberRosterRow | undefined
+  for (const m of rows) {
+    if (m.name === 'default' || !((m.last_chat_ts ?? 0) > 0)) continue
+    if (!best || (m.last_chat_ts ?? 0) > (best.last_chat_ts ?? 0)) best = m
   }
   return best
 }
@@ -447,7 +470,7 @@ function MemberRow({
   isRunning,
   isUnread,
   isNeedsYou,
-  activePatrolOf,
+  isLoopOn,
   reduceMotion,
   scrollActiveRowIntoView,
   slugCollides,
@@ -465,7 +488,8 @@ function MemberRow({
   /** The crewmate's turn is parked on an approval or a question — the same
    *  reading the status filter and the switcher row take (`signalsOf`). */
   isNeedsYou: (m: MemberRosterRow) => boolean
-  activePatrolOf: (m: MemberRosterRow) => AutoNudgeLoop | undefined
+  /** The crewmate's automation loop is on (`signalsOf().patrolling`). */
+  isLoopOn: (m: MemberRosterRow) => boolean
   reduceMotion: boolean | null
   scrollActiveRowIntoView: (el: HTMLButtonElement | null) => void
   slugCollides: boolean
@@ -575,55 +599,10 @@ function MemberRow({
                 data-testid="member-presence-dot"
               />
             )}
-            {/* Patrol badge — the member has an ACTIVE auto-nudge loop
-                on its own thread. Rendered only while the loop patrols:
-                a stopped loop and a never-armed member both show
-                nothing, because "not patrolling" is a member's resting
-                state, not an incident — a standing warn mark on an
-                idle avatar read as "something is broken", and the
-                drawer's block already spells a stopped loop's reason.
-                Top-right corner of the avatar, the composer's goal-chip
-                glyph on a solid accent fill (the presence dot's own
-                idiom — an outline read as nothing at a glance): a
-                different corner from the presence dot (bottom-right,
-                ok-green, "working now") and a different edge from the
-                row's right-side markers, so all of them can show at
-                once without covering each other. Mount/unmount is
-                animated (the badge fades out when the loop ends rather
-                than vanishing): a badge that pops in or out mid-glance
-                is what a state change looks like when it is not a
-                glitch. Under prefers-reduced-motion the tween is
-                skipped and the badge cuts straight to its new state. */}
-            <AnimatePresence initial={false}>
-              {(() => {
-                const lp = activePatrolOf(view)
-                if (!lp) return null
-                // The tooltip spells the count the drawer's way ("3 of 24"
-                // / "61 · no limit"): the compact "3/24" alone read as a date.
-                const cycle =
-                  lp.max_cycles > 0
-                    ? t('pages.membersPage.patrol_cycles_of', { n: lp.cycle_count, max: lp.max_cycles })
-                    : t('pages.membersPage.patrol_cycles_unlimited', { n: lp.cycle_count })
-                const label = t('pages.membersPage.patrol_badge', { cycle })
-                return (
-                  <motion.span
-                    key="patrol"
-                    initial={reduceMotion ? false : { opacity: 0, scale: 0.6 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.6 }}
-                    transition={reduceMotion ? { duration: 0 } : { duration: 0.15, ease: [0.2, 0, 0, 1] }}
-                    className="absolute -right-1 -top-1 w-4 h-4 rounded-full border-2 border-bg flex items-center justify-center bg-accent text-accent-fg"
-                    role="img"
-                    aria-label={label}
-                    title={label}
-                    data-testid="member-patrol-dot"
-                    data-state="active"
-                  >
-                    <Goal size={10} aria-hidden="true" />
-                  </motion.span>
-                )
-              })()}
-            </AnimatePresence>
+            {/* On watch — the member's own thread has a live monitor or
+                goal loop. Presence only: no nudge text, no cycle count; the
+                drawer's block keeps the details. */}
+            <CrewLoopIndicator on={isLoopOn(view)} testId="member-loop-indicator" />
           </span>
           <span className="min-w-0 flex-1">
             <span className={`block ${ROW_TITLE_CLS} font-semibold text-text truncate`}>{crewDisplayName(view)}</span>
@@ -649,6 +628,17 @@ function MemberRow({
                   <Square size={9} fill="currentColor" className="lucide-inline" aria-hidden="true" />
                   {t('pages.membersPage.stopped_indicator')}
                 </span>
+              )}
+              {/* The mark's word, so it reads without a tooltip (touch,
+                  reduced motion). Accent, like the mark. */}
+              {isLoopOn(view) && (
+                <Badge
+                  variant="muted"
+                  className="shrink-0 px-1.5 py-0 text-[11px] font-sans bg-accent-subtle text-accent"
+                  data-testid="member-loop-label"
+                >
+                  {t('pages.membersPage.loop_on')}
+                </Badge>
               )}
               <span className="block truncate min-w-0">{view.last_message || '\u00a0'}</span>
             </span>
@@ -1679,8 +1669,8 @@ export default function MembersPage() {
     () => ({ search: filter, starredOnly, source: sourceFilter, status: statusFilter, sort, defaultAgent, chosen: activeName }),
     [filter, starredOnly, sourceFilter, statusFilter, sort, defaultAgent, activeName],
   )
-  // The rows the roster is about right now: created crewmates and the default
-  // crew, or -- with a search typed -- whatever the search reaches, hidden rows
+  // The rows the roster is about right now: crewmates the user chatted with
+  // (or starred), or -- with a search typed -- whatever the search reaches, hidden rows
   // included. The header count, the "N of M" and the filter menu's tallies read
   // THIS list, never `members`, so no count includes a row the user cannot see.
   const shownMembers = useMemo(() => rosterPopulation(members, rosterFilterQuery), [members, rosterFilterQuery])
@@ -2074,9 +2064,9 @@ export default function MembersPage() {
   const schedulesMountedRef = useRef(false)
   const activeTabId = shownTabId ?? tabsCtl.activeId
   // The in-chat Command Center dock is the Dynamic Dashboard, a Feature Preview
-  // (Settings > Developer); off, the dock has no opener. The Dashboard TAB is the
-  // crewmate's own published page (CrewDashboardFrame), not that surface, so it
-  // stays a standing entry either way.
+  // (Settings > Developer); off, the dock has no opener. The Dashboard TAB stays a
+  // standing entry either way -- the flag decides what FILLS it, the crewmate's
+  // dynamic dashboard or the published view it showed before.
   const dashboardPreview = usePreviewFlag(PREVIEW_DASHBOARD)
   const dashboardVisible = panelVisible && activeTabId === CREW_DASHBOARD_TAB_ID
   const [dashboardVisitedFor, setDashboardVisitedFor] = useState<string | null>(null)
@@ -2535,6 +2525,18 @@ export default function MembersPage() {
     },
     [patrolLoopOf],
   )
+  // On watch: the sidebar's live-automation keys (Redux, kept by
+  // `autonudge_state` frames — structured monitors AND goal loops), or the
+  // registry read above.
+  const loopRunningKeys = useAppSelector(selectSidebarAutomationRunningKeys)
+  const isLoopOn = useCallback(
+    (m: MemberRosterRow) => {
+      if (activePatrolOf(m)) return true
+      const key = slotKeyOf(m)
+      return !!key && loopRunningKeys.includes(key)
+    },
+    [activePatrolOf, slotKeyOf, loopRunningKeys],
+  )
   // The live facts the status filters read, resolved per row the same way the
   // row's own markers are (isRunning / isUnread / activePatrolOf), so a filter
   // can never disagree with the dot it filters on.
@@ -2545,10 +2547,10 @@ export default function MembersPage() {
         running: !!isRunning(m),
         needsYou: !!key && !!liveNeedsYou[key],
         unread: isUnread(m),
-        patrolling: !!activePatrolOf(m),
+        patrolling: isLoopOn(m),
       }
     },
-    [slotKeyOf, isRunning, liveNeedsYou, isUnread, activePatrolOf],
+    [slotKeyOf, isRunning, liveNeedsYou, isUnread, isLoopOn],
   )
   // The roster row's needs-you cue reads the SAME resolver, so the full roster,
   // the folded switcher and the status filter can never disagree about a crewmate
@@ -2587,8 +2589,8 @@ export default function MembersPage() {
   // the shown population: hidden rows are not "filtered out", they are unlisted.
   const filteredOut =
     loaded && !loadError && shownMembers.length > 0 && sortedMembers.length === 0 && !filter.trim()
-  // Every crewmate exists but the listing rule hides them all (none chatted,
-  // created here, starred or the default crew): say so and name the search as
+  // Every crewmate exists but the listing rule hides them all (none chatted
+  // with, none starred): say so and name the search as
   // the way in, rather than an empty list under "0 crewmates".
   const allHidden =
     loaded && !loadError && !filter.trim() && shownMembers.length === 0 && !hasNoCrewmates(members)
@@ -2872,8 +2874,13 @@ export default function MembersPage() {
     const remembered = safeGetItem(LAST_MEMBER_KEY)
     const rememberedRow =
       remembered && remembered !== 'default' ? members.find((m) => m.name === remembered) : undefined
+    // The last crewmate the user CHATTED with outranks the memory (it is the
+    // server's record, so a restart or a new browser keeps it).
     const target =
-      rememberedRow ?? resolveDefaultMember(null, listedMembers) ?? resolveDefaultMember(null, orderedMembers)
+      lastChattedMember(orderedMembers) ??
+      rememberedRow ??
+      resolveDefaultMember(null, listedMembers) ??
+      resolveDefaultMember(null, orderedMembers)
     if (!target) {
       // Named a gone crewmate on an empty roster: say where they went above
       // the roster (shown: '' marks the roster variant of the notice, as
@@ -3048,6 +3055,9 @@ export default function MembersPage() {
     // either — the panel docks FLUSH to the window's right edge, exactly as it
     // does in the chat page's actbar column; the card columns' pr-2 lives on
     // the inner wrapper below.
+    // This page has no bottom row for the side panel, so every panel glyph
+    // in its transcripts draws the right-dock pane.
+    <SidePanelDockHost value={false}>
     <div className="flex h-full min-h-0" data-testid="members-page">
       {/* Card columns (roster + thread) keep the page's original insets. */}
       <div className="flex flex-1 min-w-0 gap-2 pr-2 pb-2">
@@ -3515,7 +3525,7 @@ export default function MembersPage() {
                       isRunning={isRunning}
                       isUnread={isUnread}
                       isNeedsYou={isNeedsYou}
-                      activePatrolOf={activePatrolOf}
+                      isLoopOn={isLoopOn}
                       reduceMotion={reduceMotion}
                       scrollActiveRowIntoView={scrollActiveRowIntoView}
                       slugCollides={collidingSlugs.has(m.slug)}
@@ -3733,7 +3743,7 @@ export default function MembersPage() {
                     no scrim, no badge (issue #9425). */}
                 {/* The face is a shared layout element: when the card docks and the
                     pill steps out, the same face slides into the card's head. */}
-                <motion.span layoutId={CREW_FACE_LAYOUT_ID} className="flex shrink-0 rounded-full">
+                <motion.span layoutId={CREW_FACE_LAYOUT_ID} className="relative flex shrink-0 rounded-full">
                   <CrewStateAvatar
                     seed={active.name}
                     avatar={active.avatar}
@@ -3742,6 +3752,7 @@ export default function MembersPage() {
                     size={30}
                     working="full"
                   />
+                  <CrewLoopIndicator on={isLoopOn(active)} testId="member-pill-loop-indicator" />
                 </motion.span>
                 <div className="min-w-0 leading-tight">
                   {/* Title row = name (+ the ID when a label covers it). */}
@@ -3784,11 +3795,11 @@ export default function MembersPage() {
                     data-testid="member-pill-activity"
                     data-activity={pillActivity.kind}
                     aria-hidden="true"
-                  >{pillActivity.label}</div>
+                  >{pillActivity.label}{isLoopOn(active) ? ` · ${t('pages.membersPage.loop_on')}` : ''}</div>
                 </div>
                 {/* The one visible sign that this chip OPENS something. Without
-                    it the pill and the switcher chip beside it are two glass
-                    chips with faces in them, and only one of them is a door to
+                    it the pill and the switcher beside it are two controls
+                    with faces in them, and only one of them is a door to
                     the Profile. Decorative: the tooltip and `aria-expanded`
                     already say it for assistive tech. */}
                 <ChevronRight size={14} className="lucide-inline shrink-0 text-muted" aria-hidden="true" data-testid="member-identity-pill-chevron" />
@@ -3812,7 +3823,7 @@ export default function MembersPage() {
                     live region — a line that changes several times a turn
                     would otherwise be announced on every change. It is in the
                     reading order for a reader who asks. */}
-                <span className="sr-only" data-testid="member-pill-activity-sr">{pillActivity.label}</span>
+                <span className="sr-only" data-testid="member-pill-activity-sr">{pillActivity.label}{isLoopOn(active) ? ` · ${t('pages.membersPage.loop_on')}` : ''}</span>
                 {showOpener && (
                   <button
                     onClick={togglePanel}
@@ -4030,18 +4041,15 @@ export default function MembersPage() {
                       page's widest region, and an uncapped line length is
                       unreadable on wide screens.
 
-                      steer-only: a DM is a conversation with one named
-                      member, not an operator console. Talking to a person has
-                      no "queue this until they finish" step, so a send while
-                      the member is working goes straight into its running
-                      turn — no Steer/Queue split, no queue stack. The main
-                      chat and split view keep the split button. */}
+                      Default (split) busy mode: a send while the member is
+                      working offers the same Steer / Queue / Jev auto choice
+                      as the main chat, so the user can queue a follow-up
+                      instead of always interrupting the running turn. */}
                   <ChatPane
                     slotKey={activeSlot}
                     agentLocked
                     frameless
                     followContentWidth
-                    busyMode="steer-only"
                     // The failure notice above owns the verdict on this thread
                     // while a repair has failed; the pane's own "Session
                     // ready" would contradict it one line down.
@@ -4094,11 +4102,19 @@ export default function MembersPage() {
           // One Dashboard: the existing crew publication is one task view.
           // Preserve its renderer and exact member identity, while the host
           // owns live task summaries, questions and approval controls.
-          // The Dashboard tab IS the crewmate's published view (crewmate-panel IA):
-          // the HTML report the crewmate writes itself, rendered straight into the
-          // panel. No card, Contained bar or Expand around it (CrewDashboardFrame,
-          // not the CrewWebview drawer) and no Command Center above it: each read
-          // as one more container stacked over the one page that matters.
+          // The Dashboard tab is the crewmate's own dynamic dashboard -- the page the
+          // read resolves for it, its adopted copy or the default template, with every
+          // number folded from its crew log -- BEHIND THE FEATURE PREVIEW. With the
+          // preview off the tab keeps rendering the published view it rendered before,
+          // which is what "off by default" has to mean: the standing Dashboard entry
+          // shows the same thing to anybody who has not turned the preview on.
+          //
+          // The entry itself is unconditional either way. The TAB is a standing one;
+          // only what fills it moves with the flag.
+          //
+          // No card, Contained bar or Expand around either (not the CrewWebview
+          // drawer) and no Command Center above it: each read as one more container
+          // stacked over the one page that matters.
           const dashboardBody = (
             <div className="h-full min-h-0 flex flex-col" data-testid="member-dashboard" aria-label={t('pages.membersPage.dashboard_tab')}>
               {/* Said here only when the MAIN COLUMN is not already saying it:
@@ -4109,7 +4125,20 @@ export default function MembersPage() {
                 ? <p role="status" className="px-4 pt-3 text-sm text-muted">{t('pages.membersPage.opening_thread')}</p>
                 : null}
               {activeSlug && activeMemberName && (
-                <CrewDashboardFrame slug={activeSlug} member={activeMemberName} displayName={crewDisplayName(activeView ?? active)} />
+                dashboardPreview ? (
+                  // Keyed per crewmate so the tab remounts on a switch instead of
+                  // opening the next crewmate on the page held for this one.
+                  <CrewDashboardTab
+                    key={JSON.stringify([activeSlug, activeMemberName])}
+                    slug={activeSlug}
+                    member={activeMemberName}
+                    displayName={crewDisplayName(activeView ?? active)}
+                    // A needs-you option lands in this crewmate's chat box; the person sends it.
+                    onAct={activeSlot ? (text: string) => mergePaneDraft(activeSlot, text, []) : undefined}
+                  />
+                ) : (
+                  <CrewDashboardFrame slug={activeSlug} member={activeMemberName} displayName={crewDisplayName(activeView ?? active)} />
+                )
               )}
             </div>
           )
@@ -4514,5 +4543,6 @@ export default function MembersPage() {
         <CrewEditorDialog ctl={crewEditor} />
       </Suspense>
     </div>
+    </SidePanelDockHost>
   )
 }

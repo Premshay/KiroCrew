@@ -135,6 +135,10 @@ from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.backends import model_registry_namespace
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling_on
 from kiro_crew.agent_spec_format import iter_agent_spec_files
+from kiro_crew.cold_start_sizing import (
+    cached_cold_start_concurrency,
+    configure_runtime_spawn_width,
+)
 from kiro_crew.config import KiroCrewConfig, live
 from kiro_crew.config.live import ConfigChange
 from kiro_crew.config.loader import (
@@ -187,8 +191,12 @@ from kiro_crew.session_allocation import (  # noqa: F401
 )
 from kiro_crew.session_allocation import (
     _collect_parent_runtime_kwargs,
+    new_cold_start_semaphore,
 )
 from kiro_crew.session_allocation import parent_work_scratch_dir as _parent_work_scratch_dir
+from kiro_crew.session_allocation import (
+    widen_cold_start_semaphore,
+)
 from kiro_crew.session_background import (
     BackgroundRuntimeDeps,
     BackgroundSessionRuntime,
@@ -1118,6 +1126,22 @@ class _Session:
     # turns. This preserves replay across empty streams, pre-output failures, and
     # soft Stops while surviving loss of the separate ``first_turn`` observation.
     provider_switch_replay: bool = False
+    # Carries the FRESH first-turn history debt that ``first_turn`` cannot: the
+    # ``first_turn`` observation is a one-shot consumed at claim time, so a turn
+    # that assembled Kiro Crew history and then failed BEFORE the provider
+    # accepted it (a pre-output backend 5xx the transient path re-queues onto the
+    # SAME live session) spends the observation while the history never lands —
+    # the re-queued turn then reads ``is_new=False`` and sends the replay bare.
+    # Armed from the FRESH observation at claim, OR'd into ``_context_is_new`` so
+    # the re-queued turn rebuilds history, and consumed once a non-slash
+    # context-bearing turn delivers that history — it assembled the replay AND the
+    # provider accepted the prompt — or a reset explicitly suppressed it. A slash
+    # command bypasses that assembly and must not settle the debt; a turn that
+    # assembled but failed before the provider accepted (a pre-output 5xx) leaves
+    # it armed for the re-queue. A provider switch arms ``provider_switch_replay``
+    # instead and never reaches this; keeping them separate leaves the replay
+    # lease's SID-preservation role (``close_all``) untouched.
+    first_turn_history_owed: bool = False
     # Set of msg_ts values cancelled (message deleted while processing)
     cancelled: set[str] = field(default_factory=set)
     # Set after context compaction drops the session-start skill index.
@@ -1327,6 +1351,8 @@ class SessionManager:
                 drain_active_turns_timeout_secs=_DRAIN_ACTIVE_TURNS_TIMEOUT_SECS,
                 unbind_reason_session_destroyed=UNBIND_REASON_SESSION_DESTROYED,
                 first_turn_nothing_armed=FirstTurnState.NOTHING_ARMED,
+                first_turn_fresh=FirstTurnState.FRESH,
+                first_turn_resumed=FirstTurnState.RESUMED,
                 provider_label_claude=PROVIDER_LABEL_CLAUDE,
             ),
             get_unlink_session_queue=lambda: _unlink_session_queue,
@@ -1548,6 +1574,16 @@ class SessionManager:
         that baseline deliberately does not advance on an incomplete sweep.
         """
         return self._lifecycle_state_boundary().identity_sweep_fingerprint
+
+    @property
+    def identity_sweep_waiting_on(self) -> tuple[str, ...]:
+        """What the last identity sweep could not finish, or ``()`` after a complete one.
+
+        One short label per holdout: a session key tagged ``busy`` or ``channel
+        member``, or the runtime that stayed up. Read-only, like the pending
+        fingerprint: the lifecycle service owns every write.
+        """
+        return self._lifecycle_state_boundary().identity_sweep_waiting_on
 
     @property
     def _recycling(self) -> dict[str, "_Session"]:
@@ -1968,7 +2004,16 @@ class SessionManager:
         # Installed by the gateway once it owns this manager (set_injection_probe);
         # None means "no gateway, so no completion injection can be in flight".
         self._injection_probe: "Callable[[str], bool] | None" = None
-        self._allocation_state = SessionRegistryState()
+        # Both cold-start widths are restart settings. Built on the gateway boot
+        # path and the event loop, so "auto" is sized from the cached host
+        # reading only (the floors until it exists); widen_cold_start_queues
+        # grows both once the gateway's post-bind sizing has read the host.
+        configure_runtime_spawn_width(getattr(cfg, "agent", None))
+        self._allocation_state = SessionRegistryState(
+            start_sem=new_cold_start_semaphore(
+                cached_cold_start_concurrency(getattr(cfg, "agent", None))
+            )
+        )
         self._allocation_boundary()
         self._lifecycle_state = SessionLifecycleState()
         self._compaction_state = CompactionState()
@@ -2014,9 +2059,7 @@ class SessionManager:
                 get_recorder=lambda: get_recorder(),
                 context_pct_is_unknown=lambda provider: _context_pct_is_unknown(provider),
                 unlink_session_queue=lambda session: _unlink_session_queue(session),
-                compact_wait_timeout_secs=lambda: _resolve_compact_wait_secs(
-                    self._cfg.session.compact_wait_secs
-                ),
+                compact_wait_timeout_secs=lambda: self.compact_wait_budget_secs(),
                 compact_result_wait_secs=lambda elapsed, budget: _compact_result_wait_secs(
                     elapsed, budget
                 ),
@@ -2657,7 +2700,8 @@ class SessionManager:
         must know exactly which session THIS reset popped -- and read it
         atomically with the pop -- opens the scope itself with
         :meth:`teardown_scope` and passes it as ``scope``; it is entered and
-        released here all the same, and its ``popped`` survives the release.
+        released here all the same, and what its ``on_pop(session)`` hook read
+        off that session in the pop's lock hold survives the release.
         """
         lifecycle = self._lifecycle_boundary()
         with scope if scope is not None else lifecycle.teardown_scope() as opened:
@@ -2728,6 +2772,21 @@ class SessionManager:
             yield
         finally:
             boundary.end_ending(key)
+
+    def compact_wait_budget_secs(self) -> float:
+        """The compaction wait budget this manager's config is in force with.
+
+        The ONE resolver for ``session.compact_wait_secs``: the automatic
+        coordinator, the task runner's context-overflow compaction, the
+        dashboard ``/compact`` and every chat channel's compact command and
+        near-limit compaction all hold this manager and read the budget here,
+        so no caller can resolve the key differently. The manager's config is
+        the one the process booted with, re-adopted on every live change, so a
+        change applies to the next compaction, and a standalone
+        ``kirocrew run`` (no live-config watcher) still honours the key. Read
+        per call -- a plain attribute read, safe on the event loop.
+        """
+        return _resolve_compact_wait_secs(self._cfg.session.compact_wait_secs)
 
     def check_context_usage(self, key: str, provider: LLMProvider) -> float:
         """Delegate context accounting and compaction triggering."""
@@ -2880,6 +2939,46 @@ class SessionManager:
         session.provider_switch_replay = False
         return True
 
+    def mark_first_turn_history_owed(self, key: str) -> bool:
+        """Arm the durable FRESH first-turn history debt.
+
+        The ``first_turn`` observation is consumed at claim time, so a turn that
+        assembled Kiro Crew history and then failed before the provider accepted
+        it loses the record that history was still owed. The dashboard runner
+        arms this from the FRESH observation; it is read (not cleared) each turn
+        and settled once a non-slash context-bearing turn KEEPS its history with
+        the provider — a normal ``end_turn``, any output-emitted exit that was not
+        cancelled and had no empty-response verdict, or a completed compaction —
+        or a reset suppresses it, so a pre-output failure the transient path
+        re-queues onto the same live session rebuilds history instead of
+        replaying bare.
+        """
+        session = self._sessions.get(self._fold_key(key))
+        if session is None:
+            return False
+        session.first_turn_history_owed = True
+        return True
+
+    def first_turn_history_owed_pending(self, key: str) -> bool:
+        """Return whether a live session still owes its FRESH first-turn history.
+
+        Read without clearing, like ``provider_switch_replay_pending``: a slash
+        command bypasses history assembly, so reading-and-clearing here would let
+        it spend the debt the next ordinary prompt must still pay.
+        """
+        session = self._sessions.get(self._fold_key(key))
+        return bool(session is not None and session.first_turn_history_owed)
+
+    def consume_first_turn_history_owed(self, key: str) -> bool:
+        """Settle the FRESH first-turn history debt once a non-slash
+        context-bearing turn delivers its history (assembled and accepted) or a
+        reset suppresses it."""
+        session = self._sessions.get(self._fold_key(key))
+        if session is None or not session.first_turn_history_owed:
+            return False
+        session.first_turn_history_owed = False
+        return True
+
     def consume_replay_suppression(self, key: str) -> bool:
         """Read and clear whether *key*'s next cold start skips replay once."""
         folded = self._fold_key(key)
@@ -2982,6 +3081,19 @@ class SessionManager:
         if probe is None:
             return False
         return probe(key)
+
+    def widen_cold_start_queues(self) -> None:
+        """Grow both cold-start queues to the widths the cached host reading gives.
+
+        The gateway calls this on the loop after its post-bind sizing task has
+        read the host, so for ``"auto"`` the manager's ``_start_sem`` and the
+        published runtime spawn width move from their floors to the host-sized
+        widths without a probe here. An explicit integer is already at its
+        width, so this is a no-op for it. Never shrinks a queue.
+        """
+        agent = getattr(self._cfg, "agent", None)
+        configure_runtime_spawn_width(agent)
+        widen_cold_start_semaphore(self._start_sem, cached_cold_start_concurrency(agent))
 
     def set_injection_probe(self, fn: "Callable[[str], bool] | None") -> None:
         """Install the "is a completion injection in flight for *key*?" predicate.
@@ -3188,8 +3300,15 @@ class SessionManager:
         self._allocation_boundary().begin_turn(key)
 
     async def pause_turn_admission_for_update(self) -> bool:
-        """Block new turns for update apply without overriding real shutdown."""
+        """Block new turns for update apply without overriding real shutdown.
+
+        Refused once a gateway stop is signalled: an apply admitted then would
+        be stopped mid-write by the shutdown that follows. Checked under the
+        lock, so a stop landing while the lock is contended is still seen.
+        """
         async with self._lock:
+            if shutdown_event.is_set():
+                return False
             if self._closing and not self._update_pause_owned:
                 return False
             self._closing = True
@@ -3204,14 +3323,23 @@ class SessionManager:
         self.update_restart_fenced = True
         return True
 
-    async def resume_turn_admission_after_update(self) -> None:
-        """Release this caller's temporary update pause, if it still owns it."""
+    async def resume_turn_admission_after_update(self) -> bool:
+        """Release this caller's temporary update pause, if it still owns it.
+
+        Returns True only when admission actually reopened. Kept once a gateway
+        stop is signalled: the shutdown stops the update first, so this runs at
+        its start, and a paused admission keeps refusing (and spooling) inbound
+        turns that reopened admission would admit only for the teardown to
+        cancel. Checked under the same lock as the release, so a stop landing
+        while the lock is contended is still seen.
+        """
         async with self._lock:
-            if not self._update_pause_owned:
-                return
+            if not self._update_pause_owned or shutdown_event.is_set():
+                return False
             self.update_restart_fenced = False
             self._update_pause_owned = False
             self._closing = False
+            return True
 
     # ── Per-session semaphore ──
 

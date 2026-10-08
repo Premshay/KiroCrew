@@ -1160,12 +1160,23 @@ async def test_structured_legacy_row_carries_exactly_the_entitled_keys(
         "gate",
         "stopped_reason",
         "approval_stalled",
+        # When that hold began; same class, and 0 on a structured monitor.
+        "approval_stalled_at",
         # Same class as ``approval_stalled``: the automation's own reading of
         # whether it can act, not a fact about what it watches. A structured
         # monitor never writes it, so the row carries 0 truthfully.
         "consecutive_start_failures",
+        # Same class and same reason as ``consecutive_start_failures``: the
+        # loop's own reading of whether its cycles can make progress, not a fact
+        # about the subject. A structured monitor never writes it, so the row
+        # carries 0 truthfully.
+        "consecutive_failed_cycles",
         "next_due_ts",
         "self_armed",
+        # Same class as ``self_armed``: who armed the loop, not what it watches.
+        # It is what lets a reader tell the gateway's default conductor patrol
+        # from a loop the agent armed itself.
+        "default_patrol",
         "terminal_notification_outcome",
         "terminal_notification_stopped_at",
         # Mapped from the monitor's own accounting, not withheld -- withholding

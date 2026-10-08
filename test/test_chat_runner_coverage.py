@@ -45,6 +45,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
 )
+from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.config import live
 from kiro_crew.config.sections import ResolvedBindings
 from kiro_crew.dashboard import chat_runner
@@ -207,6 +208,7 @@ def _set_stream(client, events) -> None:
         return _async_iter([_complete()])
 
     client.stream = MagicMock(side_effect=_stream)
+    client.stream_command = MagicMock(side_effect=_stream)
 
 
 @contextmanager
@@ -869,28 +871,26 @@ class TestSnapshotHelpers:
         # candidate is tool-inconsistent, so neither hypothesis survives.
         target.write_text("cabab", newline="\n")
 
-        out = chat_runner._reconstruct_str_replace_before(
-            str(target), {"oldStr": "ab", "newStr": "c"}
-        )
+        out = chat_runner._classify_str_replace_before(str(target), {"oldStr": "ab", "newStr": "c"})
 
-        assert out is None
+        assert out == (None, None)
 
     def test_reconstruct_declines_on_replace_all(self, tmp_path):
         target = tmp_path / "all.txt"
         target.write_text("aaa", newline="\n")
 
-        assert (
-            chat_runner._reconstruct_str_replace_before(
-                str(target), {"oldStr": "a", "newStr": "b", "replaceAll": True}
-            )
-            is None
-        )
+        assert chat_runner._classify_str_replace_before(
+            str(target), {"oldStr": "a", "newStr": "b", "replaceAll": True}
+        ) == (None, None)
 
     def test_reconstruct_declines_on_missing_params(self, tmp_path):
         target = tmp_path / "missing.txt"
         target.write_text("body", newline="\n")
 
-        assert chat_runner._reconstruct_str_replace_before(str(target), {"oldStr": "x"}) is None
+        assert chat_runner._classify_str_replace_before(str(target), {"oldStr": "x"}) == (
+            None,
+            None,
+        )
 
     def test_snapshot_write_target_ignores_non_write_commands(self):
         assert chat_runner._snapshot_write_target({"command": "read", "path": "/tmp/x"}) is None
@@ -912,7 +912,12 @@ class TestSnapshotHelpers:
 
         got = chat_runner._snapshot_write_target({"command": "create", "path": str(target)})
 
-        assert got == {"path": str(target), "content": "", "truncated": False}
+        assert got == {
+            "path": str(target),
+            "canonical_path": chat_runner.validate_file_path(str(target)),
+            "content": "",
+            "truncated": False,
+        }
 
 
 class TestFlushFileChanges:
@@ -1380,7 +1385,7 @@ class TestCrossSurfaceReply:
     async def test_empty_text_is_not_mirrored(self, tmp_path):
         state = _state(tmp_path)
 
-        with patch.object(chat_runner, "_resolve_mirror_target") as resolve:
+        with patch.object(chat_runner, "_resolve_channel_target") as resolve:
             await chat_runner._deliver_cross_surface_reply(state, "dashboard:x", "")
 
         resolve.assert_not_called()
@@ -1396,7 +1401,7 @@ class TestCrossSurfaceReply:
         transport.capabilities.max_message_bytes = 0
         link = MagicMock(channel_id="123", thread_id=None, channel_type="telegram")
 
-        with patch.object(chat_runner, "_resolve_mirror_target", return_value=(link, transport)):
+        with patch.object(chat_runner, "_resolve_channel_target", return_value=(link, transport)):
             await chat_runner._deliver_cross_surface_reply(state, "dashboard:x", "ab " * 20)
 
         assert transport.send_message.await_count > 1
@@ -1410,7 +1415,7 @@ class TestCrossSurfaceReply:
         transport.send_message.side_effect = RuntimeError("offline")
         link = MagicMock(channel_id="123", thread_id=None, channel_type="telegram")
 
-        with patch.object(chat_runner, "_resolve_mirror_target", return_value=(link, transport)):
+        with patch.object(chat_runner, "_resolve_channel_target", return_value=(link, transport)):
             await chat_runner._deliver_cross_surface_reply(state, "dashboard:x", "hello")
 
 
@@ -1681,6 +1686,8 @@ class TestPersistClaudeAutonomousTurn:
             await chat_runner._persist_claude_autonomous_turn(state, slot, turn)
 
         assert [message["content"] for message in slot.messages] == ["Routine complete."]
+
+
 class TestScheduleWidgetRegistration:
     def test_empty_text_registers_nothing(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
@@ -2801,25 +2808,6 @@ class TestStartNextQueuedTurn:
         assert [item["id"] for item in slot._queue] == [qid]
 
     @pytest.mark.asyncio
-    async def test_run_now_does_not_bypass_an_active_stage(self, tmp_path):
-        """The override is narrow: an orchestrator stage still owns dispatch."""
-        state, slot = _state(tmp_path), _slot()
-        q1 = slot.queue_append("stage-owned first")
-        q2 = slot.queue_append("wait for the stage")
-        slot._in_stage_execution = True
-        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
-
-        started = await chat_runner._start_next_queued_turn(
-            state,
-            slot,
-            allow_user_during_subagents=True,
-            required_queue_id=q2,
-        )
-
-        assert started is False
-        assert [item["id"] for item in slot._queue] == [q1, q2]
-
-    @pytest.mark.asyncio
     async def test_reset_notice_is_emitted_for_a_stopping_slot(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
         slot.queue_append("next please")
@@ -2863,40 +2851,169 @@ class TestStartNextQueuedTurn:
         assert slot._deferred_notes == []
 
     @pytest.mark.asyncio
-    async def test_a_held_note_is_withheld_from_a_plans_next_stage(self, tmp_path):
-        """A plain user message queued during a plan must not release the note.
-
-        This is the flush that leaks FIRST. A queued user message carries no
-        ``kind``, so the origin-tag guard admits the flush -- and it runs ABOVE the
-        ``in_stage`` dequeue gate that then holds that message back. So the note
-        was released while no user turn started at all, and the next stage drained
-        its context half. ``_stage_loop``'s exit flush is the seam that owes it
-        delivery, so withholding delays rather than loses it.
-        """
+    @pytest.mark.parametrize(
+        "children, ends_batch",
+        [
+            ({}, True),
+            ({"running": [{"id": "b2", "stalled": True}]}, False),
+            ({"in_memory": True}, False),
+            ({"delivering": 1}, False),
+            ({"unreadable": True}, False),
+            ({"probe_raises": True}, False),
+            ({"queued_in_store": 1}, False),
+            ({"store_unreadable": True}, False),
+        ],
+        ids=[
+            "settled",
+            "running",
+            "pending-in-memory",
+            "delivering",
+            "unreadable",
+            "probe-raises",
+            "queued-in-store",
+            "store-unreadable",
+        ],
+    )
+    async def test_a_user_message_ends_the_batch_only_when_nothing_is_out(
+        self, tmp_path, children, ends_batch
+    ):
+        """A user message drained at a turn's end (`_hand_off_queue`, the
+        ending turn still holding the floor) disarms the synthesis either way.
+        It clears the batch's turn count only when the fire gate answers clear,
+        so no child of the batch is still out: clearing a live batch's count
+        loses its synthesis, while keeping a stale one costs at most one extra
+        synthesis. A store nobody could read keeps it too. The running child is
+        flagged stalled so the drain's own child hold lets the message through;
+        the fire gate still counts it as running."""
         state, slot = _state(tmp_path), _slot()
-        slot._deferred_notes.append({"content": "held", "cls": "reconcile-note"})
-        slot.queue_append("a plain user message")  # carries no `kind`
-        slot._in_stage_execution = True
-        state.subagents = None
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 2
+        slot._subagent_deliveries_inflight = children.get("delivering", 0)
+        subs = _children(
+            running=children.get("running", ()),
+            in_memory=children.get("in_memory", False),
+            # A gate-deferred child the store alone holds. The manager has
+            # published no depth for it (its table stays empty), so only the
+            # fire gate's store read sees it. None is a store nobody could read.
+            queued=(
+                None if children.get("store_unreadable") else children.get("queued_in_store", 0)
+            ),
+        )
+        if children.get("unreadable"):
+            subs.running_agents_for = MagicMock(return_value=None)
+        if children.get("probe_raises"):
+            subs.has_in_memory_pending_work_for = MagicMock(side_effect=RuntimeError("gone"))
+        state.subagents = subs
+        slot.queue_append("a user message")
+        slot.task = ending = asyncio.get_running_loop().create_future()
 
-        assert await chat_runner._start_next_queued_turn(state, slot) is False
-
-        assert len(slot._queue) == 1, "fixture: the user message must be held back"
-        assert len(slot._deferred_notes) == 1, "the note was released into the next stage"
-        assert "held" not in [m["content"] for m in slot.messages]
-
-        # Control: the same fixture with the plan gate CLEAR does flush, so the
-        # assertion above measures the stage guard rather than the dequeue hold.
-        state2, slot2 = _state(tmp_path), _slot()
-        slot2._deferred_notes.append({"content": "held", "cls": "reconcile-note"})
-        slot2.queue_append("a plain user message")
-        state2.subagents = None
         with (
-            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()),
-            patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
         ):
-            assert await chat_runner._start_next_queued_turn(state2, slot2) is True
-        assert slot2._deferred_notes == [], "control: the note should flush off-plan"
+            try:
+                await chat_runner._hand_off_queue(
+                    state, slot, drain=True, allow_automatic_successor=True
+                )
+            finally:
+                ending.cancel()
+
+        assert spawn.call_count == 1, "the message drained as the next turn"
+        assert slot._pending_synthesis is False, "the user takes over, as before"
+        assert slot._synthesis_completion_turns == (0 if ends_batch else 2)
+
+    @pytest.mark.asyncio
+    async def test_an_armed_drain_reads_no_store_and_keeps_the_count(self, tmp_path):
+        """The drain itself (Run now, Continue, rewind, regenerate, the parked
+        drain) is origin/main's await-free dequeue: it reads no store, so it
+        cannot judge the batch, and it keeps the count. Only its callers that
+        read the fire gate with the floor held say `end_batch`."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 2
+        state.subagents = _children()
+        slot.queue_append("a user message")
+        seen: list = []
+
+        async def _verdict(_state, _slot):
+            seen.append(True)
+            return chat_runner.SYNTHESIS_CLEAR
+
+        with (
+            patch.object(chat_runner, "synthesis_fire_verdict", new=_verdict),
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            started = await chat_runner._start_next_queued_turn(state, slot)
+
+        assert started is True
+        assert spawn.call_count == 1
+        assert seen == [], "no fire-gate read in the drain"
+        state.subagents.queued_count_or_none_async.assert_not_awaited()
+        state.subagents.has_in_memory_pending_work_for.assert_not_called()
+        assert slot._pending_synthesis is False, "the user takes over, as before"
+        assert slot._synthesis_completion_turns == 2, "a drain that read nothing keeps the count"
+
+    @pytest.mark.asyncio
+    async def test_the_hand_off_reads_while_the_ending_turn_holds_the_floor(self, tmp_path):
+        """The turn-end hand-off takes the one fire-gate read, and it takes it
+        while `slot.task` is still the ending turn and the message is still
+        queued: a completion that lands then queues behind the turn instead of
+        taking the floor, so the drain that follows cannot dispatch beside one.
+        The verdict reaches the drain as `end_batch`."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 2
+        state.subagents = _children()
+        qid = slot.queue_append("a user message")
+        slot.task = ending = asyncio.get_running_loop().create_future()
+        seen: list = []
+
+        async def _verdict(_state, _slot):
+            seen.append(([item["id"] for item in _slot._queue], _slot.task))
+            await asyncio.sleep(0)  # a real suspension, as the store read is
+            return chat_runner.SYNTHESIS_CLEAR
+
+        with (
+            patch.object(chat_runner, "synthesis_fire_verdict", new=_verdict),
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            try:
+                await chat_runner._hand_off_queue(
+                    state, slot, drain=True, allow_automatic_successor=True
+                )
+            finally:
+                ending.cancel()
+
+        assert seen == [([qid], ending)], "one read, message still queued, floor still held"
+        assert spawn.call_count == 1
+        assert slot._pending_synthesis is False
+        assert slot._synthesis_completion_turns == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unarmed_hand_off_reads_no_store(self, tmp_path):
+        """Only an armed synthesis's disarm needs the verdict, so an ordinary
+        turn end costs no store read."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _children()
+        slot.queue_append("a user message")
+        slot.task = ending = asyncio.get_running_loop().create_future()
+
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            try:
+                await chat_runner._hand_off_queue(
+                    state, slot, drain=True, allow_automatic_successor=True
+                )
+            finally:
+                ending.cancel()
+
+        assert spawn.call_count == 1
+        state.subagents.queued_count_or_none_async.assert_not_awaited()
+        state.subagents.has_in_memory_pending_work_for.assert_not_called()
 
 
 def _no_children() -> MagicMock:
@@ -2913,12 +3030,15 @@ def _children(*, running=(), queued: int | None = 0, in_memory: bool = False) ->
     """A registry double for the synthesis fire gate with every probe set
     explicitly: a bare MagicMock answers an unset probe with a truthy mock
     (``int(MagicMock()) == 1``), which reads as a queued child. *queued*
-    ``None`` is a store nobody could read."""
+    ``None`` is a store nobody could read. The manager's published depth
+    table, which the slots push reads, stays empty: no synthesis check reads
+    it, so a queued child is *queued* alone."""
     return MagicMock(
         running_agents_for=MagicMock(return_value=list(running)),
         queued_count_for_async=AsyncMock(return_value=queued or 0),
         queued_count_or_none_async=AsyncMock(return_value=queued),
         has_in_memory_pending_work_for=MagicMock(return_value=in_memory),
+        published_queued_depths=MagicMock(return_value={}),
     )
 
 
@@ -2973,6 +3093,56 @@ class TestRunPendingSynthesis:
         state.subagents.queued_count_or_none_async.assert_not_awaited()
         state.subagents.running_agents_for.assert_not_called()
         assert slot._pending_synthesis is False
+
+    @pytest.mark.asyncio
+    async def test_running_the_synthesis_ends_its_batch(self, tmp_path):
+        """The consumed arm takes the batch's turn count with it, so the next
+        lone completion is a batch of its own."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 2
+        state.subagents = _children()
+
+        async def _ok():
+            return None
+
+        def _capture(_state, _slot, coro, *a, **kw):
+            coro.close()
+            return asyncio.ensure_future(_ok())
+
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", side_effect=_capture),
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            await chat_runner._run_pending_synthesis(state, slot)
+
+        assert slot._synthesis_completion_turns == 0
+
+    @pytest.mark.asyncio
+    async def test_a_queued_user_message_ends_the_batch_without_a_read(self, tmp_path):
+        """The caller launched this task on a clear verdict, so a user message
+        it drains instead of the synthesis ends the batch (count zeroed) with
+        no second fire-gate read: the drain runs with `end_batch`."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_synthesis = True
+        slot._synthesis_inflight = True
+        slot._synthesis_completion_turns = 2
+        state.subagents = _children()
+        slot.queue_append("a user message")
+
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            await chat_runner._run_pending_synthesis(state, slot)
+
+        assert spawn.call_count == 1, "the user message ran, not the synthesis"
+        assert [m["role"] for m in slot.messages if m["role"] == "inject"] == []
+        state.subagents.queued_count_or_none_async.assert_not_awaited()
+        state.subagents.has_in_memory_pending_work_for.assert_not_called()
+        assert slot._pending_synthesis is False
+        assert slot._synthesis_completion_turns == 0
+        assert slot._synthesis_inflight is False
 
     @pytest.mark.asyncio
     async def test_synthesis_timeout_is_swallowed(self, tmp_path):
@@ -3243,6 +3413,67 @@ class TestFinishQueueCycle:
             slot.task.cancel()
 
     @pytest.mark.asyncio
+    async def test_a_batch_reported_in_one_turn_drops_the_synthesis(self, tmp_path):
+        """One completion turn already carried every result: the cycle ends as
+        an ordinary one and the arm is consumed on the turn-end path."""
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 1
+        state.subagents = _children()
+
+        with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()) as synth:
+            await chat_runner._finish_queue_cycle(state, slot)
+
+        synth.assert_not_called()
+        assert slot._pending_synthesis is False
+        assert slot._synthesis_completion_turns == 0
+        assert slot._synthesis_recheck is None
+        assert slot.messages[-1]["role"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_the_outage_re_check_launches_the_synthesis_whatever_the_count(self, tmp_path):
+        """The re-check runs only after the turn-end gate could not read the
+        store, so it keeps main's shape: a clear answer launches the synthesis
+        even for a batch one turn reported. The turn's chat_done already went
+        out with the arm set, and the synthesis turn ends with its own."""
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 1
+        subs = _children()
+        answers = iter([None, 0])
+        subs.queued_count_or_none_async = AsyncMock(side_effect=lambda _k: next(answers))
+        state.subagents = subs
+
+        def _chat_dones() -> list:
+            return [
+                c.args[1]["continuing"]
+                for c in state.broadcast_ws.call_args_list
+                if c.args and c.args[0] == "chat_done"
+            ]
+
+        with (
+            patch.object(chat_runner, "_SYNTHESIS_RECHECK_SECS", 0.01),
+            patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()) as synth,
+        ):
+            await chat_runner._finish_queue_cycle(state, slot)
+            assert _chat_dones() == [True], "the arm was still set at the turn's end"
+            assert slot._synthesis_recheck is not None, "an outage arms the re-check"
+            synth.assert_not_called()
+            for _ in range(100):
+                if synth.await_count:
+                    break
+                await asyncio.sleep(0.01)
+
+        synth.assert_awaited_once()
+        assert slot._pending_synthesis is True, "consumed by the synthesis task, not here"
+        assert slot._synthesis_completion_turns == 1
+        assert _chat_dones() == [True], "no second chat_done: the synthesis turn ends its own"
+        if slot.task is not None:
+            slot.task.cancel()
+
+    @pytest.mark.asyncio
     async def test_closing_the_slot_cancels_a_pending_re_check(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
         state._slots[slot.key] = slot
@@ -3280,41 +3511,6 @@ class TestFinishQueueCycle:
         flush.assert_not_called()
         if slot.task is not None:
             slot.task.cancel()
-
-    @pytest.mark.asyncio
-    async def test_a_held_note_is_withheld_from_a_plans_next_stage(self, tmp_path):
-        """This function runs per stage, so a flush here feeds stage N+1.
-
-        Each stage of a plan is its own ``_run_chat``, and this is called from that
-        turn's ``finally`` while ``_in_stage_execution`` is still set -- so the note
-        reached the next stage instead of the next USER turn. Distinct from the
-        synthesis case above: here ``will_synthesize`` is False, which is exactly
-        why the old guard admitted the flush.
-        """
-        state, slot = _state(tmp_path), _slot()
-        state._slots[slot.key] = slot
-        slot._in_stage_execution = True
-        state.subagents = _no_children()
-
-        with patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush:
-            await chat_runner._finish_queue_cycle(state, slot)
-            await asyncio.sleep(0)
-        flush.assert_not_called()
-        if slot.task is not None:
-            slot.task.cancel()
-
-        # Control: identical state with the plan gate clear DOES flush, so the
-        # assertion above cannot pass for some reason unrelated to the stage.
-        state2, slot2 = _state(tmp_path), _slot()
-        state2._slots[slot2.key] = slot2
-        state2.subagents = _no_children()
-
-        with patch.object(type(slot2), "flush_deferred_notes", return_value=0) as flush2:
-            await chat_runner._finish_queue_cycle(state2, slot2)
-            await asyncio.sleep(0)
-        flush2.assert_called_once()
-        if slot2.task is not None:
-            slot2.task.cancel()
 
     @pytest.mark.asyncio
     async def test_a_closing_slot_does_not_lose_its_held_note_to_synthesis(self, tmp_path):
@@ -3361,6 +3557,7 @@ class TestFinishQueueCycle:
     @pytest.mark.asyncio
     async def test_idle_cycle_emits_done_and_refreshes_the_sidebar(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
+        slot._cycle_reached_provider = True  # a provider served this cycle
 
         with patch.object(chat_runner, "title_then_refresh", new=AsyncMock()):
             await chat_runner._finish_queue_cycle(state, slot)
@@ -3372,6 +3569,7 @@ class TestFinishQueueCycle:
         state.broadcast_ws.assert_any_call(
             "chat_done", {"slot": slot.key, "continuing": False, "needs_input": False}
         )
+        assert slot._cycle_reached_provider is False, "the next cycle starts unserved"
 
 
 class TestTtftMetric:
@@ -3723,23 +3921,41 @@ class TestRunChatLocalCommands:
         [
             ("acp", "", True),
             ("acp", "kas", True),
-            ("claude_code", "", False),
+            pytest.param("claude_code", "", True, id="legacy-label-does-not-select-claude"),
+            pytest.param("claude_code", "claude", False, id="legacy-label-still-uses-backend"),
             ("acp", "claude", False),
         ],
     )
     async def test_todos_is_refused_only_where_the_harness_lacks_it(
         self, tmp_path, provider, acp_backend, refused
     ):
-        """/todos is kiro-only: the claude harness answers on either provider axis."""
+        """OSS selects the harness through acp_backend, even with a legacy label.
+
+        H2 admits only provider=acp. The injected claude_code rows prove an
+        unsupported label cannot override the public factory's backend selector.
+        """
         state, client = _runner_state(tmp_path)
         _set_stream(client, [_complete()])
         slot = _slot()
         cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
         cfg.agent.provider = provider
         cfg.agent.acp_backend = acp_backend
+        client.capabilities = capabilities_for(acp_backend)
+        # A KAS capability set arms the claimed-session hook re-projection check;
+        # a mock's auto-generated batch attribute would read as stale. Record none.
+        client.kas_auto_approved_capabilities = frozenset()
 
-        with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(
+                chat_runner, "select_provider_backend", wraps=chat_runner.select_provider_backend
+            ) as select_backend,
+        ):
             await _drive(state, slot, "/todos")
+
+        select_backend.assert_called_once_with(
+            chat_runner.effective_session_key(slot), cfg.agent.member_acp_backend, acp_backend
+        )
 
         notices = [
             m for m in slot.messages if "not available in the dashboard" in m.get("content", "")
@@ -3748,7 +3964,507 @@ class TestRunChatLocalCommands:
         if refused:
             state.sessions.get_or_create.assert_not_awaited()
         else:
-            state.sessions.get_or_create.assert_awaited()
+            state.sessions.get_or_create.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "config_backend,stale_backend,actual_backend,refused",
+        [
+            # The stale row says Claude, but get_or_create evicts it and builds
+            # the configured Kiro harness: the acquired provider must refuse.
+            ("", "claude", "", True),
+            # The inverse transition must forward to the acquired Claude
+            # harness even though the dead row would have refused it.
+            ("claude", "", "claude", False),
+            # A supported successor hint still needs acquired-provider confirmation.
+            ("claude", "claude", "", True),
+        ],
+    )
+    async def test_todos_gate_uses_the_provider_acquired_after_stale_eviction(
+        self, tmp_path, config_backend, stale_backend, actual_backend, refused
+    ):
+        """A dead registry row cannot answer for its get_or_create successor.
+
+        Session allocation probes liveness and can replace the row with a
+        different harness from current config. The command gate must use the
+        provider whose lease it actually acquired, not either pre-turn hint.
+        """
+        from kiro_crew.providers.acp import AcpProvider
+
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [_complete()])
+        slot = _slot()
+        stale = AcpProvider(acp_backend=stale_backend)
+        state.sessions._sessions = {
+            chat_runner.effective_session_key(slot): SimpleNamespace(provider=stale)
+        }
+        state.sessions.get_provider = MagicMock(return_value=stale)
+        state.sessions.is_provider_alive = AsyncMock(return_value=False)
+        client.capabilities = capabilities_for(actual_backend)
+
+        async def acquire_successor(*_args, **_kwargs):
+            assert stale.is_process_alive() is False
+            return client, True, False
+
+        state.sessions.get_or_create = AsyncMock(side_effect=acquire_successor)
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.provider = "acp"
+        cfg.agent.acp_backend = config_backend
+
+        with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
+            await _drive(state, slot, "/todos")
+
+        notices = [
+            m for m in slot.messages if "not available in the dashboard" in m.get("content", "")
+        ]
+        assert bool(notices) is refused
+        if config_backend == "":
+            state.sessions.get_or_create.assert_not_awaited()
+        else:
+            state.sessions.get_or_create.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("projected_backend,refused", [("", True), ("claude", False)])
+    async def test_todos_confirms_the_reprojected_claim(self, tmp_path, projected_backend, refused):
+        """The final claim owns dispatch even when hook re-projection replaced it."""
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [_complete()])
+        client.capabilities = capabilities_for(projected_backend)
+        initial = SimpleNamespace(capabilities=capabilities_for("claude"))
+        state.sessions.get_or_create = AsyncMock(return_value=(initial, True, False))
+        slot = _slot("todos-reprojected")
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.acp_backend = "claude"
+
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(
+                chat_runner,
+                "reproject_claimed_session",
+                new=AsyncMock(return_value=(client, True, False)),
+            ) as reproject,
+        ):
+            await _drive(state, slot, "/todos")
+
+        assert reproject.await_args.args[3] == (initial, True, False)
+        notices = [
+            m for m in slot.messages if "not available in the dashboard" in m.get("content", "")
+        ]
+        assert bool(notices) is refused
+        if refused:
+            client.stream_command.assert_not_called()
+        else:
+            client.stream_command.assert_called_once_with("/todos")
+        state.sessions.release.assert_called_once_with(chat_runner.effective_session_key(slot))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prefetched_resume", [False, True])
+    async def test_fresh_todos_refusal_replays_session_start_once_for_member(
+        self, tmp_path, prefetched_resume
+    ):
+        """A fresh or resume-prefetched first command owes member start context."""
+        from kiro_crew import member_memory_auth
+        from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+        from kiro_crew.context import ContextBuilder
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.memory_stores import provision_member_memory
+        from kiro_crew.session import FirstTurnState, SessionManager, _Session
+        from kiro_crew.skills import SkillsLoader
+
+        builds: list[tuple[bool, str]] = []
+
+        def build_message(text, is_new, session_key=None, **kwargs):
+            member = kwargs.get("member", "")
+            builds.append((is_new, member))
+            assert kwargs["resumed"] is prefetched_resume
+            if prefetched_resume:
+                assert kwargs["compressed_history"] == ""
+            # A fresh claim replays as session start (is_new); a resumed claim
+            # keeps its native transcript and re-owes only the member section
+            # through needs_reinjection. Either way the start block is injected
+            # on the first ordinary turn and not the second.
+            owes_start = (is_new or kwargs.get("needs_reinjection")) and member
+            start = "[PERMANENT RULES]\nmember start\n" if owes_start else ""
+            return start + text, MagicMock(action=None, text="")
+
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        builder.build_message = build_message
+        state, client = _runner_state(tmp_path, context_builder=builder)
+        slot = _slot("member-oncall")
+        state._slots[slot.key] = slot
+        slot.mode = "member"
+        slot.agent = "oncall"
+        cfg = KiroCrewConfig.load()
+        # The pre-claim authority permits acquisition; the acquired Kiro refuses.
+        cfg.agent.member_acp_backend = "claude"
+        cfg.agents["oncall"] = KiroCrewAgentConfig()
+        store = provision_member_memory(cfg, "oncall")
+        cfg.save()
+        member_memory_auth.bind_private_session_store(
+            chat_runner.effective_session_key(slot), store
+        )
+        client.capabilities = capabilities_for("")
+        client.memory_mode = "persistent"
+        client.is_process_alive = MagicMock(return_value=True)
+        client.client.resumed = prefetched_resume
+        client.client.pop_pending_oauth_requests = MagicMock(return_value=[])
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok"), _complete()])
+        session_key = chat_runner.effective_session_key(slot)
+        manager = SessionManager(cfg)
+        # This is the record left by an eager spawn / slot-focused resume.
+        # Drive the real claim so the first /todos consumes the armed observation.
+        session = _Session(
+            provider=client,
+            first_turn=FirstTurnState.RESUMED if prefetched_resume else FirstTurnState.FRESH,
+        )
+        manager._sessions[session_key] = session
+        state.sessions.get_or_create = AsyncMock(wraps=manager.get_or_create)
+        state.sessions.release = MagicMock(wraps=manager.release)
+        state.sessions.provider_switch_replay_pending = manager.provider_switch_replay_pending
+        state.sessions.mark_provider_switch_replay = MagicMock(
+            wraps=manager.mark_provider_switch_replay
+        )
+        state.sessions.commit_provider_switch_replay_sid = manager.commit_provider_switch_replay_sid
+        state.sessions.mark_needs_reinjection = manager.mark_needs_reinjection
+        state.sessions.consume_needs_reinjection = manager.consume_needs_reinjection
+
+        with (
+            patch.object(
+                chat_runner, "record_activity", wraps=chat_runner.record_activity
+            ) as activity,
+            patch.object(chat_runner, "_surface_agent_welcome", new_callable=AsyncMock) as welcome,
+        ):
+            await _drive(state, slot, "/todos")
+            assert client.stream.call_count == 0
+            assert session.first_turn is FirstTurnState.NOTHING_ARMED
+            # A fresh refusal re-arms the replay lease (native session holds no
+            # history); a resumed refusal keeps its transcript and re-arms only
+            # the member re-injection. A replay lease forces a resumed=False
+            # next turn, so the resumed case must NOT take it.
+            assert session.provider_switch_replay is (not prefetched_resume)
+            assert session.needs_context_reinjection is True
+            assert not session.semaphore.locked()
+            activity.assert_called_once()
+            assert activity.call_args.args[:2] == ("oncall", session_key)
+            welcome.assert_awaited_once()
+
+            await _drive(state, slot, "ordinary first prompt")
+            await _drive(state, slot, "ordinary second prompt")
+            activity.assert_called_once()
+            welcome.assert_awaited_once()
+
+        # The fresh ordinary turn rebuilds as session start (is_new); the resumed
+        # ordinary turn keeps its transcript (is_new False) and re-injects the
+        # member section through needs_reinjection instead.
+        assert builds == [(not prefetched_resume, "oncall"), (False, "oncall")]
+        prompts = [call.args[0] for call in client.stream.call_args_list]
+        assert prompts[0].count("[PERMANENT RULES]") == 1
+        assert "[PERMANENT RULES]" not in prompts[1]
+        assert session.provider_switch_replay is False
+        assert session.needs_context_reinjection is False
+        if prefetched_resume:
+            state.sessions.mark_provider_switch_replay.assert_not_called()
+        else:
+            state.sessions.mark_provider_switch_replay.assert_called_once_with(session_key)
+        assert not session.semaphore.locked()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "backend,acquired_backend,refused",
+        [("", "", True), ("claude", "claude", False), ("claude", "", True)],
+    )
+    async def test_todos_expires_slack_options_only_after_capability_acceptance(
+        self, tmp_path, backend, acquired_backend, refused
+    ):
+        from kiro_crew.dashboard.chat_utils import options_records, remember_slack_options
+        from kiro_crew.slack.outbound import PostedOptions
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot("todos-options")
+        state._slots[slot.key] = slot
+        state.slack_client = MagicMock(update_message=AsyncMock(return_value=True))
+        session_key = chat_runner.effective_session_key(slot)
+        posted = PostedOptions(channel="C1", ts="options-ts", choices=("A", "B"), blocks=())
+        remember_slack_options(state, session_key, posted)
+        client.capabilities = capabilities_for(acquired_backend)
+        client.client.pop_pending_oauth_requests = MagicMock(return_value=[])
+        _set_stream(client, [_complete()])
+        client.stream_command = client.stream
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.acp_backend = backend
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(
+                chat_runner, "expire_slack_options", wraps=chat_runner.expire_slack_options
+            ) as expire,
+        ):
+            await _drive(state, slot, "/todos")
+        if refused:
+            if backend:
+                state.sessions.get_or_create.assert_awaited_once()
+            else:
+                state.sessions.get_or_create.assert_not_awaited()
+            expire.assert_not_awaited()
+            client.stream.assert_not_called()
+            assert options_records(state, session_key) == (posted,)
+            state.slack_client.update_message.assert_not_awaited()
+        else:
+            state.sessions.get_or_create.assert_awaited_once()
+            expire.assert_awaited_once_with(state, session_key)
+            client.stream.assert_called_once()
+            assert options_records(state, session_key) == ()
+            state.slack_client.update_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend,refused", [("", True), ("claude", False)])
+    @pytest.mark.parametrize("failure_site", ["memory", "claim", "spec-hooks"])
+    async def test_todos_deferred_options_cleanup_survives_early_failure(
+        self, tmp_path, backend, refused, failure_site
+    ):
+        from kiro_crew.dashboard.chat_utils import options_records, remember_slack_options
+        from kiro_crew.slack.outbound import PostedOptions
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot("todos-options-failure")
+        state._slots[slot.key] = slot
+        state.slack_client = MagicMock(update_message=AsyncMock(return_value=True))
+        session_key = chat_runner.effective_session_key(slot)
+        posted = PostedOptions(channel="C1", ts="failure-options-ts", choices=("A", "B"), blocks=())
+        remember_slack_options(state, session_key, posted)
+        client.capabilities = capabilities_for(backend)
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.acp_backend = backend
+        error = RuntimeError("early todos failure")
+        if failure_site == "memory":
+            failure_target = "kiro_crew.memory_startup.wait_for_memory_preparation"
+        elif failure_site == "claim":
+            failure_target = state.sessions.get_or_create
+            failure_target.side_effect = chat_runner.SessionBusyError("early todos failure")
+        else:
+            failure_target = "kiro_crew.dashboard.chat_runner._prepare_spec_hooks"
+
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(
+                chat_runner, "expire_slack_options", wraps=chat_runner.expire_slack_options
+            ) as expire,
+        ):
+            if failure_site == "claim":
+                await _drive(state, slot, "/todos")
+            else:
+                with patch(failure_target, new=AsyncMock(side_effect=error)) as fail:
+                    await _drive(state, slot, "/todos")
+                    if refused:
+                        fail.assert_not_awaited()
+                    else:
+                        fail.assert_awaited_once()
+        client.stream.assert_not_called()
+        if refused:
+            state.sessions.get_or_create.assert_not_awaited()
+            expire.assert_not_awaited()
+            assert options_records(state, session_key) == (posted,)
+            state.slack_client.update_message.assert_not_awaited()
+        else:
+            expire.assert_awaited_once_with(state, session_key)
+            assert options_records(state, session_key) == ()
+            state.slack_client.update_message.assert_awaited_once()
+            assert any("early todos failure" in m.get("content", "") for m in slot.messages)
+
+    @pytest.mark.asyncio
+    async def test_todos_deferred_expiry_cancellation_releases_session(self, tmp_path):
+        from kiro_crew.dashboard.chat_utils import remember_slack_options
+        from kiro_crew.slack.outbound import PostedOptions
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot("todos-options-cancel")
+        state._slots[slot.key] = slot
+        session_key = chat_runner.effective_session_key(slot)
+        remember_slack_options(
+            state,
+            session_key,
+            PostedOptions(channel="C1", ts="cancel-options-ts", choices=("A", "B"), blocks=()),
+        )
+        client.capabilities = capabilities_for("claude")
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.acp_backend = "claude"
+        preparing = asyncio.Event()
+        expiring = asyncio.Event()
+        unblock = asyncio.Event()
+
+        async def wait_preparation(*args, **kwargs):
+            preparing.set()
+            await unblock.wait()
+
+        async def wait_expiry(*args, **kwargs):
+            expiring.set()
+            await unblock.wait()
+
+        state.slack_client = MagicMock(update_message=AsyncMock(side_effect=wait_expiry))
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(
+                chat_runner, "_prepare_spec_hooks", new=AsyncMock(side_effect=wait_preparation)
+            ),
+            patch.object(
+                chat_runner, "expire_slack_options", wraps=chat_runner.expire_slack_options
+            ) as expire,
+        ):
+            task = asyncio.create_task(_drive(state, slot, "/todos"))
+            try:
+                await asyncio.wait_for(preparing.wait(), timeout=5)
+                task.cancel()
+                await asyncio.wait_for(expiring.wait(), timeout=5)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=5)
+            finally:
+                unblock.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+        expire.assert_awaited_once_with(state, session_key)
+        state.slack_client.update_message.assert_awaited_once()
+        state.sessions.release.assert_called_once_with(session_key)
+        assert slot._active_turn_session_key == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("alive", [True, False, None, "absent"])
+    async def test_todos_member_override_selects_claude_over_default_kiro(self, tmp_path, alive):
+        """Live capability or member-aware successor wins over the global default."""
+        from kiro_crew.config.loader import KiroCrewAgentConfig
+        from kiro_crew.memory_stores import provision_member_memory
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot("member-oncall")
+        state._slots[slot.key] = slot
+        slot.mode = "member"
+        slot.agent = "oncall"
+        client.capabilities = capabilities_for("claude")
+        client.client.pop_pending_oauth_requests = MagicMock(return_value=[])
+        _set_stream(client, [_complete()])
+        client.stream_command = client.stream
+        # A dead Kiro must not override the member's Claude successor either.
+        hint = SimpleNamespace(capabilities=capabilities_for("claude" if alive is True else ""))
+        state.sessions.get_provider = MagicMock(return_value=None if alive == "absent" else hint)
+        state.sessions.is_provider_alive = AsyncMock(return_value=alive)
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.acp_backend = ""
+        cfg.agent.member_acp_backend = "claude"
+        cfg.agents["oncall"] = KiroCrewAgentConfig()
+        provision_member_memory(cfg, "oncall")
+        cfg.save()
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(
+                chat_runner, "select_provider_backend", wraps=chat_runner.select_provider_backend
+            ) as select_backend,
+        ):
+            await _drive(state, slot, "/todos")
+        # Behavior first: the global-default-only gate refused here, so these are
+        # the assertions that fail against it, not the selector spy below.
+        assert not any(
+            "not available in the dashboard" in m.get("content", "") for m in slot.messages
+        )
+        state.sessions.get_or_create.assert_awaited_once()
+        client.stream.assert_called_once()
+        if alive is True:
+            select_backend.assert_not_called()
+        else:
+            select_backend.assert_called_once_with(
+                chat_runner.effective_session_key(slot), "claude", ""
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("alive", [False, None, "absent"])
+    async def test_todos_member_kiro_refuses_without_acquisition_over_default_claude(
+        self, tmp_path, alive
+    ):
+        """The mirror case: a Claude global default cannot admit a Kiro member.
+
+        An empty ``member_acp_backend`` routes the member DM to kiro, which has no
+        native /todos. Read from the global default alone, the gate admitted the
+        command and cold-started that kiro session only to refuse after the claim.
+        A dead Claude row is no better a witness than the global default.
+        """
+        from kiro_crew.config.loader import KiroCrewAgentConfig
+        from kiro_crew.memory_stores import provision_member_memory
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot("member-oncall")
+        state._slots[slot.key] = slot
+        slot.mode = "member"
+        slot.agent = "oncall"
+        client.capabilities = capabilities_for("")
+        _set_stream(client, [_complete()])
+        hint = SimpleNamespace(capabilities=capabilities_for("claude"))
+        state.sessions.get_provider = MagicMock(return_value=None if alive == "absent" else hint)
+        state.sessions.is_provider_alive = AsyncMock(return_value=alive)
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.acp_backend = "claude"
+        cfg.agent.member_acp_backend = ""
+        cfg.agents["oncall"] = KiroCrewAgentConfig()
+        provision_member_memory(cfg, "oncall")
+        cfg.save()
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(
+                chat_runner, "expire_slack_options", wraps=chat_runner.expire_slack_options
+            ) as expire_options,
+        ):
+            await _drive(state, slot, "/todos")
+        assert any("not available in the dashboard" in m.get("content", "") for m in slot.messages)
+        state.sessions.get_or_create.assert_not_awaited()
+        client.stream.assert_not_called()
+        client.stream_command.assert_not_called()
+        expire_options.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_busy_kiro_todos_refuses_before_session_claim(self, tmp_path):
+        """A held turn semaphore cannot delay an unsupported local command."""
+        from kiro_crew.session import SessionManager, _Session
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot("busy-todos")
+        client.capabilities = capabilities_for("")
+        client.is_process_alive = MagicMock(return_value=True)
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.acp_backend = "claude"
+        manager = SessionManager(cfg)
+        session = _Session(provider=client)
+        await session.semaphore.acquire()
+        session_key = chat_runner.effective_session_key(slot)
+        manager._sessions[session_key] = session
+        state.sessions.get_provider = manager.get_provider
+        state.sessions.is_provider_alive = manager.is_provider_alive
+        state.sessions.get_or_create = AsyncMock(wraps=manager.get_or_create)
+        try:
+            with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
+                await asyncio.wait_for(_drive(state, slot, "/todos"), timeout=5)
+            state.sessions.get_or_create.assert_not_awaited()
+            assert session.semaphore.locked()
+            client.stream.assert_not_called()
+            assert any(
+                "not available in the dashboard" in m.get("content", "") for m in slot.messages
+            )
+        finally:
+            session.semaphore.release()
+
+    @pytest.mark.asyncio
+    async def test_warm_todos_refusal_does_not_create_replay(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot("warm-todos")
+        client.capabilities = capabilities_for("")
+        state.sessions.get_or_create = AsyncMock(return_value=(client, False, False))
+        state.sessions.mark_provider_switch_replay = MagicMock()
+
+        await _drive(state, slot, "/todos")
+
+        state.sessions.mark_provider_switch_replay.assert_not_called()
+        client.stream.assert_not_called()
 
     def test_kiro_only_members_are_still_forwarded_once_unblocked(self):
         """The gate drops these for the claude harness; forwarding must then happen.
@@ -3970,14 +4686,18 @@ class TestRunChatRecoveryLadders:
         client.last_compaction_transient = True
         _set_stream(client, [_complete(STOP_REASON_COMPACTION_FAILED)])
 
-        await _drive(state, slot, "do the thing")
+        slot._empty_response_retries = 2
+        with _quiet_sel():
+            await chat_runner._run_chat(state, slot, "do the thing")
+        # The requeue is proven by the follow-up turn the finally DISPATCHED
+        # from it. Asserting on slot._queue cannot see it: that dispatch is the
+        # drain, so the entry is already gone by the time the turn returns. Read
+        # before settling: a settled follow-up's own tail releases slot.task.
+        assert slot.task is not None
+        await _settle(slot)
 
         assert slot._compaction_failed_retries == 1
         assert any("Compaction failed — retrying" in err for err in _errors(slot)), _errors(slot)
-        # The requeue is proven by the follow-up turn the finally DISPATCHED
-        # from it. Asserting on slot._queue cannot see it: that dispatch is the
-        # drain, so the entry is already gone by the time the turn returns.
-        assert slot.task is not None
         # Still not pipe-death: that budget and its card stay untouched.
         assert slot._acp_pipe_death_retries == 0
         assert not any("Connection lost" in err for err in _errors(slot))

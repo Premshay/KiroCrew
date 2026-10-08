@@ -35,7 +35,7 @@ from kiro_crew.metrics.sessions import (
     record_session_ended,
     record_session_started,
 )
-from kiro_crew.session_lifecycle import clear_stop_declined
+from kiro_crew.session_lifecycle import allocation_identity, clear_stop_declined
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
@@ -211,21 +211,7 @@ class _CompactionOwner(Protocol):
 
 
 def _compact_unsupported_backend(provider: LLMProvider) -> str | None:
-    """Backend id this provider names as unable to serve ``/compact``, else None.
-
-    The same capability the manual entry points read, asked for the
-    automatic one.  The property is spelled ``manual_`` because the manual
-    command was its first consumer, but its ANSWER is a property of the
-    BACKEND -- ``ACP_BACKENDS_COMPACT`` membership -- not of the entry point,
-    so it is the right question here too: a backend that cannot act on the
-    ``/compact`` prompt cannot act on it whoever sent it.
-
-    Read with the consumption contract the ABC declares: only a non-empty
-    ``str`` counts.  That guard is load-bearing rather than defensive -- the
-    compaction suite drives this gate with bare ``object()`` and ``MagicMock``
-    providers, and a truthy attribute read on either must not be mistaken for
-    a positively named unsupported backend.
-    """
+    """Read the provider capability without importing channel command handlers."""
     backend = getattr(provider, "manual_compact_unsupported_backend", None)
     return backend if isinstance(backend, str) and backend else None
 
@@ -921,12 +907,7 @@ class CompactionCoordinator:
         try:
             await owner.get_or_create(
                 key,
-                agent=getattr(session, "agent", "") or None,
-                approval_policy=getattr(session, "approval_policy", ""),
-                cwd=getattr(session.provider, "cwd", None) or None,
-                channel_id=owner.get_channel(key) or None,
-                model=getattr(session, "requested_model", "") or None,
-                crew_agent=getattr(session, "capability_member", "") or None,
+                **allocation_identity(owner, key, session),
                 speculative=True,
             )
             started = True

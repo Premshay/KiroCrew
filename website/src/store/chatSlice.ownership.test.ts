@@ -100,7 +100,7 @@ describe('store/chat owners', () => {
 
 /** Reducers the facade wires inline next to the families: small UI flags and the live frame reducer. */
 const INLINE_REDUCERS = [
-  'setPendingInput', 'setAgentSwitchNotice', 'setVoicePlaying', 'setVoiceBusy', 'setVoiceAudio',
+  'setPendingInput', 'stageToMainComposer', 'setAgentSwitchNotice', 'setVoicePlaying', 'setVoiceBusy', 'setVoiceAudio',
   'requestSlotReveal', 'clearSlotReveal', 'requestFolderReveal', 'sseChatMessage',
 ]
 
@@ -155,7 +155,7 @@ describe('reducer families', () => {
 
 /** owner module -> the names the facade re-exports from it. */
 const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
-  ['wire', wire, ['clampToolOutput', 'TOOL_OUTPUT_MAX_CHARS', 'queueEntryAttachments']],
+  ['wire', wire, ['clampToolOutput', 'TOOL_OUTPUT_MAX_CHARS', 'queueEntryAttachments', 'queueEntryQuote']],
   ['transcript', transcript, ['floorForGen', 'hasUnidentifiedDurableRow', 'raiseChunkSeq', 'snapshotChunkGen', 'snapshotChunkSeq', 'transcriptTsMs']],
   ['paging', paging, [
     'OLDER_PAGE_LIMIT', 'OLDER_WALK_PAGE_LIMIT', 'SLOT_DETAIL_MAX_LIMIT', 'PANE_HYDRATE_LIMIT', 'REFRESH_LIMIT_CEILING',
@@ -164,7 +164,7 @@ const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
   ['composerCards', composerCards, ['FOLDER_SUGGESTION_MAX_TURNS', 'capturePendingAskId', 'pendingQuestionFor', 'shouldResolveAskOnSend']],
   ['mcpApps', mcpApps, ['mcpAppKey']],
   ['subagents', subagents, [
-    'isAwaitingSpawnApproval', 'selectSidebarApprovalCounts', 'selectSidebarSubagentCounts', 'selectSlotPendingSpawnApprovals',
+    'isAwaitingSpawnApproval', 'selectSidebarApprovalCounts', 'selectSidebarStartedSubagentCounts', 'selectSidebarSubagentCounts', 'selectSlotPendingSpawnApprovals',
     'selectSlotSubagents', 'selectSlotSubagentsActive', 'selectSubagentActivityCount',
   ]],
   ['workflows', workflows, ['WORKFLOW_TERMINAL_STATUSES', 'isTerminalWorkflowStatus', 'selectSidebarWorkflowActive', 'selectSidebarWorkflowActiveKeys']],
@@ -182,7 +182,7 @@ const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
 ]
 
 /** Names the facade itself defines rather than re-exports. */
-const FACADE_OWN = ['batchedTextAboveFloor', 'default', 'deleteSlot', 'loadOlderMessages', 'missedChunkMarker', 'requestStop']
+const FACADE_OWN = ['batchedTextAboveFloor', 'default', 'deleteSlot', 'loadOlderMessages', 'loadOlderSlotMessages', 'missedChunkMarker', 'requestStop']
 
 describe('facade re-exports', () => {
   const surface = facade as unknown as Record<string, unknown>

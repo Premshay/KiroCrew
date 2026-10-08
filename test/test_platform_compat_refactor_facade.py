@@ -52,6 +52,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
         "acquire_lock",
         "release_lock",
         "try_acquire_lock",
+        "try_acquire_lock_or_raise",
         "probe_file_persistence",
         "tempfile",
     ),
@@ -66,6 +67,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
         "current_user_sid",
         "make_owner_only_dir",
         "local_user_id",
+        "stat_owned_by_current_user",
         "stat_writable_by_current_user",
         "path_writable_by_current_user",
         "restrict_to_owner",
@@ -88,7 +90,7 @@ _SEAM_IMPORTS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
     (_LOCK, "acquire_lock"): (_PC, ("IS_POSIX", "fcntl", "time")),
     (_LOCK, "file_lock"): (_PC, ("IS_POSIX", "fcntl", "msvcrt", "time")),
     (_LOCK, "release_lock"): (_PC, ("IS_POSIX", "fcntl", "msvcrt")),
-    (_LOCK, "try_acquire_lock"): (_PC, ("IS_POSIX", "fcntl", "msvcrt")),
+    (_LOCK, "try_acquire_lock_or_raise"): (_PC, ("IS_POSIX", "fcntl", "msvcrt")),
     (_OWNER, "_process_token_sid"): (_PC, ("IS_POSIX",)),
     (_OWNER, "_process_token_sid_unguarded"): (
         _PC,
@@ -99,6 +101,7 @@ _SEAM_IMPORTS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
     (_OWNER, "process_owner_sid"): (_PC, ("IS_POSIX",)),
     (_OWNER, "restrict_dir_to_owner"): (_PC, ("IS_POSIX",)),
     (_OWNER, "restrict_to_owner"): (_PC, ("IS_POSIX",)),
+    (_OWNER, "stat_owned_by_current_user"): (_PC, ("IS_POSIX",)),
     (_OWNER, "stat_writable_by_current_user"): (_PC, ("IS_POSIX",)),
 }
 

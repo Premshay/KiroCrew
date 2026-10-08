@@ -100,15 +100,14 @@ def _get_start_time(pid: int) -> int | None:
     (a no-op on win32, where ``taskkill /T`` already walks the tree), so a
     missing start time has no effect there and avoids spawning a failing ``ps``.
     """
-    from kiro_crew.acp.client import Path, platform_compat, subprocess_mod, sys  # noqa: F811
+    from kiro_crew.acp.client import platform_compat, subprocess_mod, sys  # noqa: F811
 
     if platform_compat.IS_WINDOWS:
         return None
     try:
         if sys.platform == "linux":
-            stat = Path(f"/proc/{pid}/stat").read_text()
-            fields = stat.rsplit(")", 1)[1].split()
-            return int(fields[19])  # field 22 = starttime
+            stat = platform_compat.read_proc_stat(pid)
+            return stat.start_ticks if stat is not None else None
         # macOS: use ps -o lstart= (absolute start timestamp, constant for process lifetime)
         ps_bin = platform_compat.trusted_system_bin("ps")
         if ps_bin is None:
@@ -291,16 +290,8 @@ def _get_rss_mb(pid: int) -> float | None:
     from kiro_crew.acp.runtime import platform_compat, subprocess, sys
 
     if sys.platform == "linux":
-        try:
-            with open(f"/proc/{pid}/status") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        # Format: "VmRSS:\t   123456 kB"
-                        parts = line.split()
-                        return int(parts[1]) / 1024.0
-        except (OSError, IndexError, ValueError):
-            return None
-        return None
+        rss_kb = platform_compat.read_proc_status_int(pid, "VmRSS")
+        return None if rss_kb is None else rss_kb / 1024.0
 
     if platform_compat.IS_WINDOWS:
         # Windows ships no `ps` in the fixed system directories the POSIX

@@ -84,6 +84,10 @@ ACCEPTED_KEY = "all-accepted"
 CLOSED_KEY = "all-closed"
 
 _ACCEPTED_KEY = ACCEPTED_KEY
+
+#: :attr:`WorkLedgerProbe.revision` for a ledger that was read but holds no worker
+#: report yet. Not empty, because empty means "not known" to the gate.
+_NO_REPORTS = "no-reports"
 _CLOSED_KEY = CLOSED_KEY
 
 
@@ -128,6 +132,16 @@ class WorkLedgerProbe(irq.Probe):
         self._worker_running = worker_running or _always_idle
         self._worker_closed = worker_closed or _always_open
         self._conductor = ""
+        #: A digest of each item's worker-owned report fields (``last_report_at``,
+        #: ``status``, ``summary``), read on the last successful observation, or
+        #: ``None`` when nothing was read. The AutoNudge
+        #: gate lengthens a work-ledger watch's quiet floor while it matches the one
+        #: its last turn was delivered at. Only worker reports count: the
+        #: conductor's own writes (a verdict, a dispatch) are things it already
+        #: knows, and counting them would spend the next floor turn reading them
+        #: back. A ledger read with no worker report yet still gets a token, so an
+        #: early, quiet board is recognised as unchanged too.
+        self.revision: str | None = None
 
     # -- Probe contract ---------------------------------------------------
 
@@ -189,13 +203,22 @@ class WorkLedgerProbe(irq.Probe):
             stored = len(items)
         all_readable = stored <= len(items)
         newest: dict[str, str] = {}
+        newest_report: dict[str, str] = {}
         tails: dict[str, list[work_ledger.WorkEvent]] = {}
         for item in items:
             events = work_ledger.read_events(key, item.item_id, limit=_EVENT_TAIL)
             tails[item.item_id] = events
             if events:
                 newest[item.item_id] = events[-1].id
+            if item.last_report_at:
+                # The item's WORKER-OWNED fields, not the event tail: eight conductor
+                # writes would push the newest report out of a tail and move this
+                # without any worker saying anything.
+                newest_report[item.item_id] = json.dumps(
+                    [item.last_report_at, item.status, item.summary], default=str
+                )
         epoch = ledger_wake.revision(newest)
+        self.revision = ledger_wake.revision(newest_report) or _NO_REPORTS
 
         if items and all_readable and all(item.is_terminal for item in items):
             # Every item closed means the goal this ledger serves is finished, so
@@ -260,15 +283,14 @@ class WorkLedgerProbe(irq.Probe):
     ) -> list[irq.Observation]:
         """Everything about one open item that needs the conductor.
 
-        Every observation here is ``IMMEDIATE``, not ``WAKE``. A ``WAKE`` waits out the
-        kernel's coalescing floor (``irq.DEFAULT_COALESCE_SECS``) on every entry, and
-        the tick that finds it still young answers quiet and re-arms at the loop's own
-        cadence -- so a ``question`` would reach the conductor one full cadence late,
-        however fast the crew-log push pulled the tick forward. The floor exists for a
-        subject whose sub-observations may not exist yet; a report is complete the
-        moment it is written, and a stall is a decision already made, so waiting
-        observes nothing further. ``IMMEDIATE`` skips the delay and keeps the mask,
-        and these keys never recur anyway.
+        Every observation here is ``WAKE``, and :meth:`tuning` sets the coalescing
+        window to zero, so no ``WAKE`` waits out the kernel's default floor
+        (``irq.DEFAULT_COALESCE_SECS``): every fresh one in a tick is delivered at
+        once, in one delivery, and masked together. A report is complete the moment
+        it is written, and a stall is a decision already made, so waiting would
+        observe nothing further. ``WAKE`` rather than ``IMMEDIATE`` is what lets two
+        reports found in one tick share that delivery; see :meth:`tuning`. These
+        keys never recur anyway.
         """
         found: list[irq.Observation] = []
         for event in events:
@@ -345,6 +367,24 @@ class WorkLedgerProbe(irq.Probe):
             )
             return False
         return True
+
+
+def has_open_items(conductor_key: str) -> bool:
+    """Whether *conductor_key*'s ledger holds at least one non-terminal item.
+
+    What the AutoNudge timer asks before it lets a spent cycle cap or runtime
+    budget end a work-ledger watch. Positive evidence only: an unreadable ledger,
+    or a torn item file ``list_work_items`` skips, answers False, so doubt leaves
+    the loop's own bound in force rather than lifting it -- the opposite of the
+    tick's terminal rule above, because there doubt must keep a watch ALIVE and
+    here it must not keep one running past its bound. Read-only; blocking file
+    reads, so call it off the event loop.
+    """
+    try:
+        return any(not item.is_terminal for item in work_ledger.list_work_items(conductor_key))
+    except Exception:  # noqa: BLE001 - a read fault must leave the bound in force
+        logger.debug("work-ledger probe: open-items read failed for %s", conductor_key)
+        return False
 
 
 def _conductor_key(raw: object) -> str:

@@ -11,7 +11,14 @@ from aiohttp import web
 
 from kiro_crew import agent_state
 from kiro_crew.agent_discovery import AgentInfo, list_agents
-from kiro_crew.agent_files import AGENT_FILENAME, GUEST_AGENT_FILENAME, LITE_AGENT_FILENAME
+from kiro_crew.agent_files import (
+    AGENT_FILENAME,
+    CONSOLIDATE_AGENT_FILENAME,
+    DASHBOARD_MANAGER_AGENT_FILENAME,
+    FAST_RECON_AGENT_FILENAME,
+    GUEST_AGENT_FILENAME,
+    LITE_AGENT_FILENAME,
+)
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     dispatch_kiro_agent,
@@ -24,19 +31,36 @@ from kiro_crew.dashboard.handlers.agents import (
     _roster_mask,
 )
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+from kiro_crew.dashboard.slot_ownership import deny_app_slot_access, slot_not_found
 from kiro_crew.executors import discovery_executor
 from kiro_crew.platform import current_context, safe_context_call
 
 logger = logging.getLogger(__name__)
 
-# The managed specs that are not a sensible thing to run a chat AS. Only the
-# bare cheap agent behind auto-titles and compaction (no prompt, no tools) is
-# here; it is reached by the runtime itself, never picked by a person. The
-# primary ``kirocrew`` spec is deliberately NOT here: a chat session is a
-# template choice, and the main managed agent is the default one. The other
-# owned specs (conductor, worker, research, ...) are ordinary choices; hiding
-# every owned file would drop them from a fresh install.
-_BACKGROUND_ONLY_FILES = frozenset({LITE_AGENT_FILENAME, GUEST_AGENT_FILENAME})
+# The managed specs that are not a sensible thing to run a chat AS. The bare
+# cheap agent behind auto-titles and compaction (no prompt, no tools) is here,
+# reached by the runtime itself and never picked by a person; so is the guest
+# agent, which is a trust boundary. The primary ``kirocrew`` spec is deliberately
+# NOT here: a chat session is a template choice, and the main managed agent is the
+# default one. The other owned specs (conductor, worker, research, ...) are
+# ordinary choices; hiding every owned file would drop them from a fresh install.
+#
+# The dashboard manager is here because of what it CANNOT do rather than what it
+# is for. It holds the panel server and ``fs_read`` and nothing else: no shell, no
+# file write, no session tools. A person who picked it for a chat would get an
+# agent that can change one page and cannot answer anything, which reads as the
+# product being broken rather than as a narrow agent doing its job. It is reached
+# by a crewmate handing it page work, which is what the member base prompt's item
+# 7 routes.
+_BACKGROUND_ONLY_FILES = frozenset(
+    {
+        LITE_AGENT_FILENAME,
+        GUEST_AGENT_FILENAME,
+        DASHBOARD_MANAGER_AGENT_FILENAME,
+        FAST_RECON_AGENT_FILENAME,
+        CONSOLIDATE_AGENT_FILENAME,
+    }
+)
 
 
 def _is_background_only(agent: AgentInfo) -> bool:
@@ -112,13 +136,10 @@ async def api_agent_catalog(request: web.Request) -> web.Response:
     if state is not None and session_key:
         slot_name = session_key.split(":", 1)[-1]
         slot = state._slots.get(slot_name)
+        # One body for a missing slot and a refused one, so an app cannot tell them apart.
         if slot is None:
-            return web.json_response(
-                {"error": "Conversation not found", "code": "slot_not_found"}, status=404
-            )
-        from kiro_crew.dashboard.chat_handlers import _deny_cross_app_slot_access
-
-        denied = _deny_cross_app_slot_access(request, slot, slot_name, "agents.catalog")
+            return slot_not_found()
+        denied = deny_app_slot_access(request.get("app", ""), slot, slot_name, "agents.catalog")
         if denied is not None:
             return denied
         # No single-project fallback: an unscoped chat must not acquire choices

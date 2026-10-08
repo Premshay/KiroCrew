@@ -29,9 +29,9 @@ deliberate exception to the rule the rest of the file keeps, taken for the one f
 the rule cannot reach: "nobody has driven this yet" is a statement about Crew's own
 EVIDENCE rather than about the harness, it exists today only as prose in a set's
 comment, and no bit anywhere carries it. So the alternative to declaring it is not
-deriving it: it is a two-level card, where ``ACP_BACKENDS_COMPACT`` excludes pi and
-goose for want of a driven capture ("both are unclassified", in the set's own words)
-and that exclusion wears the same mark as a harness with no compaction surface at
+deriving it: it is a two-level card, where ``ACP_BACKENDS_COMPACT`` excludes pi for
+want of a driven capture ("pi is unclassified", in the set's own words) and that
+exclusion wears the same mark as a harness with no compaction surface at
 all. Those two answers are not one answer, and a reader of two levels cannot see
 which cell a measurement would pay for.
 
@@ -350,6 +350,13 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "H6) rather than inherited from session control; if the two memberships ever "
         "diverge, that divergence is what earns a line"
     ),
+    "ACP_BACKENDS_NATIVE_TODOS": (
+        "whether the dashboard may forward the harness-native /todos command. The "
+        "dashboard still renders agent-authored task state for every harness, so this "
+        "membership selects a command-dispatch path rather than a task capability a "
+        "reader loses by choosing another harness. A wrong membership forwards a "
+        "command the acquired provider cannot serve, which is a defect"
+    ),
     "ACP_BACKENDS_HOOKS_LIST": (
         "which backend's agent may ask its client for the hooks matching a trigger, and "
         "have the client run one. Nothing a reader choosing a harness can act on: Crew "
@@ -490,6 +497,24 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "way -- a project agent running the user-level agent's servers, or a "
         "member's servers dropping out of pool and caller-identity attribution "
         "while the operator has the gateway switched on"
+    ),
+    "ACP_BACKENDS_ACP_CLIENT_SPAWNABLE": (
+        "which spawn path a pool that builds AcpClient itself may use for this "
+        "backend, rather than AcpRuntime. A session starts either way when the "
+        "caller asks the right path; a wrong membership is a spawn under the "
+        "WRONG IDENTITY -- kas or codex under a bare kiro-cli spawn -- which is a "
+        "defect, not an absent feature a reader choosing a harness acts on"
+    ),
+    "ACP_BACKENDS_HONOR_ZERO_TOOL_BAN": (
+        "whether an agent spec's `\"tools\": []` holds against this backend's "
+        "NATIVE tools too, or only narrows the MCP allowlist. Read by the "
+        "knowledge/research pool to pick a backend it can trust with a zero-tool "
+        "worker. `tool_approval` already reports the reader-facing half -- whether "
+        "and how this harness is made to ask before it runs a tool at all -- so a "
+        "reader choosing a harness for that reason has already seen it; this set "
+        "answers a narrower question the pool asks about, and a wrong membership "
+        "admits a backend whose native tools stay live under a spec that meant to "
+        "deny them, which is a defect"
     ),
     "ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD": (
         "whether a freshly installed MCP server reaches a RUNNING session. The one "

@@ -217,6 +217,25 @@ class TestTelegramOutboundAuthz:
         t = self._transport(allow_forum=True, allowed_forum_chat_ids=[-100123])
         assert t.may_send_to(bad, "7") is False
 
+    def test_a_private_chat_topic_is_permitted_on_the_dm_roster(self) -> None:
+        """A threaded link whose chat_id is an allow-listed (positive)
+        user is a forum Topic INSIDE that 1:1 DM, not a group Topic, so a
+        proactive send (cron, subagent completion, monitor wake) is authorized on
+        the same roster test as a threadless DM -- even with forums disabled."""
+        t = self._transport(allowed_user_ids=[111], allow_forum=False)
+        assert t.may_send_to("111", "9") is True
+
+    def test_a_private_topic_for_a_revoked_user_is_refused(self) -> None:
+        t = self._transport(allowed_user_ids=[222], allow_forum=False)
+        assert t.may_send_to("111", "9") is False
+
+    def test_a_negative_chat_id_with_a_thread_never_waves_through_as_a_dm(self) -> None:
+        """A supergroup chat_id is NEGATIVE; pasting one into the user allow-list
+        must not let a group Topic read as a private topic -- it still goes to the
+        fail-closed forum gate."""
+        t = self._transport(allowed_user_ids=[-100123], allow_forum=False)
+        assert t.may_send_to("-100123", "7") is False
+
 
 class TestOtherTransportsThatCanAnswer:
     def test_imessage_matches_the_handle_roster(self) -> None:
@@ -740,9 +759,10 @@ class TestTheLadderConsultsTheTransport:
         """A ``dashboard:chat-*`` key names nobody; the record the gateway admitted
         on the link does, and the transport's own pairing does not object.
 
-        The record is written by the dashboard link handler and the ``!sessions``
-        pick beside the conversation id it describes and signed by the map under
-        the gateway's admission key, which is what lets a Discord DM mirror of a
+        The record is signed under the gateway's admission key by the path that
+        creates the link -- the dashboard link handler or the ``!sessions`` pick,
+        through ``sign_mirror_admission`` -- and the map stores it verbatim beside
+        the conversation id it describes; the map never signs. That is what lets a Discord DM mirror of a
         dashboard-born session pass the recipient leg -- with or without the
         transport having seen the DM in this process.
         """
@@ -1576,6 +1596,41 @@ def _send_returns_only_empty(channel: str, class_name: str) -> bool:
     return False
 
 
+# Channels whose send returns an id only when the platform reports one, so an
+# empty id is still success and failure raises. The structural check above cannot
+# see that (the id comes from one frame deeper), so their implementation is held
+# to a different check: send_message hands the client's result straight back, and
+# the client's own send is pinned behaviourally below.
+_BEST_EFFORT_ID_CHANNELS = {"imessage"}
+
+
+def _send_only_returns_client_send(channel: str, class_name: str) -> bool:
+    """Whether every ``return`` in *class_name*'s ``send_message`` is ``await self._client.send(...)``.
+
+    That shape is what lets the client's contract stand for the transport's: no
+    branch can swallow a failure into its own empty string or invent an id.
+    """
+    path = Path(kiro_crew_pkg.__file__).parent / channel / "transport.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.AsyncFunctionDef) or item.name != "send_message":
+                continue
+            handlers = [n for n in ast.walk(item) if isinstance(n, ast.ExceptHandler)]
+            returns = [n.value for n in ast.walk(item) if isinstance(n, ast.Return)]
+            if handlers or not returns:
+                return False
+            return all(
+                isinstance(r, ast.Await)
+                and isinstance(r.value, ast.Call)
+                and ast.unparse(r.value.func) == "self._client.send"
+                for r in returns
+            )
+    return False
+
+
 def _declares_no_message_id(channel: str) -> bool:
     """Whether this channel's module-level ``TransportCapabilities(...)`` says False.
 
@@ -1613,6 +1668,19 @@ class TestTheMessageIdConventionIsDeclared:
             declared_idless = _declares_no_message_id(channel)
             for class_name in classes:
                 only_empty = _send_returns_only_empty(channel, class_name)
+                if channel in _BEST_EFFORT_ID_CHANNELS:
+                    # Its id comes from the client, best-effort: the transport must
+                    # hand that result straight back, and the client's raise-on-
+                    # failure contract is pinned by the behavioural test below.
+                    if not (
+                        declared_idless and _send_only_returns_client_send(channel, class_name)
+                    ):
+                        mismatched.append(
+                            f"{channel}.{class_name}: a best-effort-id channel must "
+                            "declare returns_message_id=False and return only "
+                            "`await self._client.send(...)` from send_message"
+                        )
+                    continue
                 if only_empty != declared_idless:
                     mismatched.append(
                         f"{channel}.{class_name}: declares returns_message_id="
@@ -1640,8 +1708,54 @@ class TestTheMessageIdConventionIsDeclared:
         assert idless == {"wecom", "feishu"}
         assert all(_declares_no_message_id(channel) for channel in idless)
 
+    def test_the_declared_id_less_set_is_named(self) -> None:
+        declared = {channel for channel in _transport_classes() if _declares_no_message_id(channel)}
+        assert declared == {"wecom", "feishu"} | _BEST_EFFORT_ID_CHANNELS
+
+    def test_imessage_reads_an_empty_id_as_delivered(self) -> None:
+        # The bridge reports the GUID best-effort, so a delivered send can answer
+        # with "". Failure raises out of IMessageClient.send instead.
+        from kiro_crew.imessage.transport import IMESSAGE_CAPABILITIES
+        from kiro_crew.messaging.transport import delivery_confirmed
+
+        assert delivery_confirmed(IMESSAGE_CAPABILITIES, "")
+        assert delivery_confirmed(IMESSAGE_CAPABILITIES, "guid-1")
+
+    @pytest.mark.asyncio
+    async def test_imessage_client_send_returns_empty_only_on_success_and_raises_on_failure(
+        self, tmp_path: Path
+    ) -> None:
+        # What makes returns_message_id=False safe for iMessage: "" comes back only
+        # from a send the bridge answered, and every failure raises.
+        from kiro_crew.imessage.client import IMessageClient
+        from kiro_crew.imessage.rpc import RpcError, RpcTransportError
+
+        replies: list[Any] = []
+
+        async def fake_call(method: str, params: dict[str, Any], **_kw: Any) -> Any:
+            reply = replies.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        imc = IMessageClient(cursor_path=tmp_path / "c.json")
+        imc._call = fake_call  # type: ignore[method-assign]
+
+        replies.append({})
+        assert await imc.send("+15550100", "no guid") == ""
+        replies.append({"guid": "g-1"})
+        assert await imc.send("+15550100", "with guid") == "g-1"
+        for failure in (
+            RpcError(-32602, "invalid params"),
+            RpcError(-32001, "delivery uncertain"),
+            RpcTransportError("bridge exited"),
+        ):
+            replies.append(failure)
+            with pytest.raises(type(failure)):
+                await imc.send("+15550100", "fails")
+
     @pytest.mark.parametrize(
-        "channel", ["telegram", "discord", "slack", "teams", "webex", "whatsapp", "imessage"]
+        "channel", ["telegram", "discord", "slack", "teams", "webex", "whatsapp"]
     )
     def test_an_id_bearing_transport_keeps_the_strict_reading(self, channel: str) -> None:
         # The other direction, per channel: these DO return an id, so an empty one

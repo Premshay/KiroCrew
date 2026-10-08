@@ -410,11 +410,13 @@ def test_an_opencode_mcp_deny_hook_meets_the_fused_tool(matcher, tmp_path, monke
     assert not _blocks(event, "mcp__other__*", tmp_path, monkeypatch)
 
 
-def test_an_at_server_slash_tool_matcher_is_not_a_spec_matcher(tmp_path, monkeypatch):
-    # The object form's matcher rule takes no "@" or "/", on every backend; the
-    # spec names an MCP tool as mcp__server__tool instead.
-    event = _opencode_mcp_permission_event(("kirocrew-core",))
-    assert not _blocks(event, "@kirocrew-core/monitor_start", tmp_path, monkeypatch)
+@pytest.mark.parametrize("matcher", ["@kirocrew-core/monitor_start", "@kirocrew-core/*"])
+def test_an_at_server_slash_tool_matcher_meets_the_fused_tool(matcher, tmp_path, monkeypatch):
+    # The documented MCP spelling the split already produces: Crew-fired spec
+    # hooks accept it beside the object form's rule, scoped to its own server.
+    event = _opencode_mcp_permission_event(("kirocrew-core", "other"))
+    assert _blocks(event, matcher, tmp_path, monkeypatch)
+    assert not _blocks(event, "@other/*", tmp_path, monkeypatch)
 
 
 def test_a_server_whose_name_prefixes_a_native_tool_keeps_the_native_names(tmp_path, monkeypatch):
@@ -674,17 +676,43 @@ def _project_spec(root: Path, name: str, spec: dict | str) -> Path:
 
 
 @pytest.mark.parametrize("backend", _MIRRORS)
-def test_a_project_spec_deny_hook_blocks_on_the_mirror(backend, agents_dir, tmp_path, monkeypatch):
-    # The user level has the agent with no hooks; the checkout's copy has the deny.
+def test_an_untrusted_project_spec_hook_is_not_loaded_on_the_mirror(backend, agents_dir, tmp_path):
+    # The checkout's copy of the agent carries a hook; a hook is a command, and the
+    # checkout is not trusted to choose commands, so neither turn loop loads it.
     _write_spec(agents_dir, "a1", {})
     project = _project_spec(
         tmp_path / "proj",
         "a1",
         {"hooks": {"preToolUse": [{"matcher": "execute_bash", "command": "deny.sh"}]}},
     )
+    turn = asyncio.run(spec_hooks.turn_spec_hooks(_provider(backend, str(project)), "a1"))
+    assert not turn.unreadable and turn.gated and turn.hooks == []
+    hooks, unreadable, _ = asyncio.run(
+        chat_runner._prepare_spec_hooks(
+            None, None, _provider(backend, str(project)), "a1", is_new=False
+        )
+    )
+    assert not unreadable and hooks == []
+
+
+@pytest.mark.parametrize("backend", _MIRRORS)
+def test_a_user_spec_deny_hook_still_blocks_under_a_shadowing_project_spec(
+    backend, agents_dir, tmp_path, monkeypatch
+):
+    # The user wrote the deny; the checkout ships a same-name spec with its own hook.
+    _write_spec(
+        agents_dir,
+        "a1",
+        {"preToolUse": [{"matcher": "execute_bash", "command": "user-deny.sh"}]},
+    )
+    project = _project_spec(
+        tmp_path / "proj",
+        "a1",
+        {"hooks": {"preToolUse": [{"matcher": "execute_bash", "command": "repo.sh"}]}},
+    )
     ran = _fake_runs(monkeypatch, exit_code=2)
     turn = asyncio.run(spec_hooks.turn_spec_hooks(_provider(backend, str(project)), "a1"))
-    assert not turn.unreadable and len(turn.hooks) == 1
+    assert not turn.unreadable and [h.command for h in turn.hooks] == ["user-deny.sh"]
     event = _permission_event(backend)
     reason = asyncio.run(
         hooks_mod.permission_pre_tool_block(
@@ -698,14 +726,13 @@ def test_a_project_spec_deny_hook_blocks_on_the_mirror(backend, agents_dir, tmp_
             harness_tool_id=event.harness_tool_id,
         )
     )
-    assert [c for _, c, _, _ in ran] == ["deny.sh"] and reason is not None
-    # The chat turn loop reads the same spec.
+    assert [c for _, c, _, _ in ran] == ["user-deny.sh"] and reason is not None
     hooks, unreadable, _ = asyncio.run(
         chat_runner._prepare_spec_hooks(
             None, None, _provider(backend, str(project)), "a1", is_new=False
         )
     )
-    assert not unreadable and [h.command for h in hooks] == ["deny.sh"]
+    assert not unreadable and [h.command for h in hooks] == ["user-deny.sh"]
 
 
 @pytest.mark.parametrize("backend", _MIRRORS)
