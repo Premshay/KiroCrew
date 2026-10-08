@@ -2004,8 +2004,12 @@ def test_the_harness_spawn_seam_is_reached_only_through_the_gated_owner():
             if "resolve_spawn(" not in line or "def resolve_spawn(" in line:
                 continue
             invocations.append(f"{path.name}:{lineno}")
+    # deepseek_shared.py is the DeepSeek harness's OWN resolve_spawn handing off
+    # to its DeepseekLaunch (a ProcessAdapter): inside the seam, reached only
+    # through the runtime's gated call, so it is not a second caller.
     assert sorted(name.split(":")[0] for name in invocations) == [
         "client.py",
+        "deepseek_shared.py",
         "runtime.py",
     ], f"the spawn seam is invoked from an unexpected place: {invocations}"
     assert not any(issubclass(cls, HarnessAdapter) for cls in _PROCESS_ADAPTERS.values())
@@ -2044,6 +2048,7 @@ def test_a_re_derive_during_the_hosts_own_pre_spawn_work_does_not_kill_the_sessi
 
     rt = object.__new__(runtime_mod.AcpRuntime)
     rt._agent = "kirocrew-worker"
+    rt._extra_env = {}
     rt._work_dir = tmp_path / "wd"
     rt._model = None
     rt._sandbox_mode = "auto"

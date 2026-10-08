@@ -175,12 +175,12 @@ class TestLauncherContract:
             os, "execv", lambda path, argv: seen.append(signal.getitimer(signal.ITIMER_REAL))
         )
         assert platform_compat.arm_process_alarm(25.0) is True  # the last heartbeat's deadline
-        assert (
-            await updates._restart_gateway(
-                state, resolver=Mock(side_effect=AssertionError("launcher path must win"))
-            )
-            is True
+        result = await updates._restart_gateway(
+            state, resolver=Mock(side_effect=AssertionError("launcher path must win"))
         )
+        # The fork returns a GatewayRestartResult so a busy-session refusal can carry
+        # its maintenance reason; the restart itself is its ``restarted`` flag.
+        assert result.restarted is True
         state.sessions.close_all.assert_awaited()
         assert seen == [(0.0, 0.0)]
 
