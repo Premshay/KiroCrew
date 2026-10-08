@@ -1327,7 +1327,7 @@ async def test_saved_claude_member_uses_existing_essentials_path(world):
     service, _, _, _, project, _, _ = world
     resource = project / "member-guide.md"
     resource.write_text("SAVED_MEMBER_RESOURCE", encoding="utf-8")
-    uri = "file://" + str(resource)
+    uri = "file://member-guide.md"
     request = {
         "revision": service.get("A")["revision"],
         "enroll": True,
