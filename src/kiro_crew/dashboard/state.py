@@ -6926,7 +6926,7 @@ class DashboardState:
         self._flush_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._persistence_coordinator = _new_dashboard_persistence()
         # Update progress tracking (shared across all connected clients)
-        self._update_progress: dict[str, str] | None = None  # {step, detail}
+        self._update_progress: dict[str, object] | None = None  # {step, detail, maintenance?}
         # Restricted (incognito/temporary): session keys with memory writes disabled
         self._restricted_keys: set[str] = set()
         # Ephemeral: session keys with no memory writes at all
@@ -10985,21 +10985,20 @@ class DashboardState:
         """
         self._broadcast({"_type": "refresh", "kinds": ",".join(kinds)})
 
-    def push_update_progress(self, step: str, detail: str = "") -> None:
+    def push_update_progress(
+        self, step: str, detail: str = "", *, maintenance: dict[str, object] | None = None
+    ) -> None:
         """Broadcast an update progress event to all connected clients.
 
         ``step`` is a short machine-readable phase name (e.g. ``pulling``,
         ``syncing``, ``building``, ``installing``, ``restarting``, ``failed``).
         ``detail`` is an optional human-readable message.
         """
-        self._update_progress = {"step": step, "detail": detail}
-        self._broadcast(
-            {
-                "_type": "update_progress",
-                "step": step,
-                "detail": detail,
-            }
-        )
+        payload: dict[str, object] = {"step": step, "detail": detail}
+        if maintenance is not None:
+            payload["maintenance"] = maintenance
+        self._update_progress = payload
+        self._broadcast({"_type": "update_progress", **payload})
 
     def clear_update_progress(self) -> None:
         """Reset update progress (e.g. after cancel or completion)."""
@@ -11060,6 +11059,8 @@ class DashboardState:
                 ws_msg = json.dumps({"type": "refresh", "data": ws_data})
             elif msg_type == "update_progress":
                 ws_data = {"step": note["step"], "detail": note.get("detail", "")}
+                if isinstance(note.get("maintenance"), dict):
+                    ws_data["maintenance"] = note["maintenance"]
                 ws_msg = json.dumps({"type": "update_progress", "data": ws_data})
             elif msg_type == "artifact_update":
                 # Typed envelope (not the generic `notification` fallback) so
