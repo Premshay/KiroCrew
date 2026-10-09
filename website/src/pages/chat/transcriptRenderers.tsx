@@ -36,6 +36,7 @@ import ThinkingBlock from './ThinkingBlock'
 import ToolCallLine from './ToolCallLine'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
 import RecoveryCard, { opensTurn, resolveInjectCard } from './RecoveryCard'
+import PeerChannelRequestCard, { parsePeerChannelRequest } from './PeerChannelRequestCard'
 import { SystemNoticeRow, isSystemNoticeRow } from './CompactionCard'
 import SkillLoadCard, { isSkillLoadRow } from './SkillLoadCard'
 import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, isAuthRequired, isCapabilitiesChanged, isModelUnentitled, isSessionStartFailed, isUsageLimit, sessionStartFailureStreak } from './ErrorCard'
@@ -394,6 +395,26 @@ export function createTranscriptRenderers(
             }
           />,
         ),
+    },
+    {
+      // Refines `inject`, and must precede `recovery_inject`: a peer-channel
+      // delivery arrives as an inject row whose content is a machine-facing
+      // envelope, so both entries claim the role and only the parse tells the
+      // two apart. It lives HERE rather than on ChatPage because the page's
+      // `bubble` entry claims `inject` unguarded and outranks every role-keyed
+      // default -- the SDK's own `peer_channel_request` is therefore
+      // unreachable on that surface, and a page-local copy would be the fork
+      // this factory exists to end. Same component and the same `tight` row as
+      // the default it replaces, so no pane's output changes.
+      id: 'peer_channel_request',
+      roles: ['inject'],
+      match: m => parsePeerChannelRequest(m.content) !== null,
+      render: (m, ctx) => {
+        const parsed = parsePeerChannelRequest(m.content)
+        return parsed
+          ? ctx.row(<PeerChannelRequestCard parsed={parsed} disclosureKey={ctx.key} />, true)
+          : null
+      },
     },
     {
       // Refines `inject`: a gateway-authored injection is a one-line card, not
