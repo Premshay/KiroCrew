@@ -5838,7 +5838,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 what a phone keyboard does — where they painted over the caret.
                 Scoping the lift to the edit is safe because opening the drawer
                 blurs the input, which commits and closes the editor. */}
-            <div className={`absolute top-0 left-0 right-1.5 ${editingTitle ? 'z-[47]' : 'z-[45]'} pointer-events-none`} style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            {/* `select-none`: the header (and the pinned prompt in it) overlays the
+                transcript, so a touch selection handle dragged up under it must not
+                jump into its text and select everything in between. */}
+            <div className={`absolute top-0 left-0 right-1.5 ${editingTitle ? 'z-[47]' : 'z-[45]'} pointer-events-none select-none`} style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
               {/* The row's left padding GLIDES between its open (20px) and
                   collapsed (60px, clearing the stationary toggle + divider)
                   values on the same 320ms curve as the panel — an instant
@@ -6250,7 +6253,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 width either side of the column lets wheel and touch reach the
                 transcript underneath, as the strip beside an iOS toolbar does.
                 `right: dockGutter` keeps the scrollbar column clear (above). */}
-            <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none" style={{ right: dockGutter }} data-testid="composer-dock-root">
+            {/* `select-none`, as on the header overlay: a selection handle dragged
+                down under the dock must stay in the transcript. The composer's
+                textarea keeps its own native selection. */}
+            <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none select-none" style={{ right: dockGutter }} data-testid="composer-dock-root">
               <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />
               {/* Status chrome never claims more than half the pane. The dock
                   is anchored to the pane's bottom edge and grows upward, so an
