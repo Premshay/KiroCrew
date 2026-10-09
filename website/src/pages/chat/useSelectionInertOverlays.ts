@@ -4,12 +4,16 @@ import { useIsTouchDevice } from '../../hooks/useIsTouchDevice'
 /** Marks an element that overlays the transcript (header, composer dock). */
 export const SELECTION_INERT_ATTR = 'data-selection-inert'
 
-/** Whether a non-empty text selection is anchored inside `scroller`. */
+/** Whether a non-empty text selection has an endpoint inside `scroller`.
+ *
+ * Either endpoint, not just the anchor: dragging the START handle onto an
+ * overlay moves the anchor out, and releasing the overlays then let the
+ * selection take the title with it.
+ */
 export function transcriptSelectionHeld(scroller: HTMLElement | null): boolean {
   const sel = typeof document !== 'undefined' ? document.getSelection() : null
   if (!scroller || !sel || sel.isCollapsed || sel.rangeCount === 0) return false
-  const anchor = sel.anchorNode
-  return !!anchor && scroller.contains(anchor)
+  return (!!sel.anchorNode && scroller.contains(sel.anchorNode)) || (!!sel.focusNode && scroller.contains(sel.focusNode))
 }
 
 /**
