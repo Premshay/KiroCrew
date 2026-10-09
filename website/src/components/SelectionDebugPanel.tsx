@@ -13,7 +13,7 @@ export default function SelectionDebugPanel({ windowRange }: { windowRange: { st
       {/* i18n-ignore: developer diagnostic, not product copy */}
       <div>{`window ${windowRange.start}-${windowRange.end}`}</div>
       {entries.map((e, i) => (
-        <div key={i}>{`${e.t} a:${e.anchor} f:${e.focus} o:${e.offsets} r:${e.retained}`}</div>
+        <div key={i}>{`${e.t} a:${e.anchor} f:${e.focus} o:${e.offsets} r:${e.retained}${e.words ? ` ${e.words}` : ''}`}</div>
       ))}
     </div>
   )

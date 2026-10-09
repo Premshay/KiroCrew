@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { describeEndpoint, recordSelectionDebug, selectionDebugEntries } from '../utils/selectionDebug'
+import { describeEndpoint, describeSelectedText, recordSelectionDebug, selectionDebugEntries } from '../utils/selectionDebug'
 
 describe('selection debug trace', () => {
   afterEach(() => { document.body.innerHTML = '' })
@@ -32,5 +32,11 @@ describe('selection debug trace', () => {
     expect(entries.length).toBe(8)
     expect(entries[0].offsets).toBe('5:9')
     expect(entries[entries.length - 1].offsets).toBe('0:29')
+  })
+
+  it('shows where a selection begins and ends', () => {
+    expect(describeSelectedText('found the')).toBe('"found the" 9ch')
+    const long = 'reached the title, they switched off\n\nand the title joined the selection.'
+    expect(describeSelectedText(long)).toBe(`"reached the title,"…"ned the selection." ${long.length}ch`)
   })
 })

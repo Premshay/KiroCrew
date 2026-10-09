@@ -11,6 +11,8 @@ export interface SelectionDebugEntry {
   focus: string
   offsets: string
   retained: string
+  /** The selection's first and last words and its length, e.g. `"found the"…"selection." 412ch`. */
+  words?: string
 }
 
 const MAX_ENTRIES = 8
@@ -53,7 +55,7 @@ const listeners = new Set<() => void>()
  * does not push out where the selection began. */
 export function recordSelectionDebug(entry: Omit<SelectionDebugEntry, 't'>, first = false): void {
   const last = entries[entries.length - 1]
-  if (!first && last && last.anchor === entry.anchor && last.focus === entry.focus && last.offsets === entry.offsets && last.retained === entry.retained) return
+  if (!first && last && last.anchor === entry.anchor && last.focus === entry.focus && last.offsets === entry.offsets && last.retained === entry.retained && last.words === entry.words) return
   if (first) entries.length = 0
   entries.push({ t: new Date().toISOString().slice(11, 23), ...entry })
   if (entries.length > MAX_ENTRIES) entries.splice(1, 1)
@@ -67,4 +69,11 @@ export function selectionDebugEntries(): readonly SelectionDebugEntry[] {
 export function subscribeSelectionDebug(listener: () => void): () => void {
   listeners.add(listener)
   return () => listeners.delete(listener)
+}
+
+/** The selected text's opening and closing words and its length. */
+export function describeSelectedText(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  if (flat.length <= 40) return `"${flat}" ${text.length}ch`
+  return `"${flat.slice(0, 18)}"…"${flat.slice(-18)}" ${text.length}ch`
 }

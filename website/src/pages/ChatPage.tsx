@@ -108,7 +108,7 @@ import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { SELECTION_INERT_ATTR, useSelectionInertOverlays } from './chat/useSelectionInertOverlays'
 import { nextRetainedRange, restoreEndpointToTranscript, rowEndpoints, type SelectionEndpoints } from '../utils/selectionRetention'
-import { describeEndpoint, recordSelectionDebug, selectionDebugEnabled } from '../utils/selectionDebug'
+import { describeEndpoint, describeSelectedText, recordSelectionDebug, selectionDebugEnabled } from '../utils/selectionDebug'
 import SelectionDebugPanel from '../components/SelectionDebugPanel'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft } from '../utils/pasteTokens'
@@ -3781,6 +3781,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           focus: describeEndpoint(scroller, selection.focusNode),
           offsets: `${selection.anchorOffset}:${selection.focusOffset}`,
           retained: next === 'keep' ? 'keep' : next ? `${next.start}-${next.end}` : 'none',
+          words: selection.isCollapsed ? undefined : describeSelectedText(selection.toString()),
         }, first)
       }
     }
