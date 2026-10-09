@@ -41,6 +41,8 @@ describe('transcript overlays do not take a touch selection', () => {
     expect(page).toMatch(/addEventListener\('selectionchange', syncSelectionRetention\)/)
     // Read-only: rewriting the selection broke the first Android long-press.
     expect(page).not.toMatch(/clampSelectionToTranscript|setBaseAndExtent/)
+    // Only a selection that has sat on rows may be restored.
+    expect(page).toMatch(/restoreEndpointToTranscript\(scroller, selection, lastOnRows\)/)
     expect(page).toMatch(/nextRetainedRange\(/)
     // An endpoint on no row must not release the retained span.
     expect(page).not.toMatch(/else retainRange\(null\)/)

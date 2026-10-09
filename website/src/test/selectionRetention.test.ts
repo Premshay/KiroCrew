@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   nextRetainedRange,
+  restoreEndpointToTranscript,
+  rowEndpoints,
   selectedRowRange,
   selectionTouchesContainer,
 } from '../utils/selectionRetention'
@@ -81,6 +83,41 @@ describe('selectionRetention', () => {
       expect(nextRetainedRange(sc, null)).toBeNull()
       expect(nextRetainedRange(sc, { ...selection(text('r4'), text('r4')), isCollapsed: true } as Selection)).toBeNull()
       expect(nextRetainedRange(sc, selection(text('out'), text('out')))).toBeNull()
+    })
+  })
+
+  describe('restoreEndpointToTranscript', () => {
+    const build = () => {
+      document.body.innerHTML = '<p id="title">title</p><div id="sc"><div data-display-index="4"><p id="a">start row text</p></div><div data-display-index="5"><p id="b">end row text</p></div></div>'
+      return document.getElementById('sc') as HTMLElement
+    }
+    const t = (id: string) => document.getElementById(id)!.firstChild!
+
+    it('puts a start handle that landed on the title back where it was', () => {
+      const sc = build()
+      const settled = selection(t('a'), t('b'))
+      settled.anchorOffset = 6
+      settled.focusOffset = 3
+      const last = rowEndpoints(sc, settled)
+      const moved = selection(t('title'), t('b'))
+      moved.anchorOffset = 2
+      moved.focusOffset = 7
+      expect(restoreEndpointToTranscript(sc, moved, last)).toBe(true)
+      expect(moved.anchorNode).toBe(t('a'))
+      expect(moved.anchorOffset).toBe(6)
+      expect(moved.focusOffset).toBe(7)
+    })
+    it('leaves a fresh long-press alone', () => {
+      const sc = build()
+      const fresh = selection(t('a'), t('title'))
+      expect(restoreEndpointToTranscript(sc, fresh, null)).toBe(false)
+      expect(fresh.focusNode).toBe(t('title'))
+    })
+    it('leaves a selection wholly inside or outside the transcript alone', () => {
+      const sc = build()
+      const last = rowEndpoints(sc, selection(t('a'), t('b')))
+      expect(restoreEndpointToTranscript(sc, selection(t('a'), t('b')), last)).toBe(false)
+      expect(restoreEndpointToTranscript(sc, selection(t('title'), t('title')), last)).toBe(false)
     })
   })
 })

@@ -107,7 +107,7 @@ import TranscriptScrollShell, { useTranscriptWidth } from './chat/TranscriptScro
 import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { SELECTION_INERT_ATTR, useSelectionInertOverlays } from './chat/useSelectionInertOverlays'
-import { nextRetainedRange } from '../utils/selectionRetention'
+import { nextRetainedRange, restoreEndpointToTranscript, rowEndpoints, type SelectionEndpoints } from '../utils/selectionRetention'
 import { describeEndpoint, recordSelectionDebug, selectionDebugEnabled } from '../utils/selectionDebug'
 import SelectionDebugPanel from '../components/SelectionDebugPanel'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
@@ -3757,13 +3757,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const { retainRange } = virt
 
   // Keep the rows under a transcript selection mounted while a touch handle
-  // scrolls, so an off-screen start is not unmounted and re-rooted.
+  // scrolls, so an off-screen start is not unmounted and re-rooted, and put a
+  // handle that lands on the title or composer back on the transcript.
   useEffect(() => {
     const scroller = scrollerRef.current
     if (!scroller) return
     let debugCollapsed = true
+    // Where this selection last sat on rows; cleared when it collapses.
+    let lastOnRows: SelectionEndpoints | null = null
     const syncSelectionRetention = () => {
       const selection = window.getSelection()
+      // The restore fires its own selectionchange, which records the result.
+      if (selection && restoreEndpointToTranscript(scroller, selection, lastOnRows)) return
+      if (!selection || selection.isCollapsed) lastOnRows = null
+      else lastOnRows = rowEndpoints(scroller, selection) ?? lastOnRows
       const next = nextRetainedRange(scroller, selection)
       if (next !== 'keep') retainRange(next)
       if (selection && selectionDebugEnabled()) {
