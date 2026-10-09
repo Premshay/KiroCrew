@@ -106,6 +106,7 @@ import EarlierMessagesBar from './chat/EarlierMessagesBar'
 import TranscriptScrollShell, { useTranscriptWidth } from './chat/TranscriptScrollShell'
 import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
+import { SELECTION_INERT_ATTR, useSelectionInertOverlays } from './chat/useSelectionInertOverlays'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft } from '../utils/pasteTokens'
 import { IMG_EXT } from '../utils/fileTokens'
@@ -3288,6 +3289,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
 
   // The floating composer dock's measured clearance (see composerDock).
   const { inputAreaRef, dockH, dockGutter, dockRef } = useComposerDockMetrics(scrollerRef)
+  useSelectionInertOverlays(scrollerRef)
 
   // Quote / Ask on selected assistant text — the shared chat-core seam
   // (chat-core/composer/selectionActions): Quote lands in this composer with
@@ -5841,7 +5843,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             {/* `select-none`: the header (and the pinned prompt in it) overlays the
                 transcript, so a touch selection handle dragged up under it must not
                 jump into its text and select everything in between. */}
-            <div className={`absolute top-0 left-0 right-1.5 ${editingTitle ? 'z-[47]' : 'z-[45]'} pointer-events-none select-none`} style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            <div className={`absolute top-0 left-0 right-1.5 ${editingTitle ? 'z-[47]' : 'z-[45]'} pointer-events-none select-none`} style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties} {...{ [SELECTION_INERT_ATTR]: '' }}>
               {/* The row's left padding GLIDES between its open (20px) and
                   collapsed (60px, clearing the stationary toggle + divider)
                   values on the same 320ms curve as the panel — an instant
@@ -6256,7 +6258,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             {/* `select-none`, as on the header overlay: a selection handle dragged
                 down under the dock must stay in the transcript. The composer's
                 textarea keeps its own native selection. */}
-            <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none select-none" style={{ right: dockGutter }} data-testid="composer-dock-root">
+            <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none select-none" style={{ right: dockGutter }} data-testid="composer-dock-root" {...{ [SELECTION_INERT_ATTR]: '' }}>
               <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />
               {/* Status chrome never claims more than half the pane. The dock
                   is anchored to the pane's bottom edge and grows upward, so an
