@@ -107,7 +107,7 @@ import TranscriptScrollShell, { useTranscriptWidth } from './chat/TranscriptScro
 import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { SELECTION_INERT_ATTR, useSelectionInertOverlays } from './chat/useSelectionInertOverlays'
-import { clampSelectionToTranscript } from '../utils/selectionRetention'
+import { clampSelectionToTranscript, nextRetainedRange } from '../utils/selectionRetention'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft } from '../utils/pasteTokens'
 import { IMG_EXT } from '../utils/fileTokens'
@@ -3760,20 +3760,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const scroller = scrollerRef.current
     if (!scroller) return
     const syncSelectionRetention = () => {
-      const selection = window.getSelection()
-      if (!selection || selection.isCollapsed) {
-        retainRange(null)
-        return
-      }
-      const range = clampSelectionToTranscript(
+      const next = nextRetainedRange(scroller, window.getSelection(), (selection) => clampSelectionToTranscript(
         scroller,
         selection,
         topSentinelRef.current,
         bottomSentinelRef.current,
         displayItemsRef.current.length,
-      )
-      if (range) retainRange(range)
-      else retainRange(null)
+      ))
+      if (next !== 'keep') retainRange(next)
     }
     document.addEventListener('selectionchange', syncSelectionRetention)
     syncSelectionRetention()

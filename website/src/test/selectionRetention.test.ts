@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   clampSelectionToTranscript,
+  nextRetainedRange,
   selectedRowRange,
   selectionTouchesContainer,
 } from '../utils/selectionRetention'
@@ -88,5 +89,31 @@ describe('selectionRetention', () => {
       .toBeNull()
     expect(selected.anchorNode).toBe(title.firstChild)
     expect(selected.focusNode).toBe(composer.firstChild)
+  })
+
+  describe('nextRetainedRange', () => {
+    // A handle over the scroller's padding under the composer sits inside the
+    // transcript but on no row. Releasing there let the start row unmount and
+    // re-rooted the selection at the top of the transcript.
+    const build = () => {
+      document.body.innerHTML = '<div id="sc"><div data-display-index="4"><p id="r4">start row</p></div><div id="pad"></div></div><p id="out">outside</p>'
+      return document.getElementById('sc') as HTMLElement
+    }
+    const text = (id: string) => document.getElementById(id)!.firstChild ?? document.getElementById(id)!
+
+    it('keeps the last retained span while an endpoint sits on no row inside the transcript', () => {
+      const sc = build()
+      expect(nextRetainedRange(sc, selection(text('r4'), document.getElementById('pad')!), () => null)).toBe('keep')
+    })
+    it('replaces the span when the clamp resolves one', () => {
+      const sc = build()
+      expect(nextRetainedRange(sc, selection(text('r4'), text('r4')), () => ({ start: 4, end: 5 }))).toEqual({ start: 4, end: 5 })
+    })
+    it('releases when the selection collapses or leaves the transcript', () => {
+      const sc = build()
+      expect(nextRetainedRange(sc, null, () => null)).toBeNull()
+      expect(nextRetainedRange(sc, { ...selection(text('r4'), text('r4')), isCollapsed: true } as Selection, () => null)).toBeNull()
+      expect(nextRetainedRange(sc, selection(text('out'), text('out')), () => null)).toBeNull()
+    })
   })
 })
