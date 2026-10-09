@@ -108,8 +108,6 @@ import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { SELECTION_INERT_ATTR, useSelectionInertOverlays } from './chat/useSelectionInertOverlays'
 import { nextRetainedRange, restoreEndpointToTranscript, rowEndpoints, type SelectionEndpoints } from '../utils/selectionRetention'
-import { describeEndpoint, describeSelectedText, recordSelectionDebug, selectionDebugEnabled } from '../utils/selectionDebug'
-import SelectionDebugPanel from '../components/SelectionDebugPanel'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft } from '../utils/pasteTokens'
 import { IMG_EXT } from '../utils/fileTokens'
@@ -3762,28 +3760,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   useEffect(() => {
     const scroller = scrollerRef.current
     if (!scroller) return
-    let debugCollapsed = true
     // Where this selection last sat on rows; cleared when it collapses.
     let lastOnRows: SelectionEndpoints | null = null
     const syncSelectionRetention = () => {
       const selection = window.getSelection()
-      // The restore fires its own selectionchange, which records the result.
+      // The restore fires its own selectionchange, which retains the result.
       if (selection && restoreEndpointToTranscript(scroller, selection, lastOnRows)) return
       if (!selection || selection.isCollapsed) lastOnRows = null
       else lastOnRows = rowEndpoints(scroller, selection) ?? lastOnRows
       const next = nextRetainedRange(scroller, selection)
       if (next !== 'keep') retainRange(next)
-      if (selection && selectionDebugEnabled()) {
-        const first = debugCollapsed && !selection.isCollapsed
-        debugCollapsed = selection.isCollapsed
-        recordSelectionDebug({
-          anchor: describeEndpoint(scroller, selection.anchorNode),
-          focus: describeEndpoint(scroller, selection.focusNode),
-          offsets: `${selection.anchorOffset}:${selection.focusOffset}`,
-          retained: next === 'keep' ? 'keep' : next ? `${next.start}-${next.end}` : 'none',
-          words: selection.isCollapsed ? undefined : describeSelectedText(selection.toString()),
-        }, first)
-      }
     }
     document.addEventListener('selectionchange', syncSelectionRetention)
     syncSelectionRetention()
@@ -5884,7 +5870,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             {/* `select-none`: the header (and the pinned prompt in it) overlays the
                 transcript, so a touch selection handle dragged up under it must not
                 jump into its text and select everything in between. */}
-            <div className={`absolute top-0 left-0 right-1.5 ${editingTitle ? 'z-[47]' : 'z-[45]'} pointer-events-none select-none`} style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties} {...{ [SELECTION_INERT_ATTR]: '' }}>
+            <div className={`absolute top-0 left-0 right-1.5 ${editingTitle ? 'z-[47]' : 'z-[45]'} pointer-events-none`} style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties} {...{ [SELECTION_INERT_ATTR]: '' }}>
               {/* The row's left padding GLIDES between its open (20px) and
                   collapsed (60px, clearing the stationary toggle + divider)
                   values on the same 320ms curve as the panel — an instant
@@ -6299,9 +6285,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             {/* `select-none`, as on the header overlay: a selection handle dragged
                 down under the dock must stay in the transcript. The composer's
                 textarea keeps its own native selection. */}
-            <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none select-none" style={{ right: dockGutter }} data-testid="composer-dock-root" {...{ [SELECTION_INERT_ATTR]: '' }}>
+            <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none" style={{ right: dockGutter }} data-testid="composer-dock-root" {...{ [SELECTION_INERT_ATTR]: '' }}>
               <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />
-              <SelectionDebugPanel windowRange={{ start: virt.virtualItems[0]?.index ?? 0, end: (virt.virtualItems[virt.virtualItems.length - 1]?.index ?? -1) + 1 }} />
               {/* Status chrome never claims more than half the pane. The dock
                   is anchored to the pane's bottom edge and grows upward, so an
                   opening keyboard — which shrinks the layout viewport — would
