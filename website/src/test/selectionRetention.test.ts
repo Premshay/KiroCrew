@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import {
-  clampSelectionToTranscript,
   nextRetainedRange,
   selectedRowRange,
   selectionTouchesContainer,
@@ -50,47 +49,6 @@ describe('selectionRetention', () => {
     expect(selectionTouchesContainer(container, selected)).toBe(true)
   })
 
-  it('clamps a transcript selection that reaches a preceding overlay', () => {
-    const host = document.createElement('div')
-    host.innerHTML = '<p>title chrome</p><div><i></i><div data-display-index="4">chat text</div><i></i></div><p>composer chrome</p>'
-    document.body.append(host)
-    const [title, container] = Array.from(host.children)
-    const [start, row, end] = Array.from(container.children)
-    const selected = selection(row.firstChild!, title.firstChild!)
-
-    expect(clampSelectionToTranscript(container as HTMLElement, selected, start, end, 12))
-      .toEqual({ start: 0, end: 5 })
-    expect(selected.anchorNode).toBe(row.firstChild)
-    expect(selected.focusNode).toBe(start)
-  })
-
-  it('clamps a transcript selection that reaches a following composer', () => {
-    const host = document.createElement('div')
-    host.innerHTML = '<p>title chrome</p><div><i></i><div data-display-index="4">chat text</div><i></i></div><p>composer chrome</p>'
-    document.body.append(host)
-    const [, container, composer] = Array.from(host.children)
-    const [start, row, end] = Array.from(container.children)
-    const selected = selection(row.firstChild!, composer.firstChild!)
-
-    expect(clampSelectionToTranscript(container as HTMLElement, selected, start, end, 12))
-      .toEqual({ start: 4, end: 12 })
-    expect(selected.focusNode).toBe(end)
-  })
-
-  it('leaves a selection that started in the composer alone', () => {
-    const host = document.createElement('div')
-    host.innerHTML = '<p>title chrome</p><div><i></i><div data-display-index="4">chat text</div><i></i></div><p>composer text</p>'
-    document.body.append(host)
-    const [title, container, composer] = Array.from(host.children)
-    const [start, , end] = Array.from(container.children)
-    const selected = selection(title.firstChild!, composer.firstChild!)
-
-    expect(clampSelectionToTranscript(container as HTMLElement, selected, start, end, 12))
-      .toBeNull()
-    expect(selected.anchorNode).toBe(title.firstChild)
-    expect(selected.focusNode).toBe(composer.firstChild)
-  })
-
   describe('nextRetainedRange', () => {
     // A handle over the scroller's padding under the composer sits inside the
     // transcript but on no row. Releasing there let the start row unmount and
@@ -103,17 +61,26 @@ describe('selectionRetention', () => {
 
     it('keeps the last retained span while an endpoint sits on no row inside the transcript', () => {
       const sc = build()
-      expect(nextRetainedRange(sc, selection(text('r4'), document.getElementById('pad')!), () => null)).toBe('keep')
+      expect(nextRetainedRange(sc, selection(text('r4'), document.getElementById('pad')!))).toBe('keep')
     })
-    it('replaces the span when the clamp resolves one', () => {
+    it('replaces the span when both endpoints sit on rows', () => {
       const sc = build()
-      expect(nextRetainedRange(sc, selection(text('r4'), text('r4')), () => ({ start: 4, end: 5 }))).toEqual({ start: 4, end: 5 })
+      expect(nextRetainedRange(sc, selection(text('r4'), text('r4')))).toEqual({ start: 4, end: 5 })
+    })
+    // A fresh Android long-press can report an endpoint outside the rows; the
+    // selection itself must come through untouched.
+    it('never rewrites the selection', () => {
+      const sc = build()
+      const selected = selection(text('r4'), text('out'))
+      selected.setBaseAndExtent = () => { throw new Error('selection rewritten') }
+      expect(nextRetainedRange(sc, selected)).toBe('keep')
+      expect(selected.focusNode).toBe(text('out'))
     })
     it('releases when the selection collapses or leaves the transcript', () => {
       const sc = build()
-      expect(nextRetainedRange(sc, null, () => null)).toBeNull()
-      expect(nextRetainedRange(sc, { ...selection(text('r4'), text('r4')), isCollapsed: true } as Selection, () => null)).toBeNull()
-      expect(nextRetainedRange(sc, selection(text('out'), text('out')), () => null)).toBeNull()
+      expect(nextRetainedRange(sc, null)).toBeNull()
+      expect(nextRetainedRange(sc, { ...selection(text('r4'), text('r4')), isCollapsed: true } as Selection)).toBeNull()
+      expect(nextRetainedRange(sc, selection(text('out'), text('out')))).toBeNull()
     })
   })
 })
