@@ -107,6 +107,7 @@ import TranscriptScrollShell, { useTranscriptWidth } from './chat/TranscriptScro
 import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { SELECTION_INERT_ATTR, useSelectionInertOverlays } from './chat/useSelectionInertOverlays'
+import { clampSelectionToTranscript } from '../utils/selectionRetention'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft } from '../utils/pasteTokens'
 import { IMG_EXT } from '../utils/fileTokens'
@@ -3751,6 +3752,36 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     runActive: !!slotRunning,
     onTopReached: handleTopReached,
   })
+  const { retainRange, topSentinelRef, bottomSentinelRef } = virt
+
+  // Keep native selection endpoints within the transcript while a touch handle
+  // scrolls. Absolute title and composer siblings cannot become copy endpoints.
+  useEffect(() => {
+    const scroller = scrollerRef.current
+    if (!scroller) return
+    const syncSelectionRetention = () => {
+      const selection = window.getSelection()
+      if (!selection || selection.isCollapsed) {
+        retainRange(null)
+        return
+      }
+      const range = clampSelectionToTranscript(
+        scroller,
+        selection,
+        topSentinelRef.current,
+        bottomSentinelRef.current,
+        displayItemsRef.current.length,
+      )
+      if (range) retainRange(range)
+      else retainRange(null)
+    }
+    document.addEventListener('selectionchange', syncSelectionRetention)
+    syncSelectionRetention()
+    return () => {
+      document.removeEventListener('selectionchange', syncSelectionRetention)
+      retainRange(null)
+    }
+  }, [activeSlot, scrollerRef, retainRange, topSentinelRef, bottomSentinelRef, displayItemsRef])
 
   // Single scroll controller wiring: expose the virtualizer's follow API to
   // the early effects/handlers (declared above) via refs, and derive the
