@@ -3761,17 +3761,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   useEffect(() => {
     const scroller = scrollerRef.current
     if (!scroller) return
+    let debugCollapsed = true
     const syncSelectionRetention = () => {
       const selection = window.getSelection()
       const next = nextRetainedRange(scroller, selection)
       if (next !== 'keep') retainRange(next)
       if (selection && selectionDebugEnabled()) {
+        const first = debugCollapsed && !selection.isCollapsed
+        debugCollapsed = selection.isCollapsed
         recordSelectionDebug({
           anchor: describeEndpoint(scroller, selection.anchorNode),
           focus: describeEndpoint(scroller, selection.focusNode),
           offsets: `${selection.anchorOffset}:${selection.focusOffset}`,
           retained: next === 'keep' ? 'keep' : next ? `${next.start}-${next.end}` : 'none',
-        })
+        }, first)
       }
     }
     document.addEventListener('selectionchange', syncSelectionRetention)

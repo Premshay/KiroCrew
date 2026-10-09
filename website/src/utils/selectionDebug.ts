@@ -31,7 +31,7 @@ export function describeEndpoint(container: HTMLElement, node: Node | null): str
   if (!node.isConnected) return 'detached'
   const element = node instanceof Element ? node : node.parentElement
   const row = element?.closest<HTMLElement>('[data-display-index]')
-  if (row && container.contains(row)) return `row ${row.dataset.displayIndex}`
+  if (row && container.contains(row)) return `row ${row.dataset.displayIndex} ${node.nodeName}`
   if (container.contains(node)) return 'in-scroller'
   const range = document.createRange()
   range.selectNodeContents(container)
@@ -48,11 +48,15 @@ export function describeEndpoint(container: HTMLElement, node: Node | null): str
 const entries: SelectionDebugEntry[] = []
 const listeners = new Set<() => void>()
 
-export function recordSelectionDebug(entry: Omit<SelectionDebugEntry, 't'>): void {
+/** Record one selection change. `first` marks the first change of a new
+ * selection: it clears the history and stays pinned at the top, so a long drag
+ * does not push out where the selection began. */
+export function recordSelectionDebug(entry: Omit<SelectionDebugEntry, 't'>, first = false): void {
   const last = entries[entries.length - 1]
-  if (last && last.anchor === entry.anchor && last.focus === entry.focus && last.offsets === entry.offsets && last.retained === entry.retained) return
+  if (!first && last && last.anchor === entry.anchor && last.focus === entry.focus && last.offsets === entry.offsets && last.retained === entry.retained) return
+  if (first) entries.length = 0
   entries.push({ t: new Date().toISOString().slice(11, 23), ...entry })
-  if (entries.length > MAX_ENTRIES) entries.shift()
+  if (entries.length > MAX_ENTRIES) entries.splice(1, 1)
   for (const listener of listeners) listener()
 }
 
