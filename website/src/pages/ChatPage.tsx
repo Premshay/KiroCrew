@@ -107,7 +107,7 @@ import TranscriptScrollShell, { useTranscriptWidth } from './chat/TranscriptScro
 import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { SELECTION_INERT_ATTR, useSelectionInertOverlays } from './chat/useSelectionInertOverlays'
-import { clampSelectionToTranscript, nextRetainedRange } from '../utils/selectionRetention'
+import { nextRetainedRange } from '../utils/selectionRetention'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft } from '../utils/pasteTokens'
 import { IMG_EXT } from '../utils/fileTokens'
@@ -3752,21 +3752,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     runActive: !!slotRunning,
     onTopReached: handleTopReached,
   })
-  const { retainRange, topSentinelRef, bottomSentinelRef } = virt
+  const { retainRange } = virt
 
-  // Keep native selection endpoints within the transcript while a touch handle
-  // scrolls. Absolute title and composer siblings cannot become copy endpoints.
+  // Keep the rows under a transcript selection mounted while a touch handle
+  // scrolls, so an off-screen start is not unmounted and re-rooted.
   useEffect(() => {
     const scroller = scrollerRef.current
     if (!scroller) return
     const syncSelectionRetention = () => {
-      const next = nextRetainedRange(scroller, window.getSelection(), (selection) => clampSelectionToTranscript(
-        scroller,
-        selection,
-        topSentinelRef.current,
-        bottomSentinelRef.current,
-        displayItemsRef.current.length,
-      ))
+      const next = nextRetainedRange(scroller, window.getSelection())
       if (next !== 'keep') retainRange(next)
     }
     document.addEventListener('selectionchange', syncSelectionRetention)
@@ -3775,7 +3769,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       document.removeEventListener('selectionchange', syncSelectionRetention)
       retainRange(null)
     }
-  }, [activeSlot, scrollerRef, retainRange, topSentinelRef, bottomSentinelRef, displayItemsRef])
+  }, [activeSlot, scrollerRef, retainRange])
 
   // Single scroll controller wiring: expose the virtualizer's follow API to
   // the early effects/handlers (declared above) via refs, and derive the
