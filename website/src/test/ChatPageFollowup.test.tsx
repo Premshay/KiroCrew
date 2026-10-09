@@ -55,6 +55,9 @@ vi.mock('../api/client', () => ({
     // an ErrorNotice (with a Retry button); an absent mock reads as a failure,
     // so answer them so the notice does not compete with the assertions below.
     chatFolders: vi.fn().mockResolvedValue([]),
+    // The composer's runtime picker reads the slot's runtimes; unanswered, it
+    // renders a second `role="alert"` beside the one under test.
+    chatSlotRuntimes: vi.fn().mockResolvedValue({ runtime_agent: '', effective_runtime_agent: '', choices: [] }),
     tagColumns: vi.fn().mockResolvedValue([]),
     // Same for the settings read behind the sidebar's folder order: unanswered,
     // it fails and the sidebar renders a second `role="alert"` beside the
