@@ -15,29 +15,78 @@ export function selectionTouchesContainer(container: HTMLElement, selection: Sel
   return container.contains(selection.anchorNode) || container.contains(selection.focusNode)
 }
 
+/** One selection endpoint, by node and by row + character offset. */
+interface RowPoint {
+  node: Node
+  offset: number
+  row: number
+  /** Characters of row text before the point; survives a re-render. */
+  chars: number
+}
+
 /** Where both endpoints of a selection last sat on transcript rows. */
 export interface SelectionEndpoints {
-  anchorNode: Node
-  anchorOffset: number
-  focusNode: Node
-  focusOffset: number
+  anchor: RowPoint
+  focus: RowPoint
+}
+
+function rowElement(container: HTMLElement, row: number): HTMLElement | null {
+  return container.querySelector<HTMLElement>(`[data-display-index="${row}"]`)
+}
+
+function rowPoint(container: HTMLElement, node: Node, offset: number): RowPoint | null {
+  const row = rowIndexFor(container, node)
+  const el = row === null ? null : rowElement(container, row)
+  if (row === null || !el) return null
+  const range = document.createRange()
+  try {
+    range.setStart(el, 0)
+    range.setEnd(node, offset)
+  } catch {
+    return null
+  }
+  return { node, offset, row, chars: range.toString().length }
+}
+
+/** The live position for `p`: its own node if still mounted, else the same
+ * character offset in its row's current text. */
+function resolvePoint(container: HTMLElement, p: RowPoint): [Node, number] | null {
+  if (p.node.isConnected && container.contains(p.node)) return [p.node, p.offset]
+  const el = rowElement(container, p.row)
+  if (!el) return null
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+  let seen = 0
+  let last: Text | null = null
+  for (let n = walker.nextNode() as Text | null; n; n = walker.nextNode() as Text | null) {
+    if (seen + n.data.length >= p.chars) return [n, p.chars - seen]
+    seen += n.data.length
+    last = n
+  }
+  return last ? [last, last.data.length] : [el, 0]
 }
 
 /** Snapshot the endpoints when both sit on rows, else null. */
 export function rowEndpoints(container: HTMLElement, selection: Selection): SelectionEndpoints | null {
   if (selection.isCollapsed || !selectedRowRange(container, selection)) return null
   const { anchorNode, anchorOffset, focusNode, focusOffset } = selection
-  return anchorNode && focusNode ? { anchorNode, anchorOffset, focusNode, focusOffset } : null
+  if (!anchorNode || !focusNode) return null
+  const anchor = rowPoint(container, anchorNode, anchorOffset)
+  const focus = rowPoint(container, focusNode, focusOffset)
+  return anchor && focus ? { anchor, focus } : null
 }
 
-/** Put an endpoint that left the transcript back where it last sat on a row.
+/** Put an endpoint that lost its transcript row back where it last sat.
  *
- * A touch handle dragged over the title or the composer can land in their
- * text, and the selection then takes everything in between. The handle goes
- * back to its own last transcript position: not a row's start or the
- * transcript's edge, which grew the selection to everything above. Only a
- * selection that has already sat on rows (`last`) is touched, so a fresh
- * long-press is never rewritten. Returns whether the selection was changed.
+ * Two ways an endpoint leaves its row while the other stays in the transcript:
+ * - a touch handle dragged over the title or the composer lands in their text;
+ * - the row holding the START is re-rendered while it is scrolled away. The
+ *   browser then parks the start between rows, and every row mounted or
+ *   unmounted above it walks it up to offset 0 of the scroller, so the
+ *   selection grew to everything from the top of the chat.
+ * The endpoint goes back to its own last position, by character offset in its
+ * row if the old node is gone: never a row's start or the transcript's edge.
+ * Only a selection that has already sat on rows (`last`) is touched, so a
+ * fresh long-press is never rewritten. Returns whether the selection changed.
  */
 export function restoreEndpointToTranscript(
   container: HTMLElement,
@@ -47,17 +96,21 @@ export function restoreEndpointToTranscript(
   if (!last || selection.isCollapsed) return false
   const { anchorNode, anchorOffset, focusNode, focusOffset } = selection
   if (!anchorNode || !focusNode) return false
-  const anchorIn = container.contains(anchorNode)
-  const focusIn = container.contains(focusNode)
-  if (anchorIn === focusIn) return false
-  if (!anchorIn) {
-    if (!last.anchorNode.isConnected) return false
-    selection.setBaseAndExtent(last.anchorNode, last.anchorOffset, focusNode, focusOffset)
-  } else {
-    if (!last.focusNode.isConnected) return false
-    selection.setBaseAndExtent(anchorNode, anchorOffset, last.focusNode, last.focusOffset)
+  const anchorOnRow = rowIndexFor(container, anchorNode) !== null
+  const focusOnRow = rowIndexFor(container, focusNode) !== null
+  if (!anchorOnRow && focusOnRow) {
+    const at = resolvePoint(container, last.anchor)
+    if (!at) return false
+    selection.setBaseAndExtent(at[0], at[1], focusNode, focusOffset)
+    return true
   }
-  return true
+  if (anchorOnRow && !container.contains(focusNode)) {
+    const at = resolvePoint(container, last.focus)
+    if (!at) return false
+    selection.setBaseAndExtent(anchorNode, anchorOffset, at[0], at[1])
+    return true
+  }
+  return false
 }
 
 /** Return the exclusive row span containing both selection endpoints.
