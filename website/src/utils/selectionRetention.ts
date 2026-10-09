@@ -15,47 +15,6 @@ export function selectionTouchesContainer(container: HTMLElement, selection: Sel
   return container.contains(selection.anchorNode) || container.contains(selection.focusNode)
 }
 
-/** Pull a dragged endpoint off the title or composer onto the nearest visible row.
- *
- * Mobile browsers can move a touch handle out of the scroller onto the chat
- * chrome, and the selection then takes the title or the composer with it. Only
- * a selection already ESTABLISHED on rows is touched: a fresh Android
- * long-press can report an off-row endpoint while it is still being built, and
- * rewriting it there selected the whole chat or cancelled the press. The
- * endpoint goes to the first or last row visible in the scroller, never the
- * transcript's edge, which grew the selection to everything above it.
- * Returns whether the selection was changed.
- */
-export function pullEndpointFromChrome(
-  container: HTMLElement,
-  selection: Selection,
-  established: boolean,
-): boolean {
-  if (!established || selection.isCollapsed) return false
-  const { anchorNode, anchorOffset, focusNode, focusOffset } = selection
-  const anchorRow = rowIndexFor(container, anchorNode)
-  const focusRow = rowIndexFor(container, focusNode)
-  if ((anchorRow === null) === (focusRow === null)) return false
-  const outside = anchorRow === null ? anchorNode : focusNode
-  if (!outside || container.contains(outside)) return false
-  const outsideEl = outside instanceof Element ? outside : outside.parentElement
-  if (!outsideEl) return false
-  const box = container.getBoundingClientRect()
-  const at = outsideEl.getBoundingClientRect()
-  const above = at.top + at.height / 2 < box.top + box.height / 2
-  const rows = Array.from(container.querySelectorAll<HTMLElement>('[data-display-index]'))
-  const visible = rows.filter((row) => {
-    const r = row.getBoundingClientRect()
-    return r.bottom > box.top && r.top < box.bottom
-  })
-  const row = above ? visible[0] : visible[visible.length - 1]
-  if (!row) return false
-  const [node, offset] = above ? [row, 0] : [row, row.childNodes.length]
-  if (anchorRow === null) selection.setBaseAndExtent(node, offset, focusNode!, focusOffset)
-  else selection.setBaseAndExtent(anchorNode!, anchorOffset, node, offset)
-  return true
-}
-
 /** Return the exclusive row span containing both selection endpoints.
  *
  * A range is intentionally returned only when both endpoints are transcript

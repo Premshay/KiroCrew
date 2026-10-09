@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
   nextRetainedRange,
-  pullEndpointFromChrome,
   selectedRowRange,
   selectionTouchesContainer,
 } from '../utils/selectionRetention'
@@ -82,51 +81,6 @@ describe('selectionRetention', () => {
       expect(nextRetainedRange(sc, null)).toBeNull()
       expect(nextRetainedRange(sc, { ...selection(text('r4'), text('r4')), isCollapsed: true } as Selection)).toBeNull()
       expect(nextRetainedRange(sc, selection(text('out'), text('out')))).toBeNull()
-    })
-  })
-
-  describe('pullEndpointFromChrome', () => {
-    // jsdom has no layout: give each element a fixed box.
-    const box = (el: Element, top: number, bottom: number) => {
-      el.getBoundingClientRect = () => ({ top, bottom, height: bottom - top, left: 0, right: 100, width: 100, x: 0, y: top, toJSON() {} }) as DOMRect
-    }
-    const build = () => {
-      document.body.innerHTML = '<p id="title">title</p><div id="sc"><div data-display-index="3"><p>above</p></div><div data-display-index="4"><p>first visible</p></div><div data-display-index="5"><p>held</p></div><div data-display-index="6"><p>last visible</p></div></div><p id="composer">draft</p>'
-      const sc = document.getElementById('sc')!
-      box(document.getElementById('title')!, 0, 40)
-      box(sc, 0, 800)
-      box(document.getElementById('composer')!, 760, 800)
-      const rows = Array.from(sc.querySelectorAll('[data-display-index]'))
-      box(rows[0], -200, -10)
-      box(rows[1], -10, 300)
-      box(rows[2], 300, 600)
-      box(rows[3], 600, 900)
-      return { sc, rows }
-    }
-
-    it('pulls a handle on the title to the first visible row, not the transcript top', () => {
-      const { sc, rows } = build()
-      const selected = selection(rows[2].firstChild!.firstChild!, document.getElementById('title')!.firstChild!)
-      expect(pullEndpointFromChrome(sc, selected, true)).toBe(true)
-      expect(selected.anchorNode).toBe(rows[2].firstChild!.firstChild)
-      expect(selected.focusNode).toBe(rows[1])
-    })
-    it('pulls a handle on the composer to the last visible row', () => {
-      const { sc, rows } = build()
-      const selected = selection(rows[2].firstChild!.firstChild!, document.getElementById('composer')!.firstChild!)
-      expect(pullEndpointFromChrome(sc, selected, true)).toBe(true)
-      expect(selected.focusNode).toBe(rows[3])
-    })
-    it('leaves a fresh long-press alone', () => {
-      const { sc, rows } = build()
-      const selected = selection(rows[2].firstChild!.firstChild!, document.getElementById('title')!.firstChild!)
-      expect(pullEndpointFromChrome(sc, selected, false)).toBe(false)
-      expect(selected.focusNode).toBe(document.getElementById('title')!.firstChild)
-    })
-    it('leaves an endpoint inside the scroller alone', () => {
-      const { sc, rows } = build()
-      const selected = selection(rows[2].firstChild!.firstChild!, sc)
-      expect(pullEndpointFromChrome(sc, selected, true)).toBe(false)
     })
   })
 })
