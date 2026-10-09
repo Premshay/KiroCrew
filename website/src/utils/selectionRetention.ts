@@ -15,6 +15,51 @@ export function selectionTouchesContainer(container: HTMLElement, selection: Sel
   return container.contains(selection.anchorNode) || container.contains(selection.focusNode)
 }
 
+/** Where both endpoints of a selection last sat on transcript rows. */
+export interface SelectionEndpoints {
+  anchorNode: Node
+  anchorOffset: number
+  focusNode: Node
+  focusOffset: number
+}
+
+/** Snapshot the endpoints when both sit on rows, else null. */
+export function rowEndpoints(container: HTMLElement, selection: Selection): SelectionEndpoints | null {
+  if (selection.isCollapsed || !selectedRowRange(container, selection)) return null
+  const { anchorNode, anchorOffset, focusNode, focusOffset } = selection
+  return anchorNode && focusNode ? { anchorNode, anchorOffset, focusNode, focusOffset } : null
+}
+
+/** Put an endpoint that left the transcript back where it last sat on a row.
+ *
+ * A touch handle dragged over the title or the composer can land in their
+ * text, and the selection then takes everything in between. The handle goes
+ * back to its own last transcript position: not a row's start or the
+ * transcript's edge, which grew the selection to everything above. Only a
+ * selection that has already sat on rows (`last`) is touched, so a fresh
+ * long-press is never rewritten. Returns whether the selection was changed.
+ */
+export function restoreEndpointToTranscript(
+  container: HTMLElement,
+  selection: Selection,
+  last: SelectionEndpoints | null,
+): boolean {
+  if (!last || selection.isCollapsed) return false
+  const { anchorNode, anchorOffset, focusNode, focusOffset } = selection
+  if (!anchorNode || !focusNode) return false
+  const anchorIn = container.contains(anchorNode)
+  const focusIn = container.contains(focusNode)
+  if (anchorIn === focusIn) return false
+  if (!anchorIn) {
+    if (!last.anchorNode.isConnected) return false
+    selection.setBaseAndExtent(last.anchorNode, last.anchorOffset, focusNode, focusOffset)
+  } else {
+    if (!last.focusNode.isConnected) return false
+    selection.setBaseAndExtent(anchorNode, anchorOffset, last.focusNode, last.focusOffset)
+  }
+  return true
+}
+
 /** Return the exclusive row span containing both selection endpoints.
  *
  * A range is intentionally returned only when both endpoints are transcript
