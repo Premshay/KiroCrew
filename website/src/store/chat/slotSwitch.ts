@@ -491,7 +491,7 @@ export function addSlotSwitchCases(builder: ActionReducerMapBuilder<ChatState>):
       // A settled older switch must not replace the transcript the NEWEST switch
       // fetched: the latest id outlives the in-flight claim (cleared above on
       // settle), so an out-of-order response for the same slot is dropped here.
-      if (state.slotSwitchLatestRequestId !== null && state.slotSwitchLatestRequestId !== action.meta?.requestId) return
+      if (state.slotSwitchLatestRequestId != null && state.slotSwitchLatestRequestId !== action.meta?.requestId) return
       const { key, messages, running, hasMore, queue, nextBefore } = action.payload
       if (isUnsafeKey(key)) return
       if (state.activeSlot !== key) return  // user switched away during fetch
@@ -661,7 +661,7 @@ export function addSlotSwitchCases(builder: ActionReducerMapBuilder<ChatState>):
       seedContextUsage(state, key, action.payload.context)
     })
     .addCase(switchSlot.rejected, (state, action) => {
-      if (state.slotSwitchLatestRequestId !== null && state.slotSwitchLatestRequestId !== action.meta?.requestId) return
+      if (state.slotSwitchLatestRequestId != null && state.slotSwitchLatestRequestId !== action.meta?.requestId) return
       // Only the CURRENT claim may unwind: a stale rejection (a newer switch
       // already took the requestId) must not fight the switch in flight.
       const target = switchSlotKey(action.meta.arg)
