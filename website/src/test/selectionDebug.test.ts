@@ -39,4 +39,10 @@ describe('selection debug trace', () => {
     const long = 'reached the title, they switched off\n\nand the title joined the selection.'
     expect(describeSelectedText(long)).toBe(`"reached the title,"…"ned the selection." ${long.length}ch`)
   })
+
+  it('hands out a new snapshot on every change, so the panel redraws', () => {
+    const before = selectionDebugEntries()
+    recordSelectionDebug({ anchor: 'row 1 #text', focus: 'row 2 #text', offsets: '1:2', retained: '1-3' })
+    expect(selectionDebugEntries()).not.toBe(before)
+  })
 })
