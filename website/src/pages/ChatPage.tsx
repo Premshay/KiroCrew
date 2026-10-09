@@ -108,6 +108,8 @@ import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { SELECTION_INERT_ATTR, useSelectionInertOverlays } from './chat/useSelectionInertOverlays'
 import { nextRetainedRange } from '../utils/selectionRetention'
+import { describeEndpoint, recordSelectionDebug, selectionDebugEnabled } from '../utils/selectionDebug'
+import SelectionDebugPanel from '../components/SelectionDebugPanel'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft } from '../utils/pasteTokens'
 import { IMG_EXT } from '../utils/fileTokens'
@@ -3760,8 +3762,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const scroller = scrollerRef.current
     if (!scroller) return
     const syncSelectionRetention = () => {
-      const next = nextRetainedRange(scroller, window.getSelection())
+      const selection = window.getSelection()
+      const next = nextRetainedRange(scroller, selection)
       if (next !== 'keep') retainRange(next)
+      if (selection && selectionDebugEnabled()) {
+        recordSelectionDebug({
+          anchor: describeEndpoint(scroller, selection.anchorNode),
+          focus: describeEndpoint(scroller, selection.focusNode),
+          offsets: `${selection.anchorOffset}:${selection.focusOffset}`,
+          retained: next === 'keep' ? 'keep' : next ? `${next.start}-${next.end}` : 'none',
+        })
+      }
     }
     document.addEventListener('selectionchange', syncSelectionRetention)
     syncSelectionRetention()
@@ -6279,6 +6290,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 textarea keeps its own native selection. */}
             <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none select-none" style={{ right: dockGutter }} data-testid="composer-dock-root" {...{ [SELECTION_INERT_ATTR]: '' }}>
               <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />
+              <SelectionDebugPanel windowRange={{ start: virt.virtualItems[0]?.index ?? 0, end: (virt.virtualItems[virt.virtualItems.length - 1]?.index ?? -1) + 1 }} />
               {/* Status chrome never claims more than half the pane. The dock
                   is anchored to the pane's bottom edge and grows upward, so an
                   opening keyboard — which shrinks the layout viewport — would
