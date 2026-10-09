@@ -34,5 +34,8 @@ describe('transcript overlays do not take a touch selection', () => {
     expect(page).toMatch(/const \{ retainRange[^}]*\} = virt/)
     expect(page).toMatch(/addEventListener\('selectionchange', syncSelectionRetention\)/)
     expect(page).toMatch(/clampSelectionToTranscript\(/)
+    expect(page).toMatch(/nextRetainedRange\(/)
+    // An endpoint on no row must not release the retained span.
+    expect(page).not.toMatch(/else retainRange\(null\)/)
   })
 })

@@ -87,3 +87,22 @@ export function selectedRowRange(
   if (anchor === null || focus === null) return null
   return { start: Math.min(anchor, focus), end: Math.max(anchor, focus) + 1 }
 }
+
+/** What the transcript's retained range should do after a selection change.
+ *
+ * `null` releases the retention; `'keep'` leaves the last retained span in
+ * place; a range replaces it. An endpoint that is inside the transcript but on
+ * no row (the scroller's padding under the composer, a spacer, a sentinel) is
+ * a transient handle position, not the end of the selection: releasing there
+ * let the virtualizer unmount the row holding the selection's start, and the
+ * browser then re-rooted the selection at the top of the transcript.
+ */
+export function nextRetainedRange(
+  container: HTMLElement,
+  selection: Selection | null,
+  clamp: (selection: Selection) => RetainedVirtualRange | null,
+): RetainedVirtualRange | 'keep' | null {
+  if (!selection || selection.isCollapsed) return null
+  if (!selectionTouchesContainer(container, selection)) return null
+  return clamp(selection) ?? 'keep'
+}
