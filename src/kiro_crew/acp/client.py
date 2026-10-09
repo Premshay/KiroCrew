@@ -6303,7 +6303,13 @@ class AcpClient:
         if msg.is_method(_CLAUDE_SDK_MESSAGE_METHOD):
             await self._handle_claude_sdk_message(msg)
             return
-        if self._claude_autonomous_origin is not None:
+        # A response to one of our own requests always belongs to the dispatch
+        # awaiting it. A prompt sent while an autonomous cycle runs is absorbed
+        # into that cycle, and its session/prompt response used to be collected
+        # here as cycle output and dropped, leaving the turn waiting until the
+        # turn ceiling.
+        is_response = msg.id is not None and msg.method is None
+        if self._claude_autonomous_origin is not None and not is_response:
             await self._collect_claude_autonomous_frame(msg)
             return
         if self._claude_dispatch_depth == 0 and self._claude_idle_handler is not None:
