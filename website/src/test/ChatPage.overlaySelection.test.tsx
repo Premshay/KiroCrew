@@ -20,6 +20,6 @@ describe('transcript overlays do not take a touch selection', () => {
     expect(page).toMatch(/ref=\{dockRef\} className="[^"]*select-none[^"]*"[^>]*data-testid="composer-dock-root"/)
   })
   it('keeps the composer textarea selectable inside the dock', () => {
-    expect(input).toMatch(/`relative block w-full select-text )
+    expect(input).toMatch(/`relative block w-full select-text /)
   })
 })
