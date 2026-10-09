@@ -180,6 +180,28 @@ class TerminalCoordinator(ManagerComponent):
         info._finalized = True
         return True
 
+    def _fire_session_ended(self, info: SubagentInfo) -> None:
+        """Tell session-end hooks this run reached a terminal state.
+
+        Skipped on gateway shutdown: those runs resume after the restart, so they
+        have not ended.
+        """
+        if self._manager._shutting_down:
+            return
+        from kiro_crew.apps.teardown import fire_session_ended
+
+        outcome = info.outcome
+        reason = {
+            "stopped": "subagent_cancelled",
+            "failed": "subagent_failed",
+        }.get(outcome, "subagent_finished")
+        fire_session_ended(
+            session_key=info.conversation_key or f"subagent:{info.id}",
+            reason=reason,
+            provider=str(getattr(info, "_session_provider", "") or ""),
+            provider_session_id=str(getattr(info, "_session_id", "") or ""),
+        )
+
     async def _report_terminal_impl(
         self,
         info: SubagentInfo,
@@ -284,6 +306,7 @@ class TerminalCoordinator(ManagerComponent):
         info.done = True
         if info._credit_accounting is not None:
             info._credit_accounting.settle()
+        self._fire_session_ended(info)
         await self._manager._fire_event(
             "subagent_done",
             info,

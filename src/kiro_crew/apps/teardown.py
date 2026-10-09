@@ -33,6 +33,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 # Module level, not deferred inside the function: these are the seams both callers'
@@ -534,10 +535,123 @@ async def notify_slot_closed(app: str, slot_key: str) -> bool:
     return True
 
 
+#: Called with a session-end event dict (see :func:`notify_session_ended`). Per app.
+SessionEndHook = Callable[[dict[str, Any]], Awaitable[None]]
+
+_SESSION_END_HOOKS: dict[str, SessionEndHook] = {}
+
+#: Longest a single app's session-end hook may run before it is abandoned.
+SESSION_END_HOOK_TIMEOUT_S = 5.0
+
+#: Strong references to in-flight fire-and-forget notifications.
+_SESSION_END_TASKS: set["asyncio.Task[None]"] = set()
+
+SESSION_END_REASONS = (
+    "user_closed",
+    "idle_archived",
+    "subagent_finished",
+    "subagent_failed",
+    "subagent_cancelled",
+)
+
+
+def register_session_end_hook(app: str, hook: SessionEndHook) -> None:
+    """Ask to be told when ANY session or subagent ends, and why.
+
+    Idempotent by app name — re-registering replaces. Same lifetime as
+    :func:`register_slot_close_hook`: process memory, re-registered from the
+    app's own watchdog. Unlike that hook this one is observational: it is not
+    scoped to the app's own slots and a failure never alters the close.
+    """
+    if app:
+        _SESSION_END_HOOKS[app] = hook
+
+
+def unregister_session_end_hook(app: str) -> None:
+    """Drop *app*'s session-end hook. Safe when nothing is registered."""
+    _SESSION_END_HOOKS.pop(app, None)
+
+
+async def _run_session_end_hook(app: str, hook: SessionEndHook, event: dict[str, Any]) -> None:
+    try:
+        await asyncio.wait_for(hook(dict(event)), timeout=SESSION_END_HOOK_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning("session-end hook for app %r timed out on %r", app, event.get("session_key"))
+    except Exception:  # noqa: BLE001 - an observer must never affect the close
+        logger.warning(
+            "session-end hook for app %r failed on %r",
+            app,
+            event.get("session_key"),
+            exc_info=True,
+        )
+
+
+async def notify_session_ended(event: dict[str, Any]) -> None:
+    """Fan *event* out to every registered session-end hook.
+
+    Never raises. Each hook runs concurrently under its own timeout, so one slow
+    or failing app cannot delay another.
+    """
+    hooks = list(_SESSION_END_HOOKS.items())
+    if not hooks:
+        return
+    try:
+        await asyncio.gather(*(_run_session_end_hook(a, h, event) for a, h in hooks))
+    except Exception:  # noqa: BLE001 - belt and braces; the gather arms already catch
+        logger.warning("session-end fan-out failed", exc_info=True)
+
+
+def session_end_identity(sessions: Any, session_key: str) -> tuple[str, str]:
+    """``(provider, provider_session_id)`` the session map holds for *session_key*.
+
+    Read in memory, so a close can capture it before it tears the session down.
+    ``("", "")`` when nothing is mapped or the lookup fails.
+    """
+    try:
+        session_map = sessions._session_map
+        provider = session_map.get_provider(session_key)
+        sid = session_map.mapped_sid(session_key)
+    except Exception:  # noqa: BLE001 - identity is best-effort metadata
+        logger.debug("session-end identity for %s unavailable", session_key, exc_info=True)
+        return "", ""
+    return (
+        provider if isinstance(provider, str) else "",
+        sid if isinstance(sid, str) else "",
+    )
+
+
+def fire_session_ended(
+    *,
+    session_key: str,
+    reason: str,
+    provider: str = "",
+    provider_session_id: str = "",
+) -> None:
+    """Build the event and deliver it in the background; never blocks the caller.
+
+    A no-op when no app registered a hook or no event loop is running.
+    """
+    if not _SESSION_END_HOOKS:
+        return
+    event = {
+        "session_key": session_key,
+        "provider": provider or "",
+        "provider_session_id": provider_session_id or "",
+        "reason": reason,
+        "ended_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        task = asyncio.get_running_loop().create_task(notify_session_ended(event))
+    except RuntimeError:
+        return
+    _SESSION_END_TASKS.add(task)
+    task.add_done_callback(_SESSION_END_TASKS.discard)
+
+
 def forget_app_hooks(app: str) -> None:
     """Drop every in-process hook *app* registered. For UNINSTALL, not disable.
 
-    The three registries above are process memory keyed by app name, and nothing
+    The registries above are process memory keyed by app name, and nothing
     dropped an entry: ``unregister_app_disable_hook``,
     ``unregister_slot_close_hook`` and ``unregister_slot_close_undo_hook`` existed
     with no caller. Uninstall already drops the app's other per-app process state
@@ -565,3 +679,4 @@ def forget_app_hooks(app: str) -> None:
     unregister_app_disable_hook(app)
     unregister_slot_close_hook(app)
     unregister_slot_close_undo_hook(app)
+    unregister_session_end_hook(app)
