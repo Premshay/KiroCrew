@@ -107,7 +107,7 @@ import TranscriptScrollShell, { useTranscriptWidth } from './chat/TranscriptScro
 import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { SELECTION_INERT_ATTR, useSelectionInertOverlays } from './chat/useSelectionInertOverlays'
-import { nextRetainedRange, pullEndpointFromChrome, selectedRowRange } from '../utils/selectionRetention'
+import { nextRetainedRange } from '../utils/selectionRetention'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft } from '../utils/pasteTokens'
 import { IMG_EXT } from '../utils/fileTokens'
@@ -3755,20 +3755,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const { retainRange } = virt
 
   // Keep the rows under a transcript selection mounted while a touch handle
-  // scrolls, so an off-screen start is not unmounted and re-rooted, and keep a
-  // handle dragged onto the title or composer on the visible transcript.
+  // scrolls, so an off-screen start is not unmounted and re-rooted.
   useEffect(() => {
     const scroller = scrollerRef.current
     if (!scroller) return
-    // Set once both endpoints have sat on rows, cleared when the selection
-    // collapses: only then is it the reader's, not a long-press being built.
-    let established = false
     const syncSelectionRetention = () => {
-      const selection = window.getSelection()
-      if (selection && pullEndpointFromChrome(scroller, selection, established)) return
-      if (!selection || selection.isCollapsed) established = false
-      else if (selectedRowRange(scroller, selection)) established = true
-      const next = nextRetainedRange(scroller, selection)
+      const next = nextRetainedRange(scroller, window.getSelection())
       if (next !== 'keep') retainRange(next)
     }
     document.addEventListener('selectionchange', syncSelectionRetention)
