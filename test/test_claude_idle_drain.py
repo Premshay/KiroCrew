@@ -259,6 +259,32 @@ class TestStretchTail:
         assert client._claude_inbox.qsize() == 2
 
     @pytest.mark.asyncio
+    async def test_a_prompt_absorbed_by_an_autonomous_cycle_still_gets_its_response(
+        self, tmp_path
+    ):
+        """chat-1979, 2026-10-09 03:42Z: a background task woke Claude between turns,
+        and an auto-nudge prompt sent during that cycle was absorbed into it. The
+        prompt's session/prompt response arrived while the cycle was still being
+        collected and was dropped, so the turn waited until the 14400 s ceiling."""
+        client = _client(tmp_path)
+        _sink(client)
+        notification = JsonRpcMessage(
+            method="_claude/sdkMessage",
+            params={
+                "sessionId": "sess-1",
+                "message": {"type": "user", "origin": {"kind": "task-notification"}},
+            },
+        )
+        await client._route_claude_frame(notification)
+        assert client._claude_autonomous_origin == "task-notification"
+
+        client._claude_dispatch_depth = 1
+        await client._route_claude_frame(JsonRpcMessage(id=7, result={"stopReason": "end_turn"}))
+
+        assert client._claude_inbox.qsize() == 1
+        assert client._claude_inbox.get_nowait().is_response_for(7)
+
+    @pytest.mark.asyncio
     async def test_text_after_a_folded_notification_opens_a_new_paragraph(self, tmp_path):
         """A notification folded into the live turn starts a new Claude message, but
         its text streams into the same reply row; without a break the two messages
