@@ -107,6 +107,22 @@ describe('selectionRetention', () => {
       expect(moved.anchorOffset).toBe(6)
       expect(moved.focusOffset).toBe(7)
     })
+    it('puts a start parked between rows back at its character in a re-rendered row', () => {
+      const sc = build()
+      const settled = selection(t('a'), t('b'))
+      settled.anchorOffset = 6
+      const last = rowEndpoints(sc, settled)
+      // The start row re-renders: same text, new nodes.
+      const row = sc.querySelector('[data-display-index="4"]')!
+      row.innerHTML = '<p>start </p><p>row text</p>'
+      const drifted = selection(sc, t('b'))
+      drifted.anchorOffset = 0
+      drifted.focusOffset = 9
+      expect(restoreEndpointToTranscript(sc, drifted, last)).toBe(true)
+      expect(drifted.anchorNode).toBe(row.firstChild!.firstChild)
+      expect(drifted.anchorOffset).toBe(6)
+      expect(drifted.focusOffset).toBe(9)
+    })
     it('leaves a fresh long-press alone', () => {
       const sc = build()
       const fresh = selection(t('a'), t('title'))
@@ -118,6 +134,8 @@ describe('selectionRetention', () => {
       const last = rowEndpoints(sc, selection(t('a'), t('b')))
       expect(restoreEndpointToTranscript(sc, selection(t('a'), t('b')), last)).toBe(false)
       expect(restoreEndpointToTranscript(sc, selection(t('title'), t('title')), last)).toBe(false)
+      // A dragged END over the scroller's padding is the reader's, not drift.
+      expect(restoreEndpointToTranscript(sc, selection(t('a'), sc), last)).toBe(false)
     })
   })
 })
