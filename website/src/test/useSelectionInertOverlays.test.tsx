@@ -36,6 +36,18 @@ describe('useSelectionInertOverlays', () => {
     expect(dock.inert).toBe(false)
   })
 
+  it('stays inert while only the focus is left in the transcript', () => {
+    stubTouch(true)
+    const { scroller, dock } = setup()
+    renderHook(() => useSelectionInertOverlays({ current: scroller }))
+    act(() => {
+      const s = document.getSelection()!
+      s.setBaseAndExtent(document.getElementById('draft')!.firstChild!, 2, document.getElementById('row')!.firstChild!, 4)
+      document.dispatchEvent(new Event('selectionchange'))
+    })
+    expect(dock.inert).toBe(true)
+  })
+
   it('leaves overlays alone for a selection outside the transcript', () => {
     stubTouch(true)
     const { scroller, dock } = setup()

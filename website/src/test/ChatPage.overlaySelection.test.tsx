@@ -11,6 +11,7 @@ import { resolve } from 'node:path'
  */
 const page = readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
 const input = readFileSync(resolve(__dirname, '../components/ChatInput.tsx'), 'utf8')
+const app = readFileSync(resolve(__dirname, '../App.tsx'), 'utf8')
 
 describe('transcript overlays do not take a touch selection', () => {
   it('marks the header overlay root select-none', () => {
@@ -21,6 +22,11 @@ describe('transcript overlays do not take a touch selection', () => {
   })
   it('keeps the composer textarea selectable inside the dock', () => {
     expect(input).toMatch(/`relative block w-full select-text /)
+  })
+  // Phone: the chat title is portaled into the shell's top bar, outside the
+  // header overlay. A start handle dragged near it landed on the title.
+  it('marks the shell top bar for selection-time inert', () => {
+    expect(app).toMatch(/className=\{`topbar topbar-glass[^`]*`\}[\s\S]{0,400}?\{\.\.\.\{ \[SELECTION_INERT_ATTR\]: '' \}\}/)
   })
   it('marks both overlays for selection-time inert', () => {
     expect(page).toMatch(/pointer-events-none select-none`\} style=\{[^}]*\}[^>]*\[SELECTION_INERT_ATTR\]/)
