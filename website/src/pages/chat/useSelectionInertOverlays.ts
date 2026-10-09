@@ -28,6 +28,13 @@ export function transcriptSelectionHeld(scroller: HTMLElement | null): boolean {
  *
  * Touch only: on desktop a selection outlives the drag, and an inert composer
  * would cost an extra click before typing.
+ *
+ * A finger on the page releases them at once. Android's selection handles are
+ * browser chrome and dispatch no touch events to the page, so a `touchstart`
+ * is the reader reaching for something, not a handle drag: without the
+ * release, the first tap on the composer or the header after selecting text
+ * fell through to the transcript and only cleared the selection. The next
+ * handle move re-applies `inert` through `selectionchange`.
  */
 export function useSelectionInertOverlays(scrollerRef: RefObject<HTMLElement | null>): void {
   const isTouch = useIsTouchDevice()
@@ -38,10 +45,15 @@ export function useSelectionInertOverlays(scrollerRef: RefObject<HTMLElement | n
       const held = transcriptSelectionHeld(scrollerRef.current)
       for (const el of overlays()) if (el.inert !== held) el.inert = held
     }
+    const release = () => {
+      for (const el of overlays()) if (el.inert) el.inert = false
+    }
     document.addEventListener('selectionchange', sync)
+    document.addEventListener('touchstart', release, { capture: true, passive: true })
     return () => {
       document.removeEventListener('selectionchange', sync)
-      for (const el of overlays()) el.inert = false
+      document.removeEventListener('touchstart', release, { capture: true })
+      release()
     }
   }, [isTouch, scrollerRef])
 }

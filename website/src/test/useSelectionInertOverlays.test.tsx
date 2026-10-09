@@ -2,6 +2,9 @@ import { describe, it, expect, afterEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { useSelectionInertOverlays, SELECTION_INERT_ATTR } from '../pages/chat/useSelectionInertOverlays'
 
+/** Parse fixture markup into nodes (the suite's no-innerHTML rule). */
+const nodes = (markup: string) => document.createRange().createContextualFragment(markup)
+
 /**
  * On touch, the transcript's overlays turn inert while a selection is held in
  * the transcript, so a handle dragged under them hit-tests the transcript
@@ -13,7 +16,7 @@ const stubTouch = (touch: boolean) => {
 }
 
 function setup() {
-  document.body.innerHTML = `<div id="sc"><p id="row">some transcript text</p></div><div id="dock" ${SELECTION_INERT_ATTR}><span id="draft">draft</span></div>`
+  document.body.replaceChildren(nodes(`<div id="sc"><p id="row">some transcript text</p></div><div id="dock" ${SELECTION_INERT_ATTR}><span id="draft">draft</span></div>`))
   return { scroller: document.getElementById('sc')!, dock: document.getElementById('dock')! }
 }
 function selectIn(id: string, from: number, to: number) {
@@ -24,7 +27,7 @@ function selectIn(id: string, from: number, to: number) {
 }
 
 describe('useSelectionInertOverlays', () => {
-  afterEach(() => { window.matchMedia = realMatchMedia; document.getSelection()?.removeAllRanges(); document.body.innerHTML = '' })
+  afterEach(() => { window.matchMedia = realMatchMedia; document.getSelection()?.removeAllRanges(); document.body.replaceChildren() })
 
   it('makes overlays inert while a transcript selection is held on touch, and restores them', () => {
     stubTouch(true)
@@ -45,6 +48,19 @@ describe('useSelectionInertOverlays', () => {
       s.setBaseAndExtent(document.getElementById('draft')!.firstChild!, 2, document.getElementById('row')!.firstChild!, 4)
       document.dispatchEvent(new Event('selectionchange'))
     })
+    expect(dock.inert).toBe(true)
+  })
+
+  it('releases the overlays on a finger touch, so the first tap reaches them', () => {
+    stubTouch(true)
+    const { scroller, dock } = setup()
+    renderHook(() => useSelectionInertOverlays({ current: scroller }))
+    act(() => selectIn('row', 0, 4))
+    expect(dock.inert).toBe(true)
+    act(() => { document.dispatchEvent(new Event('touchstart')) })
+    expect(dock.inert).toBe(false)
+    // A handle drag (no touch events) moves the selection and re-applies it.
+    act(() => selectIn('row', 0, 6))
     expect(dock.inert).toBe(true)
   })
 
