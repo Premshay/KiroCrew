@@ -633,6 +633,10 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # cookie auth and are refused before the handler's own session
         # recognition can run.
         "/api/session-ledger",
+        # MCP-only (preference_advice tool); no browser caller. Without this
+        # entry the tool's internal-secret call falls through to cookie auth
+        # and every consultation answers "Token required".
+        "/api/preference-consult",
         # MCP-only coordinator work-item operations.  The prefix covers every
         # cycle/item/archive sub-route; no browser route consumes this API.
         "/api/work-items",

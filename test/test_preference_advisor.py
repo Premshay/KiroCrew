@@ -394,3 +394,19 @@ class TestPreferenceAdvisor:
             release.set()
             await asyncio.wait_for(request.app[handler._WORK], 1)
             await pending
+
+
+def test_consult_route_is_strict_internal() -> None:
+    """The preference_advice tool authenticates with the internal secret.
+
+    Without the strict entry its call falls through to cookie auth and every
+    consultation answers "Token required"; an upstream sync dropped it once.
+    """
+    from kiro_crew.dashboard.server import (
+        _MIXED_INTERNAL_API_PATHS,
+        _STRICT_INTERNAL_API_PATHS,
+    )
+
+    path = "/api/preference-consult"
+    assert path in _STRICT_INTERNAL_API_PATHS
+    assert path not in _MIXED_INTERNAL_API_PATHS
