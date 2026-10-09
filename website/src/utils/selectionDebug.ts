@@ -47,7 +47,10 @@ export function describeEndpoint(container: HTMLElement, node: Node | null): str
   }
 }
 
-const entries: SelectionDebugEntry[] = []
+// Replaced, never mutated: `useSyncExternalStore` redraws only when the
+// snapshot's identity changes, and an in-place push left the panel frozen
+// until something else re-rendered the chat.
+let entries: readonly SelectionDebugEntry[] = []
 const listeners = new Set<() => void>()
 
 /** Record one selection change. `first` marks the first change of a new
@@ -56,9 +59,9 @@ const listeners = new Set<() => void>()
 export function recordSelectionDebug(entry: Omit<SelectionDebugEntry, 't'>, first = false): void {
   const last = entries[entries.length - 1]
   if (!first && last && last.anchor === entry.anchor && last.focus === entry.focus && last.offsets === entry.offsets && last.retained === entry.retained && last.words === entry.words) return
-  if (first) entries.length = 0
-  entries.push({ t: new Date().toISOString().slice(11, 23), ...entry })
-  if (entries.length > MAX_ENTRIES) entries.splice(1, 1)
+  const next = [...(first ? [] : entries), { t: new Date().toISOString().slice(11, 23), ...entry }]
+  if (next.length > MAX_ENTRIES) next.splice(1, 1)
+  entries = next
   for (const listener of listeners) listener()
 }
 
