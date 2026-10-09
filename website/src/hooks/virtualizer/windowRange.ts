@@ -111,6 +111,14 @@ export function useWindowState(
   return { windowRange, setWindowRange, windowRangeRef }
 }
 
+/** Whether a non-empty text selection is anchored inside `el`. */
+export function selectionHeldIn(el: HTMLElement): boolean {
+  const sel = typeof document !== 'undefined' ? document.getSelection() : null
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return false
+  const anchor = sel.anchorNode
+  return !!anchor && el.contains(anchor)
+}
+
 export interface WindowOperations {
   recomputeWindow: (expandOnly?: boolean) => void
   lastRecomputeAtRef: Ref<number>
@@ -198,7 +206,12 @@ export function useWindowOperations<T>(ctx: {
     // render-phase capture keyed on the range actually moving up (TRIGGER 2),
     // which cannot strand an anchor when this recompute's own update is merged
     // away to a no-op.
-    setWindowRange((prev) => mergeWindowRange(prev, next, expandOnly))
+    // While the reader holds a text selection inside the transcript, only
+    // MOUNT. Unmounting the row that holds the selection's anchor drops that
+    // node from the document, and the browser then re-roots the selection at
+    // an ancestor -- on touch, dragging the end handle down past the
+    // viewport turned a few lines into everything above them.
+    setWindowRange((prev) => mergeWindowRange(prev, next, expandOnly || selectionHeldIn(el)))
   }, [getH, overscan, scrollerRef, leadingOffset, itemsRef, heightIndexRef, stickRef, setWindowRange])
 
   // Ensure `index` is mounted (in the window) so callers can scroll to an
