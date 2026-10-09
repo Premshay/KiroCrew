@@ -27,4 +27,12 @@ describe('transcript overlays do not take a touch selection', () => {
     expect(page).toMatch(/data-testid="composer-dock-root" \{\.\.\.\{ \[SELECTION_INERT_ATTR\]: '' \}\}/)
     expect(page).toMatch(/useSelectionInertOverlays\(scrollerRef\)/)
   })
+  // Fork contract (e5af29d41 / 68ebc7801): the 7333edadf upstream reconcile
+  // dropped this wiring once, and an off-screen selection start then grew to
+  // everything above it. Keep the rows under a touch selection mounted.
+  it('wires the transcript selection to the virtualizer retained range', () => {
+    expect(page).toMatch(/const \{ retainRange[^}]*\} = virt/)
+    expect(page).toMatch(/addEventListener\('selectionchange', syncSelectionRetention\)/)
+    expect(page).toMatch(/clampSelectionToTranscript\(/)
+  })
 })
