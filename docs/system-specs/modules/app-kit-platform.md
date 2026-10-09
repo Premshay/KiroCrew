@@ -1224,6 +1224,18 @@ update correctness depends on it is broken, and the fix is an idempotent
 Writers: `apps/routes.py::handle_uninstall_app`, `_deregister_crons_with_retry`,
 `_run_lifecycle_script`; `apps/manager.py::uninstall_app`.
 
+### Session-end hook
+
+`apps.teardown.register_session_end_hook(app, hook)` (`async def hook(event: dict)`)
+tells an app when ANY session or subagent ends, not only its own slots. Events carry
+`session_key`, `provider`, `provider_session_id` (`""` when unknown), `reason`
+(`user_closed`, `idle_archived`, `subagent_finished`, `subagent_failed`,
+`subagent_cancelled`) and `ended_at` (UTC ISO-8601). Fired as a background task from the
+slot close, the idle-archive sweep and the subagent terminal report; never on gateway
+shutdown, and never when a replacement slot took over the key. Hooks run concurrently
+under a short timeout, failures are logged and swallowed, and `forget_app_hooks` clears
+the registration. Re-register from the app's watchdog: the registry is process memory.
+
 ## 11. Dependencies are reference-counted, and only sole ownership is removable
 
 `~/.kiro/crew/dependency-ledger.json` records which apps caused which capability

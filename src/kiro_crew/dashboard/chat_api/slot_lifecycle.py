@@ -619,6 +619,12 @@ async def _close_slot(
 
     closing_key = effective_session_key(slot)
     closing_execution = read_live_session_execution(closing_key)
+    from kiro_crew.apps.teardown import (
+        fire_session_ended,  # circular: apps.teardown -> apps.bridges -> dashboard
+        session_end_identity,
+    )
+
+    ended_provider, ended_sid = session_end_identity(state.sessions, closing_key)
     # Retire the auto-nudge loop BEFORE the awaits below, so no nudge can expire
     # into the session being closed and resurrect it. See
     # _retire_slot_nudge_loop for why disarming alone does not hold.
@@ -929,6 +935,12 @@ async def _close_slot(
         state.push_slot_removed(name)
         # Committed, so the conductor may be told now and not before.
         await _wake_conductor_for_closed_worker(name)
+        fire_session_ended(
+            session_key=closing_key,
+            reason="user_closed",
+            provider=ended_provider,
+            provider_session_id=ended_sid,
+        )
     # The app was already told, and compensated if the persist above failed — see
     # the notify block before the pop and the rollback in the except branch.
     # Kill the per-tab session to free resources. Re-check identity ONE more
@@ -1143,6 +1155,12 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
         if not removed:
             candidate.cancel_close()
             continue
+        from kiro_crew.apps.teardown import (
+            fire_session_ended,  # circular: apps.teardown -> apps.bridges -> dashboard
+            session_end_identity,
+        )
+
+        ended_provider, ended_sid = session_end_identity(state.sessions, closing_key)
         # Same tombstone as the single-tab close: the archive pass must not
         # race a concurrent channel reconcile into resurrecting the slot. Its
         # instant is persisted as closed_at for the same teardown-window
@@ -1291,6 +1309,12 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
         else:
             _release_closed_execution(state, removed, closing_key, closing_execution)
         archived.append(name)
+        fire_session_ended(
+            session_key=closing_key,
+            reason="idle_archived",
+            provider=ended_provider,
+            provider_session_id=ended_sid,
+        )
         # Collect running tasks for concurrent cancellation after the loop
         if removed.running and removed.task is not None:
             removed.task.cancel()
