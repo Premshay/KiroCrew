@@ -33,8 +33,10 @@ describe('transcript overlays do not take a touch selection', () => {
   it('wires the transcript selection to the virtualizer retained range', () => {
     expect(page).toMatch(/const \{ retainRange[^}]*\} = virt/)
     expect(page).toMatch(/addEventListener\('selectionchange', syncSelectionRetention\)/)
-    // Read-only: rewriting the selection broke the first Android long-press.
+    // Rewriting a fresh long-press broke the first Android selection: only an
+    // established selection may be pulled off the chrome.
     expect(page).not.toMatch(/clampSelectionToTranscript|setBaseAndExtent/)
+    expect(page).toMatch(/pullEndpointFromChrome\(scroller, selection, established\)/)
     expect(page).toMatch(/nextRetainedRange\(/)
     // An endpoint on no row must not release the retained span.
     expect(page).not.toMatch(/else retainRange\(null\)/)
