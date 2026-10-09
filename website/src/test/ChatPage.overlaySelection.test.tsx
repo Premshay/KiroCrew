@@ -19,7 +19,9 @@ describe('transcript overlays do not take a touch selection', () => {
   it('marks the composer dock root select-none', () => {
     expect(page).toMatch(/ref=\{dockRef\} className="[^"]*select-none[^"]*"[^>]*data-testid="composer-dock-root"/)
   })
-  it('keeps the composer textarea selectable inside the dock', () => {
-    expect(input).toMatch(/`relative block w-full select-text /)
+  // Selectable only while focused: an unfocused draft must not catch a handle
+  // dragged down from the transcript.
+  it('keeps the composer textarea selectable inside the dock while focused', () => {
+    expect(input).toMatch(/`relative block w-full select-none focus:select-text /)
   })
 })
