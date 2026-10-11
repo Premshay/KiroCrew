@@ -3553,7 +3553,7 @@ def _infer_source(session_key: str) -> str:
         return "subagent"
     if session_key.startswith("taskrunner"):
         return "taskrunner"
-    if session_key == "_bg":
+    if session_key in ("_bg", "_consolidate"):
         return "background"
     if session_key == "_hb":
         return "heartbeat"

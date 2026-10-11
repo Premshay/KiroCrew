@@ -581,6 +581,7 @@ _STATELESS_PREFIXES = (
 # agent without forcing other background callers (chat-title, consolidator,
 # taskkeeper) to load the same MCP servers.
 BACKGROUND_KEY = "_bg"
+CONSOLIDATE_KEY = "_consolidate"
 # Kiro agent the background session runs as. Named once because it is needed in
 # TWO places — the provider factory call AND the ``_Session`` record — and when
 # only the factory got it, ``_Session.agent`` stayed at its "" default, so every
@@ -1287,6 +1288,7 @@ class SessionManager:
             circuit_breaker_threshold=_CIRCUIT_BREAKER_THRESHOLD,
             agent_model_cache_ttl=lambda: _AGENT_MODEL_CACHE_TTL,
             background_key=BACKGROUND_KEY,
+            consolidate_key=CONSOLIDATE_KEY,
             heartbeat_key=HEARTBEAT_KEY,
             background_agent=BACKGROUND_AGENT,
             subagent_prefix=_SUBAGENT_PREFIX,
@@ -1381,6 +1383,7 @@ class SessionManager:
             constants=lambda: SessionLifecycleConstants(
                 max_pool=_MAX_POOL,
                 background_key=BACKGROUND_KEY,
+                consolidate_key=CONSOLIDATE_KEY,
                 stateless_prefixes=_STATELESS_PREFIXES,
                 close_all_concurrency=_CLOSE_ALL_CONCURRENCY,
                 drain_active_turns_timeout_secs=_DRAIN_ACTIVE_TURNS_TIMEOUT_SECS,
@@ -2621,9 +2624,17 @@ class SessionManager:
         cache[agent] = (model, dir_mtime, now)
         return model
 
-    async def recycle_background(self, *, context_overflowed: bool = False) -> None:
+    async def recycle_background(
+        self,
+        *,
+        context_overflowed: bool = False,
+        session_key: str | None = None,
+        agent: str | None = None,
+    ) -> None:
         """Delegate context-driven background-provider recycling."""
-        await self._background_runtime.recycle_background(context_overflowed=context_overflowed)
+        await self._background_runtime.recycle_background(
+            context_overflowed=context_overflowed, session_key=session_key, agent=agent
+        )
 
     async def recycle_heartbeat(self) -> None:
         """Delegate cycle-scoped heartbeat-provider recycling."""

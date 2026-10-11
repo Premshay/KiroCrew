@@ -669,6 +669,7 @@ class SessionLifecycleConstants:
 
     max_pool: int
     background_key: str
+    consolidate_key: str
     stateless_prefixes: tuple[str, ...]
     close_all_concurrency: int
     drain_active_turns_timeout_secs: float
@@ -2871,6 +2872,7 @@ class SessionLifecycleService:
                         sid
                         and not sess.provider_switch_replay
                         and key != constants.background_key
+                        and key != constants.consolidate_key
                         and (
                             not any(
                                 key.startswith(prefix) for prefix in constants.stateless_prefixes
@@ -2893,6 +2895,7 @@ class SessionLifecycleService:
                     if (
                         sid
                         and key != constants.background_key
+                        and key != constants.consolidate_key
                         and (
                             not any(
                                 key.startswith(prefix) for prefix in constants.stateless_prefixes

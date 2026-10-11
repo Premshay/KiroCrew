@@ -105,6 +105,11 @@ class TestTheTwoVocabulariesAreDifferentSets:
 
 
 class TestSpendKeepsTheSessionKeyAuthoritative:
+    def test_consolidation_spend_stays_in_background(self, store):
+        store([_row(slot="_consolidate", surface="bg:consolidation", credits=3.0)])
+        assert usage_mod.session_category("_consolidate") == "bg"
+        assert [row["name"] for row in usage_mod.cost_breakdown(days=1)["by_category"]] == ["bg"]
+
     def test_a_row_claiming_monitor_stays_booked_to_the_conversation_it_nudged(self, store):
         """The ruling's sharpest case, as an assertion.
 

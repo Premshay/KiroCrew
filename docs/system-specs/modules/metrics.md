@@ -1218,6 +1218,11 @@ from fields the row store already carries — no new instrumentation:
 | `conversations` | EVERY session in the window (not a top-N), each with its `category`, the unollapsed `channel` beneath it, peak occupancy, span, per-turn growth rate, and a projected turns-to-compaction. Named `conversations` for payload compatibility; the entity is a session |
 | `by_category` | same shape as `by_model`, keyed by `usage.session_category(slot)` — the taxonomy the panel groups by: `bg` for an unattended session (cron, heartbeat, task runner), otherwise the transport (`dashboard`, `telegram`, `slack`, …) |
 
+The exact singleton `_consolidate` has telemetry
+channel `consolidation` and Spend category `bg`; similarly prefixed keys remain
+`other`. Its background-turn row surface is `bg:consolidation`, a separate
+dimension from the session's telemetry channel.
+
 **Channel comes from the slot key, not from `surface`.** New writes now derive
 `surface` from the effective session identity, but historical rows may contain a
 wrong, non-empty value (for example a Telegram turn stamped `dashboard`). The

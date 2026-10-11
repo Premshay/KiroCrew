@@ -349,6 +349,22 @@ do their work, and release — the process stays warm.
 
 ### Context Overflow Protection
 
+History extraction uses `CONSOLIDATE_KEY = "_consolidate"`, created lazily with
+`kirocrew-lite`, so its long turns cannot hold the `_bg` semaphore used by cheap
+judges and lightweight jobs. It uses the existing session admission, ownership,
+memory and lifecycle paths. It is stateless for native resume and warm-pool
+allocation, but a live provider retains context between turns. It is outside
+`_PERSISTENT_KEYS`: idle cleanup can reclaim it under the configured timeout,
+while its held turn semaphore protects active extraction.
+
+`background_turn` releases and accounts against its selected key, then applies
+the existing recycling policy to that key's provider and extraction agent.
+Recycling can briefly overlap the provider with its replacement. Private V2
+memory keeps its per-store session and cleanup path. `_consolidate` has SEL and
+governance surface `background`; without a bound profile its unproven singleton
+identity is denied just like `_bg`. Telemetry labels it `consolidation`, while
+Spend groups it under `bg`.
+
 `recycle_background()` is called after every background task completes.
 It checks context usage and **recycles** (kill + fresh spawn) the session
 if needed — no compaction, since background tasks are stateless:

@@ -1435,6 +1435,24 @@ log.flush()
 
 
 class TestInferSource:
+    def test_consolidation_uses_background_governance(self, tmp_path, monkeypatch):
+        import json
+
+        from kiro_crew.platform import governance_profiles as gp
+
+        monkeypatch.setattr(gp, "_PROFILES_DIR", tmp_path)
+        gp.reset_store()
+        try:
+            assert gp.resolve_active_scope("_consolidate").name == "_deny_all:background"
+            (tmp_path / "extraction.json").write_text(json.dumps({
+                "name": "extraction", "bind": {"type": "surface", "id": "background"},
+                "tools": {"mode": "deny"},
+            }), encoding="utf-8")
+            gp.reset_store()
+            assert gp.resolve_active_scope("_consolidate").name == "extraction"
+        finally:
+            gp.reset_store()
+
     @pytest.mark.parametrize("key,expected", [
         ("dashboard:slot0", "dashboard"),
         ("dashboard:slot5", "dashboard"),
@@ -1448,6 +1466,8 @@ class TestInferSource:
         ("subagent:abc", "subagent"),
         ("taskrunner:spec1", "taskrunner"),
         ("_bg", "background"),
+        ("_consolidate", "background"),
+        ("_consolidate:other", "slack"),
         ("cli_chat", "cli"),
         # Namespaced messaging channels are attributed to their transport,
         # matching context._runtime_display_name's set — via ``{ns}:`` …

@@ -48,6 +48,9 @@ class TestTelemetryChannelOf:
     def test_singleton_sessions(self):
         assert telemetry_channel_of("_bg") == "background"
         assert telemetry_channel_of("_hb") == "heartbeat"
+        assert telemetry_channel_of("_consolidate") == "consolidation"
+        assert telemetry_channel_of("_consolidate:other") == "other"
+        assert telemetry_channel_of("_consolidateXYZ") == "other"
 
     def test_missing_key_is_unknown(self):
         assert telemetry_channel_of(None) == "unknown"

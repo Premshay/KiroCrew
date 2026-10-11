@@ -21,6 +21,7 @@ from kiro_crew.messaging.link import ChannelLink
 from kiro_crew.session import (
     _BG_BLIND_RECYCLE_PROMPTS,
     BACKGROUND_KEY,
+    CONSOLIDATE_KEY,
     SessionClosingError,
     SessionEndingError,
     SessionManager,
@@ -104,6 +105,177 @@ def _alive_provider_factory():
         return m
 
     return factory
+
+
+class TestConsolidationIsolation:
+    @pytest.mark.asyncio
+    async def test_idle_expiry_and_recreation_never_resume(self, cfg, monkeypatch):
+        from kiro_crew.providers.acp import AcpProvider
+
+        factory = _mock_provider_factory()
+
+        def acp_factory(*args, **kwargs):
+            provider = factory(*args, **kwargs)
+            provider.__class__ = AcpProvider
+            provider.client = MagicMock(_session_id="native-extraction", resumed=False)
+            provider.cwd = ""
+            return provider
+
+        mgr = SessionManager(cfg, provider_factory=acp_factory)
+        read_map = MagicMock(return_value="old-extraction")
+        write_map = MagicMock()
+        monkeypatch.setattr(mgr._session_map, "get", read_map)
+        monkeypatch.setattr(mgr._session_map, "set", write_map)
+        try:
+            first, _, resumed = await mgr.get_or_create(CONSOLIDATE_KEY, agent="kirocrew-lite")
+            assert not resumed
+            mgr.release(CONSOLIDATE_KEY)
+            mgr._sessions[CONSOLIDATE_KEY].last_used = float("-inf")
+            await mgr._expire_idle(60)
+            assert CONSOLIDATE_KEY not in mgr._sessions
+            first.shutdown.assert_awaited_once()
+            second, is_new, resumed = await mgr.get_or_create(
+                CONSOLIDATE_KEY, agent="kirocrew-lite"
+            )
+            mgr.release(CONSOLIDATE_KEY)
+            assert second is not first
+            assert is_new and not resumed
+        finally:
+            await mgr.close_all()
+        read_map.assert_not_called()
+        write_map.assert_not_called()
+        second.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_active_extraction_survives_idle_cleanup(self, cfg):
+        from kiro_crew.llm_helpers import background_turn
+
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        try:
+            async with background_turn(mgr, task="consolidation", session_key=CONSOLIDATE_KEY):
+                session = mgr._sessions[CONSOLIDATE_KEY]
+                session.last_used = float("-inf")
+                await mgr._expire_idle(60)
+                assert mgr._sessions[CONSOLIDATE_KEY] is session
+                session.provider.shutdown.assert_not_awaited()
+            session.last_used = float("-inf")
+            await mgr._expire_idle(60)
+            assert CONSOLIDATE_KEY not in mgr._sessions
+            session.provider.shutdown.assert_awaited_once()
+        finally:
+            await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_extraction_releases_its_lease(self, cfg):
+        from kiro_crew.llm_helpers import background_turn
+
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        entered = asyncio.Event()
+        hold = asyncio.Event()
+
+        async def extraction():
+            async with background_turn(mgr, task="consolidation", session_key=CONSOLIDATE_KEY):
+                entered.set()
+                await asyncio.wait_for(hold.wait(), 10)
+
+        turn = asyncio.create_task(extraction())
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            provider = mgr._sessions[CONSOLIDATE_KEY].provider
+            turn.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(turn, 10)
+            assert not mgr._sessions[CONSOLIDATE_KEY].semaphore.locked()
+            reused, is_new, _ = await asyncio.wait_for(mgr.get_or_create(CONSOLIDATE_KEY), 10)
+            assert reused is provider and not is_new
+            mgr.release(CONSOLIDATE_KEY)
+        finally:
+            turn.cancel()
+            await asyncio.wait_for(asyncio.gather(turn, return_exceptions=True), 10)
+            await mgr.close_all()
+        provider.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_recycles_own_provider_and_counts_turns(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        try:
+            background, _, _ = await mgr.get_or_create(BACKGROUND_KEY)
+            mgr.release(BACKGROUND_KEY)
+            extraction, _, _ = await mgr.get_or_create(CONSOLIDATE_KEY, agent="kirocrew-lite")
+            mgr.release(CONSOLIDATE_KEY)
+            await mgr.recycle_background(session_key=CONSOLIDATE_KEY, agent="kirocrew-lite")
+            assert mgr._sessions[CONSOLIDATE_KEY].prompt_count == 1
+            assert mgr._sessions[BACKGROUND_KEY].prompt_count == 0
+            extraction.context_usage_pct = lambda: 75.0
+            await mgr.recycle_background(session_key=CONSOLIDATE_KEY, agent="kirocrew-lite")
+            assert mgr._sessions[CONSOLIDATE_KEY].provider is not extraction
+            extraction.shutdown.assert_awaited_once()
+            assert mgr._sessions[BACKGROUND_KEY].provider is background
+            background.shutdown.assert_not_awaited()
+        finally:
+            await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_extraction_does_not_hold_background_dispatch(self, cfg, monkeypatch):
+        from kiro_crew.history_consolidation import HistoryConsolidator
+        from kiro_crew.llm_helpers import background_turn
+
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        extraction_entered = asyncio.Event()
+        finish_extraction = asyncio.Event()
+        microjob_entered = asyncio.Event()
+        background_waiter = asyncio.Event()
+
+        class ObservedSemaphore(asyncio.BoundedSemaphore):
+            async def acquire(self):
+                if self.locked():
+                    background_waiter.set()
+                return await super().acquire()
+
+        async def extraction(client, prompt, **kwargs):
+            client.last_prompt_stats = AcpPromptStats()
+            extraction_entered.set()
+            await asyncio.wait_for(finish_extraction.wait(), 10)
+            return {"history_entry": ""}
+
+        async def microjob():
+            async with background_turn(mgr, task="maintenance") as client:
+                client.last_prompt_stats = AcpPromptStats()
+                microjob_entered.set()
+
+        monkeypatch.setattr("kiro_crew.history.stream_and_collect_json", extraction)
+        await mgr.get_or_create(BACKGROUND_KEY)
+        mgr.release(BACKGROUND_KEY)
+        mgr._sessions[BACKGROUND_KEY].semaphore = ObservedSemaphore(1)
+        consolidator = HistoryConsolidator(MagicMock(), MagicMock(), sessions=mgr)
+        long_turn = asyncio.create_task(consolidator._call_llm("extract transcript"))
+        short_turn = None
+        witnesses = []
+        try:
+            await asyncio.wait_for(extraction_entered.wait(), 10)
+            short_turn = asyncio.create_task(microjob())
+            witnesses = [
+                asyncio.create_task(microjob_entered.wait()),
+                asyncio.create_task(background_waiter.wait()),
+            ]
+            await asyncio.wait_for(asyncio.wait(witnesses, return_when=asyncio.FIRST_COMPLETED), 10)
+            assert microjob_entered.is_set(), "maintenance queued on extraction's _bg semaphore"
+            assert not background_waiter.is_set()
+            assert not long_turn.done()
+        finally:
+            finish_extraction.set()
+            for witness in witnesses:
+                witness.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(
+                    long_turn,
+                    *([short_turn] if short_turn else []),
+                    *witnesses,
+                    return_exceptions=True,
+                ),
+                10,
+            )
+            await mgr.close_all()
 
 
 class TestSessionManager:

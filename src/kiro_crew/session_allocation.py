@@ -117,6 +117,7 @@ class AllocationConstants:
     circuit_breaker_threshold: int
     agent_model_cache_ttl: Callable[[], float]
     background_key: str
+    consolidate_key: str
     heartbeat_key: str
     background_agent: str
     subagent_prefix: str
@@ -2314,7 +2315,7 @@ class SessionAllocationService:
 
         resume_sid: str | None = None
         is_stateless = (
-            key in (constants.background_key, constants.heartbeat_key)
+            key in (constants.background_key, constants.heartbeat_key, constants.consolidate_key)
             or any(key.startswith(prefix) for prefix in constants.stateless_prefixes)
         ) and not owner._is_continuable_key(key)
         if not is_stateless:
