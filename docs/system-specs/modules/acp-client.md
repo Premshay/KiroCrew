@@ -3198,3 +3198,29 @@ in the gateway's own environment (for a systemd user unit,
 `Environment=CODEX_SQLITE_HOME=%h/.codex` in a drop-in) gets the shared index
 with no seed, and gives up the isolation from other `codex app-server`
 processes that this section exists for.
+
+
+### Native adapter compaction lifecycle
+
+Only Codex and Claude advertise `session.compaction = {}` through
+`ACP_BACKENDS_NATIVE_COMPACTION`; kiro-cli, KAS and other backends keep their
+existing capabilities. No AIR capability is added. Both transports translate
+native `compaction_update` frames into the existing compaction events.
+`in_progress` starts the lifecycle; `completed` resets context counts; `failed`
+preserves counts and uses the existing failure-reason classifier and bounded
+post-failure wait. `cancelled` closes silently, without a verdict or count reset.
+Terminal-only frames are accepted. `NativeCompactionStates` retains only the
+last lifecycle ID (bounded to 128 characters) and status to suppress repeated
+frames and late starts for that ID. It does not track overlapping lifecycles.
+Unknown statuses and summary chunks are ignored; older adapters retain Codex
+marker pairs and Claude text notices.
+
+Claude native pending state is separate from Codex pending state;
+`ACP_BACKENDS_COMPACTION_COMPLETES_ON_END_TURN` names its settlement rule. A dangling
+Claude start settles with synthesized completion only on `end_turn`, using
+Claude's existing automatic-compaction semantics; other endings close silently.
+Codex retains its missing-terminal failure semantics. Explicit native terminals
+prevent another verdict at turn end. Installed Claude ACP 0.84.0 source routes
+`compact_boundary` to native completion followed by `usage_update`; this path
+and the dangling-start compatibility path have deterministic fixture coverage.
+No live Claude automatic-compaction capture is claimed.

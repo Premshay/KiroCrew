@@ -141,12 +141,19 @@ extension without a published contract. What the code relies on, per backend:
 - KAS: `summarization_started/completed/failed` session-info frames map to
   `compaction_status`; `/compact` and `/clear` are plain prompt text there,
   which is why the command path pre-invalidates instead of waiting.
-- claude-agent-acp: the adapter announces a compaction with a `Compacting`
-  started text but emits `completed` only for a manual `/compact`; an
-  automatic mid-turn compaction leaves that started dangling (only a
-  `usage_update` follows), and `AcpClient` synthesizes the `completed`
-  `compaction_status` at the turn's `end_turn` terminal. This is a heuristic on
-  adapter text output, the weakest of the three.
+- Codex ACP 2.0.0 and Claude ACP 0.84.0: negotiate
+  `clientCapabilities.session.compaction = {}` (only these two backends) and
+  translate native `compaction_update` frames by `compactionId`. `in_progress`
+  becomes started; completed resets context counts; failed preserves them;
+  cancelled closes the lifecycle silently and preserves them.
+  Repeated frames and late starts for the last lifecycle ID produce no duplicate notice.
+  Claude terminal-only boundary frames are accepted. A dangling native Claude
+  start uses its existing automatic-compaction settlement: completed only at
+  `end_turn`, silently closed on other endings. Codex keeps its missing-terminal
+  failure semantics. Unknown status values and
+  summary chunks are ignored. Older adapters retain their marked Codex tool
+  pairs and Claude text notices. This capability does not opt into AIR or alter
+  tool-output delivery.
 
 History loss without any observed invalidation is not detected by the receipt:
 unchanged warm turns can continue omitting the snapshot until another invalidation,

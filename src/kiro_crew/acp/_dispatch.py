@@ -1184,6 +1184,62 @@ class BackgroundLaunchRecord:
 _CODEX_COMPACTION_META_KEY = "contextCompaction"
 
 
+#: Adapter-authored IDs are bounded before retention.
+NATIVE_COMPACTION_ID_MAX_CHARS = 128
+NATIVE_COMPACTION_CANCELLED = "cancelled"
+
+
+@dataclass
+class NativeCompactionStates:
+    """Last native lifecycle only; suppress repeats within that lifecycle."""
+
+    compaction_id: str = ""
+    status: str | None = None
+
+    def get(self, compaction_id: str) -> str | None:
+        if compaction_id[:NATIVE_COMPACTION_ID_MAX_CHARS] == self.compaction_id:
+            return self.status
+        return None
+
+    def record(self, compaction_id: str, status: str) -> None:
+        self.compaction_id = compaction_id[:NATIVE_COMPACTION_ID_MAX_CHARS]
+        self.status = status
+
+
+def parse_native_compaction_update(
+    update: dict[str, Any], states: NativeCompactionStates
+) -> str | None:
+    """Translate an ACP ``compaction_update`` frame, or ``None``.
+
+    Returns ``started``/``completed``/``failed`` (the shared status vocabulary) or
+    :data:`NATIVE_COMPACTION_CANCELLED`, which is a lifecycle close and never an
+    event. ``None`` for anything else, and for a repeat or a late start.
+    """
+    if update.get("sessionUpdate") != "compaction_update":
+        return None
+    compaction_id = update.get("compactionId")
+    status = update.get("status")
+    if not isinstance(compaction_id, str) or not compaction_id:
+        return None
+    translated = (
+        {
+            "in_progress": "started",
+            "completed": "completed",
+            "failed": "failed",
+            "cancelled": NATIVE_COMPACTION_CANCELLED,
+        }.get(status)
+        if isinstance(status, str)
+        else None
+    )
+    if translated is None:
+        return None
+    previous = states.get(compaction_id)
+    if previous is not None and (previous != "started" or translated == previous):
+        return None
+    states.record(compaction_id, translated)
+    return translated
+
+
 def parse_codex_compaction_update(update: dict[str, Any]) -> str | None:
     """Classify a codex-acp context-compaction frame, or ``None``.
 

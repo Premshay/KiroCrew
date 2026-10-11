@@ -164,6 +164,10 @@ with no row here.
      - pre-session registry query (whether the dashboard may skip a session reset)
    * - ``ACP_BACKENDS_STRUCTURED_REFUSAL``
      - driver-internal (whether the metadata refusal parser is consulted)
+   * - ``ACP_BACKENDS_NATIVE_COMPACTION``
+     - driver-internal (whether ``initialize`` advertises ``session.compaction``)
+   * - ``ACP_BACKENDS_COMPACTION_COMPLETES_ON_END_TURN``
+     - driver-internal (whether a dangling compaction completes on ``end_turn``)
    * - ``ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR``
      - driver-internal (whether an adapter-authored text chunk that ends a turn
        is the turn's provider failure rather than an answer)
@@ -1352,6 +1356,11 @@ ACP_BACKENDS_INLINE_COMPACTION = frozenset(
         ACP_BACKEND_GOOSE,
     }
 )
+
+# Native compaction updates are negotiated only on adapters that emit them.
+ACP_BACKENDS_NATIVE_COMPACTION = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX})
+
+ACP_BACKENDS_COMPACTION_COMPLETES_ON_END_TURN = frozenset({ACP_BACKEND_CLAUDE})
 
 # Backends carrying their OWN internal OS sandbox, which on macOS cannot nest
 # inside Kiro Crew's seatbelt (kernel EPERM) — so ``sandbox.wrap_argv`` skips

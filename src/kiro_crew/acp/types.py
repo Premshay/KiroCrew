@@ -27,6 +27,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_CLIENT_META_SETTINGS,
     ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_COMPACTION_COMPLETES_ON_END_TURN,
     ACP_BACKENDS_CONTEXT_RECYCLE,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
@@ -46,6 +47,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_MEMBER_PANEL,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_NATIVE_COMPACTION,
     ACP_BACKENDS_OPEN_EXTERNAL_URL,
     ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL,
     ACP_BACKENDS_POD_HOME_REMAP,
@@ -269,6 +271,19 @@ ACP_CLIENT_CAPABILITIES: dict = {
 # filter string (``clientApp/kirocrew``, ``acp-client/kirocrew``) finds Crew on both.
 KIRO_CLI_CLIENT_APPLICATION_ENV = "KIRO_CLI_CLIENT_APPLICATION"
 KIRO_CLI_CLIENT_APPLICATION = "kirocrew"
+# Negotiate native frames only on adapters whose transport handles them.
+ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION: dict = {
+    **ACP_CLIENT_CAPABILITIES,
+    "session": {"compaction": {}},
+}
+
+
+def acp_client_capabilities(backend: str | None) -> dict:
+    """The ``clientCapabilities`` the standalone transport sends for ``backend``."""
+    if backend in ACP_BACKENDS_NATIVE_COMPACTION:
+        return ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION
+    return ACP_CLIENT_CAPABILITIES
+
 
 # ── ACP Backend Identifiers ──
 # DEFINED in :mod:`kiro_crew.acp_backends` and re-exported from the import block

@@ -260,6 +260,8 @@ def _bare_client(backend: str = ACP_BACKEND_CODEX) -> AcpClient:
     client = AcpClient.__new__(AcpClient)
     client._acp_backend = backend
     client._codex_compaction_pending = False
+    client._claude_compaction_pending = False
+    client._claude_native_compaction_pending = False
     client._compaction_failed_at = None
     client.last_prompt_stats = AcpPromptStats()
     return client
@@ -557,6 +559,7 @@ def _bare_handle(backend: str = ACP_BACKEND_CODEX) -> Any:
     handle._runtime = SimpleNamespace(acp_backend=backend)
     handle._session_id = "s-1"
     handle._codex_compaction_pending = False
+    handle._claude_native_compaction_pending = False
     handle._compaction_failed_at = None
     handle.last_prompt_stats = AcpPromptStats()
     return handle
@@ -831,3 +834,276 @@ def _stub_provider(impl: Any, backend: str) -> Any:
     if "self.backend" in source:
         stub.backend = backend  # type: ignore[attr-defined]
     return stub
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CODEX, ACP_BACKEND_CLAUDE])
+@pytest.mark.parametrize("transport", ["client", "runtime"])
+def test_native_compaction_lifecycle(backend: str, transport: str) -> None:
+    target = _bare_client(backend) if transport == "client" else _bare_handle(backend)
+
+    def deliver(status: str, identity: str = "native-1"):
+        update = {"sessionUpdate": "compaction_update", "compactionId": identity, "status": status}
+        payload = _update_msg(update) if transport == "client" else update
+        return target._codex_compaction_event(payload)
+
+    assert deliver("future_status") is None
+    assert deliver("in_progress").text == "started"
+    assert deliver("in_progress") is None
+    assert deliver("completed").text == "completed"
+    assert target.last_prompt_stats.context_pct_unknown
+    assert target._settle_claude_compaction(STOP_REASON_END_TURN) is None
+    assert target._settle_codex_compaction(STOP_REASON_END_TURN) is None
+    assert deliver("completed") is None
+    assert deliver("in_progress") is None
+    assert deliver("completed", "terminal-only").text == "completed"
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CODEX, ACP_BACKEND_CLAUDE])
+@pytest.mark.parametrize("transport", ["client", "runtime"])
+def test_native_compaction_failure_preserves_counts(backend: str, transport: str) -> None:
+    target = _bare_client(backend) if transport == "client" else _bare_handle(backend)
+    target.last_prompt_stats.context_pct_unknown = False
+    target.last_prompt_stats.context_used_tokens = 170000
+    target.last_prompt_stats.context_window_tokens = 200000
+    target.last_prompt_stats.context_tokens_from_usage = True
+    update = {
+        "sessionUpdate": "compaction_update",
+        "compactionId": "failure",
+        "status": "failed",
+        "error": "context too large",
+    }
+    payload = _update_msg(update) if transport == "client" else update
+    event = target._codex_compaction_event(payload)
+    assert event is not None and event.text == "failed"
+    assert event.title == "context too large"
+    assert not target.last_compaction_transient
+    assert not target.last_prompt_stats.context_pct_unknown
+    assert target.last_prompt_stats.context_used_tokens == 170000
+    assert target.last_prompt_stats.context_window_tokens == 200000
+    assert target.last_prompt_stats.context_tokens_from_usage
+    assert target._settle_claude_compaction(STOP_REASON_END_TURN) is None
+    assert target._settle_codex_compaction(STOP_REASON_END_TURN) is None
+    assert target._codex_compaction_event(payload) is None
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CODEX, ACP_BACKEND_CLAUDE])
+@pytest.mark.parametrize("transport", ["client", "runtime"])
+def test_native_compaction_failure_arms_the_post_failure_budget(
+    backend: str, transport: str
+) -> None:
+    """Like every other failure producer: the backend may never answer the prompt
+    the compaction was for, so the bounded post-failure wait is armed."""
+    target = _bare_client(backend) if transport == "client" else _bare_handle(backend)
+    target._compaction_failed_at = None
+    update = {"sessionUpdate": "compaction_update", "compactionId": "budget", "status": "failed"}
+    payload = _update_msg(update) if transport == "client" else update
+    assert target._codex_compaction_event(payload).text == "failed"
+    assert target._compaction_failed_at is not None
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CODEX, ACP_BACKEND_CLAUDE])
+@pytest.mark.parametrize("transport", ["client", "runtime"])
+def test_native_compaction_cancel_gives_no_verdict(backend: str, transport: str) -> None:
+    """A Stop mid-compaction is not a failure: no event, no streak, no settle."""
+    target = _bare_client(backend) if transport == "client" else _bare_handle(backend)
+    target.last_prompt_stats.context_pct_unknown = False
+
+    def deliver(status: str):
+        update = {"sessionUpdate": "compaction_update", "compactionId": "stop", "status": status}
+        payload = _update_msg(update) if transport == "client" else update
+        return target._codex_compaction_event(payload)
+
+    assert deliver("in_progress").text == "started"
+    assert deliver("cancelled") is None
+    assert not target._codex_compaction_pending
+    assert not target._claude_native_compaction_pending
+    assert target._settle_claude_compaction(STOP_REASON_END_TURN) is None
+    assert not target.last_prompt_stats.context_pct_unknown
+    assert target._settle_codex_compaction("cancelled") is None
+    assert deliver("completed") is None
+
+
+def test_native_compaction_state_is_bounded() -> None:
+    from kiro_crew.acp._dispatch import (
+        NATIVE_COMPACTION_ID_MAX_CHARS,
+        NativeCompactionStates,
+        parse_native_compaction_update,
+    )
+
+    states = NativeCompactionStates()
+    long_id = "x" * (NATIVE_COMPACTION_ID_MAX_CHARS * 100)
+    update = {"sessionUpdate": "compaction_update", "compactionId": long_id, "status": "completed"}
+    assert parse_native_compaction_update(update, states) == "completed"
+    assert states.compaction_id == long_id[:NATIVE_COMPACTION_ID_MAX_CHARS]
+    assert parse_native_compaction_update(update, states) is None
+    update["compactionId"] = "next"
+    assert parse_native_compaction_update(update, states) == "completed"
+    assert states.compaction_id == "next"
+    assert states.status == "completed"
+
+
+def test_compaction_negotiation_does_not_enable_air() -> None:
+    from kiro_crew.acp.types import ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION
+
+    assert ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION["session"]["compaction"] == {}
+    assert "_meta" not in ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION
+
+
+def test_native_compaction_is_advertised_only_where_translated() -> None:
+    """kiro-cli, KAS and every other backend keep the base handshake byte-identical."""
+    from kiro_crew.acp.harness.codex import CodexHarness
+    from kiro_crew.acp.harness.kiro import KiroHarness
+    from kiro_crew.acp.types import (
+        ACP_BACKENDS_INLINE_COMPACTION,
+        ACP_BACKENDS_NATIVE_COMPACTION,
+        ACP_CLIENT_CAPABILITIES,
+        KAS_CLIENT_CAPABILITIES,
+        acp_client_capabilities,
+    )
+
+    assert "session" not in ACP_CLIENT_CAPABILITIES
+    assert "session" not in KAS_CLIENT_CAPABILITIES
+    assert ACP_BACKENDS_NATIVE_COMPACTION <= ACP_BACKENDS_INLINE_COMPACTION
+    for backend in (ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX):
+        assert acp_client_capabilities(backend)["session"] == {"compaction": {}}
+        assert _bare_client(backend)._initialize_params()[
+            "clientCapabilities"
+        ] == acp_client_capabilities(backend)
+    for backend in ("kiro", "kas", "opencode", "pi", "goose", "deepseek", None):
+        assert acp_client_capabilities(backend) is ACP_CLIENT_CAPABILITIES
+    assert "session" in CodexHarness.client_capabilities.fget(None)
+    assert "session" not in KiroHarness.client_capabilities.fget(None)
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CODEX, ACP_BACKEND_CLAUDE])
+def test_native_compaction_routes_without_tool_rows(backend: str) -> None:
+    handle = _live_handle(backend)
+    update = {
+        "sessionUpdate": "compaction_update",
+        "compactionId": "routed",
+        "status": "in_progress",
+    }
+    events = handle._handle_update(_update_msg(update))
+    assert [event.kind for event in events] == [EVENT_COMPACTION_STATUS]
+    assert handle._handle_update(_update_msg(update)) == []
+    unknown = {
+        "sessionUpdate": "compaction_summary_chunk",
+        "compactionId": "routed",
+        "content": {"type": "text", "text": "summary"},
+    }
+    assert handle._handle_update(_update_msg(unknown)) == []
+
+
+@pytest.mark.parametrize("transport", ["client", "runtime"])
+@pytest.mark.parametrize("reason", [STOP_REASON_END_TURN, STOP_REASON_CANCELLED, "refusal"])
+def test_dangling_native_claude_uses_its_own_settlement(transport: str, reason: str) -> None:
+    target = (
+        _bare_client(ACP_BACKEND_CLAUDE)
+        if transport == "client"
+        else _live_handle(ACP_BACKEND_CLAUDE)
+    )
+    start = {
+        "sessionUpdate": "compaction_update",
+        "compactionId": "automatic",
+        "status": "in_progress",
+    }
+    usage = {"sessionUpdate": "usage_update", "used": 15000, "size": 200000}
+    if transport == "client":
+        assert target._codex_compaction_event(_update_msg(start)).text == "started"
+        target._track_usage_update(_update_msg(usage))
+    else:
+        assert target._handle_update(_update_msg(start))[0].text == "started"
+        assert target._handle_update(_update_msg(usage)) == []
+    assert not target._codex_compaction_pending
+    assert target._claude_native_compaction_pending
+    assert target.last_prompt_stats.context_used_tokens == 15000
+    assert target._settle_codex_compaction(reason) is None
+    event = target._settle_claude_compaction(reason)
+    assert not target._claude_native_compaction_pending
+    if reason == STOP_REASON_END_TURN:
+        assert event is not None and event.text == "completed" and event.synthesized
+        assert target.last_prompt_stats.context_pct_unknown
+    else:
+        assert event is None
+        assert target.last_prompt_stats.context_used_tokens == 15000
+    assert target._settle_claude_compaction(reason) is None
+    terminal = {**start, "status": "completed"}
+    payload = _update_msg(terminal) if transport == "client" else terminal
+    assert target._codex_compaction_event(payload) is None
+
+
+@pytest.mark.parametrize("transport", ["client", "runtime"])
+def test_dangling_native_codex_retains_failure_semantics(transport: str) -> None:
+    target = _bare_client() if transport == "client" else _bare_handle()
+    start = {
+        "sessionUpdate": "compaction_update",
+        "compactionId": "automatic",
+        "status": "in_progress",
+    }
+    payload = _update_msg(start) if transport == "client" else start
+    assert target._codex_compaction_event(payload).text == "started"
+    event = target._settle_codex_compaction(STOP_REASON_END_TURN)
+    assert event is not None and event.text == "failed" and event.synthesized
+    assert not target.last_prompt_stats.context_pct_unknown
+    assert target._compaction_failed_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["client", "runtime"])
+@pytest.mark.parametrize("terminal", [None, "completed", "failed", "cancelled"])
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX])
+async def test_native_automatic_frames_through_turn(
+    transport: str, terminal: str | None, backend: str, tmp_path: Any, monkeypatch: Any
+) -> None:
+    from kiro_crew.acp.types import EVENT_COMPLETE
+
+    updates = [
+        {"sessionUpdate": "compaction_update", "compactionId": "automatic", "status": "in_progress"}
+    ]
+    if terminal:
+        updates.extend([{**updates[0], "status": terminal, "error": "context too large"}] * 2)
+    updates.append({"sessionUpdate": "usage_update", "used": 15000, "size": 200000})
+    response = JsonRpcMessage(id=1, result={"stopReason": STOP_REASON_END_TURN})
+    if transport == "client":
+        target = AcpClient(work_dir=tmp_path, acp_backend=backend)
+
+        async def prompt_loop(*args: Any):
+            for update in updates:
+                yield "update", _update_msg(update)
+            yield "complete", response
+
+        monkeypatch.setattr(target, "_prompt_loop", prompt_loop)
+        monkeypatch.setattr(target, "_read_new_tool_results", AsyncMock(return_value=[]))
+        stream = target._dispatch_events(1, 5)
+    else:
+        target = _live_handle(backend)
+
+        async def send_request(*args: Any):
+            for update in updates:
+                target._queue.put_nowait(_update_msg(update))
+            target._queue.put_nowait(response)
+            return 1
+
+        async def build_request():
+            return "session/prompt", {"sessionId": "s-1", "prompt": []}
+
+        monkeypatch.setattr(target._runtime, "send_request", send_request)
+        stream = target._run_turn(build_request, 5)
+
+    async def collect():
+        return [event async for event in stream]
+
+    events = await asyncio.wait_for(collect(), timeout=5)
+    statuses = [event for event in events if event.kind == EVENT_COMPACTION_STATUS]
+    inferred = "completed" if backend == ACP_BACKEND_CLAUDE else "failed"
+    expected = ["started"] if terminal == "cancelled" else ["started", terminal or inferred]
+    assert [event.text for event in statuses] == expected
+    assert events[-1].kind == EVENT_COMPLETE
+    assert events[-1].stop_reason == STOP_REASON_END_TURN
+    if terminal is None:
+        assert statuses[-1].synthesized
+    assert target.last_prompt_stats.context_pct_unknown is (
+        terminal is None and backend == ACP_BACKEND_CLAUDE
+    )
+    if terminal is not None or backend == ACP_BACKEND_CODEX:
+        assert target.last_prompt_stats.context_used_tokens == 15000

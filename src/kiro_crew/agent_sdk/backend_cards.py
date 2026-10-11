@@ -471,6 +471,14 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "table. Which code path builds the command; the session starts either way, "
         "and a wrong membership is a launch that fails, which is a defect"
     ),
+    "ACP_BACKENDS_COMPACTION_COMPLETES_ON_END_TURN": (
+        "how a dangling native compaction settles at turn end. The compaction "
+        "notice follows the adapter lifecycle on both transports"
+    ),
+    "ACP_BACKENDS_NATIVE_COMPACTION": (
+        "whether the handshake asks for native compaction frames. The compaction "
+        "notice and context reset look the same either way"
+    ),
     "ACP_BACKENDS_STRUCTURED_REFUSAL": (
         "whether a refusal card gains a category line. Visible, and nothing a "
         "reader can act on or would pick a harness for"
