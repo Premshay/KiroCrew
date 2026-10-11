@@ -167,6 +167,11 @@ Nothing on disk is rewritten. The stored pin stays as the user picked it and is
 simply not read by a harness that cannot claim it, so switching back restores it
 with no migration and no second field.
 
+An explicit dashboard agent pick is a separate binding transaction: changing
+the agent name or known member/template namespace clears the slot pin and
+persists the cleared value, so the target starts on its own model configuration.
+Same-agent resets and provider-reported in-turn agent switches keep the pin.
+
 Both resolvers scope EVERY tier and let an out-of-scope tier defer to the next, so
 an out-of-scope pin reads exactly like an unset one:
 

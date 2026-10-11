@@ -104,6 +104,14 @@ on the fallback remain visibly identified until restoration succeeds.
 
 ## Sticky restore
 
+An explicit dashboard change of agent name or known member/template namespace
+clears the slot model pin, throttle walk and sticky throttle/refusal restore
+records before resetting the session. The switch reuses
+`_clear_fallback_sticky_state` for the slot-held throttle record; the old provider
+marker belongs to the retired session. A rejected switch restores the saved
+slot state only while the transaction still owns the agent and model selection.
+Same-agent resets preserve these records.
+
 A successful swap is sticky on the provider through `TURN_FALLBACK_ATTR`.
 `probe_fallback_restore` makes one start-of-turn attempt to restore the primary
 for unattended callers. It keeps the fallback on a transient restore failure;

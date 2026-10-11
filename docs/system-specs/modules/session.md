@@ -156,6 +156,18 @@ tests have moved off the corresponding legacy seam.
 
 ## Agent selection provenance
 
+An explicit dashboard agent switch clears the slot model pin when the resolved
+agent name or known member/template namespace changes. The next session inherits
+the target agent's model configuration, including when both agents use the same
+harness. Same-agent resets preserve model state, and provider-reported in-turn
+agent switches retain their active pin.
+
+The switch holds the slot, session and model-pick locks in that order. It commits
+the cleared model with the new agent before session reset, persists both in
+transcript metadata and returns the committed model in its response. A refused
+switch restores the model and fallback state only while it still owns the agent,
+model token and model-pick generation; newer explicit selections survive rollback.
+
 Each session owns one canonical `execution_context` in its ordinary metadata.
 The frozen record binds `member_id` (or explicit Global/V1), `MemoryStoreRef`,
 member/template namespace, provider template, privacy mode and app attribution.

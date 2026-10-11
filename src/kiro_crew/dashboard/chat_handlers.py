@@ -5044,7 +5044,7 @@ def _slot_replaced_while_queued(
 
     Every switch handler (and reload) reads ``state._slots.get(name)`` before
     its first await, then queues on ``slot._lock``, the session-keyed switch
-    lock and, on the model paths, ``slot._model_pick_lock``. Slot removal and
+    lock and, on agent/model picks, ``slot._model_pick_lock``. Slot removal and
     same-name re-registration take NONE of those locks (a client reconnecting,
     or a different app claiming the name), so by the time a queued request
     resumes, ``name`` can belong to a different slot object. Everything the
@@ -5348,19 +5348,12 @@ async def switch_slot_agent(
     if refusal is not None:
         return refusal
 
-    # The whole resolve -> reset -> commit section runs under the slot's
-    # lock: the awaits yield the event loop, and an interleaved second switch
-    # could otherwise observe (or write) intermediate state. TRANSACTIONAL
-    # ordering: the new values are computed into locals, the session reset
-    # runs FIRST, and the slot is mutated only after the reset succeeds — a
-    # failed request provably changed nothing, the invariant the frontend's
-    # slotSwitch failure-recovery relies on, with no rollback machinery to
-    # race against concurrent writers (e.g. the project endpoint, which does
-    # not take this lock).
-    # Two locks, in the order documented at _slot_switch_session_lock:
-    # slot._lock, then the session lock. An ExitStack because the session
-    # lock's KEY is only known after the in-lock read below, and locking on
-    # any earlier read could leave this holding the wrong session lock.
+    # Dispatch does not take slot._lock, so publish the complete binding before
+    # reset: a sender during teardown must see the target agent's model and
+    # workspace together. Rollback may unwind only writes this request still owns.
+    # Locks follow _slot_switch_session_lock's order: slot._lock, the session
+    # lock, then slot._model_pick_lock. ExitStack defers the session lock until
+    # its key is read under slot._lock; an earlier read could lock the wrong session.
     async with contextlib.AsyncExitStack() as _stack:
         await _stack.enter_async_context(slot._lock)
         # Re-authorize after the await above (see _slot_replaced_while_queued):
@@ -5383,7 +5376,8 @@ async def switch_slot_agent(
         # a binding landed while this request waited on slot._lock (see
         # _slot_switch_session_lock).
         await _stack.enter_async_context(_slot_switch_session_lock(session_key))
-        # Second lock-acquisition await, second re-check: a same-name
+        await _stack.enter_async_context(slot._model_pick_lock)
+        # Lock-acquisition awaits, then re-check: a same-name
         # recreate lands during this wait just as easily as during the first.
         if _slot_replaced_while_queued(state, slot, name, caller.scope, "chat.slot_agent"):
             return slot_not_found()
@@ -5698,6 +5692,35 @@ async def switch_slot_agent(
         slot.agent_kind = _CommitToken(new_agent_kind)
         committed_agent = slot.agent
         committed_agent_kind = slot.agent_kind
+        agent_changed = agent_name != prior_agent or (
+            bool(new_agent_kind) and bool(prior_agent_kind) and new_agent_kind != prior_agent_kind
+        )
+        prior_model = slot.model
+        prior_model_pick_gen = slot._model_pick_gen
+        fallback_fields = (
+            "_fallback_candidate_idx",
+            "_fallback_walked",
+            "_active_fallback_model",
+            "_fallback_primary_model",
+            "_fallback_slot_model",
+            "_fallback_pick_gen",
+            "_refusal_fallback_primary",
+            "_refusal_fallback_candidate",
+        )
+        prior_fallback = {field: getattr(slot, field) for field in fallback_fields}
+        committed_model: str | None = None
+        if agent_changed:
+            from kiro_crew.dashboard.chat_runner import _clear_fallback_sticky_state
+
+            slot.model = _CommitToken("")
+            committed_model = slot.model
+            slot._model_pick_gen += 1
+            _clear_fallback_sticky_state(slot, None)
+            slot._fallback_candidate_idx = 0
+            slot._fallback_walked = []
+            slot._fallback_pick_gen = 0
+            slot._refusal_fallback_primary = ""
+            slot._refusal_fallback_candidate = ""
 
         # Derived fields commit BEFORE the reset too, compare-and-set against
         # the pre-await baseline: a send landing during the reset teardown
@@ -5752,6 +5775,15 @@ async def switch_slot_agent(
             if slot.agent is committed_agent and slot.agent_kind is committed_agent_kind:
                 slot.agent = prior_agent
                 slot.agent_kind = prior_agent_kind
+                if (
+                    committed_model is not None
+                    and slot.model is committed_model
+                    and slot._model_pick_gen == prior_model_pick_gen + 1
+                ):
+                    slot.model = prior_model
+                    slot._model_pick_gen = prior_model_pick_gen
+                    for field, value in prior_fallback.items():
+                        setattr(slot, field, value)
             if committed_workspace is not None and slot.workspace is committed_workspace:
                 slot.workspace = pre_await_workspace
             if committed_project is not None and slot.project is committed_project:
@@ -5912,7 +5944,11 @@ async def switch_slot_agent(
                     await drained_to_thread(
                         conversation_log.update_metadata,
                         _history_key_for(name),
-                        {"agent": str(slot.agent), "agent_kind": slot.agent_kind},
+                        {
+                            "agent": str(slot.agent),
+                            "agent_kind": slot.agent_kind,
+                            "model": slot.model,
+                        },
                     )
                 except Exception:
                     logger.warning(
@@ -5929,7 +5965,7 @@ async def switch_slot_agent(
                 await drained_to_thread(
                     conversation_log.update_metadata,
                     _history_key_for(name),
-                    {"agent": agent_name, "agent_kind": new_agent_kind},
+                    {"agent": agent_name, "agent_kind": new_agent_kind, "model": slot.model},
                 )
             except asyncio.CancelledError:
                 # Drain the writer before restoring history, and retain both
@@ -5965,7 +6001,11 @@ async def switch_slot_agent(
                     await drained_to_thread(
                         state.conversation_log.update_metadata,
                         _history_key_for(name),
-                        {"agent": str(slot.agent), "agent_kind": slot.agent_kind},
+                        {
+                            "agent": str(slot.agent),
+                            "agent_kind": slot.agent_kind,
+                            "model": slot.model,
+                        },
                     )
                 except Exception:
                     logger.warning(
@@ -5993,7 +6033,11 @@ async def switch_slot_agent(
                         await drained_to_thread(
                             state.conversation_log.update_metadata,
                             _history_key_for(name),
-                            {"agent": str(slot.agent), "agent_kind": slot.agent_kind},
+                            {
+                                "agent": str(slot.agent),
+                                "agent_kind": slot.agent_kind,
+                                "model": slot.model,
+                            },
                         )
 
             try:
@@ -6179,6 +6223,7 @@ async def switch_slot_agent(
         "agent": agent_name,
         "agent_kind": slot.agent_kind,
         "workspace": workspace,
+        "model": slot.model,
     }
     if teardown_incomplete:
         # Advisory only — the switch itself succeeded and the response
