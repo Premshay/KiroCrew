@@ -1717,6 +1717,27 @@ applier — a raised turn budget is in force on the next prompt.
    - `"timeout"` or `"error"` → fall through to hard kill.
 5. Hard kill: `reset(key)` → fire-and-forget `_eager_respawn(key)` task → call `on_hard` callback → return `"hard"`.
 
+### Dashboard Stop during preparation
+
+The dashboard runner publishes its owning task as `slot._preparing_task` before
+memory admission and session acquisition. The marker survives the transport's
+pre-registration awaits and clears on the first provider event. Its finalizer
+compare-and-clears only its own marker, before queue handoff.
+
+Stop and Interrupt capture `slot.task` before awaiting the provider stop. An
+`idle` or `hard` outcome cancels that captured runner only while the same live
+slot and task still own the preparing marker. Force Stop uses the same check.
+After the first provider event, stopping remains provider-owned.
+
+The handler waits up to `_STOP_PREPARATION_SETTLE_SECS` for cleanup. A timeout
+logs a warning and leaves `slot.task` attached: admission stays busy through
+the runner's existing cleanup, then its normal guarded dispatcher hands off
+preserved queued work once. No handler dispatches over unfinished cleanup.
+A preparing turn cancelled by Stop rechecks shared memory readiness for that
+handoff; unfinished preparation retains the queue for its completion drain.
+Provider stopping, escalation budgets, authentication and queue admission checks
+are unchanged.
+
 ### Session-scoped Stop record
 
 `SessionManager.stop_generation(key)` reads the count from step 1 (0 for a key

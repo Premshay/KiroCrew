@@ -3607,6 +3607,40 @@ async def _settle_discarded_stage_deliveries(
             )
 
 
+_STOP_PREPARATION_SETTLE_SECS = 2.0
+
+
+async def _cancel_preparing_turn(
+    state: DashboardState, slot: _ChatSlot, task: asyncio.Task[Any] | None
+) -> bool:
+    """Settle only the captured preparing runner, retaining its cleanup ownership."""
+    if (
+        task is None
+        or state._slots.get(slot.key) is not slot
+        or slot.task is not task
+        or slot._preparing_task is not task
+        or task is asyncio.current_task()
+        or task.done()
+    ):
+        return False
+    if not task.cancelling():
+        task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=_STOP_PREPARATION_SETTLE_SECS)
+    if not done:
+        logger.warning(
+            "Stopped preparing turn for slot %s is still cleaning up; queued work waits",
+            slot.key,
+        )
+        return True
+    try:
+        await task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+    return True
+
+
 async def stop_slot_turn(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -3646,6 +3680,7 @@ async def stop_slot_turn(
     """
     name = slot.key
     cancel_key = cancel_key or _cancel_target(slot)
+    task_at_stop = getattr(slot, "task", None)
 
     # The second press after a DECLINED Stop (the session was compacting) is
     # the user's escape hatch and takes the escalation branch below, which is
@@ -3792,6 +3827,7 @@ async def stop_slot_turn(
             preserve_queue=compaction_escape,
             on_hard=_on_hard_force,
         )
+        await _cancel_preparing_turn(state, slot, task_at_stop)
         sel().log_tool_invocation(
             session_key=_history_key_for(name),
             agent=getattr(slot, "agent", "") or "kirocrew",
@@ -3899,6 +3935,9 @@ async def stop_slot_turn(
         on_soft=_on_soft,
         on_hard=_on_hard,
     )
+    cancelled_preparing = False
+    if outcome in ("idle", "hard"):
+        cancelled_preparing = await _cancel_preparing_turn(state, slot, task_at_stop)
     # A genuine in-flight turn whose cooperative cancel does not confirm within
     # the budget answers ``stop_turn`` with a non-acked outcome, which that
     # method escalates to a hard reset on its own -- a dispatched, mid-execution
@@ -3909,11 +3948,9 @@ async def stop_slot_turn(
     # but the slot has not seen the terminal event settle it. The orphaned card
     # is resolved and the reply names the honest state -- there is no running
     # provider turn here to report as "stopped", and no provider turn to kill.
-    _idle_running = outcome == "idle" and slot.running
-    if outcome == "idle" and slot._stop_event_id:
-        _resolve_stop_event(slot, "soft")
-        slot._stop_state = "idle"
-        state.push_slots_update()
+    _idle_running = outcome == "idle" and slot.running and not cancelled_preparing
+    if outcome == "idle":
+        await _on_soft()
     elif outcome == "compacting":
         # The race the pre-check above cannot close: the compaction committed
         # between that read and the cancel. Same answer, and the soft-stop side
@@ -4410,6 +4447,7 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return slot_not_found()
+    task_at_stop = getattr(slot, "task", None)
     # Before the _stop_state claim and the queue promotion below, both of which
     # mutate the slot ahead of stop_turn.
     # Resolved once, before the request-body await below, and used for both the
@@ -4665,11 +4703,11 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         on_soft=_on_soft,
         on_hard=_on_hard,
     )
+    if outcome in ("idle", "hard"):
+        await _cancel_preparing_turn(state, slot, task_at_stop)
     # Resolve orphaned card when provider reports no active turn
-    if outcome == "idle" and slot._stop_event_id:
-        _resolve_stop_event(slot, "soft")
-        slot._stop_state = "idle"
-        state.push_slots_update()
+    if outcome == "idle":
+        await _on_soft()
     elif outcome == "compacting":
         # The window the two probes above cannot close: a compaction commits
         # between the second probe and ``stop_turn`` taking the registry lock,

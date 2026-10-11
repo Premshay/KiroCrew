@@ -10037,9 +10037,11 @@ async def _run_chat(
     _deferred_options_expiry = (
         _prompt_depth == 0 and first_word in _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
     )
+    _preparing_task = slot.task or asyncio.current_task()
     try:
-        # Publish the immutable identity BEFORE the first admission await, as
-        # the first statement the enclosing finally covers. From here down the
+        slot._preparing_task = _preparing_task
+        # Publish the immutable identity BEFORE the first admission await,
+        # inside the enclosing finally's coverage. From here down the
         # local session_key is what the turn acquires, audits and releases
         # while slot.linked_session_key remains mutable underneath it -- and
         # the admission awaits below are exactly where a rebind can land: a
@@ -12166,6 +12168,8 @@ async def _run_chat(
         _crew_log_step_t0 = time.monotonic()
         event_stream = client.stream_command(message) if is_slash else client.stream(full_message)
         async for event in event_stream:
+            if slot._preparing_task is _preparing_task:
+                slot._preparing_task = None
             if (_todo_sync_rendered or _todo_recovery_carried) and (
                 event.kind in _TODO_BLOCK_READ_EVENT_KINDS
             ):
@@ -17819,6 +17823,8 @@ async def _run_chat(
             await _deliver_cross_surface_reply(state, session_key, assistant_text, slot=slot)
     except asyncio.CancelledError:
         _crew_log_error = "CancelledError"
+        if slot._preparing_task is _preparing_task and _stop_pressed():
+            _memory_preparation_admitted = _memory_preparation_settled(state)
         # A bare CancelledError here is either the operator's Stop press — the
         # one cancel they cause deliberately, labelled the non-fault
         # ``cancelled`` — or an involuntary cancel (tab close, idle-slot sweep,
@@ -19339,6 +19345,8 @@ async def _run_chat(
                 "nudge_turn": _directive_self_wake and _turn_landed,
             },
         )
+        if slot._preparing_task is _preparing_task:
+            slot._preparing_task = None
         # The turn's crew log closers, in the one order a reader can trust: every
         # `message/sent` for this turn has now been flushed, so the tool closer,
         # the last step's completion and the turn's own completion land after the

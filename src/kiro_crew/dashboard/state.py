@@ -2845,6 +2845,7 @@ class _ChatSlot:
         "messages",
         "total_messages",
         "_task",
+        "_preparing_task",
         "_turn_admission_reserved",
         "_turn_generation",
         "_chunk_seq",
@@ -3267,6 +3268,7 @@ class _ChatSlot:
         self._dismissed_txn_pending: set[str] = set()
         self.total_messages: int = 0  # lifetime count (survives trimming)
         self._task: asyncio.Task[Any] | None = None
+        self._preparing_task: asyncio.Task[Any] | None = None
         # A send reserved the next turn and is between admission and dispatch.
         self._turn_admission_reserved: bool = False
         # Monotonic publication history for turn ownership. ``task`` returns to
