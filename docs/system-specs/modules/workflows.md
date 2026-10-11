@@ -651,7 +651,10 @@ Two distinct serializations:
   complete run. `from_store_json` demotes a stored `running` run to `failed` with
   `"interrupted: gateway restarted while running"`, because it can never resume in
   a new process and would otherwise wedge the registry as a zombie that eviction
-  refuses to reclaim.
+  refuses to reclaim. Snapshot `ended_at` is the `ts` of the run's terminal
+  event; such a demoted run has none, so `ended_at` falls back to its last
+  recorded event, which every later restart reproduces unchanged. An active
+  (`running`/`paused`) run without a terminal event reports `None`.
 
 Before each model turn, authoring, pooled workers and named sessions publish the
 ordinary strict transport identity for their acquired key. The run itself owns

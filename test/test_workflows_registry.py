@@ -18,9 +18,12 @@ import asyncio
 
 import pytest
 
+from kiro_crew.workflows import WorkflowEvent
 from kiro_crew.workflows.registry import (
     STATUS_CANCELLED,
+    STATUS_FAILED,
     STATUS_FINISHED,
+    STATUS_PAUSED,
     STATUS_RUNNING,
     RunHandle,
     RunRegistry,
@@ -184,6 +187,70 @@ async def test_list_is_compact_no_result_payload() -> None:
     # terminal transition the poll above returned on.
     await asyncio.wait_for(notified.wait(), timeout=3.0)
     assert done_snapshots and done_snapshots[0]["result"] == {"done": True}
+
+
+async def test_list_reports_when_a_run_ended() -> None:
+    """``ended_at`` is the terminal event's ``ts``, so a reader can tell a fresh
+    failure from an old one; a run still going has none."""
+    reg = RunRegistry()
+    runner = WorkflowRunner(agent_fn=_echo, audit=lambda *a, **k: None)
+    rid = await runner.run_background(GOOD, registry=reg, run_id="wf_end1", now=NOW, name="d")
+    snap = await _wait_terminal(reg, rid)
+    terminal = [
+        e for e in reg.status(rid, include_events=True)["events"] if e["type"] == "run_finished"
+    ]
+
+    (row,) = reg.list()
+    assert row["ended_at"] == snap["ended_at"] == terminal[-1]["ts"]
+
+
+def _stored(status: str, *events: tuple[str, str]) -> dict:
+    return {
+        "run_id": "wf_old",
+        "name": "d",
+        "status": status,
+        "events": [
+            {"run_id": "wf_old", "seq": i, "ts": ts, "type": typ, "data": {}}
+            for i, (typ, ts) in enumerate(events)
+        ],
+    }
+
+
+async def test_a_run_interrupted_by_restart_ends_at_its_last_event() -> None:
+    """A run demoted to failed on restore has no terminal event, so it ends at its
+    last recorded event, and a later restart reports the same moment."""
+    stored = _stored(
+        STATUS_RUNNING, ("run_started", "2026-06-01T00:00:00Z"), ("log", "2026-06-01T00:05:00Z")
+    )
+
+    handle = RunHandle.from_store_json(stored)
+    again = RunHandle.from_store_json(handle.to_store_json())
+
+    assert handle.status == STATUS_FAILED
+    assert handle.snapshot()["ended_at"] == "2026-06-01T00:05:00Z"
+    assert again.snapshot()["ended_at"] == "2026-06-01T00:05:00Z"
+
+
+async def test_an_active_run_has_not_ended() -> None:
+    started = WorkflowEvent("wf_live", 0, "2026-06-01T00:00:00Z", "run_started")
+    running = RunHandle(run_id="wf_live", name="d", events=[started])
+    paused = RunHandle(run_id="wf_live", name="d", status=STATUS_PAUSED, events=[started])
+
+    assert running.snapshot()["ended_at"] is None
+    assert paused.snapshot()["ended_at"] is None
+
+
+async def test_a_terminal_event_sets_ended_at_over_later_events() -> None:
+    handle = RunHandle.from_store_json(
+        _stored(
+            STATUS_FAILED,
+            ("run_started", "2026-06-01T00:00:00Z"),
+            ("run_failed", "2026-06-01T00:01:00Z"),
+            ("log", "2026-06-01T00:02:00Z"),
+        )
+    )
+
+    assert handle.snapshot()["ended_at"] == "2026-06-01T00:01:00Z"
 
 
 async def test_cancel_unknown_run_is_false() -> None:
