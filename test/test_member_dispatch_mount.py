@@ -1252,3 +1252,82 @@ class TestGooseIdentityDrift:
         client.reject_tool = _never  # type: ignore[method-assign]
         event = self._event(MEMBER_DISPATCH_SERVER, "session_stop")
         assert asyncio.run(client._refuse_identity_drift(event)) is False
+
+
+class _LeanProfileClient:
+    """The attributes ``_session_mcp_servers`` reads on a claude session.
+
+    ``translated`` stands for the spec projection after the member appends ran;
+    ``explicit`` for the operator's lean ``claude_session_servers`` profile.
+    """
+
+    backend = ACP_BACKEND_CLAUDE
+    _allowed_tools = None
+    _is_claude = True
+    _is_goose = False
+    _is_opencode = False
+    _seeds_local_settings = True
+    _permission_surface_governed = True
+    _session_mcp_withheld = False
+    _member_session_entries = staticmethod(AcpClient._member_session_entries)
+
+    def __init__(self, session_key: str, translated: list[dict], lean: bool = True):
+        self._session_key = session_key
+        self._translated = translated
+        self._mcp_gateway_claude_servers = frozenset({"context7"}) if lean else frozenset()
+
+    def _translated_session_mcp_servers(self):
+        return list(self._translated)
+
+    def _claude_explicit_session_mcp_servers(self):
+        return [{"name": "context7"}]
+
+    def _claude_session_mcp_servers(self):
+        return list(self._translated)
+
+    def _pooled_mcp_servers(self):
+        return [{"name": "kirocrew-core"}]
+
+    def _session_capability_mcp_servers(self):
+        return []
+
+
+def _names(client) -> list[str]:
+    return [e["name"] for e in AcpClient._session_mcp_servers(client)]
+
+
+class TestClaudeLeanProfileKeepsMemberServers:
+    """The lean Claude profile used to drop the member's session control while the
+    session still reported it mounted, so desks were told about tools they lacked."""
+
+    TRANSLATED = [
+        {"name": "brave-search"},
+        {"name": MEMBER_DISPATCH_SERVER, "env": [{"name": "KIROCREW_SESSION_KEY"}]},
+        {"name": "kirocrew-panel"},
+    ]
+
+    def test_member_session_keeps_dispatch_and_panel(self):
+        names = _names(_LeanProfileClient(MEMBER_KEY, self.TRANSLATED))
+        assert names == ["context7", MEMBER_DISPATCH_SERVER, "kirocrew-panel", "kirocrew-core"]
+
+    def test_spec_servers_stay_off_the_lean_profile(self):
+        assert "brave-search" not in _names(_LeanProfileClient(MEMBER_KEY, self.TRANSLATED))
+
+    def test_non_member_session_gains_nothing(self):
+        # A conductor spec may declare the dashboard server itself; the lean
+        # profile keeps it off exactly as before.
+        names = _names(_LeanProfileClient("dashboard:chat-1-2", self.TRANSLATED))
+        assert names == ["context7", "kirocrew-core"]
+
+    def test_a_withheld_mount_stays_withheld(self):
+        withheld = [e for e in self.TRANSLATED if e["name"] != MEMBER_DISPATCH_SERVER]
+        assert MEMBER_DISPATCH_SERVER not in _names(_LeanProfileClient(MEMBER_KEY, withheld))
+
+    def test_without_the_lean_profile_the_projection_is_unchanged(self):
+        names = _names(_LeanProfileClient(MEMBER_KEY, self.TRANSLATED, lean=False))
+        assert names == [
+            "brave-search",
+            MEMBER_DISPATCH_SERVER,
+            "kirocrew-panel",
+            "kirocrew-core",
+        ]

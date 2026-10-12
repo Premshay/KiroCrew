@@ -3236,7 +3236,10 @@ class AcpClient:
                 return []
             projected = (
                 (
-                    self._claude_explicit_session_mcp_servers()
+                    [
+                        *self._claude_explicit_session_mcp_servers(),
+                        *self._member_session_entries(self._session_key, translated),
+                    ]
                     if self._mcp_gateway_claude_servers
                     else self._claude_session_mcp_servers()
                 )
@@ -3410,6 +3413,36 @@ class AcpClient:
             self._session_id,
         )
         return servers
+
+    @staticmethod
+    def _member_session_entries(
+        session_key: str | None, translated: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """The member-only entries the spec projection appended, for a lean profile.
+
+        The explicit Claude profile replaces the spec projection with a short named
+        list, which also dropped the session-control and panel servers that
+        :meth:`_append_member_dispatch_server` / ``_append_member_panel_server``
+        add to a member DM -- while ``member_dispatch_mounted`` still said True, so
+        the member was taught tools it did not hold. Carrying the already-decided
+        entries over keeps every withhold that composer applied and keeps the
+        recorded answer true.
+
+        Member sessions only: those appends replace any same-named spec entry, so in
+        a member array the entry under either name is the host's own. A non-member
+        session gets nothing back, so a spec that declares the dashboard server
+        (a conductor) stays on the lean profile exactly as before.
+        """
+        from kiro_crew.members import (
+            MEMBER_DISPATCH_SERVER,
+            MEMBER_PANEL_SERVER,
+            is_member_session_key,
+        )
+
+        if not is_member_session_key(session_key):
+            return []
+        member_names = {MEMBER_DISPATCH_SERVER, MEMBER_PANEL_SERVER}
+        return [entry for entry in translated if entry.get("name") in member_names]
 
     def _claude_explicit_session_mcp_servers(self) -> list:
         """Resolve the configured explicit Claude MCP profile without wiring it in."""
