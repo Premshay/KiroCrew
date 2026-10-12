@@ -542,6 +542,7 @@ def _bind_cron_slot(
     job: "CronJob",
     history: list[dict[str, Any]] | None,
     dismissed: object = _DISMISSED_UNREAD,
+    workspace: str | None = None,
 ) -> Any | None:
     """Create-or-find the job's dashboard slot, bind its identity, publish it.
 
@@ -568,7 +569,15 @@ def _bind_cron_slot(
         # A cron result is the job's output, not something the person typed.
         # A USER label would expose it to any app holding `slots:user`.
         origin=SlotOrigin.CRON,
+        **({"workspace": workspace} if workspace else {}),
     )
+    if workspace and getattr(slot, "workspace", "default") != workspace:
+        # The tab IS the job's caller identity for session control, which reads
+        # the caller's workspace off it. A tab minted before the job's agent was
+        # bound elsewhere (or by the synchronous result path, which resolves
+        # nothing) would refuse every crewmate the job creates as a workspace
+        # mismatch, so the run-start bind corrects it to the agent's binding.
+        slot.workspace = workspace
     slot.title = f"Cron: {_safe_job_name(job)}"
     # A provider-template alias on a legacy V1 job cannot authorize a private
     # member. Private cron dispatch publishes its protected session binding;
@@ -906,6 +915,33 @@ async def prefetch_cron_dismissed(state: DashboardState, job_id: str) -> object:
     return dismissed
 
 
+def cron_job_workspace(job: "CronJob") -> str:
+    """The workspace the job's agent is bound to, or ``""`` when unresolvable.
+
+    Blocking (reads config); run off the loop. The session-control gate refuses a
+    created crewmate whose binding differs from the caller tab's workspace, so the
+    tab must carry this one. ``""`` leaves the tab's workspace as it is.
+    """
+    agent = job.member_id or job.agent_id or ""
+    if not agent:
+        return ""
+    try:
+        from kiro_crew.config.loader import (
+            KiroCrewConfig,
+            _workspace_name_for_dir,
+            resolve_agent_bindings,
+        )
+
+        cfg = KiroCrewConfig.load()
+        bindings = resolve_agent_bindings(cfg, agent, validate_memory_files=False)
+        if not bindings.requested_resolved:
+            return ""
+        return _workspace_name_for_dir(cfg, bindings.workspace_dir)
+    except Exception:
+        logger.debug("cron %s: agent workspace unresolved", job.id, exc_info=True)
+        return ""
+
+
 async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
     """Make an eligible job's tab exist — and carry its identity — at run START.
 
@@ -941,12 +977,15 @@ async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
         # Never adopted (see _bind_cron_slot). Returned before any read, and with
         # no audit row: the result injection records the one refusal per run.
         return
+    workspace = await asyncio.to_thread(cron_job_workspace, job)
     if slot is not None and slot.linked_session_key:
+        if workspace and getattr(slot, "workspace", "default") != workspace:
+            slot.workspace = workspace
         await prefetch_cron_dismissed(state, job.id)
         return
     history = await prefetch_cron_history(state, job.id)
     dismissed = await prefetch_cron_dismissed(state, job.id)
-    _bind_cron_slot(state, job, history, dismissed)
+    _bind_cron_slot(state, job, history, dismissed, workspace=workspace)
 
 
 def hydrate_slot_from_history(slot: Any, messages: list[dict[str, Any]]) -> None:

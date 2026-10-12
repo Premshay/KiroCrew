@@ -50,11 +50,12 @@ def _make_state(history_messages=None):
     slots: dict[str, MagicMock] = {}
     state._slots = slots
 
-    def get_or_create_slot(name=None, agent="", origin=""):
+    def get_or_create_slot(name=None, agent="", origin="", workspace="default"):
         if name not in slots:
             slot = MagicMock()
             slot.key = name
             slot._origin = origin
+            slot.workspace = workspace
             slot.linked_session_key = ""
             slot.messages = []
             slot.title = ""
@@ -387,3 +388,71 @@ class TestPreCreateGuard:
         assert state.get_slot("cron-job42") is None
         assert job.run_never_started is False
         assert self._delete_owed(job) is True
+
+
+class TestCronTabWorkspace:
+    """The tab is the job's session-control identity; its workspace must be the
+    job agent's binding, or every crewmate the job creates is refused."""
+
+    @pytest.mark.asyncio
+    async def test_new_tab_takes_the_agent_workspace(self, monkeypatch):
+        import kiro_crew.dashboard.cron_inject as ci
+
+        monkeypatch.setattr(ci, "cron_job_workspace", lambda job: "atlomy-atlas")
+        state = _make_state()
+        await ensure_cron_slot(state, _make_job())
+        assert state.get_slot("cron-job42").workspace == "atlomy-atlas"
+
+    @pytest.mark.asyncio
+    async def test_existing_linked_tab_is_corrected(self, monkeypatch):
+        import kiro_crew.dashboard.cron_inject as ci
+
+        state = _make_state()
+        monkeypatch.setattr(ci, "cron_job_workspace", lambda job: "")
+        await ensure_cron_slot(state, _make_job())
+        slot = state.get_slot("cron-job42")
+        assert slot.workspace == "default" and slot.linked_session_key
+
+        monkeypatch.setattr(ci, "cron_job_workspace", lambda job: "atlomy-atlas")
+        await ensure_cron_slot(state, _make_job())
+        assert slot.workspace == "atlomy-atlas"
+
+    @pytest.mark.asyncio
+    async def test_unresolved_agent_leaves_the_workspace_alone(self, monkeypatch):
+        import kiro_crew.dashboard.cron_inject as ci
+
+        monkeypatch.setattr(ci, "cron_job_workspace", lambda job: "")
+        state = _make_state()
+        await ensure_cron_slot(state, _make_job())
+        assert state.get_slot("cron-job42").workspace == "default"
+
+    @pytest.mark.asyncio
+    async def test_hidden_job_gets_no_tab_and_no_resolution(self, monkeypatch):
+        import kiro_crew.dashboard.cron_inject as ci
+
+        calls = []
+        monkeypatch.setattr(ci, "cron_job_workspace", lambda job: calls.append(job) or "x")
+        state = _make_state()
+        await ensure_cron_slot(state, _make_job(hidden=True))
+        assert state.get_slot("cron-job42") is None and calls == []
+
+    def test_resolver_answers_from_the_agent_binding(self, monkeypatch):
+        from types import SimpleNamespace
+        from pathlib import Path
+
+        import kiro_crew.config.loader as loader
+        from kiro_crew.dashboard.cron_inject import cron_job_workspace
+
+        cfg = SimpleNamespace(workspaces={"atlomy-atlas": SimpleNamespace(dir="/w/atlas")})
+        monkeypatch.setattr(loader.KiroCrewConfig, "load", staticmethod(lambda: cfg))
+        monkeypatch.setattr(
+            loader,
+            "resolve_agent_bindings",
+            lambda c, agent, **kw: SimpleNamespace(
+                workspace_dir=Path("/w/atlas"), requested_resolved=agent == "conductor-atlas"
+            ),
+        )
+        job = SimpleNamespace(id="j", member_id="", agent_id="conductor-atlas")
+        assert cron_job_workspace(job) == "atlomy-atlas"
+        assert cron_job_workspace(SimpleNamespace(id="j", member_id="", agent_id="nope")) == ""
+        assert cron_job_workspace(SimpleNamespace(id="j", member_id="", agent_id="")) == ""
