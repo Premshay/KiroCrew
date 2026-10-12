@@ -79,11 +79,21 @@ export interface ApprovalMeta {
   base_command?: string
 }
 
+interface AttachRequest {
+  id: string
+  slot: string
+  title: string
+  role: string
+  reason: string
+  requestedBy: string
+}
+
 interface Channel {
   id: string
   topic: string
   agents: ChannelAgent[]
   messages: ChannelMessage[]
+  attachRequests: AttachRequest[]
 }
 
 interface ChannelPageError {
@@ -132,11 +142,21 @@ const mapMsg = (m: any): ChannelMessage => ({
   meta: m.meta && typeof m.meta === 'object' ? m.meta : undefined,
 })
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mapAttachRequest = (r: any): AttachRequest => ({
+  id: r.id,
+  slot: r.slot,
+  title: r.title || r.slot,
+  role: r.role || r.title || r.slot,
+  reason: r.reason || '',
+  requestedBy: r.requested_by || r.requestedBy || '',
+})
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mapChannel = (c: any): Channel => ({
   id: c.id,
   topic: c.topic,
   agents: Object.values(c.members || {}).map(mapAgent),
   messages: (c.messages || []).map(mapMsg),
+  attachRequests: (c.attach_requests || []).map(mapAttachRequest),
 })
 
 // ── Agent colors ──
@@ -1010,6 +1030,50 @@ function AttachSessionForm({
 
 // ── Sidebar ──
 
+/** A coordinator's request to attach a session; the user's click is the grant. */
+function AttachRequestCard({
+  request,
+  coordinator,
+  onResolve,
+}: {
+  request: AttachRequest
+  coordinator: string
+  onResolve: (action: 'approve' | 'decline') => Promise<void>
+}) {
+  const [busy, setBusy] = useState(false)
+  const resolve = async (action: 'approve' | 'decline') => {
+    setBusy(true)
+    try {
+      await onResolve(action)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <div
+      className="mb-2 rounded-md border border-border bg-bg-elevated px-3 py-2 text-sm text-text"
+      data-testid="channel-attach-request"
+    >
+      <div className="font-medium">
+        {i18nT('pages.channelPage.attach_request_title', {
+          coordinator: coordinator || request.requestedBy,
+          session: request.title,
+          role: request.role,
+        })}
+      </div>
+      {request.reason && <div className="mt-1 text-muted">{request.reason}</div>}
+      <div className="mt-2 flex gap-2">
+        <Btn primary disabled={busy} onClick={() => void resolve('approve')}>
+          {i18nT('pages.channelPage.attach_request_approve')}
+        </Btn>
+        <Btn disabled={busy} onClick={() => void resolve('decline')}>
+          {i18nT('pages.channelPage.attach_request_decline')}
+        </Btn>
+      </div>
+    </div>
+  )
+}
+
 function ChannelListItem({
   ch,
   active,
@@ -1189,6 +1253,14 @@ export default function ChannelPage() {
         setChannels((prev) => prev.filter((c) => c.id !== data.channel_id))
       } else if (type === 'channel_agent_joined') {
         reload()
+      } else if (type === 'channel_attach_requests') {
+        setChannels((prev) =>
+          prev.map((c) =>
+            c.id === data.channel_id
+              ? { ...c, attachRequests: (data.requests || []).map(mapAttachRequest) }
+              : c,
+          ),
+        )
       } else if (type === 'channel_agent_left') {
         setChannels((prev) =>
           prev.map((c) =>
@@ -1818,6 +1890,24 @@ export default function ChannelPage() {
               <div
                 className={`border-t border-border px-4 py-3 ${isMobile && (threadId || showAgents) ? 'hidden' : ''}`}
               >
+                {channel.attachRequests.map((req) => (
+                  <AttachRequestCard
+                    key={req.id}
+                    request={req}
+                    coordinator={
+                      channel.agents.find((a) => a.id === req.requestedBy)?.role ?? ''
+                    }
+                    onResolve={async (action) => {
+                      try {
+                        await api.channelResolveAttachRequest(channel.id, req.id, action)
+                      } catch (err) {
+                        fail('pages.channelPage.failed_to_resolve_attach_request', err)
+                      } finally {
+                        reload()
+                      }
+                    }}
+                  />
+                ))}
                 {/* No hand-off: the unsent message text (`input`) */}
                 <ErrorNotice
                   title={i18nT('pages.channelPage.failed_to_send_message')}

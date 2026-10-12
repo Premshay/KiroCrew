@@ -309,30 +309,34 @@ async def api_channel_close(request: web.Request) -> web.Response:
     return web.json_response({"ok": ok})
 
 
-async def api_channel_attach_session(request: web.Request) -> web.Response:
-    """Attach one live dashboard session to an existing channel."""
-    ch, body = await _get_channel_body(request)
-    slot_name = body.get("slot")
+def _attach_slot(
+    request: web.Request, ch, slot_name: object, role: object, listen_mode: object
+) -> tuple[Any, web.Response | None]:
+    """Attach a live dashboard slot; shared by the picker and approved requests."""
     if not isinstance(slot_name, str):
-        return web.json_response({"error": "slot required", "code": "slot_required"}, status=400)
+        return None, web.json_response(
+            {"error": "slot required", "code": "slot_required"}, status=400
+        )
     state: DashboardState = request.app["state"]
     slot = state._slots.get(slot_name)
     if slot is None:
-        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
+        return None, web.json_response(
+            {"error": "slot not found", "code": "slot_not_found"}, status=404
+        )
     request_app = request.get("app", "")
     if request_app and request_app != slot._app:
-        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
+        return None, web.json_response(
+            {"error": "slot not found", "code": "slot_not_found"}, status=404
+        )
     session_key = effective_session_key(slot)
     if not session_key.startswith("dashboard:"):
-        return web.json_response(
+        return None, web.json_response(
             {"error": "slot is not a dashboard session", "code": "unsupported_session"}, status=409
         )
-    role = body.get("role")
     if not isinstance(role, str) or not role.strip():
         role = slot.title or slot.key
-    listen_mode = body.get("listen", "all")
     if listen_mode not in {"all", "mention", "silent"}:
-        return web.json_response(
+        return None, web.json_response(
             {"error": "invalid listen mode", "code": "invalid_listen_mode"}, status=400
         )
     member = ch.attach_session(
@@ -342,11 +346,76 @@ async def api_channel_attach_session(request: web.Request) -> web.Response:
         listen_mode=listen_mode,
     )
     if member is None:
-        return web.json_response(
+        return None, web.json_response(
             {"error": "session is already attached or channel is full", "code": "attach_rejected"},
             status=409,
         )
+    return member, None
+
+
+async def api_channel_attach_session(request: web.Request) -> web.Response:
+    """Attach one live dashboard session to an existing channel."""
+    ch, body = await _get_channel_body(request)
+    member, error = _attach_slot(
+        request, ch, body.get("slot"), body.get("role"), body.get("listen", "all")
+    )
+    if error is not None:
+        return error
     return web.json_response({"ok": True, "agent": member.to_dict()})
+
+
+async def api_channel_resolve_attach_request(request: web.Request) -> web.Response:
+    """Approve or decline a coordinator's attach request.
+
+    Operator-authenticated like the picker it stands in for: the dashboard
+    user's click is the grant, so this route must never join the session-bound
+    MCP surface.
+    """
+    ch, body = await _get_channel_body(request)
+    action = body.get("action")
+    if action not in {"approve", "decline"}:
+        return web.json_response(
+            {"error": "action must be approve or decline", "code": "invalid_attach_action"},
+            status=400,
+        )
+    pending = ch.attach_requests.get(request.match_info["rid"])
+    if pending is None:
+        return web.json_response(
+            {"error": "attach request not found", "code": "attach_request_not_found"},
+            status=404,
+        )
+    member = None
+    if action == "approve":
+        # Capacity counted this request while it was pending; release it first
+        # so the attach sees the slot it reserved.
+        ch.attach_requests.pop(pending.id, None)
+        member, error = _attach_slot(
+            request, ch, pending.slot, pending.role, pending.listen_mode.value
+        )
+        if error is not None:
+            ch.attach_requests[pending.id] = pending
+            return error
+        ch._broadcast_attach_requests()
+        ch._save()
+    else:
+        ch.pop_attach_request(pending.id)
+    if ch.orchestrator_id == pending.requested_by:
+        outcome = (
+            f"✅ The user approved attaching {pending.title or pending.slot} "
+            f"as @{member.role} ({member.id})."
+            if member is not None
+            else f"🚫 The user declined attaching {pending.title or pending.slot}."
+        )
+        await ch.post(
+            "system",
+            outcome,
+            from_role="System",
+            mention=pending.requested_by,
+            msg_type="system",
+        )
+    return web.json_response(
+        {"ok": True, "agent": member.to_dict() if member is not None else None}
+    )
 
 
 # ── Messages ──

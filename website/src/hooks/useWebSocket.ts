@@ -812,6 +812,7 @@ export function useWebSocket() {
           case 'channel_closed':
           case 'channel_agent_joined':
           case 'channel_agent_left':
+          case 'channel_attach_requests':
             emitChannelEvent(type, data)
             break
           case 'cron_history':

@@ -5098,6 +5098,87 @@ def _mark_channel_membership_change(state: DashboardState, session_key: str) -> 
             return
 
 
+_CHAT_PAGE_SLOT_MODES = frozenset({"", "orchestrator"})
+_ATTACH_REQUEST_REFUSALS = {
+    "already_attached": ("that session is already a channel member", 409),
+    "already_requested": ("an attach request for that session is already pending", 409),
+    "too_many_requests": ("too many attach requests are pending", 409),
+    "channel_full": ("channel member limit reached, counting pending requests", 409),
+    "invalid_listen_mode": ("listen must be all, mention, or silent", 400),
+}
+
+
+def _attach_target_slot_name(value: object) -> str | None:
+    """Accept a live slot name, its ``dashboard:`` key, or its history key."""
+    if not isinstance(value, str) or not value or len(value) > 200:
+        return None
+    for prefix in ("dashboard:", "dashboard_"):
+        if value.startswith(prefix):
+            return value[len(prefix) :] or None
+    return value
+
+
+async def _request_channel_attach(
+    state: DashboardState, channel: Any, member: Any, caller_slot: Any, body: dict
+) -> web.Response:
+    """File a coordinator's attach request; only the dashboard user can grant it."""
+    slot_name = _attach_target_slot_name(body.get("session"))
+    if slot_name is None:
+        return web.json_response(
+            {"error": "session must name a dashboard session", "code": "invalid_attach_target"},
+            status=400,
+        )
+    slot = state._slots.get(slot_name)
+    # Same visibility the channel picker applies: an open chat-page session in
+    # the caller's own app. A crewmate desk or cron slot is not offered there,
+    # so it is not requestable here either.
+    if (
+        slot is None
+        or (caller_slot is not None and slot._app != caller_slot._app)
+        or not effective_session_key(slot).startswith("dashboard:")
+        or (getattr(slot, "mode", "") or "") not in _CHAT_PAGE_SLOT_MODES
+    ):
+        return web.json_response(
+            {
+                "error": "no attachable open dashboard session by that name",
+                "code": "slot_not_found",
+            },
+            status=404,
+        )
+    if caller_slot is not None and slot is caller_slot:
+        return web.json_response(
+            {"error": "the caller is already a channel member", "code": "invalid_attach_target"},
+            status=400,
+        )
+    role = body.get("role")
+    if role is not None and (not isinstance(role, str) or len(role) > 100):
+        return web.json_response(
+            {"error": "role must be at most 100 characters", "code": "invalid_worker_role"},
+            status=400,
+        )
+    reason = body.get("reason", "")
+    if not isinstance(reason, str) or len(reason) > 500:
+        return web.json_response(
+            {"error": "reason must be at most 500 characters", "code": "invalid_attach_reason"},
+            status=400,
+        )
+    listen_mode = body.get("listen", "mention")
+    title = sanitize_string(slot.title or slot.key).strip()
+    request, code = channel.request_attach(
+        requested_by=member.id,
+        slot=slot_name,
+        title=title,
+        role=sanitize_string(role or "").strip() or title,
+        listen_mode=listen_mode if isinstance(listen_mode, str) else "",
+        reason=sanitize_string(reason).strip(),
+    )
+    if request is None:
+        error, status = _ATTACH_REQUEST_REFUSALS.get(code, ("attach request refused", 409))
+        return web.json_response({"error": error, "code": code}, status=status)
+    state.push_slots_update()
+    return web.json_response({"ok": True, "request": request.to_dict()})
+
+
 async def api_session_channel(request: web.Request) -> web.Response:
     """Read, report, or coordinate through the caller's own persistent channel."""
     state: DashboardState = request.app["state"]
@@ -5148,10 +5229,10 @@ async def api_session_channel(request: web.Request) -> web.Response:
                 ],
             }
         )
-    if action not in {"post", "add_agent", "remove_member"}:
+    if action not in {"post", "add_agent", "remove_member", "request_attach"}:
         return web.json_response(
             {
-                "error": "action must be status, post, add_agent, or remove_member",
+                "error": "action must be status, post, add_agent, remove_member, or request_attach",
                 "code": "invalid_channel_action",
             },
             status=400,
@@ -5173,7 +5254,7 @@ async def api_session_channel(request: web.Request) -> web.Response:
             status=403,
         )
     channel, member = selected
-    if action in {"add_agent", "remove_member"}:
+    if action in {"add_agent", "remove_member", "request_attach"}:
         if not channel.is_active_coordinator(member):
             return web.json_response(
                 {
@@ -5182,6 +5263,9 @@ async def api_session_channel(request: web.Request) -> web.Response:
                 },
                 status=403,
             )
+        if action == "request_attach":
+            caller_slot = slots[0] if slots else None
+            return await _request_channel_attach(state, channel, member, caller_slot, body)
         if action == "add_agent":
             role = body.get("role")
             task = body.get("task")

@@ -82,6 +82,29 @@ The envelope states that it is a peer-agent message, not a user instruction or
 operator authorization; ordinary queued delivery is not appended to the visible
 user chat transcript.
 
+### Coordinator Attach Requests
+
+Attaching an existing dashboard session stays a dashboard-user grant. The
+active coordinator may ask for one with `session_channel_manage`
+`action: request_attach`, naming an open chat-page session (slot name,
+`dashboard:<slot>` key, or the `dashboard_<slot>` history key `list_sessions`
+returns), an optional role, `listen` mode (default `mention`) and a short
+reason. The gateway records an `AttachRequest` on the channel, persists it, and
+broadcasts `channel_attach_requests`; membership does not change. Pending
+requests count against channel capacity, a session can have one pending request,
+and the target must be an open chat-page slot in the caller's app — the same
+set the picker offers, so a crewmate desk or cron slot cannot be requested.
+
+The dashboard renders each request as a card with Approve and Decline. The card
+calls the operator-authenticated
+`POST /api/channels/{id}/attach-requests/{rid}`, which is on neither internal
+path list, so an agent's internal-secret credential cannot resolve its own
+request. Approval runs the picker's attach path; if the slot has closed the
+request stays pending and the error is returned. Either outcome posts a
+system message mentioning the coordinator. A coordinator transfer or removal
+withdraws requests the new coordinator did not file, and a reload drops
+requests whose author is no longer coordinator.
+
 ### Prompt-Busy Recovery
 
 `_stream_task` returns whether the provider reported a prompt-busy wedge (`llm_helpers.is_prompt_busy`: an `AcpPromptBusy`, or an `AcpError` carrying `already in progress` for producers that format the marker away) and posts no error card for it, because only `run_channel_agent` owns the `SessionManager`. The predicate is shared with `llm_helpers.stream_and_collect`, which reaches the same recovery contract from the unattended surfaces, so the two cannot disagree about what a wedge is — and `channel.py` does not have to cross the agent-SDK import boundary to ask. On that signal the loop calls `_recover_busy_agent`, which replaces the session through `_reset_busy_session` — a `SessionManager.reset` bound to the observed entry via `expect_session`, so a concurrent `api_channel_clear_context` reset is never mistaken for a session this loop may discard — replays the same message once on the cold session, and rebinds the now-dead client. Every other stream error keeps its existing card, since a reset cannot fix it.
@@ -173,6 +196,7 @@ members.
 | DELETE | `/api/channels/{id}` | Close a channel and cancel its live agents. |
 | POST | `/api/channels/{id}/clear-context` | Reset one agent context or all agent contexts and shared channel state. |
 | POST | `/api/channels/{id}/sessions` | Attach one existing dashboard session as a channel peer. |
+| POST | `/api/channels/{id}/attach-requests/{rid}` | Approve or decline a coordinator's attach request (dashboard user only). |
 | POST | `/api/channels/{id}/messages` | Post a human message, optional mentions, and an optional thread parent. |
 | POST | `/api/channels/{id}/agents` | Add and start an agent. |
 | PATCH | `/api/channels/{id}/agents/{aid}` | Update an agent approval policy or listen mode. |

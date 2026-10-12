@@ -2504,7 +2504,7 @@ SESSION_CHANNEL_MANAGE_SCHEMA = ToolSchema(
             "action",
             str,
             required=True,
-            allowed=frozenset({"add_agent", "remove_member"}),
+            allowed=frozenset({"add_agent", "remove_member", "request_attach"}),
         ),
         FieldSpec(
             "channel_id",
@@ -2518,6 +2518,9 @@ SESSION_CHANNEL_MANAGE_SCHEMA = ToolSchema(
         FieldSpec("agent", str, max_len=100),
         FieldSpec("member_id", str, max_len=8, pattern=_PERSISTENT_AGENT_CHANNEL_ID_RE),
         FieldSpec("force", bool),
+        FieldSpec("session", str, max_len=200),
+        FieldSpec("listen", str, allowed=frozenset({"all", "mention", "silent"})),
+        FieldSpec("reason", str, max_len=500),
     ],
 )
 

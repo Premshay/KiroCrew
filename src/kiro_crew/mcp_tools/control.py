@@ -1249,16 +1249,18 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
             "name": "session_channel_manage",
             "description": (
                 "As the current channel coordinator only, add a bounded channel-owned agent, "
-                "or remove a terminal member. Attaching an existing dashboard session requires "
-                "the dashboard user's explicit action in the channel UI. Other channel members "
-                "may inspect and report but cannot use this to change membership."
+                "remove a terminal member, or request_attach an existing open dashboard "
+                "session (name it by the key list_sessions shows; give a short reason). A "
+                "request only files an approval card: the dashboard user approves or declines "
+                "it in the channel UI, and the outcome arrives as a channel system message. "
+                "Other channel members may inspect and report but cannot change membership."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add_agent", "remove_member"],
+                        "enum": ["add_agent", "remove_member", "request_attach"],
                     },
                     "channel_id": {"type": "string", "maxLength": 8},
                     "role": {"type": "string", "maxLength": 100},
@@ -1266,6 +1268,9 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                     "agent": {"type": "string", "maxLength": 100},
                     "member_id": {"type": "string", "maxLength": 8},
                     "force": {"type": "boolean"},
+                    "session": {"type": "string", "maxLength": 200},
+                    "listen": {"type": "string", "enum": ["all", "mention", "silent"]},
+                    "reason": {"type": "string", "maxLength": 500},
                 },
                 "required": ["action", "channel_id"],
                 "additionalProperties": False,
@@ -2516,6 +2521,14 @@ def session_channel_manage(name: str, args: dict[str, Any]) -> str:
     if action == "add_agent":
         agent = result.get("agent") or {}
         return f"Channel agent added: {agent.get('role', 'Agent')} ({agent.get('id', 'unknown')})."
+    if action == "request_attach":
+        pending = result.get("request") or {}
+        return (
+            f"Attach request {pending.get('id', 'recorded')} filed for "
+            f"{pending.get('title') or pending.get('slot', 'the session')}. Membership has not "
+            "changed: the dashboard user decides in the channel UI, and the outcome arrives "
+            "as a channel system message."
+        )
     return f"Channel member removed: {result.get('removed_member_id', 'unknown')}."
 
 

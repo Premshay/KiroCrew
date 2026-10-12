@@ -17,6 +17,8 @@ export function createAgentChannelsEndpoints({ post, del, patch, j, jfetch: fetc
       post('/api/channels', { topic, agents, ...(sessionOnly ? { session_only: true } : {}) }).then(j),
     channelAttachSession: (id: string, slot: string) =>
       post('/api/channels/' + encodeURIComponent(id) + '/sessions', { slot }).then(j),
+    channelResolveAttachRequest: (id: string, rid: string, action: 'approve' | 'decline') =>
+      post('/api/channels/' + encodeURIComponent(id) + '/attach-requests/' + encodeURIComponent(rid), { action }).then(j),
     channelClose: (id: string) => del('/api/channels/' + encodeURIComponent(id)).then(j),
     channelPost: (id: string, content: string, mention?: string | string[], thread_id?: string) => post('/api/channels/' + encodeURIComponent(id) + '/messages', { content, mention, thread_id }).then(j),
     channelAddAgent: (id: string, agent: object) => post('/api/channels/' + encodeURIComponent(id) + '/agents', agent).then(j),

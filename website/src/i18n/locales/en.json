@@ -6379,6 +6379,9 @@
       "agent_2_one": "{{count}} agent",
       "agent_2_other": "{{count}} agents",
       "agents": "Agents",
+      "attach_request_approve": "Approve",
+      "attach_request_decline": "Decline",
+      "attach_request_title": "{{coordinator}} asks to add {{session}} as {{role}}",
       "cancel": "Cancel",
       "channels": "Channels",
       "clear_all_context": "Clear all context",
@@ -6414,6 +6417,7 @@
       "thread": "Thread",
       "topic": "Topic",
       "coordinator": "Coordinator",
+      "failed_to_resolve_attach_request": "Failed to resolve the attach request",
       "failed_to_set_coordinator": "Failed to set coordinator",
       "make_coordinator": "Make coordinator"
     },

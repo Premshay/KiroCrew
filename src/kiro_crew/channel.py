@@ -457,6 +457,59 @@ class ChannelAgent:
         }
 
 
+# A coordinator may ask to attach an existing dashboard session, but only the
+# dashboard user grants it: the request is recorded here and resolved by the
+# operator-authenticated channel route, never by the session-bound MCP route.
+_MAX_ATTACH_REQUESTS = 8
+_ATTACH_REQUEST_REASON_MAX_CHARS = 500
+
+
+@dataclass
+class AttachRequest:
+    """One coordinator request to attach an existing dashboard session."""
+
+    id: str
+    slot: str
+    title: str
+    role: str
+    listen_mode: ListenMode
+    reason: str
+    requested_by: str
+    created_at: float = field(default_factory=time.time)
+
+    @property
+    def session_key(self) -> str:
+        return f"dashboard:{self.slot}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "slot": self.slot,
+            "title": self.title,
+            "role": self.role,
+            "listen_mode": self.listen_mode.value,
+            "reason": self.reason,
+            "requested_by": self.requested_by,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AttachRequest | None":
+        try:
+            return cls(
+                id=str(data["id"]),
+                slot=str(data["slot"]),
+                title=str(data.get("title", "")),
+                role=str(data["role"]),
+                listen_mode=ListenMode(data.get("listen_mode", "mention")),
+                reason=str(data.get("reason", "")),
+                requested_by=str(data.get("requested_by", "")),
+                created_at=float(data.get("created_at", time.time())),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
 def _channel_collaboration_skill() -> str:
     """Read the packaged collaboration contract without making a turn depend on it."""
     path = Path(__file__).with_name("builtin_skills") / "channel-collaboration" / "SKILL.md"
@@ -532,6 +585,7 @@ class Channel:
     messages: list[ChannelMessage] = field(default_factory=list)
     _msg_index: dict[str, ChannelMessage] = field(default_factory=dict)
     exchange_counts: dict[tuple[str, str], int] = field(default_factory=dict)
+    attach_requests: dict[str, AttachRequest] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     trusted: bool = False  # channel-level trust — auto-approve all tools
     _broadcast_fn: Any = None  # set by ChannelManager
@@ -553,12 +607,25 @@ class Channel:
             member.is_orchestrator = member.id == agent_id
         agent.listen_mode = ListenMode.ALL
         self.orchestrator_id = agent_id
+        self._drop_foreign_attach_requests()
         self._broadcast(
             "channel_coordinator_changed",
             {"channel_id": self.id, "agent_id": agent_id},
         )
         self._save()
         return True
+
+    def _drop_foreign_attach_requests(self) -> None:
+        """Withdraw requests the current coordinator did not make."""
+        stale = [
+            rid
+            for rid, request in self.attach_requests.items()
+            if request.requested_by != self.orchestrator_id
+        ]
+        for rid in stale:
+            del self.attach_requests[rid]
+        if stale:
+            self._broadcast_attach_requests()
 
     def add_agent(
         self,
@@ -650,12 +717,72 @@ class Channel:
         self._save()
         return agent
 
+    def request_attach(
+        self,
+        requested_by: str,
+        slot: str,
+        title: str,
+        role: str,
+        listen_mode: ListenMode | str = ListenMode.MENTION,
+        reason: str = "",
+    ) -> tuple[AttachRequest | None, str]:
+        """Record a coordinator's request to attach a session; the user grants it.
+
+        Returns ``(request, "")`` or ``(None, code)``. Capacity counts pending
+        requests too, so approving every open card can never overfill the channel.
+        """
+        session_key = f"dashboard:{slot}"
+        if any(member.session_key == session_key for member in self.members.values()):
+            return None, "already_attached"
+        if any(request.slot == slot for request in self.attach_requests.values()):
+            return None, "already_requested"
+        if len(self.attach_requests) >= _MAX_ATTACH_REQUESTS:
+            return None, "too_many_requests"
+        if len(self.members) + len(self.attach_requests) >= self._max_agents:
+            return None, "channel_full"
+        if isinstance(listen_mode, str):
+            try:
+                listen_mode = ListenMode(listen_mode)
+            except ValueError:
+                return None, "invalid_listen_mode"
+        request = AttachRequest(
+            id=uuid.uuid4().hex[:8],
+            slot=slot,
+            title=title[:100],
+            role=role[:100],
+            listen_mode=listen_mode,
+            reason=reason[:_ATTACH_REQUEST_REASON_MAX_CHARS],
+            requested_by=requested_by,
+        )
+        self.attach_requests[request.id] = request
+        self._broadcast_attach_requests()
+        self._save()
+        return request, ""
+
+    def pop_attach_request(self, request_id: str) -> AttachRequest | None:
+        """Remove one pending attach request; the caller decides its outcome."""
+        request = self.attach_requests.pop(request_id, None)
+        if request is not None:
+            self._broadcast_attach_requests()
+            self._save()
+        return request
+
+    def _broadcast_attach_requests(self) -> None:
+        self._broadcast(
+            "channel_attach_requests",
+            {
+                "channel_id": self.id,
+                "requests": [r.to_dict() for r in self.attach_requests.values()],
+            },
+        )
+
     def remove_agent(self, agent_id: str, reason: str = "dismissed") -> bool:
         agent = self.members.pop(agent_id, None)
         if not agent:
             return False
         if agent_id == self.orchestrator_id:
             self.orchestrator_id = None
+            self._drop_foreign_attach_requests()
         agent.state = "done"
         self._broadcast(
             "channel_agent_left",
@@ -896,6 +1023,7 @@ class Channel:
             "topic": self.topic,
             "orchestrator_id": self.orchestrator_id,
             "members": {k: v.to_dict() for k, v in self.members.items()},
+            "attach_requests": [r.to_dict() for r in self.attach_requests.values()],
             "message_count": len(self.messages),
             "created_at": self.created_at,
         }
@@ -910,6 +1038,7 @@ class Channel:
             "members": {k: v.to_dict() for k, v in self.members.items()},
             "messages": [m.to_dict() for m in self.messages],
             "exchange_counts": {f"{a}:{b}": c for (a, b), c in self.exchange_counts.items()},
+            "attach_requests": [r.to_dict() for r in self.attach_requests.values()],
             "trusted": self.trusted,
             "max_exchanges": self.max_exchanges,
         }
@@ -980,6 +1109,12 @@ class Channel:
             parts = k.split(":", 1)
             if len(parts) == 2:
                 ch.exchange_counts[(parts[0], parts[1])] = v
+        for rd in data.get("attach_requests", []):
+            request = AttachRequest.from_dict(rd) if isinstance(rd, dict) else None
+            # A request outlives its coordinator only as a stale card nobody
+            # can be notified about; drop it rather than offer it for approval.
+            if request is not None and request.requested_by == ch.orchestrator_id:
+                ch.attach_requests[request.id] = request
         return ch
 
 

@@ -104,7 +104,7 @@ class TestSessionChannelTools:
         } <= names
         manage = next(tool for tool in tools if tool["name"] == "session_channel_manage")
         properties = manage["inputSchema"]["properties"]
-        assert properties["action"]["enum"] == ["add_agent", "remove_member"]
+        assert properties["action"]["enum"] == ["add_agent", "remove_member", "request_attach"]
         assert "session_label" not in properties
         assert "approval" not in properties
 
