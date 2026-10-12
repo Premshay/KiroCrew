@@ -6081,8 +6081,18 @@ async def api_session_archive_read(request: web.Request) -> web.Response:
     return web.Response(text=redacted, content_type="application/x-ndjson")
 
 
+_MEMBER_CHANNEL_ACTIONS = frozenset({"status", "post", "request_attach"})
+
+
 async def _member_channel_report_guard(request: web.Request) -> web.Response | None:
-    """Let a member read and post in its own channels, never change membership."""
+    """Let a member read, post and request attaches in its own channels.
+
+    ``request_attach`` only files a card the dashboard user approves, and the
+    handler still requires the caller to be that channel's coordinator, so a
+    crewmate coordinator can assemble its channel without changing membership
+    itself. ``add_agent`` and ``remove_member`` change membership directly and
+    stay owner-only.
+    """
     scope, refusal = await internal_memory_scope(request, "api_session_channel")
     if refusal is not None or scope is None:
         return refusal
@@ -6090,7 +6100,7 @@ async def _member_channel_report_guard(request: web.Request) -> web.Response | N
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
         return None  # the handler reports the malformed body
-    if isinstance(body, dict) and body.get("action") in {"status", "post"}:
+    if isinstance(body, dict) and body.get("action") in _MEMBER_CHANNEL_ACTIONS:
         return None
     return await member_scope_denied_refusal("api_session_channel")
 
@@ -6098,8 +6108,8 @@ async def _member_channel_report_guard(request: web.Request) -> web.Response | N
 # Every ``api_session*`` handler is an owner surface, so a private member's
 # internal call is refused before it runs (audit label = handler name). The
 # member-scoped ones act only on the caller's own slot and verify it
-# themselves; the channel route admits a member to its own channels for status
-# and post only. Maintenance stays owner-only: its status lists every busy
+# themselves; the channel route admits a member to its own channels for status,
+# post and request_attach (user-approved) only. Maintenance stays owner-only: its status lists every busy
 # session.
 guard_owner_surface_routes(
     globals(),

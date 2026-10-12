@@ -1687,6 +1687,7 @@ async def test_session_callbacks_use_the_ordinary_transport_identity(
         ("api_session_restart_continuation", {"checklist": "verify"}),
         ("api_session_channel", {"action": "status"}),
         ("api_session_channel", {"action": "post", "channel_id": "c1"}),
+        ("api_session_channel", {"action": "request_attach", "channel_id": "c1"}),
     ],
 )
 async def test_member_reaches_its_own_session_callbacks(env, handler_name, body):
@@ -1720,6 +1721,110 @@ async def test_member_cannot_manage_channels_or_read_maintenance(env, handler_na
     )
     assert response.status == 403
     assert json.loads(response.text)["code"] == "member_scope_denied"
+
+
+def _crewmate_channel(env, *, coordinator: bool):
+    """A channel the member ``alice`` (session ``dashboard:alice``) belongs to."""
+    from kiro_crew.channel import Channel
+
+    def slot(key: str, title: str):
+        return SimpleNamespace(
+            key=key,
+            title=title,
+            mode="",
+            _app="",
+            linked_session_key="",
+            mark_checkpoint_activity=lambda: None,
+        )
+
+    env.state._slots = {
+        "alice": slot("alice", "Alice desk"),
+        "helper": slot("helper", "Helper"),
+        "review-lane": slot("review-lane", "Review lane"),
+    }
+    env.state.push_slots_update = lambda: None
+    channel = Channel(id="deadbeef", topic="Crewmate coordination", _max_agents=4)
+    lead = channel.attach_session("dashboard:helper", role="Helper")
+    member = channel.attach_session("dashboard:alice", role="Alice")
+    assert lead is not None and member is not None
+    if coordinator:
+        channel.set_coordinator(member.id)
+    channels = {channel.id: channel}
+    env.state.channel_manager = SimpleNamespace(_channels=channels, get=channels.get)
+    return channel, member
+
+
+@pytest.mark.asyncio
+async def test_crewmate_coordinator_files_an_attach_request(env):
+    """The point of request_attach: a crewmate coordinator assembles its channel."""
+    from kiro_crew.dashboard.handlers import sessions
+
+    channel, member = _crewmate_channel(env, coordinator=True)
+    response = await sessions.api_session_channel(
+        request(
+            env,
+            internal=True,
+            session="dashboard:alice",
+            body={"action": "request_attach", "channel_id": channel.id, "session": "review-lane"},
+        )
+    )
+    assert response.status == 200, response.text
+    filed = json.loads(response.text)["request"]
+    assert filed["requested_by"] == member.id
+    assert len(channel.members) == 2
+
+
+@pytest.mark.asyncio
+async def test_crewmate_that_is_not_coordinator_cannot_request_attach(env):
+    from kiro_crew.dashboard.handlers import sessions
+
+    channel, _member = _crewmate_channel(env, coordinator=False)
+    response = await sessions.api_session_channel(
+        request(
+            env,
+            internal=True,
+            session="dashboard:alice",
+            body={"action": "request_attach", "channel_id": channel.id, "session": "review-lane"},
+        )
+    )
+    assert response.status == 403
+    assert json.loads(response.text)["code"] == "channel_coordinator_required"
+    assert channel.attach_requests == {}
+
+
+@pytest.mark.asyncio
+async def test_crewmate_coordinator_still_cannot_add_agents_directly(env):
+    from kiro_crew.dashboard.handlers import sessions
+
+    channel, _member = _crewmate_channel(env, coordinator=True)
+    response = await sessions.api_session_channel(
+        request(
+            env,
+            internal=True,
+            session="dashboard:alice",
+            body={
+                "action": "add_agent",
+                "channel_id": channel.id,
+                "role": "Worker",
+                "task": "Run checks.",
+            },
+        )
+    )
+    assert response.status == 403
+    assert json.loads(response.text)["code"] == "member_scope_denied"
+
+
+@pytest.mark.asyncio
+async def test_crewmate_status_names_itself_and_its_coordinator_role(env):
+    from kiro_crew.dashboard.handlers import sessions
+
+    channel, member = _crewmate_channel(env, coordinator=True)
+    response = await sessions.api_session_channel(
+        request(env, internal=True, session="dashboard:alice", body={"action": "status"})
+    )
+    status = json.loads(response.text)["channels"][0]
+    assert status["self"] == {"id": member.id, "role": "Alice"}
+    assert status["coordinator"] is True
 
 
 @pytest.mark.asyncio

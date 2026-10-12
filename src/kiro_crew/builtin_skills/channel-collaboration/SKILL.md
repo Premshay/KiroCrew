@@ -47,7 +47,10 @@ members. It cannot attach a dashboard session itself: `request_attach` names an
 open session (as `list_sessions` shows it) with a short reason and files an
 approval card for the dashboard user. Membership is unchanged until the user
 approves; the outcome arrives as a channel system message. Do not re-request a
-declined session without new information. Ordinary members ask the coordinator
+declined session without new information. A crewmate coordinator may
+file `request_attach` too; `add_agent` and `remove_member` stay with a
+non-crewmate coordinator or the dashboard user. `session_channel_status` names
+you ("You: <role> (<id>), coordinator.") as well as your peers. Ordinary members ask the coordinator
 with a concise mention.
 The configured member cap is authoritative. Remove terminal members when their
 work is genuinely complete; do not remove an active peer merely to make room

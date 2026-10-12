@@ -2485,9 +2485,16 @@ def session_channel_status(name: str, args: dict[str, Any]) -> str:
             if isinstance(capacity, dict)
             else ""
         )
+        own = channel.get("self") or {}
+        self_text = (
+            f" You: {own.get('role', 'member')} ({own.get('id', 'unknown')})"
+            f"{', coordinator' if channel.get('coordinator') is True else ''}."
+            if isinstance(own, dict) and own
+            else ""
+        )
         summaries.append(
-            f"{channel.get('id', 'unknown')} — {channel.get('topic', '')}: "
-            f"{peer_text or 'no peers'}.{capacity_text}"
+            f"{channel.get('id', 'unknown')} — {channel.get('topic', '')}:{self_text} "
+            f"Peers: {peer_text or 'none'}.{capacity_text}"
         )
     return "Attached persistent-agent channels:\n" + "\n".join(summaries)
 

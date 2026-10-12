@@ -1070,3 +1070,32 @@ class TestAttachedSessionWake:
         assert request["peer_message_id"] == "request-card"
         assert "From: Claude" in request["content"]
         assert "Please review the cache patch." in request["content"]
+
+
+class TestStatusToolNamesTheCaller:
+    def test_status_text_includes_self_and_coordinator(self, monkeypatch) -> None:
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:baton")
+        monkeypatch.setattr(
+            mcp_core,
+            "_post",
+            MagicMock(
+                return_value={
+                    "ok": True,
+                    "channels": [
+                        {
+                            "id": "deadbeef",
+                            "topic": "Import",
+                            "self": {"id": "2241fef0", "role": "Baton"},
+                            "coordinator": True,
+                            "peers": [],
+                            "capacity": {"used": 1, "max": 10},
+                        }
+                    ],
+                }
+            ),
+        )
+
+        text = mcp_core._call_tool_inner("session_channel_status", {})
+
+        assert "You: Baton (2241fef0), coordinator." in text
+        assert "Peers: none." in text
