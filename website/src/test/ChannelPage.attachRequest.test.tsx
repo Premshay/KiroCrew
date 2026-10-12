@@ -56,4 +56,30 @@ describe('ChannelPage — coordinator attach requests', () => {
       expect(vi.mocked(api).channelResolveAttachRequest).toHaveBeenCalledWith('ch1', 'req1', action),
     )
   })
+
+  it('approves every request from one coordinator through the single-request route', async () => {
+    const user = userEvent.setup()
+    const batch = {
+      ...channel,
+      attach_requests: [
+        ...channel.attach_requests,
+        { id: 'req2', slot: 'chat-b', title: 'B lane', role: 'B', reason: '', requested_by: 'lead' },
+        { id: 'req3', slot: 'chat-c', title: 'C lane', role: 'C', reason: '', requested_by: 'lead' },
+      ],
+    }
+    vi.mocked(api).channelsList = vi.fn().mockResolvedValue({ channels: [batch] })
+    vi.mocked(api).channelGet = vi.fn().mockResolvedValue(batch)
+    renderWithProviders(<ChannelPage />)
+    await user.click(await screen.findByRole('button', { name: 'Approve all 3 from Lead' }))
+    await waitFor(() => expect(vi.mocked(api).channelResolveAttachRequest).toHaveBeenCalledTimes(3))
+    for (const rid of ['req1', 'req2', 'req3']) {
+      expect(vi.mocked(api).channelResolveAttachRequest).toHaveBeenCalledWith('ch1', rid, 'approve')
+    }
+  })
+
+  it('offers no batch button for a single request', async () => {
+    renderWithProviders(<ChannelPage />)
+    await screen.findByTestId('channel-attach-request')
+    expect(screen.queryByRole('button', { name: /Approve all/ })).toBeNull()
+  })
 })

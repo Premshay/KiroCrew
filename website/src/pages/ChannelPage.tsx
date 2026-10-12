@@ -1030,6 +1030,49 @@ function AttachSessionForm({
 
 // ── Sidebar ──
 
+/** One "Approve all" per coordinator with two or more pending requests (a changeover). */
+function AttachRequestBatches({
+  requests,
+  roleOf,
+  onApproveAll,
+}: {
+  requests: AttachRequest[]
+  roleOf: (memberId: string) => string
+  onApproveAll: (batch: AttachRequest[]) => Promise<void>
+}) {
+  const [busy, setBusy] = useState(false)
+  const batches = new Map<string, AttachRequest[]>()
+  for (const req of requests) {
+    batches.set(req.requestedBy, [...(batches.get(req.requestedBy) ?? []), req])
+  }
+  const multi = [...batches].filter(([, batch]) => batch.length > 1)
+  if (multi.length === 0) return null
+  return (
+    <div className="mb-2 flex flex-wrap gap-2">
+      {multi.map(([requester, batch]) => (
+        <Btn
+          key={requester}
+          primary
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true)
+            try {
+              await onApproveAll(batch)
+            } finally {
+              setBusy(false)
+            }
+          }}
+        >
+          {i18nT('pages.channelPage.attach_request_approve_all', {
+            coordinator: roleOf(requester),
+            count: batch.length,
+          })}
+        </Btn>
+      ))}
+    </div>
+  )
+}
+
 /** A coordinator's request to attach a session; the user's click is the grant. */
 function AttachRequestCard({
   request,
@@ -1890,6 +1933,22 @@ export default function ChannelPage() {
               <div
                 className={`border-t border-border px-4 py-3 ${isMobile && (threadId || showAgents) ? 'hidden' : ''}`}
               >
+                <AttachRequestBatches
+                  requests={channel.attachRequests}
+                  roleOf={(id) => channel.agents.find((a) => a.id === id)?.role ?? id}
+                  onApproveAll={async (batch) => {
+                    // One request at a time through the same route as a single
+                    // click, so each approval re-runs every server-side check.
+                    for (const req of batch) {
+                      try {
+                        await api.channelResolveAttachRequest(channel.id, req.id, 'approve')
+                      } catch (err) {
+                        fail('pages.channelPage.failed_to_resolve_attach_request', err)
+                      }
+                    }
+                    reload()
+                  }}
+                />
                 {channel.attachRequests.map((req) => (
                   <AttachRequestCard
                     key={req.id}

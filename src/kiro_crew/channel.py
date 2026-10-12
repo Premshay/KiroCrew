@@ -460,7 +460,6 @@ class ChannelAgent:
 # A coordinator may ask to attach an existing dashboard session, but only the
 # dashboard user grants it: the request is recorded here and resolved by the
 # operator-authenticated channel route, never by the session-bound MCP route.
-_MAX_ATTACH_REQUESTS = 8
 _ATTACH_REQUEST_REASON_MAX_CHARS = 500
 
 
@@ -501,7 +500,7 @@ class AttachRequest:
                 slot=str(data["slot"]),
                 title=str(data.get("title", "")),
                 role=str(data["role"]),
-                listen_mode=ListenMode(data.get("listen_mode", "mention")),
+                listen_mode=ListenMode(data.get("listen_mode", "all")),
                 reason=str(data.get("reason", "")),
                 requested_by=str(data.get("requested_by", "")),
                 created_at=float(data.get("created_at", time.time())),
@@ -723,21 +722,20 @@ class Channel:
         slot: str,
         title: str,
         role: str,
-        listen_mode: ListenMode | str = ListenMode.MENTION,
+        listen_mode: ListenMode | str = ListenMode.ALL,
         reason: str = "",
     ) -> tuple[AttachRequest | None, str]:
         """Record a coordinator's request to attach a session; the user grants it.
 
         Returns ``(request, "")`` or ``(None, code)``. Capacity counts pending
-        requests too, so approving every open card can never overfill the channel.
+        requests too, so approving every open card can never overfill the channel;
+        it is also the only bound on how many can be pending at once.
         """
         session_key = f"dashboard:{slot}"
         if any(member.session_key == session_key for member in self.members.values()):
             return None, "already_attached"
         if any(request.slot == slot for request in self.attach_requests.values()):
             return None, "already_requested"
-        if len(self.attach_requests) >= _MAX_ATTACH_REQUESTS:
-            return None, "too_many_requests"
         if len(self.members) + len(self.attach_requests) >= self._max_agents:
             return None, "channel_full"
         if isinstance(listen_mode, str):

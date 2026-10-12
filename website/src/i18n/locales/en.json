@@ -6380,6 +6380,7 @@
       "agent_2_other": "{{count}} agents",
       "agents": "Agents",
       "attach_request_approve": "Approve",
+      "attach_request_approve_all": "Approve all {{count}} from {{coordinator}}",
       "attach_request_decline": "Decline",
       "attach_request_title": "{{coordinator}} asks to add {{session}} as {{role}}",
       "cancel": "Cancel",

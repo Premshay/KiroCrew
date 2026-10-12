@@ -5102,7 +5102,6 @@ _CHAT_PAGE_SLOT_MODES = frozenset({"", "orchestrator"})
 _ATTACH_REQUEST_REFUSALS = {
     "already_attached": ("that session is already a channel member", 409),
     "already_requested": ("an attach request for that session is already pending", 409),
-    "too_many_requests": ("too many attach requests are pending", 409),
     "channel_full": ("channel member limit reached, counting pending requests", 409),
     "invalid_listen_mode": ("listen must be all, mention, or silent", 400),
 }
@@ -5121,7 +5120,12 @@ def _attach_target_slot_name(value: object) -> str | None:
 async def _request_channel_attach(
     state: DashboardState, channel: Any, member: Any, caller_slot: Any, body: dict
 ) -> web.Response:
-    """File a coordinator's attach request; only the dashboard user can grant it."""
+    """File a coordinator's attach request; only the dashboard user can grant it.
+
+    ``member`` is the caller's own membership, resolved from its verified session
+    key and already checked against ``channel.orchestrator_id``. The requester is
+    always that member: nothing in the body can name a different one.
+    """
     slot_name = _attach_target_slot_name(body.get("session"))
     if slot_name is None:
         return web.json_response(
@@ -5162,7 +5166,7 @@ async def _request_channel_attach(
             {"error": "reason must be at most 500 characters", "code": "invalid_attach_reason"},
             status=400,
         )
-    listen_mode = body.get("listen", "mention")
+    listen_mode = body.get("listen", "all")
     title = sanitize_string(slot.title or slot.key).strip()
     request, code = channel.request_attach(
         requested_by=member.id,

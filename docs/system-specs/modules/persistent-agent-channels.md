@@ -88,10 +88,13 @@ Attaching an existing dashboard session stays a dashboard-user grant. The
 active coordinator may ask for one with `session_channel_manage`
 `action: request_attach`, naming an open chat-page session (slot name,
 `dashboard:<slot>` key, or the `dashboard_<slot>` history key `list_sessions`
-returns), an optional role, `listen` mode (default `mention`) and a short
+returns), an optional role, `listen` mode (default `all`, carried through to the attach) and a short
 reason. The gateway records an `AttachRequest` on the channel, persists it, and
-broadcasts `channel_attach_requests`; membership does not change. Pending
-requests count against channel capacity, a session can have one pending request,
+broadcasts `channel_attach_requests`; membership does not change. The
+requester is the caller's own membership, checked against the channel record's
+coordinator; no payload field names it. Pending requests count against channel
+capacity (the only bound on how many can be pending), a session can have one
+pending request,
 and the target must be an open chat-page slot in the caller's app — the same
 set the picker offers, so a crewmate desk or cron slot cannot be requested.
 

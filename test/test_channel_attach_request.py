@@ -98,19 +98,47 @@ class TestRequestAttach:
         assert response.status == 200
         assert body["request"]["slot"] == "review-lane"
         assert body["request"]["role"] == "Review lane"
-        assert body["request"]["listen_mode"] == "mention"
+        assert body["request"]["listen_mode"] == "all"
         assert len(channel.members) == 2
         assert channel.to_dict()["attach_requests"][0]["reason"] == "Needs the review lane."
         assert events[-1][0] == "channel_attach_requests"
 
     @pytest.mark.asyncio
-    async def test_non_coordinator_cannot_request(self, tmp_path):
+    async def test_non_coordinator_member_is_refused(self, tmp_path):
         state, channel, _lead, _helper, _events = _setup(tmp_path)
 
         response = await _file(state, channel, session_key="dashboard:helper")
 
         assert response.status == 403
         assert json.loads(response.text)["code"] == "channel_coordinator_required"
+        assert channel.attach_requests == {}
+
+    @pytest.mark.asyncio
+    async def test_payload_cannot_name_the_requester(self, tmp_path):
+        # A member that names the coordinator in the body is still itself.
+        state, channel, lead, helper, _events = _setup(tmp_path)
+
+        refused = await _file(
+            state,
+            channel,
+            session_key="dashboard:helper",
+            requested_by=lead.id,
+            member_id=lead.id,
+        )
+        filed = await _file(state, channel, requested_by=helper.id)
+
+        assert refused.status == 403
+        request = json.loads(filed.text)["request"]
+        assert request["requested_by"] == lead.id == channel.orchestrator_id
+
+    @pytest.mark.asyncio
+    async def test_former_coordinator_is_refused_after_transfer(self, tmp_path):
+        state, channel, _lead, helper, _events = _setup(tmp_path)
+        channel.set_coordinator(helper.id)
+
+        response = await _file(state, channel, session_key="dashboard:lead")
+
+        assert response.status == 403
         assert channel.attach_requests == {}
 
     @pytest.mark.asyncio
@@ -143,6 +171,18 @@ class TestRequestAttach:
         assert json.loads(duplicate.text)["code"] == "already_requested"
         assert json.loads(overflow.text)["code"] == "channel_full"
 
+    @pytest.mark.asyncio
+    async def test_a_changeover_can_file_ten_requests(self, tmp_path):
+        state, channel, _lead, _helper, _events = _setup(tmp_path)
+        channel._max_agents = 12
+        for i in range(10):
+            state.get_or_create_slot(f"next-{i}").title = f"Next {i}"
+
+        statuses = [(await _file(state, channel, session=f"next-{i}")).status for i in range(10)]
+
+        assert statuses == [200] * 10
+        assert len(channel.attach_requests) == 10
+
     def test_tool_advertises_request_attach(self):
         manage = next(t for t in mcp_core._list_tools() if t["name"] == "session_channel_manage")
         properties = manage["inputSchema"]["properties"]
@@ -170,6 +210,20 @@ class TestRequestAttach:
 
 class TestResolveAttachRequest:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("listen", ["all", "mention", "silent"])
+    async def test_requested_listen_mode_reaches_the_member(self, tmp_path, listen):
+        state, channel, _lead, _helper, _events = _setup(tmp_path)
+        filed = json.loads((await _file(state, channel, listen=listen)).text)["request"]
+        assert filed["listen_mode"] == listen
+
+        response = await api_channel_resolve_attach_request(
+            _operator_request(state, channel.id, filed["id"], {"action": "approve"})
+        )
+
+        member = channel.members[json.loads(response.text)["agent"]["id"]]
+        assert member.listen_mode.value == listen
+
+    @pytest.mark.asyncio
     async def test_approve_attaches_and_notifies_the_coordinator(self, tmp_path):
         state, channel, lead, _helper, _events = _setup(tmp_path)
         filed = json.loads((await _file(state, channel, role="Reviewer")).text)["request"]
@@ -181,7 +235,7 @@ class TestResolveAttachRequest:
         body = json.loads(response.text)
         assert response.status == 200
         assert body["agent"]["role"] == "Reviewer"
-        assert body["agent"]["listen_mode"] == "mention"
+        assert body["agent"]["listen_mode"] == "all"
         assert body["agent"]["session_key"] == "dashboard:review-lane"
         assert channel.attach_requests == {}
         notice = channel.messages[-1]
