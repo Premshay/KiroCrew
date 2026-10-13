@@ -52,7 +52,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.mcp_cleanup import CONTROL_PLANE_SERVERS
+from kiro_crew.code_fingerprint import require_current_code
+from kiro_crew.mcp_cleanup import CONTROL_PLANE_SERVERS, KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.mcp_gateway.hashing import STUB_FLAGS_FLAG, encode_target_args, expand_stub_flags
 from kiro_crew.mcp_gateway.rewriter import _WRAPPER_MARKER, _WRAPPER_MARKER_LEGACY
@@ -454,6 +455,8 @@ def pooled_session_servers(
         shaped = _acp_server_entry(str(name), entry, channel_id)
         if shaped is not None:
             out.append(shaped)
+    if any(entry["name"] in KIROCREW_BIN_MCP_SERVERS for entry in out):
+        require_current_code()
     return out
 
 
@@ -495,6 +498,15 @@ def explicit_session_servers(
         shaped = _acp_server_entry(str(name), entry, channel_id)
         if shaped is not None:
             out.append(shaped)
+    if any(
+        entry["name"] in KIROCREW_BIN_MCP_SERVERS
+        and (
+            servers[entry["name"]].get(_WRAPPER_MARKER)
+            or servers[entry["name"]].get(_WRAPPER_MARKER_LEGACY)
+        )
+        for entry in out
+    ):
+        require_current_code()
     return out
 
 

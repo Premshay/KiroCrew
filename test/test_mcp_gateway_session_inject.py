@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew import code_fingerprint as cf
+from kiro_crew.mcp_gateway import session_servers
 from kiro_crew.mcp_gateway.hashing import expand_stub_flags
 from kiro_crew.mcp_gateway.rewriter import _WRAPPER_MARKER
 from kiro_crew.mcp_gateway.session_servers import (
@@ -58,6 +60,50 @@ def _write_overlay(tmp_path: Path, agent: str, servers: dict) -> Path:
 
 
 # ── selection: only stubs are injected ──────────────────────────────────────
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("server", ["kirocrew-core", "kirocrew-cron"])
+def test_managed_stubs_refuse_source_drift(tmp_path, monkeypatch, explicit, server):
+    overlay = _write_overlay(tmp_path, "agent", {server: _stub()})
+    monkeypatch.setattr(cf, "code_fingerprint", lambda: "running-package")
+    monkeypatch.setattr(cf, "fingerprint_of", lambda root: "updated-package")
+    with pytest.raises(RuntimeError, match="restart the gateway"):
+        if explicit:
+            explicit_session_servers(overlay, "agent", {server})
+        else:
+            pooled_session_servers(overlay, "agent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["codex", "deepseek"])
+async def test_mirrored_backend_propagates_source_drift(tmp_path, monkeypatch, backend):
+    from kiro_crew.acp.client import AcpClient
+
+    overlay = _write_overlay(tmp_path, "agent", {"kirocrew-core": _stub()})
+    monkeypatch.setattr(cf, "code_fingerprint", lambda: "running-package")
+    monkeypatch.setattr(cf, "fingerprint_of", lambda root: "updated-package")
+    client = AcpClient(
+        work_dir=tmp_path, agent="agent", acp_backend=backend, mcp_gateway_overlay=overlay
+    )
+    with pytest.raises(RuntimeError, match="restart the gateway"):
+        await client._prepare_session_mcp()
+    assert client._session_mcp_cache is None
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_third_party_stubs_do_not_check_crew_source(tmp_path, monkeypatch, explicit):
+    overlay = _write_overlay(tmp_path, "agent", {"context7": _stub()})
+
+    def unexpected_check():
+        pytest.fail("third-party server does not import Crew's package")
+
+    monkeypatch.setattr(session_servers, "require_current_code", unexpected_check)
+    if explicit:
+        servers = explicit_session_servers(overlay, "agent", {"context7"})
+    else:
+        servers = pooled_session_servers(overlay, "agent")
+    assert [entry["name"] for entry in servers] == ["context7"]
 
 
 def test_injects_only_wrapped_stub_entries(tmp_path):

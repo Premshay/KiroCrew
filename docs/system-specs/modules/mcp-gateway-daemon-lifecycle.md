@@ -6,6 +6,18 @@ This module states the contract that closes it. Two gateways deliberately sharin
 
 ## Code fingerprint
 
+Before projecting managed broker stubs into a new session, `session_servers`
+compares the running process's cached package fingerprint with the source on
+disk. Source drift refuses the launch with a gateway restart instruction.
+The check runs off-loop on the existing projection path and covers both pooled
+arrays and the explicit Claude profile. Third-party stubs do not require this
+check. A managed stub from changed source would otherwise reject the daemon's
+generation and execute directly inside the harness sandbox, where admission
+stores containing signing keys are deliberately unreadable. Codex can continue
+after that MCP startup failure with the affected tools absent; DeepSeek refuses
+session startup. Restarting the gateway loads the staged source and restores the
+matching generation without exposing admission credentials to either harness.
+
 `code_fingerprint.code_fingerprint()` is one opaque token naming WHICH Kiro Crew code a process imported, computed once per process. Git is resolved through `platform_compat.trusted_git_bin` (fixed system directories, never `PATH`) and run with global and system config disabled, inherited `GIT_*` variables dropped and `--no-ext-diff --no-textconv`, because this runs in the gateway process on a tree an agent can write to; no trusted git means the mtime rule. Inside a git worktree it is the HEAD commit plus `+<sha256 of the tracked diff>` when tracked files differ — the diff TEXT, not a dirty bit, because two uncommitted edits to one HEAD are different code, and a bare `+dirty` would let a daemon from the first edit be adopted by a gateway on the second. Otherwise it is `mtime:<digest>` over the installed distribution version and the newest `*.py` mtime under the package, since a wheel is immutable until replaced and replacing it moves the mtimes. The only contract is *equal iff the same code*. The first computation runs `git` or walks the package tree, so the two async owners — `run_gatewayd` before it binds, `GatewayManager._start_locked` before its election loop — await `warm_code_fingerprint()` (`asyncio.to_thread`) once; every later synchronous read on their event loops (the pong, the stand-down handler, `_code_drift`) is a cache hit. The stub computes it inside `build_register_payload`, which already runs on the subprocess executor.
 
 This exists because nothing else could answer the question. The MCP stub's `binary_version` (`mcp_gateway/stub.py::_binary_version`) hashes the target binary, and for Kiro Crew's own servers that binary is the `.venv/bin/kirocrew` console-script shim — byte-identical across every commit of an editable install. The distribution version changes only at a release.

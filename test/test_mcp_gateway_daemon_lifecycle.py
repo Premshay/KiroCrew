@@ -126,13 +126,18 @@ class TestCodeFingerprint:
         ).stdout.strip()
 
         assert cf.fingerprint_of(pkg) == tree
+        monkeypatch.setattr(cf, "_PACKAGE_ROOT", pkg)
+        cf.require_current_code()
         (tmp_path / "test.txt").write_text("fixture changed\n", encoding="utf-8")
         git("add", "test.txt")
         git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "test only")
         assert cf.fingerprint_of(pkg) == tree
+        cf.require_current_code()
         (pkg / "a.py").write_text("x = 2\n", encoding="utf-8")
         first_edit = cf.fingerprint_of(pkg)
         assert first_edit.startswith(f"{tree}+") and first_edit != tree
+        with pytest.raises(RuntimeError, match="restart the gateway"):
+            cf.require_current_code()
         # A SECOND uncommitted edit on the same tree is different code, and
         # must not read as the same fingerprint -- a bare dirty bit did, and a
         # daemon from the first edit was then adopted by a gateway on the second.
@@ -143,6 +148,8 @@ class TestCodeFingerprint:
         git("add", "pkg/a.py")
         git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "package change")
         assert cf.fingerprint_of(pkg) != tree
+        cf.code_fingerprint.cache_clear()
+        cf.require_current_code()
 
     def test_git_is_resolved_from_system_dirs_and_runs_with_no_planted_config(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -190,5 +190,22 @@ async def warm_code_fingerprint() -> str:
 
 
 def fingerprint_of(root: Path) -> str:
-    """Uncached fingerprint of an arbitrary package root; for tests."""
+    """Uncached fingerprint of an arbitrary package root."""
     return _git_fingerprint(root) or _mtime_fingerprint(root)
+
+
+def require_current_code() -> None:
+    """Refuse new managed MCP launches after the running package changes on disk.
+
+    Blocking: call off-loop before handing broker stubs to a harness. A fresh
+    stub imports the on-disk package, not this process's cached generation.
+    """
+    running = code_fingerprint()
+    current = fingerprint_of(_PACKAGE_ROOT)
+    if current != running:
+        raise RuntimeError(
+            "Kiro Crew source changed since this gateway started; restart the gateway "
+            "before starting a session with managed MCP tools. The running gateway and "
+            "new MCP stubs have different code fingerprints; direct execution inside "
+            "the harness sandbox cannot replace the shared gateway."
+        )
