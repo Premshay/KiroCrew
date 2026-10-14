@@ -244,13 +244,13 @@
  1 test_mcp_caller.py
  1 test_mcp_cron_security.py
  1 test_mcp_discovery.py
- 8 test_mcp_gateway_adopted_daemon_repair.py
+ 7 test_mcp_gateway_adopted_daemon_repair.py
  8 test_mcp_gateway_backend_coverage.py
  5 test_mcp_gateway_backend_record.py
  3 test_mcp_gateway_bluegreen.py
  8 test_mcp_gateway_daemon_composition_contract.py
  1 test_mcp_gateway_daemon_control.py
- 6 test_mcp_gateway_daemon_lifecycle.py
+ 5 test_mcp_gateway_daemon_lifecycle.py
  1 test_mcp_gateway_exclusive_backend.py
  1 test_mcp_gateway_liveness_verdict.py
  6 test_mcp_gateway_pool_integ.py

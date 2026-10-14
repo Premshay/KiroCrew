@@ -39,6 +39,7 @@ from kiro_crew import code_fingerprint as cf
 from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import manager as mgr
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.testing.wait import async_wait_until
 
 _POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="/proc and unix sockets")
 
@@ -402,15 +403,14 @@ async def test_a_real_daemon_exits_when_its_owner_dies(
         start_new_session=True,
     )
     try:
-        from kiro_crew.mcp_gateway import transport
-
-        deadline = asyncio.get_running_loop().time() + 60
-        while not await asyncio.to_thread(transport.endpoint_exists, sock):
-            assert asyncio.get_running_loop().time() < deadline, "daemon never bound"
-            await asyncio.sleep(0.05)
         from kiro_crew.mcp_gateway.daemon_control import describe_daemon
 
-        info = await asyncio.to_thread(describe_daemon, sock)
+        info = await async_wait_until(
+            lambda: describe_daemon(sock),
+            timeout=60,
+            off_loop=True,
+            describe=lambda: f"daemon {daemon.pid} on {sock}; returncode={daemon.returncode}",
+        )
         assert info is not None
         assert info.owner_pid == owner.pid
         assert info.pid == daemon.pid

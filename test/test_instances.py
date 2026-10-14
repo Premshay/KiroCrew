@@ -9615,10 +9615,13 @@ class TestOrphanForwarderReclaim:
         self, tmp_path, monkeypatch, orphan_test, mismatch
     ):
         """With the orphan gate OPEN on either platform's test, a forged MAC, a
-        start-time mismatch or a foreign argv still signals nothing."""
+        start-time mismatch or a foreign argv still signals nothing.
+
+        Reclaim needs the recorded listener, not a replacement tunnel: allocating
+        a replacement adds a probe-to-bind race unrelated to identity refusal.
+        """
         import kiro_crew.instances.ssh_tunnel_manager as stm
         from kiro_crew import platform_compat as pc
-        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
 
         proc, port, argv = self._spawn_port_holder()
         try:
@@ -9639,9 +9642,10 @@ class TestOrphanForwarderReclaim:
             reg, mgr = self._mgr(tmp_path)
             self._record(reg, port=port, pid=proc.pid, start=recorded, sig=sig)
 
-            st = await mgr.connect("cd-1")
+            params = stm._TransportParams(method="ssh", ssh_host="cd-1-alias")
+            async with mgr._lock:
+                await mgr._reclaim_orphan_forwarder(reg.get("cd-1"), params)
 
-            assert st.state == TunnelState.CONNECTED
             assert proc.poll() is None, f"a {mismatch}-mismatched forwarder was signalled"
         finally:
             self._cleanup(proc)

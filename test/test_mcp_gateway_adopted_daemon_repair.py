@@ -51,6 +51,7 @@ from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import manager as mgr
 from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.gatewayd import resolvable_target_stems
+from kiro_crew.testing.wait import async_wait_until
 
 #: The fingerprint every fake pong in this module carries. The REAL one, because
 #: the end-to-end test spawns a real daemon from this same checkout and the
@@ -958,13 +959,17 @@ async def _round_trip(socket_path: Path, frame: dict[str, Any]) -> dict[str, Any
 
 
 async def _await_endpoint(socket_path: Path, *, timeout: float = 60.0) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        if await asyncio.to_thread(transport.endpoint_exists, socket_path):
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"daemon never bound {socket_path}")
+    async def answering_ping() -> bool:
+        pong = await _round_trip(socket_path, {"type": "ping"})
+        assert pong["type"] == "pong"
+        return True
+
+    await async_wait_until(
+        answering_ping,
+        timeout=timeout,
+        ignoring=(FileNotFoundError, ConnectionRefusedError),
+        describe=lambda: f"daemon on {socket_path} has not answered ping",
+    )
 
 
 def _isolate(monkeypatch: pytest.MonkeyPatch, home: Path) -> Path:
@@ -1110,9 +1115,9 @@ async def test_a_stale_survivor_is_repaired_end_to_end(
             "KIROCREW_MCP_TARGET_PDF": "npx -y server-pdf --stdio",
         }
         _only_targets(monkeypatch, wanted)
-        # Wait on the replacement's bind itself, then run the real readiness
+        # Wait for the replacement's ping, then run the real readiness
         # check with production's unchanged 5 s ceiling. _await_endpoint's bound
-        # is only a lost-run ceiling: a daemon that never binds still fails.
+        # is only a lost-run ceiling: a daemon that never answers still fails.
         original_wait_for_socket = mgr.GatewayManager._wait_for_socket
 
         async def _wait_for_bound_socket(path: Path, timeout: float) -> bool:
