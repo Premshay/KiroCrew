@@ -168,23 +168,48 @@ class TestDeepseekSessionArray:
             MEMBER_DISPATCH_SERVER,
         ]
 
-    def test_an_unreadable_spec_mounts_member_elements_only(
-        self, agents_dir, tmp_path, monkeypatch
-    ):
-        """When the spec cannot be read, the mirror returns empty servers; member mounts still land."""
-        from kiro_crew.providers.mirrors import deepseek as deepseek_mod
-
-        def _boom(*_a, **_k):
-            raise OSError("unreadable")
-
-        # Patch via the deepseek module's own reference (the mirror imports directly).
-        monkeypatch.setattr(deepseek_mod, "session_mcp_projection", _boom)
+    def test_an_unreadable_spec_still_mounts_the_member_elements(self, agents_dir, tmp_path):
+        """A spec that cannot be parsed reads as no spec; the member mounts still land."""
+        (agents_dir / "kirocrew.json").write_text("{not json", encoding="utf-8")
         client = _client(tmp_path, MEMBER_KEY)
-        # Empty spec projection → only member mounts (dispatch + panel).
-        assert _names(client._resolve_session_mcp_servers()) == [
-            MEMBER_DISPATCH_SERVER,
-            MEMBER_PANEL_SERVER,
-        ]
+        names = _names(client._resolve_session_mcp_servers())
+        assert CONTROL_PLANE_SERVER in names
+        assert names[-2:] == [MEMBER_DISPATCH_SERVER, MEMBER_PANEL_SERVER]
+        assert client._spec_zero_tools is False
+
+    def test_a_stale_derived_spec_refuses_the_session(self, agents_dir, tmp_path, monkeypatch):
+        """The freshness gate's refusal reaches the spawn rather than a zero-tool session.
+
+        Driven through the real gate: the default spec drops an auto-approval, the
+        heartbeat copy keeps it, and the re-derive that would bring it current fails.
+        """
+        import kiro_crew.agent as agent_mod
+
+        def default_spec(auto_approve: list[str]) -> str:
+            core = {"command": "/opt/kirocrew", "args": ["mcp-core"], "autoApprove": auto_approve}
+            return json.dumps(
+                {
+                    "name": "kirocrew",
+                    "tools": ["@" + CONTROL_PLANE_SERVER],
+                    "mcpServers": {CONTROL_PLANE_SERVER: core},
+                }
+            )
+
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents_dir)
+        (agents_dir / "kirocrew.json").write_text(
+            default_spec(["learn_add", "cron_add"]), encoding="utf-8"
+        )
+        agent_mod._install_heartbeat_agent()
+        (agents_dir / "kirocrew.json").write_text(default_spec(["learn_add"]), encoding="utf-8")
+
+        def failing() -> None:
+            raise OSError("heartbeat spec is not writable")
+
+        monkeypatch.setattr(agent_mod, "_install_heartbeat_agent", failing)
+        client = _client(tmp_path, MEMBER_KEY)
+        client._agent = "kirocrew-heartbeat"
+        with pytest.raises(agent_mod.DerivedSpecStale):
+            client._resolve_session_mcp_servers()
 
     def test_pi_takes_session_control_and_not_the_panel(self, agents_dir, tmp_path):
         """The mirror-less branch is gated per membership: pi holds dispatch, not panel."""

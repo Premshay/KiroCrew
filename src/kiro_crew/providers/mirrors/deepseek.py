@@ -61,31 +61,15 @@ def deepseek_projection(
     own control plane withheld on the same terms. Named here so the day deepseek gains
     a per-call deny channel this is the one function that changes.
 
-    Fail-closed on an unreadable spec: returns an empty SessionProjection so the caller
-    can still mount the member session-control and panel servers.
+    Nothing is caught here, as in goose: an unreadable spec already reads as no spec
+    inside the projection, so the one thing that raises is the freshness gate's
+    ``DerivedSpecStale``, and that has to reach the spawn so it is refused.
     """
-    try:
-        projection = session_mcp_projection(
-            agent,
-            stub_server_names=stub_server_names,
-            work_dir=work_dir,  # type: ignore[arg-type]
-        )
-    except Exception:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "deepseek session MCP: agent spec unreadable -- mounting member elements only",
-            exc_info=True,
-        )
-        return SessionProjection(
-            params={"mcpServers": []},
-            disabled_servers=frozenset(),
-            restricted_servers=frozenset(),
-            unhonoured_servers=frozenset(),
-            zero_tools=True,
-            derived_spec_snapshot=None,
-            agent_spec=None,
-        )
+    projection = session_mcp_projection(
+        agent,
+        stub_server_names=stub_server_names,
+        work_dir=work_dir,  # type: ignore[arg-type]
+    )
     narrowed = frozenset(server for server, _tool in projection.disabled_tools)
     out = place_single_binary_array(
         projection,

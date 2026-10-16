@@ -49,6 +49,7 @@ from kiro_crew.acp.client import (
     resolve_pin_spelling,
 )
 from kiro_crew.acp.types import (
+    ACP_BACKENDS_MEMBER_CAPABILITIES,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -1024,6 +1025,17 @@ async def _retire_sessions_on_identity_change(state: Any, *, unattended: bool = 
             )
     except Exception:
         logger.debug("Could not apply a Kiro identity change", exc_info=True)
+
+
+def _member_capable_backend_names() -> str:
+    """The ``agent.member_acp_backend`` values that can load a member's saved spec.
+
+    Read from :data:`ACP_BACKENDS_MEMBER_CAPABILITIES` so the remedy a refused member
+    chat shows names the set the refusal was judged against. kiro-cli's id is the
+    empty string, so it is spelled ``kiro``, the name the other remedies use.
+    """
+    names = sorted(backend or "kiro" for backend in ACP_BACKENDS_MEMBER_CAPABILITIES)
+    return ", ".join(names[:-1]) + " or " + names[-1] if len(names) > 1 else names[0]
 
 
 def _mark_kiro_signed_out(state: Any) -> None:
@@ -18149,8 +18161,9 @@ async def _run_chat(
                 "capability_harness_unsupported: This crew member has saved "
                 "capabilities, and the backend its chats run on "
                 "(agent.member_acp_backend, not agent.acp_backend) cannot load "
-                "them. Set agent.member_acp_backend to kas or kiro, or reset "
-                "the member's Capabilities page, then start a new chat."
+                "them. Set agent.member_acp_backend to "
+                f"{_member_capable_backend_names()}, or reset the member's "
+                "Capabilities page, then start a new chat."
             )
             _err_meta = _terminal_error_meta(exc)
         elif (
