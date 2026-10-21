@@ -1,9 +1,17 @@
 ---
 name: dynamic-workflows
-description: Author, run, inspect, or resume multi-phase agent workflows with the workflow tools.
+description: Author, run, inspect, or resume multi-phase agent workflows with the KiroCrew workflow_* tools. Not Claude Code's built-in Workflow tool.
 ---
 
 # Dynamic workflows
+
+This skill covers KiroCrew's workflow engine: the `workflow_*` tools, whose runs
+appear in the dashboard's Workflows tab. Claude Code ships an unrelated feature
+with the same name — its built-in `Workflow` tool, documented by its
+`workflow-authoring` skill and triggered by `ultracode` — and a Claude-engine
+session can see both. Their scripts are not interchangeable: never pass a Claude
+`Workflow` script to `workflow_run(source=...)`, or a `META` / `workflow(ctx)` script
+to Claude's `Workflow`. Use Claude's tool only when the user asks for it.
 
 Before selecting an author or workers, including mid-session replanning, consult `preference_advice` if available with the task summary, role (`parent` for the coordinator, `worker` for delegated work), and target's advertised model IDs; advice is optional, respects explicit user choices and seat limits, and never blocks work when unavailable or abstaining.
 
