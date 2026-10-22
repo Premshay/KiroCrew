@@ -1204,8 +1204,9 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # legitimate agent WRITE at all — ``seed_provenance.record`` writes
     # the path directly through ``atomic_write``, which does not route through this
     # gate.
-    f"{prefix}/settings_seeds.json"
+    f"{prefix}/{leaf}"
     for prefix in _CREW_HOME_PREFIXES
+    for leaf in ("seed-provenance", "settings_seeds.json")
 ]
 _WRITE_PROTECTED_HOME_PATHS += [
     # The app-sources checkout root — the persistent tree every installed app
