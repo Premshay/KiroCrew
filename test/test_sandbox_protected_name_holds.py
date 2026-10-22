@@ -321,7 +321,16 @@ class TestLeafOnlyPopulationIsRecorded:
     #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
     #: approved launch. Each sits beside writable siblings, so no parent stand-in
     #: can hold it.
-    EXPECTED: dict[str, int] = {"standard": 265, "cc": 272, "strict": 273}
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``seed-provenance`` -- the settings-seed record, moved out of the root-level
+    #:   ``settings_seeds.json`` file into its own directory so the gateway's
+    #:   ``atomic_write`` of the record renames INSIDE the sealed name rather than
+    #:   over it. That is the move this module asks for: the directory's own inode
+    #:   stays the same on a republish. It sits at the data-home root beside
+    #:   writable siblings, so it is counted leaf-only like ``skill-projection``.
+    EXPECTED: dict[str, int] = {"standard": 268, "cc": 275, "strict": 276}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:
