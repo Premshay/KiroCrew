@@ -687,6 +687,16 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # Paired with the same leaf on ``security``'s write floors -- the deny rules
     # fence how a command SPELLS this path, and the kernel denial is what still
     # holds when a spelling is built at runtime (``$(printf ...)``).
+    #
+    # The record lives INSIDE the ``seed-provenance`` directory, and the directory is
+    # what is sealed, because the writer publishes every save through ``atomic_write``
+    # (a new inode) and does so on every claude-agent-acp seed and release. A sealed
+    # FILE whose inode changes after the pre-spawn pass recorded it is refused by the
+    # launcher's pin, so sealing the file made an unrelated spawn fail whenever a seed
+    # write landed in that window. The rename leaves the directory's inode alone.
+    # The old top-level name stays sealed too: a Crew process started before the
+    # upgrade still reads and writes it, so it must stay unforgeable for that process.
+    "seed-provenance",
     "settings_seeds.json",
     # The crew webview template directory. A ceiling in exactly the sense above:
     # the whole value of splitting a panel into human-authored TEMPLATE and
@@ -931,6 +941,7 @@ _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
     # Authorization and lineage records an in-sandbox reader resolves. Read-only
     # sealed for the same reason: a forged entry decides a later grant.
     "apps/.dev-grants.json",
+    "seed-provenance",
     "settings_seeds.json",
     "agent_model_state.json",
     "agent_model_state.json.lock",
@@ -1462,6 +1473,13 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     # Pre-creation gives Linux concrete bind targets on a fresh install.
     "mcp-launch-approvals",
     "mcp/resolved",
+    # The settings-seed provenance directory. (1) Its reader
+    # (``acp.seed_provenance._read_disk_seeds``) reads a missing sidecar file as no
+    # records, exactly as it reads an absent directory. (2) The bind is live, so every
+    # later seed write is seen.
+    # Without this entry the seal skips the directory until the first seed, and the
+    # name is one an agent could create to forge the record.
+    "seed-provenance",
 )
 #: Read-only directory leaves whose NAME must remain the mounted name. A resolving
 #: symlink is unsafe here: the mount follows its target and leaves the lexical name
@@ -1478,6 +1496,7 @@ _CREW_NOFOLLOW_READONLY_DIR_LEAVES: tuple[str, ...] = (
     "pi-gate",
     "mcp-launch-approvals",
     "mcp/resolved",
+    "seed-provenance",
 )
 assert set(_CREW_NOFOLLOW_READONLY_DIR_LEAVES) <= set(_CREW_PRECREATE_READONLY_DIR_LEAVES)
 #: Read-only FILE leaves whose NAME must remain the sealed name, for the same reason
@@ -1545,6 +1564,11 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
     "mcp/resolved": (
         "sealed resolved MCP launches",
         "the agent could replace the executable the gateway substitutes for an approved launch",
+    ),
+    "seed-provenance": (
+        "sealed settings-seed record",
+        "the agent could forge the record that lets Kiro Crew overwrite and delete a "
+        "settings.local.json the user wrote",
     ),
 }
 assert set(_DELEGATED_OVERLAP_LEAF_REASONS) == set(_CREW_NOFOLLOW_READONLY_FILE_LEAVES) | set(
