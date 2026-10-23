@@ -116,16 +116,14 @@ def _goose_client(tmp_path: Path, session_key: str):
     """
     from kiro_crew.acp.client import AcpClient as _C
 
-    client = object.__new__(_C)
-    # ``backend`` is a read-only property over this attribute on the real class.
-    client._acp_backend = ACP_BACKEND_GOOSE
-    client._mcp_gateway_overlay = None  # shared gateway off: no broker stubs
-    client._agent = "kirocrew"
-    client._work_dir = tmp_path / "work"
-    client._session_key = session_key
-    client._channel_id = "dashboard"
+    client = _C(
+        work_dir=tmp_path / "work",
+        agent="kirocrew",
+        session_key=session_key,
+        channel_id="dashboard",
+        acp_backend=ACP_BACKEND_GOOSE,
+    )
     client._stub_session_token = "9" * 64
-    client._claude_settings_authored = False
     return client
 
 
