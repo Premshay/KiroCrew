@@ -493,7 +493,7 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
         return
     # Local import for the same reason as the mask builder: this is a leaf that
     # ``acp/client.py`` imports at import time.
-    from kiro_crew.sandbox import credential_mask_applies
+    from kiro_crew.sandbox import credential_mask_applies, nested_sandbox_passthrough
 
     # Ask whether the mask WILL BE APPLIED, never whether one particular tier is
     # selected. An earlier revision tested ``effective_sandbox_mode(mode) != "off"``
@@ -512,6 +512,17 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
             "sandbox backend here to protect credential files; changing agent.sandbox "
             "cannot enable it. Select Kiro CLI in Settings → Agent Harness and start "
             "a new session.".format(label_for(backend))
+        )
+    # Launched from inside an agent's sandbox (e.g. `kirocrew chat` run by an
+    # agent): the configured tier is fine, so the generic copy would send the
+    # operator to a setting that is already correct.
+    if nested_sandbox_passthrough():
+        raise ToolGateUnroutable(
+            "{} cannot start from inside a Kiro Crew sandbox: sandboxes cannot be "
+            "nested, so its OS-level credential mask is never applied and the "
+            "adapter's credential reads would be unfenced. Start it through the "
+            "gateway instead (a dashboard session, spawn_run or spawn_sub_agents), "
+            "not by running kirocrew chat from inside an agent session.".format(label_for(backend))
         )
     raise ToolGateUnroutable(
         "{} routes tool calls through an enforced permission route whose "
