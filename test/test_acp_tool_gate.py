@@ -869,8 +869,15 @@ def test_nested_sandbox_passthrough_refuses_an_enforced_adapter(
     monkeypatch.setattr(sandbox, "_governance_sandbox_floor", lambda: None)
     monkeypatch.setattr(sandbox, "_inside_kirocrew_sandbox", lambda: True)
     monkeypatch.setattr(sandbox, "_macos_sandbox_state", lambda: None)
-    with pytest.raises(gate.ToolGateUnroutable):
+    with pytest.raises(gate.ToolGateUnroutable) as excinfo:
         gate.enforce_sandbox_floor(ACP_BACKEND_CODEX, "standard")
+    # The configured tier is already correct here, so the refusal names the
+    # nesting and the gateway route, not a sandbox setting to change.
+    msg = str(excinfo.value)
+    assert "inside a Kiro Crew sandbox" in msg
+    assert "spawn_sub_agents" in msg
+    assert _GENERIC_SANDBOX_REMEDY not in msg
+    assert "agent.sandbox is 'off'" not in msg
 
 
 def _pin_no_sandbox_backend(monkeypatch: pytest.MonkeyPatch, *, opted_in: bool = False) -> None:

@@ -9863,6 +9863,16 @@ def reset_backend() -> None:
 _SANDBOX_MODE_ALIASES = {"auto": "standard"}
 
 
+def nested_sandbox_passthrough() -> bool:
+    """Whether :func:`wrap_argv` passes argv through because this process is nested.
+
+    True inside a KiroCrew sandbox unless the macOS kernel definitely says this
+    process is not confined (see the marker/kernel note in :func:`wrap_argv`).
+    Public so a refusal can name this cause instead of guessing at configuration.
+    """
+    return _inside_kirocrew_sandbox() and _macos_sandbox_state() is not False
+
+
 def credential_mask_applies(mode: str) -> bool:
     """Whether :func:`wrap_argv` would actually APPLY ``extra_hidden_dirs`` for *mode*.
 
@@ -9893,7 +9903,7 @@ def credential_mask_applies(mode: str) -> bool:
     # was built for the tier's own hidden dirs -- which deliberately leave ~/.aws,
     # ~/.ssh and ~/.kube readable for kiro-cli's sake -- so it is NOT a substitute for
     # an adapter-specific credential mask.
-    if _inside_kirocrew_sandbox() and _macos_sandbox_state() is not False:
+    if nested_sandbox_passthrough():
         return False
     if detect_backend(config_mode=effective) != "none":
         return True
@@ -10252,7 +10262,7 @@ def wrap_argv(
     # kernel "not sandboxed" therefore vetoes the marker. An *unanswerable* probe
     # does not: that says nothing, and must not invalidate a marker the Linux
     # path honours unconditionally.
-    if _inside_kirocrew_sandbox() and _macos_sandbox_state() is not False:
+    if nested_sandbox_passthrough():
         if not getattr(wrap_argv, "_nested_passthrough_logged", False):
             wrap_argv._nested_passthrough_logged = True  # type: ignore[attr-defined]
             logger.info(
