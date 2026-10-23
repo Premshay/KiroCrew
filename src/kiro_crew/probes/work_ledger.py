@@ -13,7 +13,7 @@ even write, how many wakes one item may cause -- lives in
 :mod:`kiro_crew.ledger_wake` as pure functions. What is left here is the reading
 itself, which is the only part that needs a disk.
 
-Two facts this probe cannot read for itself and takes as values instead:
+Three facts this probe cannot read for itself and takes as values instead:
 
 * ``worker_running`` -- whether a worker's slot has a turn in flight. That lives
   in the dashboard's in-process slot table, which a probe running on a worker
@@ -22,13 +22,19 @@ Two facts this probe cannot read for itself and takes as values instead:
   separate question: "not running" is true of a worker thinking between turns as
   well as of one that ended, which is why ``is_stale`` makes the first wait out a
   window and lets the second skip it.
+* ``worker_looping`` -- whether the worker's own session holds an active loop that
+  will wake it. That lives in the AutoNudge service's loop table, not in the
+  ledger, so the driver injects a resolver for it too.
 
-Both default to the safe direction rather than to nothing: an absent resolver
-reads as "not running" and "not closed", which can only make the gate LOUDER (a
-stall wake the conductor did not need costs one turn) or later, never quieter
-about a worker that stopped. The opposite default would turn a missing handle into
-a watch that never reports a stalled worker, which is the failure this gate exists
-to remove.
+All three default to ``False`` rather than to nothing. For ``worker_running`` and
+``worker_looping`` that is the safe direction: "not running" and "not looping" can
+only make the gate LOUDER (a stall wake the conductor did not need costs one turn),
+never quieter about a worker that stopped, and the opposite default would turn a
+missing handle into a watch that never reports a stalled worker, which is the
+failure this gate exists to remove. ``worker_closed`` is the other way round:
+``True`` is the answer that flags, so "not closed" is the default that cannot invent
+a stall, and a worker that is gone is judged as a quiet one (see
+:func:`_always_open`).
 """
 
 from __future__ import annotations
@@ -38,14 +44,14 @@ import logging
 from typing import Callable
 
 from kiro_crew import irq, ledger_wake, work_ledger
+from kiro_crew.work_vocab import WORK_BLOCKED_REASONS, WORK_REASON_STATUSES
 
 logger = logging.getLogger(__name__)
 
-#: This probe's subject kind. Defined HERE rather than in ``probes/__init__``, which
-#: imports this module: the constant has to be readable without reaching back into
-#: the package that is still mid-import. ``probes/__init__`` spells it a second time
-#: as its own literal (``WORK_LEDGER``) rather than re-exporting this one, for the
-#: same boot-path reason; the two must stay equal.
+#: This probe's subject kind. ``probes/__init__`` imports this module only inside
+#: ``build``, which keeps the ledger store off the gateway boot path, so it spells the
+#: kind a second time as its own literal (``WORK_LEDGER``) rather than importing this
+#: one; the two must stay equal.
 WORK_LEDGER_KIND = "work-ledger"
 
 #: Events read per item per tick. The kernel masks a repeat by key, so the tail
@@ -83,12 +89,9 @@ ACCEPTED_KEY = "all-accepted"
 #: abandoned is not persisted as an outcome its conductor never reached.
 CLOSED_KEY = "all-closed"
 
-_ACCEPTED_KEY = ACCEPTED_KEY
-
 #: :attr:`WorkLedgerProbe.revision` for a ledger that was read but holds no worker
 #: report yet. Not empty, because empty means "not known" to the gate.
 _NO_REPORTS = "no-reports"
-_CLOSED_KEY = CLOSED_KEY
 
 
 def _always_idle(_session_key: str) -> bool:
@@ -104,10 +107,21 @@ def _always_open(_session_key: str) -> bool:
     """Default close resolver: nothing is closed.
 
     Not ``True``, and the reason is the opposite side of :func:`_always_idle`'s. This
-    input only ever REMOVES the staleness window, so answering ``True`` without a handle
-    on the slot table would flag every quiet item the instant it was created -- a wake
-    per item for a worker that is simply still working. ``False`` falls back to measuring
-    the window, which is the behaviour that shipped.
+    input only ever makes the gate flag MORE or SOONER -- it skips the staleness window
+    for an item that has reported, flags a reported ``blocked`` / ``question`` item at
+    once, and outranks an active loop -- so answering ``True`` without a handle on the
+    slot table would flag an item the moment its worker reported ``progress``: a wake
+    per item for a worker that is simply still working. ``False`` falls back to
+    measuring the window.
+    """
+    return False
+
+
+def _never_looping(_session_key: str) -> bool:
+    """Default loop resolver: no worker holds an active loop.
+
+    Not ``True``, for :func:`_always_idle`'s reason: this input only ever SUPPRESSES a
+    stall wake, so an unknown answer must not be able to.
     """
     return False
 
@@ -119,8 +133,10 @@ class WorkLedgerProbe(irq.Probe):
         worker_running: ``session_key -> has a turn in flight``. Defaults to
             :func:`_always_idle`.
         worker_closed: ``session_key -> its slot is gone``. Defaults to
-            :func:`_always_open`, so a build with no resolver measures the staleness
-            window exactly as it did before this input existed.
+            :func:`_always_open`, so a build with no resolver never skips the
+            staleness window.
+        worker_looping: ``session_key -> its session holds an active loop``.
+            Defaults to :func:`_never_looping`, which never suppresses a flag.
     """
 
     def __init__(
@@ -128,10 +144,15 @@ class WorkLedgerProbe(irq.Probe):
         *,
         worker_running: Callable[[str], bool] | None = None,
         worker_closed: Callable[[str], bool] | None = None,
+        worker_looping: Callable[[str], bool] | None = None,
     ) -> None:
         self._worker_running = worker_running or _always_idle
         self._worker_closed = worker_closed or _always_open
+        self._worker_looping = worker_looping or _never_looping
         self._conductor = ""
+        #: The polling driver's identity, read off the ctx each tick. The seen set
+        #: is kept per driver; see ``ledger_wake._MAX_WATCHERS_PER_ITEM``.
+        self._watcher = ""
         #: A digest of each item's worker-owned report fields (``last_report_at``,
         #: ``status``, ``summary``), read on the last successful observation, or
         #: ``None`` when nothing was read. The AutoNudge
@@ -182,6 +203,7 @@ class WorkLedgerProbe(irq.Probe):
         watch.
         """
         key = self._conductor or _conductor_key(getattr(ctx, "message", ""))
+        self._watcher = str(getattr(getattr(ctx, "job", None), "id", "") or "")
         record = work_ledger.read_conductor(key)
         if record is None:
             # No ledger, or one that could not be read. Deliberately NOT the same
@@ -203,22 +225,14 @@ class WorkLedgerProbe(irq.Probe):
             stored = len(items)
         all_readable = stored <= len(items)
         newest: dict[str, str] = {}
-        newest_report: dict[str, str] = {}
         tails: dict[str, list[work_ledger.WorkEvent]] = {}
         for item in items:
             events = work_ledger.read_events(key, item.item_id, limit=_EVENT_TAIL)
             tails[item.item_id] = events
             if events:
                 newest[item.item_id] = events[-1].id
-            if item.last_report_at:
-                # The item's WORKER-OWNED fields, not the event tail: eight conductor
-                # writes would push the newest report out of a tail and move this
-                # without any worker saying anything.
-                newest_report[item.item_id] = json.dumps(
-                    [item.last_report_at, item.status, item.summary], default=str
-                )
         epoch = ledger_wake.revision(newest)
-        self.revision = ledger_wake.revision(newest_report) or _NO_REPORTS
+        self.revision = worker_report_revision(items)
 
         if items and all_readable and all(item.is_terminal for item in items):
             # Every item closed means the goal this ledger serves is finished, so
@@ -247,13 +261,20 @@ class WorkLedgerProbe(irq.Probe):
                 epoch=epoch,
                 observations=[
                     irq.Observation(
-                        _ACCEPTED_KEY if finished_well else _CLOSED_KEY,
+                        ACCEPTED_KEY if finished_well else CLOSED_KEY,
                         irq.Severity.TERMINAL,
                         detail,
                         irq.ResetsOn.NEVER,
                     )
                 ],
             )
+
+        # A closed item never wakes again, so its seen set has nothing left to
+        # suppress. Dropping it here is what keeps that set bounded by the item's
+        # life rather than by the ledger's.
+        closed = [item.item_id for item in items if item.is_terminal]
+        if closed:
+            ledger_wake.forget_items(key, closed)
 
         observations: list[irq.Observation] = []
         for item in items:
@@ -318,6 +339,7 @@ class WorkLedgerProbe(irq.Probe):
             item,
             worker_running=self._worker_running(item.worker_session_key or ""),
             worker_closed=self._worker_closed(item.worker_session_key or ""),
+            worker_looping=self._worker_looping(item.worker_session_key or ""),
         ):
             # The whole liveness conjunction is ``is_stale``'s, not this module's:
             # quiet past the window -- or the worker's session gone, which needs no
@@ -325,7 +347,7 @@ class WorkLedgerProbe(irq.Probe):
             # move with it. Restating any part of it here would be a second copy of a
             # shipped rule.
             token = f"{_STALL_KEY}:{item.last_report_at or 'none'}"
-            if self._spend(conductor_key, item.item_id, token):
+            if self._spend(conductor_key, item.item_id, token, replaces=f"{_STALL_KEY}:"):
                 found.append(
                     irq.Observation(
                         f"{_STALL_KEY}:{item.item_id}:{item.last_report_at or 'none'}",
@@ -339,13 +361,17 @@ class WorkLedgerProbe(irq.Probe):
                 )
         return found
 
-    def _spend(self, conductor_key: str, item_id: str, token: str) -> bool:
+    def _spend(self, conductor_key: str, item_id: str, token: str, *, replaces: str = "") -> bool:
         """Whether this item may wake now, charging the budget if it does.
 
-        The budget counts DISTINCT wakes, keyed on *token*: a condition the probe
-        re-reports on every tick until the kernel's mask expires must not burn the
-        hour's allowance, or a genuinely new report on the same item would be
-        swallowed by a rate limit that its own predecessor had already spent.
+        A *token* that already woke the conductor never wakes it again while the item
+        is open. The kernel masks its key for ``realert_secs`` only,
+        and this probe re-reads the same events and the same silence on every tick, so
+        the kernel cannot be the dedupe here.
+
+        The same check is what makes the budget count DISTINCT wakes: a re-read never
+        reaches it, so an unchanged fact cannot burn the hour's allowance and swallow
+        a genuinely new report on the same item.
 
         A charge that does not persist refuses the wake. The alternative reads as the
         safer one and is not: an unwritable rate file leaves every later tick reading
@@ -353,13 +379,17 @@ class WorkLedgerProbe(irq.Probe):
         costing one extra wake. Refusing costs the conductor its event-driven wakes
         while the file cannot be written, and its plain timer still runs the goal.
         """
-        if not ledger_wake.within_rate_limit(conductor_key, item_id, token=token):
+        if ledger_wake.already_woke(conductor_key, item_id, token, watcher=self._watcher):
+            return False
+        if not ledger_wake.within_rate_limit(conductor_key, item_id):
             logger.debug(
                 "work-ledger probe: item %s is over its wake budget; folding forward",
                 item_id,
             )
             return False
-        if not ledger_wake.note_wake(conductor_key, item_id, token=token):
+        if not ledger_wake.note_wake(
+            conductor_key, item_id, token=token, replaces=replaces, watcher=self._watcher
+        ):
             logger.warning(
                 "work-ledger probe: item %s's wake could not be charged; folding "
                 "forward rather than waking uncounted",
@@ -385,6 +415,76 @@ def has_open_items(conductor_key: str) -> bool:
     except Exception:  # noqa: BLE001 - a read fault must leave the bound in force
         logger.debug("work-ledger probe: open-items read failed for %s", conductor_key)
         return False
+
+
+def worker_report_revision(items: list[work_ledger.WorkItem]) -> str:
+    """A digest of each item's newest WORKER report: the one rule both readers share.
+
+    The quiet floor (:attr:`WorkLedgerProbe.revision`) and the person-wait hold
+    (:func:`person_wait_fingerprint`) both ask "has a worker said anything since the
+    conductor last looked?", so both read this. Worker-owned fields only, not the
+    event tail: the conductor's own writes are things it already knows, and eight of
+    them would push the newest report out of a tail. Every report moves
+    ``last_report_at``, so a report that repeats the last one still counts. A ledger
+    with no report yet answers :data:`_NO_REPORTS`, never empty.
+    """
+    newest_report: dict[str, str] = {}
+    for item in items:
+        if item.last_report_at:
+            newest_report[item.item_id] = json.dumps(
+                [item.last_report_at, item.status, item.summary], default=str
+            )
+    return ledger_wake.revision(newest_report) or _NO_REPORTS
+
+
+def person_wait_fingerprint(
+    conductor_key: str, *, worker_closed: Callable[[str], bool] | None = None
+) -> str | None:
+    """The ledger's fingerprint when every open item waits on a person, else ``None``.
+
+    What the AutoNudge timer asks before a work-ledger watch spends a turn: an open
+    item that is ``blocked`` or ``question`` with a ``reason`` of ``approval`` or
+    ``needs_human`` cannot move until someone acts, and when every open item is one,
+    the patrol has nothing to read that its last turn did not. The fingerprint IS
+    :func:`worker_report_revision`, the digest the quiet floor uses, so a worker's
+    report -- even one that stays blocked, because ``last_report_at`` moves -- changes
+    it and the conductor's own writes do not. The timer holds only while it equals the
+    copy taken at the loop's last delivered turn (``ledger_seen_fp``), which the timer
+    keeps apart from the floor's ``ledger_delivered_revision`` because the two are
+    forgotten at different times: the hold's copy is read at the top of the tick and
+    cleared when a cycle never starts, fails, or a person presses Nudge.
+
+    An item whose worker session is gone (*worker_closed*) is not a wait on a person:
+    nobody is left to answer its approval, so the patrol must run and the probe's
+    stall wake must reach the conductor.
+
+    Positive evidence only, like :func:`has_open_items`: no open item, a torn item
+    file, an unreadable header or a read that raises all answer ``None``, so doubt
+    leaves the loop firing as it always has. Blocking file reads; call it off-loop.
+    """
+    try:
+        record = work_ledger.read_conductor(conductor_key)
+        if record is None:
+            return None
+        items = work_ledger.list_work_items(conductor_key)
+        stored = sum(1 for _ in work_ledger.items_dir(conductor_key).glob("it_*.json"))
+        if stored > len(items):
+            return None
+        open_items = [item for item in items if not item.is_terminal]
+        if not open_items:
+            return None
+        if not all(
+            item.status in WORK_REASON_STATUSES and item.reason in WORK_BLOCKED_REASONS
+            for item in open_items
+        ):
+            return None
+        closed = worker_closed or _always_open
+        if any(closed(item.worker_session_key or "") for item in open_items):
+            return None
+        return worker_report_revision(items)
+    except Exception:  # noqa: BLE001 - a read fault must never hold a patrol
+        logger.debug("work-ledger probe: person-wait read failed for %s", conductor_key)
+        return None
 
 
 def _conductor_key(raw: object) -> str:

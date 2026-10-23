@@ -1,5 +1,8 @@
 """The context a dashboard turn's input carries: the execution context's memory-mode
-fold, the pending context drain, the folder-steering gate and the appended-context split."""
+fold, the pending context drain, the folder-steering gate and the appended-context split,
+the unavailable-agent message, the DM member binding check, the memory assignment, the
+skills context restored after a compaction and the gate on embedding the first message
+ahead of its session-start build."""
 
 from __future__ import annotations
 
@@ -9,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         _CONTEXT_FRAME_CONTRACT,
+        NATIVE_SKILL_ALIAS_PREFIX,
         DashboardState,
         _ChatSlot,
         _MemoryUnavailable,
@@ -19,6 +23,35 @@ if TYPE_CHECKING:
         stricter_memory_mode,
         tighten_live_session_execution,
     )
+
+
+def _startup_query_prewarm_applies(
+    builder: Any, slot: Any, text: str, execution_context: Any
+) -> bool:
+    """Whether a turn may embed its first message before the session-start build.
+
+    The build ranks the memory it starts with against the first message, and that
+    embedding is the slow step of the build, so it can start early and run beside
+    the rest of the turn's start. Not where the build reads no learned memory: no
+    builder, an empty message, a temporary chat or execution, or a private member,
+    whose session start runs no embedding search. ``embed_startup_query`` checks the
+    rest: the config gates, the store and its embedder.
+    """
+    if builder is None or not text.strip() or slot.blocks_reads:
+        return False
+    if execution_context is None:
+        return True
+    return execution_context.member_id is None and execution_context.memory_mode != "temporary"
+
+
+def _message_rewritten_before_build(slot: Any, message: str) -> bool:
+    """Whether the turn's text changes between the session claim and the build.
+
+    An ``@prompt`` expansion replaces it, and drained sub-agent failures or pending
+    context are put in front of it. An embed of the claim-time text would then rank
+    nothing and hold the one inference thread ahead of the embed the build reads.
+    """
+    return bool(message.startswith("@") or slot._pending_subagent_failures or slot._pending_context)
 
 
 def _folder_steering_turn(
@@ -249,3 +282,82 @@ def channel_collaboration_prefix(
         )
         + "\n\n"
     )
+
+
+def unavailable_agent_message(agent_name: str) -> str:
+    """What a resumed conversation whose agent does not resolve tells its user.
+
+    A recorded skill-view name the projection cannot map back is not a Crew
+    Member the user can restore: nothing records which agent it was built
+    from, and none can be recovered (the view name is a one-way digest). The
+    remedy that works is to pick the agent again or start a new chat, so that
+    is what it says, rather than naming a generated file as a missing member.
+    """
+    if agent_name.startswith(NATIVE_SKILL_ALIAS_PREFIX):
+        return (
+            "This chat was recorded under a generated skill view from an earlier "
+            f"version ('{agent_name}'), and the agent it was built from is not "
+            "recorded. Pick the agent for this chat again, or start a new chat."
+        )
+    return f"Crew Member '{agent_name}' is unavailable; restore it or choose a member"
+
+
+def _slot_member_slug(slot_key: str) -> str:
+    """The slug a member DM slot key encodes, or ``""`` for a non-member key.
+
+    A member with a persisted identity gets an id-based slug, so its DM slot key
+    (``member-<member_id>``) carries that immutable id directly -- the one
+    identity source that survives BOTH a restart AND the removal of the original
+    member. The ``dm.json`` binding cannot serve this: ``read_dm_binding``
+    reports it absent whenever the encoded id fails to resolve in config (exactly
+    the reassignment case that matters). The transcript line is not consulted
+    either -- it is the operator-editable JSONL the pin must never re-derive
+    identity from. A legacy member's key carries a name-derived slug that equals
+    no member's id, so a caller comparing this against a resolved ``member_id``
+    only ever sees a divergence for a genuine stable-identity thread.
+    """
+    from kiro_crew import members as members_mod
+
+    return members_mod.slug_from_dm_slot_key(slot_key) or ""
+
+
+def _dm_member_binding_changed(bound_member_id: str, slot_key: str) -> bool:
+    """Whether a DM member thread's encoded id differs from the resolved alias.
+
+    The slot KEY is the one un-plantable identity a restored session carries
+    (the session's address, not the agent-writable metadata line). A DM slot
+    key encodes the member_id; when the alias resolves to a member whose id
+    differs, the thread belongs to a member the alias does not name, so the
+    carrier-less re-selection must refuse. Returns ``False`` when the slot key
+    encodes no id (an ordinary ``chat-N`` slot) -- there is nothing to compare,
+    and the leak this guards is specific to a DM thread whose alias has been
+    reassigned to a different member.
+    """
+    slot_member_slug = _slot_member_slug(slot_key)
+    return bool(bound_member_id) and bool(slot_member_slug) and bound_member_id != slot_member_slug
+
+
+def _require_session_memory_assignment(session_key: str, memory_store: str | None) -> None:
+    """A captured execution outranks a later mutable member declaration."""
+    from kiro_crew.execution_context import read_session_execution  # noqa: F811
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    execution = read_session_execution(session_key)
+    if execution is not None and execution.store.store_id != (memory_store or "default"):
+        raise UnknownMemoryStore(
+            "This conversation retains its member memory assignment. "
+            "Restore that member binding or open a new conversation."
+        )
+
+
+def _restore_skills_context_after_compaction(turn) -> None:
+    """Re-inject the session-start skills context on the next turn."""
+    session_key = turn.session_key
+    state = turn.state
+    try:
+        state.sessions.mark_needs_reinjection(session_key)
+    except Exception:
+        logger.warning(
+            "post-compaction skills context reinjection could not be armed",
+            exc_info=True,
+        )

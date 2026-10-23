@@ -37,6 +37,7 @@ from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import AgentInfo
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, config_path
 from kiro_crew.memory_stores import provision_member_memory
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 @pytest.fixture(autouse=True)
@@ -190,6 +191,23 @@ def _run(specs: dict, log, **kw):
 
 
 class TestThePass:
+    def test_never_removes_the_first_crewmate(self, old_style_config, bindings_dir, log):
+        # The row the installer writes for the first crewmate is bound to the
+        # ordinary template under a different key, so it is never a sync row.
+        from kiro_crew.agent_files import ASSISTANT_MEMBER_NAME
+
+        cfg = KiroCrewConfig.load()
+        cfg.agents[ASSISTANT_MEMBER_NAME] = KiroCrewAgentConfig(
+            kiro_agent="kirocrew", source="builtin"
+        )
+        cfg.save()
+
+        report = _run(old_style_config, log)
+
+        assert ASSISTANT_MEMBER_NAME not in report.removed
+        assert ASSISTANT_MEMBER_NAME in KiroCrewConfig.load().agents
+        assert "scout" in report.removed
+
     def test_removes_never_chatted_keeps_chatted_leaves_hand_made(
         self, old_style_config, bindings_dir, log
     ):
@@ -1488,7 +1506,7 @@ class TestAwaitSettled:
         assert state.crewmate_prune_abandon.is_set()
         assert not waiter.done()  # the writer does not start beside the pass
         state.crewmate_prune_settled.set()
-        await asyncio.wait_for(waiter, timeout=1)
+        await await_until(waiter, what="the prune gate's waiter finishing")
 
     @pytest.mark.asyncio
     async def test_deferred_transcript_removal_runs_only_after_the_pass_returns(self, monkeypatch):
@@ -1514,16 +1532,12 @@ class TestAwaitSettled:
         await asyncio.sleep(0.05)
         assert calls == []  # nothing removed beside a pass that can still delete
         state.crewmate_prune_settled.set()
-        for _ in range(50):
-            if calls:
-                break
-            await asyncio.sleep(0.01)
+        await async_wait_until(lambda: calls, describe=lambda: "the deferred removal never ran")
         assert calls == [{"dashboard_slots": claimed, "remove": True}]
-        for _ in range(50):
-            if not state._background_tasks:
-                break
-            await asyncio.sleep(0.01)
-        assert not state._background_tasks
+        await async_wait_until(
+            lambda: not state._background_tasks,
+            describe=lambda: f"background tasks still live: {state._background_tasks}",
+        )
 
 
 class TestOneProcess:

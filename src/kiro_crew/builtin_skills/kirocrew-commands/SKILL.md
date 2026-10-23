@@ -145,7 +145,7 @@ and the full operate verbs. It must be on `PATH`; install via **Settings → Bro
 | `playwright-cli click <ref>` / `fill <ref> <text>` | Act on an element from a snapshot |
 | `playwright-cli screenshot [ref]` | Write a PNG, print its path. `[ref]` is an ELEMENT, not a path; do not pass `--filename` (it resolves against the CWD and is not auto-approved) |
 | `playwright-cli state-save` / `state-load <file>` | Save or restore a logged-in session. Bare `state-save` writes into the service's own directory; both a name and `state-load` prompt for approval, because each names a local path |
-| `playwright-cli attach --extension` | Drive the user's own running Chrome, with their logins |
+| `PLAYWRIGHT_MCP_ISOLATED=false playwright-cli attach --extension=chrome` | Drive the user's own running Chrome, with their logins |
 | `playwright-cli show --port <n> --host 127.0.0.1` | Serve the CLI's dashboard for the Browser panel |
 
 **Browsing workflow:** load the `web-browse`, `web-verify`, or `browser-auth`
@@ -224,6 +224,8 @@ writes.
 |---------|-------------|
 | `kirocrew spawn run "task"` | Spawn a background subagent (wait for result) |
 | `kirocrew spawn run --async "task"` | Fire-and-forget subagent |
+| `kirocrew spawn run --crew NAME "task"` | Run as a crew member (its memory and template); an unknown name is refused |
+| `kirocrew spawn run --agent NAME "task"` | Run under a named agent template; an unknown name is refused |
 | `kirocrew spawn list` | List active subagents |
 
 ## Cron Jobs
@@ -268,6 +270,7 @@ writes.
 | `kirocrew memory search "query"` | Search episodic memories |
 | `kirocrew memory stats` | Show memory statistics |
 | `kirocrew memory audit` | Scan memory for suspicious content |
+| `kirocrew memory create-store <name>` | Create the directory of a named V1 store declared in `memory_stores` (`use` never creates it; refuses the default store, an undeclared name and a V2 member store) |
 | `kirocrew memory export` | Export the default store's rows to JSON (stdout) |
 | `kirocrew memory export -o file.json` | Export to file |
 | `kirocrew memory export --store <name>` | Export a named store's rows instead |
@@ -313,6 +316,7 @@ LLM-generated UI components (widgets, HTML, markdown, SVG, JSON, text).
 | `kirocrew agent create --name NAME` | Create a new agent |
 | `kirocrew agent create --name NAME --kiro-agent kirocrew --workspace default` | Full options |
 | `kirocrew agent update NAME --kiro-agent new-agent` | Update agent settings |
+| `kirocrew agent update NAME --display-name "Label"` | Change the name the dashboard shows (`""` clears it); the agent name stays |
 | `kirocrew agent delete NAME` | Delete an agent |
 | `kirocrew agent reset-model [--agent kirocrew]` | Clear a pinned model so the agent tracks the shipped default |
 | `kirocrew workspace list` | List workspaces |
@@ -340,7 +344,7 @@ keystone paths are still refused). The CLI is the stricter of the two.
 |---------|-------------|
 | `kirocrew app list` | List installed apps |
 | `kirocrew app install /path/to/app-dir` | Install app from local directory (needs app.json) |
-| `kirocrew app enable NAME` | Enable an installed app |
+| `kirocrew app enable NAME` | Enable an installed app (an app that asks to control your chats is allowed in the dashboard only) |
 | `kirocrew app disable NAME` | Disable an installed app |
 | `kirocrew app uninstall NAME` | Uninstall an app and preserve its data directory |
 | `kirocrew app uninstall NAME --purge-data` | Uninstall and explicitly delete the app data directory |
@@ -457,7 +461,7 @@ resolved by the `aws` CLI and never stored by Kiro Crew. All verbs accept
 | `kirocrew cloud destroy` | Remove the instance and ALL its AWS resources |
 | `kirocrew cloud destroy --dry-run` | Show the delete command without running it |
 | `kirocrew cloud iam-policy` | Print the least-privilege IAM policy to apply |
-| `kirocrew cloud iam-boundary` | Pre-create the immutable permissions boundary (admin, one-time) |
+| `kirocrew cloud iam-boundary` | Pre-create the immutable EC2 + Fargate permissions boundaries (admin, one-time) |
 
 ## Tailnet (Tailscale)
 

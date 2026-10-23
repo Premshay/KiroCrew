@@ -61,6 +61,10 @@ from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat_runner import _eager_spawn, _slot_predecessor_store
 from kiro_crew.dashboard.state import CrewLogPrevious, _ChatSlot
 
+#: The eager-prefetch tests need a pre-warm allowance, which is zero while the
+#: host's memory posture is critical (see ``ample_host_free_memory``).
+pytestmark = pytest.mark.usefixtures("ample_host_free_memory")
+
 PREDECESSOR = "sid-the-slot-was-writing"
 PREWARMED = "sid-the-prefetch-allocated"
 #: The store opened AFTER ``PREDECESSOR`` on the same slot, whose id the mapping
@@ -1356,7 +1360,7 @@ def _after_restart(home: Path, slot: str, mapped: str) -> str:
     A real subprocess, because that is the only thing this can be: an in-memory
     record answers correctly for as long as the interpreter that wrote it lives, so
     a test that stays inside one process passes whether or not the answer is
-    durable. Modelled on the boot probe in ``test_crew_log_emit``: fixed argv, no
+    durable. Modelled on the boot probe in ``test_crew_log_emit_redaction_and_flag``: fixed argv, no
     shell, an absolutised interpreter so a relative PATH entry cannot break the
     child, and the repo's own ``src`` on the path.
     """

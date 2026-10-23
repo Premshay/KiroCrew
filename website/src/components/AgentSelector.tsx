@@ -8,8 +8,12 @@ import { isTouchDevice } from '../utils/isTouchDevice'
 import { Input, Btn, PanelSectionHeader } from './ui'
 import { SourceBadge } from './SourceBadge'
 import ErrorNotice from './ErrorNotice'
+import { MarkdownOnlyBadge } from './MarkdownOnlyBadge'
 
 import { i18nT } from '../i18n/t'
+import { isAssistantMember } from '../lib/assistantMember'
+import type { MarkdownBlock } from '../lib/markdownAgents'
+import { useInsideDialog } from './overlayRoot'
 export interface KiroCrewAgent {
   name: string
   kiro_agent: string
@@ -53,18 +57,24 @@ export interface KiroCrewAgent {
   selection_kind?: 'member' | 'template'
   /** `global` or `project`; only catalog rows carry it. */
   scope?: string
+  /** Catalog rows only: defined in markdown, with no JSON spec for its name. */
+  markdown_only?: boolean
+  /** Set by `useAgents` when this chat's harness cannot load the markdown spec. */
+  markdown_block?: MarkdownBlock
 }
 
 /** The label a roster surface shows for a crew: its display name when one is
  *  set, otherwise its name. One helper rather than `a.display_name || a.name`
  *  at each site, so every surface applies the same fallback (and the same
  *  trim — a stored label arrives trimmed, but an in-flight edit draft may
- *  not be). */
-export function crewDisplayName(a: Pick<KiroCrewAgent, 'name' | 'display_name'>): string {
-  return a.display_name?.trim() || a.name
+ *  not be). The built-in Assistant (see `isAssistantMember`) with no label of
+ *  its own reads as its localized name rather than its config key. */
+export function crewDisplayName(a: Pick<KiroCrewAgent, 'name' | 'display_name'> & { kiro_agent?: unknown }): string {
+  return a.display_name?.trim() || (isAssistantMember(a) ? i18nT('components.assistantWelcome.default_name') : a.name)
 }
 
 interface Props {
+  groupByKind?: boolean
   agents: KiroCrewAgent[]
   defaultAgent: string
   value: string
@@ -81,7 +91,7 @@ interface Props {
    * there is no host dialog to coexist with. The transfer has a transient
    * cost in modal mode: while the popup is open, the wheel lock belongs to
    * the popup, so the dialog body itself does not wheel-scroll until the
-   * popup closes.
+   * popup closes. Outside a dialog the shared Popover ignores it.
    */
   modal?: boolean
   /**
@@ -104,14 +114,6 @@ interface Props {
    * pixel-identical after every press during an outage.
    */
   rosterFailure?: { reloading: boolean; onReload: () => void }
-  /**
-   * Group the list by `selection_kind` — crewmates first, then installed agent
-   * templates — when the roster carries one (the folded execution catalog does).
-   * Opt-in: the schedule form asks for it, because a cron may name either kind
-   * and a flat list of both reads as one roster. Surfaces that did not opt in
-   * keep the flat rendering they had, whatever their rows carry.
-   */
-  groupByKind?: boolean
 }
 
 /**
@@ -135,10 +137,12 @@ export default function AgentSelector({
   defaultAgent,
   value,
   onChange,
-  modal = false,
+  modal: modalProp = false,
   rosterFailure,
   groupByKind = false,
 }: Props) {
+  const insideDialog = useInsideDialog()
+  const modal = modalProp && insideDialog
   const provider = useProvider()
   const [open, setOpen] = useState(false)
   const [filter, setFilter] = useState('')
@@ -276,7 +280,7 @@ export default function AgentSelector({
     closeToTrigger,
   })
 
-  // One option row, shared by the flat and grouped renderings. The roster
+  // One option row. The roster
   // `useAgents` hands this picker is folded to one row per name (a member wins
   // over a same-named template), so the name is the key and the default badge
   // marks the row named as the default — a template-only default carries it
@@ -323,6 +327,7 @@ export default function AgentSelector({
                 {a.source}
               </SourceBadge>
             )}
+            <MarkdownOnlyBadge block={a.markdown_block} />
           </div>
           <span className="text-[11px] text-muted truncate">
             {a.description || provider.resolveAgentTemplate(a)}

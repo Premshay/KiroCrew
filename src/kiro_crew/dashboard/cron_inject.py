@@ -7,12 +7,16 @@ gateway.py and dashboard.handlers.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.dashboard.chat_persistence import _restore_dismissed_source_links
-from kiro_crew.dashboard.chat_utils import redact_display_content
+from kiro_crew.dashboard.chat_persistence import (
+    _restore_dismissed_source_links,
+    _validate_turn_timeout_secs,
+)
+from kiro_crew.dashboard.chat_utils import CRON_NOTIFICATION_KIND, redact_display_content
 from kiro_crew.dashboard.slot_ownership import app_holds_gateway_key
 from kiro_crew.dashboard.state import (
     DashboardState,
@@ -569,7 +573,7 @@ def _bind_cron_slot(
         # A cron result is the job's output, not something the person typed.
         # A USER label would expose it to any app holding `slots:user`.
         origin=SlotOrigin.CRON,
-        **({"workspace": workspace} if workspace else {}),
+        workspace=workspace or "default",
     )
     if workspace and getattr(slot, "workspace", "default") != workspace:
         # The tab IS the job's caller identity for session control, which reads
@@ -600,6 +604,13 @@ def _bind_cron_slot(
         # derived pin needs no exception for this one.
         note_crew_log_class(state, slot)
         hydrate_slot_from_history(slot, history or [])
+        # The tab's own turn time limit lives on the transcript's metadata line,
+        # which this bind does not read. Until restore_cron_turn_timeout reads
+        # it, the slot's saves carry the on-disk value forward rather than
+        # writing "follow the global limit" over it; a reused slot's limit from
+        # a prior binding is dropped for the same reason.
+        slot.turn_timeout_secs = None
+        slot._turn_timeout_hydrated = False
         if dismissed is not _DISMISSED_UNREAD:
             _restore_dismissed_source_links(slot, dismissed)
         else:
@@ -628,6 +639,29 @@ def _bind_cron_slot(
     if minted:
         persist_cron_chat_folder(state, job, slot)
     return slot
+
+
+def queue_cron_notification(slot: Any, wrapped: str, label: str) -> str:
+    """Queue *wrapped* behind *slot*'s running turn and draw its card; return the queue id.
+
+    The one writer of the ``queued`` card both cron injectors draw for a
+    notification that waits: a cron's ``send_message`` to its origin session
+    (``handlers.messaging.api_send_message``) and a script cron's result
+    (``GatewayOrchestrator._deliver_script_result``). The card names its entry in
+    ``meta.queueId``, the key the dashboard's queue reducers match
+    (``website/src/store/chat/queue.ts``: the drain's ``queue_pop``, cancel, edit
+    and the slot-detail hydration), so the drain takes the card down when the
+    notification starts its turn. The JSON ``cls`` carries ``cronLabel`` for the
+    card's label and ``queue_id`` for ``chat_utils._edit_queued_by_id``.
+    """
+    queue_id = slot.queue_append(wrapped, kind=CRON_NOTIFICATION_KIND)
+    slot.append(
+        "queued",
+        wrapped,
+        json.dumps({"cronLabel": label, "queue_id": queue_id}),
+        meta={"queueId": queue_id},
+    )
+    return queue_id
 
 
 def inject_cron_result_to_dashboard(
@@ -982,10 +1016,58 @@ async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
         if workspace and getattr(slot, "workspace", "default") != workspace:
             slot.workspace = workspace
         await prefetch_cron_dismissed(state, job.id)
+        await restore_cron_turn_timeout(state, job.id)
         return
     history = await prefetch_cron_history(state, job.id)
     dismissed = await prefetch_cron_dismissed(state, job.id)
     _bind_cron_slot(state, job, history, dismissed, workspace=workspace)
+    await restore_cron_turn_timeout(state, job.id)
+
+
+def apply_cron_turn_timeout(slot: Any, meta: dict[str, Any]) -> bool:
+    """Restore a bound cron tab's own turn time limit from a READABLE metadata line.
+
+    A restore only fills a limit that is still unread. When the tab is already
+    hydrated, a user's change or another restore committed while the metadata
+    read ran, so the line in hand is older than the slot's own value and is
+    dropped. Returns whether the line was applied.
+    """
+    if getattr(slot, "_turn_timeout_hydrated", True):
+        return False
+    slot.turn_timeout_secs = _validate_turn_timeout_secs(meta.get("turn_timeout_secs"))
+    slot._turn_timeout_hydrated = True
+    return True
+
+
+async def restore_cron_turn_timeout(state: DashboardState, job_id: str) -> None:
+    """Off-loop read of a just-bound cron tab's own turn time limit.
+
+    :func:`_bind_cron_slot` links the tab without reading the transcript's
+    metadata line, so the limit the tab was given before it closed is still on
+    disk only; the tab's saves carry it forward meanwhile. This reads it back
+    once the tab is bound to this job's transcript. A failed or unreadable read,
+    or a tab rebound or already restored while the read ran, leaves the slot as
+    it is, still carrying the on-disk value, and a later bind or run start
+    retries.
+    """
+    log = state.conversation_log
+    if log is None:
+        return
+    slot = state.get_slot(f"cron-{job_id}")
+    history_key = f"cron:{job_id}"
+    if slot is None or getattr(slot, "_turn_timeout_hydrated", True):
+        return
+    if slot.linked_session_key != history_key:
+        return
+    try:
+        meta, readable = await asyncio.to_thread(log.get_metadata_status, history_key)
+    except Exception:
+        return
+    if not readable or state.get_slot(f"cron-{job_id}") is not slot:
+        return
+    if slot.linked_session_key != history_key or slot._turn_timeout_hydrated:
+        return
+    apply_cron_turn_timeout(slot, meta)
 
 
 def hydrate_slot_from_history(slot: Any, messages: list[dict[str, Any]]) -> None:

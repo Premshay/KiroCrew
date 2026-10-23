@@ -101,9 +101,7 @@ For the full hook list see [getting-started.md](getting-started.md#app-sdk-hooks
 ## Embedded Chat
 
 `ChatEmbed` mounts Kiro Crew's native transcript and compact composer for an
-existing session. The required `slotKey` selects the session. Existing props such
-as `agent`, `placeholder`, `frameless`, `startAtBottom`, `onSend`, and
-`aboveComposer` keep their current contracts.
+existing session. The required `slotKey` selects the session.
 
 ```tsx
 import { ChatEmbed } from '@kirocrew/app-sdk'
@@ -111,15 +109,143 @@ import { ChatEmbed } from '@kirocrew/app-sdk'
 <ChatEmbed slotKey="coder-abc123" />
 ```
 
+Unless `frameless` is set, a header strip shows the session's title. Without a
+title it shows a label in the user's language: "Loading session…" until the
+first read arrives, "New session" for a session with no history, and "Untitled
+session" for one that has messages. The slot key is never
+shown as text, only as the header's hover tooltip.
+
+| Prop | Type | Default | What it does |
+|---|---|---|---|
+| `slotKey` | `string` | required | The chat slot (session) the embed reads and sends to. |
+| `agent` | `string` | unset (sent as `''`) | Agent name sent with each `POST /api/chat`, and shown in the title strip when set. Ignored by `onSend`. |
+| `placeholder` | `string` | localized "Message..." (`appSdk.chatEmbed.message`) | Composer placeholder while the session is idle. While a turn runs the composer shows its own "agent is working" text instead. |
+| `frameless` | `boolean` | `false` | Drops the outer border, rounding, background and title strip, and makes the input row transparent, so a host card can hold the chat flush. |
+| `startAtBottom` | `boolean` | `false` | Opens scrolled to the newest row and stays pinned there as rows arrive, until the user scrolls up; shows a jump-to-bottom button while unpinned. Without it the embed opens at the top and smooth-scrolls to each new message. |
+| `onSend` | `(message: string, meta?: ChatEmbedSendMeta) => Promise<unknown> \| void` | none | Replaces `POST /api/chat` as the send path. Use it when the app owns its slots: the generic endpoint creates a missing slot with no app ownership and no project. Every send passes `meta` (`{ sendId?: string; files?: string[]; pastes?: PasteBlock[] }`): `sendId` always, `files` and `pastes` when the send has non-image attachments or a collapsed paste. Forward it as `meta` on your own chat POST (see [Attachments](#attachments) and [Long pastes](#long-pastes)); forwarding `meta.sendId` lets the embed prove a send landed even when `onSend` rejects. |
+| `aboveComposer` | `ReactNode` | none | Content placed in normal flow directly above the composer, such as a docked quote bar. |
+| `composerMaxHeight` | `number` (px) | `240` | Cap for the composer's auto-grow (see below). |
+| `onFileOpen` | `(path: string, opts?: { line?: number; endLine?: number }) => void` | none | Opens a file the transcript names; without it the tool-row file chip is hidden and path links stay plain (see below). |
+| `onArtifactOpen` | `(slug: string) => void` | none | Opens a saved artifact from a link in a reply; without it artifact links follow their href. |
+| `hide` | `readonly ChatEmbedHideKey[]` | none | Parts of the embed not to mount (see [Hiding parts](#hiding-parts)). |
+
+### Hiding parts
+
+`hide` removes parts of the embed. A hidden part is not mounted at all.
+
+```tsx
+import { ChatEmbed, type ChatEmbedHideKey } from '@kirocrew/app-sdk'
+
+const HIDE: ChatEmbedHideKey[] = ['header', 'stop', 'toolDetails']
+
+<ChatEmbed slotKey="coder-abc123" hide={HIDE} />
+```
+
+| Key | What goes away |
+|---|---|
+| `header` | The title strip. The same strip `frameless` drops, without changing the frame. |
+| `attach` | The attach button. A pasted or dropped file is refused with the same notice an app without the upload grant shows, so nothing is uploaded. |
+| `stop` | The Stop button and its hints. Send stays in its place: it is disabled while the draft is empty and queues a typed draft. The user then has no way to halt a running turn from the embed, so hide it only where the host offers its own stop or turns are short. |
+| `queue` | The queued-message cards above the composer. A message sent while the agent works is still queued; it shows once the turn reaches it. Until then nothing in the embed shows it was kept, so a user may send it again; hide it only where the host shows its own pending state or sends while idle. |
+| `toolDetails` | The panel a tool row opens on click. Each tool row stays as a status pill. An open panel closes when the key is added. |
+| `followUps` | The follow-up suggestion chips above the composer. |
+
+Any other string is a type error. Hiding only removes: it never shows a part
+the app has no grant for (`attach` still needs `/api/upload/file`, approvals
+still need `/api/chat`), and voice input stays off either way. The transcript
+and the message box cannot be hidden.
+
+### Required permissions and limitations
+
+The embed calls the Gateway through the host's scoped `useAppApi()` client, so
+the app must grant `/api/chat` in its `permissions.api` (a builtin host passes it
+in `AppApiProvider`'s `allowedApiPaths`). This entry satisfies the scoped client's
+API-path check for each of these calls:
+
+- `GET /api/chat/slots/{slot}?limit=N` — the transcript poll.
+- `POST /api/chat` — sending, unless `onSend` is supplied.
+- `POST /api/chat/slots/{slot}/approve` — Approve, Reject and Trust on a tool approval.
+
+File attachments upload to `POST /api/upload/file`, which `/api/chat` does not
+cover: it is a separate, optional grant (see [Attachments](#attachments)).
+The `/` command menu and the `@` file menu read `GET /api/slash-commands` and
+`GET /api/file-search`; each is its own optional grant (see
+[Command and file pickers](#command-and-file-pickers)).
+
+Without the API-path grant the scoped client throws before any request is sent:
+the transcript shows its load error, and sending and approving fail. Supplying
+`onSend` removes only the send call; the poll and approvals still need the grant.
+
+For app-token callers, approvals also require `permissions.sessionApproval`.
+Without that permission, the Gateway returns 403 `session_approval_not_granted`,
+even for the app's own slots. The API-path grant alone does not authorize an
+approval; the session ownership rules still apply. See **Ownership for app
+callers** under [Approvals](#approvals).
+
+What the embed does not do today, one line each:
+
+- No live stream. It polls the slot every 1 s while a turn runs and every 5 s
+  when idle, reading the newest 200 rows; "load earlier" widens that by 200 rows
+  a press, up to 500. Replies are displayed from the transcript poll, not from
+  the send response. After 10 s of failed polls it backs off, up to 30 s
+  between attempts.
+- No Stop control. A running turn cannot be cancelled from the embed.
+- No reasoning display. Model thinking is sent only as the `chat_thinking`
+  WebSocket event, which the poll never sees.
+- Trust is a lasting grant, not a one-shot approval. Choosing Trust on an
+  approval card approves the call and sets the session's approval policy to
+  auto-approve, so later tool calls in that session run without asking until
+  the policy is changed.
+
+### Composer
+
 The composer accepts multiple lines. `Enter` sends the draft, `Shift+Enter`
 inserts a line break, and an Enter used to commit an input method editor (IME)
 candidate does not send. The box grows with the draft up to 240 pixels, then
-keeps its height and scrolls vertically.
+keeps its height and scrolls vertically. The embed's composer has no voice input:
+dictation reads its settings outside the app's granted API paths.
+
+A sent message appears at once, where the server's copy will appear. On an idle
+slot that is a row at the end of the transcript. On a busy slot it is a queued
+card in the queue strip above the composer, and a `queued` receipt moves it
+there too. The embed keeps it until a poll returns this send: its own `user`
+row by `sendId`, or its queue entry by the receipt's `queue_id` (the server
+entry then takes over the same card). Once seen, it does not come back. Each
+send is held on its own, so a second send made before the poll shows the first
+leaves the first's copy in place. A send
+whose text goes back to the composer (refused, or delivery not confirmed) drops
+the row. An `onSend` handler posts on its own endpoint. If it forwards
+`meta.sendId`, the server copy is found by id as for a default send. If not,
+the server copy is a new `user` row with the same text, one that was not in
+the transcript at send time.
 
 A host that boxes the embed at a fixed height passes `composerMaxHeight` (in
 pixels) to lower that cap, so a long draft cannot take most of the box from the
 transcript. The resting (empty) size of the composer is unchanged; only the cap
 moves. Omitted, the 240-pixel default applies.
+
+While the agent is working and the draft is empty, a Stop button takes the send
+button's place. It is the dashboard composer's own Stop control. The first press
+asks the agent to stop, and the header then reads "Stopping…". A
+second press made while that stop is still pending forces the stop: it ends the
+turn at once and drops any queued messages, and a hint above the composer says
+so before the press. If the forced stop itself stalls, the button comes back
+after 15 seconds and the hint says to press it again. The hint shows only while
+the Stop button does: typing a draft brings Send back, and Send queues the
+draft. A failed stop shows an error above the composer. While the session is
+compacting its context, a first press stops nothing: the header does not change
+to "Stopping…", and for the next 60 seconds the hint warns that Stop will
+restart the session: the chat history stays, but work in progress and queued
+messages are dropped. A stop belongs to the turn it was pressed in: when the
+next queued turn starts, the embed shows an unpressed Stop again. The embed's Stop is not
+the dashboard guide's `composer.stop` target, which stays on the chat page. Stop calls
+`POST /api/chat/slots/{slot}/stop` (`?force=true` for the second press), which
+the `/api/chat` entry the embed already needs in `allowedApiPaths` covers. The
+embed reads the stop phase from the `stop_state` field of
+`GET /api/chat/slots/{slot}` (`idle`, `soft_pending` or `killing`), and from
+its `stop_declined` field whether the next press restarts the session, so an
+embed opened during that window warns before the first press. Its `turn` and
+`turn_gen` fields tell it when a new turn has started.
 
 ```tsx
 <div style={{ height: 420 }}>
@@ -127,11 +253,177 @@ moves. Omitted, the 240-pixel default applies.
 </div>
 ```
 
+A message sent while the session is busy waits in the session's queue. While a
+turn runs, typing a message turns the Send button into a **Queue** button, so
+the button says the message will wait for the current work to finish. The embed
+shows each waiting message as a card above the composer, the same card the
+dashboard's chat shows, and the card leaves when the message is delivered. This
+covers sends from the embed itself and from any other surface (another tab, a
+scheduled job). The cards are read-only in the embed: to cancel or edit a queued
+message, open the session in the dashboard. Finished sub-agent results waiting
+for the same turn show as one progress line instead of cards.
+
+The embed polls the session about once a second while the agent works and
+every five seconds otherwise. A failed poll is retried at the same pace and
+stays silent. Once polls have kept failing for 10 seconds, counted from the
+first failure (the gateway restarted, the session was deleted, or access was
+lost), the transcript stays on its last update, the header stops showing the
+session as running and its dot turns muted, a half-written reply loses its live
+caret, and a notice with a Reconnect button appears above the composer. The poll
+then backs off, waiting as long as the outage has lasted, up to 30 seconds
+between reads. Reconnect reads the session at once: the button is disabled and
+marked busy while that read is in flight, and a read that fails announces the
+notice again. The first successful read clears the notice. Sending stays
+available during the outage, since the gateway may be back before the next
+read; a send that is refused or unconfirmed hands its text back to the composer
+as usual.
+
+A file the agent sends with `file_send` appears in the transcript as the same
+card the main chat shows: a download card, or an inline player or image for
+audio, video and pictures. The card links to `/api/outbox/<filename>` as an
+ordinary same-origin URL, so the browser fetches it with the viewer's dashboard
+sign-in and the gateway's own download checks apply. It does not go through
+`useAppApi`, so the app needs no `allowedApiPaths` entry for it. A `file` row
+draws a card only when its content is a file record: JSON with a non-empty
+string `filename`, plus optional string `content_type` and `description` and
+a number `size`. Any other row draws nothing in the embed; the main chat runs
+the same check and shows such a row's text as a message instead.
+
+A host that can open files or artifacts itself passes `onFileOpen` and
+`onArtifactOpen`. The embed hands both straight to the transcript, as in the
+main chat: `onFileOpen(path, { line, endLine })` turns on a tool row's file chip
+and opens path links in replies, and `onArtifactOpen(slug)` opens an
+`/artifacts/<slug>` link instead of following it. Omitted, the file chip stays
+hidden and both kinds of link behave as before.
+
+Keep both handlers the same function between renders while their behaviour
+does not change. The transcript re-renders its messages whenever either one
+changes identity, so an inline arrow re-renders it on every render of the host.
+Wrap each in `useCallback`, listing what it reads as dependencies, or pass a
+function defined outside the component.
+
+```tsx
+import { useCallback } from 'react'
+import { ChatEmbed } from '@kirocrew/app-sdk'
+
+// Defined outside the component, so it is the same function on every render.
+function openArtifactTab(slug: string) {
+  myTabs.open({ kind: 'artifact', slug })
+}
+
+function CoderChat({ viewer }: { viewer: MyViewer }) {
+  // Changes only when `viewer` does.
+  const handleFileOpen = useCallback(
+    (path: string, opts?: { line?: number; endLine?: number }) =>
+      viewer.open(path, opts),
+    [viewer],
+  )
+  return (
+    <ChatEmbed
+      slotKey="coder-abc123"
+      onFileOpen={handleFileOpen}
+      onArtifactOpen={openArtifactTab}
+    />
+  )
+}
+```
+
+### Attachments
+
+The composer attaches files the way the main chat does: paste a file or
+screenshot, drop one on the box, or press the paperclip to pick files. Each file
+uploads to `POST /api/upload/file` through the app's scoped client. While it
+uploads, the file's name shows above the composer with an "Uploading files…"
+status, and the paperclip and Send wait for it; once the upload returns, the
+file shows as a chip, and a chip's remove button unstages it. An attachment
+alone is a sendable turn, and queues like any other send while a turn runs. On
+send, images become inline image lines and other files become
+`[attached_file N]` markers whose paths ride `meta.files`, exactly as the main
+chat sends them. A folder token such as `@src/utils/` stays in the text as
+typed: the embed does not attach folders.
+
+The upload writes to the gateway's disk, so it is an explicit grant. Declare it
+in the manifest to turn attachments on; nothing grants it by default:
+
+```json
+"permissions": { "api": ["/api/chat", "/api/chat/slots", "/api/upload/file"] }
+```
+
+Without the grant the paperclip is not rendered, and a pasted or dropped file
+shows "This app doesn't accept files. Attach them in Sessions instead." above the composer instead of uploading.
+The page is named by its sidebar label (`nav.sessions`), in the user's language.
+A server refusal (unsupported type, over the size cap) shows the same way with
+the server's reason.
+
+A host that passes `onSend` receives the meta as a second argument on a send
+with non-image attachments, `onSend(message, { sendId, files })`, and forwards
+it as `meta` on its own chat POST. A send without attachments calls
+`onSend(message, { sendId })`.
+
+### Command and file pickers
+
+The composer offers the main chat's own `/` command menu and `@` file menu, the
+same components with the same keys: arrows move, Enter or Tab accepts, Escape
+closes. Each menu reads through the app's scoped client, and each is shown only
+when the manifest declares its endpoint; nothing grants either by default:
+
+```json
+"permissions": { "api": ["/api/chat", "/api/chat/slots", "/api/slash-commands", "/api/file-search"] }
+```
+
+| Menu | Opens on | Reads | Without the grant |
+|---|---|---|---|
+| Commands | a `/` at the start of the text | `GET /api/slash-commands` | no menu; `/text` sends as typed |
+| Files | an `@` token at the caret, two characters on | `GET /api/file-search?q=…` | no menu; `@text` sends as typed |
+
+Accepting a command puts it in the composer; the send runs it, as in the main
+chat. Each file row shows the folder it sits in, cut from the start, so files
+with the same name stay distinguishable in a narrow embed. The menu leaves out `/side`, `/btw`, `/onboarding` and `/kb`: the main
+chat runs those in the browser, and the embed has nothing to run them with.
+Accepting a file writes its `@path` token and stages the file like an
+attachment, so the send carries it in `meta.files`; removing the file's chip
+takes its `@path` token out of the text as well. A folder writes only its
+`@path/` token, which stays text (see [Attachments](#attachments)). Staging a
+picked file uploads nothing, so it needs no `/api/upload/file` grant.
+
+Both menus are opt-in: no host in this repository declares either path today,
+so they appear only in a host that does. The gateway answers the file search
+only for the dashboard owner's own requests. A builtin page mounted in the
+dashboard gets results. An installed app does not: declaring
+`/api/file-search` gives it no working `@` menu today, since its token is
+refused and the menu reports a failed search, so an installed app should not
+declare it.
+
+The main chat's `./` path completion and `$` skill menu are not offered: path
+completion resolves against a project directory the embed does not name, and
+the skill list is resolved against the chat's session key, which the scoped
+client does not let an app choose.
+
+### Long pastes
+
+A long paste collapses the way it does in the main chat. Text of four lines or
+more, or over 200 characters, goes into the draft as one
+`[ Paste #N · M lines ]` chip instead of its full text. The chip moves and
+deletes as one unit, hovering it (or putting the caret inside it) previews the
+text, and a double-click (a tap on touch) expands it back into the draft.
+Copy and cut of a selection that covers a chip copy the full text, and
+Cmd/Ctrl+Z after deleting a chip brings it back with its text.
+`Cmd/Ctrl+Shift+V` pastes in full once, and the user's **Show Pasted Text in
+Full** chat setting turns collapsing off.
+
+On send each chip is expanded in `message`, and its block rides
+`meta.pastes`, the main chat's send shape, so the transcript folds the text
+back into the same chip. A refused send hands the chip back with its block, so
+pressing Send again still sends the full text. A host that passes `onSend`
+receives that meta, `onSend(message, { sendId, pastes })`, and forwards it as `meta`
+on its own chat POST. No permission is involved: nothing is uploaded.
+
 ## Native Chat Panel
 
 `ChatPanel` mounts Kiro Crew's native chat experience for an existing session. The required
 `slotKey` selects the session. By default, the component keeps the standard embedded ChatPage
-behavior.
+behavior. A session the app has just created with `POST /api/chat/slots` can be passed straight
+away: the panel shows it before the dashboard's session list has caught up.
 
 ```tsx
 import { ChatPanel } from '@kirocrew/app-sdk'
@@ -263,7 +555,7 @@ That renders the built-in rows. To change one, pass `renderers`.
 ### Adding a row the transcript does not draw
 
 Four roles are deliberately undrawn — `thinking`, `system`, `done` and `queued` — because the
-dashboard shows them through other affordances. `file` is undrawn too. Claim one and it is yours:
+dashboard shows them through other affordances. Claim one and it is yours:
 
 ```jsx
 const renderers = [{
@@ -311,9 +603,16 @@ Import `defaultMessageRenderers` if you need to read what the built-ins do, and 
 | `onFileOpen` | open a path, when the host supports it |
 | `autoDeniedIds` | tool calls a policy or hook blocked |
 | `renderTool` | the host's tool row, if it passed one |
+| `handOff` | whether a row's error notice may offer "Ask the agent"; absent means yes |
 
-Two rules the registry relies on:
+Three rules the registry relies on:
 
+- **Look ahead at roles, not at streaming text.** A renderer may read any neighbour off `messages`,
+  but not the text of a `streaming` row other than its own. When the list owns its scroller (the
+  `transcript` mount `ChatEmbed` uses), a row is drawn again when its own messages, the host's props
+  or any other row change, except one change: a streaming row's text growing, which redraws that row
+  alone. Every built-in rule that looks ahead (the reply footer, the steer chip, a retry notice's
+  tense) reads a streaming row by its role.
 - **Shape beats role.** Resolution is first-match, and your entries sit between the two built-ins
   recognised by message *shape* — a stop event and a sub-agent completion, which claim `'*'` and gate
   on a `match` predicate — and the role-keyed ones. This matters because a stop event reaches the
@@ -325,6 +624,15 @@ Two rules the registry relies on:
   says "no row by design"; no entry at all says "nothing handles this". Both look identical on
   screen, so `website/src/test/messageRenderers.test.ts` pins which is which.
 
+### Error hand-off inside the list
+
+A failed approval decision, a refused tool-output copy and a failed MCP sign-in banner render an
+`ErrorNotice` with the "Ask the agent" hand-off, which navigates to the main chat. A host holding unsaved local state that the
+navigation would drop passes `handOff={false}` to `ChatMessageList`: those notices then render
+without the button, and renderers see `ctx.handOff === false`. `ChatEmbed` does this because its
+composer draft lives only in the embed; `ChatPane` does too, for its staged message quote. `ToolCallPill` takes the same switch as `askAgent`.
+Default is `true`, so a host with nothing to lose keeps the hand-off.
+
 ### Exports
 
 | Export | Kind | Purpose |
@@ -333,7 +641,7 @@ Two rules the registry relies on:
 | `defaultMessageRenderers` | value | the built-in registry, in resolution order |
 | `mergeRenderers(extra)` | function | shape-matched defaults, then host entries, then the rest |
 | `resolveRenderer(message, renderers)` | function | first entry that claims the message |
-| `ToolCallPill` | component | the store-free tool row the default registry uses |
+| `ToolCallPill` | component | the store-free tool row the default registry uses; expanded, it shows the persisted `meta.input` / `meta.output` in the main chat's Input/Output panel, and falls back to the row's `content` only when both are empty; with a payload, its Copy control copies input and output together whichever tab is showing, and says so in a visible "Copy input and output" label, while a fallback row keeps the icon-only Copy |
 | `GROUPED_ROLES` | value | frozen array of the roles grouped before per-row resolution (see the limitation above) |
 | `MessageRenderer` | type | `{ id, roles, match?, render }` |
 | `MessageRenderContext` | type | what `render` is handed |
@@ -670,6 +978,32 @@ return. Only the SDK call takes `params`: the HTTP start route
 (`POST /api/apps/{app}/_jobs/{kind}/start`) accepts a `dedupe_key` and no
 parameters.
 
+### Crewmate proposals (`ctx.crewmate`)
+
+> **Preview, switched off.** `ctx.crewmate` is `None` for every app, even one that declares the permission, until the dashboard view that lists an app's cards lands (#21718). The calls below describe the contract that view will switch on (`apps/crewmate_sdk.py::PREVIEW_ENABLED`).
+
+Once switched on, present when the manifest declares `permissions.proposeCrewmate: true`, and `None` otherwise. The app hands core one parsed `.crewmate` bundle ([rfc-crewmate-share.md](../request-for-change/rfc-crewmate-share.md) §5.2). Core checks it and raises one `crewmate.import` change card for the owner. The app creates nothing: only the owner's press creates the crewmate.
+
+```python
+card_id = await ctx.crewmate.propose(bundle)   # raises CrewmateProposalError(code, message)
+state = await ctx.crewmate.status(card_id)     # {"status": "pending"} ... {"status": "applied", "crew": "<key>"}
+```
+
+`bundle` is `{"crewmate": <crewmate.json>, "agent": <agent.json>, "goals"?: {"longTerm", "keyResults"}, "rules"?: {"rules"}, "crons"?: [...], "avatar"?: {"type", "size"}}`. Core refuses it before any card exists when:
+
+| Code | Cause |
+|---|---|
+| `unknown_param` | an unknown key in the bundle, `crewmate`, `agent`, `goals`, `rules`, `sender` or `avatar` (`{"type", "size"}`); crons and key results are only counted |
+| `invalid_bundle` | not `format: "kirocrew.crewmate"`, a bad shape, or a `dashboardTemplate` that is not a `builtin:` or `user:` id |
+| `newer_format` | a `formatVersion` this version does not read |
+| `grant_in_bundle` | `allowedTools`, `autoApprove` or `permissions` in `agent.json` |
+| `needs_mate_config` | any `mcpServers` or `skills` entry, until the mate-owned agent file exists (RFC §5.7) |
+| `rules_unsupported` | non-empty rules, which this version cannot import yet |
+
+The card creates the crewmate from the `kirocrew` template with a fresh member id, its own empty memory and workspace, and `approval_mode: "normal"` in the create. It writes the long-term goal when the bundle has one. It lists the crons, key results, picture or face, model or effort hints and dashboard template a bundle carries under "Not brought over", as codes the dashboard words, and memory, history, credentials and the sender's approval settings under "Stays with the sender". A taken name becomes the first free `<name> 2` to `<name> 9`, and the owner can edit it.
+
+The card is stored under the key `app:<name>` with no conversation, so an app's open cards count against one per-app cap. `status` reads only this app's own cards. The dashboard view where the owner presses an app card is not built yet.
+
 ### Gateway Application (`ctx.http_app`)
 
 The gateway's own aiohttp `Application`, for background work that must be anchored
@@ -738,9 +1072,9 @@ startup call, and teardown is the only thing that stops it.
 | `setApprovalMode(mode)` | `—` (no body) | Set the chat trust mode (`normal`, `trust_reads`, `trust`, `yolo`) through `POST /api/chat/mode`; a different setting from `agent.approval_mode` |
 
 **Ownership for app callers** (a dashboard caller is unrestricted). The rule follows the request's app claim: an app token, and also an agent running in one of your app's sessions, whose internal calls carry your app's identity.
-- `POST /api/approvals/{id}/{action}` needs `permissions.sessionApproval`, exactly like `POST /api/chat/slots/{slot}/approve`: without it both answer 403 `session_approval_not_granted` to an app-token caller, even for your own slots. An agent running in your app's sessions (its cron job or subagent, calling over the internal secret) is exempt from that grant on both routes alike, and is still limited to the slots your app owns. With the grant, the id resolves a request on a slot you own or on a local user session. Request ids can recur across sessions, so an id pending on more than one session you may control is refused; name the session with the slot route instead (`resolveApproval(id, action, slotId)`). A background approval (cron, autonudge, subagent, task runner) is never resolvable by an app.
+- `POST /api/approvals/{id}/{action}` needs `permissions.sessionApproval`, exactly like `POST /api/chat/slots/{slot}/approve`: without it both answer 403 `session_approval_not_granted` to an app-token caller, even for your own slots. An agent running in your app's sessions that calls over the internal secret is NOT exempt on these routes: a bare internal-secret caller is refused 403 like a non-owner on both `POST /api/approvals/{id}/{action}` and `POST /api/chat/slots/{slot}/approve`. The one internal path still admitted is a cron script's attested `cron:` key on `setApprovalMode`'s `POST /api/chat/mode`; see `docs/system-specs/modules/app-kit-platform.md`. With the grant, the id resolves a request on a slot you own or on a local user session. Request ids can recur across sessions, so an id pending on more than one session you may control is refused; name the session with the slot route instead (`resolveApproval(id, action, slotId)`). A background approval (cron, autonudge, subagent, task runner) is never resolvable by an app.
 - `GET /api/approvals` lists only what the app could resolve. The list carries background approvals only, so for an app it is always empty. Read a slot's pending requests from its history instead.
-- `GET /api/sessions`, `GET /api/sessions/search`, `GET /api/sessions/{key}`, `DELETE /api/sessions/{key}` and `POST /api/sessions/summarize` reach only transcripts that record the calling app as their owner. `total` counts only those, search ranks only those, and summarize skips any other key as if it were missing (so `list_sessions` with `summarize` from your app's agent returns summaries for your transcripts only). A delete is also refused when a live slot holding the transcript belongs to someone else.
+- `GET /api/sessions`, `GET /api/sessions/search`, `GET /api/sessions/{key}`, `GET /api/sessions/{key}/meta`, `DELETE /api/sessions/{key}` and `POST /api/sessions/summarize` reach only transcripts that record the calling app as their owner. `total` counts only those, search ranks only those, and summarize skips any other key as if it were missing (so `list_sessions` with `summarize` from your app's agent returns summaries for your transcripts only). A delete is also refused when a live slot holding the transcript belongs to someone else.
 - `DELETE /api/sessions` (bulk clear) and `GET /api/sessions/clearable/count` act on every closed transcript at once, so an app is always refused them.
 - A new slot can only be opened on a fresh name or on a transcript your app already owns. `POST /api/chat/slots` with a `name`, `POST /api/chat` that would create its slot, and `POST /api/chat/slots/{slot}/resume` answer 404 for a transcript that belongs to someone else.
 - Apart from the missing-grant 403, every refusal returns the same body as a missing target, `{"error": "not found", "code": "slot_not_found"}`. The reason is recorded in the security-event log, and so is every access the ownership rule allows.
@@ -802,7 +1136,7 @@ Silent background context for LLM — content appears in the next user-initiated
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `injectContext(slotId, content, options?)` | `—` (no body) | Inject context (null slotId = buffer locally) |
-| `flushPendingContext(slotId)` | `number` | Flush buffered entries to a slot; returns the count the full queue refused and dropped. A `context_not_queued` entry is dropped (not re-buffered) so it never blocks later sends; a transient failure is re-buffered and raised |
+| `flushPendingContext(slotId)` | `number` | Flush buffered entries to a slot; returns the count the Gateway refused for good and dropped. A `context_not_queued` or `context_secret_shaped` entry is dropped (not re-buffered) so it never blocks later sends; a transient failure is re-buffered and raised |
 | `setDefaultSlot(slotId)` | `void` | Auto-flush pending context on sendMessage |
 | `pendingContextCount` | `number` | Number of buffered context entries |
 
@@ -812,6 +1146,8 @@ Options: `{ source?: string, ephemeral?: boolean, maxAge?: number }`
 - `source`: ≤64 chars, no control characters or newlines; whitespace-trimmed (a padded label and its bare form share one per-source cap bucket)
 - `maxAge`: must be a finite positive number (rejects boolean, NaN, Infinity, ≤0); omit or pass null for no expiry
 - `content`: must be a non-empty string, ≤40,000 chars
+
+**Boundary: pending context is in-band, model-visible, and not confidential.** Context entries are prepended to the next user message as background text. The model reads them as ordinary prompt text, so "consume silently" is a request the model usually follows, not a guarantee, and anything in an entry can surface in a reply or in what that turn's output reaches. Never put a secret in pending context: pass the agent a reference it can resolve (a secret name, a file path, a tool), never the value. The Gateway enforces the credential part of this rule: a `content` the credential redactor would rewrite (an API token, a private key, a URL carrying credentials, a base64-encoded credential) is refused with `400` and body `{ error, code: "context_secret_shaped" }`, the queue is left unchanged, and the error never echoes the content. On `/note` the same check skips only the context half: the visible line is still written, redacted, and `contextSkipped` is true. The detectors are pattern-based, so the refusal does not make any other content safe to send.
 
 **Ownership** (404 on refusal; applies to app callers — a dashboard caller is unrestricted):
 - An app may only target a slot it owns, and a slot carrying no app scope is refused as well.
@@ -824,9 +1160,9 @@ Options: `{ source?: string, ephemeral?: boolean, maxAge?: number }`
 
 `POST /api/chat/slots/{slot}/note` drops a short declarative line into a chat that is both visible in the transcript immediately and known to the agent on the user's next message — without firing an LLM turn. Context injection alone is silent; a transcript append alone is invisible to the model, because a live provider forwards only the new user message. The note endpoint does both writes against one slot.
 
-Body: `{ content, source?, maxAge?, ephemeral? }`. A note always does both writes -- there is no visible-only or context-only mode. The visible line is appended as `role: "inject"` with `cls: "reconcile-note"`, and its content is redacted (credentials, exfiltration URLs) before it reaches the transcript. The bubble's author pill comes from the authenticated app identity, never from the body's `source`. A dashboard user's note has no pill, and neither does a note from an app whose name is over 64 characters or contains a control character. The body's `source` is only the label of the context frame. `maxAge` defaults to 24h for the context half when the key is omitted, so a note nobody follows up on expires instead of attaching to an unrelated message later. An explicit null means no expiry, the same as it does on `/context` — the two endpoints share the field and do not give it opposite meanings. The same `source`/`maxAge`/`content` constraints above apply.
+Body: `{ content, source?, maxAge?, ephemeral? }`. A note always does both writes -- there is no visible-only or context-only mode. The visible line is appended as `role: "inject"` with `cls: "reconcile-note"`, and its content is redacted (credentials, exfiltration URLs) before it reaches the transcript. A credential-shaped `content` seats no context half, because the context half is model-visible pending context (see the boundary under Context Injection): the redacted visible line is still written and `contextSkipped` is true. The bubble's author pill comes from the authenticated app identity, never from the body's `source`. A dashboard user's note has no pill, and neither does a note from an app whose name is over 64 characters or contains a control character. The body's `source` is only the label of the context frame. `maxAge` defaults to 24h for the context half when the key is omitted, so a note nobody follows up on expires instead of attaching to an unrelated message later. An explicit null means no expiry, the same as it does on `/context` — the two endpoints share the field and do not give it opposite meanings. The same `source`/`maxAge`/`content` constraints above apply.
 
-Returns `{ ok, appended, visibleDeferred, deliveryConditional, contextSkipped, pending }`. `contextSkipped` is true whenever the context half is refused but the visible line is still written: either the source's per-source context cap is full, **or** the whole 50-entry pending-context queue has no seat. The request is **not** rejected in either case, because the caps protect the context queue rather than the transcript. The full-queue refusal is checked at admission on both arms — an immediate note (`append_pending_context` returns false) and a note held during a running turn (`has_pending_context_seat()` is false) — so a held note never acknowledges a context half the turn-end flush would then drop. If a turn is already running the note is held until that turn ends -- `appended` is false and `visibleDeferred` is true -- so that it lands on the next turn rather than the one it was written during. Ordering is preserved, and `deliveryConditional` is true whenever a note is held -- because a hold is delivered only if the slot still routes to the SAME session when the turn ends. An unbound slot can acquire a foreign binding while the note waits (a cron result or workflow injection claims an empty `linked_session_key` with no running gate), and both the transcript path and the next turn's session resolve that binding at flush time rather than at the POST. When that happens BOTH halves of the note are dropped rather than retargeted, because writing them would surface content authorized for one conversation inside another; the drop is recorded in the security-event log. So a 200 with `visibleDeferred: true` promises ordering against the running turn, not that the note will certainly be written. `pending` counts held entries as well as queued ones.
+Returns `{ ok, appended, visibleDeferred, deliveryConditional, contextSkipped, pending }`. `contextSkipped` is true whenever the context half is refused but the visible line is still written: the source's per-source context cap is full, the whole 50-entry pending-context queue has no seat, **or** the content is credential-shaped. The request is **not** rejected in any of these cases, because the caps and the credential check protect the context queue rather than the transcript. The full-queue refusal is checked at admission on both arms — an immediate note (`append_pending_context` returns false) and a note held during a running turn (`has_pending_context_seat()` is false) — so a held note never acknowledges a context half the turn-end flush would then drop. If a turn is already running the note is held until that turn ends -- `appended` is false and `visibleDeferred` is true -- so that it lands on the next turn rather than the one it was written during. Ordering is preserved, and `deliveryConditional` is true whenever a note is held -- because a hold is delivered only if the slot still routes to the SAME session when the turn ends. An unbound slot can acquire a foreign binding while the note waits (a cron result or workflow injection claims an empty `linked_session_key` with no running gate), and both the transcript path and the next turn's session resolve that binding at flush time rather than at the POST. When that happens BOTH halves of the note are dropped rather than retargeted, because writing them would surface content authorized for one conversation inside another; the drop is recorded in the security-event log. So a 200 with `visibleDeferred: true` promises ordering against the running turn, not that the note will certainly be written. `pending` counts held entries as well as queued ones.
 
 **A 200 for a held note is a durable acknowledgement — for a slot that has a durable identity.** The hold is persisted verbatim (both halves, the silent context included) into the slot's own session metadata *before* the 200 is returned, replayed into the hold by both slot-restore paths after a gateway restart, and retired by the save that commits the delivered rows -- so a note accepted with `visibleDeferred: true` survives a restart and is delivered, unaltered, on the first turn after it. Two edges keep the original gateway-lifetime meaning instead: a memory-only deployment (no conversation log at all), and a slot that has never been persisted (no metadata line to attach the hold to -- such a tab does not itself survive a restart, so there is no restored slot the note could outlive). Do **not** re-post a held note after a restart; the restored hold delivers it, and a re-post would put the same line in the transcript twice. Three boundary refusals protect that promise: a note posted during a running turn is capped at 4,000 characters (`413`, code `deferred_note_too_large` -- shorten it or wait for the turn to end), a slot whose durable hold is full answers `429 deferred_notes_full` until its rows are saved, and a slot that is rebound to another session while the hold is persisting answers the endpoint's uniform `404` -- the note was neither delivered nor made durable (a note the turn-end flush drops at that same rebind seam takes this `404` too; the 200 stands only when the note observably exists in a delivered row or the durable hold). The one retry-the-same-request signal is a `503` with code `deferred_note_persist_failed`, which means the durable write itself failed and the note was **not** accepted. The queued context of an *immediate* (non-held) note still behaves exactly as `/context`'s queue always has -- in memory, for this gateway lifetime. Note the retention consequence of durability: a HELD note's context half -- the trusted-caller channel, which is deliberately not redacted -- lives on disk in the session metadata until delivery or retirement, while an immediate note's context lives only in memory.
 
@@ -840,6 +1176,8 @@ Use these main-package helpers in Python app backends:
 | `raw_request_target(request)` | `str` | Preserve the raw percent-encoded path and query that the Gateway signed |
 | `proxy_secret()` | `str` | Read the injected `KIROCREW_PROXY_SECRET`, or an empty string |
 | `verify_proxy_request(header, *, method, target, body, secret=None, now=None)` | `bool` | Verify the body-bound HMAC and fixed ±60-second freshness window; fail closed on malformed input |
+| `verify_proxy_principal_claim(header, *, method, target, body, replay_cache, secret=None, now=None)` | `ProxyPrincipalClaim \| None` | Verify and consume one `X-KiroCrew-Principal` claim for an app that sets `backend.signedPrincipal`. Returns `None` for any malformed, stale, mismatched or replayed claim. See [Signed principal claim](#signed-principal-claim) |
+| `ProxyPrincipalReplayCache(*, max_entries=4096)` | cache | The replay cache the verifier needs. Create one per backend process |
 
 ---
 
@@ -975,6 +1313,30 @@ does so before each reconnect.
 | `flushPendingContext(slot)` | `flush_pending_context(slot)` |
 | `setDefaultSlot(slot)` | `set_default_slot(slot)` |
 
+When `send_message` targets the default slot it flushes buffered context first.
+An entry the Gateway refuses for good (`context_not_queued` or
+`context_secret_shaped`) is dropped so it cannot block the send, and the send
+still goes through. Read the `last_flush_dropped` property after the call to see
+how many entries that send dropped: `send_message` resets it to 0 before it
+sends, and a direct `flush_pending_context` call sets it too, including when the
+flush raises on a transient failure.
+
+```python
+await mc.send_message("slot-1", "hello")
+if mc.last_flush_dropped:
+    print(f"{mc.last_flush_dropped} context entries were dropped; the turn ran without them")
+```
+
+`last_flush_dropped` belongs to the client, not to one call, so it describes a
+send only while sends on that client do not overlap; a later overlapping send or
+flush overwrites it. When you send concurrently, flush first and read the count
+that call returns, which is that call's alone:
+
+```python
+dropped = await mc.flush_pending_context("slot-1")
+await mc.send_message("slot-1", "hello")
+```
+
 The standalone package exports `KiroCrewClient`, `KiroCrewError`, `ErrorCode`,
 `WsClient`, `WsEvent` and `GATEWAY_CONFIG_KEYS`. It does not export
 `AppManifest`, `AppLifecycle`, `GatewayManager` or proxy-auth helpers. Validate
@@ -996,6 +1358,7 @@ All `kirocrew-client` errors are `KiroCrewError` instances with `code`,
 | `NOT_FOUND` | 404 response | No |
 | `RATE_LIMITED` | 429 response | Yes (Retry-After or backoff) |
 | `CONTEXT_NOT_QUEUED` | 429 with code `context_not_queued` (pending-context queue full) | No (only a turn drains the queue) |
+| `CONTEXT_SECRET_SHAPED` | 400 with code `context_secret_shaped` (credential-shaped pending context) | No (the same bytes are always refused) |
 | `SERVER_ERROR` | 5xx response | `GET`/`PUT`/`DELETE`: yes; `POST`/`PATCH`: no |
 | `NETWORK_ERROR` | Timeout, connection failure, or truncated chat stream | Core `GET`/`PUT`/`DELETE`: yes; core `POST`/`PATCH`, `stream_chat`, and `transcribe`: no |
 | `WS_DISCONNECTED` | Reserved enum value; `WsClient` reconnects on its own and does not raise it | No |
@@ -1045,14 +1408,14 @@ dashboard, app, or internal credential; a bare `curl` request is not authenticat
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/apps` | List all installed apps |
+| GET | `/api/apps` | List all installed apps, each with cached `update` state |
 | GET | `/api/apps/registry` | List available apps from registry |
 | GET | `/api/apps/blob?repo=&path=&ref=` | Proxy images from a registry app's git repo |
 | POST | `/api/apps/install` | Install from local path (owner only) |
 | POST | `/api/apps/register` | Register a self-managed app (owner only) |
 | POST | `/api/apps/registry/install` | Install from registry (owner only) |
 | POST | `/api/apps/registry/install-stream` | Install from registry with an SSE progress stream (owner only) |
-| GET | `/api/apps/{name}` | Get app details |
+| GET | `/api/apps/{name}` | Get app details, including cached `update` state |
 | GET | `/api/apps/{name}/manifest` | Get app manifest |
 | GET/PUT | `/api/apps/{name}/config` | Read/write app config (PUT from a dashboard subject: owner only) |
 | POST | `/api/apps/{name}/update` | Update installed app (owner only) |
@@ -1110,6 +1473,107 @@ the value in the `X-KiroCrew-Proxy` header (constant-time), rejecting stale time
 > constant-time compare and the ±60s freshness window. A gateway that signs body-bound
 > HMACs fails verification against any verifier that omits the body hash, so a
 > backend that implements the HMAC itself has to be updated in lockstep with the gateway.
+
+#### Signed principal claim
+
+`X-KiroCrew-Proxy` proves that the gateway forwarded a request. It does not say who
+the gateway authenticated. An app that needs to know sets
+[`backend.signedPrincipal: true`](manifest-reference.md) in its manifest. The gateway
+then adds `X-KiroCrew-Principal` to every request it proxies to that backend. An app
+without that exact opt-in receives no new header, and its `X-KiroCrew-Proxy` bytes
+do not change. The gateway strips any `X-KiroCrew-Proxy` or `X-KiroCrew-Principal`
+header the caller sent, so a backend only ever sees the gateway's own values.
+
+The header value is the encoded claim, a period, and an HMAC:
+
+```text
+<base64url-canonical-json>.<hmac-sha256>
+```
+
+The decoded claim has exactly these five fields:
+
+```json
+{
+  "issuedAt": 1791589507,
+  "kind": "owner-session",
+  "ownerId": "demo-owner",
+  "requestId": "0123456789abcdef0123456789abcdef",
+  "version": 1
+}
+```
+
+Canonical JSON sorts the keys and adds no whitespace. The base64url encoding has no
+padding. The HMAC uses the app secret as the key, over these newline-separated lines:
+
+```text
+kirocrew-proxy-principal-v1
+<issuedAt>
+<method>
+<raw-target>
+<sha256(body)>
+<base64url-canonical-json>
+```
+
+`<raw-target>` and `<sha256(body)>` are the same values `X-KiroCrew-Proxy` signs, so
+the claim is bound to one method, target and body.
+
+The gateway assigns the first kind that matches:
+
+| Kind | Assigned when | `ownerId` |
+|---|---|---|
+| `agent-tool` | Internal authentication granted the call. MCP tools, agents, subagents and crons reach admitted gateway routes this way. | empty |
+| `app-token` | The caller authenticated with an app token. | empty |
+| `owner-session` | A dashboard session cookie authenticated the request, the request is not a `?token=` link exchange, and the caller is the dashboard owner. | the owner's user id |
+| `none` | Any other request, such as a `?token=` link exchange or an authenticated non-owner. | empty |
+
+`agent-tool` is checked first, so an internal caller never becomes `owner-session`,
+even when the same request also carries the owner's cookie.
+
+A Python backend that can import `kiro_crew` verifies the claim with the gateway's
+helper:
+
+```python
+from kiro_crew.apps.proxy_auth import (
+    PRINCIPAL_OWNER_SESSION,
+    ProxyPrincipalReplayCache,
+    raw_request_target,
+    verify_proxy_principal_claim,
+)
+
+principal_replays = ProxyPrincipalReplayCache()  # one per process, not per request
+
+body = await request.read()
+claim = verify_proxy_principal_claim(
+    request.headers.get('X-KiroCrew-Principal', ''),
+    method=request.method,
+    target=raw_request_target(request),
+    body=body,
+    replay_cache=principal_replays,
+)
+if claim is None or claim.kind != PRINCIPAL_OWNER_SESSION:
+    return Response(status=403)
+```
+
+The replay cache keeps each accepted `requestId` until its 60-second window closes,
+and it rejects the same id a second time. When the cache is full, it rejects new
+claims instead of evicting a live id.
+
+A backend that cannot import `kiro_crew` verifies the claim in this order:
+
+1. Require the header and the app secret.
+2. Split the header at its last period.
+3. Decode the claim. Reject malformed JSON and any missing or extra field.
+4. Require `version` 1 and one of the four kinds.
+5. Require a `requestId` of 32 lowercase hexadecimal characters.
+6. Require a non-empty `ownerId` for `owner-session` and an empty one for every other kind.
+7. Reject an `issuedAt` more than 60 seconds from the backend's clock.
+8. Recompute the HMAC over the lines above and compare it in constant time.
+9. Reject a `requestId` already accepted inside its window, and record the new one
+   atomically before the request runs.
+
+A valid claim proves which kind of caller the gateway authenticated for this exact
+request. It does not grant an action or a resource. The backend still runs its own
+checks on what the request asks to do and on which resource it touches.
 
 ### Backend Environment Variables
 

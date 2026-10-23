@@ -92,6 +92,9 @@ export interface Run {
    *  delivery happened; this proves the draft still on the pull request is that one,
    *  because a later run replaces the draft rather than editing it. */
   posted_review_ids?: Record<string, string>
+  /** Findings the user chose not to send, keyed by change id then comment key,
+   *  each with the reason given. A dismissed finding is never posted. */
+  dismissed?: Record<string, Record<string, DismissedFinding>>
   posting?: boolean
   post_error?: string | null
   /** The frozen rule resolution per change URL, written when the run was created.
@@ -104,6 +107,10 @@ export interface Run {
     resolved_model: string | null
     model_resolution: 'reported' | 'unavailable'
   }
+}
+
+export interface DismissedFinding {
+  reason: string
 }
 
 export interface PoolStats {

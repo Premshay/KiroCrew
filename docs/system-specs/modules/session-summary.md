@@ -20,8 +20,8 @@ to pay for, so the whole subsystem is inert until `session_summary.enabled`.
 | Config section and its clamps | `config/memory_sections.py` (`SessionSummaryConfig`; built by `config/section_builders.py`) |
 | Transcript extraction, payload shaping | `session_summary.py` |
 | Turn-end generation, the prompt | `dashboard/chat_summary.py` |
-| Sidecar cache | `history.py` (`ConversationLog`) |
-| Read endpoint | `dashboard/chat_handlers.py` (`api_chat_slot_summary`) |
+| Sidecar cache | `history_summaries.py` (bound on `ConversationLog`) |
+| Read endpoint | `dashboard/chat_api/slot_summary.py` (`api_chat_slot_summary`) |
 
 ## Storage: a sidecar, never the transcript
 
@@ -230,7 +230,7 @@ crowd out the session; intent survives truncation.
 
 ## Generation
 
-Dispatched from `_finish_queue_cycle` in `dashboard/chat_runner.py` — the post-turn
+Dispatched from `_finish_queue_cycle` in `dashboard/chat_turn/queue_cycle.py` — the post-turn
 hub, alongside auto-titling — as a background task, for a cycle in which a turn
 reached a provider (learn-cron-dashboard.md, "Every turn exit runs the turn's
 tail"); a cycle of local commands has nothing to summarize. Not from `hooks.py`: the
@@ -280,6 +280,18 @@ inherits `agent.model`, so unattended summarization cannot ride the interactive
 flagship. Every failure path is swallowed and logged: a lost summary must never
 surface as a failed turn, and the previous cached summary stays valid.
 
+The summary text follows the **workspace UI language** (`dashboard.language`)
+rather than the transcript's. `_generate_locked` hands `context.ui_language_tag(cfg)`
+to `_build_prompt`, which fills the prompt's `{language}` slot just before the
+transcript; an unset language, or a tag that names no shipped catalog, fills it with
+nothing and leaves the prompt byte-identical. The slot is filled by `str.replace` on
+the constant alone, before the transcript is appended, so a transcript that quotes
+`{language}` cannot restate it. The JSON keys and the `status` values stay as the
+prompt spells them, because `normalize_payload` reads them. A summary already cached
+for the current transcript keeps the language it was written in until the transcript
+changes. `TestPromptFollowsTheUiLanguage` in `test_session_summary_generate.py` pins
+the slot.
+
 On success, `push_session_summary()` broadcasts `{"_type": "session_summary"}` so
 the panel invalidates immediately rather than polling.
 
@@ -320,7 +332,24 @@ retry, and a user correction is the highest-value signal per character in the fi
 
 With the dashboard preview flag on, the Sessions three-dot menu also opens `/session-dashboards`: a read-only
 summary gallery alongside each session's model-authored Dynamic Dashboards.
-A centralized Needs you inbox precedes the gallery, including on phones. Each
+The gallery cards the sessions that have a CARD to show, by `canCarryCard` — not
+private, not remote, no session-tree `parent` — which is the same predicate
+`SessionStatusFrame` fetches on, so the list and the frame cannot disagree about who
+has a board. That is deliberately NOT the root test: `GET .../dashboard-card` has no
+root test, so a session another session DISPATCHED still owns a derived board and the
+route serves it, and this gallery is that board's only mount. What a non-root session
+does not own is the dashboard PACKAGE (`GET .../dashboard`, 404 `not_root_session`,
+and the side panel's Overview), so the page's own wording names what an entry carries
+— a saved summary and a status card — rather than promising each session a dashboard
+of its own.
+Sessions the gallery withholds are SAID, not silently dropped: a muted line under the
+list counts them (`commandCenter.cards_withheld`), and when the open sessions have no
+card between them the empty state says that (`commandCenter.no_cards`) rather than "No
+sessions", which would tell someone with open sessions that their sessions were gone.
+"No sessions" is kept for the one case where it is true, no open session at all.
+A centralized Needs you inbox precedes the gallery, including on phones. It covers
+every open session, carded or not: an adopted worker's question is answered here,
+and the search and Needs you filter reach those items. Each
 native question or approval has one control there, labeled with its human
 session name and current task context when available; session cards do not
 duplicate those controls. Search filters both sections, but the summary page
@@ -351,12 +380,26 @@ behavior the feature exists to remove.
 | `404` `{"code": "slot_not_found"}` | Unknown slot, or a slot the calling app does not own |
 
 While `enabled` is false the panel's `+`-menu row is **hidden** as well
-(`newMenuSections` in `SidePanel.tsx`), because the feature is turned on from
+(`newMenuSections` in `SidePanelAddMenu.tsx`), because the feature is turned on from
 Settings → Chat (`session_summary.enabled`), not from the panel, so offering the
 row would only lead to a panel saying the feature is off. `SidePanel` reads the flag from this same
 endpoint under the same react-query key the tab uses, so it is one cheap
 read-only request per slot that doubles as the tab's prefetch, and it fails OPEN
 so a slow response can never hide a feature that is enabled.
+
+With Pin Summary in Side Panel (`dashboard.side_panel_pin_summary`) on, Summary is
+the first pinned tab instead, ahead of Changes, Artifacts and Files
+(`pages/chat/usePinnedViews.ts`), and the `+` menu leaves its row out. The pin reads
+the same flag strictly: Summary is pinned only once a read says on, since a chip
+pinned on an unknown flag would come down again when the read says off. Until a
+chat's read answers, the strip keeps the pinned block it has. A plain show of the
+panel lands on Summary once per show, after a read that says on; a panel opened for
+something specific, like a file chip, keeps that item (`takePlainPanelShow` in
+`hooks/usePanelTabs.ts`). After that landing, an automatic discovery open creates or
+updates its Git, Changes or Issues tab without moving focus while pinned Summary
+remains active. Before the landing, after another tab is chosen, with Pin Summary
+off, and for every explicit open, the opened tab takes focus as before. A host that
+withholds Summary, such as the Members page, never pins it.
 
 ### `POST /api/chat/slots/{slot}/summary` — generate on request
 
@@ -462,8 +505,8 @@ no check on where a message came from — it gates on `enabled`, an in-flight pa
 incognito mode, liveness, a clean `end_turn`, the turn count and the cadence, and
 nothing else. Coverage is decided instead by *where the generator is called from*:
 the automatic pass has exactly one dispatch site, `_finish_queue_cycle` at the
-tail of a `_ChatSlot` turn in `dashboard/chat_runner.py`, plus the explicit
-on-demand route in `dashboard/chat_handlers.py`. Only a turn that ran through
+tail of a `_ChatSlot` turn in `dashboard/chat_turn/queue_cycle.py`, plus the explicit
+on-demand route in `dashboard/chat_api/slot_summary.py`. Only a turn that ran through
 `_run_chat` on a slot reaches the automatic pass — and reaching it is not the same
 as producing a summary, because the gates above still apply. The on-demand route
 is the one path that produces a summary with no turn at all.
@@ -473,10 +516,10 @@ than "not the dashboard":
 
 | Surface | Where its turn is driven instead |
 |---|---|
-| Slack | `slack/handler.py` (native ACP loop) or `messaging/driver.py` (`TurnDriver`) |
+| Slack | `slack/handler_runtime/turn.py` (native ACP loop, run by `slack/handler.py`) or `messaging/driver.py` (`TurnDriver`) |
 | Discord, Telegram, Teams, Webex, WeCom, WeChat | `messaging/driver.py` (`TurnDriver`), one shared loop |
 | Task runner | `task_executor.py`, streaming an ACP client directly |
-| Cron wake | `slack/gateway.py`; the result is *appended* into a `cron-<id>` slot by `dashboard/cron_inject.py` — a bare append with no turn lifecycle |
+| Cron wake | `slack/gateway_runtime/cron_turn.py` and `cron_delivery.py`; the result is *appended* into a `cron-<id>` slot by `dashboard/cron_inject.py` — a bare append with no turn lifecycle |
 | Agent webhooks | `dashboard/handlers/hooks.py` |
 | Workflow phase calls | `workflows/agent_exec.py` |
 | Subagents | `subagent.py` — never a `_ChatSlot` at all, so a `.intents` sidecar is not reachable |
@@ -521,6 +564,6 @@ addition later; if one is ever added it must be registered inline in
 | `test_session_summary_config.py` | Defaults, clamping, disk parsing, malformed sections |
 | `test_session_summary_extract.py` | Role filtering, `meta` ignored, excerpting, the two mechanical traps |
 | `test_session_summary_storage.py` | Sidecar round-trip, invalidation, transcript-untouched, delete reaping |
-| `test_session_summary_generate.py` | Gating, caching, failure containment, prompt trap coverage |
+| `test_session_summary_generate.py` | Gating, caching, failure containment, prompt trap coverage, the UI-language slot |
 | `test_session_summary_api.py` | Status codes, error `code`, stale flag, never-generates |
 | `test_mcp_dashboard_session_summary.py` | The `session_summary` MCP reader |

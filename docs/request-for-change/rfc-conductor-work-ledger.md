@@ -75,7 +75,7 @@ Four costs follow from that shape.
 #:   reachable; nothing bounds WHAT is sent.
 ```
 
-`send_to_target` in [`src/kiro_crew/dashboard/session_control.py`](../../src/kiro_crew/dashboard/session_control.py) hands the body to `enqueue_or_run_prompt` — the same call the human composer uses. A worker's text would therefore *be* the conductor's next prompt, executed under the conductor's grants. Granting it downward turns every worker into an operator of its parent.
+`send_to_target` in [`src/kiro_crew/dashboard/session_control_parts/session_messaging.py`](../../src/kiro_crew/dashboard/session_control_parts/session_messaging.py) hands the body to `enqueue_or_run_prompt` — the same call the human composer uses. A worker's text would therefore *be* the conductor's next prompt, executed under the conductor's grants. Granting it downward turns every worker into an operator of its parent.
 
 So the requirement is not "a channel from worker to conductor". It is a channel that cannot carry an instruction.
 
@@ -132,7 +132,7 @@ Both agents reach the store through the dashboard HTTP API with a server-resolve
 
 ### Identity: resolved, never asserted
 
-Every one of the six tools resolves the caller with `require_strict_session_key` in [`src/kiro_crew/mcp_core.py`](../../src/kiro_crew/mcp_core.py). Strict means the gateway-injected caller block, the `KIROCREW_SESSION_KEY` environment variable, or the HMAC host-pid sidecar — and explicitly *not* the lenient resolver's `/proc` ancestor walk, because a subagent walking its ancestry would resolve to its parent's identity. `session_ledger_read` and `issue_radar_crew_read` already depend on exactly this property; the failure text and diagnosis helper are reused unchanged.
+Every one of the six tools resolves the caller with `require_strict_session_key` in [`src/kiro_crew/mcp_core_parts/identity.py`](../../src/kiro_crew/mcp_core_parts/identity.py). Strict means the gateway-injected caller block, the `KIROCREW_SESSION_KEY` environment variable, or the HMAC host-pid sidecar — and explicitly *not* the lenient resolver's `/proc` ancestor walk, because a subagent walking its ancestry would resolve to its parent's identity. `session_ledger_read` and `issue_radar_crew_read` already depend on exactly this property; the failure text and diagnosis helper are reused unchanged.
 
 No tool takes a session key, a conductor id, or an item id from the worker side. The server derives all three.
 
@@ -303,7 +303,7 @@ one file describes the pair, whichever end asks about it. The conductor is the o
 writer, exactly like `bindings/`, so the file needs no lock discipline beyond the
 atomic write itself.
 
-Caps: 32 open items per conductor (closed items do not count toward the open cap and stay on the board) and 256 items stored per conductor in total, open and closed together, measured against `created_total`, a monotonic per-conductor create counter in the header that every create bumps under the conductor lock and that a deleted or lost item record does not lower (the crew log fold's per-board ceiling, so a board is always folded whole; a board at it refuses further creates with `item_store_full` until the finished ledger is purged; a create finding the header unreadable under the lock is refused rather than counted against a pre-lock snapshot), 200 events per item with oldest-dropped, `depth` ≤ 2,
+Caps: 32 open items per conductor (closed items do not count toward the open cap). There is no lifetime bound on creates: per [rfc-work-fold-forget-closed](rfc-work-fold-forget-closed.md), the crew log fold forgets a closed item once 32 newer closed items sit behind it and only counts it, so the fold holds the open items plus the newest 32 closed ones; the cache keeps every record. `created_total`, a monotonic per-conductor create counter in the header that every create bumps under the conductor lock, still counts every create for the goal's spend cap (a create finding the header unreadable under the lock is refused rather than counted against a pre-lock snapshot), 200 events per item with oldest-dropped, `depth` ≤ 2,
 16 channel files per conductor, a channel TTL of at most 86400 seconds and at most 50
 messages over a channel's life. Every cap refuses rather than truncates, because a
 silent truncation leaves the worker believing its report landed whole. `message`
@@ -322,7 +322,7 @@ key whichever party wrote it. The entry carries `actor`, `by`, `action` and only
 fields that action set; an omitted field means "unchanged".
 
 The `work` fold in
-[`src/kiro_crew/crew_log/projection.py`](../../src/kiro_crew/crew_log/projection.py),
+[`src/kiro_crew/crew_log/projection_work.py`](../../src/kiro_crew/crew_log/projection_work.py),
 registered in the projection registry beside the session folds, replays those entries
 across the conductor's and its workers' units into the shape the readers already
 consume: the conductor header and every item in creation order, each with its event
@@ -438,7 +438,7 @@ into a `cache_dirty` refusal for readers.
 
 The record's authority to rebuild a board lasts exactly as long as the units that
 hold its entries. The crew log is on by default, and its retention sweep
-(`sweep_expired` in [`src/kiro_crew/crew_log/store.py`](../../src/kiro_crew/crew_log/store.py))
+(`sweep_expired` in [`src/kiro_crew/crew_log/store_retention.py`](../../src/kiro_crew/crew_log/store_retention.py))
 removes a finished session's unit once it is older than `session.archive_retention_days`.
 Retention must keep every unit an open board's entries live in, or checkpoint the fold
 before removing one, otherwise a rebuild after expiry folds only the survivors. That rule belongs to
@@ -467,7 +467,7 @@ Five tools ship, all mounted on one opt-in MCP server, `kirocrew-work`: `work_br
 
 Caller: worker. Input schema: `{}`. No arguments, following `session_ledger_read` and `issue_radar_crew_read`.
 
-**As implemented (Phase 2, [#9152](https://github.com/kirodotdev/KiroCrew/pull/9152)):** returns the item's `item_id`, `title`, `acceptance`, `round`, the conductor's latest `decision`, and the worker's own last `status`/`summary` — `read_work_brief` in [`src/kiro_crew/work_ledger.py`](../../src/kiro_crew/work_ledger.py) composes exactly those seven keys, and the route re-checks channel-mirror containment *after* its thread hop, because a brief carries a private dispatch's acceptance bar.
+**As implemented (Phase 2, [#9152](https://github.com/kirodotdev/KiroCrew/pull/9152)):** returns the item's `item_id`, `title`, `acceptance`, `round`, the conductor's latest `decision`, and the worker's own last `status`/`summary` — `read_work_brief` in [`src/kiro_crew/work_ledger_writes.py`](../../src/kiro_crew/work_ledger_writes.py) composes exactly those seven keys, and the route re-checks channel-mirror containment *after* its thread hop, because a brief carries a private dispatch's acceptance bar.
 
 **Phase 3b adds `siblings`**, a list over the same conductor's other **open** items:
 
@@ -582,7 +582,7 @@ Caller: conductor. One `action` selects the operation, because the field sets ar
 | `decide` | `item_id`, `decision`, optional `round` | appends `decision` |
 | `verdict` | `item_id`, `verdict`, optional `fails` | appends `verdict` |
 | `close` | `item_id`, `state`, optional `decision` | stamps `closed_at`, appends `close` |
-| `goal` | `goal`, `round` | conductor record only |
+| `goal` | `goal`, `round`, optional `item_cap` (advisory total, 1..256, default 20), `concurrency_cap` (open items at once, 1..32, default 6; a `create` past it is refused `goal_concurrency_cap_reached`), `new_goal` | conductor record only |
 | `channel` | `item_a`, `item_b`, optional `ttl_secs` (≤ 86400), optional `max_messages` (≤ 50) | writes `channels/<pair-id>.json`, appends `channel_open` to **both** items |
 | `channel_close` | `item_a`, `item_b` | removes the record, appends `channel_close` to both items |
 
@@ -591,7 +591,7 @@ which is checked against the derived item list rather than trusted from the argu
 `ttl_secs` and `max_messages` default to the caps rather than to unbounded, so a
 conductor that grants a channel carelessly still grants a channel that ends.
 
-Errors: `identity_unresolved` (403), `no_ledger` (404), `unknown_item` (404), `already_bound` (409), `item_closed` (409), `item_cap_exceeded` (409), `item_store_full` (409), `depth_exceeded` (409), `channel_cap_exceeded` (409), `field_too_long` (400), `invalid_action` (400), `invalid_value` (400).
+Errors: `identity_unresolved` (403), `no_ledger` (404), `unknown_item` (404), `already_bound` (409), `item_closed` (409), `item_cap_exceeded` (409), `goal_concurrency_cap_reached` (409), `depth_exceeded` (409), `channel_cap_exceeded` (409), `field_too_long` (400), `invalid_action` (400), `invalid_value` (400).
 
 ### Worker-to-worker communication
 
@@ -699,7 +699,7 @@ flowchart TD
 
 The fingerprint is the newest event `id` per open item, which is content-addressed and therefore stable across a re-read. What Phase 3 actually built covers every item rather than only the open ones; §Phase 3 records that difference and why the effect is the same, so read it before implementing this sentence as written.
 
-Liveness is a conjunction, and the conjunction is the point: an item is `stale` when `last_report_at` is older than a staleness window, **and** its worker session is not running, **and** its last report still left the next move with the worker. That third condition is what keeps the flag pointed at the worker: after `done` the move belongs to the conductor (verify, promote, close) or to a human, so silence there is the expected end of the work rather than a gap worth waking anyone for. `progress`, `blocked`, `question` and no-report-yet all still count — and so does a `done` item the conductor has already ruled `verdict: fail` on and left open, because that ruling hands the retry back to the worker and its silence is a gap again. A worker in a thirty-minute build is running, so it is never flagged however long it stays silent; the window exists only to cover the gap between `bind` and the first report, and to catch a session that ended without reporting. The probe runs in a thread inside `AutoNudgeService`, in the same process as the dashboard state, so "is it running" is a direct slot read and not an HTTP call.
+Liveness is a conjunction, and the conjunction is the point: an item is `stale` when `last_report_at` is older than a staleness window, **and** its worker session is not running, **and** its last report still left the next move with the worker. That third condition is what keeps the flag pointed at the worker: after `done`, `blocked` or `question` the report has already woken the conductor and the move belongs to the conductor (verify, rule, unblock) or to a human, so silence there is the expected shape of that wait rather than a gap worth waking anyone for. `progress` and no-report-yet count. So does a `done` item the conductor has ruled `verdict: fail` on and left open, and a `blocked` or `question` item the conductor has answered with `decide` (its `decided_at` at or after the last report): each hands the move back to the worker, and the window then runs from the decision. The conductor's `session_send` to that bound worker records the same `decide` on the server: the first send after a `blocked` or `question` report that names no `reason` (one with `approval` or `needs_human` waits on a person), from the conductor the binding resolves to, stamps `decided_at` with the redacted message as the decision. It answers only the report the conductor saw before delivery, and a later send to an already-answered report writes nothing, so a conductor that forgets the explicit `decide` still hands the move back. An explicit `decide` stays the documented path and overwrites the stamp. A `blocked` or `question` item whose worker session has closed after reporting is flagged at once, because nobody is left to act on the answer. A worker whose own session holds an active, bounded loop is alive, like one with a turn running. A worker in a thirty-minute build is running, so it is never flagged however long it stays silent; the window exists only to cover the gap between `bind` and the first report, and to catch a session that ended without reporting. The probe runs in a thread inside `AutoNudgeService`, in the same process as the dashboard state, so "is it running" is a direct slot read and not an HTTP call.
 
 A `progress` event advances the fingerprint without waking. That keeps chatter free while still letting the existing quiet-streak floor deliver eventually, so a conductor watching a long-running item is not silent forever.
 
@@ -746,7 +746,7 @@ The threat model is what shapes the tool surface, so each row names the mechanis
 
 **A worker rewrites what acceptance means.** Unrepresentable: `acceptance`, `verdict` and `state` have no parameter on the worker tool. A worker cannot widen its own bar.
 
-**A worker edits the ledger files directly.** The two "unrepresentable" rows above hold only for the tools: a worker is a full-capability agent with `fs_write`, so a prompt-injected one could bypass `work_report` and open `items/it_*.json` itself — forging `state: accepted`, gutting `acceptance` before the conductor's evaluator runs, or reading a sibling item past `read_work_brief`'s scoping — and the conductor would read the forgery as its own writing. Prevented by the file fence, on two planes. The file-tool plane: `work-ledger` is a directory leaf in `_CREW_SECRET_LEAVES` ([`src/kiro_crew/security/paths.py`](../../src/kiro_crew/security/paths.py)), which projects it into `_SENSITIVE_HOME_DIRS` under both crew data-home prefixes and re-anchors it under a `KIROCREW_HOME` override, so `is_sensitive_path` is true for every path under `<data_home>/work-ledger/` and `hooks.on_tool_call` refuses the agent's read and edit tools there — read AND write, because reading a sibling's record is the scoping bypass and writing one is the forgery. The shell plane: the same leaf is in `sandbox._CREW_HIDDEN_LEAVES`, so `echo >` and `python -c` inside the agent's sandbox find no such directory; command text is deliberately not matched (see `is_sensitive_bash_command`), because a text matcher denies ordinary commands whenever a fenced spelling appears as data. The store's own `atomic_write` runs in the gateway process and opens the paths directly, not through the gate, so the sanctioned writers are unaffected. A directory leaf rather than a file leaf for the reason the sibling `ledger` entry is one: the store publishes through a `mkstemp` sibling, and fencing final names only leaves the same bytes writable under a temp name.
+**A worker edits the ledger files directly.** The two "unrepresentable" rows above hold only for the tools: a worker is a full-capability agent with `fs_write`, so a prompt-injected one could bypass `work_report` and open `items/it_*.json` itself — forging `state: accepted`, gutting `acceptance` before the conductor's evaluator runs, or reading a sibling item past `read_work_brief`'s scoping — and the conductor would read the forgery as its own writing. Prevented by the file fence, on two planes. The file-tool plane: `work-ledger` is a directory leaf in `_CREW_SECRET_LEAVES` ([`src/kiro_crew/security/paths_lists.py`](../../src/kiro_crew/security/paths_lists.py)), which projects it into `_SENSITIVE_HOME_DIRS` under both crew data-home prefixes and re-anchors it under a `KIROCREW_HOME` override, so `is_sensitive_path` is true for every path under `<data_home>/work-ledger/` and `hooks.on_tool_call` refuses the agent's read and edit tools there — read AND write, because reading a sibling's record is the scoping bypass and writing one is the forgery. The shell plane: the same leaf is in `sandbox._CREW_HIDDEN_LEAVES`, so `echo >` and `python -c` inside the agent's sandbox find no such directory; command text is deliberately not matched (see `is_sensitive_bash_command`), because a text matcher denies ordinary commands whenever a fenced spelling appears as data. The store's own `atomic_write` runs in the gateway process and opens the paths directly, not through the gate, so the sanctioned writers are unaffected. A directory leaf rather than a file leaf for the reason the sibling `ledger` entry is one: the store publishes through a `mkstemp` sibling, and fencing final names only leaves the same bytes writable under a temp name.
 
 **A worker points acceptance at someone else's green pull request.** This is live and worth stating plainly, because it is the one place the shape nearly leaked. `accept_eval.py` needs an integer `pr`, and the worker is what learns the number, so the tempting design has `work_ledger_read` fill `acceptance.pr` from the worker's report. A worker could then claim any already-green pull request and pass. The design therefore keeps the worker's `pr` as a **claim only**: `accept_batch` is composed from `acceptance` alone, the claim is surfaced beside the item, and the conductor promotes it with an explicit `work_ledger_record verdict`-adjacent write. The two-phase acceptance the skill performs by hand — leaving an unknown `pr` out of the batch entirely — becomes a visible field instead of a manual omission, without moving control of the bar: the read itself drops an item whose bar is still a placeholder and says why on `acceptance_concrete`, and the `accept` promotion is what puts it back.
 
@@ -798,7 +798,7 @@ rather than noise.
 
 **Oversized payload.** Every string and collection is capped, and a cap refuses with `field_too_long` naming the field. Refusal rather than truncation, because a truncated value that the worker believes landed whole is a silent data loss the worker cannot detect. `work_report`'s `summary` is the one clamped field ([#16669](https://github.com/kirodotdev/KiroCrew/pull/16669)): an over-cap summary is cut to 500 characters, stamped with a truncation marker, and the response tells the worker it was clamped, so the loss is reported rather than silent.
 
-**Unbounded growth.** 32 open items per conductor and 256 items stored per conductor in total, open and closed together, measured against a monotonic per-conductor create counter kept in the header rather than against the records in the directory, so a deleted or lost record reclaims no capacity and the count can never fall below the creates the crew log holds (closed items stay on the board until that stored bound; a board at it refuses further creates, and the ledger sweep removes a finished ledger whole), 200 events per item with oldest-dropped, 16 channels per conductor, one directory per conductor. A ledger cannot grow without bound and cannot grow into another conductor's space.
+**Unbounded growth.** 32 open items per conductor. The fold holds those plus the newest 32 closed items and only counts older closed ones ([rfc-work-fold-forget-closed](rfc-work-fold-forget-closed.md)); the cache keeps every record, and the ledger sweep removes a finished ledger whole. 200 events per item with oldest-dropped, 16 channels per conductor, one directory per conductor. The fold cannot grow without bound; the cache grows with the board's history, one bounded record per item, until the sweep removes the finished ledger; no ledger can grow into another conductor's space.
 
 **Path traversal.** `item_id` is server-minted `it_<8 hex>`, a channel's pair id is two such ids sorted and joined, and the conductor directory name is derived from a hashed session key. No model-supplied string reaches a path component — which is what lets `work_request` and `work_message` take an `item_id` argument at all: the value is validated against the derived item list, and a value that is not a minted id of this ledger never becomes a filename.
 
@@ -879,7 +879,7 @@ Two mechanics are worth stating outright, because both are easy to get wrong and
 
 **An omitted `agent` inherits the CALLER's agent, not the global default.** `create_session` in [`src/kiro_crew/dashboard/session_control.py`](../../src/kiro_crew/dashboard/session_control.py) falls back to the caller slot's own agent, and the comment above that fallback gives the reason: the caller is already running in this workspace, so its agent is the one bound here, and dropping to the global default would put the child on another workspace's memory store the moment that default is bound elsewhere. For a conductor, an omitted `agent` therefore produces a *second conductor* — which has no `fs_write` and cannot do the work. That is what `goal-conductor/SKILL.md` warns about, and it is why this design makes the value explicit per item instead of leaning on any default.
 
-`session_create`'s own MCP parameter description in [`src/kiro_crew/mcp_dashboard.py`](../../src/kiro_crew/mcp_dashboard.py) says the agent may be omitted "to use the default agent", which is wrong about the one mechanism a conductor most depends on. Phase 2 corrects it.
+`session_create`'s own MCP parameter description in [`src/kiro_crew/mcp_dashboard_session_tools.py`](../../src/kiro_crew/mcp_dashboard_session_tools.py) says the agent may be omitted "to use the default agent", which is wrong about the one mechanism a conductor most depends on. Phase 2 corrects it.
 
 ### Scope: conductors outside `kirocrew-conductor`
 
@@ -906,7 +906,7 @@ Seven phases. Each is independently shippable and independently abandonable, and
 | 3b — visibility (`siblings`) | proposed — not implemented | |
 | 5 — communication | proposed — not implemented | |
 | 4 — the surfaces (Crew board) | **done** | [#12792](https://github.com/kirodotdev/KiroCrew/pull/12792) |
-| 6 — every conductor records (v5): pipeline and security mount `kirocrew-work` from the shared base | in progress | [#17992](https://github.com/kirodotdev/KiroCrew/pull/17992), issue [#17977](https://github.com/kirodotdev/KiroCrew/issues/17977) |
+| 6 — every conductor records (v5): pipeline and security mount `kirocrew-work` from the shared base | **done** | [#17992](https://github.com/kirodotdev/KiroCrew/pull/17992) (`8fe49bd54a`), issue [#17977](https://github.com/kirodotdev/KiroCrew/issues/17977) |
 
 **Phase 3 is not a precondition for use.** `kirocrew-conductor` runs a goal end to end
 on a plain timer too: it polls with `work_ledger_read` on its nudge interval and pays
@@ -916,8 +916,8 @@ the per-quiet-tick turn as the accepted cost rather than as a blocker.
 
 ### Phase 1 — the store, with no tools (done, [#8855](https://github.com/kirodotdev/KiroCrew/pull/8855))
 
-As implemented, [`src/kiro_crew/work_ledger.py`](../../src/kiro_crew/work_ledger.py)
-carries the record dataclasses, the five vocabularies as `frozenset` constants, every cap
+As implemented, [`src/kiro_crew/work_ledger.py`](../../src/kiro_crew/work_ledger.py) and its `work_ledger_*` owners
+carry the record dataclasses, the five vocabularies as `frozenset` constants, every cap
 as a module constant, path resolution, the lock helpers, the derived list and derived
 flags, content-addressed event ids with merge-on-read dedupe, and the depth cap. Two
 details differ from what this section proposed and both are the design catching up with
@@ -951,7 +951,7 @@ audit on every branch, and the channel-agent re-check after the read. `agent.py`
 the `kirocrew-work` opt-in entry, `_install_worker_agent`, and — originally — the two
 conductor mounts that Phase 2.5 then retracted.
 
-Scope: `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_record`; their input schemas in the validation module; the dashboard routes; strict identity resolution and dispatch by resolved caller; the binding file; SEL audit; the `kirocrew-work` opt-in server in `_MANAGED_MCP_SERVERS`; the `kirocrew-worker` agent and its prompt constant; the conductor and pipeline-conductor mounts and per-tool grants; the channel-agent block extended to cover `kirocrew-work`; and the corrected `agent` parameter description in `mcp_dashboard.py`.
+Scope: `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_record`; their input schemas in the validation module; the dashboard routes; strict identity resolution and dispatch by resolved caller; the binding file; SEL audit; the `kirocrew-work` opt-in server in `_MANAGED_MCP_SERVERS`; the `kirocrew-worker` agent and its prompt constant; the conductor and pipeline-conductor mounts and per-tool grants; the channel-agent block extended to cover `kirocrew-work`; and the corrected `agent` parameter description in `mcp_dashboard_session_tools.py`.
 
 Exit criteria:
 - A worker's `work_report` reaches its own item and no other, asserted against a two-conductor two-worker fixture.
@@ -965,7 +965,7 @@ Exit criteria:
 - A default-agent spec carries neither a `kirocrew-work` entry nor an `@kirocrew-work` reference, asserted on the output of both loops that write specs.
 - `kirocrew-work` carries no `autoApprove` key, asserted so it cannot be added later without a failing test.
 - Each of the four caller states in the dispatch table resolves as tabulated, asserted against both tool halves.
-- `mcp_dashboard.py`'s `agent` parameter description states the caller-inheritance rule, asserted against the string so it cannot silently revert.
+- `mcp_dashboard_session_tools.py`'s `agent` parameter description states the caller-inheritance rule, asserted against the string so it cannot silently revert.
 - `<data_home>/work-ledger/**` is on the sensitive-path floor and the sandbox mask (§Security considerations, "A worker edits the ledger files directly"), asserted two ways: by spelling under both crew data-home prefixes, and end to end through `hooks.on_tool_call` against the real item, binding and conductor files of a dispatched worker under a `KIROCREW_HOME` override — an edit and a read are both refused, and the worker's route and the conductor's store action still write the very file the tool was refused. Deferred from the Phase 1 design review as [#9083](https://github.com/kirodotdev/KiroCrew/issues/9083); the fence itself shipped in #9152.
 
 ### Phase 2.5 — isolation (done, [#9277](https://github.com/kirodotdev/KiroCrew/pull/9277))
@@ -1015,7 +1015,7 @@ Exit criteria:
 
 ### Phase 3b — visibility (proposed — not implemented)
 
-Scope: the `siblings` list on `work_brief`, composed in `work_ledger.py` beside
+Scope: the `siblings` list on `work_brief`, composed in `work_ledger_writes.py` beside
 `read_work_brief` so the mask lives with the store rather than in the route.
 
 Exit criteria:
@@ -1213,9 +1213,9 @@ which expire on the same schedule as the alias, so its deletion — with
 `test_conductor_ledger_entry.py` — moves out of Phase 4 and rides with the alias's
 removal next release. Phase 4 keeps the Crew page surfaces.
 
-`kirocrew-pipeline-conductor` and `kirocrew-security-conductor` still mount nothing, for
-the reason §Agent spec changes gives — their children report through their own skills'
-scripts.
+`kirocrew-pipeline-conductor` and `kirocrew-security-conductor` mount `kirocrew-work`
+from the shared conductor base since v5 ([#17992](https://github.com/kirodotdev/KiroCrew/pull/17992)),
+recording each dispatched item while keeping their own skills' stores as detail.
 
 ## Open questions
 
@@ -1229,7 +1229,7 @@ scripts.
 
 **Q5. Is `depth` 2 the right cap?** Two levels is a guess informed by session multiplication and summary fidelity, not by measurement. A conductor of conductors has not been run, so the number should be re-examined once one has.
 
-**Q6 — closed in Phase 1. Consecutive `progress` reports coalesce.** `_coalesce_progress` in `work_ledger.py` keeps only the newest of a run of `progress` events on an item, following the rule Issue Radar applies to consecutive sweeps. A rate limit was the alternative and is not needed: coalescing bounds the history cost without refusing a write, so a chatty worker loses nothing it said that still mattered. The rule deliberately does not extend to `message` — see §Security considerations.
+**Q6 — closed in Phase 1. Consecutive `progress` reports coalesce.** `_coalesce_progress` in `work_ledger_store.py` keeps only the newest of a run of `progress` events on an item, following the rule Issue Radar applies to consecutive sweeps. A rate limit was the alternative and is not needed: coalescing bounds the history cost without refusing a write, so a chatty worker loses nothing it said that still mattered. The rule deliberately does not extend to `message` — see §Security considerations.
 
 **Q7. Should a worker see a sibling's `summary`?** v3 says no, and the sibling digest carries only pointers and enumerations. The case *for* is that a summary is often the cheapest way for B to learn what A actually did, and the conductor relaying it by hand is the cost this design otherwise removes. The case against is that it puts one agent's free text in front of another with no gate in between, which is the objection that keeps `session_send` away from workers. The channel path exists so the answer can stay "no" without the need going unmet: a conductor that wants A's prose to reach B opens a channel and lets A say it deliberately.
 

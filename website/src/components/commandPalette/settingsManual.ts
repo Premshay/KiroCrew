@@ -31,7 +31,7 @@ export function connectionsOAuthClientEntryId(slug: string): string {
  * Contract per entry: entries are KEY-ONLY (the i18n gate forbids English
  * prose literals in hand-written source). Generation resolves `label` (and
  * `description`) from the English catalogs — the registry is an English
- * search corpus — and SecurityPanel.tsx carries a
+ * search corpus — and each SecurityPanel section owner (SecurityPanel*.tsx) carries a
  * `data-setting-label={i18nT('<labelKey>')}` anchor on the section's wrapper
  * so deep-link highlighting (useSettingHighlight) finds the element in any
  * locale.
@@ -205,6 +205,15 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     params: { sub: 'percategory' },
     labelKey: 'pages.settings.notificationsPanel.category_turn',
     descriptionKey: 'pages.settings.notificationsPanel.category_turn_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
+  {
+    id: 'notifications.sound-category-dictation',
+    params: { sub: 'percategory' },
+    labelKey: 'pages.settings.notificationsPanel.category_dictation',
+    descriptionKey: 'pages.settings.notificationsPanel.category_dictation_description',
     tab: 'notifications',
     type: 'select',
     occurrence: 1,

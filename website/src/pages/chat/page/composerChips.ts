@@ -58,11 +58,13 @@ export function useComposerChips({
   queryClient,
   showActionError,
 }: ComposerChipsOptions) {
-  // Resolve model for existing slots that don't have one stored
+  // Resolve model for existing slots that don't have one stored. A slot an app
+  // owns also asks for that app's own model setting, which its session starts on.
   const _slotAgentName = (currentSlot && !currentSlot.model) ? (currentSlot.agent || defaultAgent || 'default') : ''
+  const _slotApp = (_slotAgentName && currentSlot?.app) || ''
   const { data: _slotResolvedModel } = useQuery({
-    queryKey: ['resolved-model', _slotAgentName, provider.id],
-    queryFn: () => provider.resolveModel(_slotAgentName),
+    queryKey: ['resolved-model', _slotAgentName, provider.id, _slotApp],
+    queryFn: () => provider.resolveModel(_slotAgentName, _slotApp || undefined),
     enabled: !!_slotAgentName,
   })
   // The agent the composer's "set as default" row acts on: the active slot's
@@ -233,4 +235,24 @@ export function useComposerChips({
     defaultEffort, effectiveEffort,
     _slotProject, projectGit, projectGitError, projectBranch, gitBadge,
   }
+}
+
+/**
+ * The repository root a project directory sits inside, when the directory is
+ * not that root itself; otherwise `undefined`.
+ *
+ * A worktree surface needs the project to BE a git work-tree root: the
+ * worktree endpoint refuses a root above the session's project unless another
+ * session is scoped to that root, and a session scoped to one folder did not
+ * ask to branch the whole enclosing repository. An errored
+ * probe, a non-repo, a project that is its own root, and a gateway too old to
+ * send `isRepoRoot` all answer `undefined`, which leaves the worktree action
+ * as it was and the server as the backstop.
+ */
+export function enclosingRepoRootOf(
+  git: { repo: boolean; repoRoot?: string; isRepoRoot?: boolean } | undefined,
+  errored: boolean,
+): string | undefined {
+  if (errored || !git?.repo || git.isRepoRoot !== false) return undefined
+  return git.repoRoot || undefined
 }

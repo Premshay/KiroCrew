@@ -14,7 +14,7 @@ import asyncio
 import inspect
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from kiro_crew.llm_helpers import background_turn, provider_last_turn_usage
 from kiro_crew.providers.base import LLMProvider
@@ -51,22 +51,62 @@ class _Sessions:
     def __init__(self, client: _Client) -> None:
         self._bg_client = client
         self.acquire_calls: list[tuple[str, dict]] = []
-        self.order: list[str] = []
+        self.released_keys: list[str] = []
         self.recycle_calls: list[dict[str, object]] = []
+        self.order: list[str] = []
 
     async def get_or_create(self, key: str, **kw: object):
         self.acquire_calls.append((key, dict(kw)))
         return self._bg_client, False, False
 
     def release(self, key: str) -> None:
+        self.released_keys.append(key)
         self.order.append("release")
 
     async def recycle_background(self, **kwargs: object) -> None:
-        self.order.append("recycle")
         self.recycle_calls.append(dict(kwargs))
+        self.order.append("recycle")
 
 
 class TestBackgroundTurnAccounting(unittest.IsolatedAsyncioTestCase):
+    async def test_extraction_and_cheap_judge_use_separate_keys(self):
+        from kiro_crew.history_consolidation import HistoryConsolidator
+
+        sessions = _Sessions(_Client())
+        consolidator = HistoryConsolidator(
+            MagicMock(),
+            MagicMock(),
+            sessions=sessions,
+            consolidation_endpoint="",
+            consolidation_model="",
+            consolidation_auth_token="",
+        )
+        with (
+            patch(_USAGE_TARGET),
+            patch(
+                "kiro_crew.history_consolidation._facade_stream_and_collect_json",
+                new_callable=AsyncMock,
+                return_value={"history_entry": "extracted"},
+            ),
+            patch(
+                "kiro_crew.history_consolidation._facade_stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="DUP",
+            ),
+        ):
+            self.assertEqual(
+                await consolidator._call_llm("extract"), {"history_entry": "extracted"}
+            )
+            self.assertEqual(await consolidator._dedupe_judge("judge"), "DUP")
+        self.assertEqual(
+            sessions.acquire_calls,
+            [
+                ("_consolidate", {"agent": "kirocrew-consolidate"}),
+                ("_bg", {"agent": "kirocrew-lite"}),
+            ],
+        )
+        self.assertEqual(sessions.released_keys, ["_consolidate", "_bg"])
+
     async def test_billed_turn_writes_a_row_tagged_with_its_task(self):
         sessions = _Sessions(_Client())
         with patch(_USAGE_TARGET) as persist:
@@ -217,21 +257,23 @@ class TestBackgroundTurnAccounting(unittest.IsolatedAsyncioTestCase):
             async with background_turn(
                 sessions,
                 task="consolidation",
-                agent="kirocrew-consolidate",
+                agent="kirocrew-lite",
                 session_key="_consolidate",
-                reset_conversation=True,
             ) as client:
                 client.begin_turn(1.0)
 
+        self.assertEqual(persist.await_count, 1)
+        self.assertEqual(persist.await_args.args[0], "_consolidate")
+        self.assertEqual(persist.await_args.kwargs["surface"], "bg:consolidation")
         self.assertEqual(
-            sessions.acquire_calls, [("_consolidate", {"agent": "kirocrew-consolidate"})]
+            sessions.acquire_calls,
+            [("_consolidate", {"agent": "kirocrew-lite"})],
         )
+        self.assertEqual(sessions.released_keys, ["_consolidate"])
         self.assertEqual(
             sessions.recycle_calls,
-            [{"session_key": "_consolidate", "agent": "kirocrew-consolidate"}],
+            [{"session_key": "_consolidate", "agent": "kirocrew-lite"}],
         )
-        self.assertEqual(persist.await_args.args[0], "_consolidate")
-        self.assertEqual(client.reset_calls, 1)
 
 
 class TestBillingStatsReachThroughTheAdapter(unittest.TestCase):

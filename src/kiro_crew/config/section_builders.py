@@ -55,6 +55,7 @@ from kiro_crew.config.integration_sections import (
     _resolve_stub_servers,
 )
 from kiro_crew.config.memory_sections import (
+    STARTUP_RECALL_TIMEOUT_MAX_SECS,
     KnowledgeConfig,
     MemoryConfig,
     SessionSummaryConfig,
@@ -132,9 +133,17 @@ KNOWLEDGE_MAX_SOURCES_MAX = 1000
 
 def _build_taskrunner_config(taskrunner_data: dict) -> TaskRunnerConfig:
     section = SectionReader(TaskRunnerConfig, taskrunner_data)
+    argv = section.get("test_command")
     return TaskRunnerConfig(
         max_parallel_steps=section.get("max_parallel_steps"),
         workspace_dir=str(section.get("workspace_dir")),
+        # All or nothing: dropping one bad element would run a different command.
+        test_command=(
+            list(argv)
+            if isinstance(argv, list) and all(isinstance(a, str) and a for a in argv)
+            else []
+        ),
+        require_verification=section.get("require_verification") is True,
     )
 
 
@@ -196,6 +205,10 @@ def _build_memory_config(memory_data: dict) -> MemoryConfig:
         # deliberate opt-in to the interactive pool.
         embedding_bulk_threads=section.read("embedding_bulk_threads", _safe_int, 0, 256),
         embedding_bulk_duty=section.read("embedding_bulk_duty", _safe_float, 0.05, 1.0),
+        # 0 is the documented "never unload" sentinel, so the floor is 0.
+        embedding_idle_evict_secs=section.read(
+            "embedding_idle_evict_secs", _safe_int, 0, 365 * 24 * 3600
+        ),
         embed_model_url=section.get("embed_model_url"),
         embed_model_path=section.get("embed_model_path"),
         embed_model_id=section.get("embed_model_id"),
@@ -224,10 +237,15 @@ def _build_memory_config(memory_data: dict) -> MemoryConfig:
         backup_enabled=section.read("backup_enabled", _safe_bool),
         backup_keep=section.read("backup_keep", _safe_int, 1, None),
         persistence_enabled=section.read("persistence_enabled", _safe_bool),
+        writes_enabled=section.read("writes_enabled", _safe_bool),
+        lesson_extraction_enabled=section.read("lesson_extraction_enabled", _safe_bool),
         inject_memory=section.read("inject_memory", _safe_bool),
         inject_lessons=section.read("inject_lessons", _safe_bool),
         inject_lessons_per_turn=section.read("inject_lessons_per_turn", _safe_bool),
         inject_activity=section.read("inject_activity", _safe_bool),
+        startup_recall_timeout_secs=section.read(
+            "startup_recall_timeout_secs", _safe_float, 0.0, STARTUP_RECALL_TIMEOUT_MAX_SECS
+        ),
         migrated=section.get("migrated"),
     )
 
@@ -779,7 +797,15 @@ def _build_stt_config(stt_data: dict) -> SttConfig:
     return SttConfig(
         enabled=section.read("enabled", _safe_bool),
         provider=_validated_stt_provider(section.get("provider")),
-        model=_validated_stt_model(section.get("model")),
+        model=_validated_stt_model(
+            section.get("model"),
+            custom_path=section.get("custom_model_path"),
+            custom_sha256=section.get("custom_model_sha256"),
+        ),
+        custom_model_path=_sections._validated_stt_custom_path(section.get("custom_model_path")),
+        custom_model_sha256=_sections._validated_stt_custom_sha256(
+            section.get("custom_model_sha256")
+        ),
         language_code=section.get("language_code"),
         # Reached through the module rather than re-exported: the loader facade's
         # import list from `sections` is a frozen pre-split snapshot
@@ -798,7 +824,9 @@ def _build_stt_config(stt_data: dict) -> SttConfig:
         idle_evict_secs=section.read(
             "idle_evict_secs", _safe_int, lo=_STT_IDLE_EVICT_SECS_MIN, hi=_STT_IDLE_EVICT_SECS_MAX
         ),
+        threads=_sections._validated_stt_threads(section.get("threads")),
         endpointing=section.read("endpointing", _safe_bool),
+        submit_on_release=section.read("submit_on_release", _safe_bool),
         dictation_panel=section.read("dictation_panel", _safe_bool),
         timeout_secs=section.read(
             "timeout_secs", _safe_int, lo=_STT_MIN_TIMEOUT_SECS, hi=_STT_MAX_TIMEOUT_SECS
@@ -807,5 +835,8 @@ def _build_stt_config(stt_data: dict) -> SttConfig:
         transcribe_profile=section.get("transcribe_profile"),
         transcribe_vocabulary=_sections._validated_transcribe_vocabulary(
             section.get("transcribe_vocabulary")
+        ),
+        transcribe_languages=_sections._validated_transcribe_languages(
+            section.get("transcribe_languages")
         ),
     )

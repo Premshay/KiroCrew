@@ -94,7 +94,6 @@ import json
 import logging
 import math
 import re
-import sqlite3
 import ssl
 import time
 import urllib.error
@@ -104,6 +103,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 from kiro_crew import hooks
+
+# The kiro-cli store is also read in this process through the shim; one SQLite
+# library keeps the other readers' locks when this connection closes.
+from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.identity_stores import Trust, sqlite_dbs
 
 logger = logging.getLogger(__name__)
@@ -332,7 +335,7 @@ def _note_api_outcome(ok: bool, reason: str = "") -> None:
     if not _API_DEGRADED_WARNED:
         _API_DEGRADED_WARNED = True
         logger.warning(
-            "Kiro usage API degraded to text-scrape fallback (%s) — "
+            "Kiro usage API returned no reading (%s); "
             "overage will not be visible until the API path recovers",
             reason,
         )

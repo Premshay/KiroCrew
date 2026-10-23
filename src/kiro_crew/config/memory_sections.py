@@ -17,6 +17,10 @@ from kiro_crew.effort import EFFORT_LEVELS
 
 logger = logging.getLogger("kiro_crew.config.loader")
 
+#: Ceiling of ``memory.startup_recall_timeout_secs``. The dashboard's early embed
+#: keeps its own allowance above it, so a build never outwaits the embed it joined.
+STARTUP_RECALL_TIMEOUT_MAX_SECS = 10.0
+
 
 @dataclass
 class MemoryConfig:
@@ -85,6 +89,15 @@ class MemoryConfig:
             "30-second pause and so runs hotter than the configured share. 1.0 runs "
             "flat out. Clamped to [0.05, 1.0]; a sweep a user explicitly starts from "
             "Settings is never paced.",
+        ),
+    )
+    embedding_idle_evict_secs: int = field(
+        default=3600,
+        metadata=_meta(
+            "Unload Embedding Model When Idle (seconds)",
+            "Seconds without any embedding before the embedding model is unloaded "
+            "from memory. The next search or memory write loads it again, which takes "
+            "a few seconds. 0 keeps the model loaded.",
         ),
     )
     embed_model_url: str = field(
@@ -231,6 +244,25 @@ class MemoryConfig:
             "edits and deletions stay available.",
         ),
     )
+    writes_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Memory Writes Enabled",
+            "Off: no automatic memory writes (lessons, consolidation extraction, "
+            "task-runner lessons), the same writers Persistence Enabled stops, "
+            "while stored memory and lessons are still injected into new sessions "
+            "and memory_recall still answers. Incognito is unaffected. Explicit "
+            "dashboard edits and deletions stay available.",
+        ),
+    )
+    lesson_extraction_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Lesson Extraction Enabled",
+            "Off: history consolidation and the task runner save no extracted "
+            "lessons; every other memory write, learn_add and injection carry on.",
+        ),
+    )
     inject_memory: bool = field(
         default=True,
         metadata=_meta(
@@ -269,6 +301,19 @@ class MemoryConfig:
             "Requires inject_memory.",
         ),
     )
+    startup_recall_timeout_secs: float = field(
+        default=1.0,
+        metadata=_meta(
+            "Session-Start Recall Wait (seconds)",
+            "How long a new dashboard chat's first message waits for its own "
+            "embedding, which the dashboard starts ahead of the session-start build, "
+            "beside session startup when the chat has to start its session. The "
+            "embedding ranks the memory activity and lessons the session starts with "
+            "by meaning; past the wait they are ranked by keyword. 0 turns the early "
+            "embedding off, and the build embeds the message itself, as on other "
+            "surfaces. Clamped to [0, 10].",
+        ),
+    )
     migrated: bool = field(
         default=False,
         metadata=_meta("Migrated", "Whether memory has been migrated to vector store."),
@@ -284,6 +329,32 @@ class MemoryConfig:
 #: widgets). ``svg`` is excluded because ``.svg`` is not in
 #: ``FileReader.SUPPORTED``.
 DEFAULT_AUTO_INGEST_ARTIFACT_KINDS = ["markdown", "text", "html", "json"]
+
+
+def memory_writes_off_key(memory: object) -> str | None:
+    """The config key that stops automatic memory writes, or None when writes run.
+
+    ``memory.persistence_enabled`` stops writes and injection together;
+    ``memory.writes_enabled`` stops writes alone. Every automatic writer gates on
+    this one answer, so the two switches cover the same writers. Read with
+    ``getattr`` so a partial config stand-in that predates a key counts it as on.
+    """
+    if not getattr(memory, "persistence_enabled", True):
+        return "memory.persistence_enabled"
+    if not getattr(memory, "writes_enabled", True):
+        return "memory.writes_enabled"
+    return None
+
+
+def lesson_extraction_enabled(memory: object) -> bool:
+    """Whether automatic lesson extraction may save lessons.
+
+    False when ``memory.lesson_extraction_enabled`` is off, or when automatic
+    writes are off as a whole.
+    """
+    return memory_writes_off_key(memory) is None and bool(
+        getattr(memory, "lesson_extraction_enabled", True)
+    )
 
 
 def _coerce_embedding_provider(raw: str) -> str:
@@ -770,7 +841,11 @@ class SkillsConfig:
             "Extra Skill Paths",
             "Additional directories to scan for skills. Supports ~ expansion. "
             "Skills from extra_paths are read-only (trigger matching + loading). "
-            "Local ~/.kiro/crew/skills/ takes precedence for duplicate names.",
+            "Local ~/.kiro/crew/skills/ takes precedence for duplicate names. "
+            "A skill folder linked into the skills directory from an outside "
+            "location is not followed through the link; to load it, add the "
+            "target's parent directory here. Otherwise it is skipped and a "
+            "warning naming the target is logged.",
         ),
     )
     project_skills_enabled: bool = field(

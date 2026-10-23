@@ -144,7 +144,10 @@ vi.mock('../components/MarkdownRenderer', () => ({
 }))
 vi.mock('../components/TypewriterText', () => ({ default: () => null }))
 vi.mock('../components/OverlayDrawer', () => ({ default: ({ children }: { children?: ReactNode }) => children }))
-vi.mock('../components/AgentDropdownList', () => ({
+vi.mock('../components/AgentDropdownList', async (importOriginal) => ({
+  // The pure helpers (`isCrewmateChat`, `defaultWriteKind`, `defaultWriteFailureOf`)
+  // stay real: ChatPage reads them to decide whether the row renders and what it writes.
+  ...(await importOriginal<typeof import('../components/AgentDropdownList')>()),
   default: (props: AgentDropdownListProps) => {
     agentDropdownProps = props
     return <div data-testid="agent-dropdown" />
@@ -215,6 +218,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       retainRange: vi.fn(),
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(() => false),
+      retainRange: vi.fn(),
       farmIsMeasured: () => true,
       farmRecord: vi.fn(() => true),
       measureRef: () => () => {},
@@ -641,7 +645,10 @@ describe('ChatPage default-agent footer row', () => {
     // literal 'default' placeholder the pre-fix fallback rendered.
     expect(defaultAgentRowProps!.agentName).toBe('kirocrew')
     act(() => { defaultAgentRowProps!.onSetDefault() })
-    await waitFor(() => expect(setDefault).toHaveBeenCalledWith('kirocrew'))
+    // The row writes the default for NEW SESSIONS. This slot carries no
+    // `agent_kind`, so no namespace is sent and the server routes the name
+    // (a non-alias is the template default); a slot stamped `template` sends it.
+    await waitFor(() => expect(setDefault).toHaveBeenCalledWith('kirocrew', undefined))
   })
 })
 
@@ -703,6 +710,10 @@ describe('ChatPage renderMessage — role dispatch', () => {
     renderChatPage([
       msg('tool', '🔧 grep', { ts: 't1', meta: { output: 'no matches' } }),
     ])
+    // A settled one-tool turn folds behind its "1 tool call" toggle (#23017);
+    // open it to reach the row this test is about.
+    const toggle = await screen.findByRole('button', { name: /1 tool call/i })
+    fireEvent.click(toggle)
     await waitFor(() => expect(shown()).toContain('grep'))
   })
 

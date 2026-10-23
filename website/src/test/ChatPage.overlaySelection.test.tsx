@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 /**
@@ -9,8 +9,18 @@ import { resolve } from 'node:path'
  * transcript: the overlays are made `inert` while a selection is held, and the
  * page puts an endpoint that leaves its row back where it last sat.
  */
-const page = readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
-const app = readFileSync(resolve(__dirname, '../App.tsx'), 'utf8')
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so
+// the pins read the page and those owners.
+const PAGES_DIR = resolve(__dirname, '../pages')
+const OWNER_DIR = resolve(PAGES_DIR, 'chat/page')
+const page = [
+  readFileSync(resolve(PAGES_DIR, 'ChatPage.tsx'), 'utf8'),
+  ...readdirSync(OWNER_DIR).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+    .map(f => readFileSync(resolve(OWNER_DIR, f), 'utf8')),
+  ...readdirSync(PAGES_DIR).filter(f => /^useChatPage.*\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+    .map(f => readFileSync(resolve(PAGES_DIR, f), 'utf8')),
+].join('\n')
+const app = ['App.tsx', 'shell/appShell.tsx', 'shell/topbar/shellHeader.tsx', 'shell/nav/navRail.tsx', 'shell/nav/navRow.tsx'].map(f => readFileSync(resolve(__dirname, '..', f), 'utf8')).join('\n')
 
 describe('transcript overlays do not take a touch selection', () => {
   it('marks the header overlay and the composer dock for selection-time inert', () => {

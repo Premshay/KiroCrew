@@ -7,7 +7,12 @@ level, and an eager import of the domain modules would close that loop.
 
 Adding a tool means adding its descriptor to the domain module's
 ``schemas()`` and its handler to that module's ``HANDLERS``; nothing here needs
-to change.
+to change. A domain whose tools belong to something that can be switched off
+declares ALL of them in ``schemas()`` -- the half ``test_mcp_tool_registry``
+holds against ``HANDLERS`` -- and narrows what the full ``tools/list`` emits with
+an ``advertised()`` function; ``apps`` is the one domain that does. The
+names-only build (``build_tool_names``) reads ``schemas()``, never
+``advertised()``, so it performs no enablement read.
 
 Two modules in this package are not domains, and nothing here imports them:
 ``table`` (:class:`~kiro_crew.mcp_tools.table.ToolTable`, the one-row-per-tool
@@ -19,7 +24,10 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from kiro_crew.mcp_shared import DeferredTool
 
 # Descriptor modules, in the order their tools are advertised.
 DOMAIN_MODULES: tuple[str, ...] = (
@@ -41,21 +49,27 @@ DOMAIN_MODULES: tuple[str, ...] = (
 
 
 def build_tool_list(*, names_only: bool = False) -> list[dict[str, Any]]:
-    """Every ``kirocrew-core`` tool descriptor, concatenated by domain.
+    """Every ``kirocrew-core`` tool descriptor ``tools/list`` emits, concatenated by domain.
 
     Descriptors are rebuilt per call rather than cached: some carry a live
     value (the concurrent sub-agent cap), and a cache would pin the first
-    reading for the life of the server process.
+    reading for the life of the server process. A domain's ``advertised()``,
+    when it defines one, is read in place of its ``schemas()`` on the full build
+    -- that is where the ``apps`` domain drops the tools of an app that is
+    switched off.
 
     ``names_only`` is the read path for a caller that keeps only tool NAMES and
     discards every description (``build_tool_names`` / in-process discovery). The
     two builders that reach for a live value to fill a description --
     ``spawn.schemas`` (a user-level agents directory scan) and ``control.schemas``
     (a config read) -- are told not to, so a names-only read never performs that
-    work. The names and their order are identical to a full build; only the
-    descriptions differ (empty under ``names_only``), and the caller discards
-    those anyway. This is what lets those builders carry NO ``get_running_loop``
-    skip of their own: asking for descriptors does not pull in the live reads.
+    work. The names and their order are identical to a full build with every app
+    enabled; only the descriptions differ (empty under ``names_only``), and the
+    caller discards those anyway. This is what lets those builders carry NO
+    ``get_running_loop`` skip of their own: asking for descriptors does not pull
+    in the live reads. The same rule covers ``advertised()``: the names-only path
+    never consults it, so no app's enablement record is read there either -- it
+    lists every name a domain DECLARES, including the tools of a disabled app.
     """
     tools: list[dict[str, Any]] = []
     for name in DOMAIN_MODULES:
@@ -67,10 +81,13 @@ def build_tool_list(*, names_only: bool = False) -> list[dict[str, Any]]:
         # Only the two builders with a live-valued description accept the flag;
         # the rest build static descriptors cheaply and are called unchanged.
         schemas = module.schemas
-        if names_only and _schemas_accepts_names_only(schemas):
-            tools.extend(schemas(names_only=True))
-        else:
-            tools.extend(schemas())
+        if names_only:
+            tools.extend(
+                schemas(names_only=True) if _schemas_accepts_names_only(schemas) else schemas()
+            )
+            continue
+        advertised = getattr(module, "advertised", None)
+        tools.extend(advertised() if advertised is not None else schemas())
     return tools
 
 
@@ -103,7 +120,7 @@ def _schemas_accepts_names_only(schemas: Any) -> bool:
         return False
 
 
-def dispatch(name: str, args: dict[str, Any]) -> str:
+def dispatch(name: str, args: dict[str, Any]) -> "str | DeferredTool":
     """Run the handler for *name*, or report the tool as unknown.
 
     Domains are searched in the order they are advertised. A name is claimed by

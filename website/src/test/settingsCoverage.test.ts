@@ -66,10 +66,14 @@ function readPanel(file: string): string {
  * an unlisted file fails, so the choice is always conscious.
  */
 const UNMAPPED_PANELS: Record<string, string> = {
+  'KiroHarnessFallbackNote.tsx': 'informational note ChatPanel mounts above the fallback pickers on a Kiro harness, zero controls',
   'BrowserInstallStatus.tsx': 'read-only install progress region BrowserPanel mounts above its sections, zero controls',
   'ChannelDisabledPanel.tsx': 'informational placeholder (locked/loading/error states), zero controls',
   'ChannelFolderBackfill.tsx': 'one action button shared by the channel panels; files existing conversations into the folder the OWNING panel configures, and holds no setting of its own',
+  'CustomSoundsSection.tsx': 'the Notifications tab\'s add-a-sound form (name + tones) and the list of saved sounds; it creates entries rather than holding settings, and the sounds it saves are chosen through the per-category pickers NotificationsPanel already indexes',
+  'FollowDefaultModelAction.tsx': 'one action button under the Chat tab\'s Default Model that counts, then clears, the model older chats keep; it holds no setting of its own',
   'ChannelsPanel.tsx': 'list-detail shell routing to per-channel panels; carries no controls of its own',
+  'CrewVersionStatus.tsx': "a connected Remote Crew row's version badge and its Update action; it reports and acts on one crew, and holds no setting",
   'DecisionsProviderPicker.tsx': 'the Decisions card\'s provider choice writes a preset id through the owner-only PUT /api/decisions/provider, not a config path, so there is no configKey to index; it is reached through the card the developer.decisions-jev entry deep-links to',
   'DiscordPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=discord',
   'TelegramPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=telegram',
@@ -78,11 +82,15 @@ const UNMAPPED_PANELS: Record<string, string> = {
   'ImportPanel.tsx': 'single action button launching the import wizard; no persistent settings',
   'InstanceFormFields.tsx': 'per-instance CRUD form fields (add/edit crew), not global settings',
   'McpManagement.tsx': 'mounted only on the standalone Developer page — a settings deep link would be dead',
+  'McpManagementAssessment.tsx': "McpManagement.tsx's read-only Sharing assessment view, on the standalone Developer page — a settings deep link would be dead",
+  'McpManagementLaunchReview.tsx': "McpManagement.tsx's launch review and refused-row panels, on the standalone Developer page — a settings deep link would be dead",
   'MobileLoginCard.tsx': 'mint-a-sign-in-link action card; the link it returns is a one-time credential, not a persistent setting',
+  'OptionalSdkCard.tsx': 'read-only install-command card the Feishu, Teams and WhatsApp panels mount when their optional SDK is missing; zero controls, only a copy button',
   'PostureDisclosure.tsx': "read-only disclosure rows for SecurityPanel's posture section (manual entry security.live-security-posture)",
   'ReleasesPanel.tsx': 'read-only changelog viewer, zero persistent settings',
   'ReportProblemCard.tsx': 'feedback action card, no settings',
   'SettingsSearch.tsx': 'the settings search box itself — indexing it would be self-referential',
+  'SttRetentionNote.tsx': "read-only \"Is my audio kept?\" line under SttSettings' provider picker; an info tip and a docs link, zero controls",
   'ThemeDroppedRulesNotice.tsx': 'informational notice, zero controls',
   'TranslucentPanelsPreview.tsx': 'aria-hidden illustration under the Translucent panels switch (registry id display.translucent-panels, on DisplayPanel); it holds no control of its own',
   'WebhooksPanel.tsx': 'status summary card; the real controls live on the /webhooks page',
@@ -201,7 +209,7 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
     counts: { SegmentedControl: 2 },
     reason: 'the two channel SegmentedControls share manual: about.update-channel',
   },
-  'ChatPanel.tsx': {
+  'ChatPanelLinkPatternsEditor.tsx': {
     counts: { Input: 2 },
     reason: "LinkPatternsEditor's per-row pattern/url fields — part of a composite the extractor indexes whole (chat.text-link-patterns)",
   },
@@ -232,6 +240,10 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
     counts: { SimpleSelect: 1, input: 9 },
     reason: 'per-instance add/edit CRUD form fields, not global settings',
   },
+  'CustomSoundsSection.tsx': {
+    counts: { Input: 2 },
+    reason: 'add-a-custom-sound form (name + per-tone number fields) — creates an entry, not a persistent setting',
+  },
   'McpManagement.tsx': {
     counts: { Switch: 2 },
     reason: 'Developer-page-only surface, deliberately outside settings search',
@@ -248,8 +260,8 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       'primitive (manual: notifications.volume)',
   },
   'PortabilityTab.tsx': {
-    counts: { input: 2, SimpleSelect: 1 },
-    reason: 'backup-restore form: the export\'s include-chat-history box, the export zip file picker and the merge/replace mode for that one import — per-export and per-import arguments, not persistent settings',
+    counts: { input: 6, SimpleSelect: 1 },
+    reason: 'backup-restore form: the export\'s include-chat-history, include-agent-templates and memory-only boxes, the export zip file picker, the import\'s memory-only box, the import preview\'s per-template install box (one control rendered once per bundled template) and the merge/replace mode for that one import — per-export and per-import arguments, not persistent settings',
   },
   'RemoteCrewPanel.tsx': {
     counts: { input: 7 },
@@ -259,17 +271,31 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       'choice (2 radios), Identity Center start-URL/region and subnet ID fields — per-launch ' +
       'arguments sent with the launch request, not persistent settings',
   },
+  'RemoteCrewPanelCrewRow.tsx': {
+    counts: { Toggle: 1 },
+    reason:
+      'the per-crew on/off switch rendered once per runtime-fetched crew row, a field of that ' +
+      'crew\'s record, not a global setting',
+  },
   'SecretsPanel.tsx': {
     counts: { Input: 2 },
     reason: 'add-secret name/value form — transient CRUD, not persistent knobs',
   },
-  'SecurityPanel.tsx': {
-    counts: { Toggle: 5, Checkbox: 2, Input: 3 },
+  'SecurityPanelDeniedCommands.tsx': {
+    counts: { Toggle: 4, Checkbox: 1, Input: 3 },
     reason:
       'disable-all + per-rule + custom-rule Toggles are data-driven table rows ' +
-      '(manual: security.denied-commands); Checkboxes are confirm-modal acks; ' +
+      '(manual: security.denied-commands); the Checkbox is a confirm-modal ack; ' +
       'Inputs are the rule search filter and the add-custom-deny form ' +
       '(manual: security.your-custom-denies)',
+  },
+  'SecurityPanelTailnet.tsx': {
+    counts: { Toggle: 1 },
+    reason: 'the tailnet-name trust switch (manual: security.trust-this-machine-s-tailnet-name)',
+  },
+  'SecurityPanelTrust.tsx': {
+    counts: { Checkbox: 1 },
+    reason: 'a confirm-modal ack (blanket third-party app trust)',
   },
   'SettingsSearch.tsx': {
     counts: { input: 1 },
@@ -331,6 +357,13 @@ describe('settings coverage gate — bare controls', () => {
  * skipped"; this pins each one so a new silent skip fails the build.
  */
 const EXPECTED_DYNAMIC_SKIPS: Record<string, { count: number; reason: string }> = {
+  'AppModelsSection.tsx': {
+    count: 1,
+    reason:
+      'one model row per enabled app, labelled with that app\'s own display name; the ' +
+      'set of apps is whatever is installed, so there is no fixed label to index. The ' +
+      'rows sit on the Model page every chat.* model entry already deep-links to',
+  },
   'BotChannelPanel.tsx': {
     count: 16,
     reason:
@@ -437,7 +470,12 @@ describe('settings coverage gate — manual entries anchor to panel source', () 
 
 describe('settings coverage gate — Chat rail pages', () => {
   it('every Chat control is tagged with a page the rail lists', () => {
-    const source = readPanel('ChatPanel.tsx')
+    // Settings ▸ Chat is a facade over sibling owners: read them as one text, owners first,
+    // so a control an owner gained has no `case` above it and reads as off the rail.
+    const source = [
+      'ChatPanelLinkPatternsEditor.tsx', 'chatPanelOptions.ts', 'useChatPanelDashboard.ts',
+      'useChatPanelModels.ts', 'useChatPanelTypedFields.ts', 'ChatPanel.tsx',
+    ].map(readPanel).join('\n')
     const railStart = source.indexOf('= [', source.indexOf('const railItems'))
     const railBlock = source.slice(railStart, source.indexOf('\n  ]', railStart))
     const railKeys = [...railBlock.matchAll(/key: '([a-z0-9-]+)'/g)].map(m => m[1])

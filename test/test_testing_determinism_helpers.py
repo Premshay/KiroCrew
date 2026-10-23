@@ -28,6 +28,7 @@ from kiro_crew.testing import clock as clock_mod
 from kiro_crew.testing import ids as ids_mod
 from kiro_crew.testing import wait
 from kiro_crew.testing.clock import DEFAULT_START, ManualClock
+from kiro_crew.testing.fixtures import one_pool_thread  # noqa: F401 (fixture)
 
 pytest_plugins = ("pytester",)
 
@@ -84,12 +85,56 @@ class TestManualClock:
         assert clock.now() == dt.datetime(2023, 11, 14, 22, 13, 20, tzinfo=dt.timezone.utc)
         assert clock.now().tzinfo is dt.timezone.utc
 
-    def test_monotonic_starts_at_the_real_reading_unless_given(self):
+    def test_monotonic_starts_within_a_grid_step_of_the_real_reading_unless_given(self):
         before = time.monotonic()
         clock = ManualClock()
         after = time.monotonic()
-        assert before <= clock.monotonic() <= after
+        grid = clock_mod._MONO_GRID_NS / 10**9
+        # Floored onto the grid: never ahead of the real reading, less than a step behind.
+        assert before - grid < clock.monotonic() <= after
+        # The default start is ON the 1/512 s grid, so the reading is exact as a float.
+        assert clock.monotonic_ns() % clock_mod._MONO_GRID_NS == 0
         assert ManualClock(monotonic_start=42.5).monotonic() == 42.5
+
+    # Raw ``time.monotonic_ns()`` readings (hosts up for 4 minutes to 24 days) whose
+    # float round-trip is one ULP off: ``fl(fl(ns/1e9) + 60)`` lands ABOVE
+    # ``fl((ns + 60e9)/1e9)``. Found by sampling; on a host up a few minutes (a fresh CI
+    # runner) one start in twenty-five does it.
+    _ULP_SHORT_STARTS_NS = (
+        230_581_778_801,
+        262_140_780_045_015,
+        2_097_111_569_668_913,
+    )
+
+    @pytest.mark.parametrize("real_ns", _ULP_SHORT_STARTS_NS)
+    def test_a_whole_second_deadline_is_met_after_advancing_that_many_seconds(
+        self, monkeypatch, real_ns
+    ):
+        """The product sets ``deadline = time.monotonic() + 60`` (a float sum) and the
+        test calls ``advance(60)`` (an integer step); the two must agree exactly, or a
+        wait the test advanced to its deadline still reports itself not due. This is
+        the shape of ``test_wait_tool_early_end.py::TestWaitSettlementAudit``."""
+        # The unsnapped reading is the trap: product float arithmetic rounds twice.
+        assert real_ns / 10**9 + 60 > (real_ns + 60 * 10**9) / 10**9
+
+        # Feed the real snapping function this reading instead of the host's. The
+        # module's ``_time`` must stay the stdlib module: install() recognises it by
+        # identity.
+        real_snap = clock_mod._snap_monotonic_start_ns
+        monkeypatch.setattr(clock_mod, "_snap_monotonic_start_ns", lambda ns: real_snap(real_ns))
+        clock = ManualClock()
+        deadline = clock.monotonic() + 60
+        assert clock.advance(60) == deadline
+        assert clock.monotonic() == deadline
+        # The product's own predicate, ``remaining = deadline - now; remaining <= 0``.
+        assert deadline - clock.monotonic() == 0
+
+    def test_snapping_floors_the_start_by_less_than_one_grid_step(self):
+        grid = clock_mod._MONO_GRID_NS
+        for real_ns in self._ULP_SHORT_STARTS_NS:
+            snapped = clock_mod._snap_monotonic_start_ns(real_ns)
+            assert snapped % grid == 0
+            assert 0 <= real_ns - snapped < grid
 
     def test_ten_tenth_second_steps_land_exactly_one_second_later(self):
         clock = ManualClock(monotonic_start=0.0)
@@ -937,6 +982,213 @@ class TestDrainedProgress:
 
         with pytest.raises(RuntimeError):
             asyncio.run(main())
+
+
+# ── await_until: the signal itself, under a lost-run bound ───────────────
+
+#: Bound for the real-time NEGATIVE cases below: the thing awaited never happens, so
+#: this is the ceiling under test, not a wait for anything that could arrive late.
+#: ``asyncio.wait`` reads the loop's own clock, which the ``virtual`` fixture does not
+#: reach, so these few cases take real time.
+_NEGATIVE_BOUND_SECS = 0.05
+
+
+class TestAwaitUntil:
+    @pytest.mark.asyncio
+    async def test_returns_when_an_event_is_set(self):
+        event = asyncio.Event()
+        asyncio.get_running_loop().call_soon(event.set)
+        assert await wait.await_until(event, what="the event") is True
+
+    @pytest.mark.asyncio
+    async def test_an_already_set_event_returns_at_once(self):
+        event = asyncio.Event()
+        event.set()
+        assert await wait.await_until(event) is True
+
+    @pytest.mark.asyncio
+    async def test_returns_a_futures_result(self):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        loop.call_soon(future.set_result, "landed")
+        assert await wait.await_until(future) == "landed"
+
+    @pytest.mark.asyncio
+    async def test_a_futures_own_exception_propagates_as_itself(self):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        loop.call_soon(future.set_exception, LookupError("its own"))
+        with pytest.raises(LookupError, match="its own"):
+            await wait.await_until(future)
+
+    @pytest.mark.asyncio
+    async def test_awaits_a_gather(self):
+        async def one():
+            return 1
+
+        assert await wait.await_until(asyncio.gather(one(), one())) == [1, 1]
+
+    @pytest.mark.asyncio
+    async def test_an_unset_event_fails_by_name_at_the_bound(self):
+        with pytest.raises(
+            AssertionError,
+            match=r"the gate had not happened after .*lost-run bound 0\.05s\); it is still clear",
+        ):
+            await wait.await_until(asyncio.Event(), timeout=_NEGATIVE_BOUND_SECS, what="the gate")
+
+    @pytest.mark.asyncio
+    async def test_a_pending_future_is_left_as_it_was_at_the_bound(self):
+        future = asyncio.get_running_loop().create_future()
+        with pytest.raises(
+            AssertionError, match="the future had not happened .*it is still pending"
+        ):
+            await wait.await_until(future, timeout=_NEGATIVE_BOUND_SECS)
+        assert not future.done(), "the test owns the future; the bound must not cancel it"
+        future.cancel()
+
+    @pytest.mark.asyncio
+    async def test_refuses_what_is_neither_an_event_nor_a_future(self):
+        with pytest.raises(TypeError, match=r"await_until\(\) takes .* not function"):
+            await wait.await_until(lambda: True)  # type: ignore[arg-type]
+
+        async def coroutine():
+            return 1
+
+        pending = coroutine()
+        try:
+            with pytest.raises(TypeError, match="not coroutine"):
+                await wait.await_until(pending)  # type: ignore[arg-type]
+        finally:
+            pending.close()
+
+    @pytest.mark.asyncio
+    async def test_the_bound_defaults_to_half_the_tests_timeout(self, monkeypatch):
+        monkeypatch.setattr(wait, "runner_timeout_secs", 80.0)
+        seen = []
+        real_wait = asyncio.wait
+
+        async def spy(fs, *, timeout=None, **kw):
+            seen.append(timeout)
+            return await real_wait(fs, timeout=timeout, **kw)
+
+        monkeypatch.setattr(asyncio, "wait", spy)
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(None)
+        await wait.await_until(future)
+        assert seen == [40.0]
+
+
+class TestLoopHop:
+    @pytest.mark.asyncio
+    async def test_runs_a_coroutine_on_the_loop_from_another_thread(self):
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        hop = wait.LoopHop(loop)
+        seen = []
+
+        async def on_loop():
+            seen.append(threading.get_ident())
+            hop.note("ran on the loop")
+            return "landed"
+
+        assert await asyncio.to_thread(hop.run, on_loop(), "the hop") == "landed"
+        assert seen == [loop_thread]
+        hop.check()
+        assert hop.steps == ["ran on the loop"]
+
+    @pytest.mark.asyncio
+    async def test_the_coroutines_own_exception_reaches_the_hook_as_itself(self):
+        hop = wait.LoopHop(asyncio.get_running_loop())
+
+        async def fails():
+            raise LookupError("its own")
+
+        with pytest.raises(LookupError, match="its own"):
+            await asyncio.to_thread(hop.run, fails(), "the failing hop")
+        hop.check()  # a failure of the coroutine is not an expired hop
+
+    @pytest.mark.asyncio
+    async def test_an_expired_hop_raises_in_the_hook_and_is_recorded_for_check(self, monkeypatch):
+        """Expiry is forced only AFTER the coroutine has entered: the hop's future is
+        stood in by one whose ``result()`` waits for the entry mark and then raises
+        the ``TimeoutError`` a real expiry raises, while ``cancel()`` reaches the real
+        task. A real short bound would race the loop's scheduling of the coroutine."""
+        monkeypatch.setattr(wait, "runner_timeout_secs", 2 * _JOIN_CEILING_SECS)
+        hop = wait.LoopHop(asyncio.get_running_loop())
+        entered = threading.Event()
+        cancelled = asyncio.Event()
+        real_run = asyncio.run_coroutine_threadsafe
+
+        class _ExpiringFuture:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def result(self, timeout=None):
+                assert entered.wait(_JOIN_CEILING_SECS), "the coroutine never entered"
+                raise TimeoutError
+
+            def cancel(self):
+                return self._inner.cancel()
+
+        monkeypatch.setattr(
+            asyncio,
+            "run_coroutine_threadsafe",
+            lambda coro, loop: _ExpiringFuture(real_run(coro, loop)),
+        )
+
+        async def never():
+            hop.note("entered")
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with pytest.raises(
+            AssertionError,
+            match=r"the stuck hop was still pending on the loop after .*lost-run ceiling 30s\); "
+            r"last step: entered",
+        ):
+            await asyncio.to_thread(hop.run, never(), "the stuck hop")
+        with pytest.raises(AssertionError, match="the stuck hop was still pending"):
+            hop.check()
+        assert await wait.await_until(cancelled, what="the expired hop's cancellation")
+
+    @pytest.mark.asyncio
+    async def test_the_ceiling_defaults_to_half_the_tests_timeout(self, monkeypatch):
+        monkeypatch.setattr(wait, "runner_timeout_secs", 80.0)
+        assert wait.LoopHop(asyncio.get_running_loop())._timeout == 40.0
+
+
+class TestOnePoolThreadFixture:
+    @staticmethod
+    async def _second_job_runs_after_the_first() -> tuple[bool, bool]:
+        """Hold the pool's first job, queue a second, release; report what the second saw."""
+        loop = asyncio.get_running_loop()
+        started = threading.Event()
+        release = threading.Event()
+
+        def _held() -> int:
+            started.set()
+            assert release.wait(wait.default_timeout()), "the test never released the first job"
+            return threading.get_ident()
+
+        def _second() -> tuple[int, bool]:
+            return threading.get_ident(), release.is_set()
+
+        first = loop.run_in_executor(None, _held)
+        await wait.async_wait_until(started.is_set, describe=lambda: "the first job never ran")
+        second = loop.run_in_executor(None, _second)
+        release.set()
+        first_thread = await first
+        second_thread, saw_release = await second
+        return first_thread == second_thread, saw_release
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("one_pool_thread")
+    async def test_the_pytest_fixture_installs_it(self):
+        assert await self._second_job_runs_after_the_first() == (True, True)
 
 
 # ── ids ───────────────────────────────────────────────────────────────

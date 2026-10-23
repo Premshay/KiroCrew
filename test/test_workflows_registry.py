@@ -18,6 +18,7 @@ import asyncio
 
 import pytest
 
+from kiro_crew.testing.wait import async_wait_until, await_until
 from kiro_crew.workflows.registry import (
     STATUS_CANCELLED,
     STATUS_FINISHED,
@@ -46,16 +47,16 @@ GOOD = (
 )
 
 
-async def _wait_terminal(reg: RunRegistry, run_id: str, timeout: float = 3.0) -> dict:
-    """Poll the registry until the run leaves 'running' (or time out)."""
-    loop_deadline = 0.0
-    while loop_deadline < timeout:
+async def _wait_terminal(reg: RunRegistry, run_id: str) -> dict:
+    """Wait until the run leaves 'running'; one that never does fails by name."""
+
+    def _terminal() -> dict | None:
         snap = reg.status(run_id)
-        if snap and snap["status"] != STATUS_RUNNING:
-            return snap
-        await asyncio.sleep(0.02)
-        loop_deadline += 0.02
-    raise AssertionError(f"run {run_id} did not finish within {timeout}s")
+        return snap if snap and snap["status"] != STATUS_RUNNING else None
+
+    return await async_wait_until(
+        _terminal, describe=lambda: f"run {run_id} did not finish: {reg.status(run_id)}"
+    )
 
 
 async def test_background_run_finishes_and_captures_result() -> None:
@@ -139,7 +140,7 @@ async def test_on_done_fires_once_with_terminal_snapshot() -> None:
     )
     await _wait_terminal(reg, rid)
     # Terminal state precedes the durable flush and the on_done callback.
-    await asyncio.wait_for(notified.wait(), timeout=3.0)
+    await await_until(notified, what="the on_done notification")
 
     assert len(done) == 1
     assert done[0]["rid"] == rid
@@ -211,7 +212,7 @@ async def test_list_is_compact_no_result_payload() -> None:
     assert reg.status(rid, include_events=True)["result"] == {"done": True}
     # … and so does the completion-injection snapshot, which lands after the
     # terminal transition the poll above returned on.
-    await asyncio.wait_for(notified.wait(), timeout=3.0)
+    await await_until(notified, what="the on_done notification")
     assert done_snapshots and done_snapshots[0]["result"] == {"done": True}
 
 
@@ -222,7 +223,9 @@ async def test_list_reports_when_a_run_ended() -> None:
     runner = WorkflowRunner(agent_fn=_echo, audit=lambda *a, **k: None)
     rid = await runner.run_background(GOOD, registry=reg, run_id="wf_end1", now=NOW, name="d")
     snap = await _wait_terminal(reg, rid)
-    terminal = [e for e in reg.status(rid, include_events=True)["events"] if e["type"] == "run_finished"]
+    terminal = [
+        e for e in reg.status(rid, include_events=True)["events"] if e["type"] == "run_finished"
+    ]
 
     (row,) = reg.list()
     assert row["ended_at"] == snap["ended_at"] == terminal[-1]["ts"]

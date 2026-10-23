@@ -88,7 +88,7 @@ runtime scoper still removes the pin, so the preference is protected either way.
 ## File-drop artwork contrast
 
 `ChatDropOverlay` renders its transparent file-chomper image with the stable
-class `chat-drop-art` and paints no inline colour. `website/src/index.css`
+class `chat-drop-art` and paints no inline colour. `website/src/styles/chat-transcript.css`
 (next to the loader-ghost block) gives that class a 1px black silhouette
 shadow (`drop-shadow`) under `[data-mode="light"]`, the resolved mode
 `useTheme` writes on `<html>`, so it applies to installed light palettes too.
@@ -175,6 +175,15 @@ dashboard load into header-only round trips.
   `sandbox="allow-scripts"` iframes **without** `allow-same-origin`, so they get
   no cookies, storage, or same-origin fetch. This is the real runtime boundary;
   install-time denylists are defense-in-depth.
+- **Overlay layers** — each overlay declaration may set `layer`. `above`
+  (default) paints in the shell's decor slot, over the chat but under the top
+  bar. `behind` paints in a second slot at z-index -1 inside the shell, over the
+  shell background but under the nav, content and panels, so message bubbles
+  and cards cover it. A `behind` overlay must be click-through: install rejects
+  `layer: "behind"` with `pointerEvents: true`, and the client forces
+  `pointer-events: none` on it. Routes without the shell (`/popout/`, `/embed/`)
+  have no behind slot and skip `behind` overlays, since nothing there would
+  cover them.
 - **Locked CSP** — overlay/topbar responses carry a fixed
   `Content-Security-Policy` including a `sandbox` directive; asset responses
   carry `X-Content-Type-Options: nosniff` and a content-type allowlist.
@@ -228,7 +237,7 @@ dashboard load into header-only round trips.
   INSTALLED pack, the consent modal shows the persona text **verbatim** and the
   user's grant is keyed to `sha256(persona_text)`, stored in the browser's
   localStorage. On every first-turn chat the frontend threads that hash as
-  `theme_consent_sha`; `_maybe_inject_persona` (`chat_utils.py`)
+  `theme_consent_sha`; `_maybe_inject_persona` (`chat_utils_slots.py`)
   injects the pack's persona **only when `theme_consent_sha` equals sha256 of
   the persona text it reads from disk at that moment** (constant-time compare).
   A missing hash, or a stale one after a reinstall rewrote `persona.md`, **fails
@@ -261,8 +270,8 @@ dashboard load into header-only round trips.
   `capabilities.theme_persona` governance capability (`SCOPE_CATALOG`,
   `capability_default=True`): standalone it defaults to allow, but an
   enterprise POLICY can force-disable installed-pack persona injection
-  wholesale (consulted at the `chat_runner.py` injection site; a denying policy
-  skips injection silently). See `governance.md`.
+  wholesale (consulted at the injection site in `_turn_build_prompt`,
+  `chat_turn/prompt_assembly.py`; a denying policy skips injection silently). See `governance.md`.
 
 ## Frontend Integration Points
 

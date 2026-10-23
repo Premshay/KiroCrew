@@ -23,12 +23,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from chat_test_helpers import _make_state
+from chat_test_helpers import _make_state, pin_harness_choice
 
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -46,9 +47,9 @@ class TestCompactCapabilitySet:
     def test_membership_is_the_harnesses_that_answer_the_prompt(self) -> None:
         """Opting a harness in is a deliberate edit with evidence (H6).
 
-        KAS stays out because it does not act on the ``/compact`` prompt;
-        granting it here would re-introduce the 300s strand this set exists to
-        prevent. codex is in because codex-acp 1.11.0 advertises ``compact`` and
+        KAS is in because its engine serves ``_kiro/session/compact``, which the
+        session handle sends for a KAS ``/compact`` instead of the prompt (see
+        ``test_kas_manual_compact``). codex is in because codex-acp 1.11.0 advertises ``compact`` and
         answers the ``/compact`` prompt once the compaction is done. Every harness
         that joined is held to the same bar, and
         ``test_compaction_other_backends`` carries the evidence per harness.
@@ -60,13 +61,13 @@ class TestCompactCapabilitySet:
                 ACP_BACKEND_CODEX,
                 ACP_BACKEND_OPENCODE,
                 ACP_BACKEND_GOOSE,
+                ACP_BACKEND_KAS,
+                ACP_BACKEND_PI,
             }
         )
-        # pi is absent on the evidence CLASS, not on the feature: its source says
-        # inline and no capture confirms it. goose joined on a driven capture. See
-        # ``test_compaction_other_backends``.
-        assert ACP_BACKEND_PI not in ACP_BACKENDS_COMPACT
-        assert ACP_BACKEND_KAS not in ACP_BACKENDS_COMPACT
+        # deepseek is the one known harness outside the set: its ACP surface carries
+        # no compaction of any kind. See ``test_compaction_other_backends``.
+        assert ACP_BACKEND_DEEPSEEK not in ACP_BACKENDS_COMPACT
 
     def test_subset_of_known_backends(self) -> None:
         """H8: a capability cannot be granted to an identifier nothing recognizes."""
@@ -87,9 +88,18 @@ class TestCompactCapabilitySet:
 class TestManualCompactUnsupportedBackend:
     """Unit surface of the capability property across the provider shapes."""
 
-    def test_kas_acp_provider_names_itself(self) -> None:
+    def test_deepseek_acp_provider_names_itself(self) -> None:
+        provider = AcpProvider(acp_backend=ACP_BACKEND_DEEPSEEK)
+        assert provider.manual_compact_unsupported_backend == ACP_BACKEND_DEEPSEEK
+
+    def test_pi_acp_provider_passes(self) -> None:
+        """pi serves /compact inline: ``test/fixtures/acp_frames/pi/compact-live.jsonl``."""
+        provider = AcpProvider(acp_backend=ACP_BACKEND_PI)
+        assert provider.manual_compact_unsupported_backend is None
+
+    def test_kas_acp_provider_passes(self) -> None:
         provider = AcpProvider(acp_backend=ACP_BACKEND_KAS)
-        assert provider.manual_compact_unsupported_backend == ACP_BACKEND_KAS
+        assert provider.manual_compact_unsupported_backend is None
 
     def test_kiro_acp_provider_passes(self) -> None:
         provider = AcpProvider(acp_backend=ACP_BACKEND_KIRO)
@@ -99,13 +109,18 @@ class TestManualCompactUnsupportedBackend:
         provider = AcpProvider(acp_backend=ACP_BACKEND_CLAUDE)
         assert provider.manual_compact_unsupported_backend is None
 
-    def test_kas_session_provider_names_itself(self) -> None:
+    def test_deepseek_session_provider_names_itself(self) -> None:
         """The shared-subagent shape: a bare AcpSessionProvider, no AcpProvider
         wrap. Built via __new__ so the test exercises the property's real logic
         without spawning a runtime."""
         provider = AcpSessionProvider.__new__(AcpSessionProvider)
+        provider._runtime = SimpleNamespace(acp_backend=ACP_BACKEND_DEEPSEEK)  # type: ignore[attr-defined]
+        assert provider.manual_compact_unsupported_backend == ACP_BACKEND_DEEPSEEK
+
+    def test_kas_session_provider_passes(self) -> None:
+        provider = AcpSessionProvider.__new__(AcpSessionProvider)
         provider._runtime = SimpleNamespace(acp_backend=ACP_BACKEND_KAS)  # type: ignore[attr-defined]
-        assert provider.manual_compact_unsupported_backend == ACP_BACKEND_KAS
+        assert provider.manual_compact_unsupported_backend is None
 
     def test_kiro_session_provider_passes(self) -> None:
         provider = AcpSessionProvider.__new__(AcpSessionProvider)
@@ -225,8 +240,8 @@ class TestDashboardManualCompactGate:
     @pytest.mark.parametrize(
         "default_backend,member_backend,refused",
         [
-            (ACP_BACKEND_KIRO, ACP_BACKEND_KAS, True),
-            (ACP_BACKEND_KAS, ACP_BACKEND_KIRO, False),
+            (ACP_BACKEND_KIRO, ACP_BACKEND_DEEPSEEK, True),
+            (ACP_BACKEND_DEEPSEEK, ACP_BACKEND_KIRO, False),
         ],
     )
     async def test_dead_member_row_uses_member_backend_for_compact(
@@ -243,6 +258,8 @@ class TestDashboardManualCompactGate:
         cfg.agents["oncall"] = KiroCrewAgentConfig()
         provision_member_memory(cfg, "oncall")
         cfg.save()
+        # save() keeps the harness fields as stored, so the choice goes on disk.
+        pin_harness_choice(acp_backend=default_backend, member_acp_backend=member_backend)
         stale = AcpProvider(acp_backend=default_backend)
         assert stale.is_process_alive() is False
         successor = MagicMock(spec=AcpProvider)
@@ -258,7 +275,7 @@ class TestDashboardManualCompactGate:
             await _run_chat(state, slot, "/compact")
 
         texts = [m.get("content", "") for m in slot.messages]
-        assert any("manages compaction" in text for text in texts) is refused
+        assert any("no way to compact" in text for text in texts) is refused
         if refused:
             state.sessions.get_or_create.assert_not_awaited()
             dispatched.assert_not_called()
@@ -268,10 +285,10 @@ class TestDashboardManualCompactGate:
             dispatched.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_kas_config_backend_answers_without_live_session(self, tmp_path) -> None:
+    async def test_unsupported_config_backend_answers_without_live_session(self, tmp_path) -> None:
         """With no live session to peek, the gate answers from the same config
         field (`agent.acp_backend`) the provider factory would build a new
-        session with — a cold /compact on a KAS-configured slot must not
+        session with — a cold /compact on a deepseek-configured slot must not
         create a session just to refuse it."""
         client = MagicMock(spec=AcpProvider)
         dispatched = _empty_stream(client)
@@ -280,14 +297,16 @@ class TestDashboardManualCompactGate:
 
         from kiro_crew.dashboard import chat_runner as cr
 
-        _cfg = SimpleNamespace(agent=SimpleNamespace(provider="acp", acp_backend=ACP_BACKEND_KAS))
+        _cfg = SimpleNamespace(
+            agent=SimpleNamespace(provider="acp", acp_backend=ACP_BACKEND_DEEPSEEK)
+        )
         with patch.object(cr.KiroCrewConfig, "load", staticmethod(lambda: _cfg)):
             await _run_chat(state, slot, "/compact")
 
         dispatched.assert_not_called()
         state.sessions.get_or_create.assert_not_called()
         texts = [m.get("content", "") for m in slot.messages]
-        assert any("manages compaction" in t for t in texts)
+        assert any("no way to compact" in t for t in texts)
 
     @pytest.mark.asyncio
     async def test_member_backend_compact_still_dispatches(self, tmp_path) -> None:

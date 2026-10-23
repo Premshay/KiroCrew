@@ -21,6 +21,7 @@ import {
   captureScreen,
   currentTabCaptureDeps,
   screenSnipSupported,
+  ScreenSnipRefusedError,
 } from '../../hooks/useScreenSnip'
 import { useTheme } from '../../hooks/useTheme'
 import { i18nT } from '../../i18n/t'
@@ -29,7 +30,7 @@ import { openActivityPanel } from '../../store/chatSlice'
 import type { ChatMessage } from '../../types'
 import { mergeIntoDraft, setDraft } from '../../utils/chatDrafts'
 import { classifyDrop } from '../../utils/dropClassify'
-import { spliceDirTokens, VIDEO_EXT } from '../../utils/fileTokens'
+import { servedUploadMb, spliceDirTokens, VIDEO_EXT } from '../../utils/fileTokens'
 import {
   adoptSourceSelections,
   commitSourceSelection,
@@ -37,10 +38,13 @@ import {
   loadRevealedSources,
   loadSeenPullRequestLinks,
   loadSourceSelections,
+  findSourceForUrl,
   partitionSourceLinks,
   persistSeenPullRequestLinks,
   PullRequestLinkIndex,
   recordNewPullRequestLinks,
+  type PullRequestLink,
+  sourceLinkKey,
   sourceSelection,
   type RevealedSources,
   type SourceLinkKind,
@@ -52,12 +56,13 @@ import { usePanelDocumentActions } from '../../hooks/usePanelDocumentActions'
 import { fetchDashboardConfig } from '../../api/dashboardConfigQuery'
 import {
   cancelComposerUploads,
+  composerUploadSlot,
   holdComposerSend,
   registerComposerUpload,
   finishComposerAttachment,
   releaseComposerSend,
   unregisterComposerUpload,
-  useComposerUploadCancellable,
+  useComposerUploadCount,
 } from '../../utils/composerSendHolds'
 
 type MutableRef<T> = { current: T }
@@ -70,6 +75,9 @@ interface ChatPageResourcesComposerPorts {
   voiceCaretRef: MutableRef<{ start: number; end: number } | null>
   voicePendingCaretRef: MutableRef<number | null>
   saveDrafts: () => void
+  /** True while the composer is locked (a memory-mode switch in flight):
+   *  composer drops, pastes and attachments are refused. */
+  composerLockedRef: MutableRef<boolean>
 }
 
 interface ChatPageResourcesCapturePorts {
@@ -120,6 +128,7 @@ export function useChatPageResourcesController({
     voiceCaretRef,
     voicePendingCaretRef,
     saveDrafts,
+    composerLockedRef,
   } = composer
   const {
     setUploading,
@@ -164,7 +173,7 @@ export function useChatPageResourcesController({
   // on each tick. Instead the WS 'slots' push carries the allowlist generation
   // (see useWebSocket), which invalidates this query only when the allowlist
   // actually changes — an edit on disk still propagates, without the churn.
-  const { data: sourceHostCfg, error: sourceHostError, errorUpdatedAt: sourceHostErrorAt } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[] }>({
+  const { data: sourceHostCfg, error: sourceHostError, errorUpdatedAt: sourceHostErrorAt } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[]; github_hosts?: string[]; bitbucket_server_hosts?: string[]; upload_max_mb?: number }>({
     queryKey: ['dashboardConfig'],
     queryFn: fetchDashboardConfig,
     staleTime: 30_000,
@@ -178,6 +187,8 @@ export function useChatPageResourcesController({
   }, [sourceHostErrorAt])
   const sourceHosts = sourceHostCfg?.gitlab_hosts ?? []
   const jiraSourceHosts = sourceHostCfg?.jira_hosts ?? []
+  const githubSourceHosts = sourceHostCfg?.github_hosts ?? []
+  const bitbucketServerSourceHosts = sourceHostCfg?.bitbucket_server_hosts ?? []
   // Operator link rules (dashboard.link_patterns) are registered into the
   // autolink registry by the app shell (useConfigAutolinkRules), so every
   // surface linkifies regardless of whether a chat page has rendered. This
@@ -188,11 +199,17 @@ export function useChatPageResourcesController({
   sourceHostsRef.current = sourceHosts
   const jiraSourceHostsRef = useRef(jiraSourceHosts)
   jiraSourceHostsRef.current = jiraSourceHosts
+  const githubSourceHostsRef = useRef(githubSourceHosts)
+  githubSourceHostsRef.current = githubSourceHosts
+  const bitbucketServerSourceHostsRef = useRef(bitbucketServerSourceHosts)
+  bitbucketServerSourceHostsRef.current = bitbucketServerSourceHosts
   const indexedSourceLinks = sourceLinkIndex.current.update(
     activeSlot,
     messages,
     sourceHosts,
     jiraSourceHosts,
+    githubSourceHosts,
+    bitbucketServerSourceHosts,
   )
   // One scan, one dedup map, two panels: the extractor returns pull requests and
   // issues together (they share the per-role cap), and the two side-panel tabs
@@ -245,11 +262,17 @@ export function useChatPageResourcesController({
   const revealedForSlot = activeSlot ? revealedSources[activeSlot] : undefined
   const revealedChange = revealedForSlot?.change ?? null
   const revealedIssue = revealedForSlot?.issue ?? null
-  const panelSources = useMemo(() => (
-    revealedChange && !sourceLinks.some(link => link.url === revealedChange.url)
-      ? [revealedChange, ...sourceLinks]
-      : sourceLinks
-  ), [sourceLinks, revealedChange])
+  // Compared by `sourceLinkKey`, not url: a link revealed (and persisted) at an
+  // older revision is the same review the scan now lists at its newest one, and
+  // injecting it would show that review twice. The scan's url wins, since it
+  // follows the transcript as new revisions are mentioned.
+  const panelSources = useMemo(() => {
+    if (!revealedChange) return sourceLinks
+    const revealedKey = sourceLinkKey(revealedChange)
+    return sourceLinks.some(link => sourceLinkKey(link) === revealedKey)
+      ? sourceLinks
+      : [revealedChange, ...sourceLinks]
+  }, [sourceLinks, revealedChange])
   const panelIssues = useMemo(() => (
     revealedIssue && !issueLinks.some(link => link.url === revealedIssue.url)
       ? [revealedIssue, ...issueLinks]
@@ -339,10 +362,12 @@ export function useChatPageResourcesController({
   // transcript is append-only within a slot, so growth is the only way a
   // previously-absent url can appear, and gating on it keeps this off the
   // per-render (and per-streaming-chunk) path. Membership in `links` is the
-  // "the fetch proved it still exists" condition.
+  // "the fetch proved it still exists" condition. A stored url names its review
+  // even when `links` now carries that review at a newer revision, so the
+  // restore lands on the listed url for the same review.
   const restoreFromStorage = useCallback((
     kind: SourceLinkKind,
-    links: readonly { url: string }[],
+    links: readonly PullRequestLink[],
   ): boolean => {
     const slot = activeSlotRef.current
     if (!slot) return false
@@ -350,11 +375,12 @@ export function useChatPageResourcesController({
     if (seen === undefined || links.length <= seen) return false
 
     const stored = sourceSelection(loadSourceSelections(), slot, kind)
-    if (stored && links.some(link => link.url === stored)) {
+    const listed = stored ? findSourceForUrl(links, stored) : undefined
+    if (listed) {
       const provisional = { ...provisionalFallbackRef.current[slot] }
       delete provisional[kind]
       provisionalFallbackRef.current = { ...provisionalFallbackRef.current, [slot]: provisional }
-      setSourceSelections(previous => withSourceSelection(previous, slot, kind, stored))
+      setSourceSelections(previous => withSourceSelection(previous, slot, kind, listed.url))
       return true
     }
     // Not there yet — wait for further growth rather than re-reading every render.
@@ -413,8 +439,11 @@ export function useChatPageResourcesController({
     const newIssues = recordNewPullRequestLinks(seenSourceUrls, activeSlot, issueLinks)
     if (!newChanges && !newIssues) return
     persistSeenPullRequestLinks(seenSourceUrls)
-    if (newChanges) tabsCtl.openView('changes')
-    if (newIssues) tabsCtl.openView('issues')
+    // Automatic: a discovery focus, not a request, so a panel opened later
+    // with Pin Summary on still lands on Summary, and a Summary the landing
+    // chose keeps the focus (see `openView`).
+    if (newChanges) tabsCtl.openView('changes', { automatic: true })
+    if (newIssues) tabsCtl.openView('issues', { automatic: true })
     // tabsCtl is intentionally not a dependency: this effect reacts only to
     // source discovery, not tab focus or panel visibility changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -456,7 +485,12 @@ export function useChatPageResourcesController({
       // earlier PROVISIONAL transcript but present now that the fetch landed.
       // Look there once before falling back, gated on the url being in THIS
       // transcript (that gate IS the "the fetch proved it exists" condition).
-      reconcileSelection('change', panelSources[0].url, panelSources.length)
+      //
+      // A remembered url can also be an older revision of a review the list now
+      // carries at its newest url. That is still the user's tab, so stay on the
+      // same review rather than jumping to the first one.
+      const sameChange = findSourceForUrl(panelSources, selectedSourceUrl)
+      reconcileSelection('change', (sameChange ?? panelSources[0]).url, panelSources.length)
     }
     // reconcileSourceUrl reads the active slot through a ref, so it is stable and
     // this effect reacts only to sources, selection, and hydration state.
@@ -512,6 +546,7 @@ export function useChatPageResourcesController({
   // save-baseline reconcile cannot drift between hosts.
   const {
     openFile: handleFileOpen,
+    openWorkingTreeDiff: handleOpenWorkingTreeDiff,
     openArtifact: handleArtifactOpen,
     saveFile: handleFileSave,
   } = usePanelDocumentActions({
@@ -627,6 +662,11 @@ export function useChatPageResourcesController({
     let canvas: HTMLCanvasElement | null = null
     try {
       canvas = await capture()
+    } catch (e) {
+      // A pane refusal (the packaged app's display-capture trust gate) is not
+      // a cancel: say so, or the snip button reads as broken.
+      if (!(e instanceof ScreenSnipRefusedError)) throw e
+      showActionError(i18nT('pages.chatPage.snip_refused_in_embedded_pane'))
     } finally {
       if (!canvas) endSnipHold(token)
     }
@@ -637,15 +677,17 @@ export function useChatPageResourcesController({
     }
     activeSnipTokenRef.current = token
     setSnipFrame(canvas)
-  }, [beginSnipHold, endSnipHold, activeSlotRef, setSnipFrame])
+  }, [beginSnipHold, endSnipHold, activeSlotRef, setSnipFrame, showActionError])
 
   /** Screen capture entry: cross-platform snip+crop when supported, else native macOS screenshot. */
   const handleCapture = useCallback(async () => {
-    if (!activeSlotRef.current) return
+    // Locked by a memory-mode switch: a capture finishing after the upload
+    // handover would land in the slot being deleted and vanish.
+    if (!activeSlotRef.current || composerLockedRef.current) return
     snipSlotRef.current = activeSlotRef.current
     if (!screenSnipSupported) { takeScreenshot(); return }
     await snipFrom(() => captureScreen())
-  }, [snipSlotRef, activeSlotRef, takeScreenshot, snipFrom])
+  }, [composerLockedRef, snipSlotRef, activeSlotRef, takeScreenshot, snipFrom])
 
   // The Web Preview tab's crop button asks for an area screenshot via a window
   // event. Same crop→attach pipeline as the composer button, but capture pre-
@@ -654,14 +696,14 @@ export function useChatPageResourcesController({
   // no prompt either way via setDisplayMediaRequestHandler.)
   useEffect(() => {
     const onSnip = async () => {
-      if (!activeSlotRef.current) return
+      if (!activeSlotRef.current || composerLockedRef.current) return
       snipSlotRef.current = activeSlotRef.current
       if (!screenSnipSupported) { takeScreenshot(); return }
       await snipFrom(() => captureScreen(currentTabCaptureDeps()))
     }
     window.addEventListener(PREVIEW_SNIP_EVENT, onSnip)
     return () => window.removeEventListener(PREVIEW_SNIP_EVENT, onSnip)
-  }, [snipSlotRef, activeSlotRef, takeScreenshot, snipFrom])
+  }, [composerLockedRef, snipSlotRef, activeSlotRef, takeScreenshot, snipFrom])
 
   // Each upload's controller is registered per slot in the shared
   // composerSendHolds registry, not kept on this hook: the hold outlives a
@@ -674,7 +716,7 @@ export function useChatPageResourcesController({
   // flag is SHARED with takeScreenshot, which registers no controller, so a
   // control gated on it would offer a cancel during a macOS `screencapture -i`
   // with nothing to abort.
-  const uploadCancellable = useComposerUploadCancellable(activeSlot)
+  const uploadCount = useComposerUploadCount(activeSlot)
   /** Abort every upload in flight for the ACTIVE slot, whichever host started it. */
   const cancelUpload = useCallback(() => {
     cancelComposerUploads(activeSlotRef.current)
@@ -691,12 +733,16 @@ export function useChatPageResourcesController({
     setUploadHint('')
     if (files.length > 20) { setUploadHint(i18nT('pages.chatPage.too_many_files_max_20')); return }
     // Video is deliberately exempt from this pre-check: it has a much larger
-    // server-side ceiling and streams to disk there, so the 50 MB figure this
-    // message states would be a lie for a recording. Its own 413 carries the
-    // real cap and surfaces through the `upload_failed_error` branch below,
-    // the same route every other server-side rejection already takes.
-    const big = files.find(f => !VIDEO_EXT.test(f.name) && f.size > 50 * 1024 * 1024)
-    if (big) { setUploadHint(i18nT('pages.chatPage.file_too_large', { name: big.name })); return }
+    // server-side ceiling and streams to disk there, so the per-file figure
+    // this message states would be a lie for a recording. Its own 413 carries
+    // the real cap and surfaces through the `upload_failed_error` branch below,
+    // the same route every other server-side rejection already takes. The cap
+    // is the gateway's `dashboard.upload_max_mb` (same shared config query);
+    // until that query has served a usable figure, the server's own 413 is
+    // the only check.
+    const maxMb = servedUploadMb(sourceHostCfg?.upload_max_mb)
+    const big = maxMb === null ? undefined : files.find(f => !VIDEO_EXT.test(f.name) && f.size > maxMb * 1024 * 1024)
+    if (big) { setUploadHint(i18nT('pages.chatPage.file_too_large', { name: big.name, max: maxMb })); return }
     setUploading(true)
     holdComposerSend(requestSlot)
     const controller = new AbortController()
@@ -720,16 +766,19 @@ export function useChatPageResourcesController({
         setUploadError(i18nT('pages.chatPage.upload_failed_check_file_type_and_size_max_50_mb'))
       }
     } finally {
+      // Where THIS upload lives now: the replacement when a memory-mode switch
+      // handed it over (with its hold) while it ran, else where it started.
+      const landing = composerUploadSlot(controller) ?? requestSlot
       // Drop only THIS request's controller: the registry keeps Cancel offered
       // while a sibling upload of the slot is still running.
-      unregisterComposerUpload(requestSlot, controller)
-      finishComposerAttachment(requestSlot, completedPaths)
+      unregisterComposerUpload(landing, controller)
+      finishComposerAttachment(landing, completedPaths)
       // Unchanged from main, and still wrong for concurrent uploads: the first
       // request to settle clears the shared flag while a sibling runs. Left
       // alone deliberately -- the cancel control reads the registry, not this.
       setUploading(false)
     }
-  }, [activeSlotRef, setUploadError, setUploadHint, setUploading, setResizedInfo])
+  }, [activeSlotRef, setUploadError, setUploadHint, setUploading, setResizedInfo, sourceHostCfg])
 
   /** The overlay's crop: `uploadFiles` takes its own hold synchronously (before
    *  its first await) and only then is the snip's released, so Send is never
@@ -786,6 +835,7 @@ export function useChatPageResourcesController({
   }, [drafts, saveDrafts, activeSlotRef, setInput])
 
   const handleDrop = useCallback((dataTransfer: DataTransfer) => {
+    if (composerLockedRef.current) return
     // Classify BEFORE acting (issue #743): a dropped folder inserts its path
     // into the composer as an `@rel/` token — the same reference the @-picker
     // stages — instead of taking the upload route, which cannot ingest a
@@ -813,7 +863,13 @@ export function useChatPageResourcesController({
     if (files.length) {
       uploadFiles(files)
     }
-  }, [currentProjectRef, inputRef, voiceCaretRef, voicePendingCaretRef, setInput, uploadFiles])
+  }, [composerLockedRef, currentProjectRef, inputRef, voiceCaretRef, voicePendingCaretRef, setInput, uploadFiles])
+  /** The composer's own paste/attach entry: refused while it is locked, unlike
+   *  a snip or panel annotation, which name the slot they land in. */
+  const composerUploadFiles = useCallback((files: File[]) => {
+    if (composerLockedRef.current) return
+    return uploadFiles(files)
+  }, [composerLockedRef, uploadFiles])
   const { active: dragOver, dropTargetProps } = useChatFileDrop(handleDrop)
   return {
     tabsCtl,
@@ -823,6 +879,8 @@ export function useChatPageResourcesController({
     sourceHostsRef,
     jiraSourceHosts,
     jiraSourceHostsRef,
+    githubSourceHostsRef,
+    bitbucketServerSourceHostsRef,
     panelSources,
     panelIssues,
     selectedSourceUrl,
@@ -836,6 +894,7 @@ export function useChatPageResourcesController({
     addSourceCommentToChat,
     colorThemeRef,
     handleFileOpen,
+    handleOpenWorkingTreeDiff,
     handleFolderOpen,
     handleArtifactOpen,
     handleOpenDiff,
@@ -844,8 +903,9 @@ export function useChatPageResourcesController({
     handleSnipComplete,
     handleSnipCancel,
     uploadFiles,
+    composerUploadFiles,
     cancelUpload,
-    uploadCancellable,
+    uploadCount,
     handleOptimizeResult,
     dragOver,
     dropTargetProps,

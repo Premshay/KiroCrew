@@ -16,17 +16,15 @@ import MarkdownRenderer, { COPIED_FLASH_MS } from '../components/MarkdownRendere
 import { OPEN_DELAY_MS } from '../components/InstantTip'
 import { copyToClipboard } from '../utils/clipboard'
 import { __resetPathKindCache } from '../hooks/usePathKind'
+import { stubPathKinds } from './pathKindStub'
 
 vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn(async () => true) }))
 
 const realFetch = globalThis.fetch
 
-/** Stub the HEAD probe so the backend "confirms" the span as a file or directory. */
+/** Stub the kind probe so the backend "confirms" the span as a file or directory. */
 function stubKind(kind: 'file' | 'dir' | null) {
-  const headers = new Headers(kind ? { 'X-Path-Kind': kind } : {})
-  globalThis.fetch = vi.fn(() =>
-    Promise.resolve({ ok: kind !== null, status: kind ? 200 : 404, headers } as Response),
-  ) as unknown as typeof fetch
+  stubPathKinds(() => kind)
 }
 
 /** Classes that turn an inline box atomic. A chip carrying any of them cannot
@@ -206,11 +204,11 @@ describe('inline-code chips: each class names its own click', () => {
     expect(notices).toHaveLength(1)
     // The shared title-cued notice names WHAT failed to copy — this chip copies
     // the path — and never the copy chip's "select the text" recovery: that
-    // sentence belongs to the chip whose value IS its visible text. The gesture
-    // leads the sentence, so it reads as what failed — never as advice to try
-    // Ctrl+click — and a reader who did not press it does not learn that a
-    // plain click copies.
-    expect(notices[0]).toHaveTextContent(/^The copy failed\. Ctrl\/Cmd\+click copies the path a\.md\.$/)
+    // sentence belongs to the chip whose value IS its visible text. It names no
+    // gesture: it shows only after Ctrl/Cmd+click was refused, and naming the
+    // gesture again read as advice to try something else (#14294).
+    expect(notices[0]).toHaveTextContent(/^Couldn’t copy the path a\.md\.$/)
+    expect(notices[0]).not.toHaveTextContent(/ctrl|cmd|click/i)
     expect(notices[0]).not.toHaveTextContent(/select the text/i)
     expect(screen.getByRole('tooltip').contains(notices[0])).toBe(true)
     expect(flow.innerHTML).toBe(flowRest)
@@ -294,11 +292,12 @@ describe('inline-code chips: each class names its own click', () => {
       // The flow container is the renderer's own per-message root: the element
       // that already carries the lightbox's `data-image-scope`, now also marked
       // `data-tip-flow` for the bubble — the hook's own attribute, so the two
-      // features share a root, not a meaning. Nothing else on the root changes
-      // (its click delegation and class list are main's).
+      // features share a root, not a meaning. The guide's `data-guide-untrusted`
+      // rides on the same root (authored content is never a guide target).
+      // Nothing else on the root changes (its click delegation and class list are main's).
       const root = document.querySelector('[data-tip-flow]') as HTMLElement | null
       expect(root).not.toBeNull()
-      expect(root!.getAttributeNames().filter(n => n.startsWith('data-'))).toEqual(['data-image-scope', 'data-tip-flow'])
+      expect(root!.getAttributeNames().filter(n => n.startsWith('data-'))).toEqual(['data-image-scope', 'data-tip-flow', 'data-guide-untrusted'])
       expect(root!.contains(screen.getByRole('button', { name: 'Copy npm test' }))).toBe(true)
       root!.getBoundingClientRect = () => rect(100, 0, 600, 140)
       const first = screen.getByRole('button', { name: 'Copy npm test' })

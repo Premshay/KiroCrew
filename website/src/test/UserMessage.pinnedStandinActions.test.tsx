@@ -2,7 +2,7 @@
  * The pinned-prompt card stands in for a user BUBBLE, not for the whole row.
  *
  * While a prompt is pinned its transcript row is `visibility: hidden` and the
- * PinnedPrompt card is drawn in its place (see ChatPage's row `visibility`,
+ * PinnedPrompt card is drawn in its place (see ChatTranscriptView's row `visibility`,
  * VirtualTranscript's `isRowHidden`, ChatMessageList's `hiddenRow`). The row
  * also holds the message's action strip — copy, copy link, pin, edit, the
  * timestamp — which the card does not carry, so hiding the row wholesale took
@@ -17,16 +17,15 @@
  * wrapper (ChatMessageList's virtualized mount) under the REAL rule, read from
  * index.css itself — the test does not restate the rule.
  */
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import { render } from '@testing-library/react'
 import type { ChatMessage } from '../types'
 import { i18nT } from '../i18n/t'
 
 import ChatMessageList from '../app-sdk/ChatMessageList'
 import UserMessage from '../pages/chat/UserMessage'
+import { readIndexCss } from './indexCssSource'
 
-const INDEX_CSS = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
+const INDEX_CSS = readIndexCss()
 
 /** The stand-in rules exactly as index.css ships them (comments stripped). */
 function pinnedStandinRules(): string {

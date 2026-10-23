@@ -1,11 +1,11 @@
 ---
 title: Agent-started turns — show a turn the agent starts between user turns as its own reply
-status: draft
+status: accepted
 author: iamwhatever
 created: 2026-10-08
 last-audited: 2026-10-08
 audited-at: 1ad2d6d05f
-doc-pr:
+doc-pr: 18051
 implementation-prs: []
 tracking-issues: [17566]
 supersedes: []
@@ -14,7 +14,7 @@ superseded-by: []
 
 # RFC: Agent-started turns — show a turn the agent starts between user turns as its own reply
 
-- Status: draft — nothing implemented on main. Acceptance is requested from a maintainer; the open product calls are in [Decisions needed](#decisions-needed).
+- Status: accepted. The product owner chose option A on all four [decisions](#decisions-needed) on 2026-10-08: an agent-started turn is its own assistant message with a notification, claude only, a user message queues behind it, and every other backend keeps today's behaviour. Phases 0 to 2 are unlocked; Phase 3 stays blocked. Phase 0's verdicts are recorded under [Phase 0](#phase-0--probe-no-product-code). Nothing is implemented on main yet.
 - Author: iamwhatever
 - Design credit: the reader hand-off, the prompt-less turn through `_run_chat` and the end-of-turn signal are rinbn's [design note on #17566](https://github.com/kirodotdev/KiroCrew/issues/17566). This document writes that note up and adds what review of [#17884](https://github.com/kirodotdev/KiroCrew/pull/17884) found a new path must keep.
 - Related: `docs/system-specs/modules/acp-client.md` (stdout, the replay buffer, cancellation), `docs/system-specs/modules/app-notifications.md` (unread badge, turn sound)
@@ -38,7 +38,7 @@ This RFC adds an **agent-started turn**: a reader that watches stdout between tu
 
 ### Current frame flow
 
-All readers below are `AcpClient` methods in `src/kiro_crew/acp/client.py`.
+All readers below are `AcpClient` methods: `_prompt_loop` in `src/kiro_crew/acp/client_turn.py`, the command and init waits in `src/kiro_crew/acp/client_transport.py`, and the compaction readers in `src/kiro_crew/acp/client_usage.py`.
 
 | When | Who reads stdout | What happens to a frame |
 |---|---|---|
@@ -47,13 +47,13 @@ All readers below are `AcpClient` methods in `src/kiro_crew/acp/client.py`.
 | Compaction | `wait_for_compaction`, `_drain_post_compaction_metadata` | Read outside `_turn_lock` |
 | Between turns | nobody | Frames sit in the pipe; the next `_prompt_loop` takes `_buffer` first (`_read_message`), then reads them as this turn's |
 
-Those five sites are every caller of `_read_message` in `client.py`. `_process_message` classifies any `session/update` as `"update"` with no turn attribution, and nothing on main reads `_meta["_claude/origin"]`.
+Those five sites are every caller of `_read_message` (`client_transport.py`) on `AcpClient`. `_process_message` classifies any `session/update` as `"update"` with no turn attribution, and nothing on main reads `_meta["_claude/origin"]`.
 
-`AcpSessionHandle` backends (kiro, KAS, codex; `ACP_BACKENDS_ACP_RUNTIME`, `src/kiro_crew/agent_sdk/backends.py`) do not misplace these frames: the pre-turn drain in `AcpSessionHandle.prompt()` (`src/kiro_crew/acp/session_handle.py`) discards them, counted in one warning, never shown. `AcpClient` backends (`ACP_BACKENDS_ACP_CLIENT_SPAWNABLE`, `backends.py`) have no drain.
+`AcpSessionHandle` backends (kiro, KAS, codex; `ACP_BACKENDS_ACP_RUNTIME`, `src/kiro_crew/agent_sdk/backends.py`) do not misplace these frames: the pre-turn drain in `AcpSessionHandle.prompt()` (`src/kiro_crew/acp/session_handle_turn.py`) discards them, counted in one warning, never shown. `AcpClient` backends (`ACP_BACKENDS_ACP_CLIENT_SPAWNABLE`, `backends.py`) have no drain.
 
 ### Why dropping is not enough
 
-[#17884](https://github.com/kirodotdev/KiroCrew/pull/17884) gave `AcpClient` a claude-only drain. Its review rounds showed that every frame type other than text carries a side effect the read loop runs: the SEL tool-invocation audit (`_maybe_audit_tool_call`, `client.py`), PreToolUse / PostToolUse hooks (`_maybe_fire_pre_tool_hooks`, `_maybe_fire_post_tool_hooks`), the per-harness tripwires, permission answers, MCP OAuth and init notices, config-option updates, usage tracking (`_track_usage_update`, `client.py`), background-launch tracking (`_note_background_launch`, `client.py`), the harness parity gate, and the 100-entry replay buffer bound (`AcpClient._buffer`). Its final form dropped only text chunks and left every other frame to the next turn. The [self-review](https://github.com/kirodotdev/KiroCrew/pull/17884#issuecomment-6052833639) rejected that: the model's reply is lost while its tool rows still render, and Claude's own session holds a reply the user never saw. #17884 is closed in favour of this RFC.
+[#17884](https://github.com/kirodotdev/KiroCrew/pull/17884) gave `AcpClient` a claude-only drain. Its review rounds showed that every frame type other than text carries a side effect the read loop runs: the SEL tool-invocation audit (`_maybe_audit_tool_call`, `client_tool_events.py`), PreToolUse / PostToolUse hooks (`_maybe_fire_pre_tool_hooks`, `_maybe_fire_post_tool_hooks`), the per-harness tripwires, permission answers, MCP OAuth and init notices, config-option updates, usage tracking (`_track_usage_update`, `client_usage.py`), background-launch tracking (`_note_background_launch`, `client_turn_control.py`), the harness parity gate, and the 100-entry replay buffer bound (`AcpClient._buffer`). Its final form dropped only text chunks and left every other frame to the next turn. The [self-review](https://github.com/kirodotdev/KiroCrew/pull/17884#issuecomment-6052833639) rejected that: the model's reply is lost while its tool rows still render, and Claude's own session holds a reply the user never saw. #17884 is closed in favour of this RFC.
 
 The lesson that shapes this design: a second reader that interprets frames has to re-implement the read loop. The reader proposed here interprets nothing. It only notices that a frame arrived and hands stdout to a real turn.
 
@@ -83,14 +83,21 @@ Cancelling the reader inside `readline()` loses no bytes: `asyncio.StreamReader.
 
 When the reader gets a line, it parses it and puts the frame back at the front of `_buffer`. Then:
 
-- A `session/update` or a server request (`session/request_permission`, or any request with an id) is the start of an agent-started turn. The reader calls `on_agent_turn(client)`, which the dashboard registers, and exits. It never dispatches the frame itself.
-- Any other notification (metadata, MCP init, config option) stays in `_buffer` for the next reader, as on main, and the reader reads again while `_buffer` has room. When `_buffer` is full it exits and leaves the rest in the pipe in order.
+- A frame that shows the agent acting is the start of an agent-started turn: a `session/update` of kind `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update` or `plan`, or a server request (`session/request_permission`, or any request with an id). The reader calls `on_agent_turn(client)`, which the dashboard registers, and exits. It never dispatches the frame itself.
+- Any other frame stays in `_buffer` for the next reader, as on main, and the reader reads again while `_buffer` has room. That covers the notifications (metadata, MCP init, config option) and the `session/update` kinds that report state, not activity. Phase 0 saw two such frames between turns: a `session_info_update` (the session title) about a second after a session's first turn, and a lone origin-marked `usage_update` right after a turn that waited for a subagent. A turn started on either would be an empty reply with a notification. When `_buffer` is full the reader exits and leaves the rest in the pipe in order.
 
 The reader holds `_turn_lock` until the callback has marked the slot busy (step 2), so no user turn can start reading in between.
 
 ### 2. The agent-started turn in the dashboard
 
-`on_agent_turn` runs synchronously on the event loop. It claims the slot the way a dispatched user turn does (compare `_start_next_queued_turn`, `src/kiro_crew/dashboard/chat_runner.py`): it sets `slot.running` and schedules `_run_chat` with a new `agent_started=True` flag and no message. `_run_chat` then holds the per-session semaphore for the turn, as every turn does. Only after `slot.running` is set does the reader release `_turn_lock`.
+`on_agent_turn` runs synchronously on the event loop. It claims the slot the way a dispatched user turn does (compare `_start_next_queued_turn`, `src/kiro_crew/dashboard/chat_turn/queue_drain.py`): it sets `slot.running` and schedules `_run_chat` with a new `agent_started=True` flag and no message. `_run_chat` then holds the per-session semaphore for the turn, as every turn does. Only after `slot.running` is set does the reader release `_turn_lock`.
+
+If `slot.running` is already set, the callback starts nothing and the frame stays in `_buffer`. Two kinds of turn can hold the slot at that moment, and the rule has to serve both:
+
+- A user turn that has claimed the slot but not yet called `_claim_stdout()`, because it still waits on the semaphore. It reads the frame from `_buffer` when it starts, as on main. §6 lists this window.
+- The previous turn, which has stopped reading stdout but has not released the slot yet, because its turn-end bookkeeping still runs. Nothing reads the frame until the next user message, which is the bug this RFC fixes.
+
+So the callback also registers a retry for when the task that holds the slot ends. `AcpClient` marks a hand-off as pending, and the next `_prompt_loop` clears the mark when it takes the frames from `_buffer`. The retry checks the mark: if a user turn took the frames, it does nothing; otherwise it starts the agent-started turn.
 
 With `agent_started=True`, `_run_chat`:
 
@@ -101,7 +108,7 @@ With `agent_started=True`, `_run_chat`:
 
 `AcpClient.stream_unsolicited()` calls `_dispatch_events` with a request id no response can match. `_dispatch_events` acquires `_turn_lock` through `_prompt_loop`, so the reader hand-off and the turn's read follow the same lock discipline as a user turn. The turn ends on the first of:
 
-- a `usage_update` whose `_meta["_claude/origin"].kind` names an autonomous origin (`task-notification`, `peer`, and the rest of the adapter's closed set);
+- a `usage_update` whose `_meta["_claude/origin"].kind` is in the adapter's autonomous set: `task-notification`, `peer`, `coordinator`, `observer` and `observer-activity`. A user turn's closing `usage_update` carries an origin too, `{"kind": "human"}`, so the test is membership in that set, never the presence of `_claude/origin`. Only the agent-started turn ends on such a frame; a user turn that reads one, such as the lone one after a held turn (§1), treats it as a usage frame. Phase 0 saw it end every autonomous cycle, a cancelled one included. The adapter's source skips it when no assistant message set the cycle's usage, and such a cycle ends on the gates below;
 - process death (the normal `AcpProcessDied` path);
 - the stale-turn and timeout gates a user turn already has (`acp-client.md`, "Stale-turn gate");
 - a user Stop (see Cancel).
@@ -110,11 +117,11 @@ A turn that ends on a timeout gets the same synthetic completion a user turn get
 
 ### 3. Persistence and redaction
 
-The assistant row and its tool rows are written by the same code a user turn uses, so `_redact_tool_field` (`src/kiro_crew/dashboard/chat_utils.py`) and assistant-text redaction apply unchanged. The assistant row carries `meta.origin = {"kind": "agent", "reason": <origin kind>}`; the reason is drawn from a closed set and any other value is stored as `other`, so adapter text never reaches the row. The history replay on resume includes the row as an ordinary assistant turn, so the transcript and Claude's own session agree.
+The assistant row and its tool rows are written by the same code a user turn uses, so `_redact_tool_field` (`src/kiro_crew/dashboard/chat_utils.py`) and assistant-text redaction apply unchanged. The assistant row carries `meta.origin = {"kind": "agent", "reason": <origin kind>}`; the reason is drawn from a closed set and any other value is stored as `other`, so adapter text never reaches the row. Only `kind` is read from the origin object: a `peer` origin carries a subagent's report as free text in `body` (Phase 0). The history replay on resume includes the row as an ordinary assistant turn, so the transcript and Claude's own session agree.
 
 ### 4. Notifications
 
-The turn ends through the normal turn-end path, so the unread badge and the turn sound fire the way they do for a finished user turn (`app-notifications.md`, "Unread badge" and "Sound events"). `_notify_autonudge_turn_end` (`chat_runner.py`) is skipped for an agent-started turn: a monitor or autonudge loop did not send its prompt, so the turn must not count as one of its cycles.
+The turn ends through the normal turn-end path, so the unread badge and the turn sound fire the way they do for a finished user turn (`app-notifications.md`, "Unread badge" and "Sound events"). `_notify_autonudge_turn_end` (`chat_turn/queue_cycle.py`) is skipped for an agent-started turn: a monitor or autonudge loop did not send its prompt, so the turn must not count as one of its cycles.
 
 ### 5. Slot busy accounting
 
@@ -124,11 +131,11 @@ The gap before the agent-started turn begins is already covered on claude: the h
 
 ### 6. A user message during the agent-started turn
 
-Per decision 3 (recommended: queue), a message sent while the agent-started turn runs takes the existing queued path, because `slot.running` is set. It runs when the agent-started turn ends. A message whose prompt was already written before the reader saw the first frame is the one case this design does not attribute: Claude may interleave the two turns. Phase 0 records what claude-agent-acp does there.
+Per decision 3 (recommended: queue), a message sent while the agent-started turn runs takes the existing queued path, because `slot.running` is set. It runs when the agent-started turn ends. A message whose prompt was already written before the reader saw the first frame is the one case this design does not attribute. So is a user turn that claimed the slot before the frame arrived (§2). In both, that turn reads the agent-started frames as its own. Phase 0 found the adapter does not interleave the two: it queues the prompt behind the running cycle, so the cycle's frames arrive first and end with its origin `usage_update`, and the prompt's own reply follows.
 
 ### 7. Cancel and interrupt
 
-Stop on an agent-started turn sends `session/cancel` for the session, as Stop on a user turn does, then runs the normal cancel grace window (`acp-client.md`, "Cancel Grace Window"). If the adapter ignores a cancel for a turn it started itself (Phase 0 checks), the grace window ends the Kiro Crew turn locally, and frames that arrive afterwards start a new agent-started turn instead of leaking into the next user turn.
+Stop on an agent-started turn sends `session/cancel` for the session, as Stop on a user turn does, then runs the normal cancel grace window (`acp-client.md`, "Cancel Grace Window"). Phase 0 found that the adapter honours that cancel: the cycle stops and still ends with its origin `usage_update`, so the turn ends on its normal end condition. If a cancel is ignored, the grace window ends the Kiro Crew turn locally, and frames that arrive afterwards start a new agent-started turn instead of leaking into the next user turn.
 
 ### 8. What stays
 
@@ -144,6 +151,21 @@ A script drives claude-agent-acp directly over stdio with the repro and records 
 - whether a `session/cancel` stops an agent-started turn;
 - what happens when a `session/prompt` is written while an agent-started turn streams (queued by the adapter, interleaved, or rejected).
 
+**Verdicts, 2026-10-08.** Measured on claude-agent-acp 0.87.0 (claude-agent-sdk 0.3.287), with Claude Code on Bedrock and the `initialize` capabilities `AcpClient` sends. Four runs: a background command, a Stop during the agent-started turn, a prompt during it, and a background subagent. Only frame structure is recorded here.
+
+- **Origin shape.** The closing `usage_update` carries `_meta["_claude/origin"]`, an object whose `kind` names the origin, plus fields that depend on the kind:
+  - after a background command: `{"kind": "task-notification", "producer": "session-task", "runId": ...}`;
+  - when a subagent hands back: `{"kind": "peer", "from": ..., "senderTaskId": ..., "name": ..., "body": ..., "handback": true}`, with the subagent's report as text in `body`;
+  - on every user turn: `{"kind": "human"}`.
+
+  The adapter's autonomous set is `task-notification`, `peer`, `coordinator`, `observer` and `observer-activity` (`AUTONOMOUS_RESULT_ORIGINS` in `dist/acp-agent.js`). Its source sends that `usage_update` only when an assistant message set the cycle's usage; every cycle in the four runs had one.
+- **Cancel.** A `session/cancel` sent at the first chunk of an agent-started turn stopped it. The last chunk and the origin `usage_update` arrived within about 10 ms, and no response followed, since there is no request to answer. The next prompt ran normally.
+- **Prompt during the turn.** Queued by the adapter, which advertises `agentCapabilities._meta.claudeCode.promptQueueing: true` in `initialize`. The agent-started cycle streamed to its end and its origin `usage_update`; then came the prompt's reply, its `{"kind": "human"}` `usage_update` and its response. Nothing interleaved and nothing was rejected.
+- **Background subagent.** A turn that starts a background subagent does not end when its text ends: the adapter holds the `session/prompt` response until the subagent hands back (`settleOrDefer` in `dist/acp-agent.js`). The subagent's tool calls and the model's follow-up streamed inside that open turn, so none of them arrived between turns. A permission request from such a subagent was not exercised: the probe session ran in Claude Code's `auto` mode, which sent none.
+- **Frames between turns that start no turn.** A `session_info_update` with the session title arrived about a second after the first turn of every run, and a lone `usage_update` with a `task-notification` origin arrived right after the held turn's response. §1 leaves both in `_buffer`.
+
+To rerun: send `initialize` and `session/new`, then a prompt asking for `sleep 15; echo probe-done` with `run_in_background`; answer each `session/request_permission` with its first allow option; read stdout for two minutes. For the Stop and prompt runs, ask for a long reply when the command finishes and send `session/cancel` or a second `session/prompt` at its first `agent_message_chunk`.
+
 ### Phase 1 — transport (`AcpClient` only, no visible change)
 
 Idle reader, `_claim_stdout()` at all five read sites, `stream_unsolicited()`. With no `on_agent_turn` registered, the reader puts the frame back and exits, so behaviour matches main. Exit criteria:
@@ -151,6 +173,7 @@ Idle reader, `_claim_stdout()` at all five read sites, `stream_unsolicited()`. W
 - a cancel inside `readline()` loses no bytes (real `StreamReader`, partial line);
 - each of the five read sites stops the reader before it reads; a caller-enumeration test fails if a new `_read_message` caller skips `_claim_stdout()`;
 - `stream_unsolicited()` yields the frames of a fake agent-started turn and ends on the origin `usage_update`, on process death and on the timeout gate;
+- an origin of kind `human` ends no agent-started turn, and a `session_info_update` or a lone origin `usage_update` between turns starts none;
 - `check_harness_parity.py` passes: the reader adds no enforcement role, because it dispatches nothing.
 
 ### Phase 2 — dashboard wiring (claude)
@@ -163,6 +186,7 @@ Idle reader, `_claim_stdout()` at all five read sites, `stream_unsolicited()`. W
 - the assistant row is in the resume history replay;
 - RSS recycle and the idle sweep skip the session while the turn runs;
 - a user message sent during the turn queues and runs after it;
+- the two interleavings in §2: a frame that arrives while a user turn has claimed the slot but waits on the semaphore is read by that turn and starts no second turn; a frame that arrives while the previous turn is still tearing down starts the agent-started turn when that turn's task ends;
 - Stop ends the turn within the cancel grace window;
 - the turn does not count as an autonudge or monitor cycle.
 
@@ -193,6 +217,8 @@ No stored-data migration. A row without `meta.origin` is a user-prompted turn, a
 
 ## Decisions needed
 
+All four are decided (product owner, 2026-10-08). Each table is kept as the record of what was weighed.
+
 ### 1. How an agent-started turn is shown
 
 | Option | What the user sees |
@@ -201,6 +227,8 @@ No stored-data migration. A row without `meta.origin` is a user-prompted turn, a
 | B. Hidden (drop and count) | Nothing; Claude remembers a reply the user never saw |
 
 Recommendation: **A**. B is what #17884 shipped and review rejected; it leaves the transcript and the model disagreeing.
+
+**Decided: A.** An agent-started turn shows as its own assistant message, and the normal end-of-turn notification fires.
 
 ### 2. Scope
 
@@ -211,6 +239,8 @@ Recommendation: **A**. B is what #17884 shipped and review rejected; it leaves t
 
 Recommendation: **A**, built so a backend joins by naming its end signal (Phase 3).
 
+**Decided: A.** The claude backend only, because its adapter is the one that marks the end of such a turn.
+
 ### 3. A user message during the agent-started turn
 
 | Option | Effect |
@@ -219,6 +249,8 @@ Recommendation: **A**, built so a backend joins by naming its end signal (Phase 
 | B. Interrupt it | Sends `session/cancel`, then the user's prompt; the background reply may be cut |
 
 Recommendation: **A**. It is how the dashboard treats every running turn, and the user can still press Stop. Claude Code's own behaviour is unchecked; Phase 0 records it, and this decision is revisited if Claude itself interrupts.
+
+**Decided: A.** A user message sent while the agent-started turn streams queues behind it; nothing interrupts it.
 
 ### 4. kiro, KAS, codex and the other `AcpClient` backends
 
@@ -229,6 +261,8 @@ Recommendation: **A**. It is how the dashboard treats every running turn, and th
 
 Recommendation: **A**. No other adapter is known to start turns today, and none marks the end of one.
 
+**Decided: A.** Other backends keep today's behaviour; Phase 3 stays blocked.
+
 ## Acceptance
 
-This RFC is accepted when a maintainer records a choice on each of the four decisions above and flips `status` to `accepted`. Phase 0 can start before that; Phases 1 and 2 follow acceptance.
+Accepted 2026-10-08: the product owner chose A on each of the four decisions above, recorded by iamwhatever. Phases 0 to 2 follow for the claude backend; Phase 3 waits for another adapter to mark the end of a turn it starts.

@@ -372,11 +372,15 @@ class TestTheMembersRosterCarriesIdentity:
         sentinel. That is a redaction of the VALUE, not a withdrawal of the
         field, so the roster still carries a crew's identity.
         """
+        import importlib
         import inspect
 
         from kiro_crew.dashboard.handlers import members as members_handler
 
         src = inspect.getsource(members_handler)
+        src += "".join(
+            inspect.getsource(importlib.import_module(o)) for o in members_handler._OWNERS
+        )
         assert '"description": _roster_mask(agent_cfg.description)' in src
         assert '"triggers": _roster_mask(agent_cfg.triggers)' in src
 
@@ -480,11 +484,15 @@ class TestTheSpawnEndpointActuallyDelegates:
 
     def test_the_crew_field_description_does_not_gate_on_triggers(self):
         """The tool text is what an agent reads before it delegates."""
+        import importlib
         import inspect
 
         from kiro_crew.mcp_tools import spawn as spawn_tool
 
-        src = inspect.getsource(spawn_tool)
+        src = "".join(
+            inspect.getsource(importlib.import_module(name))
+            for name in (spawn_tool.__name__, *spawn_tool._OWNERS)
+        )
         assert "Naming a member is enough" in src
         assert "must have non-empty Triggers" not in src
         assert "delegated tasks" not in src
@@ -520,15 +528,32 @@ class TestTheSpawnEndpointActuallyDelegates:
         guidance saying so is a leak the docs teach. The `select_crew` tool text
         is the copy that matters most: it is what the model reads at routing
         time now that the always-on conductor skill is gone."""
+        import re
         from pathlib import Path
 
         import kiro_crew
 
         root = Path(kiro_crew.__file__).parent
-        for rel in ("mcp_tools/control.py",):
+        for rel in (
+            "mcp_tools/control.py",
+            "mcp_tools/control_parts/schemas.py",
+            "mcp_tools/control_parts/directive.py",
+            "mcp_tools/control_parts/monitor.py",
+        ):
             text = (root / rel).read_text()
             assert 'spawn_run(agent="<name>"' not in text, rel
             assert "spawn_run(agent=<crew>" not in text, rel
+        # Packaged prompts, skills and docs are guidance too: one that routes with
+        # `select_crew` / `route_crew` must not then hand the pick to `agent=`.
+        pages = sorted(root.rglob("*.md"))
+        assert root / "builtin_skills" / "goal-conductor" / "SKILL.md" in pages
+        routing = re.compile(r"\b(select_crew|route_crew)\b")
+        offenders = [
+            str(p.relative_to(root))
+            for p in pages
+            if routing.search(text := p.read_text(encoding="utf-8")) and "spawn_run(agent=" in text
+        ]
+        assert not offenders, offenders
 
 
 class TestASymlinkCannotAliasTwoCrewsOntoOneSilo:

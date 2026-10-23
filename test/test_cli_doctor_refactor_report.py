@@ -20,13 +20,15 @@ from __future__ import annotations
 import subprocess
 import sys
 import urllib.error
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from kiro_crew import cli_doctor
+from kiro_crew import _llama_lib_path, cli_doctor
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.doctor_checks import access, install
 from kiro_crew.platform import PlatformCompositionError
 
 pytestmark = pytest.mark.skipif(
@@ -51,6 +53,7 @@ _SECTIONS = (
     "_doctor_deprecated_agent_specs",
     "_doctor_path_launcher",
     "_doctor_trust_root",
+    "_doctor_signing_key",
     "_doctor_name_grant_platform_scope",
     "_doctor_strict_identity",
     "_doctor_mcp_gateway_daemon",
@@ -94,6 +97,12 @@ _TAKES_ISSUES = frozenset(_SECTIONS) - {
     "_doctor_selected_backend_projection",
     "_doctor_overload_resilience",
     "_doctor_source_checkout",
+}
+
+#: Sections defined in a family AFTER the move. The facade forwards only the names
+#: it held before, so these are stubbed on their family module.
+_FAMILY_ONLY = {
+    "_doctor_signing_key": access,
 }
 
 _GATED_OFF = frozenset({"kirocrew-computer"})
@@ -177,6 +186,9 @@ class _Host:
         mp.setattr(cli_doctor, "_load_llama_class", lambda: self.llama)
         mp.setattr(cli_doctor, "_platform_libs_dirname", lambda: self.libs_dir)
         mp.setattr(cli_doctor, "verify_vendored_libs", lambda: self.vendored)
+        # The lib-path row reads the start-up record as well as the variable cleared
+        # above, and a start-up step that ran earlier in this process leaves that record.
+        mp.setattr(cli_doctor, "dropped_inherited_lib_path", lambda: None)
         mp.setattr(cli_doctor, "resolve_custom_model", lambda: self.custom_model)
         mp.setattr(cli_doctor, "model_file_present", lambda path=None: self.model_present)
         mp.setattr(cli_doctor, "default_model_path", lambda: self.tmp / "model.gguf")
@@ -202,15 +214,50 @@ class _Host:
         mp.setattr(cli_doctor, "machine_hostname", lambda: "devbox")
         mp.setattr(cli_doctor, "is_local_only", lambda host, has_slack: self.local)
         import kiro_crew._sqlite_compat as sqlite_compat
+        import kiro_crew.browser_cli.install as browser_install
         import kiro_crew.channels as channels
 
         mp.setattr(sqlite_compat, "fts5_available", lambda: self.fts5)
+        # The timezone-data row reads the host's zone files; pin both probes so
+        # the host's real data never decides.
+        mp.setattr(install, "_tz_probe_offset", lambda: self.tz_offset)
+        mp.setattr(install, "_tz_data_from_system", lambda: True)
+        # The browser-bootstrap rows resolve through the patched ``shutil.which``;
+        # pin the writability probe too, so the host's real files never decide.
+        mp.setattr(
+            browser_install,
+            "bootstrap_tool_provenance",
+            lambda path: {
+                "path": path,
+                "real_path": path,
+                "writable_at": "",
+                "own_toolchain": False,
+                "shared_write": False,
+            },
+        )
         mp.setattr(channels, "channel_readiness", lambda cfg, creds: tuple(self.readiness))
+        import kiro_crew.doctor_checks.resources as resources
+
+        # Added after the sections moved, so the facade does not forward it: the
+        # marker goes on the family that defines it. The real section reads the
+        # host's process table, which no frozen report can pin.
+        mp.setattr(resources, "_doctor_acp_runtimes", self._marker("_doctor_acp_runtimes"))
+        import kiro_crew.doctor_checks.workload as workload
+
+        # Same reason: added after the move. The real section walks the host's
+        # ledger stores, which no frozen report can pin.
+        mp.setattr(workload, "_doctor_ledger_backlog", self._marker("_doctor_ledger_backlog"))
         mp.setitem(sys.modules, "faiss", None)
         mp.setitem(sys.modules, "amazon_transcribe", None)
         mp.setitem(sys.modules, "amazon_transcribe.client", None)
         mp.setitem(sys.modules, "boto3", None)
         for name in _SECTIONS:
+            if name in _FAMILY_ONLY:
+                # A section added after the move is not re-exported through the
+                # facade (see test_cli_doctor_refactor_facade), so it is stubbed
+                # on the family that defines it.
+                mp.setattr(_FAMILY_ONLY[name], name, self._marker(name))
+                continue
             mp.setattr(cli_doctor, name, self._marker(name))
 
         self.kiro: str | None = _KIRO
@@ -243,6 +290,7 @@ class _Host:
         self.paused: str | None = None
         self.local = True
         self.fts5 = True
+        self.tz_offset = timedelta(hours=-7)
 
     def _marker(self, name: str):
         def marker(*args, **kwargs):
@@ -324,6 +372,10 @@ Dependencies
   <<_doctor_agent_auth>>
   git:         ✅ /usr/bin/git
   node:        ✅ /usr/bin/node (v22.3.0)
+  browser npm: ⏹ not found (the browser install needs Node.js with npm)
+  browser node: ✅ /usr/bin/node
+               These rows resolve from this shell's PATH; the gateway logs the npm and Node it
+               actually ran at install time.
 
 Project
   source dir:  ✅ <TMP>/checkout (Kiro Crew source checkout)
@@ -352,6 +404,7 @@ Configuration
   <<_doctor_deprecated_agent_specs>>
   <<_doctor_path_launcher>>
   <<_doctor_trust_root>>
+  <<_doctor_signing_key>>
   <<_doctor_name_grant_platform_scope>>
   <<_doctor_strict_identity>>
   <<_doctor_mcp_gateway_daemon>>
@@ -366,11 +419,13 @@ Configuration
   <<_doctor_live_target_pointer>>
   <<_doctor_masked_credential_aliases>>
   <<_doctor_memory_pressure>>
+  <<_doctor_acp_runtimes>>
   <<_doctor_runtime_tmpfs>>
   <<_doctor_cli_installer_residue>>
   <<_doctor_cron_health>>
   <<_doctor_task_store>>
   <<_doctor_overload_resilience>>
+  <<_doctor_ledger_backlog>>
   <<doctor_dead_paths>>
 
 MCP Tools
@@ -383,6 +438,7 @@ Runtime
   deps:        ✅ websockets, slack_sdk, aiohttp available
   <<_doctor_import_path>>
   sqlite fts5: ✅ available
+  tz data:     ✅ current (America/Vancouver stays UTC-7 in winter)
 
 Vector Memory (in-process embeddings)
   runtime:     ✅ vendored llama-cpp-python importable
@@ -468,6 +524,20 @@ def test_a_ready_host_prints_every_section_in_order_and_passes(host, capsys) -> 
     assert len(lists) == 1
 
 
+def test_a_start_up_record_of_an_inherited_lib_path_leaves_the_report_unchanged(
+    host, capsys
+) -> None:
+    """A start-up step that ran earlier in the process records the lib path it removed."""
+    _ready(host)
+    installed = host.tmp / "old" / "kiro_crew" / "_vendor" / "llama_cpp_libs" / "linux_x86_64"
+    host.mp.setattr(_llama_lib_path, "_dropped_inherited", str(installed))
+
+    out, code = host.run(capsys)
+
+    assert out == _READY
+    assert code is None
+
+
 _BROKEN = """\
 Kiro Crew Doctor 👻
 
@@ -481,6 +551,10 @@ Dependencies
   git:         ❌ not found (needed for kirocrew update)
   node:        ❌ v18.19.0 < v20.0.0
                Fix: Node.js v18.19.0 is too old: Kiro Crew needs v20.0.0 or newer. Update Node.js: install 24 LTS from https://nodejs.org, or run `nvm install 24` / `mise use -g node@24`.
+  browser npm: ⏹ not found (the browser install needs Node.js with npm)
+  browser node: ✅ /usr/bin/node
+               These rows resolve from this shell's PATH; the gateway logs the npm and Node it
+               actually ran at install time.
 
 Project
   source dir:  ❌ stale — points to deleted <TMP>/gone
@@ -511,6 +585,7 @@ Configuration
   <<_doctor_deprecated_agent_specs>>
   <<_doctor_path_launcher>>
   <<_doctor_trust_root>>
+  <<_doctor_signing_key>>
   <<_doctor_name_grant_platform_scope>>
   <<_doctor_strict_identity>>
   <<_doctor_mcp_gateway_daemon>>
@@ -525,11 +600,13 @@ Configuration
   <<_doctor_live_target_pointer>>
   <<_doctor_masked_credential_aliases>>
   <<_doctor_memory_pressure>>
+  <<_doctor_acp_runtimes>>
   <<_doctor_runtime_tmpfs>>
   <<_doctor_cli_installer_residue>>
   <<_doctor_cron_health>>
   <<_doctor_task_store>>
   <<_doctor_overload_resilience>>
+  <<_doctor_ledger_backlog>>
   <<doctor_dead_paths>>
 
 MCP Tools
@@ -540,6 +617,11 @@ Runtime
   <<_doctor_import_path>>
   sqlite fts5: ❌ missing (memory/knowledge search will fail)
                Or use a Python whose SQLite was built with FTS5.
+  tz data:     ⚠️  out of date (older than IANA tzdb 2026b)
+               It still moves America/Vancouver back to UTC-8 on
+               2026-11-01, so a job in that zone runs an hour late.
+               Fix: update the operating system's timezone data
+               (the tzdata package), then restart the gateway.
   <<_doctor_source_checkout>>
 
 Vector Memory (in-process embeddings)
@@ -589,7 +671,7 @@ Connectivity
      Then run: kirocrew token
   auth check:  ❌ external access allowed without token!
 
-❌ Fix these issues: platform composition failed: companion missing, git, node, stale project_dir, agent config, agent model pin, dashboard auth: remote bind without Slack, _doctor_effective_model issue, render_doctor_section issue, _doctor_credentials issue, _doctor_sandbox issue, _doctor_live_target_pointer issue, doctor_dead_paths issue, python deps, _doctor_import_path issue, sqlite fts5, embedding runtime, custom embedding model unusable, speech recogniser (extra_missing), ffmpeg, _doctor_discord issue, _doctor_whatsapp issue, telegram: missing TELEGRAM_BOT_TOKEN and telegram.allowed_chat_ids, loop-stall dump attributed to cron job 'nightly' ('job-7'), recent loop-stall crash dump (2h ago), dashboard auth: no token required on external interface
+❌ Fix these issues: platform composition failed: companion missing, git, node, stale project_dir, agent config, agent model pin, dashboard auth: remote bind without Slack, _doctor_effective_model issue, render_doctor_section issue, _doctor_credentials issue, _doctor_sandbox issue, _doctor_live_target_pointer issue, doctor_dead_paths issue, python deps, _doctor_import_path issue, sqlite fts5, timezone data out of date, embedding runtime, custom embedding model unusable, speech recogniser (extra_missing), ffmpeg, _doctor_discord issue, _doctor_whatsapp issue, telegram: missing TELEGRAM_BOT_TOKEN and telegram.allowed_chat_ids, loop-stall dump attributed to cron job 'nightly' ('job-7'), recent loop-stall crash dump (2h ago), dashboard auth: no token required on external interface
 """
 
 
@@ -620,6 +702,7 @@ def test_a_broken_host_reports_every_issue_in_order_and_exits_one(host, capsys) 
     host.ffmpeg = None
     host.pip_ok = False
     host.fts5 = False
+    host.tz_offset = timedelta(hours=-8)
     host.llama = None
     host.vendored = {"linux-x86_64": ["libllama.so", "libggml.so"]}
     host.custom_model = SimpleNamespace(
@@ -744,6 +827,29 @@ def test_bundle_mode_prints_only_the_bundle(host, capsys, monkeypatch) -> None:
     out, code = host.run(capsys, bundle=True)
 
     assert out == _BUNDLE
+    assert code is None
+    assert host.calls == []
+
+
+def test_bundle_mode_prints_the_bundle_when_the_companion_does_not_compose(
+    host, capsys, monkeypatch
+) -> None:
+    result = cli_doctor.diagnostics.BundleResult(
+        zip_path=host.tmp / "diag.zip", filename="diag.zip"
+    )
+    monkeypatch.setattr(cli_doctor.diagnostics, "collect_bundle", lambda: result)
+
+    def refuse_context():
+        raise PlatformCompositionError("companion did not compose")
+
+    monkeypatch.setattr(cli_doctor.diagnostics, "current_context", refuse_context)
+
+    out, code = host.run(capsys, bundle=True)
+
+    assert "  ✅ bundle: <TMP>/diag.zip\n" in out
+    assert out.endswith("\n  Issue link skipped: the platform companion does not compose.\n")
+    assert "Open a GitHub issue" not in out
+    assert "github.com" not in out
     assert code is None
     assert host.calls == []
 

@@ -19,17 +19,15 @@ environment (``KIROCREW_DSH_MODEL``) supplies the boot default; without a
 provider behind a direct runtime consumer to apply one, the harness carries the
 caller's model through ``SpawnPlan.session_model``.
 
-**Sessions, not agents.** dsh reads no ``~/.kiro/agents/<name>.json``: the
-session's whole tool surface is the harness's own shipped tool set plus the
-shared broker append the runtime composes for every mirror-less backend. So
-there is no ``--agent`` flag to verify after spawn, and no spec to refuse over.
+**Sessions, not native agent files.** dsh reads no ``~/.kiro/agents/<name>.json``.
+The runtime projects Crew's spec through ``DeepSeekMirror`` and passes the
+composed MCP array to the session. There is no ``--agent`` flag to verify.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from kiro_crew.acp.harness import deepseek as deepseek_mod
@@ -85,12 +83,17 @@ class DeepseekHarness(MembershipHarness):
         (Sage's review pool) has no provider behind it to apply one, so without
         ``session_model`` every review would silently run the seat's boot model.
         """
-        session = SimpleNamespace(
-            _deepseek_gate_nonce="",
-            _session_key=None,
-            _extra_env=dict(ctx.extra_env),
-            _spawn_work_dir=str(ctx.work_dir or "."),
+        from kiro_crew.acp.client import AcpClient
+
+        session = AcpClient(
+            work_dir=ctx.work_dir,
+            agent=ctx.agent,
+            model=ctx.model,
+            sandbox_mode=ctx.sandbox_mode,
+            extra_env=dict(ctx.extra_env),
+            acp_backend=self.backend,
         )
+        session._spawn_work_dir = str(ctx.work_dir or ".")
         plan = await self._launch.resolve_spawn(replace(ctx, session=session))
         return replace(plan, session_model=ctx.model or None)
 
@@ -117,9 +120,7 @@ class DeepseekHarness(MembershipHarness):
 
         loader_mod.strip_kiro_cli_api_key(env)
         self._launch.apply_spawn_env(env, spawned_binary=spawned_binary)
-        deepseek_env, _ = deepseek_mod._deepseek_vault_env()
-        env.update(deepseek_env)
-        deepseek_env.clear()
+        deepseek_mod._inject_deepseek_vault_env(env)
 
     @property
     def verifies_agent_activation(self) -> bool:
@@ -152,7 +153,7 @@ class DeepseekHarness(MembershipHarness):
         crew_panel: bool = False,
         session_key: str = "",
     ) -> SessionExtras:
-        """Empty. dsh has no custom-agent channel to register anything on."""
+        """No extra fields beyond the runtime's mirrored MCP array."""
         return SessionExtras()
 
     def session_mcp_servers(
@@ -163,12 +164,8 @@ class DeepseekHarness(MembershipHarness):
     ) -> list[dict[str, Any]]:
         """Pass the caller's array through unchanged.
 
-        dsh has no agent-spec mirror to subtract from (``providers/mirrors``
-        declares no projection for it), and what reaches the session is the
-        shared broker append the runtime composes for every mirror-less backend.
-        The direct runtime consumers this harness serves (Sage's review pool)
-        request no per-session servers at all, so this seam answers with exactly
-        what the caller asked.
+        The runtime has already composed the spec mirror and broker entries.
+        This seam adds no transport-specific filtering or duplicate projection.
         """
         return requested
 

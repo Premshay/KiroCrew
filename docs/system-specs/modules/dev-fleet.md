@@ -35,12 +35,23 @@ behind that facade is split by state and lifecycle ownership:
   subprocesses, and shutdown admission.
 - `repository.py` owns `MAIN_REPO`, repository discovery and validation, git/worktree
   access, and dirty-state inspection.
-- `live.py` owns live-target discovery, gateway restart backends, the Make Live lock and
-  committed-cutover latch, and rollback.
+- `live.py` owns the pointer-provider seam, live-target discovery (`_live_worktree_path`)
+  and its cache, the Make Live lock and committed-cutover latch, removal-lease acquisition
+  and the backend's lease client, the gateway restart, the cutover and its rollback. Its
+  owners hold the rest:
+  - `live_leases.py`: the gateway-held removal-lease and pod-start registries;
+  - `live_service.py`: the checkout probes discovery uses (own package, launchd program,
+    running checkout, staged target) and the live gateway as a service (unit and label,
+    systemd/launchd/foreground restart backend, service probes, the drop-in);
+  - `live_plan.py`: a cutover's dry-run plan, operator-facing text, and the Switch-back
+    undo-binding check (`_undo_binding_holds`).
 - `fleet_state.py` owns PR/context/resource caches, fleet projections and tombstones, and
   provision reattachment state.
-- `worktree_ops.py` owns pod actions, worktree remove/sync/rebase/prune orchestration, and
-  the background task handles.
+- `worktree_ops.py` owns rebase and prune orchestration and the background task handles.
+  Its owners hold the rest:
+  - `worktree_ops_pods.py`: pod actions and the per-worktree lock `_wt_lock`;
+  - `worktree_ops_removal.py`: removing one worktree, and `_GIT_MUTATION_LOCK`;
+  - `worktree_ops_sync.py`: Pull + Build sync of the main checkout.
 - `http_api.py` owns proxy HMAC verification, request/audit adapters, and response-shape
   translation.
 
@@ -51,12 +62,37 @@ authoritative instance. The facade forwards legacy private attribute reads, writ
 deletes to that owner, but tests patch the actual owner rather than treating the facade as
 a dependency-injection namespace.
 
+`live.py` and `worktree_ops.py` are in turn `kiro_crew._facade_mirror` facades over their
+`live_*` and `worktree_ops_*` owners: a name is still reached as `live.<name>` or
+`worktree_ops.<name>`, a patch through the facade reaches every owner holding the name,
+and each facade keeps the code that rebinds the state it shares. Owners never import
+their facade; new work goes to the owner of its responsibility.
+
 The split does not change lifecycle ordering. Shutdown first closes admission and
 snapshots active runs under the runtime admission lock, then kills process trees before
 cancelling their workers, and only then cancels the idle refresher/reaper/prune tasks.
 Destructive worktree operations retain the lock order `_wt_lock(name)` ->
 `_MAKE_LIVE_LOCK` -> `_GIT_MUTATION_LOCK`; changing either ordering can strand a build or
 deadlock removal against a live cutover.
+
+## Frontend component boundaries
+
+`website/src/pages/DevFleetPage.tsx` is the page and its only import path. It keeps
+the page's state, effects and actions (the sync and provision poll loops, the row
+actions, prune, restart and Make Live), the notification bus the page writes to,
+the log-window merge and the relative-time label. The owners beside it take new
+work for their part:
+
+- `devFleetPageModel.ts` owns the fleet payload types, the sync step-marker
+  protocol, the restart identity handshake and its route-independent watcher, the
+  provision progress model, the prune labels and the Switch back dismissal receipt.
+- `DevFleetPageMenus.tsx` owns the row-actions menu and the confirm popover.
+- `DevFleetPageRow.tsx` owns a row's action buttons, its Pull+Build and provision
+  steppers, the pod readout and the expanded detail panel.
+- `DevFleetPagePrune.tsx` owns the prune review and progress dialogs.
+- `DevFleetPageNotices.tsx` owns the notices between the header and the table.
+
+Every other module imports the page, never an owner.
 
 ## Main Checkout Discovery
 
@@ -228,17 +264,17 @@ verification. Route names below are relative to that prefix.
 | `/apps/dev-fleet/api/sync` | — | Pull main + rebuild (single-flight; a concurrent call is refused **409**) |
 | `/apps/dev-fleet/api/worktree/remove` | `{name, force?, discard_untracked_paths?}` | Remove a worktree (stops its pod and reclaims that pod's isolated HOME first); `discard_untracked_paths` is a list of non-empty paths, else `400 invalid_discard_paths` |
 | `/apps/dev-fleet/api/prune-run` | `{names[], force_names?, discard_untracked_paths?}` | Batch-remove eligible worktrees. `force_names` is a list of names to force-remove (`400 invalid_force_names` otherwise); `discard_untracked_paths` maps a worktree name to its list of paths (`400 invalid_discard_paths` otherwise). The main checkout and the live or staged worktree are never forced |
-| `/apps/dev-fleet/api/pod/up` | `{name}` | Start isolated pod instance (re-verifies the unit is active) |
+| `/apps/dev-fleet/api/pod/up` | `{name}` | Start isolated pod instance (re-verifies the unit is active). Boots with `--no-token`: this backend is sandboxed, so the pod would refuse its mint; the Open button gets the token from the gateway's `pod-token` route |
 | `/apps/dev-fleet/api/pod/down` | `{name}` | Stop pod instance (re-verifies the unit is gone before reporting success) |
-| `/apps/dev-fleet/api/pod/restart` | `{name}` | Stop then start pod |
-| `/apps/dev-fleet/api/pod/token` | `{name}` | Mint a dashboard token for the pod |
+| `/apps/dev-fleet/api/pod/restart` | `{name}` | Stop then start pod (same `--no-token` boot as `pod/up`) |
+| `/apps/dev-fleet/api/pod/token` | `{name}` | Refused with `code=wrong_process`: the mint moved to the gateway's `POST /api/apps/dev-fleet/pod-token` |
 | `/apps/dev-fleet/api/pod/provision` | `{name}` | Start async venv+dist build (returns `{run_id}`) |
 | `/apps/dev-fleet/api/pod/provision/dismiss` | `{name, run_id}` | Forget a terminal provision failure when the run id still matches |
 | `/apps/dev-fleet/api/rebase` | `{name}` | Rebase worktree onto `{remote}/{base branch}` |
 
-Six routes are served by the **gateway process** rather than the backend, under the
+Seven routes are served by the **gateway process** rather than the backend, under the
 in-gateway namespace `/api/apps/dev-fleet/` (`gateway_routes.py`, mounted by the
-`BUILTIN_NAMES` loop). `restart-gateway` and `make-live` are **dashboard-owner only**
+`BUILTIN_NAMES` loop). `restart-gateway`, `make-live` and `pod-token` are **dashboard-owner only**
 and refuse any app token. `live-target` and the three `live-target/removal-lease`
 verbs admit ONLY Dev Fleet's own app token (`_principal_is_backend`); a dashboard
 human and any other app's token are refused:
@@ -247,7 +283,8 @@ human and any other app's token are refused:
 |---|---|---|
 | `POST /api/apps/dev-fleet/restart-gateway` | — | Restart the live gateway through its service-manager backend; returns the pre-restart `start_id` for the restart handshake |
 | `POST /api/apps/dev-fleet/make-live` | `{path, dry_run?, undo?, expected_staged?}` | Repoint the live gateway at another worktree (see Make Live); a real cutover returns `start_id` for the restart handshake |
-| `GET /api/apps/dev-fleet/live-target` | `?fresh=1` | The pointer-state read broker `{live, staged, staged_cancel_available, previous}` (`previous` is the pointer's validated one-level undo target, so the fleet's Undo banner needs no pointer read of its own) — admits ONLY Dev Fleet's own app token (how the sandboxed backend learns which row is live); a dashboard human and any other app's token are refused |
+| `POST /api/apps/dev-fleet/pod-token` | `{name}` | Mint the pod's 2h dashboard token for the row's Open button; answers `{ok, token, url}`. Here because the pod's `/api/token/local` certifies only a caller in the gateway's own namespaces (see *Token mint runs in the gateway*), so a mint from the sandboxed backend is always refused. App tokens are refused because Dev Fleet's is readable by every build child in the backend's namespace, and a pod runs outside the sandbox |
+| `GET /api/apps/dev-fleet/live-target` | `?fresh=1` | The pointer-state read broker `{live, staged, staged_cancel_available, previous, live_verified}` (`previous` is the pointer's validated one-level undo target, so the fleet's Undo banner needs no pointer read of its own; `live_verified` is false when `live` is the pointer's target taken on trust because a packaged gateway has no running checkout to compare it with) — admits ONLY Dev Fleet's own app token (how the sandboxed backend learns which row is live); a dashboard human and any other app's token are refused |
 | `POST /api/apps/dev-fleet/live-target/removal-lease` | `{path}` | Lease a worktree before `git worktree remove`, so a cutover or a gateway restart cannot land mid-deletion; answers `{ok, granted, token}`, refused while a cutover is in flight. The token is the capability to renew or release |
 | `PUT /api/apps/dev-fleet/live-target/removal-lease` | `{token}` | Renew the lease; `{ok, renewed}`, where `false` means it is gone and the holder must not start a mutation it has not started |
 | `DELETE /api/apps/dev-fleet/live-target/removal-lease` | `{token}` | Release the lease; idempotent, and a token that names no lease is a no-op |
@@ -255,7 +292,8 @@ human and any other app's token are refused:
 Why these routes run in the gateway: they write or read the live-target pointer (or hold its cutover latch), and
 that file is bind-masked from the sandboxed backend **and every child it spawns** — a
 nested sandbox is denied by design, so a worktree's `npm ci` lifecycle script runs in the
-backend's namespace. See *Make Live → Pointer file*.
+backend's namespace. See *Make Live → Pointer file*. `pod-token` is the exception: it
+needs the gateway's host namespaces, not the pointer.
 
 ### Agent surface (gateway process, `/api/apps/dev-fleet/pod/*`)
 
@@ -346,6 +384,11 @@ Contract:
   the pod accepts. This does NOT widen `/api/token/local`: a sandboxed foreign
   process is still refused; the fix only moves the mint to a process the gate
   already trusts.
+  The same rule applies to the dashboard's buttons, whose `worktree_ops` calls run
+  in the sandboxed backend (`live.running_in_backend()`): there `_pod_up` still
+  boots with `--no-token` but skips the mint, and `_pod_token` refuses with
+  `code=wrong_process`. The Open button mints through the gateway's owner-only
+  `POST /api/apps/dev-fleet/pod-token` instead.
 - **Refusals are 409 with a literal `code`** (`pod_up_failed`, `pod_down_failed`,
   `pod_status_failed`, `pod_list_failed`); malformed input is 400
   (`invalid_worktree`, `invalid_body`). A refused lifecycle op is a host-state
@@ -361,8 +404,15 @@ Contract:
 The model-facing half is the `pod_up` / `pod_down` / `pod_status` / `pod_ls` tools on
 `kirocrew-core` (`mcp_tools/apps.py`). The pod token is returned to the agent
 verbatim — redacting it would hand back an unusable handle — which is safe because it
-is a 2h credential scoped to that pod's own gateway, minted server-side from the
+is a credential scoped to that pod's own gateway, minted server-side from the
 pod's own internal-API credential so the agent never touches the secret itself.
+The token carries two limits and `pod_up` names both: the raw token is accepted only
+within the link window (5 minutes), and the first request that carries it opens a
+pod session, kept in a cookie, that lasts 2h. The `pod/up` route reads both from the
+minted token's own `exp`, `session_exp` and `iat` claims and returns them as
+`link_ttl_secs` and `session_ttl_secs`. The gateway does not hold the pod's secret,
+so it reads those claims unverified; they are display-only and the pod enforces the
+limits. `pod_up` on a running pod leaves it running and returns a fresh token.
 
 ## Authorization
 
@@ -1520,6 +1570,14 @@ choose the gateway's next image. Instead:
   worktree removal and the prune override screen **refuse**, because "nothing is
   live" from an outage would let a removal delete a staged cutover target. Toasts
   on those refusals carry the plain sentence; the exception text stays in the log.
+- **The live badge says whether it is confirmed.** The fleet payload carries
+  `live_verified`: false only when a packaged / site-packages gateway has no
+  running checkout, so `_live_worktree_path` takes the pointer's target on trust
+  (`PointerState.live_verified` is false). The row keeps `is_live` (the removal
+  guards still protect it), but the page shows a **live?** badge with the reason
+  as visible text beside it ("Packaged install: can't confirm this checkout is
+  running.", also the badge's `title`) instead of the plain **live** badge. A pointer outage is
+  `live_state_known: false`, not this field.
 - **No inline filesystem reads on the gateway loop.** `_make_live_inner` now runs
   on the loop that serves the whole dashboard, so every probe of the pointer, the
   checkout path or the service drop-in (`snapshot`, `_staged_target`, `exists`,
@@ -1866,6 +1924,17 @@ Two different jobs live in that one dict, and they are worth keeping apart:
   leaves the other as an unpinned way to name the same exec. The trigger is pinned
   beside the programs, because a program name is a value and this is a place not
   to depend on one.
+
+  The `core.hooksPath` pin above reaches only git's hook DIRECTORY; it does
+  not reach a config-defined hook (`hook.<name>.command`, git 2.54+), whose
+  name the repo chooses. So every git command this module runs is
+  additionally given `-c hook.<name>.enabled=false` for each config hook git
+  can see, plus the submodule-recursion pins, injected per call as `-c` flags
+  by `runtime._with_config_hooks_off` (which calls
+  `git_config_hooks.config_hook_disable_args`) rather than through the env
+  dict, because the hook names are read per repository. A scan that cannot
+  list those names safely fails the command closed (`ConfigHookScanError`,
+  surfaced as `git hook config refused`).
 - **What git writes on a read.** `GIT_OPTIONAL_LOCKS=0` is also not a config key.
   `git status` refreshes the index's stat cache and saves it back under
   `index.lock`, so a command that is a read to its caller is a **write** to the
@@ -2134,8 +2203,8 @@ stages no top-level `skills/` tree.
 Skills are registered as symlinks into `~/.kiro/crew/skills/` via the app bridge at
 two lifecycle points:
 
-1. **On enable** — `register_app()` in `bridges.py` creates namespaced + flat symlinks
-2. **On gateway startup** — `reconcile_app_skills()` in `bridges.py` (called from
+1. **On enable** — `register_app()` in `bridges_register.py` creates namespaced + flat symlinks
+2. **On gateway startup** — `reconcile_app_skills()` in `bridges_skills.py` (called from
    `start_enabled_app_backends()`) ensures manifest-declared skills are linked for
    already-enabled apps, creating missing symlinks and removing stale ones for skills
    dropped from the manifest since the last registration

@@ -61,12 +61,12 @@ The reader line it should have carried, with the test that now pins it:
 Reader: src/kiro_crew/cron_script.py:run_script_sandboxed -- app -- test_app_script_cron_sibling_import.py::TestAScriptCronNamingTheBundle
 ```
 
-**#12798, delete.** It pruned sync-generated crewmate `config.agents` rows after
+**#12798, delete.** It pruned sync-generated mate `config.agents` rows after
 checking only the Crew page. Chat resume, subagent continue/spawn and the prompt
 builder still read those rows. Fixed by #16016 and #16033. Its reader lines:
 
 ```
 Reader: src/kiro_crew/session_agent_selection.py:resolve_session_agent_bindings -- chat -- test_resume_after_crewmate_prune_resolves_installed_agent
-Reader: src/kiro_crew/subagent_manager/admission/gate.py:resolve_spawn_execution -- subagent -- test_pruned_crewmate_records.py
+Reader: src/kiro_crew/subagent_manager/admission/gate_execution.py:resolve_spawn_execution -- subagent -- test_pruned_crewmate_records.py
 Reader: src/kiro_crew/execution_context.py:execution_from_record -- subagent -- test_decoder_reads_a_pruned_synced_crewmate_as_its_template
 ```

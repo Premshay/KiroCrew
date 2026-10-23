@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
+import { OverlayPortal } from './overlayRoot'
 import { ArrowUpFromLine, Check, ChevronDown, Sparkles, Target } from 'lucide-react'
 import { useMenuKeyboard } from '../hooks/useMenuKeyboard'
 import { useAnchorRemeasure } from '../hooks/useAnchorRemeasure'
@@ -171,6 +171,7 @@ export default function BusySendButton({
   disabledReason,
   altChordAvailable = false,
   autoAvailable = false,
+  onPicked,
 }: {
   mode: BusySendMode
   onModeChange: (m: BusySendMode) => void
@@ -193,6 +194,13 @@ export default function BusySendButton({
    * in `enter-ctrl-newline` inserts a newline.
    */
   altChordAvailable?: boolean
+  /** Where focus goes after a PICK closes the menu. Without it the caret
+   *  trigger takes focus back, which is right for Escape (the user returns to
+   *  where they were) but wrong after choosing steer/queue: the caret is a
+   *  button, so the Enter meant as "send" re-opens the menu (#18313). The
+   *  host owns the composer and returns `true` when it took focus; `false`
+   *  (touch: focusing the box pops the keyboard) falls back to the caret. */
+  onPicked?: () => boolean
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuRect, setMenuRect] = useState<DOMRect | null>(null)
@@ -212,7 +220,7 @@ export default function BusySendButton({
 
   useEffect(() => {
     if (!menuOpen) return
-    // Menu is portaled to <body> (escapes the composer's overflow-hidden), so the
+    // Menu is portaled to the body-level overlay root (escapes the composer's overflow-hidden), so the
     // outside-click guard must exclude both the split button and the menu.
     const h = (e: MouseEvent) => {
       const t = e.target as Node
@@ -236,7 +244,10 @@ export default function BusySendButton({
   }
   const select = (m: BusySendMode) => {
     onModeChange(m)
-    closeToTrigger()
+    setMenuOpen(false)
+    // A pick is a finished action whose next step is the composer; only a
+    // cancel (Escape above) returns to the caret unconditionally.
+    if (!onPicked?.()) caretRef.current?.focus()
   }
 
   return (
@@ -270,7 +281,7 @@ export default function BusySendButton({
           <ChevronDown size={14} className={`transition-transform ${menuOpen ? 'rotate-180' : ''}`} />
         </button>
       </div>
-      {menuOpen && menuRect && createPortal(
+      {menuOpen && menuRect && <OverlayPortal>
         <div
           ref={menuRef}
           role="menu"
@@ -322,9 +333,8 @@ export default function BusySendButton({
                 : i18nT('components.chatInput.alt_action_hint_queues', { chord: platformShortcut('Cmd+Enter') })}
             </div>
           )}
-        </div>,
-        document.body
-      )}
+        </div>
+      </OverlayPortal>}
     </div>
   )
 }

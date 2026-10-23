@@ -7,15 +7,23 @@ against the real ``/proc`` of the test process.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import sys
 import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from kiro_crew.dashboard.stall_enrichment import (
+    _callable_name,
     _decode_proc_addr,
     _established_lines,
     _event_loop_stack_lines,
     collect_stall_enrichment,
+    describe_loop_thread,
 )
+from kiro_crew.testing.wait import wait_until
 
 
 def test_decode_proc_addr_ipv4() -> None:
@@ -78,16 +86,115 @@ def test_collect_never_raises_even_if_silence_weird() -> None:
     assert collect_stall_enrichment(1e9)
 
 
-def test_event_loop_stack_is_bounded_and_path_shortened() -> None:
-    frame = sys._getframe()
-    thread_id = threading.main_thread().ident
-    assert thread_id is not None
+# ── Where the loop thread is ─────────────────────────────────────────────────
 
-    lines = _event_loop_stack_lines({thread_id: frame})
+_HANDLE_RUN = asyncio.events.Handle._run.__code__
 
-    assert lines[0] == "EVENT LOOP STACK (outermost -> innermost):"
-    assert len(lines) <= 21
-    assert any("test_stall_enrichment.py" in line for line in lines)
+
+@contextmanager
+def loop_thread() -> Iterator[tuple[asyncio.AbstractEventLoop, int]]:
+    """An event loop running on its own thread; yields ``(loop, thread ident)``."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, name="test-stall-loop", daemon=True)
+    thread.start()
+    started = threading.Event()
+    loop.call_soon_threadsafe(started.set)
+    assert started.wait(5.0)
+    assert thread.ident is not None
+    try:
+        yield loop, thread.ident
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5.0)
+        loop.close()
+
+
+def wait_until_inside_handle(thread_id: int) -> None:
+    """Block until the loop thread's innermost frame is asyncio's ``Handle._run``."""
+
+    def _inside_handle() -> bool:
+        frame = sys._current_frames().get(thread_id)
+        return frame is not None and frame.f_code is _HANDLE_RUN
+
+    wait_until(
+        _inside_handle,
+        timeout=5.0,
+        describe=lambda: "the loop thread never entered the scheduled callback",
+    )
+
+
+def test_loop_thread_capture_names_a_native_callback() -> None:
+    # A native callable scheduled straight onto the loop leaves Handle._run as
+    # the innermost Python frame; the capture names what that handle runs.
+    gate = threading.Lock()
+    gate.acquire()
+    with loop_thread() as (loop, thread_id):
+        loop.call_soon_threadsafe(gate.acquire)
+        try:
+            wait_until_inside_handle(thread_id)
+            lines = describe_loop_thread(thread_id)
+        finally:
+            gate.release()
+
+    # The line number is the Python version's own; the file and function are not.
+    assert lines[0].startswith(f"loop thread {thread_id:#x} is at (asyncio/events.py:")
+    assert lines[0].endswith("):_run")
+    assert lines[1:] == [
+        "  asyncio Handle._run is running _thread.lock.acquire "
+        "(a native callable with no Python frame of its own)"
+    ]
+
+
+def test_loop_thread_capture_shows_a_python_callback_frame() -> None:
+    gate = threading.Lock()
+    gate.acquire()
+
+    def hold() -> None:
+        gate.acquire()  # the innermost Python frame is this function's
+        gate.release()
+
+    with loop_thread() as (loop, thread_id):
+        loop.call_soon_threadsafe(hold)
+        try:
+            lines: list[str] = []
+
+            def _in_hold() -> bool:
+                nonlocal lines
+                lines = describe_loop_thread(thread_id)
+                return lines[0].endswith("):hold")
+
+            wait_until(_in_hold, timeout=5.0, describe=lambda: lines)
+        finally:
+            gate.release()
+
+    assert lines == [lines[0]]
+    assert lines[0].startswith(f"loop thread {thread_id:#x} is at (")
+    assert "test_stall_enrichment.py:" in lines[0]
+    assert lines[0].endswith("):hold")
+
+
+def test_loop_thread_capture_without_a_known_thread() -> None:
+    assert describe_loop_thread(None) == []
+    absent = max(sys._current_frames()) + 1
+    assert describe_loop_thread(absent) == [f"(loop thread {absent:#x} has no Python frame)"]
+
+
+class _ReprBomb:
+    def __repr__(self) -> str:  # pragma: no cover - the point is that nothing calls it
+        raise AssertionError("the capture must not call __repr__")
+
+    def method(self) -> None:  # pragma: no cover - never called
+        pass
+
+
+def test_callable_name_reads_attributes_only() -> None:
+    bomb = _ReprBomb()
+    assert _callable_name(functools.partial(bomb.method, bomb)) == (
+        f"{__name__}._ReprBomb.method",
+        False,
+    )
+    assert _callable_name(time.sleep) == ("time.sleep", True)
+    assert _callable_name([].append) == ("builtins.list.append", True)
 
 
 class _DumpFile:
@@ -217,3 +324,15 @@ def test_lag_episodes_inside_the_cooldown_capture_once(caplog) -> None:
     _beat(wd, 3.0)
     assert calls == [3.0, 3.0]
     assert dump_file.writes == []
+
+
+def test_event_loop_stack_is_bounded_and_path_shortened() -> None:
+    frame = sys._getframe()
+    thread_id = threading.main_thread().ident
+    assert thread_id is not None
+
+    lines = _event_loop_stack_lines({thread_id: frame})
+
+    assert lines[0] == "EVENT LOOP STACK (outermost -> innermost):"
+    assert len(lines) <= 21
+    assert any("test_stall_enrichment.py" in line for line in lines)

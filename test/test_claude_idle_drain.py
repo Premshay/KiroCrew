@@ -167,6 +167,22 @@ class TestIdleRouting:
         assert client._claude_inbox.qsize() == 1
 
 
+@pytest.mark.asyncio
+async def test_malformed_autonomous_permission_is_refused(tmp_path, monkeypatch):
+    client = _client(tmp_path)
+    monkeypatch.setattr(client, "_build_permission_event", lambda _message: None)
+    send_error = AsyncMock()
+    reject_tool = AsyncMock()
+    monkeypatch.setattr(client, "_send_error", send_error)
+    monkeypatch.setattr(client, "reject_tool", reject_tool)
+    request = JsonRpcMessage(id=7, method="session/request_permission", params={})
+
+    await client._collect_claude_autonomous_frame(request)
+
+    send_error.assert_awaited_once_with(7, -32600, "invalid request id")
+    reject_tool.assert_not_awaited()
+
+
 def _tool_done_frame(call_id: str = "t1", output: str = "ok") -> JsonRpcMessage:
     return JsonRpcMessage(
         method=METHOD_SESSION_UPDATE,
@@ -259,9 +275,7 @@ class TestStretchTail:
         assert client._claude_inbox.qsize() == 2
 
     @pytest.mark.asyncio
-    async def test_a_prompt_absorbed_by_an_autonomous_cycle_still_gets_its_response(
-        self, tmp_path
-    ):
+    async def test_a_prompt_absorbed_by_an_autonomous_cycle_still_gets_its_response(self, tmp_path):
         """chat-1979, 2026-10-09 03:42Z: a background task woke Claude between turns,
         and an auto-nudge prompt sent during that cycle was absorbed into it. The
         prompt's session/prompt response arrived while the cycle was still being
@@ -294,8 +308,10 @@ class TestStretchTail:
         client._claude_dispatch_depth = 1
         notification = JsonRpcMessage(
             method="_claude/sdkMessage",
-            params={"sessionId": "sess-1",
-                    "message": {"type": "user", "origin": {"kind": "task-notification"}}},
+            params={
+                "sessionId": "sess-1",
+                "message": {"type": "user", "origin": {"kind": "task-notification"}},
+            },
         )
 
         assert client._extract_text_chunk(_text_frame("Ending the turn."))[0] == "Ending the turn."

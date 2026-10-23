@@ -10,8 +10,8 @@ The channel is the one already measured for the stubs
 the ``session/new`` ``mcpServers`` array, mounted and called by the harness itself. So
 the array's MECHANICS are the sibling single-binary harnesses' -- the shared
 translation, the ``tools`` allowlist, the control-plane re-derivation and the
-one-owner rule for the pooled stubs -- and this module DELEGATES to
-:func:`~kiro_crew.providers.mirrors.opencode.opencode_projection` as goose does.
+one-owner rule for the pooled stubs -- through
+:func:`~kiro_crew.providers.mirrors.opencode.place_single_binary_array` as goose does.
 
 What is deepseek's, and changes no projection rule:
 
@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 from typing import Any
 
+from kiro_crew.acp.session_mcp import session_mcp_projection
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_DEEPSEEK
 from kiro_crew.providers.mirrors.base import (
     AgentConfigMirror,
@@ -38,7 +39,7 @@ from kiro_crew.providers.mirrors.base import (
     Ruling,
     SessionProjection,
 )
-from kiro_crew.providers.mirrors.opencode import opencode_projection
+from kiro_crew.providers.mirrors.opencode import place_single_binary_array
 
 __all__ = ["DeepSeekMirror", "deepseek_projection"]
 
@@ -59,15 +60,34 @@ def deepseek_projection(
     for both halves of the array, a server narrowed per tool withheld whole, and Crew's
     own control plane withheld on the same terms. Named here so the day deepseek gains
     a per-call deny channel this is the one function that changes.
+
+    Nothing is caught here, as in goose: an unreadable spec already reads as no spec
+    inside the projection, so the one thing that raises is the freshness gate's
+    ``DerivedSpecStale``, and that has to reach the spawn so it is refused.
     """
-    return opencode_projection(
+    projection = session_mcp_projection(
         agent,
         stub_server_names=stub_server_names,
+        work_dir=work_dir,  # type: ignore[arg-type]
+    )
+    narrowed = frozenset(server for server, _tool in projection.disabled_tools)
+    out = place_single_binary_array(
+        projection,
+        label="deepseek",
+        unhonoured=narrowed,
         stub_elements=stub_elements,
-        work_dir=work_dir,
         session_key=session_key,
         channel_id=channel_id,
         session_token=session_token,
+    )
+    return SessionProjection(
+        params={"mcpServers": out},
+        disabled_servers=projection.disabled_servers,
+        restricted_servers=narrowed,
+        unhonoured_servers=narrowed,
+        zero_tools=projection.zero_tools,
+        derived_spec_snapshot=projection.derived_spec_snapshot,
+        agent_spec=projection.agent_spec,
     )
 
 

@@ -384,7 +384,7 @@ def shared_topo(tmp_path: Path) -> ProcessTopology:
     t.add(KIRO_CLI, SESSION_HOST)
     t.add(MCP_SERVER, KIRO_CLI)
     # The founder published; the co-tenant did not (a shared subagent session
-    # deliberately does not overwrite the mapping — subagent_manager/run.py
+    # deliberately does not overwrite the mapping — subagent_manager/run_turn.py
     # guards the publish on ``not use_session_sharing``). So line 1 stays the
     # founder's key for every reader that predates the tenant section, and the
     # section is what records the second session.
@@ -553,6 +553,127 @@ def test_mcp_core_names_the_co_tenant_from_its_own_token(shared_topo, monkeypatc
     monkeypatch.setattr(mcp_caller, "_parent_pid", shared_topo.parent_lookup("host"))
     monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: shared_topo.cfg_dir)
     assert mcp_core._resolve_session_key() == CO_TENANT_KEY
+
+
+# -- the strict resolver's env-var source on a shared pid -------------------
+
+
+def _wire_strict_env(monkeypatch, cfg_dir: Path, env_key: str, *, tenants) -> None:
+    """Run as an MCP child of a runtime whose SIGNED mapping names *tenants*.
+
+    Published through ``publish_session_pid`` itself rather than the model's own
+    writer, so the bytes and the tenant section are the publisher's. Both guards
+    read the mapping UNSIGNED on purpose -- they only ever DENY an identity -- so
+    the sidecar is not what makes this fixture work; the tenant section is.
+    ``_wire_shared`` deliberately clears both env vars to
+    exercise the walk, so the env-var source needs them put back -- *env_key* is
+    the value the runtime was stamped with, and ``KIROCREW_HOST_PID`` names the
+    runtime whose mapping says how many sessions it serves. ``tenants=None``
+    publishes nothing at all.
+    """
+    from kiro_crew import session_pid_sig
+
+    topo = ProcessTopology(cfg_dir)
+    topo.add(GATEWAY, 1)
+    topo.add(SESSION_HOST, GATEWAY)
+    topo.add(KIRO_CLI, SESSION_HOST)
+    topo.add(MCP_SERVER, KIRO_CLI)
+    _wire_shared(monkeypatch, topo)
+    monkeypatch.setattr(session_pid_sig, "config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr(session_pid_sig.platform_compat, "get_process_start_id", lambda pid: None)
+    if tenants is not None:
+        session_pid_sig.publish_session_pid(KIRO_CLI, SESSION_KEY, co_tenants=tenants)
+    monkeypatch.setenv("KIROCREW_SESSION_KEY", env_key)
+    monkeypatch.setenv("KIROCREW_HOST_PID", str(KIRO_CLI))
+
+
+def test_strict_refuses_the_env_var_on_a_shared_pid(tmp_path, monkeypatch) -> None:
+    """THE property. The env var is stamped once per runtime and inherited by
+    every MCP child of it, so on a runtime serving two sessions it names one of
+    them and cannot say which is calling. Answering hands this caller the
+    co-tenant's identity, and a state-mutating tool then writes that session's
+    state -- which is a work_report landing on another worker's item."""
+    from kiro_crew import mcp_core
+
+    _wire_strict_env(monkeypatch, tmp_path, SESSION_KEY, tenants=[SESSION_KEY, CO_TENANT_KEY])
+    assert mcp_core._resolve_session_key_strict() == ""
+
+
+def test_strict_refuses_even_when_the_env_var_names_the_other_tenant(tmp_path, monkeypatch) -> None:
+    """The value is the same for every child of the runtime, so which tenant it
+    happens to name changes nothing about who is calling."""
+    from kiro_crew import mcp_core
+
+    _wire_strict_env(monkeypatch, tmp_path, CO_TENANT_KEY, tenants=[SESSION_KEY, CO_TENANT_KEY])
+    assert mcp_core._resolve_session_key_strict() == ""
+
+
+def test_strict_keeps_the_env_var_on_a_sole_tenant_pid(tmp_path, monkeypatch) -> None:
+    """The control, and the compatibility guarantee: one session on the pid means
+    the env var names it, and that is the topology the var was written for."""
+    from kiro_crew import mcp_core
+
+    _wire_strict_env(monkeypatch, tmp_path, SESSION_KEY, tenants=[SESSION_KEY])
+    assert mcp_core._resolve_session_key_strict() == SESSION_KEY
+
+
+def test_strict_keeps_the_env_var_when_no_mapping_is_published(tmp_path, monkeypatch) -> None:
+    """Absence is not evidence of sharing. A deployment that publishes no mapping
+    keeps the env var exactly as authoritative as it was, so the guard costs an
+    unshared install nothing."""
+    from kiro_crew import mcp_core
+
+    _wire_strict_env(monkeypatch, tmp_path, SESSION_KEY, tenants=None)
+    assert mcp_core._resolve_session_key_strict() == SESSION_KEY
+
+
+def test_the_shared_ladder_refuses_the_env_var_on_a_shared_pid(tmp_path, monkeypatch) -> None:
+    """The env rung of ``resolve_own_identity`` holds the same line.
+
+    That ladder is the one client-side resolver every consumer shares, so
+    guarding only the strict helper would leave the identical process-keyed rung
+    answering with a co-tenant's key for every caller that goes through it.
+    """
+    from kiro_crew import mcp_caller
+
+    _wire_strict_env(monkeypatch, tmp_path, SESSION_KEY, tenants=[SESSION_KEY, CO_TENANT_KEY])
+    ident = mcp_caller.resolve_own_identity()
+    assert ident.source != mcp_caller.SOURCE_ENV
+    assert ident.session_key != SESSION_KEY
+
+
+def test_the_shared_ladder_keeps_the_env_var_on_a_sole_tenant_pid(tmp_path, monkeypatch) -> None:
+    """The control: one session on the pid and the env rung answers as it always did."""
+    from kiro_crew import mcp_caller
+
+    _wire_strict_env(monkeypatch, tmp_path, SESSION_KEY, tenants=[SESSION_KEY])
+    ident = mcp_caller.resolve_own_identity()
+    assert (ident.session_key, ident.source) == (SESSION_KEY, mcp_caller.SOURCE_ENV)
+
+
+def test_a_parent_with_no_usable_token_is_refused_on_a_shared_runtime(
+    tmp_path, monkeypatch
+) -> None:
+    """The deliberate trade, pinned so it is a decision and not an oversight.
+
+    A ``session_sharing`` parent whose own token cannot be verified -- the SEL
+    trust root is missing, so the token channel fails closed -- is refused on a
+    runtime a subagent has joined, EVEN THOUGH the runtime's env var names that
+    parent. The parent loses the tools that demand a strict identity until a
+    usable token names it.
+
+    This is chosen over the alternative. Answering would hand the parent's key to
+    whichever of the two sessions is calling, and the subagent is the one that
+    would then write the parent's state. A refusal that names its reason is
+    recoverable; a silent write to another session's state is not.
+    """
+    from kiro_crew import mcp_core
+
+    _wire_strict_env(monkeypatch, tmp_path, SESSION_KEY, tenants=[SESSION_KEY, CO_TENANT_KEY])
+    assert mcp_core._resolve_session_key_strict() == ""
+    # And the diagnosis is reachable, so an operator is not left guessing.
+    assert isinstance(mcp_core.strict_identity_diagnosis(), str)
 
 
 # -- walk copy 3: the policy walk in mcp_shared -----------------------------
@@ -1111,14 +1232,18 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "which from_env reads above its own cache so a warm-pool rekey stays "
         "visible"
     ),
-    "mcp_core.py": (
+    "mcp_core_parts/identity.py": (
         "stale-file cleanup glob only (assumes HOST pids) — its lenient "
         "resolver no longer carries a walk of its own and delegates to "
         "mcp_caller.resolve_own_identity; the STRICT path delegates to "
         "session_pid_sig.verify_session_pid (HMAC-verified, direct "
         "KIROCREW_HOST_PID lookup, no walk)"
     ),
-    "mcp_gateway/stub.py": "reader via CallerContext.from_env; register-time caller block — assumes HOST pids",
+    "mcp_gateway/stub.py": (
+        "warm-pool caller repair: polls until the claimed session's key resolves, then "
+        "re-sends the caller block stub_register builds — assumes HOST pids"
+    ),
+    "mcp_gateway/stub_register.py": "reader via CallerContext.from_env; register-time caller block — assumes HOST pids",
     "peer_resolve.py": (
         "reader: the SERVER-side /proc ancestry walk (extracted from "
         "mcp_gateway/gatewayd._resolve_peer_identity, which now delegates "
@@ -1127,10 +1252,10 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "plus the host ancestor chain (gatewayd indexes the chain for "
         "claim-push matching); .txt reads via "
         "session_pid_sig.read_session_pid_txt (hardened, unsigned). Consumed "
-        "by gatewayd (stub register) and dashboard/token_auth (unix-socket "
+        "by gatewayd (stub register) and dashboard/token_auth_callers (unix-socket "
         "peer verification)"
     ),
-    "dashboard/token_auth.py": (
+    "dashboard/token_auth_callers.py": (
         "reader (via peer_resolve.resolve_peer_identity, no inline walk): "
         "kernel-attests internal-API requests arriving on the dashboard's "
         "AF_UNIX socket — SO_PEERCRED peer pid → host-namespace ancestry walk "
@@ -1151,6 +1276,10 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "in a home the real gateway never writes"
     ),
     "session_pid.py": (
+        "docstring and comment reference only (no code reads): the startup sweep "
+        "names the session_pid_mappings prune it runs as its third pass"
+    ),
+    "session_pid_mappings.py": (
         "stale-file cleanup: globs session_pid_*.txt (+ .sig sidecars) for dead "
         "processes, and (age-bounded) session_token_*.sig mappings, whose "
         "token-hash filenames name no pid to probe"
@@ -1268,10 +1397,10 @@ def test_reflexive_tools_route_through_the_strict_gate() -> None:
         if _REFLEXIVE_GATE_CALL.search(text):
             gated.add(rel)
 
-    # 1. The gate is the ONLY caller of the strict resolver. mcp_core.py hosts
-    #    both, plus the resolver's own internal consumers (diagnosis, the
+    # 1. The gate is the ONLY caller of the strict resolver. mcp_core_parts/identity.py
+    #    hosts both, plus the resolver's own internal consumers (diagnosis, the
     #    Slack identity classifier), so it is the single permitted file.
-    direct -= {"mcp_core.py"}
+    direct -= {"mcp_core_parts/identity.py"}
     assert not direct, (
         f"Direct _resolve_session_key_strict() call(s) outside mcp_core: "
         f"{sorted(direct)}.\n"
@@ -1283,7 +1412,7 @@ def test_reflexive_tools_route_through_the_strict_gate() -> None:
 
     # 2. Every module calling the gate is registered as reflexive, and every
     #    registered module still calls it — the set is data, not lore.
-    gated -= {"mcp_core.py"}
+    gated -= {"mcp_core_parts/identity.py", "mcp_core_parts/governance.py"}
     registered = set(REFLEXIVE_TOOL_MODULES)
     unregistered = gated - registered
     stale = registered - gated

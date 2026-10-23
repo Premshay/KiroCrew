@@ -4,7 +4,6 @@ import {
   AlertTriangle,
   ArrowRight,
   Boxes,
-  CheckCircle2,
   ChevronDown,
   Download,
   ExternalLink,
@@ -19,7 +18,7 @@ import {
   type AcpBackendProbe,
   type KiroPrerequisiteStatus,
 } from '../api/client'
-import { ACP_BACKEND_KAS, ACP_BACKEND_KIRO, acpBackendName, acpProbeConfirmsUse, agentChoiceSaved, setupMarkerErrorBody, setupMarkerErrorMessage } from '../api/acpBackend'
+import { ACP_BACKEND_KAS, ACP_BACKEND_KIRO, acpBackendName, acpProbeConfirmsUse, agentChoiceSaved, configuredAcpBackend, setupMarkerErrorBody, setupMarkerErrorMessage } from '../api/acpBackend'
 import { clearCachedModels } from '../providers/adapters/acp'
 import {
   PANEL_CLASS,
@@ -30,8 +29,9 @@ import {
 } from './OnboardingChapterShell'
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
 import { useScrollEdgesY } from '../hooks/useScrollEdges'
-import { Badge, Btn, Card, SendBtn } from './ui'
+import { Btn, Card, SendBtn } from './ui'
 import ErrorNotice from './ErrorNotice'
+import { KiroUnzipPrerequisite } from './KiroUnzipPrerequisite'
 import {
   AgentDetailActions,
   AgentInstallDetail,
@@ -174,20 +174,6 @@ function SetupShell({
   )
 }
 
-function StepStatus({
-  complete,
-  current,
-}: {
-  complete: boolean
-  current: boolean
-}) {
-  if (complete) {
-    return <Badge variant="ok"><CheckCircle2 className="lucide-inline" /> {i18nT('components.kiroPrerequisiteGate.complete')}</Badge>
-  }
-  return <Badge variant={current ? 'aim' : 'muted'}>{current ? i18nT('components.kiroPrerequisiteGate.required') : i18nT('components.kiroPrerequisiteGate.waiting')}</Badge>
-}
-
-
 function OwnerSetupRequired({
   retrying,
   onRetry,
@@ -278,7 +264,7 @@ function SetupStatusError({
   return (
     <SetupShell>
       <>
-        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-danger/10 text-danger">
+        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-danger/10 text-danger-text">
           <AlertTriangle className="lucide-inline" />
         </div>
         <p className="mt-6 text-[12px] font-bold uppercase tracking-[0.16em] text-danger">
@@ -287,14 +273,12 @@ function SetupStatusError({
         <h1 className="mt-2 text-3xl font-bold tracking-tight text-text-strong">
           {i18nT('components.kiroPrerequisiteGate.we_could_not_check_kiro_cli')}
         </h1>
-        {/* No hand-off: this gate stands between the user and the chat the
-            hand-off would navigate to, and the failure is that kiro-cli — the
-            agent runtime — could not even be checked, so there is no agent to
-            hand it to. Try again is the remedy. */}
+        {/* Try again is the remedy. */}
         <ErrorNotice
           className="mt-3 max-w-lg text-left"
           message={asSentence(message)}
           testId="kiro-gate-status-error"
+          noHandoffReason="this gate stands between the user and the chat the hand-off would open, and kiro-cli, the agent runtime, could not even be checked, so there is no agent to hand it to"
         />
         <p className="mt-3 max-w-lg text-sm leading-relaxed text-muted">
           {i18nT('components.kiroPrerequisiteGate.retry_the_gateway_check_before_starting_a_sessio')}
@@ -583,7 +567,7 @@ function SandboxUnavailable({
   // A momentary failure that clears on retry should not be dressed in the same
   // alarm red as a host-level verdict — the body immediately walks that back.
   const transient = failureKind === 'transient'
-  const tone = transient ? 'bg-accent-subtle text-accent' : 'bg-danger/10 text-danger'
+  const tone = transient ? 'bg-accent-subtle text-accent' : 'bg-danger/10 text-danger-text'
   const eyebrowTone = transient ? 'text-accent' : 'text-danger'
   return (
     <SetupShell
@@ -721,14 +705,13 @@ function CliOutdated({
             complete (ErrorNotice's body is whitespace-pre-wrap, so the CLI
             output keeps its shape). It appears in place after the button press
             with no route change, which is what role="alert" is for. */}
-        {/* No hand-off: kiro-cli — the agent runtime — is the thing that is
-            outdated here, and this gate hides the chat the hand-off would open. */}
         <ErrorNotice
           className="mt-4 w-full max-w-lg text-left text-xs"
           messageClassName="font-mono"
           title={i18nT('components.kiroPrerequisiteGate.the_update_attempt_failed')}
           message={updateError || null}
           testId="kiro-gate-update-error"
+          noHandoffReason="kiro-cli, the agent runtime, is what is outdated here, and this gate hides the chat the hand-off would open"
         />
         {updateError ? (
           <p className="mt-2 max-w-lg text-left text-[13px] leading-relaxed text-muted">
@@ -757,7 +740,7 @@ function AgentSpecsMissing({
       asideBody={i18nT('components.kiroPrerequisiteGate.kiro_crew_installs_the_agent_specs_kiro_cli_load')}
     >
       <>
-        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-danger/10 text-danger">
+        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-danger/10 text-danger-text">
           <AlertTriangle className="lucide-inline" />
         </div>
         <p className="mt-6 text-[12px] font-bold uppercase tracking-[0.16em] text-danger">
@@ -782,14 +765,13 @@ function AgentSpecsMissing({
             also informative — it means no repair has been attempted yet.
             `role="alert"` because it appears in place after the button press with
             no route change, so a screen reader would otherwise get nothing. */}
-        {/* No hand-off: the agent specs kiro-cli refused are what the agent runs
-            on, and this gate hides the chat the hand-off would open. */}
         <ErrorNotice
           className="mt-4 w-full max-w-lg text-left text-xs"
           messageClassName="font-mono"
           title={i18nT('components.kiroPrerequisiteGate.the_repair_attempt_failed')}
           message={repairError || null}
           testId="kiro-gate-repair-error"
+          noHandoffReason="the agent specs kiro-cli refused are what the agent runs on, and this gate hides the chat the hand-off would open"
         />
         {/* Plain-language next step: the verbatim output above is for a bug
             report, not something a user can act on by itself. */}
@@ -834,7 +816,7 @@ function AgentSpecsRejected({
       asideBody={i18nT('components.kiroPrerequisiteGate.kiro_crew_installs_the_agent_specs_kiro_cli_load')}
     >
       <>
-        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-danger/10 text-danger">
+        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-danger/10 text-danger-text">
           <AlertTriangle className="lucide-inline" />
         </div>
         <p className="mt-6 text-[12px] font-bold uppercase tracking-[0.16em] text-danger">
@@ -867,14 +849,13 @@ function AgentSpecsRejected({
             </pre>
           </div>
         ) : null}
-        {/* No hand-off: the agent specs kiro-cli refused are what the agent runs
-            on, and this gate hides the chat the hand-off would open. */}
         <ErrorNotice
           className="mt-4 w-full max-w-lg text-left text-xs"
           messageClassName="font-mono"
           title={i18nT('components.kiroPrerequisiteGate.the_repair_attempt_failed')}
           message={repairError || null}
           testId="kiro-gate-repair-error"
+          noHandoffReason="the agent specs kiro-cli refused are what the agent runs on, and this gate hides the chat the hand-off would open"
         />
         {/* Plain-language next step: the verbatim output above is for a bug
             report, not something a user can act on by itself. */}
@@ -921,17 +902,14 @@ function AgentSpecsRejected({
 
 // ── Agent choice ─────────────────────────────────────────────────────────────
 //
-// Kiro CLI is the DEFAULT agent, not the only one: the gateway can drive any
-// selectable ACP harness (Settings → Agent Harness). This gate used to check Kiro CLI
-// alone, so an operator who runs Claude Code (or Codex, …) and has no Kiro CLI
-// was held on "Set up Kiro" forever. The gate now asks the configured backend:
-// Kiro checks apply only while Kiro CLI is the configured agent.
+// KAS is the DEFAULT agent, while Kiro CLI remains selectable. This gate asks the
+// resolved backend, so Kiro-only checks apply only after an explicit Kiro choice.
 
 /** The config field Settings → Agent Harness owns; the same key is written here. */
 const ACP_BACKEND_CONFIG_KEY = 'agent.acp_backend'
 /**
- * The core spells the Kiro CLI backend as the empty string — a real value. The
- * one definition lives in acpBackend.ts, beside `isKiroBackend`, so this gate
+ * Kiro CLI as the config and probe rows spell it (`'kiro'`; `''` is "no choice").
+ * The one definition lives in acpBackend.ts, beside `isKiroBackend`, so this gate
  * and Settings → Agent Harness cannot drift on what "kiro" is spelled as.
  */
 const KIRO_BACKEND = ACP_BACKEND_KIRO
@@ -1070,14 +1048,20 @@ export function knownPlatform(platform: string | undefined): string {
  * other install route (RPM, AppImage, musl). The commands are `<code>` children,
  * never catalog values — a translated command cannot be typed.
  */
-function KiroInstallCommands({ platform }: { platform: string }) {
+function KiroInstallCommands({ platform, unzipMissing }: { platform: string; unzipMissing: boolean }) {
   const windows = platform === 'Windows'
   const unix = platform === 'macOS' || platform === 'Linux'
   const known = knownPlatform(platform) !== ''
+  // The prerequisite and the installer read as two ordered steps: "First, install
+  // unzip", then this line.
+  const unzipFirst = platform === 'Linux' && unzipMissing
   return (
     <div className="space-y-3">
+      {unzipFirst && <KiroUnzipPrerequisite />}
       <p className="text-[13px] leading-relaxed text-text">
-        {known
+        {unzipFirst
+          ? i18nT('components.kiroPrerequisiteGate.install_kiro_cli_then_run_on_host', { platform })
+          : known
           ? i18nT('components.kiroPrerequisiteGate.install_kiro_cli_run_on_host', { platform })
           : i18nT('components.kiroPrerequisiteGate.install_kiro_cli_run_for_platform')}
       </p>
@@ -1269,12 +1253,10 @@ function OtherCodingAgents({
             </p>
           ) : failed && others.length === 0 ? (
             <>
-              {/* No hand-off: this prerequisite gate also blocks /chat. With
-                  no confirmed ready harness, navigating there cannot reach an
-                  agent to diagnose the probe failure. */}
               <ErrorNotice
                 message={i18nT('components.kiroPrerequisiteGate.other_agents_unavailable')}
                 testId="other-agents-probe-error"
+                noHandoffReason="this prerequisite gate also blocks /chat, and with no confirmed ready harness there is no agent to diagnose the probe failure"
                 footer={<Btn type="button" onClick={onRetryBackends}>{i18nT('components.kiroPrerequisiteGate.try_again')}</Btn>}
               />
             </>
@@ -1532,7 +1514,7 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
     retry: false,
   })
   const configuredBackend = configQuery.data
-    ? (configQuery.data.agent?.acp_backend ?? KIRO_BACKEND)
+    ? configuredAcpBackend(configQuery.data)
     : undefined
   const otherBackendConfigured = configuredBackend !== undefined && configuredBackend !== KIRO_BACKEND
   const kiroBlocking = kiroPrerequisiteIsBlocking(statusQuery.data)
@@ -1858,33 +1840,30 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
           )}
 
           <Card className="border-accent/60 shadow-[0_10px_35px_var(--accent-glow)]">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <h2 className="flex items-center gap-2 text-base font-semibold text-text-strong">
-                  <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-subtle text-accent">
-                    <Package className="lucide-inline" />
-                  </span>
-                  {i18nT('components.kiroPrerequisiteGate.get_kiro_cli')}
-                </h2>
-                {/* The card's first line is the state, in both states: "isn't
-                    installed yet" or "is installed, finish signing in". The
-                    footer used to carry the installed line, below the other
-                    agents section, where it read as an afterthought. */}
-                <p className="mt-2 text-sm leading-relaxed text-muted">
-                  {status.installed
-                    ? i18nT('components.kiroPrerequisiteGate.kiro_cli_is_installed_finish_signing_in_to_conti')
-                    : i18nT('components.kiroPrerequisiteGate.kiro_cli_is_not_installed_yet')}
-                </p>
-              </div>
-              <StepStatus complete={false} current />
-            </div>
+            <h2 className="flex items-center gap-2 text-base font-semibold text-text-strong">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-subtle text-accent">
+                <Package className="lucide-inline" />
+              </span>
+              {i18nT('components.kiroPrerequisiteGate.get_kiro_cli')}
+            </h2>
+            {/* The card's first line is the state, in both states: "isn't
+                installed yet" or "is installed, finish signing in". It sits
+                here, not in a footer below the other agents section, where it
+                would read as an afterthought. The card carries no step badge:
+                an agent chosen under "Use other coding agents" finishes setup
+                without Kiro CLI, so a "Required" tag here would be false. */}
+            <p className="mt-2 text-sm leading-relaxed text-muted">
+              {status.installed
+                ? i18nT('components.kiroPrerequisiteGate.kiro_cli_is_installed_finish_signing_in_to_conti')
+                : i18nT('components.kiroPrerequisiteGate.kiro_cli_is_not_installed_yet')}
+            </p>
             {/* The one-line installer is SHOWN, never run: Kiro Crew does not
                 install Kiro CLI. The setup page stays as the route for every
                 other install form (RPM, AppImage, musl) and stays correct as
                 those change. */}
             {!status.installed && (
               <div className="mt-4">
-                <KiroInstallCommands platform={platform} />
+                <KiroInstallCommands platform={platform} unzipMissing={status.unzip_missing === true} />
                 <a
                   className="mt-3 inline-flex items-center gap-1.5 text-[13px] font-medium text-accent hover:underline focus-ring"
                   href={status.docs_url}

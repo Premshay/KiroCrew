@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
+import { OverlayPortal } from './overlayRoot'
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext'
 import { useLexicalNodeSelection } from '@lexical/react/useLexicalNodeSelection'
 import {
@@ -114,11 +114,11 @@ function PasteTokenChip({ block, nodeKey }: { block: PasteBlock; nodeKey: NodeKe
         onMouseLeave={closePreview}
         onFocus={schedulePreview}
         onBlur={closePreview}
-        className={`inline-flex max-w-full items-center rounded-md border px-1.5 py-0.5 align-baseline text-[12px] font-body leading-none cursor-default select-none transition-colors focus:outline-hidden focus-visible:ring-1 focus-visible:ring-accent ${selected ? 'border-accent bg-accent-subtle text-accent' : 'border-border bg-accent-subtle text-text'}`}
+        className={`inline-flex max-w-full items-center rounded-md border px-1.5 py-0.5 align-baseline text-[12px] font-body leading-none cursor-default select-none transition-colors focus-ring-accent ${selected ? 'border-accent bg-accent-subtle text-accent' : 'border-border bg-accent-subtle text-text'}`}
       >
         {displayLabel}
       </Clickable>
-      {createPortal(
+      <OverlayPortal>
         <PastePreviewTooltip
           open={previewOpen}
           panelId={panelId}
@@ -126,9 +126,8 @@ function PasteTokenChip({ block, nodeKey }: { block: PasteBlock; nodeKey: NodeKe
           content={block.content}
           seq={block.seq}
           testIdPrefix="lexical-paste-preview"
-        />,
-        document.body,
-      )}
+        />
+      </OverlayPortal>
     </>
   )
 }

@@ -43,6 +43,8 @@ from kiro_crew.monitoring.pull_request import (
     PullRequestFacts,
     PullRequestProbeResult,
     build_pull_request_probe_result,
+    comment_body_digest,
+    comment_body_fingerprint,
     opaque_provider_check_identity,
     provider_error_result,
 )
@@ -372,6 +374,9 @@ class GitHubPullRequestProvider:
         try:
             gh = self._resolver()
         except (SetupError, FileNotFoundError, OSError) as exc:
+            # The resolver is the same trust decision the glab and az paths
+            # audit as `denied`, so its refusal leaves the same evidence.
+            audit_provider_cli_denied("gh", reason=_resolver_refusal_reason(exc))
             results.update(_group_error(members, _exception_failure(exc)))
             return results
         for chunk in _chunked(members, _MAX_SUBJECTS_PER_QUERY):
@@ -1693,17 +1698,10 @@ def _rollup_page(
 def _body_fingerprint(body: str) -> str:
     """A FIXED-LENGTH stand-in for one externally-authored comment body.
 
-    This is where the bound lives. A comment body is unbounded third-party text
-    and a paged read accumulates one entry per comment across every page, so
-    retaining the body itself would let a single large comment, or many of them,
-    size the probe's own memory. Hashing at the moment of retention makes what is
-    kept 64 characters wide whatever arrives, and nothing downstream ever sees
-    the body again -- neither the aggregate digest nor the condition key.
-
-    Only the digest of the body is ever needed: the conditions built from these
-    answer "did this change", never "what does it say".
+    Thin alias for the shared :func:`comment_body_fingerprint`; the name stays so
+    this module's callers and tests keep addressing it per adapter.
     """
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return comment_body_fingerprint(body)
 
 
 def _review_thread_page(
@@ -1775,19 +1773,10 @@ def _pr_comment_page(node: Mapping[str, Any]) -> tuple[list[str], bool, bool, st
 def _pr_comment_body_digest(fingerprints: list[str]) -> str:
     """A stable digest over a pull request's PR-level comment bodies.
 
-    Takes per-comment FINGERPRINTS, never bodies, so nothing on the path from
-    read to condition key scales with how much a reviewer wrote.
-
-    Empty when no readable non-empty body was seen, so a pull request with no
-    comments emits no condition. Fingerprints are SORTED before hashing so the
-    page order they arrived in cannot move the digest, mirroring the thread
-    digest.
+    Thin alias for the shared :func:`comment_body_digest`; the name stays so this
+    module's callers and tests keep addressing it per adapter.
     """
-    kept = sorted(fingerprints)
-    if not kept:
-        return ""
-    encoded = json.dumps(kept, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return comment_body_digest(fingerprints)
 
 
 # ``gh`` stderr classification and the process-wide ``github:api`` cooldown are
@@ -1853,6 +1842,15 @@ def _provider_exception_kind(error: BaseException) -> ProviderErrorKind:
 def _classified_failure(kind: ProviderErrorKind) -> _Failure:
     """Pair a classified kind with the reason code it is reported under."""
     return kind, _PROVIDER_ERROR_REASONS[kind]
+
+
+def _resolver_refusal_reason(error: BaseException) -> str:
+    """Name a gh resolver refusal with one fixed, credential-free audit word."""
+    if isinstance(error, SetupError):
+        return error.reason or "executable_untrusted"
+    if isinstance(error, FileNotFoundError):
+        return "executable_not_found"
+    return "executable_untrusted"
 
 
 def _exception_failure(error: BaseException) -> _Failure:

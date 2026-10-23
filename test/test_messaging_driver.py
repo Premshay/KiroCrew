@@ -20,11 +20,13 @@ from kiro_crew.acp.types import (
     EVENT_STEER_CONSUMED,
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
     AcpEvent,
     TurnUsage,
 )
 from kiro_crew.constants import (
     DENY_CAUSE_APPROVAL_TIMEOUT,
+    DENY_CAUSE_APPROVAL_UNDELIVERABLE,
     STEER_NOTICE_BOUND_SECS,
     split_trailing_protocol_suffix,
 )
@@ -38,6 +40,7 @@ from kiro_crew.messaging import (
 from kiro_crew.messaging.renderer import Renderer
 from kiro_crew.monitoring.completion import MonitorCompletionHook
 from kiro_crew.monitoring.models import MonitorActionCompletion, MonitorActionDisposition
+from kiro_crew.testing.wait import await_until, finished
 
 
 class _RecordingRenderer(Renderer):
@@ -53,6 +56,9 @@ class _RecordingRenderer(Renderer):
 
     async def on_tool_call(self, tool_call_id, title, tool_kind="", tool_purpose=""):
         self.events.append(("tool_call", tool_call_id, title))
+
+    async def on_tool_result(self, tool_call_id, tool_status):
+        self.events.append(("tool_result", tool_call_id, tool_status))
 
     async def on_prompt_choice(
         self, options, request_id, tool_title="", tool_purpose="", tool_input=""
@@ -360,6 +366,32 @@ class TestTurnDriverTranslation:
         # Every EVENT_TOOL_CALL maps to one uniform tool_call (no start/result split).
         assert kinds == ["tool_call", "tool_call", "done"]
 
+    def test_terminal_tool_result_emits_tool_result_event(self):
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="t1", title="grep", tool_final=False),
+                # A non-terminal update is NOT an outcome and must not be forwarded.
+                AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="t1", tool_status="in_progress"),
+                AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="t1", tool_status="failed"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ]
+        )
+        _run(p, r)
+        assert ("tool_result", "t1", "failed") in r.events
+        assert not any(e[0] == "tool_result" and e[2] == "in_progress" for e in r.events)
+
+    def test_tool_result_without_call_id_is_not_forwarded(self):
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="", tool_status="failed"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ]
+        )
+        _run(p, r)
+        assert not any(e[0] == "tool_result" for e in r.events)
+
     def test_compaction(self):
         r = _RecordingRenderer()
         p = _ScriptedProvider(
@@ -461,6 +493,57 @@ class TestTurnDriverTranslation:
         assert out == emitted == "✅ Context compacted."
         assert "OBJECTIVE" not in emitted
         assert "operating instructions" not in emitted
+
+
+def _unfinished_turn(stop_reason: str, *, with_text: bool = True) -> list[AcpEvent]:
+    events = [AcpEvent(kind=EVENT_TEXT_CHUNK, text="Here is the first half of the pl")]
+    return [*(events if with_text else []), AcpEvent(kind=EVENT_COMPLETE, stop_reason=stop_reason)]
+
+
+class TestUnfinishedTurn:
+    """The session handle ends a turn the backend never finished with
+    stop_reason "timeout" (its turn ceiling) or "stale_recover". The partial
+    text is kept, the timeout notice follows it as the turn's last text, and
+    the driver marks the turn unfinished so the dispatcher books a failure and
+    resets the session."""
+
+    @pytest.mark.parametrize("stop_reason", ["timeout", "stale_recover"])
+    def test_the_notice_follows_the_partial_text(self, stop_reason):
+        renderer = _RecordingRenderer()
+        driver = TurnDriver(_ScriptedProvider(_unfinished_turn(stop_reason)), renderer)
+
+        text = asyncio.run(driver.run("hello"))
+
+        shown = "".join(t for k, t in renderer.events if k == "text_chunk")
+        assert shown.startswith(
+            "Here is the first half of the pl\n\n⏱️ The agent did not finish"
+        ), shown
+        assert renderer.events[-1] == ("done", stop_reason)
+        assert text == "Here is the first half of the pl"
+        assert driver.empty_turn_notice == ""
+        assert getattr(driver, "unfinished_turn", False) is True
+
+    def test_a_textless_unfinished_turn_shows_the_notice_alone(self):
+        renderer = _RecordingRenderer()
+        driver = TurnDriver(
+            _ScriptedProvider(_unfinished_turn("timeout", with_text=False)), renderer
+        )
+
+        asyncio.run(driver.run("hello"))
+
+        shown = "".join(t for k, t in renderer.events if k == "text_chunk")
+        assert shown.startswith("⏱️ The agent did not finish"), shown
+        assert driver.empty_turn_notice == "", "the textless verdict is not owed on top"
+
+    @pytest.mark.parametrize("stop_reason", ["end_turn", "cancelled"])
+    def test_a_finished_or_cancelled_turn_gets_no_timeout_notice(self, stop_reason):
+        renderer = _RecordingRenderer()
+        driver = TurnDriver(_ScriptedProvider(_unfinished_turn(stop_reason)), renderer)
+
+        assert asyncio.run(driver.run("hello")) == "Here is the first half of the pl"
+        assert getattr(driver, "unfinished_turn", False) is False
+        shown = "".join(t for k, t in renderer.events if k == "text_chunk")
+        assert "did not finish" not in shown
 
 
 class TestApprovalLadder:
@@ -587,6 +670,25 @@ class TestApprovalTimeoutInbandNotice:
         assert [c[0] for c in p.calls] == ["reject_tool"]
 
     @pytest.mark.asyncio
+    async def test_an_undeliverable_prompt_steers_the_cause_before_the_reject(self):
+        """An approval prompt that could not reach the operator steers the
+        undeliverable cause, not the generic deny, so the model knows
+        the host blocked it and can explain the constraint."""
+        r = _RecordingRenderer()
+        p = _SteerRecordingProvider(self._perm_script())
+        await TurnDriver(
+            p,
+            r,
+            approval_mode=APPROVAL_INTERACTIVE,
+            decider=_ExpiringDecider(cause=DENY_CAUSE_APPROVAL_UNDELIVERABLE),
+        ).run("hi")
+        assert [c[0] for c in p.calls] == ["steer", "reject_tool"]
+        notice = p.calls[0][1]
+        assert "could not be delivered" in notice
+        assert "bash: rm -rf build" in notice
+        assert p.rejected == ["rq1"]
+
+    @pytest.mark.asyncio
     async def test_a_plain_callable_decider_denies_without_a_cause(self):
         r = _RecordingRenderer()
         p = _SteerRecordingProvider(self._perm_script())
@@ -628,11 +730,11 @@ class TestApprovalTimeoutInbandNotice:
             await asyncio.Event().wait()
 
         p.steer = _hanging_steer  # type: ignore[method-assign]
-        await asyncio.wait_for(
+        await finished(
             TurnDriver(p, r, approval_mode=APPROVAL_INTERACTIVE, decider=_ExpiringDecider()).run(
                 "hi"
             ),
-            timeout=2.0,
+            "the bounded steer's turn",
         )
         assert [c[0] for c in p.calls] == ["steer", "reject_tool"]
 
@@ -666,10 +768,10 @@ class TestApprovalTimeoutInbandNotice:
                 "hi"
             )
         )
-        await asyncio.wait_for(parked.wait(), timeout=2.0)
+        await await_until(parked)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=2.0)
+            await await_until(task)
         assert ("reject_tool", "rq1") in p.calls
         denied = [a for a in audited if a.get("operation") == "tool_permission"]
         assert len(denied) == 1
@@ -928,6 +1030,108 @@ class TestStreamCredentialRedaction:
         assert "text_chunk" in kinds  # flushed tail emitted before done
         assert "AKIA1234567890ABCDEX" not in out
         assert "[REDACTED: credential]" in out
+
+
+def _tool(tool_call_id: str = "t1") -> AcpEvent:
+    return AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id=tool_call_id, title="grep", tool_final=False)
+
+
+def _text(text: str) -> AcpEvent:
+    return AcpEvent(kind=EVENT_TEXT_CHUNK, text=text)
+
+
+def _turn_across_tool(before: list[str], after: list[str]) -> tuple[str, list[tuple]]:
+    r = _RecordingRenderer()
+    p = _ScriptedProvider(
+        [*map(_text, before), _tool(), *map(_text, after)]
+        + [AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")]
+    )
+    out = _run(p, r)
+    joined = "".join(e[1] for e in r.events if e[0] == "text_chunk")
+    assert joined == out
+    return joined, r.events
+
+
+class TestTextAcrossAToolCall:
+    """Text written before a tool call is delivered before it, and ends there.
+
+    The redactor holds back each chunk's trailing run, so with nothing at the
+    boundary the tail of the pre-tool text was released by the post-tool text,
+    glued on and after the tool card: "around that time." + "No logs" read
+    "time.No logs" on Slack, and a fence opened after a file edit landed on the
+    end of the prose line.
+    """
+
+    def test_sentence_before_and_after_a_tool_stay_two_paragraphs(self):
+        joined, _ = _turn_across_tool(["I looked around that time."], ["No protocol logs here."])
+        assert joined == "I looked around that time.\n\nNo protocol logs here."
+
+    def test_held_tail_still_arrives_after_the_tool_card(self):
+        # Residual, pinned: the redactor's held run is released with the next
+        # text, so it reaches the renderer on the far side of the card. Joined
+        # renderers (Slack's plan-mode stream among them) read it correctly now
+        # that the break sits between the two; one that draws the card inline
+        # between chunks still shows "time." after it.
+        _, events = _turn_across_tool(["I looked around that time."], ["No logs."])
+        tool_at = [e[0] for e in events].index("tool_call")
+        before = "".join(e[1] for e in events[:tool_at] if e[0] == "text_chunk")
+        assert before == "I looked around that "
+
+    def test_fence_after_a_tool_opens_on_its_own_line(self):
+        joined, _ = _turn_across_tool(["Changed the examples."], ["```diff\n-old\n+new\n```\n"])
+        assert "\n```diff\n" in joined
+        assert "examples.```" not in joined
+
+    def test_pre_tool_text_ending_in_a_newline_gets_no_extra_break(self):
+        joined, _ = _turn_across_tool(["Checking now.\n"], ["Found it."])
+        assert joined == "Checking now.\nFound it."
+
+    def test_post_tool_text_opening_with_a_break_is_left_as_written(self):
+        joined, _ = _turn_across_tool(["Checking now."], ["\n\nFound it."])
+        assert joined == "Checking now.\n\nFound it."
+
+    def test_a_sentence_continued_across_the_tool_is_not_split(self):
+        joined, _ = _turn_across_tool(["Checking the server"], [" and the disk."])
+        assert joined == "Checking the server and the disk."
+
+    def test_only_the_first_text_after_the_tool_is_considered(self):
+        joined, _ = _turn_across_tool(["Done."], ["Next", "Step"])
+        assert joined == "Done.\n\nNextStep"
+
+    def test_no_text_before_the_tool_adds_nothing(self):
+        joined, _ = _turn_across_tool([], ["Found it."])
+        assert joined == "Found it."
+
+    def test_credential_split_by_a_tool_call_is_redacted_whole(self):
+        # Both sides of this join are non-whitespace, so the break rule fires.
+        # The redactor must still see the key joined: a break fed in between
+        # would let each half pass the scan alone and show both.
+        # Split literal on purpose so Semgrep does not mistake the synthetic
+        # fixture for a hardcoded AWS access key.
+        secret = "AKIA" + "1234567890ABCDEF"
+        joined, _ = _turn_across_tool([f"key {secret[:14]}"], [f"{secret[14:]} end"])
+        assert secret[:14] not in joined
+        assert secret[14:] not in joined
+        assert "[REDACTED: credential]" in joined
+
+    def test_no_break_once_a_redaction_has_changed_the_output(self):
+        # Residual, pinned: once the output differs from the raw text there is
+        # no held text to anchor the break on, so the join stays glued.
+        secret = "AKIA" + "1234567890ABCDEF"
+        joined, _ = _turn_across_tool([f"key {secret} then that time."], ["No logs."])
+        assert "[REDACTED: credential]" in joined
+        assert joined.endswith("time.No logs.")
+
+    def test_break_waits_while_the_join_is_still_held(self):
+        # "time." + "No" is one credential-class run, so the redactor emits
+        # nothing until " here." ends it; the break lands when it does.
+        joined, _ = _turn_across_tool(["Around that time."], ["No", "thing here."])
+        assert joined == "Around that time.\n\nNothing here."
+
+    def test_break_is_placed_when_the_turn_ends_on_the_held_join(self):
+        # Nothing terminates the run, so only the end-of-turn flush releases it.
+        joined, _ = _turn_across_tool(["See the api_key"], ["Next."])
+        assert joined == "See the api_key\n\nNext."
 
 
 class TestToolGateEnforcement:

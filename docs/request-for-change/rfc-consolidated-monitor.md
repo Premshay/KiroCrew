@@ -38,7 +38,7 @@ Three streams currently work on the same problem, which is keeping an agent turn
 |---|---|---|
 | structured monitors | `src/kiro_crew/monitoring/` | merged: [#5180](https://github.com/kirodotdev/KiroCrew/pull/5180), [#5181](https://github.com/kirodotdev/KiroCrew/pull/5181), [#5182](https://github.com/kirodotdev/KiroCrew/pull/5182), [#5183](https://github.com/kirodotdev/KiroCrew/pull/5183), [#5184](https://github.com/kirodotdev/KiroCrew/pull/5184). [#5185](https://github.com/kirodotdev/KiroCrew/pull/5185), [#5186](https://github.com/kirodotdev/KiroCrew/pull/5186), [#5305](https://github.com/kirodotdev/KiroCrew/pull/5305) |
 | irq kernel | `irq.py`, `probes/gh_pr.py` | merged: [#5273](https://github.com/kirodotdev/KiroCrew/pull/5273), [#5886](https://github.com/kirodotdev/KiroCrew/pull/5886), [#6071](https://github.com/kirodotdev/KiroCrew/pull/6071), [#6279](https://github.com/kirodotdev/KiroCrew/pull/6279), [#7431](https://github.com/kirodotdev/KiroCrew/pull/7431), [#7634](https://github.com/kirodotdev/KiroCrew/pull/7634), [#8122](https://github.com/kirodotdev/KiroCrew/pull/8122), [#8326](https://github.com/kirodotdev/KiroCrew/pull/8326) |
-| self-armed loops for member slots | `autonudge_selfarm.py` (new), `autonudge.py`, `autonudge_authz.py`, `mcp_tools/control.py` | merged: [#8919](https://github.com/kirodotdev/KiroCrew/pull/8919) |
+| self-armed loops for member slots | `autonudge_selfarm.py` (new), `autonudge.py`, `autonudge_authz.py`, `mcp_tools/control_parts/monitor.py` | merged: [#8919](https://github.com/kirodotdev/KiroCrew/pull/8919) |
 
 This document states the target shape, what gets deleted, and the order.
 
@@ -118,7 +118,7 @@ Step 0, independent of all of the above and the only item with an external deadl
 
 Two remainders of step 0 are DEFERRED rather than closed, and both are named here so neither reads as an oversight:
 
-- **The websocket does not push a structured change to a non-owner.** The REST reads now entitle a non-owner to a reduced monitor row, but the `autonudge_state` frame for a structured loop still goes through `broadcast_ws_owners` (`slack/gateway.py`), so that reader gets no invalidation and its view stays as fetched until it reconnects. Closing this means a reduced presence frame riding `broadcast_ws`, in the same file the step-0 API change deliberately did not touch. An owner is unaffected: it receives the frame and re-reads.
+- **The websocket does not push a structured change to a non-owner.** The REST reads now entitle a non-owner to a reduced monitor row, but the `autonudge_state` frame for a structured loop still goes through `broadcast_ws_owners` (`slack/gateway_runtime/nudge_wiring.py`), so that reader gets no invalidation and its view stays as fetched until it reconnects. Closing this means a reduced presence frame riding `broadcast_ws`, in the same file the step-0 API change deliberately did not touch. An owner is unaffected: it receives the frame and re-reads.
 - **The frame and the REST read now disagree about the same record.** The frame still carries `message`, `max_cycles` and `cycle_count` for a structured monitor. `message` is not a boundary crossing there, since the frame is owner-only, but the two counters are as misleading on the socket as they were on the read.
 
 ## Failure modes the merged design must carry

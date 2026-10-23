@@ -6,30 +6,34 @@ import asyncio
 import contextvars
 import functools
 import hashlib
+import importlib as _importlib
 import json
 import logging
 import os
+import sys as _sys
 import time as _time
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 from uuid import uuid4
 
-from kiro_crew.embeddings import PRIORITY_BULK, PRIORITY_NORMAL, bulk_pace_delay
+from kiro_crew import _facade_mirror
+from kiro_crew.embeddings import PRIORITY_NORMAL
 from kiro_crew.llm_helpers import _extract_json_of_type
-from kiro_crew.security import (
+from kiro_crew.security import (  # noqa: F401 - pinned by test_ingestion_facade.py
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
 )
 from kiro_crew.sel import sel
 
-from .chunker import CHUNK_OVERLAP, CHUNK_TOKEN_SIZE, MAX_CHUNKS_PER_FILE, HeadingAwareChunker
+from .chunker import CHUNK_OVERLAP, CHUNK_TOKEN_SIZE, HeadingAwareChunker
 from .dedup import PERSISTENT_SOURCE_TYPES, dedup_document
 from .embedder import embedder_signature, floats_to_bytes
 from .extractor import EntityExtractor
+from .ingestion_budget import ImportChunkBudget, _import_chunk_budget
 from .readers import FileReader
 from .store import AUTO_ADDED_PROP, KnowledgeStore
 
@@ -71,15 +75,32 @@ logger = logging.getLogger(__name__)
 #: ``FileReader.SUPPORTED`` -- that set is the folder-scan gate, so an extension
 #: listed here but absent there never reaches this dispatch at all.
 CODE_EXTS = {
-    '.py', '.java', '.ts', '.js', '.rs', '.go', '.rb', '.c', '.cpp', '.h',
-    '.sh', '.ps1', '.psm1', '.cs', '.kt', '.kts', '.swift', '.scala',
+    ".py",
+    ".java",
+    ".ts",
+    ".js",
+    ".rs",
+    ".go",
+    ".rb",
+    ".c",
+    ".cpp",
+    ".h",
+    ".sh",
+    ".ps1",
+    ".psm1",
+    ".php",
+    ".cs",
+    ".kt",
+    ".kts",
+    ".swift",
+    ".scala",
 }
 
-MARKDOWN_EXTS = {'.md', '.docx'}
+MARKDOWN_EXTS = {".md", ".docx"}
 
 #: ``ingestion_jobs.status`` for a write the pre-ingest gate refused because the
 #: exact content is already in the Library. Terminal, like 'completed'.
-DUPLICATE_JOB_STATUS = 'skipped_duplicate'
+DUPLICATE_JOB_STATUS = "skipped_duplicate"
 
 DEFAULT_MAX_INGEST_FILE_MB = 100.0
 _MB = 1024 * 1024
@@ -144,6 +165,7 @@ def get_embed_rate_limiter() -> EmbedRateLimiter:
     global _embed_rate_limiter
     try:
         from kiro_crew.config.loader import KiroCrewConfig
+
         rate = max(0, int(KiroCrewConfig.load().knowledge.embed_rate_limit))
     except Exception:
         rate = 0
@@ -199,205 +221,19 @@ def _max_ingest_file_mb() -> float:
     # config.loader imports knowledge.doc_links, so a top-level import here
     # would create an import cycle.
     from kiro_crew.config.loader import KiroCrewConfig  # circular import
+
     try:
         return KiroCrewConfig.load().knowledge.max_ingest_file_mb
     except Exception:
         return DEFAULT_MAX_INGEST_FILE_MB
 
 
-#: Rolling window (seconds) over which the explicit-import chunk budget is
-#: totalled. 60s is a short window because the explicit paths are interactive
-#: (a user adding files, an agent handing over a document), so the ceiling bounds
-#: a burst of successive adds within about a minute rather than pacing a
-#: long-running scan the way the watcher's per-sweep budget does. Inlined as the
-#: single window: only ``ImportChunkBudget()`` is constructed in production.
-_IMPORT_CHUNK_BUDGET_WINDOW_SECS = 60.0
-
-
-class ImportChunkBudgetError(RuntimeError):
-    """Raised when an explicit import would exceed ``knowledge.import_chunk_budget``.
-
-    Carries the budget, the window and the count already spent in the window so a
-    caller can surface WHY the import was deferred rather than failing opaquely --
-    the whole point of refusing rather than silently truncating a deliberate
-    import. The message is deterministic and ASCII so it is safe to surface to an
-    agent tool result or a dashboard error.
-    """
-
-    def __init__(self, budget: int, window_secs: float, spent: int):
-        self.budget = budget
-        self.window_secs = window_secs
-        self.spent = spent
-        super().__init__(
-            f"Knowledge import deferred: the explicit-import chunk budget "
-            f"(knowledge.import_chunk_budget={budget} chunks per {window_secs:g}s) "
-            f"is already spent ({spent} chunks reserved or ingested this window). "
-            f"Retry after the window rolls over, ingest fewer files at once, or "
-            f"raise knowledge.import_chunk_budget (0 removes the bound)."
-        )
-
-
-class ImportChunkBudget:
-    """Rolling-window ceiling on chunks ingested through the EXPLICIT import paths.
-
-    The watcher path (folder sweep) already has its own per-sweep and global
-    chunk budgets; those are bounded by a scan (one pass over one source). The
-    explicit routes -- single-file add, agent ``knowledge_add_document``, direct
-    text ingest, remote sync -- are many independent calls in succession with no
-    scan boundary, so there is nothing to total the cost across files. This is
-    the equivalent ceiling for that path: a rolling 60-second window over which
-    at most ``budget`` chunks may be ingested.
-
-    ``budget=0`` disables it (unbounded). Per-file cost stays bounded by the
-    chunker's 50-chunk cap independently; this bounds the CROSS-FILE total.
-
-    The gate is enforced at CALL granularity, not chunk granularity: a file whose
-    real cost pushes the window PAST ``budget`` still completes (its chunks are
-    already produced), and the NEXT call is the one refused. So the effective
-    bound is ``[budget, budget + MAX_CHUNKS_PER_FILE)`` -- a run of adds can end at
-    most one file's worst case (50 chunks) above ``budget``, never unbounded. This
-    is deliberate: the alternative -- rejecting a file mid-flight once its chunk
-    count is known -- would waste the extraction already spent and is the
-    silent-truncation failure this exists to avoid. Treat ``budget`` as a soft
-    ceiling with a bounded, single-file overshoot, not a hard cap.
-
-    Trip behaviour is REFUSE, not truncate: a single-file cap that silently
-    dropped part of a user's deliberate import would be a worse failure than the
-    cost it prevents. :meth:`reserve` raises :class:`ImportChunkBudgetError` at
-    entry, before any chunking/extraction cost is incurred; an accepted file
-    always runs to completion, its reservation settled to its real chunk count.
-
-    Concurrency: the caller does ``reserve()`` (synchronous), then awaits the
-    chunk/extract work, then ``settle()``. If N imports each only checked a
-    running total they would all pass before any recorded, overrunning by
-    concurrency x file. So ``reserve`` books a placeholder of the per-file
-    maximum (:data:`~kiro_crew.knowledge.chunker.MAX_CHUNKS_PER_FILE`) INTO the
-    window immediately, and that reservation is visible to every concurrent
-    ``reserve`` across the await -- ``settle`` later reconciles it down to the
-    real count. The reservation is an UPPER bound, so a burst is refused a little
-    early rather than allowed to overrun; the worst residual error is one file's
-    slack per in-flight import, never unbounded. Every caller is on the event
-    loop and reserve/settle/release are synchronous and non-awaiting, so no lock
-    is needed (unlike the embed limiter, whose refill straddles an await).
-    """
-
-    def __init__(self, budget: int = 0):
-        self._budget = max(0, int(budget))
-        self._window_secs = _IMPORT_CHUNK_BUDGET_WINDOW_SECS
-        # (monotonic_ts, chunk_count, token) entries; pruned to the window on each
-        # touch. token identifies a live reservation so settle/release can find it.
-        self._events: list[tuple[float, int, int]] = []
-        self._next_token = 0
-        # Tokens already settled: a later release() of one is a no-op, which is
-        # what makes a finally-release safe after a success-path settle.
-        self._settled: set[int] = set()
-        # Tokens reserved and not yet settled or released, i.e. imports still in
-        # flight. Window pruning skips their events: an import slower than the
-        # window would otherwise age out of its own reservation while still
-        # running, and a concurrent reserve() would stop seeing it and admit
-        # another import past the concurrency ceiling the placeholder enforces.
-        self._open: set[int] = set()
-
-    def set_budget(self, budget: int) -> None:
-        """Update the ceiling live (config is read per-ingest, no restart)."""
-        self._budget = max(0, int(budget))
-
-    def _spent(self, now: float) -> int:
-        """Chunks reserved-or-recorded within the trailing window.
-
-        Prunes entries older than the window, EXCEPT an open reservation: an
-        import still in flight holds its slot however long it runs, so a file
-        slower than the window cannot age out of the ceiling it occupies.
-        """
-        cutoff = now - self._window_secs
-        self._events = [
-            (ts, n, t) for (ts, n, t) in self._events if ts >= cutoff or t in self._open
-        ]
-        return sum(n for (_, n, _t) in self._events)
-
-    def reserve(self) -> int | None:
-        """Refuse a new import when the window is at/over budget; else book a
-        worst-case placeholder and return its token.
-
-        Returns ``None`` when the budget is disabled (0) -- the caller then does
-        not settle. Raises :class:`ImportChunkBudgetError` when the trailing
-        window (including live reservations from concurrent in-flight imports) is
-        already exhausted.
-
-        The placeholder is the per-file maximum because the true chunk count is
-        not known until the file is chunked, which happens after an await; booking
-        the maximum now is what makes a concurrent ``reserve`` see this import and
-        stops N simultaneous imports from each passing before any records.
-        """
-        if self._budget <= 0:
-            return None
-        now = _time.monotonic()
-        spent = self._spent(now)
-        if spent >= self._budget:
-            raise ImportChunkBudgetError(self._budget, self._window_secs, spent)
-        token = self._next_token
-        self._next_token += 1
-        self._events.append((now, MAX_CHUNKS_PER_FILE, token))
-        self._open.add(token)
-        return token
-
-    def settle(self, token: int | None, chunk_count: int) -> None:
-        """Reconcile a reservation to the real chunk count of an accepted import.
-
-        No-op when ``token`` is ``None`` (budget was disabled at reserve time).
-        The reservation timestamp is preserved so the window still expires the
-        cost at the moment the import began, not when it finished. After a settle
-        the token is CONSUMED, so a later :meth:`release` of it is a no-op -- that
-        is what lets every caller put ``release`` in a ``finally`` and settle on
-        the success path without double-counting.
-        """
-        if token is None:
-            return
-        self._settled.add(token)
-        self._open.discard(token)
-        n = max(0, int(chunk_count))
-        for i, (ts, _placeholder, t) in enumerate(self._events):
-            if t == token:
-                self._events[i] = (ts, n, t)
-                return
-
-    def release(self, token: int | None) -> None:
-        """Drop a still-open reservation, so a failed OR no-op import does not hold
-        budget. A no-op when the token is ``None`` or was already settled -- so it
-        is safe to call unconditionally in a ``finally`` after a possible settle.
-
-        This is the fix for the reservation LEAK on the no-op success paths
-        (content-hash-unchanged, dedup-refused): those branches return before any
-        chunk work, so they never settle; a finally-release reclaims their
-        placeholder. Without it, ten no-op re-ingests would each strand a 50-chunk
-        placeholder and falsely refuse genuine imports at the default budget.
-        """
-        if token is None:
-            return
-        if token in self._settled:
-            self._settled.discard(token)
-            return
-        self._open.discard(token)
-        self._events = [(ts, n, t) for (ts, n, t) in self._events if t != token]
-
-
-def _import_chunk_budget() -> int:
-    # Read live so a config change takes effect without a restart, matching
-    # _max_ingest_file_mb. Circular import guarded the same way.
-    from kiro_crew.config.loader import KiroCrewConfig  # circular import
-
-    try:
-        return max(0, int(KiroCrewConfig.load().knowledge.import_chunk_budget))
-    except Exception:
-        return 0
-
-
 def _run_chunker(chunker: HeadingAwareChunker, ext: str, text: str, uri: str) -> list[dict]:
     """Dispatch to the right chunker. CPU-bound -- run via asyncio.to_thread."""
-    if ext == '.pptx':
+    if ext == ".pptx":
         return chunker.chunk_slides(text)
     if ext in CODE_EXTS:
-        return chunker.chunk_code(text, language=ext.lstrip('.'))
+        return chunker.chunk_code(text, language=ext.lstrip("."))
     if ext in MARKDOWN_EXTS:
         return chunker.chunk_markdown(text)
     return chunker.chunk(text, source_uri=uri)
@@ -407,8 +243,9 @@ def _redact(text: str | None) -> str | None:
     """Redact LLM-derived text before storing."""
     if not text:
         return text
-    text, _ = redact_exfiltration_urls(text)
-    text, _ = redact_credentials(text)
+    from kiro_crew.security import redact
+
+    text = redact(text)
     return text
 
 
@@ -420,8 +257,9 @@ def _redact_for_ingest(text: str) -> str:
     credential pasted into a file never reaches the extraction worker or the index.
     Same helper the artifact path uses on its body.
     """
-    cleaned, _ = redact_credentials(text)
-    cleaned, _ = redact_exfiltration_urls(cleaned)
+    from kiro_crew.security import redact
+
+    cleaned = redact(text)
     return cleaned
 
 
@@ -446,10 +284,10 @@ def _coerce_chunk_param(value: object, default: int, minimum: int) -> int:
 
 def _job_status(processed: int, total: int) -> str:
     if processed == 0 and total > 0:
-        return 'failed'
+        return "failed"
     if processed < total:
-        return 'partial'
-    return 'completed'
+        return "partial"
+    return "completed"
 
 
 def _first_line_title(content: str) -> str:
@@ -477,9 +315,15 @@ def _summary_shaped(value: object) -> bool:
 class IngestionPipeline:
     """Orchestrates: read file -> chunk -> extract entities -> store."""
 
-    def __init__(self, store: KnowledgeStore, extractor: EntityExtractor,
-                 chunker: HeadingAwareChunker, reader: FileReader, embedder=None,
-                 dedup_enabled: bool = True):
+    def __init__(
+        self,
+        store: KnowledgeStore,
+        extractor: EntityExtractor,
+        chunker: HeadingAwareChunker,
+        reader: FileReader,
+        embedder=None,
+        dedup_enabled: bool = True,
+    ):
         self.store = store
         self.extractor = extractor
         self.chunker = chunker
@@ -554,12 +398,20 @@ class IngestionPipeline:
         event loop. The ingest paths fold it into the duplicate-gate hop, just
         ahead of the gate's own transaction.
         """
-        return [row['id'] for row in self.store.db.execute(
-            "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()]
+        return [
+            row["id"]
+            for row in self.store.db.execute(
+                "SELECT id FROM items WHERE source_id = ?", (source_id,)
+            ).fetchall()
+        ]
 
-    def _skip_as_duplicate(self, content_hash: str, source_id: str | None,
-                           old_item_ids: list[str] | None = None,
-                           on_duplicate: Callable[[str], None] | None = None) -> str | None:
+    def _skip_as_duplicate(
+        self,
+        content_hash: str,
+        source_id: str | None,
+        old_item_ids: list[str] | None = None,
+        on_duplicate: Callable[[str], None] | None = None,
+    ) -> str | None:
         """Terminal job id when this exact document is already in the Library.
 
         Returns ``None`` when the write should proceed.
@@ -598,8 +450,7 @@ class IngestionPipeline:
         # Cheap unlocked probe: "not a duplicate" is the overwhelmingly common
         # answer, and taking the write lock to learn it would serialize every
         # ingest behind every other one.
-        if not self.store.find_doc_by_content_hash(
-                content_hash, exclude_source_id=source_id):
+        if not self.store.find_doc_by_content_hash(content_hash, exclude_source_id=source_id):
             return None
 
         # Everything below is ONE write transaction, and that is load-bearing.
@@ -611,8 +462,7 @@ class IngestionPipeline:
         # its only surviving items are deleted, and the content is unrecoverable.
         self.store.db.execute("BEGIN IMMEDIATE")
         try:
-            holder = self.store.find_doc_by_content_hash(
-                content_hash, exclude_source_id=source_id)
+            holder = self.store.find_doc_by_content_hash(content_hash, exclude_source_id=source_id)
             if not holder:
                 # Vanished between the probe and the lock: fall through to a
                 # normal ingest instead of deduping against something gone.
@@ -622,8 +472,7 @@ class IngestionPipeline:
                 self.store.db.execute("COMMIT")
                 return None
             if old_item_ids:
-                self.store.delete_items_batch_in_txn(
-                    list(old_item_ids), owner_source_id=source_id)
+                self.store.delete_items_batch_in_txn(list(old_item_ids), owner_source_id=source_id)
             # This source HAS a copy of the document -- it just does not need a second
             # physical one. Under "one document, many locations" that has to be recorded,
             # or the copy is invisible to the reference count: deleting the holder would
@@ -632,8 +481,9 @@ class IngestionPipeline:
             # Attaching costs nothing and makes the refusal safe.
             if source_id:
                 for row in self.store.db.execute(
-                        "SELECT id FROM items WHERE content_hash = ? AND source_id = ?",
-                        (content_hash, holder.get("source_id"))).fetchall():
+                    "SELECT id FROM items WHERE content_hash = ? AND source_id = ?",
+                    (content_hash, holder.get("source_id")),
+                ).fetchall():
                     self.store.add_source_location_in_txn(row["id"], source_id)
             job_id = uuid4().hex[:12]
             now = datetime.now().isoformat()
@@ -641,7 +491,8 @@ class IngestionPipeline:
                 "INSERT INTO ingestion_jobs (id, source_id, status, items_total, "
                 "items_processed, created_at, updated_at) "
                 f"VALUES (?, ?, '{DUPLICATE_JOB_STATUS}', 0, 0, ?, ?)",
-                (job_id, source_id, now, now))
+                (job_id, source_id, now, now),
+            )
             # The caller's terminal state row, written INSIDE this transaction.
             # After the COMMIT is too late: the row may not exist yet (a first-time
             # aggregate document), and a `delete_source_cascade` landing in the gap
@@ -670,7 +521,9 @@ class IngestionPipeline:
             self.store.reload_graph()
         logger.info(
             "Skipping ingest: identical content already in source %r (%s)",
-            holder.get("source_name"), holder.get("source_type"))
+            holder.get("source_name"),
+            holder.get("source_type"),
+        )
         return job_id
 
     def _source_is_auto_added(self, source_id: str) -> bool:
@@ -683,7 +536,8 @@ class IngestionPipeline:
         """
         try:
             row = self.store.db.execute(
-                "SELECT properties FROM sources WHERE id = ?", (source_id,)).fetchone()
+                "SELECT properties FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()
         except Exception:
             return False
         if not row or not row["properties"]:
@@ -715,7 +569,8 @@ class IngestionPipeline:
         if not source_id or holder_type in PERSISTENT_SOURCE_TYPES:
             return False
         row = self.store.db.execute(
-            "SELECT source_type FROM sources WHERE id = ?", (source_id,)).fetchone()
+            "SELECT source_type FROM sources WHERE id = ?", (source_id,)
+        ).fetchone()
         return bool(row) and str(row["source_type"] or "") in PERSISTENT_SOURCE_TYPES
 
     def _maybe_dedup(self, source_id: str, content_hash: str = "") -> None:
@@ -730,8 +585,7 @@ class IngestionPipeline:
         if not self._dedup_enabled:
             return
         try:
-            dedup_document(self.store, source_id, content_hash=content_hash or None,
-                           apply=True)
+            dedup_document(self.store, source_id, content_hash=content_hash or None, apply=True)
         except Exception:
             logger.debug("Post-ingest dedup skipped", exc_info=True)
 
@@ -806,6 +660,9 @@ class IngestionPipeline:
         embed_priority: int = PRIORITY_NORMAL,
         count_toward_import_budget: bool = True,
         import_budget_token: int | None = None,
+        on_committed_in_txn: bool = False,
+        include_paths: frozenset[str] | None = None,
+        included: set[str] | None = None,
     ) -> str | None:
         """Full pipeline. Returns job_id, or None if content hash unchanged.
 
@@ -836,6 +693,16 @@ class IngestionPipeline:
         and the record that makes them replaceable -- each one a cancellation
         point that strands the items unowned. Passing the write in here gives it
         the same run-to-completion guarantee as the delete it belongs with.
+
+        ``on_committed_in_txn`` goes one step further: ``on_committed`` then runs
+        INSIDE the old group's delete transaction, so the delete and the caller's
+        ownership write commit together or not at all. Run-to-completion covers a
+        cancellation, not a hard kill or a raising callback; with two commits a
+        failure between them persists "old group gone, new group named by no
+        row", and the agent path's residue sweep would then read the new group as
+        crash residue and delete the document's only copy. The callback must not
+        commit or open a transaction of its own (it runs under the caller's
+        ``BEGIN IMMEDIATE``); if it raises, the delete rolls back with it.
 
         ``on_duplicate`` is that same bargain for the branch where the pre-ingest
         gate REFUSES the write. It receives the extracted-text hash matched by the
@@ -879,10 +746,18 @@ class IngestionPipeline:
             try:
                 return await self._ingest_file_impl(
                     budget_token=budget_token,
-                    path=path, on_progress=on_progress, original_name=original_name,
-                    namespace=namespace, source_id=source_id, old_item_ids=old_item_ids,
-                    on_committed=on_committed, on_duplicate=on_duplicate,
+                    path=path,
+                    on_progress=on_progress,
+                    original_name=original_name,
+                    namespace=namespace,
+                    source_id=source_id,
+                    old_item_ids=old_item_ids,
+                    on_committed=on_committed,
+                    on_duplicate=on_duplicate,
                     embed_priority=embed_priority,
+                    on_committed_in_txn=on_committed_in_txn,
+                    include_paths=include_paths,
+                    included=included,
                 )
             finally:
                 # Reclaim the reservation on EVERY exit that did not settle it: an
@@ -906,6 +781,9 @@ class IngestionPipeline:
         on_committed: Callable[[list[str]], None] | None = None,
         on_duplicate: Callable[[str], None] | None = None,
         embed_priority: int = PRIORITY_NORMAL,
+        on_committed_in_txn: bool = False,
+        include_paths: frozenset[str] | None = None,
+        included: set[str] | None = None,
     ) -> str | None:
         p = Path(path)
         display_name = original_name or p.name
@@ -926,8 +804,10 @@ class IngestionPipeline:
         resolved = await asyncio.to_thread(lambda: str(p.resolve()))
         if is_sensitive_path(path) or is_sensitive_path(resolved):
             sel().log_tool_invocation(
-                session_key="ingestion", agent="knowledge-ingest",
-                tool_name="knowledge.ingest_denied", outcome="denied",
+                session_key="ingestion",
+                agent="knowledge-ingest",
+                tool_name="knowledge.ingest_denied",
+                outcome="denied",
                 resources=f"source_id={source_id} file={log_name} reason=sensitive_path",
             )
             raise PermissionError(f"Refusing to ingest sensitive path: {log_name}")
@@ -957,22 +837,30 @@ class IngestionPipeline:
                 "Skipping oversized file for source_id=%s (%.1f MB > "
                 "knowledge.max_ingest_file_mb=%g MB); raise "
                 "knowledge.max_ingest_file_mb in config to ingest it",
-                source_id or "(new)", file_size / _MB, limit_mb,
+                source_id or "(new)",
+                file_size / _MB,
+                limit_mb,
             )
             sel().log_tool_invocation(
-                session_key="ingestion", agent="knowledge-ingest",
-                tool_name="knowledge.ingest_denied", outcome="denied",
-                resources=(f"source_id={source_id} file={log_name} "
-                           f"reason=oversized size_mb={file_size / _MB:.1f} limit_mb={limit_mb:g}"),
+                session_key="ingestion",
+                agent="knowledge-ingest",
+                tool_name="knowledge.ingest_denied",
+                outcome="denied",
+                resources=(
+                    f"source_id={source_id} file={log_name} "
+                    f"reason=oversized size_mb={file_size / _MB:.1f} limit_mb={limit_mb:g}"
+                ),
             )
             raise FileTooLargeError(msg)
 
         # 1. Read (offloaded: readers do synchronous whole-file parsing -- pdfplumber,
         # python-docx, etc. -- which must not block the event loop on a large file)
         if on_progress:
-            on_progress('reading', 0, 1)
-        text, meta = await asyncio.to_thread(self.reader.read, path)
-        if meta.get('format') == 'error':
+            on_progress("reading", 0, 1)
+        text, meta = await asyncio.to_thread(
+            self.reader.read, path, include_paths=include_paths, included=included
+        )
+        if meta.get("format") == "error":
             raise RuntimeError(f"Failed to read {path}: {meta.get('error')}")
 
         # Content the user never explicitly chose to index gets its secrets scrubbed
@@ -1005,7 +893,9 @@ class IngestionPipeline:
             props: dict[str, object] = {}
             src_row = await asyncio.to_thread(
                 lambda: self.store.db.execute(
-                    "SELECT uri, properties FROM sources WHERE id = ?", (source_id,)).fetchone())
+                    "SELECT uri, properties FROM sources WHERE id = ?", (source_id,)
+                ).fetchone()
+            )
             uri = src_row["uri"] if src_row else display_name
             props = json.loads(src_row["properties"] or "{}") if src_row else {}
         else:
@@ -1013,18 +903,26 @@ class IngestionPipeline:
             uri = str(p.resolve())
             existing = await asyncio.to_thread(self.store.get_source_by_uri, uri)
             if existing:
-                props = json.loads(existing.get('properties', '{}')) if isinstance(existing.get('properties'), str) else existing.get('properties', {})
-                if props.get('content_hash') == content_hash:
+                props = (
+                    json.loads(existing.get("properties", "{}"))
+                    if isinstance(existing.get("properties"), str)
+                    else existing.get("properties", {})
+                )
+                if props.get("content_hash") == content_hash:
                     return None
-                source_id = existing['id']
+                source_id = existing["id"]
                 resolve_old_group = True
             else:
                 props = {}
-                source_id = await asyncio.to_thread(functools.partial(
-                    self.store.add_source,
-                    name=display_name, source_type='local_file', uri=uri,
-                    properties={'content_hash': content_hash, **meta},
-                ))
+                source_id = await asyncio.to_thread(
+                    functools.partial(
+                        self.store.add_source,
+                        name=display_name,
+                        source_type="local_file",
+                        uri=uri,
+                        properties={"content_hash": content_hash, **meta},
+                    )
+                )
 
         # 3. Job record
         # One hop for the whole gate: it resolves the pre-existing item group
@@ -1034,8 +932,10 @@ class IngestionPipeline:
         # of blocking SQLite on a large library.
         def _gate() -> tuple[str | None, list[str]]:
             ids = self._resolve_old_item_ids(source_id) if resolve_old_group else _old_item_ids
-            return self._skip_as_duplicate(
-                content_hash, source_id, ids, on_duplicate=on_duplicate), ids
+            return (
+                self._skip_as_duplicate(content_hash, source_id, ids, on_duplicate=on_duplicate),
+                ids,
+            )
 
         dupe_job, _old_item_ids = await run_to_completion(_gate)
         if dupe_job:
@@ -1051,7 +951,8 @@ class IngestionPipeline:
         def _insert_job() -> None:
             self.store.db.execute(
                 "INSERT INTO ingestion_jobs (id, source_id, status, created_at, updated_at) VALUES (?, ?, 'processing', ?, ?)",
-                (job_id, source_id, now, now))
+                (job_id, source_id, now, now),
+            )
             self.store.db.commit()
 
         await run_to_completion(_insert_job)
@@ -1064,13 +965,24 @@ class IngestionPipeline:
         # on the way out and re-raise; callers keep seeing the original error.
         try:
             return await self._ingest_file_body(
-                job_id=job_id, source_id=source_id, props=props, meta=meta,
-                ext=ext, text=text, uri=uri, content_hash=content_hash,
-                display_name=display_name, namespace=namespace,
+                job_id=job_id,
+                source_id=source_id,
+                props=props,
+                meta=meta,
+                ext=ext,
+                text=text,
+                uri=uri,
+                content_hash=content_hash,
+                display_name=display_name,
+                namespace=namespace,
                 old_item_ids=old_item_ids,
-                _old_item_ids=_old_item_ids, path=path, on_progress=on_progress,
-                embed_priority=embed_priority, on_committed=on_committed,
+                _old_item_ids=_old_item_ids,
+                path=path,
+                on_progress=on_progress,
+                embed_priority=embed_priority,
+                on_committed=on_committed,
                 budget_token=budget_token,
+                on_committed_in_txn=on_committed_in_txn,
             )
         except Exception:
             try:
@@ -1083,9 +995,11 @@ class IngestionPipeline:
                 def _mark_failed() -> None:
                     self.store.db.execute(
                         "UPDATE ingestion_jobs SET status = 'failed', updated_at = ? WHERE id = ?",
-                        (datetime.now().isoformat(), job_id))
+                        (datetime.now().isoformat(), job_id),
+                    )
                     self.store.db.execute(
-                        "UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
+                        "UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,)
+                    )
                     self.store.db.commit()
 
                 await run_to_completion(_mark_failed)
@@ -1093,11 +1007,28 @@ class IngestionPipeline:
                 logger.warning("failed to mark ingestion job %s failed", job_id, exc_info=True)
             raise
 
-    async def _ingest_file_body(self, *, job_id, source_id, props, meta, ext, text,
-                                uri, content_hash, display_name, namespace,
-                                old_item_ids, _old_item_ids, path,
-                                on_progress, embed_priority,
-                                on_committed=None, budget_token=None) -> str | None:
+    async def _ingest_file_body(
+        self,
+        *,
+        job_id,
+        source_id,
+        props,
+        meta,
+        ext,
+        text,
+        uri,
+        content_hash,
+        display_name,
+        namespace,
+        old_item_ids,
+        _old_item_ids,
+        path,
+        on_progress,
+        embed_priority,
+        on_committed=None,
+        budget_token=None,
+        on_committed_in_txn=False,
+    ) -> str | None:
         """Chunk/extract/store/finalize — split out so ingest_file can mark the
         pre-inserted job row 'failed' on ANY exception in one place."""
         # 4. Chunk (use per-source chunk size if configured)
@@ -1118,13 +1049,14 @@ class IngestionPipeline:
 
         def _set_total() -> None:
             self.store.db.execute(
-                "UPDATE ingestion_jobs SET items_total = ? WHERE id = ?", (total, job_id))
+                "UPDATE ingestion_jobs SET items_total = ? WHERE id = ?", (total, job_id)
+            )
             self.store.db.commit()
 
         await asyncio.to_thread(_set_total)
 
         # 5. Extract all chunks in batch via pool
-        chunk_contents = [chunk['content'] for chunk in chunks]
+        chunk_contents = [chunk["content"] for chunk in chunks]
         extractions = await self.extractor.extract_batch(chunk_contents)
 
         # What THIS call wrote, collected at the write itself rather than
@@ -1137,16 +1069,16 @@ class IngestionPipeline:
         processed = 0
         for i, (chunk, extraction) in enumerate(zip(chunks, extractions)):
             try:
-                extraction['summary'] = _redact(extraction.get('summary'))
-                for ent in extraction.get('entities', []):
-                    ent['name'] = _redact(ent.get('name')) or ''
-                    ent['description'] = _redact(ent.get('description'))
+                extraction["summary"] = _redact(extraction.get("summary"))
+                for ent in extraction.get("entities", []):
+                    ent["name"] = _redact(ent.get("name")) or ""
+                    ent["description"] = _redact(ent.get("description"))
                 item_title = (
-                    _redact(extraction.get('title'))
-                    or _first_line_title(chunk['content'])
+                    _redact(extraction.get("title"))
+                    or _first_line_title(chunk["content"])
                     or f"{Path(display_name).stem} chunk {i}"
                 )
-                item_tags = ['content_type:markdown'] if is_markdown else None
+                item_tags = ["content_type:markdown"] if is_markdown else None
 
                 # add_item opens its own BEGIN/COMMIT and add_source_location
                 # commits on the same autocommit connection, so on the loop each
@@ -1171,20 +1103,21 @@ class IngestionPipeline:
                 def _write_chunk() -> str:
                     new_id = self.store.add_item(
                         title=item_title,
-                        content=chunk['content'],
-                        item_type=extraction.get('category', 'document'),
+                        content=chunk["content"],
+                        item_type=extraction.get("category", "document"),
                         source_id=source_id,
-                        chunk_index=chunk.get('chunk_index', i),
-                        summary=extraction.get('summary'),
+                        chunk_index=chunk.get("chunk_index", i),
+                        summary=extraction.get("summary"),
                         namespace=namespace,
                         tags=item_tags,
                         content_hash=content_hash,
                     )
                     created_item_ids.append(new_id)
                     self.store.add_source_location(
-                        item_id=new_id, source_id=source_id,
+                        item_id=new_id,
+                        source_id=source_id,
                         chunk_range=f"{chunk.get('line_start', 0)}-{chunk.get('line_end', 0)}",
-                        section_title=chunk.get('section_title'),
+                        section_title=chunk.get("section_title"),
                     )
                     return new_id
 
@@ -1199,15 +1132,15 @@ class IngestionPipeline:
                 await self._embed_item(
                     item_id,
                     item_title,
-                    extraction.get('summary'),
-                    chunk['content'],
+                    extraction.get("summary"),
+                    chunk["content"],
                     embed_priority=embed_priority,
                 )
                 processed += 1
             except Exception:
                 logger.exception("Failed to process chunk %d of %s", i, path)
             if on_progress:
-                on_progress('extracting', i + 1, total)
+                on_progress("extracting", i + 1, total)
 
         # 6. Finalize
         now = datetime.now().isoformat()
@@ -1225,9 +1158,30 @@ class IngestionPipeline:
             # (isolation_level=None), so no enclosing transaction spans this,
             # and WAL + busy_timeout=10000 rides out write-lock contention.
             if processed == total:
-                self.store.delete_items_batch(_old_item_ids, owner_source_id=source_id)
-                if on_committed is not None:
-                    on_committed(list(created_item_ids))
+                if on_committed is not None and on_committed_in_txn:
+                    # ONE transaction for the old group's delete and the
+                    # caller's ownership write (see ingest_file). Two commits
+                    # leave a window where a crash or a raising callback
+                    # persists the old group deleted and the new group owned
+                    # by no row.
+                    self.store.db.execute("BEGIN IMMEDIATE")
+                    try:
+                        if _old_item_ids:
+                            self.store.delete_items_batch_in_txn(
+                                _old_item_ids, owner_source_id=source_id
+                            )
+                        on_committed(list(created_item_ids))
+                        self.store.db.execute("COMMIT")
+                    except BaseException:
+                        self.store.db.execute("ROLLBACK")
+                        raise
+                    if _old_item_ids:
+                        # The duty delete_items_batch_in_txn hands its caller.
+                        self.store.reload_graph()
+                else:
+                    self.store.delete_items_batch(_old_item_ids, owner_source_id=source_id)
+                    if on_committed is not None:
+                        on_committed(list(created_item_ids))
                 # A key DELTA onto the row's current blob, in one write-locked
                 # take with the status and timestamp: the sync scheduler's
                 # outcome writers land on this same row from their own worker
@@ -1236,8 +1190,11 @@ class IngestionPipeline:
                 # whatever they committed since. revise_source_properties
                 # documents the serialization.
                 self.store.merge_source_properties(
-                    source_id, set_keys={'content_hash': content_hash, **meta},
-                    sync_status='synced', last_synced=now)
+                    source_id,
+                    set_keys={"content_hash": content_hash, **meta},
+                    sync_status="synced",
+                    last_synced=now,
+                )
             elif processed < total:
                 # Partial failure: remove only items created during THIS ingestion
                 # call, taken from the write itself -- a before/after re-read of
@@ -1252,10 +1209,13 @@ class IngestionPipeline:
                 # empty group, which the doc-state recovery paths treat as "re-
                 # attempt", so the next scan restores a complete copy.
                 self.store.delete_items_batch(list(created_item_ids))
-                self.store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
+                self.store.db.execute(
+                    "UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,)
+                )
             self.store.db.execute(
                 "UPDATE ingestion_jobs SET status = ?, items_processed = ?, updated_at = ? WHERE id = ?",
-                (_job_status(processed, total), processed, now, job_id))
+                (_job_status(processed, total), processed, now, job_id),
+            )
             self.store.db.commit()
 
         await run_to_completion(_finalize)
@@ -1282,10 +1242,15 @@ class IngestionPipeline:
         self._import_budget.settle(budget_token, total)
         return job_id
 
-    async def ingest_text(self, text: str, title: str, source_type: str = 'manual',
-                          source_id: str | None = None,
-                          old_item_ids: list[str] | None = None,
-                          on_duplicate: Callable[[str], None] | None = None) -> str | None:
+    async def ingest_text(
+        self,
+        text: str,
+        title: str,
+        source_type: str = "manual",
+        source_id: str | None = None,
+        old_item_ids: list[str] | None = None,
+        on_duplicate: Callable[[str], None] | None = None,
+    ) -> str | None:
         """Ingest raw text (dashboard drop, chat, or a shared aggregate source).
 
         Without ``source_id`` the source is found-or-created by a
@@ -1317,8 +1282,12 @@ class IngestionPipeline:
             budget_token = await self._enter_import_budget(True)
             try:
                 return await self._ingest_text_impl(
-                    text, title, source_type=source_type, source_id=source_id,
-                    old_item_ids=old_item_ids, on_duplicate=on_duplicate,
+                    text,
+                    title,
+                    source_type=source_type,
+                    source_id=source_id,
+                    old_item_ids=old_item_ids,
+                    on_duplicate=on_duplicate,
                     budget_token=budget_token,
                 )
             finally:
@@ -1327,11 +1296,16 @@ class IngestionPipeline:
                 # consumes the token so this release is a no-op there. See ingest_file.
                 self._import_budget.release(budget_token)
 
-    async def _ingest_text_impl(self, text: str, title: str, source_type: str = 'manual',
-                                source_id: str | None = None,
-                                old_item_ids: list[str] | None = None,
-                                on_duplicate: Callable[[str], None] | None = None,
-                                budget_token: int | None = None) -> str | None:
+    async def _ingest_text_impl(
+        self,
+        text: str,
+        title: str,
+        source_type: str = "manual",
+        source_id: str | None = None,
+        old_item_ids: list[str] | None = None,
+        on_duplicate: Callable[[str], None] | None = None,
+        budget_token: int | None = None,
+    ) -> str | None:
         content_hash = hashlib.sha256(text.encode()).hexdigest()
 
         # Resolve the source and the prior item ids this call should replace.
@@ -1344,17 +1318,25 @@ class IngestionPipeline:
             uri = f"{source_type}://{content_hash[:16]}"
             existing = await asyncio.to_thread(self.store.get_source_by_uri, uri)
             if existing:
-                props = json.loads(existing.get('properties', '{}')) if isinstance(existing.get('properties'), str) else existing.get('properties', {})
-                if props.get('content_hash') == content_hash:
+                props = (
+                    json.loads(existing.get("properties", "{}"))
+                    if isinstance(existing.get("properties"), str)
+                    else existing.get("properties", {})
+                )
+                if props.get("content_hash") == content_hash:
                     return None  # unchanged
-                source_id = existing['id']
+                source_id = existing["id"]
                 resolve_old_group = True
             else:
-                source_id = await asyncio.to_thread(functools.partial(
-                    self.store.add_source,
-                    name=title, source_type=source_type, uri=uri,
-                    properties={'content_hash': content_hash},
-                ))
+                source_id = await asyncio.to_thread(
+                    functools.partial(
+                        self.store.add_source,
+                        name=title,
+                        source_type=source_type,
+                        uri=uri,
+                        properties={"content_hash": content_hash},
+                    )
+                )
         elif old_item_ids is None:
             # Existing source, replace-all (single-text / remote-sync source).
             resolve_old_group = True
@@ -1366,8 +1348,10 @@ class IngestionPipeline:
         # of blocking SQLite on a large library.
         def _gate() -> tuple[str | None, list[str]]:
             ids = self._resolve_old_item_ids(source_id) if resolve_old_group else _old_item_ids
-            return self._skip_as_duplicate(
-                content_hash, source_id, ids, on_duplicate=on_duplicate), ids
+            return (
+                self._skip_as_duplicate(content_hash, source_id, ids, on_duplicate=on_duplicate),
+                ids,
+            )
 
         dupe_job, _old_item_ids = await run_to_completion(_gate)
         if dupe_job:
@@ -1382,7 +1366,8 @@ class IngestionPipeline:
         def _insert_job() -> None:
             self.store.db.execute(
                 "INSERT INTO ingestion_jobs (id, source_id, status, created_at, updated_at) VALUES (?, ?, 'processing', ?, ?)",
-                (job_id, source_id, now, now))
+                (job_id, source_id, now, now),
+            )
             self.store.db.commit()
 
         await run_to_completion(_insert_job)
@@ -1390,7 +1375,7 @@ class IngestionPipeline:
         chunks = await asyncio.to_thread(self.chunker.chunk, text)
         total = len(chunks)
 
-        chunk_contents = [chunk['content'] for chunk in chunks]
+        chunk_contents = [chunk["content"] for chunk in chunks]
         extractions = await self.extractor.extract_batch(chunk_contents)
 
         # What THIS call wrote, collected at the write itself rather than
@@ -1404,10 +1389,10 @@ class IngestionPipeline:
         processed = 0
         for i, (chunk, extraction) in enumerate(zip(chunks, extractions)):
             try:
-                extraction['summary'] = _redact(extraction.get('summary'))
-                for ent in extraction.get('entities', []):
-                    ent['name'] = _redact(ent.get('name')) or ''
-                    ent['description'] = _redact(ent.get('description'))
+                extraction["summary"] = _redact(extraction.get("summary"))
+                for ent in extraction.get("entities", []):
+                    ent["name"] = _redact(ent.get("name")) or ""
+                    ent["description"] = _redact(ent.get("description"))
 
                 # ONE uncancellable unit, for both reasons spelled out in
                 # _ingest_file_body: a cancellation must not be able to land
@@ -1416,19 +1401,20 @@ class IngestionPipeline:
                 # leaves the item nameable by the partial-failure rollback.
                 def _write_chunk() -> str:
                     new_id = self.store.add_item(
-                        title=chunk.get('section_title') or f"{title} chunk {i}",
-                        content=chunk['content'],
-                        item_type=extraction.get('category', 'document'),
+                        title=chunk.get("section_title") or f"{title} chunk {i}",
+                        content=chunk["content"],
+                        item_type=extraction.get("category", "document"),
                         source_id=source_id,
-                        chunk_index=chunk.get('chunk_index', i),
-                        summary=extraction.get('summary'),
+                        chunk_index=chunk.get("chunk_index", i),
+                        summary=extraction.get("summary"),
                         content_hash=content_hash,
                     )
                     created_item_ids.append(new_id)
                     self.store.add_source_location(
-                        item_id=new_id, source_id=source_id,
+                        item_id=new_id,
+                        source_id=source_id,
                         chunk_range=f"{chunk.get('line_start', 0)}-{chunk.get('line_end', 0)}",
-                        section_title=chunk.get('section_title'),
+                        section_title=chunk.get("section_title"),
                     )
                     return new_id
 
@@ -1442,9 +1428,9 @@ class IngestionPipeline:
                 await asyncio.to_thread(self._store_entities, extraction, item_id)
                 await self._embed_item(
                     item_id,
-                    chunk.get('section_title') or f"{title} chunk {i}",
-                    extraction.get('summary'),
-                    chunk['content'],
+                    chunk.get("section_title") or f"{title} chunk {i}",
+                    extraction.get("summary"),
+                    chunk["content"],
                 )
                 processed += 1
             except Exception:
@@ -1462,7 +1448,9 @@ class IngestionPipeline:
             # write-lock contention.
             if processed == total:
                 self.store.delete_items_batch(_old_item_ids, owner_source_id=source_id)
-                self.store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
+                self.store.db.execute(
+                    "UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,)
+                )
                 self.store.update_source(source_id, last_synced=now)
             elif processed < total:
                 # Partial failure: remove only items created during THIS call so we
@@ -1474,10 +1462,13 @@ class IngestionPipeline:
                 # duplicate-gate attacher, or that attacher keeps a truncated
                 # document its unchanged hash never lets a rescan repair.
                 self.store.delete_items_batch(list(created_item_ids))
-                self.store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
+                self.store.db.execute(
+                    "UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,)
+                )
             self.store.db.execute(
                 "UPDATE ingestion_jobs SET status = ?, items_total = ?, items_processed = ?, updated_at = ? WHERE id = ?",
-                (_job_status(processed, total), total, processed, now, job_id))
+                (_job_status(processed, total), total, processed, now, job_id),
+            )
             self.store.db.commit()
 
         await run_to_completion(_finalize)
@@ -1506,38 +1497,41 @@ class IngestionPipeline:
         return job_id
 
     def get_job_status(self, job_id: str) -> dict | None:
-        row = self.store.db.execute("SELECT * FROM ingestion_jobs WHERE id = ?", (job_id,)).fetchone()
+        row = self.store.db.execute(
+            "SELECT * FROM ingestion_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
         return dict(row) if row else None
 
     def _store_entities(self, extraction: dict, item_id: str):
         """Deduplicate and store entities, mentions, and relations."""
         entity_map: dict[str, str] = {}  # name -> entity_id
-        for ent in extraction.get('entities', []):
-            name = ent.get('name', '').strip()
+        for ent in extraction.get("entities", []):
+            name = ent.get("name", "").strip()
             if not name:
                 continue
             existing = self.store.find_entity(name)
             if existing:
-                eid = existing['id']
+                eid = existing["id"]
             else:
                 eid = self.store.add_entity(
                     name=name,
-                    entity_type=ent.get('type', 'concept'),
-                    description=ent.get('description'),
+                    entity_type=ent.get("type", "concept"),
+                    description=ent.get("description"),
                 )
             entity_map[name] = eid
-            self.store.add_mention(item_id, eid, context=ent.get('description'))
+            self.store.add_mention(item_id, eid, context=ent.get("description"))
 
-        for rel in extraction.get('relations', []):
-            src_name = rel.get('source', '').strip()
-            tgt_name = rel.get('target', '').strip()
+        for rel in extraction.get("relations", []):
+            src_name = rel.get("source", "").strip()
+            tgt_name = rel.get("target", "").strip()
             src_id = entity_map.get(src_name)
             tgt_id = entity_map.get(tgt_name)
             if src_id and tgt_id:
                 self.store.add_entity_relation(
-                    source_id=src_id, target_id=tgt_id,
-                    relation_type=_redact(rel.get('type', 'uses')) or 'uses',
-                    description=_redact(rel.get('description')),
+                    source_id=src_id,
+                    target_id=tgt_id,
+                    relation_type=_redact(rel.get("type", "uses")) or "uses",
+                    description=_redact(rel.get("description")),
                     source_item_id=item_id,
                 )
 
@@ -1583,9 +1577,7 @@ class IngestionPipeline:
         if embed_priority == PRIORITY_NORMAL:
             # Preserve the established attended-call contract for lightweight
             # embedders that do not expose scheduling; bulk is an explicit opt-in.
-            embed_call = functools.partial(
-                self.embedder.embed_for_item, title, summary, content
-            )
+            embed_call = functools.partial(self.embedder.embed_for_item, title, summary, content)
         else:
             embed_call = functools.partial(
                 self.embedder.embed_for_item,
@@ -1602,7 +1594,8 @@ class IngestionPipeline:
             def _stamp() -> None:
                 self.store.db.execute(
                     "UPDATE items SET embedding = ?, embedding_sig = ?, embedded_at = ? WHERE id = ?",
-                    (blob, sig, stamped_at, item_id))
+                    (blob, sig, stamped_at, item_id),
+                )
                 self.store.db.commit()
 
             # A dropped stamp is safe in the one direction that matters: the
@@ -1617,7 +1610,9 @@ class IngestionPipeline:
         rows = await asyncio.to_thread(
             lambda: self.store.db.execute(
                 "SELECT summary FROM items WHERE source_id = ? AND summary IS NOT NULL AND summary != '' ORDER BY chunk_index",
-                (source_id,)).fetchall())
+                (source_id,),
+            ).fetchall()
+        )
         if not rows:
             return
         chunk_summaries = "\n".join(r["summary"] for r in rows)
@@ -1645,7 +1640,8 @@ class IngestionPipeline:
                 def _store_summary() -> None:
                     self.store.db.execute(
                         "UPDATE sources SET summary_topic = ?, summary_themes = ? WHERE id = ?",
-                        (topic, themes, source_id))
+                        (topic, themes, source_id),
+                    )
                     self.store.db.commit()
 
                 await asyncio.to_thread(_store_summary)
@@ -1653,346 +1649,62 @@ class IngestionPipeline:
             logger.debug("Source summary generation failed for %s", source_id, exc_info=True)
 
 
-_REBUILD_BATCH_SIZE = 50
+# This module is the facade of the ingestion owners and keeps the pipeline itself:
+# IngestionPipeline, the ingestion gate and its hand-off context, the embed rate limiter,
+# the cancellation-safe worker hop and the helpers the pipeline reads. Every other name is
+# reached through it as ``kiro_crew.knowledge.ingestion.<name>``: a read is served by the
+# owner that binds the name, and a write -- ``monkeypatch.setattr``, ``mock.patch`` --
+# reaches every module holding it (:mod:`kiro_crew._facade_mirror`). Owners never import
+# this module. New work goes to the owner of its responsibility:
+#
+#   ``ingestion_budget`` -- the explicit-import chunk budget and its refusal.
+#   ``ingestion_rebuild`` -- the corpus re-embed sweep and its single-flight job row.
+#
+#: Owner modules, lowest layer first: the first holder of a name answers its reads.
+_OWNERS = (
+    "kiro_crew.knowledge.ingestion_budget",
+    "kiro_crew.knowledge.ingestion_rebuild",
+)
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+#: Name the facade serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+#: What a star import binds: every public name of the unsplit module's namespace.
+__all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
 
-# A rebuild commits progress (refreshing updated_at) at least every batch. A job
-# row stuck in 'processing' past this window is from a crash that bypassed cleanup,
-# so the single-flight guard treats it as dead and lets a new rebuild start.
-_REBUILD_STALE_AFTER = timedelta(minutes=10)
-
-# Ordinary ingestion does not have a single-flight claimant, but a crashed job
-# can still pin its source against orphan cleanup forever. The deadline is much
-# longer than the largest normal extraction batch so a live low-concurrency
-# ingest is never reaped as a crash leftover.
-_INGESTION_JOB_STALE_AFTER = timedelta(hours=2)
-
-# Items that just failed a re-embed (vec is None) keep a stale sig but get an
-# `embedded_at` stamp; the watcher backs off from re-triggering on them until this
-# window elapses, so a perpetually-failing item (model not resident) can't drive a fresh
-# rebuild every scan interval. Longer than _REBUILD_STALE_AFTER so a legit retry
-# isn't suppressed but a tight retrigger loop is.
-_REEMBED_RETRY_BACKOFF = timedelta(minutes=15)
-
-
-def _heartbeat_rebuild_job(store, job_id: str, now_iso: str) -> None:
-    """Advance a rebuild job's ``updated_at`` (single write + commit).
-
-    Called via ``asyncio.to_thread`` from the async rebuild loop so the blocking
-    SQLite write never runs on the event loop. ``store.db`` resolves to the
-    WORKER thread's own connection (per-thread ``threading.local``), so this is
-    safe to run off-loop; the loop awaits it serially.
-    """
-    store.db.execute(
-        "UPDATE ingestion_jobs SET updated_at = ? WHERE id = ?", (now_iso, job_id)
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.knowledge.ingestion_budget import (  # noqa: F401
+        _IMPORT_CHUNK_BUDGET_WINDOW_SECS,
+        ImportChunkBudgetError,
     )
-    store.db.commit()
-
-
-def _write_item_embedding(store, item_id: str, blob: bytes, sig: str, now_iso: str, snap) -> bool:
-    """Persist a freshly-computed vector for one item; return True if it landed.
-
-    Runs via ``asyncio.to_thread`` (blocking SQLite off the event loop; worker's
-    own thread-local connection). The ``updated_at <= snap`` guard skips the
-    write when a concurrent re-ingest rewrote the item mid-embed (lost-update
-    protection) — ``cur.rowcount == 0`` then, so the caller counts it as failed.
-    """
-    cur = store.db.execute(
-        "UPDATE items SET embedding = ?, embedding_sig = ?, embedded_at = ? "
-        "WHERE id = ? AND (updated_at IS NULL OR updated_at <= ?)",
-        (blob, sig, now_iso, item_id, snap))
-    store.db.commit()
-    return bool(cur.rowcount)
-
-
-def _stamp_embed_attempt(store, item_id: str, now_iso: str) -> None:
-    """Stamp ``embedded_at`` after a transient embed failure (leaves sig stale so
-    the item is retried, but backs the watcher off it). Offloaded like the other
-    per-item writes so it never blocks the event loop.
-    """
-    store.db.execute(
-        "UPDATE items SET embedded_at = ? WHERE id = ?", (now_iso, item_id))
-    store.db.commit()
-
-
-def _init_rebuild_total(store, count_where: str, params_tail: tuple, job_id: str) -> None:
-    """Count the rebuild's total items and stamp it on the job row (single commit).
-
-    Runs on a worker thread (``asyncio.to_thread``): the COUNT(*) scans the items
-    table and can stall for tens of seconds on a large KB under WAL contention, so
-    it must never run inline on the gateway event loop. ``store.db`` is a
-    per-thread connection; the UPDATE and its commit stay on this thread's own
-    connection.
-    """
-    total = store.db.execute(
-        f"SELECT COUNT(*) AS c FROM items WHERE {count_where}",  # noqa: S608
-        params_tail).fetchone()["c"]
-    store.db.execute(
-        "UPDATE ingestion_jobs SET items_total = ?, updated_at = ? WHERE id = ?",
-        (total, datetime.now().isoformat(), job_id))
-    store.db.commit()
-
-
-def _fetch_rebuild_page(store, page_where: str, params_tail: tuple, last_id: str):
-    """Fetch one keyset page of items to re-embed (worker thread; see above)."""
-    return store.db.execute(
-        f"SELECT id, title, summary, content, updated_at FROM items WHERE {page_where} "  # noqa: S608
-        "ORDER BY id LIMIT ?",
-        (*params_tail, last_id, _REBUILD_BATCH_SIZE)).fetchall()
-
-
-def _commit_rebuild_progress(store, job_id: str | None, processed: int, failed: int) -> None:
-    """Write end-of-batch progress counters and commit (worker thread; see above)."""
-    if job_id is not None:
-        store.db.execute(
-            "UPDATE ingestion_jobs SET items_processed = ?, items_failed = ?, "
-            "updated_at = ? WHERE id = ?",
-            (processed, failed, datetime.now().isoformat(), job_id))
-    store.db.commit()
-
-
-def _select_active_rebuild_job(store, *, now: datetime | None = None):
-    """Return a FRESH (within the staleness window) active rebuild job row, or None.
-
-    A corpus-wide rebuild is identified by ``source_id IS NULL`` + ``status='processing'``.
-    Rows older than the staleness window are crashed leftovers and are NOT returned
-    (callers sweep them). Must be called inside an open transaction by the claimer.
-    """
-    fresh = ((now or datetime.now()) - _REBUILD_STALE_AFTER).isoformat()
-    return store.db.execute(
-        "SELECT id FROM ingestion_jobs WHERE source_id IS NULL AND status = 'processing' "
-        "AND updated_at > ? ORDER BY created_at DESC LIMIT 1",
-        (fresh,)).fetchone()
-
-
-def start_rebuild_job(store, *, now: datetime | None = None) -> str | None:
-    """Atomically claim the single-flight slot for a corpus rebuild.
-
-    Wraps check-then-insert in a single ``BEGIN IMMEDIATE`` transaction so the
-    watcher's 300s tick and a user-clicked rebuild can't both observe "no active
-    job" and each insert one (the per-path single-flight guard was not safe across
-    paths). Also sweeps any stale ``processing`` rows from prior crashes to
-    ``abandoned`` so they don't accumulate as phantom jobs forever.
-
-    Returns the new ``job_id`` if this caller claimed the slot, or ``None`` if a
-    fresh rebuild is already in flight (caller should not start one).
-    """
-    now = now or datetime.now()
-    ts = now.isoformat()
-    fresh = (now - _REBUILD_STALE_AFTER).isoformat()
-    store.db.execute("BEGIN IMMEDIATE")
-    try:
-        if _select_active_rebuild_job(store, now=now) is not None:
-            store.db.execute("COMMIT")
-            return None
-        # Sweep crashed leftovers (stale 'processing' rows) so they don't linger.
-        store.db.execute(
-            "UPDATE ingestion_jobs SET status = 'abandoned', "
-            "error = 'abandoned: updated_at past staleness window', updated_at = ? "
-            "WHERE source_id IS NULL AND status = 'processing' AND updated_at <= ?",
-            (ts, fresh))
-        job_id = uuid4().hex[:12]
-        store.db.execute(
-            "INSERT INTO ingestion_jobs (id, source_id, status, created_at, updated_at) "
-            "VALUES (?, NULL, 'processing', ?, ?)",
-            (job_id, ts, ts))
-        store.db.execute("COMMIT")
-        return job_id
-    except Exception:
-        store.db.execute("ROLLBACK")
-        raise
-
-
-def abandon_stale_ingestion_jobs(store, *, now: datetime | None = None) -> int:
-    """Finalize crashed ordinary ingestion jobs that can no longer make progress.
-
-    Corpus-wide embedding rebuilds have their own short single-flight lease and
-    are deliberately excluded. This only releases source-owned jobs whose
-    status has stayed ``processing`` beyond the ordinary ingestion deadline.
-    """
-    now = now or datetime.now()
-    ts = now.isoformat()
-    stale_before = (now - _INGESTION_JOB_STALE_AFTER).isoformat()
-    cur = store.db.execute(
-        "UPDATE ingestion_jobs SET status = 'abandoned', "
-        "error = 'abandoned: no progress before ingestion deadline', updated_at = ? "
-        "WHERE source_id IS NOT NULL AND status = 'processing' AND updated_at <= ?",
-        (ts, stale_before),
+    from kiro_crew.knowledge.ingestion_rebuild import (  # noqa: F401
+        _INGESTION_JOB_STALE_AFTER,
+        _REBUILD_BATCH_SIZE,
+        _REBUILD_STALE_AFTER,
+        _REEMBED_RETRY_BACKOFF,
+        _commit_rebuild_progress,
+        _embed_row_paced,
+        _fetch_rebuild_page,
+        _heartbeat_rebuild_job,
+        _init_rebuild_total,
+        _select_active_rebuild_job,
+        _stamp_embed_attempt,
+        _write_item_embedding,
+        abandon_stale_ingestion_jobs,
+        count_stale_items,
+        rebuild_embeddings,
+        start_rebuild_job,
     )
-    store.db.commit()
-    return int(cur.rowcount)
 
+if TYPE_CHECKING:  # names it serves from outside the family, from their homes
+    from datetime import timedelta  # noqa: F401
 
-def count_stale_items(store, sig: str, *, now: datetime | None = None) -> int:
-    """Count active items whose embedding sig is stale and not in retry backoff.
-
-    Excludes items re-attempted within ``_REEMBED_RETRY_BACKOFF`` (stale sig but a
-    recent ``embedded_at``) so a perpetually-failing item can't make the watcher
-    re-trigger every scan interval.
-    """
-    cutoff = ((now or datetime.now()) - _REEMBED_RETRY_BACKOFF).isoformat()
-    return store.db.execute(
-        "SELECT COUNT(*) AS c FROM items WHERE status = 'active' "
-        "AND (embedding_sig IS NULL OR embedding_sig != ?) "
-        "AND (embedded_at IS NULL OR embedded_at < ?)",
-        (sig, cutoff)).fetchone()["c"]
-
-
-def _embed_row_paced(embedder, title, summary, content, priority: int,
-                     pace: bool) -> "tuple[list[float] | None, float]":
-    """Embed one row and derive its pace delay, both on the worker thread.
-
-    Runs via ``run_in_executor`` — the inference is the CPU floor, and the
-    delay is computed here rather than on the event loop because
-    ``bulk_pace_delay`` re-reads the duty cycle from ``config.json`` on every
-    call (an uncached stat + read + parse that must not run per row on the
-    gateway loop; the no-blocking-call-on-event-loop rule). This is the same
-    division the vector-memory sweep uses: measure and derive on the sweep's
-    own thread, never on the loop. Measuring around the embed call itself also
-    keeps the executor queue wait out of the paced elapsed. The delay derives
-    from measured elapsed time (0.0 for ``elapsed <= 0``), so a row that
-    failed fast paces to nothing on its own — failures need no separate
-    branch. Returns ``(vec, delay)``; ``delay`` is always 0.0 when unpaced.
-    """
-    started = _time.monotonic()
-    vec = embedder.embed_for_item(title, summary, content, priority=priority)
-    delay = bulk_pace_delay(_time.monotonic() - started) if pace else 0.0
-    return vec, delay
-
-
-async def rebuild_embeddings(store, embedder, *, job_id: str | None = None,
-                             force: bool = False, pace: bool = True) -> int:
-    """Re-embed active items in place, stamping the current embedding signature.
-
-    Sig-gated by default: only items whose stored ``embedding_sig`` differs from the
-    current setup (or is NULL) are re-embedded, which makes the operation idempotent
-    — a partial-failure retry skips already-done items, and a re-run on an unchanged
-    setup is a no-op. ``force=True`` re-embeds every active item regardless of sig
-    (escape hatch for suspected vector corruption).
-
-    Vectors are overwritten one item at a time so search stays queryable throughout.
-    When ``job_id`` is given, progress is written to that ``ingestion_jobs`` row; the
-    same function powers the dashboard trigger and the watcher self-heal. Returns the
-    number of items successfully re-embedded.
-
-    Serial single-item embed (the in-process embedder is the CPU floor and fans out
-    internally); batch size is only the commit/progress cadence, not a throttle.
-
-    ``pace`` keys the sweep's resource envelope on attendance. This is an
-    unattended corpus loop when the watcher self-heal fires it — to a user, a
-    full-corpus re-embed at full speed is indistinguishable from a runaway
-    process — so the paced default embeds at ``PRIORITY_BULK`` (the reduced
-    ``memory.embedding_bulk_threads`` pool) and idles between rows per
-    ``memory.embedding_bulk_duty`` (see :func:`kiro_crew.embeddings.bulk_pace_delay`).
-    Paced is the default so a caller that forgets the argument gets the quiet
-    behaviour. ``pace=False`` is for a sweep a human explicitly asked for and is
-    watching a progress bar on: it embeds at ``PRIORITY_NORMAL`` and never idles.
-    ``pace`` selects the scheduling class as well as the idling — an attended
-    sweep that only skipped the pauses would stay on the reduced bulk pool and
-    run several times slower than before pacing existed, on exactly the path
-    declared "full speed".
-    """
-    loop = asyncio.get_running_loop()
-    sig = embedder_signature(embedder)
-    priority = PRIORITY_BULK if pace else PRIORITY_NORMAL
-    processed = 0
-    failed = 0
-    # Keep the COUNT predicate and the page predicate as separate strings so neither
-    # is derived by stripping a clause out of the other (a string-replace that would
-    # silently no-op if the WHERE were ever reworded).
-    if force:
-        count_where = "status = 'active'"
-        page_where = "status = 'active' AND id > ?"
-        params_tail: tuple = ()
-    else:
-        count_where = "status = 'active' AND (embedding_sig IS NULL OR embedding_sig != ?)"
-        page_where = count_where + " AND id > ?"
-        params_tail = (sig,)
-
-    if job_id is not None:
-        # OFFLOADED: the total COUNT scans the items table and can stall on a
-        # large KB; an inline call blocks the event loop (loop-watchdog risk).
-        await asyncio.to_thread(_init_rebuild_total, store, count_where, params_tail, job_id)
-
-    last_id = ""
-    while True:
-        # OFFLOADED: page reads can block behind a concurrent writer's
-        # busy_timeout; keep every DB touch in this loop off the event loop.
-        rows = await asyncio.to_thread(
-            _fetch_rebuild_page, store, page_where, params_tail, last_id)
-        if not rows:
-            break
-        for row in rows:
-            # functools.partial rather than a local closure: run_in_executor
-            # forwards positional args only, and the partial names the bound
-            # arguments at the call site instead of one hop away in a nested
-            # def. Embed + delay derivation both happen on the worker thread
-            # (see _embed_row_paced); only the idle itself runs here.
-            vec, delay = await loop.run_in_executor(
-                None,
-                functools.partial(
-                    _embed_row_paced,
-                    embedder,
-                    row["title"], row["summary"], row["content"],
-                    priority, pace,
-                ),
-            )
-            if delay > 0:
-                # Idle between this row's inference and its write — the
-                # interruption-safe point: a sweep killed mid-pause leaves the
-                # row's sig stale and the next sweep re-embeds it, the same
-                # idempotent contract every row it never reached already has.
-                # ``await asyncio.sleep`` is this coroutine's equivalent of the
-                # vector-memory sweep's on-thread pause: it yields the event
-                # loop and holds neither the DB connection nor the model, so an
-                # interactive embed arriving mid-pause is served at full speed.
-                await asyncio.sleep(delay)
-            now_iso = datetime.now().isoformat()
-            # Per-item SQLite writes are OFFLOADED (asyncio.to_thread): a sync
-            # write can block up to the busy_timeout under a concurrent writer,
-            # and rebuild_embeddings is awaited on the gateway event loop — an
-            # inline write would freeze chat/liveness (the
-            # no-blocking-call-on-event-loop rule). store.db is a per-thread connection
-            # (threading.local, WAL); the loop awaits each serially, so there is
-            # no concurrent-connection use.
-            if vec:
-                # Guard against a lost update: if ingestion (file-change re-ingest)
-                # rewrote title/content while we were embedding, its updated_at moved
-                # past our snapshot's -- skip our stale-vector UPDATE and let that
-                # item re-embed via its own _embed_item. ``snap`` is the row's
-                # updated_at at read time.
-                snap = row["updated_at"]
-                landed = await asyncio.to_thread(
-                    _write_item_embedding, store, row["id"], floats_to_bytes(vec), sig, now_iso, snap
-                )
-                if landed:
-                    processed += 1
-                else:
-                    failed += 1  # raced with a concurrent writer; counts as not-done
-            else:
-                # Transient embed failure: leave sig stale (so it's retried) but stamp
-                # embedded_at as the attempt time so the watcher backs off this item.
-                await asyncio.to_thread(_stamp_embed_attempt, store, row["id"], now_iso)
-                failed += 1
-            last_id = row["id"]
-            if job_id is not None:
-                # Heartbeat the job row PER ITEM, not just per batch: a single embed
-                # is the CPU floor, so 50 serial embeds can exceed
-                # _REBUILD_STALE_AFTER on a slow/cold host. If updated_at only
-                # advanced at end-of-batch, the single-flight claimer would judge a
-                # live rebuild abandoned mid-batch and start a second one (duplicated
-                # embedding work). Committing the timestamp each item keeps the job
-                # demonstrably alive within the staleness window. The heavier
-                # progress counters still land once per batch below.
-                #
-                # OFFLOAD the write: rebuild_embeddings is awaited on the gateway
-                # event loop, and a synchronous SQLite write can block up to the
-                # busy_timeout when another writer holds the lock — freezing chat /
-                # liveness (the no-blocking-call-on-event-loop rule). ``store.db`` is
-                # a per-thread connection (threading.local, WAL), so the worker
-                # thread safely uses its OWN connection to the same db; the loop
-                # awaits it serially, so there is no concurrent-connection use.
-                await asyncio.to_thread(_heartbeat_rebuild_job, store, job_id, now_iso)
-        # OFFLOADED end-of-batch progress write + commit (same no-blocking rule).
-        await asyncio.to_thread(_commit_rebuild_progress, store, job_id, processed, failed)
-
-    return processed
+    from kiro_crew.embeddings import (  # noqa: F401
+        PRIORITY_BULK,
+        bulk_pace_delay,
+    )
+    from kiro_crew.knowledge.chunker import (  # noqa: F401
+        MAX_CHUNKS_PER_FILE,
+    )

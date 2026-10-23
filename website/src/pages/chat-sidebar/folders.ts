@@ -364,10 +364,13 @@ export function useFolderFilterRows({ folderTree, folders, folderCompare, filter
 }
 
 /** Folder create, delete and optimistic update. */
-export function useFolderMutations({ queryClient, setFolderActionError, folders }: {
+export function useFolderMutations({ queryClient, setFolderActionError, setFolderOfflineNotice, folders, connected }: {
   queryClient: QueryClient
   setFolderActionError: Dispatch<SetStateAction<string>>
+  /** Cleared by every real failure, so it never inherits the offline presentation. */
+  setFolderOfflineNotice: Dispatch<SetStateAction<string>>
   folders: ChatFolder[]
+  connected: boolean
 }) {
   // Folder mutations
   const createFolderMutation = useMutation({
@@ -380,17 +383,34 @@ export function useFolderMutations({ queryClient, setFolderActionError, folders 
         tags: v.tags && v.tags.length > 0 ? v.tags : undefined,
         steering_dirs: v.steeringDirs && v.steeringDirs.length > 0 ? v.steeringDirs : undefined,
       }),
-    // Through the idle gate, not a direct invalidate: a refetch here would
-    // land inside a still-pending update's optimistic window.
-    onSuccess: () => invalidateFoldersWhenIdle(queryClient),
-    onError: (e) => setFolderActionError((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))),
+    // Add the server's own record to the cache before the refetch, so the new
+    // folder is in the tree on the next render. The create modal reveals it right
+    // after this resolves, and the reveal looks the folder up in this list: without
+    // the seed it would find nothing and give up before the refetch landed. The
+    // refetch still runs and replaces the seed with the authoritative list.
+    //
+    // Only into a list that already loaded. When the first load failed the cache
+    // holds no data, and seeding one folder into it would read as a successful
+    // load: the error notice and its Retry would vanish and the tree would show
+    // that one folder alone.
+    onSuccess: (created: unknown) => {
+      const row = created as ChatFolder | null
+      if (row && typeof row.id === 'string' && row.id) {
+        queryClient.setQueryData<ChatFolder[]>(['chat-folders'], old =>
+          old && !old.some(f => f.id === row.id) ? [...old, row] : old)
+      }
+      // Through the idle gate, not a direct invalidate: a refetch here would
+      // land inside a still-pending update's optimistic window.
+      invalidateFoldersWhenIdle(queryClient)
+    },
+    onError: (e) => { setFolderActionError((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))); setFolderOfflineNotice('') },
   })
   const deleteFolderMutation = useMutation({
     mutationFn: (id: string) => api.deleteChatFolder(id),
     // Through the idle gate, not a direct invalidate: a refetch here would
     // land inside a still-pending update's optimistic window.
     onSuccess: () => invalidateFoldersWhenIdle(queryClient),
-    onError: (e) => setFolderActionError((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))),
+    onError: (e) => { setFolderActionError((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong'))); setFolderOfflineNotice('') },
   })
   const updateFolderMutation = useMutation({
     mutationKey: CHAT_FOLDERS_WRITE_KEY,
@@ -419,6 +439,7 @@ export function useFolderMutations({ queryClient, setFolderActionError, folders 
       // The rollback below restores the cache; this names the failure so the
       // rename / collapse / move that just snapped back is not read as a dead click.
       setFolderActionError((errMessage(err) || i18nT('components.errorBoundary.something_went_wrong')))
+      setFolderOfflineNotice('')
       if (!ctx?.before) return
       const { id, body, before } = ctx
       queryClient.setQueryData<ChatFolder[]>(['chat-folders'], old => (old ?? []).map(f => {
@@ -438,8 +459,20 @@ export function useFolderMutations({ queryClient, setFolderActionError, folders 
   })
   const toggleCollapse = useCallback((id: string) => {
     const f = folders.find(x => x.id === id)
-    if (f) updateFolderMutation.mutate({ id, body: { collapsed: !f.collapsed } })
-  }, [folders, updateFolderMutation])
+    if (!f) return
+    // Offline this flips the CACHED flag and sends nothing. Disclosure is a read:
+    // the rows inside a collapsed folder are already in hand, so refusing the
+    // toggle would make cached sessions unreachable for the whole outage. Letting
+    // the PATCH through instead would fail and raise the false "Folder update
+    // failed" this gate exists to stop. Not persisted, deliberately: a queued
+    // write would have to reconcile against the server on reconnect.
+    if (!connected) {
+      queryClient.setQueryData<ChatFolder[]>(['chat-folders'], old =>
+        (old ?? []).map(x => x.id === id ? { ...x, collapsed: !f.collapsed } : x))
+      return
+    }
+    updateFolderMutation.mutate({ id, body: { collapsed: !f.collapsed } })
+  }, [folders, updateFolderMutation, connected, queryClient])
   return { createFolderMutation, deleteFolderMutation, updateFolderMutation, toggleCollapse }
 }
 

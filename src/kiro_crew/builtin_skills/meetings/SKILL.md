@@ -1,5 +1,6 @@
 ---
 name: meetings
+app: meetings
 description: Context for the Meetings app's data — where a meeting's notes, diagram, transcript-derived tasks and calendar cache live, what the lifecycle states mean, how the app's agents are driven. Load when asked about a meeting's notes or action items, or when touching the meetings app data dir.
 triggers: meeting, meeting notes, action items, meeting tasks, transcript, standup, retro, calendar, meetings app
 ---
@@ -106,7 +107,7 @@ keeps the sync but stops pre-creation.
 
 Transcription uses KiroCrew's own streaming endpoint (`/api/ws/stt`), driven from
 the browser. Cloud transcription is optional
-(`pip install 'boto3>=1.34,<2' 'amazon-transcribe>=0.6,<1'`); when it is not
+(`pip install 'boto3>=1.34,<2' 'amazon-transcribe>=0.6.3,<1'`); when it is not
 installed the app says so and the user can still type into the broadcast bar to
 feed the agents.
 

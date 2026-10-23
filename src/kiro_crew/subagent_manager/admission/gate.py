@@ -5,34 +5,33 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .._component import ManagerComponent
+from . import gate_execution as _gate_execution
+from . import gate_pressure as _gate_pressure
+from . import gate_reporting as _gate_reporting
 from .types import ClaimPoint, MemoryReadPoint, PreparedSpawn
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from typing import Any
 
-    from ...execution_context import ExecutionContext
     from ...subagent import (
-        _PRESSURE_EPISODE_MAX_GAP_SECS,
-        _PRESSURE_HOLD_PRUNE_FACTOR,
         AGENT_NOT_AVAILABLE_CODE,
-        DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS,
         MEMORY_CAUSE_CGROUP_USAGE_UNREADABLE,
         MEMORY_CAUSE_READ_UNANSWERED,
         MEMORY_PRESSURE_DETAIL,
         MEMORY_PRESSURE_NEVER_STARTED,
-        MEMORY_PRESSURE_RECHECK_SECS,
         QUEUED_REASON_CONCURRENCY_LIMIT,
         QUEUED_REASON_LOW_MEMORY,
         QUEUED_REASON_MEMORY_PRESSURE,
         QUEUED_WAIT_EXPIRED_TEXT,
-        SEL_MEMORY_PRESSURE_NEVER_STARTED,
         AgentCheck,
         KiroCrewConfig,
         ParentSpawnPolicy,
         SubagentInfo,
         _cost_bucket,
         _dedicated_start_price_gb,
-        _owns_dedicated_runtime,
+        _inherited_member_agent,
+        _parent_runs_remotely,
         _shared_start_price_gb,
         _spawn_memory_floor_and_cost,
         _startup_memory_reserve_gb,
@@ -43,24 +42,16 @@ if TYPE_CHECKING:
         asyncio,
         check_memory_available,
         logger,
+        on_event_loop,
         parent_spawn_policy,
         platform_compat,
         pop_memory_check_cause,
-        pressure_level_held,
-        read_memory_pressure_level,
         redact_credentials,
         redact_exfiltration_urls,
         sel,
         time,
         validate_cwd,
     )
-
-
-#: ``tool`` on a spawn prompt's crew-log entries. The parent's own tool call is
-#: what is waiting on the human, so the name is that call's, not the child's
-#: agent -- and it is one constant because the request and the decision must
-#: agree for a reader pairing them by ``approval_id``.
-_SPAWN_APPROVAL_TOOL = "spawn_run"
 
 
 class _GateMixin(ManagerComponent):
@@ -76,130 +67,14 @@ class _GateMixin(ManagerComponent):
         MEMORY_WAIT_UNTIL_KEY: str
         MEMORY_CAUSE_LANE_SHARE: str
 
-    def resolve_spawn_execution(
-        self,
-        *,
-        parent_session_key="",
-        agent="",
-        conversation_key="",
-        memory_store="",
-        app="",
-        crew="",
-        target_member=None,
-        _memory_mode="persistent",
-        _execution_context=None,
-        _record=...,
-        _inherited_selection=None,
-    ) -> ExecutionContext:
-        """Resolve routing on-loop; async admission supplies its off-loop record read."""
-        from dataclasses import replace
-
-        from kiro_crew.config.loader import KiroCrewConfig, member_template_id
-        from kiro_crew.execution_context import (
-            ExecutionContext,
-            derive_execution,
-            execution_for_store,
-            execution_from_record,
-            read_session_execution,
-        )
-
-        execution: ExecutionContext | None
-        if _execution_context is not None:
-            execution = execution_from_record({"execution_context": _execution_context})
-        elif conversation_key:
-            from kiro_crew.subagent_persistence import read_run_execution
-
-            execution = (
-                read_run_execution(conversation_key.removeprefix("subagent:"))
-                if _record is ...
-                else _record
-            )
-            if execution.selection_kind == "member" and not agent:
-                # Refresh ordinary persona/capability selection for this new
-                # invocation, while retaining the original memory identity.
-                from kiro_crew.execution_context import member_config_for_id
-
-                config = KiroCrewConfig.load()
-                if execution.member_id is not None:
-                    alias, selected = member_config_for_id(config, execution.member_id)
-                else:
-                    alias = execution.selection_name
-                    selected = config.agents.get(alias)
-                    if selected is None:
-                        raise ValueError("selected member is unavailable")
-                execution = replace(
-                    execution,
-                    template_id=member_template_id(selected),
-                    selection_name=alias,
-                )
-        else:
-            execution = read_session_execution(parent_session_key) if _record is ... else _record
-            if execution is None:
-                inherited = ("template", "")
-                if parent_session_key and not agent:
-                    inherited = (
-                        self._manager._sessions.get_agent_selection(parent_session_key)
-                        if _inherited_selection is None
-                        else _inherited_selection
-                    )
-                    if (
-                        not isinstance(inherited, tuple)
-                        or len(inherited) != 2
-                        or inherited[0] not in ("template", "member")
-                        or not isinstance(inherited[1], str)
-                    ):
-                        raise ValueError("effective agent template is invalid")
-                execution = execution_for_store(
-                    memory_store,
-                    memory_mode=_memory_mode,
-                    app=app,
-                    template_id=agent or inherited[1],
-                )
-                if inherited[0] == "member":
-                    from kiro_crew.crewmate_prune_migration import (
-                        removed_crewmate_names as _removed_crewmate_names,
-                    )
-
-                    selected = KiroCrewConfig.load().agents.get(inherited[1])
-                    if selected is not None:
-                        execution = replace(
-                            execution,
-                            selection_kind="member",
-                            selection_name=inherited[1],
-                            template_id=member_template_id(selected),
-                        )
-                    elif (
-                        execution.store.store_id != "default"
-                        or execution.member_id is not None
-                        or inherited[1] not in _removed_crewmate_names()
-                    ):
-                        raise ValueError("selected member is unavailable")
-                    # Otherwise the member is a synced crewmate the startup prune
-                    # removed: same rule ``adopt_removed_synced_crewmate`` applies
-                    # to records, so the run keeps its template on the shared store.
-            execution = derive_execution(
-                execution,
-                target_member=target_member or crew or None,
-                requested_mode=_memory_mode,
-            )
-        execution = execution.with_mode(_memory_mode)
-        if agent and not conversation_key:
-            if not crew and not target_member:
-                # The delegate split: the parent's store and identity, the selected
-                # template's namespace. A member with no persisted id has no
-                # identity field, so its child is a plain template run on the
-                # parent's store (the `session_create` arm keeps that member's
-                # selection instead; the record cannot say "this member, under
-                # that template" on either path).
-                execution = execution.with_template(agent, agent)
-            else:
-                execution = replace(execution, template_id=agent)
-        if execution.app and app and execution.app != app:
-            raise ValueError("subagent app ownership does not match its parent")
-        app = execution.app or app
-        if execution.app != app:
-            execution = replace(execution, app=app)
-        return execution
+    # Each name below IS its owner module's function, whose first parameter is ``self``:
+    # ``_hoist_impls`` and ``bind_component_globals`` see a bound ``*_impl`` exactly as
+    # one defined in this class body, and a member without the suffix runs on its
+    # owner's globals.
+    #
+    # The execution a spawn runs under (store, identity, template, app):
+    # ``gate_execution``.
+    resolve_spawn_execution = _gate_execution.resolve_spawn_execution
 
     def spawn_impl(
         self,
@@ -238,6 +113,8 @@ class _GateMixin(ManagerComponent):
         crew: str = "",
         target_member: str | None = None,
         delegation: dict[str, str] | None = None,
+        backend: str | None = None,
+        label: str = "",
         _execution_context: dict | None = None,
         _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
         _agent_check: "AgentCheck | None" = None,
@@ -321,7 +198,7 @@ class _GateMixin(ManagerComponent):
         if batch_id and not _from_queue and not _store_accepted and not _memory_reentry:
             _bs = self._manager._batch_submitted.setdefault(batch_id, [0, max(0, int(batch_total))])
             _bs[0] += 1
-            self._manager._batch_progress_ts[batch_id] = time.time()
+            self._manager._batch_progress_ts[batch_id] = time.monotonic()
         # --- Task guard: refuse empty/whitespace-only tasks (defense in depth).
         # The HTTP handler (api_spawn) and MCP tool schemas validate too, but
         # direct Python callers reach this choke point unvalidated. An empty
@@ -639,6 +516,11 @@ class _GateMixin(ManagerComponent):
             "max_turns": max_turns,
             "model": model,
             "reasoning_effort": reasoning_effort,
+            # The drain re-enters ``spawn`` from this dict alone: a run that hit
+            # the concurrency gate would otherwise start on the default backend.
+            "backend": backend,
+            # Same reason: a queued row would otherwise start under its task text.
+            "label": label,
             "allowed_tools": allowed_tools,
             "bare": bare,
             "cwd": resolved_cwd,
@@ -785,6 +667,7 @@ class _GateMixin(ManagerComponent):
                 task=_redacted_task,
                 memory_mode=admitted_memory_mode,
                 agent=agent,
+                label=label,
                 app=app,
                 parent_session_key=parent_session_key,
                 queued=True,
@@ -837,13 +720,23 @@ class _GateMixin(ManagerComponent):
         # The off-loop answer, when the caller took one for this exact
         # ``(agent, cwd, app)``: both checks below walk the agents directory, which
         # must not happen on the gateway loop.
+        _effective_cwd = resolved_cwd or str(
+            getattr(self._manager._sessions, "_pool_cwd", "") or ""
+        )
+        _checked_name = agent or (
+            ""
+            if conversation_key
+            else _inherited_member_agent(
+                execution.selection_kind, execution.template_id, _effective_cwd
+            )
+        )
         _checked = (
             _agent_check
             if _agent_check is not None
             and _agent_check[:3]
             == (
-                agent,
-                resolved_cwd or str(getattr(self._manager._sessions, "_pool_cwd", "") or ""),
+                _checked_name,
+                _effective_cwd,
                 app,
             )
             else None
@@ -870,22 +763,23 @@ class _GateMixin(ManagerComponent):
                     batch_total=max(0, int(batch_total)),
                 )
                 return self._manager._announce_rejection(info)
-        if agent and not _agent_prevalidated:
+        if _checked_name and not _agent_prevalidated:
             # Validate against the cwd the subagent will ACTUALLY run in. When no
             # explicit cwd was given the runtime falls back to the session pool's
             # cwd, so validating only the explicit value refused a project agent
             # kiro-cli would have loaded — the same interface asymmetry the project
             # scope exists to remove, just one layer down.
-            effective_cwd = resolved_cwd or str(
-                getattr(self._manager._sessions, "_pool_cwd", "") or ""
-            )
             # An event-loop caller (``spawn_async``, the coroutine pump) took
             # this answer off the loop; it is used for the same inputs only, so a
             # cwd the gate resolved differently is checked here as before.
-            if _checked is not None and effective_cwd == _checked[1]:
-                agent, err, err_code = _checked[4:]
+            if _checked is not None and _effective_cwd == _checked[1]:
+                validated, err, err_code = _checked[4:]
+            elif agent or not on_event_loop():
+                validated, err, err_code = _validate_agent(_checked_name, _effective_cwd)
             else:
-                agent, err, err_code = _validate_agent(agent, effective_cwd)
+                validated, err, err_code = "", "", ""
+            if agent:
+                agent = validated
             if err:
                 # The row was accepted; an agent name that does not resolve at
                 # dispatch is a terminal failure of THAT row, never a silent drop.
@@ -928,6 +822,9 @@ class _GateMixin(ManagerComponent):
         # runtime launches no process; the decision is the run's own
         # (``_sharing_plan``), and only a real True prices it shared -- an
         # unknown answer is the dedicated projection, since it may become one.
+        # The probe resolves no AWS profile binding (that reads paths, and this
+        # runs on the loop), so a start that may bind another profile than its
+        # parent (``aws.project_profiles``) is priced dedicated.
         candidate_price: float | None = None
         priced_shared = False
         # A nested start that will share its parent's runtime: its
@@ -938,6 +835,8 @@ class _GateMixin(ManagerComponent):
         # admission charges it until it settles. Without it, a parent waiting on
         # its own child at the floor could only end at the max wait.
         nested_shared = False
+        # A remote session's child: its engine reserve only, never the gateway floor.
+        remote_child = False
         settled = self._manager._learned_settled_gb
         # The fields the sharing decision reads, shared by the prediction's probe
         # and the row registered below so the two cannot describe different runs.
@@ -947,10 +846,12 @@ class _GateMixin(ManagerComponent):
             "parent_session_key": parent_session_key,
             "model": model or "",
             "reasoning_effort": reasoning_effort or "",
+            "backend": backend,
             "allowed_tools": list(allowed_tools) if allowed_tools else [],
             "bare": bare,
             "keep": keep,
             "execution_context": execution,
+            "cwd": resolved_cwd,
         }
         if _dispatch_now:
             # The claim re-entry registers at the price its first half CHECKED;
@@ -964,14 +865,19 @@ class _GateMixin(ManagerComponent):
                 else claim.get(agent_id, (None, False))
             )
         elif min_mem > 0:
+            # A remote session's child works in that workspace; only its engine runs
+            # here. So it is priced from its ``@remote`` bucket and owes the engine
+            # reserve, not ``spawn_min_memory_gb``; the 0 off-switch and posture gate
+            # still apply, and it is never priced shared (``_run_inner``).
+            remote_child = _parent_runs_remotely(parent_session_key)
             candidate_price = _dedicated_start_price_gb(
-                start_cost, settled, _cost_bucket(agent, execution)
+                start_cost, settled, _cost_bucket(agent, execution, remote=remote_child)
             )
             try:
                 plan = self._manager._sharing_plan(
                     SubagentInfo(task="", agent=agent, **run_fields), cfg=loaded_cfg
                 )
-                if plan.shared is True:
+                if plan.shared is True and not remote_child:
                     candidate_price = _shared_start_price_gb(candidate_price)
                     priced_shared = True
                     nested_shared = _is_child
@@ -982,7 +888,7 @@ class _GateMixin(ManagerComponent):
             # the next controller sample: this start at its own price, and each
             # row still warming at the price it was admitted at. Memory used by
             # work a run launches later is not priced here.
-            min_mem += _startup_memory_reserve_gb(
+            min_mem = (0.0 if remote_child else min_mem) + _startup_memory_reserve_gb(
                 agents_snapshot,
                 running_count=self._manager._running_count,
                 cost_gb=start_cost,
@@ -1061,6 +967,7 @@ class _GateMixin(ManagerComponent):
                 price_gb=candidate_price,
                 nested=_is_child,
                 durable=_durable,
+                remote=remote_child,
             )
             if lane_held:
                 # No reading was taken and the bar is not what holds it.
@@ -1106,15 +1013,22 @@ class _GateMixin(ManagerComponent):
             # A floor wait carries no pressure clock (the hold below is not
             # evaluated for it): one an earlier hold started is dropped, so time
             # spent below the floor never counts toward the hold's bound.
-            self._manager._pressure_holds.pop(agent_id, None)
-            self._manager._pressure_hold_expired.discard(agent_id)
+            self._manager._forget_pressure_clock(agent_id)
+            headroom_unknown = memory_cause == MEMORY_CAUSE_CGROUP_USAGE_UNREADABLE
             memory_wait = {
                 "reason": QUEUED_REASON_LOW_MEMORY,
-                # No figure when nothing was read: -1 is not an amount. A start
-                # the lane share holds names no bar either: the bar is not what
-                # holds it, so the UI says "waiting for memory" figure-less.
-                **({"available_gb": round(float(avail_gb), 2)} if avail_gb >= 0 else {}),
+                # No figure when nothing was read: -1 is not an amount. An
+                # unreadable cgroup usage file reads as 0, which is not an amount
+                # either: the wait names the cause so the chip says "unknown". A
+                # start the lane share holds names no bar either: the bar is not
+                # what holds it, so the UI says "waiting for memory" figure-less.
+                **(
+                    {"available_gb": round(float(avail_gb), 2)}
+                    if avail_gb >= 0 and not headroom_unknown
+                    else {}
+                ),
                 **({} if lane_held else {"required_gb": round(float(min_mem), 2)}),
+                **({"cause": memory_cause} if headroom_unknown else {}),
             }
             if _durable:
                 # Built ahead of the deferral, not after it: a durable defer the
@@ -1310,7 +1224,6 @@ class _GateMixin(ManagerComponent):
             # from this point the row is durable (write-before-ack) and WILL
             # start on its own, whether it joins the in-memory window below or
             # waits on disk for the pump's refill.
-            self._manager.bump_attachment(parent_session_key)
             # A prevalidated app spawn does not carry its prevalidation INTO the
             # queue. `_agent_prevalidated` skips the agent-directory ownership
             # scan (it was validated off the loop at request time); while the
@@ -1401,6 +1314,7 @@ class _GateMixin(ManagerComponent):
                 id=agent_id,
                 task=_redacted_task,
                 agent=agent,
+                label=label,
                 app=app,
                 parent_session_key=parent_session_key,
                 queued=True,
@@ -1482,6 +1396,7 @@ class _GateMixin(ManagerComponent):
                 task=_redacted_task,
                 memory_mode=_memory_mode,
                 agent=agent,
+                label=label,
                 app=app,
                 parent_session_key=parent_session_key,
                 queued=True,
@@ -1518,11 +1433,11 @@ class _GateMixin(ManagerComponent):
         info = SubagentInfo(
             task=_redacted_task,
             agent=agent,
+            label=label,
             app=app,
             approval_mode=approval_mode or "",
             silent=silent,
             max_turns=max_turns,
-            cwd=resolved_cwd,
             batch_id=batch_id,
             batch_total=max(0, int(batch_total)),
             conversation_key=conversation_key,
@@ -1543,7 +1458,6 @@ class _GateMixin(ManagerComponent):
         # A started child attaches here; the removal fence counts the moment a
         # run becomes visible to ``running_agents_for`` so a parent cannot be
         # reaped off an attachment probe that answered just before it.
-        self._manager.bump_attachment(parent_session_key)
         self._manager._agents[agent_id] = info
         self._manager._forget_pending_start(agent_id)
         self._record_crew_log_dispatch(info, from_queue=_from_queue, asked=_crew_log_asked)
@@ -1556,6 +1470,9 @@ class _GateMixin(ManagerComponent):
                 0, int(self._manager._startup_reservations) - 1
             )
         self._manager._last_spawn_ts = time.monotonic()  # stagger gate: one start per interval
+        if not _is_child:
+            # Progress of the lane the pressure hold may keep rows waiting in.
+            self._manager._pressure_lane_started(parent_session_key, self._manager._last_spawn_ts)
         # Batch lifecycle: announce the wave ONCE, on its first member to
         # actually start (queued members haven't started yet — the event marks
         # execution begin, and the UI uses it to key batch progress).
@@ -1620,6 +1537,9 @@ class _GateMixin(ManagerComponent):
             else:
                 info.done = True
                 info.error = "spawn rejected: no approval mechanism configured"
+                # Registered terminal flip whose announce task arms a loop
+                # cycle later -- arm with the flip.
+                self._manager.arm_report_in_flight(info)
                 self._manager._running_count -= 1
                 self._manager._drain_queue()
                 sel().log_tool_invocation(
@@ -1644,6 +1564,9 @@ class _GateMixin(ManagerComponent):
         else:
             info.done = True
             info.error = "spawn rejected: no approval mechanism configured"
+            # Registered terminal flip whose announce task arms a loop cycle
+            # later -- arm with the flip.
+            self._manager.arm_report_in_flight(info)
             self._manager._running_count -= 1
             self._manager._drain_queue()
             sel().log_tool_invocation(
@@ -1665,8 +1588,12 @@ class _GateMixin(ManagerComponent):
             self._manager._admission.taskq_settle(info)
         else:
             # Registered and handed to a run (or to the approval prompt, which
-            # is part of starting): admitted -> starting. ``running`` is written
-            # by the run itself at its first stream event addressed to its session.
+            # is part of starting): admitted -> starting. A row the off-loop
+            # pump claimed is ``starting`` already (``claim_and_start`` took
+            # that write as its compare-and-set), and ``advance`` writes
+            # nothing for it; an inline claim writes it here. ``running`` is
+            # written by the run itself at its first stream event addressed to
+            # its session.
             self._manager._admission.taskq_mark(info, "starting")
             # Nested: a parent blocked in spawn_sub_agents yields its lane slot
             # for this child (taskq.waits, W3); an event-loop caller awaits the
@@ -1675,429 +1602,24 @@ class _GateMixin(ManagerComponent):
                 self._manager._admission.taskq_child_registered(info)
         return info
 
-    def _memory_pressure_hold_impl(self, *, floor_gb: float | None = None) -> int | None:
-        """The level the macOS kernel memory-pressure hold applies at now, or None.
-
-        Gateway-wide and read fresh; the rules are subagent.md's (*macOS: the
-        kernel memory-pressure hold*). The level is read first, so a host where
-        it is never held (every non-macOS one) pays no config read. While the
-        hold applies, one timer re-pumps every ``MEMORY_PRESSURE_RECHECK_SECS``.
-        When it stops applying, the WARNING latch resets and a parent still
-        labelled with the pressure reason is relabelled as a capacity wait. A
-        hold that has applied without a break for the live
-        ``agent.subagent_queue_max_wait_secs`` (``taskq_memory_wait_bound_secs``;
-        0 is no bound) marks its episode spent (``_pressure_episode_spent``)
-        until it stops applying, and every row the hold would keep then expires
-        at once.
-        """
-        mgr = self._manager
-        level: int | None = None
-        try:
-            reading = read_memory_pressure_level()
-            if pressure_level_held(reading):
-                if floor_gb is None:
-                    floor_gb, _cost = _spawn_memory_floor_and_cost()
-                if floor_gb > 0 and _owns_dedicated_runtime(
-                    mgr._agents.values(), claim_prices=mgr._claim_prices
-                ):
-                    level = reading
-            # The episode is the hold APPLYING without a break, so a host at WARN
-            # with nothing of ours running never spends it. A gap between reads
-            # longer than a few recheck intervals is a break nobody observed, so
-            # the episode restarts rather than being assumed continuous across it.
-            now = time.monotonic()
-            bound = mgr._admission.taskq_memory_wait_bound_secs()
-            unobserved = now - mgr._pressure_episode_read_at > _PRESSURE_EPISODE_MAX_GAP_SECS
-            mgr._pressure_episode_read_at = now
-            since = mgr._pressure_episode_since
-            if level is None or unobserved or since is None:
-                mgr._pressure_episode_since = now if level is not None else None
-                mgr._pressure_episode_spent = False
-            elif bound > 0 and now - since >= bound:
-                if not mgr._pressure_episode_spent:
-                    mgr._pressure_episode_spent = True
-                    logger.warning(
-                        "macOS memory pressure has held subagent starts for %.0fs; root "
-                        "starts it would hold are ended, never started, until it eases",
-                        now - since,
-                    )
-            else:
-                # The bound is live: one raised past the episode, or set to 0 (no
-                # bound), un-spends an episode spent under the earlier value.
-                mgr._pressure_episode_spent = False
-        except Exception:
-            logger.debug("Subagent memory-pressure hold: reading failed", exc_info=True)
-            level = None
-        if level is None:
-            mgr._pressure_hold_level = None
-            if mgr._pressure_hold_on:
-                mgr._pressure_hold_on = False
-                for parent, wait in list(mgr._queue_wait.items()):
-                    if wait.get("reason") == QUEUED_REASON_MEMORY_PRESSURE:
-                        mgr._emit_queue_depth(
-                            parent, wait={"reason": QUEUED_REASON_CONCURRENCY_LIMIT}
-                        )
-            # A row's clock outlives a pause in the hold (our last runtime ending
-            # between two of its starts), so only clocks far past any wait are
-            # dropped here: rows that left without a registration or a refusal.
-            now = time.monotonic()
-            prune_after = _PRESSURE_HOLD_PRUNE_FACTOR * max(
-                mgr._admission.taskq_memory_wait_bound_secs(),
-                float(DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS),
-            )
-            for agent_id, since in list(mgr._pressure_holds.items()):
-                if now - since >= prune_after:
-                    del mgr._pressure_holds[agent_id]
-                    mgr._pressure_hold_expired.discard(agent_id)
-            return None
-        mgr._pressure_hold_on = True
-        if not mgr._shutting_down:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            handle = mgr._pressure_recheck_handle
-            # Re-armed when none is pending, including one whose loop went away
-            # before it fired (past due by more than a second).
-            if loop is not None and (
-                handle is None or handle.cancelled() or handle.when() < loop.time() - 1.0
-            ):
-
-                def _recheck() -> None:
-                    mgr._pressure_recheck_handle = None
-                    mgr._drain_queue()
-
-                mgr._pressure_recheck_handle = loop.call_later(
-                    MEMORY_PRESSURE_RECHECK_SECS, _recheck
-                )
-        return level
-
-    def _memory_pressure_holds_impl(
-        self,
-        agent_id: str,
-        level: int,
-        *,
-        parent_session_key: str = "",
-        batch_id: str = "",
-        available_gb: float | None = None,
-        relabel: bool = False,
-        commit_expiry: bool = True,
-    ) -> str:
-        """What the hold, applying at *level*, does with root start *agent_id*.
-
-        ``"held"`` while it waits; ``"expired"`` once its own wait has run out
-        (``agent.subagent_queue_max_wait_secs`` from its first hold, read live;
-        0 is no bound) or the episode has
-        outlived that bound (``_pressure_episode_spent``): the caller ends it,
-        never started (``MEMORY_PRESSURE_NEVER_STARTED``). *available_gb* is the
-        floor's figure when the caller read one (negative: unreadable), None
-        when it read none. *relabel* publishes the pressure label on the row's
-        first hold, for a caller (the pump) that is not about to emit one.
-        *commit_expiry* False only classifies an expired row (the pump's pick,
-        which hands it to the gate's re-check): the WARNING and SEL row are
-        written by the caller that actually ends it.
-        """
-        mgr = self._manager
-        now = time.monotonic()
-        first = agent_id not in mgr._pressure_holds
-        since = mgr._pressure_holds.setdefault(agent_id, now)
-        name = platform_compat.memory_pressure_name(level)
-        bound = mgr._admission.taskq_memory_wait_bound_secs()
-        own_wait_ran_out = bound > 0 and now - since >= bound
-        if own_wait_ran_out or mgr._pressure_episode_spent:
-            if commit_expiry and agent_id not in mgr._pressure_hold_expired:
-                mgr._pressure_hold_expired.add(agent_id)
-                # Which bound ended it is part of the audit: a start the spent
-                # episode ends at once waited nothing itself, and reporting it as
-                # one that sat out its own bound would misstate both.
-                cause = "wait" if own_wait_ran_out else "episode"
-                episode_since = mgr._pressure_episode_since
-                episode_secs = (
-                    round(now - episode_since, 1)
-                    if cause == "episode" and episode_since is not None
-                    else None
-                )
-                if cause == "wait":
-                    logger.warning(
-                        "Subagent %s: never started -- macOS reported memory pressure "
-                        "(%s) for its whole wait (%.0fs)",
-                        agent_id,
-                        name,
-                        now - since,
-                    )
-                else:
-                    logger.warning(
-                        "Subagent %s: never started -- macOS memory pressure (%s) has "
-                        "lasted %.0fs, past the %ds bound, so it was ended without waiting",
-                        agent_id,
-                        name,
-                        episode_secs or 0.0,
-                        int(bound),
-                    )
-                expiry: dict[str, Any] = {
-                    "memory_pressure_level": level,
-                    "waited_secs": round(now - since, 1),
-                    "expired_by": cause,
-                    "subagent_id": agent_id,
-                }
-                if episode_secs is not None:
-                    expiry["episode_secs"] = episode_secs
-                sel().log_tool_invocation(
-                    session_key=parent_session_key or "",
-                    source="subagent",
-                    tool_name="spawn_run",
-                    outcome=SEL_MEMORY_PRESSURE_NEVER_STARTED,
-                    metadata=expiry,
-                )
-            return "expired"
-        if first:
-            log = logger.debug
-            if mgr._pressure_hold_level != level:
-                mgr._pressure_hold_level = level
-                log = logger.warning
-            metadata: dict[str, Any] = {"memory_pressure_level": level, "subagent_id": agent_id}
-            figure = ""
-            if available_gb is not None:
-                unreadable = available_gb < 0
-                metadata["available_gb"] = None if unreadable else available_gb
-                figure = (
-                    " (figure unreadable)"
-                    if unreadable
-                    else f" ({available_gb:.2f} GB reclaimable)"
-                )
-            log(
-                "Subagent %s held: macOS reports memory pressure (%s) while a dedicated "
-                "subagent of this gateway is running%s",
-                agent_id,
-                name,
-                figure,
-            )
-            sel().log_tool_invocation(
-                session_key=parent_session_key or "",
-                source="subagent",
-                tool_name="spawn_run",
-                outcome="deferred_memory_pressure",
-                metadata=metadata,
-            )
-            if relabel:
-                mgr._emit_queue_depth(
-                    parent_session_key, batch_id, wait={"reason": QUEUED_REASON_MEMORY_PRESSURE}
-                )
-        return "held"
-
-    async def _safe_announce_impl(self, info: SubagentInfo) -> None:
-        """Notify completion callback with error handling.
-
-        Args:
-            info (SubagentInfo): The subagent metadata.
-        """
-        assert self._manager._on_done is not None
-        if info.id in getattr(self._manager, "_teardown_cancelled_ids", ()):
-            # Same statement as the terminal-report gate, at the OTHER announce
-            # entry point. ``_on_done`` resolves the parent key through the
-            # session registry and injects, which CREATES a session when none is
-            # live, so announcing here rebuilds the conversation the teardown
-            # just took down. The rejection paths reach this function directly
-            # rather than through ``_report_terminal``, so the gate that covers
-            # the run that EXECUTED does not cover the run that was refused
-            # before it ever started -- and a spawn parked on its approval is
-            # marked by the teardown precisely because its delivery must not
-            # land. The id is left in the gate rather than discarded: this
-            # function is one of several announce entry points, and the age
-            # backstop is what retires the mark.
-            logger.info("Skipping parent announce for %s - its parent ended", info.id)
-            return
-        try:
-            await self._manager._on_done(info)
-        except Exception as exc:
-            logger.error("Subagent announce failed for %s (%s)", info.id, type(exc).__name__)
-
-    def _record_crew_log_dispatch(
-        self,
-        info: SubagentInfo,
-        *,
-        from_queue: bool,
-        asked: "tuple[str, int] | None" = None,
-    ) -> None:
-        """PIN the parent session and turn that asked for *info*. Writes nothing.
-
-        Called from both accepted exits of ``spawn`` and from neither rejection.
-        Pinning here and writing elsewhere is deliberate: this is normally the only
-        moment the ASKING turn is knowable -- a spawn arrives as a tool call inside
-        the parent's turn -- but being accepted is not being started. Registration
-        is followed by the spawn approval gate, and a decline returns through
-        ``_claim_finalize`` + ``_safe_announce`` without ever reaching ``_run``, so
-        an entry written here would be an opener nothing closes. The entry is
-        written by ``_log_spawned``, the one site that means the run is really
-        starting, from the pin this leaves behind.
-
-        ``asked`` overrides that reading, and one caller needs it: a queued
-        follow-up is DISPATCHED by its watcher after the run it continues has
-        finished, so no turn is asking at this moment and the parent may be on an
-        unrelated one. That caller pinned the asking ordinal where the follow-up was
-        requested and hands it in; without it the continuation would be filed under
-        a turn that did not ask for it. A caller that supplies no ``asked`` is
-        dispatching from inside its own turn, where the live reading is correct.
-
-        ``from_queue`` marks a member re-entering under the same id after the
-        stagger or concurrency gate held it, and the pin it was accepted with must
-        stand. ``remember_child_origin`` is what keeps it: it refuses to move an
-        origin already in the map. What that map does not survive is a restart, and
-        the durable queue replays a queued row into this site in a process whose map
-        is empty -- so the pin is re-established on that pass rather than skipped,
-        or the child's spawn, steer and terminal entries are all omitted with
-        nothing to report the gap. The turn is left UNOBSERVED there: the turn that
-        asked died with the process that recorded it, the parent's live turn names
-        one that did not ask, and the writers omit an unobserved ordinal rather
-        than stamping a turn that never existed.
-
-        Best-effort throughout. A spawn must not fail because a log entry could
-        not be pinned, and an unresolvable parent yields an empty session id, which
-        the pin refuses -- leaving the later write with nothing to open, which is
-        the correct outcome rather than a guessed one.
-
-        Every name is imported inside the body on purpose. This method does NOT
-        end in ``_impl``, so ``bind_component_globals`` leaves it running on this
-        module's own globals -- where the facade's imports, ``logger`` included,
-        exist only under ``TYPE_CHECKING``.
-        """
-        from kiro_crew.crew_log import emit as crew_log_emit
-        from kiro_crew.crew_log.resolve import unit_for_session_key
-        from kiro_crew.subagent import logger as _logger
-
-        try:
-            if not crew_log_emit.enabled():
-                return
-            if asked is not None:
-                sid, turn = asked
-            else:
-                sid = unit_for_session_key(self._manager._sessions, info.parent_session_key)
-                if from_queue:
-                    # A drained member: in THIS process its origin is already
-                    # pinned and the pin refuses to move, so this pass changes
-                    # nothing. In a process that replayed the row from the durable
-                    # queue the map is empty and this is the pass that restores it,
-                    # with the turn unobserved because the one that asked is gone
-                    # with the process that held it.
-                    turn = 0
-                else:
-                    turn = crew_log_emit.live_turn(sid) if sid else 0
-            if not sid:
-                return
-            crew_log_emit.remember_child_origin(info.id, sid, turn)
-        except Exception:
-            _logger.debug("crew log: pinning a subagent dispatch failed", exc_info=True)
-
-    def _record_crew_log_spawn_started(self, info: SubagentInfo) -> None:
-        """Write *info*'s ``subagent/spawned`` into the PARENT session's crew log.
-
-        Called from ``_log_spawned``, which every path that actually starts a run
-        goes through and no rejection does -- including the approval gate, which
-        reaches it only after a human said yes.
-
-        The turn comes from the pin, never from the parent's live turn. This site
-        can be reached an unbounded human approval after the ask, by which point the
-        parent is very likely on a different turn; reading it here is exactly the
-        after-the-fact re-derivation the log may not contain. An unpinned child (the
-        flag came on mid-flight, or the parent could not be resolved) writes nothing.
-
-        No ``ref`` into the child's log. The schema describes one and a child that
-        had a crew log would deserve it, but no subagent path opens one, so the
-        citation would name a file that does not exist -- indistinguishable, to a
-        reader, from one that was deleted.
-        """
-        from kiro_crew.crew_log import emit as crew_log_emit
-        from kiro_crew.subagent import logger as _logger
-
-        try:
-            if not crew_log_emit.enabled():
-                return
-            sid, asked_turn = crew_log_emit.open_child_origin(info.id)
-            if not sid:
-                return
-            crew_log_emit.on_subagent_spawned(
-                sid,
-                asked_turn,
-                agent_id=info.id,
-                agent=info.agent,
-                model=info.model,
-                task=info.task,
-                scope={
-                    "memory": info.include_memory,
-                    "lessons": info.include_lessons,
-                    "project": info.include_project,
-                },
-            )
-        except Exception:
-            _logger.debug("crew log: recording a subagent spawn failed", exc_info=True)
-
-    def _record_crew_log_spawn_approval_requested(
-        self, info: SubagentInfo, *, approval_id: str, reason: str
-    ) -> "tuple[str, int]":
-        """Write *info*'s spawn prompt as an ``approval/requested`` entry.
-
-        Returns the parent session and asking turn the entry was filed under, so
-        the decision is recorded beside its own request -- hand it to
-        :meth:`ManagerComponent._record_crew_log_approval_decided`, the shared
-        closer. An empty session id means nothing was written and that closer is
-        a no-op too, so the pair is all-or-nothing by construction rather than by
-        two separate checks.
-
-        The origin comes from the pin, read through ``dispatch_origin`` because the
-        prompt happens BEFORE the opener: the dispatch has been accepted and the
-        run has not started, which is the one window ``child_origin`` is designed
-        to refuse. Reading the parent's live turn instead would file the prompt
-        under whatever turn the parent reached while a person took their time.
-
-        ``tool`` is the spawn tool rather than the child's own agent name, because
-        what is waiting on the human is the parent's tool call.
-        """
-        from kiro_crew.crew_log import emit as crew_log_emit
-        from kiro_crew.subagent import logger as _logger
-
-        try:
-            if not crew_log_emit.enabled():
-                return ("", 0)
-            sid, asked_turn = crew_log_emit.dispatch_origin(info.id)
-            if not sid:
-                return ("", 0)
-            crew_log_emit.on_approval_requested(
-                sid,
-                asked_turn,
-                approval_id=approval_id,
-                tool=_SPAWN_APPROVAL_TOOL,
-                reason=reason,
-            )
-            return (sid, asked_turn)
-        except Exception:
-            _logger.debug("crew log: recording a spawn approval request failed", exc_info=True)
-            return ("", 0)
-
-    def _announce_rejection_impl(self, info: SubagentInfo) -> SubagentInfo:
-        """Route a terminal spawn rejection through the done callback.
-
-        A rejected batch member is counted as submitted (top of ``spawn``)
-        but never registers and never reaches ``_run``'s completion path.
-        Without an announce, the gateway's wave accounting never sees its
-        terminal state — and when the rejection is the wave's FINAL
-        submission, no later completion event re-evaluates the wave, so
-        every sibling result already held for the digest strands forever.
-        Announcing lets ``_subagent_done`` count the member
-        as failed and release the digest when it closes the wave.
-
-        Non-batch rejections skip the announce: the caller already receives
-        the error synchronously in the returned info, and injecting a
-        completion turn for them would double-report. That holds for
-        queue-drained non-batch rejections too — ``_drain_queue`` announces
-        those itself off the returned info, so announcing here as well would
-        inject the completion twice.
-        """
-        self._manager._forget_pending_start(info.id)
-        if info.batch_id and self._manager._on_done:
-            try:
-                self._manager._tasks[f"reject-{info.id}"] = asyncio.ensure_future(
-                    self._manager._safe_announce(info)
-                )
-            except RuntimeError:
-                pass  # no running loop (sync/test context)
-        return info
+    # The macOS kernel memory-pressure hold: ``gate_pressure``.
+    _memory_pressure_hold_impl = _gate_pressure._memory_pressure_hold_impl
+    _pressure_lane_started_impl = _gate_pressure._pressure_lane_started_impl
+    _forget_pressure_clock_impl = _gate_pressure._forget_pressure_clock_impl
+    _memory_pressure_holds_impl = _gate_pressure._memory_pressure_holds_impl
+    # How a spawn's outcome reaches others (the done-callback announce and the
+    # crew-log pin and entries): ``gate_reporting``.
+    _safe_announce_impl = _gate_reporting._safe_announce_impl
+    _record_crew_log_dispatch = _gate_reporting._record_crew_log_dispatch
+    if TYPE_CHECKING:
+        # ``_PumpMixin`` declares these two as ``def`` stubs. mypy compares the two
+        # bases' definitions without binding ``self`` on a name bound by assignment,
+        # so it reads their bound types here.
+        _record_crew_log_spawn_started: Callable[[SubagentInfo], None]
+        _record_crew_log_spawn_approval_requested: Callable[..., tuple[str, int]]
+    else:
+        _record_crew_log_spawn_started = _gate_reporting._record_crew_log_spawn_started
+        _record_crew_log_spawn_approval_requested = (
+            _gate_reporting._record_crew_log_spawn_approval_requested
+        )
+    _announce_rejection_impl = _gate_reporting._announce_rejection_impl

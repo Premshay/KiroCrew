@@ -1,6 +1,6 @@
 """``instances.ssh_tunnel_manager`` — the ``_SshTunnel`` teardown / exit paths.
 
-``test_instances.py`` covers the state machine's happy path, the probe loop and
+``test_instances_self_heal.py`` covers the state machine's happy path, the probe loop and
 the ssh error classifier. What it leaves unobserved is everything that runs when
 a tunnel goes DOWN, plus the whole SSM error vocabulary:
 
@@ -36,6 +36,7 @@ from kiro_crew.instances.ssh_tunnel_manager import (
     _SshTunnel,
     _TransportParams,
 )
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 class _FakeProc:
@@ -295,7 +296,7 @@ class TestForwardAlive:
 
         t._port_reachable = _socket_bound  # type: ignore[assignment]
         t._forward_alive = _far_end_dead  # type: ignore[assignment]
-        await asyncio.wait_for(t._probe_loop(), timeout=2)
+        await await_until(asyncio.ensure_future(t._probe_loop()))
         await asyncio.sleep(0.05)
 
         assert called["forward_alive"] >= 2  # the loop consulted the end-to-end check
@@ -336,6 +337,198 @@ class TestCaptureStderr:
         tunnel._proc = _FakeProc(stderr=_FakeStderr(b"z" * 200))  # type: ignore[assignment]
         await tunnel._capture_stderr()
         assert len(tunnel._stderr_buf) == 16
+
+
+# A stand-in tunnel child: it writes ``size`` bytes of the line ssh prints for
+# every forwarded connection the far end refuses, then records that it got past
+# the writes. The test, not the child, holds the forward's listening socket.
+_CHATTY_CHILD = r"""
+import os, sys, time
+size, marker = int(sys.argv[1]), sys.argv[2]
+line = b"channel 3: open failed: connect failed: Connection refused\r\n"
+written = 0
+while written < size:
+    os.write(2, line)
+    written += len(line)
+with open(marker, "w") as f:
+    f.write(str(written))
+time.sleep(60)
+"""
+
+# A child that fails the way ExitOnForwardFailure does: stderr, then exit 255.
+_BIND_FAILURE_CHILD = r"""
+import sys
+sys.stderr.write("bind [127.0.0.1]:53997: Address already in use\r\n")
+sys.stderr.write("Could not request local forwarding.\r\n")
+sys.exit(255)
+"""
+
+
+def _held_port(*, listening: bool) -> Any:
+    """A 127.0.0.1 socket on a port the OS assigned, held open by the test.
+
+    The tunnel takes a port number, so the port is picked by binding port 0 and
+    kept bound until the test ends: it is never released between the pick and
+    the use, and no other process can take it. A listening socket answers the
+    readiness wait's connect from its backlog, with no accept needed; a socket
+    that is bound but not listening refuses it.
+    """
+    import socket
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    if listening:
+        sock.listen(16)
+    return sock
+
+
+def _pending_tasks() -> list[asyncio.Task]:  # type: ignore[type-arg]
+    current = asyncio.current_task()
+    return [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+
+
+class TestStderrIsDrainedWhileRunning:
+    """``start()`` reads the child's stderr while it runs, through the real spawn."""
+
+    async def _run_chatty_child(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch, size: int
+    ) -> tuple[bool, bool, list[Any]]:
+        import sys
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        forward = _held_port(listening=True)
+        marker = tmp_path / "past-the-writes"
+        tunnel = _SshTunnel(
+            "cd-1", "cd-1-alias", forward.getsockname()[1], 7777, connect_timeout_secs=10
+        )
+        argv = [sys.executable, "-c", _CHATTY_CHILD, str(size), str(marker)]
+        monkeypatch.setattr(tunnel, "_build_argv", lambda: argv)
+        proc = None
+        try:
+            started = await tunnel.start()
+            proc = tunnel._proc
+            await async_wait_until(
+                lambda: marker.exists(),
+                describe=lambda: "marker file not yet created",
+            )
+            past_the_writes = marker.exists()
+            await tunnel.stop()
+            assert proc is not None and proc.returncode is not None, "stop() ended the child"
+            return started, past_the_writes, _pending_tasks()
+        finally:
+            forward.close()
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+
+    @pytest.mark.asyncio
+    async def test_a_child_that_writes_1mb_to_stderr_keeps_running(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        started, past_the_writes, pending = await self._run_chatty_child(
+            tmp_path, monkeypatch, 1024 * 1024
+        )
+        assert started
+        assert past_the_writes, "the child blocked writing stderr while the tunnel ran"
+        assert pending == [], "a drain task outlived stop()"
+
+    @pytest.mark.asyncio
+    async def test_a_child_that_writes_64kb_to_stderr_keeps_running(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        started, past_the_writes, pending = await self._run_chatty_child(
+            tmp_path, monkeypatch, 64 * 1024
+        )
+        assert started and past_the_writes
+        assert pending == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_start_still_reports_its_stderr(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sys
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        # Held bound but not listening, so the readiness wait's connect is refused
+        # and no other process can start listening on this port mid-test.
+        held = _held_port(listening=False)
+        tunnel = _SshTunnel(
+            "cd-1", "cd-1-alias", held.getsockname()[1], 7777, connect_timeout_secs=10
+        )
+        argv = [sys.executable, "-c", _BIND_FAILURE_CHILD]
+        monkeypatch.setattr(tunnel, "_build_argv", lambda: argv)
+
+        try:
+            assert await tunnel.start() is False
+        finally:
+            held.close()
+        assert tunnel.status.state is TunnelState.ERROR
+        assert tunnel.status.error.startswith(
+            "ssh forward bind failed (local port already in use)"
+        ), tunnel.status.error
+        assert "Address already in use" in tunnel.status.error
+        assert _pending_tasks() == []
+
+    @pytest.mark.asyncio
+    async def test_the_exit_wait_for_the_drain_is_bounded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A grandchild that inherited the pipe can hold it open after the child
+        # exits, so the drain never sees EOF. The exit path stops waiting at the
+        # bound and keeps what the drain captured.
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        monkeypatch.setattr(stm, "_STDERR_DRAIN_GRACE_SECS", 0.05)
+        stream = asyncio.StreamReader()
+        stream.feed_data(b"Connection closed by remote host\r\n")  # and no EOF, ever
+        tunnel = _tunnel()
+        tunnel._proc = _FakeProc(returncode=255, stderr=stream)  # type: ignore[assignment]
+        tunnel._stderr_task = asyncio.create_task(tunnel._drain_stderr())
+        # Wait until the drain has read what is buffered and is blocked on the
+        # missing EOF, on the condition itself and under a monotonic bound.
+        await async_wait_until(
+            lambda: "Connection closed by remote host" in tunnel._stderr_buf,
+            describe=lambda: f"stderr_buf={tunnel._stderr_buf!r}",
+        )
+        assert not tunnel._stderr_task.done(), "the drain must still be waiting for EOF"
+
+        await await_until(asyncio.ensure_future(tunnel._capture_stderr()))
+
+        assert tunnel._stderr_task is None
+        assert "Connection closed by remote host" in tunnel._stderr_buf
+        assert _pending_tasks() == []
+
+    @pytest.mark.asyncio
+    async def test_a_stop_during_the_exit_wait_is_not_an_unexpected_exit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The child exits on its own and the monitor waits for the stderr drain,
+        # which never sees EOF. A deliberate stop() in that window must end
+        # STOPPED without calling on_exit, the self-heal seam: otherwise the stop
+        # itself schedules a replacement tunnel.
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        monkeypatch.setattr(stm, "_STDERR_DRAIN_GRACE_SECS", 5.0)
+        exits: list[str] = []
+        stream = asyncio.StreamReader()
+        stream.feed_data(b"Connection closed by remote host\r\n")  # and no EOF, ever
+        tunnel = _tunnel(on_exit=exits.append)
+        tunnel._proc = _FakeProc(returncode=255, stderr=stream)  # type: ignore[assignment]
+        tunnel._stderr_task = asyncio.create_task(tunnel._drain_stderr())
+        tunnel.status.state = TunnelState.CONNECTED
+        tunnel._monitor_task = asyncio.create_task(tunnel._monitor())
+        # The monitor takes the drain task when it starts waiting for it.
+        await async_wait_until(
+            lambda: tunnel._stderr_task is None,
+            describe=lambda: "monitor has not yet taken the stderr task",
+        )
+        assert not tunnel._monitor_task.done(), "the monitor must still be waiting on stderr"
+
+        await await_until(asyncio.ensure_future(tunnel.stop()))
+
+        assert exits == [], f"a deliberate stop fired the self-heal seam: {exits}"
+        assert tunnel.status.state == TunnelState.STOPPED
+        assert _pending_tasks() == []
 
 
 class TestMonitor:

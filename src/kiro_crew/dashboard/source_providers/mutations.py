@@ -72,14 +72,51 @@ _GITHUB_NODE_ID_RE = re.compile(r"^[A-Za-z0-9_=+-]{1,128}$")
 _GITHUB_PULL_REQUEST_NODE_QUERY = (
     "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo)"
     "{squashMergeAllowed mergeCommitAllowed rebaseMergeAllowed"
-    " pullRequest(number:$number){id isDraft state autoMergeRequest{enabledAt}}}}"
+    " pullRequest(number:$number){id headRefOid isDraft state mergeStateStatus autoMergeRequest{enabledAt}}}}"
 )
+
+# ``mergeStateStatus`` is GitHub's merge-state vocabulary: it tells "nothing left
+# to wait for" (CLEAN/UNSTABLE) from "still gated" (BLOCKED/BEHIND/...). GitHub
+# COMPUTES it (a trial merge commit per PR), so folding it into a card query that
+# also walks the head commit and paginates the check rollup reliably 502s at
+# ``first:100`` (see issue_radar's github_client). This query is LEAN -- one
+# ``pullRequest(number)`` node, no rollup, no pagination -- where the same field
+# is comfortable, so it is safe to carry here.
 
 _GITHUB_AUTO_MERGE_MUTATION = (
     "mutation($pullRequestId:ID!,$mergeMethod:PullRequestMergeMethod!)"
     "{enablePullRequestAutoMerge(input:{pullRequestId:$pullRequestId,mergeMethod:$mergeMethod})"
     "{pullRequest{autoMergeRequest{enabledAt}}}}"
 )
+
+# When a PR is ALREADY mergeable, GitHub refuses ``enablePullRequestAutoMerge``
+# ("Pull request is in clean/unstable status") -- auto-merge only arms when
+# something is left to wait for. The honest action for that state is an immediate
+# merge, so the already-mergeable confirm path dispatches this instead. Branch
+# protection (required reviews, checks, conversation resolution) is adjudicated by
+# GitHub inside the merge, not here: a PR whose rules are unmet is rejected by the
+# server, so this cannot bypass a gate. ``expectedHeadOid`` pins the merge to the
+# head this confirm read returned, so a push landing between that read and this
+# dispatch makes GitHub reject the merge rather than merging a different commit.
+# It does NOT cover the operator's decision window: the read happens on the confirm
+# call, after the prompt, so a push that lands before the operator confirms is read
+# and merged as the current head -- closing that gap would need the prompt to carry
+# the head and the confirm to echo it, which this change deliberately does not add.
+_GITHUB_MERGE_MUTATION = (
+    "mutation($pullRequestId:ID!,$mergeMethod:PullRequestMergeMethod!,$head:GitObjectID!)"
+    "{mergePullRequest(input:{pullRequestId:$pullRequestId,mergeMethod:$mergeMethod,"
+    "expectedHeadOid:$head})"
+    "{pullRequest{merged}}}"
+)
+
+# The merge-state values GitHub reports when no REQUIRED check is left to wait on.
+# ``CLEAN`` is fully clear; ``UNSTABLE`` means a NON-required check is failing or
+# still pending -- it cannot block the merge, but it is not "all green".
+# ``HAS_HOOKS`` is clean-with-pre-receive-hooks (GitHub Enterprise Server): also
+# mergeable now. For all three, GitHub refuses to ARM auto-merge, so the dashboard
+# offers an immediate merge instead and the confirm prompt names the
+# non-required-check caveat.
+_GITHUB_ALREADY_MERGEABLE_STATES = frozenset({"CLEAN", "UNSTABLE", "HAS_HOOKS"})
 
 _GITHUB_READY_MUTATION = (
     "mutation($pullRequestId:ID!)"
@@ -150,6 +187,7 @@ async def _github_pull_request_node(ref: SourceRef) -> tuple[str, dict[str, Any]
         f"repo={ref.repo}",
         "-F",
         f"number={ref.number}",
+        host=ref.host,
     )
     repository = _github_repository_node(payload)
     pull_request = repository.get("pullRequest")
@@ -197,6 +235,7 @@ async def _github_thread_ref(raw_url: str, thread_id: str) -> SourceRef:
         f"repo={ref.repo}",
         "-F",
         f"number={ref.number}",
+        host=ref.host,
     )
     if thread_id not in github._github_thread_ids(threads):
         raise ValueError("Review thread does not belong to this pull request.")
@@ -254,6 +293,7 @@ async def reply_to_review_thread(raw_url: str, thread_id: str, body: str) -> Non
         f"threadId={thread_id}",
         "-f",
         f"body={text}",
+        host=ref.host,
     )
     _raise_on_graphql_errors(payload, "could not post the reply")
 
@@ -302,6 +342,7 @@ async def unresolve_pull_request_thread(raw_url: str, thread_id: str) -> None:
         f"query={_GITHUB_UNRESOLVE_MUTATION}",
         "-f",
         f"threadId={thread_id}",
+        host=ref.host,
     )
     _raise_on_graphql_errors(payload, "could not reopen the thread")
 
@@ -351,6 +392,7 @@ async def comment_on_pull_request(raw_url: str, body: str) -> None:
         f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments",
         "-f",
         f"body={text}",
+        host=ref.host,
     )
 
 
@@ -382,6 +424,7 @@ async def resolve_pull_request_thread(raw_url: str, thread_id: str) -> None:
             f"repo={ref.repo}",
             "-F",
             f"number={ref.number}",
+            host=ref.host,
         )
         if thread_id not in github._github_thread_ids(threads):
             raise ValueError("Review thread does not belong to this pull request.")
@@ -397,6 +440,7 @@ async def resolve_pull_request_thread(raw_url: str, thread_id: str) -> None:
             f"query={_GITHUB_RESOLVE_MUTATION}",
             "-f",
             f"threadId={thread_id}",
+            host=ref.host,
         )
     else:
         project = quote(ref.project, safe="")
@@ -498,6 +542,42 @@ async def enable_pull_request_auto_merge(
         )
         if not method:
             raise ValueError("This repository does not allow any merge method.")
+        # Already-mergeable PRs: GitHub refuses to ARM auto-merge once nothing is
+        # left to wait for (CLEAN/UNSTABLE), returning "Pull request is in clean/
+        # unstable status". Surfacing that blind dispatch failure as a 503 made a
+        # normal, user-actionable state look like a provider outage. Instead mirror
+        # the GitLab immediate-merge handshake: a client that has not acknowledged
+        # the merge gets an answerable ConfirmationRequired, and only the explicit
+        # acknowledgement dispatches an immediate merge (never the arming mutation,
+        # which GitHub would reject). A still-gated PR falls through to arming.
+        merge_state = str(pull_request.get("mergeStateStatus") or "").upper()
+        if merge_state in _GITHUB_ALREADY_MERGEABLE_STATES:
+            if not confirm_immediate_merge:
+                raise ConfirmationRequired(
+                    "This pull request can be merged now -- no REQUIRED check is "
+                    "left to wait on (a non-required check may still be failing or "
+                    "pending). Merge it now?"
+                )
+            await cache._invalidate_pull_request_cache(ref.url)
+            head_oid = str(pull_request.get("headRefOid") or "")
+            if not head_oid:
+                raise SourceProviderError("GitHub did not return a usable head commit to merge")
+            payload = await runner._run_json(
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={_GITHUB_MERGE_MUTATION}",
+                "-f",
+                f"pullRequestId={node_id}",
+                "-f",
+                f"mergeMethod={method}",
+                "-f",
+                f"head={head_oid}",
+                host=ref.host,
+            )
+            _raise_on_graphql_errors(payload, "GitHub refused to merge the pull request")
+            return method.lower()
         # Invalidate before dispatch: once the provider call starts its remote
         # result is uncertain under cancellation, so stale generations must
         # already be unable to refill or satisfy a post-mutation refresh.
@@ -512,6 +592,7 @@ async def enable_pull_request_auto_merge(
             f"pullRequestId={node_id}",
             "-f",
             f"mergeMethod={method}",
+            host=ref.host,
         )
         _raise_on_graphql_errors(payload, "GitHub refused to enable auto-merge")
         return method.lower()
@@ -573,6 +654,7 @@ async def mark_pull_request_ready(raw_url: str) -> None:
             f"query={_GITHUB_READY_MUTATION}",
             "-f",
             f"pullRequestId={node_id}",
+            host=ref.host,
         )
         _raise_on_graphql_errors(payload, "GitHub refused to mark the pull request ready")
         return

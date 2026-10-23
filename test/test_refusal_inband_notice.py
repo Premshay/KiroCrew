@@ -673,7 +673,11 @@ class TestEveryHostDenyCallSiteIsWired:
     CALL = re.compile(r"^\s*await (?:%s)\(" % "|".join(HELPERS))
 
     def _src(self) -> str:
-        return self.RUNNER.read_text(encoding="utf-8")
+        return "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(self.RUNNER.with_name("chat_turn").glob("*.py")), self.RUNNER]
+            if turn_file.name != "__init__.py"
+        )
 
     def _call_blocks(self) -> list[tuple[int, str]]:
         lines = self._src().splitlines(keepends=True)
@@ -731,12 +735,14 @@ class TestEveryHostDenyCallSiteIsWired:
         # defect. Pinned at source level because both sites live inside the
         # turn coroutine.
         src = self._src()
-        assert src.count("def _stop_pressed() -> bool:") == 1, "the live Stop signal helper moved"
-        body = src.split("def _stop_pressed() -> bool:", 1)[1][:2000]
+        assert (
+            src.count("def _stop_pressed(turn) -> bool:") == 1
+        ), "the live Stop signal helper moved"
+        body = src.split("def _stop_pressed(turn) -> bool:", 1)[1][:2000]
         assert "_stop_generation" in body and "_stop_gen_at_entry" in body
         # ...and the session-scoped count, so a stop issued on a linked channel
         # surface (which never touches the slot's own state) is seen too.
-        assert "_session_stop_generation()" in body and "_session_stop_gen_at_entry" in body
+        assert "_session_stop_generation(turn)" in body and "_session_stop_gen_at_entry" in body
         # refusal recovery: the gate call, and the re-read after the awaited
         # credential-hint lookup, before the queue write.
         gate = "if should_queue_refusal_recovery("
@@ -744,14 +750,14 @@ class TestEveryHostDenyCallSiteIsWired:
             src.count(gate) == 1
         ), "the refusal-recovery gate moved or multiplied -- guard is stale"
         window = src.split(gate, 1)[1][:2400]
-        assert "user_stopped=_stop_pressed()" in window[:600]
+        assert "user_stopped=_stop_pressed(turn)" in window[:600]
         assert "_stop_reason" not in window[:400], "the gate must not take the wire stop reason"
         after_await = window.split("await _credential_tool_hint_for(", 1)[1]
-        assert "if _stop_pressed()" in after_await.split("_queue_recovery(", 1)[0]
+        assert "if _stop_pressed(turn)" in after_await.split("_queue_recovery(", 1)[0]
         assert "turn_aborted=(_stop_reason == STOP_REASON_CANCELLED)" in window
         # stop-hook continuation: outer gate and the recheck after the config load.
         hook_calls = re.findall(
-            r"should_queue_hook_continuation\(\s*needs_session_reset, user_stopped=_stop_pressed\(\)\s*\)",
+            r"should_queue_hook_continuation\(\s*needs_session_reset, user_stopped=_stop_pressed\(turn\)\s*\)",
             src,
         )
         assert (
@@ -763,7 +769,11 @@ class TestEveryHostDenyCallSiteIsWired:
         # anyway, so "user denied tool execution" is not merely unhelpful but
         # false. Pinned separately because it is the one a reader most needs to
         # trust, and both its deny calls were among the four originally missed.
-        src = self.RUNNER.read_text(encoding="utf-8")
+        src = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(self.RUNNER.with_name("chat_turn").glob("*.py")), self.RUNNER]
+            if turn_file.name != "__init__.py"
+        )
         approved = src.split('if outcome == "approved":', 1)
         assert len(approved) == 2, "the interactive approved branch moved -- guard is stale"
         window = approved[1][:4000]
@@ -936,7 +946,7 @@ class TestEveryHostDenyCallSiteIsWired:
     # keyword-only ``attribution`` is required (an omission is a mypy error). So
     # this half only has to be textual: no ``.reject_tool(`` outside those four
     # functions, and every ``_reject_attributed`` call states a real value.
-    # chat_runner.py answers the dashboard's ``session/request_permission``;
+    # chat_turn/tool_approval.py and permission_prompt.py answer ``session/request_permission``;
     # other modules answer their own surfaces and are out of this guard's scope.
     # ------------------------------------------------------------------
 

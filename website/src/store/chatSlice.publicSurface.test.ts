@@ -12,6 +12,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as chatSlice from './chatSlice'
 import reducer, {
+  isAnsweredQuestionEnding,
+  markQuestionSettled,
   selectSidebarApprovalCounts,
   selectSidebarAutomationRunningKeys,
   selectSidebarSubagentCounts,
@@ -33,28 +35,28 @@ const ACTION_CREATORS = [
   'clearMessages', 'clearPendingPermissions', 'clearQuestionCard', 'clearSlotCache',
   'clearSlotReveal', 'clearSlotState', 'clearSubagentsForSnapshot', 'clearSwitchSlotGone',
   'clearTerminalSubagents', 'clearUndeletableHistory', 'clearUnresumableResume',
-  'clearWorkflowRun', 'confirmOptimisticSend', 'dismissFollowupItem', 'editQueuedMessage',
-  'endLocalTurn', 'finalizeAssistant', 'hydrateSlotMessages', 'markSendUnconfirmed', 'markSubagentApproving',
-  'openActivityPanel', 'openActivityToTab', 'openActivityToTool', 'reconcileWorkflowRuns',
-  'reconcileSubagentQueuedFromSlots',
+  'clearWorkflowRun', 'confirmOptimisticSend', 'dismissFollowupItem', 'dropActiveSlot', 'editQueuedMessage',
+  'endLocalTurn', 'finalizeAssistant', 'forkOpenSettled', 'forkOpenStarted', 'hydrateSlotMessages', 'markQuestionSettled', 'markSendUnconfirmed', 'markSubagentApprovalGone', 'markSubagentApproving',
+  'openActivityPanel', 'openActivityToTab', 'openActivityToTool', 'reconcileSubagentApprovalGone', 'reconcileSubagentQueuedFromSlots', 'reconcileWorkflowRuns',
   'removeAutomation', 'removeByApprovalId', 'removeQueuedMessage', 'removeThinking',
-  'reorderQueuedMessages', 'replaceMessages', 'requestFolderReveal', 'requestSlotReveal',
+  'reorderQueuedMessages', 'replaceMessages', 'requestFolderReveal', 'requestSlotFolderOpen', 'requestSlotReveal',
   'resolveByApprovalId', 'resolveOptimisticSteer', 'resolveQuestionCard', 'selectSubagent',
   'setActiveSlot', 'setAgentSwitchNotice', 'setAutomations', 'setCloseRefused', 'setFolderSuggestion',
-  'setFollowupCard', 'setPendingInput', 'setQuestionCard', 'setQuestionDraft', 'setSlotRunning',
-  'setSlotState', 'setSlotStatusDetail', 'setSlotStopping', 'setStopPressedAt', 'stageToMainComposer', 'setVoiceAudio',
-  'setVoiceBusy', 'setVoicePlaying', 'settleStopNotRunning', 'sideClose', 'sideOptimisticAppend',
-  'sideOptimisticRollback', 'sideReleaseConsumed', 'sseActivityEvent', 'sseAutomation',
+  'setFollowupCard', 'setPendingInput', 'setQuestionCard', 'setQuestionDraft', 'setQuestionNotice', 'setQuestionRequestInFlight', 'setSidePanelAlwaysOpen', 'setSlotRunning',
+  'setSlotState', 'setSlotStatusDetail', 'setSlotStopping', 'setStopPressedAt', 'setVoiceAudio',
+  'setVoicePlaying', 'setVoiceBusy', 'setVoicePreparing', 'settleStopNotRunning', 'sideClose', 'sideOptimisticAppend',
+  'sideOptimisticRollback', 'sideReleaseConsumed', 'sideRestore', 'sideSendStatus', 'sseActivityEvent', 'sseAutomation',
   'sseChatMessage', 'sseChatMessagePatchByTs', 'sseChatMessageUpdate', 'sseContextUsage',
   'sseMcpAppRender', 'sseSideQueue', 'sseSideResult', 'sseSubagentBatchChunks',
   'sseSubagentBatchUpdate', 'sseSubagentDone', 'sseSubagentPending', 'sseSubagentQueued',
   'sseSubagentRetrying', 'sseSubagentSnapshot', 'sseSubagentSpawn', 'sseSubagentStalled',
-  'sseSubagentTool', 'sseThinkingChunk', 'startRemoteTurn', 'sseToolActivity', 'sseToolResult', 'sseWorkflowEvent',
-  'startLocalTurn', 'syncSlotRunningFromServer', 'toggleActivity', 'truncateAfterIndex',
+  'sseSubagentTool', 'sseThinkingChunk', 'sseToolActivity', 'sseToolResult', 'sseWorkflowEvent',
+  'stageToMainComposer', 'startLocalTurn', 'startServerTurn', 'startRemoteTurn', 'syncSlotRunningFromServer', 'toggleActivity', 'truncateAfterIndex',
   'updateStreamingMessage',
 ]
 
 const THUNKS: Record<string, string> = {
+  clearHistorySessions: 'chat/clearHistorySessions',
   createSlot: 'chat/createSlot',
   deleteHistorySession: 'chat/deleteHistorySession',
   deleteSlot: 'chat/deleteSlot',
@@ -64,6 +66,8 @@ const THUNKS: Record<string, string> = {
   loadOlderSlotMessages: 'chat/loadOlderSlot',
   refreshSlot: 'chat/refreshSlot',
   requestStop: 'chat/requestStop',
+  reconcileGoneSubagent: 'chat/reconcileGoneSubagent',
+  restoreSideConversation: 'chat/restoreSideConversation',
   resumeFromHistory: 'chat/resumeFromHistory',
   switchSlot: 'chat/switchSlot',
   warmSlotCache: 'chat/warmSlotCache',
@@ -71,18 +75,18 @@ const THUNKS: Record<string, string> = {
 
 const FUNCTIONS = [
   'abortActiveOlderFetch', 'batchedTextAboveFloor', 'capturePendingAskId', 'clampToolOutput',
-  'countMatchedFetchLimit', 'floorForGen', 'hasUnidentifiedDurableRow', 'isAwaitingSpawnApproval',
-  'isSupersededPagingRejection', 'isTerminalWorkflowStatus', 'mcpAppKey', 'missedChunkMarker',
-  'pendingQuestionFor', 'queueEditBroadcastAt', 'queueEntryAttachments', 'queueEntryQuote', 'raiseChunkSeq',
+  'countMatchedFetchLimit', 'floorForGen', 'hasUnidentifiedDurableRow', 'hydrateQueuedBubbles', 'isActiveSubagent', 'isAnsweredQuestionEnding', 'isAwaitingSpawnApproval', 'isSpawnApprovalGone', 'isSpawnApprovalRetired',
+  'captureForkOrigin', 'forkMayOpen', 'isSupersededPagingRejection', 'isTerminalWorkflowStatus', 'listForkedSlot', 'mcpAppKey', 'missedChunkMarker', 'normalizeQueueEntries',
+  'openCreatedSlot', 'pendingQuestionFor', 'queueEditBroadcastAt', 'queueEntryAttachments', 'queueEntryQuote', 'raiseChunkSeq',
   'selectActiveSlotProject', 'selectAutomationForSlot', 'selectComposerBusy', 'selectContinuable',
-  'selectSendConfirmed', 'selectSidebarApprovalCounts', 'selectSidebarAutomationRunningKeys',
+  'selectProjectChipLocked', 'selectSendAccepted', 'selectSendConfirmed', 'selectSidebarApprovalCounts', 'selectSidebarAutomationRunningKeys',
   'selectSidebarStartedSubagentCounts', 'selectSidebarSubagentCounts', 'selectSidebarWorkflowActive', 'selectSidebarWorkflowActiveKeys',
   'selectSlotMessages', 'selectSlotPendingApproval', 'selectSlotPendingSpawnApprovals',
   'selectSlotRunEpoch', 'selectSlotStreamState', 'selectSlotSubagents',
   'selectSlotSubagentsActive', 'selectSlotToolLog', 'selectSubagentActivityCount', 'selectTrailingSendUnconfirmed',
-  'selectTurnInterrupted', 'shouldResolveAskOnSend', 'slotCoverageShortfall',
+  'selectSlotTurnFromWake', 'selectTurnInterrupted', 'shouldResolveAskOnSend', 'slotCoverageShortfall',
   'slotSwitchFetchLimit', 'snapshotChunkGen', 'snapshotChunkSeq', 'switchSlotNoticeCopy',
-  'transcriptTsMs',
+  'transcriptTsMs', 'wireTurnIdentity',
 ]
 
 const CONSTANTS: Record<string, unknown> = {
@@ -90,6 +94,8 @@ const CONSTANTS: Record<string, unknown> = {
   OLDER_PAGE_LIMIT: 100,
   OLDER_WALK_PAGE_LIMIT: 100,
   PANE_HYDRATE_LIMIT: 50,
+  QUIET_END_SERVER: 'kirocrew-core',
+  QUIET_END_TOOL: 'nothing_to_do',
   REFRESH_LIMIT_CEILING: 500,
   SLOT_DETAIL_MAX_LIMIT: 500,
   TOOL_OUTPUT_MAX_CHARS: 64000,
@@ -100,23 +106,23 @@ const CONSTANTS: Record<string, unknown> = {
 /** The initial state in its declared key order. `lastChunkSeq` and
  *  `lastChunkGen` are present as `undefined`, which JSON would hide. */
 const INITIAL_STATE = {
-  activeSlot: null, messages: [], localTranscriptEpoch: 0, slotRunning: false, slotStopping: false, slotState: 'idle',
+  activeSlot: null, activeSlotMoves: 0, activeSlotAutoMoves: 0, messages: [], localTranscriptEpoch: 0, slotRunning: false, slotStopping: false, slotState: 'idle',
   slotStatusDetail: {}, slotHasMore: false, slotOldestIndex: 0, slotCursorKey: null,
   slotSwitchRequestId: null, slotSwitchLatestRequestId: null, slotSwitchTarget: null, slotSwitchOrigin: null, switchSlotGone: null,
   loadingOlder: false, slotOlderError: false, lastChunkSeq: undefined, lastChunkGen: undefined,
   _wsChunkedDuringFetch: false, liveFrameSeq: 0, refreshAppliedSeq: {}, _redeliveredFramesDropped: 0, history: [], historyHasMore: false,
   historyOffset: 0, unresumableResume: null, lastResumeRequestId: null, undeletableHistory: null,
-  pendingInput: null, mainComposerAppend: null, agentSwitchNotice: null, creatingSlot: false, foregroundCreateId: null,
-  lastCreatedActivation: null, slotContextPct: {}, slotContextTokens: {}, voicePlaying: false, voiceBusy: false,
-  voiceAudio: null, subagents: {}, subagentQueued: {}, subagentQueuedReason: {}, automations: {},
-  selectedSubagentId: null, toolLog: [], workflowRuns: {}, activityOpen: false,
+  pendingInput: null, mainComposerAppend: null, agentSwitchNotice: null, creatingSlot: false, foregroundCreateId: null, pendingForkOpens: 0,
+  lastCreatedActivation: null, slotContextPct: {}, slotContextTokens: {}, voicePlaying: false,
+  voiceBusy: false, voicePreparing: false, voiceAudio: null, subagents: {}, subagentQueued: {}, subagentQueuedReason: {}, automations: {},
+  selectedSubagentId: null, toolLog: [], workflowRuns: {}, activityOpen: false, sidePanelAlwaysOpen: false, sidePanelAlwaysOpenSetting: null, sidePanelReopenSlot: null,
   activityTab: 'changes', activityTabRequest: 0, revealRequest: null, revealNonce: 0,
   focusToolCallId: null, mcpApps: {}, slotActivity: {}, slotMessages: {}, slotPaneHasMore: {},
   slotPaneBounded: {}, slotServerTotal: {}, slotServerTotalSeq: {}, thinkingOrphans: {},
-  slotRun: {}, slotHydrated: {}, slotLoading: false, slotSide: {}, slotSideClosed: {},
-  slotHistory: [], slotsSnapshotSeen: false, pendingQuestions: {}, followups: {},
+  slotRun: {}, slotHydrated: {}, slotLoading: false, slotSide: {}, slotSideClosed: {}, slotSideRestored: {},
+  slotHistory: [], slotsSnapshotSeen: false, slotListPartial: false, slotListHeldKeys: [], slotListHoldChannels: false, pendingQuestions: {}, questionRequestsInFlight: {}, questionsSettled: {}, restoredQuestionNotices: {}, followups: {},
   folderSuggestions: {}, stopPressedAt: {}, runEpoch: {}, activeRunEpochAtEntry: 0,
-  pendingTurnSlot: null,
+  endedTurn: {}, pendingTurnSlot: null,
   closeRefused: null,
 }
 
@@ -161,6 +167,30 @@ describe('chatSlice public surface', () => {
     const init = reducer(undefined, { type: '@@INIT' })
     expect(Object.keys(init)).toEqual(Object.keys(INITIAL_STATE))
     expect(init).toStrictEqual(INITIAL_STATE)
+  })
+
+  it.each(['answered', 'composer', 'queued'])('treats %s as an answered question ending', reason => {
+    expect(isAnsweredQuestionEnding(reason)).toBe(true)
+  })
+
+  it.each(['dismissed', 'withdrawn', 'expired', 'no_client', undefined])(
+    'treats %s as an unanswered or unknown question ending',
+    reason => {
+      expect(isAnsweredQuestionEnding(reason)).toBe(false)
+    },
+  )
+
+  it('keeps only the newest settled question ids', () => {
+    let state = reducer(undefined, { type: '@@INIT' })
+    for (let i = 0; i < 201; i++) state = reducer(state, markQuestionSettled({ ask_id: `ask-${i}` }))
+    expect(Object.keys(state.questionsSettled)).toHaveLength(200)
+    expect(state.questionsSettled['ask-0']).toBeUndefined()
+    expect(state.questionsSettled['ask-200']).toBe(true)
+
+    state = reducer(state, markQuestionSettled({ ask_id: 'ask-1' }))
+    state = reducer(state, markQuestionSettled({ ask_id: 'ask-new' }))
+    expect(state.questionsSettled['ask-1']).toBe(true)
+    expect(state.questionsSettled['ask-2']).toBeUndefined()
   })
 
   it('an unrelated action returns the state object itself', () => {

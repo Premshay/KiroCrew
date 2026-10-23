@@ -280,6 +280,7 @@ const FRAME_CASES: Array<[string, Frame[], Frame[]]> = [
   }]],
   ['slots repeated frame only reconciles the queued depth', [{ type: 'slots', data: SLOTS, foldersGeneration: 3 }], [{ type: 'slots', data: SLOTS, foldersGeneration: 3 }]],
   ['slots unchanged generations', [{ type: 'slots', data: SLOTS, foldersGeneration: 3, gitlabHostsGeneration: 4 }], [{ type: 'slots', data: [...SLOTS].reverse(), foldersGeneration: 3, gitlabHostsGeneration: 4 }]],
+  ['slots partial frame of a restarting gateway', [], [{ type: 'slots', data: SLOTS, slotsPartial: true }]],
   ['credential_redaction_changed', [], [{ type: 'credential_redaction_changed', data: { enabled: true, changed_at: TS } }]],
   ['credential_redaction_changed without a boolean', [], [{ type: 'credential_redaction_changed', data: { enabled: 'yes', changed_at: 3 } }]],
   ['skills.pending_changed', [], [{ type: 'skills.pending_changed', data: {} }]],
@@ -336,6 +337,12 @@ const FRAME_CASES: Array<[string, Frame[], Frame[]]> = [
   ['dashboard_value_written', [], [
     { type: 'dashboard_value_written', data: { slug: 'ada' } },
     { type: 'dashboard_value_written', data: {} },
+  ]],
+  // A crewmate's dashboard PAGE changed (a template applied or rolled back).
+  // Same effect as a value write: the tab re-reads; no slug, nothing happens.
+  ['dashboard_instance_changed', [], [
+    { type: 'dashboard_instance_changed', data: { slug: 'ada' } },
+    { type: 'dashboard_instance_changed', data: {} },
   ]],
   ['chat_message user row in the active slot', [], [{ type: 'chat_message', data: { slot: ACTIVE, role: 'user', content: 'hi', ts: TS } }]],
   ['chat_message assistant row in a background slot', [], [{ type: 'chat_message', data: { slot: BACKGROUND, role: 'assistant', content: 'done', ts: TS } }]],
@@ -585,6 +592,30 @@ describe('useWebSocket lifecycle trace', () => {
     await act(async () => { WS_INSTANCES[1].open() })
     act(() => { drainFrames() })
     expect(trace).toEqual(EXPECTED_LIFECYCLE['reconnect catch-up'])
+  })
+
+  it('hidden reconnect sends no return frame until visibility returns', async () => {
+    const { ws, view } = await mountOpen()
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+    try {
+      act(() => document.dispatchEvent(new Event('visibilitychange')))
+      trace = []
+      vi.useFakeTimers()
+      try {
+        act(() => { ws.drop() })
+        act(() => { vi.advanceTimersByTime(1000) })
+      } finally {
+        vi.useRealTimers()
+      }
+      await act(async () => { WS_INSTANCES[1].open() })
+      expect(trace.some(line => line.includes('slot_focused'))).toBe(false)
+      hidden.mockReturnValue(false)
+      act(() => document.dispatchEvent(new Event('visibilitychange')))
+      expect(trace).toContain('send {"type":"slot_focused","slot":"slot-a"}')
+      view.unmount()
+    } finally {
+      hidden.mockRestore()
+    }
   })
 
   it('reconnect after an update restart reloads', async () => {
@@ -865,6 +896,27 @@ describe('useWebSocket lifecycle trace', () => {
     expect(WS_INSTANCES).toHaveLength(1)
   })
 
+  it('a hidden first connect sends no focus frame; reveal sends the return frame', async () => {
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+    try {
+      testStore.dispatch(sseSlots(SLOTS))
+      testStore.dispatch(setActiveSlot(ACTIVE))
+      const view = renderHook(() => useWebSocket(), {
+        wrapper: ({ children }) => createElement(Provider, { store: testStore },
+          createElement(QueryClientProvider, { client: qc }, children)),
+      })
+      const ws = WS_INSTANCES[0]
+      await act(async () => { ws.open() })
+      expect(trace.some(line => line.includes('slot_focused'))).toBe(false)
+      hidden.mockReturnValue(false)
+      act(() => document.dispatchEvent(new Event('visibilitychange')))
+      expect(trace).toContain('send {"type":"slot_focused","slot":"slot-a"}')
+      view.unmount()
+    } finally {
+      hidden.mockRestore()
+    }
+  })
+
   it('focus changes, visibility and the pane-focus emitter share one sender', async () => {
     const { emitSlotFocused } = await import('../hooks/useWebSocket')
     const { view } = await mountOpen()
@@ -894,6 +946,8 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
   ],
   "slots first frame of a connection": [
     'action chat/reconcileSubagentQueuedFromSlots [{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"}]',
+    'action dashboard/sseSlotListHolds {"heldKeys":[],"holdChannels":false}',
+    'action dashboard/sseSlotsPartial false',
     'action dashboard/sseSlots [{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"}]',
     'action dashboard/sseYolo true',
     'action dashboard/setChannelTrusted false',
@@ -904,10 +958,21 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
   ],
   "slots repeated frame only reconciles the queued depth": [
     'action chat/reconcileSubagentQueuedFromSlots [{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"}]',
+    'action dashboard/sseSlotListHolds {"heldKeys":[],"holdChannels":false}',
+    'action dashboard/sseSlotsPartial false',
   ],
   "slots unchanged generations": [
     'action chat/reconcileSubagentQueuedFromSlots [{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"}]',
+    'action dashboard/sseSlotListHolds {"heldKeys":[],"holdChannels":false}',
+    'action dashboard/sseSlotsPartial false',
     'action dashboard/sseSlots [{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"}]',
+    'event mc:app:slots',
+  ],
+  "slots partial frame of a restarting gateway": [
+    'action chat/reconcileSubagentQueuedFromSlots [{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"}]',
+    'action dashboard/sseSlotListHolds {"heldKeys":[],"holdChannels":false}',
+    'action dashboard/sseSlotsPartial true',
+    'action dashboard/sseSlots [{"key":"slot-a","title":"Active","last_ts":"2026-09-01T00:00:00.000Z"},{"key":"slot-b","title":"Background","last_ts":"2026-09-01T00:00:00.000Z"}]',
     'event mc:app:slots',
   ],
   "credential_redaction_changed": [
@@ -983,7 +1048,7 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'event mc-live-notification {"note":{"kind":"info","title":"Quiet","ts":"1790000003","priority":"passive"}}',
   ],
   "panel_published": [
-    'query invalidateQueries ["member-panel","crew"]',
+    'query invalidateQueries ["member-dashboard","crew"]',
   ],
   "notification ack, unack and clear": [
     'action notifications/ackNotificationByTs "1"',
@@ -1050,6 +1115,7 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'query invalidateQueries ["mcp-tools"]',
     'query invalidateQueries ["kirocrew-agents"]',
     'query invalidateQueries ["default-agent"]',
+    'query invalidateQueries ["agent-templates"] {"exact":true}',
     'query invalidateQueries ["workspaces"]',
     'query invalidateQueries ["kirocrewConfig"]',
     'query invalidateQueries ["resolved-model"]',
@@ -1077,6 +1143,9 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
   ],
   "members_subscribed with nothing to drop": [],
   "dashboard_value_written": [
+    "query invalidateQueries [\"member-dashboard\",\"ada\"]",
+  ],
+  "dashboard_instance_changed": [
     "query invalidateQueries [\"member-dashboard\",\"ada\"]",
   ],
   "chat_message user row in the active slot": [
@@ -1335,6 +1404,7 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'query invalidateQueries ["mcp-tools"]',
     'query invalidateQueries ["kirocrew-agents"]',
     'query invalidateQueries ["default-agent"]',
+    'query invalidateQueries ["agent-templates"] {"exact":true}',
     'query invalidateQueries ["workspaces"]',
     'query invalidateQueries ["kirocrewConfig"]',
     'query invalidateQueries ["resolved-model"]',
@@ -1352,6 +1422,7 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'query invalidateQueries ["mcp-tools"]',
     'query invalidateQueries ["kirocrew-agents"]',
     'query invalidateQueries ["default-agent"]',
+    'query invalidateQueries ["agent-templates"] {"exact":true}',
     'query invalidateQueries ["workspaces"]',
     'query invalidateQueries ["kirocrewConfig"]',
     'query invalidateQueries ["resolved-model"]',
@@ -1414,7 +1485,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'action chat/clearSubagentsForSnapshot undefined',
     'send {"type":"subscribe_subagents"}',
     'send {"type":"subscribe_logs"}',
-    'send {"type":"slot_focused","slot":"slot-a"}',
+    'send {"type":"slot_focused","slot":"slot-a","announce":true}',
     'action chat/reconcileWorkflowRuns []',
     'query setQueryData ["command-center","workflows"]',
     'action chat/setAutomations {"records":[],"legacyComplete":true,"structuredComplete":true,"protectedSlots":[]}',
@@ -1440,6 +1511,8 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'query fetchQuery ["credential-redaction"] {"staleTime":0}',
     'query invalidateQueries ["chat-thread"]',
     'query invalidateQueries ["chat-threads"]',
+    'query invalidateQueries ["guide-pending"]',
+    'query invalidateQueries ["change-cards"]',
     'query removeQueries ["member-thread"]',
     'query fetchQuery ["automation-seed","legacy"] {"staleTime":0,"retry":false}',
     'query fetchQuery ["automation-seed","structured"] {"staleTime":0,"retry":false}',
@@ -1448,7 +1521,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'action chat/refreshSlot/pending',
     'action chat/clearSubagentsForSnapshot undefined',
     'send {"type":"subscribe_subagents"}',
-    'send {"type":"slot_focused","slot":"slot-a"}',
+    'send {"type":"slot_focused","slot":"slot-a","announce":true}',
     'action dashboard/fetchSlots/fulfilled',
     'action chat/reconcileWorkflowRuns []',
     'query setQueryData ["command-center","workflows"]',
@@ -1489,6 +1562,8 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'query fetchQuery ["credential-redaction"] {"staleTime":0}',
     'query invalidateQueries ["chat-thread"]',
     'query invalidateQueries ["chat-threads"]',
+    'query invalidateQueries ["guide-pending"]',
+    'query invalidateQueries ["change-cards"]',
     'query removeQueries ["member-thread"]',
     'query fetchQuery ["automation-seed","legacy"] {"staleTime":0,"retry":false}',
     'query fetchQuery ["automation-seed","structured"] {"staleTime":0,"retry":false}',
@@ -1497,7 +1572,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'action chat/refreshSlot/pending',
     'action chat/clearSubagentsForSnapshot undefined',
     'send {"type":"subscribe_subagents"}',
-    'send {"type":"slot_focused","slot":"slot-a"}',
+    'send {"type":"slot_focused","slot":"slot-a","announce":true}',
     'action dashboard/fetchSlots/fulfilled',
     'action chat/reconcileWorkflowRuns []',
     'query setQueryData ["command-center","workflows"]',
@@ -1518,7 +1593,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'query fetchQuery ["workflow-runs-reconcile"] {"staleTime":0,"gcTime":30000,"retry":false}',
     'action chat/clearSubagentsForSnapshot undefined',
     'send {"type":"subscribe_subagents"}',
-    'send {"type":"slot_focused","slot":"slot-a"}',
+    'send {"type":"slot_focused","slot":"slot-a","announce":true}',
     'action chat/reconcileWorkflowRuns []',
     'query setQueryData ["command-center","workflows"]',
     'action chat/setAutomations {"records":[],"legacyComplete":true,"structuredComplete":true,"protectedSlots":[]}',
@@ -1544,13 +1619,19 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
   ],
   "voice frames for a registered request": [
     'event voice-synthesis-start {"slot":"slot-a","request_id":"r-1"}',
-    'action chat/setVoicePlaying true',
+    'action chat/setVoicePreparing true',
     'action chat/setVoiceBusy true',
+    'action chat/setVoicePlaying true',
     'audio blob:voice',
     'audio play',
+    'action chat/setVoicePreparing false',
     'action chat/setVoiceAudio "QQ=="',
     'event voice-synthesis-start {"slot":"slot-a","request_id":"r-2"}',
+    'action chat/setVoicePreparing true',
+    'action chat/setVoicePreparing false',
     'event voice-synthesis-start {"slot":"slot-a","request_id":"r-3"}',
+    'action chat/setVoicePreparing true',
+    'action chat/setVoicePreparing false',
     'event voice-error {"slot":"slot-a","request_id":"r-3","code":"voice_synthesis_failed","report":"<report>"}',
     'event voice-stop',
     'audio pause',
@@ -1587,6 +1668,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'cancel-frame 1',
     'action chat/sseChatMessage {"slot":"slot-a","role":"chunk","content":"First sentence. Second","seq":1,"batched":true,"parts":[{"seq":1,"text":"First sentence. Second"}]}',
     'action chat/setVoiceBusy true',
+    'action chat/setVoicePreparing true',
     'action chat/sseChatMessage {"slot":"slot-a","role":"_segment"}',
     'frame',
     'cancel-frame 2',
@@ -1596,7 +1678,6 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'send {"type":"slot_read","slot":"slot-a","read_ts":"2026-09-01T00:00:00.000Z"}',
     'action chat/setSlotStatusDetail {"slot":"slot-a","kind":"idle","ts":"<clock>"}',
     "synthesize slot-a \"First sentence.\\nSecond\\nAfter tool.\\nTail\"",
-    'action chat/setVoiceBusy false',
   ],
   "unmount during backoff still lands the buffered recency bump": [
     'action dashboard/touchSlotActivity {"key":"slot-a","ts":"2026-09-01T00:00:00.000Z","settled":true}',

@@ -69,11 +69,12 @@ PLUMBING: frozenset[tuple[str, str]] = frozenset(
         # Channel file migration: moves rows between stems, derives nothing.
         ("kiro_crew/channel_transcript_migration.py", "read_messages"),
         # SEL audit log `recent`, not a transcript.
-        ("kiro_crew/cli_commands.py", "recent"),
+        ("kiro_crew/cli_commands_security.py", "recent"),
         # The live session's OWN rows into its OWN prompt / compaction.
         ("kiro_crew/context.py", "read_messages"),
         ("kiro_crew/context.py", "read_messages_chained"),
         ("kiro_crew/context.py", "recent"),
+        ("kiro_crew/context_assembly/turn_message.py", "recent"),
         ("kiro_crew/dashboard/channel_slots.py", "read_messages"),
         # The chat handlers' resume and slot-detail owners, composed into
         # chat_handlers: the same resume and render reads it made.
@@ -86,21 +87,23 @@ PLUMBING: frozenset[tuple[str, str]] = frozenset(
         ("kiro_crew/dashboard/chat_fork.py", "read_messages_chained_full"),
         # ``selection.recent`` -- a mirror selection field, not a transcript read.
         ("kiro_crew/dashboard/chat_mirror.py", "recent"),
-        ("kiro_crew/dashboard/chat_persistence.py", "read_messages_chained"),
+        ("kiro_crew/dashboard/chat_persistence_parts/slot_builders.py", "read_messages_chained"),
         ("kiro_crew/dashboard/chat_rewind.py", "read_messages_chained"),
-        ("kiro_crew/dashboard/chat_runner.py", "recent"),
         ("kiro_crew/dashboard/chat_slack.py", "recent"),
+        # The decisions hooks composed into chat_runner: the same read it made.
+        ("kiro_crew/dashboard/chat_turn/decisions_hooks.py", "recent"),
         ("kiro_crew/dashboard/chat_threads.py", "read_messages_chained"),
         ("kiro_crew/dashboard/cron_inject.py", "read_messages"),
         # Rendering the transcript's own artifacts / rows to its user.
-        ("kiro_crew/dashboard/handlers/artifacts.py", "read_messages"),
+        ("kiro_crew/dashboard/handlers/artifacts_parts/session_documents.py", "read_messages"),
         # SEL audit log `recent`, not a transcript.
-        ("kiro_crew/dashboard/handlers/core.py", "recent"),
-        ("kiro_crew/dashboard/handlers/cron.py", "read_messages"),
+        ("kiro_crew/dashboard/handlers/core_security.py", "recent"),
+        ("kiro_crew/dashboard/handlers/cron_runs.py", "read_messages"),
         ("kiro_crew/dashboard/handlers/session_control.py", "read_messages"),
         # The History browser showing the user their own transcript. Its
         # list_sessions(summarize=true) leg goes through the seam (derive_recent).
-        ("kiro_crew/dashboard/handlers/sessions.py", "read_messages"),
+        ("kiro_crew/dashboard/handlers/sessions_parts/app_scope.py", "read_messages"),
+        ("kiro_crew/dashboard/handlers/sessions_parts/history_reads.py", "read_messages"),
         ("kiro_crew/decisions/points/compaction_keep.py", "read_messages"),
         # Thread diagnostics probe `recent`, not a transcript.
         ("kiro_crew/diag/threads.py", "recent"),
@@ -118,14 +121,25 @@ PLUMBING: frozenset[tuple[str, str]] = frozenset(
         ("kiro_crew/history.py", "recent"),
         ("kiro_crew/history.py", "recent_chained"),
         ("kiro_crew/history.py", "sliding_window"),
+        # The log's own members, bound from its owners: the append dedup check, the
+        # seam itself, the consolidation snapshot and counts, the thread parent probe.
+        ("kiro_crew/history_append.py", "_read_messages"),
+        ("kiro_crew/history_derivation.py", "_read_messages"),
+        ("kiro_crew/history_derivation.py", "read_messages"),
+        ("kiro_crew/history_derivation.py", "recent"),
+        ("kiro_crew/history_marker.py", "_read_messages"),
+        ("kiro_crew/history_threads.py", "read_messages_chained"),
         # Scheduling counts only (`len(...)`); the rows it consolidates come from
         # the gated snapshot and skill detection goes through derive_messages.
         ("kiro_crew/history_consolidation.py", "_read_messages"),
-        ("kiro_crew/history_projection.py", "_read_messages"),
-        ("kiro_crew/history_projection.py", "_read_messages_locked"),
-        ("kiro_crew/history_projection.py", "_recent_via_tail"),
-        ("kiro_crew/history_projection.py", "read_messages_chained"),
-        ("kiro_crew/slack/gateway.py", "read_messages"),
+        ("kiro_crew/history_projection_reads.py", "_read_messages"),
+        ("kiro_crew/history_projection_reads.py", "_read_messages_locked"),
+        ("kiro_crew/history_projection_reads.py", "_recent_via_tail"),
+        ("kiro_crew/history_projection_reads.py", "read_messages_chained"),
+        # SEL audit log `recent` (the class binds sel_reader's), not a transcript.
+        ("kiro_crew/sel.py", "recent"),
+        ("kiro_crew/slack/gateway_runtime/cron_delivery.py", "read_messages"),
+        ("kiro_crew/slack/gateway_runtime/nudge_wiring.py", "read_messages"),
         # A yes/no "does this session already have turns" check on its OWN
         # transcript, gating a write to that transcript; no rows leave.
         ("kiro_crew/slack/thread_parent.py", "recent"),
@@ -172,6 +186,10 @@ class TestTheFence:
         derivers = {
             "kiro_crew/dashboard/chat_summary.py",
             "kiro_crew/dashboard/session_transfer.py",
+            "kiro_crew/dashboard/session_transfer_install.py",
+            "kiro_crew/dashboard/session_transfer_intake.py",
+            "kiro_crew/dashboard/session_transfer_layers.py",
+            "kiro_crew/dashboard/session_transfer_staging.py",
             "kiro_crew/dashboard/session_export.py",
             "kiro_crew/suggestions.py",
             "kiro_crew/mcp_tools/sessions.py",
@@ -206,9 +224,25 @@ _PUBLISH_MODULES = frozenset(
     {
         "kiro_crew/dashboard/chat_summary.py",
         "kiro_crew/dashboard/handlers/sessions.py",
+        "kiro_crew/dashboard/handlers/sessions_parts/app_scope.py",
+        "kiro_crew/dashboard/handlers/sessions_parts/delete_claim.py",
+        "kiro_crew/dashboard/handlers/sessions_parts/delete_routes.py",
+        "kiro_crew/dashboard/handlers/sessions_parts/history_reads.py",
+        "kiro_crew/dashboard/handlers/sessions_parts/live_turn.py",
+        "kiro_crew/dashboard/handlers/sessions_parts/restart.py",
+        "kiro_crew/dashboard/handlers/sessions_parts/slot_teardown.py",
+        "kiro_crew/dashboard/handlers/sessions_parts/summaries.py",
+        "kiro_crew/dashboard/handlers/sessions_parts/tool_policy.py",
+        "kiro_crew/dashboard/handlers/sessions_parts/usage_scrape.py",
         "kiro_crew/dashboard/session_export.py",
         "kiro_crew/dashboard/handlers_instances.py",
+        "kiro_crew/dashboard/handlers_instances_gate.py",
+        "kiro_crew/dashboard/handlers_instances_peer.py",
         "kiro_crew/history_consolidation.py",
+        "kiro_crew/history_consolidation_memory.py",
+        "kiro_crew/history_consolidation_pass.py",
+        "kiro_crew/history_consolidation_skills.py",
+        "kiro_crew/history_consolidation_span.py",
     }
 )
 _EXPECTED_PUBLISHERS = Counter(
@@ -219,39 +253,63 @@ _EXPECTED_PUBLISHERS = Counter(
             "set_cached_intent_summary",
         ): 1,
         (
-            "kiro_crew/dashboard/handlers/sessions.py",
+            "kiro_crew/dashboard/handlers/sessions_parts/summaries.py",
             "_publish_if_derivation_is_allowed",
             "set_cached_summary",
         ): 1,
-        ("kiro_crew/history_consolidation.py", "_write_preferences", "write_preferences"): 1,
-        ("kiro_crew/history_consolidation.py", "_write_projects", "write_projects"): 1,
+        ("kiro_crew/history_consolidation_pass.py", "_write_preferences", "write_preferences"): 1,
+        ("kiro_crew/history_consolidation_pass.py", "_write_projects", "write_projects"): 1,
         (
-            "kiro_crew/history_consolidation.py",
+            "kiro_crew/history_consolidation_pass.py",
             "_apply_member_consolidation",
             "apply_consolidation",
         ): 1,
         (
-            "kiro_crew/history_consolidation.py",
+            "kiro_crew/history_consolidation_pass.py",
             "_append_history_under_hold",
             "append_history",
         ): 1,
         (
-            "kiro_crew/history_consolidation.py",
+            "kiro_crew/history_consolidation_memory.py",
             "_write_structured_memory",
             "propose_semantic_delete",
         ): 1,
         (
-            "kiro_crew/history_consolidation.py",
+            "kiro_crew/history_consolidation_memory.py",
             "_write_structured_memory",
             "delete_semantic",
         ): 1,
-        ("kiro_crew/history_consolidation.py", "_write_structured_memory", "set_semantic"): 1,
-        ("kiro_crew/history_consolidation.py", "_save_lessons", "write_lesson"): 1,
-        ("kiro_crew/history_consolidation.py", "_write_structured_memory", "write_episodic"): 1,
-        ("kiro_crew/history_consolidation.py", "_stage_skill_update", "stage_skill_candidate"): 1,
-        ("kiro_crew/history_consolidation.py", "_process_auto_skills", "stage_skill_candidate"): 1,
-        ("kiro_crew/history_consolidation.py", "_process_auto_skills", "create_auto_skill"): 1,
-        ("kiro_crew/history_consolidation.py", "_process_auto_skills", "update_auto_skill"): 1,
+        (
+            "kiro_crew/history_consolidation_memory.py",
+            "_write_structured_memory",
+            "set_semantic",
+        ): 1,
+        ("kiro_crew/history_consolidation_memory.py", "_save_lessons", "write_lesson"): 1,
+        (
+            "kiro_crew/history_consolidation_memory.py",
+            "_write_structured_memory",
+            "write_episodic",
+        ): 1,
+        (
+            "kiro_crew/history_consolidation_skills.py",
+            "_stage_skill_update",
+            "stage_skill_candidate",
+        ): 1,
+        (
+            "kiro_crew/history_consolidation_skills.py",
+            "_process_auto_skills",
+            "stage_skill_candidate",
+        ): 1,
+        (
+            "kiro_crew/history_consolidation_skills.py",
+            "_process_auto_skills",
+            "create_auto_skill",
+        ): 1,
+        (
+            "kiro_crew/history_consolidation_skills.py",
+            "_process_auto_skills",
+            "update_auto_skill",
+        ): 1,
         (
             "kiro_crew/dashboard/session_export.py",
             "api_chat_slot_export",
@@ -381,7 +439,9 @@ class TestThePublicationFence:
         assert all(reason.strip() for reason in _PUBLICATION_ALLOWLIST.values())
 
     def test_the_skill_guard_is_the_publication_seam(self):
-        calls = _calls_in_function("kiro_crew/history_consolidation.py", "_skill_publication_guard")
+        calls = _calls_in_function(
+            "kiro_crew/history_consolidation_skills.py", "_skill_publication_guard"
+        )
         assert len(calls.get("_publication_hold_checked", [])) == 1
         assert not calls.get("publication_hold")
         assert not calls.get("derivation_hold")
@@ -402,7 +462,11 @@ class TestThePublicationFence:
             "_try_embed",
         }
         offenders: list[tuple[str, int, str]] = []
-        for rel in sorted(_PUBLISH_MODULES | {"kiro_crew/history.py"}):
+        # The log's facade and every owner it binds members from.
+        history_family = {"kiro_crew/history.py"} | {
+            f"kiro_crew/{owner.rsplit('.', 1)[-1]}.py" for owner in history_mod._OWNERS
+        }
+        for rel in sorted(_PUBLISH_MODULES | history_family):
             tree = ast.parse((SRC / rel).read_text(encoding="utf-8"), filename=rel)
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.With, ast.AsyncWith)):
@@ -468,7 +532,7 @@ class TestThePublicationFence:
     def test_consolidation_embedding_precedes_the_publication_hold(
         self, function, embed_call, write_call
     ):
-        calls = _calls_in_function("kiro_crew/history_consolidation.py", function)
+        calls = _calls_in_function("kiro_crew/history_consolidation_memory.py", function)
         assert len(calls[embed_call]) == len(calls[write_call]) == 1
         assert calls["_publication_hold_checked"]
         holds_before_write = [
@@ -481,12 +545,12 @@ class TestThePublicationFence:
         ("rel", "function", "write_call"),
         [
             (
-                "kiro_crew/dashboard/chat_handlers.py",
+                "kiro_crew/dashboard/chat_api/handover_drain.py",
                 "_persist_handover_tail",
                 "save_slot_off_loop",
             ),
             (
-                "kiro_crew/dashboard/chat_runner.py",
+                "kiro_crew/dashboard/chat_turn/tool_rows.py",
                 "_persist_tool_result_rows",
                 "save_slot_off_loop",
             ),

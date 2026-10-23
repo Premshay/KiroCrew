@@ -2,12 +2,12 @@
 
 Three landed fixes are pinned here:
 
-1. **ACP identity plumbing** (``acp/types.py`` + ``acp/_dispatch.py``): an
+1. **ACP identity plumbing** (``acp/types.py`` + ``acp/_dispatch_parts/tool_call_identity.py``): an
    ``AcpEvent`` carries provenance-checked adapter tool identity. Kiro emits
    ``_meta.kiro``; Claude and Codex have their own exact, adapter-owned shapes.
    Missing or mismatched identity fails closed.
 
-2. **chat_runner directive gate** (``dashboard/chat_runner.py``): the
+2. **chat_runner directive gate** (``chat_turn/tool_rows.py``, ``tool_results.py``): the
    ``EVENT_TOOL_CALL`` handler records ``_pending_dir_tool[id]`` ONLY when
    ``event.mcp_server_name`` is set AND ``session_directive.match_tool`` resolves
    a directive tool; the ``EVENT_TOOL_RESULT`` gate applies a directive only for
@@ -36,6 +36,7 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.types import (
+    EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_SUBAGENT_ACTIVITY,
     EVENT_SUBAGENT_LIST,
@@ -299,7 +300,7 @@ class TestClientToolCallEventIdentityProvenance:
 # ACP client that streams ``AcpEvent``s (``LLMEvent`` is an alias of
 # ``AcpEvent``), exercising the actual ``_pending_dir_tool`` / ``_native_tc_card``
 # gate — not a reimplementation. The harness mirrors
-# ``test_dashboard_chat.TestKiroReadinessQueueHandoff``.
+# ``test_dashboard_chat_history.TestKiroReadinessQueueHandoff``.
 
 
 def _stub_state(tmp_path):
@@ -454,13 +455,8 @@ class TestChatRunnerDirectiveSeam:
         assert call.kwargs["producer_is_user_facing"] is True
 
     @pytest.mark.asyncio
-    async def test_successful_question_card_ends_turn_without_recovery(self, tmp_path, monkeypatch):
-        """A delivered non-blocking question card is the turn's terminal output.
-
-        The tool explicitly tells the model to end with no assistant text. Treating
-        that shape like a generic tool-only turn injects a continuation, which asks
-        the model to finish the same request and can post the same card repeatedly.
-        """
+    async def test_legacy_question_directive_cannot_post_a_card(self, tmp_path, monkeypatch):
+        """Question cards are tool results; legacy markers cannot post cards."""
         from kiro_crew.dashboard import chat_runner
 
         state = _stub_state(tmp_path)
@@ -512,11 +508,9 @@ class TestChatRunnerDirectiveSeam:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-        state.post_question_card.assert_awaited_once_with(slot.key, questions)
-        assert queue_calls == [], "a terminal question card queued a recovery turn"
-        assert slot._empty_response_retries == 0
-        notices = [m for m in slot.messages if m.get("role") == "notice"]
-        assert not any("continu" in m.get("content", "").lower() for m in notices)
+        state.post_question_card.assert_not_awaited()
+        assert "ask_question" not in session_directive.DIRECTIVE_TOOLS
+        assert queue_calls, "a legacy tool-only stop bypassed empty-response recovery"
 
     @pytest.mark.asyncio
     async def test_automation_provenance_reaches_directive_applier(self, tmp_path, monkeypatch):
@@ -860,3 +854,38 @@ class TestChatRunnerDirectiveSeam:
             spy = await _drive(state, slot, events, monkeypatch)
         spy.assert_not_called()
         assert "session-directive decode FAILED" in caplog.text
+
+
+class TestInTurnAgentSwitchPreservesTheModelPin:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("same_agent", [False, True])
+    async def test_provider_reported_switch_preserves_the_pin(
+        self, tmp_path, monkeypatch, same_agent
+    ):
+        from kiro_crew.dashboard import chat_runner
+
+        monkeypatch.setattr(chat_runner, "record_provider_agent_switch", MagicMock())
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("in-turn-switch")
+        # The turn resolves both agent names against the fixture config.
+        others = [n for n in KiroCrewConfig.load().agents if n != slot.agent]
+        assert others, "the fixture must offer a different agent"
+        new_agent = slot.agent if same_agent else others[0]
+        slot.model = "claude-opus-5"
+        slot._fallback_primary_model = "claude-opus-5"
+        gen_before = slot._model_pick_gen
+        await _drive(
+            state,
+            slot,
+            [
+                AcpEvent(kind=EVENT_AGENT_SWITCHED, text=new_agent),
+                AcpEvent(kind=EVENT_COMPLETE),
+            ],
+            monkeypatch,
+        )
+        assert slot.agent == new_agent
+        assert slot.model == "claude-opus-5"
+        assert slot._model_pick_gen == gen_before
+        assert slot._fallback_primary_model == "claude-opus-5"

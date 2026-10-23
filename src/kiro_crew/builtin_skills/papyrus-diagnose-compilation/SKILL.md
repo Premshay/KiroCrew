@@ -1,7 +1,8 @@
 ---
 name: papyrus-diagnose-compilation
+app: papyrus
 description: Diagnose and fix LaTeX compilation failures. Use when the document does not compile, pdflatex/bibtex/biber/tectonic errors out, the PDF is stale, or the author reports a build/compile error in the Papyrus editor.
-triggers: pdflatex error, tectonic error, bibtex, biber, latex compile, undefined control sequence, missing $, stale pdf, .tex will not compile
+triggers: pdflatex error, tectonic error, bibtex, biber, latex compile, undefined control sequence, missing $ inserted, stale pdf, .tex will not compile
 ---
 
 # Diagnose LaTeX Compilation
@@ -56,6 +57,9 @@ Common cause → fix:
   margins).
 
 Apply the smallest fix at the identified line, recompile (in Papyrus the app
-recompiles when your turn ends, so check the new `.log` on the next turn;
+recompiles when your turn ends **only while the author has the Papyrus page
+open** — it is a page-scoped effect, and nothing server-side compiles — so on
+the next turn check that the `.log` is NEWER than your edit before believing
+it, and ask the author to press Cmd+S when it is not;
 outside it, rerun the compiler), and confirm THAT error is gone before moving on.
 Report what broke and exactly what you changed.

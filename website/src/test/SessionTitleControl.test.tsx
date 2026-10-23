@@ -37,6 +37,7 @@ vi.mock('../api/client', () => ({
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { MOVE_UNDO_MS } from '../components/MoveUndoBar'
 import { api } from '../api/client'
+import { sseSlotTitle, updateSlotPin } from '../store/dashboardSlice'
 
 const SLOT = 'pane-a'
 const TITLE = 'Alpha session'
@@ -166,6 +167,35 @@ describe('SessionTitleControl', () => {
   it.each([
     ['split-view pane header (compact)', true],
     ['single-session header', false],
+  ])('%s: the open editor says which keys save and cancel, and is described by it (#15808)', (_host, compact) => {
+    renderControl({ compact })
+    // The read-only title shows no key legend.
+    expect(screen.queryByText('Enter saves · Esc cancels')).toBeNull()
+    const input = openEditor()
+    const hint = screen.getByText('Enter saves · Esc cancels')
+    expect(hint.id).not.toBe('')
+    expect(input.getAttribute('aria-describedby')).toBe(hint.id)
+    expect(input).toHaveAccessibleDescription('Enter saves · Esc cancels')
+    // Beside the box, in the same row, never squeezing the box's own padding.
+    expect(hint.parentElement).toBe(input.parentElement)
+    // Touch-only devices have no Escape key, so the legend is hidden there.
+    expect(classes(hint)).toContain('[@media(hover:none)]:hidden')
+    // In a narrow pane the hint gives way instead of squeezing the box: the
+    // row it sits in is the container it hides against, and above that width
+    // it truncates.
+    // A pane's row fills the pane and is the container; the main header sizes
+    // to its content, so a container there would collapse it, and the hint
+    // keys off the viewport instead.
+    expect(classes(input.parentElement!).includes('@container')).toBe(compact)
+    expect(classes(hint)).toEqual(expect.arrayContaining(['min-w-0', 'truncate', compact ? '@max-[420px]:hidden' : 'md:block']))
+    expect(classes(hint)).not.toContain('shrink-0')
+    act(() => { fireEvent.keyDown(input, { key: 'Escape' }) })
+    expect(screen.queryByText('Enter saves · Esc cancels')).toBeNull()
+  })
+
+  it.each([
+    ['split-view pane header (compact)', true],
+    ['single-session header', false],
   ])('%s: the editor keeps the read-only title\'s type and box, so the header does not move when editing starts or ends', (_host, compact) => {
     renderControl({ compact })
     const pill = screen.getByRole('button', { name: RENAME }).parentElement!
@@ -252,6 +282,30 @@ describe('SessionTitleControl', () => {
     expect(api.renameSlot).toHaveBeenCalledWith(SLOT, TITLE)
     // One shot: used, it is gone.
     expect(screen.queryByRole('button', { name: /^Undo/ })).toBeNull()
+  })
+
+  it('names the Undo for an untitled session "Untitled session", never its key, and still restores the raw value (#20871)', async () => {
+    const { store } = renderControl()
+    act(() => { store.dispatch(sseSlotTitle({ key: SLOT, title: SLOT })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
+    await waitFor(() => expect(storeTitle(store)).toBe('Generated title'))
+    const undo = await screen.findByRole('button', { name: 'Undo: Untitled session' })
+    expect(undo.getAttribute('title')).toBe('Untitled session')
+    await act(async () => { fireEvent.click(undo) })
+    expect(storeTitle(store)).toBe(SLOT)
+  })
+
+  it('types out a generated title that replaces the "Untitled session" label (#20871)', async () => {
+    const { store } = renderControl()
+    act(() => { store.dispatch(sseSlotTitle({ key: SLOT, title: SLOT })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
+    await waitFor(() => expect(storeTitle(store)).toBe('Generated title'))
+    const trigger = screen.getByRole('button', { name: 'Generated title (rename session)' })
+    // Still typing: a strict prefix of the generated title is on screen.
+    const typed = trigger.textContent ?? ''
+    expect(typed.length).toBeLessThan('Generated title'.length)
+    expect('Generated title'.startsWith(typed)).toBe(true)
+    await waitFor(() => expect(trigger.textContent).toBe('Generated title'))
   })
 
   it('the Undo offer ends when the title moves on or the user starts another attempt', async () => {
@@ -805,5 +859,30 @@ describe('SessionTitleControl', () => {
     expect(screen.getByDisplayValue(TITLE)).toBeTruthy()
     // Beside the editor the glyph names itself.
     expect(screen.getByRole('img', { name: 'Incognito — memory writes disabled' })).toBeTruthy()
+  })
+
+  it('marks a pinned session beside the title and follows a pin toggled elsewhere', () => {
+    // The header menu's Pin moves the sidebar row into the pinned group, often
+    // out of view, so the header is where the user sees whether it took.
+    const { store } = renderControl()
+    expect(screen.queryByTestId('session-pinned-glyph')).toBeNull()
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: true })) })
+    const glyph = screen.getByTestId('session-pinned-glyph')
+    expect(glyph.getAttribute('title')).toBe('Pinned')
+    const trigger = screen.getByRole('button', { name: `${RENAME}, Pinned` })
+    expect(trigger.contains(glyph)).toBe(true)
+    // Beside the editor it names itself, as the memory glyph does.
+    fireEvent.click(glyph)
+    expect(screen.getByRole('img', { name: 'Pinned' })).toBeTruthy()
+    act(() => { fireEvent.keyDown(screen.getByDisplayValue(TITLE), { key: 'Escape' }) })
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: false })) })
+    expect(screen.queryByTestId('session-pinned-glyph')).toBeNull()
+    expect(screen.getByRole('button', { name: RENAME })).toBeTruthy()
+  })
+
+  it('orders the pin before the memory-mode glyph in the trigger name', () => {
+    const { store } = renderControl({ memoryMode: 'incognito' })
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: true })) })
+    expect(screen.getByRole('button', { name: `${RENAME}, Pinned, Incognito — memory writes disabled` })).toBeTruthy()
   })
 })

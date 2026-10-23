@@ -31,10 +31,10 @@ once at gateway startup and an unwrapped one would answer regardless of the opt-
 |--------|------|---------|
 | GET | `/health` | Whether a compiler and `git` exist on the host, so the UI can explain "Cmd+S does nothing" before the first compile rather than as a failure. Also carries `managed` — whether this platform has a pinned Tectonic build, whether one is installed, and the provisioning job's live state — so ONE poll drives both the warning banner and the install progress |
 | POST | `/compiler/provision` | Install the managed Tectonic compiler. **202 + poll `/health`**; idempotent (200 when already installed), 422 `compiler_unsupported_platform` where no pinned build exists. See Managed compiler |
-| GET | `/projects` | List papers (name, main-document mtime, whether a PDF exists) |
+| GET | `/projects` | List papers (display name, directory name, main-document mtime, whether a PDF exists) |
 | POST | `/projects` | Create a paper from the standard `article` template (or a supplied `template`) |
 | POST | `/projects/clone` | Shallow-clone a git remote as a paper. A repo with no `.tex` is rejected **and removed**, so the name is not held hostage by an unopenable project |
-| GET | `/project` | Resolved main document + file list + PDF presence |
+| GET | `/project` | Resolved display name + main document + file list + PDF presence |
 | DELETE | `/project` | Delete a paper and its tree. **500 `project_delete_incomplete`** when the tree survives the removal, rather than answering `ok: true` over a partial delete that leaves the name taken with no explanation |
 | GET | `/files` | The paper's file list |
 | GET | `/file` | Read one file as UTF-8 text |
@@ -42,6 +42,7 @@ once at gateway startup and an unwrapped one would answer regardless of the opt-
 | POST | `/file` | Create a file, refusing to clobber |
 | DELETE | `/file` | Delete a file; the main document is refused |
 | PUT | `/main` | Choose which `.tex` is the main document |
+| PUT | `/title` | Set the paper's display name, or clear it with an empty value and fall back to the directory name (see Naming a paper). **400** when `title` is missing or not a string — an explicit `""` is the clear, so an absent field must not be read as one. **409 `project_config_refused`** when `.papyrus.json` is a link or uncontained and cannot be written, rather than answering success over a rename that was not saved. **400** when `generation` is missing: it is the value the list row carried (`GET /projects` sends one per paper), and **409 `project_replaced`** answers a row loaded before its paper was deleted and recreated under the same name, so a stale list cannot rename the replacement |
 | POST | `/compile` | Compile and return `{ok, log, errors[], duration_ms}`. **422 on a failed compile, and the log/diagnostics still ride the response** — that payload is exactly what the user needs to fix the document. **422 `compiler_sandbox_unavailable`** is the distinct case where this host could not build an OS-level sandbox, so the compiler never ran (see Platform) |
 | GET | `/pdf` | Serve the compiled PDF (see Security) |
 | GET | `/git` | Branch, dirtiness, ahead/behind, recent commits — or `{is_git: false}` |
@@ -73,6 +74,46 @@ argv could read as an option. Normalization never launders a traversal into an
 accepted name — pinned by
 `test/test_papyrus_store.py::TestSafeProjectDir::test_normalize_does_not_make_a_traversal_safe`.
 
+The slug is lowercase ASCII on purpose, not by oversight: the name is a directory and
+a `git`/`pdflatex` argument, so it must mean one thing on every platform and
+filesystem, with no normalization form, case folding or case-insensitive collision to
+reason about. A name typed in another script (`论文`, `Отчет`, `München`) is therefore
+refused, and the refusal says why: create, clone and open answer a JSON 400
+`{"code": "invalid_project_name", "char": …}`, where `char` is the first character of
+the name as the user typed it (after NFC, before lowercasing) that the slug cannot
+hold, so `Отчет` reports the capital `О` they typed rather than a lowercase letter
+that looks like an allowed Latin `o`. A bidi override, zero-width or other invisible
+character is sent as its `U+XXXX` code point instead, so it cannot hide or reorder the
+message, and `char` is `""` when the name failed on its length or first character.
+The dashboard renders that code as the rule in the user's own language; the English
+`error` is for logs. A refused letter is shown with its script and code point
+(`“О” (Cyrillic letter, U+041E)`), because a Cyrillic or Greek capital renders exactly
+like the Latin one the rule allows, and the rule beside it is one clause
+(`Use lowercase a–z, 0–9, . - _`), its `. - _` tail joined by a no-break space between
+the characters and a word joiner after the hyphen so it never wraps mid-list. Pinned by `test/test_papyrus_store.py::TestProjectNameStaysAscii`
+and the `test_create_explains_*` tests in `test/test_papyrus_routes.py`.
+
+### Naming a paper
+
+That slug is the app's **identifier** — the `?name=` of every route, the PDF URL,
+the "last opened paper" pointer, the key of the paper's co-author session — and it
+is never renamed. For a cloned paper it is the last segment of the clone URL,
+which for an Overleaf remote is the project id, so on its own it shows the reader
+a string they never chose. A **display name** can therefore be set beside it: the
+name the user typed, held in `.papyrus.json`, else the directory name.
+`PUT /title` sets it and an empty value clears it.
+
+The name is **untrusted** — `.papyrus.json` can be shipped inside a cloned
+repository — so it is kept as plain text: `%` and a backslash are ordinary
+characters, while control **and format** characters (a bidi override in a name
+reorders the whole row) are removed, a line break or tab becoming a space. A name
+with nothing left is refused, and a refused stored name falls back to the
+directory name. It then
+takes the same redaction the compile log takes, and only then is length-capped —
+cutting first could split a credential into a fragment the redactor no longer
+recognizes. For the same reason a raw name longer than the sanitizer's work
+bound is no name at all rather than a cut prefix.
+
 ## Security model
 
 ### Caller authorization (owner only)
@@ -82,7 +123,7 @@ owner's private drafts, and the git routes run with the owner's own git credenti
 a caller who can reach any one route can read, overwrite or publish the owner's work.
 
 `_require_enabled` runs two checks in order. A disabled app answers 403 `app_disabled`
-to everyone. Then `require_owner_dashboard_request` (`dashboard/handlers/_shared.py`)
+to everyone. Then `require_owner_dashboard_request` (`dashboard/handlers/_shared_access.py`)
 lets only the owner through and answers everyone else with 403 `owner_only`, writing a
 SEL denial record named `papyrus.<route>`. The same wrapper covers all 19 routes, so a
 route added to `register_routes` cannot skip the gate.
@@ -116,7 +157,7 @@ external compiler, so two functions own every filesystem decision:
   app supports. `store.is_reparse_link` is the shared answer (used here and by
   `gitops`'s attributes guard) so the two cannot drift on which link types they
   cover; `os.path.isjunction` is 3.12+ and always `False` off Windows, resolved
-  once via `getattr` the same way `apps/manager.py` does.
+  once via `getattr` the same way `apps/manager_tree.py` does.
 
   The strictness is load-bearing. A check of the form
   `resolved != base_resolved and base_resolved not in resolved.parents` would let
@@ -171,6 +212,10 @@ input. `get_main_file` re-validates the configured value through `safe_child` on
 **every read** and ignores it on failure — without that, a hostile repo naming
 `../../etc/passwd.tex` would pivot through the PDF-serving route. Pinned by
 `test/test_papyrus_store.py::TestMainFile`.
+
+Its `title` key is untrusted for a second reason: it is **display text**, so a
+cloned repo can ship a name that lands in a dashboard table cell. It takes the
+treatment described in Naming a paper.
 
 ### The compiler is never given shell escape
 
@@ -368,8 +413,9 @@ manual install path. `platform.machine()` normalization handles the
 `KIROCREW_PAPYRUS_TECTONIC_URL` overrides the download URL for a mirrored or
 air-gapped deployment. It must be `https://` (a `file://` or `http://` value is
 refused and logged), and the pin still has to match — an override changes **where**
-bytes come from, never **which** bytes are accepted. Logged URLs are redacted to
-scheme+host+path so a signed query string or userinfo never reaches a log.
+bytes come from, never **which** bytes are accepted. Logged and returned URLs are
+redacted to scheme+host, so a signed query string, userinfo or path token never
+reaches a log or the install banner.
 `KIROCREW_PAPYRUS_SKIP_TECTONIC_DOWNLOAD=1` refuses provisioning outright, which
 is how the test suite guarantees it never reaches the network.
 
@@ -440,9 +486,12 @@ immediately** and hands the work to a **daemon** thread: a transfer must not pin
 interpreter exit (a `ThreadPoolExecutor` or the loop's default executor joins its
 non-daemon workers at exit, so a Ctrl-C would hang for up to the HTTP timeout),
 and the default executor is also what the loop uses for DNS. One job at a time; a
-second click while one runs starts nothing. The sha256 is computed over the
-**stream**, so verification cannot be fooled by a file swapped between write and
-check, and the binary is `chmod`-ed and then `os.replace`-d into place, so it is
+second click while one runs starts nothing. The transfer is
+`asset_downloader.download_to`, the same one the embedding model and feature
+videos use: the sha256 is computed over the **stream**, and the archive reaches its
+path only once the digest matches, so extraction never sees unverified bytes.
+Redirects may change host (the release url 302s to GitHub's asset host) but never
+leave https. The binary is `chmod`-ed and then `os.replace`-d into place, so it is
 never observable at its final path without its exec bit.
 
 Every failure degrades cleanly and leaves the manual route working:
@@ -493,7 +542,7 @@ config keys name an *executable* git will run. Push deliberately runs in
 `standard` sandbox mode (an SSH push needs the key), so on that path the OS
 sandbox does **not** back this up: the denylist is the load-bearing control.
 
-`_git` therefore neutralizes three classes, each shaped by what `-c` can and
+`_git` therefore neutralizes four classes, each shaped by what `-c` can and
 cannot reach:
 
 1. **~19 `-c` overrides** — `core.sshCommand`, `core.hooksPath=/dev/null`,
@@ -510,6 +559,15 @@ cannot reach:
 3. **`GIT_PROXY_COMMAND=true` in the env** — because `core.gitProxy` is
    **multi-valued**, so `-c` APPENDS and git uses the repo's value first. `=none`,
    `=` and `=true` were all tested via `-c` and all still executed the script.
+4. **Config-defined hooks** (`hook.<name>.command`, git 2.54+) are disabled by
+   name: `core.hooksPath=/dev/null` moves only the hook directory, so `_git`
+   scans the repository config through
+   `git_config_hooks.config_hook_disable_args_sandboxed_async` (wrapped by the
+   same `sandboxed_spawn_argv` the real call uses) and emits
+   `-c hook.<name>.enabled=false` for each, because a config hook's name is the
+   repository's choice, the same reason the attributes pin and pack-program
+   flags exist. A sandbox-unavailable scan becomes `GitSandboxUnavailable`; an
+   unreadable config becomes `GitError`.
 
 **Two ways the pin itself was defeatable**, both fixed and both pinned by
 `TestTheAttributesPinCannotBeNeutralized`:
@@ -577,10 +635,16 @@ Two views behind one route:
   narrow rail, and that collapsed flag persists. The PDF column is capped at
   `PDF_MAX_VIEWPORT_SHARE` (half the viewport), and the co-author panel's ceiling
   yields to the tree and PDF so the editor keeps at least `MIN_EDITOR_WIDTH`
-  (280px). Whether the co-author panel is open persists too (`CHAT_OPEN_KEY`),
-  read and written only on a desktop viewport: on a narrow viewport the panel
-  covers the pane, so it opens closed and closing it there does not rewrite the
-  desktop layout.
+  (280px). Whenever Papyrus uses that desktop layout, the editor row also keeps
+  a 180px minimum. The editor row and co-author column are size-contained, so
+  editor content and a long transcript cannot enlarge the shared row. The status
+  bar and diagnostics remain non-shrinking siblings:
+  diagnostics are capped at 224px and scroll internally, while the shell's page
+  scroller keeps the lower workspace reachable when the window is shorter than
+  the combined stack. Whether the co-author panel is open persists too
+  (`CHAT_OPEN_KEY`), read and written only on a desktop viewport: on a narrow
+  viewport the panel covers the pane, so it opens closed and closing it there
+  does not rewrite the desktop layout.
 
 Dependency decisions, both deliberate:
 
@@ -616,8 +680,10 @@ navigating away from a dirty buffer therefore flushes it first:
   compiler reads the file off disk and would otherwise typeset the previous
   revision.
 - `closeProject` (the toolbar's **Papers** back button) awaits the same save
-  before tearing the workspace down. This is the gesture most likely to surprise:
-  the toolbar advertises "Editing {file} — unsaved" immediately beside the button.
+  before tearing the workspace down. The main-document picker already names a
+  clean main file, so the toolbar omits that duplicate label. A clean non-main file
+  still shows "Editing {file}", and any dirty buffer shows
+  "Editing {file} — unsaved" beside the button.
   If the flush **fails**, the workspace deliberately stays mounted and surfaces the
   error rather than discarding the very edits the flush exists to protect.
 
@@ -733,7 +799,7 @@ The Windows-specific contract lives in these places:
   `rmtree(..., ignore_errors=True)` would silently leave `.git/objects` behind
   while the handler answered `ok: true`, keeping the project name taken. Delete
   reports `project_delete_incomplete` if the tree survives.
-- **`PlatformConfig`** (`apps/manifest.py`) carries a `windows` row in
+- **`PlatformConfig`** (`apps/manifest_sections.py`) carries a `windows` row in
   `_OS_TO_PLATFORM`/`_PLATFORM_TO_OS`, so `"windows"` is expressible in a
   manifest and `current_os()` maps `"win32"` to it. The default stays
   `["macos", "linux"]`: an app opts in by naming `windows`.

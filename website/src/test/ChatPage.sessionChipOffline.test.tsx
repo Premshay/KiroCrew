@@ -20,6 +20,8 @@ import { Provider } from 'react-redux'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
+import i18next from 'i18next'
+import { initI18n } from '../i18n/all'
 
 // Stub AssistantMessage: expose onOpenDiff as clickable buttons.
 // Button fires with original === modified (the no-op case).
@@ -72,6 +74,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       retainRange: vi.fn(),
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(),
+      retainRange: vi.fn(),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
       bottomSentinelRef: { current: null },
@@ -290,16 +293,48 @@ describe('chip roster carries only surfaces ChatPage can show', () => {
   })
 })
 
+describe('chip roster names an untitled session in the active language (#23059)', () => {
+  const SLOT_UNTITLED = { key: 'chat-9-1785440411', title: '', messages: 1, running: false, mode: '', created: '', last_ts: '' }
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    await initI18n()
+    await i18next.changeLanguage('en')
+  })
+
+  it('rebuilds the "Untitled session" label after a language switch, with no slot change', async () => {
+    const { store } = renderChatPage(true, [SLOT_UNTITLED])
+    seedMessage(store)
+    await screen.findByTestId('chip')
+    expect(lastAssistantProps.sessions?.get(SLOT_UNTITLED.key)).toBe('Untitled session')
+
+    await act(async () => { await i18next.changeLanguage('ja') })
+    const ja = i18next.t('pages.artifactDetailPage.untitled_session')
+    expect(ja).not.toBe('Untitled session')
+    expect(lastAssistantProps.sessions?.get(SLOT_UNTITLED.key)).toBe(ja)
+
+    await act(async () => { await i18next.changeLanguage('en') })
+  })
+})
+
 describe('one session-entry path', () => {
   // A SOURCE guard: the two callees were behaviourally identical, so only the
   // structure can distinguish the collapsed form from the duplicated one.
-  const pageSource = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf-8')
   const sessionSource = readFileSync(join(__dirname, '..', 'pages', 'chat', 'useChatPageSessionController.ts'), 'utf-8')
   // The page's owners (pages/chat/page/) are scanned too, so neither absence
   // below can be escaped by moving code out of ChatPage.tsx.
-  const ownerSources = readdirSync(join(__dirname, '..', 'pages', 'chat', 'page'))
-    .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
-    .map(f => readFileSync(join(__dirname, '..', 'pages', 'chat', 'page', f), 'utf-8'))
+  const ownerSources = [
+    ...readdirSync(join(__dirname, '..', 'pages', 'chat', 'page'))
+      .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
+      .sort()
+      .map(f => readFileSync(join(__dirname, '..', 'pages', 'chat', 'page', f), 'utf-8')),
+    ...readdirSync(join(__dirname, '..', 'pages'))
+      .filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f))
+      .sort()
+      .map(f => readFileSync(join(__dirname, '..', 'pages', f), 'utf-8')),
+  ]
+  // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+  const pageSource = [readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf-8'), ...ownerSources].join('\n')
 
   it('routes the in-message chip through the shared switch callee', () => {
     expect(pageSource).toContain('onSessionOpen={selectSessionTab}')

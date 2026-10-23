@@ -22,7 +22,7 @@ from test_sandbox_launcher_program import CoveringLibc, identity, launch, payloa
 
 from kiro_crew import sandbox, sandbox_launcher_program
 from kiro_crew.acp import seed_provenance as sp
-from kiro_crew.sandbox import _referent_identity
+from kiro_crew.sandbox_aliases import _referent_identity
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher only")
 

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         _ForkBookkeepingFailed,
         _get_config_lock,
         _is_reserved_basename,
+        _lineage_unverifiable_error,
         _load_template_specs,
         _PublishNameBound,
         _read_agent_spec,
@@ -83,12 +84,9 @@ async def api_agent_fork(request: web.Request) -> web.Response:
             source, source_name, taken, source_path = await asyncio.to_thread(
                 _load_template_specs, agents_dir, name, "api_agent_fork"
             )
-        except _AmbiguousTemplateName:
+        except _AmbiguousTemplateName as exc:
             return web.json_response(
-                {
-                    "error": f"'{name}' matches more than one template file; rename one first.",
-                    "code": "ambiguous_template_name",
-                },
+                {"error": exc.refusal_text(), "code": "ambiguous_template_name"},
                 status=409,
             )
         if source is None:
@@ -376,12 +374,9 @@ async def api_agent_publish(request: web.Request) -> web.Response:
             source, source_name, taken, source_path = await asyncio.to_thread(
                 _load_template_specs, agents_dir, name, "api_agent_publish"
             )
-        except _AmbiguousTemplateName:
+        except _AmbiguousTemplateName as exc:
             return web.json_response(
-                {
-                    "error": f"'{name}' matches more than one template file; rename one first.",
-                    "code": "ambiguous_template_name",
-                },
+                {"error": exc.refusal_text(), "code": "ambiguous_template_name"},
                 status=409,
             )
         if source is None:
@@ -589,11 +584,11 @@ async def api_agent_publish(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
-        except _UnverifiableLineage:
+        except _UnverifiableLineage as exc:
             await asyncio.to_thread(_undo_publish)
             return web.json_response(
                 {
-                    "error": f"Cannot verify whether '{new_name}' is a private copy; retry.",
+                    "error": _lineage_unverifiable_error(new_name, exc),
                     "code": "lineage_unverifiable",
                 },
                 status=409,
@@ -707,12 +702,9 @@ async def api_agent_reset(request: web.Request) -> web.Response:
             origin_spec, origin_name, _taken, _path = await asyncio.to_thread(
                 _load_template_specs, agents_dir, origin, "api_agent_reset"
             )
-        except _AmbiguousTemplateName:
+        except _AmbiguousTemplateName as exc:
             return web.json_response(
-                {
-                    "error": f"'{origin}' matches more than one template file; rename one first.",
-                    "code": "ambiguous_template_name",
-                },
+                {"error": exc.refusal_text(), "code": "ambiguous_template_name"},
                 status=409,
             )
         if origin_spec is None:
@@ -752,12 +744,12 @@ async def api_agent_reset(request: web.Request) -> web.Response:
                 {"error": f"'{crew}' is no longer bound to '{name}'", "code": "stale_binding"},
                 status=409,
             )
-        except _UnverifiableLineage:
+        except _UnverifiableLineage as exc:
             # Ownership of the origin cannot be verified: refuse with the copy
             # kept rather than rebinding onto an unverifiable target.
             return web.json_response(
                 {
-                    "error": f"Cannot verify whether '{origin_name}' is a private copy; retry.",
+                    "error": _lineage_unverifiable_error(origin_name, exc),
                     "code": "lineage_unverifiable",
                 },
                 status=409,

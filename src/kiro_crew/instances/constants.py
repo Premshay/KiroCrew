@@ -344,10 +344,10 @@ DEFAULT_CAPABILITY_PROXY_TIMEOUT_SECS: float = 8.0
 # other four reads answer from state the peer already holds, but the model list
 # is the one read whose COLD path runs real subprocess work on the peer: up to
 # 5s of sandbox-backend detection (_SANDBOX_BACKEND_PROBE_TIMEOUT_SECS in
-# sandbox.py) plus up to 10s of `kiro-cli chat --list-models`
+# sandbox_probe.py) plus up to 10s of `kiro-cli chat --list-models`
 # (_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS in dashboard/handlers/agents.py), plus
 # up to 3s of entitlement revalidation
-# (_READ_PATH_PROBE_DEADLINE_SECS in acp/session_handle.py, bounding the
+# (_READ_PATH_PROBE_DEADLINE_SECS in acp/session_handle_model_selection.py, bounding the
 # read-path probe before the picker narrows) before the first reply is cached,
 # ~18s worst case end to end (5 + 10 + 3 < 20). Each term is a named production
 # bound, and the proxy test sums those names.

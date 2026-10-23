@@ -17,9 +17,11 @@ Usage:
 Each mode prints one JSON object on stdout. Stdlib only.
 
 ``check`` - run BEFORE ``monitor_start`` / ``monitor_update``.
-    Rule: ``interval_secs`` is 300..900 (conductor patrol policy: a worker's
-    report wakes a ``watch="work-ledger"`` loop early, so a longer interval only
-    delays the re-check of a silent fleet), ``interval x max_cycles >=
+    Rule: ``interval_secs`` is 300..900 (conductor patrol policy: a worker
+    reporting ``blocked``, ``question`` or ``done`` wakes a
+    ``watch="work-ledger"`` loop early, so a longer interval only delays the
+    re-check of a silent fleet - which is also what finds a worker that
+    crashed, so the band has a ceiling), ``interval x max_cycles >=
     max_runtime_secs``, so the time budget - not the cycle count - is what ends
     the loop, and ``interval <= 10% of max_runtime_secs``, so a cycle always lands
     in the renewal window. On failure ``suggest`` carries bounds that pass.
@@ -56,7 +58,7 @@ import re
 import sys
 from fractions import Fraction
 
-#: Server-side bounds (``validation.py`` FieldSpec for monitor_start/update).
+#: Server-side bounds (``validation_parts/core_agent_schemas.py`` FieldSpec for monitor_start/update).
 SERVER_MAX_CYCLES = 1000
 SERVER_MIN_INTERVAL_SECS = 15
 SERVER_MAX_INTERVAL_SECS = 86400

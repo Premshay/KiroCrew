@@ -770,6 +770,70 @@ class TestPromptCarriesTheTraps:
         assert '"verified"' in p and "independent of status" in p
 
 
+class TestPromptFollowsTheUiLanguage:
+    """The summary text is panel content beside chrome in ``dashboard.language``."""
+
+    pytestmark = pytest.mark.asyncio
+
+    @staticmethod
+    async def _prompt(env, monkeypatch, language) -> str:
+        state, slot = env
+        prompts: list[str] = []
+
+        async def fake(_sessions, prompt, **_kwargs):
+            prompts.append(prompt)
+            return _GOOD_REPLY
+
+        monkeypatch.setattr(chat_summary, "run_bg_oneliner", fake)
+        cfg = _cfg()
+        cfg.dashboard.language = language
+        assert await chat_summary.generate_session_summary(state, slot, cfg=cfg) is True
+        [prompt] = prompts
+        return prompt
+
+    async def test_prompt_carries_the_configured_ui_language(self, env, monkeypatch):
+        prompt = await self._prompt(env, monkeypatch, "zh-CN")
+
+        assert "BCP-47 tag zh-CN" in prompt
+        assert (
+            prompt.index("BCP-47 tag zh-CN")
+            < prompt.index("TRANSCRIPT")
+            < prompt.index("request 0")
+        )
+        assert "{language}" not in prompt
+
+    async def test_the_json_keys_and_status_values_stay_out_of_the_ui_language(
+        self, env, monkeypatch
+    ):
+        # ``normalize_payload`` coerces an unknown status to "active", so a translated
+        # status word would silently turn every intent active.
+        prompt = await self._prompt(env, monkeypatch, "zh-CN")
+
+        assert 'The JSON keys and the "status" values stay exactly as written above' in prompt
+
+    @pytest.mark.parametrize("language", ["", "ar"])
+    async def test_prompt_is_unchanged_without_a_usable_ui_language(
+        self, env, monkeypatch, language
+    ):
+        # "" is the follow-the-browser sentinel; "ar" names no shipped catalog.
+        prompt = await self._prompt(env, monkeypatch, language)
+
+        assert "BCP-47" not in prompt and "{language}" not in prompt
+        assert prompt.startswith(chat_summary._PROMPT.replace("{language}", ""))
+        assert "request 0" in prompt
+
+    async def test_a_transcript_quoting_the_slot_cannot_restate_the_ui_language_line(
+        self, env, monkeypatch
+    ):
+        state, _slot = env
+        state.conversation_log.append(state.hkey, "user", "what does {language} mean here")
+
+        prompt = await self._prompt(env, monkeypatch, "zh-CN")
+
+        assert prompt.count("BCP-47 tag zh-CN") == 1
+        assert "what does {language} mean here" in prompt
+
+
 class _GateSlot:
     """The attributes ``_should_summarize`` reads, and nothing else.
 

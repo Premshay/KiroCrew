@@ -39,7 +39,13 @@ class TestDefaults:
         and a bound (how many quiet verdicts may pass before a tick fires anyway).
         None of them arms anything: the Jev lane still needs the keystone switch AND
         the ``nudge_evidence`` scope, checked by the seam, and the judge only runs at
-        all for a loop carrying its own brief."""
+        all for a loop carrying its own brief.
+
+        ``model_route_derive`` is held to it too. It picks among the same models the
+        ``model_route`` map may already name -- ids the account advertises -- and it
+        sends nothing anywhere: the question it answers is only asked once the
+        keystone consents, so it chooses where a consented answer lands and arms
+        nothing."""
         from dataclasses import fields
 
         assert {f.name for f in fields(DecisionsConfig)} == {
@@ -47,6 +53,7 @@ class TestDefaults:
             "history_budget_chars",
             "model_route",
             "spawn_route",
+            "model_route_derive",
             "nudge_wake",
             "provider",
         }
@@ -147,6 +154,7 @@ class TestMigrationFromThePreviewSpelling:
             "history_budget_chars",
             "model_route",
             "spawn_route",
+            "model_route_derive",
             "nudge_wake",
             "provider",
         }

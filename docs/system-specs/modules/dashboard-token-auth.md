@@ -66,7 +66,7 @@ sequenceDiagram
     participant Owner as Slack Owner
     participant Handler as commands.py (_bang_dashboard)
     participant Allowlist as allowlist.py (send_dashboard_link)
-    participant TokenGen as token_auth.py
+    participant TokenGen as token_auth_tokens.py
     participant Browser as Browser
     participant MW as Token Auth Middleware
     participant App as Dashboard App
@@ -126,7 +126,7 @@ graph LR
 6. `_workflow_ready` (`_register_workflow_lifecycle`) answers 503 on `/api/workflows`
    until the workflow service is ready, and `_crewmate_prune_gate`
    (`_register_crewmate_prune_gate`, dashboard only) holds every mutating request,
-   and any request under `/api/members`, until the crewmate prune settles, 503
+   and any request under `/api/members`, until the mate prune settles, 503
    past its timeout.
    Both RETURN their refusal, inner to `sel_audit`.
 
@@ -151,6 +151,18 @@ gates (`_workflow_ready`, `_crewmate_prune_gate`, each a 503).
 ### 1. `token_auth.py` — Token Generator, Validator & Middleware
 
 Location: `src/kiro_crew/dashboard/token_auth.py`
+
+`token_auth.py` keeps the middleware and is the import path for every name below: a
+mirror facade (`kiro_crew._facade_mirror`) that serves what its owners bind and sends a
+patch of `token_auth.<name>` to every owner holding it. Owners never import it. New work
+goes to the owner of its responsibility:
+
+| Owner | Responsibility |
+|---|---|
+| `token_auth_paths.py` | Requests that skip token auth (static assets, self-authenticating webhooks, CSRF exemptions, the SPA shell and app-window paths), and the refusal and auth-log helpers |
+| `token_auth_tokens.py` | Minting, validating, pinning and revoking session tokens; app secrets; the per-process token state |
+| `token_auth_app_scope.py` | What an app token may reach: its namespace and its manifest `permissions.api` prefixes |
+| `token_auth_callers.py` | Unix-socket peer verification, and attributing a request to its app, cron job, sub-agent or member |
 
 #### Token Format
 
@@ -324,7 +336,7 @@ def token_auth_middleware(local_only: bool = True) -> Callable[..., Any]:
 The `local_only` parameter is accepted for backward compatibility but does not control whether ordinary loopback requests authenticate. `token_auth_middleware()` requires a token on ordinary loopback routes (`test_loopback_requires_token`). An internal route can grant a loopback caller with a valid `X-Internal-Secret`; a mixed internal route without that secret follows its cookie-authentication branch.
 
 Request flow:
-1. Internal-path handling is separate: a loopback caller with a valid `X-Internal-Secret` is admitted, a mixed internal path can validate a cookie, and a strict internal path denies non-loopback callers; ordinary loopback requests continue to the token gate (`token_auth_middleware`; `test_loopback_requires_token`).
+1. Internal-path handling is separate: a loopback caller with a valid `X-Internal-Secret` is admitted, a mixed internal path can validate a cookie, and a strict internal path denies non-loopback callers; ordinary loopback requests continue to the token gate (`token_auth_middleware`; `test_loopback_requires_token`). A mixed internal path's cookie branch, on loopback and off it, sets `auth_from_query_token` from the credential `_extract_and_validate_token` validated, as the main path does: true for a `?token=` link, false for the session cookie, including a cookie adopted after a failed link.
 2. Bypass named non-secret routes: prefix routes `/assets/`, `/static/`, `/fonts/`, `/vendor/`, `/artifact-app/`, `/sandbox-doc/`, and `/browser-view/`; exact routes `/logo.png`, `/favicon.ico`, `/manifest.json`, `/sw.js`, `/pcm-worklet.js`, `/api/token/local`, `/api/shutdown`, `/api/logout`, `/api/theme/boot`, `/api/health`, `/api/live`, `/api/ready`, and `/browser-view` (the bare form, which the trailing-slash prefix misses — bypassed so the relay's uniform 404 answers instead of the middleware's distinguishable 403); anchored icon files; and method-scoped routes `GET`/`HEAD /apps/<name>/ui/*`, `POST /api/hooks/agent`, `POST /api/messaging/teams`, `POST /api/apps/<name>/token`, `POST /api/auth/refresh`, `POST /api/auth/logout`, and `POST /api/update/revalidate` (`UPDATE_REVALIDATE_PATH`: the CLI's post-update badge revalidate, which self-authenticates over loopback with `X-Local-Secret`, re-checked in `api_update_revalidate`) (`_BYPASS_PREFIXES`, `_BYPASS_EXACT`, `_BYPASS_EXACT_METHODS`, and `token_auth_middleware()`). `/browser-view/` is unlike every other bypass on this list: it is the one route that **proxies foreign content** (the Playwright CLI browser view) rather than serving gateway-owned assets. It carries its own authentication — a per-instance capability token embedded in the path, minted by the view supervisor and disclosed only through the cookie-authed, owner-gated `/api/browser/view` payload, constant-time-compared before any per-request ownership probe runs — and every tokenless or wrong-token request answers a uniform 404. The full model (post-connect ownership re-proof, CSP sandbox stamp, SEL audit of every allow/deny) is specified in `dashboard/handlers/browser_view_relay.py` and the [browser module spec](browser.md).
 
    `/api/token/local` carries its own gate: loopback (or a same-principal unix
@@ -332,7 +344,21 @@ Request flow:
    refusal is a `403` with a machine-readable `code` matching its SEL
    `token.local` record's `resources`: `loopback_only` (`non-loopback`),
    `invalid_secret` (`invalid-secret`) and `member_owner_token_refused`
-   (`unverified-owner-process`).
+   (`unverified-owner-process`). The owner-process check answers with
+   provenance, not a bare verdict (`member_memory_auth.local_owner_bootstrap_provenance`
+   returns a `LocalOwnerProvenance`): when the caller is owned by an app backend
+   this gateway spawned, the backend registry's name for that app
+   (`apps.backend.spawned_backend_owner`) is consulted before the host-process
+   leg, so an unsandboxed backend that would also pass as a host process is still
+   attributed to its app. The success record's `resources` is `token-issued` for
+   a host process and `token-issued app=<name>` for an app backend; the response
+   body is unchanged. The name is the registry key, which `apps.manifest.app_name_error`
+   holds to kebab-case, so it can carry neither a space nor `=` and cannot forge a
+   second field in the row. It is NOT a token claim: an `app`-scoped token is
+   refused by `is_owner_dashboard_request`, so a claim would withdraw the
+   capability the admission grants. Consulting the registry first changes what is
+   recorded, never what is admitted; a registry that raises names no app and
+   leaves the host-process leg to decide as before.
 3. Extract token from `?token=` query param or `mc_token_{port}` cookie
 4. Validate signature + expiry (link window for query param, session_exp for cookie)
 5. Check IP binding
@@ -421,7 +447,7 @@ If `index()` cannot read the static bundle, its `FileNotFoundError` fallback
 body (`_DASHBOARD_HTML_NOT_FOUND` in `handlers/core.py`) is likewise static and
 secret-free, honoring the same unauthenticated cold-start contract.
 
-**One predicate, no drift:** `_is_spa_shell_request` in `token_auth.py` is the
+**One predicate, no drift:** `_is_spa_shell_request` in `token_auth_paths.py` is the
 single source of truth for "paths that are never the SPA shell". It combines
 three exclusions:
 
@@ -485,7 +511,7 @@ re-enable unexpired sessions previously revoked by `kirocrew logout`.
 
 An **app token** (payload carries a non-empty `app` claim, minted by the `X-App-Secret` exchange at `POST /api/apps/<name>/token`) must not have the same reach as a dashboard-user token. `_enforce_app_scope(request, app_name, path)` applies least privilege, **deny-by-default**:
 
-- An app token may access **only** (1) its **own namespace** — `/apps/<name>/...` and `/api/apps/<name>/...`, matched on a path boundary so app `foo` cannot reach app `foo-bar` — and (2) the API path prefixes the app declared in its manifest `permissions.api` allowlist (`_app_api_allowlist`, cached ~30s; any load failure returns an empty tuple → confined to its own namespace only). Everything else is a 403 with an `app_scope_check` SEL audit event.
+- An app token may access **only** (1) its **own namespace** — `/apps/<name>/...` and `/api/apps/<name>/...`, matched on a path boundary so app `foo` cannot reach app `foo-bar` — and (2) the API path prefixes the app declared in its manifest `permissions.api` allowlist (`_app_api_allowlist`, cached ~30s; any load failure returns an empty tuple → confined to its own namespace only; entries an update added stay out until the owner approves them, see `approved-grants.json` in app-kit-platform §13). Everything else is a 403 with an `app_scope_check` SEL audit event.
 - It is enforced in **every** middleware branch that admits a token (the normal cookie/query-param flow and the cross-app `/apps/<other>/api` reverse-proxy re-check) — otherwise an app token could reach a mixed internal path (e.g. `/api/chat`, `/api/spawn`) with no app identity set and be mistaken for the dashboard user (privilege escalation).
 - It is a **no-op for dashboard-user tokens** (empty `app` claim), which bypass the gate entirely.
 
@@ -609,7 +635,8 @@ compressed body is never inflated synchronously on the event loop; without the
 middleware such a body would reach a handler as raw bytes.
 
 The two internal-path sets passed to `token_auth_middleware` are the module-level
-`_STRICT_INTERNAL_API_PATHS` and `_MIXED_INTERNAL_API_PATHS` in `server.py`, the
+`_STRICT_INTERNAL_API_PATHS` and `_MIXED_INTERNAL_API_PATHS` that `server.py` binds
+from `dashboard/server_internal_paths.py`, the
 second read through `_mixed_internal_api_paths()` so an edition's mixed paths join
 it — so the headless server (below) binds to the **same** sets and the two
 entrypoints cannot drift.
@@ -779,7 +806,7 @@ byte-identical to the pre-token scheme. The senders are `mcp_core`'s own
 
 ### 6. `gateway.py` Integration
 
-`_init_dashboard()` resolves config and passes to `start_dashboard()` (abbreviated):
+`_init_dashboard()` (in `slack/gateway_runtime/service_boot.py`) resolves config and passes to `start_dashboard()` (abbreviated):
 
 ```python
 configured_host, dashboard_port = parse_dashboard_url(self._cfg.dashboard.url)
@@ -875,7 +902,11 @@ tries the same refresh and, when it fails, hands recovery to its hub instead of
 raising the banner. A 401 or 403 without the header whose
 body is an HTML document came from a proxy in front of the gateway; the client
 words it through `website/src/api/edgeAuthChallenge.ts` and never offers the
-token flow, which could not clear it.
+token flow, which could not clear it. In a top-level document that refusal also
+raises the same fixed banner the gateway denial uses, with the reload instruction
+and a reload button in place of the token field; it shares that banner's latch,
+so the first 2xx clears it. An embedded pane raises nothing, because its message
+already names where to sign in.
 
 > **Note:** the *No token* / *Expired token* / *Invalid HMAC signature* rows above apply to `/api/*`, `/apps/*`, and non-`GET`/`HEAD` requests. A non-API `GET`/`HEAD` navigation in those same states is instead served the public SPA shell (200) so the app can cold-start its refresh flow — see *SPA Shell Bypass (cold-start recovery)*. `IP mismatch` is **not** relaxed: it remains a hard 403 (theft signal).
 
@@ -890,7 +921,7 @@ token flow, which could not clear it.
 
 ## Security Properties
 
-1. Persistent HMAC secret (`token_signing.key`, owner-restricted) — signed access and refresh cookies survive a process restart; `token_secret` supplies an ephemeral fallback only when the key cannot be persisted
+1. Persistent HMAC secret (`token_signing.key`, owner-restricted) — signed access and refresh cookies survive a process restart; `token_secret` supplies an ephemeral fallback only when the key cannot be persisted. A persisted key that exists but is shorter than 32 bytes is never accepted and is not repaired in place: the gateway boot preflight (`slack.gateway.signing_key_preflight`, backed by `token_secret.signing_key_health` and, for the bytes actually loaded, `token_secret.load_boot_secret`) refuses to start, logs CRITICAL and prints manual repair steps (stop the gateway and any restore, check the length, delete the file by hand, restart), and `kirocrew doctor` reports the same state, so a truncated key is a loud operator action instead of an ephemeral secret that logs every session out at each restart (#13221).
 2. Dual expiry: link click expiry plus configured cookie-session expiry, enforced by `validate_token()`
 3. Peer-keyed session pinning on first use — prevents token theft across networks. The pin binds to the client address (`ip:<addr>`), or — when the operator opted into `dashboard.tailscale.trust_identity` and the local daemon verified the forwarded peer — to the tailnet identity (`ts:node:<login>|<node>` or `ts:login:<login>` per `pin_scope`, ACL-tagged nodes always node-scoped). A verified login outside `allowed_logins` is denied outright. Resolution failure is fail-closed on identity and fail-open on availability for new ordinary sessions: they degrade to the address pin. A `require_peer` QR link instead fails closed, enrolls one verified allowed peer on its main exchange path, and carries that HMAC-signed original `peer_key` through access cookies, refresh rotation/grace replay, and child mints. A session pinned to a tailnet identity is denied (`tailnet identity unverified`) while the daemon cannot answer and denied on signed-key mismatch after restart — never satisfiable by an unverified proxied request or whichever allowed node presents a stolen cookie first. Transient daemon failures are cached briefly. Behind a non-Tailscale tunnel the pin binds to the tunnel's loopback address and is therefore shared (reported by Security Posture).
 4. Link re-exchange is allowed during the signed link window; each query-param use mints a distinct session cookie (`test_link_token_still_reusable_via_query_param_after_exchange`; `test_url_token_exchanged_for_distinct_session_cookie`)

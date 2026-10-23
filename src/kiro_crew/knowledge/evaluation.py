@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 
 from .retrieval import HybridRetriever
 from .store import KnowledgeStore
@@ -21,6 +21,19 @@ from .store import KnowledgeStore
 GOLDEN_VERSION = 1
 DEFAULT_LIMIT = 5
 MIN_SCORE = 0.012
+
+
+class _ScoredCase(TypedDict):
+    id: str
+    category: str
+    query: str
+    scope_source_uri: str | None
+    expected_count: int
+    matched_expected: int
+    first_relevant_rank: int | None
+    latency_ms: float
+    scope_leak: bool
+    results: list[dict[str, object]]
 
 
 class GoldenSetError(RuntimeError):
@@ -259,7 +272,7 @@ def evaluate_golden_set(
                     f"case {case.case_id!r} expected source is not registered; refresh its fixture"
                 )
     retriever = HybridRetriever(store, embedder=embedder)
-    scored: list[dict[str, object]] = []
+    scored: list[_ScoredCase] = []
     latencies: list[float] = []
     scope_cases = 0
     scope_leaks = 0
@@ -321,9 +334,9 @@ def evaluate_golden_set(
         if case["first_relevant_rank"] is not None
     )
     ndcg = 0.0
-    for case in answerable:
-        relevant = [bool(row["matched"]) for row in case["results"]]  # type: ignore[index]
-        ndcg += _ndcg(relevant, int(case["expected_count"]), limit)
+    for scored_case in answerable:
+        relevant = [bool(row["matched"]) for row in scored_case["results"]]
+        ndcg += _ndcg(relevant, scored_case["expected_count"], limit)
     abstained = sum(1 for case in abstention if not case["results"])
     item_row = store.db.execute(
         "SELECT COUNT(*) AS count, MAX(updated_at) AS latest FROM items WHERE status = 'active'"
@@ -378,8 +391,10 @@ def report_summary(report: dict[str, object]) -> str:
     """Render the non-sensitive aggregate report for CLI output."""
     metrics = report["metrics"]
     assert isinstance(metrics, dict)
+    config = report["config"]
+    assert isinstance(config, dict)
     return (
-        f"Knowledge retrieval: hit@{report['config']['limit']}={metrics['hit_at_k']:.3f} "
+        f"Knowledge retrieval: hit@{config['limit']}={metrics['hit_at_k']:.3f} "
         f"recall={metrics['recall_at_k']:.3f} MRR={metrics['mrr']:.3f} "
         f"nDCG={metrics['ndcg_at_k']:.3f} p95={metrics['p95_latency_ms']:.1f}ms"
     )

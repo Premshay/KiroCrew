@@ -114,6 +114,10 @@ requests whose author is no longer coordinator.
 
 If the wedge survives the replacement, or the replacement lease is unobtainable, the agent is not usable again: the loop posts one unrecoverable-session system message, sets `failed`, and stops consuming its inbox rather than resetting once per later message. `_recover_busy_agent` also tears the abandoned replacement back down, because `channel:`-keyed sessions are exempt from both session reapers (`session_cleanup._rss_threshold_check` and `_expire_idle` skip that prefix) and `api_channel_wake_agent` would otherwise re-acquire the same wedged session out of the registry. `test/test_channel_prompt_busy.py` pins the detection arms, the single replay, the one-shot report, and the teardown.
 
+### Unfinished Turns
+
+`_stream_task` asks `llm_helpers.unfinished_turn_error` at the turn's terminal event. A turn the backend never finished (stop reason `timeout` or `stale_recover`) is not the agent's reply: it takes the error branch and posts the error card as a system message, not the partial text and not silence. A finished turn and a user-requested stop (`cancelled`) post their text as before. `test/test_channel_prompt_busy.py` pins both.
+
 ### Message Routing
 
 1. `Channel.post` delivers an unmentioned top-level human message to the orchestrator.
@@ -126,6 +130,7 @@ If the wedge survives the replacement, or the replacement lease is unobtainable,
    `progress` and `done` reports wait for the recipient's next normal turn.
    Attached persistent peers are exempt from the directed exchange budget in
    rule 5, which governs provider-owned agents only.
+7. `Channel.post(..., notify_members=False)` records, broadcasts and saves a message without queueing it for any member. It carries display-only notices for the human reader, which must not wake the agent whose thread they land in.
 
 `run_channel_agent` keeps coordination in a thread. The orchestrator posts at the top level only for a top-level human request or when reporting back after threaded agent work, which preserves a readable human-facing summary without suppressing specialist work.
 
@@ -135,7 +140,7 @@ If the wedge survives the replacement, or the replacement lease is unobtainable,
 
 For each permission request that reaches `_stream_task`, the channel waits for a human decision unless global YOLO is active, `Channel.trusted` is already set, or an agent-scoped command grant matches. The approval endpoint accepts `approved`, `rejected`, `trust`, `trust_command`, and `trust_base`; a missing, invalid, denied, or timed-out decision rejects the provider request. `asyncio.wait_for` supplies the timeout. Every approval path (YOLO, channel trust, a command grant, a human approval) writes an `OUTCOME_PENDING_APPROVAL` row through `sel().log_tool_invocation()` before calling `approve_tool`, because `approve_tool` can raise. The definitive row follows: the tier's own outcome, or `rejected_transport_floor` when the transport floor refuses the approval (carrying the human decision as metadata on the human path). A human rejection is audited once, before `reject_tool`.
 
-A `trust` decision sets and persists `Channel.trusted`, so subsequent permission requests in that channel auto-approve. `trust_command` and `trust_base` are runtime-only, agent-scoped shell grants. The server derives their authority from the pending provider-classified shell event's canonical `tool_input`; the request pattern is only a consent proof and a stale or divergent card fails closed. Exact grants use case-sensitive literal equality, and base grants are available only for one simple, unambiguous invocation. Non-shell, redacted, compound, quoted-executable, environment-prefixed, and unparseable commands remain allow-once/reject only where a safe base cannot be derived.
+A `trust` decision sets and persists `Channel.trusted`, so subsequent permission requests in that channel auto-approve. `trust_command` and `trust_base` are runtime-only, agent-scoped shell grants. The server derives their authority from the pending provider-classified shell event's canonical `tool_input`; the request pattern is only a consent proof and a stale or divergent card fails closed. Exact grants use case-sensitive literal equality, and base grants are available only for one simple, unambiguous invocation. A first token containing a backslash (a Windows path such as `.\deploy.bat`) gets no base offer, no base grant and no base match (`_offerable_base_binary`, used by the card, the `trust_base` endpoint and `_match_trusted_channel_command`): POSIX tokenizing would derive `.deploy.bat`, a name the user never typed, and `n\pm` would derive `npm`, so an existing `npm` grant would cover a different Windows file. Only the exact-command tier covers such a command. Non-shell, redacted, compound, quoted-executable, environment-prefixed, and unparseable commands remain allow-once/reject only where a safe base cannot be derived.
 
 Global YOLO, channel-wide trust, agent-scoped command trust and the human card all run after two gates. First the containment denylist: `_blocked_tool_named` rejects the tools in `CHANNEL_AGENT_BLOCKED_TOOLS` before every auto-approval branch. Then the identity-bearing permission gate: `permission_floor.refusal_for(event, session_key=..., agent=..., security_only=False)` runs with this agent's session and name, so its governance profile applies; any deny is audited as `rejected_hook_deny` and the request is rejected. `test/test_channel_blocked_tools.py::test_blocked_tool_rejected_even_on_trusted_channel` pins the denylist ordering.
 
@@ -170,10 +175,11 @@ No lock guards any of this. What makes the pair decidable against the index the 
 ## Security
 
 - `_stream_task` redacts credentials and exfiltration URLs from streamed agent output, tool status, and approval content before channel publication.
+- A reply that carries a redaction placeholder is followed by the shared `messaging.renderer.redaction_notice`, counted with `count_redaction_tags` over the posted reply, so a reader learns a pasted command or link will not work as-is. The notice is a `system` message in the reply's thread, posted with `notify_members=False`, and is best-effort: a failed post is logged and the reply stands. `test/test_channel_redaction_notice.py` pins it.
 - `CHANNEL_AGENT_BLOCKED_TOOLS` and `_blocked_tool_named` contain direct-to-user messaging, session-control, and work-ledger operations so a channel agent cannot move channel content into a private dashboard session, take control of one, or write into another dispatch's decision record.
 - `api_channel_approve_agent` validates the decision allowlist. Per-command trust requires a pattern matching the server-bound pending command, records grants as opaque literals, audits both grants and refusals, and resolves the current request as a one-time approval. `_stream_task` repeats the result allowlist check before acting on the approval future.
 - A channel-owned agent posts its bounded, redacted failure detail as a system message; the gateway retains the traceback in logs for diagnosis.
-- `_json_object` rejects invalid JSON and non-object request bodies before channel handlers read fields.
+- `_json_object` reads through `handlers/_shared.read_bounded_json`: a body not declared JSON is refused 415 `unsupported_media_type` before it is read, and invalid JSON or a non-object body is refused 400 before channel handlers read fields. It is uncapped below `client_max_size`, because a channel message carries user prose.
 - Channel approval and trust decisions are logged through `sel().log_tool_invocation`; context-clear requests are logged through `sel().log_api_access`.
 
 ## Frontend
@@ -216,6 +222,7 @@ members.
 |---|---|
 | `src/kiro_crew/apps/builtins/channels/app.json` | Hidden opt-in app manifest, platform declaration, permissions, and `/channels` page registration. |
 | `src/kiro_crew/channel.py` | Channel model, routing, persistence, containment, and agent execution loop. |
+| `src/kiro_crew/channel_policy.py` | Command trust and containment policy, serialized message/member/attach-request records; patches through `channel` reach this owner. |
 | `src/kiro_crew/dashboard/handlers_channel.py` | Validated channel REST handlers, agent lifecycle calls, approvals, presets, and context resets. |
 | `src/kiro_crew/dashboard/routes/connections.py` | Dashboard route registration. |
 | `website/src/pages/ChannelPage.tsx` | Channel workspace UI, WebSocket reconciliation, threads, presets, and agent controls. |

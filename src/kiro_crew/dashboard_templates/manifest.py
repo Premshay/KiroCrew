@@ -4,7 +4,7 @@ A template is a directory with two files:
 
 ``manifest.json``
     ``id``, ``version`` (positive int), ``title``, ``description``, ``source``
-    (``builtin`` | ``user`` | ``shared``) and ``fields``: field name -> field spec.
+    (one of :data:`SOURCES`) and ``fields``: field name -> field spec.
 ``template.html``
     A body fragment. Each value sits on an element carrying
     ``data-dashboard-field="<name>"``; scripts may read the same values from
@@ -14,8 +14,18 @@ A field spec is ``{"type": ..., "source": ...}``. ``type`` is one of
 :data:`FIELD_TYPES`. ``source`` says where the value comes from:
 
 ``{"fold": "<name>", "path": "a.b.c"}``
-    A crew-log fold (session or slot keyed) read through the bus subscription, never
-    by refolding the log. ``path`` walks the rendered fold value.
+    A crew-log fold, read through the bus subscription rather than by refolding the
+    log. ``path`` walks the rendered fold value.
+
+    One of the THREE key kinds -- session, slot or tree. A TREE-keyed fold is the one a
+    block binding a TREE reaches, and it is the one exception to the sentence above: it
+    joins the logs of many slots, so no bus scope keys it and it cannot be pushed, which
+    puts it on the page-load and refetch read instead. That read ships with the first
+    block that consumes it, so a tree binding validates and reports unavailable until
+    then (see
+    :data:`~kiro_crew.crew_log.projection.TREE_PROJECTION_NAMES` and
+    :func:`~kiro_crew.dashboard_feed.scope_for`). A block binds it exactly the same way;
+    what differs is when the value arrives.
 ``{"agentic": true}``
     The agent writes the value itself (an agentic fold). The page marks it.
 
@@ -36,6 +46,13 @@ whose keys the page never reads is still an array. The shape keys are:
 
 A nested shape is ``{"type": ...}`` plus the same keys, and nothing else.
 
+An agentic field may also declare ``upkeep``: ``{"means", "when", "how"}``, three
+short sentences, plus an optional ``helper`` -- a file under the template's own
+``helpers/`` that fetches data the crew log does not hold and prints a ready
+``dashboard_write`` payload. ``dashboard_upkeep`` turns them into the crewmate's
+upkeep skill. A fold field has no upkeep: the fold writes it. Only a ``builtin``
+template names a helper, because a helper is code and this format carries none.
+
 This is declarative on purpose: a user template carries no code, so the gateway can
 load one at run time without running anything an agent wrote. Built-in templates use
 the same format, so one loader, one parity check and one registry serve all three
@@ -50,7 +67,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Mapping
 
-from kiro_crew.crew_log.projection import SESSION_FOLD_NAMES, SLOT_PROJECTION_NAMES
+from kiro_crew.crew_log.projection import (
+    SESSION_FOLD_NAMES,
+    SLOT_PROJECTION_NAMES,
+    TREE_PROJECTION_NAMES,
+)
 from kiro_crew.dashboard_templates.parity import ExtractionRefused, html_fields
 
 __all__ = [
@@ -58,8 +79,10 @@ __all__ = [
     "FOLD_NAMES",
     "FieldSpec",
     "ManifestError",
+    "PACKAGE_FOLD_NAMES",
     "Shape",
     "TemplateManifest",
+    "Upkeep",
     "load_template",
     "parse_manifest",
 ]
@@ -69,7 +92,39 @@ __all__ = [
 #: list or an object where a name belongs, and an unhashable candidate raises out of
 #: the loader instead of being collected as one more refusal.
 FIELD_TYPES: Final[frozenset[str]] = frozenset({"number", "string", "boolean", "array", "object"})
+#: Every fold a block may bind, as the union of the kernel's THREE key-kind sets rather
+#: than as a list here, so a fold added to the kernel is bindable without this file being
+#: edited.
+#:
+#: A name this set accepts is a name the save gate admits, so admitting one the feed can
+#: neither key nor read would hand a block author a binding that only ever draws the
+#: stale band. A TEMPLATE's reader is :func:`~kiro_crew.dashboard_feed.DashboardFeed`,
+#: which reaches a fold by its bus scope, so this set is the two SCOPED families and the
+#: tree family is deliberately not in it.
 FOLD_NAMES: Final[frozenset[str]] = frozenset(SESSION_FOLD_NAMES) | frozenset(SLOT_PROJECTION_NAMES)
+#: The same question for a dashboard PACKAGE, which has a reader the template path does
+#: not.
+#:
+#: SEPARATE FROM :data:`FOLD_NAMES` BECAUSE THE TWO SURFACES HAVE DIFFERENT READERS, and
+#: reachability is what either set is for. A tree-keyed fold has no bus scope by design
+#: -- it joins the logs of many slots, so no event can carry a key saying which one
+#: moved -- so it is READ instead, by ``member_dashboard_fields.LivePage``, the host that
+#: draws a package's page. A template is rendered by ``member_dashboard._render``, whose
+#: feed subscribes by scope and has no tree read, so a template binding a tree fold would
+#: leave that field missing on every read: the permanently stale block this gate exists
+#: to refuse. Widening the template set to admit the package's extra family would hand an
+#: operator writing a ``panel-templates`` page exactly that binding.
+PACKAGE_FOLD_NAMES: Final[frozenset[str]] = FOLD_NAMES | frozenset(TREE_PROJECTION_NAMES)
+#: Where a manifest came from. Every value names a template DIRECTORY, which is what
+#: lets two consumers read this word and both be right: ``instance.RENDERABLE_SOURCES``
+#: gates whether a page may EXECUTE, and the catalogue's scan checks a directory's
+#: declared source against where the directory actually sits.
+#:
+#: An agent-composed dashboard package gets a fourth value when a manifest is
+#: synthesized from one -- it has no directory and carries no page, so it has to be
+#: distinguishable from a template a person wrote. That value ships with the
+#: synthesis, because a source no manifest declares is a word both consumers would
+#: accept off disk and nothing would ever produce.
 SOURCES: Final[frozenset[str]] = frozenset({"builtin", "user", "shared"})
 #: ``\Z``, never ``$``: Python's ``$`` also matches just before a TRAILING NEWLINE, so
 #: ``"report\n"`` satisfies a ``$``-anchored id. That id becomes a user-template
@@ -93,6 +148,50 @@ _PROPERTY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 MAX_SHAPE_DEPTH: Final[int] = 8
 #: How many values one ``enum`` may list.
 MAX_ENUM: Final[int] = 32
+#: Longest ``upkeep`` sentence.
+MAX_UPKEEP_CHARS: Final[int] = 200
+#: The sentences an ``upkeep`` object carries, every one required.
+UPKEEP_KEYS: Final[tuple[str, ...]] = ("means", "when", "how")
+#: A helper's file name under the template's ``helpers/``.
+_HELPER = re.compile(r"^[a-z][a-z0-9_]{0,40}\.py\Z")
+
+
+@dataclass(frozen=True)
+class Upkeep:
+    """What an agentic field means, when the crewmate writes it, and how."""
+
+    means: str
+    when: str
+    how: str
+    #: A file under the template's ``helpers/``, or ``None``.
+    helper: str | None = None
+
+
+def _upkeep(name: str, raw: Any, problems: list[str]) -> Upkeep | None:
+    """Parse a field's ``upkeep`` object; every problem is appended, never raised."""
+    where = f"field {name!r}: upkeep"
+    if not isinstance(raw, dict):
+        problems.append(f"{where} must be an object with {list(UPKEEP_KEYS)}")
+        return None
+    extra = sorted(str(k) for k in raw if k not in UPKEEP_KEYS and k != "helper")
+    if extra:
+        problems.append(f"{where}: unknown key(s) {extra}")
+    texts: dict[str, str] = {}
+    for key in UPKEEP_KEYS:
+        value = raw.get(key)
+        if not (isinstance(value, str) and value.strip() and len(value) <= MAX_UPKEEP_CHARS):
+            problems.append(
+                f"{where}.{key} must be a non-empty string of at most {MAX_UPKEEP_CHARS} characters"
+            )
+        else:
+            texts[key] = " ".join(value.split())
+    helper = raw.get("helper")
+    if "helper" in raw and not (isinstance(helper, str) and _HELPER.match(helper)):
+        problems.append(f"{where}.helper must be a file name matching {_HELPER.pattern}")
+        helper = None
+    if len(texts) != len(UPKEEP_KEYS):
+        return None
+    return Upkeep(texts["means"], texts["when"], texts["how"], helper)
 
 
 class ManifestError(ValueError):
@@ -139,6 +238,8 @@ class FieldSpec:
     agentic: bool
     #: The value's declared shape, or ``None`` when only ``type`` is declared.
     shape: Shape | None = None
+    #: What it means and when and how the crewmate writes it, or ``None``.
+    upkeep: Upkeep | None = None
 
 
 def _enum_member_ok(declared: str, value: Any) -> bool:
@@ -267,11 +368,14 @@ def _field(name: str, raw: Any, problems: list[str]) -> FieldSpec | None:
         shape = None
         if declares_shape and isinstance(ftype, str) and ftype in FIELD_TYPES:
             shape = _shape(f"field {name!r}", raw, problems, 1)
-        return FieldSpec(name, str(ftype), None, None, True, shape)
+        upkeep = _upkeep(name, raw["upkeep"], problems) if "upkeep" in raw else None
+        return FieldSpec(name, str(ftype), None, None, True, shape, upkeep)
     if declares_shape:
         # The fold writes these values, so a shape here would be a promise about
         # bytes nothing on the write path checks.
         problems.append(f"field {name!r}: only an agentic field declares a shape")
+    if "upkeep" in raw:
+        problems.append(f"field {name!r}: only an agentic field declares upkeep")
     fold, path = source.get("fold"), source.get("path")
     if not isinstance(fold, str) or fold not in FOLD_NAMES:
         problems.append(f"field {name!r}: fold {fold!r} is not one of {sorted(FOLD_NAMES)}")
@@ -308,6 +412,11 @@ def parse_manifest(raw: Any) -> TemplateManifest:
                 fields[parsed.name] = parsed
     if problems:
         raise ManifestError(problems)
+    helpers = sorted(n for n, f in fields.items() if f.upkeep and f.upkeep.helper)
+    if helpers and tsource != "builtin":
+        raise ManifestError(
+            [f"field {n!r}: only a builtin template names an upkeep helper" for n in helpers]
+        )
     assert isinstance(tid, str) and isinstance(version, int)  # narrowed by the checks above
     return TemplateManifest(
         id=tid,
@@ -353,4 +462,11 @@ def load_template(directory: Path) -> tuple[TemplateManifest, str]:
         raise ManifestError([f"{directory.name}: {exc}"]) from None
     manifest = parse_manifest(raw)
     check_parity(manifest, html)
+    missing = [
+        f"field {n!r}: upkeep helper helpers/{f.upkeep.helper} is not in {directory.name}"
+        for n, f in sorted(manifest.fields.items())
+        if f.upkeep and f.upkeep.helper and not (directory / "helpers" / f.upkeep.helper).is_file()
+    ]
+    if missing:
+        raise ManifestError(missing)
     return manifest, html

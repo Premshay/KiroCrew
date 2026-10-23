@@ -27,6 +27,7 @@ import webbrowser
 from dataclasses import dataclass
 from typing import Optional
 
+from kiro_crew.atomic_write import read_bytes_with_retry
 from kiro_crew.cloud import ssm
 from kiro_crew.instances.validation import split_ecs_target
 from kiro_crew.platform.interfaces import BUILTIN_PROVISIONER_ID
@@ -253,6 +254,19 @@ def ssm_proxy_ssh_host(instance_id: str, region: str) -> str:
     return instance_id
 
 
+def _run_as_kwargs(ssm_run_as: str) -> dict:
+    """``{"ssm_run_as": ...}`` when a caller named one, otherwise nothing.
+
+    Omitted rather than passed empty, so the registry's own default stands for
+    every lane that does not name a user and nothing about EC2 or Fargate
+    changes. Only a lane whose guest runs the crew as some other user has to say
+    so -- and it must, because ``cloud/ssm.py`` wraps every in-guest command as
+    ``sudo -u <run_as> -i``, and a user the guest does not have makes that
+    command fail with ``sudo: unknown user``.
+    """
+    return {"ssm_run_as": ssm_run_as} if ssm_run_as else {}
+
+
 def register_instance(
     instance_id: str,
     *,
@@ -262,6 +276,7 @@ def register_instance(
     remote_port: int = DEFAULT_REMOTE_DASHBOARD_PORT,
     connection_method: str = "ssm",
     provisioner_id: str = BUILTIN_PROVISIONER_ID,
+    ssm_run_as: str = "",
 ) -> Optional[str]:
     """Register the box in the Instances registry for the /instances dashboard.
 
@@ -312,6 +327,7 @@ def register_instance(
                     aws_region=region,
                     remote_port=remote_port,
                     provisioner_id=provisioner_id,
+                    **_run_as_kwargs(ssm_run_as),
                 )
                 return existing.id
         inst = reg.add(
@@ -322,6 +338,7 @@ def register_instance(
             aws_region=region,
             remote_port=remote_port,
             provisioner_id=provisioner_id,
+            **_run_as_kwargs(ssm_run_as),
         )
         return inst.id
     except Exception as exc:  # pragma: no cover - non-fatal
@@ -372,7 +389,7 @@ def is_launched_instance(ssm_target: str) -> bool:
         return False
     for path in sorted(root.glob("*.json")):
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(read_bytes_with_retry(path).decode("utf-8"))
         except FileNotFoundError:
             continue
         if isinstance(raw, dict) and raw.get("instance_id") == ssm_target:

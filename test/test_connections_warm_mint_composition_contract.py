@@ -38,6 +38,7 @@ from test_connections_warm import (
 from kiro_crew import hooks
 from kiro_crew.connections import mint, warm
 from kiro_crew.connections.mint import _mints
+from kiro_crew.testing.wait import await_until, finished
 
 _PC = warm.platform_compat
 
@@ -469,8 +470,9 @@ async def test_concurrent_activations_serialize_on_the_lock_and_spawn_once(
     monkeypatch.setattr(warm, "_MINT_GRANT_POLL_SECONDS", 3600)
     _pin_start_ids(monkeypatch, "1")
 
-    first, second = await asyncio.wait_for(
-        asyncio.gather(warm._warm_mint.mint_for(), warm._warm_mint.mint_for()), 10
+    first, second = await finished(
+        asyncio.gather(warm._warm_mint.mint_for(), warm._warm_mint.mint_for()),
+        "parallel mint_for",
     )
 
     assert len(built) == 1, "the second activation must reuse the process the first spawned"
@@ -502,7 +504,7 @@ async def test_a_rearm_is_declined_while_an_explicit_warm_holds_the_lock(
         warm._warm_mint._lock.release()
     task = warm._warm_mint.start_rearm(3)
     assert task is not None
-    await asyncio.wait_for(task, 5)
+    await await_until(task)
     assert started == [3]
     assert warm._warm_mint._rearms_remaining == 0
 
@@ -516,7 +518,7 @@ async def test_a_rearm_outlives_the_reaper_that_started_it(monkeypatch: pytest.M
 
     async def _rearm(generation: int) -> list[str]:
         entered.set()
-        await asyncio.wait_for(gate.wait(), 5)
+        await await_until(gate)
         return ["linear"]
 
     monkeypatch.setattr(warm, "_rearm_dead_warm_mint", _rearm)
@@ -526,7 +528,7 @@ async def test_a_rearm_outlives_the_reaper_that_started_it(monkeypatch: pytest.M
     monkeypatch.setattr(warm._warm_mint, "_runtime", _Runtime(False))
 
     reaper = asyncio.get_running_loop().create_task(warm._warm_mint_reaper(6))
-    await asyncio.wait_for(entered.wait(), 5)
+    await await_until(entered)
     rearm = warm._warm_mint._rearm_task
     assert rearm is not None
     reaper.cancel()
@@ -534,7 +536,7 @@ async def test_a_rearm_outlives_the_reaper_that_started_it(monkeypatch: pytest.M
         await reaper
     assert not rearm.cancelled()
     gate.set()
-    assert await asyncio.wait_for(rearm, 5) == ["linear"]
+    assert await await_until(rearm) == ["linear"]
     await asyncio.sleep(0)
     assert warm._warm_mint._rearm_task is None
 
@@ -548,7 +550,7 @@ async def test_invalidation_rearms_are_single_flight_per_slug_not_across_slugs(
 
     async def _blocked(slug: str) -> list[str]:
         started.append(slug)
-        await asyncio.wait_for(release.wait(), 5)
+        await await_until(release)
         return [slug]
 
     monkeypatch.setattr(warm, "_rearm_invalidated_provider", _blocked)
@@ -567,7 +569,7 @@ async def test_invalidation_rearms_are_single_flight_per_slug_not_across_slugs(
         assert registry["linear"] is linear, "only the registered task may forget itself"
 
         release.set()
-        await asyncio.wait_for(asyncio.gather(linear, vercel), 5)
+        await finished(asyncio.gather(linear, vercel), "gather linear and vercel")
         await asyncio.sleep(0)
         assert "linear" not in registry and "vercel" not in registry
 
@@ -714,7 +716,7 @@ async def test_the_drain_withdraws_a_parked_generation_that_died_while_parked(
         "token": "t",
     }
 
-    await asyncio.wait_for(warm._drain_parked_generations(), 5)
+    await finished(warm._drain_parked_generations(), "drain parked generations")
 
     assert _mints["linear"]["state"] == "expired"
     assert _mints["linear"]["reason"] == "mint_process_gone"
@@ -813,10 +815,83 @@ _OWNERS: dict[str, tuple[str, ...]] = {
         "_shared_mints_pending",
         "_warm_table_row",
     ),
+    "spec_body": (
+        "_WARM_AGENT_PREFIX",
+        "_WARM_ALL_AGENT",
+        "_WARM_BASE_AGENT",
+        "_WARM_NAME_RE",
+        "_WARM_SPEC_SENTINEL",
+        "_is_stale_warm_spec",
+        "_warm_ownership_marks",
+        "_warm_spec_body",
+        "_warm_spec_description",
+        "connections_tool_aliases",
+    ),
+    "generation_tree": (
+        "_WARM_GENERATION_MARKER",
+        "_WARM_GENERATION_MARKER_MAX_BYTES",
+        "_WARM_GENERATION_MARKER_VERSION",
+        "_WARM_GENERATION_PREFIX",
+        "_WARM_GENERATION_SENTINEL",
+        "_WARM_RUNTIME_DIR_ATTR",
+        "_bind_warm_generation",
+        "_create_warm_generation_dir",
+        "_release_runtime_generation",
+        "_remove_warm_generation_dir",
+        "_runtime_generation_dir",
+        "_spawn_left_no_process",
+        "_warm_generation_agents_dir",
+        "_warm_generation_marker_path",
+        "_warm_generation_owner",
+        "_warm_generations_dir",
+        "_warm_work_dir",
+        "_write_warm_generation_owner",
+    ),
+    "mint_process": (
+        "_WarmMintResult",
+        "_WarmSession",
+        "_acp_runtime_factory",
+        "_collect_oauth_requests",
+        "_destroy_session_quietly",
+        "_kill_quietly",
+        "_runtime_alive",
+        "_warm_session_mcp_servers",
+    ),
+    "rearms": (
+        "_forget_invalidation_rearm",
+        "_invalidation_rearms",
+        "_rearm_dead_warm_mint",
+        "_rearm_invalidated_provider",
+        "_settle_invalidation_rearms",
+        "rearm_invalidated_provider",
+    ),
+    "table_flow": (
+        "_absorb_warm_requests",
+        "_adopt_shared_row",
+        "_providers_with_requests",
+        "_recover_redrained_requests",
+        "adopt_shared_mint",
+        "warm_mint_all",
+    ),
 }
 
-#: The one facade name an owner may reach at call time, and the owner that reaches it.
-_FACADE_REACH = {"shared_rows": frozenset({"_dispose_mint"})}
+#: The facade names each owner reaches at call time, as a call on ``_warm_facade()``.
+_FACADE_REACH = {
+    "shared_rows": frozenset({"_dispose_mint"}),
+    "spec_body": frozenset({"declared_tool_aliases"}),
+    "generation_tree": frozenset(
+        {
+            "_is_plain_warm_generation_dir",
+            "_read_warm_generation_owner",
+            "_recorded_runtime_is_dead",
+            "data_home",
+        }
+    ),
+    "rearms": frozenset({"_rearm_invalidated_provider", "warm_mint_all"}),
+    "table_flow": frozenset(
+        {"_absorb_warm_requests", "_mint_watcher", "_warm_activate", "_warm_row_alive"}
+    ),
+}
 
 #: Every name a test or caller substitutes on the warm facade. An owner calling one of them by
 #: its bare name would bind its own copy and silently stop seeing the substitution.

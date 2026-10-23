@@ -8,7 +8,8 @@ define on the runner's globals. These tests pin what that composition promises:
 
 * every name the runner bound before the split still resolves on it, and each
   moved name keeps the kind and signature it had in the one-module file and is ONE
-  object whichever module a caller reads it from;
+  object whichever module a caller reads it from (the table of moved names and its
+  tests are in ``test_chat_runner_base_surface.py``);
 * each owner function runs on the runner's globals, every global it reads resolves
   there, and no owner captures a name a test rebinds on the runner, so a patch of
   ``kiro_crew.dashboard.chat_runner.<name>`` reaches it (the rebound names are
@@ -55,18 +56,45 @@ _GLOBAL_OPS = frozenset({"LOAD_GLOBAL", "STORE_GLOBAL", "DELETE_GLOBAL"})
 #: so the set is spelled out rather than globbed.
 _OWNER_MODULES = frozenset(
     {
+        "account_identity",
         "acp_recovery",
+        "app_agent_binding",
+        "context_cap",
+        "crew_log_attribution",
+        "decisions_hooks",
+        "deny_chokepoints",
         "directives",
+        "eager_spawn",
         "file_changes",
         "mcp_session",
         "model_fallback",
+        "native_cards",
+        "permission_prompt",
         "prompt_assembly",
+        "queue_cycle",
+        "queue_drain",
         "recipient",
         "recovery",
+        "segment_flush",
+        "session_events",
+        "session_reset",
+        "slash_commands",
         "steer_queue",
+        "stop_recovery",
         "tool_approval",
+        "tool_results",
+        "tool_rows",
+        "turn_admission",
         "turn_context",
+        "turn_dispatch_gates",
+        "turn_ending",
+        "turn_entry",
+        "turn_failures",
+        "turn_ledgers",
+        "turn_locals",
         "turn_marker",
+        "turn_reply_seams",
+        "turn_spec_hooks",
         "turn_stats",
     }
 )
@@ -92,13 +120,13 @@ _BASE_NAMES = frozenset("""
         FileTooLargeError HOOK_CONTINUATION_RECOVERY_PREFIX HOOK_EVENT_AGENT_SPAWN
         HOOK_EVENT_POST_TOOL_USE HOOK_EVENT_PRE_TOOL_USE HOOK_EVENT_STOP
         HOOK_EVENT_USER_PROMPT_SUBMIT HOOK_HALTED_RECOVERY_PREFIX HUMAN_TURN_META_KEY
-        InfraError KiroCrewConfig L1_TOOL_CALL LLMEvent MAX_BLOCKED_LINKS_PER_MESSAGE
+        InfraError KiroCrewConfig L1_TOOL_CALL LLMEvent
         MAX_PROMPT_BYTES MCP_APP_MESSAGE_KIND MODEL_UNENTITLED_KIND MONITOR_WAKE_PREFIX
         MonitorCompletionHook NATIVE_SUBAGENT_DONE_RESULT_CAP NATIVE_SUBAGENT_DONE_TRUNC_MARKER
         NATIVE_SUBAGENT_OUTPUT_HARD NATIVE_SUBAGENT_OUTPUT_TAIL NATIVE_SUBAGENT_TERMINAL_KEEP
         NATIVE_SUBAGENT_TERMINAL_TTL_SECS NamedTuple OUTCOME_REJECTED_TRANSPORT_FLOOR
         PENDING_CHANNEL_ATTR PHASE_PER_TURN PHASE_SESSION_START POISONED_SESSION_CYCLES Path
-        PostedOptions PromptBusyExhaustedError QUESTION_CARD_SHOWN_PREFIX QUICK_PROMPTS
+        PostedOptions PromptBusyExhaustedError QUICK_PROMPTS
         REFUSAL_INBAND_RECOVERY_PREFIX REFUSAL_RECOVERY_PREFIX RESTORED_QUEUE_KEY
         RecoveryPayload Refusal RefusalInfo
         ResetCause ResolvedBindings
@@ -126,7 +154,7 @@ _BASE_NAMES = frozenset("""
         UnknownMemoryStore ValidationError WAIT_REASON_INPUT _ACTIVITY_NO_REPLY_CONTINUE_MSG
         _AppAgentNotLoaded _BATCH_REJECT_CLEARED_BY _BLOCKED_SLASH_COMMANDS _BUSY_RECOVER_MSG
         _COMPACTION_CONTINUE_MSG _COMPACTION_FAILED_RETRIES _COMPACT_FAIL_REASON_MAX_CHARS
-        _CONN_RECOVER_MSG _CONTEXT_FRAME_CONTRACT _CREDENTIAL_HINT_CLASSES _CREDENTIAL_TAG_RE
+        _CONN_RECOVER_MSG _CONTEXT_FRAME_CONTRACT _CREDENTIAL_HINT_CLASSES
         _ChatSlot _DIRECTIVE_NOT_APPLIED_FALLBACK _DIRECTIVE_NOT_APPLIED_OUTCOMES
         _DIRECTIVE_SHAPED_RE _EAGER_SPAWN_BACKOFF_BASE_SECS _EAGER_SPAWN_BACKOFF_MAX_SECS
         _EAGER_SPAWN_DEBOUNCE_SECS _EAGER_SPAWN_ERROR_DETAIL_MAX_CHARS _EAGER_SPAWN_FAILURE_CAP
@@ -161,7 +189,7 @@ _BASE_NAMES = frozenset("""
         _clip_card_error _configured_refusal_fallback _connections_managed_mcp_names
         _consume_pending_reset _context_usage_payload _credential_tool_hint_for _crew_log_class
         _crew_log_lineage _crew_log_model _crew_log_workspace _current_turn_carries_image_ref
-        _decisions_strip_meta _default_session_model _deliver_cross_surface_reply
+        _decisions_strip_meta _deliver_cross_surface_reply
         _deliver_cross_surface_user_message _deliver_linked_slack_message _dequeue_next_message
         _dequeue_next_system_message _detach_appended_context _directive_recovery_instruction
         _discard_stale_decision _drain_session_init_oauth_requests _drop_stale_admissions
@@ -289,309 +317,6 @@ _BASE_NAMES = frozenset("""
         warm_project_agent_names with_bounded_redaction_records
     """.split())
 
-#: Each moved name, the owner that holds it, and its kind and signature in the
-#: one-module runner (captured from it before the split).
-_BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
-    "directives": (
-        ("UNCLAIMED_DIRECTIVE_NOTICE", "value", "str"),
-        ("_DIRECTIVE_NOT_APPLIED_FALLBACK", "value", "str"),
-        ("_DIRECTIVE_NOT_APPLIED_OUTCOMES", "value", "dict"),
-        ("_MONITOR_DIRECTIVE_TOOLS", "value", "frozenset"),
-        ("_directive_recovery_instruction", "function", "(tool: 'str') -> 'str'"),
-        ("unverified_directive_notice", "function", "(tool: 'str') -> 'str'"),
-        ("unverified_directive_outcome", "function", "(tool: 'str') -> 'str'"),
-    ),
-    "file_changes": (
-        ("_PATH_TRUNCATION_MARKER", "value", "str"),
-        ("_Snapshot", "class", ""),
-        (
-            "_apply_turn_snapshot_budget",
-            "function",
-            "(entries: 'list[dict[str, Any]]') -> 'tuple[list[dict[str, Any]], int, int]'",
-        ),
-        (
-            "_classify_str_replace_before",
-            "function",
-            "(path: 'str', raw_params: 'dict') -> 'tuple[str | None, str | None]'",
-        ),
-        (
-            "_line_change_input",
-            "function",
-            "(fc: 'dict[str, Any]', after: '_Snapshot | None') -> 'dict[str, str] | None'",
-        ),
-        ("_note_reply_row", "function", "(slot: \"'_ChatSlot'\", row: 'dict[str, Any]') -> 'None'"),
-        (
-            "_pending_str_replace_payload",
-            "function",
-            "(content: 'str', old_str: 'str', new_str: 'str') -> 'dict[str, _Snapshot]'",
-        ),
-        (
-            "_record_turn_snapshot",
-            "function",
-            "(slot: \"'_ChatSlot'\", snapshot: 'dict[str, Any]', writer_key: 'str' = '') -> 'None'",
-        ),
-        (
-            "_resolve_pending_str_replace",
-            "function",
-            "(pending: 'dict[str, Any]', after: 'str') -> '_Snapshot | None'",
-        ),
-        ("_safe_read_snapshot", "function", "(path: 'str') -> '_Snapshot | None'"),
-        (
-            "_snapshot_write_target",
-            "function",
-            "(raw_params: 'dict | None', diff_old_text: 'str | None' = None, diff_path: 'str' = '') -> 'dict | None'",
-        ),
-        ("_truncate_snapshot", "function", "(content: 'str') -> '_Snapshot'"),
-        ("_turn_line_changes", "function", "(changes: 'Any') -> 'int'"),
-        (
-            "_turn_rows",
-            "function",
-            "(slot: \"'_ChatSlot'\", turn_boundary: 'int', turn_start_mid: 'str | None') -> 'list[dict[str, Any]]'",
-        ),
-    ),
-    "mcp_session": (
-        ("_connections_managed_mcp_names", "function", "() -> 'frozenset[str]'"),
-        (
-            "_drain_session_init_oauth_requests",
-            "async function",
-            "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\", client: 'Any') -> 'None'",
-        ),
-        (
-            "_mcp_server_name_is_ambiguous",
-            "function",
-            "(server_name: 'str', safe_name: 'str') -> 'bool'",
-        ),
-        (
-            "_publish_session_mcp_report",
-            "function",
-            "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\", provider: 'Any') -> 'None'",
-        ),
-        (
-            "_record_session_mcp_event",
-            "function",
-            "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\", provider: 'Any', kind: 'str', server_name: 'str', error: 'str' = '', *, fanout_no_owner: 'bool' = False) -> 'None'",
-        ),
-    ),
-    "model_fallback": (
-        ("_agent_fallback_chain", "function", "() -> 'tuple[str, ...]'"),
-        ("_clear_fallback_sticky_state", "function", "(slot: 'Any', client: 'Any') -> 'None'"),
-        ("_configured_refusal_fallback", "function", "() -> 'str'"),
-        (
-            "_default_session_model",
-            "function",
-            "(cfg: \"'KiroCrewConfig | None'\", slot: \"'_ChatSlot'\", agent_model: 'str') -> 'str'",
-        ),
-        (
-            "_fallback_swap_for_turn",
-            "async function",
-            "(slot: 'Any', client: 'Any') -> 'str | None'",
-        ),
-        (
-            "_probe_fallback_restore_for_slot",
-            "async function",
-            "(slot: 'Any', client: 'Any') -> 'None'",
-        ),
-        (
-            "_probe_fallback_restore_for_slot_locked",
-            "async function",
-            "(slot: 'Any', client: 'Any') -> 'None'",
-        ),
-        (
-            "_refusal_fallback_swap",
-            "async function",
-            "(slot: 'Any', client: 'Any', candidate: 'str', session_key: 'str' = '') -> 'str | None'",
-        ),
-        (
-            "_resolve_refusal_fallback_target",
-            "function",
-            "(refusal: \"'RefusalInfo | None'\") -> 'str'",
-        ),
-        ("_restore_refusal_fallback", "async function", "(slot: 'Any', client: 'Any') -> 'None'"),
-        ("_sync_served_model", "function", "(slot: 'Any', client: 'Any') -> 'None'"),
-    ),
-    "recipient": (
-        ("_attested_peer", "function", "(transport: 'Any', conversation_id: 'str') -> 'str'"),
-        (
-            "_audit_admission_refusal",
-            "function",
-            "(session_key: 'str', link: 'Any', *, outcome: 'str' = 'unverified') -> 'None'",
-        ),
-        (
-            "_authorize_recipient",
-            "function",
-            "(transport: 'Any', channel_type: 'str', conversation_id: 'str', thread_id: 'str | None', *, principal: 'str', session_key: 'str', audit_allowed: 'bool' = False) -> 'bool'",
-        ),
-        ("_link_principal", "function", "(link: 'Any') -> 'str'"),
-        (
-            "_log_once",
-            "function",
-            "(marker: 'tuple[str, str, str]', level: 'int', message: 'str', *args: 'Any') -> 'None'",
-        ),
-        ("_marker_digest", "function", "(marker: 'tuple[str, str, str]') -> 'str'"),
-        (
-            "_recipient_principal",
-            "function",
-            "(session_key: 'str', link: 'Any', transport: 'Any') -> 'str'",
-        ),
-        (
-            "_resolve_channel_target",
-            "function",
-            "(state: 'Any', session_key: 'str', link: 'Any', *, principal: 'str | None' = None, check_recipient: 'bool' = True) -> 'Any'",
-        ),
-        ("_resolve_mirror_target", "function", "(state: 'Any', session_key: 'str') -> 'Any'"),
-        ("_session_principal", "function", "(session_key: 'str') -> 'str'"),
-        ("cross_surface_withheld", "function", "(state: 'Any', slot: 'Any') -> 'bool'"),
-    ),
-    "recovery": (
-        (
-            "_answer_text_only",
-            "function",
-            "(segment_text: 'str', notice_chunks: 'list[str]') -> 'str'",
-        ),
-        ("_current_turn_carries_image_ref", "function", "(message: 'str') -> 'bool'"),
-        ("_empty_auto_continue_enabled", "function", "() -> 'bool'"),
-        ("_empty_max_auto_continues", "function", "() -> 'int'"),
-        (
-            "_model_unentitled_meta",
-            "function",
-            "(exc: 'BaseException') -> 'dict[str, object] | None'",
-        ),
-        (
-            "_note_cycle_start_failure",
-            "function",
-            "(slot_key: 'str', exc: 'BaseException', *, self_wake: 'bool') -> 'None'",
-        ),
-        ("_recovery_delay", "async function", "(secs: 'float') -> 'None'"),
-        (
-            "_session_stop_generation_for",
-            "function",
-            "(sessions: 'Any', session_key: 'str') -> 'int'",
-        ),
-        (
-            "_shared_dependency_delay",
-            "function",
-            "(exc: 'BaseException', local_delay: 'float', *, slot_key: 'str') -> 'float'",
-        ),
-        ("_should_suppress_requeue", "function", "(slot) -> 'bool'"),
-        (
-            "_terminal_error_meta",
-            "function",
-            "(exc: 'BaseException') -> 'dict[str, object] | None'",
-        ),
-    ),
-    "steer_queue": (
-        ("_QUEUE_KIND_ACTORS", "value", "dict"),
-        ("_actor_for_queue_items", "function", "(items: \"'list[dict]'\") -> 'str'"),
-        (
-            "_drop_stale_admissions",
-            "function",
-            "(state: 'DashboardState', slot: '_ChatSlot') -> 'None'",
-        ),
-        ("_has_user_queued_followup", "function", "(slot: \"'_ChatSlot'\") -> 'bool'"),
-        (
-            "_mark_steer_row_state",
-            "function",
-            "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\", message: 'str', new_state: 'str', siblings: 'list[str] | None' = None) -> 'None'",
-        ),
-        ("_queue_entry_is_orchestration", "function", "(item: 'dict') -> 'bool'"),
-        (
-            "_requeue_unconsumed_steers",
-            "function",
-            "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\") -> 'None'",
-        ),
-        (
-            "_settle_consumed_steers",
-            "function",
-            "(slot: \"'_ChatSlot'\", snapshot: 'str', state: \"'DashboardState | None'\" = None) -> 'None'",
-        ),
-    ),
-    "tool_approval": (
-        ("_CREDENTIAL_HINT_CLASSES", "value", "frozenset"),
-        ("_SPEC_HOOKS_UNREADABLE_BLOCK", "value", "str"),
-        (
-            "_audit_name_grant_refusal",
-            "function",
-            "(*, session_key: 'str', slot: 'Any', event: 'Any', refusal: 'Refusal', tier: 'str') -> 'None'",
-        ),
-        ("_auto_approve_reason", "function", "(slot: 'Any', yolo_active: 'bool') -> 'str'"),
-        (
-            "_credential_tool_hint_for",
-            "async function",
-            "(reason: 'str', cause: 'str', subject: 'str' = '') -> 'str'",
-        ),
-        ("_name_grant_refusal_for", "async function", "(event: 'object') -> 'Refusal | None'"),
-        ("_native_crew_should_auto_approve", "function", "(native_tracker, state, slot) -> 'bool'"),
-        ("_persistable_session_policy", "function", "(slot: 'Any', yolo_active: 'bool') -> 'str'"),
-        ("_pre_tool_block_reason", "function", "(pre_hook_results: 'Any') -> 'str'"),
-        ("_pre_tool_hooks_should_block", "function", "(pre_hook_results: 'Any') -> 'bool'"),
-        ("_slot_is_trusted", "function", "(slot: 'Any') -> 'bool'"),
-        ("_spec_confirm_hooks_notice", "function", "(agent: 'str', count: 'int') -> 'str'"),
-        ("_spec_keys_notice", "function", "(agent: 'str', keys: 'list[str]') -> 'str'"),
-    ),
-    "turn_context": (
-        (
-            "_detach_appended_context",
-            "function",
-            "(original: 'str', expanded: 'str') -> 'tuple[str, str]'",
-        ),
-        (
-            "_folder_steering_turn",
-            "function",
-            "(slot: 'Any', execution_context: 'Any', *, context_is_new: 'bool', provider_has_history: 'bool', needs_reinjection: 'bool') -> 'bool'",
-        ),
-        (
-            "_read_and_tighten_turn_execution",
-            "function",
-            "(conversation_log: 'Any', session_key: 'str', transcript_key: 'str | None' = None)",
-        ),
-        ("drain_pending_context", "function", "(slot: \"'_ChatSlot'\") -> 'str'"),
-    ),
-    "turn_marker": (
-        ("_LOCAL_TURN_OPENER_ROLES", "value", "frozenset"),
-        ("_LOCAL_TURN_PROMPT_META_KEYS", "value", "tuple"),
-        (
-            "_begin_local_turn_marker",
-            "async function",
-            "(state: 'DashboardState', slot: '_ChatSlot', generation: 'int') -> 'None'",
-        ),
-        (
-            "_clear_local_turn_marker",
-            "async function",
-            "(state: 'DashboardState', slot: '_ChatSlot', generation: 'int') -> 'None'",
-        ),
-        ("_gateway_shutdown_requested", "function", "(state: 'DashboardState') -> 'bool'"),
-        ("_local_turn_generation_for", "function", "(slot: '_ChatSlot') -> 'int'"),
-        (
-            "_local_turn_opening_row",
-            "function",
-            "(slot: '_ChatSlot') -> \"'dict[str, Any] | None'\"",
-        ),
-        (
-            "_retire_local_turn_marker",
-            "function",
-            "(slot: '_ChatSlot', generation: 'int') -> 'bool'",
-        ),
-    ),
-    "turn_stats": (
-        ("_FirstVisibleClock", "class", ""),
-        (
-            "_attach_turn_stats",
-            "function",
-            "(slot: \"'_ChatSlot'\", elapsed_ms: 'int', credits: 'float', cost_usd: 'float', turn_boundary: 'int' = 0, model: 'str' = '', ttft_ms: 'int' = 0) -> 'bool'",
-        ),
-        (
-            "_context_usage_payload",
-            "function",
-            "(slot_key: 'str', client: 'Any') -> 'dict[str, Any]'",
-        ),
-        (
-            "_turn_clock",
-            "function",
-            "(slot: \"'_ChatSlot'\", t0: 'float | None', *, top_level: 'bool', recovery_turn: 'bool') -> '_FirstVisibleClock'",
-        ),
-    ),
-}
-
 
 def _owner(stem: str) -> types.ModuleType:
     return importlib.import_module(f"{_OWNER_PACKAGE}.{stem}")
@@ -640,46 +365,12 @@ def _owner_sources() -> dict[str, str]:
 # ── the surface ───────────────────────────────────────────────────────────────
 
 
-def test_the_owner_set_is_the_package() -> None:
-    assert {info.name for info in pkgutil.iter_modules([str(_OWNER_DIR)])} == _OWNER_MODULES
-    assert set(_BASE_SURFACE) <= _OWNER_MODULES
-
-
 def test_every_name_the_runner_bound_at_the_base_still_resolves() -> None:
     """Callers, the ``dashboard.chat`` facade and tests read private names off the
     runner as well as public ones, so every module-level binding survives the
     split, not only the public surface."""
     assert len(_BASE_NAMES) > 600
     assert sorted(name for name in _BASE_NAMES if not hasattr(cr, name)) == []
-
-
-def _member(name: str) -> tuple[object, str]:
-    obj = getattr(cr, name)
-    if inspect.isclass(obj):
-        return obj, "class"
-    if inspect.isfunction(obj):
-        return obj, ("async " if inspect.iscoroutinefunction(obj) else "") + "function"
-    return obj, "value"
-
-
-@pytest.mark.parametrize(
-    ("owner", "name", "kind", "signature"),
-    [(owner, *row) for owner, rows in _BASE_SURFACE.items() for row in rows],
-    ids=[f"{owner}:{row[0]}" for owner, rows in _BASE_SURFACE.items() for row in rows],
-)
-def test_a_moved_name_keeps_its_base_shape_and_owner(
-    owner: str, name: str, kind: str, signature: str
-) -> None:
-    """Every name that moved keeps the kind and signature it had in the one-module
-    runner, lives in the owner its responsibility names, and is ONE object: the
-    runner attribute and the owner's are the same."""
-    obj, found_kind = _member(name)
-    assert found_kind == kind
-    if kind == "value":
-        assert type(obj).__name__ == signature
-    elif kind != "class":
-        assert str(inspect.signature(obj)) == signature  # type: ignore[arg-type]
-    assert getattr(_owner(owner), name) is obj
 
 
 def test_the_handler_seams_are_the_runner_objects() -> None:
@@ -713,29 +404,44 @@ def test_the_chat_facade_reexports_the_runner_objects() -> None:
     assert [name for name in names if getattr(chat, name) is not getattr(cr, name)] == []
 
 
-#: Functions that stay defined in ``dashboard/chat_runner.py``. The first five are
-#: the coroutines tasks are started with: ``stall_attribution`` names a stalled task
-#: by the outermost frame it can place, and a frame in that file is what reads as a
-#: dashboard chat turn. ``_arm_pending_reset_retry`` and ``_arm_synthesis_recheck``
-#: define the coroutines they start, ``_launch_synthesis`` starts the pending
-#: synthesis, and ``_finish_queue_cycle`` starts it and the title and summary passes,
-#: so each stays beside the tasks it creates.
-_RUNNER_FILE_DEFS = (
-    "_run_chat",
-    "_start_next_queued_turn",
-    "_run_pending_synthesis",
-    "_eager_spawn",
-    "_prefetch_ttl",
-    "_arm_pending_reset_retry",
-    "_arm_synthesis_recheck",
-    "_launch_synthesis",
-    "_finish_queue_cycle",
-)
+#: The file each coroutine a task is started with is defined in, and each function
+#: that starts one. ``stall_attribution`` names a stalled task by the outermost frame
+#: it can place, and it reads a frame in the runner or in a ``chat_turn`` owner as a
+#: dashboard chat turn, so an entry may live in either; the map pins each entry to its
+#: file, and the stall test below proves the reach for each. ``_run_chat``'s row is the
+#: exit guard's ``guarded`` (``_hands_off_queue_on_exit``), the coroutine every turn task
+#: runs; ``_arm_pending_reset_retry`` and ``_arm_synthesis_recheck`` define the coroutines
+#: they start, ``_launch_synthesis`` starts the pending synthesis, and
+#: ``_finish_queue_cycle`` starts it and the title and summary passes.
+_RUNNER_HOME = "dashboard/chat_runner.py"
+_TASK_ENTRY_HOMES: dict[str, str] = {
+    "_run_chat": _RUNNER_HOME,
+    "_start_next_queued_turn": "dashboard/chat_turn/queue_drain.py",
+    "_run_pending_synthesis": "dashboard/chat_turn/queue_cycle.py",
+    "_eager_spawn": "dashboard/chat_turn/eager_spawn.py",
+    "_prefetch_ttl": "dashboard/chat_turn/eager_spawn.py",
+    "_arm_pending_reset_retry": "dashboard/chat_turn/session_reset.py",
+    "_arm_synthesis_recheck": "dashboard/chat_turn/queue_cycle.py",
+    "_launch_synthesis": "dashboard/chat_turn/queue_cycle.py",
+    "_finish_queue_cycle": "dashboard/chat_turn/queue_cycle.py",
+}
 
 
-@pytest.mark.parametrize("name", _RUNNER_FILE_DEFS)
-def test_a_task_entry_stays_defined_in_the_runner_file(name: str) -> None:
-    assert Path(getattr(cr, name).__code__.co_filename).resolve() == _FACADE_PATH
+@pytest.mark.parametrize(("name", "home"), sorted(_TASK_ENTRY_HOMES.items()))
+def test_a_task_entry_is_defined_in_its_home_file(name: str, home: str) -> None:
+    home_path = (_SRC / "kiro_crew" / home).resolve()
+    assert Path(getattr(cr, name).__code__.co_filename).resolve() == home_path
+
+
+@pytest.mark.parametrize("name", sorted(_TASK_ENTRY_HOMES))
+def test_a_stalled_task_entry_reads_as_a_dashboard_chat_turn(name: str) -> None:
+    """Wherever an entry's home is, a stall whose outermost frame is that entry still
+    names the dashboard chat surface."""
+    from kiro_crew.stall_attribution import Frame, classify_surface
+
+    code = getattr(cr, name).__code__
+    frame = Frame(Path(code.co_filename).as_posix(), code.co_firstlineno, code.co_name)
+    assert classify_surface([frame]) == "dashboard chat"
 
 
 #: Owner phases cut from blocks of ``_run_chat`` and ``_start_next_queued_turn``
@@ -754,6 +460,17 @@ _AWAIT_FREE_PHASES = (
     "_requeue_auth_retry",
     "_requeue_after_prompt_busy",
     "_report_unclaimed_directives",
+    "_on_mcp_server_initialized",
+    "_on_mcp_server_init_failure",
+    "_on_todo_update",
+    "_on_subagent_list",
+    "_on_subagent_activity",
+    "_on_compaction_status",
+    "_on_clear_status",
+    "_on_steer_consumed",
+    "_turn_context_usage",
+    "_on_app_agent_not_loaded",
+    "_on_session_closing",
 )
 _SUSPENDING_OPS = frozenset(
     {"GET_AWAITABLE", "SEND", "YIELD_VALUE", "GET_AITER", "GET_ANEXT", "BEFORE_ASYNC_WITH"}
@@ -800,6 +517,8 @@ def test_run_chat_keeps_its_entry_signature() -> None:
         "_synthetic_recovery_turn",
         "_replays_completion",
         "_steer_possibly_delivered",
+        "_responsive_human",
+        "_responsive_protected",
         "_directive_user_origin",
         "_post_restart_continuation",
         "_peer_channel_request_refs",
@@ -873,16 +592,6 @@ def test_the_owners_log_as_the_runner() -> None:
 
 
 # ── one namespace ─────────────────────────────────────────────────────────────
-
-
-def test_the_owners_define_functions_for_the_sweeps_to_check() -> None:
-    """Every sweep below proves nothing unless it has functions to sweep."""
-    labels = {label for label, _ in _owner_functions()}
-    callables = sum(
-        kind.endswith("function") for rows in _BASE_SURFACE.values() for _, kind, _ in rows
-    )
-    assert len(labels) >= callables
-    assert {"recipient._resolve_channel_target", "steer_queue._drop_stale_admissions"} <= labels
 
 
 def test_every_owner_function_runs_on_the_runner_globals() -> None:
@@ -1546,62 +1255,200 @@ def test_no_owner_captures_a_name_tests_rebind_on_the_runner() -> None:
 
 # ── the path-keyed guards keep their reach ────────────────────────────────────
 
-#: Constructs repository guards enumerate in ``dashboard/chat_runner.py`` by path:
+#: Constructs repository guards enumerate by path, each with the files it lives in:
 #: redaction sinks and the redactor census, the deny chokepoints and the approve
 #: sites, the turn-ceiling, allocation, usage-row and turn-metric sites, the
 #: runtime-death attribution, the transcript-derivation plumbing, the hook gate, the
 #: agent-spec read registry, the slot.running reader map, the task entries, the
 #: stop classifier, the crew-log closers, the persona gate, the L1 budget resets, the
 #: memory-store seam's calls, the frame contract, the compaction-continuation and
-#: native question-card wiring, and the start-priority claimer calls. An owner that
+#: native question-card wiring, and the start-priority claimer calls. A file that
 #: grew one would move it out of such a guard's sight without failing it, so each
-#: stays in the runner.
-_STAYS_IN_THE_RUNNER = (
-    r"\b\w*redact\w*\(",
-    r"StreamRedactor",
-    r"\.reject_tool\(",
-    r"_reject_attributed\(",
-    r"\.approve_tool\(",
-    r"begin_turn\(",
-    r"get_or_create\(",
-    r"persist_token_record",
-    r"_emit_turn_metric\(",
-    r"caused_by_this_session",
-    r"note_shared_death",
-    r"clear_shared_deaths",
-    r"_acp_pipe_death_retries",
-    r"except AcpProcessDied",
-    r"\.recent\(",
-    r"warm_project_agent_names\(",
+#: pattern matches exactly the homes listed here, and a construct moves only together
+#: with its row and the guard that reads it.
+_GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
+    r"\b\w*redact\w*\(": (
+        _RUNNER_HOME,
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/claude_background.py",
+        "dashboard/chat_turn/deny_chokepoints.py",
+        "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/file_changes.py",
+        "dashboard/chat_turn/mcp_session.py",
+        "dashboard/chat_turn/model_fallback.py",
+        "dashboard/chat_turn/native_cards.py",
+        "dashboard/chat_turn/permission_prompt.py",
+        "dashboard/chat_turn/prompt_assembly.py",
+        "dashboard/chat_turn/queue_drain.py",
+        "dashboard/chat_turn/recipient.py",
+        "dashboard/chat_turn/segment_flush.py",
+        "dashboard/chat_turn/session_events.py",
+        "dashboard/chat_turn/slash_commands.py",
+        "dashboard/chat_turn/tool_approval.py",
+        "dashboard/chat_turn/tool_results.py",
+        "dashboard/chat_turn/tool_rows.py",
+        "dashboard/chat_turn/turn_admission.py",
+        "dashboard/chat_turn/turn_failures.py",
+        "dashboard/chat_turn/turn_ledgers.py",
+        "dashboard/chat_turn/turn_reply_seams.py",
+        "dashboard/chat_turn/turn_spec_hooks.py",
+        "dashboard/chat_turn/turn_stats.py",
+    ),
+    r"StreamRedactor": (
+        _RUNNER_HOME,
+        "dashboard/chat_turn/turn_entry.py",
+        "dashboard/chat_turn/turn_locals.py",
+    ),
+    r"\.reject_tool\(": ("dashboard/chat_turn/deny_chokepoints.py",),
+    r"_reject_attributed\(": (
+        "dashboard/chat_turn/deny_chokepoints.py",
+        "dashboard/chat_turn/permission_prompt.py",
+        "dashboard/chat_turn/tool_approval.py",
+    ),
+    r"\.approve_tool\(": (
+        "dashboard/chat_turn/permission_prompt.py",
+        "dashboard/chat_turn/tool_approval.py",
+    ),
+    r"begin_turn\(": (
+        "dashboard/chat_turn/turn_dispatch_gates.py",
+        "dashboard/chat_turn/turn_entry.py",
+    ),
+    r"get_or_create\(": (
+        "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/turn_admission.py",
+    ),
+    r"persist_token_record": (
+        _RUNNER_HOME,
+        "dashboard/chat_turn/turn_reply_seams.py",
+        "dashboard/chat_turn/turn_stats.py",
+    ),
+    r"_emit_turn_metric\(": ("dashboard/chat_turn/turn_stats.py",),
+    r"caused_by_this_session": (
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/stop_recovery.py",
+    ),
+    r"note_shared_death": (
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/stop_recovery.py",
+    ),
+    r"clear_shared_deaths": ("dashboard/chat_turn/stop_recovery.py",),
+    r"_acp_pipe_death_retries": (
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/recovery.py",
+        "dashboard/chat_turn/stop_recovery.py",
+    ),
+    r"except AcpProcessDied": (_RUNNER_HOME,),
+    # The dashboard turn is EXEMPT from the turn ceiling (test_turn_ceiling.py lists its
+    # begin_turn homes): no part of the turn composes the ceiling.
+    r"turn_ceiling\.gate\(": (),
+    # test_session_control_set_model.py orders the model pick before these two anchors in
+    # _turn_admit; each lives only in its homes, so the turn's own copy stays there.
+    r"await _consume_pending_reset\(state, slot\)": (
+        "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/session_reset.py",
+        "dashboard/chat_turn/turn_admission.py",
+    ),
+    r"_requested_model = slot\.model": (
+        "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/turn_admission.py",
+    ),
+    # test/metrics/test_context_trace.py orders the composition emit after the dispatch
+    # gates by line; the emit lives only beside those gates, in _turn_dispatch_gates.
+    r"on_context_composed\(": ("dashboard/chat_turn/turn_dispatch_gates.py",),
+    r"\.recent\(": ("dashboard/chat_turn/decisions_hooks.py",),
+    r"warm_project_agent_names\(": ("dashboard/chat_turn/turn_admission.py",),
     # The tool-gate consultation: the sync call, or the awaitable form a coroutine uses.
-    r"\.on_tool_call\(|run_in_tool_gate_pool\(\s*[\w.]+\.on_tool_call,",
-    r"spawn_guarded_turn\(",
-    r"create_task\(",
-    r"ensure_future\(",
-    r"\bslot\.task = ",
-    r"\.(?:turn_)?running\b",
-    r"is_claude_code\(",
-    r"capabilities_of\(",
-    r"classify_stop_reason\(",
-    r"notify_turn_complete\(",
-    r"on_tool_completed\(",
-    r"latch_crew_log_previous\(",
-    r"capabilities\.theme_persona",
-    r"(?m)^_CONTEXT_FRAME_CONTRACT\b",
-    r"slot\._infra_retries = 0",
-    r"slot\._transient_5xx_retries = 0",
-    r"\bmemory_store=",
-    r"compaction_settled=_compaction_completed,",
-    r"await _post_native_question_card\(",
-    r"\brun_bg_oneliner\(",
-)
+    r"\.on_tool_call\(|run_in_tool_gate_pool\(\s*[\w.]+\.on_tool_call,": (
+        "dashboard/chat_turn/tool_approval.py",
+    ),
+    r"spawn_guarded_turn\(": (
+        "dashboard/chat_turn/queue_cycle.py",
+        "dashboard/chat_turn/queue_drain.py",
+    ),
+    r"create_task\(": (
+        _RUNNER_HOME,
+        "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/queue_cycle.py",
+        "dashboard/chat_turn/queue_drain.py",
+        "dashboard/chat_turn/segment_flush.py",
+        "dashboard/chat_turn/session_events.py",
+        "dashboard/chat_turn/session_reset.py",
+    ),
+    r"ensure_future\(": (
+        "dashboard/chat_turn/file_changes.py",
+        "dashboard/chat_turn/queue_cycle.py",
+        "dashboard/chat_turn/queue_drain.py",
+    ),
+    r"\bslot\.task = ": (
+        "dashboard/chat_turn/queue_cycle.py",
+        "dashboard/chat_turn/queue_drain.py",
+    ),
+    r"\.(?:turn_)?running\b": (
+        "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/queue_cycle.py",
+        "dashboard/chat_turn/session_reset.py",
+    ),
+    r"is_claude_code\(": (
+        "dashboard/chat_turn/model_fallback.py",
+        "dashboard/chat_turn/slash_commands.py",
+    ),
+    r"capabilities_of\(": (
+        _RUNNER_HOME,
+        "dashboard/chat_turn/model_fallback.py",
+        "dashboard/chat_turn/slash_commands.py",
+        "dashboard/chat_turn/tool_rows.py",
+        "dashboard/chat_turn/turn_admission.py",
+        "dashboard/chat_turn/turn_spec_hooks.py",
+        "dashboard/chat_turn/turn_stats.py",
+    ),
+    r"classify_stop_reason\(": (
+        "dashboard/chat_turn/turn_dispatch_gates.py",
+        "dashboard/chat_turn/turn_stats.py",
+    ),
+    r"notify_turn_complete\(": ("dashboard/chat_turn/queue_cycle.py",),
+    r"on_tool_completed\(": ("dashboard/chat_turn/tool_results.py",),
+    r"latch_crew_log_previous\(": (
+        "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/turn_admission.py",
+    ),
+    r"capabilities\.theme_persona": ("dashboard/chat_turn/prompt_assembly.py",),
+    r"(?m)^_CONTEXT_FRAME_CONTRACT\b": (_RUNNER_HOME,),
+    r"slot\._infra_retries = 0": (
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/stop_recovery.py",
+        "dashboard/chat_turn/turn_failures.py",
+    ),
+    r"slot\._transient_5xx_retries = 0": (
+        "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/stop_recovery.py",
+        "dashboard/chat_turn/turn_failures.py",
+    ),
+    r"\bmemory_store=": (
+        _RUNNER_HOME,
+        "dashboard/chat_turn/prompt_assembly.py",
+        "dashboard/chat_turn/turn_admission.py",
+    ),
+    r"compaction_settled=_compaction_completed,": ("dashboard/chat_turn/segment_flush.py",),
+    r"await _post_native_question_card\(": ("dashboard/chat_turn/tool_rows.py",),
+    r"\brun_bg_oneliner\(": ("dashboard/chat_turn/turn_failures.py",),
+}
 
 
-@pytest.mark.parametrize("pattern", _STAYS_IN_THE_RUNNER)
-def test_a_construct_the_runner_guards_count_stays_in_the_runner(pattern: str) -> None:
-    assert re.search(pattern, _FACADE_PATH.read_text(encoding="utf-8"))
-    holders = [stem for stem, source in _owner_sources().items() if re.search(pattern, source)]
-    assert holders == []
+def _turn_texts() -> dict[str, str]:
+    """The runner's and every owner's source, keyed by path under ``kiro_crew``."""
+    texts = {_RUNNER_HOME: _FACADE_PATH.read_text(encoding="utf-8")}
+    texts.update(
+        {f"dashboard/chat_turn/{stem}.py": source for stem, source in _owner_sources().items()}
+    )
+    return texts
+
+
+@pytest.mark.parametrize(("pattern", "homes"), sorted(_GUARDED_CONSTRUCT_HOMES.items()))
+def test_a_construct_guards_count_lives_only_in_its_homes(
+    pattern: str, homes: tuple[str, ...]
+) -> None:
+    holders = sorted(path for path, text in _turn_texts().items() if re.search(pattern, text))
+    assert holders == sorted(homes)
 
 
 def test_a_stalled_owner_frame_still_reads_as_a_dashboard_chat_turn() -> None:

@@ -39,13 +39,13 @@ name. ``config_dir()`` and ``data_home()`` resolve to the SAME directory, so a
 * ``mcp.json`` -> ``<data home>/mcp.json``. The Kiro Crew-scope MCP config is
   ``data_home()/"mcp.json"`` -- the highest-priority source in
   ``mcp_discovery._mcp_sources`` (``mcp_discovery.py:297``,
-  ``SCOPE_KIROCREW``) and what ``dashboard/handlers/mcp.py:1620``
+  ``SCOPE_KIROCREW``) and what ``dashboard/handlers/mcp_config_files.py``
   (``_kirocrew_mcp_json`` -> ``data_home()/"mcp.json"``) reads for its
-  ``mcpServers`` (``:704``).
+  ``mcpServers`` (``mcp_probe.py`` ``_kirocrew_mcp_servers``).
 
-* ``skills/`` -> ``<data home>/skills/``. ``skills.py:1422`` ``skills_dir()`` is
+* ``skills/`` -> ``<data home>/skills/``. ``skills_discovery.py`` ``skills_dir()`` is
   ``config_dir() / SKILLS_DIR_NAME`` and ``SKILLS_DIR_NAME == "skills"``
-  (``skills.py:49``); ``config_dir()`` (``config/paths.py:265``) honours
+  (``skills_discovery.py``); ``config_dir()`` (``config/paths.py:265``) honours
   ``KIROCREW_HOME``, so in the container this is ``<data home>/skills``.
 
 THE DIGEST is recomputed here byte-identically to the producer

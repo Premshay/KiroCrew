@@ -55,11 +55,13 @@ def _reset_catalog_cache():
     agents._catalog_cache.models = None
     agents._catalog_cache.fetched_at = 0.0
     agents._catalog_cache.task = None
+    agents._catalog_cache.failure = None
     yield
     _drain_catalog_task()
     agents._catalog_cache.models = None
     agents._catalog_cache.fetched_at = 0.0
     agents._catalog_cache.task = None
+    agents._catalog_cache.failure = None
 
 
 async def _no_audit(**kwargs: Any) -> None:
@@ -162,7 +164,7 @@ def test_list_models_timeout_returns_503(tmp_path):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
     # The timeout branch itself answered, not the generic exception handler.
-    assert _body(resp) == {"error": "model list timed out"}
+    assert _body(resp) == {"error": "model list timed out", "code": "model_list_unavailable"}
 
 
 def test_list_models_nonzero_exit_returns_503(tmp_path):
@@ -180,7 +182,7 @@ def test_list_models_nonzero_exit_returns_503(tmp_path):
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert _body(resp) == {"error": "model list command failed"}
+    assert _body(resp) == {"error": "model list command failed", "code": "model_list_unavailable"}
 
 
 def test_list_models_empty_stdout_returns_503(tmp_path):
@@ -197,7 +199,10 @@ def test_list_models_empty_stdout_returns_503(tmp_path):
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert _body(resp) == {"error": "model list returned empty output"}
+    assert _body(resp) == {
+        "error": "model list returned empty output",
+        "code": "model_list_unavailable",
+    }
 
 
 def test_list_models_invalid_json_returns_503(tmp_path):
@@ -214,7 +219,10 @@ def test_list_models_invalid_json_returns_503(tmp_path):
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert _body(resp) == {"error": "model list returned invalid JSON"}
+    assert _body(resp) == {
+        "error": "model list returned invalid JSON",
+        "code": "model_list_unavailable",
+    }
 
 
 def test_list_models_invalid_payload_returns_503(tmp_path):
@@ -232,7 +240,10 @@ def test_list_models_invalid_payload_returns_503(tmp_path):
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert _body(resp) == {"error": "model list returned an invalid payload"}
+    assert _body(resp) == {
+        "error": "model list returned an invalid payload",
+        "code": "model_list_unavailable",
+    }
 
 
 def test_unexpected_exception_returns_503(tmp_path):

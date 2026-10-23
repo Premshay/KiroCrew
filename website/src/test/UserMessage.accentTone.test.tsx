@@ -15,16 +15,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render } from '@testing-library/react'
 import React from 'react'
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
 import UserMessage from '../pages/chat/UserMessage'
 import { mergeRenderers, resolveRenderer, type MessageRenderContext } from '../app-sdk/messageRenderers'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import type { ChatMessage } from '../types'
+import { readIndexCss } from './indexCssSource'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const INDEX_CSS = readFileSync(resolve(HERE, '..', 'index.css'), 'utf8')
+const INDEX_CSS = readIndexCss()
 
 const bubbleOf = (container: HTMLElement) => container.querySelector('.message-bubble.msg-content') as HTMLElement
 
@@ -85,14 +82,21 @@ describe('UserMessage tone', () => {
   })
 })
 
-describe("the crewmate chat's user entry", () => {
-  it('turns the accent tone on, and only when a crewmate is drawn', () => {
+describe("the mate chat's user entry", () => {
+  it('turns the accent tone on, and only when a mate is drawn', () => {
     const crewmate = { name: 'kirocrew-radar', label: 'Radar' }
-    const withCrewmate = mergeRenderers(createTranscriptRenderers({ slot: 's1', hideSteerBadge: true, crewmate, crewmateTranscript: [userRow] }))
+    // Built the way ChatPane builds it for the Members page: `crewmate` set,
+    // `hideSteerBadge` NOT set (the page runs the split busy mode since
+    // #16684). The fill must not depend on the badge flag (#18361).
+    const withCrewmate = mergeRenderers(createTranscriptRenderers({ slot: 's1', crewmate, crewmateTranscript: () => [userRow] }))
     const entry = resolveRenderer(userRow, withCrewmate)!
     expect(entry.id).toBe('user')
     const { container } = render(<>{entry.render(userRow, ctx({ messages: [userRow] }))}</>)
     expect(bubbleOf(container).classList.contains('user-bubble-accent')).toBe(true)
+    // A crewmate hides the mechanics even for historical metadata.
+    const steered = { ...userRow, meta: { steer: true, steerState: 'settled' } } as typeof userRow
+    const steeredView = render(<>{entry.render(steered, ctx({ messages: [steered] }))}</>)
+    expect(steeredView.container.textContent).not.toMatch(/Steered/)
 
     // The steer badge hidden on its own (no crewmate) is not the iMessage pairing.
     const badgeOnly = mergeRenderers(createTranscriptRenderers({ slot: 's1', hideSteerBadge: true }))
@@ -103,7 +107,7 @@ describe("the crewmate chat's user entry", () => {
 })
 
 describe('the index.css hook', () => {
-  it('scopes the crewmate bubble\'s nested surfaces one step off its --bg-hover fill', () => {
+  it('scopes the mate bubble\'s nested surfaces one step off its --bg-hover fill', () => {
     // Kiro-light paints inline code with var(--bg-hover), the fill itself; `hover:bg-bg-hover`
     // controls do the same. Without this scope they vanish inside the bubble (Design review on #17918).
     expect(INDEX_CSS).toMatch(/:has\(>\.message-bubble\.crewmate-bubble\)\{--crewmate-fill:var\(--bg-hover\)\}/)

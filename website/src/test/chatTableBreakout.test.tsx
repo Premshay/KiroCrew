@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { useRef } from 'react'
@@ -8,13 +8,28 @@ import ChatMessageList from '../app-sdk/ChatMessageList'
 import AssistantMessage from '../pages/chat/AssistantMessage'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import TranscriptScrollShell, { PANE_WIDTH_PROPERTY } from '../pages/chat/TranscriptScrollShell'
+import { readIndexCss } from './indexCssSource'
 
 const TABLE = '| Signal | Value |\n| --- | --- |\n| `sample.daily.messages` | 42 |'
 // The CSS matches the renderer's stable root wrapper, not all descendant
 // tables: nested list/quote tables and formatted code cards must stay local.
 const TABLE_SELECTOR = '[data-role="assistant"] > .message-bubble:not([data-bordered]) > [data-image-scope] > div > .markdown-table'
 const here = dirname(fileURLToPath(import.meta.url))
-const css = readFileSync(resolve(here, '../index.css'), 'utf8')
+const css = readIndexCss()
+
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
+// so the pins read the page and those owners.
+function chatPageSource(): string {
+  const pages = resolve(here, '../pages')
+  const owners = resolve(pages, 'chat', 'page')
+  return [
+    readFileSync(resolve(pages, 'ChatPage.tsx'), 'utf8'),
+    ...readdirSync(owners).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+      .map(f => readFileSync(resolve(owners, f), 'utf8')),
+    ...readdirSync(pages).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort()
+      .map(f => readFileSync(resolve(pages, f), 'utf8')),
+  ].join('\n')
+}
 
 describe('transcript table breakout contract', () => {
   it('matches top-level tables through the actual shared message renderer', () => {
@@ -74,7 +89,7 @@ describe('transcript table breakout contract', () => {
   it('matches the main-page assistant without depending on the SDK extra wrapper', () => {
     const { container } = render(<div className="chat-message-body"><AssistantMessage content={TABLE} isStreaming={false} /></div>)
     expect(container.querySelector(`.chat-message-body:has(${TABLE_SELECTOR})`)).not.toBeNull()
-    const main = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
+    const main = chatPageSource()
     expect(main).toContain('chat-message-body flex flex-col gap-0.5 min-w-0 overflow-hidden max-w-full')
   })
 
@@ -125,7 +140,7 @@ describe('transcript table breakout contract', () => {
     expect(container.querySelector(TABLE_SELECTOR)).toBeNull()
   })
 
-  it('keeps a bordered (crewmate) bubble\'s table inside its card', () => {
+  it('keeps a bordered (mate) bubble\'s table inside its card', () => {
     // A crewmate's chat draws the reply as a bordered card via bubbleClassName;
     // a table breaking out of it paints past the card's edges.
     const { container } = render(<div className="chat-message-body"><AssistantMessage content={TABLE} isStreaming={false} bubbleClassName="bg-card border" /></div>)
@@ -213,7 +228,7 @@ describe('transcript scroll shell pane width', () => {
 })
 
 it('colon-scopes chat heights by width without changing scroll-anchor identity', () => {
-  const main = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
+  const main = chatPageSource()
   const shared = readFileSync(resolve(here, '../chat-core/transcript/VirtualTranscript.tsx'), 'utf8')
   for (const host of [main, shared]) {
     // Colon-delimited: storageGc attributes `vc_heights_<scope>` to the session

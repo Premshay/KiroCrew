@@ -812,7 +812,7 @@ class LaunchTools:
     platform_compat: ModuleType
     agent_scratch: ModuleType
     apply_pod_bundle_spawn: Callable[..., tuple[list[str], bool]]
-    forward_ssh_auth_sock: Callable[[], bool]
+    forward_ssh_auth_sock: Callable[[str, tuple[str, ...]], bool]
     wrap_argv_async: Callable[..., Awaitable[tuple[list[str], str | None]]]
     wrap_argv: Callable[..., Any]
     wrapped_by_crew_sandbox: Callable[[Sequence[str]], bool]
@@ -826,6 +826,20 @@ class LaunchTools:
     bind_voice_safe_agent_workspace_async: Callable[[Any], Awaitable[tuple[str, int | None]]]
     create_subprocess_limited: Callable[..., Awaitable[asyncio.subprocess.Process]]
     retrying_spawn_factory: Callable[..., Awaitable[asyncio.subprocess.Process]] | None = None
+    #: ``agent.env`` (``acp.agent_env.agent_env_overlay``); blocking, run off-loop.
+    agent_env_overlay: Callable[[], dict[str, str]] = field(default=dict)
+    #: ``sandbox.remember_namespace_launcher``; non-blocking ``/proc`` reads, never raises.
+    remember_namespace_launcher: Callable[[int, Sequence[str], str | None], None] = field(
+        default_factory=lambda: _remember_namespace_launcher
+    )
+
+
+def _remember_namespace_launcher(
+    pid: int, wrapped_argv: Sequence[str], launcher_script: str | None
+) -> None:
+    from kiro_crew.sandbox import remember_namespace_launcher
+
+    remember_namespace_launcher(pid, wrapped_argv, launcher_script)
 
 
 def _unscoped(argv: list[str]) -> tuple[list[str], str]:
@@ -871,6 +885,10 @@ class LaunchRequest:
     env_after_marker: Callable[[dict[str, str]], None] = field(default=_no_env_step)
     env_after_scratch: Callable[[dict[str, str]], None] = field(default=_no_env_step)
     scope_argv: Callable[[list[str]], tuple[list[str], str]] = field(default=_unscoped)
+    #: ``agent.env`` as the driver already read it for this spawn, or ``None`` to
+    #: read it here. A driver whose harness verifies its config before the spawn
+    #: passes the snapshot that verification used, so both see the same values.
+    agent_env: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -879,6 +897,83 @@ class LaunchedProcess:
 
     process: asyncio.subprocess.Process
     scope_unit: str = ""
+
+
+def _well_formed_port(value: str) -> bool:
+    """1-5 ASCII decimal digits naming a port in 1..65535 (the KAS projection's gate)."""
+    return 1 <= len(value) <= 5 and value.isascii() and value.isdecimal() and 0 < int(value) < 65536
+
+
+def drop_foreign_inherited_port(env: dict[str, str]) -> None:
+    """Remove an inherited ``KIROCREW_PORT`` that names a gateway other than this one.
+
+    A gateway started from a shell that already exports ``KIROCREW_PORT`` (an
+    agent shell of ANOTHER gateway carries one) keeps that value in its own
+    environment beside the ``KIROCREW_BOUND_PORT`` its listener exports
+    (``dashboard.server_runtime.listener._export_bound_port``). Every child it
+    spawns -- the agent CLI and the managed MCP servers that CLI starts --
+    inherits both, and ``port_resolution.resolve_client_port_src`` reads
+    ``KIROCREW_PORT`` first. The child then dials the OTHER gateway with THIS
+    gateway's credential and every tool call fails ``internal_auth_mismatch``.
+
+    Dropping the foreign value, rather than overwriting it with the bound port,
+    is deliberate: the listener keeps the two variables apart so the transient
+    bound port is never written under the operator-intent name (which
+    ``service_environment()`` would bake into a unit file), and nothing here is
+    persisted -- it shapes one child's environment at spawn time. With the
+    foreign value gone the child's chain falls to ``KIROCREW_BOUND_PORT``, the
+    gateway that spawned it.
+
+    A no-op when no well-formed bound port is exported (nothing to prove the
+    inherited value foreign) or when the inherited value already equals it (the
+    operator's own ``KIROCREW_PORT`` that this gateway bound). Mutates *env*.
+    """
+    bound = env.get("KIROCREW_BOUND_PORT", "")
+    if not _well_formed_port(bound):
+        return
+    inherited = env.get("KIROCREW_PORT")
+    if inherited is None:
+        return
+    value = inherited.strip()
+    if value.isascii() and value.isdecimal() and int(value) == int(bound):
+        return
+    env.pop("KIROCREW_PORT", None)
+
+
+def process_directory(host: LaunchHost) -> tuple[str, int | None]:
+    """The directory the host process is created in, and the descriptor that enters it.
+
+    An app agent's launch copy on kiro-cli must START in its empty, read-only launch
+    directory (``apps.agent_launch.launch_process_cwd``): kiro-cli takes project agents
+    from its process directory, so no checkout spec is read, while its sessions still
+    name ``host._work_dir``. Crew's Linux launcher enters that directory itself, after
+    its seals (:func:`exec_cwd_options`), so it is created in the workspace like any
+    other host: a process created inside the directory would keep the writable mount
+    under the seal, and the launcher's hardlinked-credential scan walks the directory it
+    was created in. Every other launch copy spawn (no Crew launcher) is created in the
+    directory directly. Every other host starts in its workspace.
+    """
+    process_cwd = getattr(host, "_launch_process_cwd", "")
+    if process_cwd and not _launcher_enters_exec_cwd(host):
+        return process_cwd, None
+    return host._spawn_work_dir, host._bound_workspace_fd
+
+
+def exec_cwd_options(host: LaunchHost) -> dict[str, str]:
+    """The sandbox wrap's ``exec_cwd`` for a launch copy, as keyword arguments."""
+    process_cwd = getattr(host, "_launch_process_cwd", "")
+    return {"exec_cwd": process_cwd} if process_cwd else {}
+
+
+def _launcher_enters_exec_cwd(host: LaunchHost) -> bool:
+    """Whether the wrap put the spawn behind Crew's Linux launcher, which takes ``exec_cwd``.
+
+    Read off the wrap's own record (``_sandbox_wrapped_by_crew``): on Linux Crew's only
+    wrapper is that launcher. Crew's macOS Seatbelt wrap takes no working directory.
+    """
+    return bool(getattr(host, "_sandbox_wrapped_by_crew", False)) and sys.platform.startswith(
+        "linux"
+    )
 
 
 async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -> LaunchedProcess:
@@ -948,12 +1043,17 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
         )
     if host._shared_scratch is not None:
         scratch_window = (*scratch_window, str(host._shared_scratch))
-    # Resolve the SSH_AUTH_SOCK forward opt-in OFF the event loop (the config
-    # load may stat/read config) ONCE, then pass the resolved boolean into both
-    # the sandbox wrap below and the parent-side scrub further down, so neither
-    # reads config synchronously on the loop. Scoped to this agent spawn:
-    # generic launchers default the flag off and keep scrubbing the socket.
-    forward_ssh_auth_sock = await asyncio.to_thread(tools.forward_ssh_auth_sock)
+    # Resolve the SSH_AUTH_SOCK forward OFF the event loop (the governance
+    # floor and the consent leaf are filesystem reads) ONCE, then pass the
+    # resolved boolean into both the sandbox wrap below and the parent-side
+    # scrub further down, so neither reads config synchronously on the loop.
+    # The tier and this spawn's credential mask decide whether ~/.ssh is
+    # readable to the child, which is what makes the forward a default rather
+    # than a consent. Scoped to this agent spawn: generic launchers default the
+    # flag off and keep scrubbing the socket.
+    forward_ssh_auth_sock = await asyncio.to_thread(
+        tools.forward_ssh_auth_sock, request.sandbox_mode, tuple(request.extra_hidden_dirs)
+    )
     argv, host._sandbox_cleanup = await tools.wrap_argv_async(
         argv,
         mode=request.sandbox_mode,
@@ -965,6 +1065,7 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
         extra_hidden_dirs=request.extra_hidden_dirs,
         extra_private_dirs=scratch_window,
         extra_expose_files=request.extra_expose_files,
+        **exec_cwd_options(host),
         is_kiro_cli=delegate_internal_sandbox,
         _prepare=tools.wrap_argv,
     )
@@ -975,6 +1076,7 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
     # refusal has to name the layer to turn off; the cgroup scope below prepends
     # its own tokens, so the read happens before it.
     host._sandbox_wrapped_by_crew = tools.wrapped_by_crew_sandbox(argv)
+    sandbox_wrapped_argv = tuple(argv)
     host._sandbox_hidden_dirs = tuple(request.extra_hidden_dirs)
     # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server / tool
     # descendants with pids.max (fork bomb) + memory.max (RSS balloon). No-op +
@@ -987,6 +1089,18 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
     argv, scope_unit = request.scope_argv(argv)
 
     env = {**os.environ}
+    # Before any configured layer: only the INHERITED value can be foreign.
+    drop_foreign_inherited_port(env)
+    # ``agent.env``: the operator's variables for everything the agent runs, over
+    # the inherited gateway environment and under everything below -- the
+    # driver's ``extra_env``, its session identity and credential repair, and the
+    # scrub, which still removes any denied name. Off-loop (reads config);
+    # guarded because the sandbox launcher above is live. A driver that already
+    # read it for this spawn hands that snapshot over instead.
+    if request.agent_env is not None:
+        env.update(request.agent_env)
+    else:
+        env.update(await host._to_thread_guarding_sandbox(tools.agent_env_overlay))
     if request.extra_env:
         env.update(request.extra_env)
     env["PATH"] = tools.augmented_path(env.get("PATH", ""))
@@ -1063,7 +1177,7 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=host._spawn_work_dir,
+        cwd=process_directory(host)[0],
         limit=_STDOUT_BUFFER_LIMIT,
         env=env,
         start_new_session=tools.platform_compat.IS_POSIX,
@@ -1076,7 +1190,7 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
         # workspace through this verified descriptor instead of resolving
         # ``cwd``'s pathname, which a same-UID symlink retarget could aim elsewhere
         # in between; ``cwd`` stays the same directory by name.
-        chdir_fd=host._bound_workspace_fd,
+        chdir_fd=process_directory(host)[1],
         profile=RLIMIT_PROFILE_SESSION_HOST,
     )
     if tools.retrying_spawn_factory is not None:
@@ -1087,4 +1201,9 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
         await host._discard_bound_workspace()
         host._discard_sandbox_cleanup()
         raise
+    # The live-agent confinement check trusts a namespace launcher only from this
+    # record: the launcher stays in the host namespaces by design, so its command
+    # line cannot be what proves Crew started it. The recorder checks the wrap's
+    # own argv against the launcher script the wrap generated.
+    tools.remember_namespace_launcher(process.pid, sandbox_wrapped_argv, host._sandbox_cleanup)
     return LaunchedProcess(process=process, scope_unit=scope_unit)

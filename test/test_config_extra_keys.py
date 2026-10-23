@@ -10,6 +10,7 @@ kind. See ``KiroCrewConfig._extra_keys`` and
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 
 import pytest
@@ -269,6 +270,55 @@ def test_retired_keys_are_purged_not_preserved(cfg_home):
         assert dead not in written
     # The live setting sharing the section is untouched.
     assert written["language_code"] == "fr-FR"
+
+
+_RETIRED_KNOWLEDGE_KEYS = (
+    "auto_discover_folder",
+    "auto_discover_dirname",
+    "auto_ingest_chunk_budget",
+    "auto_register_project_docs",
+    "max_sources",
+)
+
+
+def test_the_retired_knowledge_chunk_budget_is_purged_not_mistaken_for_a_typo(cfg_home, caplog):
+    """auto_discover_folder, auto_discover_dirname, auto_ingest_chunk_budget,
+    auto_register_project_docs and max_sources all configured the automatic folder-registration paths, which are gone. None is a
+    rename of a surviving field, so each must be dropped on save rather than
+    preserved -- and auto_ingest_chunk_budget must not be offered the unrelated
+    folder_ingest_chunk_budget as a close-match correction."""
+    _write(
+        cfg_home,
+        {
+            "knowledge": {
+                "auto_discover_folder": False,
+                "auto_discover_dirname": "knowledge-docs",
+                "auto_ingest_chunk_budget": 150,
+                "auto_register_project_docs": True,
+                "max_sources": 50,
+                "folder_ingest_chunk_budget": 250,
+            }
+        },
+    )
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+        cfg = KiroCrewConfig.load()
+
+    assert "knowledge" not in cfg._extra_keys
+    # No retired key resembles the live folder budget: no misspelling warning.
+    assert not any(k in w for w in _misspelling_warnings(caplog) for k in _RETIRED_KNOWLEDGE_KEYS)
+
+    written = cfg.to_dict()["knowledge"]
+    for dead in _RETIRED_KNOWLEDGE_KEYS:
+        assert dead not in written
+    # The live setting that shares the section round-trips untouched.
+    assert cfg.knowledge.folder_ingest_chunk_budget == 250
+    assert written["folder_ingest_chunk_budget"] == 250
+    # diagnose_settings reads the same to_dict(), so no retired key shows up there.
+    from kiro_crew.dashboard.change_cards import non_default_settings
+
+    diagnosed = {row["key"] for row in non_default_settings()}
+    assert not diagnosed & {f"knowledge.{k}" for k in _RETIRED_KNOWLEDGE_KEYS}
+    assert "knowledge.folder_ingest_chunk_budget" in diagnosed
 
 
 def test_the_retired_conductor_skill_flag_is_purged(cfg_home):
@@ -634,3 +684,71 @@ def test_an_overlay_shadowed_unknown_section_keeps_its_base_values(cfg_home, tmp
 
     after = json.loads(cfg_home.read_text(encoding="utf-8"))
     assert after["amazon"] == {"flags": "-o -s", "keep": 1}
+
+
+# ── A key that looks like a misspelled field is reported ───────────────────
+
+_MISSPELLING_WARNING = "unrecognized keys inside known sections"
+
+
+def _misspelling_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and _MISSPELLING_WARNING in r.getMessage()
+    ]
+
+
+def test_a_misspelled_section_key_is_reported_with_the_field_it_resembles(cfg_home, caplog):
+    default_timeout = KiroCrewConfig().agent.subagent_timeout_secs
+    _write(cfg_home, {"agent": {"subagent_timeout_sec": default_timeout + 777}})
+
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+        cfg = KiroCrewConfig.load()
+
+    (warning,) = _misspelling_warnings(caplog)
+    assert "agent.subagent_timeout_sec (did you mean agent.subagent_timeout_secs?)" in warning
+    # The typo has no effect, and it is still kept for the round-trip.
+    assert cfg.agent.subagent_timeout_secs == default_timeout
+    assert cfg._extra_keys["agent"] == {"subagent_timeout_sec": default_timeout + 777}
+
+
+def test_the_misspelling_warning_fires_once_per_disk_read(cfg_home, caplog):
+    _write(cfg_home, {"agent": {"subagent_timeout_sec": 1}})
+    KiroCrewConfig.load()  # may rewrite the file (write-back migration)
+    KiroCrewConfig.load()  # reads the settled file and caches it
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+        KiroCrewConfig.load()  # unchanged file: a cache hit, no warning
+        assert _misspelling_warnings(caplog) == []
+        _write(cfg_home, {"agent": {"subagent_timeout_sec": 22}})
+        KiroCrewConfig.load()  # a changed file is read again, and reported again
+    assert len(_misspelling_warnings(caplog)) == 1
+
+
+def test_an_unknown_key_with_no_close_field_is_not_reported(cfg_home, caplog):
+    _write(cfg_home, {"agent": {"provider": "acp", "retired_knob": "keep-me"}})
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+        cfg = KiroCrewConfig.load()
+    assert _misspelling_warnings(caplog) == []
+    assert cfg._extra_keys["agent"] == {"retired_knob": "keep-me"}
+
+
+def test_a_misspelling_in_the_overlay_is_reported(cfg_home, tmp_path, caplog):
+    _write(cfg_home, {"agent": {"provider": "acp"}})
+    (tmp_path / "config.local.json").write_text(
+        json.dumps({"agent": {"subagent_timeout_sec": 5}}), encoding="utf-8"
+    )
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+        KiroCrewConfig.load()
+    (warning,) = _misspelling_warnings(caplog)
+    assert "agent.subagent_timeout_sec" in warning
+
+
+def test_a_misspelled_key_inside_a_named_record_is_reported(cfg_home, caplog):
+    _write(cfg_home, {"agents": {"my-agent": {"model": "auto", "modle": "opus"}}})
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+        cfg = KiroCrewConfig.load()
+    (warning,) = _misspelling_warnings(caplog)
+    assert "agents.my-agent.modle (did you mean agents.my-agent.model?)" in warning
+    assert cfg._extra_keys["agents"] == {"my-agent": {"modle": "opus"}}

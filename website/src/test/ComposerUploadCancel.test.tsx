@@ -169,7 +169,8 @@ function pasteImage(input: HTMLElement, name = 'pasted.png') {
   })
 }
 
-const cancelControl = () => screen.queryByRole('button', { name: 'Cancel upload' })
+// Either label: singular for one upload, counted once two or more are live (#13071).
+const cancelControl = () => screen.queryByRole('button', { name: /^Cancel (\d+ uploads|upload)$/ })
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -201,7 +202,7 @@ describe.each([
     // the user-visible half of the fix: the control disappears with the spinner.
     await waitFor(() => expect(cancelControl()).not.toBeInTheDocument())
     // A cancel the user asked for is not an upload failure.
-    expect(screen.queryByText(/max 50 MB/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/max \d+ MB/)).not.toBeInTheDocument()
     expect(screen.queryByText(/Upload failed/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/aborted/i)).not.toBeInTheDocument()
   })
@@ -239,6 +240,8 @@ describe('ChatPage composer: what the cancel control speaks for (#5744)', () => 
     await act(async () => { pasteImage(screen.getByLabelText('Message input')) })
     await waitFor(() => expect(api.uploadFiles).toHaveBeenCalledTimes(2))
     expect(signals).toHaveLength(2)
+    // One press ends both, so the label must say so rather than claim one.
+    await waitFor(() => expect(cancelControl()).toHaveAccessibleName('Cancel 2 uploads'))
 
     await act(async () => { fireEvent.click(cancelControl()!) })
 

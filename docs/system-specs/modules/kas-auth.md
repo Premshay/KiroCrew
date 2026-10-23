@@ -19,8 +19,11 @@
 > before, an API-key sign-in included: that cli-owned relay is handed `KIRO_API_KEY`
 > like the kiro backend, while a Crew-owned relay has it stripped because the engine
 > prefers an environment key over the callback (`KasHarness.apply_spawn_env`,
-> `cli_owned_auth`). kiro-cli remains the ACP service either way; Crew never spawns the KAS
-> bundle itself.
+> `cli_owned_auth`). On the relay route kiro-cli remains the ACP service either way.
+> On the bundle route (`agent.kas_bundle`, [acp-client.md](acp-client.md) § KAS bundle
+> route) Crew spawns its own installed engine and is the auth owner unconditionally:
+> the callback always reaches Crew, and there is no `--auth-method cli` to fall back
+> to.
 
 ## Why this exists
 
@@ -226,6 +229,23 @@ cross-process lock** (mirror kiro-cli's `refresh_coordinator`) so concurrent ses
 don't stampede the refresh endpoint; re-read the store inside the lock and skip the
 HTTP call if a peer already refreshed.
 
+Two callers renew a stored identity, both through `auth/refresh.ensure_fresh`, so
+the lock above orders them: the engine's `_kiro/auth/getAccessToken` callback
+(`KasAuthProvider.current`), and a gateway tick
+(`dashboard/sign_in_refresher.run_sign_in_refresher`, started beside the
+stale-asset watchdog) that sleeps until the highest-priority stored identity
+enters the margin and renews it then, so the stored expiry the sign-in card and
+`kirocrew doctor` read does not freeze while no agent turn runs. The
+tick never renews a token outside the margin, does not retry while the
+refresh-rejected marker stands (a new sign-in clears it), backs off from 30s to
+5min on a transient failure, and does not import `kiro_crew.auth` until the vault
+file exists. It renews while the gateway is idle too, so a refused renewal
+surfaces without waiting for a chat turn. Each renewal request is capped at
+8s, and gateway shutdown waits up to 9s (alongside, and inside, the graceful
+shutdown budget) for an in-flight renewal to finish
+(`drain_sign_in_refresher`), so a rotated refresh token is persisted rather
+than consumed at the issuer and lost to the hard exit.
+
 ## Storage
 
 Context: kiro-cli does **not** encrypt its tokens — they live plaintext in a SQLite
@@ -302,6 +322,13 @@ access token.
   existing credential-redaction floor).
 - The child process running any browser-open MUST bind the callback listener to
   `127.0.0.1` only.
+- The loopback sign-in listener (`auth/login/portal.py:bind_allowed_port`) claims its
+  port per platform: `SO_REUSEADDR` on POSIX (a rebind through `TIME_WAIT`; a live
+  listener still refuses it) and `SO_EXCLUSIVEADDRUSE` on Windows, where two listeners
+  that both set `SO_REUSEADDR` share one address and the browser's callback can reach
+  either. A held port then fails the bind and the loop takes the next allowlisted port.
+  `test/test_reuseaddr_platform_branch.py` fails any production `SO_REUSEADDR` set
+  outside a platform branch.
 - `KIRO_API_KEY` remains a supported headless path (matches KAS `EnvAuthProvider`), and
   its ApiKey identity must fail-fast on usage/credit APIs (existing lesson).
 
@@ -386,7 +413,7 @@ access token.
   SettingsPage mounts; the card's older home, `/developer?tab=agent-backend`,
   is forwarded there by DeveloperPage with the `highlight` kept) and from the KAS remedy
   strings in `agent_sdk/host_auth.py`. Its intro sentence names the backend
-  ("Used only by the KAS (kiro-agent) backend") and says Kiro CLI keeps its own
+  ("Used only by the Kiro Agent backend") and says Kiro CLI keeps its own
   kiro-cli login, because the card sits under a switch that also lists Kiro
   CLI. It is deliberately NOT on Settings > Overview and not indexed into
   Settings search: a provider chooser on the landing page read as a required
@@ -398,3 +425,42 @@ access token.
   than Kiro CLI, so a user who set up with one of those can switch agents later
   without turning on Developer Mode. `KasLoginGate` itself is still not mounted at the app
   root; the full-screen form stays available for that.
+- The persistent signal for a lapsed sign-in is the app-level **Kiro sign-in
+  notice** (`website/src/components/KiroSignInNotice.tsx`, mounted in `App.tsx`
+  above every route beside `CrashReportNotice`), because the card above lives on
+  a page nobody keeps open. It is a banner, not a top-bar control: the top bar's
+  action groups are at the two-control cap. It renders only while
+  `agent.acp_backend` is `kas`, a sign-in is stored, and the card's own verdict
+  (`signInLapsed` in `pages/developer/kiroSignInState.ts`, shared by both:
+  `!usable || refresh_rejected`) calls it lapsed; it is hidden on Settings >
+  Agent Harness itself, where the card shows the same state. Every lapsed shape
+  it draws is an `ErrorNotice` with the agent hand-off, an "Open sign-in settings"
+  button and dismiss, so an expiry with nothing to renew it and a renewal Kiro
+  refused read at the same weight (in both the agents' credential requests are
+  refused, or will be); the title and text say which one happened. Because the
+  renewal tick only asks Kiro inside the refresh margin, a refusal is usually
+  recorded on a token that is already `expired` (while `usable` stays true,
+  since a refresh token is stored); the refused notice then says the agents
+  cannot run, and only a refusal on a token outside the margin says they will
+  stop. The button asks the page's leave guard and then deep-links to
+  `KIRO_SIGN_IN_PATH`; dismissing hides the notice for the current cause until
+  the page reloads (a refusal that has since expired is a new cause). A
+  failed status read on a KAS gateway renders the same way under "We could not
+  check sign-in status", with a plain-language line saying what to do (the
+  server's error goes to the hand-off, not the visible text), since the
+  sign-in then goes unchecked. A config read that fails before any good read
+  shows "Could not read the dashboard settings" with the hand-off and no
+  sign-in button or sign-in claim: it cannot say whether KAS runs the agents,
+  and kiro-cli and Claude have no Kiro sign-in. It stays hidden while the
+  gateway is offline or asks for a token, since the offline capsule and the
+  token banner already name that cause and its fix. A failure after a good read
+  shows nothing, since the query keeps that read's backend, so a KAS gateway
+  goes on reading the status. If the notice itself fails to load or render,
+  its error boundary shows "Part of the dashboard could not load" with the
+  hand-off (`KiroSignInNoticeFallback`, outside the notice's lazy chunk). It
+  reads the same
+  token-free `GET /api/kas-login` status under the same `['kas-login']` query
+  key the card and flow use, polling once a minute only on a KAS gateway
+  (another backend never reads it), so the refusal marker the renewal tick
+  records shows on the next read and a new sign-in or a successful renewal
+  clears it.

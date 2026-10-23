@@ -150,7 +150,7 @@ class TestVenvPipInstall:
         state = _make_state(monkeypatch, tmp_path)
         seen: dict = {}
 
-        def fake_sync(repo, target_py, emit=None, timeout=None):
+        def fake_sync(repo, target_py, emit=None, timeout=None, **_kw):
             seen["repo"] = repo
             seen["target"] = target_py
             return 0
@@ -171,7 +171,7 @@ class TestVenvPipInstall:
         state = _make_state(monkeypatch, tmp_path)
         errors = _track_errors(state)
 
-        def fake_sync(repo, target_py, emit=None, timeout=None):
+        def fake_sync(repo, target_py, emit=None, timeout=None, **_kw):
             emit("dep-sync: pip install -e exited 1: ERROR: could not find setup.py", True)
             return 1
 
@@ -195,7 +195,7 @@ class TestVenvPipInstall:
         state = _make_state(monkeypatch, tmp_path)
         errors = _track_errors(state)
 
-        def fake_sync(repo, target_py, emit=None, timeout=None):
+        def fake_sync(repo, target_py, emit=None, timeout=None, **_kw):
             emit(r"dep-sync: C:\v\kirocrew.exe locked; substituting", False)
             return 0
 
@@ -232,7 +232,7 @@ class TestVenvPipInstall:
 
         state.push_update_progress = _record
 
-        def fake_sync(repo, target_py, emit=None, timeout=None):
+        def fake_sync(repo, target_py, emit=None, timeout=None, **_kw):
             # Called on the executor thread — assert that, so the test cannot pass
             # by accident if the install stops being offloaded.
             assert threading.get_ident() != loop_thread
@@ -259,7 +259,7 @@ class TestVenvPipInstall:
         state = _make_state(monkeypatch, tmp_path)
         errors = _track_errors(state)
 
-        def fake_sync(repo, target_py, emit=None, timeout=None):
+        def fake_sync(repo, target_py, emit=None, timeout=None, **_kw):
             emit("failed: AKIAIOSFODNN7EXAMPLE token leaked", True)
             return 1
 

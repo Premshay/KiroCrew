@@ -3,11 +3,12 @@
  * nothing else: no view switch, no crew-log panel.
  */
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { screen } from "@testing-library/react";
+import { renderWithProviders as render } from "./helpers";
 
 vi.mock("../pages/members/CrewDynamicDashboard", () => ({
-  default: (p: { slug: string; displayName: string }) => (
-    <div data-testid="frame-stub">{`${p.slug}/${p.displayName}`}</div>
+  default: (p: { target: { slug: string }; displayName: string }) => (
+    <div data-testid="frame-stub">{`${p.target.slug}/${p.displayName}`}</div>
   ),
 }));
 
@@ -21,7 +22,7 @@ import CrewDashboardTab from "../pages/members/CrewDashboardTab";
 const LAZY_IMPORT_READY = { timeout: 2000 };
 
 describe("CrewDashboardTab", () => {
-  it("shows only the crewmate's own page", async () => {
+  it("shows only the mate's own page", async () => {
     render(<CrewDashboardTab slug="ada" member="Ada" displayName="Ada" />);
     expect(
       (await screen.findByTestId("frame-stub", undefined, LAZY_IMPORT_READY)).textContent,

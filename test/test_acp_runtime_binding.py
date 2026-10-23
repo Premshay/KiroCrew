@@ -9,7 +9,7 @@ import pytest
 
 from kiro_crew.acp.client import PROTOCOL_VERSION_CLAUDE
 from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_CLIENT_CAPABILITIES, METHOD_SESSION_NEW
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, METHOD_SESSION_NEW, acp_client_capabilities
 from kiro_crew.platform import acp_binding
 
 
@@ -23,6 +23,26 @@ class _BoundRegistry:
             "model_switch_method": "session_set_model",
             "sandbox_mode": "off",
         }
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, AttributeError, TypeError])
+@pytest.mark.parametrize("source", ["context", "registry"])
+def test_runtime_binding_does_not_switch_engines_after_lookup_failure(
+    monkeypatch, error_type, source
+):
+    def fail(*args):
+        raise error_type("binding unavailable")
+
+    if source == "context":
+        monkeypatch.setattr(acp_binding, "current_context", fail)
+    else:
+        monkeypatch.setattr(
+            acp_binding,
+            "current_context",
+            lambda: SimpleNamespace(providers=SimpleNamespace(agent_client_binding=fail)),
+        )
+    with pytest.raises(error_type, match="binding unavailable"):
+        acp_binding.runtime_client_binding("kirocrew-lite")
 
 
 def test_runtime_binding_is_empty_for_the_default_registry(monkeypatch):
@@ -77,9 +97,9 @@ async def _plan_claude_spawn(runtime: AcpRuntime, monkeypatch) -> None:
     every session on the process needs, so a session started without the plan
     having run would test a runtime no production caller can build.
     """
-    from kiro_crew.acp import client as client_mod
+    from kiro_crew.acp.harness import claude as claude_mod
 
-    monkeypatch.setattr(client_mod, "_resolve_claude_acp_bin", lambda: (["claude-agent-acp"], ""))
+    monkeypatch.setattr(claude_mod, "_resolve_claude_acp_bin", lambda: (["claude-agent-acp"], ""))
     await runtime._resolve_spawn_plan()
 
 
@@ -130,55 +150,33 @@ async def test_claude_runtime_uses_config_option_without_bound_switch_method(mon
 
 
 @pytest.mark.asyncio
-async def test_claude_runtime_spawn_uses_claude_adapter_protocol(monkeypatch, tmp_path):
-    """Direct runtimes must not send Kiro's incompatible handshake to Claude."""
-    runtime = AcpRuntime(work_dir=str(tmp_path), acp_backend=ACP_BACKEND_CLAUDE)
-    process = SimpleNamespace(pid=12345, stdout=object(), stderr=object())
-    create_process = AsyncMock(return_value=process)
+async def test_claude_runtime_uses_claude_handshake_and_environment(monkeypatch, tmp_path):
+    """Shared Claude sessions use the adapter protocol and native executable."""
+    from kiro_crew.acp import runtime as runtime_mod
+    from kiro_crew.acp.client import CLIENT_NAME, CLIENT_VERSION
+    from kiro_crew.acp.harness import claude as claude_mod
+
+    runtime = AcpRuntime(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+    monkeypatch.setattr(claude_mod, "_resolve_claude_acp_bin", lambda: (["claude-agent-acp"], ""))
+    monkeypatch.setattr(claude_mod, "_resolve_claude_code_executable", lambda: "/usr/bin/claude")
+    monkeypatch.setattr(runtime_mod, "agents_slice_throttling", lambda: False)
+    plan = await runtime._resolve_spawn_plan()
+    assert plan.argv == ["claude-agent-acp"]
+
+    env = {"KIRO_API_KEY": "test-key"}
+    runtime._harness.apply_spawn_env(env)
+    assert "KIRO_API_KEY" not in env
+    assert env["CLAUDE_CODE_EXECUTABLE"] == "/usr/bin/claude"
+
     handshake = AsyncMock(return_value={"agentCapabilities": {}})
-    wrapped: dict[str, object] = {}
-
-    def wrap(argv, **kwargs):
-        wrapped["argv"] = argv
-        wrapped.update(kwargs)
-        return argv, None
-
-    async def no_reader():
-        return None
-
-    monkeypatch.delenv("CLAUDE_CODE_EXECUTABLE", raising=False)
-    monkeypatch.setattr(
-        "kiro_crew.acp.runtime._resolve_claude_acp_bin", lambda: ["claude-agent-acp"]
-    )
-    monkeypatch.setattr(
-        "kiro_crew.acp.runtime._resolve_claude_code_executable", lambda: "/usr/bin/claude"
-    )
-    monkeypatch.setattr("kiro_crew.acp.runtime.wrap_argv", wrap)
-    monkeypatch.setattr("kiro_crew.acp.runtime.cgroup_scope_argv", lambda argv: argv)
-    monkeypatch.setattr("kiro_crew.acp.runtime.create_subprocess_limited", create_process)
-    monkeypatch.setattr("kiro_crew.acp.runtime._track_pid", lambda _pid: None)
-    monkeypatch.setattr("kiro_crew.acp.runtime._track_session_pid", lambda _pid: None)
-    monkeypatch.setattr("kiro_crew.acp.runtime.register_protected_pid", lambda _pid: None)
-    monkeypatch.setattr("kiro_crew.acp.runtime._get_start_time", lambda _pid: None)
-    monkeypatch.setattr(runtime, "_reader_loop", no_reader)
-    monkeypatch.setattr(runtime, "_drain_stderr", no_reader)
     monkeypatch.setattr(runtime, "_send_and_await", handshake)
-
-    await runtime.spawn()
-
-    assert wrapped == {
-        "argv": ["claude-agent-acp"],
-        "is_kiro_cli": None,
-        "mode": "auto",
-        "strip_python_env": True,
-    }
-    assert create_process.await_args.args == ("claude-agent-acp",)
-    assert create_process.await_args.kwargs["env"]["CLAUDE_CODE_EXECUTABLE"] == "/usr/bin/claude"
+    await runtime._initialize_handshake(runtime._harness.client_capabilities)
     handshake.assert_awaited_once_with(
         "initialize",
         {
-            "clientCapabilities": ACP_CLIENT_CAPABILITIES,
-            "clientInfo": {"name": "kirocrew", "version": "0.1.2"},
+            "clientCapabilities": acp_client_capabilities(ACP_BACKEND_CLAUDE),
+            "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
             "protocolVersion": PROTOCOL_VERSION_CLAUDE,
         },
+        timeout=runtime_mod._INITIALIZE_TIMEOUT,
     )

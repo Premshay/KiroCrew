@@ -27,11 +27,35 @@ carry an `area:` label naming the subsystem they land in — `area: dashboard`,
 codebase you want to work in, and a type label (`bug`, `enhancement`,
 `documentation`) telling you what kind of change it is.
 
-Before starting anything substantial, check whether someone is already on it and
-comment on the issue saying you are picking it up. For a large change, open an
-issue first and get a reaction to the approach. Nobody enjoys declining a
-finished pull request that went the wrong direction, and a maintainer can usually
-tell you in a paragraph.
+Before starting anything substantial, check whether someone is already on it. For a
+large change, open an issue first and get a reaction to the approach. Nobody
+enjoys declining a finished pull request that went the wrong direction, and a
+maintainer can usually tell you in a paragraph.
+
+### Claiming an issue
+
+To tell us you are working on a `tier:T1` or `tier:T2` issue, comment `/claim` on it
+as the first line of your comment. If nobody holds it, the maintainers' automation
+assigns it to you and labels it `claimed`, and our own fix pipelines leave it
+alone while your claim lasts.
+
+| Comment | What it does |
+|---|---|
+| `/claim` | claims an open, unassigned `tier:T1` or `tier:T2` issue for 7 days |
+| `/claim extend` | adds 7 more days, once per claim |
+| `/unclaim` | hands the issue back |
+
+- An open pull request that links the issue (`Closes #N`, a draft is fine) keeps
+  the claim for as long as it stays open, so you can push a draft and keep
+  reviewing your own work before you mark it ready.
+- With no linked pull request, you get a reminder after 7 days, and the claim ends
+  3 days later. A linked pull request closed without merging ends it 3 days after
+  the close. The issue is then open for anyone again.
+- You can hold 2 claims at a time.
+- `tier:T3` and `tier:T4` issues are design work and cannot be claimed; comment on
+  them instead. Security reports go through [SECURITY.md](SECURITY.md), never an
+  issue.
+- The reply to your `/claim` comes from the daily triage run, so allow up to a day.
 
 ## Prerequisites
 
@@ -226,7 +250,7 @@ index, no changelog narration, run `./scripts/docs-lint.sh` — plus the
 ## Extending Kiro Crew
 
 - **Skills** — a skill is a directory holding a `SKILL.md`. See [skills/README.md](skills/README.md) for the format and where skills are installed
-- **MCP tools** — a `kirocrew-core` tool is a `schemas()` descriptor plus a `HANDLERS` entry in `src/kiro_crew/mcp_tools/<domain>.py`; cron tools live in `mcp_cron.py`. See [MCP](docs/architecture/mcp.md#a-kirocrew-core-tool-has-two-halves). Every LLM-facing command must have an MCP tool
+- **MCP tools** — a `kirocrew-core` tool is a `schemas()` descriptor plus a `HANDLERS` entry in `src/kiro_crew/mcp_tools/<domain>.py`; cron tools live in `mcp_cron.py` (their bodies) and `mcp_cron_tool_list.py` (their schemas). See [MCP](docs/architecture/mcp.md#a-kirocrew-core-tool-has-two-halves). Every LLM-facing command must have an MCP tool
 - **Hooks** — see [Steering files, prompts and hooks](src/kiro_crew/docs/steering-and-hooks.md)
 - **Lessons** — self-learned from corrections and stored in the memory store (`lessons.jsonl` is a legacy fallback); see [Memory & Learning](src/kiro_crew/docs/memory-and-learning.md#lessons)
 

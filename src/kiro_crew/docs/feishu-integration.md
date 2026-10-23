@@ -14,6 +14,17 @@ hostname, or open port to manage.
 > it directly into the environment that runs the gateway:
 > `pip install 'lark-oapi>=1.4,<2'`. Without it the gateway logs a line and skips
 > the channel — nothing else is affected.
+>
+> **Desktop app: do not install the SDK into the app.** The desktop app runs
+> its own bundled Python inside `backend-dist`, and the install line above does
+> not apply to it. A `pip install` there writes into the code-signed bundle,
+> which can break launches and updates, and every app upgrade replaces the whole
+> bundle and removes the package anyway (see #14618). On the desktop app,
+> Settings says this gateway cannot install the SDK and shows no command. To use
+> Feishu, run the gateway yourself from a source checkout or a virtual
+> environment (see [Getting Started](getting-started.md)) and install
+> `lark-oapi` there. The Feishu channel then runs on that gateway, not on the
+> app's bundled one, and app upgrades do not touch that environment.
 
 ## Quick start
 
@@ -84,9 +95,16 @@ Deny-by-default, in both directions:
 - **`allowed_open_ids` is the allow-list.** An empty list authorises **nobody** —
   the bot stays reachable on the Feishu side but rejects every message. This is
   deliberate: publishing an app must never mean an open door.
-- **Group chats need two switches.** A group message is served only when
-  `allow_group` is `true` **and** the group's `chat_id` is in
-  `allowed_group_ids`. Either one alone denies.
+- **Group chats need two switches and an @-mention.** A group message is
+  served only when `allow_group` is `true` **and** the group's `chat_id` is in
+  `allowed_group_ids`. Either one alone denies. Inside an allowed group, the
+  message must also @-mention **this** bot: the gateway checks the message's
+  mention list for the bot's own `open_id`, which it looks up from Feishu when
+  the channel starts. A plain message from an allow-listed sender is ignored,
+  even when the app holds a permission that delivers every group message.
+  Until the bot's `open_id` is known (the lookup failed, and the gateway logs
+  one warning and keeps retrying) every group message is ignored; direct
+  messages are unaffected.
 - **A group has its own conversation.** A group turn is keyed by the group's
   `chat_id` under a non-direct chat type, so an allow-listed user writing in a
   group never resumes their private DM session — their DM history cannot become
@@ -99,9 +117,13 @@ Deny-by-default, in both directions:
   never evaluated can never run a turn.
 - **Every denial is audited.** Rejected inbound messages write a SEL audit
   record with `source: feishu`, so an unexpected sender shows up in
-  `kirocrew security events` rather than vanishing.
-- Feishu itself only delivers a group message to the bot when it is
-  **@-mentioned**, so a bot in a busy group does not see unrelated chatter.
+  `kirocrew security events` rather than vanishing. A group message that does
+  not mention the bot is chatter, not an access attempt, so it is ignored
+  without a record.
+- With only the `im:message.group_at_msg.include_bot:readonly` grant, Feishu
+  delivers just the group messages that **@-mention** the bot, so a bot in a
+  busy group does not see unrelated chatter. A broader grant delivers more,
+  and the gateway's own mention check still ignores it.
 - **Mentions reach the agent as names.** Feishu puts opaque placeholders
   (`@_user_1`) in the message text and the display names in a separate
   `mentions` list, so the two are rejoined before the agent sees the prompt:
@@ -146,6 +168,7 @@ masked preview: a saved secret can be **replaced or cleared, never read back**.
 | --- | --- |
 | `/new` (or `/reset`) | Start a fresh session; the old context is dropped. |
 | `/compact` | Compact the current context in place. |
+| `/agent [name]` | Show the agent and the ones you can pick; `/agent <name>` switches, `/agent default` goes back. |
 
 Anything else is a prompt.
 
@@ -164,12 +187,14 @@ Known gaps, all follow-up work rather than defects:
 - **Text only.** Non-text messages (images, files, audio) are not read inbound.
   The bot answers with a short line saying so rather than staying silent, so a
   photo does not look like a dead bot — but only to a sender who is already on
-  the allow-list, and in a group only one that is allow-listed too.
+  the allow-list, and in a group only one that is allow-listed too and that
+  @-mentions the bot.
 - **Replies only.** The bot answers an inbound message and cannot start a
   conversation, so it is not a proactive-notification target.
 - **The panel configures the channel; it does not install it.** `lark-oapi` is an
   optional extra, and running `pip` from a dashboard action would be a new way to
   execute code in the gateway's own environment. When the SDK is missing, Settings reports whether installation is supported for this gateway interpreter and shows its exact install command only when it is; you run that command yourself.
+- **The desktop app cannot run Feishu on its own gateway** until the SDK ships in the bundle (#14618); see the desktop note at the top of this page.
 - **Credentials are not verified on save.** A REST tenant-token probe would have
   to pick a domain (`open.feishu.cn` or `open.larksuite.com`) and would report a
   false failure for whichever tenant it guessed wrong, so the panel stores what

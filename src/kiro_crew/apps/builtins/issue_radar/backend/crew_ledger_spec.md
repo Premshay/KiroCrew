@@ -22,11 +22,23 @@ migration is required from the first release.
 **The ledger** -- work items, progress lines and the repository-shared skip index
 -- is not a file of its own. It is a **projection of the crew log**: every
 `issue_radar_crew_record` call appends exactly ONE `radar/recorded` entry to the
-crew log of the session the crew runs on (`crew_log/entry_types.py` declares the
-shape; `docs/reference/crew-log/session-types.md` documents it), and every read is
-the `radar` fold of those entries (`crew_log/projection.py`, registered in the fold
-registry as a SLOT-keyed fold). The store module (`crew_store.py`) keeps the same
+crew log of the session the crew runs on (`crew_log/entry_types_ledgers.py` declares
+the shape; `docs/reference/crew-log/session-types.md` documents it), and every read is
+the `radar` fold of those entries (`crew_log/projection_radar.py`, registered in the
+fold registry as a SLOT-keyed fold). The store module (`crew_store.py`) keeps the same
 function names its callers had; what they do is fold.
+
+`crew_store.py` is a mirror façade (`kiro_crew._facade_mirror`): callers and tests reach
+`crew_store.<name>`, and a patch through it reaches every owner binding the name. The
+code is in six owners beside it: `crew_store_records` (the record schema with its
+phases, event kinds and skip scopes, the number guards, the crew-id rules and paths, the
+settings, and the crew records), `crew_store_unit_order` (the `.unit-order` file and the
+no-follow holds it is read and written through), `crew_store_log` (the ledger's entry
+type and fold, the per-crew write lock and undrained receipts, the landed check, the
+ledger's error classes, a crew's units and the fold checkpoint), `crew_store_carry`
+(carrying the pre-projection files forward), `crew_store_ledger` (the folded reads and
+the two writes) and `crew_store_fabric` (the fabric fold). New crew-store code goes to
+the owner of its responsibility, and an owner never imports the façade.
 
 ```
 <data home>/crew-log/session/<unit>/                     # one unit per ACP session the
@@ -126,6 +138,10 @@ pass for a clear. The route turns each name into an explicit null in the patch; 
 typed entry field cannot hold a null, so the writer carries the cleared names in the
 entry's own `clear` list and the fold empties each one before applying the fields
 the same update sets -- a call that clears and sets one field keeps the set value.
+`clear` is also how a crew records that it holds no labels after removing its
+last one: the tool forwards `labels_applied: []` when it arrives, but a client that
+drops empty lists delivers it as an omitted field, so the record tool's description
+points at `clear: ["labels_applied"]`.
 
 **A refusal is not a commit.** The write drains the writer and reads its entry back
 from the log. A writer that drained WITHOUT the entry showing in the log did not
@@ -190,7 +206,7 @@ for disk reasons is a choice made knowing what else it shortens.
 carries its message bodies, so the fold is continued rather than redone. The warm
 fold is the crew log's shared slot memo (`crew_log.projection.fold_slot_warm`, keyed
 by the crew's slot), the same one every other slot-keyed reader uses, so the rules
-live in one implementation (`crew_store._fold_checkpoint`). It continues the cached
+live in one implementation (`crew_store_log._fold_checkpoint`). It continues the cached
 cell over the entries that arrived since and refolds cold for every shape that
 cannot be carried, each of which would otherwise be a wrong answer rather than a
 slow one: a different unit list, a unit whose log was removed and recreated under
@@ -323,6 +339,8 @@ pre-projection state.
 | `avatar_variant` | int \| null | 0–7 pins one ghost outfit; null = derive from `avatar_seed` |
 | `agent` | str | `kirocrew` by default |
 | `model` | str | `""` = governed default |
+| `triage_model` | str | `""` = off: every turn runs on `model`. Set, a turn with no open item in an acting phase (`selected`, `claimed`, `investigating`, `implementing`, `addressing-review`) runs on this model, and any acting item puts the crew back on `model`. Switched between turns, never inside one. A model the account cannot run falls back to `model` and is named on the crew page as `triage_model_unavailable` |
+| `model_held` | bool | written by the runtime. True once a person picked the model of the crew's session by hand (the model picker or `session_set_model`) while `triage_model` is set: the crew stops switching that session's model, and the crew page names the held model with a Switch back to triage model action. A patch may only clear it (`false`, that action); an edit that changes `model` or `triage_model` clears it too |
 | `extra_prompt` | str | appended after the brief, never replacing it |
 | `labels` | [str] | its scope. Empty = every label |
 | `auto_resolve_conflicts` | bool | default true, structural files only |
@@ -726,7 +744,7 @@ than on every turn.
 
 The gate must stay a **full-path** allowlist entry, never the
 `/api/apps/issue-radar` prefix. That distinction is deliberate in
-`dashboard/server.py`: prefix-matching there would also admit the app's GitHub
+`dashboard/server_internal_paths.py`: prefix-matching there would also admit the app's GitHub
 write routes (label, close, comment) to anything holding the internal secret.
 
 ### `issue_radar_crew_read`
@@ -786,7 +804,7 @@ numberless call takes none of the work-item fields (they patch an item this call
 does not create, so they are refused rather than dropped). A present-but-invalid
 number stays a 400 and is never reinterpreted as "no issue".
 
-Validation lives in `validation.py` alongside the existing schemas. The handler
+Validation lives in `kiro_crew/validation_parts/app_schemas.py` alongside the existing schemas. The handler
 sends `owner`/`repo` explicitly so a same-numbered issue in another repo cannot
 overwrite this record, and refuses a second item entering an editing phase.
 

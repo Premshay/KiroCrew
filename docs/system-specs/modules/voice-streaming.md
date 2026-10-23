@@ -4,14 +4,20 @@
 
 Dashboard text-to-speech has four providers: local Piper, the host's built-in
 speech engine, a locally configured Pocket runtime, and Amazon Polly.
-`voice_reply.DEFAULT_PROVIDER` selects Piper unless configuration selects a
-valid provider. `chat_voice.api_voice_synthesize()` streams local Piper PCM as
+`voice_reply.DEFAULT_PROVIDER` selects the built-in engine for new setups.
+Explicit Pocket/Piper selections and legacy local-model configurations stay local. `chat_voice.api_voice_synthesize()` streams local Piper PCM as
 small WAV chunks, sends built-in-engine output as one WAV chunk, and streams
 Polly sentences as MP3; the browser queues either form for sequential playback.
 Every synthesis has a request identity so the browser can reject audio from a
 stopped request. Polly auto-speak starts as soon as the first sentence finishes
 streaming; Pocket starts a manual replay from the first progressively encoded
 Ogg Opus bytes. Sending a new message interrupts playback immediately.
+
+The fork retains the local providers because the Nexus Pocket compatibility
+runtime is not replaced by upstream's system/Polly choices. Upstream's Piper
+removal (RFC `rfc-remove-piper-tts.md`, issue #23154) is a product-policy change,
+not an equivalent local provider. New unconfigured setups follow upstream's
+system default; existing local selections and their runtime fields remain.
 
 ## The built-in engine
 
@@ -78,11 +84,6 @@ Two properties are load-bearing:
   `test_spawn_audit.py::FIRST_PARTY_SPAWNS` with that reasoning, and
   `test_sapi_claims_the_first_party_carve_out` asserts on the REAL argv that
   neither the voice nor the text appears in it.
-
-  One consequence to keep in view: Piper keeps no carve-out, so fixing its
-  `Scripts\piper.exe` resolution makes `is_available()` report it usable while a
-  spawn still fails closed on Windows without the global opt-in — Piper there is
-  found, not yet audible.
 - **Text never reaches argv.** `say` and `espeak-ng` read it on stdin. SAPI
   reads it from a temp file whose path is interpolated into a base64
   `-EncodedCommand` payload, so no quoting decision is made about model output.
@@ -128,8 +129,7 @@ Telegram and dashboard paths. Three rules:
 - An **unnamed** provider on a section that already carries `piper_model` keeps
   Piper. That section is a working Piper install, and resolving it to the
   default would silently downgrade it to a lower-quality voice on upgrade. The
-  branch is inert while `DEFAULT_PROVIDER` is Piper; it protects the upgrade
-  path on a build whose default is the built-in engine.
+  branch preserves that setup while unconfigured installations use the built-in engine.
 
 ## Components
 
@@ -191,14 +191,12 @@ after a newer response starts.
 
 For Polly, `api_voice_synthesize()` iterates
 `voice_reply.streaming_voice_reply()`, broadcasts each `voice_chunk`, then
-uses `stitch_mp3s()` to broadcast `voice_complete`. For Piper,
-`_synthesize_piper_stream()` broadcasts `voice_chunk` frames while the child
-still runs and collects bounded PCM for one WAV `voice_complete` replay clip.
+uses `stitch_mp3s()` to broadcast `voice_complete`.
 The built-in engine broadcasts its completed WAV. Only the explicit Polly
 provider reaches the Polly branch; a future provider cannot silently reach a
 paid AWS service. Both event types include `audioMime` and echo the synthesis `request_id`.
 `voice_complete` also updates the Redux
-`voiceAudio` field; `UseWebSocketCoverage.test.tsx` covers that state update.
+`voiceAudio` field; `UseWebSocketCoverage.voice.test.tsx` covers that state update.
 
 `VoicePcmPlayer` decodes WAV chunks in order and schedules their sources on one
 `AudioContext` clock. Consecutive ready chunks abut on that clock instead of
@@ -264,94 +262,14 @@ error journal at the WebSocket playback owner before dispatching the UI event.
 Thus failures are recorded even when ChatPage is unmounted. The notice consumes
 the same report without creating a duplicate; it owns only page-local recovery.
 
-## Local synthesis pipeline
+## Admission
 
-When no custom `piper_binary` is configured and the gateway interpreter has a
-compatible Piper Python API, `streaming_piper_reply()` uses the dashboard's
-`PiperRuntime`. API capability probing runs off the event loop and never loads
-a voice in the gateway. The owned `python -m kiro_crew.piper_worker` subprocess
-loads `PiperVoice` once and serves serial requests over stdin/stdout. Every
-bounded frame has a type and request identity; PCM additionally carries its
-sample rate. Explicit `ready`, `done`, and `error` frames establish lifecycle and
-request boundaries without relying on quiet periods or process exit.
-
-The dashboard owns at most one loaded Piper model. Changed model/config paths,
-sizes, or modification times retire the old worker before a replacement starts.
-The dashboard admits at most two syntheses: the resident path runs one and can
-queue one, with its 180-second deadline covering both the wait and synthesis.
-Each browser already serializes its sentence requests; the waiter serves
-concurrent clients. Further requests receive HTTP 429 with `voice_busy`, which is
-retryable after the outstanding work finishes. Cancelled work continues to occupy
-capacity until its subprocess and sandbox resources have been reaped. Two clients
-interrupting together can therefore receive 429 for their immediate replacements;
-they can retry Read aloud once cancellation finishes. Releasing admission before
-reaping would let repeated interrupts exceed the model/process bound.
-Successful requests retain it for up to 120 seconds of inactivity. Cancellation,
-an early generator close, malformed output, or a request timeout kills and reaps
-the active worker; a cancelled waiter does not kill another request's worker.
-Application shutdown closes the runtime after cancelling active HTTP requests.
-The first request after startup, eviction, or cancellation still pays the model's
-cold-load and initial phonemizer cost; residency improves subsequent requests,
-not cold inference. Cleanup runs in a tracked, shielded task so repeated
-cancellation cannot abandon the child or its sandbox launcher; the next start
-and shutdown join any outstanding reap before proceeding.
-
-An explicit `piper_binary` or a missing/incompatible Python API retains the CLI
-fallback with `--output-raw`. It loads one model for all phrases in that request.
-Its raw PCM has no reliable per-line end marker, so EOF defines completion. The
-CLI is not reused across requests by guessing that silence means completion.
-Its request retains and shields the bounded reap and sandbox-file cleanup task
-until completion, including when another stop or shutdown cancels it again.
-
-A successful gateway API probe does not guarantee that the isolated worker can
-import and run Piper. If that worker fails before sending any PCM, a synthesis
-or protocol failure, or a non-permission OS failure, can use the discovered CLI
-after the worker is reaped. No available CLI preserves the original failure.
-After any PCM, failure is propagated without replay. Cancellation, timeout,
-sandbox or permission refusal, invalid request/model settings and output limits
-never trigger fallback. One outer 180-second deadline covers both attempts,
-including capability probing and queueing; fallback does not reset the budget.
-Both timeout scopes use `piper_runtime.REQUEST_TIMEOUT_SECONDS`; the runtime
-retains its own bound when called directly. The worker, resident reader, and CLI
-reader share `piper_worker.MAX_AUDIO_BYTES`.
-
-Both paths use `split_sentences()` for CJK/Latin punctuation and newlines, and
-`_piper_phrases()` bounds unpunctuated phrases while preserving their tails.
-
-The model JSON declares the actual sample rate. Invalid or absent audio format
-is a coded failure before spawn; a guessed rate would change pitch and playback
-speed. PCM is signed little-endian mono Int16. Pipe reads are bounded by
-`_PIPER_CHUNK_SECONDS`, and an odd trailing byte carries into the next read.
-`pcm_to_wav()` wraps complete samples for immediate browser decoding. Replay
-encoding runs off the event loop. Piper's own inference still determines when
-the first samples become available; chunk size is not a promised synthesis
-latency.
-
-Model and configuration paths pass the shared sensitive-path gate before the
-gateway reads configuration or starts a worker. Protected paths and paths whose
-resolution stalls fail closed with `voice_model_path_forbidden`; the refusal
-does not include file contents.
-
-The provider bounds total output and runtime and drains stderr concurrently;
-the CLI retains only a bounded diagnostic tail and the resident worker discards
-native diagnostics instead of retaining user text. CLI failure logs pass that
-tail through `redact_log_via_context`, preserving an installed credential policy
-and withholding diagnostic text when its composition fails. Cancellation, timeout, output
-overflow, and early generator closure kill and reap the child before removing
-sandbox resources. The worker uses the same standard sandbox and subprocess
-resource ceilings as the CLI, without an unconfined first-party exception.
-Both dashboard Piper spawn paths remove credential-bearing environment keys
-with the shared `scrub_env` helper and prepare cgroup argv off the event loop,
-matching the upstream built-in engine's controls without changing sandbox policy.
-Unsupported sandbox environments still fail closed. The dashboard explicitly
-closes the generator even when a request is interrupted while it is suspended
-at a yield. `test/test_voice_streaming.py` verifies first PCM before child exit
-through real OS pipes, odd-byte alignment, full replay, errors, and cancellation.
-`test/test_piper_runtime.py` additionally exercises real framed pipes, reuse,
-model replacement, active and waiting cancellations, protocol limits, idle
-eviction, and shutdown. Malformed requests and invalid provider PCM retire the
-worker without a success frame or processing the next request; entrypoint tests
-also verify that model-load failures return a bounded error without native text.
+The dashboard admits at most two syntheses (`chat_voice._MAX_ACTIVE_SYNTHESES`).
+Each browser already serializes its sentence requests; further requests receive
+HTTP 429 with `voice_busy`, which is retryable after the outstanding work
+finishes. Cancelled work keeps its slot until the request task has unwound.
+`test/test_voice_streaming.py` covers request identity, cancellation before and
+during synthesis, and malformed requests.
 
 ## Interruption
 
@@ -444,7 +362,7 @@ running a value the file does not hold. A failed write answers non-2xx with a
 
 | Setting | Meaning |
 |---|---|
-| `provider` | Resolved by `voice_reply.resolve_configured_provider()` for every reader; invalid values fall back to `voice_reply.DEFAULT_PROVIDER`, and an unnamed provider beside a configured `piper_model` keeps Piper. |
+| `provider` | Resolved by `voice_reply.resolve_configured_provider()` for every reader. Supports system, Polly, Piper and Pocket; invalid values fall back to `voice_reply.DEFAULT_PROVIDER`. |
 | `enabled` | Enables global Slack voice replies. |
 | `auto_speak` | Enables dashboard auto-speak; `api_voice_config()` exposes it as `autoSpeak`. |
 | `voice_id`, `engine`, `pitch` | Polly synthesis settings. The dashboard synthesis endpoint accepts per-request overrides on the Polly path only, as body fields `voice` (not `voice_id`), `engine`, `rate` and `pitch`. |
@@ -495,8 +413,21 @@ spawning the AWS CLI. It returns no audio when consent is absent, which lets its
 callers retain their text response rather than spending through an unattended
 path.
 
-`_synthesize_polly()` and `streaming_piper_reply()` run their commands through
-`wrap_argv_async(..., _prepare=wrap_argv)`. `_synthesize_piper()` instead delegates
+The dashboard's sentence stream, `streaming_voice_reply()`, is the one caller with
+a person waiting, so it passes `raise_refusal=True`. When the gate refuses and
+`aws_consent.is_granted()` reports no consent for this profile and region, the
+first sentence raises `VoiceSynthesisError("voice_consent_required")` with fixed
+text that names neither the account, the profile nor the region; the gate's log
+line and audit entry keep the full reason. The synthesis endpoint answers 502 with
+that code and broadcasts it on `voice_error`; `voiceFailureMessage()` maps it to a
+localized notice that names the confirmation step, above the existing
+Text-to-speech settings link. A refusal while the consent stands (the account could
+not be re-checked, or the consent changed during the check) returns no audio for
+that sentence, and the next sentence is checked again.
+
+Local Piper/Pocket binary discovery and model-file checks run off the event loop.
+`_synthesize_polly()` and Pocket's replay stream run their commands through
+`wrap_argv_async(..., _prepare=wrap_argv)`. `_synthesize_system()` instead delegates
 to `_run_tts_subprocess()`, which uses `sandboxed_spawn_argv_async()` and the
 credential-scrubbed child environment. Those chokepoints catch
 `SandboxUnavailableError` separately from provider failures, log the sandbox
@@ -541,10 +472,6 @@ surface can show:
   sentence-chunked one; Polly needs its own clause because without it the refusal
   would fall to the generic handler — a 500 with no note — and stay invisible on a
   Polly host, which is the defect itself rather than a cosmetic difference.
-  The `piper` provider takes neither: it has its own streaming path whose runtime
-  converts the refusal into `VoiceSynthesisError("voice_sandbox_unavailable")`,
-  which carries the sandbox's own prose to the HTTP caller but raises no
-  notification; recovering the note there would mean reading the preserved cause.
 - `synthesize_and_deliver()` has no channel for prose, so it still reports "no
   audio" and catches the refusal explicitly so it cannot escape as an unhandled
   error on a voice reply. Both callers drop that signal — Slack's

@@ -197,13 +197,15 @@ class ContinuationCoordinator(ManagerComponent):
             # report retryable failure so continue_conversation rolls it back.
             self._manager._sessions.mark_continuable(conv_key)
             self._manager._conversations[conv_key] = (
-                last_used if last_used is not None else time.time()
+                last_used if last_used is not None else time.monotonic()
             )
             return self._persistence.RetentionPromotionResult.RETRYABLE
         if result is not self._persistence.RetentionPromotionResult.PROMOTED:
             return result
         self._manager._sessions.mark_continuable(conv_key)
-        self._manager._conversations[conv_key] = last_used if last_used is not None else time.time()
+        self._manager._conversations[conv_key] = (
+            last_used if last_used is not None else time.monotonic()
+        )
         return result
 
     def _scan_keep_states_impl(self) -> list[tuple[str, str, str, str, str, float]]:
@@ -317,7 +319,12 @@ class ContinuationCoordinator(ManagerComponent):
             if not self._manager._sessions.resumable_sid(conv_key):
                 continue
             self._manager._sessions.mark_continuable(conv_key)
-            self._manager._conversations[conv_key] = last_used or time.time()
+            # The stored stamp is wall-clock and the registry is monotonic, so
+            # the conversation's AGE is carried across. A stamp in the future
+            # (the clock stepped back after it was written) reads as age 0: it
+            # can neither release the conversation early nor keep it past its TTL.
+            age = max(0.0, time.time() - last_used) if last_used else 0.0
+            self._manager._conversations[conv_key] = time.monotonic() - age
             seeded += 1
             # Cooperative yield: keep restart cold-start turns responsive
             # while a large keep batch seeds (one small file write each).
@@ -671,6 +678,26 @@ class ContinuationCoordinator(ManagerComponent):
             if _captured_state is ...
             else self._inherited_context_groups_impl(conv_id, state=_captured_state)
         )
+        # A continuation is another turn of the SAME run, so it keeps the model
+        # the caller pinned at spawn and the effort that went with it, unless the
+        # caller names a model. Only the caller's own pin is kept: a model the run
+        # took from ``agent.role_models['subagent']`` or from a ``model.route``
+        # tier is not one (``requested_model`` records the effective pin and holds
+        # both), so it resolves again, as it does for a run still in memory. After
+        # a gateway restart the run is gone from memory and state.json holds what
+        # the spawn recorded.
+        if original is not None:
+            run_model, run_effort = original.model or "", original.reasoning_effort
+        else:
+            recorded = (read_state(conv_id) or {}) if _captured_state is ... else _captured_state
+            run_model = str(recorded.get("pinned_model") or "")
+            run_effort = str(recorded.get("reasoning_effort") or "")
+        # Effort follows the model (rfc-worker-model-inheritance, rule 4): the
+        # run's effort was chosen for the run's model, so a caller who names a
+        # model gets that model's own effort resolution instead.
+        named_model = bool(model)
+        if not named_model and run_model:
+            model = run_model
         delegation = (
             original.delegation
             if original is not None
@@ -678,6 +705,17 @@ class ContinuationCoordinator(ManagerComponent):
                 "delegation", {}
             )
         )
+        # The conversation lives on the harness its first run started on: a
+        # follow-up on another backend could not load it, and would start over.
+        backend = (
+            original.backend
+            if original is not None
+            else ((read_state(conv_id) or {}) if _captured_state is ... else _captured_state).get(
+                "backend"
+            )
+        )
+        if not isinstance(backend, str):
+            backend = None
         # A continuation has to run WHERE THE RUN RAN. `spawn` resolves an empty
         # cwd to the pool project before it validates the agent name, so a run
         # spawned against a project-local agent (defined under that project's
@@ -698,11 +736,13 @@ class ContinuationCoordinator(ManagerComponent):
             parent_session_key=parent_session_key,
             agent=agent,
             model=model,
+            reasoning_effort="" if named_model else run_effort,
             max_turns=max_turns,
             keep=True,
             cwd=cwd,
             conversation_key=conv_key,
             delegation=dict(delegation or {}),
+            backend=backend,
             include_memory=inc_memory,
             include_lessons=inc_lessons,
             include_project=inc_project,
@@ -969,12 +1009,21 @@ class ContinuationCoordinator(ManagerComponent):
         completion event through the normal ``_on_done`` path — the parent
         must not wait forever on an event that is not coming.
 
-        Hard-bounded and manager-owned: gives up at the manager's run timeout
+        Hard-bounded and manager-owned: gives up at the run's captured timeout
         plus a margin, and the task is registered in ``_followup_watchers`` so
         ``cancel_all()`` cancels it — a watcher must never dispatch a fresh
         run into a shutting-down gateway.
         """
-        deadline = time.monotonic() + self._manager._default_timeout + 300
+        # A follow-up can be queued before `_run_impl` captures this run's
+        # deadline, while spawn approval or a queued start still holds the run.
+        # Timing from the manager default at that point starts this clock ahead
+        # of the run's own and can expire the message while the run is still
+        # inside its deadline. Polling is already this watcher's ownership
+        # model; shutdown cancels the manager-owned task, and a terminal run
+        # needs no capture to dispatch.
+        while info.timeout_secs == 0 and not info.done and self._manager._default_timeout > 0:
+            await asyncio.sleep(self._manager._FOLLOWUP_POLL_SECS)
+        deadline = time.monotonic() + (info.timeout_secs or self._manager._default_timeout) + 300
         while time.monotonic() < deadline:
             if info.done and info.id not in self._manager._tasks:
                 break
@@ -1033,26 +1082,60 @@ class ContinuationCoordinator(ManagerComponent):
             # announce-and-drop for pending messages.
             return
         task = "\n\n---\n\n".join(messages)
-        # Finalization may hold the conversation for a beat after the task is
-        # popped (shielded report); retry a bounded number of times.
-        for _attempt in range(self._manager._FOLLOWUP_BUSY_RETRIES):
-            child = await self._manager.continue_conversation_async(
-                info.id,
-                task,
-                parent_session_key=info.parent_session_key,
-                agent=info.agent,
-                # The turn that asked for this follow-up, pinned when it was
-                # queued. This dispatch runs after the continued run finished, so
-                # the asking ordinal is not readable here. Several queued messages
-                # merge into one continuation, and the pin holds one turn, so for a
-                # merged dispatch this is the turn that asked LAST; each individual
-                # ask is recorded at its own turn as `subagent/steered`.
-                _crew_log_asked=getattr(info, "_crew_log_followup_asked", None),
+        # A continuation run executes on its root conversation, so the follow-up is a
+        # continuation of the root: dispatched by the root id, it shares the root's busy
+        # check and claim instead of keying its own.
+        conversation_id = (
+            self._persistence.subagent_id_from_conversation_key(info.conversation_key or "")
+            or info.id
+        )
+        # By the root id the dispatch would not claim the run it follows up, and a
+        # dashboard retry of that run checks only that run's own claim (claim_retry).
+        # So the follow-up claims it as well, as a continuation by its id does, and
+        # settles it with the dispatch's outcome: a retry and a follow-up of one run
+        # stay mutually exclusive whichever comes first.
+        followed: SubagentInfo | None = None
+        child: SubagentInfo | None = None
+        err = ""
+        if conversation_id != info.id and self._manager._agents.get(info.id) is info:
+            followed, child = self._manager._claim_continuation(
+                info.id, task, info.parent_session_key
             )
-            err = "spawn_failed" if child is None else str(getattr(child, "error", "") or "")
-            if not err.startswith("conversation_busy"):
-                break
-            await asyncio.sleep(self._manager._FOLLOWUP_BUSY_RETRY_SECS)
+            if child is not None:
+                followed = None  # refused: the claim belongs to whoever holds it
+                err = str(child.error or "")
+        attempts = self._manager._FOLLOWUP_BUSY_RETRIES if child is None else 0
+        # Only a dispatch in flight counts as a start of unknown outcome. A cancel in the
+        # sleep between busy attempts settles with the last refusal, which releases the
+        # claim, so a later retry of the followed-up run is not refused for nothing.
+        raised = False
+        try:
+            # Finalization may hold the conversation for a beat after the task is
+            # popped (shielded report); retry a bounded number of times.
+            for _attempt in range(attempts):
+                raised = True
+                child = await self._manager.continue_conversation_async(
+                    conversation_id,
+                    task,
+                    parent_session_key=info.parent_session_key,
+                    agent=info.agent,
+                    # The turn that asked for this follow-up, pinned when it was
+                    # queued. This dispatch runs after the continued run finished, so
+                    # the asking ordinal is not readable here. Several queued messages
+                    # merge into one continuation, and the pin holds one turn, so for
+                    # a merged dispatch this is the turn that asked LAST; each
+                    # individual ask is recorded at its own turn as `subagent/steered`.
+                    _crew_log_asked=getattr(info, "_crew_log_followup_asked", None),
+                )
+                raised = False
+                err = "spawn_failed" if child is None else str(getattr(child, "error", "") or "")
+                if not err.startswith("conversation_busy"):
+                    break
+                await asyncio.sleep(self._manager._FOLLOWUP_BUSY_RETRY_SECS)
+        finally:
+            if followed is not None:
+                # Held only when the claim above was granted; a refused claim is its holder's.
+                self._manager._settle_continuation(info.id, followed, child, raised=raised)
         if err:
             logger.warning("follow_up delivery for %s failed: %s", info.id, err.split(":", 1)[0])
             self._manager._audit_followup(info, "followup_failed")
@@ -1259,6 +1342,8 @@ class ContinuationCoordinator(ManagerComponent):
         Every release awaits, and a conversation can be continued or released
         while it does, so each entry's timestamp is re-read from the live
         registry right before its expiry check rather than taken from a snapshot.
+        The reaper passes a ``time.monotonic()`` reading, the clock the registry
+        holds, so a wall-clock step cannot expire every conversation at once.
         """
         for conv_key in list(self._manager._conversations):
             last_used = self._manager._conversations.get(conv_key)

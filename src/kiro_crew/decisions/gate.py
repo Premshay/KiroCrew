@@ -44,7 +44,7 @@ import re
 import threading
 import time
 from hashlib import sha256
-from typing import Any
+from typing import Any, Sequence
 
 from kiro_crew import credential_patterns as _cred
 from kiro_crew.config.sections import (
@@ -340,7 +340,10 @@ def _capability_denied(session_key: str | None, *, local: bool = False) -> bool:
 
 
 def _consented_for(
-    config: Any | None, session_key: str | None = None, point: str | None = None
+    config: Any | None,
+    session_key: str | None = None,
+    point: str | None = None,
+    scopes: Sequence[str] = (),
 ) -> bool:
     """Read the keystone and hold it against the configured endpoint. Filesystem IO.
 
@@ -368,6 +371,10 @@ def _consented_for(
     second keystone read, and because this is the documented chokepoint every
     ``decide`` and ``is_enabled`` path funnels through. ``None`` asks for no scope
     and is what a caller with no point of its own gets.
+
+    *scopes* names further keystone scopes ONE request needs beyond its point's
+    own (:data:`REQUEST_SCOPES`), held against this same keystone read -- so the
+    scope and the endpoint it authorizes come from one snapshot.
     """
     state = _consent.load_state()
     endpoint = configured_endpoint(config)
@@ -378,6 +385,8 @@ def _consented_for(
         return False
     if _consent.permits(endpoint, state):
         if not _scope_consented(point, state):
+            return False
+        if not _request_scopes_consented(scopes, state):
             return False
         from kiro_crew.decisions.capability import is_local_preset, names_local_preset
 
@@ -481,6 +490,39 @@ def _scope_consented(point: str | None, state: dict) -> bool:
             category,
         )
     return False
+
+
+#: Scopes a caller may require for ONE request on top of its point's own
+#: (``decide(scopes=...)``), keyed by the keystone field the consent card writes,
+#: as ``field -> (keystone reader, the switch's own words)``. For a point whose
+#: requests mostly send what the main switch covers but sometimes carry a wider
+#: category: ``model.route`` classifies an owner-typed message on a chat turn and
+#: an agent-written tool argument on a sub-agent start.
+REQUEST_SCOPES: dict[str, tuple[str, str]] = {
+    _consent.STATE_KEY_TOOL_ARGS: ("consented_tool_args", "tool-call arguments"),
+}
+
+
+def _request_scopes_consented(scopes: Sequence[str], state: dict) -> bool:
+    """Whether every scope in *scopes* is consented in *state*. Never raises.
+
+    A scope this table does not know refuses, and so does an unreadable one: each
+    decides whether a category of content leaves the machine.
+    """
+    for scope in scopes:
+        entry = REQUEST_SCOPES.get(scope)
+        if entry is None:
+            logger.debug("decisions: unknown request scope %r; refusing", scope)
+            return False
+        reader_name, category = entry
+        try:
+            if not bool(getattr(_consent, reader_name)(state)):
+                logger.debug("decisions: request needs consent to send %s; refusing", category)
+                return False
+        except Exception:
+            logger.debug("decisions: %s scope unreadable; refusing", category)
+            return False
+    return True
 
 
 def in_bucket(session_key: str | None, bucket: object) -> bool:
@@ -788,6 +830,19 @@ def model_route_map(config: Any | None = None) -> dict[str, str]:
     }
 
 
+def model_route_derive(config: Any | None = None) -> bool:
+    """``decisions.model_route_derive``: whether empty tiers are derived. Never raises.
+
+    ``False`` for an absent, unreadable or non-bool value, so every failure keeps
+    the shipped behaviour where an unpinned tier applies nothing.
+    """
+    try:
+        raw = getattr(_decisions_config(config), "model_route_derive", False)
+    except Exception:
+        return False
+    return raw is True
+
+
 def _budget(name: str, default: int, config: Any | None = None) -> int:
     """One bounded integer knob off the decisions section, or *default*."""
     try:
@@ -921,6 +976,7 @@ async def decide(
     config: Any | None = None,
     extra: dict[str, Any] | None = None,
     receipt: dict[str, Any] | None = None,
+    scopes: Sequence[str] = (),
 ) -> Answers | None:
     """Ask *questions* about *state* at *point*, or return ``None``.
 
@@ -949,9 +1005,16 @@ async def decide(
     append starts, the value resolves to true after append-line commitment or false
     after a definitive refusal, even when the post-append retention sweep outlives the
     write budget. If neither outcome arrives within the bounded grace, it remains
-    ``None`` rather than claiming a refusal while the append is still running. A caller
+    ``None`` rather than claiming a refusal while the append is still running, and the
+    gate logs one warning naming the point, the row and the time waited. A caller
     that supplies no receipt returns when the write budget expires and pays no grace.
     This additive signal does not change ``None`` as the only failure return.
+
+    *scopes* names keystone scopes THIS request needs beyond its point's own
+    (:data:`REQUEST_SCOPES`). They are checked against the same keystone read that
+    authorizes the endpoint, so a consent change between a caller's own check and
+    the send cannot let the request through under the wider category; a missing,
+    unknown or unreadable scope refuses with no row.
     """
     if receipt is not None:
         receipt["row_written"] = False
@@ -971,7 +1034,7 @@ async def decide(
             return None
         # The keystone is a file read, so it leaves the event loop; everything
         # else `_sampled` checks is attribute reads on the snapshot.
-        consented = await asyncio.to_thread(_consented_for, cfg, session_key, point)
+        consented = await asyncio.to_thread(_consented_for, cfg, session_key, point, scopes)
         # Which provider answers, and on whose authority. Every point but the judge
         # has exactly one lane and exactly one authority -- the keystone -- so this
         # is inert for all of them. The judge's LLM lane runs on its provider key
@@ -1027,6 +1090,7 @@ async def decide(
             # that needs a commit signal, so it is the only one that creates it.
             commit_event = threading.Event() if receipt is not None else None
             row_written = None
+            append_started = time.monotonic()
             append_task = asyncio.create_task(
                 asyncio.to_thread(_log.append, row)
                 if commit_event is None
@@ -1050,6 +1114,17 @@ async def decide(
                     row_written = True
                 elif append_task.done():
                     row_written = append_task.result() is True
+                else:
+                    # Neither outcome arrived, so the receipt stays unknown and a
+                    # caller that scores only a confirmed row (the wake judge's join
+                    # key) loses this one. The worker may still commit it, so the
+                    # receipt is not turned into a refusal: the loss is logged.
+                    logger.warning(
+                        "decisions: %s row %s commit unconfirmed after %.3fs; receipt left unknown",
+                        point,
+                        row.get("verdict_id") or row.get("ts"),
+                        time.monotonic() - append_started,
+                    )
                 if not commit_wait.done():
                     commit_wait.cancel()
         except Exception as exc:

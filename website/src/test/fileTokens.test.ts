@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { addPendingFile, extendsConsumably, findUnreferencedAttachments, foldWinSep, isWindowsShapedPath, mentionBoundary, mentionBoundaryFor, mentionTokenRegex, normalizeWindowsPath, parseFiles, prepareSendPayload, buildFileLabels, resolveFileSegment, mdImageDest, mdImageDestToPath, restoreQueuedContent, restoreUnreferencedImages, serializeDirTokens } from '../utils/fileTokens'
+import { addPendingFile, extendsConsumably, findUnreferencedAttachments, foldWinSep, isWindowsShapedPath, MARKER_TRAILER_SEP, mentionBoundary, mentionBoundaryFor, mentionTokenRegex, normalizeWindowsPath, parseFiles, prepareSendPayload, buildFileLabels, resolveFileSegment, mdImageDest, mdImageDestToPath, restoreQueuedContent, restoreUnreferencedImages, serializeDirTokens, servedUploadMb } from '../utils/fileTokens'
 
 describe('buildFileLabels uniqueness', () => {
   it('disambiguates paths that share a basename', () => {
@@ -721,11 +721,14 @@ describe('restoreQueuedContent with the entry\'s own attachment list', () => {
     expect(r.files).toEqual([])
   })
 
-  it('still leaves an inline mention verbatim — its @rel spelling is not on the list', () => {
+  it('restores an inline spaced-path mention as an @ mention when the list names it', () => {
+    // The list proves the path's boundary, spaces included, so the marker
+    // comes back as the shortest suffix that resolves to it on re-send.
     const { txt, filePaths } = prepareSendPayload('see @My Report.pdf for details', [spaced])
     const r = restoreQueuedContent(txt, filePaths)
-    expect(r.text).toBe(txt)
-    expect(r.files).toEqual([])
+    expect(r.text).toBe('see @My Report.pdf for details')
+    expect(r.files).toEqual([spaced])
+    expect(r.aliases).toEqual({ [spaced]: ['@My Report.pdf'] })
   })
 
   it('a list whose path disagrees with the marker text claims nothing', () => {
@@ -743,6 +746,201 @@ describe('restoreQueuedContent with the entry\'s own attachment list', () => {
     const r = restoreQueuedContent(txt, filePaths)
     expect(r.text).toBe('read')
     expect(r.files).toEqual([odd])
+  })
+})
+
+describe('restoreQueuedContent: inline mention markers (#14617)', () => {
+  // After a reload the queue-id stash is gone, so this parser is the only
+  // restore path. With the entry's own list an inline marker's path is
+  // exact, so it restores as a readable `@` mention and the file re-stages,
+  // instead of staying as raw wire text (`[attached_file 1] /repo/a.txt`
+  // plus the invisible separator) with its file dropped.
+
+  const SEP = MARKER_TRAILER_SEP
+
+  /** What a cancel restores once the stash is empty: the row's own content
+   *  and its own list, exactly what the hook hands the parser. */
+  const cancelAfterReload = (raw: string, staged: string[]) => {
+    const { txt, filePaths } = prepareSendPayload(raw, staged)
+    return { txt, r: restoreQueuedContent(txt, filePaths) }
+  }
+
+  it('a punctuated inline mention restores the chip and a readable mention', () => {
+    const { txt, r } = cancelAfterReload('check @a.txt, please', ['/repo/a.txt'])
+    // The wire shape the composer would otherwise get back verbatim.
+    expect(txt).toBe(`check [attached_file 1] /repo/a.txt${SEP}, please`)
+    expect(r.text).toBe('check @a.txt, please')
+    expect(r.text).not.toContain(SEP)
+    expect(r.files).toEqual(['/repo/a.txt'])
+    expect(r.aliases).toEqual({ '/repo/a.txt': ['@a.txt'] })
+  })
+
+  it('a whitespace-bounded inline mention restores the chip and a readable mention', () => {
+    const { txt, r } = cancelAfterReload('check @a.txt now', ['/repo/a.txt'])
+    expect(txt).toBe('check [attached_file 1] /repo/a.txt now')
+    expect(r.text).toBe('check @a.txt now')
+    expect(r.files).toEqual(['/repo/a.txt'])
+    expect(r.aliases).toEqual({ '/repo/a.txt': ['@a.txt'] })
+  })
+
+  it('drops the separator on both sides of a wrapped mention', () => {
+    const { txt, r } = cancelAfterReload('see (@a.txt) here', ['/repo/a.txt'])
+    expect(txt).toBe(`see (${SEP}[attached_file 1] /repo/a.txt${SEP}) here`)
+    expect(r.text).toBe('see (@a.txt) here')
+    expect(r.files).toEqual(['/repo/a.txt'])
+  })
+
+  it('keeps a hair space the user typed beside the mention', () => {
+    // The send emits its own separator beside a typed one, so exactly one
+    // comes off and the user's stays.
+    const { r } = cancelAfterReload(`check @a.txt${SEP}, please`, ['/repo/a.txt'])
+    expect(r.text).toBe(`check @a.txt${SEP}, please`)
+    expect(r.files).toEqual(['/repo/a.txt'])
+  })
+
+  it('a line-start mention followed by prose restores', () => {
+    const { r } = cancelAfterReload('@data.csv is broken', ['/tmp/data.csv'])
+    expect(r.text).toBe('@data.csv is broken')
+    expect(r.files).toEqual(['/tmp/data.csv'])
+  })
+
+  it('restores every occurrence of a file mentioned twice', () => {
+    const { r } = cancelAfterReload('diff @a.txt against @a.txt, again', ['/repo/a.txt'])
+    expect(r.text).toBe('diff @a.txt against @a.txt, again')
+    expect(r.files).toEqual(['/repo/a.txt'])
+  })
+
+  it('writes the shortest suffix that still names the file, which re-sends the same bytes', () => {
+    // The wire does not record the `@src/a.ts` spelling the user typed; any
+    // suffix that resolves back to the same path sends identical content.
+    const { txt, r } = cancelAfterReload('fix @src/a.ts.', ['/repo/src/a.ts'])
+    expect(r.text).toBe('fix @a.ts.')
+    expect(prepareSendPayload(r.text, r.files).txt).toBe(txt)
+  })
+
+  it('widens the suffix for two files that share a basename', () => {
+    const { txt, r } = cancelAfterReload('compare @x/a.txt with @y/a.txt', ['/repo/x/a.txt', '/repo/y/a.txt'])
+    expect(r.text).toBe('compare @x/a.txt with @y/a.txt')
+    expect(r.files).toEqual(['/repo/x/a.txt', '/repo/y/a.txt'])
+    expect(r.aliases).toEqual({ '/repo/x/a.txt': ['@x/a.txt'], '/repo/y/a.txt': ['@y/a.txt'] })
+    expect(prepareSendPayload(r.text, r.files).txt).toBe(txt)
+  })
+
+  it('widens the suffix past a same-named file the destination composer already stages', () => {
+    // The restore merges into a composer that may already hold `x/a.txt`
+    // (an earlier cancel, a pick). `@a.txt` would then bind to whichever
+    // file the next send meets first, so the mention takes `y/a.txt`.
+    const { txt, filePaths } = prepareSendPayload('against @y/a.txt', ['/repo/y/a.txt'])
+    const r = restoreQueuedContent(txt, filePaths, ['/repo/x/a.txt'])
+    expect(r.text).toBe('against @y/a.txt')
+    expect(r.files).toEqual(['/repo/y/a.txt'])
+    const merged = prepareSendPayload(`compare @a.txt\n\n${r.text}`, ['/repo/x/a.txt', ...r.files]).txt
+    expect(merged).toBe('compare [attached_file 1] /repo/x/a.txt\n\nagainst [attached_file 2] /repo/y/a.txt')
+  })
+
+  it('leaves the marker verbatim when every suffix of its path is staged elsewhere', () => {
+    // `/srv/repo/a.txt` already ends in every suffix `/repo/a.txt` has, so
+    // no mention could be told apart from it; the marker stays as sent.
+    const { txt, filePaths } = prepareSendPayload('read @a.txt now', ['/repo/a.txt'])
+    const r = restoreQueuedContent(txt, filePaths, ['/srv/repo/a.txt'])
+    expect(r.text).toBe(txt)
+    expect(r.files).toEqual([])
+    expect(r.aliases).toBeUndefined()
+  })
+
+  it('refuses a suffix a staged sibling extends with consumable punctuation, either way round', () => {
+    // With `report,` staged, a restored `@report, please` reads as THAT
+    // file's mention on send and the reconciliation unstages `report`.
+    const shorter = prepareSendPayload('check @report, please', ['/repo/report'])
+    const r1 = restoreQueuedContent(shorter.txt, shorter.filePaths, ['/repo/report,'])
+    expect(r1.text).toBe(shorter.txt)
+    expect(r1.files).toEqual([])
+    const longer = prepareSendPayload('check @report, please', ['/repo/report,'])
+    const r2 = restoreQueuedContent(longer.txt, longer.filePaths, ['/repo/report'])
+    expect(r2.text).toBe(longer.txt)
+    expect(r2.files).toEqual([])
+  })
+
+  it('a sibling that extends the name with ordinary filename characters does not block the short spelling', () => {
+    // `main.tsx` cannot be read as `@main.ts` plus punctuation.
+    const { txt, filePaths } = prepareSendPayload('fix @main.ts, then test', ['/repo/main.ts'])
+    const r = restoreQueuedContent(txt, filePaths, ['/repo/main.tsx'])
+    expect(r.text).toBe('fix @main.ts, then test')
+    expect(r.files).toEqual(['/repo/main.ts'])
+  })
+
+  it('a file the destination already stages under the same path keeps the short spelling', () => {
+    const { txt, filePaths } = prepareSendPayload('read @a.txt now', ['/repo/a.txt'])
+    const r = restoreQueuedContent(txt, filePaths, ['/repo/a.txt'])
+    expect(r.text).toBe('read @a.txt now')
+    expect(r.files).toEqual(['/repo/a.txt'])
+  })
+
+  it('spells a file under the project relative to it, the spelling the composer revives a chip for', () => {
+    // The composer brings a deleted chip back on undo only when the mention
+    // reads as the path relative to the project, so `@a.ts` for a file at
+    // src/a.ts there would lose the file on the next send after an undo.
+    const p = '/repo/main/src/a.ts'
+    const { txt, filePaths } = prepareSendPayload('check @src/a.ts, please', [p])
+    for (const project of ['/repo/main', '/repo/main/']) {
+      const r = restoreQueuedContent(txt, filePaths, undefined, project)
+      expect(r.text).toBe('check @src/a.ts, please')
+      expect(r.files).toEqual([p])
+      expect(r.aliases).toEqual({ [p]: ['@src/a.ts'] })
+    }
+  })
+
+  it('a project-relative spelling another staged file shares falls back to the shortest that does not', () => {
+    const p = '/repo/main/src/a.ts'
+    const { txt, filePaths } = prepareSendPayload('check @src/a.ts now', [p])
+    const r = restoreQueuedContent(txt, filePaths, ['/repo/other/src/a.ts'], '/repo/main')
+    expect(r.text).toBe('check @main/src/a.ts now')
+    expect(r.files).toEqual([p])
+  })
+
+  it('a file outside the project, or no project, keeps the shortest spelling', () => {
+    const p = '/tmp/notes/a.ts'
+    const { txt, filePaths } = prepareSendPayload('check @a.ts now', [p])
+    expect(restoreQueuedContent(txt, filePaths, undefined, '/repo/main').text).toBe('check @a.ts now')
+    // A sibling directory whose name only starts with the project's is not under it.
+    const q = '/repo/main2/src/a.ts'
+    const sib = prepareSendPayload('check @a.ts now', [q])
+    expect(restoreQueuedContent(sib.txt, sib.filePaths, undefined, '/repo/main').text).toBe('check @a.ts now')
+    expect(restoreQueuedContent(sib.txt, sib.filePaths).text).toBe('check @a.ts now')
+  })
+
+  it('restores an inline mention beside a bare upload and a pasted image', () => {
+    const staged = ['/tmp/shot.png', '/repo/a.txt', '/repo/b.log']
+    const { txt, r } = cancelAfterReload('look at @a.txt, then the log', staged)
+    expect(r.text).toBe('look at @a.txt, then the log')
+    expect(new Set(r.files)).toEqual(new Set(staged))
+    expect(r.aliases).toEqual({ '/repo/a.txt': ['@a.txt'] })
+    expect(prepareSendPayload(r.text, r.files).txt).toBe(txt)
+  })
+
+  it('without the list an inline marker stays verbatim: the path boundary is unproven', () => {
+    const { txt } = prepareSendPayload('check @a.txt, please', ['/repo/a.txt'])
+    const r = restoreQueuedContent(txt)
+    expect(r.text).toBe(txt)
+    expect(r.files).toEqual([])
+    expect(r.aliases).toBeUndefined()
+  })
+
+  it('marker-shaped text glued to a word is not a mention the send wrote', () => {
+    const glued = 'see x[attached_file 1] /repo/a.txt now'
+    const r = restoreQueuedContent(glued, ['/repo/a.txt'])
+    expect(r.text).toBe(glued)
+    expect(r.files).toEqual([])
+  })
+
+  it('the round-trip arbiter still gates an inline claim', () => {
+    // An own-line mention mid-text re-serializes as an appended marker, so the
+    // whole restore stays verbatim, the inline mention beside it included.
+    const { txt, filePaths } = prepareSendPayload('@data.csv\nthen check @a.txt now', ['/tmp/data.csv', '/repo/a.txt'])
+    const r = restoreQueuedContent(txt, filePaths)
+    expect(r.text).toBe(txt)
+    expect(r.files).toEqual([])
+    expect(r.aliases).toBeUndefined()
   })
 })
 
@@ -793,5 +991,110 @@ describe('restoreUnreferencedImages (legacy pane rows: image only on meta.files)
 
   it('an image-only legacy row (empty caption) yields just the image line', () => {
     expect(restoreUnreferencedImages('', { files: ['/tmp/a.png'] })).toBe('![image](/tmp/a.png)')
+  })
+
+  // Issue #22401: a stored row whose content already carries the image line but
+  // with the RAW, unwrapped path is the bug this heals. A path containing a
+  // space, `(`, or `)` is not a CommonMark destination unwrapped, so
+  // `![image](/a b.png)` renders as its literal markdown source, not the
+  // picture. The common trigger is a data home / uploads dir with a space in
+  // it (e.g. a shared mount like `/srv/shared data/...`). A bare `%` is
+  // deliberately NOT one of these triggers -- see the %-only cases below.
+  it('repairs an unwrapped spaced-path image line in place to the wrapped form', () => {
+    const p = '/srv/shared data/uploads/ab_pasted-image-1.png'
+    // The old raw-is-named rule treated this broken line as "named" and left it.
+    expect(restoreUnreferencedImages(`![image](${p})`, { files: [p] }))
+      .toBe(`![image](${mdImageDest(p)})`)
+  })
+
+  it('does not duplicate the image when it repairs the raw line', () => {
+    const p = '/srv/shared data/uploads/ab.png'
+    const out = restoreUnreferencedImages(`![image](${p})`, { files: [p] })
+    expect(out.match(/!\[image\]/g)?.length).toBe(1)
+  })
+
+  it('repairs the raw line AND keeps a surrounding caption', () => {
+    const p = '/srv/shared data/uploads/ab.png'
+    expect(restoreUnreferencedImages(`![image](${p})\n\nlook at this`, { files: [p] }))
+      .toBe(`![image](${mdImageDest(p)})\n\nlook at this`)
+  })
+
+  it('repairs only the paths meta.files knows, leaving unrelated text untouched', () => {
+    const p = '/srv/shared data/uploads/ab.png'
+    // A prose mention of a DIFFERENT spaced path is not an image destination and
+    // is not in meta.files, so it is left exactly as written.
+    const content = `![image](${p})\n\nnot a dest: /srv/shared data/notes.txt`
+    expect(restoreUnreferencedImages(content, { files: [p] }))
+      .toBe(`![image](${mdImageDest(p)})\n\nnot a dest: /srv/shared data/notes.txt`)
+  })
+
+  it('still heals a spaced path that is missing from the content entirely', () => {
+    const p = '/srv/shared data/uploads/ab.png'
+    expect(restoreUnreferencedImages('', { files: [p] })).toBe(`![image](${mdImageDest(p)})`)
+  })
+
+  // Reviewer HOLD on #22406: a path whose ONLY unsafe character is a literal
+  // `%` is not actually broken unwrapped -- `%` does not terminate CommonMark's
+  // destination grammar, so `remark-parse` returns it byte-identical and the
+  // real img-src sink (ImgWithFallback) keys its decode on whether the SOURCE
+  // TEXT was `<...>`-wrapped, not on `%`'s presence. An unwrapped %-only
+  // destination already resolves to the exact on-disk path today, so the
+  // repair must leave it alone -- wrapping it would be the bug, not the fix.
+  it('leaves an unwrapped %-only destination alone -- it already renders (no false repair)', () => {
+    const p = '/home/user/uploads/photo%20copy.png'
+    const content = `![image](${p})`
+    expect(restoreUnreferencedImages(content, { files: [p] })).toBe(content)
+  })
+
+  it('does not duplicate a %-only path left unrepaired (named() must match its own unwrapped spelling)', () => {
+    const p = '/home/user/uploads/photo%20copy.png'
+    const content = `![image](${p})\n\nlook at this`
+    const out = restoreUnreferencedImages(content, { files: [p] })
+    expect(out).toBe(content)
+    expect(out.match(/!\[image\]/g)?.length).toBe(1)
+  })
+
+  // Design Review BLOCK on #22406 (c75be1244): a prior revision of this fix
+  // narrowed named() to the UNWRAPPED spelling only, which missed every path
+  // mdImageDest wraps for a reason OTHER than needsDestRepair (non-ASCII,
+  // `+`, `,`, `'`, `&` -- anything outside the safe charset besides space/
+  // parens) and duplicated the image on every render of a freshly-sent row.
+  it('does not duplicate a freshly-sent image whose path mdImageDest wraps for a non-%, non-repair reason (non-ASCII)', () => {
+    const p = '/tmp/uploads/café.png'
+    const { displayTxt } = prepareSendPayload('look', [p])
+    const out = restoreUnreferencedImages(displayTxt, { files: [p] })
+    expect(out).toBe(displayTxt)
+    expect(out.match(/!\[image\]/g)?.length).toBe(1)
+  })
+
+  it('does not duplicate a freshly-sent image whose path mdImageDest wraps for punctuation (+ , \' &)', () => {
+    const p = "/tmp/uploads/a+b,c'd&e.png"
+    const { displayTxt } = prepareSendPayload('look', [p])
+    const out = restoreUnreferencedImages(displayTxt, { files: [p] })
+    expect(out).toBe(displayTxt)
+    expect(out.match(/!\[image\]/g)?.length).toBe(1)
+  })
+
+  it('still heals a %-only path missing from the content entirely, via the normal producer form', () => {
+    // A genuinely-missing image is prepended fresh, same as any other image --
+    // mdImageDest's own %-escaping for FRESHLY PRODUCED destinations is a
+    // separate concern from the repair loop (which must not rewrite an
+    // already-renderable existing line); this case has no existing line to
+    // preserve, so it takes the normal producer path.
+    const p = '/home/user/uploads/photo%20copy.png'
+    expect(restoreUnreferencedImages('', { files: [p] })).toBe(`![image](${mdImageDest(p)})`)
+  })
+})
+
+describe('servedUploadMb', () => {
+  it('passes a positive figure through, fractional included', () => {
+    expect(servedUploadMb(100)).toBe(100)
+    expect(servedUploadMb(0.5)).toBe(0.5)
+  })
+
+  it('answers null for anything unusable, never a default', () => {
+    for (const v of [undefined, null, 0, -1, '100', Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(servedUploadMb(v)).toBeNull()
+    }
   })
 })

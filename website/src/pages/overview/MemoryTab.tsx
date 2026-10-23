@@ -9,7 +9,8 @@ import InfoTip from '../../components/InfoTip'
 import SimpleSelect from '../../components/SimpleSelect'
 import { esc } from '../../api/helpers'
 import { findReport, parseErrorCode, parseErrorField } from '../../utils/errorReport'
-import VectorMemoryCard from './VectorMemoryCard'
+import { sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
+import VectorMemoryCard, { SEMANTIC_CARD_ID } from './VectorMemoryCard'
 import EmbeddingModelCard from './EmbeddingModelCard'
 import MemoryStoreCard, {
   MEMORY_QUERY_PREFIXES,
@@ -86,7 +87,26 @@ function scopeCell(lesson: Lesson) {
   return <>{repo}<span className="block text-[12px] text-muted">{i18nT('pages.overview.memoryTab.scope_workspace', { name: lesson.workspace })}</span></>
 }
 
-export default function MemoryTab({ refreshTrigger, selectedStore, onStoreNavigate }: { refreshTrigger: number; selectedStore?: string; onStoreNavigate?: (store: string) => void }) {
+/** The Source cell: the store's write origin in plain words. `user_explicit`
+ *  covers every deliberate save (`learn_add`, the dashboard, the CLI), whoever
+ *  made it, so its label names both the user and the agent. An origin with no
+ *  label shows its stored code; a row with none reads "Unknown". */
+function sourceCell(lesson: Lesson) {
+  switch (lesson.source || '') {
+    case '': return <span className="text-muted italic">{i18nT('pages.overview.memoryTab.source_unknown')}</span>
+    case 'user_explicit': return i18nT('pages.overview.memoryTab.source_user_explicit')
+    case 'consolidation': return i18nT('pages.overview.memoryTab.source_consolidation')
+    case 'taskrunner': return i18nT('pages.overview.memoryTab.source_taskrunner')
+    default: return <span className="font-mono">{esc(lesson.source ?? '')}</span>
+  }
+}
+
+/** `?focus=` value that lands the global Memory view on its lessons. */
+export const MEMORY_FOCUS_LESSONS = 'lessons'
+/** The Lessons card, the landing spot for that focus when vector memory is off. */
+export const LESSONS_CARD_ID = 'memory-lessons-card'
+
+export default function MemoryTab({ refreshTrigger, selectedStore, onStoreNavigate, focus }: { refreshTrigger: number; selectedStore?: string; onStoreNavigate?: (store: string) => void; focus?: string | null }) {
   const stores = useMemoryStores()
   const navigate = useNavigate()
   const leave = useGuardedLeave()
@@ -156,7 +176,7 @@ export default function MemoryTab({ refreshTrigger, selectedStore, onStoreNaviga
           }}>{i18nT('pages.kiroCrewAgentsPage.open_crew_manager')}</Btn>
         </div>
       </>}
-    </Card> : <GlobalMemoryTab refreshTrigger={refreshTrigger} onDirtyChange={setDirty} />}
+    </Card> : <GlobalMemoryTab refreshTrigger={refreshTrigger} onDirtyChange={setDirty} focusLessons={focus === MEMORY_FOCUS_LESSONS} />}
     {pendingStore !== null && <Modal open title={i18nT('memoryV2.discard_title')} onClose={() => setPendingStore(null)}><div className="flex flex-col gap-3">
       <p className="text-[13px]">{i18nT('memoryV2.discard_explanation')}</p>
       <div className="flex flex-wrap gap-2">
@@ -167,7 +187,7 @@ export default function MemoryTab({ refreshTrigger, selectedStore, onStoreNaviga
   </>
 }
 
-function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: number; onDirtyChange?: (dirty: boolean) => void }) {
+function GlobalMemoryTab({ refreshTrigger, onDirtyChange, focusLessons = false }: { refreshTrigger: number; onDirtyChange?: (dirty: boolean) => void; focusLessons?: boolean }) {
   const queryClient = useQueryClient()
   // The failed-session link leaves this tab; through the same guard as the
   // outer tab's exits, since the drafts held here are what the guard protects.
@@ -206,6 +226,19 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
   const [idleHours, setIdleHours] = useState(3); const [maxDays, setMaxDays] = useState(90); const [settingsSaved, setSettingsSaved] = useState(false)
   const [migrated, setMigrated] = useState(false)
   const [vectorActive, setVectorActive] = useState(false)
+  // `vectorActive` reads false until the vector card's status answers, so the
+  // lessons landing spot is chosen only once it has: before that the Lessons
+  // card can render and then vanish under a store that keeps lessons as
+  // `lesson.*` rows in the Semantic browser instead.
+  const [vectorSettled, setVectorSettled] = useState(false)
+  const lessonsFocused = useRef(false)
+  useEffect(() => {
+    if (!focusLessons || !vectorSettled || lessonsFocused.current) return
+    const target = document.getElementById(vectorActive ? SEMANTIC_CARD_ID : LESSONS_CARD_ID)
+    if (!target) return
+    lessonsFocused.current = true
+    target.scrollIntoView({ block: 'start' })
+  }, [focusLessons, vectorSettled, vectorActive])
   const [consolidating, setConsolidating] = useState(false)
   const [consolidateMsg, setConsolidateMsg] = useState<ReactNode>('')
   const [consolidateOk, setConsolidateOk] = useState(false)
@@ -286,6 +319,7 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
     rule: (a: Lesson, b: Lesson) => a.rule.localeCompare(b.rule),
     category: (a: Lesson, b: Lesson) => a.category.localeCompare(b.category),
     repo_scope: (a: Lesson, b: Lesson) => compareText(a.repo_scope ?? '', b.repo_scope ?? ''),
+    source: (a: Lesson, b: Lesson) => compareText(a.source ?? '', b.source ?? ''),
     ts: (a: Lesson, b: Lesson) => new Date(a.ts).getTime() - new Date(b.ts).getTime(),
   }), [])
   const recentLessons = useMemo(() => lessons.slice(-20), [lessons])
@@ -500,14 +534,14 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
             report={findReport(consolidateFailure.raw)}
             footer={<>
               {consolidateFailure.session !== undefined && (
-                /* The session by its TITLE, as the sidebar names it (the key only when
-                   it has none), and a way to act on it: the same guarded navigation as
+                /* The session by its TITLE, as the sidebar names it ("Untitled session"
+                   when it has none), and a way to act on it: the same guarded navigation as
                    the tab's other exits, since a click leaves the drafts this tab holds. */
                 <span className="block text-[12px]" data-testid="consolidate-failed-session">
                   <Trans
                     i18nKey="pages.overview.memoryTab.consolidate_failed_session"
                     count={consolidateFailure.count}
-                    values={{ session: consolidateFailure.session.title || consolidateFailure.session.key }}
+                    values={{ session: sessionDisplayTitle(consolidateFailure.session) }}
                     // eslint-disable-next-line jsx-a11y/control-has-associated-label -- the control's label is the session title `Trans` renders inside it
                     components={{ session: <button
                       type="button"
@@ -548,7 +582,12 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
         {migrated && <span className="text-[12px] text-muted ml-2">{i18nT('pages.overview.memoryTab.semantic_memory_active_text_files_are_read_only')}</span>}
       </div>
     </Card>
-    <VectorMemoryCard onActiveChange={setVectorActive} onMigratedChange={setMigrated} />
+    <VectorMemoryCard
+      onActiveChange={setVectorActive}
+      onMigratedChange={setMigrated}
+      onSettledChange={setVectorSettled}
+      initialSemanticFilter={focusLessons ? 'lesson.' : undefined}
+    />
     <EmbeddingModelCard />
     <details onToggle={event => setRecordsOpen(event.currentTarget.open)}>
       <summary className="min-h-11 cursor-pointer rounded-lg border border-border p-3 text-[13px] text-muted">
@@ -619,7 +658,7 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
     {storeReadable && <MemoryRetiredCard key={`retired-${store}`} store={store} />}
     <MemoryBackupsCard key={`backups-${store}`} store={store} />
     {!vectorActive && (
-      <Card><CardTitle>{i18nT('pages.overview.memoryTab.lessons')} <InfoTip text={i18nT('pages.overview.memoryTab.persistent_lessons_injected_into_every_session_a')} /></CardTitle>
+      <Card id={LESSONS_CARD_ID}><CardTitle>{i18nT('pages.overview.memoryTab.lessons')} <InfoTip text={i18nT('pages.overview.memoryTab.persistent_lessons_injected_into_every_session_a')} /></CardTitle>
       <div className="flex gap-2 items-center flex-wrap mb-3">
         <Input placeholder={i18nT('pages.overview.memoryTab.rule_e_g_always_use_tabs_not_spaces')} style={{ flex: 2 }} value={rule} onChange={e => setRule(e.target.value)} />
         <SimpleSelect
@@ -657,13 +696,13 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
       />
       {/* Scrolls sideways rather than clipping: five columns plus a long path
           fragment overrun a narrow viewport, and the card hides overflow. */}
-      <div className="overflow-x-auto"><table className="w-full border-collapse table-striped"><thead><tr><SortableHeader label={i18nT('pages.overview.memoryTab.rule')} sortKey="rule" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.category')} sortKey="category" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.scope')} sortKey="repo_scope" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.when')} sortKey="ts" sort={lessonSort} onToggle={toggleLessonSort} /><th aria-label={i18nT('pages.overview.memoryTab.actions')} className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium"></th></tr></thead>
-        <tbody>{lessons.length === 0 ? <tr><td colSpan={5}><EmptyState icon={<BookOpen className="lucide-inline" />} title={i18nT('pages.overview.memoryTab.no_lessons_yet')} subtitle={i18nT('pages.overview.memoryTab.lessons_empty_subtitle')} /></td></tr> : sortedLessons.map((l) => (
+      <div className="overflow-x-auto"><table className="w-full border-collapse table-striped"><thead><tr><SortableHeader label={i18nT('pages.overview.memoryTab.rule')} sortKey="rule" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.category')} sortKey="category" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.scope')} sortKey="repo_scope" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.source')} sortKey="source" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.when')} sortKey="ts" sort={lessonSort} onToggle={toggleLessonSort} /><th aria-label={i18nT('pages.overview.memoryTab.actions')} className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium"></th></tr></thead>
+        <tbody>{lessons.length === 0 ? <tr><td colSpan={6}><EmptyState icon={<BookOpen className="lucide-inline" />} title={i18nT('pages.overview.memoryTab.no_lessons_yet')} subtitle={i18nT('pages.overview.memoryTab.lessons_empty_subtitle')} /></td></tr> : sortedLessons.map((l) => (
           // Scope is part of the key: a scoped and a global row sharing rule text
           // are two lessons, and can share a timestamp. String() keeps the null
           // (unusable-scope) row distinct from the "" (global) one; the JSONL tier
           // keeps a workspace row distinct from a global one.
-          <tr key={`${l.rule}-${String(l.repo_scope)}-${l.workspace ?? ''}-${l.ts}`} className="hover:bg-bg-hover transition-colors"><td className="px-2.5 py-2 border-b border-border text-sm">{esc(l.rule)}</td><td className="px-2.5 py-2 border-b border-border text-sm"><Badge variant="ok">{l.category}</Badge></td><td className="px-2.5 py-2 border-b border-border text-sm">{scopeCell(l)}</td><td className="px-2.5 py-2 border-b border-border text-sm">{fmtDateTimeNumeric(l.ts)}</td>
+          <tr key={`${l.rule}-${String(l.repo_scope)}-${l.workspace ?? ''}-${l.ts}`} className="hover:bg-bg-hover transition-colors"><td className="px-2.5 py-2 border-b border-border text-sm">{esc(l.rule)}</td><td className="px-2.5 py-2 border-b border-border text-sm"><Badge variant="ok">{l.category}</Badge></td><td className="px-2.5 py-2 border-b border-border text-sm">{scopeCell(l)}</td><td className="px-2.5 py-2 border-b border-border text-sm">{sourceCell(l)}</td><td className="px-2.5 py-2 border-b border-border text-sm whitespace-nowrap">{fmtDateTimeNumeric(l.ts)}</td>
             <td className="px-2.5 py-2 border-b border-border text-sm"><Btn danger onClick={() => deleteLesson(l)}>{i18nT('pages.overview.memoryTab.delete')}</Btn></td></tr>
         ))}</tbody></table></div></Card>
     )}

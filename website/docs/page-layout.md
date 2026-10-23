@@ -16,16 +16,16 @@ conventions around them (a11y, data fetching, typography) live in
 The task dashboard, the **All Dashboards** page (`/session-dashboards`) and the
 automatic session cards are specified in
 [artifacts](../../docs/system-specs/modules/artifacts.md#dynamic-dashboard-presentation):
-the preview gate, the iframe and live-inventory caps, the automatic-card CSS
+the iframe and live-inventory caps, the automatic-card CSS
 restrictions, and the **Needs you** inbox with its native answer and approval
 controls. The layout rules that belong here:
 
 - In chat, the dock sits above the composer, in the composer's own column
   (`--mc-input-width`), and its tiles wrap in a narrow column. Long-run status reuses
   the side-panel dock, expansion and narrow-screen overlay, not another drawer.
-- Crew's permanent **Dashboard** tab renders the crewmate's published page
-  (`CrewDashboardFrame`) straight into the panel, with no Command Center, no Published
-  view selector and no in-chat dock opener. Once visited, its body stays mounted across
+- Crew's permanent **Dashboard** tab renders the mate's dynamic dashboard
+  (`CrewDashboardTab`) straight into the panel. There is no Command Center, no
+  Published view selector and no in-chat dock opener. Once visited, its body stays mounted across
   tab-strip switches (Dashboard to Files), so it keeps its scroll and document.
 - The All Dashboards page uses the standard page header and scroll container, with one
   column narrow and two wide.
@@ -54,6 +54,24 @@ refuses to shrink and the whole page scrolls instead.
 
 `PageHeader` also takes an `actions` node, rendered right-aligned on the title
 row. Put page-level buttons there rather than in the first `Card`.
+
+### A Settings tab's section list stays in view
+
+Tabs that host `SettingsSubNav` (Chat, Display, Notifications, Channels, Security)
+scroll in SidePanelLayout's content column, and their title and description scroll
+away with the rest. In the two-pane layout (container at least 760px wide) the
+section list is `sticky` in its row, pinned 8px below the top of that scroll area
+while the detail pane scrolls. A list taller than the area is capped and scrolls on
+its own. The cap is the area's measured height less 8px above the list and, below it,
+the larger of 8px and the space between the list's row and the end of the content
+(the pane's bottom padding). A sticky list cannot leave its row, so that space keeps
+the whole list inside the area at the end of the scroll as well. Both are measured off
+the nearest scrolling ancestor rather than computed from the viewport, so the cap also
+holds when Settings is embedded in a split pane. A capped list shows the same
+decorative "More below" cue as SidePanelLayout's tab column (`MoreBelowCue`) while
+rows remain below. The cue is a strip inside the cap, under the scrolling rows, so it
+stays on the list's visible bottom edge as the rows scroll; it hides at the end of the
+list and is absent when the list fits. The narrow single-column layout is unchanged.
 
 ### Read every class here narrow-first
 
@@ -245,9 +263,12 @@ per mounted row, the two sentinels at the list ends, and the `offsetBefore` /
 paging bar, a header band) needs nothing extra: the hook measures that leading
 offset itself and carries a bottom-parked reader through it. A host that steers
 toward a row that may not be mounted (the pinned-prompt glide) asks the hook
-through `mountIndex` and `estimateRowTop`. The page keeps `overflow-anchor: auto`
-on the scroller as the browser's own stabiliser. WebKit ships none, so the hook
-carries its own anchors as well.
+through `mountIndex` and `estimateRowTop`. The page declares `overflow-anchor: auto`
+on the scroller as the browser's own stabiliser for a scrolled-up reader; while
+follow is armed the hook sets it to `none` inline, because the bottom pin owns the
+position and Firefox's anchoring would drag the reader off the end
+(`followAnchorMode`). WebKit ships no anchoring, so the hook carries its own
+anchors as well.
 
 The pinned-prompt card is an overlay beside the scroller, not a row in it, and
 it paints above the composer dock, so nothing but geometry bounds it. Its
@@ -304,9 +325,62 @@ controls, and a control under the glass is an ambiguous tap. A failed suggestion
 fetch shows an `ErrorNotice` there instead.
 It is `isolate` so WelcomeView's own z-indexes order its cards against each other
 and never against the composer's, and its column uses `safe center` and compact
-rows under 600px tall so a short window still fits both rows above the dock. The
-side-panel `ChatPane.tsx` keeps
-its bars in flow and needs none of this.
+rows under 600px tall so a short window still fits both rows above the dock.
+
+`ChatPane.tsx` (split panes and a mate's chat) floats its composer the same
+way: one dock root (`composer-dock-root`) over the scroller's bottom edge holding
+the jump pill, the bars, the queue, the question card, the notices and the
+composer, measured by the same `useComposerDockMetrics` and paid for by the same
+`DOCK_CLEARANCE_PX` (`pages/chat/composerDockMetrics.ts`, shared by both hosts).
+The pane has no welcome hero, so nothing in it ends above the dock.
+
+The same reading applies at the TOP of a chat that a host crowns with a glass
+chip: the Members page's DM header (the Glass identity pill, the switcher, the
+panel opener) floats over the pane's top edge and the conversation scrolls under
+it (#18325). `ChatPane` takes the band's measured height as `topInset` and pads
+its scroller's rows below it (a mate's chat draws no pinned-prompt band,
+#18346, so the inset is the only thing it pays); the host measures the header
+with `useMeasuredHeight`, never a constant. Anything with controls that sits between such a header and the pane
+(a notice, a greeting card) stays in flow, padded below the header, and the pane
+then takes no inset: a control under the glass is an ambiguous tap. The row and
+its cells pass pointer events through; only the controls catch them. Details:
+[crew-mode](../../docs/system-specs/modules/crew-mode.md#mate-conversation-layout-switcher-profile-dashboard-files).
+
+### Mate conversation sends and runtime detail
+
+A `ChatPane` with `crewmate` always uses the `responsive` composer mode:
+one normal Send arrow for idle, busy, delegated and stopping states. Enter,
+click, voice auto-submit and direct question answers use the existing send
+transport with an optional top-level `responsive: true` in
+`POST /api/chat?ws=1`. The gateway validates a human on a real member DM and
+owns prioritization; the frontend neither sends stop nor chooses a model.
+Other panes and Sessions retain their existing Steer/Queue controls and wire.
+
+The same attachment/quote/paste serializer, send-id correlation, draft recovery,
+and measured composer dock remain in use. A responsive optimistic bubble is
+marked locally with `responsiveSend` so an exact-id steer echo can reconcile it
+and buffered streaming text stays above it. A refused send restores the draft;
+a late receipt leaves a visible delivery-pending bubble. If the server really
+queues a send, the existing cancellable queue remains visible rather than
+losing the message. No system-delivery or subagent-progress bar is drawn.
+
+Cold pane mounts hydrate the slot-detail `queue` alongside `messages` through
+the shared queue normalizer and bubble hydrator, retaining the exact send id,
+attachments and quote. The first hydrate fills missing queue cards without
+replacing newer live cards; pop/cancel ids observed before it prevent a stale
+snapshot from resurrecting completed entries, even if no message array existed
+when the frame arrived. A bounded-to-unbounded history upgrade keeps the current
+queue rather than replaying its fetched queue snapshot. Active-slot hydration
+remains owned by Sessions' existing switch/refresh path.
+
+The mate transcript filters runtime notices and stop events as well as
+tools, reasoning and injected subagent rows, without changing stored history.
+Historical steer/requeue/decision metadata draws an ordinary user bubble.
+Errors, pending approvals, questions, files and OAuth actions remain accessible.
+The existing footer is the simple working indicator, not a tool-purpose timeline;
+the detailed Sessions view and its normal engineering UI remain available through
+the profile's session links. Narrow screens keep the same width-adaptive composer,
+attachment holds, IME/Enter handling and keyboard-preserving send control.
 
 ## Stat cards
 

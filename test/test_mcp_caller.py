@@ -25,6 +25,7 @@ from kiro_crew.mcp_caller import (
     new_tenant_nonce,
     tenant_nonce_from_meta,
 )
+from kiro_crew.testing.wait import await_until
 
 
 def test_single_session_identity_preserves_cached_caller(monkeypatch):
@@ -174,7 +175,7 @@ async def test_interleaved_member_calls_keep_their_ordinary_session_identity(mon
         count += 1
         if count == 2:
             both_started.set()
-        await asyncio.wait_for(both_started.wait(), timeout=2)
+        await await_until(both_started, what="both requests being in flight")
         try:
             return mcp_core._resolve_session_key_strict(), mcp_core._caller_header()
         finally:
@@ -282,8 +283,8 @@ def test_a_malformed_mapping_mid_chain_does_not_stop_the_walk(tmp_path, monkeypa
 
 def test_a_recycled_mapping_does_not_stop_the_walk(tmp_path, monkeypatch) -> None:
     """The same stop fired on a proven recycle, which needs no planting at all:
-    the sweep deliberately leaves a stale file on disk for every live recycled
-    pid, so a legitimate tree would strand on its own housekeeping."""
+    a stale file sits on disk for a live recycled pid until the next sweep, so a
+    legitimate tree would strand on its own housekeeping."""
     monkeypatch.setattr(kiro_crew.mcp_caller, "_FROM_ENV_CACHE", None)
     from kiro_crew import platform_compat
 
@@ -381,6 +382,43 @@ def test_an_exhausted_walk_that_passed_a_recycled_record_refuses(tmp_path) -> No
 
     assert identity.session_key == ""
     assert identity.failed is True
+
+
+@pytest.mark.parametrize(
+    ("live_token", "swept_failed", "swept_key"),
+    [
+        ("live-token-bbb", False, ""),
+        ("recorded-token-aaa", False, "previous-owner-session"),
+    ],
+    ids=["recycled-is-retracted", "matching-token-is-kept"],
+)
+def test_the_sweep_ends_a_recycled_ancestors_refusal(
+    tmp_path, monkeypatch, live_token, swept_failed, swept_key
+) -> None:
+    """HEADLINE: a recycled ancestor's record refuses only until the sweep runs.
+
+    The walk itself keeps refusing on it: it reads without a signature, so it
+    cannot tell a real recycle from a planted file. The publisher's sweep can, so
+    once it runs the chain is empty and the caller gets the unattributed answer
+    of a chain that never held a record -- no session key, so nothing trusted.
+    A record whose token still matches is not touched and still resolves.
+    """
+    from kiro_crew import session_pid
+
+    monkeypatch.setattr(session_pid, "config_dir", lambda: tmp_path)
+    body = "previous-owner-session\nrecorded-token-aaa"
+    before = _exhausted_walk(tmp_path, plant=body, live_token=live_token)
+    if live_token == "live-token-bbb":
+        assert before.failed is True, "the walk must keep refusing an unswept record"
+
+    from kiro_crew import platform_compat
+
+    with mock.patch.object(platform_compat, "get_process_start_id", return_value=live_token):
+        session_pid._prune_stale_session_pid_files()
+
+    after = _exhausted_walk(tmp_path, plant=None, live_token=live_token)
+    assert after.failed is swept_failed
+    assert after.session_key == swept_key
 
 
 def test_an_exhausted_walk_that_saw_nothing_stays_permissive(tmp_path) -> None:

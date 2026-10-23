@@ -26,7 +26,7 @@ import pytest
 
 from kiro_crew import agent, agent_state
 from kiro_crew.agent_files import DASHBOARD_AUTHOR_AGENT_FILENAME, OWNED_KIRO_AGENT_FILES
-from kiro_crew.agent_materialization import worker_agent
+from kiro_crew.agent_materialization import skill_resources, worker_agent
 from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
 
 
@@ -162,6 +162,38 @@ def test_the_install_records_the_ownership_digest(
     recorded = agent_state.get_managed_digest("kirocrew-dashboard-author")
     assert recorded is not None
     assert recorded == agent_state.spec_digest(spec)
+    assert _is_installers(target) is True
+
+
+def test_the_recorded_digest_is_of_the_bytes_the_governed_write_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ceiling that moves while the install runs cannot split the bytes from their record.
+
+    The ceiling is read when the shared tail runs at the write, so the pending digest
+    must be taken after that pass. Here the ceiling starts withholding ``tool_search``
+    the moment the writer is entered: the landed spec loses the grant, and the
+    recorded digest must still be that spec's, or every later rebuild would read the
+    file as foreign and stop re-filtering it.
+    """
+    from kiro_crew.agent_materialization import auto_approve
+
+    rig = _Rig(tmp_path, monkeypatch)
+    real_write = auto_approve.write_governed_spec
+
+    def tightening_write(path: Path, config: dict[str, Any], **kwargs: Any) -> None:
+        if path.name == DASHBOARD_AUTHOR_AGENT_FILENAME:
+            monkeypatch.setattr(auto_approve, "_may_auto_approve", lambda ref: ref != "tool_search")
+        real_write(path, config, **kwargs)
+
+    monkeypatch.setattr(auto_approve, "write_governed_spec", tightening_write)
+    agent.rebuild_agent_config()
+    target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
+    spec = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
+    assert "tool_search" not in spec["allowedTools"]
+    assert agent_state.get_managed_digest("kirocrew-dashboard-author") == agent_state.spec_digest(
+        spec
+    )
     assert _is_installers(target) is True
 
 
@@ -634,9 +666,14 @@ def test_a_rebuild_preserves_the_pinned_model_and_skill_mappings(
     agent.rebuild_agent_config()
 
     refreshed = rig.read(DASHBOARD_AUTHOR_AGENT_FILENAME)
-    # The pinned model and the user skill mappings survived the rebuild.
+    # The pinned model and the user skill mappings survived the rebuild. The charter
+    # skill the prompt names is APPENDED after them, by merge: the user's entry keeps
+    # its place and its order.
     assert refreshed["model"] == "claude-user-pinned"
-    assert refreshed.get("resources") == ["skill://user/mapped-one"]
+    assert refreshed.get("resources") == [
+        "skill://user/mapped-one",
+        *skill_resources.prompt_skill_uris("kirocrew-dev/dashboard-template"),
+    ]
     # Governed grants were still regenerated from the shipped spec.
     assert refreshed["name"] == "kirocrew-dashboard-author"
     assert _is_installers(target) is True

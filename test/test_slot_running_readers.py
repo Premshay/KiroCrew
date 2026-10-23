@@ -9,7 +9,7 @@ import pytest
 
 from kiro_crew.dashboard import channel_slots, chat_regenerate, session_health
 from kiro_crew.dashboard.slot_registry import SlotRegistry
-from kiro_crew.dashboard.state import StageBoundary, _ChatSlot, stage_boundary_for
+from kiro_crew.dashboard.state import _ChatSlot
 
 # Busy-check helpers, and the slot state each one reads on its caller's behalf.
 #
@@ -29,76 +29,42 @@ _BUSY_HELPERS: dict[str, frozenset[str]] = {
     # RESERVATION, because ``slot.running`` is set at dispatch and so sees a
     # cold-starting first turn that no provider has registered yet.
     "_switch_target_busy": frozenset({"running"}),
+    # Member Fresh start: the slot's task or the session's turn.
+    "_turn_busy": frozenset({"running"}),
 }
 
 
-def test_stage_boundary_for_reraises_real_slot_assignment_failure(monkeypatch) -> None:
-    """A production slot cannot hide a missing writable boundary field."""
-    import kiro_crew.dashboard.state as state_module
-
-    slot = _ChatSlot("miswired-boundary")
-    slot.stage_boundary = None  # type: ignore[assignment]
-    real_setattr = setattr
-
-    def _reject_boundary(target, name, value) -> None:
-        if target is slot and name == "stage_boundary":
-            raise AttributeError("miswired stage boundary")
-        real_setattr(target, name, value)
-
-    monkeypatch.setattr(state_module, "setattr", _reject_boundary, raising=False)
-    with pytest.raises(AttributeError, match="miswired stage boundary"):
-        stage_boundary_for(slot)
-
-
-def test_stage_boundary_for_tolerates_frozen_minimal_test_double(caplog) -> None:
-    """A slots-only test double gets an observable ephemeral boundary."""
-
-    class _MinimalSlot:
-        __slots__ = ()
-
-    slot = _MinimalSlot()
-    caplog.set_level("WARNING", logger="kiro_crew.dashboard.state")
-
-    boundary = stage_boundary_for(slot)
-
-    assert isinstance(boundary, StageBoundary)
-    assert not hasattr(slot, "stage_boundary")
-    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
-    assert len(warnings) == 1
-    assert "_MinimalSlot" in warnings[0].getMessage()
-
-
-def _paused_slot(name: str) -> _ChatSlot:
+def _reserved_slot(name: str) -> _ChatSlot:
     slot = _ChatSlot(name)
-    slot.stage_boundary.arm(1, consumed=True)
+    slot._turn_admission_reserved = True
     assert slot.running is True
     assert slot.turn_running is False
     return slot
 
 
 @pytest.mark.asyncio
-async def test_peer_interrupt_does_not_cancel_a_paused_stage() -> None:
+async def test_peer_interrupt_does_not_cancel_a_reserved_turn() -> None:
     from unittest.mock import AsyncMock
 
     from kiro_crew.dashboard.chat_handlers import preempt_slot_for_channel_interrupt
 
-    slot = _paused_slot("peer-paused")
+    slot = _reserved_slot("peer-paused")
     stop = AsyncMock()
     state = SimpleNamespace(sessions=SimpleNamespace(stop_turn=stop))
 
     assert await preempt_slot_for_channel_interrupt(state, slot) == "queued"
     stop.assert_not_awaited()
-    assert slot.stage_boundary.stage == 1
+    assert slot._turn_admission_reserved is True
 
 
 @pytest.mark.asyncio
-async def test_peer_delivery_queues_without_steering_a_paused_stage(monkeypatch) -> None:
+async def test_peer_delivery_queues_without_steering_a_reserved_turn(monkeypatch) -> None:
     from unittest.mock import AsyncMock, MagicMock
 
     from kiro_crew.dashboard.chat_utils import effective_session_key
     from kiro_crew.dashboard.handlers_channel import deliver_attached_channel_message
 
-    slot = _paused_slot("peer-delivery-paused")
+    slot = _reserved_slot("peer-delivery-paused")
     steer = AsyncMock(return_value=True)
     slot._acp_client = SimpleNamespace(supports_steer=True, steer=steer)
     stop = AsyncMock()
@@ -126,12 +92,12 @@ async def test_peer_delivery_queues_without_steering_a_paused_stage(monkeypatch)
     assert outcome == "queued"
     steer.assert_not_awaited()
     stop.assert_not_awaited()
-    assert slot.stage_boundary.stage == 1
+    assert slot._turn_admission_reserved is True
     assert any(item.get("peer_message_id") == message.id for item in slot._queue)
 
 
-def test_slot_projection_distinguishes_paused_boundary_from_running_turn() -> None:
-    slot = _paused_slot("projection-paused")
+def test_slot_projection_distinguishes_admission_reservation_from_running_turn() -> None:
+    slot = _reserved_slot("projection-paused")
     slot.append("assistant", "Authentication paused this plan.")
 
     payload = slot.to_dict()
@@ -140,8 +106,8 @@ def test_slot_projection_distinguishes_paused_boundary_from_running_turn() -> No
     assert payload["waiting_for_input"] is True
 
 
-def test_session_health_ignores_a_paused_boundary_without_a_turn() -> None:
-    slot = _paused_slot("health-paused")
+def test_session_health_ignores_a_admission_reservation_without_a_turn() -> None:
+    slot = _reserved_slot("health-paused")
 
     snapshot = session_health.snapshot_slot(slot, mono_now=1.0)
 
@@ -150,16 +116,16 @@ def test_session_health_ignores_a_paused_boundary_without_a_turn() -> None:
     assert monitor.classify_slot(snapshot, mono_now=1.0) is None
 
 
-def test_channel_window_refresh_allows_a_paused_boundary() -> None:
-    slot = _paused_slot("channel-paused")
+def test_channel_window_refresh_allows_a_admission_reservation() -> None:
+    slot = _reserved_slot("channel-paused")
     slot.linked_session_key = "slack:1712345678.901"
     slot._dirty = False
 
     assert channel_slots._window_refresh_is_safe(slot) is True
 
 
-def test_slot_registry_excludes_a_paused_boundary_from_running_sessions() -> None:
-    slot = _paused_slot("registry-paused")
+def test_slot_registry_excludes_a_admission_reservation_from_running_sessions() -> None:
+    slot = _reserved_slot("registry-paused")
     slot.linked_session_key = "slack:1712345678.902"
     owner = SimpleNamespace(_slots={slot.key: slot})
 
@@ -168,9 +134,9 @@ def test_slot_registry_excludes_a_paused_boundary_from_running_sessions() -> Non
     assert running == frozenset()
 
 
-def test_pending_boundary_refuses_destructive_history_edits() -> None:
+def test_admission_reservation_refuses_destructive_history_edits() -> None:
     """Regenerate, variant switch, and edit-resend preserve reservations."""
-    slot = _paused_slot("destructive-history-paused")
+    slot = _reserved_slot("destructive-history-paused")
 
     response = chat_regenerate._destructive_history_busy(slot)
 
@@ -179,8 +145,8 @@ def test_pending_boundary_refuses_destructive_history_edits() -> None:
     assert json.loads(response.body) == {"error": "slot is busy", "code": "slot_busy"}
 
 
-def test_running_guarded_task_loads_null_check_task_for_pending_boundaries() -> None:
-    slot = _paused_slot("taskless-boundary")
+def test_running_guarded_task_loads_null_check_task_for_admission_reservations() -> None:
+    slot = _reserved_slot("taskless-boundary")
     assert slot.task is None
 
     dashboard = Path(__file__).parents[1] / "src" / "kiro_crew" / "dashboard"
@@ -280,49 +246,85 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
         **{
             site: reservation
             for site in {
+                # A crewmate's first greeting (Mate's, or a new crewmate's goal
+                # question) must not land on a slot a send has already reserved,
+                # so it reads the reservation, not the turn.
+                ("mate_welcome.py", "maybe_start_first_greeting"),
+                # A goal check-in skips its run rather than land on a slot a send
+                # has already reserved; it asks again after reading the ledger.
+                ("goal_reminder.py", "_idle_thread"),
                 ("chat_folders.py", "api_chat_slot_mode"),
-                ("chat_handlers.py", "_switch_target_busy"),
-                ("chat_handlers.py", "api_chat_slot_runtime"),
+                ("chat_api/slot_guards.py", "_switch_target_busy"),
+                # The palette create's retraction of a newborn whose app-agent
+                # binding did not persist: it reads the RESERVATION, because a
+                # turn that started on the slot during the write keeps it.
+                ("chat_api/slot_create.py", "api_chat_slot_create"),
+                ("handlers/members_thread_turns.py", "_turn_busy"),
+                ("handlers/members_thread_turns.py", "_turn_ends_within"),
                 # The agent route's transaction; the in-turn /agent command shares it.
-                ("chat_handlers.py", "switch_slot_agent"),
-                ("chat_handlers.py", "api_chat_slot_continue"),
-                ("chat_api/slot_detail.py", "api_chat_slot_detail"),
-                ("chat_handlers.py", "api_chat_slot_interrupt"),
-                ("chat_handlers.py", "api_chat_slot_model"),
-                ("chat_handlers.py", "api_chat_slot_note"),
-                ("chat_handlers.py", "api_chat_slot_reasoning_effort"),
+                ("chat_api/agent_switch.py", "switch_slot_agent"),
+                ("chat_api/turn_stop.py", "api_chat_slot_interrupt"),
+                ("chat_api/slot_model.py", "api_chat_slot_model"),
+                ("chat_api/runtime_selection.py", "api_chat_slot_runtime"),
+                ("chat_api/slot_note.py", "api_chat_slot_note"),
+                # The project route arms a deferred reset when a start carrying
+                # the old cwd is already in flight; slot.running (the
+                # reservation) catches a cold-starting turn no provider has
+                # registered yet.
+                ("chat_api/session_relaunch.py", "api_chat_slot_project"),
+                ("chat_api/slot_effort.py", "api_chat_slot_reasoning_effort"),
+                # Reload refuses a reserved slot or sibling alias through
+                # _switch_target_busy, as the session_reload verb does.
+                ("chat_api/session_relaunch.py", "api_chat_slot_reload"),
                 ("chat_api/slot_lifecycle.py", "api_chat_slot_reset_conversation"),
                 ("chat_api/resume.py", "api_chat_slot_resume"),
-                ("chat_handlers.py", "api_chat_slot_workspace"),
+                ("chat_api/session_relaunch.py", "api_chat_slot_workspace"),
                 ("chat_api/slot_lifecycle.py", "api_chat_slots_cleanup"),
-                ("chat_handlers.py", "api_chat_slots_model"),
-                ("chat_handlers.py", "stop_slot_turn"),
+                ("chat_api/slot_model.py", "api_chat_slots_model"),
+                ("chat_api/continue_turn.py", "continue_slot_turn"),
+                ("chat_api/turn_stop.py", "stop_slot_turn"),
+                # Stop settlement wakes retained priority only on an unreserved slot.
+                ("chat_api/turn_stop.py", "_make_stop_resolver"),
                 ("chat_rewind.py", "api_chat_slot_rewind"),
-                ("chat_runner.py", "_eager_spawn"),
-                ("chat_runner.py", "_prefetch_ttl"),
+                # The memory-ready queue drain starts a turn only on a slot no
+                # dispatch has reserved, the same guard the dispatch routes take.
+                ("chat_turn/eager_spawn.py", "_eager_spawn"),
+                ("chat_turn/eager_spawn.py", "_prefetch_ttl"),
                 ("handlers/autonudge.py", "api_autonudge_fire"),
-                ("handlers/mcp_apps.py", "api_mcp_apps_message"),
-                ("handlers/members.py", "api_member_thread"),
-                ("handlers/members.py", "api_members"),
-                ("handlers/messaging.py", "api_send_message"),
-                ("session_control.py", "create_session"),
+                ("handlers/members_thread_turns.py", "api_member_fresh_start"),
+                ("handlers/members_thread.py", "api_member_thread"),
+                ("handlers/members_roster.py", "api_members"),
+                # The session-side delivery entry point: idle gets a row and a
+                # turn, a reserved slot gets the queue or a steer.
+                ("session_deliver.py", "deliver"),
+                # A peer's steer needs a running turn to cut into.
+                ("session_deliver.py", "_deliver_peer"),
+                ("session_control_parts/session_create.py", "create_session"),
                 # The roster verb. Reservation state, like `read_messages` beside
                 # it and for the same reason: it reports whether a session is
-                # working so a patrol knows whether to wait, and a slot between a
-                # plan's stages is still working even though no task is assigned.
-                ("session_control.py", "created_session_status"),
-                ("session_control.py", "read_messages"),
+                # working so a patrol knows whether to wait.
+                ("session_control_parts/session_status.py", "created_session_status"),
+                ("session_control_parts/session_status.py", "read_messages"),
                 # The summary verb reports liveness beside the digest for the
                 # same reason `read_messages` does.
-                ("session_control.py", "read_summary"),
-                ("session_control.py", "send_to_target"),
+                ("session_control_parts/session_status.py", "read_summary"),
+                ("session_control_parts/session_messaging.py", "send_to_target"),
                 # Pre-pick idle check via _switch_target_busy (idle-only tool contract).
-                ("session_control.py", "set_model_target"),
+                ("session_control_parts/model_switch.py", "set_model_target"),
                 ("openai_compat.py", "api_completions"),
                 # Idle-only teardown: the same pre-lock and in-lock probe via
                 # _switch_target_busy, so a reserved slot between stages is busy.
-                ("session_control.py", "reload_target"),
-                ("state.py", "_ChatSlot.enqueue_or_run_prompt"),
+                ("session_control_parts/turn_control.py", "reload_target"),
+                # The idle sweep never picks or pops a slot holding a reservation.
+                ("slot_retention.py", "_still_idle_check"),
+                ("slot_retention.py", "select_idle_slot_keys"),
+                ("state_parts/chat_slot.py", "_ChatSlot.enqueue_or_run_prompt"),
+                # A return brief must not start or publish after a send has
+                # reserved the slot, even before its model turn begins.
+                ("warm_task_brief.py", "_run_warm_task_brief"),
+                ("warm_task_brief.py", "_settled"),
+                ("warm_task_brief.py", "_still_current"),
+                ("warm_task_brief.py", "_wait_for_idle_turn"),
                 ("ws.py", "_handle_slot_focused"),
             }
         },
@@ -330,20 +332,28 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
             site: execution
             for site in {
                 ("channel_slots.py", "_window_refresh_is_safe"),
-                ("chat_handlers.py", "preempt_slot_for_channel_interrupt"),
+                ("chat_api/turn_stop.py", "preempt_slot_for_channel_interrupt"),
                 ("chat_slack.py", "drain_slack_backfill"),
                 # The synthesis outage re-check fires only on an idle slot: a
                 # running TURN, not a reservation, is what it must not overlap.
-                ("chat_runner.py", "_arm_synthesis_recheck"),
+                ("chat_turn/queue_cycle.py", "_arm_synthesis_recheck"),
+                # A guide or card tool call is admitted only from the turn this
+                # slot is executing; a reservation has no tool call yet.
+                ("handlers/guide.py", "_resolve_agent_caller"),
+                # A responsive steer needs a turn executing now; a reserved
+                # slot keeps the queue path.
+                ("responsive_chat.py", "_steer_ready"),
                 ("slot_projection.py", "SlotProjection.to_dict"),
                 ("slot_registry.py", "SlotRegistry.running_session_keys"),
-                ("state.py", "_ChatSlot.running"),
+                ("state_parts/chat_slot.py", "_ChatSlot.running"),
             }
         },
         **{
             site: both
             for site in {
-                ("chat_handlers.py", "api_chat"),
+                ("chat_api/slot_detail.py", "api_chat_slot_detail"),
+                ("chat_api/chat_send.py", "api_chat"),
+                ("responsive_chat.py", "accept"),
                 ("handlers_channel.py", "deliver_attached_channel_message"),
                 ("chat_regenerate.py", "_destructive_history_busy"),
                 ("chat_regenerate.py", "api_chat_slot_edit_resend"),
@@ -354,15 +364,18 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
     }
     assert actual == expected
     assert publishers == {
-        ("chat_handlers.py", "api_chat"),
+        # A crewmate's first-open greeting: a gateway-authored turn, started the
+        # way api_send_message starts one (spawn_guarded_turn, then slot.task).
+        # The Daily Goal Reminder's hidden turn shares the same publisher.
+        ("mate_welcome.py", "dispatch_hidden_turn"),
+        ("chat_api/chat_send.py", "api_chat"),
         ("chat_regenerate.py", "api_chat_slot_edit_resend"),
         ("chat_regenerate.py", "api_chat_slot_regenerate"),
         ("chat_rewind.py", "api_chat_slot_rewind"),
-        ("chat_runner.py", "_launch_synthesis"),
-        ("chat_runner.py", "_start_next_queued_turn"),
-        ("handlers/mcp_apps.py", "api_mcp_apps_message"),
-        ("handlers/messaging.py", "api_send_message"),
+        ("chat_turn/queue_cycle.py", "_launch_synthesis"),
+        ("chat_turn/queue_drain.py", "_start_next_queued_turn"),
         ("handlers/taskrunner.py", "api_taskrunner_to_chat"),
         ("openai_compat.py", "api_completions"),
-        ("state.py", "_ChatSlot.enqueue_or_run_prompt"),
+        ("session_deliver.py", "deliver"),
+        ("state_parts/chat_slot.py", "_ChatSlot.enqueue_or_run_prompt"),
     }

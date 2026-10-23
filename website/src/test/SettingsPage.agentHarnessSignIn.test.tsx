@@ -21,11 +21,11 @@ vi.mock('../api/client', async importOriginal => {
     ...mod,
     api: {
       ...mod.api,
-      kirocrewConfig: vi.fn(() => Promise.resolve({ agent: { acp_backend: '' } })),
+      kirocrewConfig: vi.fn(() => Promise.resolve({ agent: { acp_backend: 'kiro' } })),
       patchConfig: vi.fn(() => Promise.resolve({})),
       acpBackends: vi.fn(() =>
         Promise.resolve({
-          backends: ['', 'kas', 'claude'].map(id => ({
+          backends: ['kiro', 'kas', 'claude'].map(id => ({
             id,
             policy_id: id || 'kiro',
             selectable: true,
@@ -47,8 +47,12 @@ vi.mock('../api/client', async importOriginal => {
 
 vi.mock('../components/settingRef/useConfigSchema', () => ({
   useConfigSchema: () =>
-    new Map([['agent.acp_backend', { path: 'agent.acp_backend', type: 'enum', enum: ['', 'claude', 'kas'] }]]),
+    new Map([['agent.acp_backend', { path: 'agent.acp_backend', type: 'enum', enum: ['kiro', 'claude', 'kas'] }]]),
 }))
+
+// The run cards beside the switch (Subagent Settings + Warm Pool) read a config
+// shape this suite does not seed; they are pinned in CfgTabCoverage.test.tsx.
+vi.mock('../pages/overview/KiroCrewCfgTab', () => ({ AgentRunSettings: () => <div /> }))
 
 // Settings panels: heavy and irrelevant here.
 vi.mock('../pages/settings/OverviewPanel', () => ({ OverviewPanel: () => <div data-testid="overview-panel" /> }))
@@ -104,7 +108,7 @@ describe('Settings > Agent Harness sign-in deep link, through the real tab', () 
     renderAt(KIRO_SIGN_IN_PATH)
     // Kiro CLI is the configured harness, so the tab would open on it by itself;
     // the highlight is what moves the check to KAS.
-    const kas = await screen.findByRole('radio', { name: 'KAS (kiro-agent)' })
+    const kas = await screen.findByRole('radio', { name: 'Kiro Agent' })
     await waitFor(() => expect(kas).toBeChecked())
     expect(screen.getByRole('radio', { name: 'Kiro CLI' })).toHaveAttribute('aria-current', 'true')
 
@@ -125,7 +129,7 @@ describe('Settings > Agent Harness sign-in deep link, through the real tab', () 
     renderAt('/settings/agent')
     const kiro = await screen.findByRole('radio', { name: 'Kiro CLI' })
     await waitFor(() => expect(kiro).toBeChecked())
-    expect(screen.getByRole('radio', { name: 'KAS (kiro-agent)' })).not.toBeChecked()
+    expect(screen.getByRole('radio', { name: 'Kiro Agent' })).not.toBeChecked()
     expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
   })
 })

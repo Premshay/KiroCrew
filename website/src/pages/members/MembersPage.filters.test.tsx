@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { act, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from '../../test/helpers'
 
 /* Same api mock shape as MembersPage.test.tsx, plus the crew update endpoint
@@ -27,11 +27,12 @@ vi.mock('../../api/client', () => ({
     defaultAgent: vi.fn(() => Promise.resolve({ default_agent: '' })),
     updateKirocrewAgent: vi.fn(() => Promise.resolve({ ok: true })),
     autonudgeList: vi.fn(() => Promise.resolve({ enabled: true, loops: [] })),
+    autonudgeForSlot: vi.fn(() => Promise.resolve({ enabled: true, loop: null })),
+    monitorForSlot: vi.fn(() => Promise.resolve({ enabled: true, monitor: null })),
     // The drawer's webview section. Stubbed as "nothing published" so it renders
     // its empty state: an unstubbed reader rejects, the section shows an
     // ErrorNotice of its own, and assertions that read the LAST ErrorNotice props
     // then pick up the webview's failure instead of the one under test.
-    memberPanel: vi.fn(() => Promise.resolve({ panel: null, html: null })),
   },
 }))
 
@@ -117,6 +118,7 @@ async function openFilters() {
 beforeEach(() => {
   vi.clearAllMocks()
   localStorage.clear()
+  localStorage.setItem('mc-preview-crew', '1')
 })
 
 describe('matchesSource', () => {
@@ -167,19 +169,19 @@ describe('MembersPage filters', () => {
     // The menu trigger is the sidebar's 24px filter button, docked in the field.
     const trigger = screen.getByTestId('member-filter-menu')
     expect(trigger.className).toMatch(/\bw-6\b/)
-    expect(trigger.getAttribute('aria-label')).toBe('Sort and filter crewmates')
+    expect(trigger.getAttribute('aria-label')).toBe('Sort and filter mates')
   })
 
   it('header reads "N of M" while a filter narrows the list, plain count otherwise', async () => {
     await renderPage()
-    expect(screen.getByTestId('member-count')).toHaveTextContent('5 crewmates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('5 mates')
     await openFilters()
     fireEvent.click(screen.getByTestId('member-filter-starred'))
-    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 5 crewmates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 5 mates')
     fireEvent.click(screen.getByTestId('member-filter-starred'))
     // The search box is not a "filter" for this purpose: it is transient.
     fireEvent.change(screen.getByTestId('member-search'), { target: { value: 'pkg' } })
-    expect(screen.getByTestId('member-count')).toHaveTextContent('5 crewmates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('5 mates')
   })
 
   it('starred-only keeps just the starred rows and persists the toggle', async () => {
@@ -250,7 +252,7 @@ describe('MembersPage filters', () => {
     fireEvent.click(screen.getByTestId('member-filter-source-package'))
     expect(names()).toEqual([])
     expect(screen.getByTestId('member-filtered-out')).toBeInTheDocument()
-    expect(screen.queryByText(/No crewmates yet/i)).toBeNull()
+    expect(screen.queryByText(/No mates yet/i)).toBeNull()
     fireEvent.click(screen.getByTestId('member-filters-clear'))
     expect(names()).toHaveLength(5)
     expect(localStorage.getItem('mc-members-starred-only')).toBe('0')
@@ -279,7 +281,7 @@ describe('MembersPage filters', () => {
     // A second status widens the set (OR), so a member in either state shows.
     fireEvent.click(screen.getByTestId('member-filter-status-unread'))
     expect(names()).toEqual(['conductor', 'pkg-a'])
-    expect(screen.getByTestId('member-count')).toHaveTextContent('2 of 4 crewmates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('2 of 4 mates')
     fireEvent.click(screen.getByTestId('member-filter-status-working'))
     // Only "unread" left and nothing is unread: the filters, not the roster, emptied the list.
     expect(names()).toEqual([])
@@ -381,7 +383,7 @@ describe('MembersPage star', () => {
     const notice = await screen.findByTestId('member-star-error')
     expect(screen.getByTestId('member-star-pkg-a')).toHaveAttribute('aria-pressed', 'false')
     // Localized copy, not the raw server text.
-    expect(notice).toHaveTextContent("Could not update this crewmate's star.")
+    expect(notice).toHaveTextContent("Could not update this mate's star.")
     expect(notice).not.toHaveTextContent('Forbidden')
     // The journaled report is recovered from the THROWN message (not the
     // localized one) and handed to ErrorNotice explicitly, so the agent
@@ -392,7 +394,7 @@ describe('MembersPage star', () => {
       .filter((props) => props.testId === 'member-star-error' && props.report)
       .at(-1)
     expect(noticeProps?.report).toEqual(FAKE_REPORT)
-    expect(noticeProps?.message).toBe("Could not update this crewmate's star.")
+    expect(noticeProps?.message).toBe("Could not update this mate's star.")
     // A later successful toggle clears the stale notice.
     fireEvent.click(screen.getByTestId('member-star-pkg-b'))
     await waitFor(() => expect(screen.queryByTestId('member-star-error')).toBeNull())
@@ -402,73 +404,40 @@ describe('MembersPage star', () => {
 describe('MembersPage lists registered crewmates', () => {
   const NO = { dashboard_created: false, has_dm_message: false }
   const MIXED = [
-    row('kirocrew', { source: 'builtin', ...NO }),
-    row('radar', { source: 'kirocrew', ...NO, dashboard_created: true, display_name: 'Issue Radar' }),
-    row('oncall', { source: 'radar-app', ...NO, has_dm_message: true, starred: true }),
+    row('kirocrew', { source: 'builtin', ...NO, has_dm_message: true, last_active_ts: 20 }),
+    row('radar', { source: 'kirocrew', ...NO, dashboard_created: true, display_name: 'Issue Radar', has_dm_message: true, last_active_ts: 30 }),
+    row('oncall', { source: 'radar-app', ...NO, starred: true, last_active_ts: 10 }),
     row('legacy-aim', { source: 'aim', ...NO }),
     row('pkg-tool', { ...NO }),
   ]
-  beforeEach(() => {
-    ;(api.defaultAgent as ReturnType<typeof vi.fn>).mockResolvedValue({ default_agent: 'kirocrew' })
-  })
 
   it('lists every registered row; the count matches the complete roster', async () => {
     await renderPage(MIXED)
-    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'legacy-aim', 'oncall', 'pkg-tool']))
-    expect(screen.getByTestId('member-count')).toHaveTextContent('5 crewmates')
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall', 'legacy-aim', 'pkg-tool']))
+    expect(screen.getByTestId('member-count')).toHaveTextContent('5 mates')
     expect(screen.queryByTestId('member-filter-chips')).toBeNull()
     expect(screen.queryByTestId('member-filtered-out')).toBeNull()
   })
 
   it('search narrows the complete roster without changing its count', async () => {
     await renderPage(MIXED)
-    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'legacy-aim', 'oncall', 'pkg-tool']))
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall', 'legacy-aim', 'pkg-tool']))
     fireEvent.change(screen.getByTestId('member-search'), { target: { value: 'pkg' } })
     expect(names()).toEqual(['pkg-tool'])
-    expect(screen.getByTestId('member-count')).toHaveTextContent('5 crewmates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('5 mates')
     fireEvent.click(screen.getByTestId('member-search-clear'))
-    expect(names()).toEqual(['radar', 'kirocrew', 'legacy-aim', 'oncall', 'pkg-tool'])
+    expect(names()).toEqual(['radar', 'kirocrew', 'oncall', 'legacy-aim', 'pkg-tool'])
   })
 
   it('filter tallies count the complete roster', async () => {
     await renderPage(MIXED)
-    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'legacy-aim', 'oncall', 'pkg-tool']))
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall', 'legacy-aim', 'pkg-tool']))
     await openFilters()
     expect(within(screen.getByTestId('member-filter-source-package')).getByText('3')).toBeInTheDocument()
     expect(within(screen.getByTestId('member-filter-source-builtin')).getByText('1')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('member-filter-starred'))
     expect(names()).toEqual(['oncall'])
-    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 5 crewmates')
-  })
-
-  it('a failed default-crew read lists every row and says why through ErrorNotice', async () => {
-    ;(api.defaultAgent as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('default lookup down'))
-    await renderPage(MIXED)
-    await waitFor(() => expect(screen.getByTestId('member-default-agent-error')).toHaveTextContent("Couldn't read the default crewmate, so every crewmate is shown"))
-    expect([...names()].sort()).toEqual(['kirocrew', 'legacy-aim', 'oncall', 'pkg-tool', 'radar'])
-  })
-
-  it('while the default-crew read is pending, the landing fallback waits instead of overwriting a remembered default', async () => {
-    // The remembered crewmate is the default crew, which is listed only by
-    // name: before the read answers it reads as unlisted, and resolving the
-    // fallback then would open a substitute and overwrite the memory.
-    localStorage.setItem('mc-members-last-member', 'kirocrew')
-    let answer: (v: { default_agent: string }) => void = () => {}
-    ;(api.defaultAgent as ReturnType<typeof vi.fn>).mockReturnValue(
-      new Promise((resolve) => {
-        answer = resolve
-      }),
-    )
-    ;(api.members as ReturnType<typeof vi.fn>).mockResolvedValue({ members: MIXED })
-    renderWithProviders(<MembersPage />)
-    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'legacy-aim', 'oncall', 'pkg-tool']))
-    expect(api.memberThread).not.toHaveBeenCalled()
-    expect(localStorage.getItem('mc-members-last-member')).toBe('kirocrew')
-    await act(async () => {
-      answer({ default_agent: 'kirocrew' })
-    })
-    expect(await screen.findByTestId('chat-pane-stub')).toHaveTextContent('member-kirocrew')
-    expect(localStorage.getItem('mc-members-last-member')).toBe('kirocrew')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 5 mates')
   })
 
   it('lists every team member without a prior direct chat', async () => {
@@ -504,7 +473,6 @@ describe('MembersPage lists registered crewmates', () => {
         row('pkg-old', { ...NO, last_active_ts: 1 }),
       ],
     })
-    ;(api.defaultAgent as ReturnType<typeof vi.fn>).mockResolvedValue({ default_agent: 'default' })
     renderWithProviders(<MembersPage />)
     expect(await screen.findByTestId('chat-pane-stub')).toHaveTextContent('member-pkg-tool')
     await waitFor(() => expect(names()).toContain('pkg-tool'))
@@ -538,25 +506,4 @@ describe('MembersPage lists registered crewmates', () => {
     }
   })
 
-  it('the default-crew failure notice hands the agent the journal report, not just its localized copy', async () => {
-    ;(api.defaultAgent as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Forbidden'))
-    await renderPage(MIXED)
-    await screen.findByTestId('member-default-agent-error')
-    const noticeProps = (ErrorNoticeMock as ReturnType<typeof vi.fn>).mock.calls
-      .map(([props]) => props)
-      .filter((props) => props.testId === 'member-default-agent-error')
-      .at(-1)
-    expect(noticeProps?.report).toEqual(FAKE_REPORT)
-  })
-
-  it('keeps the complete roster after a default-crew refresh fails', async () => {
-    const { queryClient } = await renderPage(MIXED)
-    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'legacy-aim', 'oncall', 'pkg-tool']))
-    ;(api.defaultAgent as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('refresh failed'))
-    await act(async () => {
-      await queryClient.refetchQueries({ queryKey: ['default-agent'] })
-    })
-    await waitFor(() => expect(screen.getByTestId('member-default-agent-error')).toHaveTextContent("Couldn't read the default crewmate, so every crewmate is shown"))
-    expect([...names()].sort()).toEqual(['kirocrew', 'legacy-aim', 'oncall', 'pkg-tool', 'radar'])
-  })
 })

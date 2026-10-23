@@ -123,15 +123,15 @@ const TOUCH = /\[@media\(hover:none\)\]:|HOVER_NONE_ACTIONS_ROW_CLS|HOVER_NONE_A
  *  inside a button that is itself always visible, or a hover tooltip. On touch
  *  these simply do not appear. Keyed by file and a snippet of the line. */
 const DECORATIVE: Array<[file: string, snippet: string, why: string]> = [
-  ['App.tsx', 'group-hover/nav:opacity-100 group-focus-visible/nav', 'keyboard-shortcut chord hint on a nav link'],
+  ['shell/nav/navRow.tsx', 'group-hover/nav:opacity-100 group-focus-visible/nav', 'keyboard-shortcut chord hint on a nav link'],
   ['apps/spec-builder/components/SpecDetail.tsx', '<Pencil size={11}', 'edit glyph inside the always-visible title button'],
   ['components/ChatInput.tsx', 'group-hover/drag:opacity-100', 'resize-grip bar; the drag handle itself stays in place'],
   ['components/CopyBranchButton.tsx', 'group-hover/branch:opacity-70', 'copy glyph inside the always-visible branch button'],
   ['components/FileChangeChips.tsx', 'group-hover/tip:opacity-100', 'hover tooltip on a clickable chip; tapping opens the diff view, which names the file'],
   ['components/crew/CrewAvatarButton.tsx', 'group-hover/avatar:opacity-100', 'hover overlay, explicitly hidden under (hover: none)'],
-  ['pages/ArtifactDetailPage.tsx', '<Pencil size={14}', 'edit glyph inside the always-visible rename button'],
+  ['pages/ArtifactDetailPageHeader.tsx', '<Pencil size={14}', 'edit glyph inside the always-visible rename button'],
   ['pages/chat/SessionTitleControl.tsx', '<Pen size=', 'edit glyph beside the always-visible title'],
-  ['pages/settings/SecurityPanel.tsx', '<ExternalLink size={11}', 'external-link glyph on an always-visible row'],
+  ['pages/settings/SecurityPanelPosture.tsx', '<ExternalLink size={11}', 'external-link glyph on an always-visible row'],
   ['components/WelcomeView.tsx', '[@media(min-width:640px)_and_(min-height:600px)]:group-hover:line-clamp-none', 'unclamps a suggestion\'s text on hover; one tap sends the full text to the composer'],
 ]
 
@@ -207,8 +207,8 @@ describe('hidden-until-hover controls stay reachable on touch', () => {
   })
 
   it.each([
-    ['pages/ChatSidebar.tsx', 'absolute top-1/2 -translate-y-1/2 right-1.5 p-1 bg-card border border-border shadow-sm opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100'],
-    ['pages/ChatSidebar.tsx', 'has-[[data-state=open]]:opacity-100'],
+    ['pages/chat-sidebar/folderBlocks.tsx', 'absolute top-1/2 -translate-y-1/2 right-1.5 p-1 bg-card border border-border shadow-sm opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100'],
+    ['pages/chat-sidebar/folderBlocks.tsx', 'has-[[data-state=open]]:opacity-100'],
     ['components/ui.tsx', "'opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100"],
     ['components/chat-input/FilePreviewStrip.tsx', 'group-hover/preview:opacity-100 [@media(hover:none)]:opacity-100'],
     ['components/notifications/NotificationCard.tsx', 'group-hover:opacity-50 [@media(hover:none)]:opacity-60'],
@@ -224,11 +224,11 @@ describe('hidden-until-hover controls stay reachable on touch', () => {
     ['apps/code-review-sage/components/RunCard.tsx', "(onDelete ? ' [@media(hover:none)]:pb-7' : '')"],
     // Every notification dismiss rests at the same weight on touch.
     ['components/notifications/NotificationFeed.tsx', 'group-hover:opacity-40 [@media(hover:none)]:opacity-60'],
-    ['pages/ChatSidebar.tsx', "${remoteInstanceId ? '' : '[@media(hover:none)]:pr-10 '}"],
+    ['pages/chat-sidebar/HistoryPane.tsx', "${remoteInstanceId ? '' : '[@media(hover:none)]:pr-10 '}"],
     // A session row on any touch screen (an iPad too) gets the single ⋯ menu, not the overlay cluster.
     ['pages/ChatSidebar.tsx', 'isMobile: isMobile || isTouchDevice'],
     // On touch a non-empty folder row's cluster sits inline, the shape an empty folder row already uses.
-    ['pages/ChatSidebar.tsx', '[@media(hover:none)]:opacity-100 [@media(hover:none)]:static [@media(hover:none)]:translate-y-0'],
+    ['pages/chat-sidebar/folderBlocks.tsx', '[@media(hover:none)]:opacity-100 [@media(hover:none)]:static [@media(hover:none)]:translate-y-0'],
     // The table view's folder row spans the whole sideways-scrolling table, so on touch its menu sits inline, not ml-auto past the viewport.
     ['components/library/LibraryTable.tsx', 'ml-auto [@media(hover:none)]:ml-0 opacity-0'],
   ])('%s carries its touch state', (file, snippet) => {

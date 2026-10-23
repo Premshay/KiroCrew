@@ -39,6 +39,7 @@ from kiro_crew import code_fingerprint as cf
 from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import manager as mgr
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.testing.wait import async_wait_until, await_until, finished
 
 _POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="/proc and unix sockets")
 
@@ -277,7 +278,7 @@ class TestOwnerLivenessSweeper:
         await asyncio.sleep(0.05)
         assert not stop.is_set(), "a live owner must not stop the daemon"
         alive["v"] = False
-        await asyncio.wait_for(stop.wait(), timeout=5)
+        await await_until(stop)
         await task
 
     @pytest.mark.asyncio
@@ -291,7 +292,7 @@ class TestOwnerLivenessSweeper:
         await asyncio.sleep(0.05)
         assert not stop.is_set()
         start["v"] = "7777"  # same PID number, different process
-        await asyncio.wait_for(stop.wait(), timeout=5)
+        await await_until(stop)
         await task
 
     @pytest.mark.asyncio
@@ -320,7 +321,7 @@ class TestOwnerLivenessSweeper:
         stop = asyncio.Event()
         monkeypatch.setattr(gw, "_process_start_time", lambda pid: None)
         monkeypatch.setattr(gw, "_pid_exists", lambda pid: True)
-        await asyncio.wait_for(gw._owner_liveness_sweeper(4242, 0.01, stop), timeout=5)
+        await finished(gw._owner_liveness_sweeper(4242, 0.01, stop), "owner liveness sweeper")
         assert not stop.is_set()
 
     @pytest.mark.asyncio
@@ -339,7 +340,7 @@ class TestOwnerLivenessSweeper:
         stop = asyncio.Event()
         monkeypatch.setattr(gw, "_process_start_time", lambda pid: None)
         monkeypatch.setattr(gw, "_pid_exists", lambda pid: False)
-        await asyncio.wait_for(gw._owner_liveness_sweeper(4242, 0.01, stop), timeout=5)
+        await finished(gw._owner_liveness_sweeper(4242, 0.01, stop), "owner liveness sweeper")
         assert stop.is_set(), "a daemon whose owner is already gone must not serve on"
 
     @pytest.mark.asyncio
@@ -354,7 +355,7 @@ class TestOwnerLivenessSweeper:
         stop = asyncio.Event()
         monkeypatch.setattr(gw, "_process_start_time", lambda pid: None)
         monkeypatch.setattr(gw, "_pid_exists", lambda pid: False)
-        await asyncio.wait_for(gw._owner_liveness_sweeper(4242, 3600.0, stop), timeout=5)
+        await finished(gw._owner_liveness_sweeper(4242, 3600.0, stop), "owner liveness sweeper")
         assert stop.is_set()
 
     def test_the_manager_names_itself_as_owner(self, tmp_path: Path) -> None:
@@ -419,12 +420,14 @@ async def test_a_real_daemon_exits_when_its_owner_dies(
         start_new_session=True,
     )
     try:
-        from kiro_crew.mcp_gateway.manager import GatewayManager
-
-        assert await GatewayManager._wait_for_socket(sock, 60), "daemon never listened"
         from kiro_crew.mcp_gateway.daemon_control import describe_daemon
 
-        info = await asyncio.to_thread(describe_daemon, sock)
+        info = await async_wait_until(
+            lambda: describe_daemon(sock),
+            timeout=60,
+            off_loop=True,
+            describe=lambda: f"daemon {daemon.pid} on {sock}; returncode={daemon.returncode}",
+        )
         assert info is not None
         assert info.owner_pid == owner.pid
         assert info.pid == daemon.pid

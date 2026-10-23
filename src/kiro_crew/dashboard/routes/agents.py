@@ -39,10 +39,14 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/agents/detail/{name}/fork", handlers.api_agent_fork)
     app.router.add_post("/api/agents/detail/{name}/publish", handlers.api_agent_publish)
     app.router.add_post("/api/agents/detail/{name}/reset", handlers.api_agent_reset)
-    from kiro_crew.dashboard.handlers.agent_capabilities import api_member_capabilities
+    from kiro_crew.dashboard.handlers.agent_capabilities import (
+        api_member_capabilities,
+        api_member_capabilities_detach,
+    )
 
     app.router.add_get("/api/agents/{name}/capabilities", api_member_capabilities)
     app.router.add_post("/api/agents/{name}/capabilities/preview", api_member_capabilities)
+    app.router.add_post("/api/agents/{name}/capabilities/detach", api_member_capabilities_detach)
     app.router.add_put("/api/agents/{name}/capabilities", api_member_capabilities)
     # Kiro Crew Agent CRUD
     app.router.add_get("/api/agents", handlers.api_kirocrew_agents)
@@ -68,6 +72,8 @@ def register(app: web.Application) -> None:
     # Crew Members (roster + per-member pinned DM thread)
     app.router.add_get("/api/members", handlers.api_members)
     app.router.add_post("/api/members/{slug}/thread", handlers.api_member_thread)
+    app.router.add_post("/api/members/{slug}/greet", handlers.api_member_greet)
+    app.router.add_post("/api/members/{slug}/fresh-start", handlers.api_member_fresh_start)
     app.router.add_get("/api/members/{slug}/activity", handlers.api_member_activity)
     app.router.add_get("/api/members/{slug}/projections", handlers.api_member_projections)
     app.router.add_get("/api/members/{slug}/briefing", handlers.api_member_briefing)

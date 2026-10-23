@@ -34,6 +34,21 @@ peer check on a shared pid ([dashboard-token-auth.md](dashboard-token-auth.md) �
 `session_pid` is the pid-bookkeeping leaf and calls the gate, so an import in the
 other direction would close `session_pid → acp → acp.runtime → session_pid`.
 
+`session_pid` is a facade over sibling owners (`kiro_crew._facade_mirror`): every name still
+resolves as `kiro_crew.session_pid.<name>`, and a patch through it reaches the owner that
+reads the name. New work goes to the owner of its responsibility:
+
+| Module | Owns |
+|---|---|
+| `src/kiro_crew/session_pid.py` | the reaper's passes over the tracking files (`cleanup_orphaned_sessions`, `_sweep_pid_entries`, `_periodic_pid_sweep`, `_kill_confirmed_and_writeback`, `_cleanup_orphaned_mcp_servers`, `cleanup_orphaned_session_roots`), the kill phase of the orphan sweep (`kill_orphan_mcps`), and the two tree kills that walk descendants through the ACP layer (`_kill_pid_tree`, `_kill_orphan_work_tree`) |
+| `src/kiro_crew/session_pid_tracking.py` | `kiro_pids.txt` and `kiro_session_pids.txt`: paths, locks, reads, atomic rewrites, track and untrack; the start-token and age probes; the sweep-protected pid registry |
+| `src/kiro_crew/session_pid_harness.py` | whether a pid is a managed agent runtime, read from its command line (`_is_managed_agent_process` and the marker sets) |
+| `src/kiro_crew/session_pid_orphan_scan.py` | the untracked-orphan predicates, the environ markers they read, the tracked-pid snapshot, the untracked-runtime report, and the find phase (`find_orphan_mcp_candidates`) |
+| `src/kiro_crew/session_pid_provider_kill.py` | the synchronous teardown of a leaked provider (`_sync_kill_provider`: the gate, the commit, the identity-pinned group and descendant signals), the orphaned spawn-group signalling (`signal_orphaned_spawn_group`, `_signal_orphaned_runtime_group`), and `_tracked_child_has_runtime_identity`, the argv check that the vouched members of the ACP runtime's group signalling must pass, and so must a tracked `kiro_pids.txt` child reparented to a `systemd` subreaper in the facade's `_cleanup_orphaned_mcp_servers` |
+| `src/kiro_crew/session_pid_orphan_kill.py` | the unreachable-gatewayd, browser-daemon and MCP-subtree orphan kills, and their security event log records |
+| `src/kiro_crew/session_pid_mappings.py` | pruning stale `session_pid_<pid>` and `session_token_*` identity mappings |
+| `src/kiro_crew/session_pid_rss.py` | a session tree's resident memory |
+
 ### What the model is made of
 
 | Mechanism | Where it lives |
@@ -86,8 +101,8 @@ On the **chat** registration path a lease means the same thing as registry
 membership, which is why it is taken there rather than at provider start:
 `session_allocation.SessionAllocationService._get_or_create_impl` calls
 `acquire_session_lease` immediately after the session enters `self._sessions`.
-Before that line no tenant exists, which is why every earlier cleanup path in that
-file may kill unconditionally.
+Before that line no tenant exists, which is why every earlier cleanup path in
+`session_allocation.py` and its `session_allocation_parts/` owners may kill unconditionally.
 
 That equivalence holds for chat and nowhere else, and the difference matters to
 anyone reading a lease count as a tenancy count. `acquire_session_lease` is reached
@@ -207,7 +222,7 @@ than blurred:
 |---|---|
 | `session_pid._sync_kill_provider` — the funnel the session layer's hard-kill sites reach | `test_kill_chokepoint_ratchet.py`'s `ATTRIBUTED_KILL_PATHS`: must call the gate, must pass `reason` and `caller`, must act on the verdict |
 | `acp.runtime.AcpRuntime.kill` | same |
-| `cron._sigkill_session` | convention |
+| `cron_service.service.run_kill._sigkill_session` (bound as `CronService._sigkill_session`; it passes `caller="cron._sigkill_session"`) | convention |
 | `session_cleanup._kill_authorized` | convention |
 | `session_scope_reap._stop_and_signal_members` | convention |
 | `subagent_manager.monitoring._reconcile_orphans_impl` | convention |
@@ -226,6 +241,36 @@ torn-down table and from the caller's captured pop — and touches no tenancy an
 other session's lease. It is best effort by design: a release that did not happen
 costs an honest refusal, while an exception raised out of it would cost a wedged
 process its only remaining kill.
+
+The funnel also ends a registration that is not a lease. A provider reaching
+`_sync_kill_provider` is being abandoned — its client's `shutdown` will never run —
+so the funnel calls the client's own synchronous hand-back for its
+`settings.local.json` seed (`AcpClient.release_settings_seed_claim`, resolved by
+name so this leaf stays ignorant of the ACP layer). Without it the client's live
+claim on that seed outlived the client for the life of the gateway and every later
+session on the same work dir read the path as a live sibling's. The hand-back
+follows the gate's verdict rather than running ahead of it, because a successor
+that adopts the seed re-writes `permissions.defaultMode` on disk, and that must not
+happen under a runtime that may still be running:
+
+- **released** when the teardown is authorized and committed, immediately before
+  the first signal (ahead of the grace, so a replacement spawn on the same work dir
+  finds the slot free when it seeds); when there is no pid at all (a seed is
+  written before the spawn publishes one, so the claim belongs to the client
+  object and no runtime stands behind it); and when the recorded root is known to
+  be gone or recycled (`_root_identity_refuted`: the pid names no process, or a
+  live start identity was read and differs from the recorded one);
+- **kept** while the gate refuses the kill because a lease or a tenancy still
+  holds the runtime, and when the root's identity cannot be read (the pid exists
+  but its start identity is unavailable, or none was recorded at spawn). A kept
+  claim keeps the successor on the live-sibling rule — it declines its own seed
+  rather than re-seeding the file — and is handed back by a later teardown of the
+  same runtime or reclaimed as stale once this process exits.
+
+Like the lease release it is best effort and never lets an exception out. Which
+registrations it withdraws, and why the durable half, is the seed's own spec
+([claude-code-provider.md](claude-code-provider.md) § *Session-scoped Claude
+settings*).
 
 ### Kill owed, and the hand-back
 
@@ -489,6 +534,15 @@ app backend table or the manager's in-memory union has no row in either tracking
 file. Folding those
 into the same `False` a real failure gets would publish one WARNING per stale pid
 per tick for the gateway's life — a steady state reported as a fault.
+
+The same rule sets the level of the two per-pass summaries. The dead-direction
+line (`runtime_reconcile owned_dead=... forgotten=...`) is WARNING only when the
+pass retracted a record or a retraction it owed failed, and the hook's
+`Runtime reconcile: unowned_alive=...` line is WARNING only when the pass killed,
+would have killed or retracted something. A reading made only of permanently
+withheld unowned pids and `not-mine` records repeats every tick, so both lines
+drop to DEBUG; the `session.runtime_reconcile` counter still carries every field
+on every pass.
 
 ### Platform scope
 

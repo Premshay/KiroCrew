@@ -49,6 +49,7 @@ from kiro_crew import validation as _validation
 from kiro_crew.decisions.log import MAX_VERDICT_ID_CHARS as _MAX_VERDICT_ID_CHARS
 from kiro_crew.decisions.points import nudge_wake as point
 from kiro_crew.hooks import _HOST_READ_ONLY_BUILTIN_TOOLS
+from kiro_crew.warm_task_brief_contract import is_warm_task_brief_message
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +239,8 @@ def session_evidence(
         if not isinstance(row, Mapping):
             continue
         if str(row.get("role", "") or "") not in EVIDENCE_ROLES:
+            continue
+        if is_warm_task_brief_message(row):
             continue
         text = row.get("content", "")
         if not isinstance(text, str) or not text.strip():
@@ -533,6 +536,30 @@ def take_pr_bodies(loop_id: str) -> tuple[dict[str, str], bool]:
             _PR_BODIES_FORGOTTEN = 0
             _PR_BODIES_FORGOTTEN_TAKES = 0
     return bodies, dropped
+
+
+def forget_pr_bodies(loop_id: str) -> None:
+    """Drop whatever this module holds under *loop_id*: its stash and its loss notice.
+
+    For the loop remover, once a removal has COMMITTED. A loop that is gone from the
+    store never takes again, so without this its stash sits in the queue until the
+    cap evicts it and its notice counts as pending until the store rotates past it --
+    the dropped total overstates real losses and the forgotten state, when set,
+    stays live for up to a rotation of takes it did not need. A loop a failed write
+    puts back is not gone: it still owes its next tick whatever is held here, so the
+    caller forgets only after the store has agreed the loop is out.
+
+    Only the two loop-id-keyed structures are touched. The forgotten state and its
+    take counter exist for a notice whose OWNER is unknown, and a caller that names a
+    loop id knows the owner; spending that state here would end it for a loss that
+    still belongs to someone else. The dropped total is history, not a queue, and
+    stays counted. The rotation backstop in :func:`take_pr_bodies` is unchanged.
+    """
+    key = str(loop_id or "")
+    if not key:
+        return
+    _PR_BODIES.pop(key, None)
+    _PR_BODIES_DROPPED.pop(key, None)
 
 
 def with_remark_bodies(

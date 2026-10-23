@@ -45,7 +45,18 @@ const noop = () => {}
 const staged = (id: string): StagedItem =>
   ({ id, url: 'blob:' + id, file: new File([''], id + '.png', { type: 'image/png' }) })
 
-const composerProps = {
+const composerProps: React.ComponentProps<typeof Composer> = {
+  agents: [],
+  defaultAgent: '',
+  selectedAgent: '',
+  setSelectedAgent: noop,
+  contexts: [],
+  brief: { contextId: '', projectName: '', repository: '', contextPaths: '', notes: '', targets: '', intent: 'ground' },
+  setBrief: noop,
+  selectContext: noop,
+  saveContext: noop,
+  deleteContext: noop,
+  hint: '',
   staged: [],
   refText: '',
   dragging: false,
@@ -67,7 +78,7 @@ const composerProps = {
   setBlocked: noop,
   setShowAuth: noop,
   onTryAgain: noop,
-} as unknown as React.ComponentProps<typeof Composer>
+}
 
 const scope = (n: number): Scope => ({
   screens: Array.from({ length: n }, (_, i) => ({ id: 's' + i, label: 'Screen ' + (i + 1) })),

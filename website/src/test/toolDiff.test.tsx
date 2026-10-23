@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { fireEvent } from "@testing-library/react";
+import { fireEvent, screen } from "@testing-library/react";
 import { renderWithProviders, createTestStore } from "./helpers";
 import ToolCallLine, { resetOpenedDiffCards } from "../pages/chat/ToolCallLine";
 import {
@@ -148,7 +148,7 @@ describe("ToolCallLine diff presentation", () => {
     };
   }
 
-  it("starts an edit tool's unified diff folded to its chip, and opens on click", () => {
+  it("starts a short edit diff open and lets the chip fold it", () => {
     const store = createTestStore({
       chat: {
         messages: [editMsg()],
@@ -166,21 +166,19 @@ describe("ToolCallLine diff presentation", () => {
         slotRunning: false,
       } as unknown as ChatState,
     });
-    const { container, getByText } = renderWithProviders(
+    const { container } = renderWithProviders(
       <ToolCallLine message={editMsg()} running={false} />,
       { store },
     );
-    // Folded by default: a multi-edit turn would otherwise stack a full patch
-    // per file and push the answer off screen.
-    expect(container.querySelector(".diff-block")).toBeNull();
+    expect(container.querySelector(".diff-block")).toBeTruthy();
     // Asserted by testid, not just by text: the card-opening chip and the
     // details-panel chip look alike, and only the testid tells them apart —
     // which is what the fold-by-default screenshot harness grabs.
     expect(
       container.querySelector('[data-testid="tool-diff-chip"]'),
     ).toBeTruthy();
-    fireEvent.click(getByText("app.py"));
-    expect(container.querySelector(".diff-block")).toBeTruthy();
+    fireEvent.click(container.querySelector('[data-testid="tool-diff-chip"]')!);
+    expect(container.querySelector(".diff-block")).toBeNull();
   });
 
   it("renders a summary chip (not a card) for an over-cap edit diff", () => {
@@ -257,13 +255,11 @@ describe("ToolCallLine diff presentation", () => {
         slotRunning: false,
       } as unknown as ChatState,
     });
-    const { container, getByText } = renderWithProviders(
+    const { container } = renderWithProviders(
       <ToolCallLine message={msg} running={false} />,
       { store },
     );
-    // The promotion is what this asserts, so open the fold and check the patch
-    // came from meta.input rather than a live toolLog entry.
-    fireEvent.click(getByText("app.py"));
+    // Short persisted diffs open without a live tool-log entry.
     expect(container.querySelector(".diff-block")).toBeTruthy();
   });
 
@@ -304,7 +300,7 @@ describe("ToolCallLine diff presentation", () => {
             type: "tool",
             text: "fs_write",
             kind: "edit",
-            input: UNIFIED_DIFF,
+            input: bigDiff(40),
             tool_call_id: "tc_d1",
             output: "ok",
             ts: 1,
@@ -367,7 +363,8 @@ describe("ToolCallLine diff presentation", () => {
       <ToolCallLine message={msg} running={false} />,
       { store: mkStore() },
     );
-    fireEvent.click(first.getByText("app.py"));
+    fireEvent.click(first.container.querySelector('[data-testid="tool-diff-chip"]')!);
+    fireEvent.click(first.container.querySelector('[data-testid="tool-diff-chip"]')!);
     expect(first.container.querySelector(".diff-block")).toBeTruthy();
     first.unmount();
     // Remount (what virtualizer recycling does): the expansion is remembered,
@@ -377,7 +374,7 @@ describe("ToolCallLine diff presentation", () => {
       { store: mkStore() },
     );
     expect(second.container.querySelector(".diff-block")).toBeTruthy();
-    expect(second.queryByText("app.py")).toBeNull();
+    expect(second.container.querySelector('[data-testid="tool-diff-chip"]')).toHaveAttribute('aria-expanded', 'true');
   });
 });
 

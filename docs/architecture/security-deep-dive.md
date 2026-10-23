@@ -211,10 +211,11 @@ operator's credential tooling for the subset who want the fence, silently, on
 upgrade. The tier is the operator's to tighten (`agent.sandbox="strict"`), and
 this document names what the default leaves open so that choice is informed.
 
-`SSH_AUTH_SOCK` is scrubbed whenever a Kiro Crew sandbox tier is active, so
-ssh-agent forwarding is unavailable inside a confined spawn. Operators who depend
-on passphrase-protected keys or hardware tokens use key files directly or leave
-`agent.sandbox` at `off`.
+`SSH_AUTH_SOCK` is kept for an agent spawn whose tier leaves `~/.ssh` readable
+(`off`, `standard`, `cc`) and whose harness mask does not hide it, so the
+agent can use the operator's ssh-agent there, including a forwarded one. Under
+`strict`, or a harness mask over `~/.ssh`, it is scrubbed unless the operator
+records consent in the keystone leaf `ssh_auth_sock_consent.json`.
 
 ## Layer 1: Filesystem gate (`security/` package + `hooks.py`)
 
@@ -397,17 +398,33 @@ The memory recovery, record editor, and member recall/copy APIs each register
 their own output boundary. Their response fields pass through the shared
 credential and exfiltration-URL chain before reaching the dashboard or MCP caller.
 
-- `redact_credentials()` recognizes credential families in plaintext and
-  base64-encoded form (it decodes base64-looking chunks and re-checks the decoded
-  bytes), including cloud access keys and secrets, private-key headers, chat and
-  forge tokens, package-registry tokens, and database connection URIs carrying
-  embedded credentials. Key-value matching is JSON-aware and value classes are
-  bounded at JSON structural delimiters, so a match in compact JSON cannot
-  over-capture and mask the next credential.
-- `redact_exfiltration_urls()` / `scan_exfiltration_urls()` are
-  **domain-agnostic**: they flag the payload, not the destination. A credential in
-  a URL is an unconditional floor; long query strings, base64 blobs and heavy
-  URL-encoding are heuristics. A flagged URL is replaced with a redaction marker.
+- `redact_credentials()` runs four passes:
+  1. Fixed patterns: cloud access key IDs and secret keys, private-key blocks,
+     chat and forge tokens, package-registry tokens, JWTs, `Authorization: Bearer`
+     headers, and database connection URIs carrying embedded credentials.
+  2. Base64: it decodes base64-looking chunks and re-runs pass 1 on the bytes.
+  3. Bare secret key: an entropy and shape heuristic for an unlabelled
+     40-character cloud secret key, with exemptions for shapes it would otherwise
+     misread (digests, document links, code literals and others).
+  4. Token parameter: the value of a `token` URL parameter, keyed on the name.
+
+  Key-value matching is JSON-aware and value classes stop at JSON structural
+  delimiters, so a match in compact JSON does not run into the next field. A
+  labelled match replaces the label together with the value, so
+  `{"AccessKeyId": "..."}` becomes `{"[REDACTED: credential]"}`.
+- `redact_exfiltration_urls()` / `scan_exfiltration_urls()` judge the payload
+  first. A credential in a URL is an unconditional floor; long query strings,
+  base64 blobs and heavy URL-encoding are heuristics. A flagged URL is replaced
+  with a redaction marker. Some destinations get narrower treatment: a valid S3
+  presigned URL is exempt; the ACP OAuth banner path spares standard OAuth
+  parameters at approved authorization endpoints; Kiro Crew's own Slack app-create
+  link keeps only its alias under the heuristics; and a companion's exact hosts and
+  a reader's allowed hosts (*Allow for this host*, kept per workspace in a
+  read-only leaf) skip only the length and base64 heuristics. The credential
+  checks still run on those last three.
+- The owner's switch (Settings → Security) applies only inside the Files view,
+  and there it turns all credential redaction off. A code-text scope spares two
+  source-code shapes from pass 3 and nothing else.
 - `redact()` composes both in order for a single call site.
 - `StreamRedactor` handles the case per-chunk redaction structurally cannot: a
   credential split across a streaming boundary, where neither fragment matches on
@@ -451,7 +468,12 @@ filter from a sandbox torn down underneath it, so it can neither audit nor
 persist anything it goes on to do, and nobody is watching it -- its parent
 records the run as ok either way. Such a child refuses instead of proceeding
 (`sandbox.refuse_unaudited_on_dead_fs`, gated on a marker the cron launcher puts
-in the child's environment AND on that errno). Everything else, including the
+in the child's environment AND on that errno). The child's own tool-call audit
+(`ScriptContext._audit_tool_call`) writes synchronously for the same reason, so
+its `ENOSYS` reaches the same refusal. The launcher also probes the data home
+again after the script body, before it prints any non-error status, and the
+parent treats every non-zero child exit as a failure, so a teardown during the
+run cannot be recorded as ok. Everything else, including the
 gateway's own spawns and any other audit failure, keeps the log-and-proceed
 posture above. `test_sandbox_cron_child_audit.py` pins both halves.
 
@@ -562,6 +584,24 @@ Dashboard tool approvals offer four decisions, in widening scope: `trust_command
 `ls *`, plus the bare binary, session-scoped), `trust_reads` (read-only bash for
 the slot), and `trust` (all tools for the slot). `yolo` is the global escalation.
 
+`trust_command` and `trust_base` can also be timed. The chat approval prompt
+offers each one for an hour or for the rest of the user's day, beside the grant
+that lasts for the chat. The request carries `ttl_seconds`, a whole number from 1
+to 86400; any other value, or a lifetime on any other decision, is refused with
+no grant recorded and the call still pending. A timed grant is kept on the chat's
+slot in its own store, apart from the chat-long patterns, so no other writer of
+those patterns can end or extend it. Its deadline is held on both the wall clock
+and the monotonic clock and checked at decision time: a grant is dropped before
+matching once either deadline passes, so neither a suspended host nor a clock
+set backwards stretches it, and the next matching call prompts again. An
+approval that rests on a timed grant carries that grant's deadline down to the
+transport, which checks it once more under its write lock, after its own
+security-floor check and right before it writes the answer: if the deadline has
+passed, nothing is written, the request stays pending, and the user is asked. An
+approval with no timed grant behind it carries no deadline and is answered as
+before. A timed grant stays on the chat
+that made it and, like every per-slot grant, is gone after a restart.
+
 The security-relevant property is what the pattern is derived from: the **actual
 command in `tool_input`**, not the model-authored display title. Trust patterns
 are per-slot fnmatch globs; a multi-command title yields one pattern per binary.
@@ -660,8 +700,13 @@ would not be noticed.
 
 **Base64 credential detection has a floor.** Only base64 chunks at or above the
 minimum length are decoded and re-checked, so a shorter encoded fragment, or one
-split across messages, can pass. Cross-message correlation and entropy-based
-detection would extend it.
+split across messages, can pass. Cross-message correlation would extend it.
+
+**A bare secret key is a guess.** Pass 3 judges an unlabelled 40-character run by
+entropy and shape, which cannot tell a random secret from a random digest, so it
+carries exemptions and still misreads some benign values. The recorded direction
+replaces it with case-insensitive labels and key-ID pairing; see
+[the redaction tier decision](../decisions/2026-10-20-redaction-classifies-by-what-a-value-can-do.md).
 
 **Write protection covers Kiro Crew's own trust root, not the user's shell
 startup files.** Credential directories and the keystone are read+write blocked,

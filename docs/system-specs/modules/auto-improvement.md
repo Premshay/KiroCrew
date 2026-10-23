@@ -160,8 +160,8 @@ and never drive the verdict, or one flaky optional job would nudge forever.
 | Edit allowlist | `spine/gate.py` + profile | ruler/harness/tests/auth are mechanically off-limits |
 | Do-not-pollute gate | `spine/pollute.py` | host state hashed before/after; drift blocks the run |
 | Second reproduce | `spine/pr_pipeline.py` | an independent A/B must confirm before a PR is drafted |
-| Pre-push review gate | `spine/driver.py:_prepush_review_clean` | optional, fail-closed; an unfounded "clean" cannot pass it |
-| Tool-request gate | `spine/agent_runner.py:_tool_permitted` + `shell_command_refusal` | the caller's `allowed_tools` is ENFORCED, and state-mutating shell verbs are refused even when Bash is allowed |
+| Pre-push review gate | `spine/driver_publish.py:_prepush_review_clean` | optional, fail-closed; an unfounded "clean" cannot pass it |
+| Tool-request gate | `spine/agent_runner_gate.py:_tool_permitted` + `shell_command_refusal` | the caller's `allowed_tools` is ENFORCED, and state-mutating shell verbs are refused even when Bash is allowed |
 | Audit-or-deny approval | `spine/agent_runner.py:_approve` | the unattended auto-approve is logged to the SEL with `critical=True` **before** it is granted; an unwritable audit REJECTS the tool |
 | Audited MCP dispatch | `backend/mcp_server.py:_audit` | every `tools/call` is logged, rejected ones included; the pre-dispatch `invoked` event is `critical=True` (audit-or-DENY — an unauditable call is refused), outcome events stay fail-soft since the handler has already run |
 | Redacted evidence | `backend/routes.py:_redact_for_display` / `_redact_tree` | EVERY agent-authored field served to the browser is scanned — diff, PR body, and the candidate's signature/hypothesis/evidence/severity/blast-radius, plus the gate tree recursively; **fail-closed** |
@@ -334,7 +334,7 @@ must choose to obey is not a control.
 
 Removing Bash for watchers would break the feature — the watcher's task is "run the repo's
 build, test and lint commands, find the root cause, and fix it". So the shell stays and the
-**verbs** are denied. The source of truth is `spine/agent_runner.py` `_FORBIDDEN_SUBCOMMANDS`
+**verbs** are denied. The source of truth is `spine/agent_runner_gate.py` `_FORBIDDEN_SUBCOMMANDS`
 and `_FORBIDDEN_BINARIES`; they cover, among others, `git push` and `git remote set-url`,
 `gh pr merge`/`ready`/`close`/`comment`/`review`/`edit`/`create`, every `gh issue` and
 `gh release` verb, `gh api`, `gh auth`, `gh secret`, `gh workflow run`, and the
@@ -543,7 +543,7 @@ widened to `$HOME`: the interpreter's own stdlib can live there — hiding `~/.l
 `import platform`.
 
 **What remains open**: arbitrary same-user files elsewhere (`~/notes.txt`) are still writable.
-Kiro Crew's own home is sealed per leaf (`sandbox.py` marks each crew-home leaf hidden,
+Kiro Crew's own home is sealed per leaf (`sandbox_leaves.py` marks each crew-home leaf hidden,
 read-only or visible), but `kiro_crew.sandbox` has no general write confinement for arbitrary
 same-user files, and adding one changes the shared sandbox for every caller. Failing closed at
 `profile._run` until then would disable the entire bug track (no test could run at all).
@@ -562,7 +562,7 @@ plain LOCAL name if the operator set one — and with HEAD on that branch the di
 so `scan_content_for_secrets("")` would report clean. `_scannable_base` therefore resolves to a
 ref distinct from HEAD (trying the remote-tracking form) and REFUSES when it cannot: refusing
 beats degrading to the narrower single-commit scan, because a narrower range that happens to pass
-is exactly the silent downgrade this guards. `driver._direct_push` follows the same rule.
+is exactly the silent downgrade this guards. `Driver._direct_push` follows the same rule.
 
 A REFUSED direct push rolls its commit back. The direct-push scan range is `HEAD~1..HEAD` — one
 commit — so a refused commit left at HEAD would be outside the next winner's scan range while its
@@ -758,6 +758,7 @@ rather than starting two threads and hoping, so it is deterministic.
 - `POST /setup-clone` re-checks `_run_is_active()` inside `clone_lock` and answers 409 `run_in_progress`. (D-95)
 - `PUT /config` takes `clone_lock` and re-checks `_run_is_active()` inside it; a structural test asserts both workspace-mutating handlers do. (D-96)
 - The draft and commit routes re-check the run status inside `clone_lock`; a structural guard asserts all four clone-mutating handlers do. (D-115)
+- `POST /run` admits under `app_lifecycle_lock` and answers 403 `app_disabled` when `is_app_enabled` is false at admission; otherwise it records `RunSupervisor.stop_seq()` and passes it to `start` as `admitted_at`, which `start` re-checks after `_build_driver` and raises `RuntimeError` ("the run was stopped before it started", mapped to 409 `session_conflict`) when a `stop` or the disable hook landed meanwhile, so a run cannot launch into an app disabled or stopped while its driver was being built (`test_run_start_honors_stop`, `test_start_is_refused_once_the_app_is_disabled`).
 
 ### Why the manual draft path materializes its own diff
 
@@ -994,6 +995,7 @@ attributes pin, and a structural test enumerates the helpers that must.
 - `clone_setup.checkout_branch` routes through the shared `git_safety` config and pin. (D-129)
 - `proposer._capture_diff` calls `require_pinned` first, and the structural helper list includes it (`test_every_host_side_git_helper_injects_the_safe_config`). (D-132)
 - Host-side `git` decodes output leniently (`errors="replace"`), so a non-UTF-8 byte in a changed file cannot kill a watcher. (D-142)
+- Every host-side git call also disables git's config-defined hooks (`hook.<name>.command`, git 2.54+), emitting `-c hook.<name>.enabled=false` for each `hook.<name>.*` git would read in the worktree and every initialized submodule (`git_safety.hook_off_args`, which delegates to `git_config_hooks.config_hook_disable_args`), because `core.hooksPath=<devnull>` moves only the hook directory and does not reach a config-defined hook whose name the repository chooses. The same call pins submodule recursion off (`submodule.recurse=false`, `fetch.recurseSubmodules=false`, `_SUBMODULE_RECURSION_PINS`) so a recursive fetch or checkout cannot read an uninitialized submodule's config, and it fails closed (`ConfigHookScanError` to `GitSafetyError`) when the hook names cannot be listed safely.
 
 ### Gate and measurement invariants
 
@@ -1124,6 +1126,10 @@ Three tiers, each where it fits:
    Stop and timeout cancel the active assignment and release its session.
    Deadline errors use the existing `timeout after Ns` contract so bug and
    performance authoring retain completed edits for the deterministic gate.
+   A turn the backend ends unfinished (stop reason `timeout` or
+   `stale_recover`, or a stream that ends with no turn end) returns `ok=False`
+   with an error that begins `the backend did not finish the turn`; authoring
+   reads it the same way and retains completed edits.
    Per-role provider-reported USD totals feed the existing combined run budget.
    Kiro credit usage is not converted to dollars; the USD cap does not bound
    credit spend. Cycle, time and tool-call limits still apply. The deterministic
@@ -1239,6 +1245,53 @@ trusts it. Adding a target never edits the engine, but it does touch
 - `runner` imports `build_profile` lazily, keeping the profile and spine off the gateway boot path; `test_perf_boot_path.py` ratchets it. (D-76)
 - MCP stdio registration resolves a bare `python`/`python3`/`py` to the running interpreter (`bridges.resolve_stdio_command`), so the server launches on every platform. (D-90)
 
+### Driver layout
+
+`spine/driver.py` holds `Driver`: the loop, the per-cycle workflow and the keep
+decisions (`_apply_verdict`, `_apply_bug_winner`). Three owner modules beside it hold the
+mechanics those decisions call. The class binds each owner function by name
+(`_direct_push = driver_publish._direct_push`), so every member stays a `Driver` method
+that callers and tests patch on the class or on an instance, and the run's state stays on
+the instance.
+
+| Module | Owns |
+|---|---|
+| `spine/driver_git.py` | `_git`, the host-side git chokepoint, and the object-id reads built on it |
+| `spine/driver_publish.py` | the F10 direct push: its gates, the credential scan and the one rebase-and-retry |
+| `spine/driver_commit.py` | the winner's provisional commit: stage, commit, amend, discard, roll back, quarantine |
+
+`driver.py` stays the import path. It serves the git helpers from `driver_git`, and a
+patch through it (`monkeypatch.setattr(driver, "_git", ...)`) reaches every owner that
+binds the name (`kiro_crew._facade_mirror`). A bound member reports its owner module as
+`__module__` and its bare name as `__qualname__`; nothing reads either. New publish or
+commit mechanics go to their owner, and new loop behaviour stays in `driver.py`.
+`test/test_driver_owner_bindings.py` pins the member inventory, the bindings and the
+patch reach.
+
+### Agent runner layout
+
+`spine/agent_runner.py` holds both runners: `AgentRunner`, the `claude -p` subprocess
+path, and `SessionAgentRunner`, the provider session the backend selects, with
+`AgentResult` and the helpers only they call (the launch and per-tool audits, the
+agent-copy install, the sandbox launcher cleanup). It also keeps the one `kiro_crew.acp`
+import the agent-sdk boundary baseline records. Three owner modules beside it hold the
+rest:
+
+| Module | Owns |
+|---|---|
+| `spine/agent_runner_gate.py` | whether a tool request is refused: `_governance_denial`, the shell-command denylist (`shell_command_refusal` and its tables) and the caller's allowlist (`_tool_permitted`) |
+| `spine/agent_runner_feed.py` | the activity feed: `_LineBuffer`, `_tool_detail`, `_detail_is_richer`, `_summarize_stream_event` |
+| `spine/agent_runner_authoring.py` | `author_bug_fix` and `author_perf_fix`: the prompt, the run, and the worktree check that decides whether a change is left for the gate |
+
+`agent_runner.py` stays the import path. It serves the moved names, and a patch through
+it (`monkeypatch.setattr(agent_runner, "HookManager", ...)`) reaches every owner that
+binds the name (`kiro_crew._facade_mirror`). The owners log through the facade's logger,
+named from their package, so a record keeps the name it had. `_GovernanceDeny` reports
+the gate module as its `__module__`; nothing reads it. New tool-gate, feed or authoring
+work goes to its owner, and new runner behaviour stays in `agent_runner.py`.
+`test/test_agent_runner_owner_bindings.py` pins the owners, the served names and the
+patch reach.
+
 ## Frontend
 
 `website/src/apps/auto-improvement/AutoImprovementPage.tsx`, routed at
@@ -1341,6 +1394,8 @@ integration test — nothing in the tree runs the full loop against a live repos
 - Repo-level handler and coverage tests under `test/`: `test_ai_backend_routes_coverage.py`,
   `test_ai_agent_runner_coverage.py`, `test_ai_runner_coverage.py`,
   `test_ai_pr_watchers_coverage.py`, `test_ai_spine_driver_coverage.py`,
+  `test_ai_spine_driver_coverage_cycle.py`,
+  `test_driver_owner_bindings.py`, `test_agent_runner_owner_bindings.py`,
   `test_ai_github_profile_coverage.py`, `test_ai_runner_purpose_not_identity.py`,
   `test_auto_improvement_owner_gate.py`, `test_auto_improvement_members.py` and
   `test_handlers_auto_improvement_deny_notice.py`.
@@ -1473,6 +1528,11 @@ across delegation refuse execution, naming the scope. The app does not grant dae
 access or relax platform policy. See [governance](governance.md#repository-runner-admission).
 
 ## Bounded measurements and finalist regression
+
+`profiles/github_repo/profile.py` remains the profile API and patch surface.
+Its `profile_execution.py` owner handles bounded subprocess execution, pytest
+commands and measurements. The facade mirrors patches into that owner; the
+existing environment adapter and sandbox admission contracts apply unchanged.
 
 Repository measurement settings are exposed with the test environment in Setup:
 `track`, `benchmarkCommand`, `benchmarkCanaryCommand`, `benchmarkResultMode`

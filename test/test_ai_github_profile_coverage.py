@@ -24,7 +24,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -60,8 +59,12 @@ class _FakeRun:
     def __init__(self, *results: object) -> None:
         self.results: list[object] = list(results) or [_Proc()]
         self.calls: list[dict[str, object]] = []
+        self.probes: list[list[str]] = []
 
     def __call__(self, argv, *, cwd, timeout, env=None):  # noqa: ANN001 - test double
+        if "-c" in argv and "KIRO_XDIST_ABSENT" in argv[-1]:
+            self.probes.append(list(argv))
+            return _Proc(3, "KIRO_XDIST_ABSENT")
         self.calls.append({"argv": list(argv), "cwd": cwd, "timeout": timeout, "env": env})
         result = self.results.pop(0) if len(self.results) > 1 else self.results[0]
         if isinstance(result, BaseException):
@@ -229,15 +232,22 @@ def test_measure_env_omits_a_missing_src_dir(tmp_path, monkeypatch):
 # ── xdist probing ────────────────────────────────────────────────────────────
 
 
-def test_xdist_argv_present(monkeypatch):
-    monkeypatch.setitem(sys.modules, "xdist", types.ModuleType("xdist"))
-    assert gh._xdist_argv() == ("-n", "auto")
+def test_xdist_argv_present(tmp_path):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return _Proc(0)
+
+    environment = gh.TestEnvironment(None, tmp_path, run)
+    assert gh._xdist_argv(environment, tmp_path) == ("-n", "auto")
+    assert calls[0][0] == sys.executable
+    assert "KIRO_XDIST_ABSENT" in calls[0][-1]
 
 
-def test_xdist_argv_absent_runs_serially(monkeypatch):
-    """``None`` in ``sys.modules`` makes ``import xdist`` raise, as an absent plugin does."""
-    monkeypatch.setitem(sys.modules, "xdist", None)
-    assert gh._xdist_argv() == ()
+def test_xdist_argv_absent_runs_serially(tmp_path):
+    environment = gh.TestEnvironment(None, tmp_path, lambda *a, **kw: _Proc(3, "KIRO_XDIST_ABSENT"))
+    assert gh._xdist_argv(environment, tmp_path) == ()
 
 
 @pytest.mark.parametrize(
@@ -434,28 +444,28 @@ def test_ruler_time_once_runs_a_custom_benchmark_command(tmp_path, monkeypatch):
     root = _repo(tmp_path, name="bench")
     fake = _FakeRun(_Proc(0))
     monkeypatch.setattr(gh, "_run", fake)
-    seconds, passed = gh.SuiteRuler(benchmark_cmd="make bench")._time_once(root)
+    seconds, passed = gh.SuiteRuler(benchmark_cmd="python -m bench")._time_once(root)
     assert passed is True
     assert seconds >= 0.0
-    assert fake.argvs[0] == ["make", "bench"]
+    assert fake.argvs[0] == [sys.executable, "-m", "bench"]
 
 
 def test_ruler_time_once_nan_when_the_benchmark_cannot_run(tmp_path, monkeypatch):
     root = _repo(tmp_path, name="benchboom")
     monkeypatch.setattr(gh, "_run", _FakeRun(OSError("no such command")))
-    seconds, passed = gh.SuiteRuler(benchmark_cmd="make bench")._time_once(root)
+    seconds, passed = gh.SuiteRuler(benchmark_cmd="python -m bench")._time_once(root)
     assert seconds != seconds
     assert passed is False
 
 
-def test_ruler_time_once_collect_only_ignores_the_benchmark_command(tmp_path, monkeypatch):
-    """The collect-only arm is always pytest -- that is what the canary compares."""
+def test_ruler_time_once_collect_only_refuses_a_custom_benchmark(tmp_path, monkeypatch):
+    """Custom benchmark controls must measure the same workload, not pytest collection."""
     root = _repo(tmp_path, name="benchcollect")
     fake = _FakeRun(_Proc(0))
     monkeypatch.setattr(gh, "_run", fake)
-    gh.SuiteRuler(benchmark_cmd="make bench")._time_once(root, collect_only=True)
-    assert "--collect-only" in fake.argvs[0]
-    assert fake.argvs[0][0] == sys.executable
+    with pytest.raises(ValueError, match="do not use collection"):
+        gh.SuiteRuler(benchmark_cmd="python -m bench")._time_once(root, collect_only=True)
+    assert fake.calls == []
 
 
 def _stub_time_once(monkeypatch, ruler, mapping):
@@ -480,7 +490,7 @@ def test_ruler_measure_returns_a_signed_delta_and_stage_breakdown(tmp_path, monk
             (cand, True): (2.0, True),
         },
     )
-    monkeypatch.setattr(gh, "_collected_count", lambda tree: 100)
+    monkeypatch.setattr(gh, "_collected_count", lambda tree, environment=None, run=None: 100)
     m = ruler.measure(base_src=base, cand_src=cand, commit_sha="deadbeefcafe", scenario="")
     assert m.ok is True
     assert m.primary_delta == pytest.approx(-3.0)
@@ -508,7 +518,7 @@ def test_ruler_measure_flags_a_red_candidate_suite(tmp_path, monkeypatch):
             (cand, True): (2.0, True),
         },
     )
-    monkeypatch.setattr(gh, "_collected_count", lambda tree: 10)
+    monkeypatch.setattr(gh, "_collected_count", lambda tree, environment=None, run=None: 10)
     m = ruler.measure(base_src=base, cand_src=cand, commit_sha="abcdef1234", scenario="suite")
     assert m.guardrails[gh.GUARDRAIL_TESTS_PASS] == 1.0
     assert m.rh_functional_ok is False
@@ -558,7 +568,9 @@ def test_ruler_measure_rh_guard_on_collected_test_counts(
         },
     )
     counts = {base: base_n, cand: cand_n}
-    monkeypatch.setattr(gh, "_collected_count", lambda tree: counts[Path(tree)])
+    monkeypatch.setattr(
+        gh, "_collected_count", lambda tree, environment=None, run=None: counts[Path(tree)]
+    )
     m = ruler.measure(base_src=base, cand_src=cand, commit_sha="0123456789", scenario="")
     assert m.rh_capability_ok is expected
 
@@ -605,7 +617,7 @@ def test_ruler_baseline_samples_honours_a_stop_click(tmp_path, monkeypatch):
 def test_ruler_canary_refuses_to_certify_a_custom_benchmark_command(tmp_path):
     m = gh.SuiteRuler(benchmark_cmd="make bench").measure_canary(base_src=tmp_path)
     assert m.ok is False
-    assert "mechanically-known win" in m.note
+    assert "benchmarkCanaryCommand" in m.note
 
 
 def test_ruler_canary_clears_when_skipping_execution_wins(tmp_path, monkeypatch):
@@ -703,7 +715,7 @@ def test_build_gate_spawn_error(tmp_path, monkeypatch):
 def test_build_gate_retries_serially_when_xdist_itself_failed(tmp_path, monkeypatch):
     """A broken plugin must read as 'run serially', never as 'suite red'."""
     root = _repo(tmp_path, name="gatexdist")
-    monkeypatch.setattr(gh, "_XDIST_ARGV", ("-n", "auto"))
+    monkeypatch.setattr(gh, "_xdist_argv", lambda environment, root: ("-n", "auto"))
     fake = _FakeRun(_Proc(4, "", "error: unrecognized arguments: -n"), _Proc(0, "5 passed"))
     monkeypatch.setattr(gh, "_run", fake)
     res = gh.PytestBuildGate().build_and_test(worktree=root, src=root / "src")
@@ -714,7 +726,7 @@ def test_build_gate_retries_serially_when_xdist_itself_failed(tmp_path, monkeypa
 
 def test_build_gate_serial_retry_can_still_time_out(tmp_path, monkeypatch):
     root = _repo(tmp_path, name="gateretrytimeout")
-    monkeypatch.setattr(gh, "_XDIST_ARGV", ("-n", "auto"))
+    monkeypatch.setattr(gh, "_xdist_argv", lambda environment, root: ("-n", "auto"))
     monkeypatch.setattr(
         gh,
         "_run",
@@ -727,7 +739,7 @@ def test_build_gate_serial_retry_can_still_time_out(tmp_path, monkeypatch):
 
 def test_build_gate_serial_retry_can_still_fail_to_spawn(tmp_path, monkeypatch):
     root = _repo(tmp_path, name="gateretryspawn")
-    monkeypatch.setattr(gh, "_XDIST_ARGV", ("-n", "auto"))
+    monkeypatch.setattr(gh, "_xdist_argv", lambda environment, root: ("-n", "auto"))
     monkeypatch.setattr(
         gh, "_run", _FakeRun(_Proc(4, "", "worker crashed"), OSError("fork failed"))
     )
@@ -756,7 +768,8 @@ def test_bug_runner_import_smoke_compiles_rather_than_imports(
     fake = _FakeRun(proc)
     monkeypatch.setattr(gh, "_run", fake)
     assert gh.PytestBugRunner().build_imports_ok(src=root / "src") is expected
-    assert "compileall" in fake.argvs[0]
+    assert "-c" in fake.argvs[0]
+    assert "compile(" in fake.argvs[0][-1]
 
 
 def test_bug_runner_import_smoke_false_on_spawn_failure(tmp_path, monkeypatch):
@@ -776,7 +789,6 @@ def test_bug_runner_lint_findings_are_keyed_file_plus_code(tmp_path, monkeypatch
         "src/pkg/short.py:1:1\n"
         "nonsense\n"
     )
-    monkeypatch.setattr(gh.shutil, "which", lambda name: "/usr/bin/ruff")
     monkeypatch.setattr(gh, "_run", _FakeRun(_Proc(1, out)))
     findings = gh.PytestBugRunner()._lint_findings(root)
     assert findings == {
@@ -792,7 +804,6 @@ def test_bug_runner_lint_findings_skips_a_missing_module_and_uses_pyflakes(tmp_p
         _Proc(1, "", "No module named ruff"),
         _Proc(1, "src/pkg/mod.py:3:1: F401 unused\n"),
     )
-    monkeypatch.setattr(gh.shutil, "which", lambda name: None)
     monkeypatch.setattr(gh, "_run", fake)
     assert gh.PytestBugRunner()._lint_findings(root) == {"src/pkg/mod.py:F401"}
     assert "ruff" in fake.argvs[0]
@@ -801,8 +812,14 @@ def test_bug_runner_lint_findings_skips_a_missing_module_and_uses_pyflakes(tmp_p
 
 def test_bug_runner_lint_findings_none_when_no_linter_runs(tmp_path, monkeypatch):
     root = _repo(tmp_path, name="lintnone")
-    monkeypatch.setattr(gh.shutil, "which", lambda name: None)
-    monkeypatch.setattr(gh, "_run", _FakeRun(OSError("not installed")))
+    monkeypatch.setattr(
+        gh,
+        "_run",
+        _FakeRun(
+            _Proc(1, "", "No module named ruff"),
+            _Proc(1, "", "No module named pyflakes"),
+        ),
+    )
     assert gh.PytestBugRunner()._lint_findings(root) is None
 
 
@@ -890,7 +907,7 @@ def test_bug_runner_run_suite_green(tmp_path, monkeypatch):
 
 def test_bug_runner_run_suite_red_returns_the_nodeids(tmp_path, monkeypatch):
     root = _repo(tmp_path, name="suitered")
-    monkeypatch.setattr(gh, "_XDIST_ARGV", ())
+    monkeypatch.setattr(gh, "_xdist_argv", lambda environment, root: ())
     monkeypatch.setattr(gh, "_run", _FakeRun(_Proc(1, "FAILED tests/test_a.py::test_one - x")))
     green, failing = gh.PytestBugRunner().run_suite(src=root)
     assert green is False
@@ -900,7 +917,7 @@ def test_bug_runner_run_suite_red_returns_the_nodeids(tmp_path, monkeypatch):
 def test_bug_runner_run_suite_unparsed_failure_uses_the_sentinel(tmp_path, monkeypatch):
     """An empty list beside False would let the gate subtract zero and admit a regression."""
     root = _repo(tmp_path, name="suitesentinel")
-    monkeypatch.setattr(gh, "_XDIST_ARGV", ())
+    monkeypatch.setattr(gh, "_xdist_argv", lambda environment, root: ())
     monkeypatch.setattr(gh, "_run", _FakeRun(_Proc(2, "INTERNALERROR")))
     assert gh.PytestBugRunner().run_suite(src=root) == (False, ["<unparsed-suite-failure>"])
 
@@ -913,7 +930,7 @@ def test_bug_runner_run_suite_sentinel_on_spawn_failure(tmp_path, monkeypatch):
 
 def test_bug_runner_run_suite_retries_serially_after_an_xdist_failure(tmp_path, monkeypatch):
     root = _repo(tmp_path, name="suitexdist")
-    monkeypatch.setattr(gh, "_XDIST_ARGV", ("-n", "auto"))
+    monkeypatch.setattr(gh, "_xdist_argv", lambda environment, root: ("-n", "auto"))
     fake = _FakeRun(_Proc(4, "", "Replacing crashed worker"), _Proc(0, "9 passed"))
     monkeypatch.setattr(gh, "_run", fake)
     assert gh.PytestBugRunner().run_suite(src=root) == (True, [])
@@ -922,7 +939,7 @@ def test_bug_runner_run_suite_retries_serially_after_an_xdist_failure(tmp_path, 
 
 def test_bug_runner_run_suite_sentinel_when_the_serial_retry_cannot_spawn(tmp_path, monkeypatch):
     root = _repo(tmp_path, name="suiteretryboom")
-    monkeypatch.setattr(gh, "_XDIST_ARGV", ("-n", "auto"))
+    monkeypatch.setattr(gh, "_xdist_argv", lambda environment, root: ("-n", "auto"))
     monkeypatch.setattr(gh, "_run", _FakeRun(_Proc(4, "", "node down"), OSError("no exec")))
     assert gh.PytestBugRunner().run_suite(src=root) == (False, ["<unparsed-suite-failure>"])
 
@@ -930,7 +947,7 @@ def test_bug_runner_run_suite_sentinel_when_the_serial_retry_cannot_spawn(tmp_pa
 def test_bug_runner_run_suite_serial_retry_still_red_yields_a_real_verdict(tmp_path, monkeypatch):
     """After an xdist-side failure the serial retry's own nodeids are what count."""
     root = _repo(tmp_path, name="suiteretryred")
-    monkeypatch.setattr(gh, "_XDIST_ARGV", ("-n", "auto"))
+    monkeypatch.setattr(gh, "_xdist_argv", lambda environment, root: ("-n", "auto"))
     monkeypatch.setattr(
         gh,
         "_run",
@@ -945,7 +962,7 @@ def test_bug_runner_run_suite_serial_retry_still_red_yields_a_real_verdict(tmp_p
 
 def test_bug_runner_run_suite_red_after_a_real_xdist_run(tmp_path, monkeypatch):
     root = _repo(tmp_path, name="suitexdistred")
-    monkeypatch.setattr(gh, "_XDIST_ARGV", ("-n", "auto"))
+    monkeypatch.setattr(gh, "_xdist_argv", lambda environment, root: ("-n", "auto"))
     monkeypatch.setattr(gh, "_run", _FakeRun(_Proc(1, "FAILED t/test_a.py::test_x - boom")))
     assert gh.PytestBugRunner().run_suite(src=root) == (False, ["t/test_a.py::test_x"])
 
@@ -972,7 +989,8 @@ def test_bug_runner_agent_test_hint_names_this_interpreter(tmp_path):
     root = _repo(tmp_path, name="hint")
     hint = gh.PytestBugRunner().agent_test_hint(root)
     assert sys.executable in hint
-    assert hint.endswith("-m pytest -q <test_path>")
+    assert "-m pytest -q <test_path>" in hint
+    assert "Do not fall back to the gateway interpreter" in hint
 
 
 # ── ③ RepoEditAllowlist ─────────────────────────────────────────────────────
@@ -1224,11 +1242,16 @@ def test_isolation_measurement_boot_is_a_documented_no_op(tmp_path):
 def _profile(tmp_path, monkeypatch, **kwargs) -> gh.GitHubRepoProfile:
     clone = kwargs.pop("clone", None) or _repo(tmp_path, name="profclone")
     monkeypatch.setattr(gh.scope_util, "scoped_relpaths", kwargs.pop("scoped", lambda c, r: None))
-    return gh.GitHubRepoProfile(
+    # This suite verifies adapters with scripted commands; environment admission
+    # has separate integration coverage. Keep its executor injectable after construction.
+    monkeypatch.setattr(gh, "_run", _FakeRun(_Proc(0, "1 tests collected")))
+    prof = gh.GitHubRepoProfile(
         clone_path=clone,
         pr_queue_dir=tmp_path / "queue",
         **kwargs,
     )
+    monkeypatch.setattr(prof.environment, "_sandbox_run", lambda *a, **kw: gh._run(*a, **kw))
+    return prof
 
 
 def test_profile_assembles_all_six_fields(tmp_path, monkeypatch):

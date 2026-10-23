@@ -123,12 +123,37 @@ retry the allowance exists for IS the debt's own fire.
 
 The judged baseline (`judge_pr_seen`) is committed only after the judge returns a
 verdict (`autonudge_service/gate.py` `_commit_judge_pr_seen`), so a turn spent without
-a verdict cannot move it. With no judge, a quiet tick delivers, except when the reading
-is whole and byte-identical to the previous one: no criterion about the subject can have
-become true while the subject did not change. PR bodies the judge compares are stashed in
-memory only, capped at `MAX_BODY_STASHES` (64) in `autonudge_judge.py`; a dropped stash
-makes the next reading partial, and a partial reading fires. Merged and closed map to a
-terminal outcome in the auto-nudge core, not in the fetcher.
+a verdict cannot move it. A reading that is whole and byte-identical to the previous one
+means no criterion about the subject can have become true while the subject did not
+change. With no judge, that tick is quiet and every other quiet tick delivers. With a
+judge, the same tick asks no judge when every target the judge would read is the watched
+pull request and no judge wake or terminal turn is owed (`gate.py`
+`_unchanged_reading_skips_judge`), so a judge that cannot answer (a timeout is a
+fallback, and a fallback fires) does not spend a turn on an unchanged board. The quiet
+floor still delivers, and a `decisions.nudge_wake.quiet_streak_floor` set below it keeps
+every tick judged, so that shorter bound holds. PR bodies the judge compares are stashed
+in memory only, capped at `MAX_BODY_STASHES` (64) in `autonudge_judge.py`; a dropped
+stash makes the next reading partial, and a partial reading fires. Merged and closed map
+to a terminal outcome in the auto-nudge core, not in the fetcher.
+
+A partial reading is never screened quiet on the half that arrived, but a REPEAT of one
+does not buy a turn every interval either. `MonitorState.short_reading_digest` holds the
+digest of the partial reading the last DELIVERED turn was decided on, written only where
+delivery is confirmed (`_record_delivered_reading`, against the reading, instruction and
+brief read before the dispatch), so a refused fire, a process that stops before its turn
+lands, or a re-aim while the turn is in flight holds nothing. A later tick whose partial
+reading has that
+same digest is held (`gate.py` `_holds_short_reading`): no judge call, no baseline commit,
+no quiet counter, and one notice row on the owning session naming why the reading is
+short and when the next turn is due. `short_reading_held` counts the repeats and is
+written durably before the held tick returns (a refused write delivers instead), and the
+`_SHORT_READING_HOLD_CEILING`th (the quiet floor, `_MAX_QUIET_STREAK`) delivers anyway, so
+a sustained degradation costs one turn per ceiling's worth of ticks. Anything else
+delivers or ends the run: a change in what was read (a lane turning red, a new remark), a
+different `incomplete` reason, a whole reading (which clears both fields in the same write
+that keeps it), an owed judge wake, a brief naming any target other than the watched pull
+request (a session, a second pull request, or none at all), or an
+update that re-aims the loop (a reworded instruction or a replaced brief clears both).
 
 Every uncertain path -- no probe, no inferable target, a probe defect, a kernel that
 reached no verdict -- fires, because a wrongly-quiet tick is silence with
@@ -168,7 +193,7 @@ re-arm the bound legacy loop. The binding-key and collision tests in
 
 A retained stop is refused at the turn boundary, and the three tools say so
 before the turn ends **whenever the retained record is readable**.
-`mcp_tools.control._retained_stop_refusal` reads the same
+`mcp_tools.control._arming_preflight_refusal` reads the same
 `/api/autonudge/session-monitor` endpoint `monitor_inspect` reads and, when the
 binding holds an inactive record whose outcome is retained evidence, returns a
 refusal naming the retained outcome, its target, and the owner-only clear —
@@ -205,6 +230,21 @@ must still arm, and the endpoint wire contract the refusal depends on — droppi
 `outcome` from `MONITOR_PUBLIC_FIELDS` would make the preflight fail open
 silently.
 
+The same preflight also refuses when the session cannot host a loop at all. An
+incognito or temporary dashboard slot is denied by the authorizer on every arm
+and on every update of a structured monitor, and that denial is as certain as a
+retained stop (a slot's memory mode only tightens). A `monitor_update` of a
+legacy timer loop is not refused: `authorize_and_update_nudge` applies no
+memory-mode rule, so a loop armed before the slot tightened can still be shrunk
+or paused. The session-monitor
+reading carries `hosting_refusal` when
+`autonudge_authz.loop_hosting_refusal` refuses the live slot. That is the one
+predicate both authorizer paths and the commit-time admission check call, so the
+tools quote the exact text the authorizer denies with and emit no directive.
+The key is present only when it refuses, so every other reading keeps its shape.
+`test_monitor_temporary_session_false_ack.py` covers the three tools, the
+endpoint and the authorizer.
+
 `NudgeLoop.next_due_ts`, `notify_user_input`, and `notify_turn_complete` make
 dashboard-loop cadence deadline-preserving: user activity cancels a pending
 timer but does not move its deadline, and a delivered nudge begins its next
@@ -219,7 +259,7 @@ turn-lifecycle hooks.
 
 The schemas in `validation.MONITOR_START_SCHEMA` and
 `validation.MONITOR_UPDATE_SCHEMA` bound the message, interval, cycle cap, and
-wall-clock budget. `mcp_tools.control.monitor_start` supplies bounded positive
+runtime budget. `mcp_tools.control.monitor_start` supplies bounded positive
 defaults from `mcp_tools._limits`; zero and negative cycle or runtime limits are
 rejected. The operator ceiling is `monitoring.max_runtime_secs`; setting 2592000
 permits a 30-day request without extending existing loops. The cap is a runaway backstop, not evidence that the watched work
@@ -231,7 +271,7 @@ loop and emits
 measures a configured wall-clock
 budget from the persisted creation time. `_timer` checks it before a fire and
 `_run_fire_cycle` checks it after a delivered turn, so a running turn is not
-cancelled but an expired loop is not re-armed. `test_autonudge.py` pins budget
+cancelled but an expired loop is not re-armed. `test_autonudge_budget.py` pins budget
 persistence across restart and the post-delivery check.
 
 `monitor_update` resolves the loop only by the calling session's binding and
@@ -252,7 +292,7 @@ retained `USER_STOP` record, a manual pause, an empty reason) refuses the arm; a
 row that is active, or that its own cycle cap, runtime budget, terminal subject,
 stop file or dropped sentinel deactivated, admits it, and the create-only and
 `replace_stopped` rules then decide as for any other arm. The self-arm tests in
-`test_autonudge_member_self_arm.py` and `test_monitor_directive_apply.py` pin
+`test_autonudge_member_self_arm.py` and `test_monitor_directive_apply_wake_authority.py` pin
 the four answers. When the wake carries a loop id, its `monitor_update`,
 `monitor_stop`, and `autonudge_stop` directives apply only while that id is the
 monitor currently bound to the session; a replacement monitor is never mutated
@@ -348,7 +388,8 @@ The reading itself:
 * One `status` per reading: `ok` when every page was read, `partial` when something
   was read and something was not, `unavailable` when the subject was not reached.
   A refusal becomes a status, never an exception. A consumer treats `partial` as a
-  target nobody read whole, which fires.
+  target nobody read whole, which fires; the gate holds only a repeat of a partial
+  reading a turn was already delivered on, up to the quiet floor.
 * `as_facts` is the durable half -- typed facts plus who said something and when.
   `bodies` is a separate call, so keeping the first cannot accidentally keep the
   second: remark prose stays in the process that fetched it. Each remark does carry a
@@ -410,13 +451,17 @@ above, so script-cron `Skip`/`Report`/`Done` delivery is not this watch's path.
 
 ## Non-goals
 
-The structured GitHub monitor digests PR-level comment bodies to detect that
-one changed, so an in-place edit whose `created_at` never moves still wakes the
-owner. It never interprets what a comment says or decides whether an advisory
-finding is valid, and it deliberately does not read inline review-thread bodies
-at all -- it reports only the count of unresolved, non-outdated threads there. It
-reports typed provider facts and leaves judgment, source inspection, and any
-reply to the reactivated babysit session.
+The structured monitor digests comment bodies to detect that one changed, so an
+in-place edit whose `created_at` never moves still wakes the owner. GitHub
+digests its PR-level issue comments; Azure DevOps digests the comments nested
+inside its PR threads, skipping the `system`-type lifecycle narration it posts on
+its own; both reduce each body to a fixed-width fingerprint and fail closed to an
+empty digest (no wake) on an incomplete read. It never interprets what a comment
+says or decides whether an advisory finding is valid, and on GitHub it
+deliberately does not read inline review-thread bodies at all -- it reports only
+the count of unresolved, non-outdated threads there. It reports typed provider
+facts and leaves judgment, source inspection, and any reply to the reactivated
+babysit session.
 `monitor_start` remains appropriate when each delivered cycle requires the agent
 to make progress, the objective requires untyped evidence, or the watched subject
 is unsupported by a structured provider.

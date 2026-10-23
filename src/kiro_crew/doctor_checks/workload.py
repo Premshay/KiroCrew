@@ -2,12 +2,18 @@
 
 Cron job health and the task queue are read off disk rather than from the
 gateway's API, so they still answer when the gateway is the thing that is wedged.
+The adaptive controller's caps and cap history are the one exception: they exist
+only inside the gateway process, so they are read from the running gateway's
+loopback API and reported as unread when it does not answer.
 """
 
 from __future__ import annotations
 
+import json
 import sys
-from typing import TYPE_CHECKING
+import urllib.error
+import urllib.request
+from typing import TYPE_CHECKING, Any
 
 from kiro_crew import cli_doctor
 from kiro_crew.doctor_checks import render
@@ -24,6 +30,15 @@ if TYPE_CHECKING:
 #: stall as a past incident. Within a day a stall is still the operator's news,
 #: restarts notwithstanding.
 _STALL_CURRENT_SECS = 24 * 3600
+
+#: Ceiling on the loopback read of the running gateway's controller snapshot,
+#: the same bound the other doctor probes of the local gateway use: a wedged
+#: gateway costs a short pause, never a hung diagnostic.
+_ADAPTIVE_READ_TIMEOUT_SECS = 2
+
+#: The loopback host the controller read dials. The local credential is
+#: resolved for this same host, so it pairs with the listener actually reached.
+_LOOPBACK_HOST = "127.0.0.1"
 
 
 # ── cron job health ───────────────────────────────────────────────────────────
@@ -50,6 +65,15 @@ _STALL_CURRENT_SECS = 24 * 3600
 # a cron verb that already exists.
 _CRON_REPORT_CAP = 5
 
+#: How long past its ``next_run_at`` an unleased, non-terminal task row must be
+#: before doctor calls it stranded. A due row still waits for a free slot, so the
+#: bound leaves room for one queued behind a full cap; a row a lost terminal write
+#: strands stays due for as long as nothing settles it, hours rather than minutes.
+_STRANDED_OVERDUE_SECS = 3600
+
+#: Stranded rows named one per line; the rest are summarised as ``+N more``.
+_STRANDED_REPORT_CAP = 5
+
 
 def _format_job_labels(entries: list[tuple[str, str]]) -> str:
     """Render ``(id, name)`` *entries* capped at :data:`_CRON_REPORT_CAP`.
@@ -73,13 +97,19 @@ def _format_job_labels(entries: list[tuple[str, str]]) -> str:
 
 
 def _doctor_task_store(issues: list[str]) -> None:
-    """Report the durable task queue: depth, oldest wait, journal warnings.
+    """Report the durable task queue: depth, oldest wait, stranded rows, journal warnings.
 
     Reads ``$KIROCREW_HOME/tasks/tasks.db`` directly with a read-only view of
     the store's own diagnostics, so a wedged gateway cannot hide a backlog.
     Silent on a fresh install with no store yet. A network-filesystem data home
     is reported here because the store then runs on ``journal_mode=DELETE``,
     which is slower but never a refusal.
+
+    A stranded row is one that is not terminal, holds no lease and fell due more
+    than :data:`_STRANDED_OVERDUE_SECS` ago (:meth:`TaskStore.overdue_unleased_rows`).
+    It is reported, never settled: doctor writes nothing to the store, and which
+    ending a row earned is the boot reconcile's call, made from the run's own
+    artifacts, not a diagnostic's.
     """
     from kiro_crew.config.paths import data_home
     from kiro_crew.taskq import TaskStore, TaskStoreUnavailable
@@ -101,10 +131,18 @@ def _doctor_task_store(issues: list[str]) -> None:
     if not path.exists():
         return
     store = TaskStore(path, diagnostic=True)
+    stranded: list[Any] = []
+    stranded_unread = ""
     try:
         store.open()
         lines = store.doctor_lines()
         by_state = store.count_by_state()
+        try:
+            stranded = store.overdue_unleased_rows(_STRANDED_OVERDUE_SECS)
+        except (TaskStoreUnavailable, ValueError) as exc:
+            # A row this build cannot model, or a read refused after the open:
+            # the counts above still stand, so only this check is reported unread.
+            stranded_unread = str(exc)
     except TaskStoreUnavailable as exc:
         print(f"  task store: ⚠️  {path} cannot be opened ({exc})")
         issues.append(
@@ -119,19 +157,114 @@ def _doctor_task_store(issues: list[str]) -> None:
     queued = {state: n for state, n in sorted(by_state.items()) if n}
     if queued:
         print("  task states: " + ", ".join(f"{state}={n}" for state, n in queued.items()))
+    if stranded_unread:
+        from kiro_crew.terminal_safe import safe_terminal_line
+
+        print(f"  stranded rows: ⚠️  not checked ({safe_terminal_line(stranded_unread)})")
+    elif stranded:
+        _report_stranded_rows(stranded, store.now(), issues)
     for warning in store.warnings:
         issues.append(warning)
+
+
+def _report_stranded_rows(rows: list[Any], now: float, issues: list[str]) -> None:
+    """Name each row :meth:`TaskStore.overdue_unleased_rows` returned, capped.
+
+    Each row is named by id, state, session key and how long it is overdue, the
+    four things a user needs to find it in the store or match it to a chat slot.
+    The id and session key are read off disk, so each goes through
+    :func:`~kiro_crew.terminal_safe.safe_terminal_line` before it is printed.
+
+    The verdict depends on whether a gateway runs, read from the lock-holder pair
+    the Memory Pressure section composes (``cli_doctor._read_gateway_pid`` and
+    ``resources._gateway_lock_indeterminate``). With none running, a due row may
+    only be waiting for the next start, which claims it, so the rows are listed as
+    advisory and no issue is recorded. With one running, or when the probe cannot
+    tell, the rows are a warning and an issue.
+    """
+    from kiro_crew.doctor_checks import resources
+    from kiro_crew.terminal_safe import safe_terminal_line
+
+    hours = _STRANDED_OVERDUE_SECS / 3600
+    try:
+        gateway_down = (
+            cli_doctor._read_gateway_pid() is None and not resources._gateway_lock_indeterminate()
+        )
+    except Exception:
+        # The probe failed, which does not say the gateway is stopped: the
+        # warning stands, as the Memory Pressure section's own "probe failed" does.
+        gateway_down = False
+    icon = "ℹ️ " if gateway_down else "⚠️ "
+    print(
+        f"  stranded rows: {icon} {len(rows)} task row(s) not terminal, with no lease, "
+        f"due more than {hours:g}h ago"
+    )
+    for rec in rows[:_STRANDED_REPORT_CAP]:
+        overdue_h = max(0.0, now - float(rec.next_run_at or 0.0)) / 3600
+        print(
+            f"               {safe_terminal_line(rec.id)} ({safe_terminal_line(rec.state)}, "
+            f"session {safe_terminal_line(rec.session_key or '-')}, overdue {overdue_h:.1f}h)"
+        )
+    if len(rows) > _STRANDED_REPORT_CAP:
+        print(f"               +{len(rows) - _STRANDED_REPORT_CAP} more")
+    if gateway_down:
+        print("               No gateway is running, so these may only be waiting for it:")
+        print("               a gateway claims due rows when it starts. Run doctor again")
+        print("               once it has been up a few minutes; a row still listed then")
+        print("               is stranded.")
+        return
+    print("               No gateway holds these rows. A queued, retry_wait or recovering")
+    print("               sub-agent row still counts as its parent session's pending")
+    print("               work, so that session's chat slot answers")
+    print("               409 slot_subagents_running until the row ends.")
+    issues.append(
+        f"{len(rows)} task row(s) not terminal, with no lease, due more than {hours:g}h ago"
+    )
+
+
+def _doctor_ledger_backlog() -> None:
+    """Count the ledgers ``kirocrew ledger-sweep`` would list, and name that command.
+
+    Advisory and read-only, so it takes no ``issues`` list: an old finished ledger
+    is housekeeping, not a broken install, and an entry there would fail the
+    doctor run. It runs the sweep's own :func:`ledger_sweep.scan` at the module's
+    default window, so the count includes every entry the dry run lists: finished
+    stores plus unreadable, linked or unaddressable stores listed for a human.
+    It never purges. Per-ledger detail stays in the dry run. A ledger root that
+    exists but cannot be read makes ``scan`` raise ``OSError``; that becomes one
+    "could not check" row so the rest of the report still runs.
+    """
+    from kiro_crew import ledger_sweep
+    from kiro_crew.terminal_safe import safe_terminal_line
+
+    window = f"{ledger_sweep.DEFAULT_OLDER_THAN_DAYS:g}-day window"
+    print("\nLedgers")
+    try:
+        report = ledger_sweep.scan()
+    except OSError as exc:
+        print(f"  ledgers:     ⚠️  could not check: {safe_terminal_line(str(exc))}")
+        return
+    count = len(report.candidates)
+    if not count:
+        print(f"  ledgers:     ✅ kirocrew ledger-sweep lists nothing ({window})")
+        return
+    print(
+        f"  ledgers:     🧹 kirocrew ledger-sweep lists {count} ledger(s) ({window})"
+        " -- run it to review them"
+    )
 
 
 def _doctor_overload_resilience(cfg: KiroCrewConfig) -> None:
     """Print the overload-resilience contract this install runs under.
 
-    Configuration and static platform facts only: the live gate counts, the
-    adaptive caps and the per-scope dependency schedules are gateway-process
-    state, served by ``GET /api/sessions/health`` — a doctor process cannot
-    read them and must not pretend to. What it CAN state is the bound each
-    mechanism is configured to (so a stuck queue can be read against its
-    budget) and which liveness evidence this host's platform provides.
+    Configuration and static platform facts, plus one live block: the running
+    gateway's adaptive-controller snapshot (:func:`_doctor_adaptive_live`),
+    read from the gateway rather than computed here. The live gate counts and
+    the per-scope dependency schedules stay gateway-process state, served by
+    ``GET /api/sessions/health``, and a doctor process does not print them.
+    What it CAN state is the bound each mechanism is configured to (so a stuck
+    queue can be read against its budget) and which liveness evidence this
+    host's platform provides.
     """
     from kiro_crew.cold_start_sizing import describe_cold_start_limits
     from kiro_crew.recovery.ladder import configure_default_ladder
@@ -164,6 +297,7 @@ def _doctor_overload_resilience(cfg: KiroCrewConfig) -> None:
         f"  adaptive concurrency: {mode} floor={agent.adaptive_floor} "
         f"sample={agent.controller_sample_secs}s"
     )
+    _doctor_adaptive_live()
     print("  recovery ladder:")
     # Through the boot seam a gateway uses, on this process's own ladder: these
     # rows are the CONFIGURED schedule, so they cannot disagree with the
@@ -189,6 +323,104 @@ def _doctor_overload_resilience(cfg: KiroCrewConfig) -> None:
         '(live count: GET /api/sessions/health "uncharged")'
     )
     print(f"  liveness evidence: {_liveness_platform_line()}")
+
+
+def _gateway_adaptive_state() -> tuple[int, dict[str, Any] | None, str]:
+    """Read the running gateway's adaptive-controller snapshot.
+
+    Returns ``(port, state, why)``. *state* is the snapshot the controller's
+    ``state()`` builds (mode, caps against their ceilings, ``last_cut`` with
+    its ``age_secs``, ``recent_decisions`` newest last), or ``None`` with *why*
+    naming what stopped the read.
+
+    The controller exists only in the gateway process, so the snapshot comes
+    from ``GET /api/spawn/adaptive``: the route the gateway serves for exactly
+    this out-of-process reader, under the internal-API prefix a loopback
+    ``X-Internal-Secret`` caller reaches. The credential and transport are the
+    ones the other CLI clients of the local gateway use: the local secret
+    resolved for the loopback host this request dials, and the gateway's unix
+    socket when it is present, TCP loopback otherwise. Without a credential
+    nothing is sent at all. Read-only: a GET, and the route only reads the
+    controller.
+    """
+    from kiro_crew.config.loader import read_local_secret
+    from kiro_crew.dashboard.urls import dashboard_socket_path
+    from kiro_crew.loopback_http import loopback_urlopen
+    from kiro_crew.port_resolution import resolve_client_port
+
+    port = resolve_client_port(None)
+    secret = read_local_secret(port, dial_host=_LOOPBACK_HOST)
+    if not secret:
+        return port, None, "no local gateway credential for this port (gateway not running?)"
+    req = urllib.request.Request(
+        f"http://{_LOOPBACK_HOST}:{port}/api/spawn/adaptive",
+        headers={"X-Internal-Secret": secret},
+    )
+    try:
+        socket_path: str | None = str(dashboard_socket_path(port))
+    except Exception:
+        socket_path = None
+    try:
+        with loopback_urlopen(
+            req, timeout=_ADAPTIVE_READ_TIMEOUT_SECS, unix_socket_path=socket_path
+        ) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return port, None, f"the gateway refused the read (HTTP {exc.code})"
+    except (urllib.error.URLError, OSError) as exc:
+        # Only a bare read timeout (the connection was accepted and the gateway
+        # then stalled -- a loop thread starved of the GIL) means it is up but
+        # busy. A connect-phase failure is reported as no answer: this read uses
+        # a 2 s deadline, which on native Windows coincides with the SYN-retry
+        # before a closed loopback port reports a refusal, so a connect timeout
+        # here must not read busy. The non-doctor sites, whose deadlines sit past
+        # that window, use loopback_http.deadline_expired.
+        if isinstance(exc, TimeoutError):
+            return port, None, "the gateway is busy (up but did not answer)"
+        return port, None, "no gateway answered"
+    except ValueError:
+        return port, None, "the gateway's answer was not JSON"
+    state = payload.get("adaptive") if isinstance(payload, dict) else None
+    if not isinstance(state, dict):
+        return port, None, "the gateway's answer carried no controller snapshot"
+    if not state:
+        return port, None, "the running gateway has no adaptive controller"
+    return port, state, ""
+
+
+def _doctor_adaptive_live() -> None:
+    """Print the running gateway's adaptive controller: caps, last cut, cap history.
+
+    The configured line above it states the bounds; this states what the
+    controller did inside them: the mode, the execution cap and the spawn gate
+    against their ceilings, the last pressure cut with its signals and age
+    while the execution cap is below its ceiling, the last decision, and the
+    recent cap changes, newest last, each stamped with the ``gateway.log``
+    clock so it can be matched against the log line it produced.
+
+    Rendered by ``resource_status.adaptive_summary_lines``, the renderer the
+    ``resource_status`` tool prints the same snapshot with, so the two surfaces
+    cannot describe one controller two ways. Every line goes through
+    :func:`~kiro_crew.terminal_safe.safe_terminal_line`, since it arrives over
+    a socket. Advisory: an unread state is one line and never an issue, because
+    the Connectivity section already reports a gateway that is down.
+    """
+    from kiro_crew.resource_status import adaptive_summary_lines
+    from kiro_crew.terminal_safe import safe_terminal_line
+
+    try:
+        port, state, why = _gateway_adaptive_state()
+    except Exception as exc:
+        print(f"  adaptive controller: not read (check failed: {safe_terminal_line(str(exc))})")
+        return
+    if state is None:
+        print(f"  adaptive controller: not read on port {port}: {why}")
+        return
+    print(f"  adaptive controller (running gateway on port {port}):")
+    # The renderer's first line is its own heading; the line above replaces it
+    # with the source of the snapshot.
+    for line in adaptive_summary_lines(state)[1:]:
+        print(f"  {safe_terminal_line(line)}")
 
 
 def _liveness_platform_line() -> str:

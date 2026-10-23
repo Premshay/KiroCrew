@@ -29,7 +29,7 @@ not systemd's ``AppArmorProfile=`` alone.** Two other designs do not work:
    audit log shows that
    ``AppArmorProfile=`` labels only the literal top-level unit PID
    (``change_onexec`` "converted to stacking"). The gateway's sandbox probe
-   (``sandbox.py``'s ``_probe_child_sequence``) runs in a **different PID**
+   (``sandbox_probe.py``'s ``_probe_child_sequence``) runs in a **different PID**
    reached through the launcher's own exec chain, and that PID was still
    ``unconfined`` in the audit trail at the moment it called ``unshare()`` — the
    stacking never propagated that far down, reproducing identically across a
@@ -421,7 +421,9 @@ def verify_enforcement(
        trusted system ``python3``, never ``sys.executable`` (the venv python is
        user-writable), and the payload is a constant stdlib snippet that does not
        import kiro_crew — otherwise ``sudo`` would execute user-controlled
-       site-packages.
+       site-packages. A trusted interpreter is not enough on its own: it runs
+       with ``-I`` so the working directory, user site and ``PYTHON*``
+       variables cannot inject code ahead of the payload.
     3. **The probe itself must run UNPRIVILEGED**, or it proves nothing: root may
        be permitted to create namespaces regardless of the restriction, so a
        root-side success would not tell us the gateway's user can. ``setpriv``
@@ -452,6 +454,12 @@ def verify_enforcement(
             "--clear-groups",
             "--",
             python3,
+            # Isolated mode: this python runs as root under `sudo
+            # kirocrew service install`. -I keeps the caller's working
+            # directory off sys.path and ignores the user site and every
+            # PYTHON* variable, so a planted ctypes.py, .pth line,
+            # sitecustomize or PYTHONPATH entry cannot run before the payload.
+            "-I",
             "-c",
             _VERIFY_SNIPPET,
         )

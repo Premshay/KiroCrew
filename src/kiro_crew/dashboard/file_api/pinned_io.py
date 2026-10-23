@@ -14,9 +14,14 @@ from aiohttp import web
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.handlers.files import (
+        _FILE_KINDS_MAX_PATHS,
         _FILE_READ_BINARY_EXTS,
         _FILE_READ_SNIFF_BYTES,
+        _path_probe_stall_key,
+        _PathProbeBusy,
+        _probe_busy_response,
         _probe_request_path,
+        _run_path_probe,
         _sel,
         atomic_write,
         is_sensitive_path,
@@ -24,6 +29,8 @@ if TYPE_CHECKING:
         open_access_control_source,
         pinned_fs,
         pinned_parent_replace_supported,
+        read_bounded_json,
+        require_owner_dashboard_request,
     )
 
 
@@ -404,6 +411,124 @@ def _resolve_project_relative(raw: str) -> tuple[str, str | None]:
     if not (candidate == resolved_proj or candidate.startswith(resolved_proj + os.sep)):
         return "", "outside_project"
     return candidate, None
+
+
+def _project_relative_stall_path(raw: str) -> str:
+    """The path :func:`_resolve_project_relative` touches for *raw*, for the probe's stall key.
+
+    A path it passes through unchanged is its own key, as before. A relative
+    one is resolved inside the project directory, so it is charged to that
+    directory: two resolves stuck on a dead project mount then refuse the next
+    one. ``""`` (no key) when no project directory is set, since that answer
+    touches no filesystem. Lexical, so it runs on the event loop.
+    """
+    if not raw or raw.startswith(("/", "~", "\\")) or ntpath.splitdrive(raw)[0]:
+        return raw
+    return os.environ.get("KIROCREW_PROJECT_DIR", "")
+
+
+def _batch_stall_path(raws: list[str]) -> str:
+    """The stall path for :func:`_classify_request_paths` over *raws*, or ``""``.
+
+    The batch is keyed only when every path in it falls under ONE stall key;
+    then that key is exactly the mount the hop can wedge on. A batch spanning
+    several mounts gets no key: keying it on any one path (the first, say)
+    would let two batches stuck on a dead mount listed third refuse a healthy
+    mount listed first, on every route. Such a batch stays bounded by the pool.
+    """
+    paths = [_project_relative_stall_path(raw) for raw in raws]
+    keys = {_path_probe_stall_key((p,)) for p in paths}
+    return paths[0] if len(keys) == 1 else ""
+
+
+def _classify_request_paths(raws: list[str]) -> list[tuple[str, str, str]]:
+    """Classify each request path exactly as ``HEAD /api/file-read?resolve=1`` would.
+
+    Blocking; one probe-pool hop answers the whole list. Returns one
+    ``(kind, audit_outcome, audited_resource)`` triple per input, in order.
+    ``kind`` is ``file``, ``dir`` or ``missing``, and ``missing`` is every
+    outcome the per-path route answers without a kind header: a refused
+    resolution, a schema or validation refusal (a denylisted credential store
+    included), a vanished path and a malformed one. Folding them in the ANSWER
+    keeps the batch from being an existence oracle the single-path route is
+    not; the audit outcome still tells a refusal (``denied``) from an absence
+    (``not_found``), as the per-path route's audit does.
+    """
+    from kiro_crew.validation import FILE_READ_SCHEMA, ValidationError, validate_tool_args
+
+    out: list[tuple[str, str, str]] = []
+    for raw in raws:
+        try:
+            resolved, resolve_err = _resolve_project_relative(raw)
+            if resolve_err is not None:
+                out.append(("missing", "denied", raw))
+                continue
+            try:
+                validate_tool_args({"path": resolved}, FILE_READ_SCHEMA)
+            except ValidationError:
+                out.append(("missing", "denied", resolved))
+                continue
+            verdict = _read_request_path(resolved, 0)
+        except (OSError, ValueError):
+            out.append(("missing", "denied", raw))
+            continue
+        if verdict.kind == "invalid":
+            out.append(("missing", "denied", resolved))
+        elif verdict.kind == "file":
+            out.append(("file", "success", verdict.path))
+        else:
+            out.append((verdict.kind, "not_found", verdict.path))
+    return out
+
+
+async def api_file_kinds(request: web.Request) -> web.Response:
+    """POST /api/file-kinds ``{"paths": [...]}`` -- classify many paths in one request.
+
+    The batched form of ``HEAD /api/file-read``: the dashboard asks which of the
+    path-like strings in a view name a file, a directory or nothing, so it can
+    decide which to render as chips, without one request per string. Every path
+    takes the per-path route's resolution (``resolve=1``, which leaves absolute
+    and home-relative paths unchanged), validation and stat, and the answer is
+    ``{"kinds": {<path as sent>: "file" | "dir" | "missing"}}``.
+
+    The single-path route stays: this endpoint adds a cheaper way to ask, it
+    does not change what either answer can reveal.
+    """
+    owner_denied = await require_owner_dashboard_request(request, "file_read")
+    if owner_denied is not None:
+        return owner_denied
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
+    paths = body.get("paths")
+    if (
+        not isinstance(paths, list)
+        or len(paths) > _FILE_KINDS_MAX_PATHS
+        or not all(isinstance(p, str) for p in paths)
+    ):
+        return web.json_response(
+            {
+                "error": f"paths must be a list of at most {_FILE_KINDS_MAX_PATHS} strings",
+                "code": "invalid_paths",
+            },
+            status=400,
+        )
+    unique = list(dict.fromkeys(paths))
+    if not unique:
+        return web.json_response({"kinds": {}})
+    try:
+        verdicts = await _run_path_probe(
+            _classify_request_paths, unique, stall_path=_batch_stall_path(unique)
+        )
+    except _PathProbeBusy:
+        return _probe_busy_response(resource=f"{len(unique)} paths", tool_name="file_read")
+    sel = _sel()
+    for _kind, outcome, resource in verdicts:
+        sel.log_tool_invocation(
+            session_key="dashboard", tool_name="file_read", outcome=outcome, resources=resource
+        )
+    return web.json_response({"kinds": {p: v[0] for p, v in zip(unique, verdicts)}})
 
 
 def _file_write_blocking(path: str, content: str) -> str | None:

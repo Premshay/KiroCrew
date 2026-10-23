@@ -123,6 +123,29 @@ describe('mochi panelBridge chat transport', () => {
     expect(doneCount).toBe(1)
   })
 
+  it('hands a content patch for a committed row to the transcript as a _patch frame', () => {
+    // The gateway holds the last run of text before a tool call off the row it
+    // was cut from, then gives it back as this patch keyed by the row's `mid`.
+    // Without it the pet drops that word ("check the [config] file").
+    const frames: Record<string, unknown>[] = []
+    bridge.onChatMessage((m) => frames.push(m))
+    const ws = FakeWebSocket.last!
+
+    ws.emit('chat_message_update', {
+      slot: bridge.MOCHI_SLOT,
+      ts: 't1',
+      mid: 'm1',
+      content: 'Let me check the config',
+    })
+    // Nothing for a row the panel draws: a tool row's update, another slot's
+    // row, and a patch that changes only meta.
+    ws.emit('chat_message_update', { slot: bridge.MOCHI_SLOT, tool_call_id: 'tc-1', content: 'ls' })
+    ws.emit('chat_message_update', { slot: 'default', mid: 'm2', content: 'not mine' })
+    ws.emit('chat_message_update', { slot: bridge.MOCHI_SLOT, mid: 'm3', meta: { steerState: 'consumed' } })
+
+    expect(frames).toEqual([{ _patch: 'm1', content: 'Let me check the config' }])
+  })
+
   it('ignores chat events belonging to another slot', () => {
     const chunks: string[] = []
     let doneCount = 0
@@ -634,6 +657,58 @@ describe('mochi panelBridge live events', () => {
     expect(calls[0]).toBe('/api/approvals/a1/approve')
     expect(calls[1]).toBe('/api/approvals/a2/reject')
     expect(calls[2]).toBe('/api/chat/slots/mochi/approve')
+  })
+
+  it('carries the coordinator target on an approval frame', () => {
+    const seen: Record<string, unknown>[] = []
+    bridge.onApprovalRequest((r) => seen.push(r))
+    FakeWebSocket.last!.emit('approval', { slot: 'mochi', id: 'a1', tool: 'fs_write', instance: 'inst-a' })
+    expect(seen[0].target).toEqual({ origin: 'coordinator', slot: 'mochi', instance: 'inst-a' })
+  })
+
+  it('carries the native target (row mid) on a permission frame', () => {
+    const seen: Record<string, unknown>[] = []
+    bridge.onApprovalRequest((r) => seen.push(r))
+    const cls = JSON.stringify({ request_id: 'req-9', tool_title: 'fs_read' })
+    FakeWebSocket.last!.emit('chat_message', {
+      slot: 'mochi', role: 'permission', content: 'fs_read', cls, meta: { mid: 'mid-a' },
+    })
+    expect(seen[0].target).toEqual({ origin: 'native', requestMid: 'mid-a' })
+  })
+
+  describe('respondApproval with an owner-bound target', () => {
+    let calls: { url: string; body: string }[]
+    beforeEach(() => {
+      calls = []
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockImplementation((url: string, init?: { body?: string }) => {
+          calls.push({ url, body: String(init?.body ?? '') })
+          return Promise.resolve({ ok: true, json: async () => ({}) })
+        }),
+      )
+    })
+
+    it('names the coordinator slot and instance on the approvals route', async () => {
+      await bridge.respondApproval('a1', 'approve', undefined, false, {
+        origin: 'coordinator', slot: 'mochi', instance: 'inst-a',
+      })
+      expect(calls[0].url).toBe('/api/approvals/a1/approve?origin=coordinator&slot=mochi&instance=inst-a')
+    })
+
+    it('sends a native decide to the slot route with its request_mid', async () => {
+      await bridge.respondApproval('req-9', 'reject', undefined, false, { origin: 'native', requestMid: 'mid-a' })
+      expect(calls[0].url).toBe('/api/chat/slots/mochi/approve')
+      expect(JSON.parse(calls[0].body)).toEqual({
+        action: 'rejected', request_id: 'req-9', origin: 'native', request_mid: 'mid-a',
+      })
+    })
+
+    it('keeps the id-only slot form for a durable trust action', async () => {
+      await bridge.respondApproval('req-9', 'trust', undefined, true, { origin: 'native', requestMid: 'mid-a' })
+      expect(calls[0].url).toBe('/api/chat/slots/mochi/approve')
+      expect(JSON.parse(calls[0].body)).toEqual({ action: 'trust', request_id: 'req-9' })
+    })
   })
 
   it('respondApproval refuses durable trust without pending-card proof', async () => {

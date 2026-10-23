@@ -69,6 +69,108 @@ def _runtime(
     return rt
 
 
+def _run_shared_cron_deaths(*, limit: int, deaths: int):
+    """Drive shared process deaths through the real gateway cron callback."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from kiro_crew.cron import CronJob, CronSchedule
+    from kiro_crew.slack.gateway import GatewayOrchestrator
+
+    gateway = GatewayOrchestrator.__new__(GatewayOrchestrator)
+    gateway.sessions = MagicMock()
+    gateway.sessions.get_pid.return_value = None
+    gateway.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
+    gateway.sessions.release = MagicMock()
+    gateway.sessions.reset = AsyncMock()
+    gateway.ctx_builder = MagicMock()
+    gateway.ctx_builder.build_message.return_value = ("msg", None)
+    gateway.ctx_builder.hooks = MagicMock()
+    gateway.slack = None
+    gateway.conv_log = None
+    gateway.dashboard_state = None
+    gateway._owner_id = "U000"
+    gateway.subagent_mgr = None
+    gateway._cron_injecting = {}
+    gateway._no_crons = False
+    gateway._interactive_approval = MagicMock(return_value="interactive_cb")
+
+    callback = None
+
+    async def capture_cron(*, on_job=None, **_kwargs):
+        nonlocal callback
+        callback = on_job
+        service = MagicMock()
+        service.start = AsyncMock()
+        return service
+
+    job = CronJob(
+        id="shared-limit",
+        name="shared-limit",
+        message="run",
+        schedule=CronSchedule(kind="every", every_secs=60),
+        auto_pause_after_failures=limit,
+    )
+
+    async def fail(*_args, **_kwargs):
+        raise RuntimeError("shared runtime died")
+
+    async def run() -> None:
+        await gateway._init_cron()
+        assert callback is not None
+        for _ in range(deaths):
+            with pytest.raises(RuntimeError, match="shared runtime died"):
+                await callback(job)
+
+    with (
+        patch(
+            "kiro_crew.slack.gateway.CronService.create", new=AsyncMock(side_effect=capture_cron)
+        ),
+        patch("kiro_crew.slack.gateway.stream_and_collect", side_effect=fail),
+        patch(
+            "kiro_crew.slack.gateway.build_cron_session_context", return_value=("cron:run", "run")
+        ),
+        patch("kiro_crew.slack.gateway.runtime_death.caused_by_this_session", return_value=False),
+    ):
+        asyncio.run(run())
+
+    return job
+
+
+def test_cron_shared_deaths_get_the_default_exemption_under_a_tight_limit():
+    """A tight limit governs failures the job owns, not deaths it did not cause.
+
+    The shared-death exemption is the same for every job: it hands over at the
+    default threshold, so a job with limit 2 still survives four shared deaths
+    and pauses at the fifth, where the hand-over lands on its own counter.
+    """
+    from kiro_crew.cron_service.model import _AUTO_PAUSE_THRESHOLD
+
+    job = _run_shared_cron_deaths(limit=2, deaths=_AUTO_PAUSE_THRESHOLD - 1)
+    assert job.consecutive_failures == 0
+    assert job.auto_paused is False and job.enabled is True
+    runtime_death.clear_shared_deaths(f"cron:{job.id}")
+    job = _run_shared_cron_deaths(limit=2, deaths=_AUTO_PAUSE_THRESHOLD)
+    assert job.consecutive_failures == _AUTO_PAUSE_THRESHOLD
+    assert job.auto_paused is True and job.enabled is False
+
+
+@pytest.mark.parametrize("limit", [0, 6, 10000])
+def test_cron_shared_deaths_charge_a_never_or_raised_limit_job_to_the_default(limit):
+    """A job set to 0 or above the default must not escape the backoff here.
+
+    Handing over only at the job's own limit left such a job's counter at 0, so
+    ``failure_backoff_until`` (which reads that counter) never engaged and the job
+    fired at full rate forever. It is charged at the default instead, which
+    starts the backoff without pausing it.
+    """
+    from kiro_crew.cron_service.model import _AUTO_PAUSE_THRESHOLD
+
+    job = _run_shared_cron_deaths(limit=limit, deaths=_AUTO_PAUSE_THRESHOLD)
+    assert job.consecutive_failures == _AUTO_PAUSE_THRESHOLD
+    assert runtime_death.shared_deaths(f"cron:{job.id}") == 0
+    assert job.auto_paused is False and job.enabled is True
+
+
 # ───────────────────────── the death reason (item d) ─────────────────────────
 
 
@@ -362,8 +464,8 @@ _SRC = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
 # exactly what an AST can answer and a mock cannot.
 _GUARDED_CHARGES = [
     ("dashboard/chat_runner.py", "_acp_pipe_death_retries", 3),
-    ("slack/handler.py", "record_failure", 1),
-    ("slack/gateway.py", "reset", 2),
+    ("slack/handler_runtime/turn.py", "record_failure", 1),
+    ("slack/gateway_runtime/runtime_charge.py", "reset", 2),
     ("task_executor.py", "recoveries", 1),
 ]
 
@@ -388,6 +490,18 @@ def _guard_names_in_ancestors(tree: ast.AST, target: ast.AST) -> set[str]:
     return names
 
 
+def _awaited_turn_phases(handler: ast.ExceptHandler) -> list[str]:
+    """The ``_on_*`` phases *handler* awaits: the dashboard runner's except arms run there."""
+    return [
+        sub.value.func.id
+        for sub in ast.walk(handler)
+        if isinstance(sub, ast.Await)
+        and isinstance(sub.value, ast.Call)
+        and isinstance(sub.value.func, ast.Name)
+        and sub.value.func.id.startswith("_on_")
+    ]
+
+
 def test_the_attribution_predicate_reaches_every_charging_site():
     """One guard, every site. A charge added later without asking whose failure
     it was is the exact regression this whole change exists to remove, and it
@@ -395,7 +509,15 @@ def test_the_attribution_predicate_reaches_every_charging_site():
     """
     found = 0
     for rel, marker, _ in _GUARDED_CHARGES:
-        src = (_SRC / rel).read_text(encoding="utf-8")
+        src = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in (
+                [*sorted((_SRC / "dashboard/chat_turn").glob("*.py")), _SRC / rel]
+                if rel == "dashboard/chat_runner.py"
+                else [_SRC / rel]
+            )
+            if turn_file.name != "__init__.py"
+        )
         assert "caused_by_this_session" in src, f"{rel} never asks whose failure it was"
         found += src.count("caused_by_this_session")
     # Control: a bare count could pass on a file that merely mentions the name in
@@ -472,6 +594,170 @@ def _names_ever_given_a_real_value(tree: ast.AST) -> set[str]:
     return real
 
 
+#: The Slack gateway's facade and the owners composed onto its globals, read as ONE
+#: unit: a function there that asks the predicate about a parameter is filled only
+#: by its callers, and those callers live in other files of the same unit.
+_GATEWAY_UNIT = (
+    _SRC / "slack" / "gateway.py",
+    *sorted((_SRC / "slack" / "gateway_runtime").glob("*.py")),
+)
+#: How many caller-to-callee hops a parameter subject may be followed through.
+_FILL_DEPTH = 6
+
+
+def _scope_real_names(fn: ast.AST) -> set[str]:
+    """Names *fn* itself assigns a real value, not counting nested functions."""
+    own: list[ast.stmt] = []
+    stack = list(ast.iter_child_nodes(fn))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            own.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return _names_ever_given_a_real_value(ast.Module(body=own, type_ignores=[]))
+
+
+def _param_names(fn: ast.AST) -> list[str]:
+    args = fn.args
+    return [a.arg for a in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)]
+
+
+def _unit_dead_subjects(sources: dict[str, str]) -> tuple[int, list[str]]:
+    """``(subjects checked, dead subjects)`` for files read as one unit.
+
+    A subject the asking function assigns, or one given a real value anywhere in the
+    unit, is filled as in the per-file rule. A subject that is a PARAMETER of the
+    asking function is filled only when every call of that function in the unit
+    passes, for it, a name the calling function assigns a real value or itself
+    receives as a parameter that is filled the same way (followed through at most
+    ``_FILL_DEPTH`` callers). A function no call in the unit reaches fills nothing,
+    and neither does one the unit reaches by a route the calls cannot be read
+    through: a ``getattr`` naming it, or an assignment binding it under another name.
+
+    An attribute call's arguments start at the function's first parameter, except
+    on a ``self.`` or ``cls.`` receiver, where Python binds that parameter itself.
+    """
+    trees = {name: ast.parse(src) for name, src in sources.items()}
+    parents: dict[ast.AST, ast.AST] = {}
+    functions: list[ast.AST] = []
+    calls: list[ast.Call] = []
+    assigns: list[ast.Assign] = []
+    unit_real: set[str] = set()
+    for tree in trees.values():
+        unit_real |= _names_ever_given_a_real_value(tree)
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions.append(node)
+            elif isinstance(node, ast.Call):
+                calls.append(node)
+            elif isinstance(node, ast.Assign):
+                assigns.append(node)
+
+    def enclosing(node: ast.AST) -> list[ast.AST]:
+        chain = []
+        cur = parents.get(node)
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                chain.append(cur)
+            cur = parents.get(cur)
+        return chain
+
+    def calls_of(fn: ast.AST) -> list[ast.Call]:
+        return [
+            c
+            for c in calls
+            if (isinstance(c.func, ast.Name) and c.func.id == fn.name)
+            or (isinstance(c.func, ast.Attribute) and c.func.attr == fn.name)
+        ]
+
+    def reached_unreadably(fn: ast.AST) -> bool:
+        """Whether a ``getattr`` or an alias assignment reaches *fn*."""
+        for call in calls:
+            if (
+                isinstance(call.func, ast.Name)
+                and call.func.id == "getattr"
+                and len(call.args) >= 2
+                and isinstance(call.args[1], ast.Constant)
+                and call.args[1].value == fn.name
+            ):
+                return True
+        for node in assigns:
+            value = node.value
+            named = (isinstance(value, ast.Name) and value.id == fn.name) or (
+                isinstance(value, ast.Attribute) and value.attr == fn.name
+            )
+            # A binding under the function's own name (the class body's
+            # ``name = _owner.name``) is reached by the same calls; any other
+            # name is an alias whose calls this scan does not follow.
+            if named and any(
+                not (isinstance(t, ast.Name) and t.id == fn.name) for t in node.targets
+            ):
+                return True
+        return False
+
+    def name_filled(node: ast.AST, name: str, depth: int) -> bool:
+        for scope in enclosing(node):
+            if name in _scope_real_names(scope):
+                return True
+            if name in _param_names(scope):
+                return param_filled(scope, name, depth + 1)
+        return False
+
+    def param_filled(fn: ast.AST, name: str, depth: int) -> bool:
+        if depth > _FILL_DEPTH:
+            return False
+        sites = calls_of(fn)
+        if not sites or reached_unreadably(fn):
+            return False
+        params = _param_names(fn)
+        for call in sites:
+            receiver = call.func.value if isinstance(call.func, ast.Attribute) else None
+            bound = (
+                isinstance(receiver, ast.Name)
+                and receiver.id in ("self", "cls")
+                and params[:1] in (["self"], ["cls"])
+            )
+            index = params.index(name) - (1 if bound else 0)
+            passed = None
+            if name in [a.arg for a in fn.args.posonlyargs + fn.args.args] and 0 <= index < len(
+                call.args
+            ):
+                passed = call.args[index]
+            for kw in call.keywords:
+                if kw.arg == name:
+                    passed = kw.value
+            if not isinstance(passed, ast.Name) or not name_filled(call, passed.id, depth):
+                return False
+        return True
+
+    checked = 0
+    dead: list[str] = []
+    for file_name, tree in trees.items():
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "caused_by_this_session"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+            ):
+                continue
+            checked += 1
+            subject = node.args[0].id
+            asker = enclosing(node)
+            if asker and subject in _param_names(asker[0]):
+                filled = param_filled(asker[0], subject, 0)
+            else:
+                filled = subject in unit_real
+            if not filled:
+                dead.append(f"{file_name}:{subject}")
+    return checked, dead
+
+
 def test_the_guards_subject_is_a_provider_the_turn_actually_obtained():
     """A guard that asks about a variable nothing ever fills is not a guard.
 
@@ -481,10 +767,17 @@ def test_the_guards_subject_is_a_provider_the_turn_actually_obtained():
     into "always charge" while every guard still reads as present, which no
     structural check on the guard alone can see. So each subject name must also be
     assigned a real value somewhere, not only initialised to ``None``.
+
+    The Slack gateway's facade and its composed owners are read as one unit
+    (``_unit_dead_subjects``): there a subject that is a parameter is filled only by
+    what its callers pass.
     """
     checked = 0
     dead: list[str] = []
+    unit = set(_GATEWAY_UNIT)
     for path in sorted(_SRC.rglob("*.py")):
+        if path in unit:
+            continue
         src = path.read_text(encoding="utf-8")
         if "caused_by_this_session" not in src:
             continue
@@ -505,8 +798,107 @@ def test_the_guards_subject_is_a_provider_the_turn_actually_obtained():
             if name in real or name in params:
                 continue
             dead.append(f"{path.name}:{name}")
+    unit_checked, unit_dead = _unit_dead_subjects(
+        {path.name: path.read_text(encoding="utf-8") for path in _GATEWAY_UNIT}
+    )
+    checked += unit_checked
+    dead += unit_dead
     assert checked >= 4, f"only {checked} guard subjects found -- scan is broken"
     assert not dead, f"ownership guard asks about a name nothing ever fills: {dead}"
+
+
+_UNIT_ASKER = (
+    "def charge(job, provider):\n" "    return runtime_death.caused_by_this_session(provider)\n"
+)
+
+
+def test_the_unit_rule_follows_a_parameter_subject_to_the_capture():
+    """Positive control: the caller captures the provider it passes."""
+    turn = "async def run(job):\n    client = await acquire()\n    return charge(job, client)\n"
+
+    assert _unit_dead_subjects({"owner.py": _UNIT_ASKER, "turn.py": turn}) == (1, [])
+
+
+def test_the_unit_rule_fails_when_the_capture_is_gone():
+    """The caller still passes the name, but only ever initialised it to ``None``."""
+    turn = "async def run(job):\n    client = None\n    pass\n    return charge(job, client)\n"
+
+    assert _unit_dead_subjects({"owner.py": _UNIT_ASKER, "turn.py": turn}) == (
+        1,
+        ["owner.py:provider"],
+    )
+
+
+def test_the_unit_rule_fails_on_a_caller_passing_none():
+    turn = "async def run(job):\n    client = await acquire()\n    return charge(job, None)\n"
+
+    assert _unit_dead_subjects({"owner.py": _UNIT_ASKER, "turn.py": turn}) == (
+        1,
+        ["owner.py:provider"],
+    )
+
+
+def test_the_unit_rule_fails_when_nothing_calls_the_asker():
+    assert _unit_dead_subjects({"owner.py": _UNIT_ASKER}) == (1, ["owner.py:provider"])
+
+
+_UNIT_METHOD_ASKER = (
+    "def charge(self, job, provider):\n"
+    "    return runtime_death.caused_by_this_session(provider)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "client,dead",
+    [("await acquire()", []), ("None", ["owner.py:provider"])],
+    ids=["captured", "never-captured"],
+)
+def test_the_unit_rule_reads_a_self_call_past_the_bound_receiver(client: str, dead: list) -> None:
+    turn = (
+        "async def run(self, job):\n"
+        f"    client = {client}\n"
+        "    return self.charge(job, client)\n"
+    )
+
+    assert _unit_dead_subjects({"owner.py": _UNIT_METHOD_ASKER, "turn.py": turn}) == (1, dead)
+
+
+@pytest.mark.parametrize(
+    "client,dead",
+    [("await acquire()", []), ("None", ["owner.py:provider"])],
+    ids=["captured", "never-captured"],
+)
+def test_the_unit_rule_reads_an_explicit_self_call_from_its_first_argument(
+    client: str, dead: list
+) -> None:
+    turn = (
+        "async def run(self, job):\n"
+        f"    client = {client}\n"
+        "    return Orchestrator.charge(self, job, client)\n"
+    )
+
+    assert _unit_dead_subjects({"owner.py": _UNIT_METHOD_ASKER, "turn.py": turn}) == (1, dead)
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        "    return getattr(self, 'charge')(job, client)\n",
+        "    fire = self.charge\n    return fire(job, client)\n",
+    ],
+    ids=["getattr", "alias"],
+)
+def test_the_unit_rule_fails_closed_on_a_route_it_cannot_read(route: str) -> None:
+    turn = "async def run(self, job):\n    client = await acquire()\n" + route
+    owner = (
+        _UNIT_METHOD_ASKER
+        + "\n\nasync def direct(self, job):\n    client = await acquire()\n    return self.charge(job, client)\n"
+    )
+
+    assert _unit_dead_subjects({"owner.py": owner, "turn.py": turn}) == (
+        1,
+        ["owner.py:provider"],
+    )
 
 
 def test_the_shared_streak_is_never_bound_as_a_budget():
@@ -657,9 +1049,11 @@ def test_a_substitute_bound_is_cleared_wherever_its_real_counter_is():
             # The module that DEFINES the pair, not a consumer of it. The string
             # check this replaced counted its own `def` lines as a clear.
             continue
+        # The runner's turn runtime is the runner and the chat_turn owners composed into it.
+        unit = "chat_runner.py" if path.parent.name == "chat_turn" else path.name
         src = path.read_text(encoding="utf-8")
         if "note_shared_death" in src:
-            counts.append(path.name)
+            counts.append(unit)
         if "clear_shared_deaths" not in src:
             continue
         for block in (_direct(b) for b in _blocks(ast.parse(src))):
@@ -667,7 +1061,7 @@ def test_a_substitute_bound_is_cleared_wherever_its_real_counter_is():
                 continue
             if "reset" in _calls_in(block) or _block_assigns_attr(block, "consecutive_failures"):
                 continue  # a hand-over's own clear, not a success clear
-            clears.append(path.name)
+            clears.append(unit)
             break
     assert len(counts) >= 4, f"only {counts} count a streak -- scan is broken"
     assert clears, "no success-path clear found anywhere -- the scan is broken"
@@ -684,17 +1078,20 @@ def test_the_cron_streak_is_keyed_to_the_job_not_the_run():
     to the run, the streak could never exceed 1 and auto-pause would be disabled
     for exactly the jobs whose runtime keeps dying.
     """
-    src = (_SRC / "slack" / "gateway.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
     subjects: list[str] = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"note_shared_death", "clear_shared_deaths"}
-            and node.args
-        ):
-            subjects.append(ast.unparse(node.args[0]))
+    for path in [
+        _SRC / "slack" / "gateway.py",
+        *sorted((_SRC / "slack" / "gateway_runtime").glob("*.py")),
+    ]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"note_shared_death", "clear_shared_deaths"}
+                and node.args
+            ):
+                subjects.append(ast.unparse(node.args[0]))
     assert subjects, "no shared-death call found in the cron path -- scan is broken"
     for got in subjects:
         assert "job.id" in got, f"cron shared-death streak keyed to {got!r}, not the job"
@@ -720,10 +1117,19 @@ def test_every_death_handler_that_charges_a_budget_asks_whose_fault_it_was():
     conservative direction and needs no ownership question.
     """
     handlers = 0
+    awaited: list[str] = []
+    turn_phases: dict[str, tuple[ast.Module, ast.AsyncFunctionDef]] = {}
     unguarded: list[str] = []
     for path in sorted(_SRC.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         backed = _predicate_backed_guards(tree)
+        if path.parent.name == "chat_turn":
+            # The dashboard runner's except arms run in these owners' phases, by name.
+            turn_phases.update(
+                (node.name, (tree, node))
+                for node in tree.body
+                if isinstance(node, ast.AsyncFunctionDef)
+            )
         for node in ast.walk(tree):
             if not isinstance(node, ast.ExceptHandler):
                 continue
@@ -736,6 +1142,7 @@ def test_every_death_handler_that_charges_a_budget_asks_whose_fault_it_was():
             if "AcpProcessDied" not in names:
                 continue
             handlers += 1
+            awaited += _awaited_turn_phases(node)
             for sub in ast.walk(node):
                 if not isinstance(sub, ast.AugAssign):
                     continue
@@ -743,19 +1150,39 @@ def test_every_death_handler_that_charges_a_budget_asks_whose_fault_it_was():
                     continue
                 if not (_guard_names_in_ancestors(tree, sub) & backed):
                     unguarded.append(f"{path.name}:{sub.lineno}")
+    # A handler of the dashboard runner awaits its arm's phase in a chat_turn owner: the
+    # phase's body is the handler's, so the same sweep reads it there.
+    swept = [name for name in awaited if name in turn_phases]
+    for name in swept:
+        owner, phase = turn_phases[name]
+        owner_backed = _predicate_backed_guards(owner)
+        for sub in ast.walk(phase):
+            if not isinstance(sub, ast.AugAssign) or not isinstance(sub.op, ast.Add):
+                continue
+            if not (_guard_names_in_ancestors(owner, sub) & owner_backed):
+                unguarded.append(f"{name}:{sub.lineno}")
     # Control: the scan must actually find the handler population. Zero handlers
     # would make the assertion below vacuously true, which is the failure mode a
     # structural test is most likely to hide.
     assert handlers >= 4, f"only {handlers} AcpProcessDied handlers found -- scan is broken"
+    # Control: the runner's AcpProcessDied arm is read through its phase.
+    assert "_on_process_died" in swept, f"the runner's death-arm phase was not swept: {swept}"
     assert not unguarded, f"death handler charges a budget with no ownership guard: {unguarded}"
 
 
 def test_every_retry_budget_charge_is_guarded_by_the_predicate_itself():
-    """The same rule for the chat runner's budget specifically, including the
-    arms that catch a pipe death as a plain ``AcpError`` rather than a typed one
-    and so fall outside the handler scan above.
+    """The same rule for the chat runner's budget specifically: its death arms, the ones that
+    catch a pipe death as a plain ``AcpError`` too, charge it in their phases in
+    ``chat_turn/acp_recovery.py``, outside any ``except`` node and so outside the scan above.
     """
-    tree = ast.parse((_SRC / "dashboard" / "chat_runner.py").read_text(encoding="utf-8"))
+    runner = _SRC / "dashboard" / "chat_runner.py"
+    tree = ast.parse(
+        "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(runner.with_name("chat_turn").glob("*.py")), runner]
+            if turn_file.name != "__init__.py"
+        )
+    )
     backed = _predicate_backed_guards(tree)
     assert backed, "no guard name is bound from caused_by_this_session"
     unguarded: list[int] = []
@@ -776,21 +1203,22 @@ def test_the_subagent_death_arms_guard_their_parent_reset():
     ``reset(parent_key)`` there tears down a healthy parent conversation, and
     every co-tenant session with it, over a child that failed.
     """
-    tree = ast.parse((_SRC / "slack" / "gateway.py").read_text(encoding="utf-8"))
-    unguarded: list[int] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr == "reset"):
-            continue
-        if not any(isinstance(a, ast.Name) and a.id == "parent_key" for a in node.args):
-            continue
-        handler = _enclosing_death_handler(tree, node)
-        if handler is None:
-            continue
-        if "caused_by_this_session" not in _guard_names_in_ancestors(tree, node):
-            unguarded.append(node.lineno)
+    unguarded: list[tuple[str, int]] = []
+    for path in _GATEWAY_UNIT:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "reset"):
+                continue
+            if not any(isinstance(a, ast.Name) and a.id == "parent_key" for a in node.args):
+                continue
+            handler = _enclosing_death_handler(tree, node)
+            if handler is None:
+                continue
+            if "caused_by_this_session" not in _guard_names_in_ancestors(tree, node):
+                unguarded.append((path.name, node.lineno))
     assert not unguarded, f"parent reset on a death arm with no ownership guard: lines {unguarded}"
 
 
@@ -883,10 +1311,20 @@ def test_an_attribution_flag_is_bound_on_every_path_that_reads_it():
     checked = 0
     unreachable: list[str] = []
     for rel in (
+        *sorted(
+            owner
+            for owner in (_SRC / "dashboard" / "chat_turn").glob("*.py")
+            if owner.name != "__init__.py"
+        ),
         Path("dashboard") / "chat_runner.py",
         Path("task_executor.py"),
+        *sorted(
+            owner
+            for owner in (_SRC / "slack" / "handler_runtime").glob("*.py")
+            if owner.name != "__init__.py"
+        ),
         Path("slack") / "handler.py",
-        Path("slack") / "gateway.py",
+        *_GATEWAY_UNIT,
     ):
         path = _SRC / rel
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -981,11 +1419,14 @@ def _channel_dispatch_files() -> list[Path]:
     """
     files = sorted(_SRC.glob("*/transport_dispatch.py"))
     files.append(_SRC / "messaging" / "dispatch.py")
+    files.extend(sorted((_SRC / "messaging").glob("dispatch_*.py")))
     # A composed dispatcher's owners (``<channel>/dispatch/``) end turns too: Telegram's
     # callback, command and spawn-approval arms catch ``Exception`` there.
     owners = sorted(_SRC.glob("*/dispatch/*.py"))
     assert len(owners) >= 8, f"expected telegram's dispatch owners, found {owners}"
     files.extend(owners)
+    # Discord's owners sit beside its facade (``discord/transport_dispatch_*.py``).
+    files.extend(sorted(_SRC.glob("*/transport_dispatch_*.py")))
     return [p for p in files if p.exists()]
 
 
@@ -1132,9 +1573,11 @@ def test_a_substitute_bound_hands_over_at_its_limit_rather_than_charging_once():
       the branch hands the streak's value to the counter and lets the one charge
       below land ON the threshold.
     """
-    handler = ast.parse((_SRC / "slack" / "handler.py").read_text(encoding="utf-8"))
+    handler = ast.parse(
+        (_SRC / "slack" / "handler_runtime" / "turn.py").read_text(encoding="utf-8")
+    )
     branches = _branch_bodies_under_threshold_compare(handler, "_CIRCUIT_BREAKER_THRESHOLD")
-    assert branches, "no breaker-threshold branch in handler.py -- scan is broken"
+    assert branches, "no breaker-threshold branch in handler_runtime/turn.py -- scan is broken"
     for branch in branches:
         calls = _calls_in(branch.body)
         assert "reset" in calls, (
@@ -1146,7 +1589,9 @@ def test_a_substitute_bound_hands_over_at_its_limit_rather_than_charging_once():
             "resetting, which needs the threshold a second time"
         )
 
-    gateway = ast.parse((_SRC / "slack" / "gateway.py").read_text(encoding="utf-8"))
+    gateway = ast.parse(
+        (_SRC / "slack" / "gateway_runtime" / "runtime_charge.py").read_text(encoding="utf-8")
+    )
     # The move is THREE steps -- raise the counter, forget the transferred streak,
     # charge the failure -- and it must be indivisible. `cancel()` is a plain
     # task.cancel() that charges nothing on its way out, so an await between the
@@ -1249,9 +1694,9 @@ def test_a_hand_over_forgets_the_streak_it_transferred():
     that was already there, which is exactly how this was missed.
     """
     sites = {
-        "slack/handler.py": ("reset", None),
-        "messaging/dispatch.py": ("reset", None),
-        "slack/gateway.py": (None, "consecutive_failures"),
+        "slack/handler_runtime/turn.py": ("reset", None),
+        "messaging/dispatch_recovery.py": ("reset", None),
+        "slack/gateway_runtime/runtime_charge.py": (None, "consecutive_failures"),
     }
     for rel, (actuator_call, actuator_attr) in sites.items():
         tree = ast.parse((_SRC / Path(rel)).read_text(encoding="utf-8"))

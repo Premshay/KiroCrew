@@ -15,7 +15,7 @@
  * those modules own are re-exported below, so every import path is unchanged.
  */
 import { installSessionExpiryHandler } from './sessionExpirySignal'
-import { ApiError, friendlyErrText, toApiError } from './apiError'
+import { ApiError, friendlyErrText, toApiError, AcceptedBodyUnreadable } from './apiError'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
 import {
   STALE_OWNER_SESSION_CODE,
@@ -23,6 +23,7 @@ import {
   noteStaleOwnerResponse,
 } from './staleOwnerSignal'
 import { edgeChallengeMessage, noteEdgeAuthChallenge } from './edgeAuthChallenge'
+import { AUTH_BANNER_BUTTON_CSS, AUTH_BANNER_CSS } from './authBannerStyles'
 import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
 import { withDeadline } from '../lib/withDeadline'
 import { installApiTransport } from './apiTransport'
@@ -75,7 +76,15 @@ import type { DecisionsConsentData } from './client/decisions'
 export type { TunnelStatus } from './client/system'
 export type { WakaTimeStatsEntry, WakaTimeStats } from './client/telemetry'
 export type {
+  UsageSeriesDimension,
+  UsageSeriesLayer,
+  UsageSeriesPayload,
+} from './client/telemetry'
+export type {
+  ConfigSetHintsV1,
+  ConfigSetShellId,
   KiroPrerequisiteStatus,
+  KasBundleStatus,
   KasLoginStatus,
   KasLoginDeviceSession,
   KasLoginPollResult,
@@ -170,9 +179,12 @@ export type {
   MemberRosterRow,
   MemberActivityEntry,
   MemberRecap,
+  MemberGoals,
+  MemberGoal,
+  GoalKeyResult,
+  GoalSchedules,
+  GoalReport,
   CrewTeam,
-  CrewPanelData,
-  CrewPanelMeta,
   DashboardFieldSpec,
   DashboardManifest,
 } from './client/agents'
@@ -190,6 +202,7 @@ export type {
 export type { SkillScriptValidation } from './client/skills'
 export { SKILLS_TIMEOUT_MS } from './client/skills'
 export { FILE_SEARCH_TIMEOUT_MS, BROWSE_FILES_TIMEOUT_MS } from './client/files'
+export type { ProjectAwsProfile } from './client/files'
 export type {
   ConnectionMintState,
   ConnectionStatus,
@@ -217,7 +230,7 @@ export type {
   FileMenuSurface,
   FileMenuContext,
 } from './client/apps'
-export type { AppPublishProvider } from './client/artifacts'
+export type { AppPublishProvider, DeploySitesResponse } from './client/artifacts'
 export { browserInstallConflictJob } from './client/browserAndComputerUse'
 export type {
   BrowserInstallData,
@@ -501,9 +514,7 @@ function showSessionExpiredBanner(lead?: string): void {
   _emitAuthEvent('mc-auth-required')
   const el = document.createElement('div')
   el.id = 'mc-session-expired'
-  el.style.cssText =
-    'position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;' +
-    'padding:12px 20px;text-align:center;font:14px/1.5 system-ui;'
+  el.style.cssText = AUTH_BANNER_CSS
   const b = document.createElement('b')
   b.textContent = lead ?? i18nT('api.client.session_expired')
   const input = document.createElement('input')
@@ -647,6 +658,44 @@ function showSessionExpiredBanner(lead?: string): void {
   requestAnimationFrame(() => input.focus())
 }
 
+/**
+ * Raise the app-level notice for an interposed proxy's sign-in page.
+ *
+ * The proxy's refusal is already worded on the failing request's `ApiError`, but
+ * most of the requests a lapse breaks are background polls whose errors no card
+ * renders, so a tab left open past the proxy's session lifetime failed every poll
+ * for as long as it stayed open with nothing on screen. This is that missing
+ * signal.
+ *
+ * It shares the session-expired banner's element and latch rather than adding a
+ * second one, so the 2xx self-dismissal in `removeAuthBanner` clears it on the
+ * first request that gets through again, and a gateway denial arriving meanwhile
+ * cannot stack a second banner on top. It offers no token field: the gateway never
+ * saw the request, so no token could clear it. There is no dismiss control
+ * either; the notice lasts exactly as long as the requests keep being refused.
+ */
+function showEdgeChallengeBanner(): void {
+  if (_sessionExpiredShown || typeof document === 'undefined') return
+  _sessionExpiredShown = true
+  _emitAuthEvent('mc-auth-required')
+  const el = document.createElement('div')
+  el.id = 'mc-session-expired'
+  el.setAttribute('role', 'alert')
+  el.dataset.variant = 'edge-challenge'
+  el.style.cssText = AUTH_BANNER_CSS
+  const text = document.createElement('span')
+  text.textContent = i18nT('api.client.proxy_challenge_reload')
+  const reload = document.createElement('button')
+  reload.type = 'button'
+  reload.textContent = i18nT('components.errorBoundary.reload_page')
+  reload.style.cssText = AUTH_BANNER_BUTTON_CSS
+  // A full-document navigation is what lets a redirect-based proxy run its
+  // sign-in; a fetch cannot follow it.
+  reload.addEventListener('click', () => { window.location.reload() })
+  el.append(text, reload)
+  document.body.prepend(el)
+}
+
 export function checkSessionExpired(r: Response): Response {
   if (r.status === 403 && r.headers.get('X-Auth-Required') === 'true' && !_sessionExpiredShown) {
     // When this dashboard is running embedded in the Instances pane stack
@@ -744,7 +793,7 @@ export { STALE_OWNER_SESSION_CODE }
  * every existing consumer, and every test that mocks `../api/client`, is
  * unchanged by the move.
  */
-export { ApiError, friendlyErrText, toApiError }
+export { ApiError, friendlyErrText, toApiError, AcceptedBodyUnreadable }
 
 /**
  * Whether *e* is a failure the user can only clear by signing back in.
@@ -796,6 +845,9 @@ const apiFailure = (r: Response, errText: string, benign?: BenignDenial): ApiErr
   // Every one of these needs a person: the gateway never saw the request, so a silent
   // retry a second later reproduces it whether a session lapsed or a firewall refused.
   const edgeAuthExpired = edgeOutcome !== null
+  // A framed pane cannot complete a sign-in inside itself and its message already
+  // says where to go, so only a top-level document raises the notice.
+  if (edgeOutcome === 'challenged') showEdgeChallengeBanner()
   const message = staleOwnerSession
     ? i18nT('api.client.stale_owner_session_sign_in_again')
     : authRequired
@@ -899,13 +951,37 @@ const parseJson = async (r: Response, benign?: BenignDenial, nullOn204 = false) 
   // exactly as it did when this was its own copy of the body.
   if (nullOn204 && r.status === 204) return null
   if (!r.ok) {
-    const errText = await r.text()
+    // The status is the verdict; the body is only its explanation. A non-2xx
+    // whose body read is cut must still surface as an `ApiError` (a refusal,
+    // with the status line as the fallback reason) -- never as a raw network
+    // rejection, which the acceptance-receipt wires have to treat as
+    // indeterminate and would show as "delivery unconfirmed" instead of an
+    // error. The app-sdk's `jsonFetch` keeps the same guard.
+    const errText = await r.text().catch(() => r.statusText)
     throw apiFailure(r, errText, benign)
   }
   return r.json()
 }
 
 const j = (r: Response) => parseJson(r)
+
+/**
+ * `j()` for acceptance-receipt endpoints (a side-panel turn): the same auth
+ * recovery and `ApiError` for a non-2xx, but a body-read failure AFTER a 2xx
+ * is wrapped in `AcceptedBodyUnreadable`, so "accepted, receipt lost" stays
+ * distinguishable from a request that never left (both would otherwise
+ * surface as a `TypeError`/`SyntaxError`).
+ */
+const jAccepted = async (r: Response) => {
+  if (!r.ok) return parseJson(r)
+  checkSessionExpired(r)
+  removeAuthBanner()
+  try {
+    return await r.json()
+  } catch (e) {
+    throw new AcceptedBodyUnreadable(e, r)
+  }
+}
 
 /**
  * Nullable variant of j(): preserves auth recovery + ApiError semantics but
@@ -958,6 +1034,16 @@ const jInstancesDisabled = (r: Response) => parseJson(r, INSTANCES_DISABLED)
  */
 const CREW_BOARD_NO_LEDGER: BenignDenial = { status: 404, code: 'no_ledger' }
 const jCrewBoard = (r: Response) => parseJson(r, CREW_BOARD_NO_LEDGER)
+
+/**
+ * The third: a remote-artifact provider answering `scope_unsupported` for a
+ * browse scope it does not list. The `/artifacts` page treats it as "try the
+ * next scope", not a failure, and probes every discovery provider on each load,
+ * so journaling it would file one error report per load for a provider that
+ * works. Any other browse failure, including a different 400, journals normally.
+ */
+const REMOTE_SCOPE_UNSUPPORTED: BenignDenial = { status: 400, code: 'scope_unsupported' }
+const jRemoteBrowse = (r: Response) => parseJson(r, REMOTE_SCOPE_UNSUPPORTED)
 
 /** Add transport failures that have no HTTP Response to the same journal as apiFailure.
  *
@@ -1154,8 +1240,10 @@ export interface KiroBonusCreditGrantPayload {
 export interface KiroUsagePayload {
   available?: boolean
   /**
-   * Why usage is unavailable when `available` is false (`api_key_auth` or
-   * `signin_required`); absent when the gateway simply holds no reading.
+   * Why usage is unavailable when `available` is false (`api_key_auth`,
+   * `signin_required`, or `account_unproven` when the account is named but its
+   * reading could not be tied to it); absent when the gateway simply holds no
+   * reading.
    */
   reason?: string
   credits_used?: number
@@ -1214,6 +1302,7 @@ const transport: ClientTransport = {
   del,
   patch,
   j,
+  jAccepted,
   jNullable,
   jInstancesDisabled,
   jfetch,
@@ -1397,7 +1486,7 @@ export const api = {
         `?scope=${encodeURIComponent(opts?.scope ?? 'mine')}` +
         (opts?.q ? `&q=${encodeURIComponent(opts.q)}` : '') +
         (opts?.pageToken ? `&pageToken=${encodeURIComponent(opts.pageToken)}` : ''),
-    ).then(j),
+    ).then(jRemoteBrowse),
   ...artifacts.remoteAndComments,
   ...browserAndComputerUse.hostAutomation,
   ...decisions.consentRead,

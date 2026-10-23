@@ -26,7 +26,7 @@ event loop.
   window and the whole gateway (chat, timers, heartbeats) stalls with it. Inline
   is not an option either — ``CronService._file_lock``'s structural guard
   rejects a store-lock acquisition on a thread with a live loop. On-loop sync
-  callers must use ``*_async``. No in-tree caller is affected; ``bridges.py``
+  callers must use ``*_async``. No in-tree caller is affected; ``bridges_crons.py``
   and ``hooks_integration.py`` use the async variants exclusively.
 * ``remove_all`` removes every owned job in ONE atomic
   ``CronService.remove_jobs_by_owner`` transaction (not a per-id loop, and not
@@ -233,7 +233,7 @@ class CronSDK:
 
         A rejected payload never lands in the cron service's in-memory state.
         Safe even if a future caller reaches a mutator without the upstream
-        ``bridges.py`` vetting; legitimate callers (which already vet and skip
+        ``bridges_crons.py`` vetting; legitimate callers (which already vet and skip
         bad entries) are unaffected. command/script are NOT executed here — at
         fire time the gateway routes them through the OS-level sandbox
         (``cron_script.run_command_sandboxed`` / ``run_script_sandboxed``). The
@@ -279,7 +279,7 @@ class CronSDK:
             # resolve_script_path rejects a missing or sensitive file, and any
             # path outside ~/.kiro/crew/crons/ or this app's own bundle, by
             # raising. Emit a SEL denied audit on that path too, mirroring
-            # bridges.py, so every denial is audited. `app_root` is what makes a
+            # bridges_crons.py, so every denial is audited. `app_root` is what makes a
             # bundle-relative spec ("job.py:run", the only spelling an app can
             # write without knowing the install location) resolve next to the
             # app instead of against the gateway process's CWD.
@@ -334,6 +334,7 @@ class CronSDK:
         timeout_secs: int,
         timeout: int,
         folder_id: str = "",
+        app_manifest_digest: str = "",
     ) -> dict[str, Any]:
         """Build the kwargs common to the sync/async ``CronService.add_job``.
 
@@ -368,7 +369,13 @@ class CronSDK:
           30s for a script when it is unset, so without it an app cannot create
           a command job with a wake budget under 305s at all.
         """
-        return dict(
+        # An app-created cron is NOT promoted to a member selection even when
+        # ``agent`` names a crew member: apps are confined (as Spawn SDK confines
+        # them with an agent-scope check) and must not reach a member's private
+        # memory by naming it. The name is passed through as ``agent_id``, so an
+        # app cron behaves exactly as it does on main and can only reach global
+        # V1 memory.
+        kwargs: dict[str, Any] = dict(
             name=name,
             message=message,
             every_secs=every_secs,
@@ -389,6 +396,13 @@ class CronSDK:
             folder_id=folder_id or "",
             created_by=self._owner_prefix,
         )
+        # Only when set: the stamp travels through ``add_job_if_absent_async``
+        # into ``build_job``, which accepts it; the explicit ``add_job`` /
+        # ``add_job_async`` signatures do not, and an app's own create carries
+        # no stamp, so their kwargs stay exactly what they were.
+        if app_manifest_digest:
+            kwargs["app_manifest_digest"] = app_manifest_digest
+        return kwargs
 
     # ── Create ──
 
@@ -546,6 +560,7 @@ class CronSDK:
         timeout_secs: int = 0,
         timeout: int = 0,
         folder_id: str = "",
+        app_manifest_digest: str = "",
     ) -> Any:
         """Atomic add-if-absent by job name; returns None when already present.
 
@@ -564,6 +579,10 @@ class CronSDK:
         when the name is already present, so an app that set the mode in a
         follow-up ``update_job`` would skip that write on every registration
         after the first and leave the job on whatever mode it was created with.
+
+        ``app_manifest_digest`` is the bridge's stamp of the manifest entry the
+        job was built from (see ``bridges.app_cron_manifest_digest``); an app
+        calling this through the SDK leaves it empty.
         """
         # Off-loop, same reason as add_job_async: this is the method `bridges`
         # awaits on the gateway loop for every app cron at enable and at start.
@@ -582,6 +601,7 @@ class CronSDK:
                 approval_mode=approval_mode, timeout_secs=timeout_secs,
                 timeout=timeout,
                 folder_id=folder_id,
+                app_manifest_digest=app_manifest_digest,
             ),
         )
         if job is not None:

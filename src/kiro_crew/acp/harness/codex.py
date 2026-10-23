@@ -130,6 +130,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import acp_tool_gate
+from kiro_crew.acp.codex_sqlite import SQLITE_HOME_ENV, seed_private_state
 from kiro_crew.acp.harness._common import MembershipHarness
 from kiro_crew.acp.harness.base import (
     NotificationAliases,
@@ -160,7 +161,7 @@ PROTOCOL_VERSION_CODEX = 1
 
 
 #: Where ``codex`` keeps its SQLite databases; defaults to ``CODEX_HOME``.
-_SQLITE_HOME_ENV = "CODEX_SQLITE_HOME"
+_SQLITE_HOME_ENV = SQLITE_HOME_ENV
 
 
 def _sandbox_wrapper_generations(sandbox_mode: str) -> int:
@@ -286,12 +287,10 @@ class CodexHarness(MembershipHarness):
         # CODEX_SQLITE_HOME (the runtime's per-process scratch dir). Only the
         # databases move: config, auth and the thread rollouts stay in CODEX_HOME,
         # and a thread resumes from its rollout (measured on codex 0.159), so
-        # spawn_continue still works across runtimes. The scratch dir dies with
-        # the process, so EVERY runtime start rebuilds codex's index from the
-        # rollouts in CODEX_HOME, and that cost grows with the user's history
-        # (about a minute for a few thousand threads). An operator who set the
-        # variable chose that location; it reaches the child as set, which is
-        # the workaround for a large history.
+        # spawn_continue still works across runtimes. Seed the private index
+        # from a completed SQLite snapshot so a large rollout history does not
+        # need rebuilding at every start. Each process still owns its database.
+        # An operator-supplied location reaches the child without preparation.
         return SpawnPlan(
             argv=list(argv),
             rss_depth=self.CORE_RSS_DEPTH + wrapper_generations,
@@ -299,6 +298,7 @@ class CodexHarness(MembershipHarness):
             extra_expose_files=expose,
             session_model=ctx.model or None,
             private_state_env=None if ctx.environ.get(_SQLITE_HOME_ENV) else _SQLITE_HOME_ENV,
+            private_state_seed=seed_private_state,
         )
 
     def apply_spawn_env(
@@ -489,7 +489,7 @@ class CodexHarness(MembershipHarness):
         instead, and what it does with it is the fact this policy records.
 
         **What ``session/close`` does, measured.** The adapter drops the session from
-        its local map and unsubscribes the Codex thread. Captured live against
+        its local map and unsubscribes the Codex thread. Measured on
         codex-acp 1.11.0, with ``session/set_config_option`` on the same sessionId as
         the liveness oracle:
 

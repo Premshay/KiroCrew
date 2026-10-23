@@ -3,7 +3,7 @@
 ``kiro_crew.dashboard.handlers.messaging`` is the messaging API's import path and its
 patch surface. Most of what it defined now lives in the modules of
 ``kiro_crew.dashboard.messaging_api``, one responsibility each, and
-``messaging_api.compose`` runs every function they define on the facade's globals.
+``_facade_compose.compose`` runs every function they define on the facade's globals.
 These tests pin:
 
 * the surface: every name the facade bound before the split still resolves on it,
@@ -11,7 +11,7 @@ These tests pin:
   routes stay guarded, and the seams other modules import keep their identity;
 * the composition: every owner function runs on the facade's globals, reads only
   names the facade binds, and captures no name a test rebinds on the facade;
-* the guards: what repository guards read in ``messaging.py`` by path stays there,
+* the guards: what repository guards read by path stays in the file they read,
   and each guard widened to read the owners still fails when its construct is
   planted in an owner;
 * the send route's split: its audit row still reads what a fallback leg reached
@@ -24,6 +24,7 @@ import ast
 import asyncio
 import builtins
 import dis
+import functools
 import hashlib
 import importlib
 import importlib.util
@@ -41,11 +42,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
-from source_corpus import repo_files_named, repo_root
+from source_corpus import iter_statements, repo_files_named, repo_root
 
 import kiro_crew.dashboard.handlers as handlers_pkg
 import kiro_crew.dashboard.handlers.messaging as msg
+from kiro_crew._facade_compose import compose as facade_compose
 from kiro_crew.dashboard import messaging_api
+from kiro_crew.secrets import SecretVault
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 _FACADE = msg.__name__
@@ -118,7 +121,7 @@ _BASE_NAMES = frozenset("""
         api_teams_activity api_teams_config_get api_teams_config_save
         api_telegram_config_get api_telegram_config_save api_update_message
         api_webex_config_get api_webex_config_save api_wecom_config_get
-        api_wecom_config_save atomic_write backfill_channel_folder
+        api_wecom_config_save backfill_channel_folder
         blocks_request_remote_media browser_cli_install browser_cli_launcher
         browser_cli_token browser_cli_view browser_install_job build_options_blocks
         caller_names_a_missing_slot cast channel_restart_required chunk_for_transport
@@ -128,7 +131,7 @@ _BASE_NAMES = frozenset("""
         extract_options format_overflow generate_token get_command_bus
         guard_owner_surface_routes internal_memory_scope is_direct_local_request
         is_proxied_request is_sensitive_path live logger mint_options_token
-        parent_spawn_allowlists parent_work_supported persisted_replay_denial_reason
+        parent_template_allowlists parent_work_supported persisted_replay_denial_reason
         persisted_snapshot_denial_reason pip_extra_install_command platform_compat
         read_bounded_json read_config_text read_panel_records read_state read_tombstone
         record_panel_dismissal_outcome redact_credentials redact_exfiltration_urls
@@ -156,6 +159,11 @@ _OWNER_MODULES = (
     "imessage_settings",
     "wecom_settings",
     "feishu_settings",
+    "browser_routes",
+    "channel_config_writes",
+    "slack_workspace",
+    "channel_folder_backfill",
+    "agent_push",
 )
 
 #: Each moved name and the owner its responsibility puts it in.
@@ -220,12 +228,31 @@ _BASE_OWNERS: dict[str, tuple[str, ...]] = {
         _channel_sdk_status _feishu_config_save_locked _is_valid_feishu_id
         api_feishu_config_get api_feishu_config_save
         """.split()),
+    "browser_routes": tuple("""
+        _browser_install_active _browser_install_conflict _browser_install_job
+        _browser_install_status _browser_view_payload _deny_non_owner_browser_request
+        _start_browser_install_job _terminate_install_scope api_browser_command
+        api_browser_command_drain api_browser_command_result api_browser_engine_install
+        api_browser_install_get api_browser_install_start api_browser_open
+        api_browser_token_put api_browser_view_get api_browser_view_start
+        stop_browser_install
+        """.split()),
+    "channel_config_writes": tuple("""
+        _LockedSectionWrite _clean_id_list _mask_secret _threshold_pct_rejection
+        _wide_env_refusal _write_env_or_roll_back _write_env_updates _write_env_updates_locked
+        """.split()),
+    "slack_workspace": tuple("""
+        _missing_scope_message api_slack_manifest api_slack_pins api_slack_profile
+        api_slack_reactions
+        """.split()),
+    "channel_folder_backfill": ("api_channel_folder_backfill",),
+    "agent_push": ("api_notification_agent_push",),
 }
 
 #: SHA-256 of the sorted ``"<name> <kind> <signature>"`` lines of every name in
-#: ``_BASE_OWNERS``, captured from the one-module file before the split: each moved
-#: name keeps the kind and signature it had there.
-_BASE_SHAPE_DIGEST = "140f95078d00ee2c3b73e500e5ec24d015d4dd307d18a5cf2efbbf232c4dfc3d"
+#: ``_BASE_OWNERS``, captured from the facade before the split that moved it: each
+#: moved name keeps the kind and signature it had there.
+_BASE_SHAPE_DIGEST = "2c20b392e339e1d74c03a21bebc7aa0baa18f2f15e0d1dbe32adaa416fe46dd0"
 
 
 #: Helpers the split of ``api_send_message`` added to the send owner: the body it
@@ -436,7 +463,6 @@ def test_the_seams_other_modules_import_keep_their_identity() -> None:
 #: and must keep importing from there (not from a re-route).
 _IMPORTED_BY_NAME = {
     "_resolve_channel_target": "kiro_crew.dashboard.chat_runner",
-    "_run_chat": "kiro_crew.dashboard.chat_runner",
     "_get_config_lock": "kiro_crew.dashboard.handlers.agents",
     "is_allowed_user": "kiro_crew.slack.handler",
     "is_tracked_channel": "kiro_crew.slack.handler",
@@ -556,7 +582,7 @@ def test_the_moved_names_keep_their_base_shapes() -> None:
     lines = sorted(
         f"{name} {_shape(getattr(msg, name))}" for names in _BASE_OWNERS.values() for name in names
     )
-    assert len(lines) == 86
+    assert len(lines) == 120
     digest = hashlib.sha256("\n".join(lines).encode()).hexdigest()
     assert digest == _BASE_SHAPE_DIGEST, "\n".join(lines)
 
@@ -573,37 +599,26 @@ def _facade_module_assignments() -> set[str]:
 
 
 #: Definitions that stay in the facade file, each because something reads it there:
-#: the census-pinned Slack routes and the redact-then-authorize block of
-#: ``api_send_message`` with its origin-session injection; the two routes and the
-#: iMessage save entry that path-keyed registers name; the two predicates unowned
-#: specs cite by this path; and the shared channel-config transaction every
-#: settings owner commits through.
+#: the redact-then-authorize block of ``api_send_message`` with its origin-session
+#: injection and its two census sites; the Teams activity route and the iMessage save
+#: entry that path-keyed registers name; the two predicates unowned specs cite by this
+#: path; the two finalizer exceptions; the helpers several owners call; and the
+#: ``.env`` write's off-loop drain, whose open code-scanning finding stays at the path
+#: that tracks it. The Slack workspace routes and their ten census sites live in
+#: ``slack_workspace``, the rest of the channel-config write path every settings owner
+#: commits through in ``channel_config_writes``, and the backfill and agent-push routes
+#: in owners of their own (``_BASE_OWNERS``).
 _FACADE_DEFS = (
     "api_send_message",
-    "api_slack_pins",
-    "api_slack_reactions",
-    "api_slack_profile",
-    "_missing_scope_message",
-    "api_notification_agent_push",
     "api_teams_activity",
     "api_imessage_config_save",
-    "api_channel_folder_backfill",
-    "api_slack_manifest",
     "_run_belongs_to_caller",
     "parent_work_supported",
-    "_LockedSectionWrite",
     "_ThresholdPairInverted",
     "_CredentialTupleChanged",
     "_sel",
     "_is_slack_ts",
-    "_mask_secret",
-    "_clean_id_list",
-    "_threshold_pct_rejection",
-    "_wide_env_refusal",
     "_write_env_off_loop",
-    "_write_env_or_roll_back",
-    "_write_env_updates",
-    "_write_env_updates_locked",
 )
 
 
@@ -888,6 +903,10 @@ def test_a_second_facade_import_recomposes_the_owners_onto_it(tmp_path: Path) ->
 
 _PATCH_CALLS = ("setattr", "patch.object", "delattr")
 _MULTIPLE_OPTIONS = frozenset({"spec", "create", "spec_set", "autospec", "new_callable"})
+_FUNCTIONS = frozenset({ast.FunctionDef, ast.AsyncFunctionDef})
+_ASSIGNMENTS = frozenset({ast.Assign, ast.AugAssign})
+#: Nodes with no call inside and no binding: a name, a constant, an expression context.
+_LEAVES = frozenset({ast.Name, ast.Constant, ast.Load, ast.Store, ast.Del})
 _FACADE_STRING = re.compile(r"""^kiro_crew\.dashboard\.handlers\.messaging\.(\w+)$""")
 
 #: The patches whose attribute the scan cannot resolve from the source: each reads
@@ -919,21 +938,22 @@ _RESOLVED_DYNAMIC_PATCHES = {
 def _facade_aliases(tree: ast.Module) -> set[str]:
     """Every expression spelling a test module binds to the facade, to a fixed point."""
     aliases = {_FACADE, f"sys.modules[{_FACADE!r}]", f'sys.modules["{_FACADE}"]'}
-    for node in ast.walk(tree):
+    assignments: list[tuple[ast.expr, ast.expr]] = []
+    # An import and an assignment are statements, so the walk reads statement bodies
+    # only and skips the expressions that make up most of a module.
+    for node in iter_statements(tree):
         if isinstance(node, ast.Import):
             aliases |= {a.asname for a in node.names if a.name == _FACADE and a.asname}
         elif isinstance(node, ast.ImportFrom) and node.module == "kiro_crew.dashboard.handlers":
             aliases |= {a.asname or a.name for a in node.names if a.name == "messaging"}
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            assignments.append((node.targets[0], node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignments.append((node.target, node.value))
     changed = True
     while changed:
         changed = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                target, value = node.targets[0], node.value
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                target, value = node.target, node.value
-            else:
-                continue
+        for target, value in assignments:
             if not isinstance(target, ast.Name) or target.id in aliases:
                 continue
             if ast.unparse(value) in aliases or _imports_the_facade(value):
@@ -1002,84 +1022,142 @@ def _resolve_target(node: ast.AST, params: dict[str, set[str]]) -> set[str] | No
     return set()
 
 
+def _may_patch_the_facade(text: str) -> bool:
+    """Every spelling of a facade patch names ``messaging``, so a source without the
+    word holds none."""
+    return "messaging" in text
+
+
 def _patched_names_in(text: str) -> tuple[set[str], set[str]]:
     """``(names, dynamic)``: first-level names one test source rebinds on the
     facade, and the enclosing functions of each patch whose name the scan cannot
     resolve -- which fails the reach test closed unless it is a resolved one."""
-    if "messaging" not in text:
+    if not _may_patch_the_facade(text):
         return set(), set()
     tree = ast.parse(text)
     aliases = _facade_aliases(tree)
     found: set[str] = set()
     dynamic: set[str] = set()
-    functions = [
-        n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
-    seen: set[int] = set()
-    scopes = [(tree, {}, "<module>")] + [
-        (fn, _parametrized_strings(fn), fn.name) for fn in functions
-    ]
-    for scope, params, label in reversed(scopes):
-        for node in ast.walk(scope):
-            if id(node) in seen:
-                continue
-            seen.add(id(node))
-            if isinstance(node, ast.Call):
-                func = ast.unparse(node.func)
-                kw = {k.arg: k.value for k in node.keywords if k.arg}
-                target = node.args[0] if node.args else kw.get("target")
-                if target is not None and (
-                    ast.unparse(target) in aliases or _imports_the_facade(target)
-                ):
-                    if func.endswith(_PATCH_CALLS):
-                        name = (
-                            node.args[1]
-                            if len(node.args) >= 2
-                            else kw.get("attribute", kw.get("name"))
-                        )
-                        resolved = _resolve_name(name, params) if name is not None else None
-                        if resolved is None:
-                            dynamic.add(label)
-                        else:
-                            found |= resolved
-                    elif func.endswith("patch.multiple"):
-                        if any(k.arg is None for k in node.keywords):
-                            dynamic.add(label)
-                        found |= {k for k in kw if k not in _MULTIPLE_OPTIONS}
-                elif target is not None and func.split(".")[-1] in ("patch", "setattr", "delattr"):
-                    resolved = _resolve_target(target, params)
-                    if resolved is None:
-                        dynamic.add(label)
-                    else:
-                        found |= resolved
-            elif isinstance(node, (ast.Assign, ast.AugAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    if isinstance(target, ast.Attribute) and ast.unparse(target.value) in aliases:
-                        found.add(target.attr)
+
+    def read_call(node: ast.Call, params: dict[str, set[str]], label: str) -> None:
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+        target = node.args[0] if node.args else kw.get("target")
+        if target is None:
+            return
+        func = ast.unparse(node.func)
+        if ast.unparse(target) in aliases or _imports_the_facade(target):
+            if func.endswith(_PATCH_CALLS):
+                name = node.args[1] if len(node.args) >= 2 else kw.get("attribute", kw.get("name"))
+                resolved = _resolve_name(name, params) if name is not None else None
+                if resolved is None:
+                    dynamic.add(label)
+                else:
+                    found.update(resolved)
+            elif func.endswith("patch.multiple"):
+                if any(k.arg is None for k in node.keywords):
+                    dynamic.add(label)
+                found.update(k for k in kw if k not in _MULTIPLE_OPTIONS)
+        elif func.split(".")[-1] in ("patch", "setattr", "delattr"):
+            resolved = _resolve_target(target, params)
+            if resolved is None:
+                dynamic.add(label)
+            else:
+                found.update(resolved)
+
+    def visit(node: ast.AST, params: dict[str, set[str]], label: str) -> None:
+        # One walk, carrying the innermost enclosing ``def`` -- whose parametrize
+        # strings resolve a patched name and whose name labels an unresolved one --
+        # down to each call, decorators and defaults included; a lambda opens no
+        # scope. Names, constants and expression contexts hold no call and no
+        # assignment and are not entered: they are most of a module's nodes, and
+        # this walk runs over every test file that could patch the facade.
+        kind = type(node)
+        if kind in _LEAVES:
+            return
+        if kind in _FUNCTIONS:
+            assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            params, label = _parametrized_strings(node), node.name
+        elif kind is ast.Call:
+            assert isinstance(node, ast.Call)
+            read_call(node, params, label)
+        elif kind in _ASSIGNMENTS:
+            assert isinstance(node, (ast.Assign, ast.AugAssign))
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute) and ast.unparse(target.value) in aliases:
+                    found.add(target.attr)
+        for field in node._fields:
+            child = getattr(node, field, None)
+            if isinstance(child, ast.AST):
+                visit(child, params, label)
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, ast.AST):
+                        visit(item, params, label)
+
+    visit(tree, {}, "<module>")
     found |= set(re.findall(r"""["']kiro_crew\.dashboard\.handlers\.messaging\.(\w+)["']""", text))
     return found, dynamic
 
 
-def _facade_patched_names() -> set[str]:
+#: How many parts the patch census is read in. The per-test timeout bounds ONE test,
+#: and the whole census -- every test file that could patch the facade parsed and
+#: walked, under coverage, on a shared runner -- is more than one test's budget. Each
+#: part is one test of the capture check, so the budget bounds a quarter of the test
+#: tree; the parts hold about the same amount of source, and the sum of the work does
+#: not change.
+CENSUS_PARTS = 4
+
+
+@functools.lru_cache(maxsize=1)
+def _census_parts() -> tuple[tuple[Path, ...], ...]:
+    """The test files the census parses -- under ``test/`` and each ``src/**/tests``,
+    this file excepted, whose text could spell a facade patch -- dealt into
+    ``CENSUS_PARTS`` parts of about equal source size: each file, largest first, joins
+    the lightest part so far. Only the paths are kept; the text is read again by the
+    part that parses it."""
     root = repo_root()
     here = Path(__file__).resolve()
-    found: set[str] = set()
-    unresolved = []
+    sizes: list[tuple[int, Path]] = []
     for path in repo_files_named(".py"):
         parts = path.relative_to(root).parts
         in_tests = parts[0] == "test" or (parts[0] == "src" and "tests" in parts)
         if in_tests and path.resolve() != here:
-            names, dynamic = _patched_names_in(path.read_text(encoding="utf-8", errors="replace"))
-            found |= names
-            for label in dynamic:
-                key = (path.name, label)
-                if key in _RESOLVED_DYNAMIC_PATCHES:
-                    found |= _RESOLVED_DYNAMIC_PATCHES[key]
-                else:
-                    unresolved.append(key)
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if _may_patch_the_facade(text):
+                sizes.append((len(text), path))
+    dealt: list[list[Path]] = [[] for _ in range(CENSUS_PARTS)]
+    loads = [0] * CENSUS_PARTS
+    for size, path in sorted(sizes, key=lambda item: (-item[0], item[1])):
+        lightest = loads.index(min(loads))
+        dealt[lightest].append(path)
+        loads[lightest] += size
+    return tuple(tuple(sorted(part)) for part in dealt)
+
+
+@functools.lru_cache(maxsize=CENSUS_PARTS)
+def _census_part(index: int) -> frozenset[str]:
+    """The first-level names the tests of census part *index* rebind on the facade, each
+    unresolvable patch replaced by its listed resolution."""
+    found: set[str] = set()
+    unresolved = []
+    for path in _census_parts()[index]:
+        names, dynamic = _patched_names_in(path.read_text(encoding="utf-8", errors="replace"))
+        found |= names
+        for label in dynamic:
+            key = (path.name, label)
+            if key in _RESOLVED_DYNAMIC_PATCHES:
+                found |= _RESOLVED_DYNAMIC_PATCHES[key]
+            else:
+                unresolved.append(key)
     assert unresolved == [], "a test patches a facade name the scan cannot resolve"
-    return found
+    return frozenset(found)
+
+
+def _facade_patched_names() -> set[str]:
+    """Every first-level name the test trees rebind on the facade: the union of the
+    census parts, each read on its first use."""
+    return set().union(*(_census_part(index) for index in range(CENSUS_PARTS)))
 
 
 def _captured_names(source: str) -> set[str]:
@@ -1209,12 +1287,23 @@ def test_the_capture_scan_flags_what_an_owner_evaluates_when_it_loads() -> None:
     assert {"_sel", "is_direct_local_request"} & captured == set()
 
 
-def test_no_owner_captures_a_name_tests_rebind_on_the_facade() -> None:
+@pytest.mark.parametrize("part", range(CENSUS_PARTS))
+def test_no_owner_captures_a_name_tests_rebind_on_the_facade(part: int) -> None:
     """An owner that imported, defaulted or evaluated a rebound name when it loaded
     would keep that object, and a patch of the facade would silently stop applying
-    there. An owner may DEFINE one: the facade's binding of it is the composed copy
-    (through the guard, for a guarded route), and every caller reads it through the
-    facade's globals."""
+    there. One census part per test keeps each test's work a bounded share of the test
+    tree: a captured name is visible in the part that holds the test rebinding it."""
+    patched = _census_part(part)
+    for stem, source in _owner_sources().items():
+        assert _captured_names(source) & patched == set(), stem
+
+
+def test_the_whole_census_holds_the_known_rebinds_and_an_owner_s_definitions() -> None:
+    """The whole census, read from the parts' caches: it saw the rebinds this suite is
+    known to make, and enough of them to have measured anything. An owner may DEFINE a
+    rebound name: the facade's binding of it is the composed copy (through the guard,
+    for a guarded route), and every caller reads it through the facade's globals. In
+    file order this test follows the per-part checks and reads their cached parts."""
     patched = _facade_patched_names()
     assert {
         "_sel",
@@ -1230,8 +1319,7 @@ def test_no_owner_captures_a_name_tests_rebind_on_the_facade() -> None:
         "_send_to_channel_target",
     } <= patched
     assert len(patched) >= 35
-    for stem, source in _owner_sources().items():
-        assert _captured_names(source) & patched == set(), stem
+    for stem in _owner_sources():
         defined = {name for name in vars(_owner(stem)) if name in patched}
         assert all(
             inspect.unwrap(getattr(msg, name)) is vars(_owner(stem))[name] for name in defined
@@ -1240,40 +1328,50 @@ def test_no_owner_captures_a_name_tests_rebind_on_the_facade() -> None:
 
 # ── the path-keyed guards keep their reach ────────────────────────────────────
 
-#: Constructs repository guards read in ``dashboard/handlers/messaging.py`` by
-#: path: the cron origin-session dispatch the turn-timeout scan counts, the slot
-#: task publish the slot-reader inventory keys by
-#: ``api_send_message``, and the two bounded body reads the JSON-body register
-#: keys by function. An owner that grew one would move it out of the guard's
-#: sight, so each stays in the facade.
-_STAYS_IN_THE_FACADE = (
-    r"spawn_guarded_turn\(",
-    r"\b_run_chat\(",
-    r"\bslot\.task = task\b",
-    r"await read_bounded_json\(",
+#: Constructs repository guards read by path, each with the owners that hold it beside
+#: ``dashboard/handlers/messaging.py``: the two bounded body reads the JSON-body register keys
+#: by function -- the Teams activity route's in the facade, the agent push's in
+#: ``agent_push``, a row the register names by that path. An owner that grew one would
+#: move it out of the guard's sight, so each stays in exactly these files.
+_STAYS_IN_THE_FACADE = ((r"await read_bounded_json\(", ("agent_push",)),)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "owners"), _STAYS_IN_THE_FACADE, ids=[row[0] for row in _STAYS_IN_THE_FACADE]
 )
-
-
-@pytest.mark.parametrize("pattern", _STAYS_IN_THE_FACADE)
-def test_a_construct_a_guard_reads_in_the_facade_stays_there(pattern: str) -> None:
+def test_a_construct_a_guard_reads_in_the_facade_stays_there(
+    pattern: str, owners: tuple[str, ...]
+) -> None:
     assert re.search(pattern, _FACADE_PATH.read_text(encoding="utf-8"))
     holders = [stem for stem, source in _owner_sources().items() if re.search(pattern, source)]
-    assert holders == []
+    assert holders == list(owners)
 
 
-def test_the_census_sites_stay_in_the_facade() -> None:
-    """``test_security_posture``'s census pins twelve gate-side baseline log sites
-    to this path; every one stays here and no owner grows one."""
+#: Where ``test_security_posture``'s census pins this family's twelve gate-side
+#: baseline log sites: the send route's two in the facade, and the Slack workspace
+#: routes' ten in their owner.
+_CENSUS_HOMES = {
+    "dashboard/handlers/messaging.py": 2,
+    "dashboard/messaging_api/slack_workspace.py": 10,
+}
+
+
+def test_the_census_sites_stay_in_their_census_homes() -> None:
+    """``test_security_posture``'s census pins twelve gate-side baseline log sites to
+    two paths of this family; each stays in its home and no other owner grows one."""
     from test_security_posture import _BASELINE_LOG_SITE_CENSUS, _gate_side_baseline_log_sites
 
-    sites = _gate_side_baseline_log_sites(_FACADE_PATH.read_text(encoding="utf-8"))
-    assert len(sites) == _BASELINE_LOG_SITE_CENSUS["dashboard/handlers/messaging.py"] == 12
-    grown = {
-        stem: len(found)
+    found = {
+        f"dashboard/messaging_api/{stem}.py": len(sites)
         for stem, source in _owner_sources().items()
-        if (found := _gate_side_baseline_log_sites(source))
+        if (sites := _gate_side_baseline_log_sites(source))
     }
-    assert grown == {}
+    found["dashboard/handlers/messaging.py"] = len(
+        _gate_side_baseline_log_sites(_FACADE_PATH.read_text(encoding="utf-8"))
+    )
+    assert found == _CENSUS_HOMES
+    assert {path: _BASELINE_LOG_SITE_CENSUS.get(path) for path in _CENSUS_HOMES} == _CENSUS_HOMES
+    assert sum(_CENSUS_HOMES.values()) == 12
 
 
 def test_every_owner_coroutine_file_is_checked_for_config_dir() -> None:
@@ -1468,7 +1566,7 @@ def test_compose_rebinds_functions_and_class_members(tmp_path: Path) -> None:
     )
     namespace = {"__name__": "messaging_api_compose_host_probe", "VALUE": "host"}
     namespace["helper"] = owner.helper
-    messaging_api.compose(namespace, (owner,))
+    facade_compose(namespace, (owner,))
 
     assert namespace["helper"]() == "host" and owner.helper is namespace["helper"]
     assert owner.outer()() == "host"
@@ -1482,7 +1580,7 @@ def test_compose_rebinds_functions_and_class_members(tmp_path: Path) -> None:
     assert namespace["helper"]() == "patched"
 
     fresh = {"__name__": "messaging_api_compose_host_probe", "VALUE": "fresh"}
-    messaging_api.compose(fresh, (owner,))
+    facade_compose(fresh, (owner,))
     assert owner.helper() == "fresh"
 
 
@@ -1653,7 +1751,10 @@ def test_the_slack_saver_stores_a_token_slack_could_not_be_asked_about(
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-old")
     status, payload = _saver_put(monkeypatch, tmp_path, "slack", {"bot_token": "xoxb-2"})
     assert status == 200 and payload["ok"] is True, payload
-    assert "SLACK_BOT_TOKEN=xoxb-2" in (tmp_path / ".env").read_text(encoding="utf-8")
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "SLACK_BOT_TOKEN=secret://SLACK_BOT_TOKEN" in env_text
+    stored = SecretVault(tmp_path).get("SLACK_BOT_TOKEN")
+    assert stored is not None and stored.reveal() == "xoxb-2"
 
 
 @pytest.mark.parametrize(

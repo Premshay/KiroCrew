@@ -255,6 +255,7 @@ class TestCronListFields:
         mock_job.hide_in_chat = False
         mock_job.minimal_context = False
         mock_job.persistent_session = True
+        mock_job.auto_pause_after_failures = 5
         mock_job.schedule = CronSchedule(kind="every", every_secs=300)
         mock_job.last_run_ts = None
         mock_job.last_result = None
@@ -264,6 +265,8 @@ class TestCronListFields:
         # serialize — so a field added to the payload fails this test until the
         # stub names it.
         mock_job.last_retry_run_ts = 0.0
+        mock_job.consecutive_failures = 0
+        mock_job.failure_backoff_until.return_value = None
         mock_job.created_ts = None
         mock_job.timezone = ""
         mock_job.skip_dates = []

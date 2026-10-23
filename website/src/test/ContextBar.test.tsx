@@ -82,9 +82,10 @@ describe('composeContextReadout', () => {
     expect(composeContextReadout(pct, used, total, { showTokens: true, approx: true })).toBe('~96K/200K')
   })
 
-  it('omits the token segment when the window size is unknown (total <= 0)', () => {
-    expect(composeContextReadout(pct, used, 0, { showPct: true, showTokens: true })).toBe('48%')
-    expect(composeContextReadout(pct, used, 0, { showTokens: true })).toBe('')
-    expect(composeContextReadout(pct, used, NaN, { showTokens: true })).toBe('')
+  it('keeps the measured token count without a denominator when capacity is unknown', () => {
+    expect(composeContextReadout(pct, used, 0, { showPct: true, showTokens: true })).toBe('48% · 96K')
+    expect(composeContextReadout(pct, used, 0, { showTokens: true })).toBe('96K')
+    expect(composeContextReadout(pct, used, NaN, { showTokens: true })).toBe('96K')
+    expect(composeContextReadout(pct, used, 0, { showTokens: true, approx: true })).toBe('~96K')
   })
 })

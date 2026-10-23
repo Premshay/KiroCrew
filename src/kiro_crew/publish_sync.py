@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import hashlib
+import html as _html
 import logging
 import os
 import re
@@ -37,8 +38,9 @@ import tempfile
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Final
 
 # Concrete publish providers are NOT imported here. In the public edition no
 # provider is registered (the registry stays empty → get_provider() raises
@@ -357,6 +359,99 @@ def _redact_untrusted(text: str, source: str) -> str:  # noqa: ARG001
 _NON_TEXT_KINDS: frozenset[str] = NON_TEXT_KINDS
 
 
+#: Put ahead of a crewmate's html report (``goal_report``) when it is published or
+#: synced, so the copy a destination serves is as static as the one the viewer
+#: opens: no script, no fetch, no outside image, font or frame, only the page's
+#: inline styles and ``data:`` images. A ``meta`` policy governs everything after
+#: it and a later one can only tighten it, so the prefix comes before every page
+#: byte; the page's own doctype then parses as an ignored repeat.
+STATIC_REPORT_PREFIX: Final[str] = (
+    '<!DOCTYPE html><meta http-equiv="Content-Security-Policy" content="'
+    "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; "
+    "base-uri 'none'; form-action 'none'\">"
+)
+
+
+class _LinkTitles(HTMLParser):
+    """Pass a report through unchanged except that each link shows where it goes.
+
+    Every ``a`` and ``area`` with an ``href`` (or ``*:href``) and no ``title`` gets
+    ``title`` set to that href, so hovering a link in the published copy shows its
+    full URL, as a link in a session does. Everything else is written back as read.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.out: list[str] = []
+
+    def _tag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        raw = self.get_starttag_text() or ""
+        href = next((v for k, v in attrs if k == "href" or k.endswith(":href")), None)
+        if tag in ("a", "area") and href and not any(k == "title" for k, _ in attrs):
+            cut = len(raw) - (2 if raw.endswith("/>") else 1)
+            raw = f'{raw[:cut]} title="{_html.escape(href)}"{raw[cut:]}'
+        self.out.append(raw)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._tag(tag, attrs)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._tag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        self.out.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        self.out.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        self.out.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self.out.append(f"&#{name};")
+
+    def handle_comment(self, data: str) -> None:
+        self.out.append(f"<!--{data}-->")
+
+    def handle_decl(self, decl: str) -> None:
+        self.out.append(f"<!{decl}>")
+
+    def handle_pi(self, data: str) -> None:
+        self.out.append(f"<?{data}>")
+
+    def unknown_decl(self, data: str) -> None:
+        self.out.append(f"<![{data}]>")
+
+
+def _link_titles(content: str) -> str:
+    """*content* with each link's ``title`` set to its href (:class:`_LinkTitles`)."""
+    parser = _LinkTitles()
+    parser.feed(content)
+    parser.close()
+    return "".join(parser.out)
+
+
+def _static_report_document(name: str, content: str) -> str:
+    """A crewmate's report as the document a destination serves: one frame.
+
+    The page goes in an ``iframe`` whose ``sandbox`` is EMPTY, as its ``srcdoc``
+    attribute, escaped. An empty sandbox withholds ``allow-scripts``, and that also
+    sets the sandboxed automatic features flag, so neither a script nor a refresh
+    ``meta`` in the page runs, and nothing has to parse or clean the page to get
+    there. Escaped into one attribute value, none of the page's markup is live in
+    the outer document. Inside, :data:`STATIC_REPORT_PREFIX` still comes first, so
+    the page also loads nothing from outside. Its links stay clickable, each showing
+    its full URL on hover (:func:`_link_titles`), as links in a session do.
+    """
+    inner = STATIC_REPORT_PREFIX + _link_titles(content)
+    return (
+        f'<!DOCTYPE html><meta charset="utf-8"><title>{_html.escape(name)}</title>'
+        "<style>html,body{margin:0;height:100%}"
+        "iframe{display:block;border:0;width:100%;height:100%}</style>"
+        f'<iframe sandbox="" srcdoc="{_html.escape(inner, quote=True)}"></iframe>'
+    )
+
+
 def _render_content(art: Artifact) -> tuple[str, str]:
     """Return ``(rendered_text, content_type)`` for an artifact's current
     content, applying the widget standalone-HTML wrap where needed.
@@ -377,6 +472,9 @@ def _render_content(art: Artifact) -> tuple[str, str]:
     content = _redact_untrusted(art.content or "", art.source)
     if art.kind == "widget":
         content = wrap_widget_html(content)
+    if art.kind == "html" and art.goal_report is True:
+        # The title goes in the uploaded document, so it takes the same redaction.
+        content = _static_report_document(_redact_untrusted(art.name, art.source), content)
     return content, content_type
 
 
@@ -501,6 +599,34 @@ async def publication_guard(slug: str) -> AsyncIterator[None]:
                 _publish_locks.pop(slug, None)
 
 
+#: How wide each visibility reaches, narrowest first. An unknown value ranks as the
+#: widest: a publication of unknown reach is treated as public.
+_VISIBILITY_RANK = {"PRIVATE": 0, "SHARED": 1, "PUBLIC": 2}
+
+
+def _visibility_rank(visibility: str | None) -> int:
+    return _VISIBILITY_RANK.get((visibility or "").upper(), 2)
+
+
+def _narrows(
+    old_visibility: str | None,
+    old_shared_with: list[str] | None,
+    new_visibility: str | None,
+    new_shared_with: list[str] | None,
+) -> bool:
+    """Whether a sharing change takes access away from anyone who has it now.
+
+    A lower rank narrows; so does a shared publication that drops a person, since
+    that person is losing access just the same.
+    """
+    old_rank, new_rank = _visibility_rank(old_visibility), _visibility_rank(new_visibility)
+    if new_rank != old_rank:
+        return new_rank < old_rank
+    if new_rank == _VISIBILITY_RANK["SHARED"]:
+        return not set(new_shared_with or []) >= set(old_shared_with or [])
+    return False
+
+
 async def publish(
     slug: str,
     *,
@@ -570,6 +696,19 @@ async def _publish_unlocked(
     # plus a sharing update, reusing the same destination id/URL — never a
     # second artifact. Use the artifact's existing provider.
     if art.publication is not None:
+        sharing = Capability.SHARING in provider.capabilities()
+        # Order the two steps by direction. Widening pushes first, so the new content
+        # lands while the link is still narrow; narrowing changes sharing first, so the
+        # new content never reaches the wider audience being withdrawn.
+        narrowing = sharing and _narrows(
+            art.publication.visibility,
+            art.publication.shared_with,
+            visibility,
+            shared_with,
+        )
+        if narrowing:
+            await update_sharing(slug, visibility=visibility, shared_with=shared_with)
+            art = await asyncio.to_thread(store.get, slug)
         await push_version(art, force=True)
         # push_version is best-effort and records failures in
         # publication.last_error; update_sharing then clears last_error. Capture
@@ -581,7 +720,7 @@ async def _publish_unlocked(
         # Skip the sharing reconcile for providers whose sharing is not
         # programmable via the API (e.g. a live CRDT provider — web-UI-only). Re-publish is
         # then just a content push; the existing publication summary is returned.
-        if Capability.SHARING in provider.capabilities():
+        if sharing and not narrowing:
             result = await update_sharing(slug, visibility=visibility, shared_with=shared_with)
         else:
             result = (

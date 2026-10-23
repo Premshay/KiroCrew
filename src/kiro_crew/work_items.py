@@ -246,7 +246,7 @@ def _coerce_event(raw: Any) -> dict[str, str]:
     ts = raw.get("ts")
     kind = raw.get("kind")
     text = raw.get("text")
-    if not all(isinstance(value, str) for value in (ts, kind, text)):
+    if not isinstance(ts, str) or not isinstance(kind, str) or not isinstance(text, str):
         raise WorkItemStoreCorrupt("work-item event has invalid fields")
     # ``actor`` is the server-stamped worker fingerprint for worker-authored
     # events; coordinator events carry "". Slice 2 events predate it, so a

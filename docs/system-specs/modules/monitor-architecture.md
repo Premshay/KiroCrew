@@ -36,6 +36,13 @@ this spec states the target and that one states the present.
 | Driver | `implemented` | in-session timer of `AutoNudgeService` (`autonudge_service/firing.py`; probe gate `gate.py`, judge `judge_tick.py`), which reads the subject each tick and screens it with the wake judge |
 | Delivery | `implemented` | session directive keyed by the call's input digest, shared by both arming paths |
 
+The dashboard's `autonudge_state` lifecycle frame carries the loop's public
+`created_ts` runtime-budget clock alongside cadence, counters, deadline and stop
+state. The dashboard caches that frame over its REST seed, so omitting this clock
+would erase a known Runtime started/Runtime value after any update. Structured
+subject fields remain withheld from the broad frame and come only from the
+owner-gated monitor read.
+
 ## Three prerequisites
 
 Nothing in the seven layers is reachable until these three exist. Each is a
@@ -127,7 +134,7 @@ Giving the kind its own objective (a registry row plus a per-kind stamp) is the
 next step and is not part of the change that made it reachable.
 
 A conductor does not have to remember that arm. When `work_ledger_record`
-`action=bind` commits and the conductor's slot holds no loop at all,
+`action=bind` commits and the conductor's slot holds no ACTIVE loop,
 `conductor_patrol.ensure_patrol` arms a default patrol on it: `watch:
 "work-ledger"`, gated, every 600 seconds, 300 cycles and 86400 seconds, which
 pass the goal-conductor skill's `patrol_budget.py check`. It goes through the
@@ -135,16 +142,28 @@ same chokepoint as an agent's own `monitor_start`
 (`autonudge_authz.authorize_and_add_nudge`), create-only, as an OUTSIDE arm with
 no `initiator_slot_key`: the bind route knows the calling session but not the
 turn, so it cannot tell the session's own turn from a cron injection or a
-sub-agent sharing the slot. A crew/member conductor therefore refuses it. Any
-existing record -- active, approval-held, or stopped by a person -- is left
-alone, so a bind never stacks a second loop or revives a person's stop. The one
-re-arm is the gateway's own default patrol stopped by the system (its budget or
-cap ran out, the `_stopped_row_is_replaceable` allowlist): a new bind is new work,
-so it is replaced by a fresh default. A refusal is logged at WARNING and the bind
-still succeeds; the bind reply carries `patrol: armed | existing | refused |
-unsupported`, plus a `patrol_note` telling the conductor to arm its own
+sub-agent sharing the slot. A crew/member conductor therefore refuses it. An
+active record is left alone, so a bind never stacks a second loop. An inactive
+record the SYSTEM stopped -- its subject went terminal (every item closed), its
+budget or cap ran out, the `_stopped_row_is_replaceable` allowlist -- counts as
+no loop, whoever armed it, and is replaced by a fresh default: a new bind is new
+work. An inactive record a PERSON stopped is kept and the arm is refused with
+reason `user-stopped`. A refusal is logged at WARNING and the bind still
+succeeds; the bind reply carries `patrol: armed | existing | refused |
+unsupported` and `patrol_reason` (`no-loop`, `replaced-system-stopped`,
+`active-work-ledger`, `active-other-watch`, `user-stopped`,
+`outside-arm-refused`, `session-cannot-host-loop`, `arm-failed`,
+`autonudge-disabled`, `no-ledger`), plus a `patrol_note` telling the conductor to arm its own
 `monitor_start` in the same turn whenever no `work-ledger` watch is active after
-the bind. The armed loop carries `default_patrol: true`, and that tag is the one
+the bind. The MCP tool renders all three on every bind reply. A `session_create`
+(`POST /api/session-control/create`, not a dry run) is a dispatch too and runs
+the same `ensure_patrol` on its caller, with the same fields on its reply. A
+caller that holds no work ledger gets nothing armed (`no-ledger`): the watch
+would read nothing and fire on its timer, so the reply says what fits instead. A
+crew/member caller is still refused: neither route can tell the member's own
+turn from a cron, app or sub-agent turn on the same session key, and the only
+path that can (`session_directive_apply`, through `DIRECTIVE_TOOLS` and
+`mcp_core.derive_directive`) is reached by a member's own `monitor_start`. The armed loop carries `default_patrol: true`, and that tag is the one
 exception to create-only: ANY create-only arm of a loop that is not itself a
 default patrol -- the conductor's own `monitor_start` or `monitor_watch`, and
 equally a person's dashboard create or a channel arm -- displaces an ACTIVE
@@ -174,6 +193,75 @@ The longer floor never applies while the loop's recent turns failed to start or
 errored (`consecutive_start_failures`, `consecutive_failed_cycles`), or when the
 revision is unknown (empty, or unreadable on load). Other kinds keep the
 shipped floor.
+
+The work-ledger probe is the one kernel-path probe that wakes once per token for
+the item's life rather than re-asserting after the re-alert window. It re-reads
+the same report events and the same silence on every tick while an item is open,
+so the kernel's expiring mask would re-wake the conductor every
+`DEFAULT_REALERT_SECS` about a report it already read. Each report event id and
+each stall token (`stall:<last_report_at>`) is kept in a seen set in the
+`ledger_wake` rate file: per item, per polling driver (the `irq` job id, so the
+gate's terminal recheck cannot spend the loop's own wake), bounded by
+`_MAX_REMEMBERED_TOKENS` and `_MAX_WATCHERS_PER_ITEM`, and dropped when the item
+closes. A newer stall token replaces older ones, since only the newest can recur.
+A token is marked seen when the probe emits it, not when the turn lands; the
+quiet floor above covers a lost delivery, because a worker report moves
+`ledger_revision` and only a landed turn catches `ledger_delivered_revision` up,
+so the loop stays on the shipped floor and a plain patrol turn reads the board.
+
+A delivered work-ledger wake is a POINTER, not a copy of the board.
+`ledger_wake.wake_turn_text` prefixes the nudge with the kernel's structural briefs
+naming what moved (truncated at `MAX_WAKE_BRIEF_CHARS`, 4000) and then one
+`WAKE_READ_POINTER` line telling the conductor to call
+`work_ledger_read(item_id=<id>)` for the item a brief named, or
+`work_ledger_read(compact=true)` for the board. The conductor reads the ledger
+itself, through its own identity-gated, audited and containment-judged route.
+
+The wake used to carry the compact board inline, built at delivery by
+`compact_wake_snapshot` and bounded by `WAKE_SNAPSHOT_BUDGET_CHARS` (24000). That
+made the cost of one item moving proportional to the whole goal -- on a twenty-item
+board, around 20 KB of mostly-closed rows re-sent on every wake to save one tool
+call -- so it was replaced by the pointer and the builder, its `WakeSnapshot` value
+and its `work_ledger_wake_snapshot` audit operation were deleted. The board was also
+the only reason the delivery needed an audience fence
+(`record_audience_admission(..., for_pending_turn=True)`, likewise deleted): ledger
+prose may enter only a turn whose cross-surface publication is fenced for that
+turn's whole life, and the fence now belongs to the read route alone.
+
+A wake that lands while the slot is already running is STEERED into that running
+turn (`_steer_work_ledger_wake`) rather than declined, because its payload is small.
+The steer and the fire now carry the SAME text, which the pointer is what makes
+possible: a steer can be requeued, a requeue drops the running turn's fence, and the
+board could therefore never ride one -- while briefs and a read pointer disclose only
+item ids and statuses, the same text `irq` may already persist outside the store's
+gated read path. `AutoNudgeService.notify_turn_complete` brings the busy-retry
+forward to `delay=0` on turn end instead of waiting for the loop deadline, and the
+per-loop wake text is held in `_pending_monitor_wake`, a `dict` keyed by loop id.
+
+The steered wake keeps the ROW the fire writes. `steer_into_running_turn` takes the
+loop's `nudge_meta` (`{"cycle", "loop_id"}`) and persists the steer as a `nudge` row
+with `meta.steer`, so it draws as the nudge chip and never as a bubble the person
+typed; the sender names the origin, the role follows from it. A steer the turn ends
+before taking is requeued with `AUTOMATION_STEER_META` on its entry: the drain
+writes it as a `nudge` row too, and the entry drains alone, never merged into the
+person's own queued text (#22747).
+
+The wake reaches the steer through `session_deliver.deliver`, the session-side entry
+point a non-human sender calls with its origin (`automation`, `cron`, `app`). The
+sender never picks idle vs running or a row role: `origin_row` maps the origin to
+its row, an idle slot gets that row and a turn, and a running slot gets the steer
+(an automation wake) or a queued card (a cron notification, an app message). A
+script cron's result (`_deliver_script_result`) and a cron's `send_message` to its
+origin session (`api_send_message`), both with `evict_oldest` so a full live queue
+drops its oldest cron notification (never another kind of entry), and an MCP App's
+`ui/message`
+(`api_mcp_apps_message`) call it too, and so does a peer `session_send`
+(`send_to_target`) with a `peer` origin: a `user` row on both paths, a steer only
+when it asked for one and the slot is running. `send_to_target` keeps its audience
+fence, cancellation shield and post-RPC re-gate around those calls. The idle
+autonudge fire writes its nudge row through `session_deliver.write_origin_row` (the
+`automation` origin, plus its `monitor` record), the same mapping a steered wake
+uses, but still chooses idle vs running itself (#23064).
 
 The `monitoring/` package now has a different extension point:
 `models.MonitorProbe`, a structural Protocol with no behaviour inheritance, plus
@@ -260,7 +348,47 @@ then ends only through the probe's terminal settlement (every item closed) or a
 user or agent stop. The runaway backstop is the same
 `monitoring.max_runtime_secs` ceiling, measured as the loop's age from
 `created_ts`: past it nothing is extended, the bound stops the loop as before,
-and the refusal is logged at WARNING.
+and the refusal is logged at WARNING. The age is read from `created_ts` once per
+process (on the first read after a load) and advances on the monotonic clock
+from there, so a wall-clock step while the gateway runs neither spends a loop's
+runtime budget nor gives it back. A writer of `created_ts` in the running
+gateway moves that reading with it instead of having it read again: a new loop
+and a resume of a spent budget start it at zero, and a released approval or
+person-wait hold hands back the span it held, measured on the monotonic clock
+from the hold's start, while `created_ts` moves by the wall-clock span, which
+is what a restart reads. A step before or during a hold therefore changes the
+budget only across a restart.
+`test_autonudge_budget.py::test_a_released_hold_hands_back_the_time_it_really_held`
+pins the hold cases. The
+budget is awake time while the gateway runs, the clock the loop's own
+`asyncio` waits use: `time.monotonic()` stops while the host is suspended on
+Linux and macOS, so a suspend there spends none of the budget, and it keeps
+counting on Windows, where a suspend is spent. Time before a restart is read
+back from the stored `created_ts` on the wall clock, so a suspend or a step that
+came before a restart counts in full.
+`test_autonudge_budget.py::test_a_suspend_spends_no_runtime_budget_until_a_restart`
+pins both readings.
+
+A work-ledger watch also HOLDS while every open item waits on a person: each is
+`blocked` or `question` with the worker's `reason` `approval` or `needs_human`,
+no item's worker session is gone, and the ledger's fingerprint
+(`probes.work_ledger.person_wait_fingerprint`, which is
+`worker_report_revision` -- the same worker-report digest the quiet floor reads,
+so nothing the conductor writes moves it) equals `ledger_seen_fp`, the one read at the tick
+that delivered the loop's last turn. `_holds_for_person_wait` checks this in
+`_timer` ahead of the cycle cap and the runtime budget, so a held tick fires
+nothing, reaches no probe gate or quiet floor, and is neither extended nor
+stopped; it re-arms at the loop's interval and sets `waiting_on_person` (with
+`waiting_on_person_at`), which `monitor_inspect`, the REST row and the
+`autonudge_state` frame carry. A worker's report changes the fingerprint and
+releases it on the next tick; the conductor's own writes do not; a manual fire clears `ledger_seen_fp` so it
+is never held; a loop already held for an unanswered approval is left to that
+hold. On release the held time is added to `created_ts`, as the approval hold
+does, so it spends neither the runtime budget nor the backstop. That exemption
+is on purpose and matches the approval hold: a held loop fires nothing, so a
+patrol whose people never answer stays a paused row that costs one ledger read
+per interval, never a runaway. Doubt fires: an unreadable ledger or a fresh loop
+never holds.
 
 An unanswered tool approval HOLDS a prompt loop rather than stopping it: it
 stays active, fires nothing and spends neither bound, and it resumes on its own
@@ -539,7 +667,9 @@ the delay but not the mask. `monitoring/decision.py` now level-triggers too: it
 re-asserts an unresolved actionable change once its re-alert interval has elapsed
 and coalesces a burst of successive changes to one subject, through a window on
 `MonitorState`. So re-assertion-after-a-window is available on both paths rather
-than only the kernel one.
+than only the kernel one. The work-ledger probe is a deliberate exception: it
+dedupes each report and stall once per item's life and relies on its quiet floor
+for a lost delivery (see the `work-ledger` section above).
 
 Each key carries its own alert timestamp, and a key that is still true re-asserts
 once its window has elapsed. Edge triggering loses any condition that stayed true
@@ -663,7 +793,11 @@ keeps reaching the same conclusion.
 fingerprint against `last_wake_fingerprint`), is the budget spent
 (`monitor_budget_reason`), is this error retryable (`_provider_error_decision`
 against `_RETRYABLE_PROVIDER_ERRORS`). It takes the clock as a value through its
-`now` parameter and performs no IO at all.
+`now` parameter and performs no IO at all. A failed supplemental read on an
+otherwise readable subject goes through the same kind gate in
+`_supplemental_provider_error_decision`: only `TRANSIENT` and `RATE_LIMITED` are
+retried, under the same `max_provider_errors` budget, and every other kind stops
+the watch at once rather than spending the budget on a failure that cannot heal.
 
 **A skip is a third outcome, and it reaches three places.** A shared `github:api`
 cooldown makes a probe return WITHOUT calling the API, and it borrows the shape of a
@@ -1063,7 +1197,7 @@ lifecycle stages, in different shapes:
 
 | Site | Lifecycle stage | Shape | Reachable from code |
 |---|---|---|---|
-| `mcp_shared._resolve_tool_policy` | per call, cached per session | `ToolPolicy(excluded, unresolved)` from `managedToolPolicy.exclude` | yes |
+| `mcp_shared._resolve_tool_policy` | per call, cached per session | `ToolPolicy(excluded, unresolved, detail, included)` from `managedToolPolicy.exclude` and the gateway's `include` (per-server tool sets, present only for a spec that opts in with `managedToolPolicy.honourToolRefs`) | yes |
 | the same function's unresolved returns | before the exclude list is parsed | empty set plus the reason it could not be read; `tools/call` refuses, `tools/list` still lists | nothing to migrate; the refusal is audited per call |
 | `acp/kas_agents.to_client_custom_agent` | startup projection, before the session exists | `excludedTools` list relayed to the agent host | yes |
 | `acp/session_mcp.session_mcp_disabled_tools` | session projection: Claude `permissions.deny`, codex `rawInput.server`/`tool` | `(server, tool)` pairs, unioned from the agent spec AND the dashboard-written global `mcp.json` | yes |
@@ -1118,7 +1252,7 @@ positive reason. An installation that wants the cheap path for a few days is
 asking for exactly that shift, which is why the key is worth a row in the schema
 even though it changes no code path.
 
-It is read in `mcp_tools/control.py::schemas()`, which is the only place it is
+It is read in `mcp_tools/control_parts/schemas.py::schemas()`, which is the only place it is
 read, and read afresh on every build: `mcp_tools.build_tool_list` rebuilds
 descriptors per call rather than caching them, so a Settings write needs no
 gateway restart. It does not reach a session already open, because kiro-cli
@@ -1158,8 +1292,11 @@ corner case: a pull request reaches `readiness: passed` only once every non-PASS
 whole-design verdict carries a disposition, and those verdicts live in comment
 bodies. The digest wakes the owner when such a body changes, but a green typed
 board with an unanswered advisory finding whose text never changed is still
-indistinguishable to a probe, which is why the prompt loop keeps `gate=false` for
-that evidence in both positions of this key.
+indistinguishable to a probe, which is why that evidence stays on the prompt loop,
+whose agent turn reads the bodies, in both positions of this key. The comment-aware
+recipes arm that loop gated with `judge: false`: a finding's arrival changes its
+reading (a body digest, or the lane's check run finishing) and wakes it, and the
+quiet floor re-delivers a turn for one the woken turn left unanswered.
 
 The PR-level comment-body digest is carried as one condition,
 `review_comment_bodies:<digest>`, with severity `WAKE` and `resets_on` `NEVER`:

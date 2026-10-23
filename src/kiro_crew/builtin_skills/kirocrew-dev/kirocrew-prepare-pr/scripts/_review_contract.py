@@ -13,6 +13,60 @@ import re
 import time
 from datetime import datetime
 
+# Credential redaction (best-effort; applied to all printed untrusted text).
+_SECRET_RE = re.compile(
+    r"(?i)(ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}"
+    r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    # The dashboard link token is TWO segments (`base64url(payload).base64url(
+    # hmac_sig)`), so the three-segment alternative above never matched it and a
+    # bare token in prose printed verbatim. It needs its OWN alternative.
+    #
+    # Byte-identical to the one in `security/redaction_patterns.py`, which carries the full
+    # derivation of both bounds and is the single source for it; this script is
+    # documented as stdlib-only and portable, so it cannot import it, and
+    # `test/test_redaction_mirror_parity.py` fails if this copy drifts. Locally the
+    # points that matter: the signature width is PINNED (`{43}`, a property of the
+    # HMAC-SHA256 digest), the payload bound is a generator-derived floor rather
+    # than a guess (a guessed floor is beatable by a verbose identifier), and the
+    # left boundary (incl. `.`, so attribute access is excluded) keeps ordinary
+    # dotted code intact.
+    #
+    # Placing it after the three-segment alternative is defensive, not
+    # load-bearing for real tokens: a conventional JWS header is only 33 chars
+    # past `eyJ`, far below this alternative's first-segment floor, so it cannot
+    # match a real JWS's `header.payload`. It matters only for a JWS whose header
+    # clears that floor AND whose payload is exactly 43 chars, since the right
+    # boundary is satisfied by a `.` and would leave `.signature` in the printed
+    # log. That shape is covered by a test.
+    r"|(?<![A-Za-z0-9_.-])eyJ[A-Za-z0-9_-]{96,}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"
+    r"|-----BEGIN[A-Z ]*PRIVATE KEY-----)"
+)
+_KV_RE = re.compile(
+    r"(?i)\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|"
+    r"ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET)[A-Za-z0-9_]*)\s*[:=]\s*\S+"
+)
+_AUTH_RE = re.compile(r"(?i)\b(authorization|proxy-authorization)\b\s*:\s*.+")
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+# scheme://user:pass@host -> redact the credentials, keep the scheme/host shape.
+_URLCRED_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^\s/:@]+:[^\s/@]+@")
+# Whole PEM private-key block (header + base64 body + footer), across lines.
+_PEM_BLOCK_RE = re.compile(
+    r"-----BEGIN[A-Z ]*PRIVATE KEY-----.*?-----END[A-Z ]*PRIVATE KEY-----", re.DOTALL
+)
+
+
+def redact(text):
+    text = _PEM_BLOCK_RE.sub("[REDACTED PRIVATE KEY]", text)
+    text = _SECRET_RE.sub("[REDACTED]", text)
+    text = _AUTH_RE.sub(lambda m: m.group(1) + ": [REDACTED]", text)
+    text = _BEARER_RE.sub("Bearer [REDACTED]", text)
+    text = _URLCRED_RE.sub(lambda m: m.group(1) + "[REDACTED]@", text)
+    text = _KV_RE.sub(lambda m: m.group(1) + "=[REDACTED]", text)
+    return text
+
+
 REVIEWED_STAMP_RE = re.compile(r"\[([A-Z][A-Z0-9_-]*)-REVIEWED\]\s+([0-9a-f]{7,40})\b")
 BLOCK_MERGE_RE = re.compile(r"\[BLOCK-MERGE\]\s+([0-9a-f]{7,40})\b")
 # The SANCTIONED downgrade, read from the one part of the comment a model cannot
@@ -144,7 +198,7 @@ DEFAULT_OVERRIDE_TARGET_KEYS = (
     ("first-principles", "first-principles-review"),
 )
 FINDING_RE = re.compile(
-    r"^\s*(?:\*\*)?(BLOCKING|FINDING)(?:\*\*)?\s*(?:--|\u2014)\s*"
+    r"^\s*(?:\*\*)?(BLOCKING)(?:\*\*)?\s*(?:--|\u2014)\s*"
     r"(?:\*\*)?(\S+?):(\d+)(?:\*\*)?\s*(?:(?:--|\u2014)\s*)?(.*)$",
     re.MULTILINE,
 )
@@ -870,21 +924,17 @@ def extract_findings(
 # them above the line-level lanes in triage, which is only possible if their
 # items reach the loop with span ids of their own.
 WHOLE_DESIGN_LANES = ("DESIGN", "UX", "FIRST-PRINCIPLES")
-# `Design-Verdict: CONCERNS`, `UX-Verdict: PASS`, `First-Principles-Verdict: BLOCK`
-VERDICT_LINE_RE = re.compile(
-    r"^[A-Za-z-]+-Verdict:\s*(PASS|CONCERNS|BLOCK)\b", re.MULTILINE | re.IGNORECASE
-)
-# The item-bearing sections of those lanes' output templates. Deliberately an
-# allowlist rather than "every `###` heading": First Principles also emits a
-# `### What this change ships` INVENTORY and UX a `### Evidence gaps` note, and
-# neither is an item an author disposes of one by one.
-DESIGN_ITEM_SECTIONS = (
-    "Blockers",
-    "Watch",
-    "Subtractions",
-    "Suggestions",
-    "Not justified as shipped",
-)
+# `Design-Verdict: PASS`, `UX-Verdict: BLOCK`, `First-Principles-Verdict: BLOCK`.
+# A lane has exactly two verdicts; any other word (including the retired
+# CONCERNS) is not a verdict and reads as "no verdict for this head".
+VERDICT_LINE_RE = re.compile(r"^[A-Za-z-]+-Verdict:\s*(PASS|BLOCK)\b", re.MULTILINE | re.IGNORECASE)
+# The item-bearing section of those lanes' output templates: a BLOCK lists its
+# items under `### Blockers`, each with a `Trigger:` and an `Outcome:` line.
+# Deliberately an allowlist rather than "every `###` heading": First Principles
+# also emits a `### What this change ships` INVENTORY, UX a `### Evidence gaps`
+# note, and every lane may add `### Notes` -- none of them an item an author
+# disposes of one by one, and `Notes` never gates.
+DESIGN_ITEM_SECTIONS = ("Blockers",)
 # A per-item trailing line naming what would retire the item. Optional: it is
 # absent from every lane's older output, so parsing must not depend on it.
 CLEARS_WHEN_RE = re.compile(r"clears\s+when\s*:\s*(.+?)\s*$", re.IGNORECASE)
@@ -921,7 +971,7 @@ def design_section_items(body):
     continuation lines (the consequence chain and the fix the templates ask
     for). A section whose lane wrote PROSE instead of a list still yields its
     paragraphs: the templates say "one or two lines each" without mandating a
-    bullet, and silently yielding nothing there would hide exactly the CONCERNS
+    bullet, and silently yielding nothing there would hide exactly the Blockers
     items this extractor exists to surface.
     """
     wanted = {name.lower(): name for name in DESIGN_ITEM_SECTIONS}
@@ -1011,6 +1061,55 @@ def design_lane_verdicts(comments, head_sha, bindings, lanes=WHOLE_DESIGN_LANES)
     }
 
 
+# The bold sentence a whole-design lane writes right under its verdict line: the
+# lane's REASON, one to three sentences. On a BLOCK it is the core problem; on a
+# PASS it says in a few words why nothing blocks (or exactly NOTHING_TO_CHECK).
+# It sits outside every item section, so design_section_items never yields it.
+NOTHING_TO_CHECK = "Nothing to check."
+_ENCLOSING_BOLD_RE = re.compile(r"\A\*\*(.+)\*\*\Z")
+
+
+def lane_punchline(body):
+    """The punchline under a whole-design body's verdict line, without its bold.
+
+    Read as the first text after the verdict line. The whole paragraph is taken, so a punchline
+    wrapped over two lines survives. A heading or one of the body's own trailers
+    in that place means the lane wrote no punchline.
+    """
+    verdict = VERDICT_LINE_RE.search(body or "")
+    if not verdict:
+        return ""
+    lines: list = []
+    for raw in body[verdict.end() :].splitlines()[1:]:
+        stripped = raw.strip()
+        if not stripped:
+            if lines:
+                break
+            continue
+        if _HEADING_RE.match(raw) or REVIEWED_STAMP_RE.search(raw) or BLOCK_MERGE_RE.search(raw):
+            break
+        lines.append(stripped)
+    text = _collapse(lines)
+    bold = _ENCLOSING_BOLD_RE.match(text)
+    if bold and "**" not in bold.group(1):
+        return bold.group(1).strip()
+    return text
+
+
+def design_lane_punchlines(comments, head_sha, bindings, lanes=WHOLE_DESIGN_LANES):
+    """``{lane: punchline}`` for whole-design lanes stamped for ``head_sha``.
+
+    A lane that wrote no punchline, or exactly NOTHING_TO_CHECK, is left out, so
+    every entry is something the lane asks a human to check or answer.
+    """
+    punchlines = {}
+    for name, body, _verdict in _fresh_design_bodies(comments, head_sha, bindings, lanes):
+        punchline = lane_punchline(body)
+        if punchline and punchline != NOTHING_TO_CHECK:
+            punchlines[name] = punchline
+    return punchlines
+
+
 def extract_design_items(comments, head_sha, bindings, lanes=WHOLE_DESIGN_LANES):
     """Yield whole-design items stamped for ``head_sha`` with stable span ids.
 
@@ -1020,7 +1119,7 @@ def extract_design_items(comments, head_sha, bindings, lanes=WHOLE_DESIGN_LANES)
     would silently reclassify a today-valid spanless ``target=design``
     disposition as a violation and fail the required status on PRs nobody
     touched, so the design items feed only local reporting (pr_findings.py) and
-    the local unanswered-CONCERNS check (pr_status.py). A disposition may still
+    the local loop's block summary (pr_status.py). A disposition may still
     CLAIM one of these spans: an unknown span for a lane with no
     extract_findings identities is not a violation.
     """
@@ -1038,43 +1137,6 @@ def extract_design_items(comments, head_sha, bindings, lanes=WHOLE_DESIGN_LANES)
                 "block_merge": verdict == "BLOCK",
                 "span": span_hash(name, normalize_design_item_text(text)),
             }
-
-
-def unanswered_concern_lanes(verdicts, records, head_sha):
-    """Whole-design lanes at CONCERNS for this head with no disposition yet.
-
-    LOCAL ONLY -- the kirocrew-prepare-pr loop's own stop condition. SKILL.md says a
-    green rollup with an unanswered CONCERNS is not converged, and nothing
-    enforced it: the loop armed auto-merge straight past a fresh CONCERNS. The
-    server-side required status is deliberately NOT changed, because CONCERNS
-    is advisory by contract for every writer who never runs this loop.
-
-    Answered means a repository writer's disposition record targets that lane
-    and names this head (a short ``head=`` prefix counts, as everywhere else).
-    """
-    out = []
-    for name, verdict in sorted((verdicts or {}).items()):
-        if verdict != "CONCERNS" or name.upper() not in WHOLE_DESIGN_LANES:
-            continue
-        target = name.lower()
-        answered = any(
-            not record.get("malformed")
-            and (record.get("target") or "").lower() == target
-            and sha_matches(record.get("head") or "", head_sha)
-            for record in records or []
-        )
-        if not answered:
-            out.append(name)
-    return out
-
-
-def unanswered_concerns_reason(lane, head_sha):
-    """The one blocking reason text for an unanswered whole-design CONCERNS."""
-    return (
-        "unanswered CONCERNS from {} on current head - answer each Watch item "
-        "with an <!-- ai-review-disposition target={} head={} --> comment "
-        "(fix, rebut, or accept-and-defer)".format(lane, lane.lower(), head_sha)
-    )
 
 
 def parse_disposition_record(comment):

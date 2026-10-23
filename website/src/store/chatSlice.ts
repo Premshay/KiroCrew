@@ -20,8 +20,9 @@ import { releaseCloseHold, awaitCloseOutcome, expireCloseHold, confirmCloseHold,
 import { isChatPageSurface } from '../utils/channelOrigin'
 import { isNoteRow } from '../lib/noteContract'
 import { gcSessionStorage } from '../utils/storageGc'
+import { isUntitledSession } from '../utils/sessionDisplayTitle'
 import type { RootState } from './index'
-import type { ChatMessage } from '../types'
+import type { ChatMessage, SideSnapshot, TurnIdentityFields } from '../types'
 import { SOFT_STOP_DEBOUNCE_MS } from '../pages/chat/types'
 import { mergePreservedPastes } from '../utils/pasteTokens'
 import { initialState, type ChatState } from './chat/state'
@@ -29,7 +30,17 @@ import { filterMessages, isUnsafeKey, safeKey } from './chat/wire'
 import { ensureMsgId, finalizeTrailingStreaming, floorForGen, isBetweenTurnWork, isRedeliveredMessage, mintMsgId, reconcileOptimisticEcho } from './chat/transcript'
 import { OLDER_PAGE_LIMIT, OLDER_WALK_PAGE_LIMIT, claimOlderFetchAbort, isSupersededPagingRejection, releaseOlderFetchAbort } from './chat/paging'
 import { reinsertThinkingOrphans } from './chat/thinking'
-import { bumpRunEpoch, runStateReducers, setRunState, syncOriginRun } from './chat/runState'
+import {
+  bumpRunEpoch,
+  finalizeActiveTurn,
+  recordEndedTurn,
+  runStateReducers,
+  setRunState,
+  settleEndedBackgroundTurn,
+  syncOriginRun,
+  turnAlreadyEnded,
+  wireTurnIdentity,
+} from './chat/runState'
 import { setPagingCursor, slotCacheReducers, writeSlotPage } from './chat/slotCache'
 import { composerCardReducers } from './chat/composerCards'
 import { messageReducers } from './chat/messages'
@@ -155,7 +166,7 @@ export const batchedTextAboveFloor = (parts: BatchedChunkPart[], floor: number |
 }
 
 /** One `chat_message` frame as the WebSocket hook hands it to `sseChatMessage`. */
-type ChatFrame = { slot: string; role: string; content: string; ts?: string; seq?: number; gen?: string; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean; parts?: BatchedChunkPart[] }
+type ChatFrame = TurnIdentityFields & { slot: string; role: string; content: string; ts?: string; seq?: number; gen?: string; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean; parts?: BatchedChunkPart[] }
 
 /**
  * Path B (native session grid): apply a WS chat frame for a NON-active slot
@@ -242,17 +253,19 @@ function applyNonActiveFrame(
     if (seq !== undefined) run.lastChunkSeq = seq
     return
   }
+  // The same server-turn rule as the active path: a late duplicate `_done` can
+  // arrive after this slot was switched into the background. Leave a newer
+  // cached streaming row and busy run state intact.
   if (role === '_done') {
-    setRunState(run, 'idle')
+    const identity = wireTurnIdentity(p)
+    if (identity && turnAlreadyEnded(state, slot, identity)) return
+    settleEndedBackgroundTurn(state, slot)
     // The replay floor survives `_done`: seqs never restart within a gateway
     // generation, so a chunk redelivered after the turn ends sits at or below
     // it and is dropped instead of opening a second bubble. A turn-starting
     // `user`/`inject` frame clears it, which covers a slot whose server
     // counter did restart (rebuilt slot, gen-less gateway).
-    syncOriginRun(state, slot, 'idle')
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === 'streaming') { msgs[i].role = 'assistant'; msgs[i].rawText = msgs[i].content; break }
-    }
+    if (identity) recordEndedTurn(state, slot, p)
     return
   }
   if (role === 'compacting') { if (run.state === 'idle') bumpRunEpoch(state, slot); setRunState(run, 'compacting'); syncOriginRun(state, slot, 'compacting'); return }
@@ -285,6 +298,13 @@ function applyNonActiveFrame(
   if (role === 'inject' && !isNoteRow({ cls, meta })) {
     bumpRunEpoch(state, slot)
     if (run.state === 'idle') run.lastChunkSeq = undefined
+  }
+  // A change card / guide offer: placed like the tool row that proposed it.
+  if (role === 'card') {
+    let insertIdx = msgs.length
+    if (insertIdx > 0 && msgs[insertIdx - 1]?.role === 'streaming') insertIdx--
+    msgs.splice(insertIdx, 0, ensureMsgId({ role, content, cls: cls || '', ts, meta }))
+    return
   }
   if (role === 'tool') {
     if (run.state === 'idle') bumpRunEpoch(state, slot)
@@ -426,23 +446,18 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
     if (seq !== undefined) state.lastChunkSeq = seq
     return
   }
-  // WS done — finalize streaming into assistant, rawText preserved for reparse
+  // WS done — finalize streaming into assistant, rawText preserved for reparse.
+  // The turn step is shared with settleEndedActiveTurn. On an ordinary turn
+  // the idle `slots` row already recorded this same server turn, so this
+  // `_done` is a duplicate and cannot finalize a successor turn.
   if (role === '_done') {
+    const identity = wireTurnIdentity(p)
+    if (identity && turnAlreadyEnded(state, slot, identity)) return
     countLiveFrame(state)
-    state.slotState = 'idle'
+    finalizeActiveTurn(state)
     // Floor kept on purpose; see the background `_done` branch.
-    for (let i = state.messages.length - 1; i >= 0; i--) {
-      if (state.messages[i].role === 'streaming') {
-        const msg = state.messages[i]
-        msg.role = 'assistant'
-        msg.rawText = msg.content
-        break
-      }
-    }
-    state.slotRunning = false
-    state.slotStopping = false
-    state.slotState = 'idle'
     state.pendingTurnSlot = null
+    if (identity) recordEndedTurn(state, slot, p)
     return
   }
   // Compacting — block input, show footer indicator (no visible message)
@@ -491,6 +506,16 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   if (role === 'inject' && !isNoteRow({ cls, meta })) {
     bumpRunEpoch(state, slot)
     if (state.slotState === 'idle') state.lastChunkSeq = undefined
+  }
+  // A change card / guide offer lands mid-turn, right after the tool call that
+  // proposed it, so it is placed exactly like that tool row: ahead of the open
+  // streaming message (the gateway's own order, which the turn-end refresh
+  // restores anyway).
+  if (role === 'card') {
+    let insertIdx = state.messages.length
+    if (insertIdx > 0 && state.messages[insertIdx - 1]?.role === 'streaming') insertIdx--
+    state.messages.splice(insertIdx, 0, ensureMsgId({ role, content, cls: cls || '', ts, meta }))
+    return
   }
   // Tool call — update state, insert before streaming message
   if (role === 'tool') {
@@ -622,9 +647,22 @@ export const deleteSlot = createAsyncThunk<
       const prev = (landing !== key ? landing : null)
         || root.chat.slotHistory.filter(k => k !== key && sameSurface.has(k)).pop()
         || root.dashboard.slots.filter(s => s.key !== key && sameSurface.has(s.key)).map(s => s.key)[0]
-      dispatch({ type: 'chat/setActiveSlot', payload: null })
+      // Closing a chat is not choosing the landing: the page picks it. Both
+      // moves count as automatic, so a create or fork still pending from
+      // before the close opens its new session when it resolves, while a
+      // session the user opened during that request still wins (`forkMayOpen`).
+      dispatch({ type: 'chat/dropActiveSlot' })
       if (prev) {
-        navigation = dispatch(switchSlot(prev)).unwrap().catch(() => dispatch({ type: 'chat/clearSlotState' }))
+        // A pending create or fork can open its chat before this landing's
+        // fetch settles. A failure then belongs to a view the user has left,
+        // so it clears the pane only while this landing still owns it.
+        const landingSwitch = dispatch(switchSlot({ key: prev, automatic: true }))
+        navigation = landingSwitch.unwrap().catch(() => {
+          const chat = (getState() as RootState).chat
+          if (chat.activeSlot === prev && chat.slotSwitchLatestRequestId === landingSwitch.requestId) {
+            dispatch({ type: 'chat/clearSlotState' })
+          }
+        })
       } else {
         dispatch({ type: 'chat/clearSlotState' })
       }
@@ -668,9 +706,12 @@ export const deleteSlot = createAsyncThunk<
       dispatch(fetchSlots())
       // The row is about to come back; say why, whichever path pressed close.
       // The title is read from before the optimistic removal took the row away.
+      // An untitled row stores null, not the localized label: the notice outlives
+      // a language switch, so the sidebar localizes it at render.
+      const refusedTitle = deletedSlot ? (isUntitledSession({ key, title: deletedSlot.title }) ? null : deletedSlot.title!) : key
       dispatch({
         type: 'chat/setCloseRefused',
-        payload: { key, title: deletedSlot?.title || key, reason: closeRefusalIsHistoryWrite(err) ? 'historyWrite' : 'failed' },
+        payload: { key, title: refusedTitle, reason: closeRefusalIsHistoryWrite(err) ? 'historyWrite' : 'failed' },
       })
       throw new Error('save failed')
     } finally {
@@ -853,11 +894,26 @@ const chatSlice = createSlice({
     },
     setVoicePlaying(state, action: PayloadAction<boolean>) { state.voicePlaying = action.payload },
     setVoiceBusy(state, action: PayloadAction<boolean>) { state.voiceBusy = action.payload },
+    setVoicePreparing(state, action: PayloadAction<boolean>) { state.voicePreparing = action.payload },
     setVoiceAudio(state, action: PayloadAction<string | null>) { state.voiceAudio = action.payload },
     /** Ask the sidebar to reveal a session row (expand collapsed ancestor
      *  folders, scroll it into view, flash it). Consumed and cleared by
      *  ChatSidebar once it is mounted and ready — see `revealRequest`. */
     requestSlotReveal(state, action: PayloadAction<string>) { state.revealNonce += 1; state.revealRequest = { kind: 'session', target: action.payload, nonce: state.revealNonce } },
+    /** Ask the sidebar only to open the folder path of a session the user just
+     *  opened, keeping their search and filters (see `revealRequest.openFoldersOnly`).
+     *  `folder_id` comes from the create or fork response, not from the listed row,
+     *  which can lag it. Set by every fork entry that opens its child (a fork child
+     *  inherits its source's folder, which can be collapsed or inside a collapsed
+     *  parent) and by the header New tab gesture that opens the new chat in the
+     *  foreground, which creates with `activate: false` and so skips createSlot's
+     *  own request. No-op for a session filed at the top level. */
+    requestSlotFolderOpen(state, action: PayloadAction<{ key: string; folder_id?: string | null }>) {
+      const { key, folder_id: folderId } = action.payload
+      if (!folderId) return
+      state.revealNonce += 1
+      state.revealRequest = { kind: 'session', target: key, nonce: state.revealNonce, openFoldersOnly: true, folderId }
+    },
     clearSlotReveal(state) { state.revealRequest = null },
     /** Ask the sidebar to reveal a FOLDER row: make it visible, expand it and every
      *  collapsed ancestor, scroll it into view, flash it. Set by the command
@@ -961,43 +1017,93 @@ const chatSlice = createSlice({
 
 export const {
   setCloseRefused,
-  setActiveSlot, clearSlotState, setPendingInput, stageToMainComposer, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, confirmOptimisticSend, markSendUnconfirmed, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, endLocalTurn, startRemoteTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
-  sseContextUsage, setVoicePlaying, setVoiceBusy, setVoiceAudio,
-  toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued, reconcileSubagentQueuedFromSlots,
+  setActiveSlot, dropActiveSlot, forkOpenStarted, forkOpenSettled, clearSlotState, setPendingInput, stageToMainComposer, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, clearQuestionCard, setQuestionDraft, setQuestionNotice, setQuestionRequestInFlight, markQuestionSettled, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant, removeThinking, confirmOptimisticSend, markSendUnconfirmed, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, startServerTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, sseContextUsage, setVoicePlaying, setVoicePreparing, setVoiceAudio, toggleActivity, openActivityToTab, openActivityPanel, setSidePanelAlwaysOpen, openActivityToTool, clearFocusToolCallId, requestSlotReveal, requestSlotFolderOpen, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, markSubagentApprovalGone, reconcileSubagentApprovalGone, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued, reconcileSubagentQueuedFromSlots, startRemoteTurn, setVoiceBusy,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,
   setAutomations, sseAutomation, removeAutomation,
   sseSubagentSnapshot, sseToolActivity, sseToolResult, sseActivityEvent,
   sseMcpAppRender,
   sseWorkflowEvent, clearWorkflowRun, reconcileWorkflowRuns,
-  sseSideResult, sseSideQueue, sideReleaseConsumed, sideClose, sideOptimisticAppend, sideOptimisticRollback,
+  sseSideResult, sseSideQueue, sideSendStatus, sideReleaseConsumed, sideClose, sideRestore, sideOptimisticAppend, sideOptimisticRollback,
 } = chatSlice.actions
 
-export { clampToolOutput, TOOL_OUTPUT_MAX_CHARS, queueEntryAttachments, queueEntryQuote, type QueueEntryAttachments } from './chat/wire'
+/** The `GET /api/spawn` read in flight, shared by every gone card that asks
+ *  while it is pending: a batch refusal, a reconnect and a tab opening on N
+ *  gone cards all dispatch together, and one inventory answers them all. */
+let spawnInventoryRead: ReturnType<typeof api.spawnList> | null = null
+const readSpawnInventory = () => (spawnInventoryRead ??= api.spawnList().finally(() => { spawnInventoryRead = null }))
+
+/**
+ * Reconcile a gone approval immediately against the backend's authoritative
+ * process inventory. A failed read deliberately leaves the card unresolved and
+ * active; SubagentProgressBar's existing reconciliation loop retries later.
+ */
+export const reconcileGoneSubagent = createAsyncThunk<void, { slot: string; id: string; approval_id: string }>(
+  'chat/reconcileGoneSubagent',
+  async ({ slot, id, approval_id }, { dispatch }) => {
+    const response = await readSpawnInventory()
+    const agent = (response.agents ?? []).find(a => a.id === id) ?? null
+    dispatch(reconcileSubagentApprovalGone({ slot, id, approval_id, agent }))
+  },
+)
+
+/** The `GET .../side` read in flight per slot, shared by the panel and the
+ *  `/side` command so one reload costs one read. */
+const sideRestoreReads = new Map<string, Promise<SideSnapshot>>()
+
+/**
+ * Settle a slot's Side Chat against the gateway's copy of its side conversation,
+ * once per page (`sideRestore`). A 404 is nothing to restore: the slot is gone, or
+ * the gateway predates the read. Any other failure rejects and settles nothing, so
+ * the caller can hold a question back instead of sending it into a conversation
+ * the panel cannot show.
+ */
+export const restoreSideConversation = createAsyncThunk<void, string, { state: RootState }>(
+  'chat/restoreSideConversation',
+  async (slot, { dispatch, getState }) => {
+    if (getState().chat.slotSideRestored?.[slot]) return
+    let read = sideRestoreReads.get(slot)
+    if (!read) {
+      read = api.sideState(slot)
+        .catch((e: unknown): SideSnapshot => {
+          if (isNotFoundError(e)) return { open: false }
+          throw e
+        })
+        .finally(() => { sideRestoreReads.delete(slot) })
+      sideRestoreReads.set(slot, read)
+    }
+    dispatch(sideRestore({ slot, snapshot: await read }))
+  },
+)
+
+export { clampToolOutput, TOOL_OUTPUT_MAX_CHARS, normalizeQueueEntries, queueEntryAttachments, queueEntryQuote, type QueueEntryAttachments } from './chat/wire'
+export { hydrateQueuedBubbles } from './chat/queue'
 export { floorForGen, hasUnidentifiedDurableRow, raiseChunkSeq, snapshotChunkGen, snapshotChunkSeq, transcriptTsMs } from './chat/transcript'
 export {
   OLDER_PAGE_LIMIT, OLDER_WALK_PAGE_LIMIT, SLOT_DETAIL_MAX_LIMIT, PANE_HYDRATE_LIMIT, REFRESH_LIMIT_CEILING,
   slotSwitchFetchLimit, slotCoverageShortfall, countMatchedFetchLimit, isSupersededPagingRejection,
   abortActiveOlderFetch, type CoverageRow,
 } from './chat/paging'
-export type { FollowupItem, SideMessage, SideQueueEntry, SideState, SlotState, SlotStatusDetail, WorkflowRunProgress } from './chat/state'
-export { FOLDER_SUGGESTION_MAX_TURNS, capturePendingAskId, pendingQuestionFor, shouldResolveAskOnSend } from './chat/composerCards'
+export type { ChatState, FollowupItem, SideMessage, SideQueueEntry, SideSendStatus, SideStandingNotice, SideState, SlotState, SlotStatusDetail, WorkflowRunProgress } from './chat/state'
+export { FOLDER_SUGGESTION_MAX_TURNS, capturePendingAskId, isAnsweredQuestionEnding, pendingQuestionFor, shouldResolveAskOnSend } from './chat/composerCards'
 export { mcpAppKey } from './chat/mcpApps'
 export {
-  isAwaitingSpawnApproval, selectSidebarApprovalCounts, selectSidebarStartedSubagentCounts, selectSidebarSubagentCounts, selectSlotPendingSpawnApprovals,
+  isActiveSubagent, isAwaitingSpawnApproval, isSpawnApprovalGone, isSpawnApprovalRetired, selectSidebarApprovalCounts, selectSidebarStartedSubagentCounts, selectSidebarSubagentCounts, selectSlotPendingSpawnApprovals,
   selectSlotSubagents, selectSlotSubagentsActive, selectSubagentActivityCount,
 } from './chat/subagents'
 export { WORKFLOW_TERMINAL_STATUSES, isTerminalWorkflowStatus, selectSidebarWorkflowActive, selectSidebarWorkflowActiveKeys } from './chat/workflows'
 export { selectAutomationForSlot, selectSidebarAutomationRunningKeys } from './chat/automations'
 export { queueEditBroadcastAt } from './chat/side'
 export {
-  selectActiveSlotProject, selectComposerBusy, selectContinuable, selectSendConfirmed, selectSlotMessages,
+  selectActiveSlotProject, selectComposerBusy, selectContinuable, selectProjectChipLocked, selectSendAccepted, selectSendConfirmed, selectSlotMessages,
   selectSlotPendingApproval, selectSlotRunEpoch, selectSlotStreamState, selectSlotToolLog, selectTrailingSendUnconfirmed,
-  selectTurnInterrupted,
+  selectSlotTurnFromWake, selectTurnInterrupted,
+  QUIET_END_SERVER, QUIET_END_TOOL,
 } from './chat/selectors'
 export { clearSwitchSlotGone, switchSlot, switchSlotNoticeCopy, type SwitchSlotArg } from './chat/slotSwitch'
 export { refreshSlot, warmSlotCache } from './chat/slotRefresh'
+export { wireTurnIdentity } from './chat/runState'
 export { WINDOW_WALK_MAX_PAGES } from './chat/windowWalk'
-export { createSlot, deleteHistorySession, fetchHistory, forkSlot, resumeFromHistory } from './chat/lifecycle'
+export { captureForkOrigin, clearHistorySessions, createSlot, deleteHistorySession, fetchHistory, forkMayOpen, forkSlot, listForkedSlot, resumeFromHistory, type ForkOrigin } from './chat/lifecycle'
+export { openCreatedSlot } from './chat/openCreatedSlot'
 
 export default withRefreshRevision(chatSlice.reducer)

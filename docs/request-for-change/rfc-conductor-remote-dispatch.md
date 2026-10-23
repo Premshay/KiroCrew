@@ -41,11 +41,11 @@ Three decisions:
 
 - **Session tools.** `session_create`, `session_send`, `session_read_message`,
   `session_stop` and `session_close` (`_session_tools` in
-  `src/kiro_crew/mcp_dashboard.py`) call `/api/session-control/*` on this
-  gateway. Those routes are MCP-only and strict (`server.py`, the
+  `src/kiro_crew/mcp_dashboard_session_tools.py`) call `/api/session-control/*` on this
+  gateway. Those routes are MCP-only and strict (`dashboard/server_internal_paths.py`, the
   *Session control* block of the internal-secret path set). No argument names
   another machine.
-- **The proxy.** `api_instances_proxy` (`src/kiro_crew/dashboard/handlers_instances.py`)
+- **The proxy.** `api_instances_proxy` (`src/kiro_crew/dashboard/handlers_instances_peer.py`)
   forwards only paths under `_PROXY_ALLOWED_PREFIXES` = `api/chat`, `api/stream`,
   owner-only, and redacts every reply since
   [#16757](https://github.com/kirodotdev/KiroCrew/pull/16757)
@@ -80,7 +80,7 @@ Three decisions:
 | No crew target | The session tools reach only this gateway's slot table. |
 | Unbindable | `bind` looks up a local slot; a peer slot has none, so it answers `unknown_worker_session`. |
 | Reports land elsewhere | A worker on the peer calls the PEER's `work_brief`; the peer has no binding, so it answers `not_bound`, and its `work_report` writes nothing the hub can see. |
-| Wrong flags | `ledger_wake.worker_running` and `ledger_wake.worker_closed` read local slots. The read rows (`_slot_closed` in `handlers/work_ledger.py`) and the wake gate (`probes/work_ledger.py`, `slack/gateway.py`) both use them, so a remote worker reads as closed and, once it has reported, wakes the conductor as stalled at once. |
+| Wrong flags | `ledger_wake.worker_running` and `ledger_wake.worker_closed` read local slots. The read rows (`_slot_closed` in `handlers/work_ledger.py`) and the wake gate (`probes/work_ledger.py`, `slack/gateway_runtime/nudge_wiring.py`) both use them, so a remote worker reads as closed and, once it has reported, wakes the conductor as stalled at once. |
 
 The tunnel only opens hub → peer, so the peer cannot call the hub back.
 

@@ -3,51 +3,103 @@
 Only this module interprets inheritance. Agent JSON stays a harness document;
 provenance, pending publication and local tombstones live in agent_state.
 Filesystem entry points run on a worker, never on the inference hot path.
+Credential-safe transport rendering lives in ``agent_capabilities_redaction``;
+patches through this facade reach that owner.
 """
 
 from __future__ import annotations
 
-import copy
-import fnmatch
-import hashlib
-import hmac
-import json
-import secrets
-from contextlib import ExitStack
-from pathlib import Path
-from typing import Any, Callable
+import copy  # noqa: F401 - preserved facade import
+import fnmatch  # noqa: F401 - preserved facade import
+import hashlib  # noqa: F401 - preserved facade import
+import hmac  # noqa: F401 - preserved facade import
+import importlib as _importlib  # noqa: F401 - preserved facade import
+import json  # noqa: F401 - preserved facade import
+import logging  # noqa: F401 - preserved facade import
+import secrets  # noqa: F401 - preserved facade import
+import sys as _sys  # noqa: F401 - preserved facade import
+from contextlib import ExitStack  # noqa: F401 - preserved facade import
+from pathlib import Path  # noqa: F401 - preserved facade import
+from typing import Any, Callable  # noqa: F401 - preserved facade import
 
-from kiro_crew import agent_state, kiro_cli
-from kiro_crew.agent import (
+from kiro_crew import _facade_mirror  # noqa: F401 - preserved facade import
+from kiro_crew import agent_state, kiro_cli  # noqa: F401 - preserved facade import
+from kiro_crew.agent import (  # noqa: F401 - preserved facade import
     OWNED_KIRO_AGENT_FILES,
     _is_confirmed_managed_dashboard_author,
     _read_spec_capped,
     agents_spec_lock,
     kiro_agents_dir_path,
 )
-from kiro_crew.agent_files import DASHBOARD_AUTHOR_AGENT_FILENAME
-from kiro_crew.agent_sdk.drivers.acp import derived_agent_permissions
-from kiro_crew.agent_spec_format import (
+from kiro_crew.agent_capabilities_redaction import (  # noqa: F401 - compatibility surface
+    _argument_secrets,
+    _contains_mask,
+    _safe_view,
+    safe_view,
+)
+from kiro_crew.agent_capabilities_withheld import (  # noqa: F401 - preserved facade import
+    withheld_approvals as _withheld_approvals,
+)
+from kiro_crew.agent_files import (  # noqa: F401 - preserved facade import
+    DASHBOARD_AUTHOR_AGENT_FILENAME,
+)
+from kiro_crew.agent_sdk.drivers.acp import (  # noqa: F401 - preserved facade import
+    derived_agent_permissions,
+)
+from kiro_crew.agent_spec_format import (  # noqa: F401 - preserved facade import
     agent_spec_candidates,
     iter_agent_spec_files,
     parse_agent_spec_bytes,
 )
-from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import (
+from kiro_crew.atomic_write import atomic_write  # noqa: F401 - preserved facade import
+from kiro_crew.config.loader import (  # noqa: F401 - preserved facade import
     KiroCrewConfig,
     config_local_path,
     default_project_dir,
     update_config_locked,
 )
-from kiro_crew.config.paths import project_agents_dir
-from kiro_crew.platform import redact_via_context
-from kiro_crew.platform.governance import sanitize_agent_config_governance
-from kiro_crew.platform.governance_profiles import governance_answer_generation
-from kiro_crew.validation import is_registered_agent_name
+from kiro_crew.config.paths import project_agents_dir  # noqa: F401 - preserved facade import
+from kiro_crew.mcp_cleanup import mcp_entry_is_muted  # noqa: F401 - preserved facade import
+from kiro_crew.platform import redact_via_context  # noqa: F401 - preserved facade import
+from kiro_crew.platform.governance import (  # noqa: F401 - preserved facade import
+    sanitize_agent_config_governance,
+)
+from kiro_crew.platform.governance_profiles import (  # noqa: F401 - preserved facade import
+    governance_answer_generation,
+)
+from kiro_crew.validation import is_registered_agent_name  # noqa: F401 - preserved facade import
+
+logger = logging.getLogger(__name__)
 
 SECTIONS = agent_state.CAPABILITY_SECTIONS
 MAX_OPERATIONS = 300
 MAX_DOCUMENT_BYTES = 1024 * 1024
+
+#: Managed servers a member's copy may carry when its Parent does not: the
+#: crewmate's own record, which every crewmate is meant to have. Its transport
+#: is never the request's: it is the entry the default template carries
+#: (:func:`_member_platform_transport`), refreshed on every projection.
+MEMBER_PLATFORM_SERVERS = frozenset({"kirocrew-mate"})
+
+
+def _member_platform_transport(name: str) -> dict | None:
+    from kiro_crew import agent as agent_mod
+
+    return agent_mod.managed_member_transport(name)
+
+
+def _platform_entry(transport: dict, disabled: bool) -> dict:
+    """*transport* as the copy's entry: ``disabled`` only when it is a mute.
+
+    An enabled entry carries no ``disabled`` key at all, exactly as the default
+    template's does. A ``"disabled": false`` would be a key a per-session element
+    cannot express, so the session mount would withhold the server's identity
+    element and every call would refuse ``identity_unattested``.
+    """
+    entry = {k: v for k, v in transport.items() if k != "disabled"}
+    if disabled:
+        entry["disabled"] = True
+    return entry
 
 
 class CapabilityError(ValueError):
@@ -59,10 +111,17 @@ class CapabilityError(ValueError):
         self.status = status
         #: Crew member whose spec failed, set by the session start seam.
         self.member = ""
-        #: Basename of the member's own agent file a refusal is about. Crew names
-        #: it (``target + ".json"``), so a hand edit cannot change it. Never a
+        #: Basename of the agent file a refusal is about, as resolved on disk
+        #: (``<name>.md`` or a file declaring the name both count). Never a
         #: directory: the agents folder is fixed per scope and a path is not.
         self.file = ""
+        #: The draft's own approval reference a shape refusal is about, echoed
+        #: back so the pane names it without re-implementing the shape rule.
+        self.ref = ""
+        #: The project a start refusal names: the saved one for
+        #: ``project_identity_changed``, the one holding the shadowing file for
+        #: ``private_template_shadowed``.
+        self.project = ""
 
 
 def _digest(value: Any) -> str:
@@ -259,7 +318,9 @@ def _materialize(base: dict, rows: dict[str, dict], catalog: dict[str, str]) -> 
 
 def _approval_ref(ref: str) -> tuple[str, str]:
     if not ref.startswith("@") or "/" not in ref or not all(ref[1:].split("/", 1)):
-        raise CapabilityError("invalid_approval_ref", 400)
+        error = CapabilityError("invalid_approval_ref", 400)
+        error.ref = ref
+        raise error
     return tuple(ref[1:].split("/", 1))  # type: ignore[return-value]
 
 
@@ -484,130 +545,6 @@ def _sanitize_projection(spec: dict, intent: dict, catalog: dict[str, str]) -> N
             intent["overrides"][section][key] = {"action": "remove"}
 
 
-def safe_view(value: Any) -> Any:
-    """Keep wire types intact; credential-bearing maps never expose their values."""
-    return _safe_view(value, ())
-
-
-def _argument_secrets(args: Any) -> list[str]:
-    """Collect credential option values before masking any transport leaves.
-
-    Keep argv intact: an inline option is masked as one scalar so retain_paths
-    restores the exact original argument, not a reconstructed command line.
-    """
-    import re
-
-    if not isinstance(args, list):
-        return []
-    values = []
-    credential_value = False
-    options_ended = False
-    for index, arg in enumerate(args):
-        if not isinstance(arg, str):
-            credential_value = False
-            continue
-        if credential_value:
-            if arg:
-                values.append(arg)
-            credential_value = False
-            continue
-        if arg == "--":
-            options_ended = True
-            continue
-        option, separator, value = arg.partition("=")
-        # Complete environment assignments are credential-bearing without an
-        # option prefix (including values passed to -e/--env). A bare name must
-        # never consume the following argv element as a credential value.
-        assignment = bool(separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", option))
-        # The option terminator does not terminate environment assignments.
-        if options_ended and not assignment:
-            continue
-        # -u is also used for non-auth flags (for example Python unbuffered).
-        # Mask only its colon-bearing basic-auth shape, not arbitrary short options.
-        if arg in ("-u", "--user") and index + 1 < len(args):
-            candidate = args[index + 1]
-            if isinstance(candidate, str) and ":" in candidate:
-                values.append(candidate)
-        elif arg.startswith("-u") and ":" in arg[2:]:
-            values.append(arg[2:])
-        elif arg.startswith("--user=") and ":" in arg[7:]:
-            values.append(arg[7:])
-        # Match names, not credential formats or minimum secret lengths.
-        if (option.startswith("-") or assignment) and re.search(
-            r"(?:^|[-_])(?:key|token|secret|password|passwd|passphrase|credentials?|auth|authorization)$",
-            re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", option),
-            re.IGNORECASE,
-        ):
-            if separator:
-                if value:
-                    values.append(value)
-            else:
-                credential_value = True
-    return values
-
-
-def _safe_view(value: Any, inherited_secrets: tuple[str, ...]) -> Any:
-    """Carry known credentials through their subtree, not unrelated response rows."""
-    from urllib.parse import urlsplit
-
-    if isinstance(value, dict):
-        private_values = (
-            [
-                v
-                for field in ("env", "headers")
-                for v in (value.get(field) or {}).values()
-                if isinstance(v, str) and v
-            ]
-            if all(isinstance(value.get(field, {}), dict) for field in ("env", "headers"))
-            else []
-        )
-        oauth = value.get("oauth")
-        if isinstance(oauth, dict):
-            secret = oauth.get("clientSecret")
-            if isinstance(secret, str) and secret:
-                private_values.append(secret)
-        private_values.extend(_argument_secrets(value.get("args")))
-        private_values.extend(inherited_secrets)
-        secrets = tuple(private_values)
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            field = str(key).lower()
-            if field in {"env", "headers"} and isinstance(item, dict):
-                result[redact_via_context(str(key))] = {
-                    redact_via_context(str(k)): "[REDACTED]" if v else v for k, v in item.items()
-                }
-            elif field == "url" and isinstance(item, str):
-                try:
-                    parsed = urlsplit(item)
-                    result[key] = (
-                        "[REDACTED]"
-                        if parsed.username or parsed.password or parsed.query
-                        else _safe_view(item, secrets)
-                    )
-                except ValueError:
-                    result[key] = "[REDACTED]"
-            else:
-                result[redact_via_context(str(key))] = _safe_view(item, secrets)
-        return result
-    if isinstance(value, list):
-        return [_safe_view(v, inherited_secrets) for v in value]
-    if isinstance(value, str):
-        if any(secret in value for secret in inherited_secrets):
-            return "[REDACTED]"
-        redacted = redact_via_context(value)
-        return "[REDACTED]" if redacted != value else value
-    return value
-
-
-def _contains_mask(value: Any) -> bool:
-    """A displayed secret is not a replacement value, even in a direct HTTP call."""
-    if isinstance(value, str):
-        return any(marker in value.lower() for marker in ("[redacted", "<redacted>", "***", "•••"))
-    if isinstance(value, dict):
-        return any(_contains_mask(v) for v in value.values())
-    return isinstance(value, list) and any(_contains_mask(v) for v in value)
-
-
 def _retain_transport(value: Any, paths: Any, original: dict) -> dict:
     """Restore only revision-bound redacted leaves in a whole replacement."""
     import re
@@ -715,6 +652,57 @@ def _parent_is_owned(snap: dict) -> bool:
     return True
 
 
+def _fork_refresh_failed_for(name: str) -> bool:
+    """Did the last fork refresh record a failure for *name* (or for every fork)?"""
+    import kiro_crew.agent as agent_facade
+
+    failed: frozenset[str] = getattr(agent_facade, "_fork_refresh_failed", frozenset())
+    return bool(name) and (name in failed or "*" in failed)
+
+
+def _detach_owned(snap: dict) -> bool:
+    """Would the fork refresh re-apply owned plumbing to this member's copy?
+
+    Asks the refresh's own rule (origin NAME, any scope) as well as
+    ``_parent_is_owned`` (global scope only): a project-scoped parent at an
+    owned name is refreshed as owned too.
+    """
+    from kiro_crew.agent import fork_origin_is_owned
+
+    return _parent_is_owned(snap) or fork_origin_is_owned(snap["target"])
+
+
+def _detach_blocker(snap: dict, intent: dict, owned: bool) -> str | None:
+    """The code that refuses Stop following for this saved setup, else None.
+
+    Once the intent is gone the member runs as an independent copy, so a
+    setup that copy could not keep is refused: single-tool limits (chat
+    start checks them against the backend only for a saved setup) and a
+    removal under a template Crew owns (the refresh restores it).
+    """
+    spec = snap["spec"]
+    if tool_limited_servers(spec):
+        return "detach_tool_limits_unkept"
+    if owned and any(
+        override.get("action") == "remove"
+        for section in SECTIONS
+        for override in intent["overrides"].get(section, {}).values()
+    ):
+        return "detach_removal_unkept"
+    return None
+
+
+def _detach_loses_mcp_json(snap: dict) -> bool:
+    """Does the copy also read the global mcp.json (``includeMcpJson`` unset)?
+
+    The fork refresh pins that merge off for a private copy with no saved
+    intent, so stopping turns it off. That is the state such a copy had
+    before it was enrolled, but it changes which servers the member loads, so
+    the owner confirms it (``accept_mcp_json``) instead of it happening silently.
+    """
+    return snap["spec"].get("includeMcpJson", True) is not False
+
+
 def _unvouched(snap: dict, spec: dict) -> list[str]:
     """Top-level keys of *spec* the review cannot show and this funnel cannot vouch for.
 
@@ -788,6 +776,23 @@ def _maintain_owned(snap: dict, spec: dict) -> None:
         spec["mcpServers"] = {
             key: value for key, value in spec.get("mcpServers", {}).items() if key in selected
         }
+    else:
+        # A platform server the copy carries and its Parent does not is Crew's own
+        # entry, so it is kept current here the way an owned Parent's refresh keeps
+        # it, and retracted when a fresh build would not emit it.
+        parent_servers = snap["parent_spec"].get("mcpServers") or {}
+        for key in MEMBER_PLATFORM_SERVERS & selected.keys() - parent_servers.keys():
+            current = _member_platform_transport(key)
+            if current is None:
+                spec.get("mcpServers", {}).pop(key, None)
+                continue
+            entry = _platform_entry(current, selected[key].get("disabled") is True)
+            # A per-tool restriction the copy already holds survives the refresh:
+            # the transport is Crew's to keep current, the restriction is not.
+            retained = selected[key].get("disabledTools")
+            if retained:
+                entry["disabledTools"] = list(retained)
+            spec.setdefault("mcpServers", {})[key] = entry
     namespaced = {key for key in selected if ":" in key}
     if namespaced:
         current = _collect_app_mcp_servers(audit=False)
@@ -875,7 +880,10 @@ class CapabilityService:
         if lineage:
             path, spec, own_descriptor = _source(target, project, allow_private=True)
             if own_descriptor["scope"] != "global":
-                raise CapabilityError("private_template_shadowed")
+                shadowed = CapabilityError("private_template_shadowed")
+                shadowed.file = path.name
+                shadowed.project = project
+                raise shadowed
             if spec.get("name") != target:
                 raise CapabilityError("source_changed")
             parent_name = lineage["forked_from"]
@@ -1033,9 +1041,16 @@ class CapabilityService:
                         if set(value) != {"disabled"} or type(value["disabled"]) is not bool:
                             raise CapabilityError("managed_transport_locked", 400)
                         original = parent_rows[section].get(key)
+                        platform = original is None and key in MEMBER_PLATFORM_SERVERS
+                        if platform:
+                            original = _member_platform_transport(key)
                         if original is None:
                             raise CapabilityError("managed_transport_unavailable")
-                        value = {**original, "disabled": value["disabled"]}
+                        value = (
+                            _platform_entry(original, value["disabled"])
+                            if platform
+                            else {**original, "disabled": value["disabled"]}
+                        )
                     elif ":" in key:
                         from kiro_crew.agent import _collect_app_mcp_servers
 
@@ -1170,8 +1185,24 @@ class CapabilityService:
                 prepare_member_capabilities(snap["member"], snap["project"])
             except CapabilityError as exc:
                 runtime.update(status="failed", error_code=exc.code)
+        # Only a saved (or previewed, which always carries its projected
+        # intent) spec is gated at chat start; an unenrolled member runs its
+        # template as before and gets no warning.
+        backend_warning = member_backend_warning(selected) if intent else None
+        detach_blocked = None
+        detach_mcp_json_loss = False
+        if intent and isinstance(snap.get("spec"), dict) and snap.get("target"):
+            try:
+                detach_blocked = _detach_blocker(snap, intent, _detach_owned(snap))
+                detach_mcp_json_loss = _detach_loses_mcp_json(snap)
+            except Exception:
+                detach_blocked = None
+                detach_mcp_json_loss = False
         return safe_view(
             {
+                "backend_warning": backend_warning,
+                "detach_blocked": detach_blocked,
+                "detach_mcp_json_loss": detach_mcp_json_loss,
                 "schema_version": 1,
                 "member": snap["member"],
                 "mode": "inherited" if intent else snap["mode"],
@@ -1294,6 +1325,7 @@ class CapabilityService:
                             }
                         )
         view["impact"] = safe_view(impact)
+        view["withheld_approvals"] = _withheld_approvals(request, spec, intent, snap["catalog"])
         view["preview_token"] = self._preview_token(plans, request)
         return view
 
@@ -1319,6 +1351,124 @@ class CapabilityService:
         return self.put(
             member, {**body, "preview_token": preview["preview_token"]}, reset_parent=True
         )
+
+    def detach(self, member: str, body: Any) -> dict:
+        """Stop following the Parent: the member keeps its saved values as its own.
+
+        The member's private copy already holds the materialized effective spec,
+        so dropping the inheritance intent leaves an independent private copy
+        (``legacy_snapshot``) with exactly the values the member runs today. No
+        value is recomputed or loosened. Only verified saved bytes are kept: a
+        pending save or a drifted file is refused, so the member never keeps
+        bytes nobody reviewed. The only write is the sidecar entry, so a failure
+        changes nothing; a governance answer newer than the save is applied by
+        the fork refresh that follows. The Parent itself need not be readable: a
+        missing Parent is a reason to leave.
+        """
+        if (
+            not isinstance(body, dict)
+            or "revision" not in body
+            or not set(body) <= {"revision", "accept_mcp_json"}
+        ):
+            raise CapabilityError("invalid_request", 400)
+        if not isinstance(body["revision"], str):
+            raise CapabilityError("invalid_revision", 400)
+        accept_mcp_json = body.get("accept_mcp_json", False)
+        if not isinstance(accept_mcp_json, bool):
+            raise CapabilityError("invalid_request", 400)
+        snap = self._snapshot(member)
+        if body["revision"] != snap["revision"]:
+            raise CapabilityError("stale_revision")
+        if not snap["intent"]:
+            raise CapabilityError("not_inherited")
+        root = kiro_agents_dir_path()
+        from kiro_crew.agent import hold_spawn_gate
+
+        stale_governance = [False]
+        mcp_json_pinned = [False]
+        target_name = [""]
+        # Hold the spawn gate across the write and the refresh it triggers, so a
+        # session cannot start on not-yet-refiltered grants between them.
+        with hold_spawn_gate():
+            with ExitStack() as locks:
+
+                def mutate(document: dict) -> None:
+                    locks.enter_context(agents_spec_lock(root))
+                    locks.enter_context(agent_state._locked())
+                    fresh = self._snapshot(member, document, snap)
+                    if fresh["revision"] != snap["revision"]:
+                        raise CapabilityError("stale_revision")
+                    intent = fresh["intent"]
+                    if not intent:
+                        raise CapabilityError("not_inherited")
+                    if intent.get("status") != "saved":
+                        raise CapabilityError("materialization_pending")
+                    lineage = agent_state.get_fork_info(fresh["target"], strict=True)
+                    if not lineage or lineage["private_to"] != member:
+                        raise CapabilityError("foreign_private_copy")
+                    if _digest(fresh["spec"]) != intent.get("materialized"):
+                        raise CapabilityError("materialization_changed")
+                    # Refusals decided by the saved setup alone (the pane also gets them
+                    # in the view, so it can say so before the user opens the dialog).
+                    owned = _detach_owned(fresh)
+                    blocker = _detach_blocker(fresh, intent, owned)
+                    if blocker:
+                        raise CapabilityError(blocker)
+                    # Turning the global mcp.json merge off changes which servers the
+                    # member loads, so the owner confirms it first.
+                    loses_mcp_json = _detach_loses_mcp_json(fresh)
+                    if loses_mcp_json and not accept_mcp_json:
+                        raise CapabilityError("detach_mcp_json_unkept")
+                    # One write: the spec file is never touched, so a failure
+                    # leaves the intent and the reviewed bytes exactly as they
+                    # were. A governance answer newer than the save is applied by
+                    # the fork refresh below, which governs every private copy
+                    # that has no saved intent.
+                    target_name[0] = fresh["target"]
+                    mcp_json_pinned[0] = loses_mcp_json
+                    stale_governance[0] = intent.get("governance_generation") != (
+                        governance_answer_generation()
+                    )
+                    state = agent_state._read(strict=True)
+                    entry = state[fresh["target"]]
+                    entry.pop("capabilities")
+                    # A copy of a template Crew owns can still track the shipped
+                    # model (``model_managed``); the fork refresh would then
+                    # replace a model the member chose. The member's own copy
+                    # keeps the model it runs, so stop tracking it, in this write.
+                    if (
+                        owned
+                        and entry.get("model_managed") is True
+                        and any(
+                            override.get("action") == "set"
+                            for override in intent["overrides"].get("model", {}).values()
+                        )
+                    ):
+                        entry["model_managed"] = False
+                    agent_state._write(state)
+                    return None
+
+                self._write_bindings({member: snap}, mutate)
+            from kiro_crew.agent_discovery import clear_list_agents_cache
+
+            clear_list_agents_cache()
+            if (
+                stale_governance[0]
+                or mcp_json_pinned[0]
+                or _fork_refresh_failed_for(target_name[0])
+            ):
+                # The kept copy was last governed under an older answer, or an
+                # earlier refresh failed for it while it still had an intent (a
+                # missing Parent makes that refresh fail). Re-run the refresh that
+                # filters every intent-free private copy; if it fails the copy's
+                # sessions stay blocked (fail closed), as for any fork.
+                try:
+                    from kiro_crew.agent import _refresh_forked_templates
+
+                    _refresh_forked_templates()
+                except Exception:
+                    logger.warning("fork refresh after stop following failed", exc_info=True)
+        return self.get(member)
 
     def _finish_publish(self, member: str, expected_template: str, name: str) -> dict:
         """Clear only this publication's lineage, with normal config-first locks."""
@@ -1607,8 +1757,26 @@ def require_unmanaged_template(name: str) -> None:
         raise CapabilityError("capabilities_editor_required")
 
 
+def _parent_identity(descriptor: dict) -> dict:
+    """The Parent file a descriptor names, without the project it was resolved from.
+
+    ``_source`` records the project it searched in, but a global Parent is the
+    same file from every project that does not shadow its name, so that field
+    alone never makes two resolutions different Parents. Name, scope, source and
+    resolved path still must all match.
+    """
+    return {key: value for key, value in descriptor.items() if key != "project"}
+
+
 def prepare_member_capabilities(member: str, project_dir: str | Path | None = None) -> dict:
-    """Read-only startup seam; success proves saved bytes, never runtime loading."""
+    """Read-only startup seam; success proves saved bytes, never runtime loading.
+
+    *project_dir* is the chat's own project. It may differ from the project the
+    capabilities were saved in: the start is refused only when that project
+    resolves a different Parent than the reviewed one (``project_identity_changed``).
+    A project-scoped Parent belongs to its own project; a global Parent stays
+    the reviewed Parent until a project template shadows its name.
+    """
     cfg = KiroCrewConfig.load()
     binding = cfg.agents.get(member)
     if binding is None:
@@ -1617,8 +1785,12 @@ def prepare_member_capabilities(member: str, project_dir: str | Path | None = No
     if intent is None:
         return {"template": binding.kiro_agent, "revision": "", "status": "unverified"}
     project = str(Path(project_dir).resolve()) if project_dir else ""
-    if project != intent["parent"]["project"]:
-        raise CapabilityError("project_identity_changed")
+    saved_parent = intent["parent"]
+    other_project = project != saved_parent["project"]
+    if other_project and saved_parent["scope"] != "global":
+        moved = CapabilityError("project_identity_changed")
+        moved.project = saved_parent["project"]
+        raise moved
     if intent.get("status") != "saved":
         raise CapabilityError("materialization_pending")
     if intent.get("governance_generation") != governance_answer_generation():
@@ -1626,12 +1798,19 @@ def prepare_member_capabilities(member: str, project_dir: str | Path | None = No
     lineage = agent_state.get_fork_info(binding.kiro_agent, strict=True)
     if not lineage or lineage["private_to"] != member:
         raise CapabilityError("foreign_private_copy")
-    _, _, descriptor = _source(intent["parent"]["name"], project)
-    if descriptor != intent["parent"]:
-        raise CapabilityError("parent_identity_changed")
-    _, spec, own = _source(binding.kiro_agent, project, allow_private=True)
+    _, _, descriptor = _source(saved_parent["name"], project)
+    if _parent_identity(descriptor) != _parent_identity(saved_parent):
+        changed = CapabilityError(
+            "project_identity_changed" if other_project else "parent_identity_changed"
+        )
+        changed.project = saved_parent["project"] if other_project else ""
+        raise changed
+    own_path, spec, own = _source(binding.kiro_agent, project, allow_private=True)
     if own["scope"] != "global":
-        raise CapabilityError("private_template_shadowed")
+        shadowed = CapabilityError("private_template_shadowed")
+        shadowed.file = own_path.name
+        shadowed.project = project
+        raise shadowed
     if _digest(spec) != intent.get("materialized"):
         raise CapabilityError("materialization_changed")
     if intent.get("governance_generation") != governance_answer_generation():
@@ -1645,7 +1824,85 @@ def prepare_member_capabilities(member: str, project_dir: str | Path | None = No
             for name, server in spec.get("mcpServers", {}).items()
             if not server.get("disabled", False)
         ),
+        # Launched servers whose entry turns single tools off. Not every member
+        # backend can carry that (``ACP_BACKENDS_MEMBER_TOOL_LIMITS``).
+        "tool_limited_servers": tool_limited_servers(spec),
     }
+
+
+def tool_limited_servers(spec: dict) -> tuple[str, ...]:
+    """Launched MCP servers in *spec* whose entry turns single tools off.
+
+    The one definition both the chat-start seam (via
+    :func:`prepare_member_capabilities`) and the Capabilities page warning read,
+    so the page cannot name a different set than the start refuses on.
+    """
+    servers = spec.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return ()
+    return tuple(
+        sorted(
+            name
+            for name, server in servers.items()
+            if isinstance(server, dict)
+            and server.get("disabledTools")
+            and not mcp_entry_is_muted(server)
+        )
+    )
+
+
+def member_backend_gap(backend: str, limited_servers: tuple[str, ...]) -> str | None:
+    """Why a member chat on *backend* would refuse a saved spec, or ``None``.
+
+    Mirrors the start gate in ``session_allocation``: a backend outside
+    ``ACP_BACKENDS_MEMBER_CAPABILITIES`` refuses with
+    ``capability_harness_unsupported``; one outside
+    ``ACP_BACKENDS_MEMBER_TOOL_LIMITS`` refuses a spec with single-tool limits
+    with ``capability_tool_limits_unsupported``. Pure: no config read.
+    """
+    from kiro_crew.acp_backends import (
+        ACP_BACKENDS_MEMBER_CAPABILITIES,
+        ACP_BACKENDS_MEMBER_TOOL_LIMITS,
+    )
+
+    if backend not in ACP_BACKENDS_MEMBER_CAPABILITIES:
+        return "harness_unsupported"
+    if limited_servers and backend not in ACP_BACKENDS_MEMBER_TOOL_LIMITS:
+        return "tool_limits_unsupported"
+    return None
+
+
+def member_backend_warning(spec: dict) -> dict | None:
+    """Non-blocking warning for the Capabilities page, or ``None``.
+
+    Checks both backends a member's chats can start on, resolved as
+    ``members.select_provider_backend`` resolves them: the member DM arm
+    (``agent.member_acp_backend``) and the default arm (``agent.acp_backend``),
+    which carries the member's Slack threads, cron jobs and spawned sessions --
+    those also reach the chat-start gate through ``resolve_crew_identity``. The
+    first backend that would refuse is named, member DMs first. A spawn with an
+    explicit backend override is chosen per call and cannot be known here. A
+    warning only: the settings can change after the save, so nothing refuses.
+    """
+    from kiro_crew.acp_backends import resolve_selected_backend
+
+    cfg = KiroCrewConfig.load()
+    limited = tool_limited_servers(spec)
+    for setting, value in (
+        ("agent.member_acp_backend", cfg.agent.member_acp_backend),
+        ("agent.acp_backend", cfg.agent.acp_backend),
+    ):
+        backend = resolve_selected_backend(value)
+        code = member_backend_gap(backend, limited)
+        if code is None:
+            continue
+        warning: dict[str, Any] = {"code": code, "backend": backend, "setting": setting}
+        # Also on a harness refusal: switching to a member backend that loads
+        # saved specs (kas) would then refuse these, so the page names both fixes.
+        if limited:
+            warning["servers"] = list(limited)
+        return warning
+    return None
 
 
 def reconcile_member_capabilities(member: str) -> None:
@@ -1664,3 +1921,13 @@ def reconcile_member_capabilities(member: str) -> None:
     body = {"revision": snapshot["revision"]}
     preview = service.preview(member, body)
     service.put(member, {**body, "preview_token": preview["preview_token"]})
+
+
+# Forward facade patches to the owner as well.
+
+_OWNERS = ("kiro_crew.agent_capabilities_redaction",)
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule

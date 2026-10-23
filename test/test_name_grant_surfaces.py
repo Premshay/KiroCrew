@@ -16,7 +16,7 @@ here the subject is each surface's wiring. The surfaces here reach the check
 through ``name_grant.refusal_for_event``; the dashboard is different — its
 rungs resolve their own module-level ``_name_grant_refusal_off_loop`` alias
 (the seam its existing tests stub), so its rung behaviour is exercised by the
-``test_name_grant.py`` / ``test_chat_runner_coverage.py`` dashboard tests,
+``test_name_grant.py`` / ``test_chat_runner_coverage_approval.py`` dashboard tests,
 while this file pins that the alias IS the promoted helper and that the
 chokepoint's decline-not-raise guard covers the dashboard seam too.
 """
@@ -162,9 +162,14 @@ class TestLoopSafetyPins:
         from kiro_crew.discord import transport_dispatch as discord_dispatch
         from kiro_crew.messaging import driver
         from kiro_crew.slack import handler as slack_handler
+        from kiro_crew.slack import handler_runtime
         from kiro_crew.slack import transport_dispatch as slack_dispatch
         from kiro_crew.telegram import transport_dispatch as telegram_dispatch
+        from kiro_crew.telegram.dispatch import turn_engine as telegram_turn_engine
+        from kiro_crew.telegram.dispatch import turn_queue as telegram_turn_queue
 
+        # The Discord dispatcher is its facade and the owners it is composed from.
+        discord_owners = [importlib.import_module(o) for o in discord_dispatch._OWNERS]
         assert chat_runner._name_grant_refusal_off_loop is name_grant.refusal_for_command_off_loop
         # The dashboard's rung is composed into chat_runner from these owners.
         owners = [
@@ -172,6 +177,12 @@ class TestLoopSafetyPins:
             for info in pkgutil.iter_modules(chat_turn.__path__)
         ]
         assert owners, "the owner scan found no module, so it is measuring nothing"
+        # The native Slack turn's rungs run in these owners of the handler facade.
+        slack_owners = [
+            importlib.import_module(f"{handler_runtime.__name__}.{info.name}")
+            for info in pkgutil.iter_modules(handler_runtime.__path__)
+        ]
+        assert slack_owners, "the owner scan found no module, so it is measuring nothing"
         for mod in (
             chat_runner,
             *owners,
@@ -181,10 +192,15 @@ class TestLoopSafetyPins:
             tool_permission,
             driver,
             slack_handler,
+            *slack_owners,
             llm_helpers,
+            *map(importlib.import_module, llm_helpers._OWNERS),
             slack_dispatch,
             discord_dispatch,
+            *discord_owners,
             telegram_dispatch,
+            telegram_turn_engine,
+            telegram_turn_queue,
         ):
             assert "asyncio.to_thread(name_grant" not in inspect.getsource(mod), mod.__name__
 
@@ -194,16 +210,29 @@ class TestLoopSafetyPins:
         # instead. A gate (or its host module) that starts calling this module
         # would put PATH resolution and file digesting back on the loop. The
         # three channel transports host their gates as inline closures, so the
-        # assertion covers the whole module for each.
+        # assertion covers the whole module for each (Telegram's closure is in its
+        # turn engine owner, read with the dispatcher's other modules).
+        import importlib
         import inspect
 
         from kiro_crew.discord import transport_dispatch as discord_dispatch
         from kiro_crew.messaging import dispatch
         from kiro_crew.slack import transport_dispatch as slack_dispatch
         from kiro_crew.telegram import transport_dispatch as telegram_dispatch
+        from kiro_crew.telegram.dispatch import turn_engine as telegram_turn_engine
+        from kiro_crew.telegram.dispatch import turn_queue as telegram_turn_queue
 
+        # The Discord dispatcher is its facade and the owners it is composed from.
+        discord_owners = [importlib.import_module(o) for o in discord_dispatch._OWNERS]
         assert "name_grant" not in inspect.getsource(dispatch.build_tool_gate)
-        for mod in (slack_dispatch, discord_dispatch, telegram_dispatch):
+        for mod in (
+            slack_dispatch,
+            discord_dispatch,
+            *discord_owners,
+            telegram_dispatch,
+            telegram_turn_engine,
+            telegram_turn_queue,
+        ):
             assert "name_grant" not in inspect.getsource(mod), mod.__name__
 
 
@@ -327,7 +356,7 @@ class TestTaskRunnerSurface:
         assert declined[0]["metadata"]["tier"] == "hook_auto_approve"
         # Disclosure rule: the audit row carries the CONSTANT log text and the
         # code — never the refusal's human-facing detail, which names resolved
-        # paths (see the "Refusal reasons" note in name_grant.py).
+        # paths (see the "Refusal reasons" note in name_grant_refusals.py).
         assert declined[0]["error"] == _REFUSAL.log_text
         assert _REFUSAL.detail not in repr(declined[0])
 
@@ -433,7 +462,7 @@ class TestSubagentSurface:
         assert declined[0]["metadata"]["tier"] == "hook_auto_approve"
         # Disclosure rule: the audit row carries the CONSTANT log text and the
         # code — never the refusal's human-facing detail, which names resolved
-        # paths (see the "Refusal reasons" note in name_grant.py).
+        # paths (see the "Refusal reasons" note in name_grant_refusals.py).
         assert declined[0]["error"] == _REFUSAL.log_text
         assert _REFUSAL.detail not in repr(declined[0])
 
@@ -581,7 +610,7 @@ class TestTurnDriverSurface:
         assert declined[0]["source"] == ""
         # Disclosure rule: the audit row carries the CONSTANT log text and the
         # code — never the refusal's human-facing detail, which names resolved
-        # paths (see the "Refusal reasons" note in name_grant.py).
+        # paths (see the "Refusal reasons" note in name_grant_refusals.py).
         assert declined[0]["error"] == _REFUSAL.log_text
         assert _REFUSAL.detail not in repr(declined[0])
 
@@ -593,9 +622,9 @@ class TestTurnDriverSurface:
 
         from kiro_crew.messaging import dispatch
         from kiro_crew.slack import transport_dispatch as slack_dispatch
-        from kiro_crew.telegram import transport_dispatch as telegram_dispatch
+        from kiro_crew.telegram.dispatch import turn_engine as telegram_turn_engine
 
-        for mod in (dispatch, slack_dispatch, telegram_dispatch):
+        for mod in (dispatch, slack_dispatch, telegram_turn_engine):
             assert "audit_session_key=" in inspect.getsource(mod), mod.__name__
 
 
@@ -671,21 +700,39 @@ class TestSpawnRungEventIdentity:
         # The canonical predicate lives in hooks.event_is_spawn_run; a surface
         # that re-inlines `title == "spawn_run"` reintroduces the forgeable
         # check this rung was hardened against.
+        import importlib
         import inspect
+        import pkgutil
 
         from kiro_crew.discord import transport_dispatch as discord_dispatch
         from kiro_crew.messaging import dispatch, driver
         from kiro_crew.slack import handler as slack_handler
+        from kiro_crew.slack import handler_runtime
         from kiro_crew.slack import transport_dispatch as slack_dispatch
         from kiro_crew.telegram import transport_dispatch as telegram_dispatch
+        from kiro_crew.telegram.dispatch import turn_engine as telegram_turn_engine
+        from kiro_crew.telegram.dispatch import turn_queue as telegram_turn_queue
 
+        # The Discord dispatcher is its facade and the owners it is composed from.
+        discord_owners = [importlib.import_module(o) for o in discord_dispatch._OWNERS]
+        # The native Slack turn's spawn rung runs in an owner of the handler facade.
+        slack_owners = [
+            importlib.import_module(f"{handler_runtime.__name__}.{info.name}")
+            for info in pkgutil.iter_modules(handler_runtime.__path__)
+        ]
+        assert slack_owners, "the owner scan found no module, so it is measuring nothing"
         for mod in (
             dispatch,
+            *(importlib.import_module(owner) for owner in dispatch._OWNERS),
             driver,
             slack_handler,
+            *slack_owners,
             slack_dispatch,
             discord_dispatch,
+            *discord_owners,
             telegram_dispatch,
+            telegram_turn_engine,
+            telegram_turn_queue,
         ):
             assert 'title == "spawn_run"' not in inspect.getsource(mod), mod.__name__
 
@@ -730,6 +777,19 @@ class TestGatewayReadsModeSurface:
         assert asyncio.run(approve_fn(ev)) is True
         gateway.dashboard_state.request_approval.assert_not_awaited()
         stub.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "command",
+        ["git status", "ls && git log", "2>/dev/null git status", "python3 -c 'print(1)'"],
+    )
+    def test_a_git_command_is_never_a_reads_grant(self, monkeypatch, command):
+        """A read-shaped title cannot auto-approve a shell command the classifier
+        does not accept, or one that runs git (git reads `.git/config`, whose
+        fsmonitor / hooksPath name a program); it goes to the prompt."""
+        gateway, approve_fn = self._approve_fn(monkeypatch, None)
+        ev = _shell_permission_event(title="read repo status", raw_tool_params={"command": command})
+        assert asyncio.run(approve_fn(ev)) is True  # answered by the prompt stub
+        gateway.dashboard_state.request_approval.assert_awaited_once()
 
 
 # ── stream_and_collect helper (cron / autonudge turns) ──────────────

@@ -126,6 +126,7 @@ _MOVED: dict[str, dict[str, tuple[str, ...]]] = {
             "PiGateExtensionTampered",
             "AcpModelUnavailable",
             "AcpPromptBusy",
+            "AcpConversationBindingMismatch",
             "_RE_MODEL_UNAVAILABLE",
             "_RE_MODEL_TEMP_UNAVAILABLE",
             "_RE_INVALID_MODEL_ID",
@@ -396,7 +397,13 @@ _MOVED: dict[str, dict[str, tuple[str, ...]]] = {
 #: there is a seam like any moved helper's.
 _MOVED_METHODS: dict[str, dict[str, tuple[str, ...]]] = {
     "kiro_crew.acp.client": {
-        "kiro_crew.acp.harness.opencode": ("_verify_opencode_routing",),
+        "kiro_crew.acp.harness.opencode": (
+            "_verify_opencode_routing",
+            # The version gate's probe reads the same client-owned
+            # spawn-env internals as the routing read-back beside it, by the same
+            # function-local import.
+            "_opencode_reported_major",
+        ),
         "kiro_crew.acp.harness.pi": ("_verify_pi_gate",),
         "kiro_crew.acp.harness.deepseek": ("_verify_deepseek_gate",),
     },
@@ -1395,6 +1402,10 @@ _SEAM_IMPORTS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
             ("kiro_crew.acp.harness.pi", "_verify_pi_gate"),
             ("kiro_crew.acp.harness.deepseek", "_verify_deepseek_gate"),
             ("kiro_crew.acp.harness.opencode", "_verify_opencode_routing"),
+            # The version gate's probe builds its child's env by the SAME
+            # bindings, so the probe's answer describes the environment the
+            # read-back and the spawn actually run under.
+            ("kiro_crew.acp.harness.opencode", "_opencode_reported_major"),
         )
     },
 }
@@ -1499,7 +1510,7 @@ def test_the_owners_depend_on_each_other_one_way() -> None:
         (the_launch, framing),
         (deepseek_harness.__name__, pi_harness.__name__),
         *((host.__name__, the_launch) for host in hosts),
-        *((host.__name__, errors) for host in hosts - {goose_harness}),
+        *((host.__name__, errors) for host in hosts),
     }
     assert edges == expected
 
@@ -1746,6 +1757,7 @@ _UNRESOLVED_FACADE_PATCHES: dict[tuple[str, str], int] = {
     ("test/acp_launch_capture.py", "_capture_runtime_served"): 2,
     ("test/acp_launch_capture.py", "_stub_common"): 4,
     ("test/test_acp_pod_home_remap.py", "_remap_calls"): 1,
+    ("test/test_facade_mirror_guards.py", "patch_reach_failures"): 2,
     ("test/test_harness_parity.py", "test_is_kiro_cli_is_positive"): 2,
     **{
         ("test/test_acp_dynamic_config.py", f"TestUpdateReasoningEffortValues.{test}"): 1
@@ -1762,7 +1774,7 @@ _UNRESOLVED_FACADE_PATCHES: dict[tuple[str, str], int] = {
     (_THIS_FILE, "test_a_monkeypatch_through_the_facade_lands_on_the_owner_and_is_undone"): 1,
     (_THIS_FILE, "test_mock_patch_by_object_and_by_dotted_name_round_trip"): 2,
     (_THIS_FILE, "test_monkeypatch_and_mock_nest_either_way_through_the_facade"): 4,
-    ("test/test_acp_runtime.py", "_track_untracks"): 1,
+    ("test/test_acp_runtime_death.py", "_track_untracks"): 1,
     ("test/test_agent_spec_preflight.py", "TestGatewayInstallVerification._run_init_services"): 1,
     ("test/test_channel_session_trust_parity.py", "_run_turn"): 1,
     (
@@ -1773,10 +1785,8 @@ _UNRESOLVED_FACADE_PATCHES: dict[tuple[str, str], int] = {
         "test/test_mcp_oauth_banner.py",
         "TestAnnotationFailsOpen.test_either_lookup_raising_fails_open",
     ): 1,
-    ("test/test_pid_lifecycle.py", "TestBrowserSessionOwnerFakeProc._linux_fixture"): 1,
     ("test/test_session_core_audit.py", "test_resolve_agent_model_serves_cache_within_ttl"): 1,
     ("test/test_subagent_shared_scratch.py", "TestSpawnersMountTheTreeWindow._install_capture"): 5,
-    ("test/test_taskrunner.py", "_at_workflow_checkpoint"): 1,
 }
 
 
@@ -1799,8 +1809,9 @@ def test_the_launch_capture_patches_no_moved_name() -> None:
 
 
 #: Names a test patches through a facade that the facade AND an owner both bind, each
-#: importing its own: such a patch reaches only the facade's own code. Every entry is
-#: patched for code that stayed in the facade -- the client's stderr drain and session
+#: importing its own: such a patch reaches only the facade's own code, which a mirrored
+#: facade's write also reaches in the owner modules that code moved to. Every entry is
+#: patched for code of the facade's own family -- the client's stderr drain and session
 #: init (``logger``), ``AcpClient.send_command`` (``redact_exfiltration_urls``), the
 #: runtime's response bound and descendant snapshot -- or for the launch the driver
 #: starts: each driver hands the launch tail its OWN sandbox wrap, scrub and scratch
@@ -1820,6 +1831,7 @@ _SHARED_BINDINGS_PATCHED: frozenset[tuple[str, str]] = frozenset(
         ("kiro_crew.acp.runtime", "_get_child_pids"),
         ("kiro_crew.acp.runtime", "agent_scratch"),
         ("kiro_crew.acp.runtime", "launch"),
+        ("kiro_crew.acp.runtime", "scrub_agent_subprocess_env"),
         ("kiro_crew.acp.runtime", "wrap_argv"),
         ("kiro_crew.acp.runtime", "wrap_argv_async"),
     }

@@ -23,6 +23,11 @@ type Options = {
 type Pending = { slot: string | null; scope?: string; task: string; advice: PreferenceAdvice }
 type Response = { choice: 'use' | 'keep' | 'choose'; model: string }
 const noSubscription = () => () => {}
+const BUDGET_LABEL_KEYS = {
+  fast: 'preference_advisor.budget_fast',
+  balanced: 'preference_advisor.budget_balanced',
+  frontier: 'preference_advisor.budget_frontier',
+} as const
 const taskKey = (slot: string | null, scope: string | undefined, task: string) => JSON.stringify([slot, scope, task])
 
 export function usePreferenceAdvisor(options: Options) {
@@ -211,6 +216,8 @@ export function usePreferenceAdvisor(options: Options) {
     latest.current.enabled && latest.current.eligible ? sendRef.current(task) : true, [])
 
   const visible = pending && matches(pending) ? pending : null
+  const recommendation = visible?.advice.model || (visible?.advice.budget
+    ? t(BUDGET_LABEL_KEYS[visible.advice.budget]) : undefined)
   const ownsAttempt = attempted.current === taskKey(options.slot, options.scope, options.readDraft().trim())
   const error = ownsAttempt ? advice.error || feedback.error : null
   const saved = notice !== null && notice === options.slot && options.eligible
@@ -219,7 +226,7 @@ export function usePreferenceAdvisor(options: Options) {
     <div className="mx-auto w-full px-4 pb-2 text-sm text-text" style={{ maxWidth: 'var(--mc-content-width, 900px)' }} aria-live="polite">
       {loading && <p>{t('preference_advisor.loading')}</p>}
       {visible && <div className="rounded-lg border border-border bg-card p-3 space-y-2">
-        <p>{t('preference_advisor.recommend', { model: visible.advice.model || t(`preference_advisor.budget_${visible.advice.budget}`) })}</p>
+        <p>{t('preference_advisor.recommend', { model: recommendation })}</p>
         <p className="text-muted">{t('preference_advisor.reason', { examples: visible.advice.examples?.length ?? 0 })}</p>
         {visible.advice.evidence?.length ? <ul className="list-disc pl-5 text-muted">{visible.advice.evidence.map((example, index) => <li key={index}>{example}</li>)}</ul> : null}
         <div className="flex flex-wrap gap-2">

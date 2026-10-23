@@ -52,8 +52,14 @@ from dataclasses import field as dc_field
 from typing import Any, Callable, Final, Mapping
 
 from kiro_crew.crew_log import bus as crew_log_bus
+from kiro_crew.crew_log.entry_types import PANEL_FOLD_NAME
 from kiro_crew.crew_log.projection import SESSION_FOLD_NAMES, SLOT_PROJECTION_NAMES
 from kiro_crew.dashboard_templates.manifest import TemplateManifest
+
+#: The fold a page's OWN written values live in. No field reads a path into it -- its
+#: value IS the table of written values -- so a caller asks for it by name through
+#: ``subscribe(manifest, agentic=True)`` rather than through the manifest.
+AGENTIC_FOLD: Final[str] = "agentic"
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +81,18 @@ class _Missing:
 
 
 MISSING: Final[_Missing] = _Missing()
+
+
+def page_panel(record: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The reader's own panel *record* as a page sees it, or an empty one.
+
+    The record is chosen by the caller, by the panel read route's rule. An absent
+    one reads as an empty ``data`` object, never as another crew's. ``crew_key``
+    is left out, because the read route never hands the digest to a client.
+    """
+    if not isinstance(record, Mapping):
+        return {"template": "", "title": "", "data": {}, "published_at": ""}
+    return {key: item for key, item in record.items() if key != "crew_key"}
 
 
 def resolve_path(value: Any, path: str) -> Any:
@@ -134,12 +152,27 @@ class FieldRead:
 
 
 def scope_for(fold: str) -> str:
-    """Which bus scope a fold is keyed by.
+    """Which bus scope a fold is keyed by, or ``""`` for one no scope keys.
 
-    Read off the projection kernel's own two sets rather than from a list here, so
+    Read off the projection kernel's own key-kind sets rather than from a list here, so
     a fold that moves family -- or a new one -- is keyed correctly without an edit.
-    A name in NEITHER set is not a fold this channel can subscribe to, and saying so
-    is better than guessing a scope and silently never receiving an event.
+
+    ``""`` means this channel cannot subscribe to the fold, which is better than
+    guessing a scope and silently never receiving an event. TWO different folds answer
+    it, and a caller must not read them as the same thing:
+
+    * A name in NO key-kind set is not a registered fold at all.
+    * A TREE-keyed fold IS registered and IS bindable, and deliberately has no scope:
+      it joins the logs of many slots, so its value is stale when any member's log
+      grows and the bus has no key that covers that. Its value belongs to a page load
+      and a refetch (:func:`~kiro_crew.crew_log.projection.read_tree_projection`),
+      which the controller's gap rule already covers -- so ``subscribe`` reports a tree
+      binding unavailable and
+      :meth:`~kiro_crew.dashboard.handlers.member_dashboard_fields.LivePage._read_trees`
+      supplies the value instead. A CALLER MUST NOT read that report as "this fold is
+      unreachable": it means "not by subscription". Stated here rather than left to
+      fall out of three failed membership tests, because an absence that means "by
+      design" and an absence that means "unknown name" would otherwise look identical.
     """
     if fold in SLOT_PROJECTION_NAMES:
         return crew_log_bus.SCOPE_SLOT
@@ -168,9 +201,14 @@ class DashboardFeed:
         slot: str,
         session_unit: str = "",
         on_change: Callable[[str], None] | None = None,
+        panel_record: Mapping[str, Any] | None = None,
     ) -> None:
         #: The crewmate's DM slot, which keys every slot fold.
         self.slot = slot
+        #: The reading crewmate's OWN panel record, chosen by the panel read
+        #: route's rule. A ``panel`` binding resolves against this record and never
+        #: against the fold's top level; ``None`` reads as "never published".
+        self.panel_record = panel_record
         #: The unit id its session folds are keyed by, or ``""`` when the thread is
         #: not running. A dashboard binding only slot folds needs none, which is
         #: why this is optional rather than required: a crewmate whose DM has never
@@ -184,8 +222,16 @@ class DashboardFeed:
 
     # -- subscription ------------------------------------------------------- #
 
-    def subscribe(self, manifest: TemplateManifest) -> list[str]:
+    def subscribe(self, manifest: TemplateManifest, agentic: bool = False) -> list[str]:
         """Subscribe to the folds *manifest* names; return the ones that could not be.
+
+        *agentic* adds the ``agentic`` fold, which no field reads a path into: a page's
+        own written values live in it, and reading them off disk per change would put
+        file I/O on the fold worker's thread -- the one thread this class may not block.
+        Subscribed through the same baseline, so a value written before the page opened
+        is there on first read. Named rather than taken as a set of folds because the
+        manifest already says which folds a page reads, and this is the single one it
+        cannot say.
 
         REPLACES any earlier subscription set, so an instance edited onto a template
         with different sources stops receiving the folds it does not bind. Disposed
@@ -204,7 +250,8 @@ class DashboardFeed:
         """
         self.unsubscribe()
         unavailable: list[str] = []
-        folds = sorted(manifest.folds)
+        extra = frozenset({AGENTIC_FOLD}) if agentic else frozenset()
+        folds = sorted(frozenset(manifest.folds) | extra)
         for fold in folds:
             scope = scope_for(fold)
             key = self.slot if scope == crew_log_bus.SCOPE_SLOT else self.session_unit
@@ -349,6 +396,18 @@ class DashboardFeed:
                 continue
             fold = spec.fold or ""
             cached = cells.get(fold)
+            if fold == PANEL_FOLD_NAME:
+                # The record comes from the caller, so it resolves even when the
+                # fold has nothing: a publish lives in its file as well as the log.
+                resolved = resolve_path(page_panel(self.panel_record), spec.path or "")
+                if resolved is MISSING:
+                    read.missing.append(name)
+                    unresolved.append(name)
+                    continue
+                read.fields[name] = resolved
+                if cached is not None and cached[2]:
+                    read.seq = max(read.seq, cached[1])
+                continue
             if cached is None or not cached[2]:
                 read.missing.append(name)
                 unresolved.append(name)
@@ -367,3 +426,17 @@ class DashboardFeed:
     def folds(self) -> frozenset[str]:
         """The folds this feed is subscribed to. For a test and a log line."""
         return self._folds
+
+    def fold_value(self, fold: str) -> Mapping[str, Any]:
+        """One subscribed fold's latest cached value, or an empty mapping.
+
+        The read :meth:`read` cannot do for a caller: it resolves a PATH into a fold,
+        and the ``agentic`` fold is consumed whole -- its ``fields`` member is the table
+        of written values, keyed by field name. Empty for a fold this feed does not hold
+        and for one that has not been seen, which read the same way: no value yet.
+        """
+        with self._lock:
+            cell = self._cells.get(fold)
+            if cell is None or not cell.seen or not isinstance(cell.value, Mapping):
+                return {}
+            return cell.value

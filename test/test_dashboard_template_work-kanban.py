@@ -373,3 +373,38 @@ class TestTheShowcaseFixture:
         """The round rows are the board's grouping; one round draws one bar."""
         rounds = {item["round"] for item in _folds(SAMPLE)[WORK_FOLD_NAME]["items"]}
         assert len(rounds) > 1, f"the sample carries one round: {rounds}"
+
+
+class TestForgottenItemsCount:
+    """The fold keeps only open items and the newest closed ones, so the board's
+    whole-board numbers add the fold's ``forgotten`` counts to what ``items`` holds."""
+
+    def test_the_manifest_binds_the_forgotten_block(self, loaded: tuple[Any, str]) -> None:
+        manifest, _ = loaded
+        field = manifest.fields["forgotten"]
+        assert (field.fold, field.path, field.type) == (WORK_FOLD_NAME, "forgotten", "object")
+
+    def test_the_board_tally_adds_forgotten_items_to_their_closing_column(
+        self, script: str
+    ) -> None:
+        body = script.split("function boardTally(")[1].split("\n    function ")[0]
+        assert "t.acc += gone.acc" in body
+        assert "t.shut += gone.shut" in body
+        forgotten = script.split("function forgotten(")[1].split("\n    function ")[0]
+        assert "n('rejected') + n('abandoned')" in forgotten
+
+    @pytest.mark.parametrize(
+        "needle",
+        [
+            "stack(host, boardTotal(list), boardTally(list), 8);",
+            "var counts = boardTally(list), star = starOf(list);",
+            "out.appendChild(bold(boardTotal(list)));",
+            "var total = boardTotal(list);",
+        ],
+    )
+    def test_every_whole_board_number_counts_forgotten_items(
+        self, script: str, needle: str
+    ) -> None:
+        assert needle in script
+        assert "stack(host, list.length, tally(list), 8);" not in script
+        assert "out.appendChild(bold(list.length));" not in script

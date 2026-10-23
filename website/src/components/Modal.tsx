@@ -1,11 +1,12 @@
 import React, { useEffect, useCallback, useId, useRef } from 'react'
-import { createPortal } from 'react-dom'
+import { OverlayPortal, useLocalCrewHidden } from './overlayRoot'
 import { motion, AnimatePresence } from 'framer-motion'
 import { X } from 'lucide-react'
 
 import { useDialogFocusTrap } from '../hooks/useDialogFocusTrap'
 import { useDocumentImeLatch } from '../hooks/useImeGuard'
 import { i18nT } from '../i18n/t'
+import { guideTrustRoot, GuideTrustRootProvider, useGuideTrustRoot } from '../guide/trustRoot'
 interface ModalProps {
   /** Whether the modal is open */
   open: boolean
@@ -59,6 +60,10 @@ interface ModalProps {
    *  focus having left, and pull it back out on each keypress. See
    *  `useDialogFocusTrap`'s `enabled`. */
   interactionDisabled?: boolean
+  /** The dialog decides what the agent may do (a trust or approval prompt):
+   *  a guide never points at, resolves or reports a control inside it
+   *  (`guide/findTargetPolicy.ts`). */
+  guideTrustRoot?: boolean
   /** Modal content */
   children: React.ReactNode
 }
@@ -76,7 +81,9 @@ const SPRING = { type: 'spring' as const, stiffness: 500, damping: 35 }
  * therefore capture the restore target at page load and move focus into a
  * dialog that is not on screen.
  */
-function ModalDialog({ onClose, title, ariaLabel, footer, headerActions, maxWidth, height, layoutId, dismissDisabled = false, interactionDisabled = false, children }: ModalDialogProps) {
+function ModalDialog({ onClose, title, ariaLabel, footer, headerActions, maxWidth, height, layoutId, dismissDisabled = false, interactionDisabled = false, guideTrustRoot: trustRootProp = false, children }: ModalDialogProps) {
+  // Asked for, or opened from inside a trust-root region (it portals out of it).
+  const trustRoot = useGuideTrustRoot() || trustRootProp
   const dialogRef = useRef<HTMLDivElement>(null)
   const dismiss = useCallback(() => { if (!dismissDisabled) onClose() }, [dismissDisabled, onClose])
   const reactId = useId()
@@ -101,7 +108,7 @@ function ModalDialog({ onClose, title, ariaLabel, footer, headerActions, maxWidt
   // has focus (the Ctrl+digit session jumps, the Settings chord) — unguarded,
   // one of those typed into a part-filled form navigates away and unmounts the
   // dialog with the draft still in it. Modal portals its panel to
-  // document.body, but portal events still propagate through the React tree,
+  // the body-level overlay root, but portal events still propagate through the React tree,
   // so this one handler on the PANEL (not the backdrop) sees every keystroke
   // inside the dialog and stops it before the page's document-level listener.
   //
@@ -148,7 +155,7 @@ function ModalDialog({ onClose, title, ariaLabel, footer, headerActions, maxWidt
         transition: SPRING,
       }
 
-  return (
+  const dialog = (
     <motion.div
       ref={dialogRef}
       role="dialog"
@@ -160,6 +167,7 @@ function ModalDialog({ onClose, title, ariaLabel, footer, headerActions, maxWidt
       aria-labelledby={ariaLabel ? undefined : titleId}
       tabIndex={-1}
       onKeyDown={isolateKeys}
+      {...(trustRoot ? guideTrustRoot : {})}
       {...motionProps}
       className={`bg-card border border-border rounded-xl shadow-2xl w-full flex flex-col ${interactionDisabled ? 'pointer-events-none' : 'pointer-events-auto'} overflow-hidden outline-hidden`}
       style={{ maxWidth, height, maxHeight: '90vh' }}
@@ -195,6 +203,8 @@ function ModalDialog({ onClose, title, ariaLabel, footer, headerActions, maxWidt
       )}
     </motion.div>
   )
+  // What the dialog itself portals (a menu, a tip) is part of it too.
+  return trustRoot ? <GuideTrustRootProvider>{dialog}</GuideTrustRootProvider> : dialog
 }
 
 export default function Modal({ open, onClose, maxWidth = 640, guardAccidentalDismiss = false, dismissDisabled = false, layer = 'dialog', ...rest }: ModalProps) {
@@ -204,6 +214,9 @@ export default function Modal({ open, onClose, maxWidth = 640, guardAccidentalDi
   const softDismiss = useCallback(() => {
     if (!guardAccidentalDismiss && !dismissDisabled) onClose()
   }, [guardAccidentalDismiss, dismissDisabled, onClose])
+  // A modal in a Crew hidden behind another one keeps its state for the return,
+  // so an Escape aimed at the Crew in front must not close it.
+  const crewHidden = useLocalCrewHidden()
 
   useEffect(() => {
     if (!open) return
@@ -212,18 +225,19 @@ export default function Modal({ open, onClose, maxWidth = 640, guardAccidentalDi
     // Skip an Escape a nested layer already consumed. Overlays that render above
     // this modal call preventDefault on their own Escape handling.
     const handler = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !event.defaultPrevented) softDismiss()
+      if (event.key === 'Escape' && !event.defaultPrevented && !crewHidden) softDismiss()
     }
     window.addEventListener('keydown', handler)
     return () => {
       document.body.style.overflow = prevOverflow
       window.removeEventListener('keydown', handler)
     }
-  }, [open, softDismiss])
+  }, [open, softDismiss, crewHidden])
 
-  // Portal to document.body: fixed positioning does not escape an ancestor's
-  // clip-path, transform, or filter, and modals can mount inside those shells.
-  return createPortal(
+  // Portal to the body-level overlay root: fixed positioning does not escape an
+  // ancestor's clip-path, transform, or filter, and modals can mount inside
+  // those shells.
+  return <OverlayPortal>
     <AnimatePresence>
       {open && (
         <>
@@ -240,7 +254,6 @@ export default function Modal({ open, onClose, maxWidth = 640, guardAccidentalDi
           </div>
         </>
       )}
-    </AnimatePresence>,
-    document.body
-  )
+    </AnimatePresence>
+  </OverlayPortal>
 }

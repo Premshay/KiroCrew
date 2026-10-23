@@ -23,6 +23,7 @@ from kiro_crew.dashboard import chat_handlers, chat_runner
 from kiro_crew.dashboard.chat_handlers import SlotAgentSwitchCaller, _switch_target_busy
 from kiro_crew.dashboard.state import _ChatSlot
 from kiro_crew.execution_context import read_session_execution
+from kiro_crew.testing.wait import await_until
 
 WORKER = "kirocrew-worker"
 
@@ -119,7 +120,7 @@ async def test_a_turns_caller_is_refused_an_owner_only_choice():
 
 
 async def _chat_with_worker(tmp_path, monkeypatch):
-    state, slot, _ = await asyncio.wait_for(_template_chat(tmp_path, monkeypatch), 20)
+    state, slot, _ = await await_until(asyncio.ensure_future(_template_chat(tmp_path, monkeypatch)))
     monkeypatch.setattr(
         "kiro_crew.config.loader._materialized_kiro_agent",
         lambda name, project_dir=None: name if name in (TEMPLATE, WORKER) else "",
@@ -134,10 +135,10 @@ async def _run_command(state, slot, text):
     # read that reservation as its own turn, not as a turn in flight.
     slot._turn_admission_reserved = True
     try:
-        await asyncio.wait_for(chat_runner._run_chat(state, slot, text), 10)
+        await await_until(asyncio.ensure_future(chat_runner._run_chat(state, slot, text)))
     finally:
         slot._turn_admission_reserved = False
-    await asyncio.wait_for(drain_background_tasks(state), 10)
+    await await_until(asyncio.ensure_future(drain_background_tasks(state)))
 
 
 def _last_assistant(slot) -> str:
@@ -159,8 +160,8 @@ async def test_agent_command_switches_through_the_pickers_transaction(tmp_path, 
     assert execution is not None and execution.selection_kind == "template"
 
     # And the next turn starts on the new agent instead of being refused.
-    await asyncio.wait_for(chat_runner._run_chat(state, slot, "Continue."), 10)
-    await asyncio.wait_for(drain_background_tasks(state), 10)
+    await await_until(asyncio.ensure_future(chat_runner._run_chat(state, slot, "Continue.")))
+    await await_until(asyncio.ensure_future(drain_background_tasks(state)))
     state.sessions.record_failure.assert_not_awaited()
     state.sessions.get_or_create.assert_awaited_once()
     assert not any(row["role"] == "error" for row in slot.messages)
@@ -209,8 +210,8 @@ async def test_agent_subcommands_still_reach_the_harness(tmp_path, monkeypatch):
 
 async def _post_switch(state, body):
     async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
-        response = await asyncio.wait_for(
-            client.post("/api/chat/slots/template-chat/agent", json=body), 10
+        response = await await_until(
+            asyncio.ensure_future(client.post("/api/chat/slots/template-chat/agent", json=body))
         )
         return response.status, await response.json()
 
@@ -233,13 +234,38 @@ async def test_announce_appends_the_same_line_the_in_turn_command_does(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_the_picker_without_announce_appends_nothing(tmp_path, monkeypatch):
+async def test_the_picker_without_announce_appends_only_the_boundary_notice(tmp_path, monkeypatch):
+    """The picker writes no ``/agent`` line, only the session-switch notice."""
     state, slot = await _chat_with_worker(tmp_path, monkeypatch)
     before = list(slot.messages)
     status, body = await _post_switch(state, {"agent": WORKER, "agent_kind": "template"})
     assert status == 200 and body["ok"], body
     assert slot.agent == WORKER
+    assert slot.messages[: len(before)] == before
+    added = slot.messages[len(before) :]
+    assert [row["meta"]["kind"] for row in added] == ["session_switch"]
+    assert added[0]["content"] == switch_announcement(WORKER)
+
+
+@pytest.mark.asyncio
+async def test_a_re_pick_of_the_bound_agent_appends_no_boundary_row(tmp_path, monkeypatch):
+    state, slot = await _chat_with_worker(tmp_path, monkeypatch)
+    status, body = await _post_switch(state, {"agent": WORKER, "agent_kind": "template"})
+    assert status == 200 and body["ok"], body
+    before = list(slot.messages)
+    status, body = await _post_switch(state, {"agent": WORKER, "agent_kind": "template"})
+    assert status == 200 and body["ok"], body
     assert slot.messages == before
+
+
+@pytest.mark.asyncio
+async def test_an_announced_switch_appends_no_second_boundary_row(tmp_path, monkeypatch):
+    state, slot = await _chat_with_worker(tmp_path, monkeypatch)
+    status, body = await _post_switch(
+        state, {"agent": WORKER, "agent_kind": "template", "announce": True}
+    )
+    assert status == 200 and body["ok"], body
+    assert not any((row.get("meta") or {}).get("kind") == "session_switch" for row in slot.messages)
 
 
 @pytest.mark.asyncio
@@ -377,3 +403,176 @@ async def test_linked_thread_delivers_the_agent_command_to_the_chat_runner(text,
     assert handled is True
     run_chat.assert_awaited_once()
     assert run_chat.await_args.args[2] == delivered
+
+
+# ── The text-command channels (Webex, Discord, Teams, Feishu) ──
+
+
+def _channel_roster():
+    from kiro_crew.agent_discovery import AgentInfo
+
+    return [
+        AgentInfo(name="beta", filename="beta.json", description="", model=""),
+        AgentInfo(name="gamma", filename="gamma.json", description="", model=""),
+        AgentInfo(
+            name="kirocrew-worker",
+            filename="kirocrew-worker.json",
+            description="",
+            model="",
+            kirocrew_owned=True,
+        ),
+        AgentInfo(name="tool", filename="someapp--tool.json", description="", model=""),
+    ]
+
+
+class _ChannelSessions:
+    """``live`` names the one session key that exists, like the real manager."""
+
+    def __init__(self, *, busy: bool = False, live: str = "") -> None:
+        self.busy = busy
+        self.live = live
+
+    def is_busy(self, key: str) -> bool:
+        return self.busy
+
+    def has_session(self, key: str) -> bool:
+        return bool(self.live) and key == self.live
+
+
+async def _channel_agent(picks, arg: str, sessions=None, conv=None) -> str:
+    from kiro_crew.agent_switch_command import handle_channel_agent_command
+    from kiro_crew.messaging.conversation import ConversationState
+
+    return await handle_channel_agent_command(
+        picks,
+        "route",
+        arg,
+        conv=conv or ConversationState(),
+        configured="kirocrew",
+        sessions=sessions or _ChannelSessions(),
+        session_key=lambda: f"k:{picks.resolve('route', 'kirocrew')}",
+    )
+
+
+class TestChannelAgentCommand:
+    @pytest.fixture(autouse=True)
+    def _roster(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr(
+            "kiro_crew.telegram.transport_dispatch.list_agents", _channel_roster
+        )
+
+    @pytest.mark.asyncio
+    async def test_switch_then_back_to_default(self) -> None:
+        from kiro_crew.agent_switch_command import ChannelAgentPicks
+
+        picks = ChannelAgentPicks()
+        assert "Agent set to `beta`" in await _channel_agent(picks, "beta")
+        assert picks.resolve("route", "kirocrew") == "beta"
+        assert picks.resolve("other", "kirocrew") == "kirocrew"
+        assert "Already using `beta`" in await _channel_agent(picks, "beta")
+        assert "default (kirocrew)" in await _channel_agent(picks, "default")
+        assert picks.resolve("route", "kirocrew") == "kirocrew"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["kirocrew-worker", "tool", "missing"])
+    async def test_only_pickable_agents_are_accepted(self, name: str) -> None:
+        from kiro_crew.agent_switch_command import ChannelAgentPicks
+
+        picks = ChannelAgentPicks()
+        assert "No agent named" in await _channel_agent(picks, name)
+        assert picks.get("route") == ""
+
+    @pytest.mark.asyncio
+    async def test_bad_name_shape_answers_with_usage(self) -> None:
+        from kiro_crew.agent_switch_command import ChannelAgentPicks
+
+        picks = ChannelAgentPicks()
+        assert "not an agent name" in await _channel_agent(picks, "two words")
+        assert picks.get("route") == ""
+
+    @pytest.mark.asyncio
+    async def test_naming_the_default_agent_is_not_a_switch(self) -> None:
+        from kiro_crew.agent_switch_command import ChannelAgentPicks, handle_channel_agent_command
+        from kiro_crew.messaging.conversation import ConversationState
+
+        picks = ChannelAgentPicks()
+        reply = await handle_channel_agent_command(
+            picks,
+            "route",
+            "beta",
+            conv=ConversationState(),
+            configured="beta",
+            sessions=_ChannelSessions(live="k"),
+            session_key=lambda: "k",
+        )
+        assert "Already using" in reply
+        assert picks.get("route") == ""
+
+    @pytest.mark.asyncio
+    async def test_a_running_reply_refuses_the_switch(self) -> None:
+        from kiro_crew.agent_switch_command import ChannelAgentPicks
+
+        picks = ChannelAgentPicks()
+        reply = await _channel_agent(picks, "beta", _ChannelSessions(busy=True))
+        assert "Still working" in reply
+        assert "`/agent beta`" in reply  # the hint repeats the full command
+        assert picks.get("route") == ""
+
+    @pytest.mark.asyncio
+    async def test_a_live_conversation_is_told_the_switch_starts_fresh(self) -> None:
+        from kiro_crew.agent_switch_command import ChannelAgentPicks
+
+        # The live session is the DEFAULT agent's; the switch leaves it behind.
+        reply = await _channel_agent(
+            ChannelAgentPicks(), "beta", _ChannelSessions(live="k:kirocrew")
+        )
+        assert "leaves the current conversation" in reply
+
+    @pytest.mark.asyncio
+    async def test_a_switch_follows_the_new_agents_own_generations(self) -> None:
+        # After a restart the route's counter was seeded from the default
+        # agent's bucket (gen 0) while beta's bucket already holds gen 2. The
+        # switch must move the counter to beta's latest, so /new goes past it.
+        from kiro_crew.agent_switch_command import ChannelAgentPicks
+        from kiro_crew.messaging.conversation import ConversationState
+
+        picks = ChannelAgentPicks()
+        persisted = {"kirocrew": 0, "beta": 2}
+        conv = ConversationState(seed_fn=lambda r: persisted[picks.resolve(r, "kirocrew")])
+        assert conv.current_gen("route") == 0
+        await _channel_agent(picks, "beta", conv=conv)
+        assert conv.current_gen("route") == 2
+        assert conv.bump_gen("route") == 3  # /new is fresh, never beta's gen 1 or 2
+        await _channel_agent(picks, "default", conv=conv)
+        assert conv.current_gen("route") == 0  # back to the default agent's latest
+
+    @pytest.mark.asyncio
+    async def test_show_lists_the_pickable_agents(self) -> None:
+        from kiro_crew.agent_switch_command import ChannelAgentPicks
+
+        reply = await _channel_agent(ChannelAgentPicks(), "")
+        assert "`beta`" in reply and "`gamma`" in reply
+        assert "kirocrew-worker" not in reply and "`tool`" not in reply
+
+
+class TestTelegramAndSlackUnchanged:
+    def test_channels_offer_the_same_agents_as_the_telegram_picker(self, monkeypatch) -> None:
+        from kiro_crew.agent_switch_command import pickable_agent_names
+        from kiro_crew.telegram import transport_dispatch as td
+
+        monkeypatch.setattr(td, "list_agents", _channel_roster)
+        assert pickable_agent_names() == td.TelegramDispatcher._installed_agent_names()
+        assert pickable_agent_names() == ["beta", "gamma"]
+
+    def test_telegram_keeps_its_picker_command(self) -> None:
+        from kiro_crew.telegram.commands import parse_command
+
+        assert parse_command("/agent") == "agent"
+        assert parse_command("/agent beta") == "agent"
+
+    @pytest.mark.parametrize(
+        ("text", "agent"),
+        [("/agent beta", "beta"), ("/agent list", None), ("/agent", None), ("/agent a b", None)],
+    )
+    def test_slack_parser_reads_as_before(self, text: str, agent: str | None) -> None:
+        assert agent_switch_target(text) == agent

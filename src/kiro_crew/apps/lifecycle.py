@@ -14,7 +14,7 @@ from typing import Any
 
 from kiro_crew.apps.context import AppContext, build_app_context, manifest_declares_routes
 from kiro_crew.apps.execution import shipped_builtin_app_root
-from kiro_crew.apps.manager import app_dir
+from kiro_crew.apps.manager import app_dir, approved_manifest_permissions
 from kiro_crew.apps.module_loader import (
     cache_http_app_grant,
     cache_shutdown_callable,
@@ -419,7 +419,7 @@ class LifecycleDispatcher:
         """
         name = app_info.get("name", "")
         manifest = app_info.get("manifest", {})
-        permissions = manifest.get("permissions", {})
+        permissions = approved_manifest_permissions(app_info)
         data_path = app_dir(name) / "data"
         data_path.mkdir(parents=True, exist_ok=True)
 
@@ -442,6 +442,7 @@ class LifecycleDispatcher:
             # The same shared predicate the enable/boot builder uses, so a
             # shutdown context carries the handle exactly when the startup one did.
             http_app=self._http_app if granted else None,
+            crewmate_host=self._http_app,
         )
 
     async def _invoke(self, app_name: str, hook_path: str, ctx: AppContext, *, phase: str) -> bool:

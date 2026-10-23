@@ -40,7 +40,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from kiro_crew import decisions as core
 from kiro_crew.decisions.types import Answer, Choice, Question
@@ -167,7 +167,7 @@ def limit_hit(row: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def vendor_health(
-    rows: list[Mapping[str, Any]], now: float | None = None
+    rows: Sequence[Mapping[str, Any]], now: float | None = None
 ) -> dict[str, dict[str, Any]]:
     """Per vendor: ``out`` when its LAST event was a limit hit and the reset has not passed.
 

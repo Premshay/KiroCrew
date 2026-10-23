@@ -5,11 +5,11 @@
  */
 
 import { createVoiceRequestId } from '../../lib/voicePlayback'
-import { parseErrorCode } from '../../utils/errorReport'
+import { parseErrorCode, parseErrorField } from '../../utils/errorReport'
 import { ApiError } from '../apiError'
 import type { ClientTransport } from './transport'
 
-export function createVoiceEndpoints({ post, put, j, sessionKeyHeader: _sk }: ClientTransport) {
+export function createVoiceEndpoints({ post, put, j, jfetch, sessionKeyHeader: _sk }: ClientTransport) {
   const speechToText = {
     // STT
     sttConfig: () => fetch('/api/config/stt').then(j),
@@ -21,10 +21,15 @@ export function createVoiceEndpoints({ post, put, j, sessionKeyHeader: _sk }: Cl
       silence_ms?: number
       partial_interval_ms?: number
       endpointing?: boolean
+      submit_on_release?: boolean
       dictation_panel?: boolean
       transcribe_region?: string
       transcribe_profile?: string
       transcribe_vocabulary?: string
+      /** Languages a live Transcribe stream identifies between; fewer than two is off. */
+      transcribe_languages?: string[]
+      custom_model_path?: string
+      custom_model_sha256?: string
       language_code?: string
       polish?: boolean
     }) => put('/api/config/stt', body).then(j),
@@ -85,11 +90,11 @@ export function createVoiceEndpoints({ post, put, j, sessionKeyHeader: _sk }: Cl
     // together; it is stripped before the body is serialised. A caller that
     // aborts has cancelled deliberately, so an abort raises no failure event —
     // only a real synthesis refusal does.
-    voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; request_id?: string; signal?: AbortSignal }) => {
-      const { signal, ...rest } = opts ?? {}
+    voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; request_id?: string; signal?: AbortSignal; clientFallback?: boolean }) => {
+      const { signal, clientFallback = false, ...rest } = opts ?? {}
       const request_id = rest.request_id || createVoiceRequestId()
-      window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot, request_id } }))
-      return fetch('/api/voice/synthesize', {
+      window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot, request_id, clientFallback, text } }))
+      return jfetch('/api/voice/synthesize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ..._sk },
         body: JSON.stringify({ slot, text, ...rest, request_id }),
@@ -97,7 +102,11 @@ export function createVoiceEndpoints({ post, put, j, sessionKeyHeader: _sk }: Cl
       }).then(j).catch(error => {
         if (signal?.aborted) throw error
         const code = error instanceof ApiError ? parseErrorCode(error.body) : undefined
-        window.dispatchEvent(new CustomEvent('voice-synthesis-failed', { detail: { slot, request_id, code: code || 'voice_synthesis_failed' } }))
+        // The gateway's cleaned (strip_markdown) text, carried on voice_unavailable
+        // so the client fallback voices placeholders rather than raw markup. Only
+        // consulted when a WS voice_error frame did not already own the outcome.
+        const speakable = error instanceof ApiError ? parseErrorField(error.body, 'speakable') : undefined
+        window.dispatchEvent(new CustomEvent('voice-synthesis-failed', { detail: { slot, request_id, code: code || 'voice_synthesis_failed', speakable } }))
         throw error
       })
     },

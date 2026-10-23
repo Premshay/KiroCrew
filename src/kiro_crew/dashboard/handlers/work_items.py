@@ -259,6 +259,7 @@ async def api_work_item_launch(request: web.Request) -> web.Response:
     key, refusal = await _coordinator(request, "work_item_launch")
     if refusal is not None:
         return refusal
+    assert key is not None
     manager, refusal = _manager(request)
     if refusal is not None:
         return refusal
@@ -275,6 +276,7 @@ async def api_work_item_dispatch_retry(request: web.Request) -> web.Response:
     key, refusal = await _coordinator(request, "work_item_dispatch_retry")
     if refusal is not None:
         return refusal
+    assert key is not None
     manager, refusal = _manager(request)
     if refusal is not None:
         return refusal
@@ -291,6 +293,7 @@ async def api_work_item_revoke_assignment(request: web.Request) -> web.Response:
     key, refusal = await _coordinator(request, "work_item_revoke_assignment")
     if refusal is not None:
         return refusal
+    assert key is not None
     manager, refusal = _manager(request)
     if refusal is not None:
         return refusal

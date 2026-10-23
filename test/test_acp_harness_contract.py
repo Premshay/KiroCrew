@@ -356,6 +356,9 @@ async def test_kas_spawn_reports_the_auth_owner_it_chose(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 async def test_a_missing_binary_aborts_the_spawn(monkeypatch, tmp_path, backend):
+    from kiro_crew.acp import launch
+    from kiro_crew.acp.client import AcpError
+    from kiro_crew.acp.harness import claude as claude_mod
     from kiro_crew.acp.session_handle import AcpRuntimeError
 
     async def _no_bin(*, environ, home):
@@ -368,16 +371,17 @@ async def test_a_missing_binary_aborts_the_spawn(monkeypatch, tmp_path, backend)
     # no harness may return an argv for a binary that is not there -- and narrowing
     # it to one family would leave the next host's spawn unasserted.
     monkeypatch.setattr(client_mod, "_resolve_codex_acp_bin", lambda: (None, "/nowhere"))
-    monkeypatch.setattr(client_mod, "_resolve_claude_acp_bin", lambda: (None, "/nowhere"))
-    # The self-served family resolves through the cached module-level helper, so
-    # the cache is emptied too: a hit would answer with a real earlier verdict and
-    # the patch would never be reached.
-    monkeypatch.setattr(client_mod, "_self_served_bin_caches", {})
-    monkeypatch.setattr(client_mod, "_resolve_self_served_bin", lambda _backend: (None, "/nowhere"))
-    from kiro_crew.acp.transport_errors import AcpError
-
-    with pytest.raises((AcpRuntimeError, AcpError), match="not found"):
+    monkeypatch.setattr(claude_mod, "_resolve_claude_acp_bin", lambda: (None, "/nowhere"))
+    monkeypatch.setattr(launch, "_self_served_bin_caches", {})
+    monkeypatch.setattr(launch, "_resolve_self_served_bin", lambda backend: (None, "/nowhere"))
+    with pytest.raises((AcpRuntimeError, AcpError), match="not found") as raised:
         await harness_for(backend).resolve_spawn(_ctx(tmp_path))
+    # The two kiro-cli hosts tag the refusal so the chat row can offer the
+    # feature-request form; codex-acp is a different binary whose install the
+    # operator chose, and its refusal stays an untagged error row.
+    assert getattr(raised.value, "kiro_cli_missing", False) is (
+        backend in {ACP_BACKEND_KIRO, ACP_BACKEND_KAS}
+    )
 
 
 def test_every_client_helper_a_harness_calls_exists():

@@ -31,6 +31,7 @@ import pytest
 
 from kiro_crew import channel as channel_mod
 from kiro_crew.acp.client import AcpError, AcpPromptBusy
+from kiro_crew.acp.types import STOP_REASON_STALE_RECOVER
 from kiro_crew.channel import (
     Channel,
     _reacquire_cleared_session,
@@ -42,6 +43,7 @@ from kiro_crew.channel import (
 from kiro_crew.llm_helpers import is_prompt_busy
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.session import SessionManager
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 def _make_agent():
@@ -226,6 +228,45 @@ async def test_stream_task_returns_false_on_success():
     assert ch.post.await_args.args[1] == "done"
 
 
+def _ended_client(text: str, stop_reason: str):
+    """A turn that streams ``text`` and then ends with ``stop_reason``."""
+    client = SimpleNamespace()
+
+    async def _stream(message):
+        if text:
+            yield SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=text)
+        yield SimpleNamespace(kind=EVENT_COMPLETE, stop_reason=stop_reason)
+
+    client.stream = _stream
+    return client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["timeout", STOP_REASON_STALE_RECOVER])
+@pytest.mark.parametrize("text", ["half a pl", ""], ids=["partial", "empty"])
+async def test_stream_task_posts_a_card_not_the_text_of_an_unfinished_turn(text, stop_reason):
+    """A turn the backend never finished is not the agent's reply: the channel
+    gets the error card, not the partial text as a reply and not silence."""
+    agent, ch = _make_agent(), _make_channel()
+    busy = await _stream_task(agent, ch, _ended_client(text, stop_reason), "hi")
+    assert busy == channel_mod._STREAM_OK
+    ch.post.assert_awaited_once()
+    assert "error occurred" in ch.post.await_args.args[1]
+    assert ch.post.await_args.kwargs["msg_type"] == "system"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["end_turn", "cancelled"])
+async def test_stream_task_posts_the_text_of_a_finished_or_cancelled_turn(stop_reason):
+    """A finished turn posts its reply, and a user-requested stop keeps its partial text."""
+    agent, ch = _make_agent(), _make_channel()
+    busy = await _stream_task(agent, ch, _ended_client("half a pl", stop_reason), "hi")
+    assert busy == channel_mod._STREAM_OK
+    ch.post.assert_awaited_once()
+    assert ch.post.await_args.args[1] == "half a pl"
+    assert ch.post.await_args.kwargs["msg_type"] == "progress"
+
+
 # ── _reset_busy_session ──
 
 
@@ -322,16 +363,13 @@ async def test_recover_swallows_a_failed_teardown_of_the_abandoned_replacement()
 async def _run_until(agent, ch, sessions, done: asyncio.Event, text: str) -> asyncio.Task:
     task = asyncio.create_task(run_channel_agent(agent, ch, sessions))
     await ch.post("human", text)
-    await asyncio.wait_for(done.wait(), timeout=5)
+    await await_until(done)
     return task
 
 
 async def _wait_for(predicate) -> bool:
-    for _ in range(100):
-        if predicate():
-            return True
-        await asyncio.sleep(0.05)
-    return False
+    await async_wait_until(predicate, describe=lambda: "predicate not yet true")
+    return True
 
 
 @pytest.mark.asyncio
@@ -377,7 +415,7 @@ async def test_loop_reports_an_unrecoverable_agent_once_and_stops():
     sessions = FakeSessions([_wedged_client(done), _wedged_client(done)])
 
     task = await _run_until(agent, ch, sessions, done, "start the review")
-    await asyncio.wait_for(task, timeout=5)
+    await await_until(task)
 
     assert agent.state == "failed"
     stuck = [m.content for m in ch.messages if "could not be recovered" in m.content]
@@ -408,8 +446,8 @@ async def test_an_unrecoverable_agent_stops_consuming_its_inbox():
         await ch.post("human", f"msg {i}")
     assert agent.inbox.qsize() == 3
     task = asyncio.create_task(run_channel_agent(agent, ch, sessions))
-    await asyncio.wait_for(done.wait(), timeout=5)
-    await asyncio.wait_for(task, timeout=5)
+    await await_until(done)
+    await await_until(task)
 
     assert agent.state == "failed"
     assert len([m for m in ch.messages if "could not be recovered" in m.content]) == 1
@@ -436,7 +474,7 @@ async def test_the_stuck_card_still_lands_when_the_teardown_reset_fails():
     )
 
     task = await _run_until(agent, ch, sessions, done, "start the review")
-    await asyncio.wait_for(task, timeout=5)
+    await await_until(task)
 
     assert agent.state == "failed"
     assert len([m for m in ch.messages if "could not be recovered" in m.content]) == 1

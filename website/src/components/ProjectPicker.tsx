@@ -1,13 +1,14 @@
-import { useState, useEffect, useMemo, useRef, useCallback, RefObject } from 'react'
+import { useState, useEffect, useMemo, useRef, useCallback, RefObject, type ReactNode } from 'react'
 import { useImeGuard } from '../hooks/useImeGuard'
-import { createPortal } from 'react-dom'
-import { FolderOpen, ChevronRight, ChevronLeft, Clock, Search, Star } from 'lucide-react'
+import { OverlayPortal } from './overlayRoot'
+import { FolderOpen, FolderSearch, ChevronRight, ChevronLeft, Clock, Search, Star } from 'lucide-react'
 import { api } from '../api/client'
 import { useListKeyboardNav } from '../hooks/useListKeyboardNav'
 import ErrorNotice from './ErrorNotice'
 import { reportForError, type ErrorReport } from '../utils/errorReport'
 import { endsWithSeparator, isWindowsPath, lastSegment, parentIsDriveList, pathSeparator, stripTrailingSeparator } from '../utils/browsePath'
 import { searchErrorCause, type SearchErrorCause } from '../lib/searchErrorCause'
+import { canPickFolderNatively, hasNativeFolderPicker, pickFolderNatively } from '../lib/electron'
 
 import { i18nT } from '../i18n/t'
 
@@ -55,7 +56,7 @@ const DRIVES_FAILED_KEYS: Record<SearchErrorCause, string> = {
 }
 // Only two arms have copy of their own: the recents endpoint answers any read error
 // with 200 `{"dirs": []}` and never a coded body (`api_recent_projects` in
-// chat_handlers.py), so `denied` / `root_missing` cannot be produced for it -- a 403
+// chat_api/project_lists.py), so `denied` / `root_missing` cannot be produced for it -- a 403
 // carrying `authRequired` classifies as `failed` -- and both take the generic copy
 // rather than keys no request can reach.
 const RECENT_FAILED_KEYS: Record<SearchErrorCause, string> = {
@@ -170,7 +171,7 @@ interface Props {
   /**
    * Turn on the agent hand-off in the listing-failure notice. The hand-off
    * navigates to the chat and unmounts whatever this popover floats over, so
-   * only a mount with nothing unsaved beneath it may set this: ChatPage's
+   * only a mount with nothing unsaved beneath it may set this: ComposerDockView's
    * project chooser does (its composer draft is persisted per slot by
    * `chatDrafts`). Off by default — the safe direction — for FolderConfigModal
    * (folder form), RepoSettings (repo form) and ProjectScaffolderPage (wizard).
@@ -183,10 +184,18 @@ interface Props {
    * move the listing under the user.
    */
   startPath?: string
+  /** Rendered below the listing, inside the popover (so a click there does not dismiss it):
+   *  ComposerDockView's AWS profile row for the chat's current project. */
+  footer?: ReactNode
 }
 
-export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRect, onSelect, errorHandoff = false, startPath = '' }: Props) {
+export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRect, onSelect, errorHandoff = false, startPath = '', footer }: Props) {
   const [tab, setTab] = useState<'favorites' | 'recent' | 'browse'>('recent')
+  // Focus inside the caller's footer (a field of its own) disarms the list navigators:
+  // their document-capture listeners claim Enter and Tab, which would pick a project and
+  // close the picker over whatever the footer was being used for.
+  const [footerFocused, setFooterFocused] = useState(false)
+  useEffect(() => { if (!open) setFooterFocused(false) }, [open])
   const [input, setInput] = useState('')
   const ime = useImeGuard()
   const [browsePath, setBrowsePath] = useState('')
@@ -214,12 +223,25 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
   // object so the notice and its agent hand-off always describe one failure.
   const [listFailure, setListFailure] = useState<ListFailure | null>(null)
   const [recentFailure, setRecentFailure] = useState<RecentFailure | null>(null)
+  const [retryingRecent, setRetryingRecent] = useState(false)
   // A listing request (a directory or the drive list) is unsettled for the CURRENT ticket: set by
   // every `browse` / `browseDrives`, cleared only by the settlement that still holds the ticket.
   // It makes the notice's Retry an inert "Retrying…" for the re-ask, as WorkspacePicker's does.
   // A keystroke retires the ticket without settling it, and clears the notice the control sits
   // in on the same keystroke, so a stale `true` has nothing to make inert; the next request resets it.
   const [listingInFlight, setListingInFlight] = useState(false)
+  // The desktop app's OS-native folder chooser: offered only where the shell confirms a pick
+  // can work (its bridge is present and this window's gateway runs on this machine), asked
+  // afresh on every open. `nativePickBusy` covers the dialog and the listing that checks its
+  // answer, so one click opens one dialog.
+  const [nativePickReady, setNativePickReady] = useState(false)
+  const [nativePickBusy, setNativePickBusy] = useState(false)
+  // Why the last native pick produced no project: the dialog could not open, or the folder chosen
+  // in it did not list. Told at the foot of the picker beside the button, on whichever tab is up.
+  const [nativePickError, setNativePickError] = useState<{ message: string; report?: ErrorReport } | null>(null)
+  // A pick answers only the open it started in. Every open, close and unmount moves the
+  // generation on, so an answer that lands after any of them is dropped.
+  const openGen = useRef(0)
   const listFailed = listFailure?.kind ?? null
   const noteFailure = (kind: ListFailureKind, path: string, err: unknown) => {
     setListFailure({
@@ -342,6 +364,26 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
     if (listFailure.kind === 'drives') browseDrives()
     else browse(listFailure.path || undefined)
   }
+  // Takes a fresh recents ticket, so a reply that lands after a reopen cannot paint over the
+  // newer read. It deliberately never settles the landing tab: that was decided when the
+  // picker opened, and a recovery the user asked for must not move them off the pane they
+  // are standing on.
+  const retryRecents = () => {
+    if (retryingRecent || !recentFailure) return
+    const ticket = ++recentSeq.current
+    setRetryingRecent(true)
+    api.recentProjects().then(d => {
+      if (ticket !== recentSeq.current) return
+      setRecentDirs(d.dirs || [])
+      setRecentFailure(null)
+      setRetryingRecent(false)
+    }).catch((err: unknown) => {
+      if (ticket !== recentSeq.current) return
+      setRecentDirs([])
+      setRecentFailure({ cause: searchErrorCause(err), report: reportForError(err) })
+      setRetryingRecent(false)
+    })
+  }
 
   // "Back" has a target when the parent is a different directory, or when the
   // level above is the drive list. Every Back affordance (button, ArrowLeft at
@@ -397,6 +439,8 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
     const ticket = ++recentSeq.current
     const favTicket = ++favoriteSeq.current
     landing.current = { ticket }
+    // This open retires any retry still out, so its handlers return without clearing the flag.
+    setRetryingRecent(false)
     // The tab is chosen once BOTH reads have settled, by whichever settles second. Favourites
     // win when the user has any -- they are the list they curated -- then recents, and Browse
     // is where an install with neither starts. A read that REJECTED counts as settled with no
@@ -437,6 +481,22 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
     })
   }, [open, browse])
 
+  // Ask the shell, on every open, whether this window can use the native chooser. The answer
+  // can change between opens (a remote-host record added or cleared), and a browser tab or the
+  // PWA has no bridge at all, so there is nothing to ask there.
+  useEffect(() => {
+    if (!open || !hasNativeFolderPicker()) return
+    let live = true
+    canPickFolderNatively().then(ok => { if (live) setNativePickReady(ok) })
+    return () => { live = false }
+  }, [open])
+
+  useEffect(() => {
+    const generation = openGen
+    if (open) { generation.current++; setNativePickError(null) }
+    return () => { generation.current++ }
+  }, [open])
+
   useEffect(() => {
     if (!open) return
     let cleanup = () => {}
@@ -465,6 +525,40 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
     // Windows drive root `C:\` / `C:/` (stripping `C:/` to `C:` would yield a
     // drive-RELATIVE path, not the drive root).
     onSelect(stripTrailingSeparator(path)); onOpenChange(false)
+  }
+
+  /**
+   * Choose the project folder in the OS-native dialog. A cancel leaves the picker exactly as it
+   * was. A chosen folder is trusted no more than a typed path: it goes through the gateway's own
+   * directory listing first -- the read that refuses a missing or sensitive path -- and only a
+   * folder that lists is committed, through `select` like every other row. A dialog that could
+   * not open, and a chosen folder that did not list, are each told beside the button; the tab,
+   * the path field and the listing on screen are left as they were.
+   */
+  const pickNative = () => {
+    if (nativePickBusy) return
+    setNativePickBusy(true)
+    setNativePickError(null)
+    const gen = openGen.current
+    const current = () => openGen.current === gen
+    pickFolderNatively().then(result => {
+      if (!current()) return
+      if (result.status === 'failed') {
+        setNativePickError({ message: i18nT('components.projectPicker.system_folder_picker_failed') })
+        return
+      }
+      if (result.status !== 'picked') return
+      const picked = result.path
+      return api.browseDirs(picked).then(() => {
+        if (current()) select(picked)
+      }).catch((err: unknown) => {
+        if (!current()) return
+        const key = searchErrorCause(err) === 'timed_out'
+          ? 'components.projectPicker.system_folder_refused_timed_out'
+          : 'components.projectPicker.system_folder_refused'
+        setNativePickError({ message: i18nT(key, { failed: picked }), report: reportForError(err) })
+      })
+    }).finally(() => setNativePickBusy(false))
   }
   const rq = recentQuery.trim().toLowerCase()
   const filteredRecent = rq ? recentDirs.filter(d => d.toLowerCase().includes(rq)) : recentDirs
@@ -502,7 +596,7 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
   // Skill/File pickers). The Browse tab has its own combobox input handler
   // below, so the hook is only armed on Recent to avoid double-handling keys.
   const recentNav = useListKeyboardNav({
-    open: open && tab === 'recent',
+    open: open && tab === 'recent' && !footerFocused,
     count: filteredRecent.length,
     onChoose: i => { const d = filteredRecent[i]; if (d) select(d) },
     // The star is a pointer target inside a listbox whose own document-capture listener
@@ -516,7 +610,7 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
   // Favourites tab: the same nav, armed on its own tab so the two listeners are never both
   // live. Alt/Option+Enter un-favourites the highlighted row, the mirror of Recent's add.
   const favoriteNav = useListKeyboardNav({
-    open: open && tab === 'favorites',
+    open: open && tab === 'favorites' && !footerFocused,
     count: filteredFavorites.length,
     onChoose: i => { const d = filteredFavorites[i]; if (d) select(d) },
     onAltEnter: i => { const d = filteredFavorites[i]; if (!d) return false; toggleFavorite(d); return true },
@@ -593,6 +687,16 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
       ? { report: recentFailure.report, testId: 'pp-recent-error', message: i18nT(RECENT_FAILED_KEYS[recentFailure.cause]) }
       : null
 
+  // The recents Retry lives only here, on Browse. The Recent pane's nav hook owns Enter and
+  // Tab at document capture whenever its list is empty, which is exactly when the recents
+  // read has failed, so a control on that pane would be mouse-only; its copy already sends
+  // the user to Browse. The notice above names exactly one read, and this re-asks that one.
+  const noticeRetry = listFailure
+    ? (canRetryListing ? { busy: listingInFlight, run: retryListing } : null)
+    : recentFailure
+      ? { busy: retryingRecent, run: retryRecents }
+      : null
+
   // Keyboard isolation for the popover, matching the boundary `Modal` carries on
   // its own panel (see Modal.tsx's ModalDialog). It is needed SEPARATELY here
   // because this popover portals as a React SIBLING of the `<Modal>` it paints
@@ -636,7 +740,7 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
     e.stopPropagation()
   }
 
-  return createPortal(
+  return <OverlayPortal>{
     // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- keyboard-isolation barrier (see above), not an activatable control; there is no behaviour for a keyboard to be given, and every control inside here is a real input or button. Adding a role/tab stop would advertise an interaction this element does not have.
     <div ref={dropRef} onKeyDown={isolateKeys} className="fixed z-[9999] bg-bg-elevated border border-border rounded-xl shadow-xl w-[400px] max-w-[calc(100vw-16px)] flex flex-col overflow-hidden animate-slide-up" style={(() => {
       const dropMinH = 200
@@ -916,7 +1020,7 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
             </div>
           )}
           {browseNotice && (
-            <div className="px-3 py-2 border-b border-border flex items-center gap-2" aria-busy={(canRetryListing && listingInFlight) || undefined}>
+            <div className="px-3 py-2 border-b border-border flex items-center gap-2" aria-busy={noticeRetry?.busy || undefined}>
               {/* No hand-off unless the mount opts in (`errorHandoff`): three
                   of the four callers float this popover over an unsaved draft —
                   FolderConfigModal's folder form (name, colour, tags,
@@ -933,16 +1037,16 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
                 message={browseNotice.message}
                 testId={browseNotice.testId}
               />
-              {canRetryListing && (
+              {noticeRetry && (
                 // Inert-but-focusable while its re-ask is out, like WorkspacePicker's Retry:
                 // `aria-disabled` plus the in-handler guard, NOT `disabled`, which blurs it.
                 <button
                   type="button"
-                  onClick={retryListing}
-                  aria-disabled={listingInFlight || undefined}
+                  onClick={noticeRetry.run}
+                  aria-disabled={noticeRetry.busy || undefined}
                   className="px-2 py-1 text-[11px] bg-accent/20 text-accent rounded hover:bg-accent/30 shrink-0 aria-disabled:opacity-50"
                 >
-                  {listingInFlight ? i18nT('components.projectPicker.retrying') : i18nT('components.projectPicker.retry')}
+                  {noticeRetry.busy ? i18nT('components.projectPicker.retrying') : i18nT('components.projectPicker.retry')}
                 </button>
               )}
             </div>
@@ -969,7 +1073,47 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
           </div>
         </>
       )}
-    </div>,
-    document.body
-  )
+      {nativePickReady && (
+        <div className="px-2 py-1.5 border-t border-border shrink-0 flex flex-col gap-1.5">
+          {/* Why the last pick produced no project, told where the user just clicked. The
+              hand-off follows the mount's opt-in (`errorHandoff`), as every other notice here. */}
+          {nativePickError && (
+            <ErrorNotice
+              variant="inline"
+              className="whitespace-normal px-1"
+              askAgent={errorHandoff}
+              onHandoff={() => onOpenChange(false)}
+              report={nativePickError.report}
+              message={nativePickError.message}
+              testId="pp-native-pick-error"
+            />
+          )}
+          {/* The desktop app's OS-native folder chooser, on every tab. Shown only where the shell
+              confirmed a pick can work; everywhere else the panes above are the whole picker.
+              A bordered resting state so it reads as a control; dimmed only while its dialog (or
+              the listing that checks the answer) is out, and inert then like the Retry control:
+              `aria-disabled` plus the in-handler guard. */}
+          <button
+            type="button"
+            onClick={pickNative}
+            aria-disabled={nativePickBusy || undefined}
+            className="w-full px-2 py-1.5 text-[12px] text-text bg-bg-hover/60 border border-border rounded hover:bg-bg-hover flex items-center justify-center gap-1.5 aria-disabled:opacity-50 aria-disabled:cursor-progress"
+          >
+            <FolderSearch size={13} className="shrink-0 text-accent" />
+            <span className="truncate">{i18nT('components.projectPicker.system_folder_picker')}</span>
+          </button>
+        </div>
+      )}
+      {footer && (
+        // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- a focus tracker, not an activatable control: it only notes that focus is inside the footer so the list navigators stand down, and every control inside is the footer's own input or button.
+        <div
+          className="contents"
+          onFocus={() => setFooterFocused(true)}
+          onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFooterFocused(false) }}
+        >
+          {footer}
+        </div>
+      )}
+    </div>
+  }</OverlayPortal>
 }

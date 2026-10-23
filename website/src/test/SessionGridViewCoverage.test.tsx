@@ -21,7 +21,7 @@ import SessionGridView from '../components/SessionGridView'
 import PaneDim from '../components/PaneDim'
 import { loadChatConfig, saveChatConfig } from '../pages/chat/ChatSettings'
 import { renderWithProviders } from './helpers'
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 import { emitSlotFocused } from '../hooks/useWebSocket'
 import type { GridNode } from '../hooks/useSessionGrid'
 
@@ -600,12 +600,28 @@ describe('SessionGridView — picker list', () => {
     expect(rows[2].textContent).toContain('0 msgs')
   })
 
-  it('falls back to the slot key when a session has no title', async () => {
-    seedApi([{ key: 'untitled-slot' }])
-    renderGrid(null)
+  it('labels an untitled session "Untitled session", never its slot key (#20873)', async () => {
+    // No title, a title equal to the key, and a named control.
+    seedApi([
+      { key: 'chat-9-1785440411', last_activity_ts: '2026-01-03T00:00:00Z' },
+      { key: 'chat-8-1785440400', title: 'chat-8-1785440400', last_activity_ts: '2026-01-02T00:00:00Z' },
+      { key: 'named-slot', title: 'Named work', last_activity_ts: '2026-01-01T00:00:00Z' },
+    ])
+    renderGrid('a')
 
-    await waitFor(() => expect(rowsOf(onlyPicker())).toHaveLength(1))
-    expect(rowsOf(onlyPicker())[0].textContent).toContain('untitled-slot')
+    await waitFor(() => expect(rowsOf(onlyPicker())).toHaveLength(3))
+    const rows = rowsOf(onlyPicker())
+    expect(rows[0].textContent).toContain('Untitled session')
+    expect(rows[0].textContent).not.toContain('chat-9-1785440411')
+    expect(rows[1].textContent).toContain('Untitled session')
+    expect(rows[1].textContent).not.toContain('chat-8-1785440400')
+    expect(rows[2].textContent).toContain('Named work')
+
+    // The key still finds the untitled row, and picking it opens that key.
+    fireEvent.change(screen.getByPlaceholderText('Search sessions…'), { target: { value: '1785440411' } })
+    expect(rowsOf(onlyPicker())).toHaveLength(1)
+    fireEvent.click(rowsOf(onlyPicker())[0])
+    expect(await screen.findByTestId('pane-chat-9-1785440411')).toBeTruthy()
   })
 
   it('filters by title, key and agent', async () => {
@@ -706,6 +722,20 @@ describe('SessionGridView — picker controls', () => {
     expect(m.forkChatSlot).toHaveBeenCalledWith('a')
   })
 
+  // The child's sidebar row sits in the source's folder, which can be collapsed;
+  // the sidebar opens the path from this request without touching the filters.
+  it('asks the sidebar to open the forked child\'s folder path', async () => {
+    const m = seedApi([{ key: 'a' }, { key: 'zeta', title: 'Zeta' }])
+    m.forkChatSlot = vi.fn().mockResolvedValue({ ok: true, key: 'forked-1', folder_id: 'fB' })
+    const { store } = renderGrid('a')
+    await waitFor(() => expect(rowsOf(onlyPicker())).toHaveLength(1))
+
+    fireEvent.click(within(onlyPicker()).getByRole('button', { name: 'Fork' }))
+
+    expect(await screen.findByTestId('pane-forked-1')).toBeTruthy()
+    expect(store.getState().chat.revealRequest).toMatchObject({ kind: 'session', target: 'forked-1', openFoldersOnly: true, folderId: 'fB' })
+  })
+
   it('leaves the cell empty when the fork is refused', async () => {
     const m = seedApi([{ key: 'a' }])
     m.forkChatSlot = vi.fn().mockResolvedValue({ ok: false, key: 'forked-1' })
@@ -717,6 +747,92 @@ describe('SessionGridView — picker controls', () => {
     expect(screen.queryByTestId('pane-forked-1')).toBeNull()
   })
 
+  // Built from the mocked client's own class: the component's `instanceof ApiError`
+  // resolves against that binding, and a real instance would fail the check.
+  function overCapacity() {
+    const err = new ApiError(400, 'too large')
+    return Object.assign(err, {
+      status: 400,
+      message: 'too large',
+      body: JSON.stringify({ code: 'fork_corpus_too_large' }),
+    })
+  }
+
+  it('routes a rejected fork to the pane notice, not a native dialog', async () => {
+    const m = seedApi([{ key: 'a' }])
+    m.forkChatSlot = vi.fn().mockRejectedValue(overCapacity())
+    const nativeDialog = vi.spyOn(window, 'alert').mockImplementation(() => {})
+    renderGrid('a')
+
+    fireEvent.click(within(onlyPicker()).getByRole('button', { name: 'Fork' }))
+
+    const notice = await screen.findByTestId('grid-fork-error')
+    expect(notice.textContent).toContain('too large to fork whole')
+    expect(nativeDialog).not.toHaveBeenCalled()
+    nativeDialog.mockRestore()
+  })
+
+  it('names the pane it refused and does not tell the reader to open it', async () => {
+    const m = seedApi([{ key: 'a' }])
+    m.forkChatSlot = vi.fn().mockRejectedValue(overCapacity())
+    renderGrid('a')
+    const fork = within(onlyPicker()).getByRole('button', { name: 'Fork' })
+    // Wait for the slot list: until it loads the source is unknown and keeps its key.
+    await waitFor(() => expect(fork.getAttribute('title')).toBe('Fork Untitled session (child session)'))
+
+    fireEvent.click(fork)
+
+    const notice = await screen.findByTestId('grid-fork-error')
+    // Several panes can be visible, so "This conversation" named none of them, and the
+    // source is already open in a pane, so "Open it" asked for something already done.
+    // The source is untitled, so it is named "Untitled session", never its key (#23084).
+    expect(notice.textContent).toContain('“Untitled session”')
+    expect(notice.textContent).not.toContain('“a”')
+    expect(notice.textContent).not.toContain('Open it')
+  })
+
+  it.each([
+    ['an untitled source', undefined, 'Untitled session'],
+    ['a titled source', 'Zeta notes', 'Zeta notes'],
+  ])('the Fork tooltip and the refused-fork notice name %s by its label (#23084)', async (_case, title, shown) => {
+    const m = seedApi([{ key: 'a', title }])
+    m.forkChatSlot = vi.fn().mockRejectedValue(overCapacity())
+    renderGrid('a')
+    const fork = within(onlyPicker()).getByRole('button', { name: 'Fork' })
+    // Waiting on the label also waits for the slot list to load.
+    await waitFor(() => expect(fork.getAttribute('title')).toBe(`Fork ${shown} (child session)`))
+
+    fireEvent.click(fork)
+
+    const notice = await screen.findByTestId('grid-fork-error')
+    expect(notice.textContent).toContain(`“${shown}”`)
+  })
+
+  it('still shows the pane notice when the config lookup fails too', async () => {
+    const m = seedApi([{ key: 'a' }])
+    m.forkChatSlot = vi.fn().mockRejectedValue(overCapacity())
+    m.dashboardConfig = vi.fn().mockRejectedValue(new Error('config unavailable'))
+    renderGrid('a')
+
+    fireEvent.click(within(onlyPicker()).getByRole('button', { name: 'Fork' }))
+
+    const notice = await screen.findByTestId('grid-fork-error')
+    expect(notice.textContent).toContain('too large to fork whole')
+    expect(notice.textContent).not.toContain('earlier message')
+    expect(notice.textContent).not.toContain('later message')
+  })
+
+  it('offers the agent hand-off on a rejected fork, which cannot destroy anything', async () => {
+    const m = seedApi([{ key: 'a' }])
+    m.forkChatSlot = vi.fn().mockRejectedValue(overCapacity())
+    renderGrid('a')
+
+    fireEvent.click(within(onlyPicker()).getByRole('button', { name: 'Fork' }))
+
+    const notice = await screen.findByTestId('grid-fork-error')
+    expect(within(notice).getByRole('button', { name: /ask.*agent/i })).toBeTruthy()
+  })
+
   it('disables the fork button while no session is in the grid', async () => {
     renderGrid(null)
 
@@ -725,7 +841,7 @@ describe('SessionGridView — picker controls', () => {
     expect(fork.getAttribute('title')).toBe('No session to fork yet')
   })
 
-  it('names the fork source by title, falling back to its slot key', async () => {
+  it('names the fork source by title, falling back to its slot key when the slot list lacks it', async () => {
     seedApi([{ key: 'a', title: 'Alpha' }])
     const { unmount } = renderGrid('a')
 

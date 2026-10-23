@@ -14,7 +14,7 @@ from kiro_crew.channel import (
     ApprovalPolicy,
     ChannelManager,
     ListenMode,
-    _shell_base_binary,
+    _offerable_base_binary,
     run_channel_agent,
 )
 from kiro_crew.config.loader import coerce_config_field, config_path, read_config_text
@@ -106,19 +106,36 @@ def _mgr(request: web.Request) -> ChannelManager:
 
 
 async def _json_object(request: web.Request) -> dict:
-    """Parse a JSON request body and require a top-level object."""
-    try:
-        body = await request.json()
-    except Exception:
-        raise web.HTTPBadRequest(
-            text='{"error":"invalid JSON","code":"invalid_json"}',
-            content_type="application/json",
-        )
-    if not isinstance(body, dict):
-        raise web.HTTPBadRequest(
-            text=('{"error":"request body must be a JSON object",' '"code":"body_not_object"}'),
-            content_type="application/json",
-        )
+    """Parse a JSON request body and require a top-level object.
+
+    Reads through :func:`read_bounded_json`, so a body without a JSON content
+    type is refused 415 before it is read. Raises instead of returning, which is
+    this module's contract: the refusal goes out as an ``HTTPException`` with the
+    helper's own status and ``code``.
+
+    Uncapped (``max_bytes=None``) on purpose: a channel message carries user
+    prose, and these routes never had a byte cap below the app-wide
+    ``client_max_size``. Adding one here would be a new limit, not a refactor.
+    """
+    # Body-scope import: importing ``handlers._shared`` runs the whole
+    # ``handlers`` package ``__init__``, which this module has never depended on
+    # at import time; only a body read needs it.
+    from kiro_crew.dashboard.handlers._shared import (
+        bounded_json_error_as_exception,
+        bounded_json_error_code,
+        read_bounded_json,
+    )
+
+    body, error = await read_bounded_json(request, max_bytes=None)
+    if error is not None:
+        if bounded_json_error_code(error) == "body_not_object":
+            # Same code as the helper; this module's message, kept for clients.
+            raise web.HTTPBadRequest(
+                text=('{"error":"request body must be a JSON object",' '"code":"body_not_object"}'),
+                content_type="application/json",
+            )
+        raise bounded_json_error_as_exception(error)
+    assert body is not None
     return body
 
 
@@ -482,7 +499,7 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
     await save_slot_off_loop(state, slot, force=True, best_effort=False)
 
     if message.msg_type == "mention":
-        if message.delivery == "interrupt" and slot.turn_running and not slot._in_stage_execution:
+        if message.delivery == "interrupt" and slot.turn_running:
             client = slot._acp_client
             if client is not None and getattr(client, "supports_steer", False):
                 interrupt_text = _peer_interrupt_text(channel, message, content)
@@ -534,16 +551,16 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
             queue(request_text, **kwargs)
         else:
             queue(queue_index, request_text, **kwargs)
-        if slot.running or slot._in_stage_execution:
+        if slot.running:
             await save_slot_off_loop(state, slot, force=True, best_effort=False)
             state.push_slots_update()
-            if message.delivery == "interrupt" and not slot._in_stage_execution:
+            if message.delivery == "interrupt":
                 from kiro_crew.dashboard.chat_handlers import preempt_slot_for_channel_interrupt
 
                 return await preempt_slot_for_channel_interrupt(state, slot)
             return "queued"
 
-    if message.msg_type == "mention" and not slot.running and not slot._in_stage_execution:
+    if message.msg_type == "mention" and not slot.running:
         from kiro_crew.dashboard.chat_runner import _start_next_queued_turn
 
         await _start_next_queued_turn(state, slot)
@@ -778,7 +795,7 @@ async def api_channel_approve_agent(request: web.Request) -> web.Response:
                 # segment would run outside the shell context the user read
                 # ("cd /tmp/safe && rm target" does not license a bare
                 # "rm target" elsewhere).
-                base = _shell_base_binary(cmd)
+                base = _offerable_base_binary(cmd)
                 if base is None:
                     return _deny_trust_grant(
                         agent,

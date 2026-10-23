@@ -278,5 +278,6 @@ class ClaudeCodeMirror(AgentConfigMirror):
             # caller that appends an element of its own must still see it.
             disabled_servers=projection.disabled_servers,
             derived_spec_snapshot=projection.derived_spec_snapshot,
+            zero_tools=projection.zero_tools,
             agent_spec=projection.agent_spec,
         )

@@ -16,7 +16,7 @@ Supported providers:
   entirely through the CLI subprocess, so the module imports cleanly on a
   vanilla machine without any AWS SDK installed. When the CLI or credentials
   are absent, the Polly path degrades gracefully (returns ``None``).
-- ``piper`` (recommended offline default): Local neural TTS via the ``piper``
+- ``piper`` (optional local engine): Local neural TTS via the ``piper``
   CLI (https://github.com/OHF-Voice/piper1-gpl, published as the ``piper-tts``
   wheel). Produces WAV. Requires the ``piper`` binary and a voice model
   (.onnx + .onnx.json) on disk. Fully offline, and the best offline quality.
@@ -91,12 +91,14 @@ PROVIDER_PIPER = "piper"
 PROVIDER_POCKET = "pocket"
 PROVIDER_SYSTEM = "system"
 VALID_PROVIDERS = frozenset({PROVIDER_POLLY, PROVIDER_PIPER, PROVIDER_POCKET, PROVIDER_SYSTEM})
-# Local offline TTS (Piper) is the documented recommended default — it needs no
-# AWS credentials or network, and it is the best offline quality. ``system`` (the
-# host's built-in engine) needs nothing installed at all and is the fallback a
-# fresh machine can always reach; Polly remains fully supported when explicitly
-# selected (``provider="polly"``) with the ``aws`` CLI + credentials present.
-DEFAULT_PROVIDER = PROVIDER_PIPER
+REMOVED_PROVIDERS: frozenset[str] = frozenset()
+DEFAULT_PROVIDER = PROVIDER_SYSTEM
+DEFAULT_LENGTH_SCALE = 1.0
+_PIPER_MAX_STDERR_BYTES = 4096
+_PIPER_MAX_CONFIG_BYTES = 64 * 1024
+_PIPER_REAP_TIMEOUT_SECONDS = 5
+_PIPER_MAX_PHRASE_CHARS = 240
+_PIPER_CHUNK_SECONDS = 0.2
 
 # Built-in engine per platform. The value is what ``_synthesize_system``
 # switches on, so it names the engine rather than the OS: a host can lack the
@@ -118,9 +120,7 @@ _SYSTEM_WPM_MAX = 500
 
 
 def is_available(
-    provider: str = DEFAULT_PROVIDER,
-    piper_binary: str = "",
-    piper_model: str = "",
+    provider: str = DEFAULT_PROVIDER, *, piper_binary: str = "", piper_model: str = ""
 ) -> bool:
     """Return True if TTS for the given provider can be produced.
 
@@ -131,8 +131,6 @@ def is_available(
     - ``polly``: checks the ``aws`` CLI is on PATH. Credential validity is
       NOT verified here — a missing/expired profile still fails gracefully
       inside ``synthesize_speech`` (caught, logged, returns None).
-    - ``piper``: checks the piper binary is invocable AND the model file
-      exists. Model-less piper is unusable, so we verify both up front.
 
     Callers use this to decide whether to post a fallback ephemeral message
     when voice output was requested but cannot be produced.
@@ -227,64 +225,12 @@ def _sapi_rate(rate: object) -> int:
     return max(_SAPI_RATE_MIN, min(_SAPI_RATE_MAX, step))
 
 
-def _resolve_piper_binary(configured: str = "") -> str | None:
-    """Return piper binary path or None if not found.
-
-    Resolution order: explicit ``configured`` path → ``piper`` on PATH →
-    the console script inside a conventional ``~/piper-venv``. The venv's
-    script directory differs by platform (``Scripts`` on Windows, ``bin``
-    elsewhere), so the fallback is built from the platform rather than assumed.
-    """
-    if configured:
-        p = os.path.expanduser(configured)
-        return p if _is_executable_file(p) else None
-    found = shutil.which("piper")
-    if found:
-        return found
-    scripts = "Scripts" if IS_WINDOWS else "bin"
-    exe = "piper.exe" if IS_WINDOWS else "piper"
-    fallback = os.path.expanduser(os.path.join("~", "piper-venv", scripts, exe))
-    return fallback if _is_executable_file(fallback) else None
-
-
-def _is_executable_file(path: str) -> bool:
-    """Return True when *path* is a file this platform can launch.
-
-    ``os.access(X_OK)`` is not a usable test on Windows — it reports any
-    readable file as executable — so there a file that HAS an extension must
-    carry a launchable one. Without that, a configured
-    ``piper_model_notes.txt`` passes ``is_available``, the caller skips its
-    "voice unavailable" notice, and the spawn then fails with no explanation.
-    ``PATHEXT`` is read rather than hardcoded because an operator can extend it.
-    """
-    if not os.path.isfile(path):
-        return False
-    if IS_WINDOWS:
-        suffix = os.path.splitext(path)[1].lower()
-        if not suffix:
-            # PATHEXT governs how a bare NAME resolves against PATH, not what
-            # CreateProcess will launch from an explicit path, and a PE image
-            # needs no extension — so an extensionless configured path stands.
-            return True
-        # PATHEXT is always ';'-separated, which is not `os.pathsep` when this
-        # branch is exercised from a POSIX host's tests.
-        exts = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
-        return suffix in {e.strip().lower() for e in exts.split(";") if e.strip()}
-    return os.access(path, os.X_OK)
-
-
 # ── Config defaults ──
 DEFAULT_VOICE = "Ruth"
 DEFAULT_POCKET_VOICE = "michael"
 DEFAULT_ENGINE = "generative"
 DEFAULT_RATE = "100%"
 DEFAULT_PITCH = "+0%"
-DEFAULT_LENGTH_SCALE = 1.0  # Piper speed: <1 faster, >1 slower
-_PIPER_CHUNK_SECONDS = 0.2
-_PIPER_MAX_PHRASE_CHARS = 240
-_PIPER_REAP_TIMEOUT_SECONDS = 5
-_PIPER_MAX_CONFIG_BYTES = 64 * 1024
-_PIPER_MAX_STDERR_BYTES = 4096
 OUTPUT_FORMAT = "mp3"
 MAX_CHARS = 2900  # Polly SSML limit ~3000 chars, leave margin
 POCKET_STREAM_READ_TIMEOUT = 60
@@ -316,25 +262,6 @@ def _validate_pitch(pitch: object) -> str:
     return pitch if isinstance(pitch, str) and _PITCH_RE.match(pitch) else DEFAULT_PITCH
 
 
-def validate_length_scale(value: object) -> float:
-    """Coerce *value* to a finite, positive Piper length-scale.
-
-    Returns :data:`DEFAULT_LENGTH_SCALE` for anything non-numeric, non-finite
-    (``inf``/``nan``), zero, or negative. ``float()`` of a very large int can
-    raise ``OverflowError``, so that is caught too. Shared by the config loader
-    and the dashboard PUT handler so a bad value can never reach synthesis or be
-    persisted as unserializable JSON (``Infinity``/``NaN`` would break the
-    browser's ``JSON.parse`` of the config GET).
-    """
-    try:
-        scale = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        return DEFAULT_LENGTH_SCALE
-    if not math.isfinite(scale) or scale <= 0:
-        return DEFAULT_LENGTH_SCALE
-    return scale
-
-
 def validated_config_string(value: object) -> str | None:
     """Return *value* stripped when it is a string, else ``None``.
 
@@ -343,8 +270,8 @@ def validated_config_string(value: object) -> str | None:
     so silently coercing a wrong TYPE to ``""`` would rewrite the caller's intent
     from "set this voice" into "use the default" without telling them.
 
-    Shared by the config loader and the dashboard PUT handler, like
-    :func:`validate_length_scale`. Splitting them is what let the write path keep
+    Shared by the config loader and the dashboard PUT handler. Splitting them
+    is what let the write path keep
     persisting ``str({})`` -> ``"{}"`` as a voice name or a binary path while the
     loader was already defending against exactly that value on read.
     """
@@ -699,9 +626,7 @@ async def _synthesize_system(
                 "-o",
                 path,
                 "--file-format=WAVE",
-                # `say -o` defaults to AIFF-C; the dashboard plays PCM WAV, and
-                # the sample rate matches what the piper voices produce so the
-                # two providers sound consistently pitched.
+                # `say -o` defaults to AIFF-C; the dashboard plays PCM WAV.
                 "--data-format=LEI16@22050",
                 "-r",
                 str(_system_wpm(rate)),
@@ -936,12 +861,12 @@ async def _synthesize_piper(
     Piper doesn't understand SSML; it takes plain text on stdin. ``length_scale``
     controls speed (<1 faster, >1 slower).
     """
-    bin_path = _resolve_piper_binary(piper_binary)
+    bin_path = await asyncio.to_thread(_resolve_piper_binary, piper_binary)
     if not bin_path:
         logger.warning("piper binary not found (configured=%r)", piper_binary)
         return None
     model = os.path.expanduser(piper_model) if piper_model else ""
-    if not model or not os.path.isfile(model):
+    if not model or not await asyncio.to_thread(os.path.isfile, model):
         logger.error("piper model not found: %r", piper_model)
         return None
     # Model config is optional — piper auto-detects `<model>.onnx.json` adjacent
@@ -985,7 +910,6 @@ async def synthesize_speech(
     pitch: str = DEFAULT_PITCH,
     aws_profile: str = "",
     region: str = "",
-    # Piper-specific:
     piper_binary: str = "",
     piper_model: str = "",
     piper_model_config: str = "",
@@ -996,7 +920,7 @@ async def synthesize_speech(
     """Generate audio from *text* using the configured *provider*.
 
     Returns the path to a temp audio file (``.mp3`` for Polly, ``.wav`` for
-    Piper and the built-in system engine), or None on failure. Caller is
+    the built-in system engine), or None on failure. Caller is
     responsible for deleting the file.
 
     LLM output is redacted for credentials and exfiltration URLs before
@@ -1064,9 +988,9 @@ async def stream_pocket_speech(
     plain = strip_markdown(text).strip()
     if not plain:
         raise RuntimeError("no speakable text")
-    bin_path = _resolve_piper_binary(piper_binary)
+    bin_path = await asyncio.to_thread(_resolve_piper_binary, piper_binary)
     model = os.path.expanduser(piper_model) if piper_model else ""
-    if not bin_path or not model or not os.path.isfile(model):
+    if not bin_path or not model or not await asyncio.to_thread(os.path.isfile, model):
         raise RuntimeError("Pocket TTS is not configured")
     cfg = os.path.expanduser(piper_model_config) if piper_model_config else ""
     cmd: list[str] = [bin_path, "--stream", "-m", model]
@@ -1080,7 +1004,7 @@ async def stream_pocket_speech(
     stderr_task: asyncio.Task[bytes] | None = None
     yielded = False
     try:
-        cmd, sandbox_cleanup = wrap_argv(cmd, mode="standard")
+        cmd, sandbox_cleanup = await wrap_argv_async(cmd, mode="standard", _prepare=wrap_argv)
         proc = await create_subprocess_limited(
             *cgroup_scope_argv(cmd),
             stdin=asyncio.subprocess.PIPE,
@@ -1135,11 +1059,17 @@ async def _synthesize_polly(
     engine: str = DEFAULT_ENGINE,
     aws_profile: str = "",
     region: str = "",
+    *,
+    raise_refusal: bool = False,
 ) -> str | None:
     """Call Amazon Polly to generate MP3.  Returns temp file path or ``None``.
 
     ``ssml`` may be SSML (starting with ``<speak``) or plain text;
     text-type is auto-detected from the leading ``<speak`` tag.
+
+    ``raise_refusal`` is for a caller with a person waiting: when no consent is
+    recorded for this profile and region it raises
+    ``VoiceSynthesisError("voice_consent_required")`` instead of returning ``None``.
     """
     # Polly is a PAID AWS service and this is the request that spends money, so
     # it does not happen without a recorded operator consent for this exact
@@ -1151,6 +1081,18 @@ async def _synthesize_polly(
     if not await aws_consent.refuse_and_log(
         aws_consent.SERVICE_POLLY, profile=aws_profile, region=region
     ):
+        if raise_refusal:
+            # Only a missing grant is the person's to fix. The gate's log and
+            # audit keep the account, profile and region this text leaves out.
+            granted, _ = aws_consent.is_granted(
+                aws_consent.SERVICE_POLLY, profile=aws_profile, region=region
+            )
+            if not granted:
+                raise VoiceSynthesisError(
+                    "voice_consent_required",
+                    "Amazon Polly use is not confirmed for this profile and region. "
+                    "Nothing was sent to AWS. Confirm it in Settings -> Voice.",
+                )
         return None
     # Polly is OPTIONAL and driven via the ``aws`` CLI (no boto3 dependency).
     # On a vanilla machine without the CLI installed, degrade gracefully here
@@ -1325,6 +1267,358 @@ class VoiceSynthesisError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+async def stitch_mp3s(paths: list[str], output: str | None = None) -> str | None:
+    """Concatenate MP3 files into a single file using ffmpeg.
+
+    Windows: ffmpeg is not guaranteed on PATH, so the dashboard-streaming stitch
+    path fails there; making it optional with a warning is a known gap. The
+    Slack thread-upload path is unaffected.
+    """
+    if not paths:
+        return None
+    if len(paths) == 1:
+        if output:
+            shutil.copy2(paths[0], output)
+            return output
+        return paths[0]
+    owned = output is None
+    if output is None:
+        fd, output = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+
+    def _discard_owned_output() -> None:
+        if owned:
+            try:
+                os.unlink(output)
+            except OSError:
+                pass
+
+    concat = "|".join(paths)
+    succeeded = False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            f"concat:{concat}",
+            "-c",
+            "copy",
+            output,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=30)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # asyncio.wait_for cancels communicate() but does NOT terminate
+            # the child — kill it explicitly (mirroring the polly
+            # path) so it stops consuming CPU and, on Windows, releases the
+            # output handle that would otherwise make the unlink in the
+            # ``finally`` below fail and re-leak the file.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.communicate()
+            except Exception:
+                logger.debug("ffmpeg reap after kill failed", exc_info=True)
+            raise
+        if proc.returncode != 0 or not os.path.exists(output) or os.path.getsize(output) == 0:
+            return None
+        succeeded = True
+        return output
+    except Exception:
+        logger.exception("ffmpeg stitch failed")
+        return None
+    finally:
+        if not succeeded:
+            _discard_owned_output()
+
+
+async def streaming_voice_reply(
+    response_text: str,
+    voice_id: str = DEFAULT_VOICE,
+    engine: str = DEFAULT_ENGINE,
+    rate: str = DEFAULT_RATE,
+    pitch: str = DEFAULT_PITCH,
+    aws_profile: str = "",
+    region: str = "",
+):
+    """Async generator: yields (sentence_index, sentence_text, mp3_bytes) per sentence.
+
+    Use this for dashboard streaming — play each chunk as it arrives,
+    then call ``stitch_mp3s`` on the collected paths for a single replay file.
+
+    LLM output is redacted for credentials and exfiltration URLs before
+    synthesis (same rationale as ``synthesize_speech``) — streaming audio
+    to the dashboard bypasses the usual text-path redaction.
+    """
+    # ── Redact LLM output before it crosses an external surface (audio) ──
+    response_text, cred_warns, url_warns = redact_with_findings(response_text)
+    if cred_warns:
+        logger.warning(
+            "stream_voice_chunks: redacted %d credential pattern(s) before TTS", len(cred_warns)
+        )
+    if url_warns:
+        logger.warning(
+            "stream_voice_chunks: redacted %d suspicious URL(s) before TTS", len(url_warns)
+        )
+
+    sentences = split_sentences(response_text)
+    for i, sentence in enumerate(sentences):
+        ssml = text_to_ssml(sentence, rate=rate, pitch=pitch, engine=engine)
+        if not ssml:
+            continue
+        # Dashboard streaming is Polly-only today (sentence-by-sentence MP3
+        # chunks). Calls the Polly-specific internal to avoid double-wrapping
+        # text→SSML through the public dispatcher. Raises only when no consent
+        # is recorded for this profile and region; any other refusal skips
+        # this sentence and the next one is checked again.
+        mp3_path = await _synthesize_polly(
+            ssml,
+            voice_id=voice_id,
+            engine=engine,
+            aws_profile=aws_profile,
+            region=region,
+            raise_refusal=True,
+        )
+        if not mp3_path:
+            continue
+        try:
+            with open(mp3_path, "rb") as f:
+                mp3_bytes = f.read()
+            yield i, sentence, mp3_bytes
+        finally:
+            try:
+                os.unlink(mp3_path)
+            except OSError:
+                pass
+
+
+#: Keys read from ``voice_reply`` by every channel that can synthesize a
+#: response.  Keeping this translation here prevents a new channel from
+#: silently honoring a different subset of the shared TTS configuration.
+_SYNTHESIS_KEYS: tuple[tuple[str, str, object], ...] = (
+    ("voice_id", "voice_id", DEFAULT_VOICE),
+    ("engine", "engine", DEFAULT_ENGINE),
+    ("rate", "rate", DEFAULT_RATE),
+    ("pitch", "pitch", DEFAULT_PITCH),
+    ("aws_profile", "aws_profile", ""),
+    ("region", "region", ""),
+    ("piper_binary", "piper_binary", ""),
+    ("piper_model", "piper_model", ""),
+    ("piper_model_config", "piper_model_config", ""),
+    ("system_voice", "system_voice", ""),
+)
+
+
+_warned_removed_providers: set[str] = set()
+
+
+def _warn_removed_provider(name: str) -> None:
+    """Log, once per process, that a saved config names a removed provider."""
+    if name in _warned_removed_providers:
+        return
+    _warned_removed_providers.add(name)
+    logger.warning(
+        "voice_reply.provider %r was removed (unpinned downloads and license, see "
+        "https://github.com/kirodotdev/KiroCrew/issues/23154); speaking with %r. "
+        'Set voice_reply.provider to "system" or "polly" in config.json to silence '
+        "this notice.",
+        name,
+        DEFAULT_PROVIDER,
+    )
+
+
+def resolve_configured_provider(section: dict | None) -> str:
+    """Resolve the provider from a raw ``voice_reply`` config section.
+
+    One implementation for every reader, so the rules below cannot drift between
+    the Slack loader, the Telegram settings path, and the dashboard.
+
+    Validated here rather than at synthesis time: a typo (``"ploly"``) would
+    otherwise pass through and only fail after the user has already spoken and is
+    waiting for a spoken answer. Both the absent-key default and the
+    invalid-value fallback stay LOCAL — reaching a paid AWS service because a key
+    was missing is not a decision an operator made, and a wrong local provider
+    costs nothing and degrades to a "TTS isn't configured" notice.
+
+    An unnamed provider with a configured local model retains Piper. Explicit
+    local providers, including the Pocket compatibility runtime, remain supported.
+    """
+    section = section or {}
+    provider = section.get("provider")
+    if not provider:
+        if validated_config_string(section.get("piper_model")):
+            return PROVIDER_PIPER
+        return DEFAULT_PROVIDER
+    if isinstance(provider, str) and provider in REMOVED_PROVIDERS:
+        _warn_removed_provider(provider)
+        return DEFAULT_PROVIDER
+    # ``in VALID_PROVIDERS`` raises TypeError on an unhashable JSON value
+    # (config.json can hold a list or dict where a string belongs), so the type
+    # is checked before the membership test.
+    if not isinstance(provider, str) or provider not in VALID_PROVIDERS:
+        logger.warning(
+            "voice_reply.provider %r not in %s, defaulting to %r",
+            provider,
+            sorted(VALID_PROVIDERS),
+            DEFAULT_PROVIDER,
+        )
+        return DEFAULT_PROVIDER
+    return provider
+
+
+def synthesis_settings(raw: dict | None) -> dict:
+    """The shared ``voice_reply`` section as :func:`synthesize_and_deliver` kwargs.
+
+    *raw* is the section itself (``cfg.raw.get("voice_reply")``), so a caller with
+    a validated config and a caller reading ``config.json`` directly resolve the
+    same way.
+    """
+    section = raw or {}
+    out: dict = {"provider": resolve_configured_provider(section)}
+    for key, kwarg, default in _SYNTHESIS_KEYS:
+        out[kwarg] = section.get(key, default)
+    out["length_scale"] = validate_length_scale(section.get("piper_length_scale", 1.0))
+    return out
+
+
+async def synthesize_and_deliver(
+    deliver: Callable[[str], Awaitable[bool]],
+    response_text: str,
+    provider: str = DEFAULT_PROVIDER,
+    # Polly:
+    voice_id: str = DEFAULT_VOICE,
+    engine: str = DEFAULT_ENGINE,
+    rate: str = DEFAULT_RATE,
+    pitch: str = DEFAULT_PITCH,
+    aws_profile: str = "",
+    region: str = "",
+    # Piper/Pocket:
+    piper_binary: str = "",
+    piper_model: str = "",
+    piper_model_config: str = "",
+    length_scale: float = 1.0,
+    # System:
+    system_voice: str = "",
+) -> bool:
+    """Synthesize *response_text* and hand the audio file to *deliver*.
+
+    The channel-neutral half of the pipeline. ``synthesize_speech`` was already
+    surface-agnostic; the only Slack-shaped step was the upload, so it becomes a
+    callback taking the temp file's path and returning whether it landed.
+
+    The temp file is unlinked in a ``finally`` regardless of what *deliver* does,
+    including raising — a synthesizer that keeps its output on a delivery failure
+    leaks a decoded copy of the answer into the temp dir, which is the one place a
+    restricted session's text must not persist.
+
+    Returns False when synthesis produced nothing, so a caller can post its
+    unavailable notice rather than silently sending only text.
+    """
+    try:
+        audio_path = await synthesize_speech(
+            response_text,
+            provider=provider,
+            voice_id=voice_id,
+            engine=engine,
+            rate=rate,
+            pitch=pitch,
+            aws_profile=aws_profile,
+            region=region,
+            system_voice=system_voice,
+            piper_binary=piper_binary,
+            piper_model=piper_model,
+            piper_model_config=piper_model_config,
+            length_scale=length_scale,
+        )
+    except SandboxUnavailableError:
+        # This path delivers audio to a chat surface and has no channel for remedy
+        # prose, so a refusal is still just "no audio" here. Both current callers
+        # drop that signal — Slack's wrapper discards the bool entirely and
+        # Telegram only logs it — so on those surfaces a refusal stays silent,
+        # unchanged by this function. Caught explicitly all the same, so it cannot
+        # escape as an unhandled error on a voice reply; the dashboard synthesis
+        # endpoint is the surface that relays the remedy.
+        return False
+    if not audio_path:
+        return False
+    try:
+        return await deliver(audio_path)
+    finally:
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
+
+
+def _resolve_piper_binary(configured: str = "") -> str | None:
+    """Return piper binary path or None if not found.
+
+    Resolution order: explicit ``configured`` path → ``piper`` on PATH →
+    the console script inside a conventional ``~/piper-venv``. The venv's
+    script directory differs by platform (``Scripts`` on Windows, ``bin``
+    elsewhere), so the fallback is built from the platform rather than assumed.
+    """
+    if configured:
+        p = os.path.expanduser(configured)
+        return p if _is_executable_file(p) else None
+    found = shutil.which("piper")
+    if found:
+        return found
+    scripts = "Scripts" if IS_WINDOWS else "bin"
+    exe = "piper.exe" if IS_WINDOWS else "piper"
+    fallback = os.path.expanduser(os.path.join("~", "piper-venv", scripts, exe))
+    return fallback if _is_executable_file(fallback) else None
+
+
+def _is_executable_file(path: str) -> bool:
+    """Return True when *path* is a file this platform can launch.
+
+    ``os.access(X_OK)`` is not a usable test on Windows — it reports any
+    readable file as executable — so there a file that HAS an extension must
+    carry a launchable one. Without that, a configured
+    ``piper_model_notes.txt`` passes ``is_available``, the caller skips its
+    "voice unavailable" notice, and the spawn then fails with no explanation.
+    ``PATHEXT`` is read rather than hardcoded because an operator can extend it.
+    """
+    if not os.path.isfile(path):
+        return False
+    if IS_WINDOWS:
+        suffix = os.path.splitext(path)[1].lower()
+        if not suffix:
+            # PATHEXT governs how a bare NAME resolves against PATH, not what
+            # CreateProcess will launch from an explicit path, and a PE image
+            # needs no extension — so an extensionless configured path stands.
+            return True
+        # PATHEXT is always ';'-separated, which is not `os.pathsep` when this
+        # branch is exercised from a POSIX host's tests.
+        exts = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        return suffix in {e.strip().lower() for e in exts.split(";") if e.strip()}
+    return os.access(path, os.X_OK)
+
+
+def validate_length_scale(value: object) -> float:
+    """Coerce *value* to a finite, positive Piper length-scale.
+
+    Returns :data:`DEFAULT_LENGTH_SCALE` for anything non-numeric, non-finite
+    (``inf``/``nan``), zero, or negative. ``float()`` of a very large int can
+    raise ``OverflowError``, so that is caught too. Shared by the config loader
+    and the dashboard PUT handler so a bad value can never reach synthesis or be
+    persisted as unserializable JSON (``Infinity``/``NaN`` would break the
+    browser's ``JSON.parse`` of the config GET).
+    """
+    try:
+        scale = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_LENGTH_SCALE
+    if not math.isfinite(scale) or scale <= 0:
+        return DEFAULT_LENGTH_SCALE
+    return scale
 
 
 def pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
@@ -1611,271 +1905,6 @@ async def _stream_piper_attempts(
             raise asyncio.CancelledError
 
 
-async def stitch_mp3s(paths: list[str], output: str | None = None) -> str | None:
-    """Concatenate MP3 files into a single file using ffmpeg.
-
-    Windows: ffmpeg is not guaranteed on PATH, so the dashboard-streaming stitch
-    path fails there; making it optional with a warning is a known gap. The
-    Slack thread-upload path is unaffected.
-    """
-    if not paths:
-        return None
-    if len(paths) == 1:
-        if output:
-            shutil.copy2(paths[0], output)
-            return output
-        return paths[0]
-    owned = output is None
-    if output is None:
-        fd, output = tempfile.mkstemp(suffix=".mp3")
-        os.close(fd)
-
-    def _discard_owned_output() -> None:
-        if owned:
-            try:
-                os.unlink(output)
-            except OSError:
-                pass
-
-    concat = "|".join(paths)
-    succeeded = False
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-y",
-            "-i",
-            f"concat:{concat}",
-            "-c",
-            "copy",
-            output,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            await asyncio.wait_for(proc.communicate(), timeout=30)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                await proc.communicate()
-            except Exception:
-                logger.debug("ffmpeg reap after kill failed", exc_info=True)
-            raise
-        if proc.returncode != 0 or not os.path.exists(output) or os.path.getsize(output) == 0:
-            return None
-        succeeded = True
-        return output
-    except Exception:
-        logger.exception("ffmpeg stitch failed")
-        return None
-    finally:
-        if not succeeded:
-            _discard_owned_output()
-
-
-async def streaming_voice_reply(
-    response_text: str,
-    voice_id: str = DEFAULT_VOICE,
-    engine: str = DEFAULT_ENGINE,
-    rate: str = DEFAULT_RATE,
-    pitch: str = DEFAULT_PITCH,
-    aws_profile: str = "",
-    region: str = "",
-):
-    """Async generator: yields (sentence_index, sentence_text, mp3_bytes) per sentence.
-
-    Use this for dashboard streaming — play each chunk as it arrives,
-    then call ``stitch_mp3s`` on the collected paths for a single replay file.
-
-    LLM output is redacted for credentials and exfiltration URLs before
-    synthesis (same rationale as ``synthesize_speech``) — streaming audio
-    to the dashboard bypasses the usual text-path redaction.
-    """
-    # ── Redact LLM output before it crosses an external surface (audio) ──
-    response_text, cred_warns, url_warns = redact_with_findings(response_text)
-    if cred_warns:
-        logger.warning(
-            "stream_voice_chunks: redacted %d credential pattern(s) before TTS", len(cred_warns)
-        )
-    if url_warns:
-        logger.warning(
-            "stream_voice_chunks: redacted %d suspicious URL(s) before TTS", len(url_warns)
-        )
-
-    sentences = split_sentences(response_text)
-    for i, sentence in enumerate(sentences):
-        ssml = text_to_ssml(sentence, rate=rate, pitch=pitch, engine=engine)
-        if not ssml:
-            continue
-        # Dashboard streaming is Polly-only today (sentence-by-sentence MP3
-        # chunks). Calls the Polly-specific internal to avoid double-wrapping
-        # text→SSML through the public dispatcher.
-        mp3_path = await _synthesize_polly(
-            ssml,
-            voice_id=voice_id,
-            engine=engine,
-            aws_profile=aws_profile,
-            region=region,
-        )
-        if not mp3_path:
-            continue
-        try:
-            with open(mp3_path, "rb") as f:
-                mp3_bytes = f.read()
-            yield i, sentence, mp3_bytes
-        finally:
-            try:
-                os.unlink(mp3_path)
-            except OSError:
-                pass
-
-
-#: Keys read from ``voice_reply`` by every channel that can synthesize a
-#: response.  Keeping this translation here prevents a new channel from
-#: silently honoring a different subset of the shared TTS configuration.
-_SYNTHESIS_KEYS: tuple[tuple[str, str, object], ...] = (
-    ("voice_id", "voice_id", DEFAULT_VOICE),
-    ("engine", "engine", DEFAULT_ENGINE),
-    ("rate", "rate", DEFAULT_RATE),
-    ("pitch", "pitch", DEFAULT_PITCH),
-    ("aws_profile", "aws_profile", ""),
-    ("region", "region", ""),
-    ("piper_binary", "piper_binary", ""),
-    ("piper_model", "piper_model", ""),
-    ("piper_model_config", "piper_model_config", ""),
-    ("system_voice", "system_voice", ""),
-)
-
-
-def resolve_configured_provider(section: dict | None) -> str:
-    """Resolve the provider from a raw ``voice_reply`` config section.
-
-    One implementation for every reader, so the rules below cannot drift between
-    the Slack loader, the Telegram settings path, and the dashboard.
-
-    Validated here rather than at synthesis time: a typo (``"ploly"``) would
-    otherwise pass through and only fail after the user has already spoken and is
-    waiting for a spoken answer. Both the absent-key default and the
-    invalid-value fallback stay LOCAL — reaching a paid AWS service because a key
-    was missing is not a decision an operator made, and a wrong local provider
-    costs nothing and degrades to a "TTS isn't configured" notice.
-
-    An unnamed provider on a config that already carries ``piper_model`` keeps
-    Piper. That config is a working Piper install from before the built-in engine
-    became the default, and resolving it to the default would silently downgrade
-    it to a lower-quality voice on upgrade — a change the operator never asked
-    for and would have no reason to look for.
-    """
-    section = section or {}
-    provider = section.get("provider")
-    if not provider:
-        # The migration gate asks "did an operator configure Piper?", so it has to
-        # read a real string. str() would answer yes to a malformed value -- "{}"
-        # is truthy -- and hand an upgrader the unavailable provider, producing the
-        # exact silence this default exists to prevent.
-        if validated_config_string(section.get("piper_model")):
-            return PROVIDER_PIPER
-        return DEFAULT_PROVIDER
-    # ``in VALID_PROVIDERS`` raises TypeError on an unhashable JSON value
-    # (config.json can hold a list or dict where a string belongs), so the type
-    # is checked before the membership test.
-    if not isinstance(provider, str) or provider not in VALID_PROVIDERS:
-        logger.warning(
-            "voice_reply.provider %r not in %s, defaulting to %r",
-            provider,
-            sorted(VALID_PROVIDERS),
-            DEFAULT_PROVIDER,
-        )
-        return DEFAULT_PROVIDER
-    return provider
-
-
-def synthesis_settings(raw: dict | None) -> dict:
-    """The shared ``voice_reply`` section as :func:`synthesize_and_deliver` kwargs.
-
-    *raw* is the section itself (``cfg.raw.get("voice_reply")``), so a caller with
-    a validated config and a caller reading ``config.json`` directly resolve the
-    same way.
-    """
-    section = raw or {}
-    out: dict = {"provider": resolve_configured_provider(section)}
-    for key, kwarg, default in _SYNTHESIS_KEYS:
-        out[kwarg] = section.get(key, default)
-    out["length_scale"] = validate_length_scale(section.get("piper_length_scale", 1.0))
-    return out
-
-
-async def synthesize_and_deliver(
-    deliver: Callable[[str], Awaitable[bool]],
-    response_text: str,
-    provider: str = DEFAULT_PROVIDER,
-    # Polly:
-    voice_id: str = DEFAULT_VOICE,
-    engine: str = DEFAULT_ENGINE,
-    rate: str = DEFAULT_RATE,
-    pitch: str = DEFAULT_PITCH,
-    aws_profile: str = "",
-    region: str = "",
-    # Piper/Pocket:
-    piper_binary: str = "",
-    piper_model: str = "",
-    piper_model_config: str = "",
-    length_scale: float = 1.0,
-    # System:
-    system_voice: str = "",
-) -> bool:
-    """Synthesize *response_text* and hand the audio file to *deliver*.
-
-    The channel-neutral half of the pipeline. ``synthesize_speech`` was already
-    surface-agnostic; the only Slack-shaped step was the upload, so it becomes a
-    callback taking the temp file's path and returning whether it landed.
-
-    The temp file is unlinked in a ``finally`` regardless of what *deliver* does,
-    including raising — a synthesizer that keeps its output on a delivery failure
-    leaks a decoded copy of the answer into the temp dir, which is the one place a
-    restricted session's text must not persist.
-
-    Returns False when synthesis produced nothing, so a caller can post its
-    unavailable notice rather than silently sending only text.
-    """
-    try:
-        audio_path = await synthesize_speech(
-            response_text,
-            provider=provider,
-            voice_id=voice_id,
-            engine=engine,
-            rate=rate,
-            pitch=pitch,
-            aws_profile=aws_profile,
-            region=region,
-            piper_binary=piper_binary,
-            piper_model=piper_model,
-            piper_model_config=piper_model_config,
-            length_scale=length_scale,
-            system_voice=system_voice,
-        )
-    except SandboxUnavailableError:
-        # This path delivers audio to a chat surface and has no channel for remedy
-        # prose, so a refusal is still just "no audio" here. Both current callers
-        # drop that signal — Slack's wrapper discards the bool entirely and
-        # Telegram only logs it — so on those surfaces a refusal stays silent,
-        # unchanged by this function. Caught explicitly all the same, so it cannot
-        # escape as an unhandled error on a voice reply; the dashboard synthesis
-        # endpoint is the surface that relays the remedy.
-        return False
-    if not audio_path:
-        return False
-    try:
-        return await deliver(audio_path)
-    finally:
-        try:
-            os.unlink(audio_path)
-        except OSError:
-            pass
-
-
 async def voice_reply(
     slack_client: SlackClientOps,
     channel: str,
@@ -1889,7 +1918,6 @@ async def voice_reply(
     pitch: str = DEFAULT_PITCH,
     aws_profile: str = "",
     region: str = "",
-    # Piper:
     piper_binary: str = "",
     piper_model: str = "",
     piper_model_config: str = "",
@@ -1916,11 +1944,11 @@ async def voice_reply(
         pitch=pitch,
         aws_profile=aws_profile,
         region=region,
+        system_voice=system_voice,
         piper_binary=piper_binary,
         piper_model=piper_model,
         piper_model_config=piper_model_config,
         length_scale=length_scale,
-        system_voice=system_voice,
     )
     if not audio_path:
         return False

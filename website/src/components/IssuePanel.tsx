@@ -21,9 +21,7 @@ import {
   type PullRequestLink,
 } from '../utils/pullRequestLinks'
 import { sourceTabQualifier } from '../utils/sourceProviderMeta'
-import GithubLogo from './icons/GithubLogo'
-import GitlabLogo from './icons/GitlabLogo'
-import JiraLogo from './icons/JiraLogo'
+import SourceProviderMark from './SourceProviderMark'
 import { timeAgo } from '../utils/timeAgo'
 import MarkdownRenderer from './MarkdownRenderer'
 import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
@@ -133,7 +131,7 @@ function stateTone(source: IssueSource): string {
   if (source.state === 'closed') {
     return source.stateReason === 'not_planned' ? 'bg-bg-hover text-muted' : 'bg-aim/15 text-aim'
   }
-  return 'bg-ok/15 text-ok'
+  return 'bg-ok/15 text-ok-text'
 }
 
 /** Prefilled chat handoff for the whole issue: enough context for the agent to
@@ -448,11 +446,7 @@ export default function IssuePanel({
               className={`shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border-none cursor-pointer text-[12px] transition-colors ${item.url === selected?.url ? 'bg-bg-hover text-text' : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover/60'}`}
               title={item.url}
             >
-              {item.provider === 'github'
-                ? <GithubLogo size={13} className="shrink-0" />
-                : item.provider === 'jira'
-                ? <JiraLogo size={13} className="shrink-0" />
-                : <GitlabLogo size={13} className="shrink-0" />}
+              <SourceProviderMark provider={item.provider} size={13} />
               {/* No CSS truncation: the qualifier is already shortened to its
                   minimal unique trailing suffix; the full url is in the title. */}
               {qualifier && <span>{qualifier}</span>}
@@ -473,22 +467,20 @@ export default function IssuePanel({
             {/* askAgent on: the panel is read-only (no draft), and a provider
                 CLI that is missing, logged out or answering 404 is exactly the
                 kind of failure the agent can diagnose. The login-required
-                branch keeps the command as the remedy text beneath. */}
+                branch carries the command in the notice's footer, laid out
+                like the Changes panel's. */}
             {queryError.loginCommand ? (
-              <>
-                <ErrorNotice
-                  className="w-full"
-                  title={i18nT('components.issuePanel.cli_login_required', {
-                    provider: queryError.loginCommand === 'gh auth login' ? 'GitHub' : 'GitLab',
-                  })}
-                  message={i18nT('components.issuePanel.kiro_crew_uses_your_local_provider_cli_to_load_i')}
-                  askAgent
-                  testId="issue-panel-load-error"
-                />
-                <code className="inline-block mt-2 px-2 py-1 rounded bg-bg-hover text-[12px] text-text">
-                  {queryError.loginCommand}
-                </code>
-              </>
+              <ErrorNotice
+                className="w-full"
+                title={i18nT('components.issuePanel.cli_login_required', {
+                  provider: queryError.loginCommand.startsWith('gh ') ? 'GitHub' : 'GitLab',
+                })}
+                message={i18nT('components.issuePanel.kiro_crew_uses_your_local_provider_cli_to_load_i')}
+                footer={<code className="inline-block mt-2 px-2 py-1 rounded bg-bg-hover text-[12px] text-text break-all">{queryError.loginCommand}</code>}
+                actionPlacement="below"
+                askAgent
+                testId="issue-panel-load-error"
+              />
             ) : (
               <ErrorNotice
                 className="w-full max-h-64 overflow-y-auto leading-relaxed"
@@ -565,11 +557,7 @@ export default function IssuePanel({
                 {issueStateLabel(source)}
               </span>
               <span className="inline-flex items-center gap-1 shrink-0">
-                {source.provider === 'github'
-                  ? <GithubLogo size={12} className="shrink-0" />
-                  : source.provider === 'jira'
-                  ? <JiraLogo size={12} className="shrink-0" />
-                  : <GitlabLogo size={12} className="shrink-0" />}
+                <SourceProviderMark provider={source.provider} size={12} />
                 {/* Brand names are proper nouns, not translatable UI copy. The
                     i18n checker exempts them via the existing interpolation at
                     line 413 where they are provider: param values. Here we

@@ -22,7 +22,7 @@ platform could support it.
 | Renders markdown tables natively | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
 | Reply length before splitting | 3900 chars | 1900 chars | 4000 chars | 16000 chars | 1750 chars (7000 bytes) | 5120 chars (20480 bytes) | 4000 chars | 4000 chars | 4096 chars | 4000 chars |
 | Tappable choices per prompt | 10 | 25 | 25 | 5 | 5 | 0 | 0 | 0 | 0 | 0 |
-| Approval prompt waits | 120s | 300s | 300s | 300s | 300s | — | — | — | 300s | — |
+| Approval prompt waits | 600s (config) | 300s | 300s | 300s | 300s | — | — | — | 300s | — |
 | Agent can message you first | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Dashboard link is two-way | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Answers a send with a message id | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
@@ -85,7 +85,7 @@ and Feishu turn the whole `[OPTIONS:]` list into numbered lines in the message
 body, and you answer by typing the number as an ordinary message — nothing to
 configure, nothing to tap, nothing dropped with the trailer. It is the same helper
 that handles overflow on a channel that does have buttons
-(`render_options_as_text` is `apply_options_cap` with zero widget slots), so the
+(`render_options_as_text` numbers every choice through `format_overflow`), so the
 numbering reads the same everywhere.
 
 **WhatsApp drops the list instead**, and that is a gap rather than a setting. Its
@@ -105,8 +105,8 @@ Only six channels ask you at all. Slack, Discord, Telegram, Teams, Webex and
 WhatsApp install an approval decider, so a tool that needs permission produces a
 prompt and waits:
 
-- **Slack: 120 seconds.** Slack has its own approval path with a shorter window
-  than every other channel.
+- **Slack: `agent.tool_approval_timeout_secs`** (default 600 seconds), read
+  through the same resolver the dashboard uses.
 - **Discord, Telegram, Teams, Webex, WhatsApp: 300 seconds.**
 
 An unanswered prompt is **denied**, never approved — the timeout never means yes.
@@ -118,9 +118,9 @@ refused straight away: nothing is posted and there is no window to answer in. Th
 channels, set the approval mode to `auto` or `trust` — see the channel's own
 guide.
 
-`agent.tool_approval_timeout_secs` (default 600) does **not** govern any of
-these. It applies only to the dashboard chat path. Changing it will not lengthen
-or shorten the window on any messaging channel.
+`agent.tool_approval_timeout_secs` (default 600) governs the dashboard chat
+path and Slack only. Changing it will not lengthen or shorten the window on any
+other messaging channel.
 
 ## Owner DM targets
 

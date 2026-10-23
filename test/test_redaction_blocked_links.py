@@ -70,6 +70,24 @@ class TestCollectorRecordsMatchRedaction:
         assert _placeholder_count(cleaned) == 2
         assert len(records) == 1
 
+    @pytest.mark.parametrize("longer_first", [False, True])
+    def test_a_blocked_link_that_prefixes_a_longer_one_cannot_shelter_its_tail(
+        self, longer_first: bool
+    ) -> None:
+        """A blocked link, and the same link with a token appended: rewriting the
+        shorter one first must not leave the longer one's tail in the text."""
+        short = f"https://{_DOMAIN}/x?d={_LONG_QUERY_TAIL}"
+        longer = short + "&X-Amz-Security-Token=" + "T" * 120
+        first, second = (longer, short) if longer_first else (short, longer)
+
+        cleaned, _, records = redact_exfiltration_urls_with_records(f"see {first} and {second} .")
+
+        assert cleaned == (
+            f"see [REDACTED: suspicious URL to {_DOMAIN}] and "
+            f"[REDACTED: suspicious URL to {_DOMAIN}] ."
+        )
+        assert len(records) == 2
+
     def test_records_carry_no_positional_field(self) -> None:
         url = f"https://{_DOMAIN}/x?token={_LONG_QUERY_TAIL}"
 
@@ -139,7 +157,7 @@ class TestTheFullAddressIsKeptSoItCanBeOpened:
 
     def test_a_cjk_title_link_keeps_its_whole_address(self) -> None:
         title = "%E6%B5%8B%E8%AF%95%E9%A1%B5%E9%9D%A2%E6%A0%87%E9%A2%98%E6%96%87"
-        url = f"https://wiki.example.com/view/{title}"
+        url = f"https://wiki.example.com/view?title={title}"
 
         _, warnings, records = redact_exfiltration_urls_with_records(f"see {url}")
 
@@ -518,11 +536,18 @@ class TestRecordsReachTheDisplayPath:
         # Same guard for the recovery path: a stopped or failed turn persists its
         # partial text through this nested helper, and a two-tuple redactor there
         # would store only the placeholder, losing a wrongly blocked link for good.
-        import inspect
+        from pathlib import Path
 
         from kiro_crew.dashboard import chat_runner
 
-        lines = inspect.getsource(chat_runner).splitlines()
+        lines = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [
+                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+                Path(chat_runner.__file__),
+            ]
+            if turn_file.name != "__init__.py"
+        ).splitlines()
         start = next(i for i, ln in enumerate(lines) if "def _persist_partial_reply(" in ln)
         indent = len(lines[start]) - len(lines[start].lstrip())
         body = []
@@ -531,9 +556,9 @@ class TestRecordsReachTheDisplayPath:
                 break
             body.append(ln)
         src = "\n".join(body)
-        assert "_redact_segment(slot, body)" in src
+        assert "_redact_segment(slot, turn.assistant_text)" in src
         assert "_segment_row_meta(slot, _blocked, _redactions)" in src
-        assert "redact_exfiltration_urls(body)" not in src
+        assert "redact_exfiltration_urls(" not in src
 
 
 class TestRecordsSurviveAReopenedSession:
@@ -1157,11 +1182,19 @@ class TestEveryRetentionPointIsBounded:
     def test_each_retention_site_uses_the_bounded_helper(self) -> None:
         # Source guard over the sites that retain transcript data in the slot:
         # the two rehydrate appends, the variant attach, and the regenerate stash.
+        import importlib
         import inspect
+        import pkgutil
 
-        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.dashboard import chat_persistence_parts, chat_runner
 
-        persistence = inspect.getsource(chat_persistence)
+        # The two rehydrate appends run on the facade from its composed parts.
+        parts = [
+            importlib.import_module(f"{chat_persistence_parts.__name__}.{info.name}")
+            for info in pkgutil.iter_modules(chat_persistence_parts.__path__)
+        ]
+        assert parts, "the part scan found no module, so it is measuring nothing"
+        persistence = "".join(inspect.getsource(module) for module in (chat_persistence, *parts))
         assert 'meta=(m["meta"] if' not in persistence
         assert persistence.count('with_bounded_redaction_records(m["meta"])') == 2
         assert "with_bounded_redaction_records(" in inspect.getsource(
@@ -1213,3 +1246,66 @@ class TestAVariantsRecordsAreCheckedOnServe:
         out = _prepare_messages(msgs, False, live_child="")
 
         assert out[0]["variants"][0]["blocked_links"] == records
+
+
+class TestARawCopyNeverOutlivesTheTextItMirrors:
+    """Through the real ``_run_chat``: a site that clears the visible text mid-turn
+    clears its raw copy too, so an address streamed before the boundary is never
+    listed against the reply the reader sees after it.
+
+    The reply after the boundary opens on a link redacted inside its own delta,
+    so the flush takes that address's record from the raw copy: the reset
+    beside each clear is the only thing keeping the earlier address out, which
+    is what these pin.
+    """
+
+    _HOST = "h.example-sink.net"
+
+    def _events(self, boundary: object) -> list[object]:
+        from kiro_crew.acp.types import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            STOP_REASON_END_TURN,
+            AcpEvent,
+        )
+
+        unseen = f"https://{self._HOST}/before?q=" + "x" * 250
+        after = f"https://{self._HOST}/after?q=" + "y" * 250
+        return [
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="draft "),
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text=unseen),
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text=" . "),
+            boundary,
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text=after),
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text=" is the one."),
+            AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+        ]
+
+    def _paths(self, record: object) -> list[object]:
+        rows = [r for r in record.rows("assistant") if "is the one" in str(r.get("content"))]
+        assert len(rows) == 1
+        return [link.get("path") for link in (rows[0].get("meta") or {}).get("blocked_links", [])]
+
+    @pytest.mark.asyncio
+    async def test_a_compaction_boundary_clears_the_raw_copy(self) -> None:
+        from turn_harness import TurnScript, run_turn
+
+        from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, AcpEvent
+
+        boundary = AcpEvent(kind=EVENT_COMPACTION_STATUS, text="completed", context_usage_pct=40.0)
+        record = await run_turn(TurnScript(events=self._events(boundary)))
+
+        assert self._paths(record) == ["/after"]
+
+    @pytest.mark.asyncio
+    async def test_a_mid_turn_clear_clears_the_raw_copy(self) -> None:
+        from turn_harness import SlotSpec, TurnScript, run_turn
+
+        from kiro_crew.acp.types import EVENT_CLEAR_STATUS, AcpEvent
+
+        record = await run_turn(
+            TurnScript(events=self._events(AcpEvent(kind=EVENT_CLEAR_STATUS))),
+            slot=SlotSpec(rows=[("user", "earlier"), ("assistant", "earlier answer")]),
+        )
+
+        assert self._paths(record) == ["/after"]

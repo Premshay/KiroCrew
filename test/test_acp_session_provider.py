@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kiro_crew.acp.client import AcpProcessDied
+from kiro_crew.acp.client import AcpClient, AcpError, AcpProcessDied
 from kiro_crew.acp.runtime import AcpRuntimeDead
 from kiro_crew.acp.session_handle import WatchdogSettings
 from kiro_crew.acp.session_provider import AcpSessionProvider
@@ -237,6 +237,23 @@ class TestAcpSessionProviderStream:
         assert collected[0].kind == EVENT_TEXT_CHUNK
         assert collected[0].text == "Hello "
         assert collected[2].kind == EVENT_COMPLETE
+
+    @pytest.mark.asyncio
+    async def test_stream_forwards_explicit_transport_timeout(self):
+        handle = _make_handle()
+        seen: list[tuple[str, float | None]] = []
+
+        async def mock_prompt(message, timeout=None):
+            seen.append((message, timeout))
+            yield AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")
+
+        handle.prompt = mock_prompt
+        provider = AcpSessionProvider(handle, _make_runtime())
+
+        events = [event async for event in provider.stream("long run", timeout=21660.0)]
+
+        assert [event.kind for event in events] == [EVENT_COMPLETE]
+        assert seen == [("long run", 21660.0)]
 
     @pytest.mark.asyncio
     async def test_stream_command_routes_through_handle_stream_command(self):
@@ -757,6 +774,15 @@ class TestAcpSessionProviderRound4Parity:
         assert stats.context_tokens_from_usage is False
         assert stats.context_pct_unknown is False
 
+    def test_rekey_drops_credits_held_between_turns(self):
+        """Credits held for the next turn belong to the session served before
+        the claim, so the claiming session's first turn must not bill them."""
+        handle = _make_handle()
+        handle._between_turn_credits = 0.5
+        provider = AcpSessionProvider(handle, _make_runtime())
+        provider.rekey("dashboard:slot9", "chan-7")
+        assert handle._between_turn_credits == 0.0
+
     def test_agent_reads_from_runtime(self):
         """#5 -- session.py session-info introspection reads
         provider.client._agent; mirror AcpClient._agent via the runtime."""
@@ -1266,6 +1292,83 @@ class TestNewConversation:
         # destroyed and stays the provider's handle for the hard-reset fallback.
         new_handle.destroy.assert_awaited_once()
         assert provider._handle is old
+
+    @pytest.fixture(autouse=True)
+    def _isolate_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    def _make_warm_client(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path)
+        proc = MagicMock()
+        proc.returncode = None
+        client._process = proc
+        client._session_id = "sess-old"
+        client._turn_done.set()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_swaps_session_and_reconfigures(self, tmp_path):
+        client = self._make_warm_client(tmp_path)
+        sent: list[tuple[str, dict]] = []
+
+        async def fake_send(method, params):
+            sent.append((method, params))
+            return len(sent)
+
+        client._send_request = fake_send
+        client._wait_for_response = AsyncMock(return_value={"sessionId": "sess-new"})
+        client._apply_startup_model = AsyncMock()
+
+        await client.new_conversation()
+
+        assert client._session_id == "sess-new"
+        assert sent[0][0] == "session/new"
+        assert (
+            next(params for method, params in sent if method == "session/set_mode")["sessionId"]
+            == "sess-new"
+        )
+        client._apply_startup_model.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_or_unusable_session_keeps_prior_session(self, tmp_path):
+        client = self._make_warm_client(tmp_path)
+        client._send_request = AsyncMock(return_value=1)
+        client._wait_for_response = AsyncMock(return_value={})
+
+        with pytest.raises(AcpError, match="no sessionId"):
+            await client.new_conversation()
+
+        assert client._session_id == "sess-old"
+
+    @pytest.mark.asyncio
+    async def test_configuration_failure_restores_prior_session(self, tmp_path):
+        client = self._make_warm_client(tmp_path)
+
+        async def fake_send(method, params):
+            if method == "session/set_mode":
+                raise AcpError("mode rejected")
+            return 1
+
+        client._send_request = fake_send
+        client._wait_for_response = AsyncMock(return_value={"sessionId": "sess-new"})
+
+        with pytest.raises(AcpError, match="mode rejected"):
+            await client.new_conversation()
+
+        assert client._session_id == "sess-old"
+
+    @pytest.mark.asyncio
+    async def test_refuses_active_turn_and_dead_process(self, tmp_path):
+        client = self._make_warm_client(tmp_path)
+        client.has_active_turn = lambda: True
+
+        with pytest.raises(AcpError, match="turn is in flight"):
+            await client.new_conversation()
+
+        client.has_active_turn = lambda: False
+        client._process = None
+        with pytest.raises(AcpProcessDied):
+            await client.new_conversation()
 
 
 class TestLivePathModelEntitlement:

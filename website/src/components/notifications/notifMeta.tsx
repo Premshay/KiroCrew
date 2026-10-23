@@ -1,4 +1,4 @@
-import { ClipboardList, Anchor, Heart, Bot, Lock, GitBranch, Bell, Clock, BookOpen, Terminal } from 'lucide-react'
+import { ClipboardList, Anchor, Heart, Bot, Lock, GitBranch, Bell, Clock, BookOpen, Terminal, ArrowUpCircle } from 'lucide-react'
 import type { ReactNode } from 'react'
 
 import { i18nT } from '../../i18n/t'
@@ -74,14 +74,20 @@ export function dateGroup(d: Date): string {
  *  symmetry: these are the only labels these kinds have. */
 export const KIND_META: Record<string, { icon: ReactNode; color: string; label: string; borderColor: string }> = {
   cron:       { icon: <Clock className="lucide-inline" />, color: 'bg-accent/15 text-accent',  get label() { return i18nT('components.notifications.notifMeta.kind_cron_job') },     borderColor: 'border-l-accent' },
-  hook:       { icon: <Anchor className="lucide-inline" />, color: 'bg-info/15 text-info',      get label() { return i18nT('components.notifications.notifMeta.kind_webhook') },      borderColor: 'border-l-info' },
-  heartbeat:  { icon: <Heart className="lucide-inline" />, color: 'bg-ok/15 text-ok',          get label() { return i18nT('components.notifications.notifMeta.kind_heartbeat') },    borderColor: 'border-l-ok' },
-  agent:      { icon: <Bot className="lucide-inline" />, color: 'bg-info/15 text-info',      get label() { return i18nT('components.notifications.notifMeta.kind_agent') },        borderColor: 'border-l-info' },
-  approval:   { icon: <Lock className="lucide-inline" />, color: 'bg-warn/15 text-warn',      get label() { return i18nT('components.notifications.notifMeta.kind_approval') },     borderColor: 'border-l-warn' },
+  hook:       { icon: <Anchor className="lucide-inline" />, color: 'bg-info/15 text-info-text',      get label() { return i18nT('components.notifications.notifMeta.kind_webhook') },      borderColor: 'border-l-info' },
+  heartbeat:  { icon: <Heart className="lucide-inline" />, color: 'bg-ok/15 text-ok-text',          get label() { return i18nT('components.notifications.notifMeta.kind_heartbeat') },    borderColor: 'border-l-ok' },
+  agent:      { icon: <Bot className="lucide-inline" />, color: 'bg-info/15 text-info-text',      get label() { return i18nT('components.notifications.notifMeta.kind_agent') },        borderColor: 'border-l-info' },
+  approval:   { icon: <Lock className="lucide-inline" />, color: 'bg-warn/15 text-warn-text',      get label() { return i18nT('components.notifications.notifMeta.kind_approval') },     borderColor: 'border-l-warn' },
   subagent:   { icon: <GitBranch className="lucide-inline" />, color: 'bg-accent/15 text-accent',  get label() { return i18nT('components.notifications.notifMeta.kind_subagent') },     borderColor: 'border-l-accent' },
   taskrunner: { icon: <ClipboardList className="lucide-inline" />, color: 'bg-accent/15 text-accent',  get label() { return i18nT('components.notifications.notifMeta.kind_task_runner') }, borderColor: 'border-l-accent' },
-  skills:     { icon: <BookOpen className="lucide-inline" />, color: 'bg-warn/15 text-warn',      get label() { return i18nT('components.notifications.notifMeta.kind_skills') },       borderColor: 'border-l-warn' },
-  terminal:   { icon: <Terminal className="lucide-inline" />, color: 'bg-warn/15 text-warn',      get label() { return i18nT('components.notifications.notifMeta.kind_terminal') },     borderColor: 'border-l-warn' },
+  skills:     { icon: <BookOpen className="lucide-inline" />, color: 'bg-warn/15 text-warn-text',      get label() { return i18nT('components.notifications.notifMeta.kind_skills') },       borderColor: 'border-l-warn' },
+  terminal:   { icon: <Terminal className="lucide-inline" />, color: 'bg-warn/15 text-warn-text',      get label() { return i18nT('components.notifications.notifMeta.kind_terminal') },     borderColor: 'border-l-warn' },
+  // Both the gateway's own "a new Kiro Crew is out" notices and an installed
+  // app's "a new version is published" ones carry this kind, so the label is
+  // the generic noun rather than either source's wording. Informational tint:
+  // nothing is blocked and whatever is running keeps working on the version it
+  // has.
+  update:     { icon: <ArrowUpCircle className="lucide-inline" />, color: 'bg-info/15 text-info-text',      get label() { return i18nT('components.notifications.notifMeta.kind_update') },       borderColor: 'border-l-info' },
 }
 export const DEFAULT_META = { icon: <Bell className="lucide-inline" />, color: 'bg-muted/15 text-muted', get label() { return i18nT('components.notifications.notifMeta.kind_notification') }, borderColor: 'border-l-muted' }
 

@@ -12,11 +12,14 @@ clean up. Every rule below closes a named failure mode.
 
 ## What you track: two columns
 
-For long runs, load the `artifacts` skill's Dynamic Dashboard contract. An
-authorized descendant may publish a `task-dashboard` HTML artifact tailored
-to this pipeline and update the same slug at milestones. Design is free; the
-two facts below remain the source of truth. The page is not a second status
-store, does not authorize reading more worker context, and cannot approve tools.
+You own your dashboard page; it shows ledger evidence; workers report to you and
+do not publish that page. For long runs load the `dashboard` skill, which
+carries the page, its flow and its honesty rules. Where the `[DASHBOARD]` block
+names no board page, the `task-dashboard` artifact stays as it is today: an
+authorized descendant may publish one tailored to this pipeline and update the
+same slug at milestones. Design is free; the two facts below remain the
+source of truth. The page is not a second status store, does not authorize
+reading more worker context, and cannot approve tools.
 The host's native approval inbox names each waiting session, including Normal
 permission mode. Never broaden your role or change permission mode to publish.
 
@@ -113,7 +116,7 @@ It has to be its own file because every other place a decision could land is a
 TAIL. The status file's `events_tail` is bounded by schema and rewritten whole
 each cycle. The session ledger keeps `_MAX_EVENTS` = 100 events on disk and
 `session_ledger_read` returns only the newest `_MAX_EVENT_TAIL` = 20 (both in
-`session_ledger.py`; the injected `[work ledger]` block carries no events at
+`session_ledger_layout.py`; the injected `[work ledger]` block carries no events at
 all). A patrol writes at least one event per cycle, so a decision recorded in
 cycle 3 of a 40-cycle run is off the readable tail by about cycle 23 and off
 disk long before the `max_cycles=960` patrol ends. Tails answer "what just
@@ -268,17 +271,20 @@ never relabel it success in the friction report.
    artifact you have to remember to create is one that gets created at the end of
    the run, which is the one moment its contents no longer exist (see "What you
    write down, and when").
-4. Arm the patrol with `monitor_start` using an interval near 90 seconds, an
-   explicit `max_cycles=960`, and an explicit `max_runtime_secs=259200`. **Patrol
-   with `monitor_start`, never `wait`.** If live work needs a larger or renewed
-   bound, raise it with `monitor_update` before it expires; `monitor_start` is
-   create-only. Call `autonudge_stop` yourself when the exit condition fires —
-   coasting into the cycle cap is a failure, not a finish. That ~90s interval is
-   also what sizes your panel's stale window: `BOARD_STALE_AFTER_SECONDS` in
-   `kiro_crew.dashboard.handlers.agent_panel` is about ten of these intervals, so a
-   board reads stale only after the log has been quiet across many cycles rather
-   than after one quiet cycle. Change the cadence here and that constant needs the
-   same look.
+4. Arm the patrol with `monitor_start` using an explicit `interval_secs=90`, an
+   explicit `max_cycles=960`, and an explicit `max_runtime_secs=86400`. **Patrol
+   with `monitor_start`, never `wait`.** The interval times `max_cycles` must
+   cover `max_runtime_secs`, so the runtime, not the cycle cap, ends the loop. If
+   live work needs a larger or renewed bound, raise `max_cycles` and
+   `max_runtime_secs` together with `monitor_update` before either expires, under
+   the same rule; `max_cycles` counts the loop's whole life and the server caps it
+   at 1000. `monitor_start` is create-only. Call `autonudge_stop` yourself when
+   the exit condition fires — coasting into a bound is a failure, not a finish.
+   That ~90s interval is also what sizes your panel's stale window:
+   `BOARD_STALE_AFTER_SECONDS` in `kiro_crew.dashboard.handlers.agent_panel` is
+   about ten of these intervals, so a board reads stale only after the log has
+   been quiet across many cycles rather than after one quiet cycle. Change the
+   cadence here and that constant needs the same look.
 
 Standing patrol instruction template (keep it CURRENT — steering edits go here
 via `monitor_update`, see "Live steering"):
@@ -315,11 +321,21 @@ via `monitor_update`, see "Live steering"):
 
 ## Your panel: publish JUDGMENTS, never numbers
 
-The panel is STORED and read back through the panel route; the Dashboard tab beside
-your chat draws the crewmate's own dashboard instead. So an item under `you` reaches
-a reader only if you also write it to an agentic dashboard field with
-`dashboard_write`, where it appears under "Needs you" with the act it needs. Publish
-the panel for a reader who asks for it; write the dashboard for one who has not.
+The Dashboard tab beside your chat draws the page you have, where an item reaches
+the reader only through an agentic field written with `dashboard_write` (on
+`project-report` it appears under "Needs you" with the act it needs). So publish
+every item under `you` here, and also write it to the Dashboard tab's field when
+your `[DASHBOARD]` block names one; with no such block you have no page yet, and
+the write is refused.
+
+`panel_publish` and `dashboard_write` belong to the `@kirocrew-panel` server,
+which is mounted only on a crew member's own chat session (with `agent.crew_panel`
+on). The `kirocrew-pipeline-conductor` agent spec mounts `@kirocrew-core`,
+`@kirocrew-dashboard` and `@kirocrew-work` and not that server, so in an ordinary
+dashboard chat neither tool exists. Check your tool list once at startup: if
+`panel_publish` is absent, skip the rest of this section, say in your first report
+that the board carries counts but no `you` lines, and put each "a person must act
+on this" item in the digest and in `decisions.md` instead.
 
 `panel_publish` with template `kirocrew-pipeline-conductor` takes exactly four keys,
 and nothing else — an unknown key is refused and the refusal names it:
@@ -1204,7 +1220,9 @@ of the two you are running rather than assuming the table applies.
 
 Never page through worker transcripts yourself, and never pull the whole
 fleet's state into context — the probe line is the interface. Quiet cycle:
-print nothing beyond the probe's own `OK` line, end the turn.
+print nothing beyond the probe's own `OK` line and end the turn with
+`nothing_to_do`, because a bare stop after the probe keeps the empty-response
+recovery.
 
 ## Independent green verification
 
@@ -1528,6 +1546,13 @@ honors it, and record the mode in the ledger. Canonical example — "stop taking
 new work": edit the instruction to `DRAIN MODE: no backfill, no new
 dispatches; patrol until in-flight items resolve; then final tally +
 autonudge_stop.`
+
+When that mode change invalidates what an in-flight worker is doing right now,
+forward it with `session_send` and `steer: true` so it lands in the worker's
+running turn rather than after it; a plain send waits out the whole turn. Keep
+`steer` off for rulings, nudges and anything that can wait for the turn
+boundary. A steer does not withdraw messages already queued (`queue_depth` from
+`session_read_message`), so name the instruction it supersedes.
 
 ## Merge, cleanup, reconcile
 

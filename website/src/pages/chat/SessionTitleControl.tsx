@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import { EyeOff, Loader, Pen, Sparkles, Undo2, VenetianMask } from 'lucide-react'
+import { useEffect, useId, useRef, useState } from 'react'
+import { EyeOff, Loader, Pen, Pin, Sparkles, Undo2, VenetianMask } from 'lucide-react'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import useHeldWindow from '../../hooks/useHeldWindow'
 import { Btn, Input } from '../../components/ui'
@@ -12,6 +12,8 @@ import { sseSlotTitle } from '../../store/dashboardSlice'
 import { api } from '../../api/client'
 import { errMessage } from '../../utils/thunkError'
 import { i18nT } from '../../i18n/t'
+import { uiLocation } from '../../uiLocations/uiLocation'
+import { isUntitledSession, sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
 
 /**
  * SessionTitleControl — the session title as ONE editable control: the
@@ -19,7 +21,7 @@ import { i18nT } from '../../i18n/t'
  * reveals on `group/header` hover, and the Sparkles button that asks the LLM
  * for a new title (spinner while it runs).
  *
- * Shared by the single-session header (ChatPage) and every split-view pane
+ * Shared by the single-session header (ChatTitleOverlay) and every split-view pane
  * header (ChatPane) so the two cannot drift again — the pane header used to
  * render a bare title span with neither affordance (#9727). The HOST supplies
  * the `group/header` hover target; this control only renders the row.
@@ -100,6 +102,10 @@ export default function SessionTitleControl({
   const store = useAppStore()
   const queryClient = useQueryClient()
   const memoryMode = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.memory_mode)
+  // Pinning from the header menu moves the row to the sidebar's pinned group,
+  // often out of view, so the header itself has to show the state: without
+  // it a pin or unpin from the chevron gave no visible sign it took.
+  const pinned = useAppSelector((s) => !!s.dashboard.slots.find((x) => x.key === slotKey)?.pinned)
   const [localEditing, setLocalEditing] = useState(false)
   const editing = editingProp ?? localEditing
   const setEditing = (next: boolean) => { setLocalEditing(next); onEditingChange?.(next) }
@@ -326,11 +332,25 @@ export default function SessionTitleControl({
     : memoryMode === 'temporary'
       ? <VenetianMask size={13} className="shrink-0 text-aim" />
       : null
-  const glyphs = glyphIcon && (
-    <span role="img" aria-label={modeText} title={modeText}>{glyphIcon}</span>
+  // The pin marker: the sidebar row's glyph and tooltip, so the two surfaces
+  // name the state the same way. It leads the row, right after the header
+  // menu chevron that toggles it, and like the memory glyph it is folded into
+  // the trigger's accessible name in the display render.
+  const pinnedText = pinned ? i18nT('pages.chatSidebar.pinned') : ''
+  const pinIcon = pinned ? <Pin size={compact ? 11 : 12} className={glyphIcon ? 'mr-1 shrink-0 text-accent' : 'shrink-0 text-accent'} /> : null
+  const glyphs = (pinIcon || glyphIcon) && (
+    <>
+      {pinIcon && <span role="img" aria-label={pinnedText} title={pinnedText} data-testid="session-pinned-glyph">{pinIcon}</span>}
+      {glyphIcon && <span role="img" aria-label={modeText} title={modeText}>{glyphIcon}</span>}
+    </>
   )
-  const renameLabel = i18nT('pages.chatPage.rename_session_title', { title })
-  const triggerLabel = modeText ? `${renameLabel}, ${modeText}` : renameLabel
+  // What the header SHOWS: "Untitled session" for an untitled slot, never its
+  // key (#20871). `title` itself stays the raw value every rename, rollback and
+  // Undo comparison above works on.
+  const untitled = isUntitledSession({ key: slotKey, title })
+  const shownTitle = sessionDisplayTitle({ key: slotKey, title })
+  const renameLabel = i18nT('pages.chatPage.rename_session_title', { title: shownTitle })
+  const triggerLabel = [renameLabel, pinnedText, modeText].filter(Boolean).join(', ')
   // The SAME element in both renders (last child of a fragment in each), so
   // React keeps it mounted across the editor opening and closing: a live
   // region announces text CHANGES, and a region that remounts with its text
@@ -358,10 +378,13 @@ export default function SessionTitleControl({
     // the same editing look (#10140).
     return (
       <>
-        <div className="flex min-w-0 flex-1 items-center gap-1">
+        <div className={compact ? "@container flex min-w-0 flex-1 items-center gap-1" : "flex min-w-0 flex-1 items-center gap-1"}>
           {glyphs}
           <TitleEditor
-            initial={title}
+            // An untitled session opens the editor empty, as the sidebar's
+            // rename does, so neither the key nor the label is saved as a name.
+            initial={untitled ? '' : title}
+            compact={!!compact}
             className={compact
               ? 'text-[13px] font-semibold text-text-strong font-body rounded-l-[2px] rounded-r-md border-accent px-[5px] py-px m-0 min-w-0 flex-1'
               : 'session-header-title text-sm font-semibold text-muted font-body rounded-l-[2px] rounded-r-md border-accent px-[5px] py-px m-0 min-w-0 flex-1 md:max-w-[50vw]'}
@@ -395,16 +418,18 @@ export default function SessionTitleControl({
           list of split-view panes reads as titles, not as N identical verbs.
           The memory-mode text follows, so the glyph's meaning survives the
           label and a click on the glyph still opens the editor. */}
-      <Clickable className="group/title flex min-w-0 items-center gap-1" ref={titleTriggerRef} aria-label={triggerLabel} onClick={(e) => {
+      <Clickable className="group/title flex min-w-0 items-center gap-1" aria-label={triggerLabel} {...uiLocation('chat.session-title', titleTriggerRef)} onClick={(e) => {
         // An auto-repeat keydown from the Enter still held since the commit is
         // not a request to rename again (Clickable passes the keyboard event
         // through; a pointer click has no `repeat`).
         if (generating || (e && 'repeat' in e && (e as { repeat?: boolean }).repeat)) return
         setUndoable(null); setEditing(true)
       }}>
+        {pinIcon && <span aria-hidden="true" title={pinnedText} data-testid="session-pinned-glyph">{pinIcon}</span>}
         {glyphIcon && <span aria-hidden="true" title={modeText} data-testid="memory-mode-glyph">{glyphIcon}</span>}
         <TypewriterText
-          text={title}
+          text={shownTitle}
+          placeholder={untitled}
           className={compact
             ? 'text-[13px] font-semibold text-text-strong font-body truncate min-w-0'
             : 'session-header-title text-sm font-semibold text-muted font-body truncate min-w-0 md:max-w-[50vw]'}
@@ -419,8 +444,11 @@ export default function SessionTitleControl({
              generated title is the one on screen: the way back must be seen
              without knowing to hover. */
           <Btn
-            aria-label={`${i18nT('pages.chatPage.undo_auto_title')}: ${undo.previous}`}
-            title={undo.previous}
+            // Named by the label the header showed, "Untitled session" when the
+            // previous name was empty or the key (#20871); the commit below still
+            // restores the raw previous value.
+            aria-label={`${i18nT('pages.chatPage.undo_auto_title')}: ${sessionDisplayTitle({ key: slotKey, title: undo.previous })}`}
+            title={sessionDisplayTitle({ key: slotKey, title: undo.previous })}
             className={`shrink-0 flex items-center gap-1 text-accent hover:underline cursor-pointer bg-transparent border-none p-0 ${compact ? 'text-[11px]' : 'text-xs'} leading-none whitespace-nowrap`}
             onClick={(e) => { e.stopPropagation(); commit(undo.previous) }}
           >
@@ -468,9 +496,11 @@ export default function SessionTitleControl({
  * from the title the editor opened on and dies with it, so no stale draft can
  * survive a close and commit against a title that changed in the meantime.
  */
-function TitleEditor({ initial, className, onCommit, onClose }: {
+function TitleEditor({ initial, className, compact, onCommit, onClose }: {
   initial: string
   className: string
+  /** The pane header's variant: decides when the key hint steps aside. */
+  compact: boolean
   onCommit: (draft: string) => void
   /** How the editor closed; the host decides where focus goes from each. */
   onClose: (reason: 'enter' | 'escape' | 'blur') => void
@@ -490,9 +520,27 @@ function TitleEditor({ initial, className, onCommit, onClose }: {
   // Enter-to-commit input: the guard owns both the composition latch and the
   // keypress, so the rename cannot fire on the Enter that commits an IME candidate.
   const ime = useImeGuard()
+  // The keys that end the edit, said once beside the box (#15808): a tester
+  // could not tell what typing would do or how to finish, and nothing on
+  // screen named Enter or Escape. It is the input's description too, so a
+  // screen reader hears it on open. Touch-only devices hide it: their
+  // keyboard has no Escape and its Enter is labelled by the platform. Where
+  // room runs out the hint steps aside so the box holding the title keeps
+  // it (the description stays: a hidden element still describes). A pane's
+  // editing row is `flex-1` and splits the pane's free space with the pane
+  // header's own `flex-1` spacer, so its width never comes from its content:
+  // it is the `@container`, and the hint hides while that share is under
+  // 420px (room for a typical title plus the longest translation). The
+  // main header sizes to its content, which an
+  // inline-size container would collapse to nothing, so there the hint shows
+  // only from `md` up; below it the narrow-window header takes over. Above
+  // either threshold it truncates and shrinks faster than the box.
+  const hintId = useId()
   return (
+    <>
     <Input
       className={className}
+      aria-describedby={hintId}
       size={Math.min(Math.max(draft.length + 2, 6), 80)}
       autoFocus
       maxLength={TITLE_MAX_LENGTH}
@@ -539,5 +587,9 @@ function TitleEditor({ initial, className, onCommit, onClose }: {
         if (e.key === 'Escape') { ime.reset(); cancelRef.current = true; onClose('escape') }
       }}
     />
+    <span id={hintId} className={`ml-1 min-w-0 shrink-[4] truncate text-[11px] leading-none text-muted ${compact ? '@max-[420px]:hidden' : 'hidden md:block'} [@media(hover:none)]:hidden`}>
+      {i18nT('pages.chatPage.rename_title_hint')}
+    </span>
+    </>
   )
 }

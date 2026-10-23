@@ -4,7 +4,6 @@ import functools
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -16,6 +15,7 @@ from kiro_crew.jsonl_util import (
     SplitlinesBoundaryRecord,
     strict_raw_records_with_offsets,
 )
+from kiro_crew.testing.wait import wait_until
 
 
 def _write_transcript(
@@ -283,14 +283,15 @@ def test_same_size_rewrite_with_restored_mtime_misses_the_index_cache(
     target = b'{"role": "user", "content": "message-10"'
     assert data.count(target) == 1
     corrupted = data.replace(target, b'x"role": "user", "content": "message-10"')
-    for _attempt in range(200):
-        # Filesystem timestamps tick coarsely (ext4: jiffies); wait for a tick
-        # so ctime can differ from the stamp taken before the rewrite.
-        time.sleep(0.005)
+
+    def _rewritten_on_a_later_tick() -> bool:
+        # Filesystem timestamps tick coarsely (ext4: jiffies); rewrite until a
+        # tick has passed so ctime can differ from the stamp taken before.
         path.write_bytes(corrupted)
         os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
-        if path.stat().st_ctime_ns != before.st_ctime_ns:
-            break
+        return path.stat().st_ctime_ns != before.st_ctime_ns
+
+    wait_until(_rewritten_on_a_later_tick)
     after = path.stat()
     assert after.st_ctime_ns != before.st_ctime_ns
     assert (after.st_mtime_ns, after.st_size, after.st_ino) == (
@@ -504,3 +505,52 @@ def test_oversized_row_aborts_indexed_page_instead_of_undercounting(
         "x" * 2_000,
         "after-big",
     ]
+
+
+@pytest.mark.parametrize(
+    ("files", "tail_reads"),
+    [
+        ([250], True),
+        ([30], True),
+        ([120, 140], True),
+        ([120, 30], True),
+        ([250], False),
+    ],
+)
+def test_chained_tail_is_the_full_reads_last_rows(tmp_path: Path, files, tail_reads) -> None:
+    log = ConversationLog(base_dir=tmp_path)
+    log._tail_reads = tail_reads
+    tab_id = "shared-tab" if len(files) > 1 else None
+    start = 0
+    keys = [f"dashboard:chat-{i}" for i in range(len(files))]
+    for key, count in zip(keys, files):
+        _write_transcript(log, key, count, tab_id=tab_id, start=start)
+        start += count
+    key = keys[-1]
+
+    tail = log.read_messages_chained_tail(key, 100)
+
+    assert tail == log.read_messages_chained(key)[-100:]
+
+
+def test_chained_tail_reads_only_the_end_of_a_long_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = ConversationLog(base_dir=tmp_path)
+    key = "dashboard:chat-long"
+    _write_transcript(log, key, 5_000)
+    expected = log.read_messages_chained(key)[-100:]
+    log._invalidate_cache(key)
+    whole_file_reads: list[str] = []
+    projection = history_projection.TranscriptReadProjection
+    for name in ("_read_messages", "_row_index"):
+        real = getattr(projection, name)
+
+        def _spy(self, read_key, *args, _real=real, **kwargs):
+            whole_file_reads.append(read_key)
+            return _real(self, read_key, *args, **kwargs)
+
+        monkeypatch.setattr(projection, name, _spy)
+
+    assert log.read_messages_chained_tail(key, 100) == expected
+    assert whole_file_reads == []

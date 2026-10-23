@@ -1,5 +1,5 @@
 /**
- * The crew editor's Model pane offers a REASONING EFFORT pin, not just a model.
+ * The crewmate editor's model field comes with a REASONING EFFORT pin.
  *
  * A crew could pin the expensive model and then not say how hard it should think,
  * so the two halves of one decision lived on different surfaces (the model on the
@@ -71,6 +71,7 @@ const mockApi = vi.hoisted(() => ({
   updateKirocrewAgent: vi.fn(),
   deleteKirocrewAgent: vi.fn(),
   agentResolvedModel: vi.fn(),
+  kirocrewAgentModels: vi.fn(),
   setDefaultAgent: vi.fn(),
   createChatSlot: vi.fn(),
   models: vi.fn(),
@@ -121,6 +122,11 @@ vi.mock('../components/SimpleSelect', () => ({
 
 import KiroCrewAgentsPage from '../pages/KiroCrewAgentsPage'
 
+/** Opening the editor is a lazy `CrewEditorModal` chunk import followed by a
+ *  fresh-roster read (`staleTime: 0`) before the dialog renders, which can
+ *  outlast RTL's 1s default on a loaded runner. An explicit deadline. */
+const EDITOR_OPEN_TIMEOUT_MS = 5000
+
 const REVIEWER = {
   name: 'reviewer',
   kiro_agent: 'reviewer-agent',
@@ -128,6 +134,7 @@ const REVIEWER = {
   memory_store: 'default',
   model: 'claude-opus-5',
   reasoning_effort: 'max',
+  runtime_policy: { model: 'selectable' },
 }
 
 function renderPage() {
@@ -146,7 +153,7 @@ function renderPage() {
   )
 }
 
-/** Render the roster with one crew shaped by `crew`, then open its Model pane. */
+/** Render the roster with one crew shaped by `crew`, then open its editor. */
 async function openModelPane(crew: Record<string, unknown>): Promise<HTMLElement> {
   mockApi.kirocrewAgents.mockResolvedValue({
     agents: [{ ...REVIEWER, ...crew }],
@@ -154,10 +161,9 @@ async function openModelPane(crew: Record<string, unknown>): Promise<HTMLElement
   })
   renderPage()
   await waitFor(() => expect(screen.getAllByTestId('crew-card')).toHaveLength(1))
-  fireEvent.click(screen.getByRole('button', { name: 'Edit crewmate reviewer' }))
-  const sheet = await screen.findByRole('dialog', { name: 'Edit crewmate reviewer' })
-  fireEvent.click(within(sheet).getByTestId('crew-rail-model'))
-  return sheet
+  fireEvent.click(screen.getByRole('button', { name: 'Edit mate reviewer' }))
+  // The model and its effort live on General, the section the editor opens on.
+  return await screen.findByTestId('crew-editor-next-dialog', {}, { timeout: EDITOR_OPEN_TIMEOUT_MS })
 }
 
 /** The one select labelled `label`, scoped so a shared option label (both the
@@ -181,6 +187,9 @@ beforeEach(() => {
     effort_pinned: true,
   })
   mockApi.models.mockResolvedValue([{ model_name: 'claude-opus-5' }, { model_name: 'claude-haiku-4.5' }])
+  mockApi.kirocrewAgentModels.mockResolvedValue({
+    models: [{ modelId: 'claude-opus-5' }, { modelId: 'claude-haiku-4.5' }],
+  })
   mockApi.createKirocrewAgent.mockResolvedValue({})
   mockApi.updateKirocrewAgent.mockResolvedValue({})
   mockApi.deleteKirocrewAgent.mockResolvedValue({})
@@ -200,7 +209,7 @@ describe('crew editor — reasoning effort pin', () => {
     // which are different facts with different blast radius.
     const sheet = await openModelPane({})
     const line = await waitFor(() => within(sheet).getByText(/Thinking at Max/))
-    expect(line.parentElement).toHaveTextContent('chosen for this crewmate')
+    expect(line.parentElement).toHaveTextContent('chosen for this mate')
   })
 
   it('sends the level on save', async () => {

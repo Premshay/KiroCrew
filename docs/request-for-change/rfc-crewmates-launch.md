@@ -5,9 +5,9 @@ author: CrysisDeu
 created: 2026-09-22
 last-audited: 2026-10-06
 audited-at: 9348a25a34
-revision: 2026-10-01 — §11 roster-as-floating-card amendment
+revision: 2026-10-22 — §08 Meet your Mates launch intro
 doc-pr:
-implementation-prs: [12797, 12798, 12805, 12806, 12924, 14897, 14914, 14925, 15103, 15280, 16317]
+implementation-prs: [12797, 12798, 12805, 12806, 12924, 14897, 14914, 14925, 15103, 15280, 16317, 17156]
 tracking-issues: []
 supersedes: []
 superseded-by: []
@@ -121,11 +121,20 @@ Decided:
 - With no crewmates, the Crewmates tab is a hero: the ghost avatar, "No
   crewmates yet", the one-line positioning sentence in its singular form, and
   one button, **New crewmate**.
-- **New crewmate** opens a dialog with four things: Name; Built from (the
-  default agent or a custom agent); What it looks after (optional); Advanced,
-  folded.
-- After create, the new crewmate's chat opens and shows its first greeting.
-  There is no separate confirmation.
+- **New crewmate** opens one card as a modal over the chat, which stays
+  mounted and visible behind a glass-blur scrim: the avatar, whose
+  pencil opens the avatar editor (icon and colour only); Name, under its own
+  label; Create. The modal's header Close (X) is the way out. Everything else (Built from, the default agent unless
+  another is picked; What it looks after; the workspace, model, triggers and
+  session colour) sits behind **Advanced settings**, folded, in the same card.
+  The empty state's Advanced link and the crew manager's door open it unfolded.
+- After create, the new crewmate's chat opens and the crewmate speaks first: it
+  says hello with its name and asks, in everyday words, what its goal is, or
+  confirms the job written under Advanced settings. There is no separate
+  confirmation, and nothing is sent in the user's name.
+- A crewmate's proposal link and the `crewmate.create` guide open the same card
+  with the proposed name and goal filled in. Nothing is created until the user
+  presses Create.
 - With crewmates present and none named in the URL, the Crewmates tab lands
   on the most-recently-used crewmate's chat: the one this browser last opened
   when it remembers one, else the one with the latest activity. There is no
@@ -140,6 +149,17 @@ rare switch. This replaces the earlier "the user picks" default (#11763), which
 predated crewmates having conversations worth returning to. The auto-open is
 an ordering of what already exists — the remembered crewmate first, activity
 second — so a wrong guess costs one click and loses nothing.
+
+Amended 2026-10-10 by the product owner: creating a crewmate is this one card,
+and it replaces the guided Meet CrewMates create flow (screen 08) everywhere a
+crewmate is made on the Crewmates page. Reasoning: a person making a crewmate
+knows what to call it and what it should look like; what it should do, and
+when, is better settled by talking to it than by filling in a form, so the card
+asks for the first two and the crewmate's own first message asks for the rest.
+When the crewmate runs is no longer a create-time question: once the goal is
+clear the crewmate may offer a schedule, and sets one up only after the user
+agrees. The owning spec is
+[crew-mode.md](../system-specs/modules/crew-mode.md).
 
 ### 03 Pruning the crewmates an earlier release generated
 
@@ -292,6 +312,10 @@ Decided:
 
 ### 08 Meet CrewMates onboarding
 
+Superseded 2026-10-10 by the amendment in screen 02: a crewmate is created on
+the New crewmate card, and this flow is no longer shown. The decisions below
+stay as the record of the earlier design.
+
 Decided: a four-step flow in the product's existing split-screen first-run
 shell, not a single card.
 
@@ -330,6 +354,48 @@ Crewmates page keeps its on-demand **Meet CrewMates** entry. Reasoning: the
 flow introduces the concept and creates one crewmate the person names; neither
 depends on what the workspace already holds, and a person who opens the
 Crewmates page is looking for exactly this.
+
+Amended 2026-10-22 by the product owner (#17154, PR #17156): the four-step
+flow is replaced by **Meet your Mates**, a launch intro in the style of the
+launch poster, with "Not now" and "Try now". This supersedes the 2026-09-28
+amendment's showing rules and its on-demand entry, and the 2026-10-08 ruling
+for a looping video clip: the intro is a rendered dialog, not a clip, so it
+ships no media and nothing can fail to load.
+
+- **Where it lives:** a startup intro, shown once on a later launch after
+  first run is finished, through the feature-intro plumbing (`feature_videos`
+  catalog entry `crewmates`, `component: "crewmates"`). It is offered only
+  while the Mates preview is on, and never once `dashboard.crewmates_onboarded`
+  is true or the user has a mate of their own -- one besides `default` and the
+  first Mate (`mate`), which every install creates by itself. It is also
+  withheld once the first Mate has been deleted: "Try now" opens that Mate's
+  chat, and there would be none to open.
+- **What it shows:** the headline "Meet your Mates.", one line ("They find the
+  work, do it, and ask only when they need you."), a sample message from Mate
+  with the two answers it offers, and two rows of crewmate faces drifting past
+  in opposite directions (still under reduced motion), running off the card's
+  edges with a hard clip. The dialog is the poster's cream card in every theme;
+  the accent is the theme's own.
+- **What it does:** it does not create a crewmate. "Try now" opens Mate's chat
+  (`/members?member=mate`); on "Not now" Mate's avatar flies from the sample
+  card to the Mates rail item and lands as its "New" tag (under reduced
+  motion, or with the row off screen, the tag just appears), which opens the
+  same chat and clears the first time the page is opened by any path. Both
+  record the intro as seen. Escape is "Not now"; a click on
+  the scrim closes without a verdict, so the intro comes back.
+- **The first Mate's entrance** -- how Mate appears in the chat the first time
+  it opens, and whether anything travels from the dialog to its avatar -- is
+  not decided here. It is #23207.
+- **Entry point:** the Crewmates page has no Meet CrewMates entry.
+- **Off switch:** `dashboard.feature_videos_enabled: false` does not suppress
+  this intro, because it stands in for a first-run chapter that never had that
+  switch. `dashboard.crewmates_onboarded: true` turns it off.
+
+Reasoning: a person who already made a mate does not need the concept
+introduced, and creating a mate is the normal "+ New mate" card. A rendered
+dialog over a clip: the poster already says what the launch is about, a clip
+would need an asset shipped and fetched for a seven-second loop, and a
+missing or unplayable asset is the one failure a launch intro cannot afford.
 
 Already shipped and shown in the review as evidence, not re-decided here:
 crewmates are out of the ordinary session list; the ghost icon marks a
@@ -474,9 +540,13 @@ Implementation: the shared editor (hook + dialog) and the Crewmates-page wiring
 ship first. Folding the crew manager (`KiroCrewAgentsPage`) onto the same shared
 component, so "one editor" is literally true in code, is the committed follow-up.
 
-Status: the follow-up is open. `KiroCrewAgentsPage` shares only the section
-list (`useCrewEditorSections`) and keeps its own edit-sheet state, so a change to
-the editor must be mirrored there until the fold-in lands.
+Status: the follow-up has landed. The one editor is `CrewEditorNextDialog`
+driven by `useCrewEditor` (it replaced `CrewEditorDialog` in #19257), and
+`KiroCrewAgentsPage` (Customize > Crewmates) now opens that same editor rather
+than an edit sheet of its own, so one editor is literally true in code and
+there is nothing to mirror. Its **Built from** section is read-only: a
+crewmate's agent definition is edited on the Custom agents tab, not on the
+crewmate.
 
 Provenance: accepted by the product owner on 2026-09-30 (CREW-18688), recorded
 here ahead of the implementation PR (#15275) so the decision lands on main

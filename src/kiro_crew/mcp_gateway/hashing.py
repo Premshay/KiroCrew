@@ -15,9 +15,12 @@ import base64
 import functools
 import hashlib
 import json
+import logging
 import os
 import sys
 from typing import Any, Collection, Mapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 #: One base64url JSON list carrying the stub's own flag tokens. Every raw value
 #: the rewriter emits -- executable path, work dir, socket, env sidecar, server
@@ -126,7 +129,9 @@ def _windows_long_path(path: str) -> str | None:
     process itself (never to a caller-supplied token), and it follows no link:
     ``GetLongPathNameW`` expands each 8.3 component to its on-disk name and
     nothing else. Unavailable (non-Windows, a path the API cannot read) folds
-    to ``None`` and the alias keeps its one spelling.
+    to ``None`` and the alias keeps its one spelling. When such a path holds
+    ``~`` -- likely an 8.3 spelling the stub and the gateway would then hash
+    differently -- the failure is logged at DEBUG with the Win32 error code.
 
     Memoized per path: the only inputs are this process's own paths, so each is
     resolved at most once per process and :func:`install_aliases` -- called per
@@ -137,12 +142,23 @@ def _windows_long_path(path: str) -> str | None:
     try:
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # ``WinDLL`` and ``get_last_error`` exist only on Windows.
+        ct: Any = ctypes
+        kernel32 = ct.WinDLL("kernel32", use_last_error=True)
         buf = ctypes.create_unicode_buffer(32768)
         n = kernel32.GetLongPathNameW(path, buf, len(buf))
-    except Exception:
+    except Exception as exc:
+        if "~" in path:
+            logger.debug("GetLongPathNameW unavailable for own path %r: %r", path, exc)
         return None
     if n == 0 or n > len(buf):
+        if "~" in path:
+            logger.debug(
+                "GetLongPathNameW failed for own path %r (returned %d, last error %d)",
+                path,
+                n,
+                ct.get_last_error(),
+            )
         return None
     return str(buf.value)
 
@@ -161,11 +177,11 @@ def install_aliases() -> dict[str, bytes]:
     These are the strings the gateway's own code puts into a launch, computed
     here from the same sources it computes them from:
 
-    * ``sys.executable`` -- what ``apps/bridges.py`` substitutes for a bare
+    * ``sys.executable`` -- what ``apps/bridges_mcp.py`` substitutes for a bare
       ``python3`` (``resolve_app_python``) and for the ``kirocrew`` host CLI
       (``_pin_host_cli_command``);
     * the absolute path of ``kiro_crew/apps/deps_boot.py`` -- the stdlib-only
-      launch shim ``bridges.py`` inserts into argv by absolute path (``.pyc``
+      launch shim ``bridges_mcp.py`` inserts into argv by absolute path (``.pyc``
       spelled too, for a source-less install);
     * the directory that holds the ``kiro_crew`` package -- the
       ``site-packages`` the host-CLI pin writes into the declared ``PYTHONPATH``.
@@ -221,7 +237,7 @@ def launch_token_bytes(token: str, role: bytes) -> bytes:
     caller -- not the token -- that names it: the command slot folds the
     interpreter, an argv slot folds the ``deps_boot`` shim, a ``PYTHONPATH``
     segment folds ``site-packages``. Those are exactly the positions the
-    gateway's own writer (``apps/bridges.py``) emits the three spellings in. The
+    gateway's own writer (``apps/bridges_mcp.py``) emits the three spellings in. The
     same spelling anywhere else (the package directory as a ``--plugin-root``
     value, the interpreter as an argument, a path in some other variable) is
     content an operator or agent wrote, so it hashes literally and an upgrade
@@ -387,7 +403,7 @@ def non_secret_env(
 
 
 #: The one declared env key whose value the gateway's own writer builds from the
-#: install's ``site-packages`` (``apps/bridges.py`` host-CLI pin). Only its
+#: install's ``site-packages`` (``apps/bridges_mcp.py`` host-CLI pin). Only its
 #: segments may fold that alias; every other variable hashes as written.
 _SITE_PACKAGES_ENV_KEY = "PYTHONPATH"
 
@@ -398,7 +414,7 @@ def env_value_bytes(key: str, value: str) -> bytes:
     A ``PYTHONPATH`` value is read as an ``os.pathsep`` list and each segment
     goes through :func:`launch_token_bytes` with the ``site-packages`` role, so
     a segment that IS the install's own ``site-packages`` -- the pin
-    ``apps/bridges.py`` writes for the ``kirocrew`` host CLI -- hashes by alias
+    ``apps/bridges_mcp.py`` writes for the ``kirocrew`` host CLI -- hashes by alias
     like the interpreter beside it. A value with no alias segment re-joins to
     exactly its UTF-8 encoding (splitting on the separator and joining with the
     same separator is the identity). Any OTHER key hashes its value as written:

@@ -1,14 +1,13 @@
 """The event-loop heartbeat and its off-loop stall watchdog.
 
 The crash-dump file and exit budget the watchdog is armed with, the 5-second heartbeat
-that beats it, the prior session's crash dump reported once, and the watchdog's
-shutdown.
+that beats it, the prior session's crash dump reported once, the healthy-boot
+marker both entrypoints dispatch once ready, and the watchdog's shutdown.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import TYPE_CHECKING
 
 from aiohttp import web
@@ -28,6 +27,7 @@ if TYPE_CHECKING:
         newest_dump_with_stacks,
         open_dump_file,
         platform_compat,
+        record_healthy_boot,
         resolve_loop_stall_exit_after,
         rotate_dumps,
         sweep_stale_dumps,
@@ -111,13 +111,15 @@ def _start_loop_heartbeat(
         # than exit_after. A 5s interval keeps that worst case at ~20s (vs ~15s
         # at 10s), so genuinely-recoverable 15-20s stalls are less likely to be
         # ended while still landing well under the Electron probe's kill window.
-        # The alarm pauses while the host sleeps and this loop's clock does not
-        # advance either, so a laptop resume is not silence to the watchdog.
+        # The alarm pauses while the host sleeps and the lag is read on
+        # ``platform_compat.awake_now``, which a sleep does not advance on any
+        # platform (Windows' ``time.monotonic`` counts one), so a laptop resume
+        # is neither silence to the watchdog nor lag here.
         interval = 5.0
         while True:
-            t0 = time.monotonic()
+            t0 = platform_compat.awake_now()
             await asyncio.sleep(interval)
-            lag = time.monotonic() - t0 - interval
+            lag = platform_compat.awake_now() - t0 - interval
             # Claimed before beat(): check() holds its own capture flag until a beat.
             capture_lag = _loop_watchdog.claim_lag_enrichment(lag)
             _loop_watchdog.beat()
@@ -229,3 +231,21 @@ async def _report_prior_crash_dump(state: DashboardState) -> None:
                 )
             except Exception:
                 logger.debug("stall-exit notification failed", exc_info=True)
+
+
+def _dispatch_healthy_boot_marker(state: DashboardState) -> None:
+    """Write the healthy-boot marker without holding readiness behind it.
+
+    Dispatched rather than awaited. The data home can be on network storage,
+    and this coroutine's RETURN is what publishes ``KIROCREW_READY``, so
+    awaiting the write would let a stalled mount hold readiness open forever
+    -- and a supervisor waiting on that line respawns straight into the same
+    hang. Everything the marker is for belongs to the NEXT boot, so nothing
+    here needs it to have landed.
+
+    Tracked in ``state._background_tasks`` so the task is not collected
+    mid-write and shutdown can see it.
+    """
+    task = asyncio.create_task(asyncio.to_thread(record_healthy_boot), name="healthy-boot-marker")
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)

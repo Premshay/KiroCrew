@@ -8,7 +8,7 @@ choice is a separate field, `agent.acp_backend`. The public baseline currently
 selects kiro-cli (`ACP_BACKEND_KIRO`, the empty string), Claude, KAS, Codex,
 OpenCode, Pi, goose and DeepSeek -- every id in `ACP_BACKENDS_KNOWN`. DeepSeek is
 selectable because Crew's gate plugin routes its tool calls through the host
-permission gate (`Routing.VERIFIED_GATE_EXTENSION`, `agent_sdk/backends.py`).
+permission gate (`Routing.VERIFIED_GATE_EXTENSION`, `agent_sdk/backends_routing.py`).
 `test_baseline_ships_every_known_backend` pins the baseline as
 `ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE`, where `NOT_SHIPPED_SELECTABLE` is a
 test-side set of known-but-unshipped ids, not a product allowlist; it is empty.
@@ -101,6 +101,17 @@ Both operator-facing surfaces read that one verdict:
   `hides a backend the deployment may not select, rather than dimming it`,
   `keeps the current backend listed even if it reads as unselectable` and
   `saves the Claude Code selection the shipped build offers`.
+
+### Stale cloud credentials
+
+When the adapter answers a prompt with `data.errorKind: cloud_credential_error`
+(Bedrock credentials the process cached can no longer be loaded), every turn
+surface recycles the process once and replays the turn, the same way it
+recovers a lost session; if the fresh process fails too, the give-up line shows
+the provider's own remedy. See the Lost backend session entry in
+[error handling](../common/error-handling.md). The trigger is the provider's
+`errorKind`, not a harness check, so any backend that emits that kind is
+recycled the same way.
 
 ### What Crew gates on this harness, and what a pre-approval skips
 
@@ -326,6 +337,34 @@ one shielded worker-thread transaction. If revocation or deletion cannot complet
 the old seed is restored or re-recorded so a later session can repair it rather
 than leaving an unowned permission mode on disk.
 
+That transaction runs from `shutdown`, and not every provider is torn down through
+`shutdown`. A provider the session layer abandons — a start that was cancelled or
+refused after the spawn, a warm-pool claim that failed, a `shutdown` that hung past
+its bound — reaches `session_pid._sync_kill_provider` through `_dispatch_hard_kill`
+and its client object is dropped afterwards. That path hands the client's
+registrations back itself (`AcpClient.release_settings_seed_claim`), once the kill
+gate has said what stands behind the pid: released when the teardown is
+authorized, when there is no pid, or when the recorded root is known to be gone or
+recycled; kept while a lease or tenancy still holds the runtime and while the
+root's identity cannot be read, so a successor never re-seeds the permission file
+under a runtime that may still be running (the conditions are the funnel's spec,
+[runtime-ownership.md](runtime-ownership.md) § *The one kill gate*). The hand-back
+withdraws the owner claim through `seed_provenance.release` and a reader lease
+through `seed_provenance.unshare`, composed as `seed_provenance.release_held` and
+gated on what the client's own token holds, so a client that holds nothing — every
+kiro-backend client — performs no sidecar I/O. The release is the durable one, not
+the in-memory `release_local`: the persisted owner holder carries this process's
+live identity and `claim` re-reads it under the cross-process lock, so an in-memory
+drop alone leaves the next client refused. The file and its record stay — this is
+the recorded-orphan shape, which the next session on that `work_dir` adopts,
+re-seeds for itself and removes on its own teardown. Without the hand-back a stale
+live claim outlives its client for the rest of the gateway process: a resumed chat
+whose first provider is torn down as leaked keeps every later provider on that
+`work_dir` out of its own seed, and one whose payload the stale seed cannot be
+shared with runs with the whole `mcpServers` array withheld
+(`test_seed_claim_released_on_teardown.py`, which also pins the kept claim under a
+live tenancy: the successor cannot re-write the file).
+
 **One relaxation: a sibling seed that governs this session is SHARED, not refused.**
 Two sessions of the same agent in the same `work_dir` render the same permissions,
 and refusing the second one bought nothing — it ran with the whole `mcpServers` array
@@ -545,7 +584,8 @@ pre-approved) is kept as the session started it, so an operator's stricter postu
 never widened. A pin that fails stops the harness,
 so a session never runs with Crew's tools under a mode that approves on its own.
 
-The pin runs only on this path. A session whose file Crew authored is not pinned: a
+The pin runs only on this path and on a Side Chat session (below). Any other session
+whose file Crew authored is not pinned: a
 user `~/.claude` mode reaching it is the inherited-config gap below ("Known gap: the
 user's global `~/.claude` is inherited"), which this path does not widen. The exclusion is never taken below
 `CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION`, or when Crew requested a mode itself, so
@@ -600,6 +640,23 @@ core does not set `CLAUDE_CONFIG_DIR` itself: an isolated CC config root (seedin
 Crew-owned directory from the user's `~/.claude`, keeping credentials and models
 while stripping inherited `permissions` that would pre-approve past Crew's gate)
 is **not implemented here** — see the known gap below.
+
+### A Side Chat session
+
+A Side Chat or thread-reply session (`side_read_only`) runs under `READ_ONLY`, which
+has no approver behind it, so it cannot inherit the gap below. It is started with
+only the read built-ins (`tools`: Read, Grep, Glob, WebFetch, WebSearch), an empty
+`mcpServers` array and `strictMcpConfig`, inline settings that add a `permissions.ask`
+rule for each of those five tools (so an in-work-dir read asks too), deny the read tools every host sensitive path
+(`security.sandbox_credential_targets()`, as `Read(//<target>)` and
+`Read(//<target>/**)`) and set `disableAllHooks`, and bypass off; it is pinned
+like the exclusion path above, and refused below the same version floor. Its setting
+sources are not narrowed, because the user tier carries the provider routing and
+model ids the session needs: an allow rule or `additionalDirectories` entry there
+cannot pre-approve a read, since an ask rule outranks an allow rule, and never
+opens a sensitive path, since a deny rule outranks both from any source. A launch that cannot build the deny rules
+does not start the session.
+Detail: [side.md](side.md), "On claude the confinement is the session's own options".
 
 ### Known gap: the user's global `~/.claude` is inherited
 

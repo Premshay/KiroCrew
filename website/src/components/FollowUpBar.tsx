@@ -1,4 +1,4 @@
-import { memo, useRef, useState, useEffect, useCallback } from 'react'
+import { memo, useRef, useState, useEffect, useLayoutEffect, useCallback } from 'react'
 import { useScrollEdges } from '../hooks/useScrollEdges'
 import { ChevronLeft, ChevronRight, ArrowUp, Loader2 } from 'lucide-react'
 import { InstantTip, useInstantTip as useSharedInstantTip } from './InstantTip'
@@ -93,6 +93,23 @@ const CHIP_MAX_WIDTH = 'followup-chip'
  * `FollowUpBar.test.tsx` pins the two together.
  */
 const CHIP_ROW_GAP = 'gap-1.5'
+
+/** The blank at the trailing end of a scrolling chip row. With the row's own
+ *  gap before it (6px) it spans the arrow's 2px inset plus its 24px width and a
+ *  little air, so at the end of the scroll no chip sits under the arrow's spot. */
+const ARROW_GUTTER_CLASS = 'shrink-0 w-6 self-stretch'
+
+/**
+ * How long the left arrow's spot keeps swallowing clicks after the arrow
+ * unmounts at the start of the scroll. The start is where the first chip has
+ * to sit flush with the composer, so it cannot carry a blank the way the far
+ * end does; instead the arrow's footprint stays clickable-but-inert long
+ * enough to absorb the second click of a double click on the arrow, which
+ * would otherwise land on the first chip and send it. Above the 220ms
+ * single-click debounce so a pending chip timer cannot be armed through it.
+ * Exported so the test advances fake timers against this value.
+ */
+export const LEFT_ARROW_CLICK_SHIELD_MS = 400
 
 /**
  * Gap between consecutive chips' entrance animations. The whole option set is
@@ -574,13 +591,59 @@ type LayoutProps = Omit<FollowUpBarProps, 'layout' | 'multi'> & { animating: boo
 function ScrollLayout({ options, picked, onSelect, onSend, quickSend, multi, animating, sourceKey, pendingOptions, refusedOptions, error }: LayoutProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
+  // Whether the CHIPS overflow, measured without the gutters: the gutters are
+  // part of `scrollWidth` while they are mounted, so deciding from the hook's
+  // edges would let them keep the row overflowing after the chips alone fit.
+  const [overflows, setOverflows] = useState(false)
+  const measureOverflow = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    let gutterSpan = 0
+    const gutters = el.querySelectorAll<HTMLElement>('[data-arrow-gutter]')
+    if (gutters.length) {
+      const gap = parseFloat(getComputedStyle(el).columnGap) || 0
+      gutters.forEach(g => { gutterSpan += g.offsetWidth + gap })
+    }
+    const next = el.scrollWidth - el.clientWidth - gutterSpan > 1
+    setOverflows(prev => (prev === next ? prev : next))
+  }, [])
+  const overflowRoRef = useRef<ResizeObserver | null>(null)
 
   // The hook owns the node's edge measurement; this keeps a plain handle to the
   // same node for the row's own scroll and wheel behaviour.
   const setScroller = useCallback((node: HTMLDivElement | null) => {
     scrollRef.current = node
     attachEdges(node)
-  }, [attachEdges])
+    overflowRoRef.current?.disconnect()
+    overflowRoRef.current = null
+    if (!node) return
+    measureOverflow()
+    if (typeof ResizeObserver !== 'undefined') {
+      overflowRoRef.current = new ResizeObserver(measureOverflow)
+      overflowRoRef.current.observe(node)
+    }
+  }, [attachEdges, measureOverflow])
+
+  // The left arrow's footprint outlives the arrow by LEFT_ARROW_CLICK_SHIELD_MS
+  // (see that constant). Set on the true -> false edge only, so a row that
+  // never scrolled shows no shield at all.
+  const [leftShield, setLeftShield] = useState(false)
+  const prevLeftRef = useRef(edges.left)
+  useLayoutEffect(() => {
+    const was = prevLeftRef.current
+    prevLeftRef.current = edges.left
+    if (was && !edges.left) setLeftShield(true)
+    else if (edges.left) setLeftShield(false)
+  }, [edges.left])
+  useEffect(() => {
+    if (!leftShield) return
+    const timer = setTimeout(() => setLeftShield(false), LEFT_ARROW_CLICK_SHIELD_MS)
+    return () => clearTimeout(timer)
+  }, [leftShield])
+
+  // Mounting or dropping the gutters changes the content width without
+  // changing the row's box, so no observer reports it: re-read the edges.
+  useLayoutEffect(() => { remeasure() }, [overflows, remeasure])
 
   // A mount effect is enough here: this scroller renders unconditionally with
   // ScrollLayout, so its node exists by the time effects run — unlike the tab
@@ -602,7 +665,7 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, multi, ani
   }, [])
 
   // Chips changing keeps the row's own box, so no observer reports it.
-  useEffect(() => { remeasure() }, [options, remeasure])
+  useEffect(() => { remeasure(); measureOverflow() }, [options, remeasure, measureOverflow])
 
   // Scroll by ~80% of the visible width in the given direction, so a click
   // reveals the next set of chips while keeping one in view for continuity.
@@ -633,6 +696,18 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, multi, ani
         >
           <ChevronLeft size={16} />
         </button>
+      )}
+      {!edges.left && leftShield && (
+        // Same box and position as the left arrow, invisible and inert: it eats
+        // the click that would otherwise reach the first chip under it.
+        <span
+          aria-hidden="true"
+          data-arrow-click-shield=""
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={(e) => { e.preventDefault(); e.stopPropagation() }}
+          onDoubleClick={(e) => { e.preventDefault(); e.stopPropagation() }}
+          className="absolute top-1/2 -translate-y-1/2 z-20 h-6 w-6 left-0.5"
+        />
       )}
       {edges.right && (
         <button
@@ -678,6 +753,16 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, multi, ani
             />
           )
         })}
+        {/* While the row scrolls, the far end carries a blank as wide as an
+            arrow. The right arrow disappears the moment nothing is left to
+            show, so the spot it sat on must be empty then: without the blank
+            it is the last chip, and the next click — or the second click of a
+            double click, which sends — lands on that chip. Only the trailing
+            end: a leading blank is also there at rest, before any scroll, and
+            pushes the first chip off the composer's left edge, so the start
+            is guarded by the left arrow's click shield instead. Gated on
+            overflow so a row that fits ends on its last chip. */}
+        {overflows && <span aria-hidden="true" data-arrow-gutter="" className={ARROW_GUTTER_CLASS} />}
       </div>
       </div>
       {error != null && <ChipError error={error} />}

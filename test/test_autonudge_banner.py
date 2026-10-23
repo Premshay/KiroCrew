@@ -1465,11 +1465,18 @@ class TestARealProducerSetsTheBanner:
     """
 
     def test_the_goal_command_passes_a_banner_to_add(self) -> None:
-        import inspect
+        from pathlib import Path
 
         from kiro_crew.dashboard import chat_runner
 
-        src = inspect.getsource(chat_runner)
+        src = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [
+                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+                Path(chat_runner.__file__),
+            ]
+            if turn_file.name != "__init__.py"
+        )
         assert (
             "normalize_banner(_objective, absent_ok=True, truncate=True)" in src
         ), "/goal no longer routes the objective through normalize_banner(truncate=True)"
@@ -1528,3 +1535,24 @@ class TestBanneredRowShowsTheBannerEveryCycle:
         assert "watching CI" in row, "the first cycle did not show the banner"
         assert loop.message not in row, "the first cycle carried the full message"
         assert loop.message in prompt
+
+
+@pytest.mark.asyncio
+async def test_the_idle_fire_takes_its_row_from_the_wake_origin() -> None:
+    """The fire's nudge row comes from ``session_deliver.origin_row`` for an
+    ``automation`` origin, the one mapping a steered wake uses too."""
+    from kiro_crew.dashboard import session_deliver
+
+    real = session_deliver.write_origin_row
+    seen: list[tuple[str, int, str]] = []
+
+    def _recording(slot, text, origin, **kwargs):
+        seen.append((origin.kind, origin.nudge["cycle"], origin.nudge["loop_id"]))
+        return real(slot, text, origin, **kwargs)
+
+    loop = _loop()
+    with patch.object(session_deliver, "write_origin_row", _recording):
+        appended, _prompt, meta = await _fire_full(loop)
+    assert seen == [(session_deliver.ORIGIN_AUTOMATION, loop.cycle_count + 1, loop.id)]
+    assert meta == {"cycle": loop.cycle_count + 1, "loop_id": loop.id}
+    assert appended.startswith("[auto-nudge cycle")

@@ -5,7 +5,9 @@ import { useState, useRef, useCallback, useEffect, type MutableRefObject } from 
 import { measureAutoGrowTextarea, useAutoGrowTextarea } from '../../hooks/useAutoGrowTextarea'
 import { sseSlotTitle } from '../../store/dashboardSlice'
 import { api } from '../../api/client'
+import { generateSlotTitle } from '../../hooks/slotTitleGeneration'
 import { errMessage } from '../../utils/thunkError'
+import { sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
 import { i18nT } from '../../i18n/t'
 import type { AppDispatch, RootState } from '../../store'
 import type { Store } from '@reduxjs/toolkit'
@@ -207,6 +209,27 @@ export function useSessionRename({ dispatch, store, queryClient }: {
     suppressMenuRestoreRef, onRenameStart, onRenameChange, onRenameCancel, onRenameCommit,
     onMenuCloseAutoFocus,
   }
+}
+
+/** "Regenerate title" from a session row's menu: the same endpoint and store
+ *  write as the chat header's hover-revealed button, reachable without making
+ *  the session active. A refusal lands in `autoTitleError`, rendered by the
+ *  sidebar-root ErrorNotice cluster beside the rename one; it names the session,
+ *  because the notice sits away from the row that was picked. */
+export function useSessionAutoTitle({ dispatch, store }: { dispatch: AppDispatch; store: Store<RootState> }) {
+  const [autoTitleError, setAutoTitleError] = useState('')
+  const onAutoTitle = useCallback((key: string) => {
+    const run = generateSlotTitle(key, dispatch)
+    if (!run) return
+    setAutoTitleError('')
+    run.catch(e => {
+      // "Untitled session" for an untitled slot, never its key (#23059).
+      const title = sessionDisplayTitle({ key, title: store.getState().dashboard.slots.find(s => s.key === key)?.title })
+      const reason = errMessage(e) || i18nT('pages.chatPage.unknown_error')
+      setAutoTitleError(`${title}: ${reason}`)
+    })
+  }, [dispatch, store])
+  return { autoTitleError, setAutoTitleError, onAutoTitle }
 }
 
 /** Folder rename state, scoped to the render instance being edited. */

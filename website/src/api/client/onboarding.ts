@@ -75,6 +75,12 @@ export interface KiroPrerequisiteStatus {
    * that the check failed.
    */
   probe_error?: string
+  /**
+   * True when the gateway is a Linux host without `unzip`, which the one-line
+   * Kiro CLI installer refuses to run without. Reported only while the CLI is
+   * not installed; absent on older gateways.
+   */
+  unzip_missing?: boolean
   /** The failed probe's exit status; absent when it did not exit. */
   probe_status?: number | null
   /**
@@ -119,6 +125,51 @@ export interface KiroPrerequisiteStatus {
    * not complete.
    */
   cli_update_error?: string
+  /**
+   * The owner-only shell prefixes a `kirocrew config set` command row pastes before
+   * `config set`, resolved by the gateway that knows which launcher actually runs.
+   * Optional: a gateway older than this field does not send it, and a non-owner
+   * never receives it. Treat anything that is not a valid V1 payload as absent.
+   */
+  config_set_hints?: ConfigSetHintsV1
+}
+
+export type ConfigSetShellId = 'posix' | 'powershell' | 'cmd'
+
+/**
+ * Versioned launcher prefixes for `kirocrew config set`. Every command built from
+ * them carries its value as ONE `--value-base64=<token>` argument, because a separate
+ * empty argument does not survive Windows PowerShell 5.1 in front of a `.cmd` shim.
+ */
+export interface ConfigSetHintsV1 {
+  version: 1
+  encoding: 'utf-8-base64'
+  shells: Array<{
+    id: ConfigSetShellId
+    prefix: string
+  }>
+}
+
+/** `GET /api/kas-bundle`: Kiro Crew's own KAS engine (the `agent.kas_bundle` route). */
+export interface KasBundleStatus {
+  /** `agent.kas_bundle` as saved. */
+  enabled: boolean
+  /** The engine version this Kiro Crew release pins. */
+  pinned_version: string
+  /** The version the harness runs: the pin, unless the gateway's environment overrides it. */
+  runs_version: string
+  /**
+   * The installed engine at `runs_version`, or null when it is not installed.
+   * `bundled` is true when it is the copy built into the desktop app rather than
+   * one `kirocrew kas install` laid down under the data home.
+   */
+  installed: { version: string; node_version: string; bundled: boolean } | null
+  /** True while an install started from this gateway is running. */
+  installing: boolean
+  /** Bytes fetched so far by the running install; `total` is 0 before the first byte. */
+  progress: { done: number; total: number }
+  /** The last install's failure, as the remedy text; '' when none. */
+  error: string
 }
 
 export interface KasLoginStatus {
@@ -248,6 +299,8 @@ export interface AgentImportApplyResponse {
   ok: true
   conflict_strategy: AgentImportConflictStrategy
   summary: AgentImportSummary
+  /** Present when MCP servers were imported; false when the agent spec was not rewritten. */
+  agent_spec_rewritten?: boolean
 }
 
 export function createOnboardingEndpoints({ get, post, put, j, jNullable }: ClientTransport) {
@@ -319,6 +372,11 @@ export function createOnboardingEndpoints({ get, post, put, j, jNullable }: Clie
     // afterwards, which is the single authority on state.
     kasLoginLogout: (identity: string) =>
       post('/api/kas-login/logout', { identity }).then(j) as Promise<{ ok: boolean }>,
+    // Kiro Crew's own KAS engine. The switch is the ordinary config PATCH of
+    // `agent.kas_bundle`; these two only read and install the pinned engine. The
+    // install answers 202 with the same status shape and runs in the background.
+    kasBundleStatus: () => get('/api/kas-bundle').then(j) as Promise<KasBundleStatus>,
+    kasBundleInstall: () => post('/api/kas-bundle/install').then(j) as Promise<KasBundleStatus>,
     onboardingImportScan: () =>
       get('/api/onboarding/import/scan').then(j) as Promise<AgentImportScanResponse>,
     onboardingImportApply: (body: AgentImportApplyRequest) =>

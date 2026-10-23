@@ -22,6 +22,7 @@ any one of them is a second diagnosis of one file, and the drift guard here fail
 from __future__ import annotations
 
 import argparse
+import importlib
 import inspect
 import json
 import os
@@ -345,9 +346,9 @@ class TestTheRefusalReachesTheChatCard:
     """The dashboard surface for an agent spawn, pinned at the two places it can break.
 
     The refusal escapes ``_run_chat``'s ACP handler chain (it is a ``RuntimeError``, not
-    an ``AcpError``) and lands in its terminal ``except Exception`` handler, which appends
-    ``str(exc)`` as the error row. Two things have to hold for the remedy to arrive, and
-    each is a separate way the card could go quiet:
+    an ``AcpError``) and lands in its terminal ``except Exception`` handler, whose ``_on_error``
+    (``chat_turn/turn_failures.py``) appends ``str(exc)`` as the error row. Two things have to
+    hold for the remedy to arrive, and each is a separate way the card could go quiet:
 
     * the handler must keep using the exception's own text -- a generic "agent failed to
       start" there is exactly the substitution the issue asked about;
@@ -484,11 +485,16 @@ def _detail_formatters() -> list[tuple[str, object]]:
     list here. A hand-written enumeration is exactly how the next formatter would ship
     printing raw bytes while this file stayed green.
     """
-    found = [
-        (name, fn)
-        for name, fn in vars(sandbox).items()
-        if name.startswith("_live_target_") and name.endswith("_detail") and callable(fn)
-    ]
+    # The module and the owners carved out of it, one entry per name.
+    modules = (sandbox, *map(importlib.import_module, sandbox._CARVED_OWNERS))
+    found = list(
+        {
+            name: fn
+            for module in modules
+            for name, fn in vars(module).items()
+            if name.startswith("_live_target_") and name.endswith("_detail") and callable(fn)
+        }.items()
+    )
     assert found, "no _live_target_*_detail formatters found -- the discovery broke"
     return sorted(found)
 

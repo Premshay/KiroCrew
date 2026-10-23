@@ -585,7 +585,7 @@ class TestFileReadReservedCharacterPaths:
         Only NUL is exercised here. The other unrepresentable shape -- a lone
         surrogate -- cannot be delivered through this transport, because URL
         decoding never yields one; it is covered against the seam itself in
-        test_hooks_coverage.py.
+        test_hooks_coverage_file_branches.py.
         """
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get("/api/file-read?path=" + encoded)
@@ -832,7 +832,9 @@ class TestSendMessage:
             assert resp.status == 200
             data = await resp.json()
             assert data == {"ok": True, "slack": False, "session": False, "delivered_to": "notification"}
-            state.notify.assert_called_once_with("agent", "Agent Message", "hello")
+            state.notify.assert_called_once_with(
+                "agent", "Agent Message", "hello", meta=None, member=None, publisher_session=None
+            )
 
     @pytest.mark.asyncio
     async def test_send_message_with_slack(self):
@@ -848,7 +850,9 @@ class TestSendMessage:
             assert resp.status == 200
             data = await resp.json()
             assert data == {"ok": True, "slack": True, "session": False, "delivered_to": "slack", "ts": "1712793600.000001"}
-            state.notify.assert_called_once_with("agent", "Test", "hello")
+            state.notify.assert_called_once_with(
+                "agent", "Test", "hello", meta=None, member=None, publisher_session=None
+            )
             slack.open_dm.assert_called_once_with("U123")
             slack.post_message.assert_called_once_with(
                 "C123",

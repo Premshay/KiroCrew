@@ -28,6 +28,7 @@ from kiro_crew.artifact_store.model import (
     ArtifactStillPublishedError,
     ArtifactValidationError,
 )
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.loader import config_dir
 
 if TYPE_CHECKING:
@@ -53,7 +54,7 @@ MAX_FOLDER_DEPTH = 20
 class ArtifactFolderStore:
     """Filesystem-backed store for the nested artifact-library folder tree.
 
-    Mirrors the chat-folder subsystem (``dashboard/state.py`` folders): a flat
+    Mirrors the chat-folder subsystem (``dashboard/state_parts/sidebar_stores.py`` folders): a flat
     JSON list persisted to ``artifact_folders.json`` in the config dir, with
     nesting expressed via ``parent_id`` pointers rather than nested storage or
     path strings. Membership lives on the artifact record (``Artifact.folder_id``),
@@ -155,7 +156,7 @@ class ArtifactFolderStore:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            os.replace(tmp, str(self._path))
+            replace_with_retry(tmp, str(self._path))
         except Exception:
             try:
                 os.unlink(tmp)

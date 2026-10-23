@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test'
+import { test, expect, type Page } from '@playwright/test'
 
 // Prompt sentinels understood by the stub ACP backend. Keep in sync with
 // SLOW_TRIGGER / SLOW_NOACK_TRIGGER / SLOW_LATEACK_TRIGGER in
@@ -8,7 +8,7 @@ const SLOW_NOACK = '[[SLOW_NOACK]]'
 const SLOW_LATEACK = '[[SLOW_LATEACK]]'
 
 // The new-chat control's stable accessible name: the en.json value of
-// pages.chatSidebar.new_chat_session (ChatSidebar.tsx aria-label). A
+// pages.chatSidebar.new_chat_session (chat-sidebar/SidebarHeader.tsx aria-label). A
 // whole-string exact match cannot collide with the per-turn minimap buttons,
 // whose accessible names are prompt-derived (e.g. "What is 2+2?"), or the
 // per-folder "New chat in <name>" buttons. fork.spec.ts uses the same locator.
@@ -210,13 +210,117 @@ test.describe('Chat Page E2E Tests', { tag: '@needs-agent' }, () => {
  * data-state rather than label text: the state is the contract, the wording is
  * not. The previous `/stop/i` role selector is now a strict-mode violation —
  * three buttons carry "stop" in their accessible name.
+ *
+ * Before pressing Stop, every spec waits for the stub's first streaming chunk.
+ * That chunk is emitted only from inside session/prompt, so observing it proves
+ * the host's turn is in-flight and session/cancel has a live turn to land on.
+ * The armed Stop button alone is not that proof: it appears as soon as the slot
+ * is busy, which includes a queued but not-yet-dispatched prompt, and a stop
+ * pressed in that window finds stop_turn=idle and settles the card as "stopped"
+ * instead of driving the expiry or pulsing path.
+ *
+ * Cross-spec isolation: every spec runs on the one slot `/chat` opens, so each
+ * starts with `openChatOnIdleSlot`, which waits until the gateway reports that
+ * slot idle before the spec sends. Each spec also includes a per-run unique
+ * marker in the prompt. Waiting for that marker to appear in the transcript
+ * proves our user bubble landed BEFORE we check for chunks, preventing an old
+ * turn's chunk paragraph from matching the `transcript.locator('p').last()`
+ * wait early.
  */
 const STOP_CARD = '[data-testid="stop-event-card"]'
 
+// The first streamed chunk from any SLOW* turn: SLOW_CHUNK_TEXT + "0 " in
+// src/kiro_crew/testing/fake_acp_backend.py. Only emitted from inside
+// session/prompt, so its presence in the transcript proves the turn is live.
+const FIRST_SLOW_CHUNK = 'fake slow chunk 0'
+
+// Ceiling for the turn the spec before left on the shared slot to end
+// (`openChatOnIdleSlot`).
+const PRIOR_TURN_SETTLE_CEILING_MS = 30_000
+
+// Per-test time budget: the prior turn settling, nav/load + MCP drain
+// (FIRST_REPLY_CEILING_MS) + stop resolution (3x the 5s soft_stop_budget_secs).
+const SOFT_STOP_TEST_TIMEOUT_MS =
+  PRIOR_TURN_SETTLE_CEILING_MS + 5_000 + FIRST_REPLY_CEILING_MS + 15_000
+
+/**
+ * Open the chat page on its default slot once the gateway reports that slot
+ * idle, and return the slot key.
+ *
+ * The spec before can leave its turn running on this slot: the pulsing spec
+ * ends while its turn still waits for the late ack, the soft-ack spec ends the
+ * moment its card settles, and the budget spec ends on a hard kill that resets
+ * the session. A prompt sent while that turn winds down is queued behind it or
+ * steered into it instead of starting a turn of its own, so the spec then waits
+ * on a user bubble that never lands, or on an armed Stop that never appears.
+ *
+ * The page cannot tell idle apart from busy here: an absent armed Stop also
+ * means "stopping" (the button pulses or spins) and "not loaded yet". So the
+ * wait reads the gateway's own record of the slot, then reopens the page so it
+ * renders from that idle state rather than from whatever it loaded while the
+ * earlier turn was winding down.
+ */
+async function openChatOnIdleSlot(page: Page): Promise<string> {
+  await page.goto('/chat', { waitUntil: 'domcontentloaded' })
+  const activeRow = page.locator('.session-row.session-active').first()
+  await expect(activeRow).toBeVisible({ timeout: 30_000 })
+  const slot = await activeRow
+    .locator('xpath=ancestor::*[@data-slot-key][1]')
+    .getAttribute('data-slot-key')
+  if (!slot) throw new Error('the active session row names no slot')
+  await expect
+    .poll(
+      async () => {
+        const res = await page.request.get(`/api/chat/slots/${encodeURIComponent(slot)}?limit=1`)
+        if (!res.ok()) return `HTTP ${res.status()}`
+        const s = (await res.json()) as { running?: boolean; stopping?: boolean; queue?: unknown[] }
+        const queued = s.queue?.length ?? 0
+        return s.running || s.stopping || queued
+          ? `running=${s.running} stopping=${s.stopping} queued=${queued}`
+          : 'idle'
+      },
+      { message: `slot ${slot} did not go idle`, timeout: PRIOR_TURN_SETTLE_CEILING_MS },
+    )
+    .toBe('idle')
+  await page.goto(`/chat?sid=${encodeURIComponent(slot)}`, { waitUntil: 'domcontentloaded' })
+  await expect(page.locator(`[data-slot-key="${slot}"] .session-row.session-active`)).toBeVisible({
+    timeout: 30_000,
+  })
+  await expect(page.getByPlaceholder(/message/i)).not.toHaveAttribute('placeholder', /offline/i)
+  return slot
+}
+
+/**
+ * Wait until the stub's first chunk is visible in the CURRENT turn's response.
+ *
+ * The transcript persists across browser sessions (loaded fresh from the gateway
+ * on each test page), so a previous turn's identical `fake slow chunk 0` paragraph
+ * appears earlier in the DOM. `transcript.locator('p').last()` is the last
+ * paragraph in DOM order. After `marker` (a per-run unique string in our prompt)
+ * is visible in the transcript, our user bubble is the newest message, so any
+ * subsequent `p.last()` that contains FIRST_SLOW_CHUNK belongs to the current
+ * response, not an older one.
+ */
+async function waitForCurrentTurnFirstChunk(
+  transcript: ReturnType<import('@playwright/test').Page['getByLabel']>,
+  marker: string,
+): Promise<void> {
+  // Confirm our user bubble landed (transcript contains marker = our prompt).
+  // Without this, `p.last()` could still be an older response paragraph that
+  // already contains `fake slow chunk 0`, resolving the wait before our turn
+  // has started.
+  await expect(transcript).toContainText(marker, { timeout: 10_000 })
+  // Now p.last() is our user paragraph (or the response that follows it, once
+  // the response starts rendering). Wait for it to contain the first chunk.
+  await expect(transcript.locator('p').last()).toContainText(FIRST_SLOW_CHUNK, {
+    timeout: FIRST_REPLY_CEILING_MS,
+  })
+}
+
 test.describe('Soft-Stop E2E Tests', { tag: '@needs-agent' }, () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('/chat', { waitUntil: 'domcontentloaded' })
-    await expect(page.getByPlaceholder(/message/i)).toBeVisible({ timeout: 10000 })
+    test.setTimeout(SOFT_STOP_TEST_TIMEOUT_MS)
+    await openChatOnIdleSlot(page)
   })
 
   /**
@@ -236,36 +340,32 @@ test.describe('Soft-Stop E2E Tests', { tag: '@needs-agent' }, () => {
    * default chunk delay), so the state is observable with real margin. It still
    * acks well inside `agent.soft_stop_budget_secs`, so the turn ends
    * cooperatively and nothing leaks into the spec that follows.
-   *
-   * [[SLOW_NOACK]] would also widen the window, but it leaves the slot mid-budget
-   * with a hard kill pending, which makes the sibling spec below fail. Measured:
-   * with NOACK here, `stop resolves to Stopped on soft ack` failed 4 of 4 runs.
    */
   test('stop mid-tool-call triggers pulsing', async ({ page }) => {
-    // A cancel-aware slow turn that winds down before acking, so the
-    // soft_pending state is observable rather than a ~250ms race.
+    const marker = `pulsing-${Date.now()}`
     const messageInput = page.getByPlaceholder(/message/i)
-    await messageInput.fill(`Run a long command: sleep 30 ${SLOW_LATEACK}`)
+    await messageInput.fill(`Run a long command: sleep 30 ${SLOW_LATEACK} ${marker}`)
     await page.keyboard.press('Enter')
 
-    // Wait for the stop button to appear (agent is running)
-    const stopButton = page.getByTestId('stop-button-armed')
-    await expect(stopButton).toBeVisible({ timeout: 15000 })
+    const transcript = page.getByLabel('Chat messages', { exact: true })
+    await waitForCurrentTurnFirstChunk(transcript, marker)
 
     // Click stop — should enter the pulsing "stopping" state
-    await stopButton.click()
+    await page.getByTestId('stop-button-armed').click()
 
     await expect(page.getByTestId('stop-button-pulsing')).toBeVisible({ timeout: 5000 })
   })
 
   test('stop resolves to Stopped on soft ack', async ({ page }) => {
+    const marker = `softack-${Date.now()}`
     const messageInput = page.getByPlaceholder(/message/i)
-    await messageInput.fill(`Hello, please respond slowly ${SLOW}`)
+    await messageInput.fill(`Hello, please respond slowly ${SLOW} ${marker}`)
     await page.keyboard.press('Enter')
 
-    const stopButton = page.getByTestId('stop-button-armed')
-    await expect(stopButton).toBeVisible({ timeout: 15000 })
-    await stopButton.click()
+    const transcript = page.getByLabel('Chat messages', { exact: true })
+    await waitForCurrentTurnFirstChunk(transcript, marker)
+
+    await page.getByTestId('stop-button-armed').click()
 
     // The stub acks the cancel, so the card resolves to [Stopped].
     await expect(page.locator(`${STOP_CARD}[data-state="stopped"]`).first()).toBeVisible({
@@ -279,7 +379,7 @@ test.describe('Soft-Stop E2E Tests', { tag: '@needs-agent' }, () => {
  *
  * The agent half is [[SLOW_NOACK]]: fake_acp_backend streams SLOW_CHUNKS=30
  * chunks at SLOW_CHUNK_DELAY_SECS=0.5 (15s) and, unlike [[SLOW]], never checks
- * for the cancel. So the host's soft-stop budget always expires first and the
+ * for the cancel. So the host\'s soft-stop budget always expires first and the
  * stop escalates to a hard kill.
  *
  * The host half is `agent.soft_stop_budget_secs`, read server-side in
@@ -294,22 +394,26 @@ test.describe('Soft-Stop E2E Tests', { tag: '@needs-agent' }, () => {
  * What this covers that the two soft-ack specs above do not: the escalation
  * path settling the card. That path shipped broken, and nothing caught it
  * because this spec was dark. A turn tearing
- * down concurrently reset `_stop_state` to "idle", the hard callback's state
+ * down concurrently reset `_stop_state` to "idle", the hard callback\'s state
  * gate bailed, and the card pulsed at "stopping" for the rest of the session.
  * See TestStopCardTeardownRace in test/test_stop_handler_idempotent.py.
  */
 test.describe('Soft-Stop budget expiry', { tag: '@needs-agent' }, () => {
-  test('stop resolves to Stop Failed on budget expiry', async ({ page }) => {
-    await page.goto('/chat', { waitUntil: 'domcontentloaded' })
-    await expect(page.getByPlaceholder(/message/i)).toBeVisible({ timeout: 10000 })
+  test.beforeEach(async ({ page }) => {
+    test.setTimeout(SOFT_STOP_TEST_TIMEOUT_MS)
+    await openChatOnIdleSlot(page)
+  })
 
+  test('stop resolves to Stop Failed on budget expiry', async ({ page }) => {
+    const marker = `budgetexpiry-${Date.now()}`
     const messageInput = page.getByPlaceholder(/message/i)
-    await messageInput.fill(`Run a very long command: sleep 120 ${SLOW_NOACK}`)
+    await messageInput.fill(`Run a very long command: sleep 120 ${SLOW_NOACK} ${marker}`)
     await page.keyboard.press('Enter')
 
-    const stopButton = page.getByTestId('stop-button-armed')
-    await expect(stopButton).toBeVisible({ timeout: 15000 })
-    await stopButton.click()
+    const transcript = page.getByLabel('Chat messages', { exact: true })
+    await waitForCurrentTurnFirstChunk(transcript, marker)
+
+    await page.getByTestId('stop-button-armed').click()
 
     await expect(page.locator(`${STOP_CARD}[data-state="stop_failed_reset"]`).first()).toBeVisible({
       timeout: 15000,

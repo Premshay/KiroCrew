@@ -13,6 +13,11 @@ export const INPUT_TYPO = 'px-4 pt-3 pb-1 mc-message-font-text font-body leading
 interface Props {
   value: string
   blocks: PasteBlock[]
+  /** The box and font classes of the textarea this mirror sits behind. Every
+   *  dashboard composer shares {@link INPUT_TYPO}; a host whose textarea is
+   *  boxed differently (the app-sdk `ChatEmbed`) passes its own, and they
+   *  must match that textarea exactly for the same reason. */
+  typo?: string
 }
 
 /**
@@ -27,9 +32,11 @@ interface Props {
  * selection stay on top and fully interactive. Vertical scroll is synced by the
  * textarea's onScroll handler (see ChatInput). The mirror fills its wrapper, so
  * the textarea must be `display: block` (ChatInput) for the two boxes to be the
- * same height; otherwise their scroll ranges differ and the chips drift.
+ * same height; otherwise their scroll ranges differ and the chips drift. Both
+ * boxes also reserve the scrollbar gutter, so the textarea's scrollbar cannot
+ * make it wrap narrower than this mirror.
  */
-const PasteHighlightLayer = forwardRef<HTMLDivElement, Props>(function PasteHighlightLayer({ value, blocks }, ref) {
+const PasteHighlightLayer = forwardRef<HTMLDivElement, Props>(function PasteHighlightLayer({ value, blocks, typo = INPUT_TYPO }, ref) {
   const ranges = findTokenRanges(value, blocks)
   const nodes: React.ReactNode[] = []
   let last = 0
@@ -51,7 +58,7 @@ const PasteHighlightLayer = forwardRef<HTMLDivElement, Props>(function PasteHigh
       ref={ref}
       aria-hidden
       data-composer-typo
-      className={`pointer-events-none absolute inset-0 overflow-hidden select-none text-transparent whitespace-pre-wrap break-words ${INPUT_TYPO}`}
+      className={`pointer-events-none absolute inset-0 overflow-hidden [scrollbar-gutter:stable] select-none text-transparent whitespace-pre-wrap break-words ${typo}`}
       style={{ overflowWrap: 'break-word', wordBreak: 'normal' }}
     >
       {nodes}

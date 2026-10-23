@@ -1239,6 +1239,7 @@ def test_a_runner_turn_still_records_and_the_marker_is_the_runners_own(tmp_path,
     retires it, with the record, when it ends; and the messaging driver that runs
     channel turns never touches it -- pinned at the driver's source, so a driver
     that starts setting it reds this test rather than resurrecting the stale record."""
+    import importlib
     import inspect
 
     from turn_harness import Do, TurnScript, run_turn
@@ -1270,7 +1271,7 @@ def test_a_runner_turn_still_records_and_the_marker_is_the_runners_own(tmp_path,
     assert seen["inside"] is True, "the runner publishes its marker while the turn runs"
     assert seen["slot"]._active_turn_session_key == "", "the runner retires its marker"
     assert seen["slot"]._steer_audience_fences == {}, "the runner's teardown empties the record"
-    for module in (driver, dispatch):
+    for module in (driver, dispatch, *map(importlib.import_module, dispatch._OWNERS)):
         assert "_active_turn_session_key" not in inspect.getsource(module), module.__name__
     assert "_active_turn_session_key" in inspect.getsource(sc._in_runner_turn)
 
@@ -1739,13 +1740,24 @@ def test_every_owner_dm_surface_opens_the_crew_log_from_its_dispatcher():
     pipeline declares ``Drift.OPENS_CREW_LOG`` and the pipeline makes the call."""
     import ast
     import importlib
+    import importlib.util
     import inspect
+    import pkgutil
 
     from kiro_crew.messaging import dispatch as pipeline
 
     for surface in sorted(sc.OWNER_DM_CONDUCTOR_SURFACES):
         dispatcher = importlib.import_module(f"kiro_crew.{surface}.transport_dispatch")
         source = inspect.getsource(dispatcher)
+        # A dispatcher composed from owners in its channel's ``dispatch`` package opens the
+        # log from one of them (Telegram's turn engine), so its source is read with theirs.
+        owners = f"kiro_crew.{surface}.dispatch"
+        if importlib.util.find_spec(owners) is not None:
+            package = importlib.import_module(owners)
+            source += "".join(
+                inspect.getsource(importlib.import_module(f"{owners}.{info.name}"))
+                for info in pkgutil.iter_modules(package.__path__)
+            )
         if "ChannelTurns(" in source:
             # The drift handed over is the declared set itself, not one with the
             # opener carved out of it (``DISCORD_DRIFT - {...}`` reads as passed).

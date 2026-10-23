@@ -806,6 +806,8 @@ async def test_the_direct_client_honours_the_seam(tmp_path, attachment, allow_im
 
     client = AcpClient(work_dir=tmp_path)
     client._session_id = "sid"
+    # As if the handshake advertised promptCapabilities.image; the seam is
+    # the caller's allow_image on top of that.
     client._prompt_capabilities = {"image": True}
     client._send_request = AsyncMock(return_value=3)
 

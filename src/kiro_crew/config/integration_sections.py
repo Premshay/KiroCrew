@@ -2,7 +2,8 @@
 
 Owns the DTOs and defaults for ``mcp`` and ``mcp_gateway`` (including the MCP stub
 roster readers the gateway seed shares), ``instances``, ``tunnel``, ``publish``,
-``computer_use`` and the external app ``registries``. The computer-use and
+``computer_use``, ``aws``, the external app ``registries`` and the per-app user
+settings ``apps``. The computer-use and
 instance bounds come from ``computer_use.types`` and ``instances.constants``.
 ``config.sections`` re-exports every name; this module never imports it, the
 loader, schema or validation.
@@ -106,11 +107,72 @@ def _resolve_stub_overrides(mcp_gateway_data: dict) -> dict[str, bool]:
     }
 
 
+#: The managed server whose stub decision the followers below inherit.
+MANAGED_STUB_LEADER = "kirocrew-core"
+
+#: Kiro Crew's own managed servers that are stubbed whenever
+#: :data:`MANAGED_STUB_LEADER` is, unless an operator override says otherwise.
+#:
+#: Each one is launched from Kiro Crew's own install (so its launch needs no
+#: operator approval, see ``rewriter._is_managed_launch``), is handed the
+#: per-session token by gatewayd (``daemon.control_plane.CONTROL_PLANE_BACKENDS``)
+#: and advertises ``kirocrew.caller-identity``, refusing a caller the gateway
+#: cannot name. That is the same footing ``kirocrew-core`` stands on, so an
+#: install that stubs it has already accepted everything sharing these costs.
+#: Leaving them out cost a full Python process per session for each one a spec
+#: declares (``kirocrew-guide`` is in every default spec).
+#:
+#: Being in the stub set mounts nothing: the rewriter wraps only servers a spec
+#: already declares, so an opt-in server still reaches only the agents granted it.
+#:
+#: This is ``mcp_discovery._MANAGED_SERVERS_CALLER_AWARE`` minus the leader,
+#: ``kirocrew-computer`` and ``kirocrew-cron``. It is spelled out rather than
+#: derived because this module may import only ``config.fields`` (the config
+#: boundary contract) and ``mcp_discovery`` pulls in aiohttp and the probe
+#: executor. A ratchet test pins the equality, so a new caller-aware server fails
+#: it until it is placed here or in the test's exclusions with a reason.
+#:
+#: ``kirocrew-computer`` drives the desktop and pools only behind a
+#: per-connection tenant nonce (``mcp_caller.POOLING_REQUIRES_TENANT_NONCE``), so
+#: it stays an explicit choice. ``kirocrew-cron`` is not excluded for a known
+#: hazard: it is simply outside what this layer was measured on, and stays one
+#: operator toggle away like any other server.
+MANAGED_STUB_FOLLOWERS: tuple[str, ...] = (
+    "kirocrew-guide",
+    "kirocrew-mate",
+    "kirocrew-panel",
+    "kirocrew-dashboard",
+    "kirocrew-work",
+    "kirocrew-crew-log",
+    "kirocrew-debug",
+)
+
+
+def _resolve_stub_base(mcp_gateway_data: dict) -> list[str]:
+    """The roster plus the managed servers that follow the control plane.
+
+    This is the answer an operator who has said nothing about a server gets: the
+    layer :func:`_resolve_stub_overrides` deviates FROM. It differs from
+    :func:`_resolve_stub_roster` only by :data:`MANAGED_STUB_FOLLOWERS`, appended
+    when the leader is stubbed by the roster or by an override. Writers persist the
+    roster, never this. The seed asks this whether a name is already stubbed. The
+    dashboard writer never prunes a follower decision at all (see
+    ``_record_stub_decisions``), because this base moves with the leader.
+    """
+    roster = _resolve_stub_roster(mcp_gateway_data)
+    overrides = _resolve_stub_overrides(mcp_gateway_data)
+    if not overrides.get(MANAGED_STUB_LEADER, MANAGED_STUB_LEADER in roster):
+        return roster
+    present = set(roster)
+    return roster + [name for name in MANAGED_STUB_FOLLOWERS if name not in present]
+
+
 def _resolve_stub_servers(mcp_gateway_data: dict) -> list[str]:
     """Which MCP servers are given a stub, roster and operator decisions together.
 
-    The set in EFFECT: :func:`_resolve_stub_roster` supplies the configured base
-    and :func:`_resolve_stub_overrides` the operator's deviations from it, so a
+    The set in EFFECT: :func:`_resolve_stub_base` supplies the configured base
+    (the roster, plus :data:`MANAGED_STUB_FOLLOWERS` when the leader is
+    stubbed) and :func:`_resolve_stub_overrides` the operator's deviations from it, so a
     distribution can grow the roster without overwriting a choice the operator
     made, and the operator can turn any single server off without pinning
     themselves to today's roster.
@@ -120,7 +182,7 @@ def _resolve_stub_servers(mcp_gateway_data: dict) -> list[str]:
     write); servers added by an override are appended in sorted order, because
     they have no position in the file to preserve.
     """
-    roster = _resolve_stub_roster(mcp_gateway_data)
+    roster = _resolve_stub_base(mcp_gateway_data)
     overrides = _resolve_stub_overrides(mcp_gateway_data)
     if not overrides:
         return roster
@@ -176,6 +238,25 @@ class PublishConfig:
             "The sensitive-path denylist (~/.aws, ~/.ssh, ~/.kiro/crew, …) still "
             "applies inside every allowed root.",
             tags=["artifacts"],
+        ),
+    )
+
+
+@dataclass
+class AppSettingsConfig:
+    """The user's own settings for one installed app, ``apps.<name>``."""
+
+    model: str = field(
+        default="",
+        metadata=_meta(
+            "Model",
+            "Model this app's sessions and background agents start on when nothing "
+            "more specific picks one. Empty inherits, so the app runs exactly as it "
+            "would without this setting. A model picked for the session, the app's "
+            "own pick (a Research campaign, the Spec Builder default), and a model "
+            "pinned on the agent or crew all win over it; it wins over the global "
+            "default. A model this account cannot run is withheld like any other "
+            "pin.",
         ),
     )
 
@@ -487,7 +568,10 @@ class McpGatewayConfig:
             "initialize once the session sends it. A backend that stays silent is "
             "failed and reaped so its slot frees; the broker holds the spawn "
             "permit for this same window. Raise it for servers whose startup is "
-            "legitimately slow (large runtimes, remote resolution).",
+            "legitimately slow (large runtimes, remote resolution). On "
+            "Windows the effective deadline is floored at 30 seconds (a "
+            "cold-start floor): a configured value below it is lifted, a "
+            "value above it is used as is.",
             restart=True,
         ),
     )
@@ -985,5 +1069,42 @@ class TunnelConfig:
             "Explicit tunnel name (overrides name_mode). "
             "Note: some tunnel providers prefix your username (e.g. 'foo' becomes '<user>-foo').",
             restart=True,
+        ),
+    )
+
+
+@dataclass
+class AwsConfig:
+    """AWS settings for the agent sessions Kiro Crew starts.
+
+    ``project_profiles`` is the operator's directory -> named-profile map; the
+    rules that read it live in :mod:`kiro_crew.aws_project_profiles`.
+    """
+
+    project_profiles: dict[str, str] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Project AWS Profiles",
+            "Binds an AWS named profile to a project directory, so the agent in a "
+            "session working there starts with AWS_PROFILE and AWS_DEFAULT_PROFILE "
+            "set to it and an AWS "
+            "command reaches the intended account without --profile. Keys are "
+            "absolute directory paths, values are profile names from your own AWS "
+            "config (IAM or SSO), e.g. "
+            '{"/home/me/src/billing": "billing-prod", "/home/me/src/sandbox": "dev"}. '
+            "A session whose working directory is a key or lies under one gets that "
+            "profile; when several keys contain it the deepest wins, and a sibling "
+            "whose name merely starts the same (/a/proj and /a/project2) does not "
+            "match. A directory under no key keeps the default credential chain. A "
+            "profile a caller sets itself (a scheduled job's env, a workflow) wins "
+            "over this map. A profile name must be 1 to 128 letters, digits, '_', "
+            "'.', '+' or '-', not starting with '-'; an entry that breaks that rule "
+            "or has a relative key is refused when saved and ignored with a warning "
+            "if a hand edit puts it in config.json. Only the profile NAME is stored "
+            "and passed on: no credential is read or copied, and the binding is "
+            "never taken from a file inside the project. This picks the account a "
+            "command goes to by default; it is not isolation, and the agent can "
+            "still name another profile. Takes effect for sessions started after "
+            "the change; a running session keeps the environment it started with.",
         ),
     )

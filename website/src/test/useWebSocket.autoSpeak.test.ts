@@ -109,7 +109,7 @@ describe('useWebSocket auto-speak voice pipeline', () => {
     store.dispatch(setActiveSlot(null))
   })
 
-  async function mount() {
+  async function mount(registerManualRequest = true) {
     function wrapper({ children }: { children: React.ReactNode }) {
       return createElement(Provider, { store },
         createElement(QueryClientProvider, { client: queryClient }, children))
@@ -118,7 +118,9 @@ describe('useWebSocket auto-speak voice pipeline', () => {
     const ws = WS_INSTANCES[0]
     act(() => {
       ws.simulateOpen()
-      window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot: 'slot-1', request_id: VOICE_REQUEST_ID } }))
+      if (registerManualRequest) {
+        window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot: 'slot-1', request_id: VOICE_REQUEST_ID } }))
+      }
     })
     // Let the onopen voiceConfig() promise resolve so autoSpeak is cached.
     await act(async () => {})
@@ -226,14 +228,14 @@ describe('useWebSocket auto-speak voice pipeline', () => {
     hook.unmount()
   })
 
-  it('keeps voiceBusy true through the synthesis-in-flight gap', async () => {
+  it('keeps voiceBusy true through synthesis and the wait for its audio', async () => {
     // Nothing is queued or playing while the POST is pending — exactly the
     // gap the hands-free hold needs voiceBusy to cover.
     let resolveSynth: (v: object) => void = () => {}
     vi.mocked(api.voiceSynthesize).mockImplementationOnce(
       () => new Promise((res) => { resolveSynth = res }),
     )
-    const { hook, ws } = await mount()
+    const { hook, ws } = await mount(false)
 
     act(() => {
       ws.simulateMessage({ type: 'chat_message', data: { slot: 'slot-1', role: 'assistant', content: 'A reply that speaks after the turn.', ts: '11.0' } })
@@ -244,6 +246,14 @@ describe('useWebSocket auto-speak voice pipeline', () => {
     expect(store.getState().chat.voicePlaying).toBe(false)
 
     await act(async () => { resolveSynth({}) })
+    // The HTTP response alone is not evidence that audio arrived. Keep the
+    // hands-free microphone held until this request's voice lifecycle settles.
+    expect(store.getState().chat.voiceBusy).toBe(true)
+    const requestId = vi.mocked(api.voiceSynthesize).mock.calls[0][2]?.request_id
+    expect(requestId).toEqual(expect.any(String))
+    act(() => {
+      ws.simulateMessage({ type: 'voice_complete', data: { slot: 'slot-1', request_id: requestId } })
+    })
     expect(store.getState().chat.voiceBusy).toBe(false)
 
     hook.unmount()

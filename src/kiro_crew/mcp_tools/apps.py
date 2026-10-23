@@ -1,10 +1,18 @@
 """The app-scoped tools reachable only through this server's credential tools: what they advertise and what they do.
 
-``schemas()`` returns the ADVERTISEMENT half of each tool -- its name, the
+``schemas()`` returns the DECLARATION half of each tool -- its name, the
 model-facing description, and the JSON Schema a call is validated against.
 ``HANDLERS`` maps each of those names to the function that runs it. Both halves
 of a tool live here so its contract and its behavior are read together, and
 ``test_mcp_tool_registry`` fails if one arrives without the other.
+
+``advertised()`` is what ``tools/list`` actually emits: the declaration minus
+the tools of every app that is switched off. Each tool here belongs to one
+built-in app (``TOOL_APPS``) whose gateway routes refuse a call while the app is
+disabled, so advertising the tool regardless tells the model about a capability
+that can only refuse. The listing and the call read the SAME
+``installed.json`` through the same module; ``advertised()`` states the one
+state in which the two readers differ.
 
 Handlers reach this server's shared plumbing as attributes of ``mcp_core`` --
 ``mcp_core._post``, the identity resolvers, the governance vets. That is
@@ -18,10 +26,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TypeGuard
 from urllib.parse import quote
 
 from kiro_crew import mcp_core
+from kiro_crew.apps.manager import app_enabled_state
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.validation import (
     _ISSUE_RADAR_CREW_CLEARABLE_FIELDS,
@@ -293,9 +302,15 @@ def schemas() -> list[dict[str, Any]]:
                 "the CLI's own remedy in the message -- provisioning (venv + SPA "
                 "build) is minutes of work and is not reachable from here; run it "
                 "from the Dev Fleet page or `kirocrew pod provision <wt>`. "
-                "Requires the Dev Fleet app to be enabled. The returned token is a "
-                "2h credential scoped to that pod alone; it is not the live "
-                "gateway's, and no secret of the host is exposed by it. "
+                "Requires the Dev Fleet app to be enabled. The returned token is "
+                "scoped to that pod alone; it is not the live gateway's, and no "
+                "secret of the host is exposed by it. It carries two limits, and "
+                "the reply names both: the token itself is accepted only within a "
+                "short link window (5 minutes), and the first request that carries "
+                "it opens a pod session, kept in a cookie, that lasts 2h. Use the "
+                "token straight away and drive the pod with that session; past the "
+                "window the pod refuses the token as expired. Calling pod_up again "
+                "on a running pod leaves it running and returns a fresh token. "
                 "Release the pod with `pod_down` when done -- a pod holds a port "
                 "and memory until it is stopped."
             ),
@@ -522,7 +537,12 @@ def schemas() -> list[dict[str, Any]]:
                     "labels_applied": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Labels you applied, so a hand-back removes exactly those",
+                        "description": (
+                            "Labels you applied, so a hand-back removes exactly those. "
+                            'Once you hold none, pass clear: ["labels_applied"] rather '
+                            "than an empty list, which some clients drop before it "
+                            "reaches the server"
+                        ),
                     },
                     "clear": {
                         "type": "array",
@@ -534,7 +554,8 @@ def schemas() -> list[dict[str, Any]]:
                             "Fields to EMPTY, by name — the only way to erase one, since "
                             "an omitted field is left as stored. `pr_number` once the "
                             "pull request is closed, `claim_comment_id` once the claim "
-                            "comment is gone, `next` when there is no next step. A field "
+                            "comment is gone, `next` when there is no next step, "
+                            "`labels_applied` once you hold no labels. A field "
                             "both cleared and set in the same call keeps the set value"
                         ),
                     },
@@ -561,6 +582,73 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
     ]
+
+
+#: Which built-in app each tool reaches, by the app's installed name (the directory
+#: under ``apps/`` whose ``installed.json`` the app's gateway routes gate on). Spelled
+#: as literals rather than imported from the apps: each app's ``APP_NAME`` lives in
+#: a backend module that drags that app's whole import graph into this server
+#: process. ``test_mcp_apps_tool_gate`` pins every entry to the real constant.
+TOOL_APPS: dict[str, str] = {
+    "issue_radar_record_investigation": "issue-radar",
+    "issue_radar_crew_read": "issue-radar",
+    "issue_radar_crew_record": "issue-radar",
+    "ops_mission_control_api": "ops-mission-control",
+    "design_tweak_update_thread": "design-tweak",
+    "pod_up": "dev-fleet",
+    "pod_down": "dev-fleet",
+    "pod_status": "dev-fleet",
+    "pod_ls": "dev-fleet",
+}
+
+
+def advertised() -> list[dict[str, Any]]:
+    """The descriptors ``tools/list`` emits now: ``schemas()`` minus disabled apps' tools.
+
+    The listing and the call read ONE file through ONE module -- the app's
+    ``installed.json`` via ``kiro_crew.apps.manager`` -- with two readers. Every
+    route these tools reach refuses the call with HTTP 403 while the binary
+    ``is_app_enabled`` does not prove the app enabled (Dev Fleet's routes and the
+    app reverse proxy Design Tweak sits behind name the refusal
+    ``app_not_enabled``, Ops Mission Control ``app_disabled``, Issue Radar carries
+    no code). This reads the tri-state ``app_enabled_state`` and hides only on a
+    readable ``False`` -- not installed, or installed and switched off. So a
+    hidden tool is always one whose call would be refused, while a listed tool is
+    not always one whose call would succeed: an unreadable record lists tools the
+    route refuses. Hiding is a product decision, not a security one -- the route
+    stays the enforcement point, as it does for the computer-use tools -- and it
+    exists because kiro-cli caches ``tools/list`` once per session, so a disabled
+    app's tools would otherwise spend context in every request of every session
+    that can never use them.
+
+    Fail-OPEN on a read fault, as the per-session policy filter does: ``None``
+    (corrupt JSON, a dangling link, a directory in the file's place) lists the
+    tools, and so does a read that raises. The same once-per-session cache that
+    motivates hiding makes hiding on a transient fault permanent for the
+    session's whole life, while a listed tool whose call the gateway refuses is
+    not a hole; an exception escaping this build, by contrast, would withdraw
+    EVERY tool of the pooled server for every session that shares it.
+
+    Only the FULL descriptor build reaches this function. The names-only build
+    (``mcp_tools.build_tool_names``, which in-process discovery reads on the
+    gateway's event loop) takes ``schemas()`` directly -- the same rule that
+    keeps ``spawn.schemas`` and ``control.schemas`` from their live reads on that
+    path -- so no ``installed.json`` is read there and a disabled app's tools
+    still appear by name. The process that serves ``tools/list`` to a model is
+    ``mcp_shared.run_mcp_stdio_loop``, which takes the full build, where the gate
+    IS applied.
+    """
+    hidden: set[str] = set()
+    for app in sorted(set(TOOL_APPS.values())):
+        try:
+            state = app_enabled_state(app)
+        except Exception:
+            # Never let a metadata read break the tool advertisement: the route
+            # still refuses the call, while an escaping exception withdraws every tool.
+            continue
+        if state is False:
+            hidden.update(tool for tool, owner in TOOL_APPS.items() if owner == app)
+    return [spec for spec in schemas() if spec["name"] not in hidden]
 
 
 def _crew_session_key() -> tuple[str, str]:
@@ -721,7 +809,7 @@ def ops_mission_control_api(name: str, args: dict[str, Any]) -> str:
 # app reverse proxy (``/apps/{name}/api/{path}`` → the app's own backend
 # process; NOT ``/api/apps/...``, which carries only the gateway's own app
 # management routes). The gateway admits exactly this path to internal-secret
-# callers (``_MIXED_INTERNAL_API_PATHS`` in dashboard/server.py); every other
+# callers (``_MIXED_INTERNAL_API_PATHS`` in dashboard/server_internal_paths.py); every other
 # app route stays dashboard-only.
 _DESIGN_TWEAK_THREAD_URL = "/apps/design-tweak/api/thread"
 
@@ -802,6 +890,37 @@ def _pod_failure(payload: dict[str, Any], verb: str) -> str | None:
     return None
 
 
+def _positive_int(value: object) -> TypeGuard[int]:
+    """True for a real positive int; a bool, a float or a numeric string is not one."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _format_window(secs: int) -> str:
+    """A token window as a person reads it: '5 min', '2h', or seconds."""
+    if secs >= 3600 and secs % 3600 == 0:
+        return f"{secs // 3600}h"
+    if secs >= 60 and secs % 60 == 0:
+        return f"{secs // 60} min"
+    return f"{secs}s"
+
+
+def _pod_token_limits(resp: dict[str, Any]) -> str:
+    """Both limits of a pod token, as the route read them from its claims.
+
+    The link window and the session lifetime differ by design (minutes versus
+    hours), and naming only one of them tells the agent the wrong thing about the
+    other. When the route sent no usable window the line says to use the token
+    at once and names no duration, because a guessed one is the defect itself.
+    """
+    link, session = resp.get("link_ttl_secs"), resp.get("session_ttl_secs")
+    if _positive_int(link) and _positive_int(session):
+        return (
+            f"use within {_format_window(link)}; "
+            f"the session it opens lasts {_format_window(session)}"
+        )
+    return "use it straight away: the link window is short"
+
+
 def pod_up(name: str, args: dict[str, Any]) -> str:
     _pu_worktree = args["worktree"]
     _pu_resp = mcp_core._post(
@@ -812,8 +931,8 @@ def pod_up(name: str, args: dict[str, Any]) -> str:
         return _pu_err
     # The token is the DELIVERABLE, so it is the one string here that must survive
     # verbatim -- redacting it would return a handle that cannot be used. Scope is
-    # what makes that safe: it is a 2h credential for this pod's own gateway, not
-    # the live one. Everything else in the payload is echoed as the route sent it.
+    # what makes that safe: it is a credential for this pod's own gateway, not the
+    # live one. Everything else in the payload is echoed as the route sent it.
     _pu_port = _pu_resp.get("port")
     _pu_base = _pu_resp.get("base_url") or (f"http://127.0.0.1:{_pu_port}" if _pu_port else "")
     _pu_token = _pu_resp.get("token") or ""
@@ -822,8 +941,12 @@ def pod_up(name: str, args: dict[str, Any]) -> str:
         f"base_url: {_pu_base}",
     ]
     if _pu_token:
-        _pu_lines.append(f"token: {_pu_token}  (ttl {_pu_resp.get('ttl') or '2h'})")
+        _pu_lines.append(f"token: {_pu_token}  ({_pod_token_limits(_pu_resp)})")
         _pu_lines.append(f"open: {_pu_base}/?token={_pu_token}")
+        _pu_lines.append(
+            "Past its window the pod refuses the token as expired; call pod_up "
+            "again (the pod keeps running) for a fresh one."
+        )
     else:
         # `pod up --json` emits an empty token when it could not PROVE it owns the
         # port, and withholding the credential is the correct outcome there. Say so:

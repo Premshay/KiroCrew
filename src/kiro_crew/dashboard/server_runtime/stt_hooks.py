@@ -16,6 +16,7 @@ from aiohttp import web
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.server import (
+        _STT_BOOT_PREWARM_RECENT_USE_SECS,
         _STT_PREWARM_BOOT_DELAY_SECS,
         _STT_SWEEP_BOOT_DELAY_SECS,
         STT_PROVIDER_LOCAL,
@@ -138,10 +139,29 @@ async def _stt_startup_prewarm() -> None:
     from kiro_crew.stt import models as stt_models
     from kiro_crew.transcribe import _whisper_language
 
-    model = stt_models.resolve(cfg.stt.model)
+    # Off the loop like every neighbouring step in this coroutine: `resolve` of the
+    # `custom` selection reaches `KiroCrewConfig.load()` (a stat + read + jsonschema
+    # validate), so calling it inline would stall the gateway on the one boot where a
+    # custom model is configured.
+    model = await asyncio.to_thread(stt_models.resolve, cfg.stt.model)
     # `is_present` is a stat, so it runs off-loop with everything else in this step.
     if not await asyncio.to_thread(stt_models.is_present, model):
         logger.debug("Speech model %s is not downloaded; skipping the boot prewarm", model.name)
+        return
+    # Only for a host that actually decodes. The weights land in one anonymous
+    # native buffer (whisper.cpp reads the file; it does not mmap it), so on
+    # `large-v3-turbo` every launch held a 1.6 GB block for `idle_evict_secs`
+    # whether or not anyone dictated -- measured as the single largest mapping
+    # in a gateway's startup peak. A real decode stamps the marker this reads
+    # (`engine.decode`), so a host that dictates keeps the boot warm; one that
+    # has not in `_STT_BOOT_PREWARM_RECENT_USE_SECS` falls back to the pointer-down
+    # prewarm, which is what every host had before the boot warm existed.
+    if not await asyncio.to_thread(stt_models.used_within, _STT_BOOT_PREWARM_RECENT_USE_SECS):
+        logger.debug(
+            "Speech model %s has not decoded in %d days; skipping the boot prewarm",
+            model.name,
+            _STT_BOOT_PREWARM_RECENT_USE_SECS // 86400,
+        )
         return
     # Enough memory to hold it, and enough left over afterwards. The fourth gate,
     # the same shape as the three above: withhold unless we are sure.
@@ -170,8 +190,15 @@ async def _stt_startup_prewarm() -> None:
 
     available_gb = await asyncio.to_thread(_available_memory_gb)
     available_mib = int(available_gb * 1024) if available_gb > 0 else 0
-    needed_mib = 2 * model.size_bytes // (1024 * 1024)
-    if available_mib <= 0 or available_mib < needed_mib:
+    # A custom model carries no pinned size, so `model.size_bytes` is 0 and a guard
+    # keyed on it is dead -- it would admit an arbitrarily large local file into the
+    # speculative boot warm and OOM-loop on it. `prewarm_size_bytes` falls back to
+    # the file's own on-disk size (the file is confirmed present above), so the guard
+    # sizes a custom model by what it actually weighs; 0 back means the size could
+    # not be read at all, which the `<= 0` arm below treats as "do not speculate".
+    guard_size_bytes = await asyncio.to_thread(stt_models.prewarm_size_bytes, model)
+    needed_mib = 2 * guard_size_bytes // (1024 * 1024)
+    if available_mib <= 0 or needed_mib <= 0 or available_mib < needed_mib:
         logger.debug(
             "Skipping the boot prewarm for %s: %d MiB available, %d MiB wanted",
             model.name,
@@ -184,7 +211,11 @@ async def _stt_startup_prewarm() -> None:
     # supply bounds is the one that sets them. Booting without them would leave the
     # module defaults in force until some later caller happened to pass the
     # operator's real values.
-    engine.shared_engine(idle_evict_secs=cfg.stt.idle_evict_secs, timeout_secs=cfg.stt.timeout_secs)
+    engine.shared_engine(
+        idle_evict_secs=cfg.stt.idle_evict_secs,
+        timeout_secs=cfg.stt.timeout_secs,
+        threads=cfg.stt.threads,
+    )
     from kiro_crew import stt
 
     started = time.monotonic()
@@ -269,3 +300,15 @@ def _register_stt_hooks(app: web.Application) -> None:
         await asyncio.to_thread(local_runtime.get_runtime().deactivate, wait=True)
 
     app.on_cleanup.append(_local_decision_model_shutdown)
+
+    # The decision client keeps one HTTP session alive per event loop so a hosted
+    # provider is not re-handshaken on every decision. Gated on the module having been
+    # imported at all: a gateway that never made a decision has nothing to close.
+    async def _decision_http_shutdown(app_: web.Application) -> None:
+        if "kiro_crew.decisions.impl_jev" not in sys.modules:
+            return
+        from kiro_crew.decisions import impl_jev
+
+        await impl_jev.close_sessions()
+
+    app.on_cleanup.append(_decision_http_shutdown)

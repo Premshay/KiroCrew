@@ -34,6 +34,7 @@ See ``docs/system-specs/modules/platform-context.md`` (Plugin admission).
 
 from __future__ import annotations
 
+import base64
 import fnmatch
 import hashlib
 import hmac
@@ -97,6 +98,11 @@ def _checksum_path() -> Path:
 # The manifest a plugin ships (read import-free from its distribution files).
 _MANIFEST_FILENAME = "kirocrew_plugin.json"
 
+# Match the generic foreign-manifest container and key bounds in
+# ``apps.plugin_import`` without importing that app-layer module here.
+_MAX_CONFIG_KEYS = 200
+_MAX_CONFIG_KEY_CHARS = 200
+
 # Policy modes.
 MODE_OPEN = "open"  # admit unless explicitly banned (public default)
 MODE_ENFORCE = "enforce"  # admit only what passes every active check
@@ -138,11 +144,11 @@ def canonical_signing_bytes(body: Mapping[str, object]) -> bytes:
 def hmac_signature(secret: str, payload: bytes) -> str:
     """Compute the expected HMAC-SHA256 hex digest over *payload*.
 
-    POC symmetric primitive shared by the plugin-manifest and security-policy
-    checks.  A production implementation swaps this for an asymmetric verify
-    against a publisher/issuer public key pinned in the policy; the shape (the
-    trust root holds the key, the signed document holds only the signature) is
-    unchanged, which is why both call sites route through one helper.
+    Symmetric primitive shared by the plugin-manifest and security-policy checks.
+    It is not an authenticity proof against anyone who can read the trust root: the
+    verifier holds the same secret the signer does.  Security-policy issuers that
+    need that proof use :func:`ed25519_verify` via ``trust_public_keys``; plugin
+    manifests have no asymmetric path yet.
 
     ``surrogatepass``: the key is text parsed from a JSON trust root, and
     ``json.loads`` accepts a lone surrogate that a strict encode raises on.  A
@@ -154,6 +160,70 @@ def hmac_signature(secret: str, payload: bytes) -> str:
     return hmac.new(
         secret.encode("utf-8", errors="surrogatepass"), payload, hashlib.sha256
     ).hexdigest()
+
+
+def ed25519_verify(public_key: str, payload: bytes, signature: str) -> bool:
+    """True when *signature* is a valid Ed25519 signature over *payload*.
+
+    Asymmetric counterpart to :func:`hmac_signature`: the trust root holds only the
+    verifying half, so reading ``trust_public_keys`` does not confer the ability to
+    mint a document that verifies -- the signing half never sits on a managed host.
+
+    *public_key* and *signature* are base64 (standard alphabet, padding optional).
+    One encoding on purpose: hex is not accepted, because a 64-character hex string
+    is also valid base64 and accepting both would make a key's meaning depend on a
+    try-order rule.
+
+    Never raises.  A malformed key, malformed signature, wrong length or failed check
+    is one ``False``: an exception escaping here would leave
+    ``load_security_policy`` raising something other than
+    ``PlatformCompositionError``, which the boot handler steps past, degrading the
+    host to ungoverned on exactly the input the gate exists to refuse.
+    """
+    try:
+        # Function-local on purpose: a missing or broken ``cryptography`` wheel then
+        # degrades ONE verification to "unproven" instead of making the trust root
+        # itself fail to import.
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except Exception:  # pragma: no cover - core dependency; defensive only
+        logger.warning(
+            "cryptography is unavailable, so no Ed25519 policy signature can be "
+            "verified; treating the document as unproven"
+        )
+        return False
+    key_bytes = _decode_base64(public_key)
+    sig_bytes = _decode_base64(signature)
+    # Length-check before the primitive so a truncated paste is a plain False rather
+    # than a ValueError from the backend.
+    if key_bytes is None or sig_bytes is None or len(key_bytes) != 32 or len(sig_bytes) != 64:
+        return False
+    try:
+        Ed25519PublicKey.from_public_bytes(key_bytes).verify(sig_bytes, payload)
+    except InvalidSignature:
+        return False
+    except Exception:
+        logger.debug("Ed25519 signature verification could not run", exc_info=True)
+        return False
+    return True
+
+
+def _decode_base64(raw: object) -> Optional[bytes]:
+    """Decode base64 text, padded or not; ``None`` for anything that is not base64.
+
+    Padding is re-added rather than required because a 32-byte key encodes to 44
+    characters ending in ``=`` and operators routinely paste it stripped.  Internal
+    whitespace (a wrapped paste) is removed first.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = "".join(raw.split())
+    if not text:
+        return None
+    try:
+        return base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
+    except Exception:
+        return None
 
 
 def _normalize_name(name: str) -> str:
@@ -180,9 +250,22 @@ class PluginManifest:
     capabilities: Dict[str, List[str]] = field(default_factory=dict)
     # Detached signature over the canonical manifest (sans this field).
     signature: str = ""
+    # Top-level config.json keys owned by the installed companion.
+    config_keys: List[str] = field(default_factory=list)
 
     @staticmethod
     def from_dict(d: dict) -> "PluginManifest":
+        config_keys_raw = d.get("config_keys", [])
+        config_keys = (
+            list(config_keys_raw)
+            if isinstance(config_keys_raw, list)
+            and len(config_keys_raw) <= _MAX_CONFIG_KEYS
+            and all(
+                isinstance(key, str) and key and len(key) <= _MAX_CONFIG_KEY_CHARS
+                for key in config_keys_raw
+            )
+            else []
+        )
         return PluginManifest(
             name=str(d.get("name", "")),
             publisher=str(d.get("publisher", "")),
@@ -191,6 +274,7 @@ class PluginManifest:
                 str(k): _coerce_str_list(v) for k, v in (d.get("capabilities") or {}).items()
             },
             signature=str(d.get("signature", "")),
+            config_keys=config_keys,
         )
 
     def signing_payload(self) -> bytes:
@@ -201,7 +285,41 @@ class PluginManifest:
             "version": self.version,
             "capabilities": {k: sorted(v) for k, v in sorted(self.capabilities.items())},
         }
+        if self.config_keys:
+            body["config_keys"] = sorted(self.config_keys)
         return canonical_signing_bytes(body)
+
+
+def _coerce_public_keys(raw: object) -> Dict[str, str]:
+    """Read ``trust_public_keys`` keeping EVERY named issuer, usable value or not.
+
+    Unlike :func:`_coerce_trust_keys`, a malformed entry is not dropped. Naming an
+    issuer here is what turns off its HMAC fallback, so dropping a ``null`` or empty
+    placeholder would silently re-enable the weaker check for exactly the issuer the
+    operator was moving off it. A non-string or empty value is kept as ``""``: the
+    issuer stays asymmetric-only and no signature can verify for it, which fails
+    closed.
+    """
+    out: Dict[str, str] = {}
+    if not isinstance(raw, dict):
+        if raw is not None:
+            logger.warning(
+                "admission trust_public_keys is %s, not an object; ignoring it",
+                type(raw).__name__,
+            )
+        return out
+    for k, v in raw.items():
+        if isinstance(v, str) and v:
+            out[str(k)] = v
+        else:
+            logger.warning(
+                "admission trust_public_keys[%r] is not a non-empty string; no policy "
+                "signature can verify for this issuer, and its trust_keys secret is "
+                "not used for policies",
+                str(k),
+            )
+            out[str(k)] = ""
+    return out
 
 
 def _coerce_trust_keys(raw: object) -> Dict[str, str]:
@@ -288,11 +406,21 @@ class AdmissionPolicy:
     # authority on whether it must be authentic — see
     # ``governance.load_security_policy``.
     require_policy_signature: bool = False
-    # publisher -> shared secret (POC: HMAC; real impl: publisher public key).
+    # publisher/issuer -> shared HMAC secret.
     # Shared by BOTH signature checks: a plugin manifest is keyed by its
     # ``publisher``, a security policy by its ``identity.issuer``, so an operator
     # maintains ONE key store rather than two.
     trust_keys: Dict[str, str] = field(default_factory=dict)
+    # SECURITY-POLICY issuer -> base64 Ed25519 PUBLIC key.  When an issuer has an
+    # entry here, ``governance._policy_signature_state`` verifies that issuer's
+    # documents with it ALONE and never falls back to the issuer's ``trust_keys``
+    # secret, so the strong proof cannot be bypassed by the weak one.  Public by
+    # construction: unlike ``trust_keys`` this map confers no signing power.
+    #
+    # Policy issuers only, not plugin publishers: plugin manifest verification
+    # (``_signature_valid``) reads ``trust_keys`` alone, and a publisher listed only
+    # here has no symmetric secret, so its plugin is refused.
+    trust_public_keys: Dict[str, str] = field(default_factory=dict)
     # Marketplace allowlist. None = no allowlist (any non-banned plugin). A
     # present (even empty) list = only these names are admitted.
     approved: Optional[List[str]] = None
@@ -322,11 +450,11 @@ class AdmissionPolicy:
             require_signature=_coerce_flag(d, "require_signature"),
             require_policy_signature=_coerce_flag(d, "require_policy_signature"),
             trust_keys=_coerce_trust_keys(d.get("trust_keys")),
+            trust_public_keys=_coerce_public_keys(d.get("trust_public_keys")),
             approved=(_coerce_str_list(approved) if approved is not None else None),
             banned=_coerce_str_list(d.get("banned", [])),
             capability_ceiling={
-                str(k): _coerce_str_list(v)
-                for k, v in (d.get("capability_ceiling") or {}).items()
+                str(k): _coerce_str_list(v) for k, v in (d.get("capability_ceiling") or {}).items()
             },
         )
 
@@ -611,14 +739,39 @@ def read_policy_trust_root() -> "AdmissionPolicy":
     """
     path = policy_trust_root_path()
     try:
-        return AdmissionPolicy.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        data = path.read_bytes()
     except FileNotFoundError:
         logger.debug("no admission trust root at %s", path)
         return AdmissionPolicy()
+    except OSError:
+        logger.warning(
+            "admission trust root at %s is unreadable (the read itself failed; "
+            "on a sandboxed host the credential mask is the usual cause); "
+            "treating the policy-signature requirement as unset (kirocrew "
+            "doctor reports this)",
+            path,
+            exc_info=True,
+        )
+        return AdmissionPolicy()
+    if not data.strip():
+        logger.warning(
+            "admission trust root at %s is empty (0 bytes read, usually a "
+            "credential or namespace mask); policy-signature checks are "
+            "effectively off while it persists; treating the policy-signature "
+            "requirement as unset (kirocrew doctor reports this)",
+            path,
+        )
+        return AdmissionPolicy()
+    try:
+        # Decoding happens in here on purpose: an undecodable file is a
+        # malformed-content case and must keep the never-raises contract, not
+        # escape this function the way a read-stage decode would.
+        return AdmissionPolicy.from_dict(json.loads(data))
     except Exception:
         logger.warning(
-            "admission trust root at %s is unreadable or malformed; treating the "
-            "policy-signature requirement as unset (kirocrew doctor reports this)",
+            "admission trust root at %s is malformed (not valid JSON or not a "
+            "policy object); treating the policy-signature requirement as "
+            "unset (kirocrew doctor reports this)",
             path,
             exc_info=True,
         )

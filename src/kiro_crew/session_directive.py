@@ -12,8 +12,8 @@ confirmation line plus a machine-readable marker carrying the validated payload
 (and NO session key). A session-aware consumer that processes the tool result
 decodes the marker and applies the effect against ITS OWN session, then keeps
 the marker out of what it stores or renders. There are TWO consumers, one per
-turn loop: :func:`dashboard.chat_runner._run_chat`'s ``EVENT_TOOL_RESULT``
-handler (the dashboard-driven surfaces, which own ``slot.key``), and
+turn loop: :func:`dashboard.chat_turn.tool_results._on_tool_result`, the ``EVENT_TOOL_RESULT``
+phase (the dashboard-driven surfaces, which own ``slot.key``), and
 :class:`messaging.driver.TurnDriver` (the standalone channel transports —
 Telegram, Discord, standalone Slack, iMessage, Teams, Webex, WeCom, Weixin —
 whose dispatchers inject a consumer bound to the turn's session key via
@@ -49,13 +49,10 @@ import json
 import re
 from typing import Any
 
-# The stateless, session-bound tools. ``ask_question`` joins
-# them as a NON-BLOCKING card: the consumer broadcasts a question card (with no
-# ``ask_id``) to its own slot and the agent ends its turn; the user's answer
-# arrives as an ordinary next message that resumes the session (the full
-# transcript/context reloads), rather than blocking the turn on a server-side
-# wait. This drops only the mid-turn pause — never a capability.
-# ``nothing_to_do`` is the other TERMINAL directive: a turn that ran tools and
+# The stateless, session-bound tools. ``ask_question`` is NOT one of them: it
+# blocks on the ``/api/agent-ask/*`` routes and returns the user's answers as its
+# own tool result, so the turn that asked continues with them.
+# ``nothing_to_do`` is the one TERMINAL directive: a turn that ran tools and
 # has nothing the user needs to read ends on it instead of on a closing reply
 # (the turn-end contract: text, or ``nothing_to_do``, never a bare tool stop).
 # The consumer records the applied directive as ending the turn so the
@@ -69,7 +66,6 @@ DIRECTIVE_TOOLS: frozenset[str] = frozenset(
         "autonudge_stop",
         "set_project",
         "suggest_followup",
-        "ask_question",
         "nothing_to_do",
         "reset_conversation",
         "chat_tag",
@@ -102,14 +98,14 @@ _SENTINEL = "[[KIROCREW_SESSION_DIRECTIVE]]"
 SENTINEL = _SENTINEL
 
 # The ACP tool-result parser truncates each output part at 4000 chars
-# (``acp/_dispatch.py`` ``str(text)[:4000]``). The marker is the TAIL of the
+# (``acp/_dispatch_parts/tool_result_events.py`` ``str(text)[:4000]``). The marker is the TAIL of the
 # result, so an oversized payload loses the marker entirely — the effect would be
 # silently dropped after the model was told the request was made. Encode refuses
 # above this bound instead, leaving headroom under the transport cap.
 MAX_DIRECTIVE_CHARS = 3800
 
 # The ACP layer truncates a joined tool result to this many characters before the
-# consumer sees it (``acp/_dispatch.py``, which imports this constant so the two
+# consumer sees it (``acp/_dispatch_parts/tool_result_events.py``, which imports this constant so the two
 # cannot drift). It lives HERE because both markers are tail-anchored and so must
 # survive it: :data:`MAX_DIRECTIVE_CHARS` is deliberately far below it, and
 # :func:`tag_refusal` bounds its text against it. An unbounded refusal is

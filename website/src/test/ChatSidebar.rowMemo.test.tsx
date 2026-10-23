@@ -16,8 +16,9 @@
  *     row bodies, which is the whole-sidebar jank the boundary exists to stop.
  *
  * Render counts are unobservable from the DOM, so they are counted at the
- * row's own boundary: every SessionRow body renders exactly one pinned-session
- * `DndDroppable`, and a test-side wrapper around that real component records
+ * row's own boundary: every SessionRow body renders exactly one row-target
+ * `DndDroppable` (`pinned-session` on a pinned row, `manual-session` on any
+ * other), and a test-side wrapper around that real component records
  * each render by slot key. The wrapper re-renders only when the row body hands
  * it a new element, so its count is the row's body count. (A React `<Profiler>`
  * inside the row cannot stand in: dnd-kit's context re-runs the droppable's
@@ -125,7 +126,9 @@ vi.mock('../components/dnd', async (orig) => {
   const React = await import('react')
   const real = await orig<typeof import('../components/dnd')>()
   const DndDroppable = (props: React.ComponentProps<typeof real.DndDroppable>) => {
-    if (props.data?.type === 'pinned-session') {
+    // A row's own target: `pinned-session` on a pinned row, `manual-session` on
+    // every other row, so each row body renders exactly one of the two.
+    if (props.data?.type === 'pinned-session' || props.data?.type === 'manual-session') {
       const key = String(props.data.key)
       counts[key] = (counts[key] || 0) + 1
     }
@@ -514,5 +517,36 @@ describe('chat sidebar — agent default session colour', () => {
     expect(tintOf(rowFor('k-inherit'))).toBe(AGENT_TINT_EDITED)
     // …while a session carrying its own colour is unmoved by the agent edit.
     expect(tintOf(rowFor('k-own'))).toBe(SESSION_TINT)
+  })
+})
+
+/**
+ * The page rebuilds its source-reveal handler whenever that handler's own
+ * inputs move. Rows only call it, so a new identity must not reach the row
+ * actions object, which every row's memo compares by reference.
+ */
+describe('chat sidebar — onOpenSource identity', () => {
+  it('a new onOpenSource identity re-renders no rows', () => {
+    const slots = [slot('k-a'), slot('k-b'), slot('k-c')]
+    const { wrap } = renderSidebarWithSlots(slots)
+    let setOpen: ((f: () => boolean) => void) | undefined
+    function Harness() {
+      const [openSource, setOpenSource] = React.useState<() => boolean>(() => () => true)
+      setOpen = (f) => setOpenSource(() => f)
+      return (
+        <ChatSidebar
+          slots={slots} activeSlot={null} unreadSlots={EMPTY_UNREAD}
+          history={EMPTY_HISTORY} historyHasMore={false} defaultAgent="" installedAgents={EMPTY_AGENTS}
+          onOpenSource={openSource}
+        />
+      )
+    }
+    render(wrap(<Harness />))
+    expect(counts['k-a']).toBeGreaterThan(0)
+    for (const k of Object.keys(counts)) delete counts[k]
+
+    act(() => { setOpen!(() => false) })
+
+    expect(counts).toEqual({})
   })
 })

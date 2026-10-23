@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 
 import {
-  AGENT, HKEY, JOBKEY, SLOTSKEY, LIVEKEY, LIVE_TTL_MS, RAIL_W, MAX_SCREENS, HARD_CAP_MS,
+  DEFAULT_AGENT, HKEY, JOBKEY, SLOTSKEY, LIVEKEY, LIVE_TTL_MS, RAIL_W, MAX_SCREENS, HARD_CAP_MS,
   SEV, sevOf, KIND_LABEL, KIND_LABEL_KEY, kindLabel,
   STAGES, WRITING_STAGE, SCAN_STAGES, BLOCKED, blockedFor, KIND_WAIT,
   SAMPLE_SCREENS, SAMPLE_REPORT,
@@ -22,8 +22,8 @@ function resolved(value: string): boolean {
 }
 
 describe('design-critique protocol constants', () => {
-  it('runs as the core agent, not a bundled persona (a builtin never registers one)', () => {
-    expect(AGENT).toBe('kirocrew')
+  it('falls back to the core agent when the selected critic is unavailable', () => {
+    expect(DEFAULT_AGENT).toBe('kirocrew')
   })
 
   it('keeps every storage key distinct', () => {

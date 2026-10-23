@@ -57,7 +57,12 @@ vi.mock('../api/client', () => ({
      'chatSlotWorkspace', 'models', 'planFromChat', 'renameSlot',
      'resolveApproval', 'screenshot', 'slackChannels', 'slackLink', 'spawnList',
      'stopChatSlot', 'uploadFiles', 'voiceSynthesize', 'workspaces', 'chatSlots',
-     'notifications', 'status', 'generateTitle', 'kirocrewConfig', 'agentResolvedModel'].map(k => [k, vi.fn().mockResolvedValue(
+     'notifications', 'status', 'generateTitle', 'kirocrewConfig', 'agentResolvedModel',
+     // The pane's unrestored-tabs notice reads this on arrival. Unmocked, the read
+     // FAILS and the notice says so -- correctly, but it is a second `role="alert"`
+     // in a file that counts them. The generic `{}` leaves `reported` unset, which
+     // is "no answer yet": the notice renders nothing.
+     'chatSlotsUnrestored', 'sessionsNamed'].map(k => [k, vi.fn().mockResolvedValue(
       k === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {}
     )])
   ),
@@ -76,7 +81,7 @@ globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.res
 
 import { closeHoldForUrl } from '../pages/chat/useChatPageSessionController'
 import ChatPage from '../pages/ChatPage'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { i18nT } from '../i18n/t'
 import { api } from '../api/client'
@@ -130,9 +135,11 @@ function renderChatPage(opts: {
    *  real boot holds: the flag is set by the writer that delivers the list. Pass
    *  false with a populated list only to model the pre-arrival window. */
   slotsLoaded?: boolean
+  /** This window's recency stack, oldest first. */
+  slotHistory?: string[]
 }) {
   const { route = '/chat', entries, mode, activeSlot = null, slots = [], hostEmbed,
-          messages = [], slotCursorKey = null, slotsLoaded = slots.length > 0 } = opts
+          messages = [], slotCursorKey = null, slotsLoaded = slots.length > 0, slotHistory = [] } = opts
   const preload: PreloadState = {
     dashboard: {
       status: { platform: 'darwin' }, connected: true, slots, slotsLoaded, approvalMode: 'normal',
@@ -145,8 +152,8 @@ function renderChatPage(opts: {
       slotStatusDetail: {}, slotHasMore: false, slotOldestIndex: 0, loadingOlder: false,
       lastChunkSeq: undefined, history: [], historyHasMore: false, historyOffset: 0,
       pendingInput: null, slotContextPct: {}, voicePlaying: false, voiceAudio: null,
-      subagents: {}, toolLog: [], activityOpen: false, activityTab: 'logs', slotActivity: {}, slotHistory: [],
-      slotMessages: {}, slotLoading: false,
+      subagents: {}, toolLog: [], activityOpen: false, activityTab: 'logs', slotActivity: {}, slotHistory,
+      slotMessages: {}, slotLoading: false, slotRun: {},
     },
   }
   const store = createTestStore(preload as Partial<RootState>)
@@ -166,6 +173,10 @@ function renderChatPage(opts: {
                 path="/artifacts/:slug"
                 element={<ChatPage embedded embedMode="chat" noUrlSync={hostEmbed?.noUrlSync} />}
               />
+              {/* The two embeds whose ?sid= this page writes itself: the popout
+                  window (PopoutFrame) and the plugin's embed chat frame. */}
+              <Route path="/popout/chat/:slug?" element={<ChatPage embedded embedMode="chat" popout />} />
+              <Route path="/embed/chat/:slug?" element={<ChatPage embedded embedMode="chat" />} />
             </Routes>
             <UrlCapture />
             <NavController />
@@ -273,7 +284,18 @@ describe('ChatPage ?sid= + ?msg= deep link across a slot switch', () => {
  */
 describe('paging-failure notice by jump origin', () => {
   const GONE = /no longer/i
-  const src = readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+  // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+  const src = [
+    readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8'),
+    ...readdirSync(resolve(__dirname, '../pages/chat/page'))
+      .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
+      .sort()
+      .map(f => readFileSync(resolve(__dirname, '../pages/chat/page', f), 'utf8')),
+    ...readdirSync(resolve(__dirname, '../pages'))
+      .filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f))
+      .sort()
+      .map(f => readFileSync(resolve(__dirname, '../pages', f), 'utf8')),
+  ].join('\n')
 
   it('routes the link origin to the retry copy, not to the not-found writer', () => {
     expect(src).toContain("pendingPinnedJump.origin === 'earlier' || pendingPinnedJump.origin === 'link'")
@@ -354,6 +376,50 @@ describe('ChatPage ?sid= URL parameter', () => {
     })
   })
 
+  // ── embedded chat: popout and /embed/chat ────────────────────────────────
+  // In embed mode the ?sid= reader follows the host's URL. It must follow
+  // CHANGES to ?sid=, not treat every mismatch as a host request: a fork in a
+  // popout switches to the child locally while ?sid= still names the source on
+  // the same history entry. That unchanged value must not switch it back: the
+  // popout shows the fork it just made, and ?sid= then follows the child.
+  describe('embedded chat follows a local switch', () => {
+    function activeSlotTrace(store: ReturnType<typeof renderChatPage>['store']) {
+      const trace: (string | null)[] = []
+      store.subscribe(() => {
+        const key = store.getState().chat.activeSlot
+        if (trace.at(-1) !== key) trace.push(key)
+      })
+      return trace
+    }
+
+    it.each(['/popout/chat', '/embed/chat'])('%s keeps a locally switched-to session and names it in ?sid=', async base => {
+      const { store } = renderChatPage({ route: `${base}/debug-video-playback?sid=chat-1-100`, activeSlot: 'chat-1-100', slots })
+      await waitFor(() => expect(currentUrl).toBe(`${base}/debug-video-playback?sid=chat-1-100`))
+      const trace = activeSlotTrace(store)
+      // What handleFork does once the fork lands: switch to the child.
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toBe(`${base}/fix-login-bug?sid=chat-2-200`))
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+      expect(trace).toEqual(['chat-2-200'])
+    })
+
+    it('/embed/chat still follows a host-driven ?sid= change', async () => {
+      const { store } = renderChatPage({ route: '/embed/chat?sid=chat-1-100', activeSlot: 'chat-1-100', slots })
+      await waitFor(() => expect(currentUrl).toBe('/embed/chat/debug-video-playback?sid=chat-1-100'))
+      act(() => navTo('/embed/chat/fix-login-bug?sid=chat-2-200'))
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+    })
+
+    it('/embed/chat follows the host back to the URL session after a local switch', async () => {
+      const { store } = renderChatPage({ route: '/embed/chat?sid=chat-1-100', activeSlot: 'chat-1-100', slots })
+      await waitFor(() => expect(currentUrl).toBe('/embed/chat/debug-video-playback?sid=chat-1-100'))
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toBe('/embed/chat/fix-login-bug?sid=chat-2-200'))
+      act(() => navTo('/embed/chat/debug-video-playback?sid=chat-1-100'))
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+    })
+  })
+
   describe('session activation from URL', () => {
     it('activates session matching ?sid= on load', async () => {
       const { store } = renderChatPage({ route: '/chat?sid=chat-2-200', slots })
@@ -412,6 +478,84 @@ describe('ChatPage ?sid= URL parameter', () => {
       vi.useRealTimers()
     })
 
+    /** The denied record has no expiry and reconnects re-deliver the whole list,
+     *  so "active slot unchanged" stops meaning "still waiting for this link"
+     *  once the restore window has passed. A frame this late still proves the
+     *  banner false — it must retire the notice without moving a user who has
+     *  been sitting in the deadline's session reading or composing. */
+    it('only clears the banner when the key arrives long after the restore window', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({
+        route: '/chat?sid=chat-9-900',
+        activeSlot: 'chat-1-100',
+        slots: [],
+        slotsLoaded: false,
+      })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await vi.advanceTimersByTimeAsync(60_000)
+      await act(async () => {
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(store.getState().chat.activeSlot).toBe('chat-1-100')
+      vi.useRealTimers()
+    })
+
+    /** Control for the bound above: a frame still inside the restore window
+     *  resolves the link as before, so the expiry cannot be satisfied by
+     *  refusing every late recovery. */
+    it('still resolves the link when the key arrives inside the restore window', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({
+        route: '/chat?sid=chat-9-900',
+        activeSlot: 'chat-1-100',
+        slots: [],
+        slotsLoaded: false,
+      })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await vi.advanceTimersByTimeAsync(10_000)
+      await act(async () => {
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(store.getState().chat.activeSlot).toBe('chat-9-900')
+      vi.useRealTimers()
+    })
+
+    it('does not renew recovery on reconnect and still permits an explicit switch', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({
+        route: '/chat?sid=chat-9-900',
+        activeSlot: 'chat-1-100',
+        slots: [],
+        slotsLoaded: false,
+      })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => { store.dispatch(sseConnected(false)) })
+      await vi.advanceTimersByTimeAsync(60_000)
+      await act(async () => {
+        store.dispatch(sseConnected(true))
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(store.getState().chat.activeSlot).toBe('chat-1-100')
+
+      await act(async () => { await store.dispatch(switchSlot('chat-9-900')) })
+      expect(store.getState().chat.activeSlot).toBe('chat-9-900')
+    })
+
     /** A late list entry proves the key exists, but its transcript can still fail
      *  to load. Recovery must replace the stale not-found verdict with the
      *  existing open-session failure instead of clearing every visible error. */
@@ -462,6 +606,154 @@ describe('ChatPage ?sid= URL parameter', () => {
       expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
       expect(store.getState().chat.activeSlot).not.toBe('chat-9-900')
       vi.useRealTimers()
+    })
+  })
+
+  /** A link that names a session by its short name (`?sid=chat-7`), the way the
+   *  sidebar, agent tools and people name it. Matching `?sid=` exactly against
+   *  the open roster timed every such link out to "not found". */
+  describe('short-name ?sid= (chat-N)', () => {
+    const named = (...keys: string[]) => ({ sessions: keys.map(key => ({ key, title: key })) })
+    const notice = () => screen.queryByTestId('sid-matches')
+
+    it('opens the one open session the short name names and rewrites the URL', async () => {
+      vi.mocked(api.sessionsNamed).mockResolvedValueOnce(named('dashboard_chat-2-200'))
+      const { store } = renderChatPage({ route: '/chat?sid=chat-2', slots })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      expect(seenUrls.some(u => u.includes('sid=chat-1-100'))).toBe(false)
+      expect(api.sessionsNamed).toHaveBeenCalledWith('chat-2')
+      expect(notice()).toBeNull()
+      expect(screen.queryByTestId('sid-error')).toBeNull()
+    })
+
+    it('ignores a short-name lookup answer after unmount', async () => {
+      let answer: (v: { sessions: Array<{ key: string; title?: string }> }) => void = () => {}
+      vi.mocked(api.sessionsNamed).mockReturnValueOnce(new Promise(r => { answer = r }))
+      const { unmount } = renderChatPage({ route: '/chat?sid=chat-2', slots })
+      await waitFor(() => expect(api.sessionsNamed).toHaveBeenCalledWith('chat-2'))
+      unmount()
+
+      await act(async () => { answer({ sessions: [{ key: 'dashboard_chat-2-200', title: 'x' }] }) })
+      expect(detailCalls()).not.toContain('chat-2-200')
+      expect(currentUrl).not.toContain('sid=chat-2-200')
+    })
+
+    it('resumes a closed session the short name names', async () => {
+      vi.mocked(api.sessionsNamed).mockResolvedValueOnce({ sessions: [{ key: 'dashboard_chat-7-50', title: 'Old work' }] })
+      vi.mocked(api.resumeChatSlot).mockResolvedValueOnce({ ok: true, key: 'chat-7-50', mode: '', messages: [] })
+      const { store } = renderChatPage({ route: '/chat?sid=chat-7', slots })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-7-50'))
+      expect(api.resumeChatSlot).toHaveBeenCalledWith('dashboard_chat-7-50', 'Old work')
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-7-50'))
+    })
+
+    it('keeps URL sync alive after resuming a session ChatPage cannot show', async () => {
+      vi.mocked(api.sessionsNamed).mockResolvedValueOnce({ sessions: [{ key: 'dashboard_chat-7-50', title: 'Critique' }] })
+      vi.mocked(api.resumeChatSlot).mockResolvedValueOnce({
+        ok: true, key: 'chat-7-50', mode: 'design-critique', surface: 'design-critique', messages: [],
+      })
+      const { store } = renderChatPage({ route: '/chat?sid=chat-7', slots })
+      await waitFor(() => expect(api.resumeChatSlot).toHaveBeenCalledWith('dashboard_chat-7-50', 'Critique'))
+      await act(async () => { store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+    })
+
+    it('opens the oldest of several matches and lists the others', async () => {
+      const many = [...slots, slot('chat-7-300', 'Newer open'), slot('chat-7-100', 'Older open')]
+      vi.mocked(api.sessionsNamed).mockResolvedValueOnce({
+        sessions: [{ key: 'dashboard_chat-7-100', title: 'Older open' }, { key: 'dashboard_chat-7-300', title: 'Newer open' },
+          { key: 'dashboard_chat-7-500', title: 'Closed later' }],
+      })
+      const { store } = renderChatPage({ route: '/chat?sid=chat-7', slots: many })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-7-100'))
+      await waitFor(() => expect(notice()).toBeTruthy())
+      expect(notice()!.textContent).toContain('chat-7-300')
+      expect(notice()!.textContent).toContain('chat-7-500')
+      expect(notice()!.textContent).not.toContain('chat-7-100')
+      expect(notice()!.textContent).toContain('Older open')
+      expect(notice()!.textContent).toContain('started')
+
+      await act(async () => { screen.getByRole('button', { name: 'Newer open' }).click() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-7-300'))
+      expect(api.resumeChatSlot).not.toHaveBeenCalled()
+    })
+
+    it('drops the others notice when the oldest match cannot be resumed', async () => {
+      vi.mocked(api.sessionsNamed).mockResolvedValueOnce({
+        sessions: [{ key: 'dashboard_chat-7-50', title: 'Old' }, { key: 'dashboard_chat-7-300', title: 'Newer open' }],
+      })
+      vi.mocked(api.resumeChatSlot).mockResolvedValueOnce({ ok: false, key: 'chat-7-50', mode: '', messages: [] })
+      renderChatPage({ route: '/chat?sid=chat-7', slots: [...slots, slot('chat-7-300', 'Newer open')] })
+      await waitFor(() => expect(api.resumeChatSlot).toHaveBeenCalledWith('dashboard_chat-7-50', 'Old'))
+      await waitFor(() => expect(notice()).toBeNull())
+    })
+
+    it('says no session has the name, and opens or creates nothing', async () => {
+      vi.useFakeTimers()
+      vi.mocked(api.sessionsNamed).mockResolvedValueOnce(named('dashboard_chat-70-700'))
+      const { store } = renderChatPage({ route: '/chat?sid=chat-7', slots })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText('No session is named chat-7. Check the link, or start a new chat.')).toBeTruthy()
+      expect(screen.queryByText(/not found/i)).toBeNull()
+      expect(store.getState().chat.activeSlot).toBeNull()
+      expect(api.createChatSlot).not.toHaveBeenCalled()
+      expect(api.resumeChatSlot).not.toHaveBeenCalled()
+      vi.useRealTimers()
+    })
+
+    it('holds an unmatched short-name URL across slots frames until a user switches', async () => {
+      vi.mocked(api.sessionsNamed).mockResolvedValueOnce({ sessions: [{ key: 'dashboard_chat-70-700' }] })
+      const { store } = renderChatPage({ route: '/chat?sid=chat-7', slots, activeSlot: null })
+      expect(await screen.findByText('No session is named chat-7. Check the link, or start a new chat.')).toBeTruthy()
+
+      await act(async () => { store.dispatch(sseSlots([...slots])) })
+      expect(store.getState().chat.activeSlot).toBeNull()
+      expect(api.createChatSlot).not.toHaveBeenCalled()
+      expect(currentUrl).toContain('sid=chat-7')
+
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await waitFor(() => expect(currentUrl).toContain('sid=chat-2-200'))
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+    })
+
+    it('falls back to not found when the lookup fails and no open session matches', async () => {
+      vi.mocked(api.sessionsNamed).mockRejectedValueOnce(new Error('offline'))
+      renderChatPage({ route: '/chat?sid=chat-7', slots })
+      await waitFor(() => expect(screen.getByText(/session "chat-7" not found/i)).toBeTruthy())
+      expect(screen.queryByText('No session is named chat-7. Check the link, or start a new chat.')).toBeNull()
+    })
+
+    it('does not declare a short name missing while its lookup is still answering', async () => {
+      vi.useFakeTimers()
+      let answer: (v: { sessions: Array<{ key: string; title?: string }> }) => void = () => {}
+      vi.mocked(api.sessionsNamed).mockReturnValueOnce(new Promise(r => { answer = r }))
+      const { store } = renderChatPage({ route: '/chat?sid=chat-2', slots })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.queryByText(/not found/i)).toBeNull()
+      await act(async () => { answer(named('dashboard_chat-2-200')) })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+      vi.useRealTimers()
+    })
+
+    it('switches to a listed closed session that is open by the time it is clicked', async () => {
+      const many = [...slots, slot('chat-7-100', 'Older open')]
+      vi.mocked(api.sessionsNamed).mockResolvedValueOnce({
+        sessions: [{ key: 'dashboard_chat-7-100', title: 'Older open' }, { key: 'dashboard_chat-7-500', title: 'Closed later' }],
+      })
+      const { store } = renderChatPage({ route: '/chat?sid=chat-7', slots: many })
+      await waitFor(() => expect(notice()).toBeTruthy())
+      await act(async () => { store.dispatch(sseSlots([...many, slot('chat-7-500', 'Closed later')])) })
+      await act(async () => { screen.getByRole('button', { name: 'Closed later' }).click() })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-7-500'))
+      expect(api.resumeChatSlot).not.toHaveBeenCalled()
+    })
+
+    it('keeps a full key on the exact-match path', async () => {
+      const { store } = renderChatPage({ route: '/chat?sid=chat-2-200', slots })
+      await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+      expect(api.sessionsNamed).not.toHaveBeenCalled()
     })
   })
 
@@ -1565,5 +1857,94 @@ describe('late slot-list load does not override a user switch (deep-link race)',
     // The late deep-link activation MUST NOT revert to chat-1-100.
     await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
     expect(store.getState().chat.activeSlot).not.toBe('chat-1-100')
+  })
+})
+
+/** Every tab and popout of the origin writes `mc-active-slot-chat` on each slots
+ *  frame, so when the chat a window shows leaves the list, the stored key names
+ *  whatever ANOTHER window showed last. */
+describe('the active chat leaves the list mid-session', () => {
+  const four = [...slots, slot('chat-4-400', 'Other window')]
+  const without = (key: string) => four.filter(s => s.key !== key)
+
+  it('lands on the chat this tab showed before, not the one another window stored', async () => {
+    const { store } = renderChatPage({ route: '/chat?sid=chat-3-300', activeSlot: 'chat-3-300', slots: four, slotHistory: ['chat-2-200'] })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
+    // A second tab switches to chat-4-400 and rewrites the shared key.
+    localStorage.setItem('mc-active-slot-chat', 'chat-4-400')
+    // chat-3-300 is closed in that tab; this tab's next frame omits it.
+    await act(async () => { store.dispatch(sseSlots(without('chat-3-300'))) })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+    expect(detailCalls()).not.toContain('chat-4-400')
+  })
+
+  it('with no history of its own, does not open the chat another window stored', async () => {
+    const { store } = renderChatPage({ route: '/chat?sid=chat-3-300', activeSlot: 'chat-3-300', slots: four })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-3-300'))
+    localStorage.setItem('mc-active-slot-chat', 'chat-4-400')
+    vi.mocked(api.chatSlotDetail).mockClear()
+    await act(async () => { store.dispatch(sseSlots(without('chat-3-300'))) })
+    // The existing last resort, the first listed chat, is kept on purpose.
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1-100'))
+    expect(detailCalls()).toEqual(['chat-1-100'])
+  })
+
+  it('a first load still reopens the stored chat', async () => {
+    localStorage.setItem('mc-active-slot-chat', 'chat-4-400')
+    const { store } = renderChatPage({ route: '/chat', slots: four })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-4-400'))
+  })
+
+  it('a popout whose chat is closed elsewhere shows no chat instead of re-keying', async () => {
+    const { store } = renderChatPage({ route: '/popout/chat?sid=chat-2-200', activeSlot: 'chat-2-200', slots: four, slotHistory: ['chat-1-100'] })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+    localStorage.setItem('mc-active-slot-chat', 'chat-4-400')
+    vi.mocked(api.chatSlotDetail).mockClear()
+    await act(async () => { store.dispatch(sseSlots(without('chat-2-200'))) })
+    await act(async () => {})
+    expect(store.getState().chat.activeSlot).toBeNull()
+    expect(detailCalls()).toEqual([])
+    // ?sid= still names the popout's own chat, so a reload stays bound to it.
+    expect(currentUrl).toMatch(/sid=chat-2-200/)
+    expect(api.createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('a popout reloaded after its chat left the list stays on its own chat', async () => {
+    // The reload: a fresh mount on the URL the popout kept, with another
+    // window's chat in the shared key and the popout's chat still unlisted.
+    localStorage.setItem('mc-active-slot-chat', 'chat-4-400')
+    const { store } = renderChatPage({ route: '/popout/chat?sid=chat-2-200', slots: without('chat-2-200') })
+    await act(async () => {})
+    await act(async () => {})
+    expect(store.getState().chat.activeSlot).toBeNull()
+    expect(detailCalls()).toEqual([])
+    expect(currentUrl).toMatch(/sid=chat-2-200/)
+    expect(api.createChatSlot).not.toHaveBeenCalled()
+    // A later frame that lists it again opens it.
+    await act(async () => { store.dispatch(sseSlots(four)) })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+    // A late deep link resolves through both sid readers, so assert which
+    // chat was fetched, not how many times.
+    expect(new Set(detailCalls())).toEqual(new Set(['chat-2-200']))
+  })
+
+  it('a popout with no ?sid= of its own never opens the stored chat', async () => {
+    localStorage.setItem('mc-active-slot-chat', 'chat-4-400')
+    const { store } = renderChatPage({ route: '/popout/chat', slots: four })
+    await act(async () => {})
+    await act(async () => {})
+    expect(store.getState().chat.activeSlot).toBeNull()
+    expect(detailCalls()).toEqual([])
+    expect(api.createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('a popout reopens its own chat when a later frame lists it again', async () => {
+    const { store } = renderChatPage({ route: '/popout/chat?sid=chat-2-200', activeSlot: 'chat-2-200', slots: four })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+    await act(async () => { store.dispatch(sseSlots(without('chat-2-200'))) })
+    await act(async () => {})
+    await act(async () => { store.dispatch(sseSlots(four)) })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
+    expect(currentUrl).toMatch(/sid=chat-2-200/)
   })
 })

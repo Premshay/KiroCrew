@@ -23,6 +23,7 @@ shows a reviewer which harness moved. The capture both share is
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import logging
 import os
@@ -232,6 +233,59 @@ def test_a_capture_leaves_every_resolver_cache_as_it_found_it(tmp_path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "backend", [ACP_BACKEND_KIRO, ACP_BACKEND_CODEX], ids=["client", "runtime"]
+)
+def test_the_default_home_stays_pinned_while_the_capture_environment_is_installed(
+    backend, monkeypatch, tmp_path
+) -> None:
+    """No instant has the cleared environment installed and the real resolver live.
+
+    The fixed parent carries no ``KIROCREW_HOME``. A thread an earlier test on the
+    same worker left running reads the home when it calls ``config_dir()``, so if
+    the capture installs that environment before pinning the default resolver, or
+    lifts the pin before restoring the environment, such a thread resolves the
+    operator's real ``~/.kiro/crew`` in between. Both edges of the environment
+    patch are probed, because those are the moments a concurrent reader can land.
+    """
+    from unittest import mock
+
+    from kiro_crew.config import paths as config_paths
+
+    assert (backend in capture_mod.RUNTIME_ONLY_BACKENDS) == (backend == ACP_BACKEND_CODEX)
+    real_resolver = config_paths._resolve_default_home
+    exposed: list[str] = []
+
+    def _probe(edge: str) -> None:
+        if "KIROCREW_HOME" not in os.environ and (
+            config_paths._resolve_default_home is real_resolver
+        ):
+            exposed.append(edge)
+
+    original_patch = mock._patch_dict._patch_dict
+    original_unpatch = mock._patch_dict._unpatch_dict
+
+    def _patch(self):
+        result = original_patch(self)
+        if self.in_dict is os.environ:
+            _probe("after the environment was installed")
+        return result
+
+    def _unpatch(self):
+        if self.in_dict is os.environ:
+            _probe("before the environment was restored")
+        return original_unpatch(self)
+
+    monkeypatch.setattr(mock._patch_dict, "_patch_dict", _patch)
+    monkeypatch.setattr(mock._patch_dict, "_unpatch_dict", _unpatch)
+
+    capture_mod.capture(backend, tmp_path)
+
+    assert (
+        exposed == []
+    ), f"the real default-home resolver was live with KIROCREW_HOME absent: {exposed}"
+
+
 def test_the_deepseek_capture_writes_its_scratch_windows_only_under_tmp_path(
     monkeypatch, tmp_path
 ) -> None:
@@ -331,6 +385,7 @@ def test_the_fixed_parent_never_carries_a_variable_spawn_sets() -> None:
     contributed = {
         "KIROCREW_SPAWNED",
         "KIROCREW_SPAWN_INSTANCE",
+        "KIROCREW_RUNTIME_AGENT",
         "KIROCREW_SESSION_KEY",
         "KIROCREW_CHANNEL_ID",
         "KIROCREW_RUNTIME_PYTHON",
@@ -579,6 +634,7 @@ class _Recording:
         self.factory_argv: list[str] = []
         self.factory_kwargs: dict = {}
         self.socket_env_arg: dict | None = None
+        self.forward_args: tuple | None = None
 
 
 def _launch_tools(
@@ -608,6 +664,10 @@ def _launch_tools(
     def _pod_bundle(argv, *, backend):
         rec.calls.append("apply_pod_bundle_spawn")
         return list(argv), delegate
+
+    def _forward(mode, hidden_dirs):
+        rec.forward_args = (mode, hidden_dirs)
+        return True
 
     async def _wrap_async(argv, **kwargs):
         rec.calls.append("wrap_argv_async")
@@ -652,7 +712,7 @@ def _launch_tools(
         platform_compat=platform,
         agent_scratch=scratch,
         apply_pod_bundle_spawn=_pod_bundle,
-        forward_ssh_auth_sock=lambda: True,
+        forward_ssh_auth_sock=_forward,
         wrap_argv_async=_wrap_async,
         wrap_argv=lambda *a, **k: None,
         wrapped_by_crew_sandbox=lambda argv: argv[:1] == ["sandbox"],
@@ -720,6 +780,9 @@ def test_the_tail_hands_the_plan_mask_and_the_scratch_window_to_the_sandbox(
     # The delegation verdict is the pod bundle step's, passed through unchanged.
     assert rec.wrap_kwargs["is_kiro_cli"] is True
     assert rec.wrap_kwargs["forward_ssh_auth_sock"] is True
+    # The forward is decided from THIS spawn's tier and mask, the same two
+    # inputs the wrap applies, so it cannot judge ~/.ssh by a different sandbox.
+    assert rec.forward_args == ("auto", ("/srv/creds/.aws",))
     assert rec.wrap_kwargs["strip_python_env"] is True
     # What the host keeps from the wrap: the launcher to reclaim, the layer it got.
     assert host._sandbox_cleanup == "/run/launcher.sh"
@@ -840,6 +903,23 @@ def test_a_failed_spawn_releases_the_workspace_and_the_sandbox_launcher(
         # One discard before the bind, one for the failure.
         assert host.workspace_discards == 2
         assert host.cleanup_discards == 1
+
+
+def test_the_spawn_hands_the_recorder_the_wraps_own_argv_and_script(monkeypatch, tmp_path) -> None:
+    """The confinement check trusts a launcher only from this record.
+
+    The recorder gets the argv the wrap returned (before the cgroup scope) and the
+    launcher script the wrap generated, so it can tell a real launcher spawn from a
+    command that only looks like one.
+    """
+    _launch_env(monkeypatch)
+    recorded: list[tuple] = []
+    tools = dataclasses.replace(
+        _launch_tools(_Recording(), scratch=_Scratch(None)),
+        remember_namespace_launcher=lambda *args: recorded.append(args),
+    )
+    _run_launch(_FakeHost(tmp_path), _request(), tools)
+    assert recorded == [(99_999_999_999, ("sandbox", "/opt/bin/host", "acp"), "/run/launcher.sh")]
 
 
 def test_a_respawn_joins_the_tree_its_previous_process_staged(monkeypatch, tmp_path) -> None:

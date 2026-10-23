@@ -158,21 +158,21 @@ class SessionCapabilities:
     #: Whether this harness interprets ``/todos`` as its native task-list command.
     #:
     #: This is deliberately narrower than general slash-command transport: the
-    #: kiro family has a native slash RPC but does not implement this command.
+    #: kiro-cli has a native slash RPC but does not implement this command.
     #: Unknown and newly registered backends remain False until they opt in.
     supports_native_todos: bool
 
     #: Whether an agent spec's ``"tools": []`` is honoured as a total ban -- no
     #: MCP server AND no harness-native tool -- on this backend.
     #:
-    #: True for kiro-cli/KAS (native) and for opencode/goose, whose mirror-only
-    #: allowlist gap is closed by ``AcpClient._deny_zero_tools`` at the permission
-    #: layer. False for claude, whose routing is declared but not enforced by this
-    #: core -- an inherited ``~/.claude`` pre-approval can skip
-    #: ``session/request_permission`` entirely, so the refusal never runs. False
-    #: for codex, whose sessions are served by ``AcpRuntime``, which carries no
-    #: zero-tool refusal at all. False for pi and deepseek, which have no mirror
-    #: and so no channel that computes ``zero_tools`` for them. A consumer that
+    #: True for kiro-cli/KAS (native) and for opencode/goose/deepseek/pi, whose
+    #: harness-native tools are refused by ``AcpClient._deny_zero_tools`` at the
+    #: permission layer (pi has no mirror; its ``zero_tools`` is read beside its
+    #: member mounts from the same spec parse). False for claude, whose routing is
+    #: declared but not enforced by this core -- an inherited ``~/.claude``
+    #: pre-approval can skip ``session/request_permission`` entirely, so the refusal
+    #: never runs. False for codex, whose sessions are served by ``AcpRuntime``,
+    #: which carries no zero-tool refusal at all. A consumer that
     #: spawns a zero-tool agent (the knowledge/research pool) asks this before
     #: trusting a resolved backend, rather than enumerating identities itself.
     honors_zero_tool_ban: bool
@@ -204,6 +204,10 @@ def capabilities_for(backend: str) -> SessionCapabilities:
         model_id_namespace=model_registry_namespace(backend),
         resolves_model_from_advertised_list=backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
         effort_via_config_option=backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+        # The two effort channels are disjoint sets, so a harness is told to use
+        # at most one. KAS is in neither the command set nor this answer: it
+        # refuses ``_kiro.dev/commands/execute`` with -32603, and its effort
+        # travels only as ``effortLevel``.
         effort_via_slash_command=backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS,
         compacts_inline=backend in ACP_BACKENDS_INLINE_COMPACTION,
         crew_fires_spec_hooks=backend in ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS,
@@ -255,10 +259,26 @@ def capabilities_of(provider: object) -> SessionCapabilities:
     return caps if isinstance(caps, SessionCapabilities) else UNKNOWN_BACKEND_CAPABILITIES
 
 
+def capture_prompt_timeout(provider: object, deadline: float) -> float | None:
+    """Resolve a provider-declared transport budget for one outer deadline.
+
+    Capability ownership is read from the provider TYPE, matching the billing
+    seam: an instance-only attribute on a loose mock cannot opt in by accident.
+    A legacy duck provider declares nothing and returns ``None``, which tells the
+    caller to preserve its one-argument ``stream(message)`` invocation.
+    """
+    resolver = getattr(type(provider), "prompt_timeout_for_deadline", None)
+    if not callable(resolver):
+        return None
+    timeout = resolver(provider, deadline)
+    return float(timeout) if timeout is not None else None
+
+
 __all__ = [
     "MODEL_NAMESPACE_ACP",
     "SessionCapabilities",
     "UNKNOWN_BACKEND_CAPABILITIES",
     "capabilities_for",
     "capabilities_of",
+    "capture_prompt_timeout",
 ]

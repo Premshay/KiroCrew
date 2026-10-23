@@ -13,12 +13,14 @@ from aiohttp import web
 from kiro_crew.constants import DENY_CAUSE_SURFACE_POLICY
 from kiro_crew.dashboard.request_priority import owner_start_priority
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.image_refs import strip_image_refs
 from kiro_crew.llm_helpers import _steer_host_deny
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK
 from kiro_crew.security import (
+    _URL_RE,
     contains_injection,
     redact_credentials,
-    redact_exfiltration_urls,
+    redact_exfiltration_urls_with_records,
 )
 from kiro_crew.sel import sel
 
@@ -33,6 +35,10 @@ _OPTIMIZER_DENY_REASON = (
     "the prompt optimizer runs no tools: it only rewrites the prompt it was "
     "given and answers with text, so every tool call is refused here"
 )
+
+#: Sentence punctuation ``_URL_RE`` can include at the end of a match. Stripped
+#: from both the draft's URLs and the redacted addresses before they are compared.
+_URL_TRAILING_PUNCT = ".,;:!?]"
 
 # Placeholder the frontend collapses large pastes into (mirrors formatToken in
 # pasteTokens.ts: "[ Paste #N · M lines ]"). The middle dot is U+00B7. Captured
@@ -128,6 +134,36 @@ def _paste_token_counts(text: str) -> Counter:
     return Counter(m.group(0) for m in PASTE_TOKEN_REGEX.finditer(text))
 
 
+# The zero-width stable-id run inside a paste token (see PASTE_TOKEN_REGEX).
+_PASTE_ID_RUN_REGEX = re.compile(r"\u2063[\u200b\u200c]+\u2063")
+
+
+def _restore_paste_ids(optimized: str, prompt: str) -> str:
+    """Put each paste token in *optimized* back to the exact string the draft used.
+
+    The stable id is an invisible bit run the model cannot be relied on to copy,
+    and a rewrite that drops or garbles it still names the same visible paste.
+    So every token the model wrote is matched by its VISIBLE form
+    (``[ Paste #N · M lines ]``) and replaced with the draft's own full token,
+    id run and all. Only a visible form that maps to exactly ONE full token in
+    the draft is rewritten; when two draft tokens look the same but carry
+    different ids, the model's spelling is kept untouched, so the exact-string
+    multiset guard still decides for them. This never adds or removes a token,
+    so a dropped, duplicated or re-counted placeholder is still rejected by
+    that guard."""
+    by_visible: dict[str, set[str]] = {}
+    for m in PASTE_TOKEN_REGEX.finditer(prompt):
+        by_visible.setdefault(_PASTE_ID_RUN_REGEX.sub("", m.group(0)), set()).add(m.group(0))
+
+    def _swap(m: re.Match[str]) -> str:
+        full = by_visible.get(_PASTE_ID_RUN_REGEX.sub("", m.group(0)))
+        if full is not None and len(full) == 1:
+            return next(iter(full))
+        return m.group(0)
+
+    return PASTE_TOKEN_REGEX.sub(_swap, optimized)
+
+
 def _build_pasted_content_block(pastes: object, referenced_seqs: set[str], nonce: str) -> str:
     """Build a ``<pasted_content-{nonce}>`` block for the referenced pastes.
 
@@ -188,6 +224,13 @@ OPTIMIZER_SYSTEM = (
     "text) and place it where that content logically belongs. NEVER inline, quote, "
     "summarize, or expand the pasted content itself — reference it only through its "
     "placeholder. Do NOT invent new placeholders or renumber existing ones.\n\n"
+    "FILE MENTIONS — the draft may contain file mentions: an @ immediately followed "
+    'by a file path, such as "@src/main.ts". Each one attaches that file to the '
+    "message. In your rewrite you MUST keep every file mention verbatim (the same @ "
+    "and the same path characters, followed by a space or the end of the text). "
+    "NEVER reword a mention into prose, shorten it, or drop it. A folder mention is "
+    'the same with a trailing slash, such as "@src/utils/"; it attaches that folder '
+    "and is kept verbatim the same way, trailing slash included.\n\n"
     "## Rules (earlier rules win on conflict)\n\n"
     "1. NEVER change the user's intent, add requirements they didn't ask for, or invent "
     "specific values they left open.\n"
@@ -232,7 +275,13 @@ async def handle_optimize(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid JSON"}, status=400)
 
     prompt = data.get("prompt", "").strip()
-    context = data.get("context", "")
+    # The context is replayed chat history, forwarded as text and then run
+    # through build_prompt_blocks by the session stream — which inlines any
+    # readable absolute image path as a (multi-MB) base64 image block. A pasted
+    # screenshot ref in that history would therefore bloat every optimize call,
+    # yet the optimizer only rewrites text and never needs the picture. Scrub
+    # local image refs to a content-free marker before forwarding.
+    context = strip_image_refs(data.get("context", ""))
     # Paste blocks the frontend collapsed out of the prompt: [{seq, content}, ...]
     # (mirrors PasteBlock in pasteTokens.ts). The prompt carries only the
     # "[ Paste #N · M lines ]" placeholders; the real content rides here so the
@@ -358,6 +407,22 @@ async def handle_optimize(request: web.Request) -> web.Response:
     except Exception:
         logger.warning("Optimizer failed, returning original", exc_info=True)
         return web.json_response({"optimized": prompt, "changed": False})
+    finally:
+        # Throw away the dedicated session's conversation after every call. Each
+        # optimize is independent and needs no continuity, but a persistent
+        # "_optimizer" key RESUMES the same conversation on the next call, so its
+        # history (and the pasted-screenshot image blocks that rode in it) grows
+        # without bound until requests fail as malformed. discard_conversation
+        # with replay=False clears the resume sid and suppresses replay, so the
+        # next call cold-starts fresh; a plain reset only recycles the process
+        # and keeps the sid, which would reload the same growing transcript.
+        # Runs outside the 30s budget and on every path, after _optimize's own
+        # finally has released the lease. Best-effort: a failed discard must
+        # never replace a good rewrite with an error.
+        try:
+            await state.sessions.discard_conversation(optimizer_session_key, replay=False)
+        except Exception:
+            logger.debug("Optimizer: failed to discard dedicated session", exc_info=True)
 
     optimized = text.strip().strip('"').strip("'")
     # Strip one model-added XML wrapper before the sentinel check, the
@@ -378,7 +443,10 @@ async def handle_optimize(request: web.Request) -> web.Response:
     # its "· M lines" text (seq present but the exact string no longer matches,
     # so the token is left unexpanded) would pass yet corrupt the submitted
     # prompt. Require the full-token multiset to match exactly; otherwise discard
-    # the rewrite and keep the original.
+    # the rewrite and keep the original. The invisible stable-id run is not the
+    # model's to reproduce, so each token is first put back to the draft's own
+    # spelling by its visible form (_restore_paste_ids) and only then compared.
+    optimized = _restore_paste_ids(optimized, prompt)
     if prompt_paste_tokens != _paste_token_counts(optimized):
         logger.warning(
             "Optimizer altered paste placeholder(s) (expected %s, got %s) — "
@@ -388,8 +456,21 @@ async def handle_optimize(request: web.Request) -> web.Response:
         )
         return web.json_response({"optimized": prompt, "changed": False})
 
-    # Redact any exfiltration URLs or credentials from LLM output
-    optimized, _ = redact_exfiltration_urls(optimized)
+    # Redact any exfiltration URLs or credentials from LLM output. When the pass
+    # removes a URL the user wrote in the draft, the rewrite would hand back a
+    # placeholder for their own link, so keep the draft instead. Nothing in the
+    # model's text is exempted: the whole reply is redacted either way. A URL
+    # match can swallow the sentence punctuation after it, so both sides drop
+    # trailing ``.,;:!?]`` before the comparison; a looser match only ever
+    # keeps the user's own draft.
+    removed: list[tuple[str, str]] = []
+    optimized, _, _ = redact_exfiltration_urls_with_records(optimized, removed_out=removed)
+    draft_urls = {m.group(0).rstrip(_URL_TRAILING_PUNCT) for m in _URL_RE.finditer(prompt)}
+    if any(address.rstrip(_URL_TRAILING_PUNCT) in draft_urls for address, _ in removed):
+        logger.info("Optimizer rewrite redacted a URL from the draft; returning original")
+        return web.json_response(
+            {"optimized": prompt, "changed": False, "reason": "draft_url_redacted"}
+        )
     optimized, _ = redact_credentials(optimized)
 
     changed = optimized.lower().strip() != prompt.lower().strip()

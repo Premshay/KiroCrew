@@ -44,19 +44,19 @@ const SYSTEM_VOICE_DEFAULT = ''
 // Piper speed is controlled by length_scale (lower = faster). Map friendly
 // labels to length_scale values; the backend consumes piper_length_scale (rate
 // is a Polly-only knob and is ignored by Piper synthesis).
-const PIPER_SPEED_OPTIONS = ['0.7', '0.85', '1.0', '1.15', '1.3', '1.5']
+const PIPER_SPEED_OPTIONS = ['0.7', '0.85', '1', '1.15', '1.3', '1.5']
 /** Catalog KEY per length_scale value; resolved per render (see PROVIDER_LABEL_KEY). */
 const PIPER_SPEED_LABEL_KEY: Record<string, string> = {
   '0.7': 'pages.settings.voicePanel.fastest',
   '0.85': 'pages.settings.voicePanel.faster',
-  '1.0': 'pages.settings.voicePanel.normal',
+  '1': 'pages.settings.voicePanel.normal',
   '1.15': 'pages.settings.voicePanel.slower',
   '1.3': 'pages.settings.voicePanel.slow',
   '1.5': 'pages.settings.voicePanel.slowest',
 }
 
 /**
- * Offline stand-in for `aws polly describe-voices` (Piper users have no AWS
+ * Offline stand-in for `aws polly describe-voices` (non-Polly users have no AWS
  * credentials, so the catalogue is never fetched for them).
  *
  * DO NOT TRANSLATE any of these. `value` is the Polly VoiceId sent verbatim to
@@ -94,7 +94,7 @@ export function VoicePanel() {
   const voiceQ = useQuery<VoiceConfig>({ queryKey: ['voiceConfig'], queryFn: () => api.voiceConfig() })
   type PollyVoice = { id: string; name: string; language: string; languageCode: string; gender: string; engines: string[] }
   // Only fetch the Polly voice catalogue (aws polly describe-voices) when Polly
-  // is the active provider — Piper users have no AWS CLI/credentials.
+  // is the active provider — other users have no AWS CLI/credentials.
   const voicesQ = useQuery<{ voices: PollyVoice[] }>({ queryKey: ['voiceVoices'], queryFn: () => api.voiceVoices(), staleTime: 3600_000, enabled: voiceQ.data?.provider === 'polly' })
   type SystemVoice = { id: string; name: string; language: string }
   // Enumerating the host engine's voices costs a subprocess, so it is fetched
@@ -188,7 +188,7 @@ export function VoicePanel() {
   return (
     <>
       {/* askAgent ON: `onError` above has already reverted localProfile /
-          localRegion / localPiperBinary / localPiperModel to the server value
+          localRegion to the server value
           by the time this banner shows, so the navigation cannot destroy an
           unsaved edit — the fields hold exactly what is persisted. */}
       <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" askAgent />

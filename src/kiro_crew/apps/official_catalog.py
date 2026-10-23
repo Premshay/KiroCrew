@@ -36,6 +36,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import os
 import re
 import time
 import urllib.error
@@ -71,10 +72,27 @@ CACHE_TTL = 3600  # 1 hour
 #: cost of remembering too long is a store that stays stale after the CDN is back.
 FAILURE_TTL = 60
 FETCH_TIMEOUT = 10
+#: Escape hatch for tests and CI, mirroring ``KIROCREW_SKIP_MODEL_DOWNLOAD``: a
+#: test rig's store must never reach the published documents' origin. Set to
+#: ``"1"`` it makes every document read as unreachable, so the store degrades to
+#: the bundled seed exactly as it does offline, and the seed listing's per-row
+#: manifest clone is skipped as well (``registry_pipeline.manifests``). It is a
+#: gate on the fetch, never a redirect: nothing here lets the origin be replaced,
+#: which is the change that would turn a URL into a file read or a spoofed
+#: catalog. The E2E harness gateway sets it because ``GET /api/apps/registry``
+#: otherwise pays an uncached HTTPS round trip per listing
+#: (``fetch_inventory_entries`` is deliberately uncached) bounded only by
+#: ``FETCH_TIMEOUT``, which is also the browser specs' ready budget.
+SKIP_FETCH_ENV = "KIROCREW_SKIP_APP_STORE_FETCH"
 #: A catalog of a few dozen apps is tens of kilobytes. The cap is not about disk
 #: but about not reading an unbounded body into memory from a host we do not
 #: control at parse time.
 MAX_BYTES = 4 * 1024 * 1024
+
+
+def store_fetch_skipped() -> bool:
+    """Whether :data:`SKIP_FETCH_ENV` holds the store off the network."""
+    return os.environ.get(SKIP_FETCH_ENV) == "1"
 
 
 def _cache_path() -> Path:
@@ -135,6 +153,50 @@ def forget_cache() -> None:
         _cache_path().unlink(missing_ok=True)
     except OSError:
         logger.debug("could not drop the official catalog cache", exc_info=True)
+
+
+def cached_entries() -> tuple[list[dict[str, Any]], float | None]:
+    """The cached document's entries and when that cache was written, no fetch.
+
+    ``([], None)`` when there is no usable cache, so a caller reads a cold start
+    as "the catalog has not been consulted" rather than "the shelf is empty".
+    The timestamp is the cache file's mtime, which is what lets a caller publish
+    how old its answer is instead of implying it is current.
+
+    ``CACHE_TTL`` is deliberately not applied. A caller that cannot fetch has a
+    stale answer or no answer, and the mtime returned beside the entries is what
+    makes the staleness visible rather than silent -- whereas dropping the
+    entries past an hour would leave a surface with nothing to show and no way
+    to say why. Readers that must not act on a stale shelf use ``_read_cache``,
+    which does enforce it.
+
+    Deliberately does NOT go through ``_envelope_error``: a refused envelope
+    (unknown schema, a non-empty tombstone list) must not yield entries, and the
+    two readers that materialise rows already enforce that. This reader is for
+    annotating a row that exists ANYWAY -- the ``apps`` list is filtered to
+    well-formed, named entries and nothing more.
+
+    **Never a source of install coordinates.** The cache lives under the data
+    home and is agent-writable, so a planted entry here could carry any field it
+    likes. That is the reason this module materialises install coordinates only
+    from a fresh fetch (``fetch_inventory_entries``), and this function does not
+    widen that: use it for display facts about an app the caller already knows
+    is installed, where a planted value costs a wrong label and no more.
+    """
+    path = _cache_path()
+    try:
+        if not path.is_file():
+            return [], None
+        mtime = path.stat().st_mtime
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [], None
+    if not isinstance(data, dict) or _FAILED_KEY in data:
+        return [], None
+    apps = data.get("apps")
+    if not isinstance(apps, list):
+        return [], mtime
+    return [a for a in apps if isinstance(a, dict) and isinstance(a.get("name"), str)], mtime
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -204,7 +266,14 @@ def fetch_document(url: str) -> dict[str, Any] | None:
 
     Every failure is a degradation rather than an error: each caller has a
     working answer without the document.
+
+    Checked BEFORE the seam, not inside it: ``_open_catalog`` is what tests
+    intercept, and a skip that reached it would be indistinguishable from a
+    fetch that did.
     """
+    if store_fetch_skipped():
+        logger.info("%s=1 — not fetching %s", SKIP_FETCH_ENV, url)
+        return None
     try:
         req = _https_request(url)
         with _open_catalog(req) as resp:

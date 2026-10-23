@@ -173,11 +173,28 @@ class TestScopeIsNamed:
             assert prop in plain and prop in named
 
 
+def _runtime_family_texts() -> list[str]:
+    """runtime.py and its owner modules (runtime_*.py), which hold code that was its own."""
+    import sys
+
+    from kiro_crew.acp import runtime
+
+    return [
+        Path(sys.modules[name].__file__).read_text(encoding="utf-8")
+        for name in (runtime.__name__, *runtime._RUNTIME_OWNERS)
+    ]
+
+
+def _runtime_family_text() -> str:
+    return "".join(_runtime_family_texts())
+
+
 class TestRuntimeNamesItsScope:
     @staticmethod
-    def _launch(tmp_path, *, wrapped: bool) -> tuple[list[str], str, list[str]]:
+    def _launch(tmp_path, *, wrapped: bool) -> tuple[list[str], str, list[str], str]:
         """The runtime's real launch: the argv its scope step produced, the instance its
-        child carries, and the scope the launch reports to the runtime.
+        child carries, the scope the launch reports to the runtime, and the agent the
+        child's environment names.
 
         Driven through the launch capture with the cgroup wrap either applied (this
         file's ``_wrap``, the real helper with the backend forced available) or
@@ -192,11 +209,12 @@ class TestRuntimeNamesItsScope:
 
         from kiro_crew.acp import runtime as runtime_mod
         from kiro_crew.agent_sdk.backends import ACP_BACKEND_CODEX
-        from kiro_crew.constants import KIROCREW_SPAWN_INSTANCE_ENV
+        from kiro_crew.constants import KIROCREW_RUNTIME_AGENT_ENV, KIROCREW_SPAWN_INSTANCE_ENV
 
         named_argv: list[str] = []
         instances: list[str] = []
         reported: list[str] = []
+        agents: list[str] = []
         real_launch = runtime_mod.launch
 
         async def _observed_launch(host, request, tools):
@@ -209,6 +227,7 @@ class TestRuntimeNamesItsScope:
             def _mark(env):
                 request.env_after_marker(env)
                 instances.append(env[KIROCREW_SPAWN_INSTANCE_ENV])
+                agents.append(env.get(KIROCREW_RUNTIME_AGENT_ENV, ""))
 
             observed = dataclasses.replace(request, scope_argv=_scope, env_after_marker=_mark)
             return await real_launch(host, observed, tools)
@@ -226,7 +245,7 @@ class TestRuntimeNamesItsScope:
             ),
         )
         assert len(instances) == 1
-        return named_argv, instances[0], reported
+        return named_argv, instances[0], reported, agents[0]
 
     def test_the_runtime_spawn_names_its_scope_after_its_spawn_instance(self, tmp_path):
         """The scope name and the child's env marker are ONE token.
@@ -236,7 +255,7 @@ class TestRuntimeNamesItsScope:
         child is spawned under is compared with the instance marker in that same
         child's environment.
         """
-        argv, instance, _reported = self._launch(tmp_path, wrapped=True)
+        argv, instance, _reported, _agent = self._launch(tmp_path, wrapped=True)
         assert "--unit" in argv, argv
         assert argv[argv.index("--unit") + 1] == sb.scope_unit_name(instance), argv
 
@@ -250,16 +269,30 @@ class TestRuntimeNamesItsScope:
         runtime has none" is whether the naming step changed the argv, and the
         scope the launch reports to the runtime has to follow exactly that.
         """
-        _argv, instance, reported = self._launch(tmp_path / "wrapped", wrapped=True)
+        _argv, instance, reported, _agent = self._launch(tmp_path / "wrapped", wrapped=True)
         assert reported == [sb.scope_unit_name(instance)]
-        argv, _instance, reported = self._launch(tmp_path / "bare", wrapped=False)
+        argv, _instance, reported, _agent = self._launch(tmp_path / "bare", wrapped=False)
         assert reported == [""], "a scope that was never created must not be named"
         assert not any(arg.startswith("--unit") for arg in argv)
         # The value the launch reports is the one the runtime keeps for its init log,
         # after the process exists -- where the capture above stops. Kept as a source
         # read with that reason.
-        body = (Path(sb.__file__).with_name("acp") / "runtime.py").read_text(encoding="utf-8")
+        body = _runtime_family_text()
         assert body.count("self._scope_unit = launched.scope_unit") == 1
+
+    def test_the_child_environment_names_the_authored_agent(self, tmp_path):
+        """The agent a runtime is spawned for travels in its child's environment.
+
+        A host that binds its agent over the wire shows no ``--agent`` in argv, so
+        the environment is the one per-process record a reader of ``/proc`` has
+        for which agent a live runtime runs. Set in the same marker step as the
+        spawn instance, so it is present on every host the runtime spawns for,
+        wrapped in a scope or not.
+        """
+        _argv, _instance, _reported, agent = self._launch(tmp_path / "wrapped", wrapped=True)
+        assert agent == "kirocrew"
+        _argv, _instance, _reported, agent = self._launch(tmp_path / "bare", wrapped=False)
+        assert agent == "kirocrew"
 
     def test_the_runtime_logs_its_scope_name_beside_its_pid(self):
         """The scope name reaches a durable record, not only the live process.
@@ -271,10 +304,10 @@ class TestRuntimeNamesItsScope:
         text, so reformatting the call cannot break the pin and the pin cannot
         match its own assertion.
         """
-        src = Path(sb.__file__).with_name("acp") / "runtime.py"
-        tree = ast.parse(src.read_text(encoding="utf-8"))
+        trees = [ast.parse(text) for text in _runtime_family_texts()]
         calls = [
             node
+            for tree in trees
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and node.args
@@ -326,8 +359,7 @@ class TestRuntimeNamesItsScope:
         has ended -- which is the same false claim as naming a scope that never
         existed, just later.
         """
-        src = Path(sb.__file__).with_name("acp") / "runtime.py"
-        body = src.read_text(encoding="utf-8")
+        body = _runtime_family_text()
         token_clears = body.count('self._process_instance = ""')
         unit_clears = body.count('self._scope_unit = ""')
         assert token_clears >= 2, "control: the token is cleared on the teardown paths"

@@ -26,6 +26,17 @@ import { i18next } from '../i18n/all'
 const noop = () => {}
 
 const baseProps = {
+  agents: [],
+  defaultAgent: '',
+  selectedAgent: '',
+  setSelectedAgent: noop,
+  contexts: [],
+  brief: { contextId: '', projectName: '', repository: '', contextPaths: '', notes: '', targets: '', intent: 'ground' },
+  setBrief: noop,
+  selectContext: noop,
+  saveContext: noop,
+  deleteContext: noop,
+  hint: '',
   staged: [],
   dragging: false,
   blocked: null,

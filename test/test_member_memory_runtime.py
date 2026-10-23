@@ -19,6 +19,7 @@ from kiro_crew.subagent_persistence import (
     create_agent_folder,
     read_run_memory_store,
 )
+from kiro_crew.testing.wait import await_until
 
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
@@ -350,8 +351,16 @@ async def test_owner_create_pins_private_selection_before_history_save(
         async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             response = await client.post("/api/chat/slots", json=payload)
             assert response.status == 200, await response.text()
-    assert state._slots["owner-private"].memory_store == writer
-    assert read_private_session_store("dashboard:owner-private") == writer
+    if explicit:
+        assert state._slots["owner-private"].memory_store == writer
+        assert read_private_session_store("dashboard:owner-private") == writer
+    else:
+        # An agent-less create is the default TEMPLATE on Global: the
+        # default crewmate's private store is never pinned by a chat that did
+        # not pick it.
+        assert state._slots["owner-private"].agent_kind == "template"
+        assert state._slots["owner-private"].memory_store in ("", "default")
+        assert read_private_session_store("dashboard:owner-private") is None
 
 
 @pytest.mark.asyncio
@@ -382,11 +391,14 @@ async def test_owner_direct_first_send_pins_private_memory_before_user_history(
     monkeypatch.setattr(chat_handlers, "_maybe_auto_title", AsyncMock())
     monkeypatch.setattr(chat_handlers, "maybe_auto_tag", AsyncMock())
     async with TestClient(TestServer(_make_app(state))) as client:
+        # The member is PICKED on the first send: a send that picks nobody is
+        # the default template on Global and pins no private store.
         response = await client.post(
-            "/api/chat?ws=1", json={"slot": "owner-direct", "message": "Remember this task"}
+            "/api/chat?ws=1",
+            json={"slot": "owner-direct", "agent": "writer", "message": "Remember this task"},
         )
         assert response.status == 200, await response.text()
-        await asyncio.wait_for(drain_background_tasks(state), timeout=5)
+        await await_until(asyncio.ensure_future(drain_background_tasks(state)))
     assert pin_observations == [False]
     assert state._slots["owner-direct"].memory_store == writer
     assert read_private_session_store("dashboard:owner-direct") == writer
@@ -675,6 +687,49 @@ async def test_member_pick_on_a_conversation_with_history_names_the_boundary(
             assert body["error"] == "Open a new conversation to choose member memory."
     assert slot.agent == "default"
     assert slot.memory_store != writer
+
+
+@pytest.mark.asyncio
+async def test_empty_switch_under_the_members_own_name_is_refused(tmp_path, member_stores):
+    """A private member's chat stays pinned when the default template carries
+    that member's name: an empty switch (= the default template) changes the
+    NAMESPACE, not the name, and the durable pin is checked for that too.
+    Otherwise the conversation's private transcript would be rebound to Global
+    memory."""
+    from aiohttp.test_utils import TestClient, TestServer
+    from chat_test_helpers import _make_app_with_agent_routes, _make_state
+    from dashboard_owner_helpers import as_owner
+
+    from kiro_crew.member_memory_auth import read_private_session_store
+
+    writer, _ = member_stores
+    cfg = KiroCrewConfig.load()
+    cfg.agent.default_agent = "writer"
+    cfg.save()
+    state = _make_state(tmp_path)
+    state.sessions.reset = AsyncMock(return_value=True)
+    slot = state.get_or_create_slot("pinned-tpl", agent="default")
+    key = "dashboard:pinned-tpl"
+    body = {"agent": ""}
+    with (
+        patch("kiro_crew.dashboard.chat_handlers.schedule_eager_spawn"),
+        patch(
+            "kiro_crew.config.loader._materialized_kiro_agent",
+            lambda name, project_dir=None: name if name == "writer" else "",
+        ),
+    ):
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
+            response = await client.post(
+                "/api/chat/slots/pinned-tpl/agent", json={"agent": "writer"}
+            )
+            assert response.status == 200, await response.text()
+            assert read_private_session_store(key) == writer
+            response = await client.post("/api/chat/slots/pinned-tpl/agent", json=body)
+            assert response.status == 409, await response.text()
+            assert (await response.json())["code"] == "member_session_pinned"
+    assert slot.agent == "writer"
+    assert slot.agent_kind == "member"
+    assert read_private_session_store(key) == writer
 
 
 @pytest.mark.asyncio
@@ -1238,7 +1293,7 @@ async def test_unavailable_private_run_refused_before_provider_allocation():
     manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
     info = SubagentInfo(id="run1", task="task", memory_store="missing-private")
     with pytest.raises(ValueError, match="no captured execution context"):
-        await asyncio.wait_for(manager._run_inner(info, "subagent:run1"), 5)
+        await await_until(asyncio.ensure_future(manager._run_inner(info, "subagent:run1")))
     sessions.get_or_create.assert_not_called()
 
 
@@ -1283,7 +1338,7 @@ async def test_failed_binding_publication_blocks_an_already_scheduled_run(member
         manager._log_spawned(info)
     assert info.error.startswith("memory_unavailable:")
     with pytest.raises(RuntimeError, match="could not persist"):
-        await asyncio.wait_for(manager._run_inner(info, "subagent:run1"), 5)
+        await await_until(asyncio.ensure_future(manager._run_inner(info, "subagent:run1")))
     sessions.get_or_create.assert_not_called()
 
 
@@ -1371,12 +1426,12 @@ async def test_structural_startup_failure_keeps_memory_closed_and_explains_recov
         ):
             supervisor = asyncio.create_task(gateway._wait_for_memory_preparation())
             try:
-                await asyncio.wait_for(recovery_shell.wait(), 1)
+                await await_until(recovery_shell, timeout=1)
                 assert not supervisor.done()
                 memory.init.assert_not_called()
                 vectors.init.assert_not_called()
                 stopping.set()
-                assert await asyncio.wait_for(supervisor, 1) is False
+                assert await await_until(supervisor, timeout=1) is False
             finally:
                 stopping.set()
                 await supervisor

@@ -16,16 +16,19 @@ import useMoveUndo from '../../../hooks/useMoveUndo'
 import type { Slot } from '../types'
 import { sessionRefBlockReason } from '../../../utils/sessionRefs'
 import { boardColumnFromDroppableId } from '../../../utils/boardFolderCollapse'
+import { sessionDisplayTitle } from '../../../utils/sessionDisplayTitle'
 import { CHAT_PANE_DROP_TYPE } from './collision'
 import type { FolderSortModeRead } from '../../../hooks/useFolderSortMode'
 import type { FolderMutations } from '../folders'
 
 /** The two folder drop writes: sibling renumber and re-parent. */
-export function useFolderDropOps({ folderReorderable, queryClient, setFolderActionError, updateFolderMutation }: {
+export function useFolderDropOps({ folderReorderable, queryClient, setFolderActionError, setFolderOfflineNotice, updateFolderMutation, connected }: {
   folderReorderable: boolean
   queryClient: QueryClient
   setFolderActionError: Dispatch<SetStateAction<string>>
+  setFolderOfflineNotice: Dispatch<SetStateAction<string>>
   updateFolderMutation: FolderMutations['updateFolderMutation']
+  connected: boolean
 }) {
   const reorderFolders = useCallback((activeId: string, overId: string) => {
     if (activeId === overId) return
@@ -37,6 +40,14 @@ export function useFolderDropOps({ folderReorderable, queryClient, setFolderActi
     // restriction is expected -- the affordance is withdrawn, not a write that
     // failed. Re-parenting by drag is routed before this and still works.
     if (!folderReorderable) return
+    // Offline this is the SAME gateway write `moveFolderTo` refuses, reached by
+    // the same drag one sink over. Ungated it moved optimistically, snapped back
+    // and raised a false "Folder update failed". Refused BEFORE the optimistic
+    // `setQueryData`, so the rows never move.
+    if (!connected) {
+      setFolderOfflineNotice(i18nT('utils.offline.gateway_offline_reconnect', { action: i18nT('utils.offline.move_folders') }))
+      return
+    }
     // Read latest from cache to avoid stale-closure ordering on rapid successive drags
     const current = queryClient.getQueryData<ChatFolder[]>(['chat-folders']) ?? []
     // Scoped to the dragged folder's own container, not to the root lane: a
@@ -86,7 +97,7 @@ export function useFolderDropOps({ folderReorderable, queryClient, setFolderActi
       )
       queryClient.invalidateQueries({ queryKey: ['chat-folders'] })
     })
-  }, [queryClient, folderReorderable, setFolderActionError])
+  }, [queryClient, folderReorderable, setFolderActionError, connected, setFolderOfflineNotice])
   // Re-parent a folder: move it into `parentId`, or to the top level (null).
   // Client-side guards mirror the server (self/descendant targets rejected)
   // so an invalid pick or drop is a silent no-op instead of a 400 round-trip.
@@ -95,6 +106,14 @@ export function useFolderDropOps({ folderReorderable, queryClient, setFolderActi
   // arms on it. A guarded no-op never acknowledges, so an offer armed over one
   // simply expires unarmed.
   const moveFolderTo = useCallback((folderId: string, parentId: string | null, opts?: { onCommitted?: () => void }) => {
+    // Gated at the SINK, because re-parenting arrives by two routes (the
+    // Move-to-folder submenu's onPick and a drag). Offline both reached
+    // `updateFolderMutation`, so the row moved, snapped back, and claimed
+    // "Folder update failed" for a request that was never sent.
+    if (!connected) {
+      setFolderOfflineNotice(i18nT('utils.offline.gateway_offline_reconnect', { action: i18nT('utils.offline.move_folders') }))
+      return
+    }
     const current = queryClient.getQueryData<ChatFolder[]>(['chat-folders']) ?? []
     const folder = current.find(f => f.id === folderId)
     if (!folder) return
@@ -102,7 +121,7 @@ export function useFolderDropOps({ folderReorderable, queryClient, setFolderActi
     if ((folder.parent_id || '') === target) return
     if (target && collectFolderSubtreeIds(current, folderId).has(target)) return
     updateFolderMutation.mutate({ id: folderId, body: { parent_id: target }, onCommitted: opts?.onCommitted })
-  }, [queryClient, updateFolderMutation])
+  }, [queryClient, updateFolderMutation, connected, setFolderOfflineNotice])
   return { reorderFolders, moveFolderTo }
 }
 
@@ -177,7 +196,8 @@ export function useSidebarMoveUndo({ localSlots, folders, moveFolderTo, queryCli
       toFolderId: to,
       toFolderName: dest?.name ?? null,
       toFolderColor: dest?.color,
-      itemTitle: slot?.title || slotKey,
+      // A session missing from the list keeps its key: its title is unknown.
+      itemTitle: slot ? sessionDisplayTitle(slot) : slotKey,
     })
   }, [localSlots, folders, armDragMove, dismissFolderMove])
   const moveFolderByDrag = useCallback((folderId: string, parentId: string | null) => {
@@ -201,7 +221,10 @@ export function useSidebarMoveUndo({ localSlots, folders, moveFolderTo, queryCli
       itemTitle: folder.name,
     })
   }, [queryClient, armFolderMove, dismissDragMove])
-  return { dragMove, undoDragMove, undoBar, folderMove, undoFolderMove, folderUndoBar, moveByDrag, moveFolderByDrag }
+  // Retire both move offers, for the manual sort's offer, which shares their
+  // slot below the lanes (and the one ⌘Z listener a slot may hold).
+  const dismissMoves = useCallback(() => { dismissDragMove(); dismissFolderMove() }, [dismissDragMove, dismissFolderMove])
+  return { dragMove, undoDragMove, undoBar, folderMove, undoFolderMove, folderUndoBar, moveByDrag, moveFolderByDrag, dismissMoves }
 }
 
 /** Which session card a board column is dragging with native HTML5 DnD -- the
@@ -252,7 +275,7 @@ export function useNativeSessionDrag() {
 }
 
 /** The DndContext lifecycle handlers shared by every lane. */
-export function useSidebarDragHandlers({ releaseHoverPin, setDragFrozen, hideFolderReorderHint, setActiveDrag, activeDrag, dragFrozen, folderReorderable, folderSortRead, showFolderReorderHint, moveFolderByDrag, reorderFolders, searchRanked, pinned, reorderPinned, localSlots, activeSlot, onDropSessionRef, moveByDrag, folders, boardFolderCollapsed, updateFolderMutation, clearBoardCollapse }: {
+export function useSidebarDragHandlers({ releaseHoverPin, setDragFrozen, hideFolderReorderHint, setActiveDrag, activeDrag, dragFrozen, folderReorderable, folderSortRead, showFolderReorderHint, moveFolderByDrag, reorderFolders, searchRanked, pinned, reorderPinned, reorderManual, localSlots, activeSlot, onDropSessionRef, moveByDrag, folders, boardFolderCollapsed, updateFolderMutation, clearBoardCollapse }: {
   releaseHoverPin: () => void
   setDragFrozen: Dispatch<SetStateAction<boolean>>
   hideFolderReorderHint: () => void
@@ -267,6 +290,7 @@ export function useSidebarDragHandlers({ releaseHoverPin, setDragFrozen, hideFol
   searchRanked: Map<string, number> | null
   pinned: Set<string>
   reorderPinned: (activeKey: string, overKey: string) => void
+  reorderManual: (activeKey: string, overKey: string) => void
   localSlots: Slot[]
   activeSlot: string | null
   onDropSessionRef: ((ref: { key: string; title: string; messages?: number | undefined; }) => void) | undefined
@@ -387,6 +411,15 @@ export function useSidebarDragHandlers({ releaseHoverPin, setDragFrozen, hideFol
         reorderPinned(a.key, o.key)
         return
       }
+      // A drop between two unpinned rows of one container, in any sort: the
+      // manual order (which switches the sort to Manual). A search ranks the
+      // list by relevance, so there is no between-rows place to drop into.
+      if (!searchRanked && o?.type === 'manual-session' && o.key
+        && a.pinned !== true && a.container === o.container
+        && !pinned.has(a.key) && !pinned.has(o.key)) {
+        reorderManual(a.key, o.key)
+        return
+      }
       // Drop targets, innermost-first via pointerWithinDeepest:
       //  chat-pane-ref → stage a LINK to this session in the open chat's composer
       //  folder-drop  → assign to that folder (folderId may be null for root lane)
@@ -408,7 +441,7 @@ export function useSidebarDragHandlers({ releaseHoverPin, setDragFrozen, hideFol
       if (o?.type === 'folder-drop') moveByDrag(a.key, o.folderId ?? null)
       else if (o?.type === 'folder') moveByDrag(a.key, over.id as string)
     }
-  }, [resetSidebarDrag, reorderFolders, reorderPinned, searchRanked, pinned, moveByDrag, moveFolderByDrag, localSlots, activeSlot, onDropSessionRef, folderReorderable, folderSortRead.known, showFolderReorderHint])
+  }, [resetSidebarDrag, reorderFolders, reorderPinned, reorderManual, searchRanked, pinned, moveByDrag, moveFolderByDrag, localSlots, activeSlot, onDropSessionRef, folderReorderable, folderSortRead.known, showFolderReorderHint])
   const handleSidebarDragCancel = resetSidebarDrag
   // Auto-expand collapsed folders when a dragged item hovers over them for 500ms.
   const dragExpandTimer = useRef<{ id: string; timer: ReturnType<typeof setTimeout> } | null>(null)

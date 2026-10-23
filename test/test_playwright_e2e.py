@@ -55,8 +55,9 @@ _WEBSITE = "website"
 #
 # RAISE this when you add specs. Only LOWER it with a written reason in the
 # commit body: a drop means specs stopped running.
-# The offline browser floor adds ten member memory scenarios to the base floor.
-MIN_EXECUTED_SPECS = 239
+# The offline browser floor adds ten member memory scenarios to the base floor, and
+# one that opens the link `dashboard_preview` hands a crewmate.
+MIN_EXECUTED_SPECS = 244
 
 # Skips are silent passes. A spec should seed its preconditions rather than skip
 # when they are absent, so the intended steady state is zero. Specs excluded by
@@ -73,11 +74,21 @@ MAX_FLAKY_SPECS = 0
 # A bound on the WHOLE Playwright run, taken from the CI job's budget so the run's
 # report survives. It is not a lost-run ceiling (that bounds one wait inside a test
 # at 10x its measured worst case), and it can stop a slow run that would have
-# passed. ci.yml's 25-minute `e2e` job reaches this step about 5 minutes in, and
-# the suite took 12.8 min there (run 37340204150; 9-10 min locally). 17 min of
-# Playwright plus _STOP_GRACE_SECS leaves about 2 min to read the report and write
-# the job summary. It sits below the 1800 s pytest timeout of setup.py test_e2e.
-PLAYWRIGHT_RUN_CEILING_SECS = 1020
+# passed -- so it must be sized against the real suite length, not left behind it.
+#
+# ci.yml's 25-minute (1500 s) `e2e` job reaches this step about 4 minutes in, and
+# the Playwright run itself starts ~75 s into the step, so ~1180 s of the job
+# budget is left for the run. The suite was 12.8 min when the old 1020 s bound was
+# set (run 37340204150), but it is now ~17 min on the hosted runner: two runs with
+# every spec green were still failed here for crossing 1020 s (322 passed/16.9 min,
+# duration 1016 s; 318 passed/17.0 min, duration 1017 s), and the job itself had
+# ~225 s of its 1500 s budget still unused when the bound fired. 1200 s (20 min)
+# clears the measured ~1017 s worst case with ~3 min of margin while 1200 s plus
+# _STOP_GRACE_SECS still leaves about 2 min to read the report and write the job
+# summary before the 25-minute job timeout. It sits below the 1800 s pytest
+# timeout of setup.py test_e2e. RAISE this (not the specs) if the suite grows again
+# and the job budget allows; split or speed up the suite before it nears the budget.
+PLAYWRIGHT_RUN_CEILING_SECS = 1200
 
 # A stopped run first gets SIGINT, so Playwright can run its reporters and close
 # its browsers, and is killed with its whole process group after this long.
@@ -301,6 +312,52 @@ def _resolve_website_dir() -> Path | None:
     return in_tree if (in_tree / "playwright").is_dir() else None
 
 
+#: The crewmate dashboard-preview-link.spec.ts opens. A space and capitals on purpose:
+#: the slug (`preview-probe`) cannot name it, so a link built from the slug alone is
+#: refused with `missing_member`, which is the defect the spec guards against.
+DASHBOARD_PREVIEW_MEMBER = "Preview Probe"
+
+#: A template the live tab never shows. A crewmate that adopted nothing shows no page
+#: on the live tab, so a tab that draws this page is drawing the staged one.
+DASHBOARD_PREVIEW_TEMPLATE = "standup"
+
+
+def _stage_dashboard_preview(home: Path) -> tuple[str, str]:
+    """Seed one crewmate in *home* and stage a page for it, as `dashboard_preview` does.
+
+    Returns ``(member, url)``. The url is the one the tool hands the agent to show the
+    person -- ``stage_preview(...).wire(member)["preview_url"]``, the same two calls
+    ``agent_panel.api_dashboard_preview`` makes -- so the spec opens exactly what a
+    person is given, rather than a link it built itself.
+
+    Staged in this process with ``KIROCREW_HOME`` pointed at *home* for the duration of
+    the call: the store resolves the data home per call (``paths.data_home``), so the
+    page lands in the gateway's home, and the override is undone on exit.
+
+    Staged once, before the browser starts, so it must still be applicable when the
+    spec reaches it: ``test_the_staged_preview_outlives_the_whole_browser_run`` pins
+    the preview window above the run's ceiling.
+    """
+    from kiro_crew.config.loader import update_config_locked
+    from kiro_crew.dashboard_templates import instance
+    from kiro_crew.members import slug_for_name
+
+    def _seed(data: dict) -> dict:
+        agents = data.setdefault("agents", {})
+        assert DASHBOARD_PREVIEW_MEMBER not in agents
+        agents[DASHBOARD_PREVIEW_MEMBER] = {"kiro_agent": "kirocrew", "memory_store": "default"}
+        return data
+
+    update_config_locked(home / "config.json", mutate=_seed)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("KIROCREW_HOME", str(home))
+        staged = instance.stage_preview(
+            slug_for_name(DASHBOARD_PREVIEW_MEMBER), template_id=DASHBOARD_PREVIEW_TEMPLATE
+        )
+        url = str(staged.wire(DASHBOARD_PREVIEW_MEMBER)["preview_url"])
+    return DASHBOARD_PREVIEW_MEMBER, url
+
+
 @_requires_e2e
 def test_dashboard_playwright_suite() -> None:
     """Boot a gateway and run the credential-less Playwright spec set against it."""
@@ -399,6 +456,7 @@ def test_dashboard_playwright_suite() -> None:
                     return data
 
                 update_config_locked(gw.home / "config.json", mutate=_seed_legacy_members)
+                preview_member, preview_url = _stage_dashboard_preview(gw.home)
                 env = dict(os.environ)
                 env.update(
                     {
@@ -416,6 +474,11 @@ def test_dashboard_playwright_suite() -> None:
                         "KIROCREW_E2E_EPHEMERAL": "1",
                         "KIROCREW_E2E_LEGACY_MEMBERS": json.dumps(legacy_members),
                         "KIROCREW_E2E_INVALID_MEMORY_BINDINGS": json.dumps(invalid_memory_bindings),
+                        # The link `dashboard_preview` hands a crewmate, built by the
+                        # production store; dashboard-preview-link.spec.ts opens it.
+                        "KIROCREW_E2E_DASHBOARD_PREVIEW": json.dumps(
+                            {"member": preview_member, "url": preview_url}
+                        ),
                         # CI mode: serial workers + retries:2 (a detector: a spec that
                         # passes only on a retry counts against MAX_FLAKY_SPECS) + html
                         # reporter, per playwright.config.ts.
@@ -458,6 +521,19 @@ def test_dashboard_playwright_suite() -> None:
 # Floor-helper unit tests. Ungated on purpose: these need no gateway and no
 # browser, and a silently broken floor would never fire when it matters.
 # --------------------------------------------------------------------------- #
+
+
+def test_the_staged_preview_outlives_the_whole_browser_run() -> None:
+    """The preview staged before the run is still applicable at the run's ceiling.
+
+    `staged_preview` drops a page older than `MAX_PREVIEW_AGE_MS`, and the harness
+    stages once before Playwright starts. A ceiling past that window would let the
+    preview-link spec run late enough to read "nothing staged" and fail for a reason
+    that is not the link.
+    """
+    from kiro_crew.dashboard_templates import instance
+
+    assert instance.MAX_PREVIEW_AGE_MS / 1000 > PLAYWRIGHT_RUN_CEILING_SECS
 
 
 def _write_report(tmp_path: Path, **stats: int) -> Path:

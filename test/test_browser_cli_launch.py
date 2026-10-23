@@ -255,10 +255,16 @@ def test_gateway_startup_does_not_write_the_config_on_the_event_loop() -> None:
     functional test.
     """
     import inspect
+    from pathlib import Path
 
     from kiro_crew.dashboard import server
 
-    source = inspect.getsource(server)
+    # The server and every owner composed into it: the negative half covers both
+    # entrypoints and the helpers they call, wherever each is defined.
+    source = inspect.getsource(server) + "".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((Path(server.__file__).parent / "server_runtime").glob("[!_]*.py"))
+    )
 
     assert "asyncio.to_thread(browser_cli_launch.cli_env_overrides)" in source
     assert "os.environ.update(browser_cli_launch.cli_env_overrides())" not in source
@@ -379,15 +385,26 @@ def test_the_session_name_does_not_travel_as_extra_env() -> None:
     browser isolation. The pool decision must never see this.
     """
     import inspect
+    import sys
 
     from kiro_crew import session_allocation
 
-    assert 'pool_decision = "bypass_env"' in inspect.getsource(session_allocation)
+    allocation = "".join(
+        inspect.getsource(sys.modules[name])
+        for name in (session_allocation.__name__, *session_allocation._ALLOCATION_OWNERS)
+    )
+    assert 'pool_decision = "bypass_env"' in allocation
 
     from kiro_crew.acp import client, runtime
 
-    for module in (client, runtime):
-        source = inspect.getsource(module)
+    family = "".join(
+        inspect.getsource(sys.modules[name]) for name in (client.__name__, *client._CLIENT_OWNERS)
+    )
+    runtime_family = "".join(
+        inspect.getsource(sys.modules[name])
+        for name in (runtime.__name__, *runtime._RUNTIME_OWNERS)
+    )
+    for source in (family, runtime_family):
         assert "extra_env.update(browser_session_env" not in source
         assert "browser_session_env" in source
 
@@ -646,7 +663,7 @@ def test_an_unverified_seam_warns_about_attribution_not_capability(
 def test_a_measured_missing_hook_still_names_the_installed_cli(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Both bundles were read and a hook is gone: the capability claim is earned."""
+    """A bundle was read and its hook is gone: the capability claim is earned."""
     monkeypatch.setattr(mod, "_warned_lifecycle_losses", set())
     monkeypatch.setattr(mod, "cli_lifecycle_env_support", lambda: (mod.SeamSupport.UNSUPPORTED, ""))
 

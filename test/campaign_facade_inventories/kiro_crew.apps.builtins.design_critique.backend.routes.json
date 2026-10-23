@@ -1,0 +1,36 @@
+{
+ "base_public_names": [
+  "APP_NAME",
+  "DENIED_ROOT_PARTS",
+  "app_data_dir",
+  "atomic_write",
+  "config_dir",
+  "is_app_enabled",
+  "is_sensitive_path",
+  "link_unfurl",
+  "logger",
+  "path_contains_sensitive",
+  "platform_compat",
+  "redact_credentials",
+  "redact_exfiltration_urls",
+  "register_routes",
+  "require_owner_dashboard_request",
+  "sandbox"
+ ],
+ "rebound": {
+  "APP_NAME": "kiro_crew.apps.builtins.design_critique.backend.records",
+  "DENIED_ROOT_PARTS": "kiro_crew.security",
+  "app_data_dir": "kiro_crew.apps.manager",
+  "atomic_write": "kiro_crew.atomic_write",
+  "config_dir": "kiro_crew.config.paths",
+  "is_app_enabled": "kiro_crew.apps.manager",
+  "is_sensitive_path": "kiro_crew.security",
+  "link_unfurl": "kiro_crew",
+  "path_contains_sensitive": "kiro_crew.security",
+  "platform_compat": "kiro_crew",
+  "redact_credentials": "kiro_crew.security",
+  "redact_exfiltration_urls": "kiro_crew.security",
+  "require_owner_dashboard_request": "kiro_crew.dashboard.handlers._shared",
+  "sandbox": "kiro_crew"
+ }
+}

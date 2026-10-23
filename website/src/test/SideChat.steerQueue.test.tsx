@@ -11,6 +11,7 @@ import dashboardReducer from '../store/dashboardSlice'
 
 vi.mock('../api/client', () => ({
   api: {
+    sideState: vi.fn().mockResolvedValue({ open: false }),
     sideOpen: vi.fn().mockResolvedValue({ ok: true, open: true, messages: 0, last_run_id: '', created_at: new Date().toISOString() }),
     sideTurn: vi.fn().mockResolvedValue({ ok: true, run_id: 'r1', messages: 1 }),
     sideClose: vi.fn().mockResolvedValue({ ok: true, was_open: true }),
@@ -1461,6 +1462,8 @@ describe('chatSlice steer frame placement', () => {
 
     expect(screen.queryByText(/\[STEERING/)).toBeNull()
     expect(screen.getByText('Steered')).toBeInTheDocument()
+    // The summary is folded behind the chip and shown once the reader opens it.
+    fireEvent.click(screen.getByTestId('steer-ack-toggle'))
     expect(screen.getByText('switched to the new question')).toBeInTheDocument()
   })
 
@@ -1484,7 +1487,7 @@ describe('chatSlice steer frame placement', () => {
     renderWithProviders(<SideChat slot={SLOT} />, { store })
 
     // The danger treatment is the point: the same text in an assistant row proves nothing.
-    expect(screen.getByText('the backend refused')).toHaveClass('text-danger')
+    expect(screen.getByText('the backend refused')).toHaveClass('text-danger-text')
   })
 
   it('a card whose text this client never had can be neither edited nor cancelled', async () => {

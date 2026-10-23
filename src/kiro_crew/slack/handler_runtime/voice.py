@@ -15,7 +15,9 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kiro_crew.slack.handler import (
+        DEFAULT_POCKET_VOICE,
         PROVIDER_PIPER,
+        PROVIDER_POCKET,
         PROVIDER_SYSTEM,
         KiroCrewConfig,
         SlackClientOps,
@@ -91,18 +93,17 @@ def load_voice_reply_config(cfg: "KiroCrewConfig | None" = None) -> None:
     # users who turn voice on globally also get symmetric voice-in/voice-out
     # without needing to set a second flag.
     _vc.auto_reply_to_voice = bool(_vr.get("auto_reply_to_voice", _enabled))
-    # Resolution rules (validate-or-default, and keep an existing Piper install)
+    # Resolution rules (validate-or-default, and retire a removed provider)
     # live in one shared resolver so this loader, the Telegram settings path, and
     # the dashboard cannot drift apart on them.
     _vc.provider = resolve_configured_provider(_vr)
     _vc.piper_binary = _str_or_default(_vr.get("piper_binary"))
     _vc.piper_model = _str_or_default(_vr.get("piper_model"))
     _vc.piper_model_config = _str_or_default(_vr.get("piper_model_config"))
-    _vc.system_voice = _str_or_default(_vr.get("system_voice"))
-    # Coerce to finite/positive — a config.json with inf/NaN (JSON accepts both)
-    # would otherwise reach synthesis and be re-serialized as non-RFC JSON,
-    # breaking the dashboard's config GET.
     _vc.piper_length_scale = _validate_length_scale(_vr.get("piper_length_scale", 1.0))
+    if _vc.provider == PROVIDER_POCKET:
+        _vc.default_voice = _str_or_default(_vr.get("voice_id"), DEFAULT_POCKET_VOICE)
+    _vc.system_voice = _str_or_default(_vr.get("system_voice"))
 
 
 async def _safe_voice_reply(
@@ -182,17 +183,14 @@ async def _reply_by_voice(
                 # available. Post a one-shot ephemeral so the user knows the
                 # response fell back to text only — silent fallback is worse
                 # UX for users who explicitly opted in.
-                if _vc.provider == PROVIDER_SYSTEM:
+                if _vc.provider in {PROVIDER_PIPER, PROVIDER_POCKET}:
+                    hint = "Check the local voice runtime and model in Voice settings."
+                elif _vc.provider == PROVIDER_SYSTEM:
                     # Only reachable on a host whose built-in engine is absent,
                     # which in practice means a Linux box without espeak-ng.
                     hint = (
                         "Install the host speech engine (`espeak-ng`) or pick "
                         "another provider in Voice settings."
-                    )
-                elif _vc.provider == PROVIDER_PIPER:
-                    hint = (
-                        "Install piper (`pip install piper-tts`) and set "
-                        "`voice_reply.piper_model` to your voice .onnx file."
                     )
                 else:
                     hint = "Run `ada credentials update` and ensure `aws` CLI " "is on PATH."

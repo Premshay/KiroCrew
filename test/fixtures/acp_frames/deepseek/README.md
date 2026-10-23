@@ -1,16 +1,18 @@
 # DeepSeek Harness frame corpus
 
-Six files, all live. Read `../README.md` first for what a fixture is and what
+Seven files, all live. Read `../README.md` first for what a fixture is and what
 the corpus does and does not prove.
 
 | File | Provenance | Frame classes it carries |
 |---|---|---|
 | `handshake-live.jsonl` | live | initialize response with `agentInfo.version`, `session/new` response with a `sessionId` and its config options, the `session/load` **rejection**, and the `session/list` result |
+| `steering-live.jsonl` | live | Retained feature build `1206d4da80`: advertised steering, queued and consumed echoes, and normal completion of the same prompt. A loopback model received the steer in its second request. Published adapters without the advertised capability retain queue fallback. |
 | `turn-live.jsonl` | live | `session/new` response, `usage_update`, `tool_call`, `tool_call_update`, `agent_message_chunk`, and the `session/prompt` result carrying `stopReason` |
 | `mcp-stdio-mount-live.jsonl` | live | a stdio MCP mount completing a ROUND TRIP: `session/new` with a real server, then `tool_call` / `tool_call_update` for `mcp__crew-probe__crew_probe_echo` |
 | `mcp-stdio-rollback-live.jsonl` | live | the same mount with an unstartable command: `session/new` fails WHOLE and names the server |
 | `permission-request-live.jsonl` | live | `tool_call`, the `session/request_permission` the harness sends with Kiro Crew's gate plugin composed, and the `tool_call_update` through `completed` |
 | `tool-call-id-reuse-live.jsonl` | live | the SAME `toolCallId` (`call_0`) across two consecutive turns of one session: `tool_call`, `session/request_permission` and a terminal `tool_call_update` for each, with the first turn's `session/prompt` result between them |
+| `side-read-only-live.jsonl` | live | six calls in one turn with Kiro Crew's gate plugin composed (dsh 0.2.0-rc.2): `read`, `grep`, `glob`, `write`, `bash` and an unknown `mcp__probe__read`, each a `tool_call` naming the tool in `title`, the `session/request_permission` it raised, and its terminal `tool_call_update` (the three reads `completed` on allow-once, the rest `failed` on reject-once). The evidence `ACP_BACKENDS_SIDE_READONLY` admits deepseek on |
 
 ## What the MCP mount captures establish
 
@@ -159,7 +161,7 @@ loaded -- `agent-host-contract.md` records the version.
 
 ## What the id-reuse capture establishes
 
-The shared gate tripwire (`acp/client.py`, `_tripwire_pi_gate` and
+The shared gate tripwire (`acp/client_permissions.py`, `_tripwire_pi_gate` and
 `_note_pi_gate_asked`) consumes an id's ask and deny at that call's terminal frame,
 on the premise that a tool-call id is NOT unique for the life of a session.
 `tool-call-id-reuse-live.jsonl` is that premise captured rather than asserted. The

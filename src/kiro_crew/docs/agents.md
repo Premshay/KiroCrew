@@ -40,7 +40,19 @@ Use the agent selector dropdown in the chat topbar or welcome screen, or type
 no agent answers to is refused rather than silently running the default agent.
 The same command works in a Slack thread linked to a dashboard chat (it switches
 that chat's agent). `/agent list` and kiro-cli's other `/agent` subcommands are
-passed through unchanged.
+passed through unchanged. kiro-cli's built-in agents (`kiro_default`,
+`kiro_guide`, `kiro_planner`) have no spec file and are accepted by name.
+
+### Per-Conversation (Webex, Discord, Teams, Feishu)
+
+Send `/agent` (`!agent` on Discord) to see the conversation's agent and the
+agents you can pick: the same list Telegram's `/agent` picker shows, so Kiro
+Crew's own agents and app agents are not offered. `/agent <name>` switches:
+the conversation moves to that agent's latest conversation in this chat, or a
+new one, and switching back returns to the one you left. `/agent default` goes
+back to the default agent. `/new` after a switch always starts fresh. A switch waits until the
+current reply finishes. A conversation that continues a dashboard session keeps
+that session's agent; change it from the dashboard.
 
 ### Per-Cron Job
 
@@ -50,11 +62,11 @@ Cron jobs can specify an agent at creation time.
 
 Kiro Crew owns and rewrites a fixed set of specs; [agent-spec-fields.md](agent-spec-fields.md) lists every one of them with what refreshes it. The primary and lite specs are required; the others support goal conducting, pipeline fleet supervision, security conducting, knowledge extraction, research, and heartbeat features.
 
-`kirocrew-conductor` tracks its goal in the work ledger: it mounts `kirocrew-work`, binds each item to a session before seeding it, and settles every completion claim with the acceptance evaluator instead of by reading a transcript. `kirocrew-ledger-conductor` is a deprecated alias of it — the same spec under the flow's old name, kept for one release so a session or cron that names the old string keeps resolving, and removed next release. `kirocrew-worker` is the agent a conductor names for a leaf item — the default agent's own resolved toolset plus the two reporting tools. In short, `kirocrew-worker` is `kirocrew` + `@kirocrew-work` − cron scheduling − the opt-in sets nobody assigned to it: a worker gets your default agent's own toolset so it can do any item's work, but it does not auto-approve scheduling a recurring job that would outlive the item. Which fields are mirrored, when the mirror is re-checked, and what happens when it cannot be re-derived are in [agent-spec-fields.md](agent-spec-fields.md).
+`kirocrew-conductor` tracks its goal in the work ledger: it mounts `kirocrew-work`, binds each item to a session before seeding it, and settles every completion claim with the acceptance evaluator instead of by reading a transcript. The pipeline and security conductors mount `kirocrew-work` too and record each item they dispatch as a work-ledger row, which is what their Dashboard tab reads; their own queue or findings ledger stays the detail behind that row. `kirocrew-ledger-conductor` is a deprecated alias of it — the same spec under the flow's old name, kept for one release so a session or cron that names the old string keeps resolving, and removed next release. `kirocrew-worker` is the agent a conductor names for a leaf item — the default agent's own resolved toolset plus the two reporting tools. In short, `kirocrew-worker` is `kirocrew` + `@kirocrew-work` − cron scheduling − the opt-in sets nobody assigned to it: a worker gets your default agent's own toolset so it can do any item's work, but it does not auto-approve scheduling a recurring job that would outlive the item. Which fields are mirrored, when the mirror is re-checked, and what happens when it cannot be re-derived are in [agent-spec-fields.md](agent-spec-fields.md).
 
 ## Custom Agents
 
-Custom agents are JSON or markdown files in `~/.kiro/agents/` (or a project's `.kiro/agents/`). They define their own system prompt, tools, MCP servers, and permissions. To create, edit or delete your own custom agents in the app, open **Customize → Custom agents**: it lists every installed custom agent by origin, edits the ones you own (description, model, prompt, tools, skills), duplicates a package or built-in one into one you own, and refuses to delete a custom agent while a crewmate, the default agent, a schedule, a chat folder's default agent, a webhook token or a private copy still uses it — the refusal lists them. Deleting on disk also works: remove the file from `~/.kiro/agents/`. A crew still bound to a deleted name does not break: kiro-cli cannot resolve the missing spec and falls back to the default agent spec for that session, so the crew keeps running — with the default prompt and tools instead of the deleted template's. Check a template's bindings and repoint them before removing the file so no crew silently changes behavior.
+Custom agents are JSON or markdown files in `~/.kiro/agents/` (or a project's `.kiro/agents/`). They define their own system prompt, tools, MCP servers, and permissions. To create, edit or delete your own custom agents in the app, open **Customize → Custom agents**: it lists every installed custom agent by origin, edits the ones you own (description, model, prompt, tools, skills), duplicates a package or built-in one into one you own, and refuses to delete a custom agent while a mate, the default agent, a schedule, a chat folder's default agent, a webhook token or a private copy still uses it — the refusal lists them. Deleting on disk also works: remove the file from `~/.kiro/agents/`. A crew still bound to a deleted name does not break: kiro-cli cannot resolve the missing spec and falls back to the default agent spec for that session, so the crew keeps running — with the default prompt and tools instead of the deleted template's. Check a template's bindings and repoint them before removing the file so no crew silently changes behavior.
 
 ```json
 {
@@ -103,13 +115,13 @@ What differs from a JSON agent:
 
 ## Managing Agents
 
-**Customize → Crewmates** shows your crewmates; select one and open its **Built from** pane to see its definition — model, system prompt, skills, tools, and MCP servers. Drop a new JSON or markdown file into `~/.kiro/agents/` and it appears automatically. `/agents` redirects to Customize.
+**Customize → Custom agents** lists every agent definition and is where one is edited — model, system prompt, skills and tools. A mate's editor (**Customize → Mates**, or the Mates page) shows the agent it is built from in its **Built from** section, read-only: a mate does not own that definition, so editing it there would change every mate built from the same agent. Drop a new JSON or markdown file into `~/.kiro/agents/` and it appears automatically. `/agents` redirects to Customize.
 
 ## Mapping Skills to an Agent
 
-Each agent template can be given its own set of [skills](skills.md). Open **Customize → Crewmates**, select a crewmate, open its **Built from** pane, and use the **Skills** section to add or remove them. Every edit saves immediately.
+Each agent template can be given its own set of [skills](skills.md). Open **Customize → Custom agents**, select the agent, and use its **Skills** section to add or remove them. Every edit saves immediately.
 
-Under the hood a mapped skill is a `skill://` entry in the agent's `resources`. Kiro Crew reads that entry to scope the agent's skill directory and its `skill_search`/read access; it does not rely on the native backend loading `skill://` resources. Native launch views carry no `skill://` resources (see `src/kiro_crew/acp/skill_projection.py`), and Kiro Crew supplies the skill directory itself:
+Under the hood a mapped skill is a `skill://` entry in the agent's `resources`. Kiro Crew reads that entry to scope the agent's skill directory and its `skill_search`/read access; it does not rely on the native backend loading `skill://` resources. Native launch views carry no `skill://` resources (see `src/kiro_crew/acp/skill_projection_parts/preparation.py`), and Kiro Crew supplies the skill directory itself:
 
 ```json
 {

@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
-import { createPortal } from 'react-dom'
+import { OverlayPortal } from '../overlayRoot'
 import { Crop, FileText, Loader2, PenLine, Plus, X } from 'lucide-react'
 import { useAnchorRemeasure } from '../../hooks/useAnchorRemeasure'
+import { usePressActivation } from '../../hooks/usePressActivation'
 import { isScreenSnipSupported } from '../../hooks/useScreenSnip'
 import { i18nT } from '../../i18n/t'
+import { uiLocation } from '../../uiLocations/uiLocation'
+import { GuideRevealScope } from '../../guide/GuideRevealScope'
 import type { ComposerControl } from '../composerControl'
-import type { useComposerPickers } from './pickers'
+import type { useComposerPickers } from '../../chat-core/composer/pickers'
 import type { ChatInputProps } from './props'
 
 /* The attach control at the head of the bottom row: the "+" drop-up (upload,
@@ -90,7 +93,7 @@ export function usePlusMenu({ pickers, value, onChange, composerControl, fileInp
   const [plusRect, setPlusRect] = useState<DOMRect | null>(null)
   useEffect(() => {
     if (!plusOpen) return
-    // Menu is portaled to <body> (escapes the input's overflow-hidden), so the
+    // Menu is portaled to the body-level overlay root (escapes the input's overflow-hidden), so the
     // outside-click guard must also exclude the portaled menu, not just the button.
     const h = (e: MouseEvent) => {
       const t = e.target as Node
@@ -139,11 +142,13 @@ export function usePlusMenu({ pickers, value, onChange, composerControl, fileInp
   return { plusOpen, setPlusOpen, sketchOpen, setSketchOpen, plusWrapRef, plusBtnRef, plusMenuRef, plusRect, togglePlus, openTrigger }
 }
 
-export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, directFilePicker, collapsible, fileInputId, openPicker, isMac, isMobile, onScreenshot, collapseMenuRow, typedCommandMenus, onFileSelect }: {
+export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, uploadCount, directFilePicker, collapsible, fileInputId, openPicker, isMac, isMobile, onScreenshot, collapseMenuRow, typedCommandMenus, onFileSelect }: {
   plus: ReturnType<typeof usePlusMenu>
   onUploadFiles?: (files: File[]) => void
   uploading: boolean
   onCancelUpload?: () => void
+  /** Uploads the cancel control aborts; above one, its label names the count. */
+  uploadCount: number
   directFilePicker: boolean
   collapsible: boolean
   fileInputId: string
@@ -157,6 +162,11 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
   onFileSelect: ChatInputProps['onFileSelect']
 }) {
   const { plusOpen, setPlusOpen, setSketchOpen, plusWrapRef, plusBtnRef, plusMenuRef, plusRect, togglePlus, openTrigger } = plus
+  // The "+" trigger opens its menu on the mouse press (usePressActivation);
+  // keyboard and touch stay on click. The outside-press dismiss skips the
+  // trigger's wrapper, so a press on it while open is a toggle. The menu moves
+  // no focus on open, so the trigger takes focus as usual (no keepFocusOffTrigger).
+  const bindPlusPress = usePressActivation()
   /**
    * The exit from an upload in flight, and the reason it REPLACES the attach
    * control rather than sitting beside it.
@@ -183,13 +193,18 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
    * ends the transfer, and the control has to stop reading as the attach
    * button's spot doing attach things.
    */
+  // One press aborts EVERY upload in flight (paste, a drop and a Sketch insert
+  // all start one ungated), so with two or more the label says how many stop.
+  const cancelLabel = uploadCount > 1
+    ? i18nT('components.chatInput.cancel_n_uploads', { count: uploadCount })
+    : i18nT('components.chatInput.cancel_upload')
   const uploadCancelControl = uploading && onCancelUpload ? (
     <button
       type="button"
       onClick={onCancelUpload}
-      className="relative w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all bg-transparent border-none text-muted hover:text-danger hover:bg-danger/10"
-      aria-label={i18nT('components.chatInput.cancel_upload')}
-      title={i18nT('components.chatInput.cancel_upload')}
+      className="relative w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all bg-transparent border-none text-muted hover:text-danger-text hover:bg-danger/10"
+      aria-label={cancelLabel}
+      title={cancelLabel}
     >
       <Loader2 size={28} strokeWidth={1.5} className="animate-spin absolute inset-0 m-auto opacity-30" />
       <X size={16} strokeWidth={2.5} />
@@ -207,24 +222,27 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
               className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all bg-transparent ${uploading ? 'opacity-30 cursor-default' : 'cursor-pointer text-muted hover:text-text hover:bg-bg-hover'}`}
               aria-label={i18nT('components.chatInput.attach_files')}
               title={i18nT('components.chatInput.attach_files')}
+              {...uiLocation('composer.attach-files')}
             >
               {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} />}
             </label>
           ) : (
             <button
-              ref={plusBtnRef}
               className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? 'text-text bg-bg-hover' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
-              onClick={togglePlus}
+              {...bindPlusPress<HTMLButtonElement>(togglePlus)}
               disabled={uploading}
               aria-haspopup="menu"
               aria-expanded={plusOpen}
               aria-label={i18nT('components.chatInput.add_files_options')}
               title={i18nT('components.chatInput.add_files_options')}
+              {...uiLocation('composer.add-menu', plusBtnRef)}
             >
               {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`} />}
             </button>
           ))}
-          {!directFilePicker && plusOpen && plusRect && createPortal(
+          {/* The drop-up's scope owner, outside its own open conditional. */}
+          <GuideRevealScope id="menu:composer.add-menu" open={!directFilePicker && plusOpen}>
+          {!directFilePicker && plusOpen && plusRect && <OverlayPortal>
             <div
               ref={plusMenuRef}
               className="fixed w-[260px] rounded-xl bg-bg-elevated border border-border shadow-xl p-2 animate-slide-up z-[60]"
@@ -234,6 +252,7 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
                 <button
                   type="button"
                   onClick={() => openPicker(false)}
+                  {...uiLocation('composer.add-menu.upload')}
                   className="flex-1 flex flex-col items-center gap-1.5 px-2 py-3 rounded-lg border border-border bg-transparent hover:bg-bg-hover hover:border-border-strong transition-all cursor-pointer"
                 >
                   <FileText size={18} className="text-muted" />
@@ -243,6 +262,7 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
                   <button
                     type="button"
                     onClick={() => { setPlusOpen(false); onScreenshot() }}
+                    {...uiLocation('composer.add-menu.screenshot')}
                     className="flex-1 flex flex-col items-center gap-1.5 px-2 py-3 rounded-lg border border-border bg-transparent hover:bg-bg-hover hover:border-border-strong transition-all cursor-pointer"
                   >
                     <Crop size={18} className="text-muted" />
@@ -261,6 +281,7 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
                   type="button"
                   onClick={() => { setPlusOpen(false); setSketchOpen(true) }}
                   title={i18nT('components.chatInput.sketch')}
+                  {...uiLocation('composer.add-menu.sketch')}
                   className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                 >
                   <PenLine size={14} className="w-4 shrink-0 text-muted lucide-inline" />
@@ -296,6 +317,7 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
                   type="button"
                   onClick={() => openTrigger('/')}
                   title={i18nT('components.chatInput.slash_commands')}
+                  {...uiLocation('composer.add-menu.slash')}
                   className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                 >
                   <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">/</span>
@@ -309,6 +331,7 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
                     type="button"
                     onClick={() => openTrigger('@')}
                     title={i18nT('components.chatInput.reference_a_file')}
+                    {...uiLocation('composer.add-menu.reference-file')}
                     className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                   >
                     <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">@</span>
@@ -322,6 +345,7 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
                   type="button"
                   onClick={() => openTrigger('$')}
                   title={i18nT('components.chatInput.use_a_skill')}
+                  {...uiLocation('composer.add-menu.skill')}
                   className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                 >
                   <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">$</span>
@@ -331,9 +355,9 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, dir
                   </div>
                 </button>}
               </div>
-            </div>,
-            document.body
-          )}
+            </div>
+          </OverlayPortal>}
+          </GuideRevealScope>
         </div>
       )}
       {/* Touch path: directFilePicker replaces the "+" drop-up with a

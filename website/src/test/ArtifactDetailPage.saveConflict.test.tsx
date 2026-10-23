@@ -7,7 +7,7 @@
  * driven under jsdom; controlled so a regression that re-seeds the buffer fails.
  */
 import { forwardRef, useImperativeHandle } from 'react'
-import { screen, waitFor, fireEvent } from '@testing-library/react'
+import { screen, waitFor, fireEvent, within } from '@testing-library/react'
 import { Routes, Route, useNavigate } from 'react-router-dom'
 import ArtifactDetailPage from '../pages/ArtifactDetailPage'
 import { renderWithProviders } from './helpers'
@@ -15,6 +15,7 @@ import { api } from '../api/client'
 import { ApiError } from '../api/apiError'
 import type { PierreEditorHandle } from '../pierre'
 import type { Artifact } from '../types'
+import { chooseMore } from './artifactMoreMenu'
 
 vi.mock('../api/client')
 vi.mock('../pages/ChatPage', () => ({
@@ -68,33 +69,41 @@ const conflict = () =>
   )
 
 async function editAndDirty() {
-  renderWithProviders(
+  const view = renderWithProviders(
     <Routes>
       <Route path="/artifacts/:slug" element={<ArtifactDetailPage />} />
     </Routes>,
     { route: '/artifacts/cr-queue' },
   )
   await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-  fireEvent.click(screen.getByTitle('Edit content'))
+  fireEvent.click(screen.getByRole('button', { description: 'Edit content' }))
   const editor = await screen.findByTestId('editor-stub')
   fireEvent.change(editor, { target: { value: '# v1 edited' } })
+  return view
+}
+
+/** Pick `label` in the Version selector, confirming the discard prompt when asked. */
+async function pickVersion(label: string, { discard = false } = {}) {
+  fireEvent.click(await screen.findByRole('combobox', { name: /Version/i }))
+  fireEvent.click(await screen.findByRole('option', { name: label }))
+  if (discard) {
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Discard changes' }))
+  }
 }
 
 const saveCalls = () => vi.mocked(api.updateArtifact).mock.calls.map(([, body]) => body)
 
+const FORK_METADATA = {
+  upstream_artifact_id: 'up-1',
+  upstream_url: 'https://remote.example.com/a/up-1',
+  upstream_owner: 'alice',
+  upstream_version: 3,
+  forked_at: '2026-06-01T00:00:00Z',
+}
+
 /** Render the fork banner: a forked artifact plus one registered publish provider. */
 function withForkBanner() {
-  vi.mocked(api).artifact = vi.fn().mockResolvedValue(
-    mkArtifact({
-      fork_metadata: {
-        upstream_artifact_id: 'up-1',
-        upstream_url: 'https://remote.example.com/a/up-1',
-        upstream_owner: 'alice',
-        upstream_version: 3,
-        forked_at: '2026-06-01T00:00:00Z',
-      },
-    }),
-  )
+  vi.mocked(api).artifact = vi.fn().mockResolvedValue(mkArtifact({ fork_metadata: FORK_METADATA }))
   vi.mocked(api).getArtifactPublishProviders = vi.fn().mockResolvedValue({
     providers: [{
       name: 'companion', display_name: 'Companion', capabilities: ['content_versions'],
@@ -178,14 +187,14 @@ function renderCrossArtifactSave(write: Promise<Artifact>) {
 
 async function beginCrossArtifactSave() {
   await screen.findByText('File A')
-  fireEvent.click(screen.getByTitle('Edit content'))
+  fireEvent.click(screen.getByRole('button', { description: 'Edit content' }))
   fireEvent.change(await screen.findByTestId('editor-stub'), { target: { value: '# file a edited' } })
   fireEvent.click(screen.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(saveCalls()).toHaveLength(1))
 
   fireEvent.click(screen.getByRole('button', { name: 'go to store-b' }))
   await screen.findByText('Store B')
-  fireEvent.click(screen.getByTitle('Edit content'))
+  fireEvent.click(screen.getByRole('button', { description: 'Edit content' }))
   fireEvent.change(await screen.findByTestId('editor-stub'), { target: { value: '# store b edited' } })
 }
 
@@ -287,19 +296,90 @@ describe('stale-write guard', () => {
     expect(await screen.findByRole('button', { name: 'Save' })).toBeInTheDocument()
   })
 
+  it('switching version after a 409 clears the conflict notice', async () => {
+    vi.mocked(api).artifactVersions = vi.fn().mockResolvedValue({ slug: 'cr-queue', versions: [1, 2] })
+    vi.mocked(api).artifactVersion = vi.fn().mockResolvedValue(mkArtifact({ content: '# v1 historical' }))
+    vi.mocked(api).updateArtifact = vi.fn().mockRejectedValue(conflict())
+    await editAndDirty()
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByText(/Content changed since you loaded it/)
+
+    await pickVersion('v1', { discard: true })
+
+    await waitFor(() => expect(screen.queryByTestId('editor-stub')).not.toBeInTheDocument())
+    await waitFor(() => expect(api.artifactVersion).toHaveBeenCalledWith('cr-queue', 1))
+    expect(await screen.findByText('CR Queue')).toBeInTheDocument()
+    expect(screen.queryByText(/Content changed since you loaded it/)).not.toBeInTheDocument()
+    expect(screen.queryByText('Not saved.')).not.toBeInTheDocument()
+  })
+
+  it('a refused pull flush that returns after a version switch shows no notice', async () => {
+    withForkBanner()
+    const v1 = mkArtifact({ content: '# v1 historical', fork_metadata: FORK_METADATA })
+    vi.mocked(api).artifactVersions = vi.fn().mockResolvedValue({ slug: 'cr-queue', versions: [1, 2] })
+    vi.mocked(api).artifactVersion = vi.fn().mockResolvedValue(v1)
+    const flush = pendingWrite()
+    vi.mocked(api).updateArtifact = vi.fn().mockReturnValueOnce(flush.write)
+    const { queryClient } = await editAndDirty()
+    // Cached, so v1 renders at once and the banner, whose pull is still waiting on
+    // the flush, stays mounted through the switch.
+    queryClient.setQueryData(['artifact', 'cr-queue', 'version', 1], v1)
+    fireEvent.click(await screen.findByRole('button', { name: 'Pull latest' }))
+    await waitFor(() => expect(saveCalls()).toHaveLength(1))
+
+    await pickVersion('v1', { discard: true })
+    await waitFor(() => expect(screen.queryByTestId('editor-stub')).not.toBeInTheDocument())
+    flush.refuse(conflict())
+
+    // The pull re-enables only once the refusal has been handled.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Pull latest' })).toBeEnabled())
+    expect(screen.queryByText('Not saved.')).not.toBeInTheDocument()
+    expect(api.pullLatest).not.toHaveBeenCalled()
+  })
+
+  it('a refused save that returns after Escape and discard shows no notice', async () => {
+    const save = pendingWrite()
+    vi.mocked(api).updateArtifact = vi.fn().mockReturnValueOnce(save.write)
+    await editAndDirty()
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(saveCalls()).toHaveLength(1))
+    fireEvent.keyDown(document, { key: 'Escape' })
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Discard changes' }))
+    await waitFor(() => expect(screen.queryByTestId('editor-stub')).not.toBeInTheDocument())
+    save.refuse(conflict())
+
+    // The selector re-enables only once the refusal has been handled.
+    await waitFor(() => expect(screen.getByRole('combobox', { name: /Version/i })).toBeEnabled())
+    expect(screen.queryByText('Not saved.')).not.toBeInTheDocument()
+  })
+
+  it('a version switch leaves preview mode, so the next edit opens the editor', async () => {
+    vi.mocked(api).artifactVersions = vi.fn().mockResolvedValue({ slug: 'cr-queue', versions: [1, 2] })
+    vi.mocked(api).artifactVersion = vi.fn().mockResolvedValue(mkArtifact({ content: '# v1 historical' }))
+    await editAndDirty()
+    await chooseMore('Preview')
+    await waitFor(() => expect(screen.queryByTestId('editor-stub')).not.toBeInTheDocument())
+
+    await pickVersion('v1', { discard: true })
+    await waitFor(() => expect(api.artifactVersion).toHaveBeenCalledWith('cr-queue', 1))
+    await pickVersion('Live')
+    fireEvent.click(await screen.findByRole('button', { description: 'Edit content' }))
+    expect(await screen.findByTestId('editor-stub')).toBeInTheDocument()
+  })
+
   // Only the relabelled Save may send the overwrite token; every other save
   // path keeps the base token and is refused again.
   it.each([
-    ['the Snapshot button', () => fireEvent.click(screen.getByRole('button', { name: /^Snapshot/ })), true],
-    ['Cmd+S', () => fireEvent.keyDown(document, { key: 's', metaKey: true }), false],
-    ['Cmd+Shift+S', () => fireEvent.keyDown(document, { key: 's', metaKey: true, shiftKey: true }), true],
+    ['the Snapshot menu item', () => chooseMore(/^Snapshot/), true],
+    ['Cmd+S', () => { fireEvent.keyDown(document, { key: 's', metaKey: true }) }, false],
+    ['Cmd+Shift+S', () => { fireEvent.keyDown(document, { key: 's', metaKey: true, shiftKey: true }) }, true],
   ])('after a 409, %s keeps the base token', async (_label, act, snapshot) => {
     vi.mocked(api).updateArtifact = vi.fn().mockRejectedValue(conflict())
     await editAndDirty()
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await screen.findByRole('button', { name: 'Save — overwrite newer content' })
 
-    act()
+    await act()
     await waitFor(() => expect(saveCalls()).toHaveLength(2))
     expect(saveCalls()[1]).toEqual({ content: '# v1 edited', snapshot, expected_token: TOKEN_V1 })
     expect(screen.getByTestId('editor-stub')).toHaveValue('# v1 edited')

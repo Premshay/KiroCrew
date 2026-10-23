@@ -63,6 +63,8 @@ never changes. The fix is `launchctl setenv PATH "$PATH"` plus a full quit and
 relaunch — see the
 [macOS troubleshooting guide](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/macos-troubleshooting.md)
 for the recipe and how to persist it across reboots.
+To add only a few directories, a `PATH=` line in `~/.kiro/crew/.env` does it
+without touching launchd; see [Credentials](configuration.md#credentials).
 
 ### Dashboard asks for sign-in but `kiro-cli` is already authenticated
 
@@ -208,6 +210,19 @@ prints an `MCP Governance (enterprise)` section on Identity Center hosts with th
 current state. Full walkthrough, including the registry JSON your administrator
 needs: `docs/guides/enterprise-mcp-governance.md`.
 
+### A server from your organization's MCP registry shows "Not verified"
+
+A server you installed from your organization's MCP registry (through Kiro IDE or
+the Kiro CLI) shows **Not verified** under Connections → MCP Servers, with no
+command. That is expected. The Kiro CLI wrote it into `~/.kiro/settings/mcp.json`
+as a pointer, `{"type": "registry"}`, and loads the real server from the registry
+when a session starts. Kiro Crew cannot read the registry, so the dashboard does
+not start or check that server itself.
+
+Kiro Crew passes the pointer on to every Kiro CLI session unchanged. To see
+whether it connected, run `kiro-cli mcp list`, or ask an agent to use one of its
+tools. Sessions on the Claude or KAS backends do not load registry servers.
+
 ### A remote MCP server shows "Not verified"
 
 Remote MCP servers that authenticate with OAuth — Atlassian, for example — can
@@ -235,6 +250,7 @@ A server that is genuinely broken reads **Error** with the reason next to it, no
 
 ```bash
 kirocrew status                          # is the gateway running?
+kirocrew logs -n 200                     # what did it log before it stopped?
 curl http://localhost:5476/api/status    # is it answering on the expected port?
 ```
 
@@ -256,8 +272,9 @@ on another port with `KIROCREW_PORT`.
 Kiro Crew auto-compacts at `session.autocompact_pct` context usage (70% by
 default for a new install — an existing `config.json` keeps whatever value it
 already stores, which for installs created before this default changed is
-`90.0`; check with `kirocrew config get session.autocompact_pct`). If
-compaction fires often:
+`90.0`; check with `kirocrew config get session.autocompact_pct`). The KAS
+backend is the exception: it decides when to compact on its own, and this
+setting does not change that. If compaction fires often:
 
 - Reduce always-on skills, which consume context in every session
 - Check memory size: large preferences and project files eat into the budget
@@ -391,6 +408,30 @@ screenshots). A directory is reclaimed automatically once every process
 recorded in its `.owner` file has exited and nothing in it has been touched for
 an hour, so short-lived sessions clean up on their own.
 
+A directory that holds a git repository (a clone, a workspace of checkouts, a
+bare repository) is never deleted this way, because nothing outside the agent
+can prove the work in it is saved. It is moved into the `.quarantine`
+directory beside the others instead, named `<UTC time of the move>-<its own
+name>`, and deleted from there 14 days after the move (later, if something was
+written into it in the last hour). The gateway log names every move in one
+INFO line: `agent-scratch: moved <name> to <path in .quarantine> instead of
+deleting it`, with the date it will be deleted.
+
+The quarantine keeps the work, not what tools rebuild from it. Each kept
+directory loses its `node_modules`, `__pycache__`, `.pytest_cache`,
+`.mypy_cache`, `.ruff_cache`, `.tox` and `.nox` directories, its Python
+virtual environments (any directory holding a `pyvenv.cfg` file and no git
+repository) and its pytest temp directories (`pytest-of-*` at its top), on
+every hourly sweep, so edits under `node_modules` are not kept and a
+dependency installed inside `.quarantine` is removed again. Nothing inside a
+`.git` directory is touched. A repository that sits only inside one of those, such as
+the throwaway ones a test suite creates, does not count, so a directory whose
+only repositories are there is deleted at once. Run `npm ci` or recreate the
+venv after restoring one. To keep the work, move the
+directory out of `.quarantine` before that date (copying files out of it does
+not delay the delete), or commit and push it from there; to restore it for its
+session, move it back beside the others under its original name.
+
 One directory does not: the background runtime's tree is shared by every
 dashboard session and is handed on from one runtime to its replacement, so it
 lives as long as the gateway does and is never pruned while a session might
@@ -405,6 +446,33 @@ Do not delete a directory whose `.owner` names a live process.
 ```bash
 du -sh ~/.kiro/crew/scratch/*/ | sort -h | tail
 ```
+
+#### Moving scratch off the system drive
+
+On Windows the scratch tree lives on `C:` by default and can hold bulky,
+disposable data (staged self-update installers, clones, build logs) that fills
+the system drive. To relocate the whole managed scratch root to a data drive,
+set `KIROCREW_SCRATCH_ROOT` to a real directory and restart the gateway:
+
+```bash
+# Windows (PowerShell), persisted for the user:
+setx KIROCREW_SCRATCH_ROOT "D:\kirocrew-scratch"
+```
+
+The path is used as the scratch root itself. A value naming a drive/filesystem
+root or a known system directory is refused and logged
+(`KIROCREW_SCRATCH_ROOT=… is a system directory, ignoring`), falling back to the
+default `~/.kiro/crew/scratch`. Redirecting the directory with an NTFS junction
+or symlink is refused for safety, so this env var is the supported way to move
+it. The target must be on a drive with access control (NTFS); a FAT/exFAT volume
+is refused (`KIROCREW_SCRATCH_ROOT=… volume has no access control (FAT/exFAT)`)
+because it cannot be locked to your account. `KIROCREW_SCRATCH_ROOT` is honoured on Windows only; it is ignored on Linux
+and macOS, where scratch stays at the default `~/.kiro/crew/scratch`. Note
+`KIROCREW_SCRATCH` (no `_ROOT`) is unrelated — it is an output written
+for child processes, and setting it yourself does nothing.
+
+Setting `KIROCREW_HOME` to a data drive relocates the whole data home,
+scratch included, if you want everything off `C:` rather than scratch alone.
 
 ### Subagent completion event seems cut off
 

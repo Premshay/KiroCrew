@@ -651,7 +651,15 @@
             "spender": null
           }
         ],
-        "omitted": 0
+        "omitted": 0,
+        "forgotten": {
+          "created": 3,
+          "items": 0,
+          "accepted": 0,
+          "rejected": 0,
+          "abandoned": 0,
+          "in_round": 0
+        }
       }
     }
   },

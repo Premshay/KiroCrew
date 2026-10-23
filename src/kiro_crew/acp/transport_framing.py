@@ -5,7 +5,8 @@ multiplexed across sessions) exchange newline-delimited JSON-RPC frames over the
 harness's stdio. This module owns the parts of that framing both transports share:
 discarding one oversize stdout line while keeping the stream on a frame boundary,
 bounding a response or notification write by the reader's progress rather than by
-elapsed time, and the bounded settle of the stderr drain on a failure path. Each
+elapsed time, the bounded settle of the stderr drain on a failure path, and the
+encoding of an outgoing frame (:func:`encode_frame`). Each
 transport keeps its own write lock, pending-request table and the death handling a
 failed write triggers.
 
@@ -16,7 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import json
 from typing import Any, Awaitable, Callable
+
+# The proactor check lives in a neutral leaf, because the dashboard's WebSocket hub
+# needs it too and may not import this package. Bound here under the name this
+# module's code and its patch seam use.
+from kiro_crew.write_buffer_level import is_proactor_loop as _is_proactor_loop
 
 # Subprocess stdout buffer — kiro-cli can send large JSON-RPC lines (tool outputs)
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
@@ -42,6 +49,49 @@ class OversizeLineUnrecoverable(Exception):
 OversizeLineUnrecoverable.__module__ = "kiro_crew.acp.client"
 
 
+def _repair_lone_surrogates(value: Any) -> Any:
+    """``value`` with every lone UTF-16 surrogate in its strings made U+FFFD.
+
+    A UTF-16 round trip with ``surrogatepass`` re-pairs a high+low surrogate that
+    sit next to each other as two code points (the same character, so the wire
+    bytes do not change) and leaves only an unpaired half for ``replace`` to turn
+    into U+FFFD. Everything else in the string is untouched.
+    """
+    if isinstance(value, str):
+        return value.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    if isinstance(value, dict):
+        return {
+            _repair_lone_surrogates(key): _repair_lone_surrogates(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_repair_lone_surrogates(item) for item in value]
+    return value
+
+
+def encode_frame(message: dict[str, Any]) -> bytes:
+    """One newline-terminated JSON-RPC frame, as the bytes written to the harness.
+
+    ``json.dumps`` escapes a lone UTF-16 surrogate (half an emoji, e.g. from text
+    clipped by code unit) as ``\\udXXX`` rather than refusing it, but a strict
+    parser on the other end refuses the whole line: kiro-cli answers it with a
+    ``-32700 Parse error`` that carries no ``id``. Nothing can route that error
+    to the request that caused it, so a ``session/prompt`` built from such text
+    left the turn waiting forever with no error. Each lone surrogate is replaced
+    with U+FFFD before the frame goes out, so the agent gets the rest of the
+    message.
+
+    The repair only runs when the encoded frame holds a surrogate escape at all
+    (``json.dumps`` writes them lowercase). A frame without one is encoded exactly
+    as before, and one whose surrogates are all paired re-encodes to the same
+    bytes, so only a frame that held a lone half changes.
+    """
+    data = json.dumps(message)
+    if "\\ud" in data:
+        data = json.dumps(_repair_lone_surrogates(message))
+    return (data + "\n").encode()
+
+
 async def _drain_oversize_line(
     reader: asyncio.StreamReader,
     exc: asyncio.LimitOverrunError,
@@ -55,7 +105,7 @@ async def _drain_oversize_line(
     separator, so consuming it cannot cross into the next frame; retrying
     ``readuntil`` then either returns the remainder of the line or raises for
     another step. Same consume-prefix-and-retry drain as
-    ``mcp_gateway/backend.py::run_stdout_pump``; a plain ``read(n)`` would instead
+    ``mcp_gateway/backend_routing.py::run_stdout_pump``; a plain ``read(n)`` would instead
     eat into the NEXT frame.
 
     The recovered remainder is **discarded, never parsed**. It is a byte-slice of
@@ -147,15 +197,6 @@ _RESPONSE_WRITE_MIN_PROGRESS_BYTES = 4096
 _RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS = 900.0
 
 
-def _is_proactor_loop(loop: asyncio.AbstractEventLoop) -> bool:
-    """Whether ``loop`` is Windows's proactor loop (the only loop that drives
-    subprocess pipes through overlapped I/O). Keyed to the public
-    ``asyncio.ProactorEventLoop`` class the platform owns, which exists only
-    on Windows, rather than to a private transport class name."""
-    proactor = getattr(asyncio, "ProactorEventLoop", None)
-    return proactor is not None and isinstance(loop, proactor)
-
-
 def _level_is_progress_signal(transport: object) -> bool:
     """Whether a transport's write-buffer level moves as the reader consumes.
 
@@ -164,6 +205,10 @@ def _level_is_progress_signal(transport: object) -> bool:
     subprocess pipes: the level is the whole in-flight overlapped write until
     it completes, so it is flat while a live reader consumes a large frame.
     Decided from the running loop, not the transport's class name.
+
+    The same verdict as :func:`kiro_crew.write_buffer_level.level_is_progress_signal`,
+    which the dashboard's WebSocket hub reads. This one reads ``_is_proactor_loop``
+    from this module, where a patch through ``kiro_crew.acp.client`` lands.
     """
     return not _is_proactor_loop(asyncio.get_running_loop())
 

@@ -30,6 +30,7 @@ from kiro_crew.crew_log import (
 )
 from kiro_crew.crew_log import entry_types as reg
 from kiro_crew.crew_log import (
+    lease,
     render_markdown,
 )
 from kiro_crew.crew_log import store as store_mod
@@ -68,6 +69,7 @@ CANONICAL: dict[str, dict] = {
         "previous_parent": {"slot": "chat-3", "sid": "acp-sess-former"},
     },
     "session/released": {"previous_parent": {"slot": "chat-9", "sid": "acp-sess-adopter"}},
+    "session/spawned": {"child": {"slot": "chat-12"}},
     "turn/started": {"turn": 3, "actor": "user", "depth": 0, "message_seq": 11, "attempt": 2},
     "turn/refused": {"turn": 4, "actor": "cron", "reason": "gateway_closing", "depth": 1},
     "turn/completed": {
@@ -273,6 +275,51 @@ CANONICAL: dict[str, dict] = {
         "corrects": [],
         "crew_key": "9f2c" + "0" * 60,
     },
+    "card/proposed": {
+        "slot": "member-helper",
+        "card_id": "cc_0a1b2c3d4e5f",
+        "kind": "setting.change",
+        "title": "Change chat.verbosity to brief",
+        "revision": 1,
+        "risk": "normal",
+        "turn": 3,
+        "mid": "m-7f3a",
+    },
+    "card/finished": {"card_id": "cc_0a1b2c3d4e5f", "status": "applied", "revision": 1},
+    "guide/offered": {
+        "slot": "member-helper",
+        "guide_id": "g_0a1b2c3d4e5f",
+        "actions": ["crewmate.create"],
+        "turn": 4,
+        "mid": "m-7f3b",
+    },
+    "guide/started": {"guide_id": "g_0a1b2c3d4e5f"},
+    "dashboard/goal_recorded": {
+        "goals": [{"text": "Keep the docs current"}],
+        "milestones": [
+            {
+                "text": "Fixes proposed",
+                "target": "3",
+                "current": "4 fixes proposed",
+                "at": "2026-10-18T21:36:00+00:00",
+            }
+        ],
+    },
+    "dashboard/waiting_changed": {
+        "items": [
+            {
+                "kind": "options",
+                "text": "Open a PR for the docs fix?",
+                "options": ["Open the PR", "Not yet"],
+                "asked_at": "2026-10-18T18:40:00+00:00",
+            }
+        ]
+    },
+    "guide/finished": {"guide_id": "g_0a1b2c3d4e5f", "status": "completed"},
+    # A whole working set lost at once: of sixteen listed tabs none comes back, and
+    # all sixteen stay in the reopen seed. ``kept`` counts the SET rather than this
+    # one tab, which is what lets a reader tell that case from one bad transcript.
+    "session/unrestored": {"listed": 16, "restored": 0, "kept": 16},
 }
 
 
@@ -284,6 +331,14 @@ def _isolated_home(tmp_path, monkeypatch):
     yield
     emit.drain_for_shutdown(timeout=2.0)
     emit.reset_caches()
+    # The holder table is process-global, so a handle a test here keeps reachable
+    # is a lease the next test on this worker reads as held. The v0.9.0-insider.4
+    # release run caught one in ``test_crew_log_writer.py``'s teardown, from this
+    # file. Read here, where it is created, without a ``gc.collect()``: a lease
+    # still held is a retention (typically a ``pytest.raises`` record whose
+    # traceback holds the ``append`` frame, and so the handle), not a frame that
+    # has not finished unwinding.
+    assert not lease._held, f"a lease outlived its test on this worker: {sorted(lease._held)}"
 
 
 # --- what is declared ------------------------------------------------------
@@ -330,7 +385,26 @@ def test_every_type_written_today_is_declared_and_nothing_else_is():
     # there is no file beside it), and a refused write's whole worth is its history --
     # a mistake book is a fold over refusals, and one overwritable document could hold
     # none of it.
-    assert len(SESSION_ENTRY_TYPES) == 38
+    #
+    # The five past that are the change cards and guide offers: each proposal is
+    # a row of the conversation, and ``card/*`` / ``guide/*`` record the proposal and
+    # every outcome in the same session's history.
+    #
+    # Two past those joined most recently. The session tree's ``session/spawned`` is
+    # written on the CREATOR's log at session_create time so a child's creating edge
+    # survives a restart before the child's first turn writes a log of its own.
+    #
+    # ``session/unrestored`` is the open-tab registry's own record. It joins for the
+    # reason the agentic pair does -- this log is its ONLY record -- and the gap it
+    # covers is the sharpest of the set: a tab the startup restore lists and cannot
+    # show has nothing to show anywhere else. No ``session/closed``, because the
+    # gateway did not stop serving the session; no delete, because nothing was
+    # deleted; and the restore's own warning goes to a gateway log that rotates away.
+    #
+    # The two past that are a crewmate's own record for its Dashboard page:
+    # ``dashboard/goal_recorded`` and ``dashboard/waiting_changed``, snapshots the gateway
+    # appends when the goal record or the "waiting on you" list changes.
+    assert len(SESSION_ENTRY_TYPES) == 47
     # Nine types the vocabulary owns that nothing writes. Declaring one would state
     # a shape no writer produces, and the first emitter to land would have to
     # satisfy a contract written without it. They pass through undeclared instead.
@@ -407,11 +481,24 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
         ("work/recorded", "state"),
         ("work/recorded", "verdict"),
         ("work/recorded", "status"),
+        # A worker's blocked reason: the tool schema and the store both refuse a
+        # value outside the vocabulary before the entry is built.
+        ("work/recorded", "reason"),
         ("work/recorded", "event_kind"),
         # The dashboard instance store clamps its action the same way, and imports the
         # vocabulary from the declaration beside the type, so the closed enum and the
         # writer's set are one tuple.
         ("dashboard/instance_changed", "action"),
+        # A budget cut's reason: ``context_omissions.record`` refuses any other value
+        # before it stores the cut, and the declaration imports the same tuple, so the
+        # closed enum and the writer's set are one set.
+        ("context/composed", "reason"),
+        # The card and guide stores' own finished statuses: the emitter refuses any
+        # other value before it builds the entry.
+        ("card/finished", "status"),
+        ("guide/finished", "status"),
+        # Dropped by the emitter, not refused, when it is not a known reason.
+        ("guide/finished", "reason"),
     }
     emitted = set(_types_with_a_producing_site())
     assert {spec_type for spec_type, _ in closed} <= emitted
@@ -420,7 +507,7 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
 #: The append primitives in :mod:`kiro_crew.crew_log.emit` and its durable writer,
 #: each mapped to the index of the positional argument that names the entry type.
 #:
-#: Keyed on the CALLEE rather than on any type-shaped literal, because emit.py also
+#: Keyed on the CALLEE rather than on any type-shaped literal, because emit_turn.py also
 #: hands an entry type to helpers that append nothing -- ``_entry_line_fits`` is
 #: given ``"plan/updated"`` to measure a line -- and counting those would report a
 #: type as emitted at a site that never appends.
@@ -479,8 +566,8 @@ def _types_the_writers_append() -> dict[str, bool]:
         # one non-ignorable append is all it takes to stop a folding reader.
         skippable[entry_type] = skippable.get(entry_type, True) and ignorable
 
-    for module in (emit, writer_mod, store_mod):
-        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    for path in _writer_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 keywords = {item.arg: item.value for item in node.keywords if item.arg}
@@ -506,6 +593,15 @@ def _types_the_writers_append() -> dict[str, bool]:
     return skippable
 
 
+def _writer_files():
+    """The writers' source files: the emitter facade with its ``emit_*.py`` owners, its
+    durable writer, and the store facade with its ``store_*.py`` owners, where the
+    crash-repair closer lives."""
+    emit_files = sorted(Path(emit.__file__).parent.glob("emit*.py"))
+    store_files = sorted(Path(store_mod.__file__).parent.glob("store*.py"))
+    return [*emit_files, Path(writer_mod.__file__), *store_files]
+
+
 def _walk(fields):
     for field in fields:
         yield field
@@ -516,10 +612,7 @@ def _types_with_a_producing_site():
     # Read the writers rather than restating their list: a type is emitted when a
     # producing module names it. This holds the closed-enum rule to code that
     # exists, so wiring a resolver cannot quietly leave an unenforceable set behind.
-    sources = [
-        Path(module.__file__).read_text(encoding="utf-8")
-        for module in (emit, writer_mod, store_mod)
-    ]
+    sources = [path.read_text(encoding="utf-8") for path in _writer_files()]
     for spec_type in SESSION_ENTRY_TYPES:
         if any(f'"{spec_type}"' in text for text in sources):
             yield spec_type
@@ -814,7 +907,11 @@ def test_append_refuses_a_bad_payload_and_leaves_the_file_identical():
     before = crew_log_path("session", SESSION).read_bytes()
     with pytest.raises(CrewLogError) as caught:
         led.append("turn/started", {"turn": 1, "actor": "user"}, src="gateway")
-    assert caught.value.code == CODE_BAD_DATA_FIELD
+    code = caught.value.code
+    # The record's traceback holds this frame, and so ``led``: a cycle that keeps
+    # the write lease held past the test until the collector runs.
+    del caught
+    assert code == CODE_BAD_DATA_FIELD
     assert crew_log_path("session", SESSION).read_bytes() == before
     # The handle is still usable: a refusal happens before any byte is written.
     led.append("turn/started", CANONICAL["turn/started"], src="gateway")
@@ -845,7 +942,10 @@ def test_a_group_refuses_a_citing_entry_the_registry_rejects():
             src="acp",
             cite=lambda seqs: {"type": "message/sent", "data": {"turn": 1, "typo": seqs}},
         )
-    assert caught.value.field == "data.typo"
+    field = caught.value.field
+    # Same cycle as above: the record's traceback would keep ``led`` and its lease.
+    del caught
+    assert field == "data.typo"
     assert crew_log_path("session", SESSION).read_bytes() == before
 
 

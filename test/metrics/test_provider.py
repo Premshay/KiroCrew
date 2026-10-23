@@ -4,10 +4,43 @@ import threading
 import time
 
 import pytest
+from _clock_isolation import assert_clock_is_private
 
+import kiro_crew.metrics.provider as _provider
 from kiro_crew.config.loader import KiroCrewConfig, TelemetryConfig
 from kiro_crew.metrics.provider import MetricsRecorder, get_recorder, reset_for_testing
 from kiro_crew.metrics.provider import shutdown as provider_shutdown
+from kiro_crew.testing.clock import ManualClock
+from kiro_crew.testing.wait import wait_until
+
+#: Taken at import, before any test installs a clock.
+_REAL_SLEEP = time.sleep
+
+
+class _SignalledPolls(ManualClock):
+    """The reset wait's poll clock: ``entered`` is set on every poll sleep.
+
+    Each poll also takes its real duration, because what the wait polls for is a
+    real worker thread clearing its flag. Installed on the provider module alone.
+    Its ``time`` IS the stdlib module, so a hook on ``provider.time.sleep`` would
+    also fire for every other thread's sleep in the worker and report a poll the
+    wait loop never made.
+    """
+
+    def __init__(self, entered: threading.Event) -> None:
+        super().__init__()
+        self._entered = entered
+
+    def sleep(self, seconds: float) -> None:
+        super().sleep(seconds)
+        self._entered.set()
+        _REAL_SLEEP(seconds)
+
+
+def test_another_thread_keeps_the_real_sleep_and_clock(monkeypatch):
+    clock = ManualClock()
+    clock.install(monkeypatch, _provider)
+    assert_clock_is_private(clock, _provider)
 
 
 def _patch_config(monkeypatch, **tel_kwargs):
@@ -51,21 +84,6 @@ def test_recorder_is_cached(monkeypatch):
         assert get_recorder() is get_recorder()
     finally:
         reset_for_testing()
-
-
-def _wait_for(predicate, timeout=5.0):
-    """Poll until predicate holds. Used where the background work is a trivial
-    no-op that completes in microseconds (e.g. a fake reader shutdown call, or
-    draining a real worker after a deliberately-triggered timeout in
-    ``TestResetForTestingWaitsOutInFlightWorker``). Tests that need to observe
-    a real consent-worker RUN use event-based synchronization instead — see
-    ``_worker_event``."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return False
 
 
 def _worker_event(monkeypatch):
@@ -126,7 +144,7 @@ def test_reader_thread_reaped_when_meterprovider_init_fails(tmp_path, monkeypatc
     try:
         rec = get_recorder()
         assert rec.enabled is False  # degraded to no-op
-        assert _wait_for(lambda: shutdown_calls["n"] == 1)  # reaped, not orphaned
+        wait_until(lambda: shutdown_calls["n"] == 1)  # reaped, not orphaned
     finally:
         reset_for_testing()
 
@@ -170,9 +188,10 @@ def test_the_otlp_reader_is_reaped_too_when_init_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(provider_mod, "MeterProvider", _boom)
     try:
         assert get_recorder().enabled is False
-        assert _wait_for(
-            lambda: sorted(shut) == ["local", "otlp"]
-        ), f"expected both readers reaped, got {sorted(shut)}"
+        wait_until(
+            lambda: sorted(shut) == ["local", "otlp"],
+            describe=lambda: f"expected both readers reaped, got {sorted(shut)}",
+        )
     finally:
         reset_for_testing()
 
@@ -1108,8 +1127,8 @@ class TestResetForTestingWaitsOutInFlightWorker:
         The worker is a deliberately slow, event-gated fake build (never a
         wall-clock sleep) sitting inside the product's real
         ``_consent_worker``, so ``_check_in_flight`` is set and cleared by the
-        product code path, not by this test. A hook on the wait loop's
-        ``time.sleep`` call proves ``reset_for_testing`` actually entered its
+        product code path, not by this test. A hook on the wait loop's own
+        poll sleep (``_SignalledPolls``) proves ``reset_for_testing`` entered its
         wait loop, so the ordering is established by that signal rather than
         a guessed delay.
         """
@@ -1142,13 +1161,7 @@ class TestResetForTestingWaitsOutInFlightWorker:
             assert in_build.wait(timeout=10), "the worker never started its build"
 
             poll_entered = threading.Event()
-            real_sleep = time.sleep
-
-            def _tracking_sleep(seconds):
-                poll_entered.set()
-                real_sleep(seconds)
-
-            monkeypatch.setattr(provider_mod.time, "sleep", _tracking_sleep)
+            _SignalledPolls(poll_entered).install(monkeypatch, provider_mod)
 
             reset_done = threading.Event()
             reset_error = {}
@@ -1225,5 +1238,5 @@ class TestResetForTestingWaitsOutInFlightWorker:
             # Let the real worker actually finish (its own finally clears the
             # flag) so the next test's reset_for_testing() has nothing to wait
             # out.
-            assert _wait_for(lambda: provider_mod._check_in_flight is False, timeout=10)
+            wait_until(lambda: provider_mod._check_in_flight is False, timeout=10)
             reset_for_testing()

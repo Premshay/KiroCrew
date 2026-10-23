@@ -6,7 +6,7 @@ execution". The dashboard chat runner, ``llm_helpers``, the messaging surfaces
 and the task runner steer the real reason into the running turn first; the eval
 harness (``eval/runner.py`` for the scenario turns, ``eval/judge.py`` for the
 scoring turn) and the subagent surface (its permission ladder, settled by
-``tool_permission.settle`` from ``subagent_manager/run.py``) have no dashboard
+``tool_permission.settle`` from ``subagent_manager/run_turn.py``) have no dashboard
 slot and must do the same.
 
 * The eval modules deny inline, so a SOURCE-LEVEL guard enumerates every
@@ -754,14 +754,15 @@ _SUBAGENT_MODULES = [
     *sorted(
         path.relative_to(_SRC).as_posix() for path in (_SRC / "subagent_manager").rglob("*.py")
     ),
+    *sorted(path.relative_to(_SRC).as_posix() for path in (_SRC / "subagent_parts").glob("*.py")),
 ]
 
 
 def test_the_scanned_modules_hold_the_subagent_ladder():
     # The scan below means something only while the request arm lives in the
-    # files it scans: the run's one settle and its two limit bails.
-    assert "subagent_manager/run.py" in _SUBAGENT_MODULES
-    assert _ladder_entries("subagent_manager/run.py") == {"settle": 1, "bail": 2}
+    # files it scans: the run's one settle, its two limit bails and its stop bail.
+    assert "subagent_manager/run_turn.py" in _SUBAGENT_MODULES
+    assert _ladder_entries("subagent_manager/run_turn.py") == {"settle": 1, "bail": 3}
 
 
 @pytest.mark.parametrize("module", _SUBAGENT_MODULES)

@@ -17,21 +17,36 @@ from pathlib import Path
 
 import pytest
 
-TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "src" / "kiro_crew" / "deploy" / "skills" / "artifact-deploy" / "templates"
+TEMPLATES_DIR = (
+    Path(__file__).resolve().parent.parent
+    / "src"
+    / "kiro_crew"
+    / "deploy"
+    / "skills"
+    / "artifact-deploy"
+    / "templates"
+)
 
 
 # ── SEC-3F9C863A: search_for_context limit cap ──
+
 
 class TestSearchForContextLimitCap:
     """The limit query param must be clamped to [1, 100]."""
 
     def _parse_limit_from_source(self):
-        """Extract the limit clamp from knowledge.py source to verify it's bounded."""
-        src = (Path(__file__).resolve().parent.parent
-               / "src" / "kiro_crew" / "dashboard" / "handlers" / "knowledge.py")
+        """Extract the limit clamp from knowledge_agent_context.py source to verify it's bounded."""
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "src"
+            / "kiro_crew"
+            / "dashboard"
+            / "handlers"
+            / "knowledge_agent_context.py"
+        )
         text = src.read_text(encoding="utf-8")
         # Find the search_for_context function's limit line
-        match = re.search(r'limit\s*=\s*min\((\d+),\s*max\((\d+),', text)
+        match = re.search(r"limit\s*=\s*min\((\d+),\s*max\((\d+),", text)
         assert match, "limit must use min()/max() clamp in search_for_context"
         upper = int(match.group(1))
         lower = int(match.group(2))
@@ -48,15 +63,19 @@ class TestSearchForContextLimitCap:
 
 # ── SEC-8746A074: PII email redaction in Teams/Webex logging ──
 
+
 class TestEmailRedactionInLogs:
     """Teams and Webex dispatchers must NOT log full email addresses."""
 
-    @pytest.mark.parametrize("module_path", [
-        "src/kiro_crew/teams/transport_dispatch.py",
-        "src/kiro_crew/webex/transport_dispatch.py",
-    ])
+    @pytest.mark.parametrize(
+        "module_path",
+        [
+            "src/kiro_crew/teams/transport_dispatch.py",
+            "src/kiro_crew/webex/transport_dispatch.py",
+        ],
+    )
     def test_no_raw_email_in_log_info(self, module_path):
-        src = (Path(__file__).resolve().parent.parent / module_path)
+        src = Path(__file__).resolve().parent.parent / module_path
         text = src.read_text(encoding="utf-8")
         # The inbound log line must truncate/mask the email, not pass it raw.
         # Pattern: logger.info("...inbound from %s...", email, ...) is the BAD form.
@@ -64,19 +83,32 @@ class TestEmailRedactionInLogs:
         for line in text.splitlines():
             if "inbound from %s" in line and "logger.info" in line:
                 # Must NOT be a bare variable without masking
-                assert "***" in line or "[:" in line, \
-                    f"Email logged without redaction: {line.strip()}"
+                assert (
+                    "***" in line or "[:" in line
+                ), f"Email logged without redaction: {line.strip()}"
 
 
 # ── SEC-7B8BA5B4: sage routes error info disclosure ──
+
 
 class TestSageRoutesErrorDisclosure:
     """The 502 catch-all handlers must not return str(e)."""
 
     def test_no_raw_exception_in_502_response(self):
-        src = (Path(__file__).resolve().parent.parent
-               / "src" / "kiro_crew" / "apps" / "builtins" / "code_review_sage" / "backend" / "routes.py")
-        text = src.read_text(encoding="utf-8")
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "src"
+            / "kiro_crew"
+            / "apps"
+            / "builtins"
+            / "code_review_sage"
+            / "backend"
+            / "routes.py"
+        )
+        text = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in [src, *sorted(src.with_name("routes_parts").glob("*.py"))]
+        )
         # Find all lines with status=502 and ensure none pass str(e)
         lines_502 = [line for line in text.splitlines() if "status=502" in line]
         for line in lines_502:
@@ -85,26 +117,38 @@ class TestSageRoutesErrorDisclosure:
 
 # ── SEC-EECD3B66: weak cryptography ──
 
+
 class TestWeakCryptography:
     """MD5 must have usedforsecurity=False; SHA-1 must be replaced."""
 
     def test_vector_memory_md5_annotated(self):
-        src = (Path(__file__).resolve().parent.parent
-               / "src" / "kiro_crew" / "vector_memory.py")
+        src = Path(__file__).resolve().parent.parent / "src" / "kiro_crew" / "vector_memory.py"
         text = src.read_text(encoding="utf-8")
         md5_calls = [line for line in text.splitlines() if "hashlib.md5(" in line]
         for line in md5_calls:
-            assert "usedforsecurity=False" in line or "usedforsecurity = False" in line, \
-                f"MD5 call without usedforsecurity=False: {line.strip()}"
+            assert (
+                "usedforsecurity=False" in line or "usedforsecurity = False" in line
+            ), f"MD5 call without usedforsecurity=False: {line.strip()}"
 
     def test_sage_learning_no_sha1(self):
-        src = (Path(__file__).resolve().parent.parent
-               / "src" / "kiro_crew" / "apps" / "builtins" / "code_review_sage" / "sage_lib" / "learning.py")
-        text = src.read_text(encoding="utf-8")
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "src"
+            / "kiro_crew"
+            / "apps"
+            / "builtins"
+            / "code_review_sage"
+            / "sage_lib"
+            / "learning.py"
+        )
+        text = "\n".join(
+            path.read_text(encoding="utf-8") for path in (src, src.with_name("learning_format.py"))
+        )
         assert "hashlib.sha1(" not in text, "SHA-1 must be replaced with SHA-256"
 
 
 # ── SEC-48EC51B5: S3 bucket policy TLS enforcement ──
+
 
 class TestS3BucketPolicyTLS:
     """Both S3 bucket policies must deny non-HTTPS access."""
@@ -115,11 +159,13 @@ class TestS3BucketPolicyTLS:
         assert "aws:SecureTransport" in text, "Missing aws:SecureTransport condition"
         assert "DenyInsecureTransport" in text, "Missing DenyInsecureTransport statement"
         # Must appear for BOTH buckets — check at least 2 occurrences
-        assert text.count("DenyInsecureTransport") >= 2, \
-            "DenyInsecureTransport must appear in both LogBucketPolicy and BucketPolicy"
+        assert (
+            text.count("DenyInsecureTransport") >= 2
+        ), "DenyInsecureTransport must appear in both LogBucketPolicy and BucketPolicy"
 
 
 # ── SEC-61BB9067: SNS topic encryption ──
+
 
 class TestSNSEncryption:
     """The AlarmTopic must have KMS key configured for encryption at rest."""
@@ -128,7 +174,9 @@ class TestSNSEncryption:
         src = TEMPLATES_DIR / "reaper.yaml"
         text = src.read_text(encoding="utf-8")
         # AWS property name -- wokeignore applied inline in the source
-        assert "KmsMasterKeyId" in text, "AlarmTopic missing KMS encryption key"  # wokeignore:rule=master
+        assert (
+            "KmsMasterKeyId" in text
+        ), "AlarmTopic missing KMS encryption key"  # wokeignore:rule=master
 
 
 # ── SEC-1A27E6B3: CloudFront access logging ──
@@ -140,6 +188,7 @@ class TestSNSEncryption:
 
 
 # ── SEC-E9AC8770: engine.py deploy bucket logging ──
+
 
 class TestEngineDeployBucketLogging:
     """SUPERSEDED -- the control this asserted never took effect.
@@ -161,9 +210,8 @@ class TestEngineDeployBucketLogging:
     def test_hardening_lives_in_one_place(self):
         """What the original test should have checked: a single seam, so a control
         cannot be added to a copy that nothing calls."""
-        src = (Path(__file__).resolve().parent.parent
-               / "src" / "kiro_crew" / "deploy" / "engine.py")
+        src = Path(__file__).resolve().parent.parent / "src" / "kiro_crew" / "deploy" / "engine.py"
         text = src.read_text(encoding="utf-8")
-        assert text.count("_harden_bucket(") >= 3, (
-            "bucket hardening must go through one helper used by both paths"
-        )
+        assert (
+            text.count("_harden_bucket(") >= 3
+        ), "bucket hardening must go through one helper used by both paths"

@@ -552,7 +552,9 @@ raise SystemExit(serve(voice, SimpleNamespace, sys.stdin.buffer, sys.stdout.buff
     processes = []
 
     async def spawn(*argv, **kwargs):
-        proc = await asyncio.create_subprocess_exec(sys.executable, "-u", "-c", code, **kwargs)
+        source_root = str(Path(runtime.__file__).resolve().parents[1])
+        program = f"import sys; sys.path.insert(0, {source_root!r})\n" + code
+        proc = await asyncio.create_subprocess_exec(sys.executable, "-u", "-c", program, **kwargs)
         processes.append(proc)
         return proc
 

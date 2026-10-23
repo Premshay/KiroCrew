@@ -35,6 +35,7 @@ class TestConsolidateAgent:
         assert spec["name"] == "kirocrew-consolidate"
         assert spec["tools"] == []
         assert spec["mcpServers"] == {}
+        assert spec["includeMcpJson"] is False
         assert spec["prompt"] == ""
 
     def test_consolidation_call_uses_its_own_identity(self) -> None:
@@ -80,21 +81,8 @@ class TestConsolidateAgent:
         assert history._CONSOLIDATE_SESSION_KEY == CONSOLIDATE_KEY
 
     def test_consolidate_key_registered_stateless(self) -> None:
-        # The skip-resume decision lives in the allocation service and names the
-        # key through the constants it is handed, so both halves are pinned: the
-        # allocator consults ``consolidate_key``, and the manager binds that slot
-        # to ``CONSOLIDATE_KEY``. Either half alone lets the key resume.
-        # ``get_or_create`` only wraps the allocation in an ownership reservation;
-        # the resume decision is made in ``_get_or_create_impl``.
-        from kiro_crew.session_allocation import SessionAllocationService
+        from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.session import CONSOLIDATE_KEY, SessionManager
 
-        assert "_get_or_create_impl(" in inspect.getsource(SessionAllocationService.get_or_create)
-        assert "constants.consolidate_key" in inspect.getsource(
-            SessionAllocationService._get_or_create_impl
-        )
-
-        import kiro_crew.session as session
-
-        assert "consolidate_key=CONSOLIDATE_KEY" in inspect.getsource(
-            session.SessionManager._allocation_deps
-        )
+        manager = SessionManager(KiroCrewConfig())
+        assert CONSOLIDATE_KEY in manager._allocation_deps().constants.stateless_keys

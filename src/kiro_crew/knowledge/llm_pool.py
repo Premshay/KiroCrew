@@ -19,12 +19,16 @@ from typing import Any, Optional
 from kiro_crew import platform_compat
 from kiro_crew.agent_sdk import build_acp_provider, is_acp_timeout
 from kiro_crew.agent_sdk.backends import (
-    ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
+    POLICY_ID_BY_BACKEND,
+    Routing,
+    backend_from_stored,
     effort_config_option_id,
     effort_config_option_value,
+    resolve_selected_backend,
+    routing_for,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
@@ -35,6 +39,7 @@ from kiro_crew.effort import (
     EFFORT_LEVELS,
     is_valid_effort,
 )
+from kiro_crew.json_line import parse_json_object_line
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
@@ -68,7 +73,9 @@ except Exception:  # pragma: no cover - standalone / test fallback
 
 
 logger = logging.getLogger(__name__)
+_WARNED_UNSAFE_BACKENDS: set[str] = set()
 
+STDOUT_LINE_LIMIT = 10 * 1024 * 1024
 DEFAULT_POOL_SIZE = 3
 DEFAULT_TIMEOUT = 60.0
 FETCH_TIMEOUT = 120.0
@@ -201,25 +208,19 @@ def _resolve_client_binding() -> tuple[dict, str]:
     registry name comes back when an edition supplies a factory but nothing for
     THIS agent: the pool keeps working, on a provider the operator did not
     choose, and without this nothing in the logs would connect the two. Both are
-    empty under the Default registry, where there is no binding to miss, and on
-    any lookup failure — resolving a binding must not break the pool.
+    empty under the Default registry, where there is no binding to miss. Registry
+    errors propagate rather than silently selecting a different execution seat.
     """
-    try:
-        from kiro_crew.platform.context import current_context
-        from kiro_crew.platform.defaults import DefaultProviderRegistry
+    from kiro_crew.platform.context import current_context
+    from kiro_crew.platform.defaults import DefaultProviderRegistry
 
-        providers = current_context().providers
-    except Exception:
-        return {}, ""
+    providers = current_context().providers
     if isinstance(providers, DefaultProviderRegistry):
         return {}, ""
     lookup = getattr(providers, "agent_client_binding", None)
     raw = None
     if callable(lookup):
-        try:
-            raw = lookup(AGENT_NAME)
-        except Exception:
-            logger.debug("AcpWorker: agent_client_binding lookup failed", exc_info=True)
+        raw = lookup(AGENT_NAME)
     binding = _clean_binding(raw) if isinstance(raw, dict) else {}
     return (binding, "") if binding else ({}, type(providers).__name__)
 
@@ -265,6 +266,91 @@ def _get_sandbox_mode(config: Optional[dict] = None) -> str:
     if isinstance(mode, str) and mode in _VALID_SANDBOX_MODES:
         return mode
     return "auto"  # present but malformed -> fail secure, never silently unsandboxed
+
+
+def _get_acp_backend(config: Optional[dict] = None) -> str:
+    """Configured ``agent.acp_backend``, through the one selection gate (H3),
+    then narrowed to a backend this pool's zero-tool workers can trust.
+
+    This pool's workers run a spec carrying ``"tools": []``, meant as a total
+    ban, and construct their own ``AcpClient`` directly (not through a provider
+    that already routes by backend). Two capability questions decide whether a
+    resolved backend is safe to hand it, asked rather than enumerated so a
+    backend that later earns both answers needs no change here:
+    ``SessionCapabilities.honors_zero_tool_ban`` (kiro-cli/KAS natively, plus
+    opencode/goose/deepseek/pi via ``AcpClient._deny_zero_tools``; not claude,
+    whose routing is unenforced so an inherited pre-approval can skip the
+    permission request; not codex, whose sessions run on ``AcpRuntime`` with no
+    such refusal) and ``.acp_client_spawnable`` (not
+    kas/codex, which need ``AcpRuntime`` and have no arm in ``AcpClient._spawn``).
+
+    The pool reads raw ``config.json``, which never passed the loader's
+    normalizer, so the stored vocabulary is translated first (``"kiro"`` is Kiro
+    CLI, absent or ``""`` is the default) and an unselectable or malformed value
+    degrades to Kiro here --
+    and so does a resolved value that fails either capability check above.
+
+    The capability fallback warns only when the user declared a backend. With
+    none declared the default (KAS) is not something they chose, so the pool
+    falls back to Kiro silently instead of warning every process about it.
+    """
+    data = _read_config() if config is None else config
+    selection = backend_from_stored(_section(data, "agent").get("acp_backend"))
+    resolved = resolve_selected_backend(selection)
+    if not capabilities_for(resolved).honors_zero_tool_ban:
+        _log_capability_fallback(
+            resolved,
+            selection is not None,
+            "does not honor a zero-tool spec (honors_zero_tool_ban is False)",
+        )
+        return ACP_BACKEND_KIRO
+    if not capabilities_for(resolved).acp_client_spawnable:
+        _log_capability_fallback(resolved, selection is not None, "is not acp_client_spawnable")
+        return ACP_BACKEND_KIRO
+    return resolved
+
+
+def _log_capability_fallback(resolved: str, declared: bool, reason: str) -> None:
+    """Log the Kiro fallback: a once-per-backend WARNING for a declared backend,
+    a debug line for the undeclared default."""
+    if not declared:
+        logger.debug(
+            "Knowledge pool: default acp_backend=%s %s; using %s",
+            resolved,
+            reason,
+            ACP_BACKEND_KIRO,
+        )
+        return
+    if resolved in _WARNED_UNSAFE_BACKENDS:
+        return
+    _WARNED_UNSAFE_BACKENDS.add(resolved)
+    logger.warning(
+        "Knowledge pool: configured acp_backend=%s %s; falling back to %s",
+        resolved,
+        reason,
+        ACP_BACKEND_KIRO,
+    )
+
+
+def _knowledge_spec_model() -> str | None:
+    """The model pin the installer writes into the knowledge spec, or None for no pin.
+
+    The same rule the installer applies (``knowledge.extraction_model`` →
+    ``agent.model`` → ``"auto"``, ``kiro_crew.agent.knowledge_agent_model``), so
+    a harness that reads no spec of Crew's runs the model kiro-cli would read
+    from it. ``"auto"`` or a blank is no pin. Blocking (reads the config) and
+    never raises; callers run it off the loop.
+    """
+    try:
+        from kiro_crew.agent import knowledge_agent_model
+
+        model = knowledge_agent_model()
+    except Exception:
+        logger.debug("knowledge model pin unreadable; no pin", exc_info=True)
+        return None
+    if not isinstance(model, str) or not model.strip() or model.strip() == "auto":
+        return None
+    return model.strip()
 
 
 def _get_idle_ttl(config: Optional[dict] = None) -> float:
@@ -349,8 +435,13 @@ def _select_effort_level(requested: str, supported: list[str]) -> Optional[str]:
         level for level in supported if isinstance(level, str) and is_valid_effort(level)
     }
     if not supported_levels:
-        # An advertised option without a usable level is treated like a lazy
-        # backend: attempt the requested value and let ACP confirm it.
+        # An option offering ``off`` alone is the harness saying the current model
+        # takes no level (goose, per model): a write there is accepted and reads
+        # back as ``off``, so nothing is sent.
+        if supported and all(level == "off" for level in supported):
+            return None
+        # Any other advertised option without a usable level is treated like a
+        # lazy backend: attempt the requested value and let ACP confirm it.
         return requested
     requested_index = EFFORT_LEVELS.index(requested)
     eligible = [
@@ -412,12 +503,14 @@ class AcpWorker(Worker):
         *,
         sandbox_mode: Optional[str] = None,
         effort: Optional[str] = None,
+        acp_backend: Optional[str] = None,
     ) -> None:
         self._client: Optional[AcpClient] = None
         self._provider: Optional[Any] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
         self._sandbox_mode = sandbox_mode
+        self._acp_backend = acp_backend
         self._effort = _normalize_effort(effort)
         self._effective_effort: Optional[str] = None
         # PID currently shielded from the gateway orphan sweep (see module note).
@@ -451,26 +544,110 @@ class AcpWorker(Worker):
             else await asyncio.to_thread(_get_sandbox_mode)
         )
         binding, unbound_registry = await asyncio.to_thread(_resolve_client_binding)
-        backend = binding.get("acp_backend", ACP_BACKEND_KIRO)
-        # Claude can enforce an explicit native empty tool list even though its
-        # saved agent spec cannot enforce one by itself.
-        if not (capabilities_for(backend).honors_zero_tool_ban or backend == ACP_BACKEND_CLAUDE):
-            raise RuntimeError(
-                f"Knowledge worker backend {backend!r} cannot enforce a zero-tool session"
+        if unbound_registry:
+            logger.warning(
+                "Knowledge agent %s has no client binding in %s; using configured backend",
+                AGENT_NAME,
+                unbound_registry,
             )
+        if binding:
+            await self._spawn_bound_client(sandbox_mode, binding)
+        else:
+            acp_backend = (
+                self._acp_backend
+                if self._acp_backend is not None
+                else await asyncio.to_thread(_get_acp_backend)
+            )
+            logger.info(
+                "AcpWorker: starting with agent=%s backend=%s",
+                AGENT_NAME,
+                POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
+            )
+            self._client, authored_before_spawn = await self._spawn_client(
+                acp_backend, sandbox_mode
+            )
+            # A zero-tool spec must be CONFIRMED, not assumed. A backend that is not
+            # routed through Routing.AGENT_SPEC relies on the session's consumed
+            # projection (spec_zero_tools: the mirror's, or pi's mirror-less parse). If the spec was missing, malformed, or
+            # shadowed by a project-level spec, that signal is false and every native
+            # tool request would auto-approve, so this worker restarts on Kiro before
+            # any prompt is sent.
+            if not (routing_for(acp_backend) is Routing.AGENT_SPEC or self._client.spec_zero_tools):
+                logger.warning(
+                    "AcpWorker: backend=%s session did not confirm the zero-tool spec "
+                    '("tools": [] missing, malformed, or shadowed); restarting worker on %s',
+                    POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
+                    ACP_BACKEND_KIRO,
+                )
+                try:
+                    await self._client.shutdown()
+                except Exception:
+                    logger.debug("AcpWorker: unsafe-backend client shutdown failed", exc_info=True)
+                acp_backend = ACP_BACKEND_KIRO
+                self._acp_backend = ACP_BACKEND_KIRO
+                self._client, authored_before_spawn = await self._spawn_client(
+                    acp_backend, sandbox_mode
+                )
+            # A backend routed through Routing.AGENT_SPEC (kiro) enforces "tools": []
+            # natively but has no mirror, so spec_zero_tools cannot confirm it. The
+            # harness resolves --agent against <cwd>/.kiro/agents before the global
+            # directory, and this pool's cwd is a workspace under the data home, so a
+            # project-level spec of the same name that carries tools would shadow the
+            # installed one and auto-approve them for untrusted document text. The
+            # projected view the harness consumed through --agent is the authority
+            # when one exists: it is prepared before the spawn and never re-read, so a
+            # later spec edit cannot change the answer. Without one (the rollback
+            # switch, or an alias that could not be taken) the harness loads the named
+            # spec itself, so the authored spec is read before the spawn and again
+            # after start, and both reads must declare an empty list. A worker that
+            # cannot confirm the ban does not start: Kiro is the last fallback.
+            if routing_for(acp_backend) is Routing.AGENT_SPEC and not (
+                await asyncio.to_thread(
+                    self._client.effective_spec_declares_zero_tools,
+                    authored_before_spawn=authored_before_spawn,
+                )
+            ):
+                logger.warning(
+                    'AcpWorker: agent=%s backend=%s spec does not declare "tools": []; '
+                    "refusing to start the worker",
+                    AGENT_NAME,
+                    POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
+                )
+                try:
+                    await self._client.shutdown()
+                except Exception:
+                    logger.debug(
+                        "AcpWorker: unconfirmed-spec client shutdown failed", exc_info=True
+                    )
+                self._client = None
+                raise RuntimeError(
+                    f"knowledge agent {AGENT_NAME!r} could not be confirmed to declare a "
+                    "zero-tool spec (a project-level spec may shadow the installed one, "
+                    "or the spec could not be read); refusing to run the knowledge pool "
+                    "without a confirmed tool ban"
+                )
+        await self._apply_effort()
+        # Shield the live worker PID from the periodic orphan sweep for as long
+        # as it runs. Paired with unregister in shutdown() and on respawn above.
+        pid = getattr(self._client, "_pid", None)
+        if isinstance(pid, int) and pid > 0:
+            self._protected_pid = pid
+            register_protected_pid(pid)
+        else:
+            self._protected_pid = None
+        logger.info(
+            "AcpWorker: ready (agent=%s, pid=%s)",
+            AGENT_NAME,
+            getattr(self._client, "_pid", "unknown"),
+        )
+
+    async def _spawn_bound_client(self, sandbox_mode: str, binding: dict) -> None:
+        backend = binding.get("acp_backend", ACP_BACKEND_KIRO)
         if (
             backend not in ACP_BACKENDS_ACP_RUNTIME
             and not capabilities_for(backend).acp_client_spawnable
         ):
             raise RuntimeError(f"Knowledge worker backend {backend!r} cannot start an ACP client")
-        if unbound_registry:
-            logger.warning(
-                "AcpWorker: %s supplies a provider factory but no client binding for "
-                "agent %s, so the worker runs on the native path and any provider "
-                "binding for it (subscription or local lane) does not apply here",
-                unbound_registry,
-                AGENT_NAME,
-            )
         logger.info(
             "AcpWorker: starting with agent=%s binding=%s",
             AGENT_NAME,
@@ -507,16 +684,21 @@ class AcpWorker(Worker):
                 audit_source="subagent",
                 **binding,
             )
-            if backend == ACP_BACKEND_CLAUDE:
-                self._client.restrict_tools([])
-            elif backend == ACP_BACKEND_KIRO:
+            if not capabilities_for(backend).honors_zero_tool_ban:
+                try:
+                    self._client.restrict_tools([])
+                except NotImplementedError as exc:
+                    raise RuntimeError(
+                        f"Knowledge worker backend {backend!r} cannot enforce a zero-tool session"
+                    ) from exc
+            elif routing_for(backend) is Routing.AGENT_SPEC:
                 authored_before_spawn = await asyncio.to_thread(
                     self._client.authored_spec_declares_zero_tools
                 )
         self._effective_effort = None
         await self._client.ensure_ready()
         if self._provider is None and capabilities_for(backend).honors_zero_tool_ban:
-            if backend == ACP_BACKEND_KIRO:
+            if routing_for(backend) is Routing.AGENT_SPEC:
                 confirmed = await asyncio.to_thread(
                     self._client.effective_spec_declares_zero_tools,
                     authored_before_spawn=authored_before_spawn,
@@ -528,20 +710,43 @@ class AcpWorker(Worker):
                 raise RuntimeError(
                     f"Knowledge worker backend {backend!r} did not confirm a zero-tool spec"
                 )
-        await self._apply_effort()
-        # Shield the live worker PID from the periodic orphan sweep for as long
-        # as it runs. Paired with unregister in shutdown() and on respawn above.
-        pid = getattr(self._client, "_pid", None)
-        if isinstance(pid, int) and pid > 0:
-            self._protected_pid = pid
-            register_protected_pid(pid)
-        else:
-            self._protected_pid = None
-        logger.info(
-            "AcpWorker: ready (agent=%s, pid=%s)",
-            AGENT_NAME,
-            getattr(self._client, "_pid", "unknown"),
+
+    async def _spawn_client(self, acp_backend: str, sandbox_mode: str) -> tuple[AcpClient, bool]:
+        """Build the client for *acp_backend*, bring it up, and return it with the pre-spawn read.
+
+        The client is stored as ``self._client`` before ``ensure_ready`` so a failed
+        start still leaves it reachable. For a backend routed through
+        ``Routing.AGENT_SPEC`` the authored spec is read BEFORE this client's
+        ``ensure_ready`` spawns the harness, and the result is returned so the
+        post-start confirmation can require both reads to agree when no projection
+        was prepared. Any other backend returns False.
+
+        The model pin follows the same split. A ``Routing.AGENT_SPEC`` harness reads
+        the spec's own ``model`` (the installer resolves ``knowledge.extraction_model``
+        → ``agent.model`` → ``"auto"`` into it), so nothing is passed and its
+        construction is unchanged. Every other harness reads no spec of Crew's, so
+        the same pin, by the installer's own rule, is handed to the client, whose
+        startup model application scopes it to this backend (a model another
+        harness serves falls back to the backend default rather than being sent).
+        """
+        binding: dict[str, Any] = {"acp_backend": acp_backend}
+        if routing_for(acp_backend) is not Routing.AGENT_SPEC:
+            binding["model"] = await asyncio.to_thread(_knowledge_spec_model)
+        client = AcpClient(
+            agent=AGENT_NAME,
+            sandbox_mode=sandbox_mode,
+            audit_source="subagent",
+            **binding,
         )
+        self._client = client
+        self._effective_effort = None
+        authored_before_spawn = False
+        if routing_for(acp_backend) is Routing.AGENT_SPEC:
+            authored_before_spawn = await asyncio.to_thread(
+                client.authored_spec_declares_zero_tools
+            )
+        await client.ensure_ready()
+        return client, authored_before_spawn
 
     async def _apply_effort(self) -> None:
         """Apply the requested effort without breaking provider-default fallback.
@@ -554,11 +759,15 @@ class AcpWorker(Worker):
         client) and an identity branch: it sent every non-claude harness down the
         ``/effort`` slash command, including one that has no such command.
 
-        This pool constructs its client with the DEFAULT backend and never passes
-        ``acp_backend``, so the answer here is the kiro one and both spellings
-        agree on it; ``test_agent_sdk_capabilities`` pins that, so a future pool
-        that does select a backend gets the capability answer rather than an
-        identity guess.
+        This pool's ``acp_backend`` is restricted by ``_get_acp_backend`` to a
+        backend that answers both ``honors_zero_tool_ban`` and
+        ``acp_client_spawnable`` True, and those do NOT all answer these capabilities
+        the same way -- kiro takes the slash command, goose and opencode take the
+        config option (``thinking_effort`` and ``effort``) -- which is exactly why
+        they are asked here instead of an identity.
+        ``test_agent_sdk_capabilities`` pins every member's answers, so a backend
+        that later qualifies with different answers is caught there, not assumed to
+        inherit an existing member's.
         """
         client = self._client
         requested = self._effort
@@ -568,7 +777,11 @@ class AcpWorker(Worker):
             backend = getattr(client, "backend", "")
             via_config_option = capabilities_for(backend).effort_via_config_option
             if not via_config_option and not capabilities_for(backend).effort_via_slash_command:
-                logger.warning("AcpWorker: effort change unsupported by backend=%s", backend)
+                logger.warning(
+                    "AcpWorker: effort=%s unsupported on backend=%s; using provider default",
+                    requested,
+                    POLICY_ID_BY_BACKEND.get(backend, backend),
+                )
                 return
             # Resolved per backend, like every other effort site: writing the
             # wrong spelling draws "unknown config option", and the except
@@ -688,6 +901,24 @@ class AcpWorker(Worker):
         self.calls_since_reset = 0
 
 
+class CCWorkerReplyError(RuntimeError):
+    """The CLI answered this message with an error result."""
+
+
+def _text_blocks(container: Any) -> list[str]:
+    """The ``text`` of each text block in ``container["content"]``, skipping bad shapes."""
+    content = container.get("content") if isinstance(container, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ]
+
+
 class CCWorker(Worker):
     """Long-lived external agent CLI subprocess using stream-json I/O."""
 
@@ -718,6 +949,16 @@ class CCWorker(Worker):
             except asyncio.CancelledError:
                 pass
             self._reader_task = None
+        try:
+            await self._spawn_process()
+        except BaseException:
+            # The old reader is gone, so the old process can deliver nothing
+            # any more: retire it, and the worker reads dead until a spawn
+            # succeeds instead of being handed out to a caller it cannot answer.
+            await self.shutdown()
+            raise
+
+    async def _spawn_process(self) -> None:
         assert self._claude_bin is not None
         cmd = [
             self._claude_bin,
@@ -765,7 +1006,10 @@ class CCWorker(Worker):
             *wrapped,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            # Nothing reads it, and an unread pipe both holds what the CLI
+            # writes (up to twice the raised ``limit`` below, per worker) and
+            # stalls the CLI once it fills.
+            stderr=asyncio.subprocess.DEVNULL,
             # Own process group, so the worker's descendants are reachable as a tree.
             # `claude -p` forks helpers (see spine/agent_runner.py's _terminate_group),
             # and without this the child lands in the gateway's OWN group -- which is
@@ -782,33 +1026,44 @@ class CCWorker(Worker):
             start_new_session=platform_compat.IS_POSIX,
             creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             # The agent enforcement point, passed exactly as the agent-CLI
-            # spawns in ``dashboard/handlers/sessions.py`` pass it. This worker
+            # spawns in ``dashboard/handlers/sessions.py`` and
+            # ``sessions_parts/usage_scrape.py`` pass it. This worker
             # runs with its permission prompts disabled and its inputs are
             # knowledge documents, so gateway-owned credentials must not be
             # readable inside it. The tier does not cover this: no tier below
             # ``strict`` scrubs the agent-denied keys, so the parent side is
             # where they are removed.
             env=scrub_agent_subprocess_env(),
+            # A stream-json line carries a whole event, a fetched page echoed
+            # back in a tool_result included; asyncio's 64 KiB default would
+            # refuse it. Same ceiling as the ACP transports. stdout is the only
+            # pipe, so it is the only reader this limit sizes.
+            limit=STDOUT_LINE_LIMIT,
         )
         self._event_queue = asyncio.Queue()
         self._reader_task = asyncio.create_task(self._stdout_reader())
 
     async def _stdout_reader(self) -> None:
-        """Background task: read NDJSON lines from stdout into event queue."""
+        """Background task: read NDJSON lines from stdout into event queue.
+
+        A line that is not a JSON object, or is over :data:`STDOUT_LINE_LIMIT`,
+        is dropped and the read goes on; the reader ends only with the stream.
+        """
         assert self._proc is not None and self._proc.stdout is not None
         try:
             while True:
-                line = await self._proc.stdout.readline()
+                try:
+                    line = await self._proc.stdout.readline()
+                except ValueError:
+                    # Over the limit: asyncio has discarded what it buffered,
+                    # and the rest of that line arrives as one more line that
+                    # does not parse.
+                    continue
                 if not line:
                     break
-                text = line.decode().strip()
-                if not text:
-                    continue
-                try:
-                    event = json.loads(text)
+                event = parse_json_object_line(line)
+                if event is not None:
                     await self._event_queue.put(event)
-                except json.JSONDecodeError:
-                    continue
         except Exception:
             pass
         finally:
@@ -819,18 +1074,44 @@ class CCWorker(Worker):
             await self._spawn()
         assert self._proc is not None and self._proc.stdin is not None
 
+        stdin = self._proc.stdin
         msg = json.dumps({"type": "user", "message": {"role": "user", "content": prompt}})
-        self._proc.stdin.write((msg + "\n").encode())
-        await self._proc.stdin.drain()
 
+        async def _deliver_and_collect() -> str:
+            stdin.write((msg + "\n").encode())
+            await stdin.drain()
+            return await self._collect_response()
+
+        # The queue may hold only this prompt's events, so the worker survives
+        # a message only when its result event was consumed. Anything else (a
+        # timeout, a dead reader, a reply that broke off, a cancelled caller)
+        # leaves the rest of THIS reply queued, and the next prompt would read
+        # it as its own: retire the process instead. The write and its drain
+        # sit inside the same guard and the same timeout, because a prompt
+        # over the pipe's high-water mark is already delivered while drain()
+        # waits for the CLI to read it.
+        settled = False
         try:
-            return await asyncio.wait_for(self._collect_response(), timeout=timeout)
-        except asyncio.TimeoutError:
-            await self.shutdown()
+            reply = await asyncio.wait_for(_deliver_and_collect(), timeout=timeout)
+            settled = True
+            return reply
+        except CCWorkerReplyError:
+            settled = True  # the error result is the result event
             raise
+        finally:
+            if not settled:
+                await self.shutdown()
 
     async def _collect_response(self) -> str:
-        """Collect text from events until a result event arrives."""
+        """Collect text from events until a result event arrives.
+
+        A value of the wrong type is skipped at its own level. The real CLI's
+        ``result`` is the final answer, a string, and is the reply whenever it
+        is non-empty: the assistant turns before it may be narration around a
+        tool call. The assistant text is joined only when the result carries
+        no text of its own. A result with ``is_error: true`` fails this
+        message.
+        """
         text_parts: list[str] = []
         while True:
             event = await self._event_queue.get()
@@ -840,31 +1121,44 @@ class CCWorker(Worker):
             event_type = event.get("type", "")
 
             if event_type == "assistant":
-                for block in event.get("message", {}).get("content", []):
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
+                text_parts.extend(_text_blocks(event.get("message")))
 
             elif event_type == "result":
-                for block in event.get("result", {}).get("content", []):
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
+                result = event.get("result")
+                if event.get("is_error") is True:
+                    detail = result if isinstance(result, str) else event.get("subtype", "")
+                    raise CCWorkerReplyError(f"CLI reported an error result: {str(detail)[:500]}")
+                if isinstance(result, str):
+                    if result:
+                        return result
+                else:
+                    text_parts.extend(_text_blocks(result))
                 break
 
         return "".join(text_parts)
 
     async def shutdown(self) -> None:
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            self._reader_task = None
-        if self._proc is not None:
+        # Both handles are dropped before the first await, so the worker reads
+        # dead from here on even when the reap itself is interrupted.
+        reader, self._reader_task = self._reader_task, None
+        proc, self._proc = self._proc, None
+        if reader is not None:
+            reader.cancel()
+        if proc is not None:
             try:
-                await platform_compat.kill_and_reap(self._proc)
+                await platform_compat.kill_and_reap(proc)
             except Exception:
                 logger.debug("CCWorker shutdown error", exc_info=True)
-            self._proc = None
 
     def is_alive(self) -> bool:
-        return self._proc is not None and self._proc.returncode is None
+        # A reader that ended leaves nothing to deliver a reply, even while the
+        # process itself is still running.
+        reader = self._reader_task
+        return (
+            self._proc is not None
+            and self._proc.returncode is None
+            and (reader is None or not reader.done())
+        )
 
     async def reset_conversation(self) -> None:
         """Respawn the CLI subprocess, discarding the accumulated transcript.
@@ -1108,6 +1402,7 @@ class LLMPool:
             worker = AcpWorker(
                 sandbox_mode=sandbox_mode,
                 effort=self._effort,
+                acp_backend=await asyncio.to_thread(_get_acp_backend),
             )
         await worker.start()
         return worker

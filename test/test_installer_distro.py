@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 from installer_test_helpers import run_bounded
 
+from kiro_crew.testing.wait import wait_until
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI_SH = REPO_ROOT / "cli.sh"
 INSTALL_SH = REPO_ROOT / "install.sh"
@@ -76,16 +78,39 @@ def _run_cli_with_fake_env(
         if real:
             (tools / name).symlink_to(real)
 
-    for _util in ("sh", "env", "id", "awk", "sed", "mktemp", "rm", "rmdir",
-                  "mkdir", "cat", "printf", "chmod", "ln", "date", "grep",
-                  "tr", "head", "cut", "dirname", "basename", "uname", "sleep",
-                  "tar", "gzip", "sha256sum",
-                  # cli.sh bounds its interpreter probe with `timeout` when one
-                  # exists, so the isolated PATH must expose it for that guard
-                  # to be exercised here at all. ``with_timeout=False`` models a
-                  # stock macOS (no coreutils `timeout`), forcing the POSIX
-                  # watchdog fallback instead.
-                  *(("timeout",) if with_timeout else ())):
+    for _util in (
+        "sh",
+        "env",
+        "id",
+        "awk",
+        "sed",
+        "mktemp",
+        "rm",
+        "rmdir",
+        "mkdir",
+        "cat",
+        "printf",
+        "chmod",
+        "ln",
+        "date",
+        "grep",
+        "tr",
+        "head",
+        "cut",
+        "dirname",
+        "basename",
+        "uname",
+        "sleep",
+        "tar",
+        "gzip",
+        "sha256sum",
+        # cli.sh bounds its interpreter probe with `timeout` when one
+        # exists, so the isolated PATH must expose it for that guard
+        # to be exercised here at all. ``with_timeout=False`` models a
+        # stock macOS (no coreutils `timeout`), forcing the POSIX
+        # watchdog fallback instead.
+        *(("timeout",) if with_timeout else ()),
+    ):
         _link_real(_util)
 
     # Recording curl: the marker path is baked in absolutely because cli.sh
@@ -98,11 +123,7 @@ def _run_cli_with_fake_env(
     curl.write_text(
         curl_stub
         if curl_stub is not None
-        else (
-            "#!/bin/sh\n"
-            f'printf "%s\\n" "$*" >> "{curl_marker}"\n'
-            "exit 22\n"
-        )
+        else ("#!/bin/sh\n" f'printf "%s\\n" "$*" >> "{curl_marker}"\n' "exit 22\n")
     )
     curl.chmod(0o755)
 
@@ -243,11 +264,7 @@ def test_cli_never_executes_a_path_uv(tmp_path: Path) -> None:
     session can write -- a planted shim there would run inside the user's own
     unattended update. Only the pinned, SHA-256-verified tarball is trusted."""
     uv_marker = tmp_path / "markers" / "uv"
-    uv_stub = (
-        "#!/bin/sh\n"
-        f'printf "%s\\n" "$*" >> "{uv_marker}"\n'
-        "exit 0\n"
-    )
+    uv_stub = "#!/bin/sh\n" f'printf "%s\\n" "$*" >> "{uv_marker}"\n' "exit 0\n"
     result, markers = _run_cli_with_fake_env(tmp_path, with_uv=uv_stub)
 
     # The planted PATH uv was never invoked ...
@@ -295,7 +312,7 @@ def test_cli_rejects_a_tampered_uv_download(tmp_path: Path) -> None:
         "out=''\n"
         'while [ "$#" -gt 0 ]; do\n'
         '  case "$1" in\n'
-        "    -o) out=\"$2\"; shift 2 ;;\n"
+        '    -o) out="$2"; shift 2 ;;\n'
         "    *) shift ;;\n"
         "  esac\n"
         "done\n"
@@ -335,9 +352,9 @@ def test_cli_never_drives_the_system_package_manager() -> None:
             continue
         for needle in ("sudo ", "apt-get ", "dnf ", "yum "):
             if needle in stripped:
-                assert stripped.startswith("err ") or "|| err " in stripped, (
-                    f"cli.sh:{lineno} drives the system package manager: {line!r}"
-                )
+                assert (
+                    stripped.startswith("err ") or "|| err " in stripped
+                ), f"cli.sh:{lineno} drives the system package manager: {line!r}"
 
 
 def test_cli_relinks_the_interpreter_when_rebuilding_a_venv(tmp_path: Path) -> None:
@@ -477,33 +494,30 @@ def test_cli_restores_the_previous_venv_when_the_wheel_install_fails(
         "the pre-rebuild venv was not restored after the failed wheel "
         "install -- the migration is no longer rollback-safe"
     )
-    assert not list(tmp_path.glob("crew-venv.pre-rebuild.*")), (
-        "the restore left a stray backup tree behind"
-    )
+    assert not list(
+        tmp_path.glob("crew-venv.pre-rebuild.*")
+    ), "the restore left a stray backup tree behind"
     # Pin the transactional shape in cli.sh itself.
     text = CLI_SH.read_text()
-    assert 'mv "$VENV" "$_VENV_BACKUP"' in text, (
-        "cli.sh no longer moves the working venv aside before the rebuild"
-    )
+    assert (
+        'mv "$VENV" "$_VENV_BACKUP"' in text
+    ), "cli.sh no longer moves the working venv aside before the rebuild"
     assert '_restore_tree "$_VENV_BACKUP" "$VENV"' in text, (
-        "cli.sh no longer restores the pre-rebuild venv on a failed wheel "
-        "install"
+        "cli.sh no longer restores the pre-rebuild venv on a failed wheel " "install"
     )
     # The restore goes through _restore_tree, which refuses to `mv` onto a
     # path that survived `rm -rf` (the move would nest the backup and read
     # as a restore that never happened).
-    assert 'mv "$1" "$2"' in text and 'if [ -e "$2" ] || [ -L "$2" ]; then' in text, (
-        "cli.sh's restore helper no longer checks the target is gone before moving"
-    )
+    assert (
+        'mv "$1" "$2"' in text and 'if [ -e "$2" ] || [ -L "$2" ]; then' in text
+    ), "cli.sh's restore helper no longer checks the target is gone before moving"
     # The venv-creation step after the move-aside must be guarded too:
     # under `set -eu` an unguarded `"$PY" -m venv` failure (disk full at
     # ensurepip time) would exit past the restore and orphan the backup.
     # The creation runs through the `_run_step` progress wrapper, which
     # returns the command's own exit status, so the `if !` guard still sees
     # the failure.
-    venv_guard = re.search(
-        r'if ! _run_step "[^"]*" "[^"]*" "\$PY" -m venv "\$VENV"; then', text
-    )
+    venv_guard = re.search(r'if ! _run_step "[^"]*" "[^"]*" "\$PY" -m venv "\$VENV"; then', text)
     assert venv_guard is not None, (
         "cli.sh runs venv creation unguarded after the move-aside -- a "
         "creation failure under set -eu skips the restore and destroys the "
@@ -704,9 +718,9 @@ def test_cli_default_managed_falls_back_to_system_on_provision_failure(
     # A transient fallback must never freeze into a pin: the fallback branch
     # writes no python-mode marker, so the next run retries managed.
     text = CLI_SH.read_text()
-    assert '_write_marker python-mode system-pinned' in text
-    assert '_write_marker python-mode system\n' not in text
-    assert 'PY_MODE_FALLBACK' in text
+    assert "_write_marker python-mode system-pinned" in text
+    assert "_write_marker python-mode system\n" not in text
+    assert "PY_MODE_FALLBACK" in text
 
 
 def test_cli_never_executes_a_store_interpreter_directly(tmp_path: Path) -> None:
@@ -796,12 +810,10 @@ def _run_marker_write_shape(data_home: Path, tmp_path: Path) -> subprocess.Compl
         f'if [ -L "$d" ]; then rm -f "$d"; fi; '
         f'if [ -d "$d" ]; then echo "refusing: directory" >&2; exit 1; fi; '
         f't="$(mktemp "{data_home}/.marker.XXXXXX")"; '
-        f'printf \'%s\\n\' managed > "$t"; '
+        f"printf '%s\\n' managed > \"$t\"; "
         f'mv -f "$t" "$d"'
     )
-    return subprocess.run(
-        ["sh", "-c", shape], check=False, capture_output=True, cwd=tmp_path
-    )
+    return subprocess.run(["sh", "-c", shape], check=False, capture_output=True, cwd=tmp_path)
 
 
 def test_cli_marker_write_replaces_a_planted_symlink(tmp_path: Path) -> None:
@@ -842,9 +854,9 @@ def test_cli_marker_write_survives_a_symlink_to_a_directory(tmp_path: Path) -> N
     result = _run_marker_write_shape(data_home, tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert list(victim_dir.iterdir()) == [], (
-        "the marker rename landed inside the symlinked directory target"
-    )
+    assert (
+        list(victim_dir.iterdir()) == []
+    ), "the marker rename landed inside the symlinked directory target"
     marker = data_home / "python-mode"
     assert not marker.is_symlink()
     assert marker.read_text() == "managed\n"
@@ -863,9 +875,9 @@ def test_cli_marker_write_refuses_a_directory_target(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert (data_home / "python-mode").is_dir()
-    assert list((data_home / "python-mode").iterdir()) == [], (
-        "the marker temp file was moved inside the directory target"
-    )
+    assert (
+        list((data_home / "python-mode").iterdir()) == []
+    ), "the marker temp file was moved inside the directory target"
     # And the guards must still be present in cli.sh.
     text = CLI_SH.read_text()
     assert "_write_marker" in text
@@ -962,7 +974,7 @@ def test_run_step_off_a_terminal_prints_done_line_and_passes_exit_status(
     script = (
         f'set -eu; TMP="{tmp_path}"; . "{helpers}"; '
         f'echo "tty=$_tty curl=$CURL_PROGRESS"; '
-        f"_run_step \"{log}\" \"Installing things\" sh -c 'echo Collecting aiohttp; echo oops >&2; exit 3' "
+        f'_run_step "{log}" "Installing things" sh -c \'echo Collecting aiohttp; echo oops >&2; exit 3\' '
         f'|| echo "rc=$?"'
     )
     # Bytes, not text=True: universal newlines would fold a leaked \r into \n
@@ -1024,7 +1036,7 @@ def test_run_step_interrupt_terminates_the_child_and_fails_the_step(
         # helper's TERM can end it, and it forks a grandchild the way
         # `python -m venv` forks ensurepip. 30 s is the test's failure mode.
         f'_run_step "{tmp_path}/slow.log" "Installing" '
-        f"sh -c 'trap \"\" INT; sleep 30 & echo $! > \"{grandchild_pid}\"; wait' "
+        f'sh -c \'trap "" INT; sleep 30 & echo $! > "{grandchild_pid}"; wait\' '
         f'|| echo "rc=$?"; '
         f'if kill -0 "$_rs_pid" 2>/dev/null; then echo child-alive; else echo child-dead; fi; '
         f"trap"
@@ -1041,18 +1053,30 @@ def test_run_step_interrupt_terminates_the_child_and_fails_the_step(
         start_new_session=True,
     )
     try:
-        time.sleep(1.0)  # let the step start; the child is 30 s of sleep
+        # The step owns INT only from its trap takeover to its restore, and the
+        # takeover happens before the fork, so the child's pid file is the
+        # signal that the interrupt path is armed: a Ctrl-C before it hits
+        # the caller's trap instead and the step runs to its end. A fixed
+        # pause raced the takeover on a slow runner (CI's macOS shard).
+        wait_until(
+            lambda: grandchild_pid.exists() and grandchild_pid.read_text().strip() != "",
+            describe=lambda: _session_processes(proc.pid),
+        )
         proc.send_signal(signal.SIGINT)
         try:
             out, _ = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            raise AssertionError("SIGINT did not end the step; the child kept running")
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError(
+                "SIGINT did not end the step; the child kept running\n"
+                f"output so far: {exc.output!r}\n"
+                f"step log: {(tmp_path / 'slow.log').read_text()!r}\n"
+                f"SIGINT disposition here: {signal.getsignal(signal.SIGINT)!r}\n"
+                f"processes in the step's session:\n{_session_processes(proc.pid)}"
+            ) from None
         # Measured before the cleanup below, which would otherwise take the
         # grandchild down itself and hide a survivor.
         gc_pid = int(grandchild_pid.read_text().strip())
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and _pid_alive(gc_pid):
-            time.sleep(0.1)
+        wait_until(lambda: not _pid_alive(gc_pid), timeout=5)
         grandchild_survived = _pid_alive(gc_pid)
     finally:
         try:
@@ -1068,9 +1092,29 @@ def test_run_step_interrupt_terminates_the_child_and_fails_the_step(
     # child forked must be gone too, or a surviving ensurepip would keep
     # writing into the tree the caller then restores over.
     assert not grandchild_survived, "the step's grandchild survived the interrupt"
-    assert "outer trap" in out and "INT" in out.split("child-dead", 1)[1], (
-        "the caller's INT trap was not restored after the step"
-    )
+    assert (
+        "outer trap" in out and "INT" in out.split("child-dead", 1)[1]
+    ), "the caller's INT trap was not restored after the step"
+
+
+def _session_processes(sid: int) -> str:
+    """Every process in the step's session with its group and state, for a failure report.
+
+    `ps -g` reads a session id as a process group on BSD ps and as a session
+    on procps, so the listing is filtered here by the session column instead.
+    """
+    try:
+        listing = subprocess.run(
+            ["ps", "-A", "-o", "pid=,pgid=,sess=,stat=,command="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"(ps unavailable: {exc})"
+    rows = [line for line in listing.splitlines() if line.split()[2:3] == [str(sid)]]
+    return "\n".join(rows) or "(no process left in the session)"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1169,7 +1213,7 @@ def test_cli_downloads_use_the_progress_flag_and_pip_is_wrapped() -> None:
         r'_run_step "\$TMP/pip-install\.log" "[^"]*" \\\n\s+"\$VENV/bin/pip" install --progress-bar off',
         text,
     )
-    assert "pip\" install --quiet $PIP_BINARY_ONLY" not in text, (
+    assert 'pip" install --quiet $PIP_BINARY_ONLY' not in text, (
         "the wheel install went back to --quiet; the progress line and the "
         "failure report both need pip's Collecting/Downloading lines"
     )
@@ -1184,15 +1228,32 @@ def test_run_step_is_portable_to_dash() -> None:
     enabled off a tty there, so the group comes from setsid(1) when present.
     """
     helpers = _progress_helpers()
-    code = "\n".join(
-        line for line in helpers.splitlines() if not line.lstrip().startswith("#")
-    )
+    code = "\n".join(line for line in helpers.splitlines() if not line.lstrip().startswith("#"))
     assert "$(trap)" not in code
     assert re.search(r'trap > "\$_rs_traps"', code)
     assert re.search(r'\. "\$_rs_traps"', code)
     assert 'kill -s TERM -- "-$_rs_pid"' in code
     assert not re.search(r"kill -TERM -- ", code)
     assert re.search(r"command -v setsid .*\n\s+setsid \"\$@\"", code)
+
+
+def test_run_step_runs_no_command_substitution_while_it_owns_sigint() -> None:
+    """bash drops a trapped SIGINT that lands while it is expanding a `$(...)`.
+
+    The trap never runs, so a Ctrl-C there stops nothing and the step goes on
+    to its end, which is how the interrupt test above times out. Under
+    load a plain loop of `x=$(date +%s)` loses about 1 SIGINT in 40, and the
+    same loop through a file and `read` loses none. From the trap takeover to
+    the restore, every value goes through a file instead.
+    """
+    body = _cli_sh_function("_run_step")
+    start = body.index("trap '_rs_interrupt INT' INT")
+    end = body.index('. "$_rs_traps"')
+    span = "\n".join(
+        line for line in body[start:end].splitlines() if not line.lstrip().startswith("#")
+    )
+    assert not re.search(r"\$\((?!\()", span), "a command substitution runs while the step owns INT"
+    assert "`" not in span, "a backquote substitution runs while the step owns INT"
 
 
 def test_run_step_redrawn_line_fits_the_terminal_width(tmp_path: Path) -> None:
@@ -1384,7 +1445,7 @@ def test_cli_restores_the_venv_when_stopped_mid_rebuild(
         step = f"echo $$ > {tmp_path / 'steppid'}; exec sleep 30"
         gap = (
             f'echo ready > "{phase}"; '
-            f"_run_step \"$TMP/step.log\" \"Step\" sh -c '{step}' || exit $?"
+            f'_run_step "$TMP/step.log" "Step" sh -c \'{step}\' || exit $?'
         )
     else:
         gap = f'echo ready > "{phase}"; sleep 30 & wait $!'
@@ -1409,10 +1470,7 @@ def test_cli_restores_the_venv_when_stopped_mid_rebuild(
     )
     proc = subprocess.Popen(["sh", "-c", script], cwd=tmp_path, start_new_session=True)
     try:
-        deadline = time.monotonic() + 10
-        while not phase.exists():
-            assert time.monotonic() < deadline, "the stand-in never reached its gap"
-            time.sleep(0.02)
+        wait_until(phase.exists, timeout=10, describe=lambda: "the stand-in never reached its gap")
         time.sleep(0.2)
         os.killpg(proc.pid, getattr(signal, sig_name))
         assert proc.wait(timeout=15) == status
@@ -1447,7 +1505,9 @@ def _cli_sh_rebuild_steps() -> str:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell signals")
 @pytest.mark.parametrize("failing", ["venv create", "wheel install"])
-def test_a_stop_during_a_failure_branch_restore_keeps_the_venv(tmp_path: Path, failing: str) -> None:
+def test_a_stop_during_a_failure_branch_restore_keeps_the_venv(
+    tmp_path: Path, failing: str
+) -> None:
     """A TERM that lands inside a failed step's restore must not strand the venv.
 
     The failure branch deletes the half-built venv and renames the backup
@@ -1480,7 +1540,7 @@ def test_a_stop_during_a_failure_branch_restore_keeps_the_venv(tmp_path: Path, f
     py_stub.write_text(
         "#!/bin/sh\n"
         'mkdir -p "$3/bin"; echo half > "$3/half"\n'
-        "printf '#!/bin/sh\\nexit 4\\n' > \"$3/bin/pip\"; chmod +x \"$3/bin/pip\"\n"
+        'printf \'#!/bin/sh\\nexit 4\\n\' > "$3/bin/pip"; chmod +x "$3/bin/pip"\n'
         f"exit {3 if failing == 'venv create' else 0}\n"
     )
     py_stub.chmod(0o755)
@@ -1519,11 +1579,11 @@ def test_a_stop_during_a_failure_branch_restore_keeps_the_venv(tmp_path: Path, f
         encoding="utf-8",
     )
     try:
-        deadline = time.monotonic() + 15
-        while not phase.exists():
-            assert proc.poll() is None, proc.stderr.read() if proc.stderr else ""
-            assert time.monotonic() < deadline, "the restore never started"
-            time.sleep(0.02)
+        wait_until(
+            phase.exists,
+            timeout=15,
+            describe=lambda: f"the restore never started; proc retcode={proc.poll()!r}",
+        )
         os.killpg(proc.pid, signal.SIGTERM)
         _, stderr = proc.communicate(timeout=15)
     finally:
@@ -1586,11 +1646,11 @@ def test_a_sigkill_during_the_restore_delete_still_leaves_the_previous_venv(
     env = {**os.environ, "PATH": f"{stubs}{os.pathsep}{os.environ.get('PATH', '')}"}
     proc = subprocess.Popen(["sh", "-c", script], cwd=tmp_path, env=env, start_new_session=True)
     try:
-        deadline = time.monotonic() + 15
-        while not phase.exists():
-            assert proc.poll() is None, "the restore ended before its delete"
-            assert time.monotonic() < deadline, "the restore never reached its delete"
-            time.sleep(0.02)
+        wait_until(
+            phase.exists,
+            timeout=15,
+            describe=lambda: f"the restore never reached its delete; proc retcode={proc.poll()!r}",
+        )
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait(timeout=15)
     finally:

@@ -156,7 +156,10 @@ fails on connection refused.
 **In CI these specs run through the backend gate, not through npm.**
 `python setup.py test_e2e` boots a real gateway wired to a packaged fake ACP
 backend and shells this suite against it, entirely offline. That is the harness to
-match when you are debugging a CI-only failure.
+match when you are debugging a CI-only failure. Offline includes the app store:
+the harness gateway runs with `KIROCREW_SKIP_APP_STORE_FETCH=1`, so Discover
+renders the bundled seed, not the live catalog, and a spec's verdict never waits
+on the CDN. A gateway you start by hand for a local run does not set it.
 
 ## CI gates
 
@@ -266,6 +269,23 @@ into a deterministic local failure. Keep the forced delay in place while you ver
 the fix, then remove it: a fix that only passes once the delay is gone has not been
 shown to fix anything.
 
+**A fresh test store is offline.** `createTestStore()` starts where the real
+dashboard boots: `dashboard.connected` is `false` until the SSE stream opens. A
+component gated on `useConnected()` therefore renders its offline branch unless the
+test connects it, and a regression in its connected path stays green. Name the
+branch you test: use `createConnectedTestStore()` for the connected path (it lays
+any `dashboard` fields you pass over the reducer's initial state), and plain
+`createTestStore()` for the offline one. A gated component worth testing needs
+both.
+
+```tsx
+// WRONG: the menu is gated on `connected`, so this asserts the dimmed row.
+renderWithProviders(<FolderMenu />)
+
+// RIGHT: say which branch the test is about.
+renderWithProviders(<FolderMenu />, { store: createConnectedTestStore() })
+```
+
 ### Rules every test keeps
 
 The cases below are where these rules came from. Each one is a rule for every new or
@@ -276,9 +296,10 @@ TypeScript under `src`, `integration` and `playwright`, and a new `waitForTimeou
 shapes no semgrep rule reads (promise-sleeps in the Electron tests, unpinned `Date`, `isVisible` branches,
 elapsed-time upper bounds, unrestored fake timers) and fails a change that raises a
 file's count above its count at the change's merge-base; a line that keeps one on
-purpose carries `// flake-ok: <reason>` with a reason of ten characters or more. CI's
-backend checkout is depth 1 today, so the ratchet is a local, pre-push gate: run
-`python -m pytest -n0 test/test_flake_pattern_ratchet.py` before pushing.
+purpose carries `// flake-ok: <reason>` with a reason of ten characters or more. The
+ratchet is a local, pre-push gate (the
+[Determinism contract](../../docs/system-specs/common/testing-conventions.md#determinism-contract-read-this-first)
+says why): run `python -m pytest -n0 test/test_flake_pattern_ratchet.py` before pushing.
 
 - **Time.** A test whose output reads the clock pins it with `vi.setSystemTime(...)`,
   set after the last real-timer wait (with fake timers, see the fake-timer rule below).

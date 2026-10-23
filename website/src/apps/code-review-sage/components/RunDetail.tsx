@@ -99,7 +99,7 @@ export default function RunDetail({ run }: { run: Run }) {
   const {
     pool, cancelRun, cancelling, report, reportLoading, reportError,
     archiveRun, archiving, archiveError, runs, postComments,
-    postCommentGroups, posting, postError,
+    postCommentGroups, posting, postError, dismissFinding,
     postingSelection,
   } = useSage()
   const running = run.status === 'running'
@@ -156,6 +156,9 @@ export default function RunDetail({ run }: { run: Run }) {
           // the groups go out SEQUENTIALLY, because the backend refuses a second
           // post while one is in flight.
           onPostSelection={(groups) => postCommentGroups(run.run_id, groups)}
+          dismissed={run.dismissed}
+          onDismissFinding={(changeId, key, reason) => dismissFinding(
+            run.run_id, changeId, key, reason)}
           onArchive={() => archiveRun(run.run_id)}
             archiving={archiving}
             archiveError={archiveError?.message ?? null}

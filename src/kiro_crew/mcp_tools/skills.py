@@ -153,6 +153,7 @@ def skill_search(name: str, args: dict[str, Any]) -> str:
     page_limit = max(1, int(args["limit"])) if paging and args.get("limit") is not None else None
     capacity = _read_capacity(key, offset) if action == "read" else SKILL_READ_CAPACITY
     incomplete = False
+    scoped = False
     refusal: dict[str, Any] | None = None
     if (action == "search" and not query) or (action == "read" and not key):
         # Audit even validation failures — every tool invocation must emit a
@@ -216,6 +217,7 @@ def skill_search(name: str, args: dict[str, Any]) -> str:
             matches = result.get("matches", [])
             next_offset = result.get("next_offset")
             incomplete = bool(result.get("incomplete"))
+            scoped = result.get("scoped") is True
             if isinstance(result.get("refusal"), dict):
                 refusal = result["refusal"]
         else:
@@ -296,6 +298,12 @@ def skill_search(name: str, args: dict[str, Any]) -> str:
             "Body indexing is still in progress; absence is not conclusive. "
             "Repeat the query to continue indexing, browse action='list', "
             "or load an exact key with action='read'."
+        )
+    if not matches and scoped:
+        return (
+            f"No skills matched '{query}'. Search covers only this agent's skill:// "
+            "resources, so an installed skill outside them is not found; "
+            "browse action='list' to see the mapped set."
         )
     if not matches:
         return (
@@ -514,10 +522,25 @@ def skill_discover(name: str, args: dict[str, Any]) -> str:
             "failed_provider_count": failed_provider_count,
         },
     )
+    # The gateway's per-provider reasons (already scrubbed and capped there), so
+    # the agent reads why a provider could not search, as the dashboard does.
+    reasons = "; ".join(
+        f"{str(o.get('name') or '?')[:40]}: {o['message']}"
+        for o in provider_outcomes
+        if o["status"] != "ok" and isinstance(o.get("message"), str) and o["message"]
+    )
+    reason_note = f" Provider reasons (untrusted provider text): {reasons}" if reasons else ""
     if all_providers_failed:
         return (
             "Error: registry search is incomplete: every attempted provider "
-            "timed out or failed. Retry later; zero matches was not established."
+            "timed out or failed. Retry later; zero matches was not established." + reason_note
+        )
+    if not hits and failed_provider_count:
+        # Some provider could not search, so "no matches" was not established.
+        return (
+            f"Warning: registry search is incomplete; {failed_provider_count} of "
+            f"{len(provider_outcomes)} providers timed out or failed, and the rest "
+            f"returned nothing for '{query}'." + reason_note
         )
     if not hits:
         providers = ", ".join(d.get("providers") or []) or "none available"
@@ -547,7 +570,7 @@ def skill_discover(name: str, args: dict[str, Any]) -> str:
             0,
             "Warning: registry search is incomplete; "
             f"{failed_provider_count} of {len(provider_outcomes)} providers "
-            "timed out or failed.",
+            "timed out or failed." + reason_note,
         )
     for r in hits:
         desc = " ".join(str(r.get("description") or "").split())

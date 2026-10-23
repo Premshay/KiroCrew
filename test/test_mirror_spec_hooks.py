@@ -530,6 +530,15 @@ def test_the_direct_client_splits_by_the_servers_it_placed():
     assert client._placed_mcp_server_names() == ()
 
 
+def test_the_direct_client_uses_the_mcp_roster_sent_for_this_session():
+    client = _bare_client(ACP_BACKEND_OPENCODE)
+    client._session_mcp_cache = [{"name": "spec-server"}]
+    client._mcp_mount_servers = [{"name": "profile-core"}, {"name": 3}]
+    assert client._placed_mcp_server_names() == ("profile-core",)
+    client._mcp_mount_servers = []
+    assert client._placed_mcp_server_names() == ()
+
+
 def test_the_direct_client_permission_event_carries_the_mcp_split():
     # End to end on AcpClient: the live opencode MCP tool_call, then a permission
     # request for it, with kirocrew-core placed on the session's array.

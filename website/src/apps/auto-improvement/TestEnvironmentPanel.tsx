@@ -6,6 +6,17 @@ import SimpleSelect from "../../components/SimpleSelect";
 import { Badge, Btn, Input, PanelSectionHeader } from "../../components/ui";
 import { i18nT } from "../../i18n/t";
 
+const STATUS_LABEL_KEYS = {
+  blocked: "testEnvironment.blocked",
+  checking: "testEnvironment.checking",
+  ready: "testEnvironment.ready",
+  unchecked: "testEnvironment.unchecked",
+} as const;
+const BENCHMARK_LABEL_KEYS = {
+  benchmarkCommand: "boundedMeasurement.benchmarkCommand",
+  benchmarkCanaryCommand: "boundedMeasurement.benchmarkCanaryCommand",
+} as const;
+
 export interface TestEnvironment {
   kind: "gateway" | "python" | "runner";
   pythonExecutable?: string;
@@ -353,7 +364,7 @@ export default function TestEnvironmentPanel({
       />
       {(["benchmarkCommand", "benchmarkCanaryCommand"] as const).map((key) => (
         <label key={key} className="block text-[13px]">
-          {t(`boundedMeasurement.${key}`)}
+          {t(BENCHMARK_LABEL_KEYS[key])}
           <Input
             value={measurement[key]}
             onChange={(e) => editMeasurement({ [key]: e.target.value })}
@@ -444,7 +455,7 @@ export default function TestEnvironmentPanel({
                   : "muted"
             }
           >
-            {t(`testEnvironment.${status}`)}
+            {t(STATUS_LABEL_KEYS[status])}
           </Badge>
         </span>
       </div>

@@ -120,6 +120,16 @@ reconnect because the token is re-minted and the remote dashboard boots again.
 Each row also carries badges read off its record: **SSM** or **SSH** for the
 transport, and **EC2** when the instance was provisioned by the cloud launcher.
 
+## Turning one crew off
+
+Each crew in **Settings → Remote Crew** has a switch beside its status that reads
+**Connections: On** or **Connections: Off**. Off closes that crew's tunnel and
+keeps it closed: no click, auto-connect or gateway restart opens it again. Its
+sidebar group reads **Off** with an **Enable** button, and an open pane for it
+shows offline. A crew reached through it stays closed too, and connecting one
+names the crew that is off. Turning it back on reconnects it. The crew's
+settings are kept the whole time. Only the owner can flip the switch.
+
 ## Crews reached through another crew
 
 A remote pane is a full dashboard, so it can list remote crews of its own. When
@@ -165,18 +175,23 @@ it answers `relay_archive_read_only`; open the crew's own session to keep going.
 
 ## Another machine's sessions in your list
 
-The opposite direction: sessions a connected machine **owns** can be listed in
-this dashboard's Sessions list. Turn on **Settings → Developer → Feature
-Previews → Remote crew sessions**. With it off, nothing is fetched at all.
+The opposite direction: sessions a connected machine **owns** are listed in
+this dashboard's Sessions list. The same switch holds both: **Settings →
+Developer → Feature Previews → Chat on a crew**. With it off, nothing is fetched
+at all.
 
 With it on, the list is grouped per machine: **Local** first, then one
 collapsible group per crew, its header badged **online**, **reconnecting**,
 **error** or **offline** from the tunnel's state. A crew's group holds the
-sessions it owns and any local session whose turns run on it. A crew that
+sessions it owns and any read-only relay archive that ran on it. Inside the group
+the crew's own folders nest its rows, with unfiled rows last — a read-only
+mirror of the crew's folder tree, edited on the crew, each space keeping its own
+collapse state. A crew that
 disconnects keeps its last listed rows, dimmed and without live status, until
 you reload; nothing asks it again while it is down. Collapsing a group never
 changes which session is open. With no crew to group, the list has no group
-headers and looks as it always did. The board view groups nothing.
+headers and looks as it always did. The board view groups nothing: it leaves
+peer rows out and says how many it left out.
 
 Clicking a crew's session opens it in a crew window, the same window **New
 chat on crew** opens: the remote machine's own transcript, running state and any
@@ -227,10 +242,10 @@ confused. They are unrelated.
 |---|---|---|
 | **Kiro Crew** | The product. | Everywhere |
 | **Remote Crew** — spelled `instance` in config, routes and code (`instances.json`, `/api/instances`) | Another machine running its own gateway, reached over a tunnel. This page. | Settings → Remote Crew, the header switcher |
-| **Crew Member**, or **crewmate** | A named assistant you keep: its own workspace, memory, agent template and model, with a standing thread. Not a machine. | The Crew Members page — see [crew-members.md](crew-members.md) |
+| **Crew Member**, or **mate** | A named assistant you keep: its own workspace, memory, agent template and model, with a standing thread. Not a machine. | The Crew Members page — see [crew-members.md](crew-members.md) |
 | **Issue Radar crew** | An automation worker configured on a repository that claims an issue and moves it through the triage phases. Not a machine and not an assistant you chat with. | The Issue Radar Pipeline tab — see [issue-radar-pipeline.md](issue-radar-pipeline.md) |
 
-The short test: a Remote Crew is a **host**, a crewmate is an **assistant**,
+The short test: a Remote Crew is a **host**, a mate is an **assistant**,
 an Issue Radar crew is a **worker on a repo**.
 
 ## Tuning
@@ -285,4 +300,4 @@ reports the first broken link, which is usually the whole answer.
 - [Native SSM vs legacy SSH](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/cloud-instance-ssm-vs-ssh.md) — how a cloud-launched machine is reached.
 - [Remote and mobile access](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/remote-and-mobile.md) — installing and running a gateway on the far machine in the first place.
 - [dashboard.md](dashboard.md) — the dashboard the switcher sits in.
-- [crew-members.md](crew-members.md) — crewmates, which are not machines.
+- [crew-members.md](crew-members.md) — mates, which are not machines.

@@ -39,11 +39,16 @@ a loop that reaches its cap ran out of rope rather than completing. A cap of `0`
 is unlimited, which is worth asking for only when you genuinely want an
 unbounded loop.
 
-A separate wall-clock budget can bound elapsed time instead of cycles, which
-suits a loop whose turns are slow or whose interval is long. When the budget is
-spent the loop deactivates and tells you. No budget can exceed the operator
-ceiling `monitoring.max_runtime_secs` (default 7 days, maximum 30 days); raising
-it never extends a deadline already set.
+A separate runtime budget (awake time while the gateway runs; a restart counts
+the time since `created_ts` on the wall clock) can bound running time instead of
+cycles, which suits a loop whose turns are slow or whose interval is long. While
+the gateway keeps running, the time a host spends asleep counts toward the budget
+on Windows and not on Linux or macOS. A restart reads the time since the loop was
+armed (`created_ts`) from the wall clock instead, so a sleep that came before the
+restart counts in full on every platform. When the budget is spent the loop
+deactivates and tells you. No budget can exceed the operator ceiling
+`monitoring.max_runtime_secs` (default 7 days, maximum 30 days); raising it never
+extends a deadline already set.
 
 ## The wake judge
 
@@ -55,8 +60,12 @@ judge calls quiet costs no turn; the session gets one short notice row instead.
 
 The agent sets it with `judge` on `monitor_start` or `monitor_update`
 (`wake_when`, `quiet_when`, and optional `targets`). `judge: false` turns the
-judge off for that loop. A loop armed with `gate=false` is never screened,
-because its job is to act while its subject is quiet.
+judge off for that loop. `monitor_update` with
+`judge: {"wake_when": "", "quiet_when": ""}` drops the loop's own criteria, so
+it goes back to the built-in brief described below; an empty `judge: {}` means
+the same, but some clients drop an empty object before it reaches the server.
+A loop armed with `gate=false` is never screened, because its job is to act
+while its subject is quiet.
 
 The judge never ends a loop and never silences one for good: after a run of
 quiet cycles one fires anyway, so a wrong answer costs a late turn, not a missed

@@ -5,10 +5,13 @@ const path = require("path");
 
 const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
 const { createRendererRecovery, withSafeReload, hasSafeReload } = require("./renderer-recovery");
+const { createRendererExhaustedNotice } = require("./renderer-exhausted-notice");
 const { createHangRecovery } = require("./hang-recovery");
 const { armSplashHistoryClear, fileShellPageBasename } = require("./splash-history");
+const { armSwipeHistory, browserPanelUnderCursor } = require("./swipe-history");
 const { hideToTray, cancelPendingTrayHide, shouldKeepAppHidden } = require("./hide-to-tray");
 const { attachHtmlFullScreen } = require("./html-fullscreen");
+const { menuBarCanOverlap } = require("./fullscreen-top-reserve");
 const {
   watchFullScreenTransitions,
   repairStalledFullScreenExit,
@@ -59,6 +62,7 @@ const {
 const { createWindowPrompts } = require("./runtime/window/prompts");
 const { createSessionSecurity } = require("./runtime/window/session-security");
 const { injectLinuxCaptionControls } = require("./runtime/window/linux-captions");
+const { wireWillDownloadOnce } = require("./download-handler");
 const { attachBrowserPanels, dispatchBrowserOp } = require("./runtime/window/browser-panels");
 
 const BROWSER_PARTITION = "persist:kirocrew-browser";
@@ -97,6 +101,13 @@ function createWindowLifecycle(options) {
     backendUrl,
     port,
     glog = () => {},
+    // The launch log's path, named in the dead-renderer error dialog so the
+    // user can attach it to a report.
+    logPath = () => "",
+    // Whether a dashboard document has finished loading in this run (the
+    // gpu-crash-fallback latch). Tells the dead-renderer dialog a renderer that
+    // never started from one that crashed later.
+    dashboardLoaded = () => false,
     readInternalSecret = () => "",
     mintLocalToken,
     fetchRemoteToken,
@@ -108,6 +119,10 @@ function createWindowLifecycle(options) {
     syncTunnel = () => {},
     platform = process.platform,
     env = process.env,
+    // Shared single-use registry of downloads the renderer explicitly asked
+    // for; passed to the will-download handler so only announced downloads
+    // auto-save (see download-expectations.js).
+    downloadExpectations = null,
   } = options || {};
 
   if (!electron) throw new Error("createWindowLifecycle: electron is required");
@@ -297,6 +312,13 @@ function createWindowLifecycle(options) {
       isAlive: () => !win.isDestroyed() && !view.webContents.isDestroyed(),
       log: glog,
     });
+    // Mouse software such as Logitech's Options sends Back/Forward to macOS apps
+    // as swipes; the dashboard, or the browser panel under the cursor, takes each
+    // as a history step.
+    armSwipeHistory(win, view.webContents, {
+      isAlive: () => !win.isDestroyed() && !view.webContents.isDestroyed(),
+      panelUnderCursor: () => browserPanelUnderCursor(win, screen.getCursorScreenPoint()),
+    });
 
     // Teardown order is load-bearing: no command poller or CDP owner may outlive
     // the page it targets. Close the dashboard WebContents only after releasing
@@ -323,20 +345,28 @@ function createWindowLifecycle(options) {
     updateViewBounds();
     win.on("resize", updateViewBounds);
 
+    // `menuBarOverlap` tells the renderer whether to keep its menu-bar band
+    // clear: false when macOS already placed the fullscreen window below the
+    // menu bar (a notched built-in display).
     const sendFullScreen = () => {
       if (win.isDestroyed() || view.webContents.isDestroyed()) return;
-      view.webContents.send("fullscreen-changed", win.isFullScreen());
+      view.webContents.send("fullscreen-changed", win.isFullScreen(), {
+        menuBarOverlap: menuBarCanOverlap(win, screen),
+      });
     };
 
     // Fullscreen events can precede the window manager's final reflow. Keep the
     // immediate recompute (no flash where reflow is synchronous) and bounded
-    // deferred passes, including the late backstop slow Linux WMs need.
+    // deferred passes, including the late backstop slow Linux WMs need. Each
+    // pass re-sends the fullscreen state too, because the menu-bar verdict reads
+    // the window's position, which is only final once the reflow lands.
     let fullscreenSettleTimers = [];
     const scheduleFullscreenSettle = () => {
       for (const timer of fullscreenSettleTimers) clearTimeout(timer);
-      fullscreenSettleTimers = FULLSCREEN_SETTLE_MS.map(
-        (ms) => setTimeout(updateViewBounds, ms),
-      );
+      fullscreenSettleTimers = [
+        ...FULLSCREEN_SETTLE_MS.map((ms) => setTimeout(updateViewBounds, ms)),
+        ...FULLSCREEN_SETTLE_MS.map((ms) => setTimeout(sendFullScreen, ms)),
+      ];
     };
     win.on("closed", () => {
       for (const timer of fullscreenSettleTimers) clearTimeout(timer);
@@ -480,7 +510,7 @@ function createWindowLifecycle(options) {
         view.webContents.insertCSS(`
           #electron-drag-bar {
             position: fixed;
-            top: 0; left: 0; right: ${IS_WIN ? "138px" : LINUX_FRAMELESS ? "108px" : "0"};
+            top: 0; left: 0; right: ${IS_WIN ? "var(--mc-win-drag-reserve, 138px)" : LINUX_FRAMELESS ? "108px" : "0"};
             height: 42px;
             -webkit-app-region: drag;
             z-index: 99999;
@@ -530,13 +560,19 @@ function createWindowLifecycle(options) {
 
     // Same-origin windows remain in-app. Cross-origin web URLs and the audited
     // custom-scheme allowlist go to the OS; every other target fails closed.
-    view.webContents.setWindowOpenHandler(
-      createWindowOpenHandler({
-        openExternal: (url) => shell.openExternal(url),
-        getAppOrigin: () => windowBackendUrl,
-        log: glog,
-      }),
-    );
+    const windowOpenHandler = createWindowOpenHandler({
+      openExternal: (url) => shell.openExternal(url),
+      getAppOrigin: () => windowBackendUrl,
+      log: glog,
+    });
+    // An allowed same-origin window.open (the session pop-out) is a child window
+    // Electron creates on its own. Give it, and each of its own children, the
+    // same handler, or its external links open yet another in-app window.
+    const armWindowOpen = (contents) => {
+      contents.setWindowOpenHandler(windowOpenHandler);
+      contents.on("did-create-window", (child) => armWindowOpen(child.webContents));
+    };
+    armWindowOpen(view.webContents);
 
     // Do not leak the dashboard URL/token as a Referer to resources it embeds.
     // This listener remains attached at the same per-window setup point; moving
@@ -544,6 +580,29 @@ function createWindowLifecycle(options) {
     view.webContents.session.webRequest.onBeforeSendHeaders((details, callback) => {
       delete details.requestHeaders.Referer;
       callback({ requestHeaders: details.requestHeaders });
+    });
+
+    // Give renderer-triggered downloads (e.g. the Portability "Download Export
+    // (.zip)" button's <a download> blob) a real save path. The dashboard view
+    // is a WebContentsView under a BaseWindow, which Chromium cannot parent a
+    // native "Save As" dialog to, so without this the DownloadItem never
+    // resolves a path and nothing lands on disk (issue #13047). Attached once
+    // per session (every window shares the default session), so N windows do
+    // not stack N handlers.
+    //
+    // Because the single handler is shared by every window, it must resolve the
+    // dashboard origin for the window that OWNS each download rather than
+    // capturing one window's URL: a later window on a different gateway (the
+    // remote-host secondary windows main supports) would otherwise fail the
+    // origin checks and its export would never land. `resolveDashboardUrl` maps
+    // the download's own `webContents` back to its window's `_mcBackendUrl`;
+    // `dashboardUrl` is the fallback for the first window / an unmatched sender.
+    wireWillDownloadOnce(view.webContents.session, {
+      app,
+      log: glog,
+      dashboardUrl: windowBackendUrl,
+      resolveDashboardUrl: (wc) => windowForWebContents(wc)?._mcBackendUrl,
+      pending: downloadExpectations,
     });
 
     return view;
@@ -733,6 +792,42 @@ function createWindowLifecycle(options) {
     // request either way. See pane-asset-journal.js.
     attachPaneAssetJournal(mainWindow.webContents.session, glog, backendUrl);
 
+    function reloadDashboard() {
+      if (mainWindow.isDestroyed()) return;
+      (async () => {
+        let tokenValue = await mintLocalToken(backendUrl);
+        if (!tokenValue) {
+          ({ token: tokenValue } = await fetchRemoteToken(port));
+        }
+        if (mainWindow.isDestroyed()) return;
+        // `safe=1`: do not reopen the chat that may have caused the crash.
+        mainWindow.webContents.loadURL(withSafeReload(
+          tokenValue ? `${backendUrl}?token=${tokenValue}` : backendUrl,
+        ));
+      })().catch((error) => {
+        glog(`renderer recovery reload failed: ${error && error.message}`);
+      });
+    }
+
+    const rendererExhaustedNotice = createRendererExhaustedNotice({
+      dialog,
+      openExternal: (url) => shell.openExternal(url),
+      requestQuit,
+      // "Try again" in the dialog: a fresh reload budget, then one more load.
+      // `rendererRecovery` is created just below; this runs only after the
+      // dialog it belongs to, long after both exist.
+      retry: () => {
+        rendererRecovery.reset();
+        reloadDashboard();
+      },
+      dashboardLoaded,
+      parentWindow: () => mainWindow,
+      isQuitting,
+      platform,
+      logPath,
+      log: glog,
+    });
+
     const rendererRecovery = createRendererRecovery({
       isQuitting,
       log: glog,
@@ -762,24 +857,13 @@ function createWindowLifecycle(options) {
         }
         return parts.join(" ");
       },
-      reload: () => {
-        if (mainWindow.isDestroyed()) return;
-        (async () => {
-          let tokenValue = await mintLocalToken(backendUrl);
-          if (!tokenValue) {
-            ({ token: tokenValue } = await fetchRemoteToken(port));
-          }
-          if (mainWindow.isDestroyed()) return;
-          // `safe=1`: do not reopen the chat that may have caused the crash.
-          mainWindow.webContents.loadURL(withSafeReload(
-            tokenValue ? `${backendUrl}?token=${tokenValue}` : backendUrl,
-          ));
-        })().catch((error) => {
-          glog(`renderer recovery reload failed: ${error && error.message}`);
-        });
-      },
-      onGiveUp: ({ reason }) => {
-        glog(`renderer recovery exhausted (reason=${reason}); leaving the window as-is`);
+      reload: reloadDashboard,
+      // The budget is spent: say so on screen. A dead renderer leaves the
+      // window black with no text, so this is the only readable error the
+      // user gets (renderer-exhausted-notice.js). Never awaited here: the
+      // dialog outlives this event handler.
+      onGiveUp: (info) => {
+        void rendererExhaustedNotice.show(info);
       },
     });
 
@@ -1324,6 +1408,11 @@ function createWindowLifecycle(options) {
       }),
       alwaysOnTop: !!(store.get("windowState") || {}).alwaysOnTop,
       toggleAlwaysOnTop,
+      toggleFocusMode: () => {
+        const win = focusedDashboardWindow();
+        const wc = win && win._mcView.webContents;
+        if (wc && !wc.isDestroyed()) wc.send("focus-mode:toggle");
+      },
       openNewSessionWindow: () => openNewSessionWindow(),
       openNewConnectionWindow: () => openNewConnectionWindow(),
       renameCurrentWindow: () => renameCurrentWindow(),

@@ -168,11 +168,65 @@ class TestStagingRecordsNothing:
         with patch.object(instance, "_now_ms", return_value=instance._now_ms() + stale):
             assert instance.staged_preview(SLUG) is None
 
+    def test_a_forged_non_numeric_staged_ms_reads_as_nothing_staged(self) -> None:
+        """A fifth bad envelope: a hand-forged ``staged_ms`` that is not a number.
+
+        A gateway writer always stamps an int, so this is only reachable from a file an
+        agent forged on disk. It must read as nothing staged -- the same answer the four
+        documented bad cases give -- rather than letting the ``int()`` escape as an
+        uncaught HTTP 500 through preview and apply.
+        """
+        instance.stage_preview(SLUG, template_id="fixture-board")
+        raw = json.loads(instance._preview_path(SLUG).read_text(encoding="utf-8"))
+        raw["staged_ms"] = "not-a-number"
+        instance._preview_path(SLUG).write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+        assert instance.staged_preview(SLUG) is None
+
     def test_the_preview_wire_carries_the_link_and_never_the_page(self) -> None:
         """The html is the large half and the agent that staged it already holds it."""
-        wire = instance.stage_preview(SLUG, template_id="fixture-board").wire()
-        assert wire["preview_url"] == f"/api/members/{SLUG}/dashboard?preview=1"
+        wire = instance.stage_preview(SLUG, template_id="fixture-board").wire("Fleet")
+        assert wire["preview_url"] == "/members?member=Fleet&dashboard=preview"
         assert "html" not in wire and wire["html_bytes"] == len(PAGE.encode("utf-8"))
+
+
+class TestThePreviewLinkIsAPageForOneCrewmate:
+    """`preview_url` builds what a person OPENS: a page, for one crewmate by name.
+
+    A slug alone is refused by the dashboard route with ``missing_member``, and the
+    JSON read shows in a browser as raw JSON, so the link is the Members page, by crew
+    name, with the Dashboard tab on the staged page.
+    """
+
+    def test_it_names_the_crewmate_and_opens_the_dashboard_tab_preview(self) -> None:
+        assert instance.preview_url("bi-buddy") == "/members?member=bi-buddy&dashboard=preview"
+
+    def test_it_is_a_page_and_never_the_json_route(self) -> None:
+        link = instance.preview_url("bi-buddy")
+        assert link.startswith("/members?")
+        assert "/api/" not in link
+
+    def test_a_name_the_slug_would_lose_survives_the_round_trip(self) -> None:
+        """Spaces, case and reserved characters are what slugification throws away."""
+        from urllib.parse import parse_qs, urlsplit
+
+        for name in ("BI Buddy", "R&D", "a/b?c=d", "Ünïcødé"):
+            query = parse_qs(urlsplit(instance.preview_url(name)).query)
+            assert query == {
+                "member": [name],
+                instance.PREVIEW_PAGE_PARAM: [instance.PREVIEW_PAGE_VALUE],
+            }, name
+
+    def test_the_query_matches_the_members_page_constants(self) -> None:
+        """The page reads these two literals; a rename on one side breaks every link."""
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[1] / "website/src/pages/members/dashboardPreview.ts"
+        ).read_text(encoding="utf-8")
+        assert f"DASHBOARD_PREVIEW_PARAM = '{instance.PREVIEW_PAGE_PARAM}'" in source
+        assert f"DASHBOARD_PREVIEW_VALUE = '{instance.PREVIEW_PAGE_VALUE}'" in source
 
 
 class TestAnAgentWrittenPageCannotBeStaged:
@@ -216,7 +270,7 @@ class TestAnAgentWrittenPageCannotBeStaged:
         with pytest.raises(instance.InstanceRefused) as refused:
             instance.stage_preview(SLUG, **kwargs)
         assert str(refused.value) == instance.AUTHORED_PAGE_REFUSAL
-        assert "come later" in str(refused.value)
+        assert "dashboard_save" in str(refused.value)
         assert instance.staged_preview(SLUG) is None, "a refused page was staged anyway"
 
     def test_the_refusal_says_what_to_call_instead(self) -> None:
@@ -224,18 +278,24 @@ class TestAnAgentWrittenPageCannotBeStaged:
         assert "dashboard_templates" in instance.AUTHORED_PAGE_REFUSAL
         assert "template_id" in instance.AUTHORED_PAGE_REFUSAL
 
-    def test_only_a_built_in_source_is_renderable(self) -> None:
-        """The set behind the adopt-time half of the same rule. ONE value."""
-        assert instance.RENDERABLE_SOURCES == frozenset({catalog.BUILTIN_SOURCE})
+    def test_only_a_built_in_or_operator_source_is_renderable(self) -> None:
+        """The set behind the adopt-time half of the same rule.
 
-    def test_a_user_sourced_record_is_refused_at_adopt_as_well(self) -> None:
+        ``user`` is a page the operator placed in the panel-templates folder, which the
+        catalog serves; an authored page still never reaches the catalog, as above.
+        """
+        assert instance.RENDERABLE_SOURCES == frozenset(
+            {catalog.BUILTIN_SOURCE, catalog.USER_SOURCE}
+        )
+
+    def test_a_shared_sourced_record_is_refused_at_adopt_as_well(self) -> None:
         """Belt and braces, on the path that writes a version rather than stages one.
 
         ``_check`` runs for every committed version, so a record that reached disk
         under an older gateway cannot be rolled forward into a rendered page either.
         """
         with pytest.raises(instance.InstanceRefused) as refused:
-            instance._check(_authored_manifest(), AUTHORED_PAGE)
+            instance._check(_authored_manifest(source="shared"), AUTHORED_PAGE)
         assert "shipped with the product" in str(refused.value)
 
 
@@ -371,10 +431,11 @@ class TestTheToolSurface:
             "dashboard_rollback",
         }
 
-    def test_apply_advertises_no_arguments(self) -> None:
-        """The emptiness IS the safety property: apply cannot be pointed elsewhere."""
+    def test_apply_advertises_only_an_optional_template_id(self) -> None:
+        """A template applies without a preview: the preview is a look, not a gate."""
         apply_tool = next(t for t in _list_tools() if t["name"] == "dashboard_apply")
-        assert apply_tool["inputSchema"].get("properties") == {}
+        assert set(apply_tool["inputSchema"]["properties"]) == {"template_id"}
+        assert not apply_tool["inputSchema"].get("required")
 
 
 class TestDashboardTemplatesTool:
@@ -472,17 +533,17 @@ class TestDashboardPreviewTool:
                 "fields": ["credits", "phase"],
                 "html_bytes": 120,
                 "staged_ms": 1,
-                "preview_url": "/api/members/fleet/dashboard?preview=1",
+                "preview_url": "/members?member=fleet&dashboard=preview",
             },
         }
         with patch("kiro_crew.mcp_panel._post", return_value=body):
             out = _call_tool_inner("dashboard_preview", {"template_id": "fixture-board"})
         assert "NOTHING has changed" in out
-        assert "/api/members/fleet/dashboard?preview=1" in out
-        # The instruction to ASK is unconditional: this tool's whole value is that it
-        # changes nothing, and an agent that previews and applies in one breath has
-        # spent the staging step without letting anybody look.
-        assert "ASK the person" in out
+        # A markdown link, because the chat links a root-relative href only in that
+        # form; the bare path would show as plain text the person cannot click.
+        assert "[Open the dashboard preview](/members?member=fleet&dashboard=preview)" in out
+        # The way to keep it, and the person's own buttons, are both named.
+        assert "dashboard_apply with template_id `fixture-board` puts it live" in out
 
     @pytest.mark.parametrize(
         "args",
@@ -510,7 +571,7 @@ class TestDashboardPreviewTool:
         with patch("kiro_crew.mcp_panel._post") as mock_post:
             out = _call_tool_inner("dashboard_preview", args)
         assert out == f"Error: {instance.AUTHORED_PAGE_REFUSAL}"
-        assert "come later" in out
+        assert "dashboard_save" in out
         mock_post.assert_not_called()
 
     def test_previewing_nothing_is_refused_locally(self, _verified_caller: Any) -> None:
@@ -527,7 +588,8 @@ class TestDashboardPreviewTool:
         """
         tool = next(t for t in _list_tools() if t["name"] == "dashboard_preview")
         assert set(tool["inputSchema"]["properties"]) == {"template_id"}
-        assert "CANNOT preview a page you wrote" in tool["description"]
+        assert "OPTIONAL" in tool["description"]
+        assert "dashboard_save" in tool["description"]
 
     def test_a_refusal_from_the_gateway_comes_back_whole(self, _verified_caller: Any) -> None:
         """A parity refusal names every unpaired field in both directions.
@@ -570,6 +632,43 @@ class TestDashboardApplyTool:
         with patch("kiro_crew.mcp_panel._post", return_value={"error": refusal}):
             out = _call_tool_inner("dashboard_apply", {})
         assert out.startswith("Error:") and "preview one first" in out
+
+
+class TestTheRepliesNameNoFeaturePreview:
+    """The Dashboard tab shows the page for every reader.
+
+    So no reply that touches the page, and no panel tool, tells an agent to send
+    a person to a switch that does not exist.
+    """
+
+    def test_apply_names_no_switch(self, _verified_caller: Any) -> None:
+        body = {"ok": True, "instance_version": 4, "template_id": "fixture-board"}
+        with patch("kiro_crew.mcp_panel._post", return_value=body):
+            out = _call_tool_inner("dashboard_apply", {})
+        assert "version 4" in out
+        assert "Feature Preview" not in out
+
+    def test_write_names_no_switch(self, _verified_caller: Any) -> None:
+        body = {"ok": True, "written": {"field": "credits", "type": "number"}}
+        with patch("kiro_crew.mcp_panel._post", return_value=body):
+            out = _call_tool_inner("dashboard_write", {"field": "credits", "value": 3})
+        assert "credits" in out
+        assert "Feature Preview" not in out
+
+    def test_fields_names_no_switch(self) -> None:
+        out = _render_fields(
+            {"template": {"id": "fixture-board", "version": 1}, "instance_version": 2}
+        )
+        assert "Feature Preview" not in out
+
+    def test_no_panel_tool_description_names_the_switch(self) -> None:
+        for tool in _list_tools():
+            assert "Feature Preview" not in tool["description"], tool["name"]
+
+    def test_the_old_note_is_gone(self) -> None:
+        import kiro_crew.mcp_panel as mcp_panel
+
+        assert getattr(mcp_panel, "DASHBOARD_PREVIEW_NOTE", None) is None
 
 
 class TestDashboardRollbackTool:

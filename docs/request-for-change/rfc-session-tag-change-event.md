@@ -52,7 +52,7 @@ adding a subsystem. The positions this RFC takes, one line each:
 4. **Re-entrancy** is settled now, not deferred: the event carries **advisory
    provenance**, following the in-repo precedent that `Stop` self-limits by
    advisory `hook_continuation_count` / `stop_hook_active`
-   (`ScriptHookStore.fire`'s `Stop` payload in `src/kiro_crew/hooks.py`) rather than an enforced cap.
+   (`ScriptHookStore.fire`'s `Stop` payload in `src/kiro_crew/hook_runtime/script_hooks.py`) rather than an enforced cap.
 5. **Placement** is a **sixth `HOOK_EVENTS` entry** (a `SessionTagsChanged`
    script-hook event), because the ask is to *run an automation now* on the
    transition, which is precisely what the script-hook engine does, not to
@@ -120,13 +120,13 @@ Three neighbouring issues sit around this one; none asks for it:
 - **No new capability surface.** Script hooks are already governance-gated by
   `capabilities.script_hooks`, default OFF, via
   `_script_hooks_capability_denied` (`src/kiro_crew/hook_runtime/governance_gate.py`, checked
-  inside `run_script_hook` (`src/kiro_crew/hooks.py`, offloaded through its
+  inside `run_script_hook` (`src/kiro_crew/hook_runtime/script_hooks.py`, offloaded through its
   `asyncio.to_thread` call)). A tag-change hook rides that same gate;
   the capability surface does not widen.
 - **Dispatch from an HTTP handler with no agent turn is already supported.**
-  `api_hook_test` (`src/kiro_crew/dashboard/handlers/hooks.py`) calls
+  `api_hook_test` (`src/kiro_crew/dashboard/handlers/hooks_scripts.py`) calls
   `run_script_hook` with a synthesized payload, and `run_script_hook`
-  (`src/kiro_crew/hooks.py`) builds a default `hook_event` itself when passed
+  (`src/kiro_crew/hook_runtime/script_hooks.py`) builds a default `hook_event` itself when passed
   `None`, requiring no session and no agent config. A tag-write
   handler firing a hook is the same shape.
 
@@ -214,7 +214,7 @@ This follows the settled in-repo precedent: `Stop` controls its own re-entrancy
 with **advisory** signals, not an enforced cap. `hook_continuation_count` (the
 depth of the current continuation run) and `stop_hook_active` (its boolean
 shorthand) are stamped on the `Stop` payload unconditionally
-(`ScriptHookStore.fire` in `src/kiro_crew/hooks.py`) precisely so a hook *may* self-limit while a
+(`ScriptHookStore.fire` in `src/kiro_crew/hook_runtime/script_hooks.py`) precisely so a hook *may* self-limit while a
 real gate hook checks its own condition and ignores them. The comment there is
 explicit: *"Kiro's Stop contract defines no cap ... a hook may self-limit,
 diagnose, or surface the count."* We adopt the same stance: the runtime provides
@@ -282,7 +282,7 @@ write `slot.tags` at HEAD `6581a04ee`:
 |---|---|---|---|
 | `api_chat_slot_tags` | `chat_tags.py` | user set-tags API | **yes** |
 | `api_chat_slot_drop` | `chat_tags.py` | user drag-to-lane API | **yes** |
-| folder inheritance | `_read_folder_tags` (`slot.tags.append`), ids from `validate_folder_tag_ids` (`chat_tags.py`) | a new slot inherits a folder's tags | **yes** |
+| folder inheritance | `_read_folder_tags` (`slot.tags.append`), ids from `validate_folder_tag_ids` (`chat_tags_store.py`) | a new slot inherits a folder's tags | **yes** |
 | channel first-file / restore | both `slot.tags.append` sites in `surface_channel_session` | channel slot filing | **yes** |
 | slot restore (bulk) | `chat_handlers.py` (`slot.tags = ...`) | reconstruct from stored value | **no** (load-time) |
 | fork | `chat_fork.py` (`new_slot.tags = list(slot.tags)`) | fork inherits parent tags | see below |
@@ -290,7 +290,7 @@ write `slot.tags` at HEAD `6581a04ee`:
 | auto-tag | `chat_auto_tag.py` | never writes status tags | **n/a**, no status delta ever |
 
 The folder-inherited path is the one the issue's two-handler framing misses:
-`validate_folder_tag_ids` (`chat_tags.py`) screens a folder tag id's **shape**
+`validate_folder_tag_ids` (`chat_tags_store.py`) screens a folder tag id's **shape**
 (must be a list of strings) and **vocabulary** (intersected with the live
 `state._tags` when authoritative) but **not** `status: true`. So an inherited
 folder status tag can put a session into a lane through
@@ -311,7 +311,7 @@ only care about human transitions can filter it. Left as an open question below.
 
 **Recommendation: a single choke-point emitter, not per-handler emits.** Because
 the write surface is this wide and shares one invariant (`slot.tags` mutated under
-`tags_write_lock`, per the comment at `chat_handlers.py`), the emit
+`tags_write_lock`, per the comment at `chat_api/slot_create.py`), the emit
 belongs at a single helper that every write site funnels through, it takes the
 pre-write and post-write status-tag sets, computes the delta, and dispatches the
 hook only if the status subset changed. A single choke point is the only way to
@@ -327,7 +327,7 @@ recommendation stands as the target shape, but the implementation PR (#7669) doe
 no emit site: it touches neither `chat_tags.py` nor `chat_handlers.py`, so no writer calls
 the dispatcher and the event cannot fire. Per-writer emits — the two `chat_tags.py`
 writers, and closing-order step 1, the folder inheritance in `_read_folder_tags` reached
-from `api_chat_slot_create` (`chat_handlers.py`) — are deferred to a follow-up PR. The two
+from `api_chat_slot_create` (`chat_api/slot_create.py`) — are deferred to a follow-up PR. The two
 `slot.tags.append` sites in `surface_channel_session` (`channel_slots.py`) stay silent
 after that follow-up too, until closing-order step 2.
 
@@ -391,7 +391,7 @@ enforced suppression).
 ### Phase 3: documentation and the hook-test surface
 
 Extend the events documentation and let `api_hook_test`
-(`dashboard/handlers/hooks.py`) synthesize a `SessionTagsChanged` payload so
+(`dashboard/handlers/hooks_scripts.py`) synthesize a `SessionTagsChanged` payload so
 the event is testable through the existing test endpoint, mirroring how it
 already synthesizes the `Stop` payload.
 
@@ -448,7 +448,7 @@ and the emit helper.
 - **Enforced re-entrancy suppression.** Rejected per Question 4: it would swallow
   legitimate rapid transitions and would be the only enforced re-entrancy control
   in the hook engine, contradicting the advisory `Stop` precedent
-  (`ScriptHookStore.fire`'s `Stop` payload in `hooks.py`).
+  (`ScriptHookStore.fire`'s `Stop` payload in `hook_runtime/script_hooks.py`).
 
 ## Open questions
 

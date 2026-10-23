@@ -35,7 +35,7 @@ strict session identity, and then a SCOPE. A session may read its own unit, the
 unit of any session it dispatched at any depth, and, if it is
 the owner at a dashboard tab, any unit at all. This module shapes output and nothing
 else, which is why a reviewer looking for the security argument should read
-``dashboard/handlers/crew_log.py``.
+``dashboard/handlers/crew_log_scope.py``.
 
 **Why a dispatch tree.** A conductor reading the crew logs of the sub-sessions it
 dispatched is the ordinary shape of the work rather than a special case, and the
@@ -612,7 +612,7 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
 #: :func:`~kiro_crew.mcp_core.require_strict_session_key`, whose first source is
 #: that block, and the endpoint scopes every read on the key this server forwards.
 #:
-#: Advertising is not cosmetic. ``mcp_gateway/backend.py`` strips any client-forged
+#: Advertising is not cosmetic. ``mcp_gateway/backend_stubs.py`` strips any client-forged
 #: caller block from EVERY forwarded request and re-injects its own only when the
 #: backend advertised this capability — so without the advertisement the block
 #: never arrives and a pooled backend would resolve an empty identity for every

@@ -163,6 +163,16 @@ const isForeignInjection = (msg: ChatMessage): boolean => {
 const isBetweenTurnWork = (item: TurnItem): boolean =>
   item.kind === "single" && item.msg.meta?.between_turn === true;
 
+/**
+ * A batch holding a tool call: the rows a turn's fold counts (TurnBlock's
+ * `isTool` matches `single` tool rows only). Such a batch wraps as a turn
+ * whatever its length, so a one-tool turn folds like a two-tool turn (#23017).
+ * Shared with app-sdk `ChatMessageList`, which keeps its own grouping (its
+ * groups hold reasoning, which must not count) but must wrap the same batches.
+ */
+export const hasToolStep = (items: TurnItem[]): boolean =>
+  items.some(t => t.kind === 'single' && t.msg.role === 'tool')
+
 export interface GroupedTurns {
   turns: DisplayItem[];
   /** Index into `turns` of the turn object produced by the TRAILING flush, or
@@ -179,7 +189,7 @@ export interface GroupedTurns {
  * The region can hold both loose TurnItems (a batch too short to have been
  * wrapped) and already-wrapped turns (a completion opener splits the region
  * into several), so it is flattened back to a single item list. Flattening is
- * what makes the fold reliable: a two-item reply is spread loose by `flushTurn`
+ * what makes the fold reliable: a short reply with no tool call is spread loose by `flushTurn`
  * and would otherwise have no TurnBlock to fold it.
  *
  * Always `complete: true` — a region is only folded once the synthesis row that
@@ -292,13 +302,14 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
   // a separate predicate. Empty placeholder bursts do not count (they render
   // nothing, and mergeTurnThinking ignores them too).
   const contentThinkingCount = (items: TurnItem[]) =>
-    items.reduce((n, t) => n + (isReasoningBurst(t) ? 1 : 0), 0);
+    items.reduce((n, t) => n + (isReasoningBurst(t) ? 1 : 0), 0)
+  // A batch with a tool call wraps at ANY length (#23017). The `> 2` rule alone
+  // spread a one-tool turn (tool + answer) loose, so it never got the
+  // "1 tool call" fold a two-tool turn gets. Assistant-only batches keep the
+  // length rule: a lone answer has no step to fold and must stay loose.
   const flushTurn = (items: TurnItem[], complete: boolean) => {
-    if (
-      (hasWorkingSteps(items) && items.length > 2) ||
-      contentThinkingCount(items) >= 2
-    ) {
-      turns.push({ kind: "turn", items, complete });
+    if (hasToolStep(items) || (hasWorkingSteps(items) && items.length > 2) || contentThinkingCount(items) >= 2) {
+      turns.push({ kind: 'turn', items, complete })
     } else {
       turns.push(...items);
     }
@@ -506,35 +517,35 @@ const sameDisplayItem = (a: DisplayItem, b: DisplayItem): boolean => {
  * one and substitutes the PRIOR object wherever the new element describes the
  * same underlying message references — so a flush that only grew the trailing
  * message returns the identical settled-turn objects and only the trailing
- * turn carries a new identity.
+ * turn carries a new identity. The substitution itself is
+ * {@link createDisplayItemReconciler}'s.
  *
  * Cache shape and why it cannot leak: the closure holds exactly ONE
- * (messages, result) pair — the last call's — and both slots are overwritten
- * on every call, so the previous messages array is released as soon as the
- * next one arrives. Each caller creates its own grouper (one per mounted
+ * (messages, result) pair — the last call's — and the reconciler holds that
+ * call's turns; all of it is overwritten on every call, so the previous
+ * messages array is released as soon as the next one arrives. Each caller creates its own grouper (one per mounted
  * ChatPage via useMemo), so two transcripts never thrash a shared slot and the
  * whole cache dies with the component. `applyRunningState` stays downstream
  * and untouched: it already applies the running flag in O(1) on top of
  * whatever this returns.
  */
 export function createTurnGrouper(): (messages: ChatMessage[]) => GroupedTurns {
-  let prevMessages: ChatMessage[] | null = null;
-  let prevResult: GroupedTurns | null = null;
+  const reconcile = createDisplayItemReconciler()
+  let prevMessages: ChatMessage[] | null = null
+  let prevResult: GroupedTurns | null = null
   return (messages: ChatMessage[]): GroupedTurns => {
-    if (prevMessages === messages && prevResult) return prevResult;
-    const next = groupDisplayItems(messages);
+    if (prevMessages === messages && prevResult) return prevResult
+    const next = groupDisplayItems(messages)
+    reconcile(next.turns)
     if (prevResult) {
-      const prevTurns = prevResult.turns;
-      let allReused =
-        next.turns.length === prevTurns.length &&
-        next.trailingTurnIdx === prevResult.trailingTurnIdx;
-      for (let i = 0; i < next.turns.length; i++) {
-        const p = prevTurns[i];
-        if (p && sameDisplayItem(next.turns[i], p)) next.turns[i] = p;
-        else allReused = false;
-      }
+      const prevTurns = prevResult.turns
       // Every element (and the trailing index) survived: keep the previous
       // top-level object too, so the [groupedTurns] memos downstream also hit.
+      // The reconcile handed back the prior object for every element that
+      // survived, and `groupDisplayItems` mints a fresh one for every other.
+      const allReused = next.turns.length === prevTurns.length &&
+        next.trailingTurnIdx === prevResult.trailingTurnIdx &&
+        next.turns.every((t, i) => t === prevTurns[i])
       if (allReused) {
         prevMessages = messages;
         return prevResult;
@@ -544,6 +555,30 @@ export function createTurnGrouper(): (messages: ChatMessage[]) => GroupedTurns {
     prevResult = next;
     return next;
   };
+}
+
+/**
+ * The identity reconcile behind {@link createTurnGrouper}, used directly by a
+ * host that groups with its own rules (app-sdk `ChatMessageList`). Substitutes
+ * the PRIOR object, in place, wherever a freshly grouped element describes the
+ * same message references, so a streaming flush that only grew the trailing
+ * message hands every settled row its previous object and `memo(TurnBlock)` and
+ * the memoized list rows can bail out. One-slot cache: the closure holds only
+ * the last result, overwritten on every call, and each mounted list or grouper
+ * creates its own reconciler.
+ */
+export function createDisplayItemReconciler(): (items: DisplayItem[]) => DisplayItem[] {
+  let prev: DisplayItem[] | null = null
+  return (items: DisplayItem[]): DisplayItem[] => {
+    if (prev) {
+      for (let i = 0; i < items.length; i++) {
+        const p = prev[i]
+        if (p && sameDisplayItem(items[i], p)) items[i] = p
+      }
+    }
+    prev = items
+    return items
+  }
 }
 
 /**

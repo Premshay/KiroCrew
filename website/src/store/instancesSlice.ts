@@ -77,6 +77,14 @@ export interface HostModel {
    *  embedded header must inset its RIGHT side clear of the native caption
    *  buttons (the transparent titleBarOverlay's min/max/close cluster). */
   winInset: boolean
+  /** The host window's live, zoom-aware caption reserve (e.g. `178px`), read
+   *  from the `--mc-win-caption-reserve` the main process sets on the HOST
+   *  <html>. The pane is a separate document, so it never inherits that value,
+   *  yet it is painted at the host's page zoom: without it the pane header keeps
+   *  the static 142px default, which paints narrower than the caption buttons
+   *  below 100% zoom. Absent when the host has none to relay (an older host, a
+   *  non-Windows host, or before the main process has pushed it). */
+  winCaptionReserve?: string
   /** The parent window's focus mode, relayed so the pane hides its own chrome to
    *  match instead of landing fully-framed inside a focused window. `null` means
    *  the host SENT NO OPINION — an older host whose model predates the field —
@@ -141,7 +149,37 @@ interface CrewFormState {
    * write back a field the user never touched.
    */
   edit: { id: string; draft: InstanceDraft; seq: number } | null
+  /**
+   * What the set-up tab's launch form holds that a launch has not used yet: the
+   * optional subnet, and the Kiro sign-in choice once the reader has made one.
+   * `null` when it holds neither. Same reasoning as above: kept in memory so it
+   * outlives the hand-off, and dies with the tab. Optional because tests
+   * preload partial slices.
+   */
+  launch?: CrewLaunchDraft | null
 }
+
+/** The launch form's sign-in choice: Builder ID, or an Identity Center portal. */
+export interface CrewLaunchIdentity {
+  mode: 'builder_id' | 'identity_center'
+  start_url: string
+  region: string
+}
+
+export interface CrewLaunchDraft {
+  subnet_id: string
+  /** `null` until the reader picks one: the inherited preselection is not kept. */
+  identity: CrewLaunchIdentity | null
+}
+
+const sameLaunchDraft = (a: CrewLaunchDraft | null, b: CrewLaunchDraft | null): boolean =>
+  a === b
+  || (!!a && !!b && a.subnet_id === b.subnet_id
+    && (a.identity === b.identity
+      || (!!a.identity && !!b.identity
+        && a.identity.mode === b.identity.mode
+        && a.identity.start_url === b.identity.start_url
+        && a.identity.region === b.identity.region)))
 
 interface InstancesState {
   warm: Record<string, WarmConn>
@@ -254,6 +292,21 @@ const instancesSlice = createSlice({
       if (!state.crewForms) state.crewForms = { add: null, edit: null }
       state.crewForms.edit = action.payload
     },
+    /** Hold (or drop, with `null`) the launch form's unlaunched entries. Written
+     *  on every change, like the add form. */
+    setCrewLaunchDraft(state, action: PayloadAction<CrewLaunchDraft | null>) {
+      if (!state.crewForms) state.crewForms = { add: null, edit: null }
+      state.crewForms.launch = action.payload
+    },
+    /**
+     * A launch has used the draft it was sent with. Dropped only if the held
+     * draft is still that one: an edit typed while the launch request was in
+     * flight is a new draft, and stays.
+     */
+    dropLaunchedCrewDraft(state, action: PayloadAction<CrewLaunchDraft | null>) {
+      if (!state.crewForms) return
+      if (sameLaunchDraft(state.crewForms.launch ?? null, action.payload)) state.crewForms.launch = null
+    },
     clearInstances() {
       return initialState
     },
@@ -270,6 +323,8 @@ export const {
   setHostModel,
   setCrewAddForm,
   setCrewEditForm,
+  setCrewLaunchDraft,
+  dropLaunchedCrewDraft,
   clearInstances,
 } = instancesSlice.actions
 export default instancesSlice.reducer

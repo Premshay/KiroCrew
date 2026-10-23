@@ -1,0 +1,127 @@
+[
+  {
+    "agent_capabilities": {
+      "mcpCapabilities": {
+        "http": true
+      },
+      "promptCapabilities": {
+        "audio": false,
+        "embeddedContext": false,
+        "image": false
+      },
+      "sessionCapabilities": {
+        "close": {},
+        "list": {},
+        "resume": {}
+      }
+    },
+    "agent_version": "0.0.1",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "config_options": [
+      {
+        "category": "model",
+        "currentValue": "[\"deepseek-official\",\"deepseek-v4-flash\"]",
+        "id": "model",
+        "name": "Model",
+        "options": [
+          {
+            "group": "deepseek-official",
+            "name": "DeepSeek",
+            "options": [
+              {
+                "name": "deepseek-v4-flash",
+                "value": "[\"deepseek-official\",\"deepseek-v4-flash\"]"
+              },
+              {
+                "name": "DeepSeek-V41-Flash",
+                "value": "[\"deepseek-official\",\"deepseek-flash\"]"
+              },
+              {
+                "description": "Stronger agentic coding, knowledge, and difficult reasoning; suited to complex or quality-critical tasks at higher cost.",
+                "name": "DeepSeek-V4-Pro",
+                "value": "[\"deepseek-official\",\"deepseek-v4-pro\"]"
+              }
+            ]
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "thought_level",
+        "currentValue": "high",
+        "id": "reasoning_effort",
+        "name": "Reasoning effort",
+        "options": [
+          {
+            "description": "The default balance for most tasks.",
+            "name": "High",
+            "value": "high"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "frame": "response",
+    "id": 2,
+    "session_id": "deepseek-session-1"
+  },
+  {
+    "action": "steer",
+    "frame": "session/update",
+    "session_update": "steering_queued"
+  },
+  {
+    "frame": "response",
+    "id": 4
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "message_id": "msg-1",
+        "text": "PROBE_STARTED"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "PROBE_STARTED",
+      "thinking": false
+    }
+  },
+  {
+    "action": "steer",
+    "frame": "session/update",
+    "session_update": "steering_consumed"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "message_id": "msg-2",
+        "text": "STEER_RECEIVED"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "STEER_RECEIVED",
+      "thinking": false
+    }
+  },
+  {
+    "frame": "response",
+    "id": 3,
+    "stop_reason": "end_turn"
+  },
+  {
+    "frame": "response",
+    "id": 5
+  }
+]

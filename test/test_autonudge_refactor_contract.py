@@ -45,6 +45,7 @@ from kiro_crew.monitoring.models import (
     monitor_state_to_dict,
 )
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.testing.wait import await_until
 
 #: Every function, class and constant the pre-split ``autonudge.py`` defined.
 _BASE_DEFINED = frozenset(
@@ -224,6 +225,7 @@ _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
     "_sync_terminal_completion_timer": ("method", "fa9fb3019298"),
     "_terminal_still_holds": ("method+async", "75f382f079fb"),
     "_extend_for_open_ledger": ("method+async", "1d8c864f30a4"),
+    "_holds_for_person_wait": ("method+async", "3a33d55b099b"),
     "_timer": ("method+async", "e290ef84f151"),
     "_update_locked": ("method+async", "db9765212236"),
     "_update_unserialized": ("method+async", "db9765212236"),
@@ -232,6 +234,8 @@ _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
     "_worker_running": ("method", "490393185551"),
     # The close side of the same liveness question, injected the same way.
     "_worker_closed": ("method", "490393185551"),
+    # The loop side of the same liveness question, read from this service's own table.
+    "_worker_looping": ("method", "490393185551"),
     # Reads one loop's monitor kind: the startup resume treats a work-ledger
     # watch differently, because its news arrives by a push a restart loses.
     "_observes_work_ledger": ("method", "3a33d55b099b"),
@@ -246,7 +250,9 @@ _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
     "clear_terminal_monitor": ("method+async", "82db71923663"),
     "commit_monitor_replacement": ("method", "f7956b1e6531"),
     "deactivate_and_wait": ("method+async", "61dc2e194fa8"),
-    "fire_now": ("method+async", "082992b0b249"),
+    # ``delay`` arms a pulled-forward cycle after a batching window instead of at once,
+    # which is how several worker reports arriving together share one conductor turn.
+    "fire_now": ("method+async", "db9a43f4541c"),
     "get_by_id": ("method", "c7cdaf3c2920"),
     "get_by_slot": ("method", "1a9a46af4d72"),
     "list_all": ("method", "6672df12a725"),
@@ -262,6 +268,7 @@ _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
     "notify_cycle_start_failed": ("method", "2a34976b11b0"),
     "notify_turn_complete": ("method", "295ffab180e4"),
     "notify_user_input": ("method", "fad3ce03aadf"),
+    "pending_wake_briefs": ("method", "45a16f5ce541"),
     "record_monitor_completion_evidence_unavailable": ("method+async", "400845dc24be"),
     "release_approval_hold": ("method+async", "3e62765820c2"),
     "record_monitor_dispatch_busy": ("method+async", "400845dc24be"),
@@ -320,6 +327,9 @@ _BASE_NUDGELOOP_FIELDS: list[tuple[str, str | None]] = [
     ("stopped_reason", "''"),
     ("approval_stalled", "False"),
     ("approval_stalled_at", "0.0"),
+    ("ledger_seen_fp", "''"),
+    ("waiting_on_person", "False"),
+    ("waiting_on_person_at", "0.0"),
     ("consecutive_start_failures", "0"),
     ("consecutive_failed_cycles", "0"),
     ("next_due_ts", "0.0"),
@@ -367,6 +377,9 @@ _GOLDEN_STORE = """\
       "stopped_reason": "",
       "approval_stalled": false,
       "approval_stalled_at": 0.0,
+      "ledger_seen_fp": "",
+      "waiting_on_person": false,
+      "waiting_on_person_at": 0.0,
       "consecutive_start_failures": 0,
       "consecutive_failed_cycles": 0,
       "next_due_ts": 1790000300.0,
@@ -400,6 +413,9 @@ _GOLDEN_STORE = """\
       "stopped_reason": "interrupted_cycle",
       "approval_stalled": false,
       "approval_stalled_at": 0.0,
+      "ledger_seen_fp": "",
+      "waiting_on_person": false,
+      "waiting_on_person_at": 0.0,
       "consecutive_start_failures": 0,
       "consecutive_failed_cycles": 0,
       "next_due_ts": 0.0,
@@ -440,6 +456,9 @@ _GOLDEN_STORE = """\
       "stopped_reason": "",
       "approval_stalled": false,
       "approval_stalled_at": 0.0,
+      "ledger_seen_fp": "",
+      "waiting_on_person": false,
+      "waiting_on_person_at": 0.0,
       "consecutive_start_failures": 0,
       "consecutive_failed_cycles": 0,
       "next_due_ts": 1790000300.0,
@@ -474,6 +493,9 @@ _GOLDEN_STORE = """\
       "stopped_reason": "",
       "approval_stalled": false,
       "approval_stalled_at": 0.0,
+      "ledger_seen_fp": "",
+      "waiting_on_person": false,
+      "waiting_on_person_at": 0.0,
       "consecutive_start_failures": 0,
       "consecutive_failed_cycles": 0,
       "next_due_ts": 1790000900.0,
@@ -619,8 +641,8 @@ class TestSurface:
         assert fields == _BASE_NUDGELOOP_FIELDS
 
     def test_importing_the_facade_keeps_the_heavy_graphs_lazy(self) -> None:
-        """``mcp_tools/control.py`` and ``workflows/service.py`` import the facade at the
-        top, so everything it pulls in is paid by every MCP server process."""
+        """``mcp_tools/control_parts/monitor.py`` and ``workflows/service.py`` import the
+        facade at the top, so everything it pulls in is paid by every MCP server process."""
         code = (
             "import sys, kiro_crew.autonudge\n"
             "print('\\n'.join(sorted(m for m in sys.modules if m.startswith('kiro_crew'))))"
@@ -777,7 +799,7 @@ class TestModuleSeamsReachTheCodeThatReadsThem:
         monkeypatch.setattr(svc, "_reconcile_once", passed.set)
         task = asyncio.create_task(svc._reconcile_forever())
         try:
-            await asyncio.wait_for(passed.wait(), 10)
+            await await_until(passed, what="reconcile pass")
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -956,7 +978,7 @@ class TestInstanceSeamsReachEveryInternalCaller:
 
         monkeypatch.setattr(svc, "_persist_locked", _persist)
         svc._persist_soon()
-        await asyncio.wait_for(persisted.wait(), 10)
+        await await_until(persisted, what="persistence callback")
 
     @pytest.mark.asyncio
     async def test_mutations_go_through_emit_cancel_and_the_mutation_lock(
@@ -1125,6 +1147,7 @@ _BINDINGS = {
     "_persist_judge_state": "judge_tick",
     "_timer": "firing",
     "_extend_for_open_ledger": "firing",
+    "_holds_for_person_wait": "firing",
     "_run_fire_cycle": "firing",
     "fire_now": "firing",
     "add": "mutations",
@@ -1174,6 +1197,7 @@ _BINDINGS = {
     "record_monitor_dispatched": "monitor_records",
     "record_monitor_completion_evidence_unavailable": "monitor_records",
     "_deactivate_unwired_monitor": "monitor_records",
+    "_load": "store_loader",
 }
 _BOUND_AS = {"_serialize_loop": "LoopStore.serialize_loop"}
 
@@ -1189,11 +1213,12 @@ _OWNER_ORDER = (
     "firing",
     "mutations",
     "monitor_records",
+    "store_loader",
 )
 
-#: The names owner code reads through ``kiro_crew.autonudge`` at call time: the four
-#: tests patch there, and the four that stay defined there (a redactor-calling scrub
-#: helper, the singleton, and the two lock registries the boot smoke tracks by name).
+#: The names owner code reads through ``kiro_crew.autonudge`` at call time: the six
+#: tests patch there, and the four that stay defined there (the sentinel repair, the
+#: singleton, and the two lock registries the boot smoke tracks by name).
 _SEAMS = frozenset(
     {
         "_INSTANCE",
@@ -1201,7 +1226,9 @@ _SEAMS = frozenset(
         "_MUTATION_LOCK_OWNERS",
         "_OVERDUE_REARM_SECS",
         "_RECONCILE_INTERVAL_SECS",
+        "_bounded_judge_verdict",
         "fsync_dir",
+        "repair_sentinel_path",
         "replace_with_retry",
         "scrubbed_judge_spec",
     }
@@ -1448,7 +1475,7 @@ class TestTheOwnersReadTheSeamsThroughTheFacade:
 #: was read at its call site: the consumer imports the name from ``kiro_crew.autonudge``
 #: inside the function under test, so the patch reaches it, and the service is a stub there.
 _FACADE_PATCHES_FOR_CONSUMERS = {
-    # dashboard/session_directive_apply.py imports is_structured_monitor_loop per call;
+    # dashboard/session_directive_apply_monitor.py imports is_structured_monitor_loop per call;
     # these tests hand it a SimpleNamespace service, so no owner code runs.
     ("test/test_autonudge_member_self_arm.py", "is_structured_monitor_loop"): "directive consumer",
 }

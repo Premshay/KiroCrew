@@ -89,11 +89,6 @@ export interface RosterQuery {
   source: MemberSourceFilter
   status: ReadonlySet<MemberStatusFilter>
   sort: MemberSort
-  /** The default crew's name (top-level `default_agent`). It is listed whatever
-   *  its record says — see `listedByDefault`. `''` while unknown; `null` when
-   *  the lookup FAILED, which turns the hide rule off so the default crew is
-   *  never hidden by a read error. */
-  defaultAgent: string | null
   /** The crewmate open in the thread, if any. It stays listed while open, so a
    *  hidden row the user reached through the search does not vanish from the
    *  roster under its own chat when the search is cleared. */
@@ -102,27 +97,34 @@ export interface RosterQuery {
 
 interface RosterRowLike {
   name: string; display_name?: string; starred?: boolean; source?: unknown; last_active_ts?: number
-  last_chat_ts?: number
   dashboard_created?: unknown; has_dm_message?: unknown; last_message?: unknown
+  kiro_agent?: unknown
 }
 
 /** What the roster row RENDERS as its title: the display label when set, the
  *  name otherwise. Sort and search go through the same accessor so the list
  *  the user reads is the list these functions order and narrow. */
-function rowLabel(m: RosterRowLike): string {
+export function rowLabel(m: RosterRowLike): string {
   return m.display_name?.trim() || m.name
 }
 
-/** The search box's match: a case-insensitive substring of the name or of
- *  the displayed label. One function so the hide rule below and the narrowing
- *  agree on what "the search reaches" means. */
+/** The search box's match: a case-insensitive substring of the name, of the
+ *  displayed label, or of the agent template the row runs. One function so the
+ *  hide rule below, the narrowing, and the folded roster in the header chip all
+ *  agree on what "the search reaches" means -- the template term is how the
+ *  chip's search has always reached a row by what it RUNS (`kirocrew-oncall`)
+ *  rather than by what it is called. */
 function matchesSearch(m: RosterRowLike, needle: string): boolean {
-  return m.name.toLowerCase().includes(needle) || rowLabel(m).toLowerCase().includes(needle)
+  return (
+    m.name.toLowerCase().includes(needle) ||
+    rowLabel(m).toLowerCase().includes(needle) ||
+    (typeof m.kiro_agent === 'string' && m.kiro_agent.toLowerCase().includes(needle))
+  )
 }
 
 /** Every registered crew belongs in the Crew Members roster. The source and
  * activity controls narrow it only when the person explicitly asks them to. */
-export function listedByDefault(m: RosterRowLike, defaultAgent: string | null): boolean {
+export function listedByDefault(m: RosterRowLike, defaultAgent?: string | null): boolean {
   void m
   void defaultAgent
   return true
@@ -132,36 +134,35 @@ export function listedByDefault(m: RosterRowLike, defaultAgent: string | null): 
  * status filters. A search narrows the complete roster. */
 export function rosterShows(
   m: RosterRowLike,
-  query: Pick<RosterQuery, 'search' | 'defaultAgent' | 'chosen'>,
+  query: Pick<RosterQuery, 'search' | 'chosen'>,
 ): boolean {
   const q = query.search.trim().toLowerCase()
   if (q) return matchesSearch(m, q)
-  return listedByDefault(m, query.defaultAgent) || (!!query.chosen && m.name === query.chosen)
+  return listedByDefault(m) || (!!query.chosen && m.name === query.chosen)
 }
 
 /** The complete roster used for the header count and filter menu tallies. */
 export function rosterPopulation<M extends RosterRowLike>(
   members: readonly M[],
-  query: Pick<RosterQuery, 'search' | 'defaultAgent' | 'chosen'>,
+  query: Pick<RosterQuery, 'search' | 'chosen'>,
 ): M[] {
   const q = query.search.trim().toLowerCase()
   return members.filter(
     (m) =>
-      listedByDefault(m, query.defaultAgent) ||
+      listedByDefault(m) ||
       (!!query.chosen && m.name === query.chosen) ||
       (q !== '' && matchesSearch(m, q)),
   )
 }
 
-/** A row's place in the Recent order: the user's own last message
- *  (`last_chat_ts`), never a background turn. An older gateway's row, which
- *  has no such field, falls back to its `last_active_ts`. */
+/** A row's place in the Recent order: the last message in its DM thread,
+ *  whoever sent it (`last_active_ts`, the crew log's fold). */
 export function chatRecency(m: RosterRowLike): number {
-  return (typeof m.last_chat_ts === 'number' ? m.last_chat_ts : m.last_active_ts) ?? 0
+  return m.last_active_ts ?? 0
 }
 
-/** Most-recently-CHATTED first (like any IM member list); never-chatted
- *  members fall to the bottom alphabetically. `name` is a plain locale-aware
+/** Newest conversation first (like any messages app); threads with no
+ *  message fall to the bottom alphabetically. `name` is a plain locale-aware
  *  sort over the DISPLAYED label, since that is the text the user scans. */
 export function sortRoster<M extends RosterRowLike>(members: readonly M[], sort: MemberSort): M[] {
   const out = [...members]
@@ -217,4 +218,11 @@ export function countByFilter<M extends RosterRowLike>(
     for (const f of SOURCE_FILTERS) if (matchesSource(m, f)) out.source[f] += 1
   }
   return out
+}
+
+/** No crewmate beyond the always-present `default` row. The first crewmate
+ *  (key `mate`) IS a crewmate, so a roster holding it is not empty: the page
+ *  opens it instead. An unread roster (`undefined`) is not empty either. */
+export function hasNoCrewmates(rows: readonly { name: string }[] | undefined): boolean {
+  return Array.isArray(rows) && rows.every(r => r.name === 'default')
 }

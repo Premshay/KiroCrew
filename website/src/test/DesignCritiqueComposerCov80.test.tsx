@@ -23,6 +23,17 @@ function staged(n: number): StagedItem[] {
 
 function mount(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   const props = {
+    agents: [],
+    defaultAgent: '',
+    selectedAgent: '',
+    setSelectedAgent: vi.fn(),
+    contexts: [],
+    brief: { contextId: '', projectName: '', repository: '', contextPaths: '', notes: '', targets: '', intent: 'ground' as const },
+    setBrief: vi.fn(),
+    selectContext: vi.fn(),
+    saveContext: vi.fn(),
+    deleteContext: vi.fn(),
+    hint: '',
     staged: [],
     refText: '',
     dragging: false,
@@ -104,7 +115,7 @@ describe('Composer with a pasted reference', () => {
 
   it('starts on Enter in the reference field, and reports typing', async () => {
     const { props } = mount({ refText: '' })
-    const field = screen.getByRole('textbox')
+    const field = screen.getByPlaceholderText(/Figma link/)
     await userEvent.type(field, 'z')
     expect(props.setRefText).toHaveBeenCalled()
     fireEvent.keyDown(field, { key: 'Enter' })
@@ -162,7 +173,7 @@ describe('Composer with staged screens', () => {
 
   it('disables the reference field while screenshots are staged', () => {
     mount({ staged: staged(1) })
-    expect(screen.getByRole('textbox')).toBeDisabled()
+    expect(screen.getByPlaceholderText(/Using your screenshots/)).toBeDisabled()
   })
 })
 

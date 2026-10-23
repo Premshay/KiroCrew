@@ -286,6 +286,26 @@ class TestApplySecurityHeaders:
             assert "https://*" + " " not in connect_src
             assert "*.cloudfront.net" not in connect_src
 
+    def test_csp_connect_src_stays_local_with_public_origin_configured(self) -> None:
+        """connect-src is a fixed list: 'self', loopback and esm.sh. A
+        public dashboard origin in the allowed-origin set does not reach it.
+        A dashboard behind a reverse proxy is served same-origin, so 'self'
+        already admits its own wss:// socket (docs/guides/remote-and-mobile.md,
+        "Behind a reverse proxy")."""
+        allowed = {"'self'", "https://esm.sh"}
+        for host in ("localhost", "127.0.0.1", "0.0.0.0"):
+            allowed |= {f"{scheme}://{host}:*" for scheme in ("http", "https", "ws")}
+        for with_instances in (False, True):
+            app = _make_app(with_instances=with_instances)
+            app["allowed_origins"] = {"https://crew.example.com"}
+            resp = _make_response()
+            _apply_security_headers(resp, app)
+            csp = resp.headers["Content-Security-Policy"]
+            connect_src = next(d for d in csp.split(";") if d.strip().startswith("connect-src"))
+            sources = set(connect_src.split()[1:])
+            assert sources <= allowed, sorted(sources - allowed)
+            assert "crew.example.com" not in csp
+
     def test_csp_no_ipv6_wildcard_source(self) -> None:
         """Regression: Chromium rejects a CSP host-source that pairs a bracketed
         IPv6 literal with a wildcard port (``http://[::1]:*``) — it is invalid
@@ -347,15 +367,37 @@ class TestApplySecurityHeaders:
             # python-only checkout (sdist/wheel test run): nothing to compare.
             return
         remote_font = re.compile(r"https?://[^\s\"')]*fonts[^\s\"')]*", re.IGNORECASE)
+
+        def source(path: Path) -> str:
+            # index.css splices its styles/*.css partials in at their @import lines.
+            return re.sub(
+                r'^@import "\./(styles/[\w-]+\.css)";\n',
+                lambda m: (path.parent / m.group(1)).read_text(encoding="utf-8"),
+                path.read_text(encoding="utf-8"),
+                flags=re.M,
+            )
+
         for path in (index_html, index_css):
-            hits = remote_font.findall(path.read_text(encoding="utf-8"))
+            hits = remote_font.findall(source(path))
             assert not hits, (path.name, hits)
 
-        css = index_css.read_text(encoding="utf-8")
-        declared = re.findall(r"url\('(\./assets/fonts/[^']+\.woff2)'\)", css)
+        # Each face's url() is relative to the stylesheet that declares it: the
+        # entry spells ./assets/fonts/..., a styles/ partial ../assets/fonts/....
+        partials = re.findall(
+            r'^@import "\./(styles/[\w-]+\.css)";$', index_css.read_text(encoding="utf-8"), re.M
+        )
+        found = [
+            (sheet, url)
+            for sheet in (index_css, *(index_css.parent / p for p in partials))
+            for url in re.findall(
+                r"url\('((?:\./|\.\./)assets/fonts/[^']+\.woff2)'\)",
+                sheet.read_text(encoding="utf-8"),
+            )
+        ]
+        declared = [url for _, url in found]
         assert any("space-grotesk" in u for u in declared), declared
         assert any("jetbrains-mono" in u for u in declared), declared
-        missing = [u for u in declared if not (index_css.parent / u).is_file()]
+        missing = [u for sheet, u in found if not (sheet.parent / u).is_file()]
         assert not missing, missing
         for family_dir in ("space-grotesk", "jetbrains-mono"):
             assert (website / "public" / "fonts" / family_dir / "OFL.txt").is_file(), family_dir

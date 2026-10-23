@@ -30,6 +30,7 @@ from conftest import requires_symlinks
 from kiro_crew import session_pid, session_work_dir
 from kiro_crew.acp.types import ACP_BACKEND_KIRO
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.testing.wait import async_wait_until
 from kiro_crew.workspace_cli_settings import CLI_SETTINGS_LOCK_NAME
 
 OTHER_HOME = "f" * 24
@@ -992,8 +993,13 @@ class TestGatewayWiring:
         self,
     ) -> None:
         from kiro_crew.slack import gateway
+        from kiro_crew.slack.gateway_runtime import process_entry, service_boot
 
-        source = Path(gateway.__file__).read_text(encoding="utf-8")
+        # ``run`` holds the boot sequence; ``run_gateway``'s hourly wake comes after it.
+        source = "\n".join(
+            Path(module.__file__).read_text(encoding="utf-8")
+            for module in (service_boot, process_entry)
+        )
         reap = source.index(
             "await asyncio.to_thread(cleanup_orphaned_sessions, narrow_with_leaders=False)"
         )
@@ -1009,7 +1015,11 @@ class TestGatewayWiring:
         assert (
             "_run_agent_scratch_sweep" in source[writers:hourly]
         ), "the hourly wake keeps calling the same predecessor-only sweep"
-        assert "sweep_disposable_work_dirs" not in source
+        facade = Path(gateway.__file__)
+        assert "sweep_disposable_work_dirs" not in "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [facade, *sorted((facade.parent / "gateway_runtime").glob("*.py"))]
+        )
 
     def test_the_wrapper_hands_the_sweep_this_homes_ledger_and_live_dirs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1387,10 +1397,10 @@ def _ceiling_spent(what: str, give_up_at: float) -> NoReturn:
 async def _await_until(predicate: Callable[[], bool], what: str, give_up_at: float) -> None:
     """Yield the loop until *predicate* holds, failing by name at *give_up_at*."""
     loop = asyncio.get_running_loop()
-    while not predicate():
-        if loop.time() >= give_up_at:
-            _ceiling_spent(what, give_up_at)
-        await asyncio.sleep(0.01)
+    try:
+        await async_wait_until(predicate, timeout=max(0.0, give_up_at - loop.time()))
+    except AssertionError:
+        _ceiling_spent(what, give_up_at)
 
 
 class TestRegistryLeavesASiblingsDirectory:

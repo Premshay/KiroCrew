@@ -12,7 +12,7 @@ from collections.abc import Iterator
 # tree KiroCrew spawns (the ACP provider, MCP probes, gateway pool backends).
 # Children inherit the environment, so marking the provider process
 # transitively marks every MCP server it launches. The untracked-orphan sweep
-# (``session_pid.py``) reads it back from ``/proc/<pid>/environ`` to positively
+# (``session_pid_orphan_scan.py``) reads it back from ``/proc/<pid>/environ`` to positively
 # identify escaped MCP launcher processes whose *cmdline* carries no KiroCrew
 # fingerprint (e.g. ``npx @playwright/mcp`` -> node) without ever risking a
 # kill of a user's own identically-named processes. Constant by design: it must
@@ -32,6 +32,13 @@ KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
 # this is what tells this install's runtime from a sibling install's on the same
 # uid. Read only to WITHHOLD a kill: absent or different means not ours.
 KIROCREW_SPAWN_HOME_ENV = "KIROCREW_SPAWN_HOME"
+# The authored agent an ``AcpRuntime`` child is spawned for, set beside the
+# instance and inherited the same way. A host that takes its agent on the command
+# line shows it in argv; a host that binds the agent over the wire (the KAS relay)
+# shows nothing there, so this is the one carrier that names the agent for every
+# runtime regardless of host. Read back out of ``/proc/<pid>/environ`` by the
+# process-leak gate to tell the gateway's own background runtime from a session's.
+KIROCREW_RUNTIME_AGENT_ENV = "KIROCREW_RUNTIME_AGENT"
 # Set on every tree spawned through ``sandbox.sandboxed_spawn_argv`` -- a build, an
 # ``npx`` install, a ``git``/``gh`` read, a provisioning run -- and inherited by that
 # whole tree exactly as KIROCREW_SPAWNED is. It says what KIROCREW_SPAWNED does not:
@@ -53,6 +60,14 @@ KIROCREW_SPAWN_HOME_ENV = "KIROCREW_SPAWN_HOME"
 KIROCREW_SANDBOX_TOOL_ENV = "KIROCREW_SANDBOX_TOOL"
 KIROCREW_SANDBOX_TOOL_VALUE = "1"
 
+#: The desktop app's staged KAS engine root, exported by the Electron shell when
+#: the build staged the pinned engine for this architecture
+#: (``website/electron/gateway-env.js``, ``bundledKasEnvironment``). Lives here
+#: rather than in ``acp.kas_bundle`` because ``sandbox`` seals the directory it
+#: names (:func:`sandbox_tiers._resolved_install_root_targets`) and must not import the
+#: ACP tree to learn the env name.
+BUNDLED_KAS_DIR_ENV = "KIROCREW_BUNDLED_KAS_DIR"
+
 # Canonical truthy set for boolean environment variables (KIROCREW_NO_JAIL,
 # KIROCREW_DEV_MODE, …).  Use ``env_flag_enabled`` rather than ``bool(os.environ
 # .get(...))`` — a bare bool() treats ``"0"``/``"false"`` as truthy, which for a
@@ -62,6 +77,11 @@ ENV_TRUTHY = frozenset({"1", "true", "yes", "on"})
 # Canonical falsy set, the explicit opt-out for the crew log, which defaults ON. See
 # ``crew_log_enabled``.
 ENV_FALSY = frozenset({"0", "false", "no", "off"})
+
+# Longest prefix a generated Coder workspace name may carry: names are at most 32
+# characters and the registry adds two separators and an 8-character binding id,
+# so 21 leaves one owner character. Homed here so every boundary refuses at one number.
+CODER_WORKSPACE_PREFIX_MAX_CHARS = 21
 
 
 # Minimum supported Node.js version (major, minor, patch), shared by the startup
@@ -273,13 +293,13 @@ def crew_log_enabled() -> bool:
 # Outer wall-clock cap on a single ``_run_chat`` invocation (any dispatch site:
 # primary user turn, queue-drain, cron injection, subagent injection, Slack first
 # turn). Sized to match the inner ACP ``_DEFAULT_PROMPT_TIMEOUT`` (14400s) in
-# ``acp/client.py`` so the dashboard layer doesn't bound below the transport.
+# ``acp/client_timeouts.py`` so the dashboard layer doesn't bound below the transport.
 # Four hours is the longest single turn the shipped budgets can legitimately
 # produce (the task runner's 90-minute test command plus a fix and a re-run, or a
 # blocking subagent wave at its 2h wait cap plus synthesis); work that outlives
 # it belongs to the loop mechanisms, which end the turn between cycles.
 # Wedged-session detection is handled by ``_STALE_TURN_TIMEOUT`` (90s, also in
-# ``acp/client.py``); this cap is the upper safety ceiling for genuinely runaway
+# ``acp/client_timeouts.py``); this cap is the upper safety ceiling for genuinely runaway
 # work, not a "this turn took too long" guard.
 CHAT_TURN_TIMEOUT = 14400.0
 
@@ -317,7 +337,7 @@ COMPACT_WAIT_TIMEOUT_SECS = 300.0
 SUBAGENT_TIMEOUT_SECS = 10800
 
 # Budget for an agent backend's ``initialize`` handshake, in seconds. Spent by
-# ``acp.runtime`` (which re-exports it as ``_INITIALIZE_TIMEOUT`` and documents why
+# ``acp.runtime_spawn_launch`` (which binds it as ``_INITIALIZE_TIMEOUT`` and documents why
 # the value is what it is), and read by the subagent startup watchdog, whose window
 # has to cover a handshake that spends all of it
 # (``SubagentManager._startup_deadline``). Owned here because that second reader is
@@ -338,7 +358,7 @@ DEFAULT_SPAWN_MIN_MEMORY_GB = 2.0
 
 # Default of ``agent.subagent_queue_max_wait_secs``: how long a spawn the memory
 # floor keeps deferring (durable or in memory) may wait before it ends with the
-# delivered terminal ``never started: waiting for memory``. Finite by owner
+# delivered terminal ``QUEUED_WAIT_EXPIRED_TEXT``. Finite by owner
 # decision (a memory wait is never unbounded); one number for the config default,
 # the loader fallback and the manager's boot value.
 DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS = 1800
@@ -1470,6 +1490,22 @@ def md_link_destination(char_class: str) -> str:
 # a `startswith` written against one silently misses the other.
 SUBAGENT_COMPLETION_PREFIX = "[Subagent completion event]"
 SUBAGENT_BATCH_COMPLETION_PREFIX = "[Subagent batch completion event]"
+
+#: What a parent is told beside the result of a sub-agent run that completed
+#: without making a single tool call. Such a run wrote no file, ran no command
+#: and made no commit, yet it can still answer a task that asked for one by
+#: narrating the steps as though it had taken them -- the usual shape for a
+#: reasoning-only agent (``"tools": []``) handed write work, and possible for any
+#: agent that answered from memory. The signal is the run's own observed tool
+#: activity (``SubagentInfo.made_no_tool_calls``), so the note needs no reading
+#: of specs or backends. The dispatch is not refused, because whether a task needs writes is
+#: not decidable from its prose; the parent is told instead to treat any reported
+#: change as a claim and check it. Prefixed with the agent's label by each caller.
+NO_TOOL_CALLS_NOTE = (
+    "made no tool calls in this run, so it did not itself write a file, run a "
+    "command or make a commit. Treat any such change it reports as a claim: check "
+    "it on disk before relying on it."
+)
 
 # Key under a completion message's ``meta`` where the gateway stamps the
 # structured header facts (outcome, tallies, chunk index, agent id) the

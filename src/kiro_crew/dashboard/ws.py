@@ -18,6 +18,7 @@ from kiro_crew import shutdown_event
 from kiro_crew.constants import crew_log_enabled
 from kiro_crew.dashboard.chat_utils import effective_session_key, subagent_event_slot
 from kiro_crew.dashboard.origin import check_origin
+from kiro_crew.dashboard.slot_retention import note_foreground
 from kiro_crew.dashboard.state import (
     PERSISTED_SUBAGENT_REPLAY_KEEP,
     PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
@@ -26,6 +27,7 @@ from kiro_crew.dashboard.state import (
     _slots_serialization_note,
 )
 from kiro_crew.dashboard.status_counts import cached_status_snapshot
+from kiro_crew.dashboard.warm_task_brief import handle_focus_frame, note_view_closed
 from kiro_crew.dashboard.websocket_hub import SLOT_PATCH_CAPABILITY, SLOT_PATCH_WS_FLAG
 from kiro_crew.dashboard.ws_event_scope import (
     DASHBOARD_USER_AUDITEE,
@@ -524,6 +526,7 @@ def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
         "child_session": getattr(a, "conversation_key", "") or f"subagent:{a.id}",
         "task": _r(a.task),
         "agent": _r(a.agent),
+        "label": _r(getattr(a, "label", "") or ""),
         "model": a.resolved_model,
         "requested_model": _r(a.requested_model),
         "streaming": _r(a.streaming_text),
@@ -596,6 +599,7 @@ def broadcast_side_result(
     final: bool = False,
     ts: float | None = None,
     steer: bool = False,
+    message_id: str = "",
 ) -> None:
     """Broadcast a side conversation event on the dedicated side channel.
 
@@ -613,6 +617,11 @@ def broadcast_side_result(
     Set final=True on the terminal frame of a side turn so the frontend
     can flip the streaming flag off cleanly.
 
+    ``message_id`` names the sidecar row the frame announces (a question, a
+    steer, a final answer, a stop row). A panel restored from ``GET .../side``
+    already holds that row, and the id is how it knows. Streaming deltas and
+    the error notices the sidecar does not store carry none.
+
     No payload field is persisted — sidecar-only, ephemeral.
     """
     payload: dict[str, object] = {
@@ -629,6 +638,8 @@ def broadcast_side_result(
         payload["final"] = True
     if steer:
         payload["steer"] = True
+    if message_id:
+        payload["message_id"] = message_id
     # Owner-only, matching the queue frame and `_check_slot_ownership`: side answers and
     # steer echoes are the owner's own conversation, and an app that asks the HTTP API
     # about a slot it does not own gets a 404.
@@ -856,7 +867,9 @@ def _check_ws_origin(request: web.Request) -> None:
         raise web.HTTPForbidden(text="WebSocket origin not allowed")
 
 
-async def api_ws(request: web.Request) -> web.WebSocketResponse:
+async def _serve_ws(
+    request: web.Request, registered: list[web.WebSocketResponse]
+) -> web.WebSocketResponse:
     """GET /api/ws — single multiplexed WebSocket for all real-time events."""
     _check_ws_origin(request)
 
@@ -869,9 +882,9 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         ensure_gitlab_hosts_loaded,
         gitlab_hosts_generation,
         is_owner_dashboard_request,
-        schedule_check_refresh,
         schedule_visibility_refresh,
     )
+    from kiro_crew.dashboard.source_providers.chip_refresh import schedule_tiered_check_refresh
     from kiro_crew.platform.governance_profiles import (
         governance_answer_generation,
         poll_profiles_fresh,
@@ -933,6 +946,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             return ws
 
     state.register_ws(ws, owner=owner_request)
+    registered.append(ws)
 
     # Store app identity on the WS connection so the broadcast chokepoint can
     # filter. ``_is_dashboard_user`` comes from a POSITIVE signal produced by
@@ -1027,7 +1041,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             # detectable as a change rather than as a first sighting.
             "gitlabHostsGeneration": gitlab_hosts_generation(),
             "governanceGeneration": initial_answer_generation,
+            "slotsPartial": getattr(state, "slot_list_rebuilding", False) is True,
         }
+        if is_dashboard_user:
+            held_keys = list(state.slot_list_held_keys())
+            if held_keys:
+                snapshot_frame["slotsHeldKeys"] = held_keys
+            if state.slot_list_hold_channels() is True:
+                snapshot_frame["slotsHoldChannels"] = True
         # Same offender diagnostic as the slots broadcast.
         # ``send_json`` is ``send_str(dumps(data))``, so dumping here is
         # byte-identical on the healthy path. This whole connect block sits
@@ -1095,7 +1116,12 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                 # (fail closed) — no non-owner-driven credentialed probe.
                 if owner_request:
                     schedule_visibility_refresh(urls, state.push_slots_update)
-                    schedule_check_refresh(urls, state.push_slots_update)
+                    # Idle slots' chips (every restored tab, until it is opened
+                    # or runs a turn) go to the slow tier, so a reconnect does
+                    # not re-read the whole sidebar history.
+                    schedule_tiered_check_refresh(
+                        urls, state.idle_source_link_urls(), state.push_slots_update
+                    )
     except Exception:
         pass
 
@@ -1219,7 +1245,15 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     # read-only via is_repo_public. No non-owner-driven
                     # credentialed provider read.
                     schedule_visibility_refresh(urls, state.push_slots_update)
-                    schedule_check_refresh(urls, state.push_slots_update)
+                    # Two tiers. Chips on slots in use (a turn running, or a turn
+                    # ended / the owner opened it recently) keep the chip TTL.
+                    # Chips only idle slots link -- a restored history of tabs --
+                    # go to the idle tier: a slower clock and a small per-TTL
+                    # budget shared by every owner socket, so their cost does
+                    # not grow with the number of tabs ever left open.
+                    schedule_tiered_check_refresh(
+                        urls, state.idle_source_link_urls(), state.push_slots_update
+                    )
                 refresh_round += 1
             except asyncio.CancelledError:
                 raise
@@ -1328,7 +1362,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                         # this replays the whole ring, so a scope revoked (or an
                         # app disabled) after connect must not be able to pull
                         # the buffered history. Mirrors the per-send re-check in
-                        # handlers/updates._safe_ws_send.
+                        # handlers/updates_streams._safe_ws_send.
                         _live = effective_allowed_events(ws_app, allowed_events)
                         if not ws.get("_is_dashboard_user", False) and not (
                             "log" in _live or "log:all" in _live
@@ -1492,6 +1526,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                                 "outcome": a.outcome,
                                                 "task": _r(a.task),
                                                 "agent": _r(a.agent),
+                                                "label": _r(getattr(a, "label", "") or ""),
                                                 "model": a.resolved_model,
                                                 "requested_model": _r(a.requested_model),
                                             },
@@ -1739,6 +1774,16 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                         _focus_task = _handle_slot_focused(
                             state, data.get("slot"), _focus_task, owner=owner_request
                         )
+                        if owner_request:
+                            # The warm brief reads the registry's PREVIOUS row, so
+                            # it must run before retention applies this frame.
+                            handle_focus_frame(
+                                state,
+                                id(ws),
+                                data.get("slot"),
+                                announce=data.get("announce") is True,
+                            )
+                            note_foreground(state, id(ws), data.get("slot"))
                     elif msg_type == "slot_read":
                         _relayed = _handle_slot_read(
                             state,
@@ -1785,7 +1830,28 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         # A prefetch still debouncing for a closed dashboard serves nobody.
         if _focus_task is not None and not _focus_task.done():
             _focus_task.cancel()
+        note_view_closed(state, id(ws))
+        note_foreground(state, id(ws), None)
         state.unsubscribe_logs(ws)
         state.unsubscribe_subagents(ws)
-        state.unregister_ws(ws)
     return ws
+
+
+async def api_ws(request: web.Request) -> web.WebSocketResponse:
+    """GET /api/ws: serve the socket, and unregister it on every exit.
+
+    ``_serve_ws`` registers the socket before it sends the connect-time frames and
+    hands it back through *registered*. Those frames are awaited before the
+    handler's own ``try``/``finally``, so the release lives here, around the whole
+    handler: it runs on a clean close, on an exception, on the ``CancelledError`` a
+    cancelled handler raises at any of its awaits, and on the ``GeneratorExit``
+    that closes a suspended one.
+    """
+    registered: list[web.WebSocketResponse] = []
+    try:
+        return await _serve_ws(request, registered)
+    finally:
+        if registered:
+            state: DashboardState = request.app["state"]
+            for ws in registered:
+                state.unregister_ws(ws)

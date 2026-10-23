@@ -88,8 +88,8 @@ def test_non_numeric_elapsed_cannot_break_serialization(junk):
 # surface MUST be added here deliberately, which is the point: the counts make
 # an unnoticed drift fail loudly instead of silently recording zeros.
 EXPECTED_SITES = {
-    "dashboard/chat_runner.py": 2,  # EVENT_COMPLETE + the abnormal-end seam
-    # (_persist_abnormal_turn_usage), both passing elapsed_ms to the row write.
+    "dashboard/chat_runner.py": 1,  # the abnormal-end seam
+    # (_persist_abnormal_turn_usage); it and _on_complete below pass elapsed_ms to the row write.
     # BOTH persists opt out with emit_metric=False: EVENT_COMPLETE emits its
     # sample SEPARATELY (keyed on the effective session_key so a linked-channel
     # turn is attributed to its channel surface, and surviving the
@@ -97,13 +97,24 @@ EXPECTED_SITES = {
     # abnormal-turn sampling is out of this change's scope, and letting its
     # persist emit (default True) would mis-file a linked-channel turn under the
     # slot's `dashboard` key.
+    "dashboard/chat_turn/turn_stats.py": 1,  # EVENT_COMPLETE (_on_complete)
     "dashboard/handlers/hooks.py": 1,
-    "slack/gateway.py": 3,  # 2 cron + _persist_turn_row helper
+    "dashboard/handlers/hooks_scripts.py": 0,
+    "dashboard/handlers/hooks_webhook_intake.py": 0,
+    "dashboard/handlers/hooks_webhooks.py": 0,
+    "slack/gateway.py": 0,  # the facade: its owners persist the gateway's rows
+    "slack/gateway_runtime/cron_turn.py": 2,  # 2 cron
+    "slack/gateway_runtime/heartbeat_turns.py": 1,  # _persist_turn_row helper
     # (the helper is the single call site for
     # heartbeat + its timeout + monitor + its
     # timeout)
     "task_executor.py": 2,  # task step + self-review
-    "subagent_manager/run.py": 1,
+    "subagent_manager/run.py": 0,  # the facade: run_turn persists the sub-agent's row
+    "subagent_manager/run_lifecycle.py": 0,
+    "subagent_manager/run_records.py": 0,
+    "subagent_manager/run_start.py": 0,
+    "subagent_manager/run_turn.py": 1,
+    "subagent_manager/run_yields.py": 0,
     "workflows/agent_exec.py": 1,
 }
 
@@ -166,6 +177,11 @@ def test_chat_runner_no_longer_builds_the_dead_stats_object():
     It also fed ``inc_duration_ms(usage.duration_ms)`` — the same structurally
     zero field — so it was doubly dead. Guard against it being reintroduced.
     """
-    src = (SRC / "dashboard" / "chat_runner.py").read_text(encoding="utf-8")
+    runner = SRC / "dashboard" / "chat_runner.py"
+    src = "\n".join(
+        turn_file.read_text(encoding="utf-8")
+        for turn_file in [*sorted(runner.with_name("chat_turn").glob("*.py")), runner]
+        if turn_file.name != "__init__.py"
+    )
     assert "stats = Stats()" not in src
     assert "from kiro_crew.stats import Stats" not in src

@@ -84,7 +84,7 @@ describe('DeveloperPanel', () => {
       renderPanel()
       expect(screen.getByRole('heading', { name: 'Feature Previews' })).toBeInTheDocument()
       expect(screen.getByRole('switch', { name: 'Webhooks' })).toHaveAttribute('aria-checked', 'false')
-      expect(screen.getByRole('switch', { name: 'Crewmates' })).toHaveAttribute('aria-checked', 'false')
+      expect(screen.getByRole('switch', { name: 'Mates' })).toHaveAttribute('aria-checked', 'false')
       expect(screen.getByRole('switch', { name: 'Chat on a crew' })).toHaveAttribute('aria-checked', 'false')
     })
 
@@ -103,6 +103,18 @@ describe('DeveloperPanel', () => {
       expect(localStorage.getItem('mc-dev-mode')).toBeNull()
       fireEvent.click(screen.getByText('Open Webhooks'))
       expect(screen.getByTestId('loc').textContent).toBe('/webhooks')
+    })
+  })
+
+  describe('Automatic cards', () => {
+    it('has its own card outside Feature Previews, off by default', async () => {
+      renderPanel()
+      const sw = await screen.findByRole('switch', { name: /automatic cards for all sessions/i })
+      expect(screen.getByTestId('developer-automatic-cards')).toContainElement(sw)
+      expect(sw).toHaveAttribute('aria-checked', 'false')
+      const previews = document.querySelector('[data-setting-key="feature-previews-section"]')
+      expect(previews).not.toBeNull()
+      expect(previews!.contains(sw)).toBe(false)
     })
   })
 

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         _WALK_SKIP_DIRS,
         _WALK_TIME_BUDGET_SECS,
         DashboardState,
+        _batch_stall_path,
         _PathProbeBusy,
         _probe_busy_response,
         _run_path_probe,
@@ -154,8 +155,12 @@ async def api_file_search(request: web.Request) -> web.Response:
     """
     # Re-imported at call time (not reused from the module-level binding) so a
     # test that stubs ``kiro_crew.security.is_sensitive_path`` is observed by the
-    # project-root rejection below.
-    from kiro_crew.security import is_sensitive_path  # noqa: F811
+    # project-root rejection below, and one that stubs
+    # ``is_sensitive_canonical_path`` by the walk's per-entry check.
+    from kiro_crew.security import (  # noqa: F811
+        is_sensitive_canonical_path,
+        is_sensitive_path,
+    )
 
     owner_denied = await require_owner_dashboard_request(request, "file_search")
     if owner_denied is not None:
@@ -260,9 +265,14 @@ async def api_file_search(request: web.Request) -> web.Response:
             return bool(proj) and os.path.isdir(proj), os.path.isdir(mc_workspace)
 
         # Off-loop: two isdir probes on operator-configured paths, either of
-        # which may sit on a network mount.
+        # which may sit on a network mount. Keyed only when both roots share
+        # one mount, the batch rule: a key on either root alone would let a
+        # dead workspace mount refuse a healthy project dir, or the reverse.
         try:
-            proj_is_dir, workspace_is_dir = await _run_path_probe(_probe_fallback_roots)
+            proj_is_dir, workspace_is_dir = await _run_path_probe(
+                _probe_fallback_roots,
+                stall_path=_batch_stall_path([r for r in (proj, mc_workspace) if r]),
+            )
         except _PathProbeBusy:
             return _probe_busy_response(resource=proj, operation="file_search", caller=caller)
         if proj_is_dir:
@@ -382,8 +392,11 @@ async def api_file_search(request: web.Request) -> web.Response:
                 if score <= 0:
                     continue
                 # Resolve symlinks before the sensitivity check so a link into a
-                # sensitive tree cannot slip through.
-                if is_sensitive_path(os.path.realpath(full)):
+                # sensitive tree cannot slip through. The canonical gate matches
+                # inline on this worker thread instead of submitting one more
+                # resolution per entry to the ``mc-pathres`` pool, whose queue
+                # the event loop's own bounded checks wait behind.
+                if is_sensitive_canonical_path(os.path.realpath(full)):
                     continue
                 try:
                     st = os.stat(full)
@@ -450,7 +463,9 @@ async def api_file_search(request: web.Request) -> web.Response:
     # probe slot too: a walk into a dead mount would otherwise pin a
     # default-executor worker exactly as an unbounded stat does.
     try:
-        results = await _run_path_probe(_walk_file_search, transfer=True)
+        results = await _run_path_probe(
+            _walk_file_search, transfer=True, stall_path=_batch_stall_path(safe_roots)
+        )
     except _PathProbeBusy:
         return _probe_busy_response(resource=f"q={query}", operation="file_search", caller=caller)
 

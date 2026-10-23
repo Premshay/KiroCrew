@@ -1,24 +1,27 @@
 # Built-in dynamic-dashboard templates
 
 Templates in the format `kiro_crew.dashboard_templates.manifest` defines: one
-directory per template, holding `manifest.json` and `template.html`. This is the ONLY
-directory the registry discovers, and `load_template` is its only gate: a page that
-renders on a crewmate's Dashboard tab is a page that went through review here, because
-it runs its own script against that crewmate's task titles and summaries inside a frame
-that can navigate itself. Twelve ship: the first four are below, five more are in "The round-7 set"
-further down, then `office` in "A desk that ships decks and mail" and the last two in
-"The two views".
+directory per template, holding `manifest.json` and `template.html`. `load_template` is
+the registry's only gate. A page that renders on a crewmate's Dashboard tab runs its
+own script against that crewmate's task titles and summaries inside a frame that can
+navigate itself, so it comes from one of two places a person put it: this directory,
+which went through review, or the operator's own folder (see "An operator's own page"
+below). Thirteen ship: the first four are below, five more are in "The round-7 set"
+further down, then `office` in "A desk that ships decks and mail", two in
+"The two views", and `kirocrew-conductor` in "A page named for its crewmate".
 
 | id | folds it reads | what it answers |
 |---|---|---|
-| `project-report` | `workstreams` | what this crewmate did, what each thing cost, what came of it, what needs the reader |
+| `project-report` | `workstreams`, `panel` | what this crewmate did, what each thing cost, what came of it, what needs the reader |
 | `goal-board` | `work` | the work ledger it conducts: items, states, verdicts |
 | `work-kanban` | `work` | that same board as columns, including the one waiting on the conductor's own verdict |
 | `session-ledger` | `ledger` | what a long-running session is carrying, and what it would resume from |
 
-`project-report` is the DEFAULT: a crewmate that never adopted a template renders it,
-so the first thing anybody sees is the report rather than an empty frame
-(`kiro_crew.dashboard_templates.instance.DEFAULT_TEMPLATE_ID`). The three round-3 pages
+`project-report` is a ROOT session's default: a root session that never adopted a
+template renders it in its Overview
+(`kiro_crew.dashboard_templates.instance.DEFAULT_TEMPLATE_ID`). A crewmate renders it only
+once the page is adopted; one that adopted nothing, and has no page named for it (see
+"A page named for its crewmate"), shows no page. The three round-3 pages
 it replaced -- `crewmate-overview`, `work-map`, `spend-and-tools` -- were each one slice
 of the same question asked three ways, and a reader had to assemble the answer from
 three pages of engineering counters. One page answering the four questions in order
@@ -51,6 +54,16 @@ each page overwrites that one cell with a count and draws the real thing from
 `message`, because the order of the host's first fill against the script is not the
 page's to assume.
 
+## The reader's language
+
+`window.kirocrew.locale` is the reader's UI language, checked against the catalogs the
+app ships, and `en` for anything else. Each page keeps one `I18N` table per language
+(`en` and `zh-CN` today) and picks its own words by it: static words carry
+`data-i18n="<key>"` with the English text in the markup, script-written words go through
+`i18n(key, vars)`, and a key a language lacks falls back to English. Values from
+`fields` are never translated. In `project-report` a crewmate's `verdict.words` still
+wins over the table. zh-CN strings are `\u` escapes so the sources stay ASCII.
+
 No page fetches anything: the frame's CSP blocks the network, so a chart drawn from a CDN
 renders as a hole. The charts are plain elements sized in the page's own JS.
 
@@ -62,8 +75,8 @@ an agentic field. The page marks it from `window.kirocrew.agentic` rather than f
 own belief, so a value the crewmate wrote never looks like one folded from the record.
 
 `project-report` declares three for the same reason. `for_you` is the lines the lead
-wants its reader to act on next: the record holds which items are blocked or asking a
-question, and the page folds those itself; what it cannot fold is the lead's own
+wants its reader to act on next: the record holds which open items are blocked or asking
+a question, and the page folds those itself; what it cannot fold is the lead's own
 judgment about what matters, so that half is written and marked as written. `verdict` is
 the lead's one-line read of where the work stands, with the one thing most in the way --
 the lead already knows which of six reds is the one that matters, and no fold ranks them.
@@ -71,7 +84,48 @@ the lead already knows which of six reds is the one that matters, and no fold ra
 page draws the `crewmate wrote this` tag only when the host says the field IS agentic, so
 a value arriving some other way cannot borrow the label.
 
-`goal-board` and `work-kanban` declare none, because every number they show has a fold.
+A person answers `for_you` cards in the chat as often as on the cards: a typed reply, an
+option clicked in the chat, a steer into the running turn. None of those passes through
+the page, so the host says when the person last spoke in the chat the page belongs to,
+as `window.kirocrew.last_user_at` (UTC in whole seconds, like `written_at`, from the
+chat's own human-marked rows; `""` when it has none). `project-report` folds cards in
+two groups under the desk. Cards picked on the page go under **Answered**
+(`verdict.words.answered`), each with **Undo**. Cards written before that stamp
+(`written_at.for_you`) go under **Asked before you wrote in chat**
+(`verdict.words.in_chat`), each with the line "You wrote in chat after this was asked"
+(`verdict.words.replied`) and a **Show card** button (`verdict.words.reopen`). The page
+knows only that the person wrote in the chat after the card was written; it cannot tell
+whether that message answered the card, so it never says it did. The in-chat cards
+leave the Needs-you number but stay counted: the header adds "N asked before you wrote
+in chat" after "N need you", and when nothing else needs the reader the Needs-you KPI's
+subtitle says "N asked before you wrote in chat" instead of "nothing waiting on you".
+**Show card** unfolds its card until the person next writes in the chat; the card it
+brings back is flashed, takes focus and is scrolled into view (instantly when the reader
+asks for reduced motion), and keeps the "You wrote in chat after this was asked" line on
+a row of its own beside a **Hide card** button (`verdict.words.hide`). **Hide card**
+folds the card again and moves focus to the fold's heading. Once the crewmate writes
+the list after the person's message, the cards it kept ask again.
+
+## What a crewmate published
+
+`project-report` also binds `published` to `{"fold": "panel", "path": "data"}`: the
+object the crewmate last sent with `panel_publish`. One slot can carry two crews, and
+the fold's top level is whichever published last, so the host resolves a `panel`
+binding against the reading crewmate's OWN record, by the panel read route's own
+rule (`agent_panel.owned_panel_record`: the publish file first, then the fold). A
+crewmate that never published, or a root session's page, reads an empty object, and
+the page draws no block. The block is always the crewmate's words, so it always wears
+the `crewmate wrote this` tag. It draws any object the way the panel's default
+template does, every value as text: a short scalar is a tile, a long string a
+paragraph, an array of objects a table, an array of scalars a list, a nested object
+key/value rows. The fold holds the publish route's scrubbed copy, and the page read
+redacts again and masks `crew_key`.
+
+`work-kanban` declares none, because every number it shows has a fold. `goal-board`
+declares one, `asks`: the answers the conductor offers for an item waiting on the reader,
+keyed by item id. Its numbers are all folded; the options are a judgment no fold holds.
+Each needs-you row gets a Reply button whether or not `asks` has an entry, and every
+button posts `kirocrew-dashboard:act`, which only fills the reader's chat box.
 
 ## Checking and rendering them
 
@@ -93,6 +147,19 @@ Add the directory with both files, add its id to `EXPECTED_IDS` in the test, and
 the packaging globs still cover it (`[options.package_data]` in `setup.cfg` and the
 `recursive-include` lines in `MANIFEST.in`). A template absent from the wheel leaves the
 loader shipped and working while the registry discovers nothing, with every test green.
+
+## An operator's own page
+
+A page you write yourself goes in your data home, not here:
+`<data home>/panel-templates/<id>/manifest.json` and `template.html`, in the same
+format. Its manifest says `"source": "user"`. That folder also holds the panel's
+template overrides as `<id>.html` files; the two never collide.
+
+- A shipped id wins. A page of yours with the same id is listed as a problem.
+- The folder, the page directory and both files must be real, not links.
+- Fill values by `textContent`, as the pages here do.
+
+An agent cannot write that folder, which is why a page there may render.
 
 ## The round-7 set
 
@@ -194,7 +261,7 @@ presses send.
 (template, fold seq, theme, width) for a shot whose subject is how the page itself looks.
 The caption stays on by default, because a screenshot that cannot say what produced it is
 not evidence.
-++ b/src/kiro_crew/dashboard_templates/builtin/README.md
+
 ## The two views: who was working when, and who dispatched whom
 
 Two more, read as a pair and sharing one palette, because a reader opens them one after
@@ -267,3 +334,23 @@ session from -- the same pair the card-action route takes as lookup keys -- and 
 the key. A live click-through needs a host message and handler, which is a host change
 rather than a page one. `test_dashboard_template_views.py` asserts neither page names
 `worker_session_key` or binds a `slot`.
+
+## A page named for its crewmate
+
+| id | folds it reads | the question it answers | agentic |
+|---|---|---|---|
+| `kirocrew-conductor` | `work`, `panel` | what is my conductor running, and what does it need from me | `needs_you` |
+
+A crewmate that adopted nothing gets the page whose id is its own slug, when one ships,
+and no page otherwise (`instance.default_template_id`). This is the crew
+panel's rule that a template named after a crew is that crew's view, so a crewmate
+named like a shipped page gets that page. No page here may be named `default`: a
+crewmate can be.
+
+`kirocrew-conductor` is the conductor's task board. Its tasks, states, goal and round
+come from the `work` fold, bound the way `goal-board` binds them, so the board is
+current even when the conductor publishes nothing. `needs_you` is the conductor's own
+list of lines the person must act on; tasks whose worker asked or is stuck join it from
+the record. `note` is the conductor's last `panel_publish`, read from its own record in
+the `panel` fold, and its `next` line is drawn under a tag that says
+the crewmate wrote it.

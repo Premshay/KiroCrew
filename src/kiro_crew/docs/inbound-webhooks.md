@@ -123,7 +123,7 @@ This unsigned request works only with a bearer-only source (`require_signature: 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `message` | string | — | Required, non-empty after trimming. Max 49,999 characters. |
-| `sessionKey` | string | `hook:default:<unix-ts>` | Must start with `hook:`. The part after the prefix is the **hook id** used to look up registered context. |
+| `sessionKey` | string | `hook:default:<unix-ts>-<random hex>` | Must start with `hook:`. The part after the prefix is the **hook id** used to look up registered context. |
 | `name` | string | `Webhook` | Human label shown in the notification title. |
 | `agent` | string | source destination | Optional compatibility field. For a mapped source it must be omitted or exactly match the operator-owned destination; a conflict is `409 agent_conflict`. Unmapped historical and legacy credentials retain caller/default routing. |
 | `deliver` | boolean or truthy/falsy value | `true` | When false, the turn runs and is logged but nothing is pushed to you. Other values use normal Python truthiness. |
@@ -369,6 +369,13 @@ This is the same model subagents use, and it is why the `sessionKey` is a routin
 key rather than a handle: two calls with the same `sessionKey` are two unrelated
 turns, not a thread. Anything the second turn needs to know, the first turn has
 to have written down.
+
+Before the first prompt of a new session, the run waits up to 30 seconds for
+every MCP server the agent spec declares to report that it started, failed or
+needs authorization. Nobody can reconnect a slow server by hand in a webhook
+run. A run that still lacks a declared server ends with outcome `degraded`
+instead of `completed`, and its detail names the server. The run list and the
+notification show it, so you can see which run to retry.
 
 When the turn ends, the result is redacted for credentials and exfiltration URLs
 before it leaves the gateway. Delivery, when `deliver` is true, is a dashboard

@@ -77,7 +77,9 @@ export const TRAFFIC_LIGHT_INSET_PX = 84
  * owns the top strip there: pointing at it slides the menu bar down over the
  * window, so a control laid out at y=0 (the header and its crew switcher) can
  * no longer be clicked. Shifting the dashboard down by the menu bar's height
- * puts the header below that strip.
+ * puts the header below that strip. Not applied when the shell reports the
+ * menu bar cannot overlap (a notched display, where macOS already places the
+ * fullscreen window below the menu bar).
  */
 export const MAC_FULLSCREEN_TOP_RESERVE_PX = 24
 
@@ -93,6 +95,32 @@ export const MAC_FULLSCREEN_TOP_RESERVE_PX = 24
  */
 export function canOpenFileInEditor(): boolean {
   return typeof (window as { fileOpenAPI?: { open?: unknown } }).fileOpenAPI?.open === 'function'
+}
+
+/**
+ * Extensions the desktop shell's open-file handler accepts — a renderer-side
+ * MIRROR of `OPENABLE_EXTS` in `electron/ipc-registrar.js` (the
+ * `dashboard:open-file` handler), which stays the security bar. The mirror only
+ * lets a surface skip offering a launch the shell is certain to refuse;
+ * `editorOpenerParity.test.ts` pins the two sets equal.
+ */
+export const EDITOR_OPENABLE_EXTS: ReadonlySet<string> = new Set([
+  '.md', '.markdown', '.txt', '.text', '.rst', '.org', '.log',
+  '.json', '.jsonc', '.json5', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf', '.env',
+  '.css', '.graphql', '.proto',
+])
+
+/**
+ * Whether the shell's open-file handler would accept `filePath` by type: an
+ * absolute path (the handler resolves a relative one against its own working
+ * directory, not the gateway's project, and does not expand `~`) whose
+ * extension is in `EDITOR_OPENABLE_EXTS`.
+ */
+export function editorAcceptsPath(filePath: string): boolean {
+  if (!/^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(filePath)) return false
+  const base = filePath.split(/[\\/]/).pop() || ''
+  const dot = base.lastIndexOf('.')
+  return dot > 0 && EDITOR_OPENABLE_EXTS.has(base.slice(dot).toLowerCase())
 }
 
 /**
@@ -113,6 +141,56 @@ export async function openFileInEditor(
     return await api.open(filePath)
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * Whether the desktop shell's `folderPickAPI` bridge is present. Synchronous, so
+ * a surface can skip the availability round trip in a plain browser tab and the
+ * PWA, where the bridge never exists. Presence alone does NOT mean a pick can
+ * work -- ask {@link canPickFolderNatively} for that.
+ */
+export function hasNativeFolderPicker(): boolean {
+  const api = window.folderPickAPI
+  return typeof api?.available === 'function' && typeof api?.pick === 'function'
+}
+
+/**
+ * Whether this window can open the OS-native folder chooser: the bridge is
+ * present AND the shell's main process confirms this window's gateway runs on
+ * this machine. A connection window pointed at a remote gateway carries the same
+ * bridge, but a folder chosen there names a path on the wrong host, so the
+ * shell answers false for it. Resolves false with no bridge and on any error.
+ */
+export async function canPickFolderNatively(): Promise<boolean> {
+  if (!hasNativeFolderPicker()) return false
+  try {
+    return (await window.folderPickAPI!.available()) === true
+  } catch {
+    return false
+  }
+}
+
+/** How a native folder pick ended: a folder, a cancel, or a dialog that could not be used. */
+export type NativeFolderPick =
+  | { status: 'picked'; path: string }
+  | { status: 'cancelled' }
+  | { status: 'failed' }
+
+/**
+ * Open the OS-native folder chooser. Resolves the chosen absolute folder, a cancel, or a
+ * failure -- no bridge, a refusal from the shell, a dialog that could not open, or a malformed
+ * answer -- and never throws. The path is one the USER chose on this machine, not one the
+ * gateway vouched for: callers validate it the way they validate a typed path before using it.
+ */
+export async function pickFolderNatively(): Promise<NativeFolderPick> {
+  if (!hasNativeFolderPicker()) return { status: 'failed' }
+  try {
+    const picked = await window.folderPickAPI!.pick()
+    if (picked === null) return { status: 'cancelled' }
+    return typeof picked === 'string' && picked ? { status: 'picked', path: picked } : { status: 'failed' }
+  } catch {
+    return { status: 'failed' }
   }
 }
 /**

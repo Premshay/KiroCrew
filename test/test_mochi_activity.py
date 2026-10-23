@@ -7,7 +7,6 @@ oldest. Neither raises, so both are pinned here rather than left to inspection.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 from typing import Any
@@ -19,6 +18,7 @@ from dashboard_owner_helpers import NoConfiguredOwner
 from kiro_crew.apps.builtins.mochi import activity_log as al
 from kiro_crew.apps.builtins.mochi import hooks
 from kiro_crew.apps.builtins.mochi.backend import routes
+from kiro_crew.testing.wait import async_wait_until
 
 
 def _owner_request(*args, **kwargs):
@@ -55,10 +55,8 @@ async def _live_runtime(tmp_path):
     """Start the runtime inside the test's own loop, stop it on exit.
 
     An async CONTEXT MANAGER rather than an ``@pytest_asyncio.fixture``: the
-    suite pins pytest-asyncio 0.20.3, whose async-fixture wrapper reads the
-    ``fixturedef.unittest`` attribute pytest 8.1 removed — on CI every
-    async-generator fixture errors at setup. The repo avoids the decorator by
-    convention (see test_denied_commands_api.py's module docstring).
+    suite's convention for teardown that must await on the test's own loop
+    (see test_denied_commands_api.py's module docstring).
     """
     await hooks.on_startup(_Ctx(tmp_path))
     try:
@@ -202,12 +200,11 @@ class TestDashboardRoutes:
         async with _live_runtime(tmp_path) as runtime:
             runtime._log_activity("notification", "wired up")
             # On the event loop the persist is offloaded (a locked file write must
-            # not block the loop), so it lands asynchronously — poll briefly.
-            for _ in range(100):
-                if [e["content"] for e in al.read_recent(tmp_path)] == ["wired up"]:
-                    break
-                await asyncio.sleep(0.01)
-            assert [e["content"] for e in al.read_recent(tmp_path)] == ["wired up"]
+            # not block the loop), so it lands asynchronously.
+            await async_wait_until(
+                lambda: [e["content"] for e in al.read_recent(tmp_path)] == ["wired up"],
+                describe=lambda: al.read_recent(tmp_path),
+            )
 
     @pytest.mark.asyncio
     async def test_plan_reports_empty_when_no_queue_file(self, tmp_path):

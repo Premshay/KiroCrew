@@ -131,7 +131,7 @@ class TestPerProcessReads:
             b"1234 (\xff) \xfe) S 7 8 9 " + b"0 " * 15 + b"4242 0 55"
         )
         assert platform_compat.read_proc_stat(1234, proc_root=tmp_path) == platform_compat.ProcStat(
-            state="S", ppid=7, pgrp=8, session=9, start_ticks=4242, rss_pages=55
+            state="S", ppid=7, pgrp=8, session=9, start_ticks=4242, rss_pages=55, cpu_ticks=0
         )
         assert platform_compat._parse_ppid((tmp_path / "1234" / "stat").read_bytes()) == 7
 
@@ -359,7 +359,7 @@ class TestOneHome:
         module is observed by both callers, which is only possible if neither
         has a walk of its own left."""
         with _FakeTree(needles=(sa.STUB_MODULE,)):
-            assert pool_mod._proc_rss_kb(10) == sum(RSS.values())
+            assert pool_mod.backend_rss_kb(10) == sum(RSS.values())
             assert sa._subtree_cpu_jiffies(10) == sum(JIFFIES.values())
             sample = sa._proc_subtree_sample(10)
         assert sample.rss_kb == sum(RSS.values())

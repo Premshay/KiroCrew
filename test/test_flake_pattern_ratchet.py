@@ -5,12 +5,17 @@ the shapes a test must not use. ``semgrep/test-determinism.yaml`` refuses the
 commonest of them on a new line (a sleep as a barrier, a ``time`` patch, a bare
 ``monkeypatch.undo()``, a reload, a naive local-time read, an unseeded draw, an autouse
 fixture on the shared ``monkeypatch``, a promise-sleep, ``waitForTimeout``). This module
-counts per file only the shapes those patterns miss: patches of ``asyncio.sleep``, the
-``datetime`` classes or another module's ``time`` binding, ``sys.modules`` evictions,
+counts per file only the shapes those patterns miss: patches of ``asyncio.sleep`` or
+the ``datetime`` classes, ``sys.modules`` evictions,
 raw environment writes, duration bounds, short literal waits, literal listener ports,
-crew-log flush ceilings and unpaused removals, and five frontend shapes (promise-sleeps
+crew-log flush ceilings, unpaused removals, Event waits a test parks on an executor
+(``to_thread(<obj>.wait, ...)`` and ``run_in_executor(<any>, <obj>.wait, ...)``,
+whatever the bound, none included), and five frontend shapes (promise-sleeps
 only in the Electron tests, which the semgrep rule does not read). So no site needs
-both ``# nosemgrep`` and ``# flake-ok``. The tree already holds thousands of these, so
+both ``# nosemgrep`` and ``# flake-ok``. In a file the pinned semgrep reads no line of
+(one over its size limit, or one it cannot parse; see ``semgrep_cannot_read``), the
+``time`` patches its rule would refuse are counted too. The tree already holds
+thousands of these, so
 each file a change touches is held to its own count at the change's merge-base.
 
 * A file's count may not rise; a new file starts at zero, a deleted file passes, and
@@ -24,10 +29,13 @@ each file a change touches is held to its own count at the change's merge-base.
   module ten other diff-scoped gates read. Precedence: ``FLAKE_RATCHET_BASE`` when
   set; on CI the first parent of the merge commit a pull request, push or merge
   queue run checks out; else the newer of the merge-bases with ``upstream/<base>``
-  and ``origin/<base>``, or the local ``<base>`` branch. When none is readable (a
-  shallow clone, as CI's backend shards are today), the ratchet warns and compares
-  nothing: judging against a stored count would red a change for sites that other,
-  already merged changes added.
+  and ``origin/<base>``, or the local ``<base>`` branch. CI's Backend Tests checkout
+  is depth 2 so that first parent is readable. When none is readable (a depth-1
+  clone), the ratchet warns and compares nothing: judging against a stored count
+  would red a change for sites that other, already merged changes added. The early,
+  fail-closed run is ``fast-gate.yml``'s ``flake-pattern-ratchet`` job: a depth-2
+  checkout whose first parent this resolver reads, and a ``compared nothing`` there
+  fails the job.
 * A line that keeps a shape on purpose carries ``# flake-ok: <reason>`` (``//
   flake-ok: <reason>`` in TypeScript) with a reason of ten characters or more, words
   not punctuation, on a line of the finding.
@@ -45,15 +53,18 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import io
 import os
 import re
 import subprocess
+import tokenize
 import warnings
 from collections import Counter
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import pytest
+import yaml
 from source_corpus import repo_files, repo_root
 from test_ratchet_scope import (
     _GIT_COMMAND_LINE_CONFIG,
@@ -198,6 +209,8 @@ class _Module:
         self.calls: list[ast.Call] = []
         self.asserts: list[ast.Assert] = []
         self.writes: list[ast.AST] = []  # Assign, AugAssign, Delete
+        #: local name -> asyncio name, for ``from asyncio import to_thread as tt``.
+        self.asyncio_names: dict[str, str] = {}
         # One walk; every detector reads these lists instead of walking again.
         stack: list[ast.AST] = [tree]
         while stack:
@@ -215,6 +228,9 @@ class _Module:
                 for alias in node.names:
                     if alias.name in _CLOCK_ATTRS:
                         self.modules[alias.asname or alias.name] = alias.name
+            elif isinstance(node, ast.ImportFrom) and node.module == "asyncio":
+                for alias in node.names:
+                    self.asyncio_names[alias.asname or alias.name] = alias.name
 
     def stdlib_of(self, node: ast.AST) -> str | None:
         """The stdlib module a Name or Attribute names, through this file's aliases."""
@@ -271,30 +287,37 @@ def _patched_target(node: ast.Call) -> tuple[ast.AST | None, str | None]:
 
 
 #: What ``kirocrew.test-stdlib-clock-rebound`` (semgrep/test-determinism.yaml) refuses:
-#: ``<x>.setattr(time, ...)`` and ``patch.object(time, ...)`` on the stdlib ``time``
-#: module named directly (an ``import time as`` alias included), and a ``"time.<attr>"``
-#: target string handed to ``<x>.setattr``, ``patch`` or ``mock.patch``. K3 counts the
-#: clock and sleep patches that rule's patterns miss, so no site needs both markers.
-_TIME_RULE_STRING_CALLS = frozenset({"patch", "mock.patch"})
+#: ``<x>.setattr(time, ...)`` and ``<x>.patch.object(time, ...)`` on the stdlib ``time``
+#: module, named directly (an ``import time as`` alias included) or reached through
+#: another module's binding (``<mod>.time``), and a ``"time.<attr>"`` or
+#: ``"pkg.mod.time.<attr>"`` target string handed to ``<x>.setattr`` or ``<x>.patch``.
+#: K3 counts the clock and sleep patches that rule's patterns miss, so no site needs
+#: both markers, and, in a file semgrep reads nothing of, these as well.
+_TIME_RULE_STRING_TARGET = re.compile(r"(^|\.)time\.\w+$")
 
 
 def _time_rule_refuses(module: _Module, node: ast.Call, target: ast.AST | None) -> bool:
     name = _dotted(node.func)
     via_setattr = isinstance(node.func, ast.Attribute) and node.func.attr == "setattr"
     if isinstance(target, ast.Constant) and isinstance(target.value, str):
-        return target.value.startswith("time.") and (via_setattr or name in _TIME_RULE_STRING_CALLS)
+        via_patch = name == "patch" or name.endswith(".patch")
+        return bool(_TIME_RULE_STRING_TARGET.search(target.value)) and (via_setattr or via_patch)
+    via_patch_object = name == "patch.object" or name.endswith(".patch.object")
     return (
-        isinstance(target, ast.Name)
-        and module.modules.get(target.id) == "time"
-        and (via_setattr or name == "patch.object")
+        target is not None
+        and module.stdlib_of(target) == "time"
+        and (via_setattr or via_patch_object)
     )
 
 
-def _k3_stdlib_clock_patch(module: _Module) -> Iterable[ast.AST]:
-    """A patch on a stdlib clock or sleep the time rule does not refuse: ``asyncio.sleep``,
-    ``datetime.datetime`` / ``date``, the time module reached through another module's
-    binding (``<mod>.time``, ``"pkg.mod.time.<attr>"``), or ``mock.patch.object(time, ...)``.
+def _k3_stdlib_clock_patch(module: _Module, source: str) -> Iterable[ast.AST]:
+    """A patch on a stdlib clock or sleep the time rule does not refuse: ``asyncio.sleep``
+    and ``datetime.datetime`` / ``date``, named directly or through another module's
+    binding (``<mod>.asyncio``, ``"pkg.mod.datetime.<attr>"``). In a file semgrep cannot
+    read (:func:`semgrep_cannot_read`) the rule refuses nothing, so there the ``time``
+    patches it would refuse are counted too.
     """
+    unread = semgrep_cannot_read(module, source)
     for node in module.calls:
         name = _dotted(node.func)
         target: ast.AST | None
@@ -315,8 +338,8 @@ def _k3_stdlib_clock_patch(module: _Module) -> Iterable[ast.AST]:
             stdlib = stdlib.rsplit(".", 1)[-1]
         else:
             continue
-        if attr in _CLOCK_ATTRS.get(stdlib or "", ()) and not _time_rule_refuses(
-            module, node, target
+        if attr in _CLOCK_ATTRS.get(stdlib or "", ()) and (
+            unread or not _time_rule_refuses(module, node, target)
         ):
             yield node
 
@@ -458,6 +481,96 @@ def _k14_unpaused_crew_log_rmtree(module: _Module, source: str) -> Iterable[ast.
             yield node
 
 
+def _is_wait(node: ast.AST) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "wait"
+
+
+def _k15_parked_pool_wait(module: _Module) -> Iterable[ast.AST]:
+    """A test parking ``<obj>.wait`` on an executor: ``to_thread(<obj>.wait, ...)`` or
+    ``run_in_executor(<any>, <obj>.wait, ...)``, whatever the bound, none included.
+
+    The parked wait holds a pool thread the code it waits for may need to make the
+    event fire, so a bound only changes how the starvation fails. The callee is matched
+    by its last name, so an aliased module counts too, and a name bound by
+    ``from asyncio import to_thread as tt`` resolves to ``to_thread``. Any ``.wait``
+    counts, which may over-count a little. Known misses: ``functools.partial``, a
+    ``lambda``, a rebound ``w = ev.wait``, a rebound callee (``f = asyncio.to_thread``),
+    ``executor.submit`` and ``getattr``."""
+    for node in module.calls:
+        func = node.func
+        if isinstance(func, ast.Name):
+            callee = module.asyncio_names.get(func.id, func.id)
+        else:
+            callee = func.attr if isinstance(func, ast.Attribute) else ""
+        if callee == "to_thread" and node.args and _is_wait(node.args[0]):
+            yield node
+        elif callee == "run_in_executor" and len(node.args) >= 2 and _is_wait(node.args[1]):
+            yield node
+
+
+def _parenthesized_with_as(source: bytes, starts: list[int], node: ast.AST) -> bool:
+    """Whether *node* is ``with (a as b, ...):``: one pair of parentheses holds every
+    item and at least one binds a name. ``with (a) as b:`` and ``with (a, b):`` are not."""
+    if not isinstance(node, (ast.With, ast.AsyncWith)) or not node.body:
+        return False
+    if all(item.optional_vars is None for item in node.items):
+        return False
+    # AST columns are UTF-8 byte offsets.
+    start = starts[node.lineno - 1] + node.col_offset
+    body = starts[node.body[0].lineno - 1] + node.body[0].col_offset
+    text = source[start:body].decode("utf-8")
+    tokens = (
+        token
+        for token in tokenize.generate_tokens(io.StringIO(text).readline)
+        if token.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT)
+    )
+    depth = 0
+    try:
+        for token in tokens:
+            if depth == 0 and token.string in ("async", "with"):
+                continue
+            if depth == 0 and token.string != "(":
+                return False
+            if token.type == tokenize.OP and token.string in ("(", "[", "{"):
+                depth += 1
+            elif token.type == tokenize.OP and token.string in (")", "]", "}"):
+                depth -= 1
+                if depth == 0:
+                    return next(tokens).string == ":"
+    except (tokenize.TokenError, StopIteration):
+        return False
+    return False
+
+
+#: semgrep's default ``--max-target-bytes``: it skips a larger file unread.
+SEMGREP_MAX_TARGET_BYTES = 1_000_000
+
+
+def semgrep_cannot_read(module: _Module, source: str) -> bool:
+    """Whether the pinned semgrep (1.78, ``.github/workflows/code-review.yml``) reads
+    no line of this file, so none of its rules refuses anything in it.
+
+    Two cases. A file over :data:`SEMGREP_MAX_TARGET_BYTES` is skipped. And a file
+    holding both a lambda with a bare ``*`` (``lambda a, *, b: ...``) and a
+    parenthesized ``with (a as b, ...):`` is a whole-file syntax error: semgrep's first
+    Python parser rejects the lambda, the one it falls back to rejects the ``with``.
+    Either shape alone parses, and so does ``lambda a, *rest, b``.
+    """
+    encoded = source.encode("utf-8")
+    if len(encoded) > SEMGREP_MAX_TARGET_BYTES:
+        return True
+    nodes = list(module.parents)
+    if not any(
+        isinstance(node, ast.Lambda) and node.args.kwonlyargs and node.args.vararg is None
+        for node in nodes
+    ):
+        return False
+    starts = [0]
+    for line in encoded.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    return any(_parenthesized_with_as(encoded, starts, node) for node in nodes)
+
+
 #: class -> words one of which every shape of that class contains. A file holding none
 #: is not parsed: each set is deliberately broader than its detector, never narrower.
 PY_TRIGGERS: dict[str, tuple[str, ...]] = {
@@ -469,9 +582,13 @@ PY_TRIGGERS: dict[str, tuple[str, ...]] = {
     "K11-literal-listener-port": ("(",),
     "K13-fixed-flush-ceiling": ("flush",),
     "K14-unpaused-crew-log-rmtree": ("rmtree",),
+    "K15-parked-pool-wait": ("to_thread", "run_in_executor"),
 }
 
-#: class -> detector. K14 also reads the source text.
+#: The classes whose detector also reads the source text.
+_READS_SOURCE = frozenset({"K3-stdlib-clock-patch", "K14-unpaused-crew-log-rmtree"})
+
+#: class -> detector.
 PY_DETECTORS: dict[str, Callable[..., Iterable[ast.AST]]] = {
     "K3-stdlib-clock-patch": _k3_stdlib_clock_patch,
     "K5-sys-modules-eviction": _k5_sys_modules_eviction,
@@ -481,6 +598,7 @@ PY_DETECTORS: dict[str, Callable[..., Iterable[ast.AST]]] = {
     "K11-literal-listener-port": _k11_literal_listener_port,
     "K13-fixed-flush-ceiling": _k13_fixed_flush_ceiling,
     "K14-unpaused-crew-log-rmtree": _k14_unpaused_crew_log_rmtree,
+    "K15-parked-pool-wait": _k15_parked_pool_wait,
 }
 
 
@@ -590,7 +708,7 @@ def _python_findings(source: str) -> Iterable[tuple[str, str, bool]]:
     lines = source.splitlines()
     for klass in active:
         detector = PY_DETECTORS[klass]
-        found = detector(module, source) if klass.startswith("K14") else detector(module)
+        found = detector(module, source) if klass in _READS_SOURCE else detector(module)
         for node in found:
             span = [n for n in _excuse_lines(node) if 0 < n <= len(lines)]
             excused = any(_flake_ok(lines[n - 1]) for n in span)
@@ -824,18 +942,26 @@ PY_CASES: dict[str, tuple[tuple[str, ...], str]] = {
             "        pass\n",
             "import datetime\ndef test_x(monkeypatch):\n"
             "    monkeypatch.setattr(datetime, 'datetime', Frozen)\n",
-            "def test_x(monkeypatch):\n    monkeypatch.setattr(subject.time, 'monotonic', f)\n",
+            "def test_x(monkeypatch):\n    monkeypatch.setattr(subject.asyncio, 'sleep', f)\n",
             "def test_x(monkeypatch):\n"
-            "    monkeypatch.setattr('kiro_crew.acp.client.time.monotonic', f)\n",
-            "import time as _time\nfrom unittest import mock\ndef test_x():\n"
-            "    with mock.patch.object(_time, 'time', f):\n        pass\n",
+            "    monkeypatch.setattr('kiro_crew.acp.client.datetime.datetime', Frozen)\n",
+            "import asyncio\nfrom unittest import mock\ndef test_x():\n"
+            "    with mock.patch.object(asyncio, 'sleep', f):\n        pass\n",
         ),
         # The right seam, a non-clock attribute, and the shapes the time rule refuses.
-        "import os\nimport time\nimport time as _t\ndef test_x(monkeypatch):\n"
+        "import os\nimport time\nimport time as _t\nimport unittest.mock\n"
+        "from unittest import mock\ndef test_x(monkeypatch):\n"
         "    monkeypatch.setattr(subject, 'time', fake)\n    monkeypatch.setattr(os, 'getcwd', f)\n"
         "    monkeypatch.setattr('time.tzname', t)\n    monkeypatch.setattr(time, 'monotonic', f)\n"
         "    monkeypatch.setattr(_t, 'sleep', f)\n    monkeypatch.setattr('time.time', f)\n"
-        "    with patch('time.sleep'), patch.object(time, 'monotonic', f):\n        pass\n",
+        "    monkeypatch.setattr(subject.time, 'monotonic', f)\n"
+        "    monkeypatch.setattr('kiro_crew.acp.client.time.monotonic', f)\n"
+        "    monkeypatch.setattr('kiro_crew.acp.client.time', fake)\n"
+        "    with patch('time.sleep'), patch.object(time, 'monotonic', f):\n        pass\n"
+        "    with mock.patch.object(_t, 'time', f), unittest.mock.patch('time.sleep'):\n"
+        "        pass\n"
+        "    with mock.patch('kiro_crew.cron.time.time'), patch.object(subject.time, 'sleep'):\n"
+        "        pass\n",
     ),
     "K5-sys-modules-eviction": (
         (
@@ -889,7 +1015,88 @@ PY_CASES: dict[str, tuple[tuple[str, ...], str]] = {
         "import shutil\ndef test_x():\n    with eager.paused():\n"
         "        shutil.rmtree(crew_log_path('session', sid).parent)\n",
     ),
+    "K15-parked-pool-wait": (
+        (
+            "import asyncio\nasync def test_x():\n    assert await asyncio.to_thread(ev.wait, 5)\n",
+            "import asyncio\nasync def test_x():\n    await asyncio.to_thread(ev.wait, timeout=2.0)\n",
+            "import asyncio\nasync def test_x():\n    await asyncio.to_thread(self.ev.wait)\n",
+            "import asyncio\nasync def test_x():\n"
+            "    await asyncio.to_thread(ev.wait, default_timeout())\n",
+            "from asyncio import to_thread\nasync def test_x():\n    await to_thread(ev.wait, 5)\n",
+            "from asyncio import to_thread as tt\nasync def test_x():\n    await tt(ev.wait, 5)\n",
+            "import asyncio\nasync def test_x():\n    real = asyncio\n"
+            "    await real.to_thread(ev.wait, 5)\n",
+            "import asyncio\nasync def test_x():\n"
+            "    await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)\n",
+            "async def test_x(loop):\n    await loop.run_in_executor(pool, release.wait)\n",
+        ),
+        # Another callable, a non-blocking read, polling from the loop, a held-side
+        # wait on the code's own thread, and the shape named only in a docstring.
+        "import asyncio\nasync def test_x(loop):\n    'asyncio.to_thread(ev.wait, 5)'\n"
+        "    await asyncio.to_thread(work, 5)\n    await asyncio.to_thread(ev.is_set)\n"
+        "    await loop.run_in_executor(None, work, 5)\n"
+        "    await async_wait_until(ev.is_set)\ndef held():\n    assert ev.wait(5)\n",
+    ),
 }
+
+#: Sources the pinned semgrep reads no line of, each holding one ``time`` patch.
+_UNREAD = (
+    "def test_x(monkeypatch):\n    g(lambda a, *, b: 1)\n    with (\n        open(p) as f,\n"
+    "        open(q) as h,\n    ):\n        monkeypatch.setattr(time, 'time', f)\n",
+    "def test_x(monkeypatch):\n    with (open(p) as f):\n        g(lambda *, k=1: k)\n"
+    "    monkeypatch.setattr(subject.time, 'monotonic', f)\n",
+    # A non-ASCII last item: the columns the check slices by are bytes.
+    "async def test_x():\n    async with (a() as b, c('é')):\n        g(lambda a, *, b: 1)\n"
+    "    with patch('kiro_crew.cron.time.time'):\n        pass\n",
+    "def test_x(monkeypatch):\n    monkeypatch.setattr(time, 'sleep', f)\n"
+    + "#" * SEMGREP_MAX_TARGET_BYTES
+    + "\n",
+)
+
+#: The same ``time`` patch in sources semgrep does read: a lambda with ``*rest``, or a
+#: bare ``*`` beside a ``with`` that binds outside its parentheses, binds nothing, or
+#: has no parentheses; each shape of the pair alone; a file at the size limit.
+_READ = (
+    "def test_x(monkeypatch):\n    g(lambda a, *rest, b: 1)\n    with (open(p) as f):\n"
+    "        monkeypatch.setattr(time, 'time', f)\n",
+    "def test_x(monkeypatch):\n    g(lambda a, *, b: 1)\n    with (open(p)) as f, (open(q)):\n"
+    "        pass\n    with (open(p), open(q)):\n        pass\n"
+    "    with open(p) as f, open(q) as h:\n        monkeypatch.setattr(time, 'time', f)\n",
+    "def test_x(monkeypatch):\n    g(lambda a, *, b: 1)\n    monkeypatch.setattr(time, 'time', f)\n",
+    "def test_x(monkeypatch):\n    with (open(p) as f):\n        monkeypatch.setattr(time, 'time', f)\n",
+)
+
+
+def _at_the_size_limit() -> str:
+    head = "def test_x(monkeypatch):\n    monkeypatch.setattr(time, 'sleep', f)\n"
+    return head + "#" * (SEMGREP_MAX_TARGET_BYTES - len(head) - 1) + "\n"
+
+
+def test_semgrep_cannot_read_models_the_pinned_engine() -> None:
+    """``semgrep_cannot_read`` models 1.78's parsers and size limit. A bump of the SAST
+    job's pin fails here, so whoever bumps it re-measures what the new engine skips."""
+    workflow = (repo_root() / ".github" / "workflows" / "code-review.yml").read_text(
+        encoding="utf-8"
+    )
+    pins = set(re.findall(r"semgrep==([\w.]+)", workflow))
+    assert pins == {"1.78.0"}, (
+        f"the SAST job pins semgrep {sorted(pins)}: re-measure which files it reads no "
+        "line of and update semgrep_cannot_read and SEMGREP_MAX_TARGET_BYTES to match"
+    )
+
+
+def test_k3_counts_the_time_rule_shapes_only_where_semgrep_reads_nothing() -> None:
+    """The time rule refuses these patches only in a file semgrep reads; where it
+    reads nothing, K3 counts them, so the ratchet covers what the scan cannot."""
+    for source in _UNREAD:
+        assert semgrep_cannot_read(_Module(ast.parse(source)), source), source[:120]
+        assert count_python(source)[0]["K3-stdlib-clock-patch"] == 1, source[:120]
+    limit = _at_the_size_limit()
+    assert len(limit.encode("utf-8")) == SEMGREP_MAX_TARGET_BYTES
+    for source in (*_READ, limit):
+        assert not semgrep_cannot_read(_Module(ast.parse(source)), source), source[:120]
+        assert count_python(source)[0]["K3-stdlib-clock-patch"] == 0, source[:120]
+
 
 JS_CASES: dict[str, tuple[str, tuple[str, ...], str]] = {
     "J1-electron-promise-sleep": (
@@ -998,7 +1205,9 @@ def test_a_class_counts_only_what_its_semgrep_rule_misses() -> None:
             marks.setdefault(match.group(2), {})[index + 2] = match.group(1)
     module = _Module(ast.parse(text))
     for klass, rule in _RULE_OF.items():
-        counted = {node.lineno for node in PY_DETECTORS[klass](module)}
+        detector = PY_DETECTORS[klass]
+        found = detector(module, text) if klass in _READS_SOURCE else detector(module)
+        counted = {node.lineno for node in found}
         refused = {n for n, kind in marks.get(rule, {}).items() if kind == "ruleid"}
         missed = {n for n, kind in marks.get(rule, {}).items() if kind == "ok"}
         assert refused, f"{rule} has no refused case in its fixture"
@@ -1102,6 +1311,44 @@ def test_a_pull_request_merge_commit_is_measured_against_its_first_parent(
     base, how = merge_base(git_repo)
     assert base == before and "first parent" in how
     assert change_risen(git_repo, base) == {("K6-raw-environ-write", "test/test_b.py"): (1, 0)}
+
+
+def _ci_shaped_checkout(source: Path, dest: Path, depth: int) -> Path:
+    """Fetch ``source``'s ``main`` at ``depth`` into a fresh repo, detached, the way
+    ``actions/checkout`` fetches the merge ref: no ``origin/main`` and no ``main``."""
+    _run_git(dest.parent, "init", "-q", dest.name)
+    _run_git(dest, "fetch", "-q", f"--depth={depth}", source.as_uri(), "main")
+    _run_git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
+    return dest
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_a_ci_checkout_needs_depth_two_to_compare(git_repo, monkeypatch, depth) -> None:
+    # The base gains a commit after the branch point, so depth 2 is not the whole history.
+    (git_repo / "test" / "test_b.py").write_text(_sites("b"), encoding="utf-8")
+    _run_git(git_repo, "commit", "-q", "-am", "change")
+    _run_git(git_repo, "checkout", "-q", "main")
+    (git_repo / "test" / "test_c.py").write_text("def test_c():\n    assert 1\n", encoding="utf-8")
+    _run_git(git_repo, "add", "-A")
+    _run_git(git_repo, "commit", "-q", "-m", "main moved")
+    before = _run_git(git_repo, "rev-parse", "main")
+    _run_git(git_repo, "merge", "-q", "--no-ff", "-m", "merge", "change")
+    checkout = _ci_shaped_checkout(git_repo, git_repo.parent / f"ci-{depth}", depth)
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    base, how = merge_base(checkout)
+    if depth == 1:
+        assert base is None, how
+        return
+    assert base == before and "first parent" in how
+    assert change_risen(checkout, base) == {("K6-raw-environ-write", "test/test_b.py"): (1, 0)}
+
+
+def test_the_backend_tests_checkout_keeps_the_merge_parent() -> None:
+    # Without the merge parent the ratchet compares nothing on CI and gates nothing.
+    workflow = yaml.safe_load((repo_root() / ".github/workflows/ci.yml").read_text("utf-8"))
+    steps = workflow["jobs"]["backend-test"]["steps"]
+    checkout = next(step for step in steps if "actions/checkout" in str(step.get("uses", "")))
+    assert (checkout.get("with") or {}).get("fetch-depth") == 2
 
 
 def test_a_site_already_on_the_base_does_not_red_a_change_to_another_file(git_repo) -> None:

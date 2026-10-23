@@ -36,6 +36,7 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
+from kiro_crew.agent_switch_command import ChannelAgentPicks, handle_channel_agent_command
 from kiro_crew.config import live
 from kiro_crew.config.sections import _normalize_threshold_pair
 from kiro_crew.history import mint_row_mid
@@ -73,6 +74,7 @@ from kiro_crew.messaging.link import (
     rebind_conversation_location,
     release_conversation_location,
     seed_generation,
+    should_rotate_generation,
 )
 from kiro_crew.messaging.queue_drain import (
     drain_until_quiet,
@@ -97,7 +99,11 @@ from kiro_crew.safety_override import safety_override
 from kiro_crew.sel import sel
 from kiro_crew.start_priority import person_priority
 from kiro_crew.teams.approvals import TeamsApprovalDecider
-from kiro_crew.teams.attachments import append_attachment_context, process_teams_attachments
+from kiro_crew.teams.attachments import (
+    append_attachment_context,
+    file_attachments,
+    process_teams_attachments,
+)
 from kiro_crew.teams.cards import (
     DECISION_APPROVE,
     DECISION_DENY,
@@ -160,6 +166,24 @@ _RESUMED_BUSY_REFUSAL = (
     "⏳ That session is busy with a turn started elsewhere. Send your "
     "message again once it finishes, or /unlink to return to your "
     "Teams conversation."
+)
+
+#: Refusal for an option chip posted by a session other than the one this
+#: conversation targets now: bound to another session by `/sessions`, released by `/unlink`, or
+#: rotated to a new generation. Same invariant as Discord's and Telegram's tag
+#: gate -- a chip runs only in the session that posted it -- with the posting
+#: session read from the renderer that holds the label instead of from a wire tag.
+_STALE_OPTIONS_REFUSAL = (
+    "🔘 These choices belong to a conversation this chat has since moved away "
+    "from, so your choice was NOT applied. Type it as a message instead, or "
+    "run /sessions to reattach the session that asked."
+)
+
+#: Refusal for a valid chip whose session is mid-turn. A chip is never steered or
+#: queued, for the reason given where this is used.
+_BUSY_OPTIONS_REFUSAL = (
+    "🔘 That conversation is busy with another turn, so your choice was NOT "
+    "applied. Type it as a message once the turn finishes."
 )
 
 #: A release that could not be made durable changes nothing and says so.
@@ -364,6 +388,9 @@ class TeamsDispatcher:
         # the reloaded allow-list at it.
         self.transport: "TeamsTransport | None" = None
         self._conv = ConversationState(seed_fn=self._seed_gen)
+        # Per-person agent picked with /agent, keyed like _conv (the sender
+        # identity), because the agent is part of the session key.
+        self._agent_picks: ChannelAgentPicks[str] = ChannelAgentPicks()
         # Mid-turn queue receipts. Teams can edit a bot's own activity, so unlike
         # WeCom/Weixin (whose reply is bound to the inbound request) it can carry
         # the single collapsing receipt bubble the shared module implements.
@@ -444,6 +471,7 @@ class TeamsDispatcher:
         *,
         interpret_commands: bool = True,
         drain: bool = True,
+        option_session_key: str | None = None,
     ) -> None:
         """Drive one authorized inbound Teams message through TurnDriver.
 
@@ -455,6 +483,12 @@ class TeamsDispatcher:
         re-enter :meth:`_drain_queue` at its tail. The drain's own loop pumps
         whatever arrived during the combined turn; without this the replay would
         nest one drain inside another for every burst round.
+
+        ``option_session_key`` is set only for an option-chip label: the session
+        whose renderer posted the chip. The turn runs only if the session this
+        message resolves to is that one -- checked before the busy path and again
+        after idle/daily rotation in :meth:`_run_turn` -- so a chip cannot inject
+        its model-written label into a session that never asked the question.
         """
         assert self.client is not None, "TeamsDispatcher.client must be set"
         # Inbound channels-governance gate (off-loop) — recheck per message so a
@@ -470,6 +504,11 @@ class TeamsDispatcher:
         email = self._identity(inbound)
         text = inbound.text
         native_session_key = self._session_key(email)
+        # The files this message carries, by the ingest's own classification. Every
+        # "does it carry a file?" decision below reads this, never the raw list:
+        # Teams attaches a ``text/html`` echo of the body to every rich-text
+        # message, so the raw list is non-empty for an ordinary typed ``/help``.
+        files = file_attachments(inbound.attachments)
 
         async def _refused_turn_restricted() -> bool:
             return await refused_resume_is_restricted(
@@ -483,7 +522,7 @@ class TeamsDispatcher:
             text=inbound.text,
             user_id=email,
             message_id=inbound.activity_id,
-            attachments_dropped=len(inbound.attachments),
+            attachments_dropped=len(files),
         )
         if not await admit_inbound_callback(
             self.sessions,
@@ -506,12 +545,12 @@ class TeamsDispatcher:
             return
 
         override_mode: str | None = None
-        # An attachment-bearing message is never a command. Teams puts the caption
-        # in ``text``, so "/stop here is the log" would otherwise cancel the turn AND
+        # A FILE-bearing message is never a command. Teams puts the caption in
+        # ``text``, so "/stop here is the log" would otherwise cancel the turn AND
         # discard the file; and a caption is prose the user wrote about the upload,
         # not an instruction to this dispatcher. Discord and Telegram draw the line
-        # in the same place.
-        cmd = parse_command(text) if (interpret_commands and not inbound.attachments) else None
+        # in the same place. The body echo is not a file (see ``files`` above).
+        cmd = parse_command(text) if (interpret_commands and not files) else None
         # Resume routing runs BEFORE the intercept, and its answer is used by the
         # commands below. `/compact` and `/stop` act on the RESOLVED session, so after a
         # binding was destroyed they would compact or cancel the native Teams session
@@ -528,7 +567,7 @@ class TeamsDispatcher:
                 if await self._reply(inbound, route.refusal):
                     await self._session_resume.settle(inbound.conversation_id, route)
                 return
-        if interpret_commands and not inbound.attachments:
+        if interpret_commands and not files:
             # ── Command intercept (no LLM session needed) ──
             if cmd == "sessions":
                 await self._session_resume.show_picker(
@@ -555,6 +594,9 @@ class TeamsDispatcher:
                 return
             if cmd == "yolo":
                 await self._handle_yolo(inbound, command_argument(text))
+                return
+            if cmd == "agent":
+                await self._handle_agent(inbound, email, text, route.resumed_key)
                 return
             if cmd == "link":
                 await self._handle_link(inbound)
@@ -583,7 +625,19 @@ class TeamsDispatcher:
         # binding change between the decision and its use, which is the silent mis-route
         # the single-decision shape exists to prevent.
         session_key = route.resumed_key or self._session_key(email)
+        if option_session_key is not None and session_key != option_session_key:
+            # Re-checked here, after the one routing decision, because the
+            # binding can change between the card handler's check and route().
+            await self._reply(inbound, _STALE_OPTIONS_REFUSAL)
+            return
         if self.sessions.is_busy(session_key):
+            if option_session_key is not None:
+                # A chip never enters the busy path: the queue keeps bare text and
+                # its replay re-resolves the binding, and a refused enqueue re-enters
+                # handle_message with commands on. Either way the label would run
+                # with no check of where it came from.
+                await self._reply(inbound, _BUSY_OPTIONS_REFUSAL)
+                return
             if route.resumed_key is not None:
                 # NOT `_handle_busy` first: that queues into THIS dispatcher's queue,
                 # drained only at the tail of a TEAMS-driven turn -- so while the
@@ -611,6 +665,7 @@ class TeamsDispatcher:
             inbound_route=inbound_route,
             drain=drain,
             resumed_key=route.resumed_key,
+            option_session_key=option_session_key,
         )
 
     async def _run_admitted(
@@ -622,6 +677,7 @@ class TeamsDispatcher:
         inbound_route: InboundRoute,
         drain: bool,
         resumed_key: str | None,
+        option_session_key: str | None = None,
     ) -> None:
         """Fetch the attachments and run one turn for a message already admitted.
 
@@ -649,6 +705,7 @@ class TeamsDispatcher:
                 inbound_route=inbound_route,
                 drain=drain,
                 resumed_key=resumed_key,
+                option_session_key=option_session_key,
             )
         finally:
             if temp_paths:
@@ -665,6 +722,7 @@ class TeamsDispatcher:
         inbound_route: InboundRoute,
         drain: bool,
         resumed_key: str | None = None,
+        option_session_key: str | None = None,
     ) -> None:
         """Rotate, build the renderer, drive one turn, then drain what arrived.
 
@@ -693,7 +751,14 @@ class TeamsDispatcher:
         # Decided ONCE, upstream, and not re-resolved: re-reading the binding here would
         # let it change between the decision and its use.
         session_key = resumed_key or self._session_key(email)
-        agent = self._resolve_agent()
+        if option_session_key is not None and session_key != option_session_key:
+            # The rotation above moved this conversation to a new generation, which
+            # never asked the question the chip answers.
+            await self._reply(inbound, _STALE_OPTIONS_REFUSAL)
+            return
+        # A resumed session keeps the agent it ran before; a pick is this
+        # conversation's own.
+        agent = self._resolve_agent(None if resumed_key else email)
         session_restricted = await self._session_restricted(session_key)
 
         # Adaptive Card approvals: the decider awaits the click and denies by
@@ -767,6 +832,12 @@ class TeamsDispatcher:
                         )
                     ),
                     notice=lambda sk, provider: self._maybe_notice(inbound, sk, provider),
+                    # The runtime's own `$KIROCREW_SCRATCH`, where the agent is
+                    # told to stage screenshots, admitted beside the cwd root.
+                    # Only the live provider knows it, so it is bound here.
+                    bind_provider=lambda p: renderer.authorize_scratch_root(
+                        str(getattr(p, "work_scratch_dir", None) or "")
+                    ),
                     audit_caller=f"teams:{email}",
                     after_persist=_surface_new_session,
                 ),
@@ -844,7 +915,9 @@ class TeamsDispatcher:
             session_key,
             text,
             mode=mode,
-            has_attachments=bool(inbound.attachments),
+            # Files only: the body echo must not refuse a plain message as one whose
+            # attachments cannot wait in a dashboard queue.
+            has_attachments=bool(file_attachments(inbound.attachments)),
             # Where a drop notice goes if the drain later refuses a queued entry,
             # and the principal the outbound recipient check needs: this user was
             # authorized against the allow-list on inbound, and a dashboard slot's
@@ -920,11 +993,12 @@ class TeamsDispatcher:
             await (rerun() if rerun is not None else self.handle_message(inbound))
             return
         mode = override_mode or self._live_cfg().messaging.queue_mode
-        # An attachment-bearing message is never steered: a steer carries TEXT into
-        # the running turn, so the files would be dropped on the floor while the
-        # user is told their message was folded in. Queue it instead -- the drained
-        # turn ingests the descriptors and the picture actually arrives.
-        if mode != "queue" and not inbound.attachments:
+        # A FILE-bearing message is never steered: a steer carries TEXT into the
+        # running turn, so the files would be dropped on the floor while the user
+        # is told their message was folded in. Queue it instead -- the drained turn
+        # ingests the descriptors and the picture actually arrives. Same
+        # classification as the command gate: the body echo is not a file.
+        if mode != "queue" and not file_attachments(inbound.attachments):
             provider = self.sessions.get_provider(session_key)
             steer = getattr(provider, "steer", None)
             # Only steer a GENUINELY live turn. ``is_busy`` stays true through
@@ -965,6 +1039,10 @@ class TeamsDispatcher:
         an earlier turn is still in flight, and that turn's cards stay registered under the
         key it started with. Both keys belong to this conversation and this identity, so
         trying them widens nothing -- the per-prompt nonce still decides.
+
+        An option chip uses only the first key, the conversation's current target: its
+        label becomes a new turn there, so a label found under the other key would run
+        in a session that never asked the question.
         """
         native = self._session_key(identity)
         resumed = self._session_resume.resumed_session(inbound.conversation_id) or ""
@@ -1066,19 +1144,37 @@ class TeamsDispatcher:
             )
             return
         # An option chip: resolve the label from what this turn actually offered,
-        # then run it as an ordinary turn -- the same thing typing it would do.
-        session_key, label, renderer = "", "", None
-        for key in candidates:
-            renderer = self._active_renderers.get(key)
-            label = renderer.option_label(payload["nonce"], payload["index"]) if renderer else ""
-            if label:
-                session_key = key
-                break
+        # then run it as an ordinary turn -- the same thing typing it would do. Only
+        # the conversation's CURRENT target is looked up, because the label turn runs
+        # there: a chip posted before a `/sessions` bind or an `/unlink` is found
+        # under no live renderer and reads as stale, unsettled.
+        session_key = candidates[0]
+        renderer = self._active_renderers.get(session_key)
+        label = renderer.option_label(payload["nonce"], payload["index"]) if renderer else ""
         if not label or renderer is None:
             await self._reply(
                 inbound,
                 "⌛ Those choices are from an earlier reply — type your answer instead.",
             )
+            return
+        messaging = self._live_cfg().messaging
+        if session_key == self._session_key(identity) and should_rotate_generation(
+            self._conv.last_active(identity),
+            time.time(),
+            idle_minutes=messaging.idle_reset_minutes,
+            daily_reset_hour=messaging.daily_reset_hour,
+        ):
+            # The turn this press starts would rotate the native conversation to a new
+            # generation before it runs, and that generation never asked. Refused here,
+            # before settling, with the same predicate `_run_turn`'s rotation applies and
+            # without recording activity; the turn's own post-rotation check stays the
+            # backstop.
+            await self._reply(inbound, _STALE_OPTIONS_REFUSAL)
+            return
+        if self.sessions.is_busy(session_key):
+            # Refused here too, before settling, so the chips stay live for a retry
+            # once the turn ends; handle_message keeps the same check as a backstop.
+            await self._reply(inbound, _BUSY_OPTIONS_REFUSAL)
             return
         # Replace the chips with the pick BEFORE running the turn: every other chip
         # still looks live until this lands, and the transcript otherwise never
@@ -1096,7 +1192,9 @@ class TeamsDispatcher:
         # chip is turn content, exactly like a drained queue payload, so it reaches
         # the model as literal text.
         await self.handle_message(
-            replace(inbound, text=label, card_value=None), interpret_commands=False
+            replace(inbound, text=label, card_value=None),
+            interpret_commands=False,
+            option_session_key=session_key,
         )
 
     # ── Mid-turn queue ─────────────────────────────────────────────────────
@@ -1149,13 +1247,14 @@ class TeamsDispatcher:
         async with self._queue.lock:
             # The RAW attachment descriptors ride with the entry, not downloaded
             # bytes: the drained turn re-ingests them, so a queued picture is fetched
-            # once, when there is finally a turn to read it.
+            # once, when there is finally a turn to read it. Files only: the body echo
+            # is not re-ingested and does not count against the collapse cap.
             if not self.sessions.enqueue(
                 session_key,
                 str(time.time()),
                 text,
                 force=False,
-                attachments=list(inbound.attachments or []),
+                attachments=file_attachments(inbound.attachments),
                 # The sender and their chat ride with the entry too, because the
                 # drain replays it and the reply reaches whoever the replayed
                 # envelope names. Under ``dm_scope = "unified"`` two allow-listed
@@ -1589,8 +1688,38 @@ class TeamsDispatcher:
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
-    def _resolve_agent(self) -> str:
-        return self.agent or self.cfg.agent.default_agent or _DEFAULT_KIROCREW_AGENT
+    def _resolve_agent(self, identity: str | None = None) -> str:
+        """The agent *identity*'s conversation runs: its ``/agent`` pick, else the default."""
+        configured = self.agent or self.cfg.agent.default_agent or _DEFAULT_KIROCREW_AGENT
+        return self._agent_picks.resolve(identity, configured)
+
+    async def _handle_agent(
+        self, inbound: "TeamsInbound", email: str, text: str, resumed_key: str | None
+    ) -> None:
+        """Show the agent, or switch it with ``/agent <name>``.
+
+        Refused while this conversation continues a dashboard session: that
+        session's agent is the dashboard's to change.
+        """
+        if resumed_key is not None:
+            await self._reply(
+                inbound,
+                "ℹ️ This conversation continues a dashboard session, so its agent "
+                "is changed from the dashboard. Send `/new` to start one here.",
+            )
+            return
+        await self._reply(
+            inbound,
+            await handle_channel_agent_command(
+                self._agent_picks,
+                email,
+                command_argument(text),
+                conv=self._conv,
+                configured=self._resolve_agent(),
+                sessions=self.sessions,
+                session_key=lambda: self._session_key(email),
+            ),
+        )
 
     @staticmethod
     def _identity(inbound: "TeamsInbound") -> str:
@@ -1628,7 +1757,7 @@ class TeamsDispatcher:
         gen = self._conv.current_gen(email)
         return build_dm_session_key(
             "teams",
-            self._resolve_agent(),
+            self._resolve_agent(email),
             email,
             gen=gen,
             dm_scope=str(self.cfg.messaging.dm_scope),
@@ -1638,7 +1767,7 @@ class TeamsDispatcher:
         return seed_generation(
             self.sessions,
             channel="teams",
-            agent=self._resolve_agent(),
+            agent=self._resolve_agent(email),
             user_id=email,
             dm_scope=str(self.cfg.messaging.dm_scope),
         )

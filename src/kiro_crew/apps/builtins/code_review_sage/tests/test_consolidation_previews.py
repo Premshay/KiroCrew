@@ -92,7 +92,11 @@ class TestConsolidationPreviews(unittest.TestCase):
         )
 
     def test_duplicate_legacy_candidates_are_selected_and_applied_one_at_a_time(self) -> None:
-        candidates = self._stage("Duplicate", "Duplicate")
+        self._stage("Duplicate")
+        path = learning.candidate_file(self.root)
+        first = learning.list_candidate(self.root)[0]
+        path.write_text(path.read_text() + "\n" + learning.render_pattern(first))
+        candidates = learning.list_candidate(self.root)
         self.assertNotEqual(candidates[0]["id"], candidates[1]["id"])
 
         preview = self._preview([candidates[0]])

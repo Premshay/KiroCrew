@@ -40,8 +40,9 @@ interface UserMessageProps {
   canEdit?: boolean
   messageIndex?: number
   messageTs?: string
-  /** Returns false when the resend was refused, so the draft is kept. */
-  onEditResend?: (index: number, ts: string, newContent: string) => boolean | void
+  /** Returns `false` when the host could not take the edit right now: the
+   *  editor then stays open with the text, so nothing typed is lost. */
+  onEditResend?: (index: number, ts: string, newContent: string) => void | boolean
   /** Opt-in: a double-click on the read-only bubble opens the editor. Off by
    *  default because the gesture replaces native double-click word selection
    *  on the bubble. The pencil button is the edit path for everyone. Wired
@@ -164,7 +165,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   // what both doors carry -- the live `steer_push` / `queue_push` reconcile and a
   // row reloaded from history -- so the line survives a reload without a fetch.
   // Absent on every ordinary send, and that absence is what draws nothing.
-  const steerDecision = readSteerRecord((meta as { decisions_strip?: unknown } | undefined)?.decisions_strip)
+  const steerDecision = hideSteerBadge ? null : readSteerRecord((meta as { decisions_strip?: unknown } | undefined)?.decisions_strip)
   const steerState = (meta as { steerState?: string } | undefined)?.steerState
   const steerOptimistic = !!(meta as { optimistic?: boolean } | undefined)?.optimistic
   const isSteer = !hideSteerBadge
@@ -280,8 +281,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     // The block the editor hid goes back on the head, so the resent text
     // still carries the quoted message the user wrote the reply to.
     const resend = carriedQuote && content.startsWith(quoteBlock(carriedQuote)) ? prependQuote(trimmed, carriedQuote) : trimmed
-    const accepted = onEditResend?.(messageIndex ?? 0, messageTs ?? '', resend)
-    if (accepted === false) return
+    if (onEditResend?.(messageIndex ?? 0, messageTs ?? '', resend) === false) return
     setEditing(false)
   }, [draft, onEditResend, messageIndex, messageTs, carriedQuote, content])
 
@@ -393,7 +393,9 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
         </div>
         {/* Actions sit BELOW the bubble (like the read-only action row) so they
             never impose a min-width floor on the auto-sized bubble. */}
-        <div className="flex justify-end gap-2 mt-1">
+        <div className="flex justify-end items-center gap-2 mt-1">
+          {/* Send rewinds: say what it costs, beside the button that does it. */}
+          <span className="text-[12px] leading-4 text-muted">{i18nT('pages.chat.userMessage.edit_replaces_below')}</span>
           <button onClick={cancel} className="px-3 py-1 text-[13px] leading-5 text-muted hover:text-text rounded border border-border hover:bg-bg-hover transition-colors" title={i18nT('pages.chat.userMessage.cancel_esc')}>
             {i18nT('pages.chat.userMessage.cancel')}
           </button>
@@ -492,10 +494,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
       {renderContent(renderedBody, meta, messageTs || ((meta as { clientTs?: string })?.clientTs))}
     </div>
   )
-  // The right-click / long-press menu wraps the bubble only when Quote is
-  // offered (the menu's reason to exist); otherwise `MessageContextMenu`
+  // The right-click menu wraps the bubble only when Quote is offered (the
+  // menu's reason to exist) on a pointer device; otherwise `MessageContextMenu`
   // renders the bubble bare.
-  const bubbleWithMenu = <MessageContextMenu items={menuItems} onOpenChange={readStandIn}>{bubble}</MessageContextMenu>
+  const bubbleWithMenu = <MessageContextMenu items={menuItems} onOpenChange={readStandIn} onCopyFailed={() => setCopyFailed(true)}>{bubble}</MessageContextMenu>
 
   return (
     // Every box between the content column and the bubble is a fit-content flex

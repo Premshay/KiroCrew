@@ -6,7 +6,10 @@ import { join } from 'node:path'
 // that quotes the very class names being asserted against, and a raw-text
 // negative match hits the explanation instead of the code.
 const src = async () => {
-  const raw = await readFile(join(__dirname, '..', 'pages', 'ChannelPage.tsx'), 'utf8')
+  const sources = await Promise.all(['ChannelPage.tsx', 'ChannelActors.tsx'].map(
+    (file) => readFile(join(__dirname, '..', 'pages', file), 'utf8'),
+  ))
+  const raw = sources.join('\n')
   return raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
 }
 
@@ -43,7 +46,7 @@ describe('ChannelPage narrow viewport', () => {
     const s = await src()
     // Without this the list keeps the viewport and the transcript never shows,
     // which would make the whole change inert on a phone.
-    expect(s).toMatch(/setActiveId\(ch\.id\); openDetail\(\)/)
+    expect(s).toMatch(/setActiveId\(ch\.id\)\s*\n\s*openDetail\(\)/)
   })
 
   it('wraps the transcript header so Back cannot overlap the controls', async () => {
@@ -148,7 +151,7 @@ describe('ChannelPage narrow viewport', () => {
       .not.toMatch(/setThreadId\(null\); if \(id\) discardThreadDraft/)
     // The draft is discarded only when the send actually landed: a rejected
     // post keeps the reply in the composer and reports through ErrorNotice.
-    expect(s).toMatch(/if \(await sendMessage\(threadInput, threadId\)\) discardThreadDraft\(threadId\)/)
+    expect(s).toMatch(/if \(await sendMessage\(threadInput, threadId\)\)\s*\n\s*discardThreadDraft\(threadId\)/)
   })
 
   it('clears overlay state when the channel changes', async () => {
@@ -167,7 +170,7 @@ describe('ChannelPage narrow viewport', () => {
     // Gated on the narrow case: the counted harm -- two ~190px columns -- exists only
     // where both overlays are `w-full`. A desktop keeps them side by side, and removing
     // that was a capability loss nobody named.
-    expect(s).toMatch(/setShowAgents\(v => !v\); if \(isMobile\) setThreadId\(null\)/)
+    expect(s).toMatch(/setShowAgents\(\(v\) => !v\)\s*\n\s*if \(isMobile\) setThreadId\(null\)/)
     expect(s).toMatch(/const openThread = \(id: string\) => \{[\s\S]*?if \(isMobile\) setShowAgents\(false\)/)
   })
 
@@ -180,7 +183,10 @@ describe('ChannelPage narrow viewport', () => {
 
   it('gives the agents panel the full width rather than a second 256px rail', async () => {
     const s = await src()
-    expect(s).toMatch(/isMobile \? 'w-full' : 'w-64 shrink-0 border-l border-border'/)
+    expect(s).toMatch(/key="channel-agents-panel"[\s\S]*?storageKey="mc-channel-agents-width"/)
+    // The shared panel owns its narrow layout; keep checking its full-width branch.
+    const panel = await readFile(join(__dirname, '..', 'components', 'DetailPanel.tsx'), 'utf8')
+    expect(panel).toMatch(/if \(embedded \|\| isMobile\)\s*\{\s*return \(\s*<div className="h-full w-full min-w-0/)
     expect(s).not.toMatch(/className="w-64 shrink-0 border-l border-border flex flex-col bg-bg-elevated"/)
   })
 

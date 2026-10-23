@@ -51,7 +51,7 @@ type ModelCatalog = { models: ModelInfo[]; effortLevels?: string[]; supportsImag
  * cannot supply a shape, only read one.
  *
  * `enabled` is the one option callers still control, because it is per-observer
- * and cannot corrupt the cached value: ChatSidebar's bulk switcher passes
+ * and cannot corrupt the cached value: chat-sidebar/bulkModelSwitch.tsx's bulk switcher passes
  * `false` until its panel opens so merely rendering the sidebar does not spawn
  * kiro-cli. Other mounted observers still fetch normally — `enabled` gates who
  * *triggers* a fetch, not what lands in the cache.

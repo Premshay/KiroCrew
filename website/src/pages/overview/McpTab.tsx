@@ -4,10 +4,13 @@ import { RefreshCw, Plug, AlertTriangle, Check, ChevronRight, Zap, X, Download, 
 import { motion, AnimatePresence } from 'framer-motion'
 import { Trans } from 'react-i18next'
 import { Link } from 'react-router-dom'
+import { configuredAcpBackend, mcpServerDeny, type AcpBackendConfig } from '../../api/acpBackend'
 import { api } from '../../api/client'
+import type { AcpBackendProbe } from '../../api/client'
 import { Card, Btn, Badge, SearchInput, ContentSkeleton } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
 import ErrorNotice from '../../components/ErrorNotice'
+import AgentSpecNotRewrittenNotice from '../../components/AgentSpecNotRewrittenNotice'
 import { useProvider } from '../../providers'
 import McpBrowserModal from '../../components/McpBrowserModal'
 import McpCustomServerModal from '../../components/McpCustomServerModal'
@@ -22,12 +25,15 @@ function isToday(epochSecs: number): boolean {
 }
 import SortableHeader from '../../components/SortableHeader'
 import { connectionProviderForServer } from '../connections/registry'
-import McpRowSignIn from './McpRowSignIn'
+import McpRowSignIn, { type McpSignInTarget } from './McpRowSignIn'
 import { useConnectionsUiEnabled } from '../../hooks/useConnectionsUi'
 
 import { i18nT } from '../../i18n/t'
+import { uiLocation } from '../../uiLocations/uiLocation'
 import { copyWithOutcome } from '../../utils/clipboard'
+import { SECRETS_GUIDE_ROUTING_URL } from '../../utils/docsLink'
 import { recordError, type ErrorReport } from '../../utils/errorReport'
+import { guideAnchor } from '../../uiLocations/targetRegistry'
 async function fetchServers(): Promise<McpServer[]> {
   return await api.mcpServers()
 }
@@ -220,7 +226,7 @@ function ScopeBadge({
   const bg = disabled
     ? 'bg-bg-elevated text-muted'
     : active
-      ? 'bg-ok/20 text-ok border border-ok/40'
+      ? 'bg-ok/20 text-ok-text border border-ok/40'
       : 'bg-bg-elevated text-muted border border-border'
   const pendingRing = pendingChange
     ? 'ring-1 ring-[var(--warn)] ring-offset-1 ring-offset-bg border-dashed'
@@ -281,6 +287,10 @@ function mcpStatusLabel(status: string, auth: McpAuthState): string {
       if (auth === 'sign_in_required') return i18nT('pages.overview.mcpTab.sign_in_required')
       if (auth === 'signed_in') return i18nT('pages.overview.mcpTab.signed_in')
       return i18nT('pages.overview.mcpTab.not_verified')
+    // A registry pointer: kiro-cli resolves it from the admin's catalog, which
+    // the gateway cannot read, so there is nothing local to verify.
+    case 'registry':
+      return i18nT('pages.overview.mcpTab.not_verified')
     default:
       return i18nT('pages.overview.mcpTab.unknown')
   }
@@ -319,6 +329,27 @@ function mcpAuthState(s: McpServer): McpAuthState {
 }
 
 /**
+ * The in-place sign-in this row can start, or undefined when it can start none.
+ *
+ * A curated provider signs in by its registry slug. Any other remote server
+ * signs in by its exact name only when the gateway reports `ownerSignIn`: the
+ * owner added it from the dashboard at this url. A server an agent, a session
+ * or a hand edit added keeps the chat guidance, and the gateway refuses its
+ * mint regardless. The gateway never sets `ownerSignIn` on a name it would
+ * refuse to mint for, so this check is the whole rule here.
+ */
+function signInTargetFor(
+  s: McpServer,
+  managedProvider: { slug: string } | undefined,
+  connectionsUi: boolean,
+): McpSignInTarget | undefined {
+  if (!connectionsUi) return undefined
+  if (managedProvider) return { slug: managedProvider.slug }
+  if (s.ownerSignIn !== true) return undefined
+  return { server: s.name }
+}
+
+/**
  * Only a hard failure is toned as an error; `needs_auth` rides the warn default.
  *
  * A held grant is the exception, and it is toned `muted` rather than `warn`: amber
@@ -331,6 +362,9 @@ function mcpAuthState(s: McpServer): McpAuthState {
 function mcpStatusVariant(status: string, auth: McpAuthState): 'ok' | 'err' | 'warn' | 'muted' {
   if (status === 'ok') return 'ok'
   if (status === 'error') return 'err'
+  // Muted, not amber: no local action changes a registry row, and on a governed
+  // host every governed server would otherwise sit in the "act now" colour.
+  if (status === 'registry') return 'muted'
   return auth === 'signed_in' ? 'muted' : 'warn'
 }
 
@@ -351,7 +385,13 @@ function mcpStatusVariant(status: string, auth: McpAuthState): 'ok' | 'err' | 'w
  * what the row becomes — waits here, because it is only useful once the sign-in is
  * done, and an always-visible cell in a dense table pays for every sentence.
  */
-function mcpStatusHint(status: string, serverName: string, auth: McpAuthState, probeFailing = false): string | undefined {
+function mcpStatusHint(
+  status: string,
+  serverName: string,
+  auth: McpAuthState,
+  probeFailing = false,
+  reasonOnRow = false,
+): string | undefined {
   // "Online" is the gateway's OWN probe result: it started the server in the
   // gateway process, under the gateway's client identity. It says nothing about
   // whether any particular agent session mounted it, and reading it as if it did
@@ -369,9 +409,16 @@ function mcpStatusHint(status: string, serverName: string, auth: McpAuthState, p
   // Failing badge in the same cell, whose tip says probing stopped and names
   // Reset count, so this badge stays silent there rather than repeat it or
   // send the reader to a refresh that will not work (#15516).
+  //
+  // An `outdated` row that carries an `error` is a probe refused before any
+  // spawn: the server's env holds a `secret://` reference, which resolves only
+  // when the MCP gateway starts the server. The row's text cell states that
+  // reason, and a refresh repeats the same refusal, so the badge stays silent
+  // there too rather than promise that re-probing helps.
   if (status === 'outdated') {
-    return probeFailing ? undefined : i18nT('pages.overview.mcpTab.outdated_help')
+    return probeFailing || reasonOnRow ? undefined : i18nT('pages.overview.mcpTab.outdated_help')
   }
+  if (status === 'registry') return i18nT('pages.overview.mcpTab.registry_help', { provider: serverName })
   if (status !== 'needs_auth') return undefined
   if (auth === 'sign_in_required') return i18nT('pages.overview.mcpTab.sign_in_required_next')
   if (auth === 'signed_in') return i18nT('pages.overview.mcpTab.signed_in_help', { provider: serverName })
@@ -380,6 +427,17 @@ function mcpStatusHint(status: string, serverName: string, auth: McpAuthState, p
 
 interface McpTabProps {
   onManagedProviderClick?: (slug: string) => void
+}
+
+/** The cost of one tool-off on this server, or nothing where none holds. */
+function McpDenyReach({ reach }: { reach: { rule: string; exception: string } }) {
+  if (!reach.rule && !reach.exception) return null
+  return (
+    <div className="mb-1 max-w-prose text-[12px] leading-relaxed" data-testid="mcp-deny-reach">
+      {reach.rule && <p className="m-0 text-text-strong">{reach.rule}</p>}
+      {reach.exception && <p className="m-0 text-muted">{reach.exception}</p>}
+    </div>
+  )
 }
 
 export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
@@ -405,6 +463,8 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
   // button as scope toggles so rapid clicks don't race.
   const [pendingTools, setPendingTools] = useState<Record<string, Record<string, boolean>>>({})
   const [applyMsg, setApplyMsg] = useState('')
+  // The last apply saved but its agent-spec rebuild did not write.
+  const [specNotRewritten, setSpecNotRewritten] = useState(false)
 
   // Auto-dismiss timers for the success banners. Held in refs and cleared on
   // unmount so a pending setTimeout never fires a state update after the
@@ -432,6 +492,31 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
     queryFn: async () => (await api.mcpGlobalScopes()).scopes || [],
     staleTime: Infinity,
   })
+
+  // What turning one tool off costs on the harness in use (#11969): the same
+  // sentences Settings → Agent Harness shows on that harness's card, read
+  // through the same helper so the two cannot disagree. It only DECLARES: the
+  // toggles below stay exactly as they are.
+  //
+  // Both queries share their keys with the pages that own them, so this adds no
+  // request when either is cached. `retry: false` on the probe because its two
+  // expected failures, 403 for a non-owner and 404 on an older gateway, are
+  // permanent answers; either leaves `data` undefined and nothing renders, as
+  // it does while a query is still in flight.
+  const { data: harnessCfg } = useQuery<AcpBackendConfig>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+  })
+  const { data: harnessProbe } = useQuery<{ backends: AcpBackendProbe[] }>({
+    queryKey: ['acpBackends'],
+    queryFn: () => api.acpBackends(),
+    retry: false,
+  })
+  const denyProbe = useMemo(() => {
+    if (!harnessCfg || !harnessProbe) return undefined
+    const active = configuredAcpBackend(harnessCfg)
+    return harnessProbe.backends?.find(b => b.id === active)
+  }, [harnessCfg, harnessProbe])
 
   const pendingCount = useMemo(() => {
     return servers.reduce((count, s) => {
@@ -543,7 +628,11 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
       return r
     },
     onSuccess: (r) => {
-      setApplyMsg(i18nT('pages.overview.mcpTab.applied_change', { count: r.applied ?? 0 }))
+      const notRewritten = r.rebuild?.ok === false
+      // The notice already says the change was saved; a green "Applied" above it
+      // would read as the opposite verdict.
+      setApplyMsg(notRewritten ? '' : i18nT('pages.overview.mcpTab.applied_change', { count: r.applied ?? 0 }))
+      setSpecNotRewritten(notRewritten)
       setPending({})
       setPendingTools({})
       queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
@@ -614,13 +703,16 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
       )}
       <InfoTip text={i18nT('pages.overview.mcpTab.servers_scope_tip', { provider: provider.displayName })} />
       <span className="ml-auto flex items-center gap-2">
-        <Btn onClick={() => setCustomOpen(true)}><Braces size={14} /> {i18nT('pages.overview.mcpTab.add_custom')}</Btn>
-        <Btn primary onClick={() => setBrowserOpen(true)}><Download size={14} /> {i18nT('pages.overview.mcpTab.add_server')}</Btn>
+        <Btn onClick={() => setCustomOpen(true)} {...uiLocation('mcp.add-custom', guideAnchor('mcp.add-custom').ref)} data-guide-anchor="mcp.add-custom"><Braces size={14} /> {i18nT('pages.overview.mcpTab.add_custom')}</Btn>
+        <Btn primary onClick={() => setBrowserOpen(true)} {...uiLocation('mcp.add-server')}><Download size={14} /> {i18nT('pages.overview.mcpTab.add_server')}</Btn>
       </span>
     </h4>
     <Card>
       {apply.error && <div className="mb-3 text-[13px] text-danger">{(apply.error as Error).message}</div>}
       {applyMsg && <div className="mb-3 text-[13px] text-ok animate-rise"><Check className="lucide-inline" /> {applyMsg}</div>}
+      {/* No hand-off while changes are staged: opening the chat unmounts this tab
+          and drops the pending MCP changes it holds. */}
+      {specNotRewritten && <AgentSpecNotRewrittenNotice className="mb-3" askAgent={pendingCount === 0} />}
 
       {/* Pending-changes banner */}
       {pendingCount > 0 && (
@@ -647,7 +739,7 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
           {/* `title` as well as `aria-label`: the sign-in guidance names this control
               by that string, and an icon-only button renders none of it — without a
               hover the reader cannot match the instruction to the button it means. */}
-          <Btn onClick={() => probe.mutate()} disabled={probe.isPending} aria-label={i18nT('pages.overview.mcpTab.probe_mcp_servers')} title={i18nT('pages.overview.mcpTab.probe_mcp_servers')}><RefreshCw size={14} className={probe.isPending ? 'animate-spin' : ''} /></Btn>
+          <Btn onClick={() => probe.mutate()} disabled={probe.isPending} aria-label={i18nT('pages.overview.mcpTab.probe_mcp_servers')} title={i18nT('pages.overview.mcpTab.probe_mcp_servers')} {...uiLocation('mcp.probe')}><RefreshCw size={14} className={probe.isPending ? 'animate-spin' : ''} /></Btn>
         </div>
       </div>
       <div className="flex gap-2 flex-wrap mb-3">
@@ -701,6 +793,7 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
             const base = s.presence || DEFAULT_PRESENCE
             const hasToolOverrides = pendingTools[s.name] && Object.keys(pendingTools[s.name]).length > 0
             const managedProvider = connectionProviderForServer(s)
+            const signInTarget = signInTargetFor(s, managedProvider, connectionsUi)
             // Greyed like a pending uninstall, but not AS a pending uninstall: the
             // row is inert because its config lives elsewhere. The reason is SAID
             // on the row -- one line in the Tools cell naming the file to edit --
@@ -714,6 +807,11 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
             // server), and the line says so, because "set it to false" is the
             // wrong instruction for a value that already reads "false".
             const invalidValue = disabledByInvalidValue(s)
+            // An `outdated` row with an `error` was not probed at all, and the
+            // error says why. It is the row's one explanation, so it is shown in
+            // words in the text cell; `outdated` rows without an error (an aged
+            // result, or a quarantined server) carry none and show none.
+            const notProbedReason = s.status === 'outdated' && !!s.error
             // The line names the file as a chip that copies its path: the
             // re-enable switch is not in this table (a separate decision), so
             // the line says so and hands over the one thing it can -- the path.
@@ -837,7 +935,8 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                        `title`: a native tooltip is unreachable by keyboard,
                        touch, and AT (#3626, #8359). `mcpStatusHint` returns a
                        string only for `ok` (the host-check caveat),
-                       `outdated` when not quarantined (why, and how to re-probe) and
+                       `outdated` when neither quarantined nor carrying a
+                       reason line (why, and how to re-probe) and
                        `needs_auth`; every other status returns undefined and
                        so gets no InfoTip — this stays a named exception rather
                        than a blanket hint on every badge. */
@@ -857,7 +956,7 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                         {invalidValue ? i18nT('pages.overview.mcpTab.status_invalid_value') : mcpStatusLabel(s.status, mcpAuthState(s))}
                       </Badge>
                       {(() => {
-                        const hint = mcpStatusHint(s.status, s.name, mcpAuthState(s), s.probeFailing === true)
+                        const hint = mcpStatusHint(s.status, s.name, mcpAuthState(s), s.probeFailing === true, notProbedReason)
                         return hint ? <InfoTip text={hint} placement="top" /> : null
                       })()}
                     </span>
@@ -925,6 +1024,29 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                       </div>
                     )
                   ))}
+                  {notProbedReason && (
+                    /* Warn tone, not the error red: no probe ran, so nothing
+                       failed, but the server stays off until the reason is
+                       dealt with. The text is the backend's own, which names
+                       only env keys, never a value. The link is the next step:
+                       the guide section on routing a server through the MCP
+                       gateway, the one place a `secret://` value resolves.
+                       `break-words`, not `break-all`: the line is prose, so it
+                       wraps between words and breaks inside one only when a
+                       single token is wider than the cell. */
+                    <div className="text-warn text-[12px] break-words" data-testid="mcp-not-probed-reason">
+                      <AlertTriangle className="lucide-inline" />{' '}
+                      {s.error}
+                      <a
+                        href={SECRETS_GUIDE_ROUTING_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="block mt-0.5 text-accent hover:underline"
+                      >
+                        {i18nT('pages.overview.mcpTab.not_probed_routing_guide')}
+                      </a>
+                    </div>
+                  )}
                   {s.status === 'error' && s.error ? (
                     <span className="text-danger text-[12px]">
                       <AlertTriangle className="lucide-inline" /> {s.error}
@@ -937,28 +1059,33 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                            the raw failure over the remedy. */
                         <span className="block text-warn mt-0.5">{i18nT('pages.overview.mcpTab.oauth_not_a_static_token')}</span>
                       )}
+                      {/* A server that advertised OAuth and failed may be holding a grant
+                          that stopped working (expired, revoked, or minted for other
+                          scopes). Signing in again is the remedy the row can offer. */}
+                      {!!s.authChallenge && !s.headers && signInTarget && (
+                        <span className="flex flex-col items-start gap-1 mt-1">
+                          <McpRowSignIn target={signInTarget} serverName={s.name} again />
+                          <span className="text-muted text-[12px]">{i18nT('pages.overview.mcpTab.sign_in_again_hint')}</span>
+                        </span>
+                      )}
                     </span>
                   ) : mcpAuthState(s) === 'sign_in_required' ? (
-                    /* Two paths, split on whether the row resolves to a curated
-                       Connections provider (`managedProvider`, computed at row top)
-                       AND the Connections UI is unlocked (`connectionsUi`).
+                    /* Two paths, split on whether the row has a sign-in target
+                       (`signInTarget`, computed at row top): a curated Connections
+                       provider, or a remote server in the owner's own config, AND the
+                       Connections UI is unlocked.
 
-                       RESOLVABLE + FLAG ON: the panel now CAN start the sign-in in
-                       place — it reuses the SAME headless mint engine the Connections
-                       cards drive (mint → poll for the approval URL → authorize →
-                       paste-back relay). Minting is fenced to registry providers
-                       only; arbitrary URLs are never minted (parked maintainer
-                       decision #4286).
+                       WITH A TARGET: the panel starts the sign-in in place on the SAME
+                       headless mint engine the Connections cards drive (mint → poll for
+                       the approval URL → authorize → paste-back relay).
 
-                       EITHER FALSE (non-registry row, OR the gallery still held
-                       behind `connections_ui`): unchanged chat guidance. Nothing the
-                       dashboard can call starts a sign-in for a user-added/self-hosted
-                       server, and while the flag is closed the mint engine is not a
-                       released surface either — so the cell stays a sentence that
-                       routes the user to chat (a link, because navigating IS something
-                       the panel can do) and names the probe step that repaints the row. */
-                    managedProvider && connectionsUi ? (
-                      <McpRowSignIn slug={managedProvider.slug} serverName={s.name} />
+                       WITHOUT ONE (a server the gateway cannot sign in to from here, OR
+                       the gallery held behind `connections_ui`): the cell stays a
+                       sentence that routes the user to chat (a link, because navigating
+                       IS something the panel can do) and names the probe step that
+                       repaints the row. */
+                    signInTarget ? (
+                      <McpRowSignIn target={signInTarget} serverName={s.name} />
                     ) : (
                       <span className="text-warn text-[12px]">
                         <Trans
@@ -967,9 +1094,26 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                         />
                       </span>
                     )
+                  ) : mcpAuthState(s) === 'signed_in' && signInTarget && !s.tools?.length ? (
+                    /* A held grant the probe cannot verify. The control checks it
+                       first and asks for consent only when it no longer works, and
+                       the line beside it says so: a bare button on a row that reads
+                       Signed in looks like it would undo the sign-in. */
+                    <div className="flex flex-col items-start gap-1">
+                      <McpRowSignIn target={signInTarget} serverName={s.name} again />
+                      <span className="text-muted text-[12px]">{i18nT('pages.overview.mcpTab.sign_in_again_no_tools_hint')}</span>
+                    </div>
                   ) : s.tools?.length ? (<div>
                     <button className="flex items-center gap-1 text-[12px] text-accent hover:text-accent-hover cursor-pointer transition-colors mb-1" onClick={() => setExpandedTools(prev => { const next = new Set(prev); if (next.has(s.name)) next.delete(s.name); else next.add(s.name); return next })}>{s.tools.length} {i18nT('pages.overview.mcpTab.tools_2')}{!expandedTools.has(s.name) && (s.disabledTools?.length || 0) > 0 && <span className="text-muted ml-1">{i18nT('pages.overview.mcpTab.off_count', { count: s.disabledTools!.length })}</span>}<ChevronRight size={14} className={`transition-transform duration-200 ${expandedTools.has(s.name) ? 'rotate-90' : ''}`} /></button>
-                    <AnimatePresence>{expandedTools.has(s.name) && <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden"><div className="space-y-0.5">{s.tools.map(t => {
+                    <AnimatePresence>{expandedTools.has(s.name) && <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden">
+                    {/* The cost of a tool-off, above the tools and before any click,
+                        at the card's weight: the rule strong, its exception muted
+                        right under it. Shown whenever the list is open on a harness
+                        whose reach can cost a whole server; nothing otherwise.
+                        Worded for THIS server: a server the reach spares shows
+                        only that fact. */}
+                    <McpDenyReach reach={mcpServerDeny(denyProbe, s.name)} />
+                    <div className="space-y-0.5">{s.tools.map(t => {
                       const currentlyDisabled = (s.disabledTools || []).includes(t)
                       const toolOverride = pendingTools[s.name]?.[t]
                       const effectivelyEnabled = toolOverride !== undefined ? toolOverride : !currentlyDisabled
@@ -985,7 +1129,7 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                           : effectivelyEnabled ? i18nT('pages.overview.mcpTab.click_to_disable_pending_until_apply') : i18nT('pages.overview.mcpTab.click_to_enable_pending_until_apply')}
                       ><span className={`w-1.5 h-1.5 rounded-full shrink-0 ${effectivelyEnabled ? 'bg-ok' : 'bg-muted'}`} />{t}</button>
                     })}</div></motion.div>}</AnimatePresence>
-                  </div>) : disabledInConfig ? null : '—'}
+                  </div>) : disabledInConfig || notProbedReason ? null : '—'}
                 </td>
                 {/* Pinned like the header cell, on an OPAQUE `bg-card`. The row
                     states live on the <tr>, which the opaque base would hide, so
@@ -1027,8 +1171,14 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
       )}
     </Card>
 
-    <McpBrowserModal open={browserOpen} onClose={() => setBrowserOpen(false)} />
-    <McpCustomServerModal open={customOpen} onClose={() => setCustomOpen(false)} />
-    <McpCustomServerModal open={editTarget !== null} onClose={() => setEditTarget(null)} editName={editTarget} />
+    {/* The modals' hand-off would unmount this tab and drop its staged changes. */}
+    <McpBrowserModal open={browserOpen} onClose={() => setBrowserOpen(false)} askAgent={pendingCount === 0} />
+    <McpCustomServerModal open={customOpen} onClose={() => setCustomOpen(false)} askAgent={pendingCount === 0} />
+    <McpCustomServerModal
+      open={editTarget !== null}
+      onClose={() => setEditTarget(null)}
+      editName={editTarget}
+      askAgent={pendingCount === 0}
+    />
   </>)
 }

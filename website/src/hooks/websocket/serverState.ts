@@ -14,11 +14,14 @@ import { api } from '../../api/client'
 // do not export ApiError, and an `instanceof` against a missing mock export
 // throws inside the reconnect heal's own catch.
 import { ApiError } from '../../api/apiError'
+import { refreshDashboardReads } from '../../api/dashboardRefresh'
 import { forgetUnobservedMemberThreads, MEMBERS_ROSTER_QUERY_KEY, MEMBER_PROJECTIONS_QUERY_PREFIX } from '../../api/membersQuery'
 import { memberProjectionStore } from '../../state/memberProjectionStore'
 import { threadLiveStore, type ThreadReplyFrame } from '../../state/threadLiveStore'
 import { threadQueryKey, threadsQueryKey } from '../../api/threads'
 import { applyStatusDelta, parseStatusDelta } from '../../utils/pullRequestStatusDelta'
+import { GUIDE_PENDING_QUERY_KEY } from '../../api/guide'
+import { CHANGE_CARDS_QUERY_PREFIX } from '../../api/cards'
 import { slotChangeUrls } from '../../utils/pullRequestLinks'
 import { dashboardSessionKey, SESSION_CONTROL_STATUS_KEY } from '../useSessionControls'
 import type { ChatSlot, PullRequestStatusBatch } from '../../types'
@@ -88,6 +91,10 @@ export function invalidateRefreshQueries(qc: QueryClient): void {
   // (api/membersQuery.ts) and refreshes with the registry.
   qc.invalidateQueries({ queryKey: ['kirocrew-agents'] })
   qc.invalidateQueries({ queryKey: ['default-agent'] })
+  // A default-template write is pushed as an "agents" refresh, so the roster
+  // re-reads its "Default custom agent" row marker. Exact on the roster: a
+  // template's detail carries no such marker and need not refetch on every frame.
+  qc.invalidateQueries({ queryKey: ['agent-templates'], exact: true })
   qc.invalidateQueries({ queryKey: ['workspaces'] })
   qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
   // These answers derive from the config AND, for an `auto` default, the
@@ -158,6 +165,10 @@ export function refreshServerStateAfterReconnect(queryClient: QueryClient): void
   threadLiveStore.reset()
   queryClient.invalidateQueries({ queryKey: ['chat-thread'] })
   queryClient.invalidateQueries({ queryKey: ['chat-threads'] })
+  // A guide frame missed while the socket was down is recovered by re-reading.
+  queryClient.invalidateQueries({ queryKey: GUIDE_PENDING_QUERY_KEY })
+  // Same for a change-card frame: every slot's cards are re-read.
+  queryClient.invalidateQueries({ queryKey: CHANGE_CARDS_QUERY_PREFIX })
   // A dropped socket is the one client-visible sign the gateway may have
   // restarted — and a restart drops an unmessaged member slot while its
   // binding survives. The Crew Members page mounts a cached thread key
@@ -248,6 +259,9 @@ export function handleMemberProjection(data: FrameData): void {
  *  -- the refetch re-asks the server, which re-checks ownership. */
 export const MEMBER_DASHBOARD_QUERY_PREFIX = 'member-dashboard'
 
+/** The query key prefix a root session's Dashboard Overview reads under. */
+export const SESSION_DASHBOARD_QUERY_PREFIX = 'session-dashboard'
+
 /** A crewmate's dashboard moved, so an open tab must re-read it.
  *
  *  Two frames reach here and both mean the same thing to this tab. A
@@ -262,9 +276,20 @@ export const MEMBER_DASHBOARD_QUERY_PREFIX = 'member-dashboard'
  *  its data island, its agentic marks and its stale band already decided, so there
  *  is no client-side shape to patch. */
 export function handleDashboardMoved(queryClient: QueryClient, data: FrameData): void {
-  const slug = String(((data ?? {}) as { slug?: unknown }).slug || '')
+  const frame = (data ?? {}) as { slug?: unknown; slot?: unknown }
+  const slug = String(frame.slug || '')
+  // A busy crewmate sends these faster than one read takes, so the re-read goes
+  // through `refreshDashboardReads`, which keeps one read per open dashboard out at
+  // a time. A read per frame would pile up on the gateway, each one computed in full
+  // whether or not anyone still waits for it.
   if (slug) {
-    queryClient.invalidateQueries({ queryKey: [MEMBER_DASHBOARD_QUERY_PREFIX, slug] })
+    refreshDashboardReads(queryClient, [MEMBER_DASHBOARD_QUERY_PREFIX, slug])
+  }
+  // A ROOT session's own page is named by its slot: its store key is a digest no
+  // client can match, so the gateway's frame carries the slot instead.
+  const slot = String(frame.slot || '')
+  if (slot) {
+    refreshDashboardReads(queryClient, [SESSION_DASHBOARD_QUERY_PREFIX, slot])
   }
 }
 
@@ -353,7 +378,7 @@ export function handleSourceStatus(dispatch: AppDispatch, queryClient: QueryClie
   // that only touched the query caches would leave the sidebar glyph
   // stale until an unrelated slots broadcast — the same chip↔panel
   // divergence this feature removes, recreated on the sidebar.
-  dispatch(patchSlotSourceLinks({ url: delta.url, state: delta.state, ci: delta.ci }))
+  dispatch(patchSlotSourceLinks({ url: delta.url, state: delta.state, ci: delta.ci, ciPending: delta.ciPending }))
   // Invalidate the detail payload for EVERY changed delta, regardless
   // of origin. A 'detail'-origin delta is produced by one window's full
   // fetch; only that window received the fresh HTTP payload, so other

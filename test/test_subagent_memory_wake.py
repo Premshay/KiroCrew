@@ -52,6 +52,7 @@ from kiro_crew.subagent import SubagentManager, _SharingPlan
 from kiro_crew.subagent_manager.admission import SpawnAdmissionCoordinator
 from kiro_crew.subagent_manager.admission.types import MemoryWait
 from kiro_crew.subagent_wait_reasons import QUEUED_REASON_LOW_MEMORY, QUEUED_WAIT_EXPIRED_TEXT
+from kiro_crew.testing.wait import await_until
 
 pytestmark = [pytest.mark.timeout(60), pytest.mark.usefixtures("healthy_host_memory")]
 
@@ -120,7 +121,7 @@ class _Host:
             self.mgr._drain_queue()
             task = getattr(self.mgr, "_drain_task", None)
             if task is not None:
-                await asyncio.wait_for(asyncio.shield(task), 5)
+                await await_until(task)
             await self.settle()
 
     async def spawn(self, parent: str, task: str = "work") -> Any:
@@ -173,7 +174,7 @@ class _Host:
         mgr._admission._sampler_fired()
         task = mgr._memory_sample_task
         assert task is not None
-        await asyncio.wait_for(asyncio.shield(task), 5)
+        await await_until(task)
         await self.quiesce()
 
     def sampler_active(self) -> bool:
@@ -198,7 +199,7 @@ class _Host:
         fut.set_result(None)
         task = self.mgr._tasks.get(info.id)
         if task is not None:
-            await asyncio.wait_for(asyncio.shield(task), 5)
+            await await_until(task)
         await self.settle()
 
     def deferred_audits(self) -> list[Any]:
@@ -280,7 +281,7 @@ async def _host(
         tasks += [task for task in mgr._report_tasks if not task.done()]
         for task in tasks:
             task.cancel()
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 5)
+        await await_until(asyncio.ensure_future(asyncio.gather(*tasks, return_exceptions=True)))
         for task in (
             getattr(mgr, "_drain_task", None),
             getattr(mgr, "_memory_sample_task", None),
@@ -606,6 +607,38 @@ class TestTheMaxWaitStillEndsAHeldStart:
             assert (closed, park_from) == (7, parked_from)
             assert parked_from <= park_end <= time.monotonic_ns()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("remote", [True, False])
+    async def test_a_wake_rebuilds_a_remote_childs_bar_without_the_gateway_floor(
+        self, monkeypatch, remote
+    ) -> None:
+        # A remote session's child owes its engine reserve only, as at the gate; a
+        # wake that put the gateway floor back would keep it parked until the
+        # admit wait although its reserve fits.
+        async with _host(monkeypatch) as h:
+            floor = KiroCrewConfig().agent.spawn_min_memory_gb
+            assert floor > 1.0
+            h.free["gb"] = 1.5
+            h.mgr._memory_waits["mem-r"] = MemoryWait(
+                lane=_A,
+                parent_session_key=_A,
+                since=time.monotonic(),
+                start_gb=1.0,
+                price_gb=1.0,
+                nested=False,
+                durable=False,
+                remote=remote,
+            )
+            released: list[str] = []
+            monkeypatch.setattr(
+                SpawnAdmissionCoordinator,
+                "_release_memory_waits",
+                lambda _self, ids, _reason: released.extend(ids),
+            )
+            await h.mgr._admission._fit_pass("test")
+            assert released == (["mem-r"] if remote else [])
+            h.mgr._memory_waits.pop("mem-r", None)
+
 
 # ── (v) the share follows a live lane_weights reload ────────────────────────
 
@@ -661,7 +694,7 @@ class TestWhatAWaitWrites:
                 adm.wake_memory_waits(("child_terminal", "wait_ended", "sampler")[n % 3])
                 fit = h.mgr._memory_fit_task
                 assert fit is not None
-                await asyncio.wait_for(asyncio.shield(fit), 5)
+                await await_until(fit)
             await h.quiesce()
             assert not h.running(a2)
             assert h.deferred_events(a2) == events, "a wake that found no room re-parked it"

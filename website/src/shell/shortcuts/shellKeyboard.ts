@@ -17,6 +17,8 @@ import { useAutoConnectInstances } from '../../hooks/useAutoConnectInstances'
 import { useCommandPalette } from '../../hooks/useCommandPalette'
 import { useProvider } from '../../providers/context'
 import { useAgents } from '../../hooks/useAgents'
+import { i18nT } from '../../i18n/t'
+import { SESSION_FOLDER_UNAVAILABLE_EVENT } from '../../lib/sessionFolderNotice'
 
 const REASONING_EFFORT_LEVELS = ['', 'low', 'medium', 'high', 'xhigh', 'max']
 // Approval-mode DISCRIMINANTS in escalating order, cycled by keyboard shortcut.
@@ -44,10 +46,10 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const toggleShortcutsModal = useCallback(() => setShortcutsOpen(p => !p), [])
   // Search Everywhere command palette — global double-Shift / ⌘K
-  // trigger + open state. Mounted once at the app shell (`App.tsx`).
+  // trigger + open state. Mounted once at the app shell (`shell/appShell.tsx`).
   const commandPalette = useCommandPalette()
   const newChatMutation = useMutation({
-    mutationFn: () => dispatch(createSlot(undefined)).unwrap(),
+    mutationFn: () => dispatch(createSlot({ defaultFolder: true })).unwrap(),
     onSuccess: () => {
       navigate('/chat')
       // Unguarded on purpose: this mutation only fires from the new-chat
@@ -72,6 +74,14 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
     const timer = window.setTimeout(() => dispatch(setAgentSwitchNotice(null)), 6000)
     return () => window.clearTimeout(timer)
   }, [agentSwitchNotice, dispatch])
+  // A new chat that could not get its own session folder opened on the default
+  // project; the API client announces it for every create path (see
+  // lib/sessionFolderNotice), and it shares this transient notice.
+  useEffect(() => {
+    const onFolderUnavailable = () => dispatch(setAgentSwitchNotice(i18nT('store.chatSlice.session_folder_unavailable')))
+    window.addEventListener(SESSION_FOLDER_UNAVAILABLE_EVENT, onFolderUnavailable)
+    return () => window.removeEventListener(SESSION_FOLDER_UNAVAILABLE_EVENT, onFolderUnavailable)
+  }, [dispatch])
   const switchActiveSlotAgent = useCallback(async (slot: string, agent: string) => {
     dispatch(setAgentSwitchNotice(null))
     try {
@@ -251,11 +261,10 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
     // swallowed on behalf of a panel the rest of the UI hides.
     //
     // Also unbound in a popout or embedded pane, which render no docked terminal
-    // of their own. `useBottomTerminal`'s state is localStorage-backed AND
-    // cross-window synced (it listens for `storage` on `mc-bottom-terminal`), so
-    // a chord fired in a popout would not be a local no-op — it would open or
-    // close the terminal in the MAIN window, out of sight of the person pressing
-    // the key.
+    // of their own. `useBottomTerminal`'s tab list is localStorage-backed AND
+    // cross-window synced, while its `open` flag is per window and no surface
+    // in a popout reads it: a chord there would flip a flag nothing renders,
+    // and with an empty tab list would mint a shell into the shared list.
     onToggleTerminal: terminalEnabled && !isPopout && !isEmbed
       ? () => { if (terminalPoppedOut) focusTerminalPopout(); else toggleTerminalByChord(activeSlotProject) }
       : undefined,

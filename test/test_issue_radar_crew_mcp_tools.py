@@ -6,8 +6,9 @@ these two MCP tools are the crew's memory, and every property asserted here is
 load-bearing for a cold resume:
 
   * the ledger must be REACHABLE from an agent session, which has no dashboard
-    credential (httpOnly cookie, ``KIROCREW_INTERNAL_SECRET`` stripped from agent
-    env, ``.local_secret`` on the sensitive-path denylist) — hence the
+    credential (httpOnly cookie, an internal secret the gateway mints in-process
+    and never puts in an agent's env, ``.local_secret`` on the sensitive-path
+    denylist) — hence the
     internal-secret allowlist entries, and hence a raw HTTP call earning 403;
   * a partial write must never erase what an earlier write stored, or a resume
     reads back a ledger emptier than the work it describes;
@@ -203,6 +204,17 @@ class TestGatewayPathsAreReachableWithTheInternalSecret(unittest.TestCase):
 
 
 class TestToolRegistration(unittest.TestCase):
+    def setUp(self):
+        # The listing follows app enablement, and the isolated test home
+        # has no app installed, so Issue Radar is switched on at the one seam the
+        # listing reads. The descriptor CONTENT asserted below is the same either
+        # way; this only makes the tools visible to ``_list_tools``.
+        from kiro_crew.mcp_tools import apps as apps_tools
+
+        patcher = patch.object(apps_tools, "app_enabled_state", lambda name: name == "issue-radar")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_both_schemas_are_registered(self):
         # An unregistered tool's args pass through raw and its ValidationError
         # escapes the stdio loop, killing kirocrew-core for the whole session.
@@ -553,7 +565,7 @@ class TestAnAutoNudgeTurnResolvesTheSameIdentityAsADirectTurn:
         async def _fake_run_chat(state, target_slot, message, **kwargs):
             # Stand in for the runner's identity step verbatim: the real
             # _run_chat computes session_key = effective_session_key(slot) and
-            # hands THAT to publish_turn_identity (chat_runner.py). Recording the
+            # hands THAT to publish_turn_identity (chat_turn/turn_admission.py). Recording the
             # key the shared writer receives is recording the identity the crew
             # tools will resolve.
             published.append(effective_session_key(target_slot))

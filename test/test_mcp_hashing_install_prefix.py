@@ -1,6 +1,6 @@
 """An approved launch that pins the gateway's own interpreter survives an upgrade.
 
-``apps/bridges.py`` rewrites a manifest's bare ``python3`` (and the ``kirocrew``
+``apps/bridges_mcp.py`` rewrites a manifest's bare ``python3`` (and the ``kirocrew``
 host CLI) to ``sys.executable``, inserts the ``deps_boot`` shim by absolute
 path, and writes the package's ``site-packages`` into the declared
 ``PYTHONPATH``. All three live inside the install, which the desktop and CLI
@@ -14,12 +14,13 @@ by role (``hashing.install_aliases``), matched by raw-string equality. These
 tests pin: the same digest across two releases, a real change still changing
 it, every other token byte-for-byte the legacy digest, no literal argv colliding
 with the encoding, the two end-to-end approval paths, and the invariant that
-the spellings ``bridges.py`` actually emits ARE the alias keys.
+the spellings ``bridges_mcp.py`` actually emits ARE the alias keys.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import sys
 from pathlib import Path
@@ -81,7 +82,7 @@ def test_interpreter_hash_is_stable_across_releases(
 
 
 def test_deps_boot_shim_argv_folds_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The shim ``bridges.py`` inserts by absolute path moves with the release as well."""
+    """The shim ``bridges_mcp.py`` inserts by absolute path moves with the release as well."""
     server = str(tmp_path / "apps" / "demo" / "server.py")
     deps = str(tmp_path / "apps" / "demo" / ".deps")
     digests = []
@@ -130,7 +131,7 @@ def test_an_alias_folds_only_in_the_slot_the_gateway_emits_it_in(
 ) -> None:
     """The slot names the role, not the token: a spelling out of place hashes literally.
 
-    ``bridges.py`` writes the interpreter as the command, the shim as an
+    ``bridges_mcp.py`` writes the interpreter as the command, the shim as an
     argument and ``site-packages`` as a ``PYTHONPATH`` segment, and nowhere
     else. The same spellings in any other position are operator- or
     agent-written content, so a launch that carries them there is still a
@@ -365,7 +366,7 @@ def test_host_cli_pin_is_admitted_across_an_upgrade(
 
 
 def test_the_rewriters_own_spellings_are_the_alias_keys(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unpatched invariant: what ``bridges.py`` emits is exactly what the hash folds.
+    """Unpatched invariant: what ``bridges_mcp.py`` emits is exactly what the hash folds.
 
     This is the whole security argument -- a token is folded only when it is
     byte-identical to a string this process computed from its own
@@ -475,3 +476,30 @@ def test_the_long_name_lookup_runs_once_per_own_path() -> None:
     info = hashing._windows_long_path.cache_info()
     assert info.misses <= 4
     assert info.hits >= info.misses
+
+
+@pytest.mark.skipif(os.name != "nt", reason="GetLongPathNameW exists only on Windows")
+def test_an_unresolvable_short_own_path_is_logged_with_its_win32_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A ``~`` path the real ``GetLongPathNameW`` cannot expand says why at DEBUG.
+
+    That path keeps only its short spelling in the alias table, so a stub and a
+    gateway can reach different digests; the log line, with the Win32 error,
+    is what makes that divergence diagnosable. A path without ``~`` stays quiet.
+    """
+    missing = str(tmp_path / "GONE~1" / "python.exe")
+    plain = str(tmp_path / "gone" / "python.exe")
+    hashing._windows_long_path.cache_clear()
+    try:
+        with caplog.at_level(logging.DEBUG, logger=hashing.__name__):
+            assert hashing._windows_long_path(missing) is None
+            assert hashing._windows_long_path(plain) is None
+    finally:
+        hashing._windows_long_path.cache_clear()
+    lines = [r.getMessage() for r in caplog.records if r.name == hashing.__name__]
+    assert len(lines) == 1, lines
+    assert missing in lines[0] or repr(missing) in lines[0]
+    # ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3): the real error
+    # code is captured, not a stale or zero value.
+    assert "last error 2)" in lines[0] or "last error 3)" in lines[0], lines[0]

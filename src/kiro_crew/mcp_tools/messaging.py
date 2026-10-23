@@ -441,9 +441,11 @@ def schemas() -> list[dict[str, Any]]:
                 "If neither delivers, the file remains available from the "
                 "dashboard. To put an IMAGE inline in a "
                 "messaging conversation, reference it in your reply as "
-                "![alt](/abs/path) from the session's working directory — "
-                "the channel renderer uploads it as a native picture, which "
-                "this tool's outbox copy is not eligible for."
+                "![alt](/abs/path) from the session's working directory or "
+                "the browser tool's own output directory "
+                "($PLAYWRIGHT_MCP_OUTPUT_DIR, where playwright-cli screenshots "
+                "land) — the channel renderer uploads it as a native picture, "
+                "which this tool's outbox copy is not eligible for."
             ),
             "inputSchema": {
                 "type": "object",
@@ -930,7 +932,8 @@ def _describe_channel_skip(reason: str) -> str:
         # extraction uploads a real image referenced inline in the reply.
         return (
             f"{head}; for an inline image on a messaging channel, reference it as "
-            "![alt](/abs/path) from the session's working directory instead)"
+            "![alt](/abs/path) from the session's working directory or the browser "
+            "tool's output directory instead)"
         )
     return f"{head})"
 

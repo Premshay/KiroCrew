@@ -25,8 +25,10 @@ import {
 import { parseErrorCode } from '../utils/errorReport'
 import { fmtList } from '../i18n/format'
 import { useDocumentImeLatch } from '../hooks/useImeGuard'
+import { useLocalCrewHidden } from './overlayRoot'
 import { Btn, SendBtn } from './ui'
 import ErrorNotice from './ErrorNotice'
+import AgentSpecNotRewrittenNotice, { agentSpecNotRewritten } from './AgentSpecNotRewrittenNotice'
 import OnboardingChapterShell, {
   OnboardingShellContext,
   type ShellAsideCopy,
@@ -162,10 +164,15 @@ function ImportingLabel() {
 
 export default function AgentImportFlow({
   initialOpen,
+  keepOpenWhenEmpty = false,
   onComplete,
   onSkipAll,
 }: {
   initialOpen: boolean
+  // First run finishes this chapter by itself when the scan finds nothing to
+  // import. A replay the user asked for keeps the empty result on screen, or the
+  // click is answered by a dialog that closes before it shows anything.
+  keepOpenWhenEmpty?: boolean
   onComplete: () => void
   // "Skip all" abandons the whole first-run flow (import + onboarding tour) and
   // drops the user straight into the product. Falls back to onComplete when the
@@ -279,6 +286,7 @@ export default function AgentImportFlow({
   useEffect(() => {
     if (
       !open
+      || keepOpenWhenEmpty
       || !scanQuery.data
       || scanQuery.isError
       || sources.length > 0
@@ -290,6 +298,7 @@ export default function AgentImportFlow({
     completionMutation.mutate()
   }, [
     completionMutation,
+    keepOpenWhenEmpty,
     open,
     scanQuery.data,
     scanQuery.isError,
@@ -353,8 +362,12 @@ export default function AgentImportFlow({
     }
   }
 
+  // Hidden with the local Crew, this chapter still hears keys on the page
+  // (components/overlayRoot): Escape would skip first run unseen, and the Tab
+  // trap would swallow Tab on the Crew in front.
+  const crewHidden = useLocalCrewHidden()
   useEffect(() => {
-    if (!open) return
+    if (!open || crewHidden) return
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault()
@@ -391,7 +404,7 @@ export default function AgentImportFlow({
     return () => document.removeEventListener('keydown', onKeyDown)
     // `skipAll` intentionally follows the current mutation state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, completionMutation.isPending, applyMutation.isPending, skipAllMutation.isPending, imeLatch])
+  }, [open, crewHidden, completionMutation.isPending, applyMutation.isPending, skipAllMutation.isPending, imeLatch])
 
   if (!open) return null
 
@@ -547,7 +560,10 @@ export default function AgentImportFlow({
       },
       4: {
         title: i18nT('components.agentImportFlow.import_complete'),
-        description: i18nT('components.agentImportFlow.your_selected_setup_is_ready_in_kiro_crew'),
+        // "Ready" would contradict the notice when the agent spec did not follow.
+        description: agentSpecNotRewritten(applyMutation.data)
+          ? ''
+          : i18nT('components.agentImportFlow.your_selected_setup_is_ready_in_kiro_crew'),
       },
     }
     const { title, description } = headings[stage]
@@ -556,7 +572,7 @@ export default function AgentImportFlow({
         <h1 ref={headingRef} tabIndex={-1} className="text-2xl font-semibold text-text-strong outline-hidden">
           {title}
         </h1>
-        <p className="mt-2 text-sm leading-relaxed text-muted">{description}</p>
+        {description && <p className="mt-2 text-sm leading-relaxed text-muted">{description}</p>}
       </div>
     )
   })()
@@ -903,6 +919,7 @@ export default function AgentImportFlow({
             <dd className="mt-1 text-2xl font-semibold text-text-strong">{summary?.skipped ?? 0}</dd>
           </div>
         </dl>
+        {agentSpecNotRewritten(applyMutation.data) && <AgentSpecNotRewrittenNotice className="mt-4" />}
         {!!summary?.resolvable_conflicts && (
           <div
             className="mt-5 rounded-lg border border-warn/30 bg-warn/10 p-3 text-sm"

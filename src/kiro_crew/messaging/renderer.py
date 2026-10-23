@@ -15,9 +15,12 @@ ENFORCED (see ``test/test_capability_ledger.py``) and pinned per channel by
 the cross-channel contract test in ``test/test_options_cap_contract.py`` —
 a widget-capable renderer that skips the helper fails that test.
 Channels declaring ``max_buttons=0`` render no widget and route the whole
-trailer through :func:`render_options_as_text`, which reaches the same helper
-with zero widget slots: every choice becomes a numbered line the user answers by
-typing, rather than being deleted along with the trailer. Four channels deliver the
+trailer through :func:`render_options_as_text`, which numbers every choice
+through the same :func:`format_overflow` sink: each becomes a numbered line the
+user answers by typing, rather than being deleted along with the trailer. The
+proactive sends (``dashboard/messaging_api/channel_delivery.py``) and the
+cross-surface reply mirror call it on EVERY channel, because
+``transport.send_message`` takes no choices and so builds no widget. Four channels deliver the
 numbered list -- Weixin, iMessage and Feishu through this function, WeCom through
 its own streaming-aware copy (see below) -- and
 ``test/test_options_cap_contract.py`` drives each one. WhatsApp declares ``max_buttons=0`` and does NOT: its renderer strips a
@@ -64,6 +67,7 @@ from kiro_crew.security import (
 TEXT_CHUNK = "text_chunk"
 THINKING = "thinking"
 TOOL_CALL = "tool_call"
+TOOL_RESULT = "tool_result"  # a tool call reached a terminal outcome (see tool_status)
 PROMPT_CHOICE = "prompt_choice"
 COMPACTION = "compaction"
 NOTICE = "notice"
@@ -75,7 +79,17 @@ NOTICE_SEVERITY_PREFIX = {"info": "ℹ️", "warning": "⚠️", "error": "⛔"}
 STEER_CONSUMED = "steer_consumed"  # kiro-cli folded a mid-turn steer at a boundary
 
 OUTPUT_KINDS = frozenset(
-    {TEXT_CHUNK, THINKING, TOOL_CALL, PROMPT_CHOICE, COMPACTION, NOTICE, DONE, STEER_CONSUMED}
+    {
+        TEXT_CHUNK,
+        THINKING,
+        TOOL_CALL,
+        TOOL_RESULT,
+        PROMPT_CHOICE,
+        COMPACTION,
+        NOTICE,
+        DONE,
+        STEER_CONSUMED,
+    }
 )
 
 
@@ -100,6 +114,12 @@ class OutputEvent:
     tool_name: str = ""
     tool_kind: str = ""  # tool_call (e.g. "read"/"execute" — drives phase emoji)
     tool_purpose: str = ""  # tool_call / prompt_choice (human-readable purpose)
+    # tool_result: the call's TERMINAL outcome as the ACP layer reported it, one
+    # of ``acp.types.TERMINAL_TOOL_STATUSES`` ("completed" / "failed" /
+    # "cancelled" / "canceled" / "refused"). A renderer reads it to finalize that
+    # call's card honestly instead of marking every call complete; anything other
+    # than "completed" is a call that did NOT succeed. Empty on every other kind.
+    tool_status: str = ""
     options: list[dict[str, Any]] = field(default_factory=list)  # prompt_choice
     request_id: str | int = ""  # prompt_choice correlation
     # prompt_choice: the tool's own arguments, redacted, so a renderer can show
@@ -123,6 +143,7 @@ class OutputEvent:
             "title": self.title,
             "tool_kind": self.tool_kind,
             "tool_purpose": self.tool_purpose,
+            "tool_status": self.tool_status,
             "options": [dict(o) for o in self.options],
             "tool_input": self.tool_input,
             "request_id": self.request_id,
@@ -658,13 +679,18 @@ def apply_options_cap(
     if not overflow:
         return body, kept
     lines = format_overflow(overflow, start=len(kept), capabilities=capabilities)
+    return _append_block(body, lines), kept
+
+
+def _append_block(body: str, lines: str) -> str:
+    """*lines* after *body* with one blank line between, or *lines* alone."""
     if not body:
         sep = ""
     elif body.endswith("\n"):
         sep = "\n"
     else:
         sep = "\n\n"
-    return f"{body}{sep}{lines}", kept
+    return f"{body}{sep}{lines}"
 
 
 def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str, list[str]]:
@@ -771,32 +797,42 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
 def render_options_as_text(text: str, capabilities: TransportCapabilities) -> str:
     """Rewrite a trailing ``[OPTIONS:]`` trailer in *text* as numbered text.
 
-    The whole trailer handling for a channel that renders no widget, so a channel
-    that renders none shares one implementation instead of keeping a copy each.
-    Returns the body only; the widget half of :func:`apply_options_cap` has
-    nothing to keep at ``max_buttons == 0``.
+    The whole trailer handling for a send that attaches no widget, so every such
+    send shares one implementation instead of keeping a copy each. Two kinds of
+    caller reach it:
 
-    Three of the five zero-widget channels call it: Weixin, iMessage and Feishu.
-    WeCom reaches the same outcome through its own ``_render_options_as_text``, for
-    the ``hide_partial`` reason below, so it does not call this one. WhatsApp is the
-    channel that reaches the outcome NOWHERE: its renderer strips the trailer
-    instead, so its choices never arrive here or anywhere.
+    * a channel that renders no widget at all: Weixin, iMessage and Feishu. WeCom
+      reaches the same outcome through its own ``_render_options_as_text``, for
+      the ``hide_partial`` reason below. WhatsApp's reply renderer does not call
+      it: it strips the trailer instead, so a reply's choices are lost (a
+      proactive WhatsApp send does reach it through the legs below).
+    * a send that builds no widget even on a channel that could show one: the
+      proactive legs in ``dashboard/messaging_api/channel_delivery.py``, the
+      cross-surface reply mirror and its backfill of past answers
+      (``dashboard/chat_mirror.py``). ``transport.send_message`` takes no choices,
+      so there is no button for a choice to go on.
 
-    Parsing is :func:`split_options_trailer`, at its buffered default: this path's
-    callers do not stream — they buffer a whole turn and send once — so an
-    unfinished ``[OPTIONS`` tail is the assistant's prose here and is kept. The one
+    Every choice is numbered, whatever ``capabilities.max_buttons`` says. Keeping
+    the first ``max_buttons`` for a widget, as :func:`apply_options_cap` does,
+    would drop them here, because this function returns the body only. The
+    numbering and the join are :func:`format_overflow` and the same separator
+    rule the widget path uses, so the sanitising cannot drift between the two.
+
+    Parsing is :func:`split_options_trailer`, at its buffered default: these
+    callers do not stream, they send whole text once, so an unfinished
+    ``[OPTIONS`` tail is the assistant's prose here and is kept. The one
     zero-widget channel that DOES stream (WeCom) asks for ``hide_partial=True`` in
     its own ``wecom.renderer._render_options_as_text``, where the cost is a
     transient flash whose next frame replaces the bubble anyway.
 
-    ``apply_options_cap`` is reached unconditionally rather than behind an
-    ``if not choices`` guard, which would NOT be equivalent: a matched-but-EMPTY
-    trailer (``[OPTIONS: ]``) must still have the marker stripped. With no match
-    ``split_options_trailer`` hands back the text unchanged, and the cap is the
-    identity on an empty choice list, so one call covers all three cases.
+    A matched-but-EMPTY trailer (``[OPTIONS: ]``) still has the marker stripped:
+    ``split_options_trailer`` returns the body without it and no choices. With no
+    match it hands back the text unchanged.
     """
     body, choices = split_options_trailer(text)
-    return apply_options_cap(body, choices, capabilities)[0]
+    if not choices:
+        return body
+    return _append_block(body, format_overflow(choices, start=0, capabilities=capabilities))
 
 
 class Renderer(ABC):
@@ -946,6 +982,22 @@ class Renderer(ABC):
         marks the previous task complete and starts a new in-progress task.
         """
 
+    async def on_tool_result(self, tool_call_id: str, tool_status: str) -> None:
+        """Record a tool call's TERMINAL outcome, so its card is honest.
+
+        ``tool_status`` is one of ``acp.types.TERMINAL_TOOL_STATUSES``;
+        "completed" is success and anything else ("failed" / "cancelled" /
+        "canceled" / "refused") is a call that did not succeed. The default is a
+        no-op: ``on_tool_call`` already marks the PREVIOUS task complete when the
+        next call starts, so a renderer that does not distinguish outcomes keeps
+        its existing behaviour. A renderer that wants per-call accounting (a
+        failed card, an "N succeeded · M failed" summary) overrides this and
+        keys the open call's finalization on the status instead of marking every
+        card complete. Not abstract, for the same reason ``on_steer_consumed``
+        is not: a channel that has nowhere to show an outcome owes nothing here.
+        """
+        return None
+
     @abstractmethod
     async def on_prompt_choice(
         self,
@@ -1008,6 +1060,8 @@ class Renderer(ABC):
             await self.on_tool_call(
                 event.tool_call_id, event.title, event.tool_kind, event.tool_purpose
             )
+        elif event.kind == TOOL_RESULT:
+            await self.on_tool_result(event.tool_call_id, event.tool_status)
         elif event.kind == PROMPT_CHOICE:
             await self.on_prompt_choice(
                 event.options,

@@ -19,6 +19,8 @@ import chatReducer, {
   startRemoteTurn,
 } from './chatSlice'
 import { extractSpawnRunLaunch, isSpawnRunTool } from '../pages/chat/SubagentRunCard'
+import { ASK_ANSWERED_HEADER, isAskAnsweredToolMessage } from '../utils/askQuestionAnswers'
+import { ASK_QUESTION_SERVER } from '../utils/askQuestionTool'
 
 function makeStore() {
   return configureStore({
@@ -192,6 +194,33 @@ describe('sseToolResult — tool output also lands on the tool MESSAGE meta', ()
     expect(store.getState().chat.toolLog.length).toBeGreaterThanOrEqual(0)
   })
 
+  it('patches meta.output for an answered ask_question so TurnBlock keeps the row out of its folds live', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    const meta = { tool_call_id: 'call-ask', tool_name: 'ask_question', mcp_server: ASK_QUESTION_SERVER }
+    store.dispatch(sseChatMessage({ slot: 'active', role: 'tool', content: '🔧 ask_question', meta }))
+    const answered = `${ASK_ANSWERED_HEADER}\n"Which colour?" -> "Red"`
+
+    store.dispatch(sseToolResult({ slot: 'active', output: answered, tool_call_id: 'call-ask' }))
+
+    const msg = store.getState().chat.messages.find((m) => m.role === 'tool')!
+    expect((msg.meta as Record<string, unknown>).output).toBe(answered)
+    expect(isAskAnsweredToolMessage(msg)).toBe(true)
+  })
+
+  it('does not copy a dismissed ask_question result onto the message', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    const meta = { tool_call_id: 'call-ask', tool_name: 'ask_question', mcp_server: ASK_QUESTION_SERVER }
+    store.dispatch(sseChatMessage({ slot: 'active', role: 'tool', content: '🔧 ask_question', meta }))
+
+    store.dispatch(sseToolResult({ slot: 'active', output: 'The user dismissed the question card without answering.', tool_call_id: 'call-ask' }))
+
+    const msg = store.getState().chat.messages.find((m) => m.role === 'tool')!
+    expect((msg.meta as Record<string, unknown>).output).toBeUndefined()
+    expect(isAskAnsweredToolMessage(msg)).toBe(false)
+  })
+
   it('ignores a poisoned slot key instead of walking Object.prototype', () => {
     const store = makeStore()
     store.dispatch(setActiveSlot('active'))
@@ -336,7 +365,7 @@ describe('queue entries carry their attachment lists onto the queued row', () =>
     store.dispatch(appendQueuedMessage({ slot: 'active', content: 'x', ts: 't', queue_id: 'q1', meta: { files: [spaced], dirs: 'not-a-list', sendId: 's-1' } }))
     store.dispatch(appendQueuedMessage({ slot: 'active', content: 'y', ts: 't', queue_id: 'q2' }))
     const queued = store.getState().chat.messages.filter((m) => m.role === 'queued')
-    expect(queued[0].meta).toEqual({ queueId: 'q1', files: [spaced] })
+    expect(queued[0].meta).toEqual({ queueId: 'q1', files: [spaced], sendId: 's-1' })
     expect(queued[1].meta).toEqual({ queueId: 'q2' })
   })
 

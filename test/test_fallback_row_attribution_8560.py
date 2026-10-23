@@ -36,7 +36,7 @@ def _deep_chain_client(stream, *, primary="primary-model", advertised=("fallback
     ``AcpSessionHandle`` -> ``_runtime`` — with the extra wrapper layers a
     long-lived shared session accumulates. ``set_model`` writes the handle's
     ``_model``/``_resolved_model_id`` exactly as ``AcpSessionHandle.set_model``
-    does (``session_handle.py:1379-1384``). The depth-first walk reaches them,
+    does (``session_handle_model_selection.py``, ``set_model``). The depth-first walk reaches them,
     so this shape exercises the caller-side path with the walk as an
     independent second witness rather than as the row's only source.
     """
@@ -232,11 +232,11 @@ class TestFallbackServedTurnAttribution:
         """GPT review finding on 3f55ca11f: the sticky candidate can OUTLIVE the
         swap it records.
 
-        It deliberately survives a landed turn (`chat_runner.py:10941-10944` --
+        It deliberately survives a landed turn (`_on_complete`'s usage row in `turn_stats` --
         the session stays on the fallback until the start-of-turn restore probe
         succeeds), that probe is skipped for a synthetic recovery message
-        (`:7317-7320`), and a reset resumes the session by re-sending
-        `slot.model` as a set_model override (`:1156-1159`). So a recovery turn
+        (`_turn_dispatch_gates`), and a reset resumes the session by re-sending
+        `slot.model` as a set_model override (`model_fallback`). So a recovery turn
         can run on the PRIMARY with `_active_fallback_model` still set. The row
         must name what the live provider is serving, not the stale candidate.
         """

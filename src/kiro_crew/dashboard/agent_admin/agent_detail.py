@@ -17,10 +17,13 @@ if TYPE_CHECKING:
         MAX_AGENT_SKILLS,
         TEMPLATE_DEFINITION_KEYS,
         CapabilityError,
+        ControlPlaneNotDeclarable,
         DashboardState,
+        SharedAgentHomeRefused,
         SkillCatalogSnapshot,
         _AmbiguousTemplateName,
         _atomic_json_write,
+        _declined_foreign_spec_write,
         _get_config_lock,
         _is_confirmed_managed_dashboard_author,
         _read_agent_spec,
@@ -35,6 +38,7 @@ if TYPE_CHECKING:
         apply_skill_mapping,
         clear_list_agents_cache,
         clear_model_pin,
+        control_plane_declarations,
         discovery_executor,
         enumerate_skill_catalog,
         is_markdown_spec,
@@ -189,7 +193,9 @@ async def api_agent_detail(request: web.Request) -> web.Response:
         # the same check runs again under the write lock below.
         return web.json_response(
             {
-                "error": f"'{name}' matches more than one template file; rename one first.",
+                "error": _AmbiguousTemplateName(
+                    name, tuple(f for f, _spec in candidates)
+                ).refusal_text(),
                 "code": "ambiguous_template_name",
             },
             status=409,
@@ -368,12 +374,28 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                         # _write_spec_file and the PUT handler). Returns the
                         # skills the WRITTEN spec maps, for the reply.
                         with agents_spec_lock(f.parent):
+                            # Ownership BEFORE any bookkeeping, and inside this
+                            # lock: the model branch below writes a per-home
+                            # sidecar, and the spec write that can refuse comes
+                            # after it. Refusing only there answered 409 with
+                            # the sidecar already flipped, so the pin recorded a
+                            # model the spec on disk never carried. Asked here
+                            # the request mutates nothing at all.
+                            if _declined_foreign_spec_write(f):
+                                raise SharedAgentHomeRefused(
+                                    f"{f} belongs to another Kiro Crew data home"
+                                )
                             # The pre-lock ambiguity check re-run where it
                             # decides: a second claimant that landed after the
                             # scan (a package install) must refuse, not let
                             # the stale single match be overwritten.
-                            if [c for c, _spec in _agent_detail_candidates(name)] != [f]:
-                                raise _AmbiguousTemplateName(name)
+                            claimants = [c for c, _spec in _agent_detail_candidates(name)]
+                            if claimants != [f]:
+                                # Named only when several claim it: a lone or
+                                # vanished match is not a list to rename from.
+                                raise _AmbiguousTemplateName(
+                                    name, tuple(claimants) if len(claimants) > 1 else ()
+                                )
                             fresh = _read_agent_spec(
                                 f, operation="api_agent_detail", source="dashboard"
                             )
@@ -392,6 +414,17 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                                 (f.stem, spec_str(fresh, "name") or f.stem)
                             ):
                                 require_unmanaged_template(identity)
+                            # Asked before the bookkeeping too, for the same reason:
+                            # a tools save naming a control-plane server it cannot
+                            # declare is refused with the model sidecar untouched.
+                            declared = (
+                                control_plane_declarations(
+                                    patch_body["tools"],  # type: ignore[index]
+                                    fresh.get("mcpServers"),
+                                )
+                                if "tools" in patch_body  # type: ignore[operator]
+                                else {}
+                            )
                             if "model" in patch_body:  # type: ignore[operator]
                                 data["model"] = patch_body["model"] or None  # type: ignore[index]
                                 if data["model"] is None:
@@ -411,6 +444,17 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                                 if key not in data and key != "resources":
                                     fresh.pop(key, None)
                             _merge_resources_delta(fresh, before_patch, data, mapped_uris)
+                            if declared:
+                                # On the FRESH read, not the pre-lock snapshot: adding
+                                # one entry to the snapshot's map would make the whole
+                                # map a changed key and overwrite a concurrent writer's
+                                # ``mcpServers`` edit.
+                                # An existing declaration is never replaced.
+                                servers = fresh.get("mcpServers")
+                                servers = dict(servers) if isinstance(servers, dict) else {}
+                                for server_name, entry in declared.items():
+                                    servers.setdefault(server_name, entry)
+                                fresh["mcpServers"] = servers
                             sanitize_agent_config_governance(fresh)
                             # Atomic replace: a direct write truncates first,
                             # so ENOSPC mid-write would destroy the existing
@@ -461,12 +505,34 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                         return web.json_response(
                             {"error": exc.code, "code": exc.code}, status=exc.status
                         )
-                    except _AmbiguousTemplateName:
+                    except ControlPlaneNotDeclarable as exc:
+                        # Refused, not saved as a grant that mounts nothing: the
+                        # save bar shows the sentence, and the file is untouched.
+                        return web.json_response(
+                            {"error": str(exc), "code": exc.code, "server": exc.server},
+                            status=409,
+                        )
+                    except _AmbiguousTemplateName as exc:
+                        return web.json_response(
+                            {"error": exc.refusal_text(), "code": "ambiguous_template_name"},
+                            status=409,
+                        )
+                    except SharedAgentHomeRefused:
+                        # The edit was DISCARDED, so it must not be reported as
+                        # saved. This instance's data home does not own the
+                        # agents directory the template lives in, so writing
+                        # would re-pin another gateway's spec to this one's venv
+                        # and home. 409: the state on disk belongs to a
+                        # different owner, which retrying cannot change —
+                        # the remedy is to give this instance its own
+                        # KIRO_HOME, and the gateway log names the directory.
                         return web.json_response(
                             {
-                                "error": f"'{name}' matches more than one template file; "
-                                "rename one first.",
-                                "code": "ambiguous_template_name",
+                                "error": (
+                                    f"'{name}' is owned by another Kiro Crew data home; "
+                                    "this instance will not rewrite it."
+                                ),
+                                "code": "agent_home_not_owned",
                             },
                             status=409,
                         )

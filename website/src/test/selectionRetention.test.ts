@@ -7,6 +7,9 @@ import {
   selectionTouchesContainer,
 } from '../utils/selectionRetention'
 
+/** Parse fixture markup into nodes (the suite's no-innerHTML rule). */
+const nodes = (markup: string) => document.createRange().createContextualFragment(markup)
+
 function selection(anchorNode: Node, focusNode: Node): Selection {
   // DOM Ranges normalize start/end and so cannot model a backward mobile-handle
   // selection. The helper only reads these public Selection fields.
@@ -28,7 +31,7 @@ function selection(anchorNode: Node, focusNode: Node): Selection {
 describe('selectionRetention', () => {
   it('keeps every transcript row between reverse selection endpoints', () => {
     const container = document.createElement('div')
-    container.innerHTML = '<div data-display-index="4">first</div><div data-display-index="5">second</div><div data-display-index="6">third</div>'
+    container.replaceChildren(nodes('<div data-display-index="4">first</div><div data-display-index="5">second</div><div data-display-index="6">third</div>'))
     document.body.append(container)
     const rows = container.querySelectorAll('[data-display-index]')
 
@@ -40,7 +43,7 @@ describe('selectionRetention', () => {
 
   it('does not treat a document-spanning selection as a transcript range', () => {
     const container = document.createElement('div')
-    container.innerHTML = '<div data-display-index="4">chat text</div>'
+    container.replaceChildren(nodes('<div data-display-index="4">chat text</div>'))
     const outside = document.createElement('p')
     outside.textContent = 'dashboard chrome'
     document.body.append(container, outside)
@@ -56,7 +59,7 @@ describe('selectionRetention', () => {
     // transcript but on no row. Releasing there let the start row unmount and
     // re-rooted the selection at the top of the transcript.
     const build = () => {
-      document.body.innerHTML = '<div id="sc"><div data-display-index="4"><p id="r4">start row</p></div><div id="pad"></div></div><p id="out">outside</p>'
+      document.body.replaceChildren(nodes('<div id="sc"><div data-display-index="4"><p id="r4">start row</p></div><div id="pad"></div></div><p id="out">outside</p>'))
       return document.getElementById('sc') as HTMLElement
     }
     const text = (id: string) => document.getElementById(id)!.firstChild ?? document.getElementById(id)!
@@ -88,7 +91,7 @@ describe('selectionRetention', () => {
 
   describe('restoreEndpointToTranscript', () => {
     const build = () => {
-      document.body.innerHTML = '<p id="title">title</p><div id="sc"><div data-display-index="4"><p id="a">start row text</p></div><div data-display-index="5"><p id="b">end row text</p></div></div>'
+      document.body.replaceChildren(nodes('<p id="title">title</p><div id="sc"><div data-display-index="4"><p id="a">start row text</p></div><div data-display-index="5"><p id="b">end row text</p></div></div>'))
       return document.getElementById('sc') as HTMLElement
     }
     const t = (id: string) => document.getElementById(id)!.firstChild!
@@ -114,7 +117,7 @@ describe('selectionRetention', () => {
       const last = rowEndpoints(sc, settled)
       // The start row re-renders: same text, new nodes.
       const row = sc.querySelector('[data-display-index="4"]')!
-      row.innerHTML = '<p>start </p><p>row text</p>'
+      row.replaceChildren(nodes('<p>start </p><p>row text</p>'))
       const drifted = selection(sc, t('b'))
       drifted.anchorOffset = 0
       drifted.focusOffset = 9

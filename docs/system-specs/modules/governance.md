@@ -1,7 +1,8 @@
 # Governance Model (two-level Policy ∩ Profile)
 
-The `kiro_crew.platform.governance` + `kiro_crew.platform.governance_profiles`
-modules implement Kiro Crew's **two-level security governance model**. Governance
+The `kiro_crew.platform.governance` (with its `governance_parts` owners) +
+`kiro_crew.platform.governance_profiles` modules implement Kiro Crew's **two-level
+security governance model**. Governance
 is resolved by a single rule — *the tightest boundary wins*:
 
 - **Level 1 — POLICY** (`GovernanceCeiling`): the enterprise security ceiling,
@@ -46,7 +47,7 @@ and extensible (adding a scope is data, not engine code).
 can reorder strictness or redefine matching):
 
 - `_ORDINAL_SCALES`: `approval = yolo < auto < interactive`;
-  `sandbox = off < standard < cc < strict` (verified against `sandbox.py`).
+  `sandbox = off < standard < cc < strict` (verified against `sandbox_tiers.py`).
 - `_MATCHERS` — exactly **five**: `identifier` (case-insensitive), `command`
   (case-sensitive `fnmatchcase`), `path`, `host`, and `mcp` (a `@server` grant covers
   `@server/tool`). There is no `bundle_id` or `cu_action` matcher: naming either in a
@@ -131,7 +132,12 @@ archetype: the reserved sandbox boot flags (`sandbox.require_isolation`,
 tiers set one, the subordinate's where the authority was silent — rather than handing
 it to `_compose_controls`, which would refuse it as a type mismatch and abort boot on
 an ordinary two-tier configuration. The flags are inert (nothing reads them), so
-neither direction can widen the ceiling. Everything outside `controls` stays the
+neither direction can widen the ceiling. `channels.posture` folds through
+`ScopedMap.compose` leaf by leaf (`_compose_posture`): a leaf both tiers set is the
+intersection of the two rulesets, a leaf or member only the subordinate sets is added
+(absent posture permits, so adding one restricts), and a leaf only the authority sets
+is kept. Over a profile this is a no-op, because a profile cannot carry posture.
+Everything outside `controls` stays the
 **authority's** — identity, signature state, tier and the `updates` *commands* — so a
 subordinate document cannot relabel whose ceiling this is or supply a command the
 gateway would run unsandboxed. The two `updates` pins that are themselves restrictions
@@ -254,8 +260,8 @@ pins ride in the policy file for it:
   enterprise ceiling). It never refuses to *boot*: bricking a fleet on a policy
   typo would remove the surface an admin needs to fix it. An unparseable floor
   imposes none, for the same reason. What "takes the update" means depends on
-  the install (`slack/gateway.py` `_check_for_updates` and
-  `_check_for_updates_via_provider`):
+  the install (`slack/gateway_runtime/update_schedule.py` `_check_for_updates`
+  and `_check_for_updates_via_provider`):
   - **A policy provider** (`check_command` below) applies whenever the check
     reports a version.
   - **A git checkout** on a primary branch applies only toward a build whose
@@ -899,7 +905,8 @@ scoped to this directory rather than every entry, because widening the others ha
 blast radius (a write deny on `.aws` would break a legitimate token refresh).
 
 Those dir entries are `$HOME`-relative, so `KIROCREW_HOME` moves the cache out from under
-them — a limitation shared with the vault entries. This one directory does not inherit it:
+them — a limitation the vault avoids through `_RELOCATED_CREW_HIDDEN_LEAVES`. This one
+directory does not inherit it:
 `sandbox._relocated_policy_cache_dirs()` additionally masks the data-home path whenever it
 differs. Compared with **`normpath`, not `realpath`**: this runs inside the launcher and
 seatbelt builders, which run on the event loop for every async spawn, and a link-resolving
@@ -971,7 +978,95 @@ the fleet now forbids: the tool short-circuits inside the harness and never reac
 own PreToolUse gate. `agent.reproject_for_ceiling_change` re-derives the file, bounded to an
 actual ceiling move by `governance_generation` — hooks run on every confirming poll, so an
 unconditional rebuild would rewrite a file kiro-cli watches every refresh interval for nothing.
-Two details make that bound safe rather than merely cheap. The baseline is seeded by
+
+"The file" is every spec a session can be started on through a crew, not only `kirocrew.json`.
+The rebuild re-derives Kiro Crew's own specs, then the fork refresh
+(`agent_materialization.fork_refresh`) re-filters `allowedTools` and strips governed
+`autoApprove` on every corroborated fork, and then runs the same two passes over every
+**shared template** a crew in `config.json` is bound to: a spec created on the Agent
+templates tab, edited on the agent detail page, or turned into a shared template by publish.
+Those writers filter only when they write, so without this pass such a template would keep
+the grants the ceiling now denies. The shared-template pass touches nothing but those two
+lists, rewrites a file only when a pass removed something, and never writes a spec no crew is
+bound to. A spec counts as the bound template when its stem is the bound name or it declares
+that name, and when two specs claim it every JSON one is filtered, since which is live is
+undefined. That is why the pass does not resolve through `agent.agent_spec_path`: a resolver
+for a writer acting on one agent prefers a declared match over a stem match and refuses two
+declared matches, and either rule would leave a claimant's grants unfiltered here. The
+exemption for Kiro Crew's own specs and for forks is per file, not per name: the pass skips
+`<name>.json` for an owned name its installer governs and the file `agent.agent_spec_path`
+resolves for a fork, because those are the only files those writers rewrite, and filters
+every other file that claims the name. A second file declaring `kirocrew`, for example, is
+one kiro-cli may load as that agent while the installer re-filters only `kirocrew.json`. A
+fork whose name two files declare has no file the fork refresh wrote, so every claimant is
+filtered. The pass does
+not hold spawns the way the fork gate does. A bound template it fails to rewrite for a
+reason a retry can clear (a spec file raised an `OSError` on its read, the agents directory could not be listed, its write raised, `config.json` or
+`config.local.json` could not be read whole by this load) is folded into the rebuild's
+conductor hold (`_held_out` and `agent._conductor_spec_held`, below), so the ceiling memo
+stays behind and the next poll or maintenance wake retries it; the hook does not skip an
+unchanged generation while that hold is set, and neither does the gateway's profile watch
+(`agent.reproject_for_profile_change`, on its own retry backoff, the retry a host without
+distribution polling has between maintenance wakes), which covers a hold the boot path's deferred
+pass sets after `prime_ceiling_projection` seeded the baseline. The hold lasts until the
+template is filtered, like a held conductor spec: releasing it while the failure persists
+would mark the tightened ceiling projected with a denied grant possibly still on disk, and
+nothing would retry it once the failure cleared. That includes a read this process is
+denied (`PermissionError`). kiro-cli runs as the same user and cannot load the file while
+its permissions deny the read, but restoring them puts whatever grants it carries back in
+front of kiro-cli with no ceiling move to trigger a retry. A Windows sharing or lock
+violation arrives as the same `PermissionError` and clears when the other handle closes.
+Neither rebuilds on every poll: the probe below re-reads the file and lets the next tick
+rebuild once the read succeeds. The directory is listed with `os.scandir`, whose errors
+propagate (`agent_spec_format.iter_agent_spec_files_strict`): `Path.glob` swallows a failed
+listing and answers with an empty directory, which would let the memo advance past every
+bound template in it. A spec file with a second hard link is held too, until its link count is
+one again, and logged at WARNING with the remedy. The fenced reader refuses a
+multiply-linked inode for good, because the other name may be any file on the volume, but
+kiro-cli reads the same bytes without that fence, so its grants are live and this pass cannot
+filter them; the file is never written through the shared inode. Any other regular file the
+reader refuses is held the same way, since its link count or kernel path changed under the
+read and a retry may read it; a refused directory or pipe at a spec name is not held. Whether a config file could
+not be read is asked of the load itself (`KiroCrewConfig._base_unreadable` and
+`_overlay_unreadable`), not of `degraded_sections`, whose whole-config marker lasts the
+process: a hold on it would never clear after the file was repaired. A template no retry can
+fix (a markdown spec this writer
+cannot re-serialize, bytes that do not parse, a capability reconcile that refuses) is logged
+at WARNING and not held.
+
+A file the pass cannot read holds whether or not it claims a bound name, because an unread
+file may be the one that declares it. Such a hold cannot clear until the file changes or a
+read of it succeeds, so it does not rebuild on every poll. The same is true of a config file
+the load could not read whole. When the pass's hold rests only on what it could not read, it
+records each unreadable file's path, inode, link count and mtime, the loader's fingerprint of
+both config files when one was unreadable, and the governance answer generation it ran under
+(`fork_refresh._shared_template_hold_record`). The ceiling hook and the maintenance wake skip
+the rebuild while that answer is current and is also the one the last rebuild derived its
+grants under (`agent._rebuild_answer_generation`), every recorded file is unchanged and still reads as
+held, and a fresh config load still cannot read a file whole
+(`fork_refresh.shared_template_hold_unchanged`; it re-reads each file through the same fence
+and logs nothing, and the loader never caches a read that failed). The memo stays behind
+either way, so the tightened answer is still not recorded as projected. A new answer, any
+change to a held file or config file, or a read that now succeeds (a sharing violation that
+cleared, an extra link that was removed) runs the rebuild on the next tick. A hold with any
+other cause is retried as before, because it can clear with nothing on disk changing: a
+conductor installer's hold (`agent._conductor_installers_held`), a write or governance pass
+that raised, or a rebuild that raised. The boot, pending and retry warnings name which kind
+of spec is held.
+
+A spec no crew is bound to is not re-filtered, whoever wrote it. A file hand-placed in the
+agents directory is outside every Kiro Crew writer. A template created on the Agent
+templates tab and left unbound keeps the grants it was saved with, and a subagent started on
+it through `spawn` runs with them. That spawn path is not covered here.
+
+The removal is one-way. A denied `allowedTools` entry or governed `autoApprove` list is
+dropped from the template, not parked: when the ceiling later loosens, nothing puts it back,
+and the template's author re-adds it on the Agent templates tab or the detail page. That is
+the contract every writer of these lists already has (a template saved under a tight ceiling
+loses the same entries at write time), and keeping a restorable copy would mean storing a
+grant the fleet forbids beside a file kiro-cli reads.
+
+Two details make the generation bound safe rather than merely cheap. The baseline is seeded by
 `prime_ceiling_projection` **before the poller starts**, because the first poll can itself
 install a new ceiling and a first-call baseline would record that generation and skip the very
 rebuild it needed. And the memo advances **only after a confirmed write**: the hook calls
@@ -1024,6 +1119,38 @@ apart (`conductor_agents._TRANSIENT_READ_BACKOFF_SECS`), because the pause costs
 hour of the previous ceiling's list; a path shape or bytes that can never be a spec are not
 retried, and a failure that outlasts the attempts holds the spec with the attempt count in the
 warning.
+
+A **governance profile** governs the same lists: the writers ask `may_skip_gate_now`, which
+withholds a grant whenever any configured profile could govern the ref, so a profile saved
+after the spec was written has to re-derive it exactly as a ceiling move does. The memo the
+hook compares is therefore `governance_answer_generation()` (ceiling plus profiles), read
+after `poll_profiles_fresh` re-stats the profiles directory. Every `rebuild_agent_config`
+reads that answer before it derives any grant and publishes it
+(`agent._rebuild_answer_generation`) only once it completes; a rebuild that raised (and only that: one
+still running does not) sets `agent._rebuild_incomplete` and clears the projection memo under the lock, because such a rebuild may have written grants derived under an older answer before it failed: the seed then leaves the baseline unseeded, and the next poll or watch tick re-projects, whatever a later rebuild's completion does to the flag. Otherwise
+`prime_ceiling_projection` seeds the baseline from the published answer: the boot rebuild and the seed are far
+apart, and a profile reader between them (a tool-approval check, a dashboard read) re-stats
+and publishes an edit, which a seed read at that point would absorb as projected. With no
+rebuild recorded, the seed reads the store as it stands, loading it first if nothing has,
+because no written grant consulted it. A profile is saved by editing a file, which no
+distribution poll observes, and a host without central distribution has no poll at all, so
+the gateway runs its own **profile watch**: every `_PROFILE_PROJECTION_POLL_S` (15 s), off
+the event loop, `agent.reproject_for_profile_change` re-stats the directory and calls the
+hook when the answer differs from the one the memo records. A projection that does not land
+(a declined rebuild or a held spec, each of which logs a refusal and an audit event per
+attempt) is retried by the watch every `agent._PROFILE_WATCH_RETRY_S` (an hour) rather than
+every tick, and one whose rebuild raised after `agent._PROFILE_WATCH_RAISE_RETRY_S` (five
+minutes). The hook and the watch run on
+different threads, so both hold `agent._REPROJECT_LOCK` across the whole read, rebuild and
+record: without it, a rebuild derived under an older answer could finish last and leave its
+grants on disk while the memo records the newer answer. The other rebuilds (a dashboard
+save, a config change, the maintenance retry) run without that lock, so each one, on
+completing, clears the memo when the answer moved since it started
+(`agent._invalidate_projection_if_answer_moved`, taken under the lock so it orders after any
+projection in flight), and the next poll or watch tick re-projects over its write. The watch starts in its own block
+ahead of the seed and `start_refresher`, so a failure in either does not take it down, and
+`_shutdown` cancels it beside the refresher, so no re-projection starts into a closing
+gateway.
 
 A builtin can also be governed by a **capability** rather than by its name:
 `BUILTIN_TOOL_CAPABILITIES` maps `use_subagent` to `capabilities.spawn`. A capability is not
@@ -1185,8 +1312,8 @@ must not be published: a malformed document reaches the text through a parser er
 `json`'s errors quote the offending bytes — so an endpoint echoing back the request's
 `Authorization` header (its own request reflected, a proxy error page) would carry that
 credential to both surfaces. Those bytes are not ours, which is why
-`platform/policy_distribution.py` is a registered `_REDACTION_SINKS` entry rather than an
-allowlisted non-egress use.
+`platform/policy_distribution_boot.py`, where `_sanitize_detail` lives, is a registered
+`_REDACTION_SINKS` entry rather than an allowlisted non-egress use.
 
 `refresh_now()` **never raises**; it returns a `RefreshOutcome` whose `status` is one
 of `not_configured` / `unchanged` / `applied` / `rejected` / `unreachable`. Named
@@ -1307,8 +1434,8 @@ inventing a second scheme.
 | Piece | Where | Notes |
 |---|---|---|
 | Canonical payload | `policy_signing_payload()` | Routes through `admission.canonical_signing_bytes` — the **same** sorted-keys/compact-separators/UTF-8 canonicalization `PluginManifest.signing_payload` uses, so the two trust roots cannot drift |
-| Primitive | `admission.hmac_signature` | HMAC-SHA256 + `hmac.compare_digest`. POC symmetric; an asymmetric verify swaps in behind the same helper |
-| Trust key | admission policy `trust_keys[<issuer>]` | The **existing** operator-controlled key store — one store, not two |
+| Primitive | `admission.ed25519_verify` / `admission.hmac_signature` | Ed25519 when the issuer has a public key; otherwise HMAC-SHA256 + `hmac.compare_digest`. `ed25519_verify` never raises: malformed base64, wrong length (32-byte key, 64-byte signature) or a missing `cryptography` wheel is one `False` |
+| Trust key | admission policy `trust_public_keys[<issuer>]` (base64 Ed25519 public key), else `trust_keys[<issuer>]` (shared secret) | The **existing** operator-controlled trust root, read once per verification. An issuer **named** in `trust_public_keys` is verified with Ed25519 alone and **never** falls back to its `trust_keys` secret, even when its value is `null`, empty or not base64: such an entry is kept (as `""`) rather than dropped, so a migration placeholder makes every policy from that issuer `unverified` (refused under `require_policy_signature`) instead of silently re-enabling HMAC |
 | Opt-in | admission policy `require_policy_signature` | Separate from the plugin-facing `require_signature` |
 | Verdict | `GovernanceCeiling.signature_state` | `verified` / `unverified` / `unsigned` / `unchecked` |
 
@@ -1432,8 +1559,12 @@ can edit the admission policy (clearing the opt-in) as easily as the security
 policy. The `is_sensitive_path` keystone remains the control that stops the
 *agent* from reaching either file; signing is what makes a fleet-pushed ceiling
 tamper-**evident** to the host that loads it. Symmetric HMAC also means the
-verifier holds a secret capable of *producing* signatures, so key distribution is
-the residual weakness an asymmetric successor removes.
+verifier holds a secret capable of *producing* signatures, so anyone who can read
+`trust_keys` can mint a document that verifies. `trust_public_keys` removes that:
+the host holds only the public half, the private half never sits on a managed
+host, and because a public key disables the issuer's symmetric fallback, provisioning
+it is what stops an HMAC forgery from verifying. To stop accepting an issuer's
+symmetric proof without provisioning a public key, delete its `trust_keys` entry.
 
 `kirocrew policy show` prints the verdict verbatim
 (`GovernanceCeiling.signature_summary()`) so an operator can tell an established
@@ -1471,6 +1602,8 @@ unfenced is `echo x > ~/.kiro/agents/kirocrew.json`:
 `is_sensitive_bash_command` does not match sensitive PATHS in command text — a
 documented design choice — so the shell route rests on the OS sandbox, which seals
 the agents dir and not yet the registry leaf.
+
+**Every other harness's own permission files sit on the same write-only tier**, listed per harness in `agent_sdk.native_allow_stores.NATIVE_ALLOW_STORES`: claude `~/.claude/settings*.json`, goose `permission.yaml` and `config.yaml`, opencode's global config, codex `config.toml`, pi `settings.json` and `extensions/`, each also at its harness's own home variable (`GOOSE_PATH_ROOT`, `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR` / `CLAUDE_HOME`, `CODEX_HOME`, `PI_CODING_AGENT_DIR`) and through a symlinked config dir, plus a project's `.claude/settings*.json` in any directory. `agent.env` refuses each of those home variables, so a store cannot move for the harness child alone. Only the agent's file-edit tools are refused; a shell write to these files is not fenced yet. `test/test_native_allow_stores.py` fails when a harness has neither a row nor a stated reason.
 
 That residual matters for the same reason the whole gap did. Since
 `hooks.on_tool_call` runs **only** from the `EVENT_PERMISSION_REQUEST` branch (the
@@ -1522,10 +1655,9 @@ the `_host` sentinel session key, which classifies to surface `host`. Operators 
 `surface:host` profile to narrow these on top of the policy ceiling (e.g. an
 `apps` allowlist that further restricts which apps may activate, or a `channels`
 allowlist that narrows which transports may connect below what the ceiling
-permits). NOTE: these callers used to pass an empty session key, which
-mis-classified to `slack` and accidentally picked up `surface:slack` profiles;
-they now use the honest `host` surface, so a `surface:slack` profile no longer
-governs host-side app activation or transport startup. The two policy-scope
+permits). These callers pass the `_host` sentinel session key, which classifies to
+surface `host`, so a `surface:slack` profile does not govern host-side app
+activation or transport startup. The two policy-scope
 chokepoints (app activation + transport start) audit their decisions via
 `sel().log_governance_decision` (`governance_permits` audits only its own
 degrade, never a normal permit/deny); Slack workspace admission audits via a
@@ -1582,7 +1714,7 @@ disposition:
   nothing. `fail_closed=True` is the same disposition the authorization/admission
   chokepoints use (e.g. `capabilities.publish` in `publish_governance.py`,
   `capabilities.theme_install` in `handlers/themes.py`, `capabilities.theme_persona`
-  in `chat_runner.py`) where a wrong permit lets bytes leave the box or ingests
+  in `chat_turn/prompt_assembly.py`) where a wrong permit lets bytes leave the box or ingests
   untrusted content. The ALLOW audit is disposition-split: a **governed** allow
   (a policy/profile governs `channels`, detected as the Decision's
   `layer ∈ {policy, profile, both}`) is **audit-or-deny** — written
@@ -1602,8 +1734,9 @@ disposition:
   evaluates the `channels` scope on the host surface with `fail_closed=True` (its
   audit row names the direction, `outbound:<channel>`), writes a governed allow
   `critical=True`, and fails closed. Discord re-checks it in
-  `discord/client.py` after each REST wait and in `discord/transport_dispatch.py`
-  before the approval-verdict edit, so a policy installed during a send stops it.
+  `discord/client_recheck.py` after each REST wait and in
+  `discord/transport_dispatch_interactions.py` before the approval-verdict edit, so a
+  policy installed during a send stops it.
   Detail: [messaging.md](messaging.md).
 - **Slack workspace admission (`slack.enterprise`)** audits via `log_api_access`
   (not `log_governance_decision`) and its posture probe fails **closed** (returns
@@ -1874,7 +2007,36 @@ read-your-writes should add it deliberately, with its own tests.
   is deliberately NOT added to the deny-floor targets: that plane matches raw
   text and operator regexes, where `mcp__<server>` is a different string from
   the canonical identity a rule is written against rather than a broader form of
-  it. A server-only identity never satisfies auto-approval. Because this
+  it. A server-only identity never satisfies auto-approval. **Several spellings
+  of one tool.** A KAS built-in reaches the gate under its raw engine id
+  (`str_replace`) while the operator's rule is written under the kiro-cli name
+  it governs (`fs_write`); the two are one tool, not two targets, and asking
+  them as two targets would demand that an allow-mode rule name a raw id no
+  operator wrote. `gate_decision` therefore takes `alias_groups` -- tuples of
+  spellings for ONE tool -- and answers each group as one question: DENIED if
+  any spelling meets an explicit deny rule at either level (a deny-mode
+  `tools.deny: ["str_replace"]` still binds), otherwise PERMITTED when EACH
+  governing level permits SOME spelling -- OR within a level, intersection
+  across levels, so a ceiling granting `str_replace` beneath a profile granting
+  `fs_write` admits the one tool both granted. A group member that is also the
+  display title covers the title, which is then not asked again as a lone item
+  the allow set would have to carry. `deny_aliases` is the one-way counterpart:
+  spellings whose rules may REFUSE the call but never admit it. A KAS
+  `delete_file` reads under `fs_write` because an operator who denied writes
+  denied deletes, yet kiro-cli's `fs_write` cannot delete, so an allow-mode rule
+  naming `fs_write` must not become a deletion grant -- each deny alias is asked
+  for an explicit deny only, an allow-mode miss on it is not a refusal, and the
+  identity itself still has to be permitted on its own name. Both are empty for
+  every first-class harness; `HookManager.on_tool_call` fills them from the KAS
+  vocabulary tables (`platform/tool_names.py`, `policy_aliases` /
+  `policy_alias_split`) only for a server-less trusted identity those tables
+  know, on a permission event the KAS harness built (`kas_builtin_ids`) -- an
+  MCP-served call keeps exactly the targets it had, and another harness that
+  stamps the same bare id is asked under that id alone. This admits more than
+  asking the raw id by itself did: an allow-mode `tools: ["fs_write"]` now
+  permits a KAS `str_replace` / `fs_append` (and `fs_read` / `grep` / `glob`
+  permit the KAS read and search ids), which is the kiro-cli parity the table
+  exists for; `delete_file` is not admitted by `fs_write`. Because this
   enforcement is
   on the common path, the first-party app-own auto-approve below does **not**
   repeat it; what remains load-bearing there is the identity requirement itself
@@ -1921,7 +2083,9 @@ read-your-writes should add it deliberately, with its own tests.
   cron *capability* on/off gate in `mcp_cron._vet_cron_capability_governance`.
   Both run at `cron_add` (authoring) AND again at fire time — for EVERY job
   kind — via the shared `mcp_cron.vet_job_at_fire_time(job)` entry point
-  called from `slack.gateway._cron_callback` immediately before execution:
+  reached through `_await_cron_fire_time_gate` immediately before execution, from
+  `_cron_callback` (`slack/gateway_runtime/cron_fire.py`, the message and goal-reminder
+  gates) and from `_cron_run_command` / `_cron_run_script` (`cron_exec.py`):
   `command` jobs re-run the capability gate + the `commands` ceiling + the
   command-body COMPOSITION scan (`mcp_cron._vet_shell_command`, audited under
   the `cron_command_body` scope), `script`
@@ -1968,7 +2132,9 @@ read-your-writes should add it deliberately, with its own tests.
   spelling, which a recipient predicate over conversation ids can never match —
   and the handler re-decides recipient authorization against the resolved
   conversation id, SEL-audited, immediately after; the `channels` governance
-  decision itself always precedes the resolve's network side effect); the per-transport **startup** gate in
+  decision itself always precedes the resolve's network side effect); the
+  proactive owner DM in `dashboard.messaging_api.channel_delivery._deliver_channel_dm`
+  runs the same two-step on the same ladder; the per-transport **startup** gate in
   `slack.gateway._channel_transport_permitted` (a `channels` deny for a member
   keeps that transport — `slack`/`wecom`/`telegram`/`discord`/`webex` — from
   connecting at boot; resolved under `session_key=HOST_SESSION_KEY` so a
@@ -1983,11 +2149,10 @@ read-your-writes should add it deliberately, with its own tests.
   execution in `hooks._script_hooks_capability_denied` (at `run_script_hook`);
   app activation in `apps.manager._app_activation_denied` (at `enable_app`).
 
-Plane A carries **no live ordinal clamp**. It used to: a computer-use title under a
-`computer_use.approval: interactive` floor had both auto-approve branches suppressed,
-so the call fell through to interactive approval. That row and its clamp were removed
-along with the rest of the computer-use governance model — see [Computer use is NOT
-governed](#computer-use-is-not-governed-deliberately). The global `approval_mode`
+Plane A carries **no live ordinal clamp**. The computer-use governance model —
+including a `computer_use.approval` row and its clamp — is not present; computer
+use is not governed (see [Computer use is NOT
+governed](#computer-use-is-not-governed-deliberately)). The global `approval_mode`
 row's live clamp remains reserved (see "Still-reserved in v1").
 
 ### Owner capability previews
@@ -2101,10 +2266,10 @@ upgrade for a policy that loads today.
 `on_tool_call(..., tool_kind=, raw_params=)` carries these from the ACP event
 (`AcpEvent.tool_kind` / `.raw_tool_params`); the call sites thread them
 (`llm_helpers`, `subagent`, `task_executor`, `task_planner`, dashboard
-`chat_runner`, slack `handler`). **The `EVENT_PERMISSION_REQUEST` event the gate
-runs on must carry `raw_tool_params`** — `acp/client.py` caches the structured
+`chat_turn/tool_approval.py`, slack `handler`). **The `EVENT_PERMISSION_REQUEST` event the gate
+runs on must carry `raw_tool_params`** — `acp/client_tool_events.py` caches the structured
 rawInput at the ToolCall notification (`_tool_call_params`, keyed by
-`toolCallId`) and attaches it to the later permission event, because that
+`toolCallId`) and `acp/client_permissions.py` attaches it to the later permission event, because that
 message itself carries only a truncated title. Without this the two arg-derived
 scopes would be inert in production.
 
@@ -2210,7 +2375,7 @@ ALLOWED turn in the channel could otherwise pull it into agent context), the
 exemption** — a denied channel must still be able to halt a runaway session it
 previously started; `!restart` is NOT cancellation and stays gated.
 
-The exemption is **channel-neutral**, not Slack-only. `messaging/dispatch.py`'s
+The exemption is **channel-neutral**, not Slack-only. `messaging/dispatch_admission.py`'s
 `inbound_permitted(channel_type, *, text, has_attachments)` carries it for every
 channel on the shared pipeline, via `is_pure_cancel()`. Two properties make it
 safe to state that broadly. The match is whole-message, so `/stop the presses`
@@ -2251,7 +2416,7 @@ as denied (prompt refusal) rather than returning without resolving.
 
 ### Governance policy viewer (`GET /api/governance/policy`)
 
-`GET /api/governance/policy` (`handlers/security.build_governance_policy_snapshot`,
+`GET /api/governance/policy` (`handlers/security_governance_policy.build_governance_policy_snapshot`,
 registered in `dashboard/routes/system.py`, same dashboard-token auth) returns the
 effective ceiling across ALL scopes on the **host surface**, for the read-only
 Settings → Security viewer. It iterates `SCOPE_CATALOG` (so it auto-covers any
@@ -2370,8 +2535,9 @@ denials leave the same forensic trail.
   copy-pasteable fleet-ban policy below); a deny-mode `commands` pattern also
   becomes an un-opt-out-able force-pin via `resolve_pinned_commands`.
 - **The web terminal PTY is an ungoverned plane today.**
-  `dashboard/handlers/terminal.py` spawns a real PTY and contains **no**
-  `is_denied` / `is_sensitive_bash_command` / governance call, so
+  `dashboard/handlers/terminal.py` spawns a real PTY, and neither it nor its
+  `terminal_*` owners contain any `is_denied` / `is_sensitive_bash_command` /
+  governance call, so
   `screencapture` typed into it is bounded by neither the `commands` scope nor
   any `computer_use.*` scope. It is an operator-only surface. Routing PTY input
   through the same effective-deny floor as `on_tool_call` is tracked as its own
@@ -2421,7 +2587,7 @@ denials leave the same forensic trail.
 - **Windows has no machine-policy managed tier today, so the central ceiling is
   advisory against a local account.** There is no machine-scoped policy pin on
   Windows, so `resolve_distribution`
-  ([`src/kiro_crew/platform/policy_distribution.py`](../../../src/kiro_crew/platform/policy_distribution.py))
+  ([`src/kiro_crew/platform/policy_distribution_source.py`](../../../src/kiro_crew/platform/policy_distribution_source.py))
   lets a per-setting environment override stand: a standard user can set the
   `KIROCREW_POLICY_URL` environment variable to a document of their own and
   replace the whole central rung. Read the Windows guidance accordingly —
@@ -2609,8 +2775,8 @@ second surface cannot grow a drifting copy):
 
 | Surface | Destination id | On deny |
 |---|---|---|
-| `api_artifact_publish` + its sharing/review siblings (`handlers/artifacts.py`, via the module-local `_publish_governance_denied` alias) | the requested/effective `publication.provider` | 403 |
-| `GET /api/publish-providers` (`apps/routes.py`) | `deploy-web-aws` | the row is omitted, so the button never renders |
+| `api_artifact_publish` + its sharing/review siblings (`handlers/artifacts_parts/`: `publish_sharing.py`, with the comment, remote and update routes in `artifact_comments.py`, `remote_artifacts.py` and `create_update.py`, via the `_publish_governance_denied` alias in `handlers/artifacts_parts/route_plumbing.py`) | the requested/effective `publication.provider` | 403 |
+| `GET /api/publish-providers` (`apps/routes_listing.py`) | `deploy-web-aws` | the row is omitted, so the button never renders |
 | `POST /api/deploy/deploy` (`deploy/handlers.py`) | `deploy-web-aws` | 403, audited `deploy/denied` |
 | `POST /api/deploy/pending/{id}/confirm` | `deploy-web-aws` | 403 BEFORE `claim_pending`, so a denied confirm does not consume the entry |
 
@@ -2649,8 +2815,8 @@ the scope this row enforces today. (It does NOT gate L2 asset serving —
 overlays/topbar/audio keep working under a denying policy; if wholesale L2
 disablement is wanted it will be its own row or an extension of this one,
 tracked with kirodotdev/KiroCrew#312.) The decision is consulted at the
-injection site
-(`chat_runner.py`, via `governance_permits("capabilities.theme_persona",
+injection site (`_turn_build_prompt` in `chat_turn/prompt_assembly.py`,
+via `governance_permits("capabilities.theme_persona",
 "", session_key=...)`); a denying policy skips injection silently (info log).
 It is a **data row only** — `CONTRACT_VERSION` is unchanged and the evaluator
 (`resolve`/`gate_decision`/`load_security_policy`) is untouched, per this
@@ -2730,7 +2896,7 @@ Consulted at **four** chokepoints — the send gate plus EVERY write path to
 | Chokepoint | Pinned-off behavior |
 |---|---|
 | `beacon.telemetry_permitted()` | Refuses both heartbeat and receipt egress. Ranked **above** the config flag so the reported reason names the policy, not the (now irrelevant) local value |
-| `PATCH /api/config/kirocrew` (`handlers/core.py`) | **403** on `telemetry.beacon_enabled=true` |
+| `PATCH /api/config/kirocrew` (`handlers/core_config_patch.py`) | **403** on `telemetry.beacon_enabled=true` |
 | `kirocrew telemetry enable` (`cli_commands.py`) | Exits **1** without writing config.json |
 | `kirocrew config set [--local] …` (`cli_config.py`) | Exits **1** without writing. The *generic* setter reaches the same key, and `--local` writes the overlay that takes PRECEDENCE over the base file |
 
@@ -2826,7 +2992,7 @@ half-control:
 |---|---|
 | `tailnet.resolve_tailnet_host()` | Contributes no origin **and does not spawn the CLI**, so the pin closes both halves an administrator objects to. Checked ahead of the daemon call |
 | `tailnet_serve.publish()` | Refuses to run `tailscale serve`, so the dashboard is never put on the tailnet in the first place. Checked before the spawn — refusing after publishing would be theatre |
-| `PATCH /api/config/kirocrew` (`handlers/core.py`) | **403** on `dashboard.tailscale.enabled=true` |
+| `PATCH /api/config/kirocrew` (`handlers/core_config_patch.py`) | **403** on `dashboard.tailscale.enabled=true` |
 | `kirocrew config set [--local] …` (`cli_config.py`) | Exits **1** without writing. The generic setter reaches the same key, and `--local` writes the overlay that takes PRECEDENCE over the base file |
 
 `tailnet_serve.unpublish()` is deliberately **not** gated, and the asymmetry is
@@ -3225,7 +3391,7 @@ its own — `resolve_selected_backend` degrades a now-denied persisted value to 
 floor with a logged reason on the next load, and the `PATCH
 /api/config/kirocrew` allowlist, `GET /api/config/schema`, `GET /api/acp-backends`
 and the provider factory all read the one derivation
-(`handlers/core.py::_selectable_acp_backends`). `bootstrap_context` additionally
+(`handlers/core_config_schema.py::_selectable_acp_backends`). `bootstrap_context` additionally
 re-runs that SAME gate over the config instance it is holding — that instance was
 normalised before the narrowing — rather than adding a second gate anywhere.
 
@@ -3290,7 +3456,7 @@ server would refuse.
 ### Which tool-approval modes a deployment may select — `approval_modes`
 
 The dashboard approval-mode picker offers four modes: `normal` (interactive —
-ask for every tool), `trust_reads` (auto-approve read-only shell commands; every other tool call, MCP included, still asks), `trust` (auto-approve
+ask for every tool), `trust_reads` (auto-approve read-only shell commands except any that runs `git`; every other tool call, MCP included, still asks), `trust` (auto-approve
 the active slot), and `yolo` (auto-approve every tool everywhere). The
 `approval_modes` `SCOPE_CATALOG` row (a `ScopedRuleset` on the `identifier`
 matcher — data-only shape, no evaluator change, mirroring `agent_backend`
@@ -3331,7 +3497,7 @@ the posture is worse than one that fails to load.
 **Enforced at every `yolo` surface**, because a mode is only actually off if every
 path that can arm it — and every path that HONOURS an existing grant — refuses:
 
-- `dashboard/chat_handlers.py::api_chat_mode` — the explicit mode switch. Refuses
+- `dashboard/chat_api/slot_approval.py::api_chat_mode` — the explicit mode switch. Refuses
   with `403` + `mode_disabled_by_policy` **before any mutation**.
 - `safety_override` arming — `_commit_activation` and `activate_scoped`,
   fail-closed, so YOLO stays blocked however it is armed (dashboard, Slack `!yolo`,
@@ -3436,7 +3602,7 @@ policy. A fleet that needs any of those should not enable the feature. The
 `mcp` scope still works as a blunt instrument: denying `@kirocrew-computer` removes
 the tools entirely, which is the one governance lever that remains.
 
-**If it is ever re-governed**, the rows belong back in this file's `SCOPE_CATALOG`
+**If it is ever re-governed**, the rows belong back in `SCOPE_CATALOG` (`platform/governance_parts/catalog.py`)
 inline (never `register_scope()`d from the feature package): `load_security_policy()`
 runs at boot before any feature import, and a policy naming an unregistered scope
 raises "unknown governed key … (fail-closed)" — so a lazy registration would abort
@@ -3480,31 +3646,67 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 
 ## Files
 
-- `platform/governance.py` — archetypes, catalog, loader, evaluator
-  (`resolve`, `resolve_ordinal`, `gate_decision`, `assert_governance_floor`,
-  `compose_profiles`, `resolve_pinned_commands` + `COMMANDS_SCOPE` force-pins,
-  `policy_signing_payload` + the `identity.signature` verification path), the
-  tier ladder (`TIER_CENTRAL` … `TIER_HOME`, `_intersect_ceilings`,
-  `_audit_policy_tier`), the single precedence fold `compose_tier_ladder` with its
-  refresh entry point `compose_installed_ceiling` (+ `_TierProcessState`, the
-  per-process tier state: the remembered bundled tier and the two once-per-process
-  latches).
+- `platform/governance.py` — the governance model's import path and patch surface:
+  every name below is imported, and patched, as `kiro_crew.platform.governance.<name>`,
+  and its mirror (`_facade_mirror`) carries a patch to every owner holding the name.
+  It keeps the auto-approve surface it decides itself (`may_skip_gate` with
+  `BUILTIN_TOOL_SCOPES` / `BUILTIN_TOOL_CAPABILITIES`, `strip_ungoverned_auto_approve`,
+  the `hooks.confirm_tools` gate, `may_skip_gate_now`, `withheld_by_confirm_tools`,
+  `sanitize_agent_config_governance`) and the two boot checks,
+  `assert_governance_floor` and `assert_governance_paths_protected`. Its owners, one
+  responsibility each, lowest layer first; new work goes to the owner it belongs to:
+  - `platform/governance_parts/matching.py` — the enforcer-owned registries `_MATCHERS` /
+    `_ORDINAL_SCALES`, `register_matcher`, `_norm_item`, `_url_host`.
+  - `platform/governance_parts/tool_calls.py` — the computer-use action classes
+    (`_CU_ACTION_CLASSES`, `computer_use_action_classes`), `classify_tool_title`,
+    `classify_tool_args`, `mcp_title_to_ref`.
+  - `platform/governance_parts/archetypes.py` — `Decision`, the four archetypes and
+    `_compose_controls`.
+  - `platform/governance_parts/catalog.py` — `SCOPE_CATALOG` (with the CAPABILITY-DEFAULT
+    CONTRACT), `ScopeSpec`, `register_scope`, `COMMANDS_SCOPE`, `_SCOPE_ALIASES`.
+  - `platform/governance_parts/carriers.py` — `GovernanceCeiling`, `Profile`, `BootControls`,
+    `UpdatePins` (`active_update_pins`), `PolicyDistribution`
+    (`active_policy_distribution`), the `capabilities.agentcore` posture,
+    `deny_all_profile`, `compose_profiles`.
+  - `platform/governance_parts/parsing.py` — `parse_policy`, `parse_profile`, `_parse_controls`.
+  - `platform/governance_parts/signature.py` — `policy_signing_payload` + the
+    `identity.signature` verification path, `assert_policy_signature_satisfied`.
+  - `platform/governance_parts/tiers.py` — the tier ladder (`TIER_CENTRAL` … `TIER_HOME`,
+    `_intersect_ceilings`, `_audit_policy_tier`), the single precedence fold
+    `compose_tier_ladder` with its refresh entry point `compose_installed_ceiling`
+    (+ `_TierProcessState`, the per-process tier state: the remembered bundled tier
+    and the two once-per-process latches), and `load_security_policy`.
+  - `platform/governance_parts/evaluator.py` — `resolve`, `resolve_ordinal`, `gate_decision`,
+    `resolve_pinned_commands` + `COMMANDS_SCOPE` force-pins.
 - `platform/admission.py` — `canonical_signing_bytes` / `hmac_signature` (shared
-  by both trust roots), `require_policy_signature` / `trust_keys`, and
+  by both trust roots), `ed25519_verify` (policy issuers only),
+  `require_policy_signature` / `trust_keys` / `trust_public_keys`, and
   `read_policy_trust_root` (the side-effect-free trust-root reader).
 - `platform/update_governance.py` — the shared update seam (`resolve_remote_url`,
   `update_blocked_reason`, `update_required`, `min_version`) called by
-  `dashboard/handlers/updates.py`, `cli_server.py` and `slack/gateway.py`.
+  the update handler owners (`dashboard/handlers/updates_verdict.py`, `updates_check.py`,
+  `updates_apply.py`), `cli_server_update.py` and the gateway's update owners
+  (`slack/gateway_runtime/update_schedule.py`, `slack/gateway_runtime/update_apply.py`).
 - `platform/policy_distribution.py` — central distribution: source resolution
   (env ∘ the policy's `distribution` block), the append-only
   `register_policy_fetcher` transport seam, the last-known-good cache, the
   `refresh_now` / `validate_ceiling` / `apply_ceiling` / `start_refresher`
-  live-refresh path.
+  live-refresh path. It stays the import path and patch surface, a mirror facade
+  (`_facade_mirror`) that keeps the live-refresh path, the refresher thread and
+  `distribution_posture`, over three owners:
+  - `platform/policy_distribution_source.py` — the `KIROCREW_POLICY_*` settings,
+    the fetch records, `register_policy_fetcher` and the built-in transports, and
+    `resolve_distribution`;
+  - `platform/policy_distribution_cache.py` — the last-known-good cache and the
+    tier's process state, with `reset_process_state`;
+  - `platform/policy_distribution_boot.py` — `parse_distributed_policy`,
+    `load_distributed_policy`, `fetch_once`, `validate_ceiling` and the
+    `_sanitize_detail` redaction sink.
 - `platform/governance_profiles.py` — `ProfileStore` (hot-reload),
   `resolve_active_scope`, `governance_permits`, `governance_floor_ordinal`,
   `GOVERNANCE_ERROR_REASON` (the eval-error marker consumers match on),
   `vet_and_audit`.
-- `security/paths.py` — `_SENSITIVE_HOME_DIRS` keystone entries.
+- `security/paths_lists.py` — `_SENSITIVE_HOME_DIRS` keystone entries.
 - `security/denied_rules.py` — `pinned_builtin_command_ids` and `pinned_builtin_command_ids_for_snapshot`.
 - `agent_backend_governance.py` — the `agent_backend` scope: `SCOPE`,
   `narrow_selectable_backends` (the registry recompute, plus its host-bound,
@@ -3526,19 +3728,21 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 - `executors.py` — `governance_executor` (`mc-gov`), the bounded pool the
   externally-paced governance checks run on.
 - `dashboard/handlers_system.py` — `GET /api/governance/channels`.
-- `dashboard/handlers/security.py` — `GET /api/governance/policy` (posture-only
-  serialization).
-- chokepoints: `sandbox.py`, `mcp_cron.py`, `subagent.py`, `mcp_core.py`,
+- `dashboard/handlers/security_governance_policy.py` — `GET /api/governance/policy`
+  (posture-only serialization), served through `dashboard/handlers/security.py`.
+- chokepoints: `sandbox.py`, `mcp_cron_vet.py`, `subagent_parts/agent_policy.py`, `mcp_core.py`,
   plus the audit-only seam `computer_use/gate.py` (not a governance chokepoint:
   `require_computer_use` always proceeds and audits, and `apply_observation_ceiling`
   passes the payload through).
-- `cli.py` / `cli_commands.py` — the `policy` command.
+- `cli_parser_admin.py` (its arguments), `cli.py` (dispatch) / `cli_commands_security.py` — the `policy` command.
 
 ## Tests
 
 `test_governance_policy.py` (archetypes + loader + evaluator + E1–E13 vectors +
-extensibility + the `identity.signature` states, the opt-in fail-closed gate, and
-the `policy show` provenance reporting),
+extensibility), `test_governance_policy_signatures.py` (the `identity.signature`
+states, the opt-in fail-closed gate, and the `policy show` provenance reporting),
+`test_governance_policy_decisions.py` (an unnamed capability is ungoverned, `policy
+validate` names the ungoverned rows, and an alias group is one gate question),
 `test_governance_tier_ladder.py` (the tier ladder: that the central document
 outranks every local one, that a lower tier can only tighten it, that the reserved
 sandbox boot flags compose across tiers, that an env document beneath an authority
@@ -3549,18 +3753,22 @@ is announced once, and that a tier intersect is audited once per pair),
 `test_governance_self_protection.py` (keystone), `test_governance_profiles.py`
 (resolution + binding + hot-reload + fail-closed reload dispositions),
 `test_governance_gate.py` (Plane A enforcement + audit),
-`test_governance_chokepoints.py` (sandbox/cron/spawn/helpers + egress-reserved +
-the per-transport inbound gates), `test_governance_channels_endpoint.py`
+`test_governance_chokepoints_scope_gates.py` (sandbox/cron/spawn/helpers + the
+per-transport inbound gates + the capability, app and publish chokepoints),
+`test_governance_chokepoints.py` (filesystem/egress at the host gate + the
+degraded and fail-closed chokepoints), `test_governance_channels_endpoint.py`
 (`/api/governance/channels`, incl. the eval-error→`null` distinction),
 `test_governance_policy_viewer.py` (`/api/governance/policy` posture-only, incl.
 `test_detail_never_leaks_rule_contents` and `TestScopeAttribution` — that a
 host-profile pin is reported as surface-scoped, not install-wide),
-`test_governance_distribution.py` (the `distribution` block, the fetcher seam and
+`test_governance_distribution.py` and its `test_governance_distribution_*.py`
+siblings `_fetch_checks`, `_redaction`, `_publish`, `_cache_trust` and `_ladder`
+(the `distribution` block, the fetcher seam and
 its transport refusals, the cache and its repoint/staleness rules, the
 unavailable dispositions, the live-refresh reject-and-keep path — and the three
-controls on the cache itself — `TestAnExposedCacheIsStillReadOnly`,
-`TestTheCachePairIsWrittenUnderOneLock` and
-`TestAnUnverifiableSourceIsTreatedAsWritable`),
+controls on the cache itself — `TestAnExposedCacheIsStillReadOnly` and
+`TestTheCachePairIsWrittenUnderOneLock` in `_cache_trust`, and
+`TestAnUnverifiableSourceIsTreatedAsWritable` in `_fetch_checks`),
 `test_sandbox_mount_checked.py` (that all six launcher mounts, including the
 read-only bind and its sealing remount, refuse the spawn when they fail),
 `test_governance_updates.py` (the
@@ -3570,8 +3778,11 @@ tracked-remote resolution), `test_agent_backend_governance.py` (the
 and its restore-on-loosening behaviour, the gateway-start binding contract and that
 a runtime ceiling install deliberately does not re-derive the set, the
 host-session binding, the both-directions audit, the fail-closed disposition, and
-that no second gate exists), and `test_computer_use_gate.py` (that the
-computer-use gate is audit-only and permits — see the section above).
+that no second gate exists), `test_computer_use_gate.py` (that the
+computer-use gate is audit-only and permits — see the section above), and
+`test_governance_parts_facade.py` (that a patch through the facade reaches every
+owner holding the name, the owner layering, the surface the facade keeps, its one
+logger and the trust-root literal of its boot check).
 
 ## Repository runner admission
 

@@ -40,19 +40,11 @@ import type { RootState } from '../store'
 import { readPreviewFlag } from '../utils/previewFlags'
 
 import { i18nT } from '../i18n/t'
-export type SurfaceGroup = 'Main' | 'Apps' | 'Platform' | 'Bottom'
-
-/**
- * Marks a registry literal as a machine value rather than rendered copy.
- *
- * Keep this wrapper narrow: `label` fallbacks in the built-in registry are
- * unreachable when `labelKey` is present (enforced by navLabels.test.tsx), and
- * `group` is a routing bucket. Other surface strings such as `badgeLabel` and
- * `activityLabel` are rendered and must not use this helper.
- */
-export function surfaceMachineValue<T extends string>(value: T): T {
-  return value
-}
+import type { SurfaceGroup } from './surfaceData'
+// Defined beside the pure surface data so the find_ui generator can read that
+// data without importing the store; re-exported so call sites keep one import.
+export { surfaceMachineValue } from './surfaceData'
+export type { SurfaceGroup } from './surfaceData'
 
 /** Anything that can appear as a top-level destination in the left rail. */
 export interface Surface {
@@ -312,7 +304,8 @@ export function filterSlotsBySurface(slots: readonly ChatSlot[], slotMode: strin
  * Note — intentional asymmetry with the nav badge: `countUnreadByMode` in
  * `dashboardSlice.ts` treats orphans as the default chat surface (`''`) so
  * the Chat nav badge doesn't transiently drop while reconciliation is in
- * flight. This helper drops them instead because they can't be displayed
+ * flight. Orphans the next reconcile will not drain (a partial list, or keys
+ * the gateway holds) are left out there too. This helper drops them instead because they can't be displayed
  * in the sidebar regardless, and showing a higher count than visible
  * sessions would be a worse UX than hiding the (about-to-be-drained) item.
  */

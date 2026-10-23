@@ -9,8 +9,9 @@ mapped through both. Every untrusted value is screened or scrubbed here before i
 lands beside a trusted frame.
 
 The member section, the rules gate and the lifecycle verdict that decides both stay
-at the ``members.member_turn_context`` chokepoint in :mod:`kiro_crew.context`, as do
-the trigger-matched skill bodies and the request boundary itself.
+at the ``members.member_turn_context`` chokepoint in ``ContextBuilder.build_message``
+(:mod:`kiro_crew.context_assembly.turn_message`), as do the trigger-matched skill
+bodies and the request boundary itself.
 
 New per-turn blocks belong here.
 """
@@ -18,7 +19,7 @@ New per-turn blocks belong here.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.context_assembly import inclusion as _inclusion
@@ -88,8 +89,9 @@ def post_compaction_parts(
     runtime_source: str | None,
     steering_dirs: tuple[str, ...],
     essentials: str,
-    provider_type: str,
+    provider_type: str | None,
     context_provider: Any,
+    native_launch_sources: Collection[str],
     post_compaction_checkpoint: Mapping[str, object] | None = None,
 ) -> list[str]:
     """What a turn re-injects after a confirmed compaction dropped session start.
@@ -137,7 +139,13 @@ def post_compaction_parts(
         parts.append(
             "[Memory tools] Call memory_recall with specific keywords for prior facts and tasks.\n"
         )
-    _inject, _globs = ctx._skills_injection_plan(agent, is_cc=is_cc, project_dir=project)
+    _inject, _globs = ctx._skills_injection_plan(
+        agent,
+        is_cc=is_cc,
+        project_dir=project,
+        provider_type=provider_type,
+        session_key=session_key,
+    )
     if _inject and not minimal_context:
         _cfg = ctx.KiroCrewConfig.load()
         lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))
@@ -189,15 +197,18 @@ def post_compaction_parts(
     # labels before minting the genuine frame.
     if steering_dirs and not _essentials:
         _caps_fs = ctx._resolve_caps(model_window)
+        _skip_folder_roots, _declared_sources = _inclusion._folder_steering_delivery_snapshot(
+            provider_type=provider_type,
+            native_steering=context_provider is not None and context_provider.native_steering,
+            project=project,
+            native_launch_sources=native_launch_sources,
+        )
         _folder_ctx = _inclusion._render_folder_steering_section(
             steering_dirs,
             project,
             _caps_fs.steering,
-            skip_delivered_roots=ctx._project_steering_delivered(
-                provider_type,
-                context_provider is not None and context_provider.native_steering,
-                project,
-            ),
+            skip_delivered_roots=_skip_folder_roots,
+            delivered_sources=_declared_sources,
         )
         if _folder_ctx:
             # Bodies were scrubbed inside the renderer; the frame it
@@ -209,6 +220,38 @@ def post_compaction_parts(
                 + "\n[END REINJECTED]\n\n"
             )
     return parts
+
+
+def ledger_reinjection_part(session_key: str | None, turn_text: str) -> str:
+    """The session's ``[work ledger]`` snapshot for a post-compaction turn, or ``""``.
+
+    A compaction drops whatever the agent had read of its own durable state, and
+    the instruction to read it again went with it. A monitor-loop cycle already
+    starts from this snapshot (``compose_nudge_body``); an interactive turn gets
+    the same block here. Empty when the session has no ledger or a terminal one,
+    and when *turn_text* already carries the snapshot -- a nudge cycle that lands
+    on the first turn after a compaction is not given the block twice.
+
+    Best-effort: a failed read costs the block, never the turn. The ledger is
+    agent-written text, so its payload is scrubbed of structural markers.
+    """
+    if not session_key:
+        return ""
+    from kiro_crew import context as ctx  # circular import: the facade imports this owner
+    from kiro_crew import session_ledger
+
+    try:
+        snapshot = session_ledger.render_snapshot(session_ledger.ledger_key(session_key))
+    except Exception:
+        logger.debug("reinjection: ledger snapshot failed for %s", session_key, exc_info=True)
+        return ""
+    if not snapshot or snapshot in turn_text:
+        return ""
+    return (
+        "[REINJECTED AFTER COMPACTION — work ledger]\n"
+        + ctx._neutralize_structural_markers(snapshot)
+        + "\n[END REINJECTED]\n\n"
+    )
 
 
 def thread_context_parts(
@@ -329,7 +372,36 @@ def rail_parts(
     parts: list[str] = []
     # Project context — inject on every message so the LLM always knows
     # the active project, even when set/changed after session start.
-    if project and _inclusion._group_included(context_groups, _inclusion.CONTEXT_GROUP_PROJECT):
+    from kiro_crew.session_environment import remote_workspace_for
+
+    # A remote session works in the GUEST's directory; naming the gateway checkout
+    # (which its tools cannot reach) sent the model to the wrong machine. Values
+    # come from operator config (profile name, workdir).
+    remote = remote_workspace_for(session_key)
+    project_on = _inclusion._group_included(context_groups, _inclusion.CONTEXT_GROUP_PROJECT)
+    if remote is not None and project_on:
+        env_name, env_workdir = remote
+        parts.append(
+            f"[PROJECT] This session runs in a remote environment ({env_name}). "
+            f"Its working directory is {env_workdir} on that remote machine, "
+            "reached only through the @workspace tools (read_file, write_file, "
+            "edit_file, list_directory, glob, grep, run_command). Files, commands, "
+            "the OS and installed tools all describe that remote machine. "
+            "Subagents you spawn run in the same remote environment. "
+            "The gateway machine that hosts you is a different computer, and "
+            "anything describing it (paths, host memory) is not this session's "
+            "workspace.\n\n"
+        )
+        from kiro_crew.session_environment import take_workspace_recreated
+
+        if take_workspace_recreated(session_key):
+            parts.append(
+                "[PROJECT] This session's remote workspace was recreated empty: files, "
+                "uncommitted changes and installed tools from earlier in this "
+                "conversation are gone. Re-clone or rebuild before relying on them; "
+                "anything pushed to git is still on its remote.\n\n"
+            )
+    elif project and project_on:
         parts.append(
             f"[PROJECT] Active project directory: {project}\n"
             "This is the codebase you are working in for this session. "
@@ -386,7 +458,7 @@ def rail_parts(
             from kiro_crew.resource_status import probe as _probe_resources
 
             _rstatus = _probe_resources()
-            _rline = _rstatus.context_line()
+            _rline = _rstatus.context_line(remote=remote is not None)
             if _rline:
                 parts.append(_rline + "\n\n")
                 logger.info(
@@ -489,9 +561,10 @@ def interactive_guidance(
         # wants none of the Crew's dashboard-tool nudges (it drives its own
         # UI through its MCP tools), so honor that here too, not just for
         # _CRITICAL_RULES.
-        # ask_question posts a NON-BLOCKING card and the agent ends its turn:
-        # what blocks is the DECISION, not the tool call. [OPTIONS:] remains
-        # the cheaper choice mechanism on every interactive surface.
+        # ask_question BLOCKS on the dashboard and returns the answers as its
+        # tool result, so the answer never arrives as a user-role message.
+        # [OPTIONS:] remains the cheaper choice mechanism on every
+        # interactive surface.
         if ctx.has_dashboard_surface(session_key or "") and ctx._agent_includes_crew_context(agent):
             if not minimal_context:
                 current_config = ctx.live.snapshot() or ctx.KiroCrewConfig.load()
@@ -504,14 +577,14 @@ def interactive_guidance(
                         "status artifact.)"
                     )
             _interactive_guidance.append(
-                "\n\n(The ask_question tool posts a NON-BLOCKING dashboard card. "
+                "\n\n(The ask_question tool shows a dashboard card and BLOCKS until the "
+                "user responds; the answers are its tool result. "
                 "DEFAULT TO SILENCE: use it only when work cannot continue without a "
                 "human-only decision (permission, irreversible/costly action, or an "
                 "uninferable preference). Decide anything you can read, run, search "
                 "or infer yourself; never ask to reconfirm an authorized plan or "
-                "merely because a choice exists. END YOUR TURN after calling; the "
-                "answer arrives as the next user message, not the tool result. "
-                "When ending anyway, [OPTIONS:] is cheaper.)"
+                "merely because a choice exists. Do not end your turn after calling "
+                "unless the result says so. When ending anyway, [OPTIONS:] is cheaper.)"
             )
             # A follow-up card is distinct from both: it offers concrete NEXT
             # tasks after work is done, optionally handing one to a worktree.

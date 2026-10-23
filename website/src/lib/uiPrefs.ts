@@ -39,13 +39,26 @@
 
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
 import { bottomTerminalPrefsSnapshot } from '../hooks/useBottomTerminal'
+import { adoptBoardFolderCollapse, boardFolderCollapseBackup } from '../utils/boardFolderCollapse'
 
-/** Terminal labels have per-id write coordinates, but share the layout's
- *  existing backup key. Projection is read-only: syncing cannot race a layout
- *  mutation by publishing a synthesized snapshot back into localStorage. */
+/** Two keys are projections of state stored under other keys. Terminal labels
+ *  have per-id write coordinates and share the layout's backup key. The board
+ *  folder-collapse overrides live one localStorage key per pair and travel as
+ *  one wire key. Both projections are read-only. Syncing therefore cannot race
+ *  a live write by publishing a synthesized snapshot back into localStorage. */
 function readPreference(key: string): string | null {
+  if (key === 'kc-board-folder-collapsed') return boardFolderCollapseBackup()
   const raw = safeGetItem(key)
   return key === 'mc-bottom-terminal' && raw !== null ? bottomTerminalPrefsSnapshot(raw) : raw
+}
+
+/** Writes a host value under a plain wire key. The board folder-collapse value
+ *  is written as the per-key family it projects. The wire key itself never
+ *  reaches localStorage. Returns false when nothing was written. The caller
+ *  then treats the key as dropped, exactly as it does for `safeSetItem`. */
+function writePreference(key: string, value: string): boolean {
+  if (key === 'kc-board-folder-collapsed') return adoptBoardFolderCollapse(value)
+  return safeSetItem(key, value)
 }
 
 /**
@@ -325,6 +338,16 @@ export const DURABLE_PREF_KEYS: readonly string[] = [
   'mc-filter-folders-shelved',
   'mc-flat-hidden-folders',
   'mc-input-height',
+  // Sessions sidebar width (pages/chat-sidebar/resize.ts). The pre-board key
+  // is the width to restore when the user leaves board view. Without it a
+  // restored profile keeps the board width in list view.
+  'mc-sidebar-width',
+  'mc-sidebar-width-pre-board',
+  // Board-view folder collapse overrides (utils/boardFolderCollapse.ts). The
+  // overrides live one localStorage key per (column, folder) pair. They travel
+  // as this one key because the host caps the key count. `readPreference`
+  // projects the value from the per-key entries.
+  'kc-board-folder-collapsed',
   // Diff and file viewer toggles.
   'mc-diff-plain',
   'mc-diff-split',
@@ -355,6 +378,27 @@ export const DURABLE_PREF_KEYS: readonly string[] = [
   'mc:notif:activeKinds:v2',
   'kirocrew:account-email-hidden',
   'kirocrew:comment-hint-dismissed',
+  // Settings > Shortcuts, and the push-to-talk key on Settings > Voice. Each
+  // key is written only by an explicit user action, on its settings page or in
+  // the shortcuts reference modal. No hook writes a default on mount. The
+  // on/off switch and the macOS digit modifier hold '1' or '0'
+  // (components/ShortcutsModal.tsx). The Search everywhere chord is a JSON
+  // QuickSearchConfig (lib/quickSearchShortcut.ts). The panel toggle chords are
+  // a JSON PanelToggleOverrides holding overrides only
+  // (lib/panelToggleShortcuts.ts). The push-to-talk key is a JSON PttConfig
+  // (lib/pushToTalk.ts). Its header states what a client inherits from another
+  // machine's binding.
+  //
+  // NOT here: 'mc-mic-device-id' (hooks/mic.ts). The browser issues a
+  // microphone id for the devices on that machine, so a restored one names no
+  // device. Also NOT here: 'mc-shortcut-overrides'. lib/shortcutRegistry.ts
+  // ships only its reader. The change that adds the writer must add the key
+  // here.
+  'mc-keyboard-shortcuts',
+  'mc-mac-ctrl-digits',
+  'mc-quicksearch-shortcut',
+  'mc-panel-toggle-shortcuts',
+  'mc-ptt-config',
   // Cloud launch defaults.
   'mc-cloud-profile',
   'mc-cloud-region',
@@ -533,6 +577,27 @@ function ownedAtFailure(): Set<string> | null {
 }
 
 /**
+ * Composite fields that are PURELY cosmetic rendering prefs: the local viewport's
+ * layout/scale, carrying no cross-device-meaningful state. For these, and ONLY
+ * these, a value the profile holds locally is kept over the host's cross-origin
+ * value even on a split-aware failed-restore marker (see `compositeChildOwned`).
+ *
+ * This is the deliberate, owner-ruled exception for GH #18237 (ruling recorded on
+ * PR #18558): a user's chat content width flipped Compact->Comfortable on upgrade
+ * because another origin's host value overwrote the locally-held one after a
+ * failed reconcile. The host value is usually another origin's EXPLICIT choice
+ * (`DEFAULTS.contentWidth` is `'compact'`), and the local value may be a default
+ * a whole-blob save filled in after the failure; the module cannot tell the two
+ * apart, and the ruling accepts that for this one cosmetic field the value this
+ * origin already holds wins. It decides this origin's display only: the kept
+ * value is baselined, not uploaded, so the other origin's choice stays on the
+ * host. The narrowest honest fix is a named allowlist (just the one field the
+ * ruling names) rather than a blanket present-local-wins rule (which would
+ * reverse the GPT 5.6 / Opus 5 default-fill protection for every field).
+ */
+const COSMETIC_COMPOSITE_FIELDS = new Set<string>(['contentWidth'])
+
+/**
  * Whether a composite CHILD wire key was owned at the failure that produced
  * `owned`.
  *
@@ -551,11 +616,29 @@ function ownedAtFailure(): Set<string> | null {
  * ownership is genuinely unavailable and the whole blob is the finest grain
  * there is. When any child entry is present the marker is from a split-aware
  * build and the exact child key is required.
+ *
+ * ONE narrow exception (GH #18237, owner-ruled): a COSMETIC composite field
+ * (`COSMETIC_COMPOSITE_FIELDS`) is treated as owned when the marker carries the
+ * parent -- the parent's presence proves the profile held chat config at the
+ * failure, so a cosmetic width value this origin holds survives the host's
+ * cross-origin value. Both callers act on the answer only when the local value
+ * is present, so an absent local field still takes the host value. This does
+ * NOT touch any non-cosmetic field: `showTimestamps`, `pinLastPrompt`, and every
+ * other default-fillable setting still require their exact child entry, so the
+ * GPT 5.6 / Opus 5 default-fill protection is unchanged for them.
  */
 function compositeChildOwned(owned: Set<string>, childWireKey: string): boolean {
   if (owned.has(childWireKey)) return true
   const hasChildEntry = [...owned].some((k) => childField(k) !== null)
-  return !hasChildEntry && owned.has(COMPOSITE_KEY)
+  if (!hasChildEntry) return owned.has(COMPOSITE_KEY)
+  // Split-aware marker: the exact child entry is normally required. Cosmetic
+  // exception -- a cosmetic field counts as owned under a parent-carrying
+  // marker (the profile demonstrably held chat config at the failure).
+  const field = childField(childWireKey)
+  if (field !== null && COSMETIC_COMPOSITE_FIELDS.has(field)) {
+    return owned.has(COMPOSITE_KEY)
+  }
+  return false
 }
 
 /** Record a failed restore. Never widens an existing snapshot (see the key's doc). */
@@ -696,6 +779,77 @@ function clearDirtyChildren(sentWireKeys: Iterable<string>): void {
     if (field !== null && dirty.delete(field)) changed = true
   }
   if (changed) writeDirtyFields(dirty)
+}
+
+/**
+ * Plain durable keys the USER explicitly saved that have not uploaded yet, as a
+ * JSON list of keys. The plain-key twin of `COMPOSITE_DIRTY_KEY`.
+ *
+ * The owned-at-failure snapshot is frozen when a restore fails, so a value
+ * saved AFTER the failure reads as "not owned" and the next successful pass
+ * puts the host value over it. Right for a default a hook seeds on mount; wrong
+ * for a push-to-talk key the user just picked (GPT 6.1 F1). The writer marks
+ * the key at its save seam (`savePrefExplicitly`); a marked key counts as owned
+ * on both restore paths, is forced into the next upload, and clears once that
+ * upload is baselined. Settings import clears the marks, so its host copy wins.
+ */
+const PLAIN_DIRTY_KEY = 'mc-ui-prefs-plain-dirty'
+
+function readPlainDirty(): Set<string> {
+  const raw = safeGetItem(PLAIN_DIRTY_KEY)
+  if (raw === null) return new Set()
+  try {
+    const list: unknown = JSON.parse(raw)
+    if (!Array.isArray(list)) return new Set()
+    return new Set(list.filter((k): k is string => typeof k === 'string' && isPlainDurable(k)))
+  } catch {
+    return new Set()
+  }
+}
+
+function writePlainDirty(keys: Set<string>): boolean {
+  if (keys.size === 0) {
+    localStorage.removeItem(PLAIN_DIRTY_KEY)
+    return true
+  }
+  return safeSetItem(PLAIN_DIRTY_KEY, JSON.stringify([...keys]))
+}
+
+function isPlainDurable(key: string): boolean {
+  return childField(key) === null && DURABLE_PREF_KEYS.includes(key)
+}
+
+/**
+ * Store an explicit user choice for a plain key and mark it (PLAIN_DIRTY_KEY).
+ * The mark is written first so a choice never lands without it: a refused mark
+ * stores nothing, and a refused value rolls the mark back (GPT 6.1 F2). Returns
+ * whether the choice was stored. A key outside `DURABLE_PREF_KEYS` is stored as is.
+ */
+export function savePrefExplicitly(key: string, value: string): boolean {
+  if (!isPlainDurable(key)) return safeSetItem(key, value)
+  const before = safeGetItem(PLAIN_DIRTY_KEY)
+  if (!writePlainDirty(readPlainDirty().add(key))) return false
+  if (safeSetItem(key, value)) return true
+  if (before === null) localStorage.removeItem(PLAIN_DIRTY_KEY)
+  else safeSetItem(PLAIN_DIRTY_KEY, before)
+  return false
+}
+
+/** Drop the marks of plain keys whose upload was just baselined. */
+function clearPlainDirty(sentWireKeys: Iterable<string>): void {
+  const dirty = readPlainDirty()
+  if (dirty.size === 0) return
+  let changed = false
+  for (const k of sentWireKeys) if (dirty.delete(k)) changed = true
+  if (changed) writePlainDirty(dirty)
+}
+
+/** Every wire key with an un-uploaded explicit edit: composite children and
+ *  plain keys. */
+function dirtyWireKeys(): Set<string> {
+  const out = dirtyChildKeys()
+  for (const k of readPlainDirty()) out.add(k)
+  return out
 }
 
 /** Record the CURRENT build's roster inside the synced document. */
@@ -937,8 +1091,9 @@ export async function reconcileNewDurableKeys(): Promise<number> {
     // over the stale host value here, exactly as if it were owned. Without
     // this a failed reconcile followed by an edit of a blob-predating field
     // restores the host value AND baselines it, losing the edit silently on
-    // both sides (GPT F1, uiPrefs.ts:913).
-    const dirty = dirtyChildKeys()
+    // both sides (GPT F1, uiPrefs.ts:913). A plain key the user saved after the
+    // failure is kept the same way (see PLAIN_DIRTY_KEY).
+    const dirty = dirtyWireKeys()
     let restored = 0
     // Children whose REQUIRED host restore write was refused (quota). GPT 6.1
     // F2: such a child must NOT be marked reconciled — adding it to the roster
@@ -978,7 +1133,7 @@ export async function reconcileNewDurableKeys(): Promise<number> {
         continue
       }
       const wrote =
-        field === null ? safeSetItem(key, value) : writeCompositeField(field, parsed)
+        field === null ? writePreference(key, value) : writeCompositeField(field, parsed)
       if (wrote) {
         updates.set(key, value)
         restored += 1
@@ -987,9 +1142,16 @@ export async function reconcileNewDurableKeys(): Promise<number> {
         // so it is neither baselined nor marked reconciled, and the reconcile
         // fails below (GPT 6.1 F2).
         failedChildRestores.add(key)
+      } else if (local !== null) {
+        // A plain key's host-wins restore was refused by quota. The local value
+        // stays in use. It is baselined like a kept local value on the cold
+        // hydrate. Unbaselined, the first flush would upload it over the host
+        // copy.
+        updates.set(key, local)
       }
-      // Dropped by quota: NOT baselined, or the first flush would read the
-      // missing key as a deletion and null out a good host backup.
+      // Dropped by quota with no local value: NOT baselined, or the first flush
+      // would read the missing key as a deletion and null out a good host
+      // backup.
     }
     // Commit baselines and roster in ONE verified write. Two separate writes
     // opened a real clobber: the baseline write could be dropped by quota while
@@ -1253,7 +1415,7 @@ function buildPatch(current: Map<string, string>): {
   // storage reset restores the stale host value over it (GPT 5.6 F1, :697).
   // The dirty marker is the only thing that can tell "the user chose the
   // default" from "a hook mounted the default", which the stored blob cannot.
-  const dirty = dirtyChildKeys()
+  const dirty = dirtyWireKeys()
   for (const wireKey of dirty) withheld.delete(wireKey)
   for (const [key, value] of current) {
     if (withheld.has(key)) continue
@@ -1362,11 +1524,9 @@ function commitSent(
   // with neither a fingerprint nor a marker and lose the edit on cold restore
   // (GPT 6.1 F1, :1408). Keep the marker so the next flush forces it up again.
   if (!merged) return
-  clearDirtyChildren(
-    [...sentKeys].filter(
-      (k) => !withheld.has(k) && current.has(k) && childField(k) !== null,
-    ),
-  )
+  const landedKeys = [...sentKeys].filter((k) => !withheld.has(k) && current.has(k))
+  clearDirtyChildren(landedKeys.filter((k) => childField(k) !== null))
+  clearPlainDirty(landedKeys)
 }
 
 /**
@@ -1408,6 +1568,7 @@ async function retryPerKey(patch: Record<string, string | null>): Promise<void> 
   // fingerprint-doc write must not strand the field marker-less (GPT 6.1 F1).
   if (!merged) return
   clearDirtyChildren([...landed.keys()].filter((k) => childField(k) !== null))
+  clearPlainDirty([...landed.entries()].filter(([, v]) => v !== null).map(([k]) => k))
 }
 
 /**
@@ -1435,18 +1596,19 @@ function restoreHostValues(
   // A child the user edited but never uploaded (dirty marker set, reconcile GET
   // failed) is kept over the stale host value here too -- hydrate must honour
   // the same un-uploaded-edit ownership the reconcile path does (GPT F1).
-  const dirty = dirtyChildKeys()
+  const dirty = dirtyWireKeys()
   const winningFields = new Map<string, unknown>()
   for (const [wireKey, raw] of Object.entries(hostValues)) {
     if (typeof raw !== 'string' || !isWireKey(wireKey)) continue
     const field = childField(wireKey)
     if (field === null) {
       // Plain key: restore the host string only when local is absent or holds
-      // an untrusted post-failure default.
+      // an untrusted post-failure default. A post-failure value the user saved
+      // explicitly (PLAIN_DIRTY_KEY) is owned, not a default.
       const local = readPreference(wireKey)
       if (local === raw) continue
-      if (local !== null && (owned === null || owned.has(wireKey))) continue
-      if (safeSetItem(wireKey, raw)) restored += 1
+      if (local !== null && (owned === null || owned.has(wireKey) || dirty.has(wireKey))) continue
+      if (writePreference(wireKey, raw)) restored += 1
       continue
     }
     // Composite field: decide local-vs-host per field, then stage it.
@@ -1805,8 +1967,10 @@ export async function adoptHostUiPrefsOnNextLoad(): Promise<boolean> {
   // markers (the un-uploaded-edit protection) are untouched. Best-effort -- a
   // failed clear does not void the adoption, it only risks keeping one local
   // edit, which is strictly better than the pre-fix state.
+  // The plain-key marks (PLAIN_DIRTY_KEY) are cleared for the same reason.
   try {
     localStorage.removeItem(COMPOSITE_DIRTY_KEY)
+    localStorage.removeItem(PLAIN_DIRTY_KEY)
   } catch {
     /* storage blocked: adoption still proceeds; a stale marker is the old risk */
   }

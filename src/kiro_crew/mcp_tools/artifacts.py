@@ -88,12 +88,31 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "kind": {
                         "type": "string",
-                        "enum": ["widget", "html", "markdown", "svg", "json", "text", "webapp"],
+                        "enum": [
+                            "widget",
+                            "html",
+                            "markdown",
+                            "svg",
+                            "json",
+                            "text",
+                            "webapp",
+                            "dashboard",
+                        ],
                         "description": (
                             "Artifact kind. Optional — inferred from the content "
                             "when omitted (HTML-ish body -> widget, markdown text "
                             "-> markdown). Pass explicitly to override; markdown "
-                            "documents should set kind='markdown'."
+                            "documents should set kind='markdown'. kind='dashboard' "
+                            "is a dynamic dashboard's LAYOUT PACKAGE: content is a "
+                            "JSON object carrying exactly these five keys -- kind "
+                            "(the string 'dashboard'), bound_to, model, view, theme "
+                            "-- and no values anywhere in it, because values stay in "
+                            "the crew log and reach the page through the fold. The "
+                            "store refuses anything else, naming the rule it broke. "
+                            "To put your own page LIVE, use the dashboard_save tool "
+                            "instead: it writes this package for you and makes it "
+                            "the page your Dashboard tab draws, as a version a "
+                            "rollback can undo."
                         ),
                     },
                     "source": {
@@ -191,7 +210,18 @@ def schemas() -> list[dict[str, Any]]:
                     "tags": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Replacement tag list (optional).",
+                        "description": (
+                            "Replacement tag list (optional). To remove every "
+                            "tag, pass clear_tags: true instead of an empty list."
+                        ),
+                    },
+                    "clear_tags": {
+                        "type": "boolean",
+                        "description": (
+                            "true removes every tag. Use it rather than tags: [], "
+                            "which some clients drop before it reaches the "
+                            "server. Refused beside a non-empty tags."
+                        ),
                     },
                     "webapp_metadata": {
                         "type": "object",
@@ -248,7 +278,16 @@ def schemas() -> list[dict[str, Any]]:
                     "tag": {"type": "string", "description": "Filter by tag."},
                     "kind": {
                         "type": "string",
-                        "enum": ["widget", "html", "markdown", "svg", "json", "text", "webapp"],
+                        "enum": [
+                            "widget",
+                            "html",
+                            "markdown",
+                            "svg",
+                            "json",
+                            "text",
+                            "webapp",
+                            "dashboard",
+                        ],
                         "description": "Filter by kind.",
                     },
                     "q": {
@@ -813,6 +852,13 @@ def artifact_get(name: str, args: dict[str, Any]) -> str:
 def artifact_update(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, ARTIFACT_UPDATE_SCHEMA)
     slug = args["slug"]
+    # ``clear_tags`` is not a field of the artifact: it is the spelling of
+    # ``tags: []`` that survives a client which drops an empty list before it
+    # reaches this server, so it becomes that list here and never reaches the route.
+    if args.pop("clear_tags", None) is True:
+        if args.get("tags"):
+            return "Error: clear_tags removes every tag; pass it without tags"
+        args["tags"] = []
     update_body = {k: v for k, v in args.items() if k != "slug" and v is not None}
     if not update_body:
         return "Error: nothing to update (provide content/name/description/tags)"
@@ -1185,6 +1231,16 @@ def deploy_artifact(name: str, args: dict[str, Any]) -> str:
         return "Error: provide exactly one of artifact_slug or local_dir"
     if not has_slug and not has_dir:
         return "Error: provide artifact_slug or local_dir"
+    if has_dir:
+        from kiro_crew.session_environment import session_runs_remotely
+
+        if session_runs_remotely(mcp_core._resolve_session_key()):
+            # local_dir names a directory on this machine, not the remote workspace.
+            return (
+                "Error: local_dir is not available in this session: it runs in a remote "
+                "workspace, and local_dir would deploy a directory on the gateway machine. "
+                "Deploy an artifact_slug instead."
+            )
     deploy_body: dict[str, Any] = {"site_id": args["site_id"]}
     if args.get("artifact_slug"):
         deploy_body["artifact_slug"] = args["artifact_slug"]

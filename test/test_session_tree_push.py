@@ -23,6 +23,7 @@ from kiro_crew.crew_log import session_tree_projection as stp
 from kiro_crew.crew_log.session_tree import EDGE_NAMED, EDGE_NONE, EdgeRecord, OpenedRecord
 from kiro_crew.dashboard.state import DashboardState, SlotOrigin
 from kiro_crew.dashboard.websocket_hub import SLOT_PATCH_WS_FLAG
+from kiro_crew.testing.wait import wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -206,6 +207,31 @@ def test_a_new_slot_on_a_reused_key_inherits_nothing():
     assert chat_runner._crew_log_inherited_parent(restored, "") == ""
 
 
+def test_a_restored_child_with_no_predecessor_inherits_from_the_spawn():
+    """A child restored after a restart that happened before its first turn has no
+    predecessor log, so the edge is read from the creator's trusted session/spawned
+    record. The forged-attribution fence still holds: the answer must match the
+    restored _created_by."""
+    from kiro_crew.dashboard import chat_runner
+
+    emit.on_session_opened("s-lead", agent="kirocrew-lead", slot="lead")
+    emit.on_session_spawned("s-lead", creator_slot="lead", child_slot="worker")
+    assert emit.flush(timeout=5.0) is True
+    stp.reset_for_tests()
+    emit.reset_caches()
+
+    restored = SimpleNamespace(key="worker", _created_by="lead")
+    asyncio.run(chat_runner._crew_log_seed_tree(restored))
+    # No predecessor (head_sid == ""); the spawn names the creator and it matches.
+    assert chat_runner._crew_log_inherited_parent(restored, "") == "lead"
+    # The fence: a forged _created_by the spawn does not name resolves to nothing.
+    forged = SimpleNamespace(key="worker", _created_by="someone-else")
+    assert chat_runner._crew_log_inherited_parent(forged, "") == ""
+    # A slot the spawn never named inherits nothing.
+    other = SimpleNamespace(key="stranger", _created_by="lead")
+    assert chat_runner._crew_log_inherited_parent(other, "") == ""
+
+
 def test_an_adopter_is_never_re_cited_as_the_creator():
     """A takeover moves the node; a restored slot then cites no creator at all."""
     proj = stp.projection()
@@ -238,7 +264,6 @@ def test_a_failed_seed_is_retried_without_a_reader(monkeypatch):
     a retry that queued on it would never run.
     """
     import threading
-    import time
 
     monkeypatch.setattr(stp, "SEED_RETRY_COOLDOWN_SECS", 0.05)
     proj = stp.SessionTreeProjection()
@@ -259,9 +284,7 @@ def test_a_failed_seed_is_retried_without_a_reader(monkeypatch):
         proj.ensure_seeded()
         assert proj.reading().incomplete
         assert done.wait(5)
-        deadline = time.monotonic() + 5
-        while len(heard) < 2 and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wait_until(lambda: len(heard) >= 2, describe=lambda: heard)
     finally:
         proj.cancel_pending_checkpoint()
 

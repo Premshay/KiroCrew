@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from kiro_crew.dashboard.chat_utils import run_config_write
+from kiro_crew.testing.wait import await_until
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
 
@@ -33,7 +34,24 @@ _CONFIG_WRITERS = (
 
 #: The native handler's owners under ``slack/handler_runtime/`` are composed into
 #: handler.py and hold its ``!agent`` / ``!channel`` writes, so they are scanned too.
-_SLACK_SOURCES = ("interactions.py", "handler.py", "events.py", "allowlist.py") + tuple(
+_SLACK_SOURCES = (
+    "interactions.py",
+    "interactions_approvals.py",
+    "interactions_context.py",
+    "interactions_modals.py",
+    "interactions_options.py",
+    "interactions_sessions.py",
+    "interactions_settings.py",
+    "handler.py",
+    "events.py",
+    "events_block_text.py",
+    "events_home_tab.py",
+    "events_inbound.py",
+    "events_queue.py",
+    "events_slash.py",
+    "events_voice.py",
+    "allowlist.py",
+) + tuple(
     f"handler_runtime/{path.name}"
     for path in sorted((SRC / "slack" / "handler_runtime").glob("[!_]*.py"))
 )
@@ -63,7 +81,7 @@ class TestRunConfigWrite:
             task = asyncio.create_task(_write())
             await asyncio.sleep(0.05)
             assert not ran.is_set(), "write started while a legacy writer held the lock"
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task, what="config write to complete")
         assert ran.is_set()
 
     @pytest.mark.asyncio

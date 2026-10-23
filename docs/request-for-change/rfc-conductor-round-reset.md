@@ -1,10 +1,10 @@
 ---
 title: Conductor round reset -- a conductor drops its chat context at a round close
-status: in-progress
+status: implemented
 author: iamwhatever, with kirocrew-worker
 created: 2026-10-08
-last-audited: 2026-10-08
-audited-at: 8c7417ea82
+last-audited: 2026-10-11
+audited-at: a84f616557
 doc-pr: null
 implementation-prs: [18113]
 tracking-issues: [18093]
@@ -14,7 +14,7 @@ superseded-by: []
 
 # RFC: Conductor round reset
 
-- Status: in-progress. The implementation is [#18113](https://github.com/kirodotdev/KiroCrew/pull/18113). The operator who owns the conductor patrol decided it on 2026-10-08. This document lands on its own first, as GOVERNANCE.md asks of an RFC, so the implementation's First Principles lane can read the decision off the base branch.
+- Status: implemented in [#18113](https://github.com/kirodotdev/KiroCrew/pull/18113). The operator who owns the conductor patrol decided it on 2026-10-08. This document lands on its own first, as GOVERNANCE.md asks of an RFC, so the implementation's First Principles lane can read the decision off the base branch.
 - Amends one rule on main, named in section 5: `reset_conversation` is no longer human-only in exactly one case.
 - Related: [rfc-conductor-work-ledger.md](rfc-conductor-work-ledger.md) (the item store a conductor resumes from) and [rfc-conductor-default-patrol.md](rfc-conductor-default-patrol.md) (the patrol loop whose wakes this applies to).
 - Measured at `8c7417ea82`.
@@ -76,7 +76,7 @@ Any failed check refuses with a reason, audited `denied`, and nothing is queued.
 
 This narrows a human-only gate in one place. `set_project` and `chat_tag` remain human-only.
 
-The checks keep honest callers out; they are not proof against a hostile conductor. The self-arm record lives under `trust/`, which agent file tools cannot reach, but `trust` is a VISIBLE leaf of the crew sandbox (`_CREW_SANDBOX_VISIBLE_LEAVES` in `src/kiro_crew/sandbox.py`) so in-sandbox code can append to the audit log. A shell the conductor runs could write the record, and the loop store is agent-writable too. That residual is pre-existing and is the same one the crew/member self-arm rule carries.
+The checks keep honest callers out; they are not proof against a hostile conductor. The self-arm record lives under `trust/`, which agent file tools cannot reach, but `trust` is a VISIBLE leaf of the crew sandbox (`_CREW_SANDBOX_VISIBLE_LEAVES` in `src/kiro_crew/sandbox_leaves.py`) so in-sandbox code can append to the audit log. A shell the conductor runs could write the record, and the loop store is agent-writable too. That residual is pre-existing and is the same one the crew/member self-arm rule carries.
 
 The case therefore rests on the harm, which is bounded:
 

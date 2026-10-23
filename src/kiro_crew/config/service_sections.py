@@ -38,6 +38,23 @@ class TaskRunnerConfig:
             "Empty = use the default per-run workspace directory.",
         ),
     )
+    test_command: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Test Command",
+            'Argument list run after each step, no shell (e.g. ["python", "-m", '
+            '"pytest", "-q"]). Exit 0 verifies the step. Empty = not configured.',
+            restart=True,
+        ),
+    )
+    require_verification: bool = field(
+        default=False,
+        metadata=_meta(
+            "Require Verification",
+            "Fail a step unless its test command exited 0; refuse a run with none to run.",
+            restart=True,
+        ),
+    )
 
 
 @dataclass
@@ -201,7 +218,7 @@ class HeartbeatConfig:
 
 @dataclass
 class WatchdogConfig:
-    """ACP per-session watchdog / liveness-oracle tuning (acp/session_handle.py).
+    """ACP per-session watchdog / liveness-oracle tuning (acp/session_handle_watchdog.py).
 
     Wellness (the liveness oracle) is the primary detector; these windows govern
     only the UNKNOWN-verdict backstop class. A WORKING verdict is never acted on
@@ -286,17 +303,20 @@ class WatchdogConfig:
             "Idle seconds before an MCP tool that looks blocked on its own remote "
             "call is cancelled and the turn routed to tool-stall recovery. The "
             "shape is a tool whose process tree shows no CPU or IO movement while "
-            "a process below kiro-cli holds an established TCP connection: a "
-            "remote call waiting on a peer that may never answer. The window is "
+            "the tool's own MCP server, or a process it started, holds an "
+            "established TCP connection: a remote call waiting on a peer that may "
+            "never answer. The server is recognized by the command the session "
+            "launched it with, so another server's persistent connection never "
+            "counts; a server that cannot be recognized exactly once (a launcher "
+            "that re-executes under a different command line, or a second copy "
+            "of it on the same runtime) keeps the full window. The window is "
             "measured from the last stream frame or the last probe that saw the "
             "tree move, whichever is later, so a slow stream that moves bytes now "
             "and then keeps the full tool_stall_suspect_secs window. Linux and "
             "macOS only; Windows has no socket view and keeps the full window. "
-            "Off (0) by default: the connection cannot yet be tied to the MCP "
-            "server serving the in-flight tool, so another server's persistent "
-            "connection could cut a quiet tool short. 900 is the suggested value "
-            "when opting in. Clamped against the transport's per-prompt timeout "
-            "like the other windows.",
+            "Off (0) by default; 900 is the suggested value when opting in. "
+            "Clamped against the transport's per-prompt timeout like the other "
+            "windows.",
         ),
     )
     wellness_sample_secs: float = field(

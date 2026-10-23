@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from kiro_crew.platform.context import current_context
 from kiro_crew.platform.defaults import DefaultProviderRegistry
 from kiro_crew.platform.interfaces import ACP_CLIENT_BINDING_KEYS
-
-logger = logging.getLogger(__name__)
 
 
 def runtime_client_binding(agent_name: str) -> dict[str, Any]:
@@ -18,20 +15,13 @@ def runtime_client_binding(agent_name: str) -> dict[str, Any]:
     The binding describes which engine serves an agent. Callers retain their
     own sandbox, work directory, MCP gateway, and audit settings.
     """
-    try:
-        providers = current_context().providers
-    except Exception:
-        return {}
+    providers = current_context().providers
     if isinstance(providers, DefaultProviderRegistry):
         return {}
     lookup = getattr(providers, "agent_client_binding", None)
     if not callable(lookup):
         return {}
-    try:
-        raw = lookup(agent_name)
-    except Exception:
-        logger.debug("AcpRuntime binding lookup failed for %s", agent_name, exc_info=True)
-        return {}
+    raw = lookup(agent_name)
     if not isinstance(raw, dict):
         return {}
 

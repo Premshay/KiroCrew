@@ -18,9 +18,11 @@ import { useImeGuard } from '../hooks/useImeGuard'
 import { recordEvent } from '../rum'
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
 import { fmtTimeNumeric } from '../i18n/format'
 import ErrorNotice from './ErrorNotice'
 import { orderByReview } from './appstore/registryOrder'
+import { registryRefreshFailureMessage, type RegistryRefreshResult } from './appstore/registryRefreshMessage'
 // ``trust`` selects the credential posture for cloning a registry's apps, and it
 // is meaningful only on a BUILD-PINNED row: the backend resolves the trusted tier
 // solely from what the build supplies, because ``config.json`` is agent-writable.
@@ -174,18 +176,14 @@ export default function RegistryManager({ bare = false }: { bare?: boolean } = {
 
   const refreshMutation = useMutation({
     mutationFn: (repo?: string) => api.refreshRegistries(repo),
-    onSuccess: (res: { lastSyncedAt?: string; ok?: boolean; failed?: string[] }) => {
+    onSuccess: (res: RegistryRefreshResult & { lastSyncedAt?: string }) => {
       queryClient.invalidateQueries({ queryKey: ['registry'] })
       queryClient.invalidateQueries({ queryKey: ['registries'] })
       if (res?.lastSyncedAt) setLastSyncedAt(res.lastSyncedAt)
       // Surface per-registry failures instead of reporting a blanket success:
       // a failed refetch keeps serving the prior (stale) listing rather than
       // dropping the registry's apps, so the user must know it didn't sync.
-      if (res?.ok === false && res.failed && res.failed.length > 0) {
-        setError(i18nT('components.registryManager.could_not_refresh_still_showing_last_synced', { names: res.failed.join(', ') }))
-      } else {
-        setError('')
-      }
+      setError(registryRefreshFailureMessage(res))
     },
     onError: (e: unknown) => setError(e instanceof Error ? e.message : i18nT('components.registryManager.failed_to_refresh_registries')),
   })
@@ -491,7 +489,7 @@ export default function RegistryManager({ bare = false }: { bare?: boolean } = {
         </div>
       ) : (
         <div className="mt-4 flex items-center gap-2">
-          <Btn onClick={() => setAdding(true)}>
+          <Btn onClick={() => setAdding(true)} {...uiLocation('apps.sources.add-registry')}>
             <Plus size={14} /> {i18nT('components.registryManager.add_registry')}
           </Btn>
           {registries.length > 0 || pinned.length > 0 ? (
