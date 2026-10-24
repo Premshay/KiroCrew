@@ -111,8 +111,10 @@ class TestResolveFenceShells:
         this keeps the helper safe to call standalone) still gets a directory,
         just without the guaranteed restore.
         """
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        tmp_path.chmod(0o755)
         d = tmp_path / "bin"
-        d.mkdir(parents=True)
+        d.mkdir()
         for name in names:
             p = d / name
             p.write_text("#!/bin/sh\n")

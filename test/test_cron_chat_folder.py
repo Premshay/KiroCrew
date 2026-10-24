@@ -73,11 +73,12 @@ def _make_state(folders=(FOLDER,), history_messages=None):
     state._slots = slots
     state._folders = [{"id": fid, "name": f"folder-{fid}"} for fid in folders]
 
-    def get_or_create_slot(name=None, agent="", origin=""):
+    def get_or_create_slot(name=None, agent="", origin="", workspace="default"):
         if name not in slots:
             slot = MagicMock()
             slot.key = name
             slot._origin = origin
+            slot.workspace = workspace
             slot.linked_session_key = ""
             slot.messages = []
             slot.title = ""
@@ -485,6 +486,7 @@ class TestFilingAtTheMint:
         filing has to ride on that call -- and delivery then finds the tab in place
         and writes nothing about its placement."""
         import kiro_crew.dashboard.chat_persistence as persistence
+        import kiro_crew.dashboard.cron_inject as cron_inject
         from kiro_crew.dashboard.cron_inject import ensure_cron_slot
 
         saved: list[str] = []
@@ -494,17 +496,24 @@ class TestFilingAtTheMint:
             return True
 
         monkeypatch.setattr(persistence, "save_slot_off_loop", _save)
+        monkeypatch.setattr(
+            cron_inject,
+            "cron_job_workspace",
+            lambda job: "research" if job.agent_id == "researcher" else "",
+        )
         state = _make_state()
-        job = _job(chat_folder_id=FOLDER)
+        job = _job(chat_folder_id=FOLDER, agent_id="researcher")
         await ensure_cron_slot(state, job)
         await asyncio.gather(*list(state._background_tasks))
         slot = state.get_slot("cron-job42")
         assert slot is not None and slot.folder_id == FOLDER
+        assert slot.workspace == "research"
         assert saved == ["cron-job42"]
 
         delivered = _deliver(state, job, "the brief", history=[])
         await asyncio.gather(*list(state._background_tasks))
         assert delivered is slot and slot.folder_id == FOLDER
+        assert slot.workspace == "research"
         assert saved == ["cron-job42"]
 
 

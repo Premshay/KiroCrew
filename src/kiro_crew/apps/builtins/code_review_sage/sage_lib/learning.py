@@ -557,7 +557,7 @@ def _read_preview_transaction(root: Path | None, namespace: str | None) -> dict 
         return None
     try:
         value = json.loads(store.read_text_nolink(path, _namespace_dir(namespace, root)) or "")
-    except (json.JSONDecodeError, OSError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         raise LearningRecordError("invalid consolidation apply journal") from exc
     if (
         not isinstance(value, dict)

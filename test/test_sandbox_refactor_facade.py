@@ -282,6 +282,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _last_unshare_failure unavailable_remedy unavailable_reason remedy_guidance
         _warm_thread _record_probe_failure _background_warm _kick_background_warm
         prewarm_backend warm_backend _probe_unshare userns_available _backend
+        nested_sandbox_passthrough
         unavailable_kind _warn_no_isolation detect_backend reset_backend wrap_argv
         """.split()),
     "kiro_crew.sandbox_cgroup": tuple("""
@@ -310,7 +311,8 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _USER_MANAGER_CGROUP_BASE _agents_slice_cgroup_dir _read_cgroup_counters
         read_cgroup_int _SLICE_THROTTLE_PROBE_SEEN _SLICE_THROTTLE_EDGE_AT
         _SLICE_THROTTLE_EDGE_HOLD_SECS agents_slice_throttling _SLICE_OOM_SEEN
-        check_agents_slice_pressure
+        check_agents_slice_pressure _SLICE_HIGH_OF_MAX_RATIO
+        _PYTEST_SCOPE_MEMORY_HIGH_MB _PYTEST_SCOPE_MEMORY_MAX_MB pytest_cgroup_scope_argv
         """.split()),
     "kiro_crew.sandbox_rlimit": tuple("""
         _UNSET _RESOURCE_PREEXEC resource_limit_preexec _EXTRACTOR_PREEXEC
@@ -1401,7 +1403,9 @@ _LAYERED: dict[str, frozenset[str]] = {
     "kiro_crew.sandbox_launcher_parts.mask_stages": frozenset(
         {"kiro_crew.sandbox_launcher_program"}
     ),
-    "kiro_crew.sandbox_launcher_parts.exec_lockdown": frozenset(),
+    "kiro_crew.sandbox_launcher_parts.exec_lockdown": frozenset(
+        {"kiro_crew.sandbox_launcher_program"}
+    ),
     "kiro_crew.sandbox_launcher": frozenset({"kiro_crew.sandbox_plan"}),
     "kiro_crew.sandbox_seatbelt": frozenset({"kiro_crew.sandbox_plan"}),
 }

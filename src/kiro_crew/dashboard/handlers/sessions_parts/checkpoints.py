@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 
 from aiohttp import web
@@ -31,7 +30,7 @@ async def api_session_checkpoint(request: web.Request) -> web.Response:
         )
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         return web.json_response(
@@ -100,7 +99,7 @@ async def api_session_restart_continuation(request: web.Request) -> web.Response
         )
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         return web.json_response(

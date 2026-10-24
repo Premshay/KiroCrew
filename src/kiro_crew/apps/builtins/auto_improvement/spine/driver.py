@@ -924,7 +924,7 @@ class Driver:
 
     # ── bug-track keep/draft (M4; 05_improvement_loop_bugfix.md §4) ───────────
 
-    def _apply_bug_winner(self, cycle: int, winner: Proposal, bug_res: BugGateResult):
+    def _apply_bug_winner(self, cycle: int, winner: Proposal, bug_res: BugGateResult) -> None:
         if self._publishing_is_halted():
             return None
         head = _git(["rev-parse", "HEAD"], self.clone)

@@ -678,24 +678,11 @@ class TestConservativeShutdown:
             _shared_provider=AsyncMock(),
         )
 
-        mgr = SubagentManager.__new__(SubagentManager)
+        mgr = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
         mgr._agents = {"agent-001": info}
-        mgr._tasks = {}
-        mgr._report_tasks = set()
-        mgr._report_owners = {}
-        # The reap coalesces concurrent stops through this per-run map.
-        mgr._reaps_in_flight = {}
-        # Fork adaptation: _force_reap pumps the spawn queue after freeing a
-        # slot (a1933a4b, ported earlier in this branch); an empty queue makes
-        # _drain_queue return immediately without touching other attrs.
-        mgr._queue = []
         mgr._running_count = 1
-        mgr._default_timeout = 300
-        mgr._default_turn_limit = 100
         mgr._write_tombstone = MagicMock()
         mgr._record_cost = MagicMock()
-        mgr._on_event = None
-        mgr._on_done = None
 
         async def noop_fire(*a, **kw):
             pass
@@ -746,22 +733,11 @@ class TestConservativeShutdown:
             _shared_provider=AsyncMock(),
         )
 
-        mgr = SubagentManager.__new__(SubagentManager)
+        mgr = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
         mgr._agents = {"agent-001": info_a, "agent-002": info_b}
-        mgr._tasks = {}
-        mgr._report_tasks = set()
-        mgr._report_owners = {}
-        # The reap coalesces concurrent stops through this per-run map.
-        mgr._reaps_in_flight = {}
-        # Fork adaptation: see test_session_sharing_never_kills_runtime.
-        mgr._queue = []
         mgr._running_count = 2
-        mgr._default_timeout = 300
-        mgr._default_turn_limit = 100
         mgr._write_tombstone = MagicMock()
         mgr._record_cost = MagicMock()
-        mgr._on_event = None
-        mgr._on_done = None
 
         async def noop_fire(*a, **kw):
             pass

@@ -21,6 +21,8 @@ import json
 import sys
 from types import ModuleType
 
+from kiro_crew._facade_mirror import INDEX_ATTRIBUTE, MirroredModule, MirrorIndex
+
 #: Value written onto the freshly imported owner, then looked for through the mirror.
 SENTINEL = "kiro-crew-fresh-owner-sentinel"
 
@@ -45,9 +47,17 @@ def one_reexported_pair(module: ModuleType) -> tuple[str, str] | None:
     """
     root = module.__name__.split(".")[0]
     parent = module.__name__.rpartition(".")[0]
+    index = vars(module).get(INDEX_ATTRIBUTE)
+    tables = list(vars(module).items())
+    if (
+        type(module) is MirroredModule
+        and isinstance(index, MirrorIndex)
+        and index.facade == module.__name__
+    ):
+        tables.insert(0, ("_shared_served", index.served))
     # Snapshotted: importing a candidate below binds that submodule onto its parent,
     # which mutates this very namespace while it is being read.
-    for attribute, table in list(vars(module).items()):
+    for attribute, table in tables:
         if attribute.startswith("__") or not isinstance(table, dict):
             continue
         for key in sorted(k for k in table if isinstance(k, str) and not k.startswith("__")):
@@ -76,13 +86,39 @@ def one_reexported_pair(module: ModuleType) -> tuple[str, str] | None:
     return None
 
 
+def one_bound_pair(module: ModuleType) -> tuple[str, str] | None:
+    """A bound name the canonical mirror indexes for writes to loaded owners.
+
+    Bound facade globals follow the shared helper's family-purge contract.
+    They are not dynamic exports; a write must still resolve the current owner.
+    """
+    index = vars(module).get(INDEX_ATTRIBUTE)
+    if (
+        type(module) is not MirroredModule
+        or not isinstance(index, MirrorIndex)
+        or index.facade != module.__name__
+    ):
+        return None
+    for name, owners in sorted(index.holders.items()):
+        held = vars(module).get(name, _ABSENT)
+        if held is _ABSENT or isinstance(held, ModuleType):
+            continue
+        if type(held).__module__ == "__future__":
+            continue
+        for owner_name in owners:
+            owner = sys.modules.get(owner_name)
+            if owner is not None and vars(owner).get(name, _ABSENT) is held:
+                return name, owner_name
+    return None
+
+
 def probe(name: str) -> dict[str, object]:
     """Purge one module's owner, import it again, and report what the mirror sees.
 
-    The verdict has two parts, keyed to the two ways a second storage location
-    shows itself: ``read_resolves`` is whether a read through the mirror answers
-    from the owner ``sys.modules`` now holds, and ``retained`` names any mapping
-    still holding the discarded module.
+    Dynamic exports measure ``read_resolves`` against the fresh owner. A bound
+    name in a canonical ``MirrorIndex`` measures ``write_resolves`` and requires
+    the discarded owner to remain unchanged, matching the shared helper's
+    family-purge contract. Both modes report any ``retained`` owner-module map.
 
     A module this probe cannot measure -- one that does not import, or whose table
     spelling the discovery rule does not recognise -- reports ``unmeasurable`` and
@@ -97,9 +133,14 @@ def probe(name: str) -> dict[str, object]:
         return result
 
     pair = one_reexported_pair(module)
+    contract = "read"
     if pair is None:
-        result["unmeasurable"] = "no re-exported attribute discovered"
+        pair = one_bound_pair(module)
+        contract = "write"
+    if pair is None:
+        result["unmeasurable"] = "no dynamic export or canonical indexed binding discovered"
         return result
+    result["access_contract"] = contract
     attribute, owner_name = pair
     result["attribute"] = attribute
     result["owner"] = owner_name
@@ -107,16 +148,28 @@ def probe(name: str) -> dict[str, object]:
     purged = sys.modules.pop(owner_name)
     fresh = importlib.import_module(owner_name)
     result["reimport_is_new"] = fresh is not purged
-    setattr(fresh, attribute, SENTINEL)
-
-    try:
-        read = getattr(module, attribute)
-    except Exception as exc:
-        result["read_resolves"] = False
-        result["read"] = f"raised {type(exc).__name__}"
+    if contract == "read":
+        setattr(fresh, attribute, SENTINEL)
+        try:
+            read = getattr(module, attribute)
+        except Exception as exc:
+            result["read_resolves"] = False
+            result["read"] = f"raised {type(exc).__name__}"
+        else:
+            result["read_resolves"] = read == SENTINEL
+            result["read"] = (
+                SENTINEL if read == SENTINEL else f"{type(read).__name__} from elsewhere"
+            )
     else:
-        result["read_resolves"] = read == SENTINEL
-        result["read"] = SENTINEL if read == SENTINEL else f"{type(read).__name__} from elsewhere"
+        before = getattr(purged, attribute, _ABSENT)
+        try:
+            setattr(module, attribute, SENTINEL)
+        except Exception as exc:
+            result["write_resolves"] = False
+            result["write"] = f"raised {type(exc).__name__}"
+        else:
+            result["write_resolves"] = getattr(fresh, attribute, _ABSENT) == SENTINEL
+        result["purged_unchanged"] = getattr(purged, attribute, _ABSENT) is before
 
     result["retained"] = sorted(
         attr

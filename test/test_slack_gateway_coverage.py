@@ -652,10 +652,12 @@ class TestFireSlackNudgeGuards:
         service.mark_monitor_turn_accepted.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("trusted", [True, False], ids=["attested", "untrusted"])
     async def test_structured_turn_applies_monitor_stop_directive(
         self,
         tmp_path,
         monkeypatch,
+        trusted,
     ):
         """A genuine Slack tool result must stop its owning monitor before completion."""
         orch = _slack_nudge_orchestrator()
@@ -680,6 +682,7 @@ class TestFireSlackNudgeGuards:
                     title="monitor_stop",
                     tool_name="monitor_stop",
                     mcp_server_name=session_directive.CORE_MCP_SERVER,
+                    mcp_identity_trusted=trusted,
                 )
                 yield AcpEvent(
                     kind=EVENT_TOOL_RESULT,
@@ -708,8 +711,12 @@ class TestFireSlackNudgeGuards:
 
         assert result is monitor_models.MonitorDispatchResult.DISPATCHED
         assert loop.monitor is not None
-        assert loop.monitor.outcome is MonitorOutcome.USER_STOP
-        assert not loop.active
+        if trusted:
+            assert loop.monitor.outcome is MonitorOutcome.USER_STOP
+            assert not loop.active
+        else:
+            assert loop.monitor.outcome is None
+            assert loop.active
 
     @pytest.mark.asyncio
     async def test_unroutable_session_retires_loop(self):

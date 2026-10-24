@@ -342,7 +342,7 @@ def test_goose_gets_its_own_mcp_array_at_both_session_call_sites() -> None:
         splices += sum(
             1
             for node in ast.walk(tree)
-            if isinstance(node, ast.Attribute) and node.attr == "_session_mcp_servers"
+            if isinstance(node, ast.Attribute) and node.attr == "_bound_session_mcp_servers"
         )
     assert splices == 3, (
         "goose is in ACP_BACKENDS_SESSION_MCP_ARRAY, so its array must be spliced into "

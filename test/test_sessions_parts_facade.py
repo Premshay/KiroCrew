@@ -11,7 +11,7 @@ These tests pin what is particular to this one: every name the test trees patch 
 reaches every module holding it; the owners are exactly the ``sessions_parts`` modules, each
 importing only the owners before it; the family logs through one logger named for the
 facade; an exception class an owner defines still reports the facade's module; every
-``api_session*`` route is wrapped as an owner surface exactly once, apart from the three
+``api_session*`` route is wrapped as an owner surface exactly once, apart from the routes
 that scope their own caller; and every project name the mirror serves from an owner's
 import is named for type checkers in the facade.
 """
@@ -61,7 +61,13 @@ _KNOWN_SEAMS = frozenset(
 
 #: The routes that verify and scope their own caller, left unwrapped by every guard.
 _MEMBER_SCOPED = frozenset(
-    {"api_session_directive", "api_session_keepalive", "api_session_tool_policy"}
+    {
+        "api_session_checkpoint",
+        "api_session_directive",
+        "api_session_keepalive",
+        "api_session_restart_continuation",
+        "api_session_tool_policy",
+    }
 )
 
 
@@ -215,9 +221,9 @@ def _routes() -> dict[str, object]:
 
 def test_every_api_session_route_is_an_owner_surface_exactly_once() -> None:
     """The one module wrapped every ``api_session*`` coroutine in its namespace with
-    ``guard_owner_surface_routes`` at its bottom, leaving out the three that verify and
+    ``guard_owner_surface_routes`` at its bottom, leaving out the routes that verify and
     scope their own caller. Each owner now wraps its own, so a route is wrapped once,
-    the three stay bare, and the object every holder binds is the one callers reach."""
+    scoped routes stay bare, and every holder binds the object callers reach."""
     routes = _routes()
     assert len(routes) >= 18, sorted(routes)
     bare = sorted(n for n, r in routes.items() if not hasattr(r, "__wrapped__"))

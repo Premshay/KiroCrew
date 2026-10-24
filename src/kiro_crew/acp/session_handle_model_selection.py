@@ -56,6 +56,7 @@ from kiro_crew.acp.types import (
     METHOD_SET_MODE,
     METHOD_SET_MODEL,
     MODEL_CONFIG_ID,
+    effort_config_option_id,
 )
 from kiro_crew.agent_sdk.drivers.acp import EntitlementRevalidating
 from kiro_crew.platform.context import redact_log_via_context
@@ -563,7 +564,11 @@ def supports_config_option(self: AcpSessionHandle, config_id: str) -> bool:
 
 def get_valid_effort_levels(self: AcpSessionHandle) -> list[str]:
     """Return the session's advertised effort choices in wire order."""
-    return acp_config_option_values(self._config_options, *ACP_EFFORT_CONFIG_IDS)
+    return acp_config_option_values(
+        self._config_options,
+        effort_config_option_id(self._runtime.acp_backend),
+        *ACP_EFFORT_CONFIG_IDS,
+    )
 
 
 def _crew_agent_name(self: AcpSessionHandle, name: str) -> str:

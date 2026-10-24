@@ -42,6 +42,7 @@ import pytest
 
 from kiro_crew import platform_compat
 from kiro_crew.dashboard.handlers import updates
+from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.slack import gateway as slack_gateway
 
 
@@ -75,8 +76,14 @@ def _executable(tmp_path, name: str = "shim") -> str:
 def _state():
     return SimpleNamespace(
         _gateway_restart_in_progress=False,
+        _slots={},
+        restart_barrier=RestartBarrier(),
+        broadcast_ws=Mock(),
+        broadcast_ws_owners=Mock(),
         push_update_progress=Mock(),
-        sessions=SimpleNamespace(close_all=AsyncMock()),
+        sessions=SimpleNamespace(
+            close_all=AsyncMock(), restart_barrier_snapshot=AsyncMock(return_value=[])
+        ),
     )
 
 
@@ -107,12 +114,9 @@ class TestTheDashboardRefusesBeforeDraining:
         monkeypatch.setattr(os, "execv", execv)
         state = _state()
 
-        assert (
-            await updates._restart_gateway(
-                state, resolver=lambda: str(tmp_path / "pruned" / "python")
-            )
-            is False
-        )
+        assert await updates._restart_gateway(
+            state, resolver=lambda: str(tmp_path / "pruned" / "python")
+        ) == updates.GatewayRestartResult(restarted=False)
 
         execv.assert_not_called()
         state.sessions.close_all.assert_not_awaited()
@@ -154,7 +158,9 @@ class TestTheDashboardRefusesBeforeDraining:
         monkeypatch.setattr(os, "execv", Mock())
         state = _state()
 
-        assert await updates._restart_gateway(state, resolver=lambda: str(dud)) is False
+        assert await updates._restart_gateway(
+            state, resolver=lambda: str(dud)
+        ) == updates.GatewayRestartResult(restarted=False)
         state.sessions.close_all.assert_not_awaited()
 
 
@@ -351,7 +357,9 @@ class TestAKernelRefusalPastTheDrainExits:
         codes = _capture_exit(monkeypatch)
         state = _state()
 
-        assert await updates._restart_gateway(state, resolver=lambda: exe) is True
+        assert await updates._restart_gateway(
+            state, resolver=lambda: exe
+        ) == updates.GatewayRestartResult(restarted=True)
         assert codes == []
 
 
@@ -517,12 +525,9 @@ class TestTheseChecksDoNotBlockTheEventLoop:
         monkeypatch.setattr(os, "execv", Mock())
         state = _state()
 
-        assert (
-            await updates._restart_gateway(
-                state, resolver=lambda: str(tmp_path / "pruned" / "python")
-            )
-            is False
-        )
+        assert await updates._restart_gateway(
+            state, resolver=lambda: str(tmp_path / "pruned" / "python")
+        ) == updates.GatewayRestartResult(restarted=False)
 
         assert probe_threads, "the dashboard guard never consulted the probe"
         assert loop_thread not in probe_threads

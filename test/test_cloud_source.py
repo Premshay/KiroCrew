@@ -12,6 +12,7 @@ import tarfile
 from pathlib import Path
 
 import pytest
+from cloud_source_helpers import source_account_home  # noqa: F401
 
 from kiro_crew.cloud import aws, source
 
@@ -38,6 +39,7 @@ class TestRepoRoot:
             source.repo_root()
 
 
+@pytest.mark.usefixtures("source_account_home")
 class TestBuildTarball:
     @pytest.fixture(autouse=True)
     def _fake_tracked(self, monkeypatch):
@@ -323,6 +325,7 @@ class TestBuildTarball:
         assert source.build_source_tarball(tmp_path).path == sentinel
 
 
+@pytest.mark.usefixtures("source_account_home")
 class TestSourceChecksumPin:
     """The digest ``upload_source`` hands to S3 as ``--checksum-sha256``.
 

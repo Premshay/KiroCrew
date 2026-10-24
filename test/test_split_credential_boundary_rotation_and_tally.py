@@ -249,7 +249,7 @@ class TestDiscordRotatesWithoutHandingOverAKey:
         """A new send is a new seam, and silence is not one of its options."""
         tree = _discord_renderer_tree()
         sends = {"send_message", "send_message_with_files"}
-        answered = {"_stream_live", "_seal_current", "_land_sealed", "_flush_thinking"}
+        answered = {"_stream_live", "_seal_current", "_land_sealed", "_flush_thinking", "on_notice"}
         stack: list[tuple[ast.AST, str]] = [(tree, "")]
         senders: set[str] = set()
         while stack:

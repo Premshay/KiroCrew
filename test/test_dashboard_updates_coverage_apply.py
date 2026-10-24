@@ -491,7 +491,7 @@ class TestApplyRefusals:
 
         async def _restart(_state, *, resolver=None):
             open_at_restart.append(list(update_ownership._live))
-            return True
+            return updates.GatewayRestartResult(restarted=True)
 
         monkeypatch.setattr(updates, "_build_frontend", AsyncMock())
         monkeypatch.setattr(updates, "_venv_pip_install", AsyncMock(return_value=True))
@@ -532,7 +532,11 @@ class TestApplyRefusals:
         update_ownership.refuse_restart("an earlier install did not complete")
         monkeypatch.setattr(updates, "_build_frontend", AsyncMock())
         monkeypatch.setattr(updates, "_venv_pip_install", AsyncMock(return_value=True))
-        monkeypatch.setattr(updates, "_restart_gateway", AsyncMock(return_value=False))
+        monkeypatch.setattr(
+            updates,
+            "_restart_gateway",
+            AsyncMock(return_value=updates.GatewayRestartResult(restarted=False)),
+        )
 
         await self._drive_worker(monkeypatch, tmp_path, [_FakeProc()])
 

@@ -281,8 +281,10 @@ class TestTurnCompleteLabelling:
             if isinstance(part, ast.Name)
             or (isinstance(part, ast.Attribute) and getattr(part.value, "id", None) == "turn")
         ] == ["_directive_self_wake", "_turn_landed"]
-        assert isinstance(facts["reply_flushed"], ast.Name)
-        assert facts["reply_flushed"].id == "_turn_flushed_visible_text"
+        assert isinstance(facts["reply_flushed"], ast.Attribute)
+        assert isinstance(facts["reply_flushed"].value, ast.Name)
+        assert facts["reply_flushed"].value.id == "turn"
+        assert facts["reply_flushed"].attr == "_turn_flushed_visible_text"
         calls = [
             node
             for node in ast.walk(tree)

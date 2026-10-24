@@ -207,7 +207,7 @@ describe('ChatInput project chip on a phone-width shelf', () => {
     renderWithProviders(<ChatInput {...defaultProps} projectBranch="feat/example" />)
     expect(branchBtn()).toHaveTextContent('feat/example')
     // The folder name is what sheds, and its separator goes with it.
-    expect(chip()).not.toHaveTextContent('KiroCrew')
+    expect(chip()).not.toHaveTextContent('KiroCrew') // brand-ok: literal checkout folder basename
     expect(chip().textContent).not.toContain('·')
   })
 

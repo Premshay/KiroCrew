@@ -496,6 +496,7 @@ async def test_authenticated_http_publication_admits_runner(
         (queue / f"{fp}.{suffix}").write_text(content, encoding="utf-8")
     path = f"/api/apps/auto-improvement/{manual}/{{fp}}"
     app = web.Application(middlewares=[token_auth.token_auth_middleware()])
+    app["state"] = SimpleNamespace(owner_id="publication-tester")
     app.router.add_post(
         path, routes._handle_draft_pr if manual == "draft" else routes._handle_commit
     )

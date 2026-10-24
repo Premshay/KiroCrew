@@ -590,6 +590,7 @@ def schemas() -> list[dict[str, Any]]:
 #: a backend module that drags that app's whole import graph into this server
 #: process. ``test_mcp_apps_tool_gate`` pins every entry to the real constant.
 TOOL_APPS: dict[str, str] = {
+    "code_review_sage_api": "code-review-sage",
     "issue_radar_record_investigation": "issue-radar",
     "issue_radar_crew_read": "issue-radar",
     "issue_radar_crew_record": "issue-radar",
@@ -744,7 +745,7 @@ def code_review_sage_api(name: str, args: dict[str, Any]) -> str:
         else mcp_core._post(_crs_url, _crs_body)
     )
     # Redact BEFORE truncating: slicing first can cut a credential in half at the
-    # cap, leaving a fragment the redaction pattern no longer matches.
+    # cap, leaving a fragment outside the redaction pattern's matches.
     _crs_text = redact(json.dumps(_crs_resp, ensure_ascii=False, default=str))
     _crs_cap = 60_000
     if len(_crs_text) > _crs_cap:

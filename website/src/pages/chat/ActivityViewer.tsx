@@ -1128,7 +1128,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
       setShowAllSubagents(true)
     }
   }, [selectedSubagentId, visibleIds, ids])
-  // Provider-native cards are terminal display records, not KiroCrew runs;
+  // Provider-native cards are terminal display records, not Kiro Crew runs;
   // dismissing them must never issue a control request to their provider.
   const terminalIds = useMemo(
     () => ids.filter(id => (

@@ -1303,7 +1303,7 @@ async def test_operator_auto_opt_out_preserves_manual_consolidation(tmp_path, mo
     assert not c._tasks
     assert not c._running
     llm.assert_not_awaited()
-    outcome = await asyncio.wait_for(c.consolidate_now(KEY), 10)
+    outcome = await finished(c.consolidate_now(KEY), "c.consolidate_now(KEY)")
     assert outcome.completed and outcome.complete
     assert log.unconsolidated_count(KEY) == 0
     llm.assert_awaited_once()
@@ -1351,7 +1351,7 @@ async def _commit_chunk_without_acknowledgement(log, c):
         patch.object(log, "mark_consolidated", side_effect=OSError("offset write failed")),
     ):
         with pytest.raises(OSError, match="offset write failed"):
-            await asyncio.wait_for(c._consolidate(KEY), 10)
+            await finished(c._consolidate(KEY), "c._consolidate(KEY)")
     llm.assert_awaited_once()
     assert log.consolidation_retry_state(KEY)[0] == 1
     assert log.unconsolidated_count(KEY) == 5
@@ -1369,7 +1369,7 @@ async def test_member_chunk_receipt_recovers_without_rebilling_or_skipping_tail(
     history_before = vectors.read_editable_history()
     c = _make_consolidator(log, vector_store=vectors)
     with patch.object(c, "_call_llm", AsyncMock()) as llm:
-        recovered = await asyncio.wait_for(c._consolidate(KEY), 10)
+        recovered = await finished(c._consolidate(KEY), "c._consolidate(KEY)")
     llm.assert_not_awaited()
     assert recovered == ConsolidationOutcome(
         "consolidated", old_offset=0, new_offset=2, complete=False
@@ -1380,8 +1380,8 @@ async def test_member_chunk_receipt_recovers_without_rebilling_or_skipping_tail(
     with patch.object(
         c, "_call_llm", AsyncMock(return_value={"history_entry": "next chunk"})
     ) as llm:
-        second = await asyncio.wait_for(c._consolidate(KEY), 10)
-        final = await asyncio.wait_for(c._consolidate(KEY), 10)
+        second = await finished(c._consolidate(KEY), "c._consolidate(KEY)")
+        final = await finished(c._consolidate(KEY), "c._consolidate(KEY)")
     assert llm.await_count == 2
     assert second == ConsolidationOutcome(
         "consolidated", old_offset=2, new_offset=4, complete=False
@@ -1404,7 +1404,7 @@ async def test_member_receipt_cannot_acknowledge_an_unprocessed_tail(member_rece
         patch.object(c, "_call_llm", AsyncMock()) as llm,
     ):
         with pytest.raises(ValueError, match="source changed"):
-            await asyncio.wait_for(c._consolidate(KEY), 10)
+            await finished(c._consolidate(KEY), "c._consolidate(KEY)")
     llm.assert_not_awaited()
     assert log.unconsolidated_count(KEY) == 5
     assert log.consolidation_retry_state(KEY)[0] == 1
@@ -1429,7 +1429,7 @@ async def test_member_receipt_reports_rejected_acknowledgement(member_receipt_ca
         patch.object(log, "mark_consolidated", rewrite_before_acknowledgement),
         patch.object(c, "_call_llm", AsyncMock()) as llm,
     ):
-        outcome = await asyncio.wait_for(c._consolidate(KEY), 10)
+        outcome = await finished(c._consolidate(KEY), "c._consolidate(KEY)")
     llm.assert_not_awaited()
     assert outcome.status == "skipped"
     assert not outcome.completed and not outcome.complete

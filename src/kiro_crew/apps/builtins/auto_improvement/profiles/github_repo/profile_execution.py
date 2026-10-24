@@ -198,6 +198,7 @@ def _run(
             cwd=root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=timeout,
             shell=False,
             env=scrubbed_env,

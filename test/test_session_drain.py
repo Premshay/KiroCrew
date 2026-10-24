@@ -17,6 +17,7 @@ import pytest
 
 import kiro_crew.session as session_mod
 from kiro_crew.config import KiroCrewConfig
+from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.session import (
     SessionClosingError,
     SessionManager,
@@ -33,7 +34,7 @@ def cfg():
     return c
 
 
-class _FakeProvider:
+class _FakeProvider(AcpProvider):
     """Minimal LLMProvider stand-in with controllable turn/cancel behavior."""
 
     def __init__(
@@ -44,6 +45,7 @@ class _FakeProvider:
         unfinished: bool | None = None,
         cancel_returns: str | None = None,
     ) -> None:
+        super().__init__(work_dir="/tmp")
         # cancel_mode: "ack" -> resolves quickly; "block" -> blocks until cancelled.
         self._active = active
         # has_unfinished_turn is INDEPENDENT of cancel state; default it to

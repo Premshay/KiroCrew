@@ -125,7 +125,7 @@ def _require_enabled(handler: Callable[..., Any]) -> Callable[..., Any]:
 async def _json_body(request: web.Request) -> dict[str, Any] | None:
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return None
     return body if isinstance(body, dict) else None
 

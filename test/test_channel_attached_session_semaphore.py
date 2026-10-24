@@ -17,6 +17,7 @@ import pytest
 from kiro_crew.channel import Channel, ChannelAgent, run_channel_agent
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.session import SessionManager
+from kiro_crew.testing.wait import finished
 
 
 def _attached_channel() -> tuple[Channel, ChannelAgent]:
@@ -62,11 +63,14 @@ async def test_dashboard_turn_is_not_blocked_by_the_channel_worker():
     channel, agent = _attached_channel()
 
     worker = asyncio.create_task(run_channel_agent(agent, channel, sessions))
-    await asyncio.sleep(0.05)
+    await finished(worker, "attached channel worker returns without claiming the session")
     try:
         # Stands in for the slot's next dashboard turn. Before the guard, the
         # worker held this key's semaphore and this wait never returned.
-        await asyncio.wait_for(sessions.get_or_create("dashboard:chat-1925"), timeout=2)
+        await finished(
+            sessions.get_or_create("dashboard:chat-1925"),
+            'sessions.get_or_create("dashboard:chat-1925")',
+        )
     finally:
         sessions.release("dashboard:chat-1925")
         worker.cancel()

@@ -1228,7 +1228,18 @@ class DiscordRenderer(Renderer):
             raise
 
     async def on_notice(self, text: str) -> None:
-        await self._client.send_message(self._channel_id, text)
+        body = await asyncio.to_thread(_redact_transformed, text)
+        body = self._seam_against(self._pending_note_tail or self._sent_tail, body)
+        posted = await self._client.send_message(self._channel_id, body)
+        if posted is None:
+            return
+        self._tally_redactions(body)
+        if self._stream_mid is None:
+            self._record_sent(body)
+            self._pending_note_tail = ""
+        else:
+            # Edits still land above this notice; a fresh fallback lands below it.
+            self._pending_note_tail = body
 
     async def on_compaction(self, context_usage_pct: float) -> None:
         try:

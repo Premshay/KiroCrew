@@ -35,7 +35,7 @@ server's tools, and their outcomes into one series.
   volume and per-route failures for these twenty paths are readable there
   today. What no instrument carries is WHO called: that histogram has no
   caller-identity label, and adding one would multiply every route in the
-  gateway's bounded template set by sixteen rather than only these twenty.
+  gateway's bounded template set by eighteen rather than only these twenty.
   ``op`` and ``outcome`` are kept here as the dimensions ``caller`` is crossed
   with -- "which verbs does a conductor drive, and which of them fail for it" is
   one question, not three -- and not as a second way to count a request.
@@ -43,9 +43,9 @@ server's tools, and their outcomes into one series.
   answered with (:func:`outcome_for_status`), or ``error`` for a handler that
   raised.
 
-At most 19 x 16 x 2 = 608 series: nineteen ``op`` values (the eighteen named
+At most 19 x 18 x 2 = 684 series: nineteen ``op`` values (the eighteen named
 verbs plus ``other``, which the registered ``revive`` and ``history`` routes
-reach), sixteen ``caller`` values and two outcomes. A backend that should not
+reach), eighteen ``caller`` values and two outcomes. A backend that should not
 carry all of them can drop ``outcome`` from its dimensions.
 
 **One count per completed call.** The emit site is a wrapper around each route

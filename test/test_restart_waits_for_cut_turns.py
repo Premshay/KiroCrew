@@ -23,6 +23,7 @@ import pytest
 from kiro_crew import platform_compat
 from kiro_crew.dashboard import chat as dashboard_chat
 from kiro_crew.dashboard.handlers import updates
+from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.slack import events
 from kiro_crew.slack import gateway as slack_gateway
 from kiro_crew.slack.gateway import GatewayOrchestrator
@@ -58,10 +59,15 @@ class _Restart:
         self.order: list[str] = []
         self.turn = _CutTurn(self.order)
         self.state = SimpleNamespace(
-            _slots={"s1": SimpleNamespace(task=self.turn)},
+            _slots={"s1": SimpleNamespace(key="s1", task=self.turn)},
+            restart_barrier=RestartBarrier(),
+            broadcast_ws=Mock(),
+            broadcast_ws_owners=Mock(),
             _gateway_restart_in_progress=False,
             push_update_progress=Mock(),
-            sessions=SimpleNamespace(close_all=self.close_all),
+            sessions=SimpleNamespace(
+                close_all=self.close_all, restart_barrier_snapshot=AsyncMock(return_value=[])
+            ),
         )
 
     async def close_all(self, *_args, **_kwargs) -> None:

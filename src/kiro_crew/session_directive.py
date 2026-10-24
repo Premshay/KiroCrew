@@ -28,7 +28,7 @@ the subagent's session — never its parent's. There is no walk to get wrong.
 FORGERY: the marker payload is model-visible (it comes back as the tool result
 text), so a model *could* emit the literal bytes. The consumer defends by
 honouring a directive ONLY when the tool call it arrived under was recorded — by
-KiroCrew observing the tool CALL — as an MCP-served call whose adapter-owned
+Kiro Crew observing the tool CALL — as an MCP-served call whose adapter-owned
 canonical identity (Kiro's ``_meta.kiro``, Claude's ``_meta.claudeCode``, or
 Codex's structured MCP frame) is one of :data:`DIRECTIVE_TOOLS`. That identity
 never comes from the ``title``

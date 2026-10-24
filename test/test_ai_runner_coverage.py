@@ -1066,6 +1066,14 @@ class TestCalibrate:
 
     def _arrange(self, monkeypatch: pytest.MonkeyPatch, profile: Any) -> None:
         monkeypatch.setattr(profiles_mod, "build_profile", lambda cfg: profile)
+        monkeypatch.setattr(
+            store,
+            "measurement_provenance",
+            lambda config: {
+                "sourceRevision": "calibration-fixture",
+                "execution": {"kind": "gateway"},
+            },
+        )
 
     def test_a_clearing_canary_writes_a_calibrated_ruler(
         self, sup: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

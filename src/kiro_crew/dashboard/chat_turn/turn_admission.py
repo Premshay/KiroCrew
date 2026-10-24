@@ -1027,8 +1027,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
                 "SEL denial audit failed for an app-owned agent turn -- refusal stands",
                 exc_info=True,
             )
-        needs_session_reset = True
-        turn.needs_session_reset = needs_session_reset
+        turn.needs_session_reset = True
         slot.append("error", refusal, "msg msg-err", meta={"kind": APP_AGENT_REFUSED_KIND})
         return _Flow.END
     # This turn holds the session now: the launch copy's skills and prompt are read

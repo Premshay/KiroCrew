@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,27 +15,16 @@ from kiro_crew.dashboard import chat_handlers
 from kiro_crew.dashboard.chat import api_chat_slot_continue, api_chat_slot_project
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.testing.wait import await_until, until_parked
 
 _SLOT = "s1"
 _OLD_PROJECT = "/old/project"
 _NEW_PROJECT = "/new/project"
 
-# Scheduler turns a bounded yield will spend before giving up -- turns, not
-# seconds, for the reason the sibling seam tests give.
-_MAX_TURNS = 500
-
 # A hang guard, never a race window: every handler parked below is released by an
 # event THIS test sets, so the wait ends as soon as the handler finishes. The
 # bound only turns a broken seam into a failure instead of a hung suite.
 _HANG_GUARD_SECS = 30
-
-
-async def _yield_until(predicate: Callable[[], bool]) -> bool:
-    for _ in range(_MAX_TURNS):
-        if predicate():
-            return True
-        await asyncio.sleep(0)
-    return predicate()
 
 
 def _make_app(state: DashboardState) -> web.Application:
@@ -138,9 +126,7 @@ async def _race_recreate_while_queued(
     async with TestClient(TestServer(_make_app(state))) as client:
         async with held_lock:
             task = asyncio.create_task(client.post(route, json=body))
-            assert await _yield_until(
-                lambda: bool(held_lock._waiters)
-            ), "handler never waited on the lock"
+            await until_parked(held_lock, describe=lambda: "handler waiting on slot lock")
             # Same shape a delete-then-recreate under one name produces.
             state._slots[_SLOT] = replacement
         try:
@@ -216,8 +202,7 @@ class TestContinueRefusesARecreatedSlot:
         async with TestClient(TestServer(_make_app(state))) as client:
             task = asyncio.create_task(client.post(f"/api/chat/slots/{_SLOT}/continue", json={}))
             try:
-                parked = await _yield_until(entered.is_set)
-                assert parked, "continue never reached the children probe"
+                await await_until(entered, what="continue reached children probe")
                 assert not task.done()
                 # Same shape a delete-then-recreate under one name produces.
                 state._slots[_SLOT] = replacement

@@ -232,6 +232,12 @@ none. A family that already composes through `src/kiro_crew/_facade_compose.py`
 packages) takes new owners inside its package; start a new compose family only when moved
 functions must run on the facade's own globals, as when a contract pins their `__module__`.
 
+Dynamic exports resolve a purged owner's replacement on every read. A name bound
+for the facade's own code follows the shared mirror's family-purge contract:
+purge the whole family together. Its writes must reach the currently loaded
+owner and leave a discarded owner unchanged. Purge probes verify these distinct
+read and write contracts without exemptions for canonical mirror facades.
+
 In a mirror family, moved code reads its names as plain globals of its own owner, and the
 family keeps two rules:
 

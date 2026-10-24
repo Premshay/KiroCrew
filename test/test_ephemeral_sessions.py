@@ -168,6 +168,11 @@ class TestHistoryPersistence:
             "model": "",
             "autocompact_pct": None,
             "tab_id": slot._tab_id,
+            "checkpoint_freshness": {
+                "activity_generation": 0,
+                "covered_generation": 0,
+                "overdue": False,
+            },
         }
         assert "memory_store" not in meta
         assert slot.memory_mode == "incognito"

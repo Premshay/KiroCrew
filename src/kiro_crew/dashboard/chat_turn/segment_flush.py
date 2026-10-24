@@ -918,7 +918,6 @@ async def _turn_settle_answer(turn: _ChatTurn) -> None:
     _terminal_synthetic = turn._terminal_synthetic
     _turn_billed = turn._turn_billed
     _turn_credits = turn._turn_credits
-    _turn_flushed_visible_text = turn._turn_flushed_visible_text
     _turn_refusal = turn._turn_refusal
     _turn_successful_tool_call_ids = turn._turn_successful_tool_call_ids
     _turn_thought = turn._turn_thought
@@ -1205,7 +1204,7 @@ async def _turn_settle_answer(turn: _ChatTurn) -> None:
             terminal_synthetic=_terminal_synthetic,
             stop_reason=normalize_stop_reason(_stop_reason),
             saw_text=_saw_text_chunk,
-            flushed_visible=_turn_flushed_visible_text,
+            flushed_visible=turn._turn_flushed_visible_text,
             had_tools=_turn_tool_calls > 0,
             had_thinking=_turn_thought,
             billed=_turn_billed,

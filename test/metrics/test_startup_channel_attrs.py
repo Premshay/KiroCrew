@@ -9,6 +9,8 @@ cannot turn a metric attribute into an unbounded label.
 
 from unittest.mock import patch
 
+import pytest
+
 from kiro_crew.messaging.link import TELEMETRY_CHANNELS, telemetry_channel_of
 from kiro_crew.session import POOL_DECISIONS
 
@@ -307,14 +309,15 @@ class TestPoolDecisions:
         assert {"bypass_shared_scratch", "bypass_cwd"} <= assigned
         assert assigned | {"hit", "miss_empty"} <= POOL_DECISIONS
 
-    def test_shared_scratch_bypass_is_counted_by_name(self):
+    @pytest.mark.parametrize("reason", ["bypass_shared_scratch", "bypass_runtime_agent"])
+    def test_retained_fork_bypasses_are_counted_by_name(self, reason):
         from kiro_crew.session import SessionManager
 
         mgr = SessionManager.__new__(SessionManager)
         rec = _Rec()
         with patch("kiro_crew.session.get_recorder", return_value=rec):
-            mgr._record_pool_decision("bypass_shared_scratch", "subagent:abc")
-        assert [a["outcome"] for _, a in rec.counters] == ["bypass_shared_scratch"]
+            mgr._record_pool_decision(reason, "subagent:abc")
+        assert [a["outcome"] for _, a in rec.counters] == [reason]
 
     def test_unmodelled_decision_folds_to_other(self):
         from kiro_crew.session import SessionManager

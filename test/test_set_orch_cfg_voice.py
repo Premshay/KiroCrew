@@ -124,13 +124,27 @@ def test_provider_polly_accepted(tmp_path, monkeypatch):
     assert _vc.provider == "polly"
 
 
-def test_removed_piper_provider_loads_as_the_local_default(tmp_path, monkeypatch):
-    # A saved Piper config must keep the gateway speaking, not fail to load.
-    monkeypatch.setattr("kiro_crew.voice_reply._warned_removed_providers", set())
-    _cfg_file(tmp_path, monkeypatch, {"provider": "piper", "piper_model": "~/v.onnx"})
+@pytest.mark.parametrize("provider", ["piper", "pocket"])
+def test_supported_local_provider_preserves_runtime_settings(tmp_path, monkeypatch, provider):
+    _cfg_file(
+        tmp_path,
+        monkeypatch,
+        {
+            "provider": provider,
+            "voice_id": "custom-local-voice",
+            "piper_binary": "~/local-tts",
+            "piper_model": "~/v.onnx",
+            "piper_model_config": "~/v.onnx.json",
+            "piper_length_scale": 1.25,
+        },
+    )
     set_orch_cfg(SimpleNamespace())
-    assert _vc.provider == "system"
-    assert not hasattr(_vc, "piper_model")
+    assert _vc.provider == provider
+    assert _vc.default_voice == "custom-local-voice"
+    assert _vc.piper_binary == "~/local-tts"
+    assert _vc.piper_model == "~/v.onnx"
+    assert _vc.piper_model_config == "~/v.onnx.json"
+    assert _vc.piper_length_scale == 1.25
 
 
 def test_provider_typo_falls_back_to_local_with_warning(tmp_path, monkeypatch, caplog):

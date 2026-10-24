@@ -95,15 +95,10 @@ def test_override_to_a_dispatch_shim_keeps_the_seam_and_names_the_shim():
     assert label == "claude-agent-acp via /home/u/.local/bin/acp-dispatch"
 
 
-def test_kiro_client_carries_no_adapter_label():
-    """Only the claude and codex spawn branches assign these.
-
-    The kiro path leaves both unset, so its spawn and stderr labels resolve
-    through the seam constants exactly as they did before.
-    """
+def test_kiro_client_carries_no_adapter_stderr_override():
+    """The kiro path uses its SpawnPlan labels and no stderr override."""
     client = AcpClient()
 
-    assert client._adapter_label is None
     assert client._adapter_stderr_label is None
 
 

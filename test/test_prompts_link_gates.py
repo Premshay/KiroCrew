@@ -797,20 +797,25 @@ class TestCreateAndDeletePinTheDirectory:
         ], f"the body must be flushed before the entry's flush claims it: {order}"
         assert (tmp_path / ".kiro" / "prompts" / "byname.md").read_text() == "B"
 
+    @pytest.mark.parametrize("mask", [0o002, 0o022, 0o077])
     def test_the_named_fallback_publishes_a_correct_prompt(
-        self, tmp_path, mock_sel, force_named_fallback
+        self, tmp_path, mock_sel, force_named_fallback, mask
     ):
         """The path taken where the mount has no O_TMPFILE still creates cleanly."""
-        resp = asyncio.run(
-            api_prompts_create(_create_request({"name": "byname", "content": "FALLBACK"}))
-        )
+        previous_mask = os.umask(mask)
+        try:
+            resp = asyncio.run(
+                api_prompts_create(_create_request({"name": "byname", "content": "FALLBACK"}))
+            )
+        finally:
+            os.umask(previous_mask)
 
         assert resp.status == 201
         path = tmp_path / ".kiro" / "prompts" / "byname.md"
         assert path.read_text() == "FALLBACK"
         st = os.stat(path)
         assert st.st_nlink == 1
-        assert stat.S_IMODE(st.st_mode) == 0o644
+        assert stat.S_IMODE(st.st_mode) == 0o666 & ~mask
 
     def test_the_named_fallback_still_refuses_an_occupied_name(
         self, tmp_path, mock_sel, force_named_fallback

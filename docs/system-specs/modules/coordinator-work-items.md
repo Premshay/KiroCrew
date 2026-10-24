@@ -15,7 +15,7 @@ the gateway-vetted `X-Session-Key` and normalized only by the lossless
 dashboard-prefix fold used by `session_ledger`. A request never names a target
 session, data-home path, assignee, worker, or provider identity.
 
-Each coordinator has one store under the resolved KiroCrew data home:
+Each coordinator has one store under the resolved Kiro Crew data home:
 
 ```
 <data_home>/work-items/<safe-key-plus-digest>/

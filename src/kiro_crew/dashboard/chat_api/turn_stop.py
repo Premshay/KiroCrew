@@ -47,7 +47,7 @@ def _park_wait_end_for_stop(slot: _ChatSlot) -> None:
 async def _cancel_terminal_stop_task(
     slot: _ChatSlot, task_at_stop: asyncio.Task[Any] | None
 ) -> None:
-    """Settle the runner after its provider can no longer end the turn itself."""
+    """Settle the runner when its provider cannot end the turn itself."""
     if task_at_stop is None or task_at_stop is asyncio.current_task() or task_at_stop.done():
         return
     task_at_stop.cancel()

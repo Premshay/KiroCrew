@@ -863,7 +863,7 @@ class TestPersistTokenRecord:
         slot_key = "test-slot"
         model = "claude-sonnet-4"
 
-        event = MagicMock()
+        event = SimpleNamespace()
         event.input_tokens = 500
         event.output_tokens = 200
         event.cache_creation_tokens = 50
@@ -887,6 +887,8 @@ class TestPersistTokenRecord:
         assert record["output"] == 200
         assert record["cache_create"] == 50
         assert record["cache_read"] == 25
+        assert record["thinking"] == 0
+        assert record["total"] == 0
         assert record["cost"] == 0.05
         assert record["turns"] == 3
         assert record["duration_ms"] == 1500
@@ -895,7 +897,7 @@ class TestPersistTokenRecord:
     def test_no_crash_on_error(self, tmp_path, monkeypatch):
         slot_key = "test"
         model = "test-model"
-        event = MagicMock()
+        event = SimpleNamespace()
         event.input_tokens = 100
         event.output_tokens = 50
 
@@ -915,7 +917,7 @@ class TestPersistTokenRecord:
         slot_key = "s1"
         model = "opus"
 
-        event1 = MagicMock()
+        event1 = SimpleNamespace()
         event1.input_tokens = 100
         event1.output_tokens = 50
         event1.cache_creation_tokens = 0
@@ -924,7 +926,7 @@ class TestPersistTokenRecord:
         event1.num_turns = 1
         event1.duration_ms = 500
 
-        event2 = MagicMock()
+        event2 = SimpleNamespace()
         event2.input_tokens = 200
         event2.output_tokens = 80
         event2.cache_creation_tokens = 10
@@ -943,7 +945,7 @@ class TestPersistTokenRecord:
 
     def test_writes_provider_field(self, tmp_path, monkeypatch):
         shard_dir = _patch_shard_layout(monkeypatch, tmp_path)
-        event = MagicMock()
+        event = SimpleNamespace()
         event.input_tokens = 10
         event.output_tokens = 5
         event.cache_creation_tokens = 0
@@ -961,7 +963,7 @@ class TestPersistTokenRecord:
 
     def test_provider_defaults_to_empty(self, tmp_path, monkeypatch):
         shard_dir = _patch_shard_layout(monkeypatch, tmp_path)
-        event = MagicMock()
+        event = SimpleNamespace()
         event.input_tokens = 10
         event.output_tokens = 5
         event.cache_creation_tokens = 0
@@ -983,7 +985,7 @@ class TestPersistTokenRecord:
             ("opencode", "claude-haiku-3", 30, 10),
             ("claude_code", "opus", 200, 80),
         ):
-            event = MagicMock()
+            event = SimpleNamespace()
             event.input_tokens = ev[2]
             event.output_tokens = ev[3]
             event.cache_creation_tokens = 0
@@ -1044,7 +1046,7 @@ class TestPersistTokenRecordAsync:
     @pytest.mark.asyncio
     async def test_async_writes_same_record_as_sync(self, tmp_path, monkeypatch):
         shard_dir = _patch_shard_layout(monkeypatch, tmp_path)
-        event = MagicMock()
+        event = SimpleNamespace()
         event.input_tokens = 7
         event.output_tokens = 3
         event.cache_creation_tokens = 0
@@ -1063,7 +1065,7 @@ class TestPersistTokenRecordAsync:
 
     @pytest.mark.asyncio
     async def test_async_no_crash_on_error(self, tmp_path, monkeypatch):
-        event = MagicMock()
+        event = SimpleNamespace()
         event.input_tokens = 1
         event.output_tokens = 1
         shard_dir = _unwritable_shard_dir(monkeypatch, tmp_path)

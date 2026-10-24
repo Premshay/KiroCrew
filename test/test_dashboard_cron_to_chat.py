@@ -65,7 +65,7 @@ def _make_state(history_messages=None):
     # via _sync_dashboard_slots, which iterates state._slots.values().
     state._slots = slots
 
-    def get_or_create_slot(name=None, agent="", origin=""):
+    def get_or_create_slot(name=None, agent="", origin="", workspace="default"):
         # ``origin`` is recorded, not just tolerated: the cron paths must
         # declare SlotOrigin.CRON, and a fake that swallowed the kwarg
         # would let that regress silently (a cron slot relabelled USER is
@@ -74,6 +74,7 @@ def _make_state(history_messages=None):
             slot = MagicMock()
             slot.key = name
             slot._origin = origin
+            slot.workspace = workspace
             slot.linked_session_key = ""
             slot.messages = []
             slot.title = ""
@@ -202,6 +203,22 @@ class TestInjectCronResultToDashboard:
         _inject(state, job, "result")
         slot = state.get_or_create_slot(name=f"cron-{job.id}")
         assert slot.linked_session_key == f"cron:{job.id}"
+
+    def test_delivery_preserves_the_agent_workspace_of_a_precreated_tab(self):
+        from kiro_crew.dashboard.state import SlotOrigin
+
+        state = _make_state()
+        job = _make_job()
+        slot = state.get_or_create_slot(
+            name=f"cron-{job.id}", origin=SlotOrigin.CRON, workspace="research"
+        )
+
+        _inject(state, job, "result")
+
+        assert state.get_or_create_slot(name=f"cron-{job.id}") is slot
+        assert slot.workspace == "research"
+        assert slot.linked_session_key == f"cron:{job.id}"
+        assert any(row["role"] == "assistant" for row in slot.messages)
 
     def test_sets_title_from_job_name(self):
         state = _make_state()

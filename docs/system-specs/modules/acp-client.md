@@ -17,6 +17,10 @@ owns its bounded deduplication and staging state. Native compaction lifecycle
 translation lives with adapter signals. Both are re-exported through the shared
 `acp._dispatch` facade so direct and shared transports use the same rules.
 
+The synchronous `SessionNoticeState.pop_pending` returns staged notices; it does
+not write to or wait for an ACP transport. Pipe writes stay in the bounded
+transport framing helpers.
+
 The primary ACP session transport path spans **five** entry modules: the legacy per-session client (`acp/client.py`, one subprocess per session), the multiplexed runtime (`acp/runtime.py`, one subprocess fanned out to N sessions), the per-session handle (`acp/session_handle.py`, one `sessionId` + queue + prompt/approve/reject loop), a shared dispatch parser (`acp/_dispatch.py`, pure frame-shaping/redaction helpers all paths route through), and the session provider (`acp/session_provider.py`, `AcpSessionProvider` adapting an `AcpSessionHandle` to the `LLMProvider` ABC so runtime-backed sessions are interchangeable with `AcpClient`). All are JSON-RPC 2.0 over stdio for a registry-selected ACP harness, managing subprocess lifecycle, session initialization, prompt streaming, and tool permissions. Protocol constants live in `acp/types.py`; the complete backend and host-capability matrix is in [agent-host-contract.md](agent-host-contract.md#column-meaning).
 
 Module-level code moved out of the two transports lives in the owner modules
@@ -1361,7 +1365,7 @@ Claude ACP 0.74 dynamic workflows and background tasks instead emit standard
 updates. `asyncTaskId` joins those lifecycle frames to the existing Activity
 card model; the task id remains namespaced and opaque to the browser. Progress
 uses `lastToolName` or the provider summary, while a terminal state ends the
-card. These are observational cards too: KiroCrew does not create or control a
+card. These are observational cards too: Kiro Crew does not create or control a
 provider-owned workflow.
 
 **Request-id namespaces are independent.** Our outbound requests (prompt, initialize, set_model, ...) use `_next_req_id()`; the agent's inbound server→client requests (`session/request_permission`) carry their own id counter. The two collide on small integers, so `JsonRpcMessage.is_response_for(req_id)` requires both `id == req_id` **and** `method is None` — a response never has a `method`. Without the `method is None` guard, a permission request whose id equals the in-flight prompt's `req_id` was misclassified as that prompt's completion in `_process_message`, ending the turn early and leaving the tool's permission unanswered → the agent turn hangs on follow-up messages (the agent waits forever for a `session/request_permission` response that never comes).

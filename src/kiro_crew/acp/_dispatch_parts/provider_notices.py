@@ -48,7 +48,7 @@ class SessionNoticeState:
 
     Both are capped at ``NOTICE_STATE_MAX``. The dedupe window forgets its oldest
     key when full, which can only let a repeat through. The staging queue drops
-    its oldest notice when full; each drop is counted, and ``drain`` reports the
+    its oldest notice when full; each drop is counted, and ``pop_pending`` reports the
     count once as a warning notice so a truncated backlog never reads as complete.
     """
 
@@ -86,7 +86,7 @@ class SessionNoticeState:
             self.pending.append(event)
         return event
 
-    def drain(self, session_id: str) -> list[AcpEvent]:
+    def pop_pending(self, session_id: str) -> list[AcpEvent]:
         if self.session_id != session_id:
             self._reset(session_id)
         events = list(self.pending)

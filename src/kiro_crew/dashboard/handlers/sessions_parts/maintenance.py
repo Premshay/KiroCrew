@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 
 from aiohttp import web
@@ -53,7 +52,7 @@ async def _restart_barrier_status(
 
 
 def _publish_restart_barrier(state: DashboardState) -> None:
-    state.broadcast_ws("restart_barrier", state.restart_barrier.payload())
+    state.broadcast_ws_owners("restart_barrier", state.restart_barrier.payload())
 
 
 async def api_session_maintenance(request: web.Request) -> web.Response:
@@ -71,7 +70,7 @@ async def api_session_maintenance(request: web.Request) -> web.Response:
         )
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         return web.json_response(
@@ -197,7 +196,7 @@ async def api_sessions_clear_restart_blockers(request: web.Request) -> web.Respo
     state: DashboardState = request.app["state"]
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         return web.json_response(

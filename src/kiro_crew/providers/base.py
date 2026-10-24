@@ -30,6 +30,7 @@ from kiro_crew.acp.types import (  # noqa: F401
     EVENT_TOOL_RESULT,
 )
 from kiro_crew.acp.types import AcpEvent as LLMEvent  # noqa: F401
+from kiro_crew.agent_sdk.capabilities import compact_unsupported_backend  # noqa: F401
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.essential_delivery import EssentialDelivery
 
@@ -367,7 +368,7 @@ class LLMProvider(ABC):
     def session_provider_label(self) -> str:
         """Persistent-session namespace, or empty when this provider has none.
 
-        A label opts a provider into KiroCrew's session map. The empty default
+        A label opts a provider into Kiro Crew's session map. The empty default
         keeps providers without a documented native resume contract out of that
         map instead of treating their identifiers as kiro-cli sessions.
         """

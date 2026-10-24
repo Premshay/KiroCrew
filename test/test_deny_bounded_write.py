@@ -55,6 +55,7 @@ from test_update_provider import _UNALLOCATABLE_PID
 
 import kiro_crew.acp._dispatch as acp_dispatch
 import kiro_crew.acp.client as acp_client
+import kiro_crew.acp.harness as acp_harness
 import kiro_crew.acp.runtime as acp_runtime
 from kiro_crew.acp.client import (
     AcpClient,
@@ -65,7 +66,7 @@ from kiro_crew.acp.client import (
     write_response_frame_bounded,
 )
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead, AcpRuntimeStdinStalled
-from kiro_crew.acp.types import JsonRpcMessage
+from kiro_crew.acp.types import ACP_BACKEND_KIRO, JsonRpcMessage
 from kiro_crew.testing.wait import await_until, default_timeout
 
 # Short enough that a stalled drain fails in well under a second, long enough
@@ -1762,22 +1763,21 @@ class TestStdinWritesGoThroughTheBoundedWriters:
         assert offenders == [], f"route these through transport_framing's writers: {offenders}"
 
 
-class TestProbeTeardownIsARequestForEveryHarness:
-    def test_no_registered_harness_tears_down_by_notification(self) -> None:
-        """The direct client's entitlement probe tears its session down with an
-        awaited request. A harness declaring a notification teardown would wait
-        ``_TERMINATE_TIMEOUT`` for a reply the host never sends, so adding one
-        must restore a notification arm there, through
-        ``write_notification_best_effort``."""
-        from kiro_crew.acp import harness
+class TestEntitlementProbeTeardown:
+    def test_the_admitted_kiro_harness_tears_down_by_request(self) -> None:
+        assert acp_harness.harness_for(ACP_BACKEND_KIRO).teardown.notification is False
 
-        notifying = [
-            b for b in sorted(harness._HARNESSES) if harness.harness_for(b).teardown.notification
-        ]
-        assert notifying == [], (
-            f"{notifying} tear down by notification: give AcpClient's probe teardown "
-            "a write_notification_best_effort arm for them"
-        )
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend", sorted(set(acp_harness._HARNESSES) - {ACP_BACKEND_KIRO}))
+    async def test_other_harnesses_never_start_this_kiro_entitlement_probe(self, backend) -> None:
+        client = AcpClient(acp_backend=backend)
+        client._session_id = "live-session"
+        factory = MagicMock()
+        client._entitlement_probe_client = factory
+
+        assert await client._probe_advertised_models() == ([], 0.0)
+
+        factory.assert_not_called()
 
 
 class TestBoundSizing:

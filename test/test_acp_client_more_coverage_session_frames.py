@@ -375,7 +375,7 @@ class TestExtractHelpers:
         claude-agent-acp against an OpenAI-compatible lane streams the assistant
         message as deltas and then sends the assembled text once more under the
         SAME ``messageId``. Read as another delta it doubles every paragraph of
-        the turn — captured live 2026-09-10 as
+        the turn, producing
         ``'alpha' + ' beta' + ' gamma' + 'alpha beta gamma'``.
         """
         client = _client(tmp_path)

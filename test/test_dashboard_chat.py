@@ -1175,16 +1175,12 @@ class TestApiChatDurableAdmission:
             assert response.status == 200
             assert (await response.json())["ok"] is True
 
-        await asyncio.wait_for(entered.wait(), timeout=1)
+        await await_until(entered, what="the turn reading its persisted user row")
 
     async def test_refuses_turn_when_user_row_cannot_be_persisted(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
-        started = False
-
-        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
-            nonlocal started
-            started = True
+        fake_run_chat = AsyncMock()
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
         monkeypatch.setattr(state, "flush_slot_now", lambda _slot: False)
@@ -1197,8 +1193,7 @@ class TestApiChatDurableAdmission:
             assert response.status == 503
             assert (await response.json())["code"] == "history_unavailable"
 
-        await asyncio.sleep(0)
-        assert started is False
+        fake_run_chat.assert_not_called()
         assert [row["content"] for row in state._slots["s1"].messages] == []
 
 

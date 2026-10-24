@@ -810,7 +810,8 @@ def test_suspend_clock_none_disables_the_comparison() -> None:
     for _ in range(3):
         clock.advance(5.0)
         assert wd.check() is False
-    assert not any("suspend" in m for m in handler.messages)
+    # Stall enrichment may quote a stack frame whose test name contains "suspend".
+    assert not any(record.msg.startswith("host was suspended") for record in handler.records)
 
 
 class _UnbiasedInterruptTime:

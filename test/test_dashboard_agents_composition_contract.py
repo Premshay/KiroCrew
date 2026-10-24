@@ -1248,14 +1248,14 @@ def test_no_owner_captures_a_name_tests_rebind_on_the_facade() -> None:
 #: harness-parity sandbox literal; the conditional-GET helper the media-route fence
 #: reads this module for; the backend capability and identity reads the SDK-boundary
 #: ratchets key here; the ``project_agent_names`` call the hardened-reads census keys
-#: here; and the one ACP-layer import the boundary baseline counts for this path. An
-#: owner that grew one would move it out of the guard's sight, so each stays here.
+#: here; and the SDK driver import that replaces the former ACP-layer dependency.
+#: The SDK boundary gate scans both the facade and its owners for direct imports.
 _STAYS_IN_THE_FACADE = (
     r"return wrap_argv\(argv, mode=configured_sandbox_mode\(\), is_kiro_cli=True\)",
     r"\bconditional_response\(",
     r"\bcapabilities_(?:for|of)\(|\bis_claude_code\(|\bACP_BACKEND_CLAUDE\b",
     r'operation="api_kirocrew_agents"',
-    r"\bkiro_crew\.(?:acp|providers)\b",
+    r"\bkiro_crew\.agent_sdk\.drivers\.acp\b",
 )
 
 
@@ -1294,6 +1294,20 @@ def _red_green(path: Path, check: Any, new: str) -> None:
         check()
     path.write_text(text, encoding="utf-8")
     check()
+
+
+def test_the_sdk_boundary_covers_the_facade_and_every_owner() -> None:
+    from test_agent_sdk_boundary import _gate
+
+    gate = _gate()
+    sources = {_FACADE_PATH: _FACADE_PATH.read_text(encoding="utf-8")}
+    sources.update({_OWNER_DIR / f"{stem}.py": source for stem, source in _owner_sources().items()})
+    for path, source in sources.items():
+        relative = path.relative_to(_SRC.parent).as_posix()
+        assert not gate._violations_in_source(relative, source), relative
+        assert gate._violations_in_source(
+            relative, source + "\nfrom kiro_crew.acp.client import AcpClient\n"
+        ), relative
 
 
 def test_the_sdk_identity_ratchet_reads_the_owners(

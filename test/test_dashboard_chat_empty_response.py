@@ -509,10 +509,13 @@ class TestEmptyResponseRetry:
 
         cfg = MagicMock()
         cfg.dashboard.merge_queued_messages = False
-        with patch(
-            "kiro_crew.dashboard.chat_runner.KiroCrewConfig.load",
-            return_value=cfg,
-        ), patch("kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock) as followup:
+        with (
+            patch(
+                "kiro_crew.dashboard.chat_runner.KiroCrewConfig.load",
+                return_value=cfg,
+            ),
+            patch("kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock) as followup,
+        ):
             started = await _start_next_queued_turn(state, slot)
             if started:
                 await slot.task

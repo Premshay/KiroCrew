@@ -41,11 +41,13 @@ async def test_author_selection_http_contract(handler, method_name, selection):
     app.router.add_post("/author", handler)
     async with TestClient(TestServer(app)) as client:
         response = await client.post("/author", json={"intent": "draft", **selection})
+        body = await response.json()
     if all(isinstance(value, str) for value in selection.values()):
         assert response.status == 200
         assert method.await_args.kwargs.items() >= selection.items()
     else:
         assert response.status == 400
+        assert body["code"] == "workflow_author_selection_invalid"
         method.assert_not_awaited()
 
 

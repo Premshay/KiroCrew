@@ -360,7 +360,7 @@ async def rebuild_embeddings(
 
 
 def abandon_stale_ingestion_jobs(store, *, now: datetime | None = None) -> int:
-    """Finalize crashed ordinary ingestion jobs that can no longer make progress.
+    """Finalize crashed ordinary ingestion jobs that cannot make progress.
 
     Corpus-wide embedding rebuilds have their own short single-flight lease and
     are deliberately excluded. This only releases source-owned jobs whose

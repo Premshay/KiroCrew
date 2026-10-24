@@ -21,6 +21,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from cloud_source_helpers import source_account_home  # noqa: F401
 from group_privacy_helpers import _ACL_USER, _acl_xattr, _serve_acl
 
 from conftest import make_dir_link
@@ -29,6 +30,7 @@ from kiro_crew.cloud import aws, source
 from kiro_crew.config import ensure_data_home
 
 
+@pytest.mark.usefixtures("source_account_home")
 class TestTarballStagingDirectory:
     """Where the source tarball is built, not what goes into it.
 

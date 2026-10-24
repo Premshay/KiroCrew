@@ -6,10 +6,23 @@ import asyncio
 import json
 import os
 import subprocess
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from kiro_crew.dashboard.handlers import updates
+from kiro_crew.dashboard.restart_barrier import RestartBarrier
+
+
+def _idle_state():
+    return SimpleNamespace(
+        owner_id="",
+        _slots={},
+        sessions=SimpleNamespace(restart_barrier_snapshot=AsyncMock(return_value=[])),
+        restart_barrier=RestartBarrier(),
+        push_refresh=MagicMock(),
+    )
 
 
 def _init_repo(path) -> None:
@@ -147,7 +160,7 @@ class TestUpdateCheckGitGuard:
         monkeypatch.setattr(updates.asyncio, "create_subprocess_exec", _boom)
 
         class _Req(dict):
-            app = {"state": None}
+            app = {"state": _idle_state()}
 
         resp = asyncio.run(updates.api_update_apply(_Req(app="", user="local-app")))
         assert resp.status == 409
@@ -191,12 +204,8 @@ class TestUpdateCheckGitGuard:
 
         monkeypatch.setattr(updates.asyncio, "create_subprocess_exec", _fake_exec)
 
-        class _State:
-            def push_refresh(self, kind: str) -> None:
-                pass
-
         class _Req(dict):
-            app = {"state": _State()}
+            app = {"state": _idle_state()}
 
         resp = asyncio.run(updates.api_update_apply(_Req(app="", user="local-app")))
         assert resp.status == 409
@@ -245,12 +254,8 @@ class TestUpdateCheckGitGuard:
 
         monkeypatch.setattr(updates.asyncio, "create_subprocess_exec", _fake_exec)
 
-        class _State:
-            def push_refresh(self, kind: str) -> None:
-                pass
-
         class _Req(dict):
-            app = {"state": _State()}
+            app = {"state": _idle_state()}
 
         resp = asyncio.run(updates.api_update_apply(_Req(app="", user="local-app")))
         assert resp.status == 409
@@ -303,12 +308,8 @@ class TestUpdateCheckGitGuard:
 
         monkeypatch.setattr(updates.asyncio, "create_subprocess_exec", _fake_exec)
 
-        class _State:
-            def push_refresh(self, kind: str) -> None:
-                pass
-
         class _Req(dict):
-            app = {"state": _State()}
+            app = {"state": _idle_state()}
 
         resp = asyncio.run(updates.api_update_apply(_Req(app="", user="local-app")))
         assert resp.status == 409

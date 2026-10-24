@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kiro_crew import agent_scratch as sc
+from kiro_crew.testing.wait import async_wait_until
 
 #: A pid no live process can own on any supported platform (above every pid_max),
 #: so a cleanup path that signals a fake reaches nothing on the runner.
@@ -1177,12 +1178,12 @@ class TestBgRuntimeSuccessorInheritsTheTree:
 
 
 class TestAResumedKeyRejoinsItsTree:
-    """A conversation resumed after its process ended (gateway restart, transient
-    exit) used to come back on an EMPTY ``$KIROCREW_SCRATCH``: the new process
-    allocated its own directory and the old tree, now ownerless, was swept an
-    hour later with the session's work in it. The gateway records each key's tree
-    in an index inside the masked root, and a resume hands it back as
-    ``shared_scratch``."""
+    """Resume conversations with their existing scratch after process exit.
+
+    The gateway records each key's tree in an index inside the masked root and
+    restores it as ``shared_scratch``, preserving work across gateway restarts
+    and transient exits.
+    """
 
     def test_the_index_round_trips_and_prunes_reclaimed_trees(self, scratch_root: Path) -> None:
         scratch_root.mkdir(parents=True)
@@ -1248,6 +1249,7 @@ class TestAResumedKeyRejoinsItsTree:
             mgr = SessionManager(cfg, provider_factory=factory)
         mgr._session_map = MagicMock()
         mgr._session_map.get = MagicMock(return_value=resume_sid or None)
+        mgr._session_map.get_native_fork = MagicMock(return_value=None)
         mgr._session_map.get_cwd = MagicMock(return_value="")
         return mgr, factory
 
@@ -1285,10 +1287,10 @@ class TestAResumedKeyRejoinsItsTree:
         mgr, _factory = self._manager("", tree)
         try:
             await mgr.get_or_create("dashboard:chat-1", agent="kirocrew")
-            for _ in range(100):  # recorded off the loop, not awaited
-                if sc.recorded_tree("dashboard:chat-1") is not None:
-                    break
-                await asyncio.sleep(0.01)
+            await async_wait_until(
+                lambda: sc.recorded_tree("dashboard:chat-1") is not None,
+                describe=lambda: "new session records its exposed scratch tree",
+            )
         finally:
             await mgr.close_all()
         assert sc.recorded_tree("dashboard:chat-1") == tree
@@ -1300,8 +1302,9 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
     original bug with no red test. So enumerate the seams structurally: every
     ``AcpRuntime(`` / ``AcpClient(`` construction in ``src/`` either passes
     ``shared_scratch`` (directly, or via a ``**kwargs`` its caller filled) or is
-    a STANDALONE process listed below with the reason it has no session tree to
-    join. A new construction site fails this test until it is placed."""
+    a STANDALONE process with no session parent, or the single preparation-only
+    carrier tested in ``test_deepseek_shared_launch``. A new construction site
+    fails until it is placed."""
 
     _SRC = Path(sc.__file__).resolve().parent
     _CALL = re.compile(r"\b(AcpRuntime|AcpClient)\(")
@@ -1312,6 +1315,12 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
             "app-owned review workers; no chat session is their parent"
         ),
         "knowledge/llm_pool.py": "knowledge-indexing helper process; no session parent",
+    }
+    _PLAN_ONLY = {
+        "acp/harness/deepseek_shared.py": (
+            "one unstarted AcpClient carries native launch preparation; "
+            "the shared AcpRuntime owns the process and its scratch tree"
+        ),
     }
 
     @classmethod
@@ -1347,6 +1356,8 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
                 continue
             if rel in self._STANDALONE:
                 continue
+            if rel in self._PLAN_ONLY:
+                continue
             unplaced.append(rel)
         assert unplaced == [], (
             "a kiro-cli process is constructed without the session tree's "
@@ -1373,3 +1384,19 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
         rels = {rel for rel, _ in self._constructions()}
         stale = sorted(set(self._STANDALONE) - rels)
         assert stale == [], f"standalone entries with no construction left: {stale}"
+
+    def test_the_plan_only_list_names_one_unstarted_carrier(self) -> None:
+        from kiro_crew.acp.harness.deepseek_shared import DeepseekHarness
+
+        counts = {rel: 0 for rel in self._PLAN_ONLY}
+        for rel, _args in self._constructions():
+            if rel in counts:
+                counts[rel] += 1
+        assert counts == {"acp/harness/deepseek_shared.py": 1}
+        source = inspect.getsource(DeepseekHarness.resolve_spawn)
+        assert source.count("AcpClient(") == 1
+        assert not re.search(
+            r"\b(?:start|_spawn|ensure_ready|start_new_session|create_subprocess\w*)\s*\(",
+            source,
+        )
+        assert not set(self._PLAN_ONLY) & set(self._STANDALONE)

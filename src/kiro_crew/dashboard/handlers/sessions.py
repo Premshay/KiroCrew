@@ -36,10 +36,6 @@ if TYPE_CHECKING:
         api_sessions_clear_restart_blockers,
         api_sessions_restart_blockers,
     )
-    from kiro_crew.dashboard.handlers.sessions_parts.checkpoints import (  # noqa: F401
-        api_session_checkpoint,
-        api_session_restart_continuation,
-    )
     from kiro_crew.dashboard.handlers.sessions_parts.channels import (  # noqa: F401
         _ATTACH_REQUEST_REFUSALS,
         _CHAT_PAGE_SLOT_MODES,
@@ -219,6 +215,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_utils import slot_history_key  # noqa: F401
     from kiro_crew.dashboard.handlers._shared import SESSION_SEARCH_TEXT_FIELDS  # noqa: F401
     from kiro_crew.dashboard.handlers._shared import internal_memory_scope  # noqa: F401
+    from kiro_crew.dashboard.handlers._shared import member_scope_denied_refusal  # noqa: F401
     from kiro_crew.dashboard.interaction_coordinator import _slot_decision  # noqa: F401
     from kiro_crew.dashboard.state import _normalize_slot_key  # noqa: F401
     from kiro_crew.history import ConversationLog  # noqa: F401
@@ -248,15 +245,17 @@ if TYPE_CHECKING:
     from kiro_crew.security import redact_credentials  # noqa: F401
     from kiro_crew.security import redact_exfiltration_urls  # noqa: F401
     from kiro_crew.validation import sanitize_string  # noqa: F401
+    from kiro_crew.validation import SESSION_CHECKPOINT_SCHEMA  # noqa: F401
+    from kiro_crew.validation import SESSION_RESTART_CONTINUATION_SCHEMA  # noqa: F401
+    from kiro_crew.validation import ValidationError  # noqa: F401
+    from kiro_crew.validation import validate_tool_args  # noqa: F401
 
 from aiohttp import web
 
 from kiro_crew import _facade_mirror
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.dashboard.handlers import kiro_usage_api
-from kiro_crew.dashboard.handlers._shared import (
-    guard_owner_surface_routes,
-)
+from kiro_crew.dashboard.handlers._shared import guard_owner_surface_routes
 from kiro_crew.dashboard.handlers.sessions_parts.usage_scrape import (
     _REASON_ACCOUNT_UNPROVEN,
     _WHOAMI_DIFFERENT,
@@ -272,19 +271,13 @@ from kiro_crew.dashboard.handlers.sessions_parts.usage_scrape import (
     _whoami_agreement,
     _wrap_argv_usage_scrape,
 )
-from kiro_crew.dashboard.kiro_readiness import (
-    _POLL_GATE_MAX_AGE_SECS,
-    reject_if_kiro_unverified,
-)
+from kiro_crew.dashboard.kiro_readiness import _POLL_GATE_MAX_AGE_SECS, reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.kiro_prerequisite import spawn_supervised_oneshot
 from kiro_crew.platform_compat import _SUBPROCESS_NO_WINDOW, kill_and_reap
-from kiro_crew.sandbox import (
-    cgroup_scope_argv,
-    scrub_agent_subprocess_env,
-)
+from kiro_crew.sandbox import cgroup_scope_argv, scrub_agent_subprocess_env
 
 logger = logging.getLogger("kiro_crew.dashboard.handlers.sessions")
 
@@ -1252,11 +1245,11 @@ async def api_sessions_usage_refresh(request: web.Request) -> web.Response:
 # a name through this module lands in every owner that binds it, and here too when this
 # module binds it -- and no owner imports this module at run time.
 _OWNERS = (
+    "kiro_crew.dashboard.handlers.sessions_parts.app_scope",
     "kiro_crew.dashboard.handlers.sessions_parts.maintenance",
     "kiro_crew.dashboard.handlers.sessions_parts.checkpoints",
     "kiro_crew.dashboard.handlers.sessions_parts.channels",
     "kiro_crew.dashboard.handlers.sessions_parts.usage_scrape",
-    "kiro_crew.dashboard.handlers.sessions_parts.app_scope",
     "kiro_crew.dashboard.handlers.sessions_parts.history_reads",
     "kiro_crew.dashboard.handlers.sessions_parts.summaries",
     "kiro_crew.dashboard.handlers.sessions_parts.delete_claim",
@@ -1268,8 +1261,12 @@ _OWNERS = (
 )
 for _owner in _OWNERS:
     _importlib.import_module(_owner)
-# The three routes that verify and scope their own caller, bound here so the guard at the
+# Routes that verify and scope their own caller, bound here so the guard at the
 # bottom of this module can name them as the ones it leaves unwrapped.
+from kiro_crew.dashboard.handlers.sessions_parts.checkpoints import (  # noqa: E402, F401
+    api_session_checkpoint,
+    api_session_restart_continuation,
+)
 from kiro_crew.dashboard.handlers.sessions_parts.live_turn import (  # noqa: E402, F401
     api_session_directive,
     api_session_keepalive,
@@ -1288,11 +1285,17 @@ __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("
 
 # Every ``api_session*`` handler is an owner surface, so a private member's
 # internal call is refused before it runs (audit label = handler name). These
-# three verify and scope their own caller instead.
+# member-scoped routes verify and scope their own caller instead.
 guard_owner_surface_routes(
     globals(),
     prefix="api_session",
     member_scoped=frozenset(
-        {"api_session_directive", "api_session_keepalive", "api_session_tool_policy"}
+        {
+            "api_session_checkpoint",
+            "api_session_directive",
+            "api_session_keepalive",
+            "api_session_restart_continuation",
+            "api_session_tool_policy",
+        }
     ),
 )

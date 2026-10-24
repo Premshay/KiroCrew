@@ -301,6 +301,8 @@ MEMBER_LOG_EVENTS = frozenset({
 })
 
 _OWNER_ONLY_EVENTS = MEMBER_LOG_EVENTS | frozenset({
+    # The coordinated reset barrier names busy sessions across app boundaries.
+    "restart_barrier",
     # Per-row slot metadata edits. Sent only to dashboard-user sockets that
     # declared the capability; an app token gets its filtered full list.
     "slot_patch",

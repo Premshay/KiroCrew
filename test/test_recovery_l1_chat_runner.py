@@ -390,10 +390,12 @@ class TestRunnerBranch:
         # The assembled flag is raised in BOTH the builder and the builder-less
         # fallback context-build arms (a standalone dashboard without a builder
         # must settle too, not re-prepend history every warm turn).
-        arm = "if _context_is_new and not _provider_has_history:"
+        # A rewind's builder-less fallback excludes replay; that extra guard
+        # still arms the debt on ordinary fresh context-bearing turns.
+        arm = r"if _context_is_new and not _provider_has_history(?: and not turn\.rewound)?:"
         flagged = [
             m.start()
-            for m in re.finditer(re.escape(arm), src)
+            for m in re.finditer(arm, src)
             if "_first_turn_history_assembled = True" in src[m.start() : m.start() + 1600]
         ]
         assert len(flagged) >= 2, flagged

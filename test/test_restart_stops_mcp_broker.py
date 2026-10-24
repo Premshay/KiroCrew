@@ -32,6 +32,7 @@ import pytest
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers import updates
+from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.slack import gateway as slack_gateway
 from kiro_crew.slack.gateway import GatewayOrchestrator
 
@@ -64,8 +65,15 @@ def _recorder(seen: list[str], label: str, **kwargs) -> AsyncMock:
 def _state(seen: list[str], *, stop=None) -> SimpleNamespace:
     state = SimpleNamespace(
         _gateway_restart_in_progress=False,
+        _slots={},
+        restart_barrier=RestartBarrier(),
+        broadcast_ws=Mock(),
+        broadcast_ws_owners=Mock(),
         push_update_progress=Mock(),
-        sessions=SimpleNamespace(close_all=_recorder(seen, "close_all")),
+        sessions=SimpleNamespace(
+            close_all=_recorder(seen, "close_all"),
+            restart_barrier_snapshot=AsyncMock(return_value=[]),
+        ),
     )
     if stop is not None:
         state._mcp_gateway_stop = stop
@@ -99,7 +107,9 @@ class TestTheDashboardRestart:
             side_effect=lambda: owners.append(update_ownership.current_owner())
         )
 
-        assert await updates._restart_gateway(state, resolver=lambda: _executable(tmp_path)) is True
+        assert await updates._restart_gateway(
+            state, resolver=lambda: _executable(tmp_path)
+        ) == updates.GatewayRestartResult(restarted=True)
 
         assert owners == ["the restart into an applied update"]
         assert update_ownership.current_owner() is None
@@ -117,7 +127,7 @@ class TestTheDashboardRestart:
 
         restarted = await updates._restart_gateway(state, resolver=lambda: _executable(tmp_path))
 
-        assert restarted is False
+        assert restarted == updates.GatewayRestartResult(restarted=False)
         assert update_ownership.current_owner() == "a deferred restart into an applied update"
 
     @pytest.mark.asyncio
@@ -134,7 +144,7 @@ class TestTheDashboardRestart:
             state, resolver=lambda: str(tmp_path / "pruned" / "python")
         )
 
-        assert restarted is False
+        assert restarted == updates.GatewayRestartResult(restarted=False)
         assert seen == []
         assert update_ownership.current_owner() is None
 
@@ -147,7 +157,9 @@ class TestTheDashboardRestart:
         state = _state(seen)
         update_ownership.note_restart_deferred()
 
-        assert await updates._restart_gateway(state, resolver=lambda: _executable(tmp_path)) is True
+        assert await updates._restart_gateway(
+            state, resolver=lambda: _executable(tmp_path)
+        ) == updates.GatewayRestartResult(restarted=True)
 
         assert update_ownership.current_owner() is None
 
@@ -161,7 +173,9 @@ class TestTheDashboardRestart:
         stop = _recorder(seen, "stop")
         state = _state(seen, stop=stop)
 
-        assert await updates._restart_gateway(state, resolver=lambda: _executable(tmp_path)) is True
+        assert await updates._restart_gateway(
+            state, resolver=lambda: _executable(tmp_path)
+        ) == updates.GatewayRestartResult(restarted=True)
 
         stop.assert_awaited_once_with()
         assert seen == ["close_all", "stop", "exec"]
@@ -174,10 +188,9 @@ class TestTheDashboardRestart:
         stop = _recorder(seen, "stop")
         state = _state(seen, stop=stop)
 
-        assert (
-            await updates._restart_gateway(state, resolver=lambda: str(tmp_path / "pruned"))
-            is False
-        )
+        assert await updates._restart_gateway(
+            state, resolver=lambda: str(tmp_path / "pruned")
+        ) == updates.GatewayRestartResult(restarted=False)
 
         stop.assert_not_awaited()
         assert seen == []
@@ -191,7 +204,9 @@ class TestTheDashboardRestart:
         _dashboard_exec_seams(monkeypatch, seen)
         state = _state(seen, stop=AsyncMock(side_effect=RuntimeError("daemon wedged")))
 
-        assert await updates._restart_gateway(state, resolver=lambda: _executable(tmp_path)) is True
+        assert await updates._restart_gateway(
+            state, resolver=lambda: _executable(tmp_path)
+        ) == updates.GatewayRestartResult(restarted=True)
 
         assert seen == ["close_all", "exec"]
         assert "error" not in [c.args[0] for c in state.push_update_progress.call_args_list]
@@ -301,7 +316,9 @@ class TestTheDaemonThisGatewayOwns:
         orch.dashboard_state = state
         orch._wire_mcp_gateway_dashboard()
 
-        assert await updates._restart_gateway(state, resolver=lambda: _executable(tmp_path)) is True
+        assert await updates._restart_gateway(
+            state, resolver=lambda: _executable(tmp_path)
+        ) == updates.GatewayRestartResult(restarted=True)
 
         manager.shutdown.assert_awaited_once_with()
         assert orch._mcp_gateway_manager is None

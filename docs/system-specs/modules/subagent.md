@@ -2732,7 +2732,7 @@ also projects into this card surface, but is not a `SubagentInfo` and does not
 alter the managed three-way terminal contract above. Claude's Task terminal can
 be `completed`, `failed`, or `stopped`; Codex only reports individual activity
 records, so its still-open cards settle as `reported` when the parent turn
-ends. `reported` means KiroCrew observed provider activity, not that the child
+ends. `reported` means Kiro Crew observed provider activity, not that the child
 is live, stopped, or finished. Provider cards are replayable but non-controllable
 and use opaque browser ids, never a provider thread id or agent path.
 
@@ -3721,11 +3721,11 @@ notifications — one card per sub-agent, with each inner tool call and its
 output attributed to the right card.
 
 Claude and Codex ACP adapters can fan out provider-native children as well.
-KiroCrew uses their structured ACP metadata to show those children in the same
+Kiro Crew uses their structured ACP metadata to show those children in the same
 Activity tab. Claude cards include nested text and tool work. Codex cards show
 only reported activity because the adapter does not expose a child transcript
 or a child-session terminal boundary. Neither provider card can be stopped,
-steered, retried, or deleted through KiroCrew; its provider retains control.
+steered, retried, or deleted through Kiro Crew; its provider retains control.
 
 ```python
 spawn_sub_agents(agents=[

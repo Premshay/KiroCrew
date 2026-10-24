@@ -1,7 +1,7 @@
 """Evaluate the typed acceptance conditions used by coordinated work.
 
 This is product code, not a bundled-skill implementation.  The goal-conductor
-skill invokes it through KiroCrew's fixed internal CLI verb so installed copies
+skill invokes it through Kiro Crew's fixed internal CLI verb so installed copies
 of that skill keep using the evaluator that shipped with the running product.
 
 The security boundary is intentionally narrow: a work item can select a typed
@@ -179,7 +179,7 @@ def main(stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout) -> int:
     try:
         payload = json.load(stdin)
         results = evaluate_payload(payload)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         print(json.dumps({"error": 'stdin must be JSON: {"items": [...]}'}), file=stdout)
         return 2
     print(json.dumps({"results": results}, indent=2), file=stdout)

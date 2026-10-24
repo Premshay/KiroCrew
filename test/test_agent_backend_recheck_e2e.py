@@ -63,11 +63,14 @@ class _State:
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    """Both caches cleared on both sides, so no test inherits a verdict."""
+    """Clear caches and isolate executable search from installed host adapters."""
     from kiro_crew.acp import client
+    from kiro_crew.agent_sdk.backends import launch_for
 
     probe.clear_probe_cache()
     monkeypatch.setattr(client, "_self_served_bin_caches", {})
+    monkeypatch.delenv(launch_for(ACP_BACKEND_DEEPSEEK).bin_env_var, raising=False)
+    monkeypatch.setattr(client, "augmented_path", lambda base_path: base_path)
     yield
     probe.clear_probe_cache()
 

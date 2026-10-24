@@ -658,6 +658,8 @@ async def _new_session_following_substitution(self: AcpClient) -> dict:
         resolved_mcp = await asyncio.to_thread(self._resolve_session_mcp_servers)
         self._session_mcp_cache = resolved_mcp
         new_params["mcpServers"] = await asyncio.to_thread(self._bound_session_mcp_servers)
+        if self.backend in ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP:
+            new_params["mcpServers"] = await self._prune_unstartable_mcp(new_params["mcpServers"])
         # Rebuilt AFTER the array, from the same re-seed: the envelope carries
         # the setting sources the array was authorized under and the inline
         # settings naming the substitute model.

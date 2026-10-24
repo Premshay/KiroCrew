@@ -126,6 +126,7 @@ provider.
 | `kiro` | kiro-cli | The Kiro CLI choice. |
 | `claude` | Claude Code | Uses the public `claude-agent-acp` adapter. |
 | `codex` | Codex | Uses the Codex ACP adapter. |
+| `deepseek` | DeepSeek | Uses the DeepSeek ACP adapter. |
 | `opencode` | OpenCode | Uses OpenCode's native ACP server. |
 | `pi` | Pi | Uses `pi-acp` and its Pi gate extension. |
 | `goose` | goose | Uses goose's native ACP server. |
@@ -350,7 +351,7 @@ harness for crew-member DM sessions, reads the same values.
 | `slack.command` | Slash-command name | `"kirocrew"` |
 | `slack.reactions` | Override phase reaction emojis (set a value to `null` to suppress that phase) | `{}` |
 | `slack.reactions_enabled` | Show phase reactions on Slack messages | `true` |
-| `slack.dm_single_session` | Treat each 1:1 DM as one continuous session, threaded replies included, instead of one per message | `false` |
+| `slack.dm_single_session` | Treat each 1:1 DM as one continuous session, threaded replies included, instead of one per message. Applies only on the default messaging transport (`messaging.use_transport`, on by default) and never in a DM set to `review` mode | `false` |
 
 Only the owner (`KIROCREW_OWNER_ID`) is authorized to interact over Slack.
 Multi-user access and open channels are refused regardless of what these lists
@@ -369,7 +370,7 @@ transcribed the same way.
 | Key | Description | Default |
 |-----|-------------|---------|
 | `stt.enabled` | Turn spoken input into text you can send | `true` |
-| `stt.provider` | `"local"` (this machine, no account), `"apple"` (the on-device recognizer built into macOS 26 and later), `"transcribe"` (AWS Transcribe, which bills your AWS account), or `"off"` (no recognizer runs, the same as turning speech input off). `kirocrew config set` refuses any other value. A stored unknown value runs as `off` with a log warning, and `kirocrew config defaults --adopt stt.provider` rewrites it to `off` rather than switching to `local`; a retired name reads as `local` (see below) | `"local"` |
+| `stt.provider` | `"local"` (this machine, no account), `"bridge"` (an operator-configured batch recognizer), `"apple"` (the on-device recognizer built into macOS 26 and later), `"transcribe"` (AWS Transcribe, which bills your AWS account), or `"off"` (no recognizer runs, the same as turning speech input off). `kirocrew config set` refuses any other value. A stored unknown value runs as `off` with a log warning, and `kirocrew config defaults --adopt stt.provider` rewrites it to `off` rather than switching to `local`; a retired name reads as `local` (see below) | `"local"` |
 | `stt.model` | Which speech model the local provider downloads and runs: `tiny`, `base`, `small`, `large-v3-turbo`, or `custom` to run your own (see below). Bigger is more accurate and a longer first-time download — and on a CPU-only build the largest can recognise slower than you speak (an 11-second clip took 13.6 s on a 16-thread aarch64 CPU, 1.24x the audio), which Settings → Voice says beside the choice | `"base"` |
 | `stt.custom_model_path` | File name of a whisper.cpp ggml model in the speech models folder (`models/whisper` under the Kiro Crew home), run instead of a catalog one when `model` is `custom`. Must resolve to a regular file inside that folder; nothing is downloaded | `""` |
 | `stt.custom_model_sha256` | The 64-character hex sha256 of the file at `custom_model_path`, checked on every load. Required for `model: "custom"`; with either half missing or malformed, `custom` degrades to the default model with a warning | `""` |
@@ -660,6 +661,7 @@ member-memory sandbox is required.
 | `knowledge.folder_ingest_chunk_budget` | Chunks a folder you add by hand may ingest per watcher sweep, including the first scan started by confirming the source. Nothing is skipped — newest files land first and the rest continue on later sweeps — so this paces spend rather than limiting what is ingested. 0 removes the bound; a per-source `chunk_budget` property overrides it for one folder | `300` |
 | `knowledge.dedup_every_n_sweeps` | Run a full duplicate-collapsing pass every Nth watcher sweep (the per-write gate only catches byte-identical documents). 0 disables | `12` |
 | `knowledge.extraction_pool_size` | Concurrent LLM workers for document extraction. Applies live: the pool resizes once its in-flight extractions finish | `3` |
+| `knowledge.extraction_effort` | Reasoning effort for the document-extraction LLM pool: `""`, `low`, `medium`, `high`, `xhigh` or `max`. Empty runs the default, `high`. Only applies on reasoning-capable models. Restart required | `""` |
 | `knowledge.embed_rate_limit` | Maximum embedding generations per minute across all sources. `0` removes the bound | `120` |
 | `knowledge.sweep_chunk_budget` | Maximum chunks ingested across all sources in one watcher sweep. `0` removes the bound | `500` |
 | `knowledge.import_chunk_budget` | Maximum chunks ingested through the explicit one-shot import paths (single-file add, agent add, direct text ingest, remote sync) within a rolling ~60s window -- the cross-file cost ceiling those paths otherwise lack. When exhausted the next import is refused with a reason rather than silently truncated; a single file stays bounded by the 50-chunk per-file cap independently. `0` (the default) removes the bound; opt in by setting it (e.g. `500`). Limitation if enabled: reservation is worst-case (each in-flight import books the 50-chunk per-file maximum up front and reconciles to the real count only on completion), so concurrent imports throttle below the nominal number until that accounting is refined. | `0` |

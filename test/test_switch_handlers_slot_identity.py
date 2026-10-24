@@ -19,7 +19,6 @@ replacement's session.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -35,27 +34,12 @@ from kiro_crew.dashboard.chat import (
     api_chat_slots_model,
 )
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.testing.wait import await_until, until_parked
 
 _MODEL_OLD = "claude-opus-4.8"
 _MODEL_NEW = "gpt-5.6-sol"
 _SLOT = "s1"
 _SESSION_KEY = f"dashboard:{_SLOT}"
-
-# Scheduler turns a bounded yield will spend before giving up -- see the
-# sibling seam tests for why turns, not seconds.
-_MAX_TURNS = 500
-
-
-async def _yield_until(predicate: Callable[[], bool]) -> bool:
-    # A bounded number of loop turns (`sleep(0)`) was enough when the handler's
-    # post-lock path was pure turn-to-turn work, but the merged tree's switch
-    # handlers do REAL awaits on that path (agent resolution, config reads), so
-    # poll with a real deadline. The semantic asserts below are unchanged.
-    for _ in range(500):
-        if predicate():
-            return True
-        await asyncio.sleep(0.01)
-    return predicate()
 
 
 def _make_app(state: DashboardState) -> web.Application:
@@ -170,14 +154,12 @@ async def _race_recreate_while_queued(
     async with TestClient(TestServer(_make_app(state))) as client:
         async with held_lock:
             task = asyncio.create_task(client.post(route, json=body))
-            stuck = not await _yield_until(lambda: task.done())
-            assert stuck, f"{route} completed without ever contending for the held lock"
+            await until_parked(held_lock, describe=lambda: f"{route} queues on the held lock")
+            assert not task.done(), f"{route} completed without contending for the held lock"
             # Same shape a delete-then-recreate under one name produces.
             state._slots[_SLOT] = replacement
         try:
-            finished = await _yield_until(lambda: task.done())
-            assert finished, f"{route} never completed after the lock was released"
-            resp = task.result()
+            resp = await await_until(task, what=f"{route} completes after lock release")
             status = resp.status
             payload = await resp.json()
         finally:

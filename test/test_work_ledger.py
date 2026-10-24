@@ -729,8 +729,8 @@ def test_the_kind_vocabulary_is_derived_from_accept_eval_not_remembered():
 
     The conductor's ``accept_eval.py`` is a thin adapter that runs the fixed
     ``kirocrew _acceptance-evaluate`` verb, so the chain lives in the product module
-    ``work_acceptance.evaluate``. Pin that hop first: a chain read from a module the
-    conductor no longer reaches would agree with the ledger and prove nothing."""
+    ``work_acceptance.evaluate``. Pin that hop first so the chain being checked
+    belongs to the module the conductor actually calls."""
     import inspect
 
     from kiro_crew import work_acceptance

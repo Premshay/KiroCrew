@@ -259,6 +259,17 @@ def capabilities_of(provider: object) -> SessionCapabilities:
     return caps if isinstance(caps, SessionCapabilities) else UNKNOWN_BACKEND_CAPABILITIES
 
 
+def compact_unsupported_backend(provider: object) -> str | None:
+    """The live provider's manual-compaction refusal, else ``None``.
+
+    Only a non-empty string is a capability claim: a mock or duck-typed
+    provider's auto-created attribute must never block a compaction. Shared by
+    automatic policy and manual entry points without importing channel handlers.
+    """
+    value = getattr(provider, "manual_compact_unsupported_backend", None)
+    return value if isinstance(value, str) and value else None
+
+
 def capture_prompt_timeout(provider: object, deadline: float) -> float | None:
     """Resolve a provider-declared transport budget for one outer deadline.
 
@@ -281,4 +292,5 @@ __all__ = [
     "capabilities_for",
     "capabilities_of",
     "capture_prompt_timeout",
+    "compact_unsupported_backend",
 ]

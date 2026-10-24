@@ -83,7 +83,7 @@ def _str_field(mapping: object, key: str) -> str:
 
 
 def _claude_core_mcp_tool_name(update: dict[str, Any]) -> str:
-    """Return a KiroCrew core tool from Claude adapter metadata, or ``""``.
+    """Return a Kiro Crew core tool from Claude adapter metadata, or ``""``.
 
     ``claude-agent-acp`` obtains this field from an SDK ``mcp_tool_use``
     record.  It is not the model-authored display title.  The exact core-server
@@ -104,7 +104,7 @@ def _claude_core_mcp_tool_name(update: dict[str, Any]) -> str:
 
 
 def _codex_core_mcp_tool_name(update: dict[str, Any]) -> str:
-    """Return a KiroCrew core tool from Codex ACP metadata, or ``\"\"``.
+    """Return a Kiro Crew core tool from Codex ACP metadata, or ``\"\"``.
 
     ``codex-acp`` constructs this update from an app-server ``mcpToolCall``
     item. The provenance bit, raw server/tool pair, and canonical ACP kind must
@@ -134,7 +134,7 @@ def trusted_mcp_identity(update: dict[str, Any]) -> tuple[str, str, bool]:
     Kiro emits the pair directly in ``_meta.kiro``. Claude emits its SDK tool
     name as ``mcp__<server>__<tool>`` in ``_meta.claudeCode``. Codex emits an
     adapter-created raw server/tool pair with an explicit MCP provenance bit.
-    Provider-specific fallbacks accept only KiroCrew's own core server. Missing
+    Provider-specific fallbacks accept only Kiro Crew's own core server. Missing
     or malformed metadata fails closed rather than consulting the title or model
     arguments.
     """

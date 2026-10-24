@@ -495,10 +495,17 @@ class TestUserPrivateGroups:
 
     def test_with_nothing_stubbed_where_this_hosts_group_is_private(self, tmp_path):
         """The real question, the real rule and the real ownership policy, on a
-        host whose own databases show the directory's group holding this
-        account alone."""
+        host with accepted ancestor ownership whose own databases show the
+        directory's group holding this account alone."""
         link, _ = self._install(tmp_path)
-        directory = link.parent
+        directory = link.parent.resolve()
+        uid = os.geteuid()
+        if uid == 0:
+            pytest.skip("provider execution requires a non-root gateway account")
+        for ancestor in (directory, *directory.parents):
+            owner = ancestor.stat().st_uid
+            if owner not in (0, uid):
+                pytest.skip(f"test installation ancestor {ancestor} is owned by uid {owner}")
         verdict = platform_compat.group_write_admits_another_account(
             directory, directory.stat().st_gid
         )

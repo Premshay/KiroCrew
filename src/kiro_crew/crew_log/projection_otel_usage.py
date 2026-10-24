@@ -58,6 +58,8 @@ _AGENT_KIND_BY_STEM: Final[dict[str, str]] = {
     "kirocrew-team-lead": "team_lead",
     "kirocrew-heartbeat": "heartbeat",
     "kirocrew-dashboard-manager": "dashboard_manager",
+    "kirocrew-fast": "fast",
+    "kirocrew-consolidate": "consolidate",
 }
 
 #: The ``agent_kind`` value a session whose opening entry this fold has not yet folded

@@ -297,6 +297,7 @@ class TestEngines:
     @pytest.mark.asyncio
     @requires_rg
     async def test_ripgrep_reports_the_same_shape(self, tree):
+        _require_rg_engine()
         payload = await _grep(tree, "needle")
         assert payload["engine"] == "rg"
         hit = next(r for r in payload["results"] if r["file"].endswith("alpha.py"))
@@ -311,6 +312,7 @@ class TestEngines:
         ripgrep must not get a different search, so the two engines are compared
         against EACH OTHER on one tree rather than each against its own
         expectations."""
+        _require_rg_engine()
         with_rg = await _grep(tree, "needle")
         monkeypatch.setattr(f, "_grep_rg_executable", lambda: None)
         without_rg = await _grep(tree, "needle")

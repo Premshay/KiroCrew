@@ -13,10 +13,11 @@ across a restart through its transcript metadata, which the factory hands back a
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.types import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.acp_cli_overlay import _read_cli_overlay, _write_cli_overlay
@@ -34,17 +35,19 @@ def _provider(work_dir: Path, backend: str, **kwargs: object) -> AcpProvider:
     return AcpProvider(acp_backend=backend, work_dir=work_dir, model=MODEL, **kwargs)
 
 
-def _kas_wire(provider: AcpProvider, *, push_error: Exception | None = None) -> MagicMock:
+def _kas_wire(provider: AcpProvider, *, push_error: Exception | None = None) -> AcpClient:
     """Swap in the KAS client as it stands after ``session/new``: it serves ``effortLevel``."""
-    client = MagicMock()
-    client.backend = ACP_BACKEND_KAS
+    client = provider._client
     client._model = MODEL
-    client._work_dir = provider._client._work_dir
+    client._acp_config_options = [
+        {
+            "id": "effortLevel",
+            "type": "select",
+            "options": [{"value": level, "name": level} for level in LEVELS],
+        }
+    ]
     client.set_config_option = AsyncMock(side_effect=push_error)
     client.send_command = AsyncMock()
-    client.supports_config_option = MagicMock(side_effect=lambda cid: cid == "effortLevel")
-    client.get_valid_effort_levels = MagicMock(return_value=list(LEVELS))
-    provider._client = client
     return client
 
 

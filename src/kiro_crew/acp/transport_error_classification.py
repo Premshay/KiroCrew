@@ -516,7 +516,7 @@ class AcpContextWindowExceeded(AcpError):  # noqa: N818
 class AcpConversationPayloadExceeded(AcpContextWindowExceeded):  # noqa: N818
     """The provider retained attachments beyond its native request-size limit.
 
-    KiroCrew cannot inspect provider-owned retained attachments.  Interactive
+    Kiro Crew cannot inspect provider-owned retained attachments.  Interactive
     callers must therefore discard that native conversation and rebuild it
     from bounded dashboard history before retrying, just as for a token-window
     overflow.

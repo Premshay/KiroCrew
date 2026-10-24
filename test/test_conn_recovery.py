@@ -124,7 +124,7 @@ async def test_queue_dispatch_preserves_recovery_provenance(
     state = _make_state(tmp_path)
     state.subagents = None
     slot = state.get_or_create_slot("recovery-dispatch")
-    slot.queue_insert(0, _CONN_RECOVER_MSG, kind=kind)
+    queue_id = slot.queue_insert(0, _CONN_RECOVER_MSG, kind=kind)
     mock_run = AsyncMock()
     monkeypatch.setattr(chat_runner, "_run_chat", mock_run)
 
@@ -137,6 +137,8 @@ async def test_queue_dispatch_preserves_recovery_provenance(
         "_synthetic_payload": expected_recovery,
         "_directive_user_origin": False,
         "_directive_channel_origin": False,
+        "_post_restart_continuation": False,
+        "_drained_queue_ids": (queue_id,),
     }
     if expected_recovery:
         # A recovery-kind entry also tells the runner it IS a recovery
@@ -238,7 +240,7 @@ async def test_dispatch_classifies_the_payload_not_the_recovery(
     state = _make_state(tmp_path)
     state.subagents = None
     slot = state.get_or_create_slot("payload-classification")
-    slot.queue_insert(
+    queue_id = slot.queue_insert(
         0, "Build and deploy the service", kind=SYNTHETIC_RECOVERY_KIND, payload=payload
     )
     mock_run = AsyncMock()
@@ -259,6 +261,8 @@ async def test_dispatch_classifies_the_payload_not_the_recovery(
         _synthetic_recovery_turn=True,
         _directive_user_origin=False,
         _directive_channel_origin=False,
+        _post_restart_continuation=False,
+        _drained_queue_ids=(queue_id,),
     )
     # Provenance is unchanged by the split: either payload still renders as an
     # inject row, which is what stops the duplicate user bubble.

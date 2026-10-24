@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 
 from aiohttp import web
@@ -176,7 +175,7 @@ async def api_session_channel(request: web.Request) -> web.Response:
         )
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         return web.json_response(
@@ -407,7 +406,7 @@ async def _member_channel_report_guard(request: web.Request) -> web.Response | N
         return refusal
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return None  # the handler reports the malformed body
     if isinstance(body, dict) and body.get("action") in _MEMBER_CHANNEL_ACTIONS:
         return None

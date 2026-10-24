@@ -523,7 +523,7 @@ class TestProviderNativeChildCards:
         assert "subagent_tool" not in _ws_calls(state)
 
         # The Codex adapter closes activity records, not child threads. When the
-        # parent turn ends KiroCrew must describe that evidence as reported, not
+        # parent turn ends Kiro Crew must describe that evidence as reported, not
         # as a child completion or a remote cancellation.
         _native_subagent_close_all(state, slot, tracker, slot._native_subagent_output)
         [done] = _ws_calls(state)["subagent_done"]

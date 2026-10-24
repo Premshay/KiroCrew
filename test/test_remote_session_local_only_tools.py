@@ -495,6 +495,20 @@ update_message wait workflow_author workflow_cancel workflow_library_list workfl
 workflow_result workflow_status
 """.split())
 
+# Caller-bound coordination records and reports deliberately live on the gateway.
+# None of these tools interprets a supplied path as a gateway file to read or run.
+REMOTE_SAFE_CORE_TOOLS |= frozenset("""
+maintenance_acknowledge maintenance_status preference_advice session_channel_post
+session_channel_status session_checkpoint session_restart_continuation
+work_cycle_archive_list work_cycle_archive_read work_cycle_close work_cycle_open
+work_item_assigned_list work_item_assigned_read work_item_create work_item_evaluate
+work_item_launch_candidates work_item_list work_item_read work_item_report_progress
+work_item_revoke_assignment work_item_submit_handoff work_item_transition work_item_update
+""".split())
+# Both launches pass the verified caller as parent_session_key to manager.spawn;
+# run_turn inherits that parent's remote environment before creating the child.
+REMOTE_SAFE_CORE_TOOLS |= frozenset({"work_item_launch", "work_item_dispatch_retry"})
+
 
 def test_every_core_tool_is_classified_for_remote_sessions():
     # A new core tool must be judged local-only or remote-safe, never default in.
@@ -502,6 +516,7 @@ def test_every_core_tool_is_classified_for_remote_sessions():
     assert not REMOTE_SAFE_CORE_TOOLS & se.LOCAL_ONLY_CORE_TOOLS
     assert core - se.LOCAL_ONLY_CORE_TOOLS - REMOTE_SAFE_CORE_TOOLS == set()
     assert {"task_run", "workflow_run", "workflow_rerun_subtree"} <= se.LOCAL_ONLY_CORE_TOOLS
+    assert {"session_channel_manage", "code_review_sage_api"} <= se.LOCAL_ONLY_CORE_TOOLS
 
 
 # ── The builder is where a workspace tool gets its built-in identity ──────────

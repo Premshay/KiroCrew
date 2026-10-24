@@ -1179,7 +1179,9 @@ HTTP request on a slow synchronous author.
 Both authoring entry points accept optional `author_agent` and `author_model`.
 These choose only the isolated drafting session; worker selections remain in
 `ctx.agent(agent=..., model=...)`. Omitted fields preserve the existing author
-agent and its configured model. The `dynamic-workflows` skill and author prompt
+agent and its configured model. Invalid types or oversized selections return HTTP
+400 with code `workflow_author_selection_invalid` before authoring starts.
+The `dynamic-workflows` skill and author prompt
 direct callers to discover available identities, respect explicit selections,
 and assign local work only within verified tools, quality and capacity limits.
 

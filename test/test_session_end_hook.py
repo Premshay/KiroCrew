@@ -13,6 +13,7 @@ from kiro_crew import autonudge
 from kiro_crew.apps import teardown
 from kiro_crew.dashboard import chat_handlers as handlers
 from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.testing.wait import await_until, finished
 
 EVENT_KEYS = {"session_key", "provider", "provider_session_id", "reason", "ended_at"}
 
@@ -110,7 +111,10 @@ async def test_slow_hook_times_out_without_blocking_others(monkeypatch, caplog) 
     teardown.register_session_end_hook("good", good)
 
     with caplog.at_level(logging.WARNING, logger=teardown.logger.name):
-        await asyncio.wait_for(teardown.notify_session_ended({"session_key": "k"}), 2)
+        await finished(
+            teardown.notify_session_ended({"session_key": "k"}),
+            'teardown.notify_session_ended({"session_key": "k"})',
+        )
 
     assert events == [{"session_key": "k"}]
     assert any("timed out" in r.getMessage() for r in caplog.records)
@@ -140,7 +144,7 @@ async def test_user_close_fires_with_session_map_identity(tmp_path, monkeypatch)
     teardown.register_session_end_hook("a", hook)
 
     resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
-    await asyncio.wait_for(done.wait(), 2)
+    await await_until(done, what="done.wait()")
 
     assert resp.status == 200
     assert len(events) == 1
@@ -180,7 +184,7 @@ async def test_idle_archive_fires(tmp_path, monkeypatch) -> None:
     teardown.register_session_end_hook("a", hook)
 
     resp = await handlers.api_chat_slots_cleanup(_Req(state, NAME))
-    await asyncio.wait_for(done.wait(), 2)
+    await await_until(done, what="done.wait()")
 
     assert resp.status == 200
     assert len(events) == 1
@@ -225,7 +229,7 @@ async def test_subagent_terminal_fires_with_outcome_reason(overrides, reason) ->
     teardown.register_session_end_hook("a", hook)
 
     await _report(_info(**overrides))
-    await asyncio.wait_for(done.wait(), 2)
+    await await_until(done, what="done.wait()")
 
     assert len(events) == 1
     _assert_shape(events[0], key="subagent:a1", provider="codex", sid="acp-sid-9", reason=reason)
@@ -237,7 +241,7 @@ async def test_continued_subagent_uses_conversation_key_and_empty_sid_when_unkno
     teardown.register_session_end_hook("a", hook)
 
     await _report(_info(conversation_key="subagent:conv-1", _session_id="", _session_provider=""))
-    await asyncio.wait_for(done.wait(), 2)
+    await await_until(done, what="done.wait()")
 
     _assert_shape(events[0], key="subagent:conv-1", provider="", sid="", reason="subagent_finished")
 

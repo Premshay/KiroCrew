@@ -751,17 +751,15 @@ class TestSettingsAgentValidation(unittest.TestCase):
 class TestConsolidationWorkerFailures(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self._old_home = os.environ.get("KIROCREW_HOME")
-        os.environ["KIROCREW_HOME"] = self.tmp
+        self.env = pytest.MonkeyPatch()
+        self.addCleanup(self.env.undo)
+        self.env.setenv("KIROCREW_HOME", self.tmp)
         self.mod = _load_routes_module()
         store.ensure_layout()
         self.mod._CONSOLIDATE_STATE.clear()
 
     def tearDown(self):
-        if self._old_home is None:
-            os.environ.pop("KIROCREW_HOME", None)
-        else:
-            os.environ["KIROCREW_HOME"] = self._old_home
+        self.env.undo()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_consolidation_worker_error_is_logged_but_not_returned_to_clients(self):
@@ -795,17 +793,15 @@ class TestLearningsEndpoint(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self._old_home = os.environ.get("KIROCREW_HOME")
-        os.environ["KIROCREW_HOME"] = self.tmp
+        self.env = pytest.MonkeyPatch()
+        self.addCleanup(self.env.undo)
+        self.env.setenv("KIROCREW_HOME", self.tmp)
         self.mod = _load_routes_module()
         store.ensure_layout()
         self.learning = learning
 
     def tearDown(self):
-        if self._old_home is None:
-            os.environ.pop("KIROCREW_HOME", None)
-        else:
-            os.environ["KIROCREW_HOME"] = self._old_home
+        self.env.undo()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _req(self, namespace=None):

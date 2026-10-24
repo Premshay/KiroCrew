@@ -51,6 +51,7 @@ from kiro_crew.session import SessionManager
 from kiro_crew.session_agent_selection import session_agent_selection_kind
 from kiro_crew.session_capabilities import CapabilityStartupError, runtime_view
 from kiro_crew.skills import SkillsLoader
+from kiro_crew.testing.wait import finished
 
 
 class FakeProvider(LLMProvider):
@@ -1874,12 +1875,12 @@ async def test_saved_projection_requires_consumed_matching_spec(world, monkeypat
     assert provider.loaded_capability_template == ""
     if fault:
         with pytest.raises(AcpError):
-            await asyncio.wait_for(client._initialize_session(), 5)
+            await finished(client._initialize_session(), "client._initialize_session()")
         assert provider.loaded_capability_template == ""
         with pytest.raises(CapabilityStartupError, match="unverified"):
             loaded_stamp(provider, prepared)
         return
-    await asyncio.wait_for(client._initialize_session(), 5)
+    await finished(client._initialize_session(), "client._initialize_session()")
     assert sent[1][0] == ("session/load" if resume else "session/new")
     assert "mcpServers" in sent[1][1]
     assert provider.loaded_capability_template == prepared.template

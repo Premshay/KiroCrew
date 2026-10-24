@@ -189,32 +189,15 @@ class TestDecisionsSettingCrossLayer:
         assert callable(handlers.api_decisions_consent_get)
         assert callable(handlers.api_decisions_consent_put)
 
-    def test_the_frontend_and_backend_name_the_same_points(self):
-        """Both directions, because each one breaks a different surface.
+    def test_named_readers_ship_and_the_overview_lists_every_point(self, monkeypatch):
+        """Specialized readers name shipped points; the overview covers the full registry.
 
-        A point the FRONTEND names but the backend does not ship is a reader
-        waiting for a record nothing writes. A point the BACKEND ships but the
-        frontend cannot name draws nothing at all -- ``decisionRecord.ts``
-        dispatches on the record's own ``point`` and returns null for one it does
-        not know, so that direction fails silently and looks exactly like a healthy
-        release stamping no record.
-
-        The frontend side is DISCOVERED, not listed: every ``DECISIONS_*_POINT``
-        constant the reader exports. So shipping a third point is one constant in
-        ``decisionsPreview.ts`` and no edit here -- which also keeps two branches
-        each adding a point from colliding on this file.
-
-        The ANNOTATING point is the one name held here rather than discovered: it
-        draws a badge on the tool card instead of a line in the strip, so the
-        reader exports no constant for it. The backend-minus-frontend difference
-        therefore has to come out as exactly that one name, never as a point whose
-        record no surface draws.
-
-        Discovery is asserted non-empty and anchored on the skills point, because a
-        scan that silently matched nothing would pass while measuring nothing.
+        The Decisions card renders the gateway's point rows, including ids without
+        a specialized reader. A missing transcript reader must not force a second
+        registry or hide a point such as subagent routing from the consent overview.
         """
-        from kiro_crew.decisions.gate import DECISION_POINT_NAMES
-        from kiro_crew.decisions.points.tool_risk import POINT as ANNOTATION_POINT
+        from kiro_crew.dashboard.handlers import decisions
+        from kiro_crew.decisions.gate import DECISION_POINT_NAMES, POINT_SCOPE_KEYS
 
         source = DECISIONS_READER_PATH.read_text(encoding="utf-8")
         names = re.findall(r"export const (DECISIONS_\w+_POINT)\b", source)
@@ -232,11 +215,13 @@ class TestDecisionsSettingCrossLayer:
             f"the reader names {sorted(frontend - backend)} which the backend does "
             "not ship: a strip line waiting for a record nothing writes"
         )
-        assert backend - frontend == {ANNOTATION_POINT}, (
-            f"the backend ships {sorted(backend - frontend - {ANNOTATION_POINT})} with "
-            f"no reader constant; only the annotating point {ANNOTATION_POINT!r} draws "
-            "outside the strip, and a point is an egress path -- name it in "
-            "decisionsPreview.ts so some surface shows what was sent"
+        monkeypatch.setattr(decisions, "_sampling_admits_anybody", lambda: False)
+        monkeypatch.setattr(decisions, "_judge_lane", lambda _armed: "jev")
+        rows = decisions._points({}, permits=False)
+        assert [row["id"] for row in rows] == list(DECISION_POINT_NAMES)
+        assert {row["id"] for row in rows} - frontend == backend - frontend
+        assert {row["id"]: row["needs_scope"] for row in rows if row["needs_scope"]} == dict(
+            POINT_SCOPE_KEYS
         )
 
 

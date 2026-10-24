@@ -43,8 +43,9 @@ pytestmark = pytest.mark.xdist_group(name="tree_scan_acp_bindings")
 #: Member -> (kind, coroutine, signature digest, owning module). Frozen at the split: the
 #: kind, coroutine flag and signature are BASE's; the owner is where the member lives now.
 _MEMBERS: dict[str, tuple[str, object, str, str]] = {
-    "__init__": ("function", False, "22e43ccb505a", "acp"),
+    "__init__": ("function", False, "2a743ce342d9", "acp"),
     "_abc_impl": ("data", False, "", ""),
+    "_advertised_effort": ("function", False, "a6632a57e602", "acp_model_effort"),
     "_advertised_effort_levels": ("function", False, "93b23ca4342b", "acp_model_effort"),
     "_apply_effort_overlay": ("function", False, "66550c0d40fa", "acp_cli_overlay"),
     "_apply_initial_effort": ("function", True, "b60c5fea256e", "acp_model_effort"),
@@ -66,6 +67,14 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_start_kiro_runtime_impl": ("function", True, "bb38224e64f4", "acp_runtime_start"),
     "_to_llm_event": ("staticmethod", False, "9400e81ecdfb", "acp_turns"),
     "_tool_search_settings": ("function", False, "da838953900b", "acp"),
+    "acp_config_options": ("property", False, "7eb96c2fda05", "acp"),
+    "restrict_tools": ("function", False, "81433b0f7bda", "acp"),
+    "session_activity_at": ("property", False, "c2eec8a41739", "acp"),
+    "session_provider_label": ("property", False, "bb418bb7ece8", "acp"),
+    "session_resumed": ("property", False, "a6632a57e602", "acp"),
+    "set_resume_session_id": ("function", False, "c284282f8a1d", "acp"),
+    "slash_commands": ("property", False, "92d6193dbe19", "acp"),
+    "supports_image_prompt": ("property", False, "a6632a57e602", "acp"),
     "accepts_effort_level": ("function", False, "581451d2b011", "acp_model_effort"),
     "agent_version": ("property", False, "bb418bb7ece8", "acp"),
     "approval_withdrawable": ("data", False, "", ""),

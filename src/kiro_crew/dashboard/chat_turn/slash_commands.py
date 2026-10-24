@@ -71,7 +71,6 @@ if TYPE_CHECKING:
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         _CONTEXT_WINDOW_RECOVERY_PREFIX,
-        _redact_for_display,
         save_slot_off_loop,
     )
 
@@ -350,7 +349,6 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
                     "I'll work toward it across turns and stop when it's met "
                     "(verified by evidence) — or run `/goal clear` to stop."
                 )
-    body = _redact_for_display(body)
     sel().log_tool_invocation(
         session_key=slot.key,
         agent=slot.agent or "kirocrew",

@@ -13,7 +13,7 @@ Instance fields written: ``_client``, ``_defer_replay_sid_promotion``,
 ``_history_replay_needed``, ``_shared_scratch``.
 
 Instance fields read: ``_child_fidelity_aware``, ``_crew_agent``, ``_on_gate_acquired``,
-``_on_gate_queued``, ``_tool_search``, ``member_context``, ``memory_mode``,
+``_on_gate_queued``, ``_tool_search``, ``member_context``, ``memory_mode``, ``model_switch_method``,
 ``start_priority``.
 """
 

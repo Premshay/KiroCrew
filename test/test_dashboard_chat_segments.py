@@ -9,6 +9,8 @@ import pytest
 from chat_test_helpers import _make_state
 from dashboard_chat_helpers import _provider_mock
 
+from kiro_crew.testing.wait import async_wait_until
+
 
 class TestFlushSegment:
     """Unit tests for _flush_segment helper function."""
@@ -852,10 +854,10 @@ class TestRunChatSegmentFlush:
         # the permission event is a function of what it awaits on the way in, so
         # a fixed budget silently turns into "resolve an id that is not there
         # yet" and fails on the resolve rather than on the timeline this covers.
-        for _ in range(500):
-            if "req-1" in slot._approval_futures:
-                break
-            await asyncio.sleep(0.01)
+        await async_wait_until(
+            lambda: "req-1" in slot._approval_futures,
+            describe=lambda: "approval request is registered",
+        )
         assert "req-1" in slot._approval_futures
         assert state.resolve_approval("req-1", True) is True
         await turn

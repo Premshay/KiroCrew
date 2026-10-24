@@ -483,9 +483,7 @@ async def _turn_stop_hook(turn: _ChatTurn) -> None:
     _refusal_notices_settled = turn._refusal_notices_settled
     _refusal_reasons = turn._refusal_reasons
     _stop_reason = turn._stop_reason
-    _turn_flushed_visible_text = turn._turn_flushed_visible_text
     is_slash = turn.is_slash
-    needs_session_reset = turn.needs_session_reset
     session_key = turn.session_key
     slot = turn.slot
     state = turn.state
@@ -520,7 +518,7 @@ async def _turn_stop_hook(turn: _ChatTurn) -> None:
     # (streaming, completion persistence, or the hook _fire above) may have
     # resolved already -- stop_turn() reporting "idle" resets _stop_state --
     # and only the generation counter still says it happened.
-    if should_queue_hook_continuation(needs_session_reset, user_stopped=_stop_pressed(turn)):
+    if should_queue_hook_continuation(turn.needs_session_reset, user_stopped=_stop_pressed(turn)):
         _hook_reasons = parse_hook_continuations(_stop_hook_out)
         # No block decision -> nothing to queue; skip the cap load and
         # arithmetic on the common empty path (also what the old
@@ -531,7 +529,7 @@ async def _turn_stop_hook(turn: _ChatTurn) -> None:
             # boundary before mutating the queue so a Stop that lands during
             # that await cannot be bypassed by the stale outer guard.
             if not should_queue_hook_continuation(
-                needs_session_reset, user_stopped=_stop_pressed(turn)
+                turn.needs_session_reset, user_stopped=_stop_pressed(turn)
             ):
                 _hook_reasons = []
         else:
@@ -623,7 +621,7 @@ async def _turn_stop_hook(turn: _ChatTurn) -> None:
     # this continuation is the only channel that still reaches its model.
     if should_queue_refusal_recovery(
         _refusal_reasons,
-        needs_session_reset,
+        turn.needs_session_reset,
         user_stopped=_stop_pressed(turn),
         notices_sent=len(_refusal_notices) + _refusal_notices_settled,
         notices_pending=len(_refusal_notices),
@@ -646,7 +644,7 @@ async def _turn_stop_hook(turn: _ChatTurn) -> None:
                 answered=(
                     bool(_answer_text.strip())
                     or turn._produced_visible_output
-                    or _turn_flushed_visible_text
+                    or turn._turn_flushed_visible_text
                 ),
                 # The backend ended the blocked turn as cancelled: it will
                 # tell the model the user interrupted, so the body must say

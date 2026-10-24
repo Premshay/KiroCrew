@@ -31,7 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Collection
+from typing import TYPE_CHECKING, Any, Callable, Collection
 
 from kiro_crew import acp_tool_gate
 from kiro_crew.acp.mcp_mount_check import schedule_mount_check
@@ -709,6 +709,24 @@ def _guard_unresolved_mcp_refs(self: AcpClient, wire_servers: Any) -> None:
         logger.debug("declared MCP servers: spec unreadable", exc_info=True)
 
 
+def _session_array_projection(
+    client: AcpClient,
+    read_projection: Callable[[], list[dict[str, Any]]] | None = None,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Return host admission and its projection, including a valid empty array.
+
+    Invoke an overridden reader only after host admission. Without a reader,
+    preserve the accessor's cold-cache resolution and return a list copy.
+    """
+    if client.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY:
+        return False, []
+    if read_projection is not None:
+        return True, read_projection()
+    if client._session_mcp_cache is None:
+        client._session_mcp_cache = client._resolve_session_mcp_servers()
+    return True, list(client._session_mcp_cache)
+
+
 def _session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
     """MCP server array passed to this session's ``session/new`` / ``session/load``.
 
@@ -745,11 +763,7 @@ def _session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
     MCP install or toggle takes effect on the next session with no gateway
     restart.
     """
-    if self.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY:
-        return []
-    if self._session_mcp_cache is None:
-        self._session_mcp_cache = self._resolve_session_mcp_servers()
-    return list(self._session_mcp_cache)
+    return _session_array_projection(self)[1]
 
 
 def _claude_session_mcp_servers(self: AcpClient) -> list:
@@ -1263,7 +1277,7 @@ def _core_session_capability_servers(session_key: str | None = None) -> list[dic
 
 
 def _session_capability_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
-    """Return the session-bound KiroCrew capability server."""
+    """Return the session-bound Kiro Crew capability server."""
     if self._agent in _TOOL_FREE_CONSOLIDATION_AGENTS:
         return []
     return attach_stub_session_token(
@@ -1334,10 +1348,10 @@ def _bound_session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
     """Build one deduplicated MCP roster for a session bind."""
     if self._allowed_tools is not None or getattr(self, "_side_read_only", False):
         return []
-    if self.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY:
+    uses_session_array, translated = _session_array_projection(self, self._session_mcp_servers)
+    if not uses_session_array:
         candidates = self._pooled_mcp_servers()
     else:
-        translated = self._session_mcp_servers()
         live_governed = self._seeds_local_settings and self._permission_surface_governed
         if self._session_mcp_withheld and not live_governed:
             return []

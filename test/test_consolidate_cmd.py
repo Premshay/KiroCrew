@@ -318,14 +318,8 @@ class TestOnSessionExpire:
         sm.on_session_expire = callback
 
         # Inject an expired session
-        sess = MagicMock(spec=_Session)
+        sess = _Session(provider=MagicMock())
         sess.last_used = _time.monotonic() - 9999
-        # The idle sweep now skips sessions with a turn in flight, so the stub
-        # has to answer semaphore.locked() the way a real _Session does.
-        # spec=_Session does not supply it: dataclass fields built with
-        # default_factory are instance attributes, not class attributes.
-        sess.semaphore = MagicMock()
-        sess.semaphore.locked.return_value = False
         sm._sessions["expired-key"] = sess
 
         import asyncio
@@ -349,14 +343,8 @@ class TestOnSessionExpire:
         sm = SessionManager(cfg, provider_factory=MagicMock())
         sm.on_session_expire = MagicMock(side_effect=RuntimeError("boom"))
 
-        sess = MagicMock(spec=_Session)
+        sess = _Session(provider=MagicMock())
         sess.last_used = _time.monotonic() - 9999
-        # The idle sweep now skips sessions with a turn in flight, so the stub
-        # has to answer semaphore.locked() the way a real _Session does.
-        # spec=_Session does not supply it: dataclass fields built with
-        # default_factory are instance attributes, not class attributes.
-        sess.semaphore = MagicMock()
-        sess.semaphore.locked.return_value = False
         sm._sessions["expired-key"] = sess
 
         import asyncio
@@ -408,11 +396,7 @@ class TestConsolidateCmdExceptionPath:
         mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
         tmp_path, capsys,
     ):
-        """A raising consolidate_now is REPORTED and exits non-zero.
-
-        It used to be debug-logged only, so a crashed session was
-        indistinguishable from a quiet one in the CLI output.
-        """
+        """Report consolidate_now failures and exit nonzero, distinct from a quiet session."""
         sessions_dir = self._make_session_file(tmp_path)
         mock_cfg_cls.load.return_value = MagicMock()
         mock_log = mock_log_cls.return_value
@@ -456,14 +440,8 @@ class TestExpireIdleSelFailure:
         callback = MagicMock()
         sm.on_session_expire = callback
 
-        sess = MagicMock(spec=_Session)
+        sess = _Session(provider=MagicMock())
         sess.last_used = _time.monotonic() - 9999
-        # The idle sweep now skips sessions with a turn in flight, so the stub
-        # has to answer semaphore.locked() the way a real _Session does.
-        # spec=_Session does not supply it: dataclass fields built with
-        # default_factory are instance attributes, not class attributes.
-        sess.semaphore = MagicMock()
-        sess.semaphore.locked.return_value = False
         sm._sessions["expired-sel"] = sess
 
         import asyncio
@@ -492,14 +470,8 @@ class TestExpireIdleSelFailure:
         callback = MagicMock(side_effect=RuntimeError("callback boom"))
         sm.on_session_expire = callback
 
-        sess = MagicMock(spec=_Session)
+        sess = _Session(provider=MagicMock())
         sess.last_used = _time.monotonic() - 9999
-        # The idle sweep now skips sessions with a turn in flight, so the stub
-        # has to answer semaphore.locked() the way a real _Session does.
-        # spec=_Session does not supply it: dataclass fields built with
-        # default_factory are instance attributes, not class attributes.
-        sess.semaphore = MagicMock()
-        sess.semaphore.locked.return_value = False
         sm._sessions["expired-cb"] = sess
 
         import asyncio
@@ -513,6 +485,7 @@ class TestExpireIdleSelFailure:
 
 def test_refused_consolidation_cli_does_not_claim_zero_spend(capsys):
     from kiro_crew.cli import _consolidate_cmd
+    from kiro_crew.history_consolidation import ConsolidationOutcome
 
     with (
         patch("kiro_crew.cli.sel"),
@@ -525,7 +498,11 @@ def test_refused_consolidation_cli_does_not_claim_zero_spend(capsys):
         patch("kiro_crew.cli.HistoryConsolidator") as consolidator,
     ):
         log.return_value.unconsolidated_count.return_value = 3
-        consolidator.return_value.consolidate_now = AsyncMock(return_value=False)
+        consolidator.return_value.consolidate_now = AsyncMock(
+            return_value=ConsolidationOutcome(
+                "skipped", detail="no completed pass recorded", complete=False
+            )
+        )
         _consolidate_cmd(argparse.Namespace(session_key="test_session", consolidate_all=False))
     output = capsys.readouterr().out
     assert "no completed pass recorded" in output

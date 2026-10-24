@@ -583,10 +583,8 @@ async def _entitlement_probe_answer(self: AcpClient) -> tuple[list[dict[str, str
     if probe_sid:
         policy = harness_for(self.backend).teardown
         try:
-            # Every harness this probe runs on tears a session down with an
-            # awaited request (``TeardownPolicy.notification`` is False for
-            # kiro, KAS and codex; test_deny_bounded_write pins it), so the
-            # request is the only path here.
+            # This entitlement re-probe admits only kiro-cli, whose teardown
+            # requires an awaited request. Other harnesses never start it.
             teardown_id = await self._send_request(policy.method, {"sessionId": probe_sid})
             await self._wait_for_response(teardown_id, timeout=_TERMINATE_TIMEOUT)
         except Exception:

@@ -2195,6 +2195,11 @@ names:
 | `chat_runner.py` | the off-loop prompt expansion `_expand_prompt_mention_off_loop`: `test_prompts.py` reads its `asyncio.to_thread` call in the runner |
 | `chat_runner.py` | the crew-log closers, which guards read in the runner (the turn's `latch_crew_log_previous` call is in `turn_admission`, the eager spawn's in `eager_spawn`); a new crew-log record helper goes in `crew_log_attribution` |
 
+Pass local slash-command replies directly to `_append_command_reply`; it redacts
+credentials and links while retaining the records that explain each placeholder.
+Do not pre-redact `/goal`'s echoed objective. Its stored declared goal is normalized
+separately by `set_declared_goal`.
+
 `chat_turn.compose` composes the package's modules (`chat_turn.owner_modules()`):
 it binds on `chat_runner` every name an owner binds that the runner lacks, so
 `chat_runner.<name>` resolves for each owner function, class and constant without a

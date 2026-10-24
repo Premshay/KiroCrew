@@ -122,8 +122,9 @@ def _dummy_memory():
 
 class TestASubSliceReceiptSurvivesAHeadNoticeMigration:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("existing_notice", [False, True])
     async def test_a_committed_sub_slice_replays_after_a_notice_lands_at_the_head(
-        self, tmp_path
+        self, tmp_path, existing_notice
     ) -> None:
         """Commit a sub-slice receipt, then migrate a notice in at the head and
         replay. The replay must recognise the receipt and re-apply the durable
@@ -133,6 +134,8 @@ class TestASubSliceReceiptSurvivesAHeadNoticeMigration:
         # the message marker does not move and the durable sub-offset advances,
         # which is exactly the mid-slice window the migration can land in.
         log = _log_with_head(tmp_path, "y" * (_CONSOLIDATION_PROMPT_BUDGET_CHARS * 3))
+        if existing_notice:
+            _inject_head_notice(log, "Already present before extraction")
         store = _RecordingStore()
         c, monkey = _make_consolidator(log, store)
         try:
@@ -181,7 +184,60 @@ class TestASubSliceReceiptSurvivesAHeadNoticeMigration:
             monkey.undo()
 
     @pytest.mark.asyncio
-    async def test_a_final_slice_receipt_replays_after_a_head_notice(self, tmp_path) -> None:
+    @pytest.mark.parametrize("change", ["edit", "reorder", "empty_receipt"])
+    async def test_a_receipt_never_acknowledges_changed_prompted_content(
+        self, tmp_path, change
+    ) -> None:
+        log = _log_with_head(tmp_path, "y" * (_CONSOLIDATION_PROMPT_BUDGET_CHARS * 3))
+        _inject_head_notice(log, "Already present before extraction")
+        store = _RecordingStore()
+        c, monkey = _make_consolidator(log, store)
+        try:
+            # Commit the real receipt, then fail exactly at marker publication.
+            with (
+                patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "e"})),
+                patch.object(c, "_advance_history_marker", side_effect=OSError("crash window")),
+                pytest.raises(OSError, match="crash window"),
+            ):
+                await c._consolidate(KEY, include_history=True)
+            assert store.receipts
+            before = log.get_metadata(KEY)
+            with history_mod.allow_on_loop_persist():
+                log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
+            if change == "empty_receipt":
+                next(iter(store.receipts.values()))["source_count"] = 0
+            else:
+                path = log._path(KEY)
+                lines = path.read_text().splitlines()
+                if change == "edit":
+                    row = json.loads(lines[-1])
+                    row["content"] = "z" + row["content"][1:]
+                    lines[-1] = json.dumps(row)
+                else:
+                    row = json.loads(lines[-1])
+                    row["content"] = "z" * (_CONSOLIDATION_PROMPT_BUDGET_CHARS * 3)
+                    lines.insert(1, json.dumps(row))
+                path.write_text("\n".join(lines) + "\n")
+                log._invalidate_cache(KEY)
+            with (
+                patch.object(c, "_call_llm", AsyncMock()) as llm,
+                pytest.raises(ValueError, match="source changed"),
+            ):
+                await c._consolidate(KEY, include_history=True)
+            llm.assert_not_awaited()
+            after = log.get_metadata(KEY)
+            assert after.get("last_consolidated", 0) == before.get("last_consolidated", 0)
+            assert after.get("consolidation_sub_offset", 0) == before.get(
+                "consolidation_sub_offset", 0
+            )
+        finally:
+            monkey.undo()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("existing_notice", [False, True])
+    async def test_a_final_slice_receipt_replays_after_a_head_notice(
+        self, tmp_path, existing_notice
+    ) -> None:
         """The final slice of a drained head commits a receipt whose durable
         advance is the message marker. A notice merged in at the head before that
         advance is retried must not wedge the replay either.
@@ -192,6 +248,8 @@ class TestASubSliceReceiptSurvivesAHeadNoticeMigration:
             tmp_path,
             "y" * (_CONSOLIDATION_PROMPT_BUDGET_CHARS + _CONSOLIDATION_PROMPT_BUDGET_CHARS // 2),
         )
+        if existing_notice:
+            _inject_head_notice(log, "Already present before extraction")
         store = _RecordingStore()
         c, monkey = _make_consolidator(log, store)
         try:
@@ -204,7 +262,7 @@ class TestASubSliceReceiptSurvivesAHeadNoticeMigration:
                     await c._consolidate(KEY, include_history=True)
                     passes += 1
             assert log.unconsolidated_count(KEY) == 0, "the head drained"
-            assert log.get_metadata(KEY).get("last_consolidated") == 1
+            assert log.get_metadata(KEY).get("last_consolidated") == 1 + int(existing_notice)
 
             # Reset the marker/sub-offset to just before the final slice's
             # advance, as a crash in the commit->advance window would leave it,

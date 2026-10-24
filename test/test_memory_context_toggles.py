@@ -41,7 +41,7 @@ from kiro_crew.context import (
     _config_scoped_groups,
 )
 from kiro_crew.history import ConversationLog, HistoryConsolidator
-from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED, ConsolidationOutcome
 from kiro_crew.learn import Lesson, LessonStore
 from kiro_crew.memory import MemoryStore
 from kiro_crew.skills import SkillsLoader
@@ -303,7 +303,9 @@ class TestConsolidationGate:
         _write_config()
         cons = _make_consolidator(_seed_log(tmp_path))
         with patch.object(
-            HistoryConsolidator, "_consolidate", new=AsyncMock(return_value=None)
+            HistoryConsolidator,
+            "_consolidate",
+            new=AsyncMock(return_value=ConsolidationOutcome("consolidated")),
         ) as run:
             cons.maybe_consolidate(KEY)
             await asyncio.gather(*cons._tasks)

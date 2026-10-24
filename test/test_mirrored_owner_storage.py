@@ -18,6 +18,12 @@ The rule, stated once:
     per use with ``importlib.import_module``, which answers from ``sys.modules``
     and waits on that module's import lock while its body runs.
 
+The shared ``_facade_mirror`` helper implements that resolution centrally. Its
+dynamic exports obey the live-read rule. Names already bound for a facade's own
+code follow its family-purge contract: the whole family is purged together, and
+writes through the facade resolve the current owner without touching a discarded
+one. The probe measures the applicable contract; both reject cached owners.
+
 These tests find the modules the rule binds BY THEIR SHAPE, read off the source
 tree, rather than from a list of names. A module that begins mirroring a surface is
 therefore covered on the commit that introduces it, with no edit here. A list of
@@ -60,8 +66,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
+import mirrored_owner_probe
 import pytest
 import source_corpus
 from mirrored_owner_probe import SENTINEL, one_reexported_pair
@@ -196,13 +203,48 @@ COMPLIANT = [row for row in MIRRORING if row[0] not in _KNOWN_RESOLVED_OWNER_MIR
 COMPLIANT_IDS = [name for name, _text in COMPLIANT]
 
 
+def _uses_shared_mirror(tree: ast.Module) -> bool:
+    """Recognize the shared install and class swap through its real import."""
+    nodes = _module_level_statements(tree)
+    imported = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "kiro_crew"
+        and any(alias.name == "_facade_mirror" and alias.asname is None for alias in node.names)
+        for node in nodes
+    )
+    installs = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "_facade_mirror"
+        and node.func.attr == "install"
+        for statement in nodes
+        if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        for node in ast.walk(statement)
+    )
+    swaps = any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute) and target.attr == "__class__"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Attribute)
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "_facade_mirror"
+        and node.value.attr == "MirroredModule"
+        for node in nodes
+    )
+    return imported and installs and swaps
+
+
 def rule_violations(name: str, text: str) -> list[str]:
     """Return the ways *name* breaks the one-storage rule, read off its source.
 
     Two halves, both visible in the source: a module-level mapping whose values are
-    module objects is a second storage location, and a mirroring module that never
-    calls ``importlib.import_module`` is not resolving owners from ``sys.modules`` at
-    all. Either one alone is a violation, so the empty list is the only clean answer.
+    module objects is a second storage location. A module that neither resolves
+    owners itself nor installs the canonical shared mirror has no live-owner
+    resolution. Either one alone is a violation, so the empty list is the only
+    clean answer.
     """
     problems: list[str] = []
     tables = owner_module_tables(ast.parse(text))
@@ -211,7 +253,7 @@ def rule_violations(name: str, text: str) -> list[str]:
             f"{tables} is a mapping to resolved owner MODULES, a second storage "
             "location beside sys.modules"
         )
-    if "importlib.import_module(" not in text:
+    if "importlib.import_module(" not in text and not _uses_shared_mirror(ast.parse(text)):
         problems.append(
             "it never calls importlib.import_module, so its owners are not resolved "
             "from sys.modules per use"
@@ -316,6 +358,88 @@ def test_the_discovery_rule_answers_both_ways() -> None:
     }
     del probe._TABLE  # type: ignore[attr-defined]
     assert one_reexported_pair(probe) is None, "discovery read a dunder-named table"
+
+
+def test_shared_mirror_detection_requires_import_install_and_class_swap():
+    source = (
+        "from kiro_crew import _facade_mirror\n"
+        "_facade_mirror.install(facade, owners)\n"
+        "sys.modules[__name__].__class__ = _facade_mirror.MirroredModule\n"
+    )
+    assert _uses_shared_mirror(ast.parse(source))
+    for broken in (
+        source.replace("from kiro_crew import _facade_mirror\n", ""),
+        source.replace("_facade_mirror.install(facade, owners)\n", ""),
+        source.replace("MirroredModule", "OtherModule"),
+    ):
+        assert not _uses_shared_mirror(ast.parse(broken))
+
+
+@pytest.mark.parametrize("contract", ["read", "write"])
+@pytest.mark.parametrize("cached", [False, True])
+def test_probe_rejects_a_cached_owner_for_each_access_contract(monkeypatch, contract, cached):
+    from kiro_crew import _facade_mirror
+
+    monkeypatch.setattr(_facade_mirror, "_INSTALLED", set(_facade_mirror._INSTALLED))
+    owner_name = "kiro_crew.probe_access_owner"
+    old = ModuleType(owner_name)
+    old.VALUE = object()
+    fresh = ModuleType(owner_name)
+    fresh.VALUE = object()
+    facade = ModuleType("kiro_crew.probe_access_facade")
+    monkeypatch.setitem(sys.modules, owner_name, old)
+    monkeypatch.setitem(sys.modules, facade.__name__, facade)
+
+    def resolve(name):
+        if name == facade.__name__:
+            return facade
+        if name == owner_name:
+            if name not in sys.modules:
+                monkeypatch.setitem(sys.modules, name, fresh)
+            return sys.modules[name]
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(mirrored_owner_probe, "importlib", SimpleNamespace(import_module=resolve))
+    if contract == "read":
+        facade._EXPORTS = {"VALUE": owner_name}
+
+        def read(name):
+            if name != "VALUE":
+                raise AttributeError(name)
+            return (old if cached else resolve(owner_name)).VALUE
+
+        facade.__getattr__ = read
+    else:
+        facade.VALUE = old.VALUE
+        _facade_mirror.install(facade, (owner_name,))
+        facade.__class__ = _facade_mirror.MirroredModule
+        if cached:
+            original = _facade_mirror.MirroredModule.__setattr__
+
+            def stale_write(module, name, value):
+                if module is facade and name == "VALUE":
+                    old.VALUE = value
+                    ModuleType.__setattr__(module, name, value)
+                else:
+                    original(module, name, value)
+
+            monkeypatch.setattr(_facade_mirror.MirroredModule, "__setattr__", stale_write)
+    verdict = mirrored_owner_probe.probe(facade.__name__)
+    assert "unmeasurable" not in verdict
+    assert verdict["access_contract"] == contract
+    assert verdict[f"{contract}_resolves"] is (not cached)
+    if contract == "write":
+        assert verdict["purged_unchanged"] is (not cached)
+
+
+def test_an_empty_mirroring_module_remains_unmeasurable(monkeypatch):
+    empty = ModuleType("kiro_crew.probe_empty_mirror")
+    monkeypatch.setattr(
+        mirrored_owner_probe, "importlib", SimpleNamespace(import_module=lambda _name: empty)
+    )
+    verdict = mirrored_owner_probe.probe(empty.__name__)
+    assert "unmeasurable" in verdict
+    assert "access_contract" not in verdict
 
 
 def test_the_scan_finds_the_modules_that_mirror_a_surface() -> None:
@@ -614,10 +738,13 @@ def _measurable(verdict: dict[str, object], name: str) -> None:
 
 
 @pytest.mark.parametrize(("name", "text"), COMPLIANT, ids=COMPLIANT_IDS)
-def test_a_read_through_the_mirror_resolves_the_owner_in_sys_modules(
+def test_a_mirror_uses_sys_modules_for_its_declared_access_contract(
     name: str, text: str, probe_verdicts: dict[str, dict[str, object]]
 ) -> None:
-    """A read answers from the module ``sys.modules`` holds, not from an earlier one.
+    """Dynamic reads and canonical bound writes use the owner in ``sys.modules``.
+
+    Bound globals follow the shared helper's family-purge contract; the probe
+    checks their writes reach the fresh owner and leave the purged one unchanged.
 
     Resolving only the OWNER through the import system while the VALUE stays bound
     in the mirroring module's own namespace is not half of this rule -- it is its own
@@ -639,6 +766,16 @@ def test_a_read_through_the_mirror_resolves_the_owner_in_sys_modules(
         f"{name}: the probe's reimport returned the same object, so it measured "
         "nothing -- there was no purge to see through"
     )
+    contract = verdict.get("access_contract")
+    assert contract in {"read", "write"}, "the probe must state which access it measured"
+    if contract == "write":
+        assert (
+            verdict.get("write_resolves") is True
+        ), f"writing {name}.{verdict.get('attribute')} did not reach its current owner"
+        assert (
+            verdict.get("purged_unchanged") is True
+        ), f"writing {name}.{verdict.get('attribute')} changed its discarded owner"
+        return
     assert verdict.get("read_resolves") is True, (
         f"reading {name}.{verdict.get('attribute')} did not answer from the "
         f"{verdict.get('owner')} that sys.modules holds (got {verdict.get('read')!r}), so a "

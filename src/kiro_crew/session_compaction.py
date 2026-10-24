@@ -28,6 +28,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.agent_sdk.capabilities import (
+    compact_unsupported_backend as _compact_unsupported_backend,
+)
 from kiro_crew.messaging.queue_drain import entry_channel, wake_other_drains
 from kiro_crew.metrics.events import CONTEXT_COMPACTIONS, emit_counter
 from kiro_crew.metrics.sessions import (
@@ -220,12 +223,6 @@ class _CompactionOwner(Protocol):
         clear_conversation: bool = False,
         ends_conversation: bool = False,
     ) -> bool: ...
-
-
-def _compact_unsupported_backend(provider: LLMProvider) -> str | None:
-    """Read the provider capability without importing channel command handlers."""
-    backend = getattr(provider, "manual_compact_unsupported_backend", None)
-    return backend if isinstance(backend, str) and backend else None
 
 
 def _compaction_unmanaged_backend(provider: LLMProvider) -> str | None:

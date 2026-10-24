@@ -5,10 +5,9 @@ so the per-model effort map has no key to hold the level under. The factory
 carries the level unkeyed and the provider binds it to the model the backend
 reports serving once the session is ready, before the initial effort push.
 
-Covered for a harness that advertises its effort option per session (pi), a
-harness whose effort support comes from the model registry (claude) and the
-kiro family, whose level otherwise rides the spawn-time overlay. An unpinned
-kiro-cli serves its ``chat.defaultModel`` when one is set and ``auto`` when
+Covered for harnesses that advertise their effort option per session (pi and
+claude) and the kiro family, whose level otherwise rides the spawn-time overlay.
+An unpinned kiro-cli serves its ``chat.defaultModel`` when one is set and ``auto`` when
 none is, so both are covered there.
 """
 
@@ -28,29 +27,35 @@ _PI_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"]
 
 
 def _provider(
-    backend: str, *, unbound: str, served: str, model: str = "", work_dir=None
+    backend: str,
+    *,
+    unbound: str,
+    served: str,
+    model: str = "",
+    work_dir=None,
+    advertised_effort: bool = True,
 ) -> AcpProvider:
     """An unstarted provider whose client reports *served* once it is ready.
 
-    With *work_dir* the client is configured before construction, so the kiro
-    family seeds its effort map from a real overlay there, as on a reused
-    workspace.
+    A real client supplies effort-selector discovery from advertised options.
+    With *work_dir* the kiro family seeds its effort map from a real overlay
+    there, as on a reused workspace.
     """
-    with patch("kiro_crew.providers.acp.AcpClient") as client_cls:
-        if work_dir is not None:
-            client_cls.return_value.backend = backend
-            client_cls.return_value._model = model or "auto"
-            client_cls.return_value._resolved_model_id = None
-            client_cls.return_value._work_dir = work_dir
-        provider = AcpProvider(acp_backend=backend, model=model, unbound_effort=unbound)
+    provider = AcpProvider(
+        acp_backend=backend, model=model, unbound_effort=unbound, work_dir=work_dir
+    )
     client = provider._client
-    client.backend = backend
     # An unpinned client records the ``auto`` sentinel until the backend answers.
     client._model = model or "auto"
     client._resolved_model_id = None
-    client._work_dir = MagicMock() if work_dir is None else work_dir
-    client.supports_config_option = MagicMock(return_value=True)
-    client.get_valid_effort_levels = MagicMock(return_value=list(_PI_LEVELS))
+    if advertised_effort and backend in (ACP_BACKEND_PI, ACP_BACKEND_CLAUDE):
+        client._acp_config_options = [
+            {
+                "id": "thought_level" if backend == ACP_BACKEND_PI else "effort",
+                "type": "select",
+                "options": [{"value": level, "name": level} for level in _PI_LEVELS],
+            }
+        ]
     client.set_config_option = AsyncMock()
     client.send_command = AsyncMock()
 
@@ -110,7 +115,7 @@ class TestProviderBindsTheLevel:
         assert provider._effort_per_model == {"claude-opus-5": "minimal"}
 
     @pytest.mark.asyncio
-    async def test_registry_gated_harness_pushes_the_level_at_start(self):
+    async def test_claude_advertised_selector_pushes_the_level_at_start(self):
         provider = _provider(ACP_BACKEND_CLAUDE, unbound="high", served="claude-opus-4.7")
         await provider.start()
         provider._client.set_config_option.assert_awaited_once_with("effort", "high")
@@ -128,7 +133,9 @@ class TestProviderBindsTheLevel:
 
     @pytest.mark.asyncio
     async def test_served_model_without_effort_logs_the_drop_and_pushes_nothing(self, caplog):
-        provider = _provider(ACP_BACKEND_CLAUDE, unbound="high", served="deepseek-3.2")
+        provider = _provider(
+            ACP_BACKEND_CLAUDE, unbound="high", served="deepseek-3.2", advertised_effort=False
+        )
         with caplog.at_level(logging.WARNING, logger="kiro_crew.providers.acp"):
             await provider.start()
             await provider.start()

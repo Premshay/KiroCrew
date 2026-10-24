@@ -9,13 +9,13 @@ from unittest.mock import Mock
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import make_mocked_request
 
 from ..backend import commit, routes, store
 from ..profiles.github_repo import profile as gp
 from ..spine import driver as drv
 from ..spine.contracts import BugGateResult, Candidate, Proposal, Verdict
 from ..spine.keeper import KEPT
+from .request_helpers import owner_request
 
 SETTINGS = {
     "track": "perf",
@@ -28,7 +28,7 @@ SETTINGS = {
 
 
 def request(body):
-    req = make_mocked_request("PUT", "/config")
+    req = owner_request("PUT", "/config")
     req._read_bytes = json.dumps(body).encode()
     return req
 
@@ -293,7 +293,7 @@ async def test_manual_routes_schedule_marked_queue_before_materialization(monkey
     supervisor = Mock()
     supervisor.publish.return_value = {"publication": "pending", "status": "running"}
     monkeypatch.setattr(routes.runner, "get_supervisor", lambda: supervisor)
-    req = make_mocked_request("POST", "/publish/" + fp, match_info={"fp": fp})
+    req = owner_request("POST", "/publish/" + fp, match_info={"fp": fp})
     handler = routes._handle_commit if manual == "commit" else routes._handle_draft_pr
     response = await handler(req)
     assert response.status == 202

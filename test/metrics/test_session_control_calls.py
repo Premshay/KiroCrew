@@ -60,6 +60,8 @@ EXPECTED_AGENT_KINDS = frozenset(
         "team_lead",
         "heartbeat",
         "dashboard_manager",
+        "fast",
+        "consolidate",
         "default",
         "crewmate",
         "other",
@@ -159,6 +161,16 @@ class TestOpEnum:
 class TestCallerEnum:
     def test_the_derived_set_equals_the_hand_written_agent_kind_table(self):
         assert set(scc.SESSION_CONTROL_CALLER_KINDS) == set(EXPECTED_AGENT_KINDS)
+
+    @pytest.mark.parametrize(
+        "agent,kind",
+        [("kirocrew-fast", "fast"), ("kirocrew-consolidate", "consolidate")],
+    )
+    def test_preserved_background_agents_have_named_buckets(self, agent, kind):
+        from kiro_crew.crew_log.projection_otel_usage import _agent_kind_by_name
+
+        assert scc.caller_kind_for_agent(agent) == kind
+        assert _agent_kind_by_name(agent) == kind
 
     def test_every_owned_agent_file_has_a_kind(self):
         """Derived, so a new owned file joins the enum with no table to edit."""

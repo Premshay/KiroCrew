@@ -454,8 +454,10 @@ async def api_workflow_author(request: web.Request) -> web.Response:
         return refusal
     selection = _author_selection(body)
     if selection is None:
-        return web.json_response(
-            {"error": "author_agent and author_model must be strings"}, status=400
+        return _error(
+            f"author_agent and author_model must be strings of at most {MAX_SHORT_STRING} characters",
+            "workflow_author_selection_invalid",
+            400,
         )
     try:
         out = await svc.author(
@@ -588,8 +590,10 @@ async def api_workflow_run_intent(request: web.Request) -> web.Response:
         return refusal
     selection = _author_selection(body)
     if selection is None:
-        return web.json_response(
-            {"error": "author_agent and author_model must be strings"}, status=400
+        return _error(
+            f"author_agent and author_model must be strings of at most {MAX_SHORT_STRING} characters",
+            "workflow_author_selection_invalid",
+            400,
         )
     try:
         out = await svc.start_from_intent(

@@ -712,7 +712,7 @@ class TestPostRestartContinuation:
 
         assert response.status == 200
         frame = drain_peer_channel_inbox(claude_slot)
-        assert "[KiroCrew Channel message]" in frame
+        assert "[KiroCrew Channel message]" in frame  # brand-ok: legacy channel envelope assertion
         assert "not a user instruction or operator authorization" in frame
         assert "Delivery: next_turn" in frame
         assert "I verified the session checkpoint bridge." in frame

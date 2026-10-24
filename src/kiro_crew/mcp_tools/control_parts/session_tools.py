@@ -1,4 +1,8 @@
-"""Caller-bound checkpoints, coordination and maintenance tools."""
+"""Caller-bound checkpoints, coordination and maintenance tools.
+
+Resolve identity through the shared fail-closed gate and pass its returned key
+to each gateway request; never inherit a parent session's authority.
+"""
 
 from __future__ import annotations
 
@@ -17,9 +21,11 @@ from kiro_crew.validation import (
 def session_checkpoint(name: str, args: dict[str, Any]) -> str:
     """Persist a checkpoint through the caller-bound gateway endpoint."""
     args = validate_tool_args(args, SESSION_CHECKPOINT_SCHEMA)
-    session_key = mcp_core._resolve_session_key_strict()
+    session_key, error = mcp_core.require_strict_session_key(
+        "Error: session_checkpoint requires a verified dashboard session identity."
+    )
     if not session_key:
-        return "Error: session_checkpoint requires a verified dashboard session identity."
+        return error
     result = mcp_core._post("/api/session-checkpoint", args, session_key=session_key)
     if result.get("ok") is not True:
         if result.get("transport_error") is True:
@@ -45,7 +51,9 @@ def session_checkpoint(name: str, args: dict[str, Any]) -> str:
 
 def _session_channel_post(body: dict[str, Any]) -> dict[str, Any] | None:
     """Call the attached-channel endpoint with a verified session identity."""
-    session_key = mcp_core._resolve_session_key_strict()
+    session_key, _error = mcp_core.require_strict_session_key(
+        "Error: session channel access requires a verified session identity."
+    )
     if not session_key:
         return None
     return mcp_core._post("/api/session-channel", body, session_key=session_key)
@@ -132,9 +140,11 @@ def session_channel_manage(name: str, args: dict[str, Any]) -> str:
 def session_restart_continuation(name: str, args: dict[str, Any]) -> str:
     """Arm one persisted verification turn for the verified calling session."""
     args = validate_tool_args(args, SESSION_RESTART_CONTINUATION_SCHEMA)
-    session_key = mcp_core._resolve_session_key_strict()
+    session_key, error = mcp_core.require_strict_session_key(
+        "Error: session_restart_continuation requires a verified session identity."
+    )
     if not session_key:
-        return "Error: session_restart_continuation requires a verified session identity."
+        return error
     result = mcp_core._post("/api/session-restart-continuation", args, session_key=session_key)
     if result.get("ok") is True:
         return "Post-restart verification is armed for this session."
@@ -145,7 +155,9 @@ def session_restart_continuation(name: str, args: dict[str, Any]) -> str:
 
 def _maintenance_post(action: str) -> dict[str, Any] | None:
     """Call the session-scoped maintenance endpoint with a verified identity."""
-    session_key = mcp_core._resolve_session_key_strict()
+    session_key, _error = mcp_core.require_strict_session_key(
+        "Error: session maintenance requires a verified session identity."
+    )
     if not session_key:
         return None
     return mcp_core._post("/api/session-maintenance", {"action": action}, session_key=session_key)

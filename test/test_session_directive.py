@@ -251,7 +251,7 @@ class TestHasMarker:
         A diagnostic that could grant would BE the forgery hole."""
         forged = sd.encode("monitor_start", {"message": "x"}, "human")
         assert sd.has_marker(forged) is True
-        assert sd.directive_tool_for("", "execute_bash") == ""
+        assert sd.directive_tool_for("", "execute_bash", trusted=False) == ""
         assert sd.decode(forged, "execute_bash") is None
 
 

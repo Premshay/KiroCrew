@@ -216,7 +216,8 @@ async def test_stream_task_still_posts_a_card_for_an_unrelated_error():
     busy = await _stream_task(agent, ch, _raising_client(AcpError("InternalServerError")), "hi")
     assert busy == channel_mod._STREAM_OK
     ch.post.assert_awaited_once()
-    assert "error occurred" in ch.post.await_args.args[1]
+    assert ch.post.await_args.args[1] == "❌ dev stopped: InternalServerError"
+    assert ch.post.await_args.kwargs["msg_type"] == "system"
 
 
 @pytest.mark.asyncio
@@ -251,7 +252,11 @@ async def test_stream_task_posts_a_card_not_the_text_of_an_unfinished_turn(text,
     busy = await _stream_task(agent, ch, _ended_client(text, stop_reason), "hi")
     assert busy == channel_mod._STREAM_OK
     ch.post.assert_awaited_once()
-    assert "error occurred" in ch.post.await_args.args[1]
+    card = ch.post.await_args.args[1]
+    assert card.startswith("❌ dev stopped: ACP prompt timed out:")
+    assert stop_reason in card
+    if text:
+        assert text not in card
     assert ch.post.await_args.kwargs["msg_type"] == "system"
 
 

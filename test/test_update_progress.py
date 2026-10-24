@@ -99,8 +99,10 @@ def _pin_probe_git(monkeypatch, tmp_path):
 def _make_state(monkeypatch, tmp_path) -> DashboardState:
     """Create a minimal DashboardState for testing."""
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    sessions = MagicMock(count=0)
+    sessions.restart_barrier_snapshot = AsyncMock(return_value=[])
     return DashboardState(
-        sessions=MagicMock(count=0),
+        sessions=sessions,
         crons=MagicMock(),
         lessons=MagicMock(),
         start_time=0.0,

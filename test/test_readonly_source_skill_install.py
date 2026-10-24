@@ -49,6 +49,9 @@ def _make_skill_tree(root: Path, name: str) -> Path:
     skill_dir = root / name
     scripts = skill_dir / "scripts"
     scripts.mkdir(parents=True)
+    # The fixture changes owner bits only; ambient group-write must not alter its oracle.
+    for directory in (skill_dir, scripts):
+        directory.chmod(0o755)
     (skill_dir / "SKILL.md").write_text(
         f"---\nname: {name}\ndescription: readonly-source fixture\n---\nbody\n",
         encoding="utf-8",

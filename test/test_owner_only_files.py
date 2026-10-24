@@ -38,6 +38,7 @@ try:
 except ImportError:  # Windows, where pytestmark skips the whole module
     fcntl = None  # type: ignore[assignment]
 
+from kiro_crew import atomic_write as atomic_write_mod
 from kiro_crew import owner_only_files as oof
 from kiro_crew import platform_compat
 from kiro_crew._sqlite_compat import sqlite3
@@ -50,8 +51,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(autouse=True)
-def _umask_022() -> Iterator[None]:
+def _umask_022(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     previous = os.umask(0o022)
+    # The atomic writer caches its first umask; this fixture changes that input.
+    monkeypatch.setattr(atomic_write_mod, "_default_mode", None)
     try:
         yield
     finally:

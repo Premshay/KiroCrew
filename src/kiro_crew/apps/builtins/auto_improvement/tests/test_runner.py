@@ -570,6 +570,7 @@ class TestRunCutOffByARestart:
         "started_at",
         "finished_at",
         "offline_reason",
+        "publication_result",
     }
 
     @staticmethod
@@ -699,6 +700,7 @@ class TestRunCutOffByARestart:
         assert status["error"] == R.INTERRUPTED_BY_RESTART, status
         assert status["run_id"] == "run-before-the-exec", status
         assert set(on_disk) == self._RECORD_KEYS, on_disk
+        assert on_disk["publication_result"] == {}
         assert on_disk["status"] == R.STATUS_ERROR, on_disk
         assert on_disk["error"] == R.INTERRUPTED_BY_RESTART, on_disk
         assert elsewhere["status"] == R.STATUS_ERROR, elsewhere
@@ -907,6 +909,7 @@ class TestRunCutOffByARestart:
 
         record = json.loads(R._terminal_record_path().read_text(encoding="utf-8"))
         assert set(record) == self._RECORD_KEYS
+        assert record["publication_result"] == {}
         assert record["status"] == R.STATUS_DONE and record["run_id"] == started["run_id"]
         assert R.RunSupervisor().status()["status"] == R.STATUS_DONE
 

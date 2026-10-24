@@ -123,10 +123,9 @@ async def _route_claude_frame(self: AcpClient, msg: JsonRpcMessage) -> None:
         await self._handle_claude_sdk_message(msg)
         return
     # A response to one of our own requests always belongs to the dispatch
-    # awaiting it. A prompt sent while an autonomous cycle runs is absorbed
-    # into that cycle, and its session/prompt response used to be collected
-    # here as cycle output and dropped, leaving the turn waiting until the
-    # turn ceiling.
+    # awaiting it. An autonomous cycle can absorb a prompt, but its
+    # session/prompt response must reach that prompt's waiter rather than
+    # becoming cycle output.
     is_response = msg.id is not None and msg.method is None
     if self._claude_autonomous_origin is not None and not is_response:
         await self._collect_claude_autonomous_frame(msg)

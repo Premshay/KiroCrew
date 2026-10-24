@@ -146,6 +146,10 @@ async def test_cli_repl_still_compacts_a_backend_that_can(monkeypatch):
 def test_auto_compaction_asks_the_shared_predicate():
     """The automatic gate holds no private copy that could drift from the channels'."""
     from kiro_crew import session_compaction
+    from kiro_crew.agent_sdk.capabilities import compact_unsupported_backend
     from kiro_crew.messaging import commands
+    from kiro_crew.providers import base
 
     assert session_compaction._compact_unsupported_backend is commands.compact_unsupported_backend
+    assert commands.compact_unsupported_backend is compact_unsupported_backend
+    assert base.compact_unsupported_backend is compact_unsupported_backend

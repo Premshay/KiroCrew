@@ -710,7 +710,8 @@ def test_the_race_outcome_settles_the_card_and_undoes_the_soft_stop(tmp_path, mo
     assert '"state": "stop_declined_compacting"' in cards[0]["cls"]
 
 
-def test_a_second_press_during_compaction_escalates_to_the_force_stop(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_a_second_press_during_compaction_escalates_to_the_force_stop(tmp_path, monkeypatch):
     """The escape hatch: the decline arms ``soft_pending``, so press #2 hard-stops."""
     from unittest.mock import AsyncMock, MagicMock
 
@@ -718,27 +719,32 @@ def test_a_second_press_during_compaction_escalates_to_the_force_stop(tmp_path, 
 
     state = _dashboard_state(tmp_path)
     slot = state.get_or_create_slot("chat-14841")
-    task = MagicMock()
-    task.done.return_value = False
+    task = asyncio.create_task(asyncio.Event().wait())
     slot.task = task
     state.sessions.is_compacting = MagicMock(return_value=True)
     state.sessions.stop_turn = AsyncMock(return_value="hard")
     monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.sel", lambda: MagicMock())
 
-    asyncio.run(stop_slot_turn(state, slot))
-    state.sessions.stop_turn.assert_not_awaited()
-    assert slot._stop_state == "idle", "a declined Stop is not a stop in progress"
-    asyncio.run(stop_slot_turn(state, slot))
+    try:
+        await stop_slot_turn(state, slot)
+        state.sessions.stop_turn.assert_not_awaited()
+        assert slot._stop_state == "idle", "a declined Stop is not a stop in progress"
+        await stop_slot_turn(state, slot)
 
-    state.sessions.stop_turn.assert_awaited_once()
-    assert state.sessions.stop_turn.await_args.kwargs["force"] is True
-    # The escape from a compaction decline keeps the SESSION queue (a linked
-    # channel's, on a linked slot); the slot's own queue is still discarded.
-    assert state.sessions.stop_turn.await_args.kwargs["preserve_queue"] is True
-    assert slot._stop_declined_at == 0.0, "the marker is consumed by the press it armed"
+        state.sessions.stop_turn.assert_awaited_once()
+        assert state.sessions.stop_turn.await_args.kwargs["force"] is True
+        # The escape from a compaction decline keeps the SESSION queue (a linked
+        # channel's, on a linked slot); the slot's own queue is still discarded.
+        assert state.sessions.stop_turn.await_args.kwargs["preserve_queue"] is True
+        assert slot._stop_declined_at == 0.0, "the marker is consumed by the press it armed"
+        assert task.cancelled(), "a hard Stop settles the runner before returning"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
-def test_the_second_press_after_a_decline_gets_its_own_stop_card(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_the_second_press_after_a_decline_gets_its_own_stop_card(tmp_path, monkeypatch):
     """The decline settled its card; the hard kill that follows needs a row of its
     own, or the last stop row reads "nothing was stopped" for a reset session."""
     from unittest.mock import AsyncMock, MagicMock
@@ -747,20 +753,24 @@ def test_the_second_press_after_a_decline_gets_its_own_stop_card(tmp_path, monke
 
     state = _dashboard_state(tmp_path)
     slot = state.get_or_create_slot("chat-14841")
-    task = MagicMock()
-    task.done.return_value = False
+    task = asyncio.create_task(asyncio.Event().wait())
     slot.task = task
     state.sessions.is_compacting = MagicMock(return_value=True)
     state.sessions.stop_turn = AsyncMock(return_value="hard")
     monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.sel", lambda: MagicMock())
 
-    asyncio.run(stop_slot_turn(state, slot))
-    asyncio.run(stop_slot_turn(state, slot))
+    try:
+        await stop_slot_turn(state, slot)
+        await stop_slot_turn(state, slot)
 
-    cards = [m for m in slot.messages if '"kind": "stop_event"' in (m.get("cls") or "")]
-    assert len(cards) == 2, "one settled decline row, one row for the hard kill"
-    assert slot._stop_event_id is not None
-    assert slot._stop_escalated_card_id == slot._stop_event_id
+        cards = [m for m in slot.messages if '"kind": "stop_event"' in (m.get("cls") or "")]
+        assert len(cards) == 2, "one settled decline row, one row for the hard kill"
+        assert slot._stop_event_id is not None
+        assert slot._stop_escalated_card_id == slot._stop_event_id
+        assert task.cancelled(), "a hard Stop settles the runner before returning"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def test_a_caller_that_withholds_escalation_is_not_hard_killed_by_a_decline_marker(
@@ -841,7 +851,8 @@ def test_a_non_escalating_decline_does_not_arm_the_marker(tmp_path, monkeypatch)
     assert slot.to_dict()["stop_declined"] is False
 
 
-def test_a_non_escalating_press_does_not_spend_the_users_armed_hatch(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_a_non_escalating_press_does_not_spend_the_users_armed_hatch(tmp_path, monkeypatch):
     """A retry or a containment stop (``escalate=False``) arriving between the
     decline and the user's second press must leave the marker for that press."""
     from unittest.mock import AsyncMock, MagicMock
@@ -850,24 +861,28 @@ def test_a_non_escalating_press_does_not_spend_the_users_armed_hatch(tmp_path, m
 
     state = _dashboard_state(tmp_path)
     slot = state.get_or_create_slot("chat-14841")
-    task = MagicMock()
-    task.done.return_value = False
+    task = asyncio.create_task(asyncio.Event().wait())
     slot.task = task
     state.sessions.is_compacting = MagicMock(return_value=True)
     state.sessions.stop_turn = AsyncMock(return_value="hard")
     monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.sel", lambda: MagicMock())
 
-    asyncio.run(stop_slot_turn(state, slot))  # declined, armed
-    armed_at = slot._stop_declined_at
-    asyncio.run(stop_slot_turn(state, slot, escalate=False))  # a retry
-    assert slot._stop_declined_at == armed_at, "the retry did not spend the hatch"
-    asyncio.run(stop_slot_turn(state, slot))  # the user's real second press
+    try:
+        await stop_slot_turn(state, slot)  # declined, armed
+        armed_at = slot._stop_declined_at
+        await stop_slot_turn(state, slot, escalate=False)  # a retry
+        assert slot._stop_declined_at == armed_at, "the retry did not spend the hatch"
+        await stop_slot_turn(state, slot)  # the user's real second press
 
-    state.sessions.stop_turn.assert_awaited_once()
-    assert state.sessions.stop_turn.await_args.kwargs["force"] is True
-    # The escape from a compaction decline keeps the SESSION queue (a linked
-    # channel's, on a linked slot); the slot's own queue is still discarded.
-    assert state.sessions.stop_turn.await_args.kwargs["preserve_queue"] is True
+        state.sessions.stop_turn.assert_awaited_once()
+        assert state.sessions.stop_turn.await_args.kwargs["force"] is True
+        # The escape from a compaction decline keeps the SESSION queue (a linked
+        # channel's, on a linked slot); the slot's own queue is still discarded.
+        assert state.sessions.stop_turn.await_args.kwargs["preserve_queue"] is True
+        assert task.cancelled(), "a hard Stop settles the runner before returning"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def test_the_shared_channel_stop_forces_on_a_repeat_within_the_window():

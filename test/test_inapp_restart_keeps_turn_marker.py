@@ -66,13 +66,23 @@ async def _restart_mid_turn(tmp_path, monkeypatch, key: str, *, lands: bool):
         await turn
 
     state.sessions.close_all = _close_all
+    session_key = f"dashboard:{key}"
+    state.sessions.restart_barrier_snapshot = AsyncMock(
+        return_value=[{"session_key": session_key, "busy": True, "activity_marker": 1.0}]
+    )
     execs: list[str] = []
     monkeypatch.setattr(updates, "resolve_restart_launcher", lambda: None)
     monkeypatch.setattr(updates.platform_compat, "execv_target_available", lambda _exe: True)
     monkeypatch.setattr(updates, "flush_breadcrumb_writes", lambda _t: None)
     monkeypatch.setattr(updates, "reexec_python_module", lambda *_a, **_k: execs.append("exec"))
 
-    assert await updates._restart_gateway(state, resolver=lambda: "/python") is True
+    blocked = await updates._restart_gateway(state, resolver=lambda: "/python")
+    assert blocked.blocked is True
+    assert execs == [] and not release.is_set()
+    state.restart_barrier.note_checkpoint(session_key)
+    assert state.restart_barrier.acknowledge(session_key)[0] is True
+    result = await updates._restart_gateway(state, resolver=lambda: "/python")
+    assert result.restarted is True
     assert execs == ["exec"]
     assert turn.done()
     return state, slot

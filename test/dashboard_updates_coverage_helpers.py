@@ -15,11 +15,12 @@ imports the fixture and ``_request``.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import DEFAULT, MagicMock
+from unittest.mock import DEFAULT, AsyncMock, MagicMock
 
 import pytest
 
 from kiro_crew.dashboard.handlers import updates
+from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.platform import update_layout
 
 
@@ -67,6 +68,9 @@ def _request(body: object = None, *, query: dict[str, str] | None = None) -> Mag
     req.query = dict(query or {})
     state = MagicMock()
     state._background_tasks = set()
+    state._slots = {}
+    state.sessions.restart_barrier_snapshot = AsyncMock(return_value=[])
+    state.restart_barrier = RestartBarrier()
     state.owner_id = ""  # no owner configured: the local bootstrap subject is the owner
     req.app = {"state": state}
     _as_owner(req)

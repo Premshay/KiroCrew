@@ -1299,8 +1299,7 @@ def _names(client) -> list[str]:
 
 
 class TestClaudeLeanProfileKeepsMemberServers:
-    """The lean Claude profile used to drop the member's session control while the
-    session still reported it mounted, so desks were told about tools they lacked."""
+    """Keep advertised member session-control tools mounted under lean Claude profiles."""
 
     TRANSLATED = [
         {"name": "brave-search"},

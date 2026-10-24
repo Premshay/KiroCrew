@@ -11,9 +11,11 @@ Each function here whose first parameter is ``self`` is a ``Driver`` method: the
 it by name, so it reads and writes the run's state on the instance, and a patch of the method
 on the class or on an instance reaches every caller.
 
-Instance fields written: ``_repository_retired``, ``_rollback_failed``.
+Instance fields written: ``_repository_retired``, ``_rollback_failed``, ``pushed_sha``.
 
-Instance fields read: ``branch``, ``clone``, ``guardrail_tolerances``, ``log``, ``profile``.
+Instance fields read: ``_publication_failure``, ``archive``, ``branch``, ``clone``,
+``guardrail_tolerances``, ``ledger``, ``log``, ``measurer``, ``pr_pipeline``, ``profile``,
+``stats``.
 """
 
 from __future__ import annotations

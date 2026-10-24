@@ -583,7 +583,7 @@ class TestPatchReach:
         assert {
             "_RUNS",
             "_save_runs",
-            "_KNOWN_MODELS",
+            "_known_models",
             "is_app_enabled",
             "_post_comments_bg",
         } <= set(patched)
@@ -604,7 +604,7 @@ class TestPatchReach:
         assert {
             "_RUNS",
             "_save_runs",
-            "_KNOWN_MODELS",
+            "_known_models",
             "_write_runs",
             "_post_comments_bg",
         } <= reached

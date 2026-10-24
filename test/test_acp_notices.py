@@ -79,18 +79,18 @@ def test_bounded_pending_dedup_and_session_isolation():
     for i in range(NOTICE_STATE_MAX + 5):
         state.accept(notice(title=str(i)), "session-a", stage=True)
     assert len(state.seen) == len(state.pending) == NOTICE_STATE_MAX
-    pending = state.drain("session-a")
+    pending = state.pop_pending("session-a")
     # The five dropped notices are reported once, ahead of the survivors.
     assert pending[0].title == "5 earlier provider notice(s) were dropped"
     assert pending[0].notice_severity == "warning"
     assert pending[1].title == "5"
     assert len(pending) == NOTICE_STATE_MAX + 1
     state.accept(notice(title="after"), "session-a", stage=True)
-    assert [e.title for e in state.drain("session-a")] == ["after"]
+    assert [e.title for e in state.pop_pending("session-a")] == ["after"]
     assert state.accept(notice(title=str(NOTICE_STATE_MAX + 4)), "session-a") is None
     assert state.accept(notice(title=str(NOTICE_STATE_MAX + 4), severity="error"), "session-a")
     state.accept(notice(title="old"), "session-a", stage=True)
-    assert state.drain("new-session") == []
+    assert state.pop_pending("new-session") == []
     assert state.accept(notice("new-session", title="old"), "new-session")
 
 
@@ -213,9 +213,9 @@ async def test_direct_init_drain_retains_notice_once(tmp_path):
     client._session_id = "session-a"
     client._mcp_notifications.extend([notice(), notice(), notice("old-session")])
     await client._drain_notifications(duration=0)
-    pending = client._session_notices.drain("session-a")
+    pending = client._session_notices.pop_pending("session-a")
     assert len(pending) == 1 and pending[0].kind == EVENT_NOTICE
-    assert client._session_notices.drain("session-a") == []
+    assert client._session_notices.pop_pending("session-a") == []
 
 
 @pytest.mark.asyncio

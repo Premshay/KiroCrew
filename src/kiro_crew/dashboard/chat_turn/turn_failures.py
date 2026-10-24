@@ -134,8 +134,7 @@ async def _on_auth_required(turn: _ChatTurn, exc) -> None:
     )
     _auth_required = True
     turn._auth_required = _auth_required
-    needs_session_reset = True
-    turn.needs_session_reset = needs_session_reset
+    turn.needs_session_reset = True
     await _persist_partial_reply(turn, "error: auth required")
     _auth_msg = str(exc)
     # Stamped with a kind (live broadcast `kind`, rebuilt transcript
@@ -159,8 +158,7 @@ async def _on_prompt_busy(turn: _ChatTurn) -> None:
     _turn_emitted = turn._turn_emitted
     message = turn.message
     logger.info("Prompt busy exhausted in slot %s — resetting session", slot.key)
-    needs_session_reset = True  # checked in _run_chat's finally
-    turn.needs_session_reset = needs_session_reset
+    turn.needs_session_reset = True  # checked in _run_chat's finally
     await _persist_partial_reply(turn, "error: prompt busy exhausted")
     slot._prompt_busy_retries += 1
     await _requeue_after_prompt_busy(
@@ -360,8 +358,7 @@ async def _on_acp_error_card(turn: _ChatTurn, exc) -> None:
         # enqueued (mirrors _posttoken_retry_used accounting). The
         # streak stays: this discard came from it.
         _escalation.arm_discard(clear_streak=False)
-        needs_conversation_discard = True  # checked in _run_chat's finally
-        turn.needs_conversation_discard = needs_conversation_discard
+        turn.needs_conversation_discard = True  # checked in _run_chat's finally
         slot.append(
             "error",
             "⟳ The backend keeps rejecting this conversation — "

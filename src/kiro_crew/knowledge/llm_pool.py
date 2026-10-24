@@ -82,10 +82,9 @@ FETCH_TIMEOUT = 120.0
 # Minimum seconds any pool prompt may wait when the pool is BOUND to an
 # edition engine (a local lane). Local prompts queue behind up to
 # pool_size - 1 peers on a single serving slot, and behind a cold model
-# swap, so caller intents tuned for cloud latency (30-120 s here) expire
-# before the queue drains — after the 2026-08-11 reroute every extraction
-# blew its 60 s budget in groups of pool_size, zero completions. Unbound
-# pools keep caller values untouched: cloud prompts do not queue this way,
+# swap, so caller intents tuned for cloud latency (30-120 s here) can expire
+# before the queue drains. Unbound pools keep caller values untouched:
+# cloud prompts do not queue this way,
 # and a fast-fail intent there is deliberate. ``knowledge.llm_timeout_secs``
 # in config.json overrides this floor.
 BOUND_TIMEOUT_FLOOR = 300.0

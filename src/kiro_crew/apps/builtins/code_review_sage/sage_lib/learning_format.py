@@ -174,7 +174,7 @@ def _read_learning_records_document(path: Path, namespace_dir: Path) -> tuple[di
     try:
         raw = store.read_text_nolink(path, namespace_dir)
         document = json.loads(raw or "")
-    except (json.JSONDecodeError, OSError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         raise _record_error(str(exc)) from exc
     validate_learning_records_document(document)
     return document, raw

@@ -65,6 +65,7 @@ from kiro_crew.monitoring.models import (
     MonitorDispatchResult,
     MonitorOutcome,
 )
+from kiro_crew.providers.base import LLMProvider
 from kiro_crew.session import SessionManager
 from kiro_crew.session_allocation import SessionClosingError
 
@@ -153,7 +154,7 @@ class TestDispatcher:
     ) -> None:
         """A user turn winning after the advisory check must not make the wake wait."""
 
-        class _LiveProvider(FakeProvider):
+        class _LiveProvider(FakeProvider, LLMProvider):
             async def start(self) -> None:
                 return None
 
@@ -537,6 +538,8 @@ class TestDispatcher:
                     title="autonudge_stop",
                     tool_name="autonudge_stop",
                     mcp_server_name=session_directive.CORE_MCP_SERVER,
+                    tool_identity_trusted=True,
+                    mcp_identity_trusted=True,
                 )
                 yield AcpEvent(
                     kind=EVENT_TOOL_RESULT,

@@ -389,7 +389,6 @@ test/test_cron_skip_dates.py
 test/test_cron_slack_delivery.py
 test/test_cron_thread_routing.py
 test/test_cron_timezone_display.py
-test/test_cse_2026_08_05_fixes.py
 test/test_cse_2026_08_07_fixes.py
 test/test_dashboard.py
 test/test_dashboard_branding.py
@@ -610,7 +609,6 @@ test/test_model_registry.py
 test/test_model_registry_parity.py
 test/test_module_loader.py
 test/test_no_blocking_call_on_loop.py
-test/test_no_config_dir_in_async.py
 test/test_node_toolchain_resolution.py
 test/test_node_version_pins.py
 test/test_notification_bus.py

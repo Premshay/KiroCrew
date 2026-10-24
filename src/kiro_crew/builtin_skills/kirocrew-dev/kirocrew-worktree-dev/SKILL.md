@@ -2,7 +2,6 @@
 name: kirocrew-worktree-dev
 description: "HARD RULE for developing the Kiro Crew source repo ITSELF (not users' projects): develop, build and verify in a git worktree, never against the live gateway. Covers env setup, main-clone sync, build/dist ordering, flags, previews, cleanup, publish authorization; prepare-pr owns the PR workflow."
 triggers: kirocrew worktree, kirocrew main clone sync, kirocrew build gate, kirocrew dev, kirocrew source, contribute to kirocrew, kirocrew repo
-repo_scope: src/kiro_crew
 ---
 
 # Kiro Crew worktree development
@@ -89,7 +88,7 @@ and never escalates to a full suite -- meta, mixed and large diffs all get a
 related set; an unreadable diff exits 2 and runs nothing. The full suite is CI's
 job; `--full` exists for a human who asks. `--dry-run` prints the plan,
 `--base REF` selects a base. Before publication, MUST load
-[prepare-pr](../prepare-pr/SKILL.md) and run its complete resolved `gates[]`
+[prepare-pr](../kirocrew-prepare-pr/SKILL.md) and run its complete resolved `gates[]`
 floor from the base-ref profile. That skill alone owns PR preparation, local
 reviewers, history, dispositions and push-to-green steps.
 
@@ -234,7 +233,7 @@ a complete preview-isolation switch.
 ## Review repair and publication authorization
 
 For Kiro Crew PR CI AI comments, MUST load
-[prepare-pr: Review repair routing](../prepare-pr/SKILL.md#review-repair-routing)
+[prepare-pr: Review repair routing](../kirocrew-prepare-pr/SKILL.md#review-repair-routing)
 BEFORE any repair. Follow that canonical model-pinned delegation procedure;
 parent self-fixing is not a substitute. This pointer does not change the profile's
 read-only local-review gate.
@@ -254,7 +253,7 @@ Keep scratch, PR bodies, logs and QA media under `$KIROCREW_SCRATCH`, not the
 worktree. Capture scripts' gitignored `temp-screenshots/` is also permitted;
 evidence is uploaded as attachments, never committed — with write access, which
 this agent has. (A fork contributor, whose `--attach` upload GitHub refuses, may
-instead `git add -f` the media there; see prepare-pr's *Screenshots*.) A directory
+instead `git add -f` the media there; see kirocrew-prepare-pr's *Screenshots*.) A directory
 that must survive your own processes so a later run can advance it is not scratch
 and not `/tmp`: report that you need one instead of choosing a path. Before
 ending:

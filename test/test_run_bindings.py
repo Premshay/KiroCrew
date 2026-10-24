@@ -58,6 +58,11 @@ _REPO_ROOT = _TEST_ROOT.parent
 #: and signature are the one-module class's. ``run`` is ``subagent_manager/run.py`` itself;
 #: ``subagent_persistence`` holds the three persistence helpers the class head wraps.
 _MEMBERS: dict[str, tuple[str, str, str]] = {
+    "_route_spawn_model": (
+        "coroutine",
+        "(self, info: 'SubagentInfo', agent: 'str') -> 'dict | None'",
+        "run",
+    ),
     "_publish_identity": (
         "staticmethod",
         "(agent_id: 'str', *, session_id: 'str' = '', provider: 'str' = '', cwd: 'str' = '', keep: 'bool | None' = None, conversation_key: 'str' = '') -> 'None'",

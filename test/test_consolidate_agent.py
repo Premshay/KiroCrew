@@ -2,9 +2,8 @@
 
 The identity exists so deployments can route consolidation's whole-session-
 tail payload to a large-context engine while kirocrew-lite's micro-jobs
-(titles, link labels) stay on the cheap seat. Observed 2026-08-11: on the
-shared lite identity, 4/4 consolidation attempts were rejected as oversized
-by a 32k lane while lite's titles succeeded on the same lane.
+(titles, link labels) stay on the cheap seat. Whole-session tails require a
+larger context budget than those micro-jobs.
 """
 
 from __future__ import annotations
@@ -51,25 +50,21 @@ class TestConsolidateAgent:
         assert "agent=self._consolidation_agent" in inspect.getsource(HistoryConsolidator._call_llm)
 
     def test_consolidation_uses_its_own_session_key(self) -> None:
-        """Pin the dedicated session key: under the shared BACKGROUND_KEY the
-        agent identity never binds (the ``_bg`` session is cold-started at
-        gateway startup as kirocrew-lite, and get_or_create ignores ``agent``
-        for an existing key) — verified live 2026-08-11 when the rerouted
-        identity produced zero factory traffic."""
+        """Keep a dedicated key so consolidation binds its own agent identity.
+
+        The shared ``_bg`` session starts as kirocrew-lite; get_or_create keeps
+        the existing key's agent rather than applying a new ``agent`` argument.
+        """
         from kiro_crew.history import _CONSOLIDATE_SESSION_KEY
         from kiro_crew.session import BACKGROUND_KEY
 
         assert _CONSOLIDATE_SESSION_KEY != BACKGROUND_KEY
-        # ``history`` re-exports the name, but the ``background_turn`` call that
-        # binds it is in ``history_consolidation`` — read the module that holds
-        # the call site, or the assertion inspects a facade and always passes.
-        import kiro_crew.history_consolidation as history_consolidation
+        from kiro_crew.history import HistoryConsolidator
 
-        # The shared-store turn passes the key in a kwargs dict, because a
-        # private V2 store turn must NOT pass one (background_turn mints and
-        # retires its own key, and rejects a caller-supplied one).
-        src = inspect.getsource(history_consolidation)
-        assert '"session_key": _CONSOLIDATE_SESSION_KEY' in src
+        # Shared-store turns bind the dedicated key; private V2 turns let
+        # background_turn mint and retire their store-bound key.
+        src = inspect.getsource(HistoryConsolidator._call_llm)
+        assert "session_key=_CONSOLIDATE_SESSION_KEY if not memory_store else None" in src
 
     def test_consolidation_session_is_bounded(self) -> None:
         import kiro_crew.history as history
@@ -77,7 +72,7 @@ class TestConsolidateAgent:
         from kiro_crew.session import CONSOLIDATE_KEY
 
         call_llm_src = inspect.getsource(HistoryConsolidator._call_llm)
-        assert '"reset_conversation": True' in call_llm_src
+        assert "fresh_conversation=True" in call_llm_src
         assert history._CONSOLIDATE_SESSION_KEY == CONSOLIDATE_KEY
 
     def test_consolidate_key_registered_stateless(self) -> None:

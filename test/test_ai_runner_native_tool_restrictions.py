@@ -41,7 +41,7 @@ def test_runner_binds_native_restrictions_before_prompt(tmp_path, monkeypatch, a
     monkeypatch.setattr(client, "_guard_unresolved_mcp_refs", Mock())
     # Each source would expose a shell-capable MCP tool if restriction is lost.
     for source in (
-        "_translated_session_mcp_servers",
+        "_session_mcp_servers",
         "_claude_session_mcp_servers",
         "_session_capability_mcp_servers",
         "_pooled_mcp_servers",

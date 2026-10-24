@@ -19,13 +19,13 @@ Covers:
 """
 
 import ast
+import atexit
 import errno
 import io
 import logging
 import os
 import sys
 import threading
-import time
 from logging.handlers import QueueHandler, RotatingFileHandler
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -44,6 +44,7 @@ from kiro_crew.cli import (
 )
 from kiro_crew.cli_logging import _fd_is_regular_file as _real_fd_is_regular_file
 from kiro_crew.config import config_dir
+from kiro_crew.testing.wait import wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -704,6 +705,10 @@ class TestSetupCliLoggingServiceErrorFile:
         logging.getLogger("kiro_crew.test_service").info("kc-info-record")
         logging.getLogger("kiro_crew.test_service").warning("kc-warn-record")
         _stop_log_queue_listener()
+        for listener in cli_mod._LOG_QUEUE_LISTENERS:
+            listener.stop()
+            atexit.unregister(listener.stop)
+        cli_mod._LOG_QUEUE_LISTENERS.clear()
         assert "kc-info-record" not in self.console.getvalue()
         assert "kc-warn-record" in self.console.getvalue()
         text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
@@ -804,10 +809,8 @@ class TestQueueRoutedLogging:
     """No caller may perform handler I/O inline — that is what stalls the loop.
 
     A handler holds its own lock across its write, so a thread inside a slow
-    handler blocks every other thread that logs. On 2026-08-31 the gateway's
-    event loop stalled 45.8s inside one ``logger.warning`` while another thread
-    sat in the security-event log's flush, and the stall watchdog killed the
-    process.
+    handler blocks every other thread that logs. Keep that wait off the event
+    loop so chat and watchdog tasks can progress.
     """
 
     @pytest.fixture(autouse=True)
@@ -844,9 +847,7 @@ class TestQueueRoutedLogging:
         caller = threading.current_thread().name
         kc.warning("stall probe")
 
-        deadline = time.monotonic() + 5
-        while not emitted_on and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wait_until(lambda: bool(emitted_on), describe=lambda: "queued log reaches its handler")
 
         assert emitted_on, "record never reached the handler"
         # The whole point: the write happened on the listener thread, not here.

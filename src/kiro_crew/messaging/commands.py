@@ -54,6 +54,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_CONTEXT_RECYCLE,
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
 )
+from kiro_crew.agent_sdk.capabilities import compact_unsupported_backend
 from kiro_crew.apps.manager import TASK_RUNNER_APP, TASK_RUNNER_DISABLED_MESSAGE, app_disabled
 from kiro_crew.config.sections import CONTEXT_WARN_MARGIN_PCT
 from kiro_crew.cron import (
@@ -427,25 +428,6 @@ def format_ttl(ttl_secs: int) -> str:
     if hours:
         return f"{hours}h"
     return f"{mins}m"
-
-
-def compact_unsupported_backend(provider: Any) -> str | None:
-    """Backend id when *provider* cannot serve a manual ``/compact``, else ``None``.
-
-    The channel half of the dashboard's manual-``/compact`` capability gate:
-    a backend outside ``ACP_BACKENDS_COMPACT`` treats the ``/compact``
-    prompt as ordinary text and never emits a compaction status, so dispatching
-    it strands ``wait_for_compaction()`` for its whole deadline. The capability
-    is read off the LIVE provider — ``manual_compact_unsupported_backend`` is
-    declared on the ``LLMProvider`` ABC with a ``None`` (supported) default per
-    harness-parity H14 — and only a non-empty ``str`` (the ABC's stated
-    contract) reads as a refusal, so a mocked or duck-typed provider's truthy
-    attribute never blocks a compaction.
-    """
-    value = getattr(provider, "manual_compact_unsupported_backend", None)
-    if isinstance(value, str) and value:
-        return value
-    return None
 
 
 #: The three answers a surface can give a backend it cannot compact. One name per

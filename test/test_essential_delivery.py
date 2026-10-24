@@ -46,6 +46,10 @@ SENTINEL = "Preference anchor: 请保留中文原文。"
 
 
 class Wire:
+    def effort_config_option_id(self):
+        # This transport advertises neither a model nor an effort selector.
+        return None
+
     def __init__(self, project, backend=ACP_BACKEND_CLAUDE):
         self._work_dir = project
         self.backend = backend

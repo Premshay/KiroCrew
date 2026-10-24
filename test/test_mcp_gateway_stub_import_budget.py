@@ -274,6 +274,7 @@ def _fingerprint(limit: int) -> dict:
         sandbox_mode="standard",
         approval_mode="on-request",
         stub_set=frozenset(["kirocrew-core"]),
+        shared_readonly_set=frozenset(),
         pooling_enabled=True,
         forward_env=False,
         identity_keys=(),

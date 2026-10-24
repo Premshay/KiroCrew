@@ -377,8 +377,11 @@ CRON_SESSION_RE = re.compile(r"^cron:[a-zA-Z0-9]+(?::[a-zA-Z0-9]+)?$")
 
 # Model identifiers passed to kiro-cli ``--model`` (AcpRuntime). First char
 # must be alphanumeric so a value can never be parsed as a CLI flag, and the
-# charset covers real model ids (gpt-5.6-sol, claude-sonnet-4.6) only.
-MODEL_ID_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
+# charset covers model ids with one optional trailing effort/window qualifier.
+# Keep the complete identifier within the existing 128-character bound.
+MODEL_ID_RE: re.Pattern[str] = re.compile(
+    r"^(?=.{1,128}\Z)[a-zA-Z0-9][a-zA-Z0-9._-]*(?:\[[a-zA-Z0-9._-]+\])?\Z"
+)
 # Model identifiers stored in the model-picker VISIBILITY list
 # (``dashboard.model_picker_hidden_models``). Unlike ``MODEL_ID_RE`` these are
 # never passed to a CLI; they are display-only state that mirrors a provider's

@@ -132,6 +132,7 @@ def _drive(tmp_path, monkeypatch, backend: str, *, rolls_back: bool):
     monkeypatch.setattr(client, "_goose_session_mcp_servers", lambda: [good, bad])
     monkeypatch.setattr(client, "_deepseek_session_mcp_servers", lambda: [good, bad])
     monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [])
+    monkeypatch.setattr(client, "_session_capability_mcp_servers", lambda: [])
     return client, sent
 
 
@@ -260,6 +261,7 @@ async def test_a_backend_outside_the_set_sends_the_array_untouched(tmp_path, mon
     monkeypatch.setattr(client, "_wait_for_response", _wait)
     monkeypatch.setattr(client, "_opencode_session_mcp_servers", lambda: [bad])
     monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [])
+    monkeypatch.setattr(client, "_session_capability_mcp_servers", lambda: [])
 
     await client._new_session_following_substitution()
 

@@ -1,11 +1,11 @@
 ---
 name: dynamic-workflows
-description: Author, run, inspect, or resume multi-phase agent workflows with the KiroCrew workflow_* tools. Not Claude Code's built-in Workflow tool.
+description: Author, run, inspect, or resume multi-phase agent workflows with the Kiro Crew workflow_* tools. Not Claude Code's built-in Workflow tool.
 ---
 
 # Dynamic workflows
 
-This skill covers KiroCrew's workflow engine: the `workflow_*` tools, whose runs
+This skill covers Kiro Crew's workflow engine: the `workflow_*` tools, whose runs
 appear in the dashboard's Workflows tab. Claude Code ships an unrelated feature
 with the same name — its built-in `Workflow` tool, documented by its
 `workflow-authoring` skill and triggered by `ultracode` — and a Claude-engine

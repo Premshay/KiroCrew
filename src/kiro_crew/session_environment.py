@@ -94,6 +94,8 @@ LOCAL_ONLY_CORE_TOOLS: frozenset[str] = frozenset(
         # Each ctx.agent() step is a fresh session here, not the caller's environment.
         "workflow_run",
         "workflow_rerun_subtree",
+        "session_channel_manage",  # can start an independent gateway-side channel worker
+        "code_review_sage_api",  # reviews run in the app's gateway-side reviewer pool
     }
 )
 #: Whole servers that act on the gateway machine: computer use drives its desktop,

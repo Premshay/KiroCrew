@@ -470,9 +470,9 @@ def explicit_session_servers(
 
     Claude Code otherwise discovers the operator's whole user-level MCP
     registry.  That is useful for an interactive CLI, but it means every
-    KiroCrew session starts every user-configured server.  An operator can opt
+    Kiro Crew session starts every user-configured server.  An operator can opt
     into an explicit profile instead: the selected entries come from the
-    KiroCrew agent overlay, so broker stubs still pool and ordinary entries
+    Kiro Crew agent overlay, so broker stubs still pool and ordinary entries
     retain their declared environment.
 
     An empty allowlist is deliberately not a profile.  Callers must preserve

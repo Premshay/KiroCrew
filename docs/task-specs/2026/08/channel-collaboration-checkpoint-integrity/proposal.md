@@ -12,7 +12,7 @@ or compaction without relying on an earlier conversation turn.
 
 This delivery implements two connected changes:
 
-1. A global `channel-collaboration` skill is packaged for every KiroCrew session.
+1. A global `channel-collaboration` skill is packaged for every Kiro Crew session.
    It teaches channel membership, peer-message semantics, capacity, and the
    distinction between a new channel agent and an attached dashboard session.
    A member that is not the channel coordinator may inspect and report, but it
@@ -23,7 +23,7 @@ This delivery implements two connected changes:
    requests a checkpoint after meaningful state changes; it never manufactures
    a goal, decision, progress claim, or next action from a transcript.
 
-These changes use the existing KiroCrew turn lifecycle. They do not depend on
+These changes use the existing Kiro Crew turn lifecycle. They do not depend on
 an external Claude Code or Codex hook for dashboard sessions.
 
 ## Problem
@@ -35,7 +35,7 @@ Persistent channels currently have two gaps.
 Peer etiquette exists in the Nexus harness skill
 `kirocrew-orchestration`: `progress` is passive, `mention` requests attention,
 `done` hands off work, and an interrupt is reserved for information that
-invalidates an active premise. That skill is not a packaged KiroCrew built-in,
+invalidates an active premise. That skill is not a packaged Kiro Crew built-in,
 so a new dashboard session, attached session, or channel-owned worker is not
 guaranteed to discover it.
 
@@ -60,7 +60,7 @@ session adopted the peer's request.
 
 ## Goals
 
-- Make collaboration rules discoverable to all KiroCrew sessions, including
+- Make collaboration rules discoverable to all Kiro Crew sessions, including
   sessions that join a channel after they start.
 - Give channel coordinators an authenticated, bounded management capability;
   keep ordinary members read/report-only.
@@ -70,14 +70,14 @@ session adopted the peer's request.
   deterministic activity changed but the owner has not recorded its new work
   state.
 - Preserve the same durable checkpoint contract across dashboard-backed
-  KiroCrew, Claude Code, and Codex sessions while allowing KiroCrew to produce
+  Kiro Crew, Claude Code, and Codex sessions while allowing Kiro Crew to produce
   its own lifecycle facts in-process.
 
 ## Delivered behavior
 
 ### 1. Packaged channel-collaboration skill
 
-One KiroCrew built-in skill named `channel-collaboration` is indexed for
+One Kiro Crew built-in skill named `channel-collaboration` is indexed for
 every dashboard session and loaded when channel work is relevant or the skill
 is named. It covers:
 
@@ -95,7 +95,7 @@ is named. It covers:
 
 The Nexus harness `kirocrew-orchestration` skill becomes a pointer to this
 shared channel contract for its peer-channel section. The packaged skill stays
-self-contained so KiroCrew sessions never require the Nexus repository merely
+self-contained so Kiro Crew sessions never require the Nexus repository merely
 to learn basic channel behavior.
 
 ### 2. Deterministic channel-bound skill injection
@@ -169,7 +169,7 @@ never be pattern-matched or rewritten.
 
 ### 5. Checkpoint freshness guard
 
-KiroCrew already applies an explicit `session_checkpoint` through a signed,
+Kiro Crew already applies an explicit `session_checkpoint` through a signed,
 session-bound directive and persists it on an attached dashboard slot. The new guard adds
 deterministic in-gateway lifecycle hooks and freshness state beside that record:
 
@@ -177,7 +177,7 @@ deterministic in-gateway lifecycle hooks and freshness state beside that record:
 - a successful explicit checkpoint records the generation it covers;
 - when activity is newer than the last checkpoint, the slot is marked
   `checkpoint_overdue`;
-- before the next normal agent turn, KiroCrew injects a concise system reminder
+- before the next normal agent turn, Kiro Crew injects a concise system reminder
   to publish a checkpoint before ending the turn; and
 - Multiplex renders the stale condition rather than inventing a replacement
   summary.
@@ -192,13 +192,13 @@ blocks a task turn. The existing maintenance barrier remains stricter: a session
 already must write a fresh checkpoint before it can acknowledge a coordinated
 restart.
 
-These are KiroCrew-native hooks at channel membership, peer-delivery, child
+These hooks are native to Kiro Crew at channel membership, peer-delivery, child
 completion, and pre-turn boundaries. Claude Code and Codex retain their existing
-external lifecycle bridges because KiroCrew does not own their client process.
+external lifecycle bridges because Kiro Crew does not own their client process.
 
 ## Success criteria
 
-- A new, attached, or channel-owned KiroCrew session can discover the shared
+- A new, attached, or channel-owned Kiro Crew session can discover the shared
   collaboration guidance after startup or compaction without relying on an LLM
   to select the skill.
 - Every channel participant receives its own channel-local member ID and a
@@ -230,7 +230,7 @@ external lifecycle bridges because KiroCrew does not own their client process.
 3. Change the Multiplex projection/UI to separate semantic Updates, peer inbox,
    peer-request attention, and roster capacity. Include compatibility handling
    for already-persisted generated receipt entries.
-4. Verify one KiroCrew session and one attached channel session end-to-end,
+4. Verify one Kiro Crew session and one attached channel session end-to-end,
    then verify the existing native Claude/Codex lifecycle bridge does not change
    authored checkpoint ownership.
 

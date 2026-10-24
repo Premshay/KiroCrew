@@ -16,10 +16,11 @@ from kiro_crew.platform.app_execution import (
 
 from .. import profiles
 from ..backend import clone_setup, routes, runner, store
+from .request_helpers import owner_request
 
 
 def request_for(user="operator", app="", dashboard=True):
-    request = make_mocked_request("POST", "/")
+    request = owner_request("POST", "/")
     request["user"] = user
     request["app"] = app
     request["is_dashboard_user"] = dashboard
@@ -30,6 +31,7 @@ def request_for(user="operator", app="", dashboard=True):
 @pytest.mark.parametrize("method", ["start", "calibrate"])
 @pytest.mark.parametrize("authenticated", [True, False])
 async def test_route_provenance_reaches_real_worker(monkeypatch, method, authenticated):
+    monkeypatch.setattr(routes, "is_app_enabled", lambda _: True)
     supervisor = runner.RunSupervisor()
     seen = []
     monkeypatch.setattr(runner, "get_supervisor", lambda: supervisor)
@@ -41,9 +43,15 @@ async def test_route_provenance_reaches_real_worker(monkeypatch, method, authent
     monkeypatch.setattr(supervisor, "_build_driver", observe)
     monkeypatch.setattr(supervisor, "_run_loop", observe)
     monkeypatch.setattr(supervisor, "_calibrate_loop", observe)
-    request = request_for() if authenticated else make_mocked_request("POST", "/")
+    request = request_for() if authenticated else request_for(user="", dashboard=False)
     handler = routes._handle_run_start if method == "start" else routes._handle_calibrate
     response = await handler(request)
+    if not authenticated:
+        assert response.status == 403
+        assert supervisor._thread is None
+        assert seen == []
+        assert current_app_execution() is None
+        return
     assert response.status == 200
     assert supervisor._thread is not None
     await asyncio.to_thread(supervisor._thread.join, 2)
@@ -65,7 +73,7 @@ def test_direct_supervisor_config_cannot_supply_provenance(monkeypatch, method):
     seen = []
     monkeypatch.setattr(supervisor, "_build_driver", lambda config: None)
     monkeypatch.setattr(
-        supervisor, "_run_loop", lambda driver: seen.append(current_app_execution())
+        supervisor, "_run_loop", lambda driver, run_id: seen.append(current_app_execution())
     )
     monkeypatch.setattr(
         supervisor, "_calibrate_loop", lambda config: seen.append(current_app_execution())

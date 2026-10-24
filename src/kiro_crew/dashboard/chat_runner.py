@@ -991,7 +991,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _IDENTITY_RECONCILE_READ_TIMEOUT_SECS = 2.0
-_CONTEXT_WINDOW_RECOVERY_PREFIX = "[KiroCrew context-window recovery]"
+_CONTEXT_WINDOW_RECOVERY_PREFIX = "[KiroCrew context-window recovery]"  # brand-ok: wire marker
 
 #: Shown once when a live backend lost this chat's session and a fresh
 #: runtime re-loads it; the turn is retried once behind it.
@@ -1911,8 +1911,7 @@ async def _run_chat(
                         )
                     elif turn.assistant_text:
                         _cut_segment(turn)
-                        _turn_flushed_visible_text = True
-                        turn._turn_flushed_visible_text = _turn_flushed_visible_text
+                        turn._turn_flushed_visible_text = True
                     else:
                         # No accumulated text, but still tell frontend to
                         # finalize any streaming message before tools.
@@ -2304,7 +2303,6 @@ async def _run_chat(
         _seen_tool_identity = turn._seen_tool_identity
         _shell_tool_calls = turn._shell_tool_calls
         _terminal_synthetic = turn._terminal_synthetic
-        _turn_flushed_visible_text = turn._turn_flushed_visible_text
         _turn_priority = turn._turn_priority
         _turn_started = turn._turn_started
         _turn_t0 = turn._turn_t0
@@ -2346,7 +2344,7 @@ async def _run_chat(
                 "tool_calls": _turn_tool_calls,
                 "tool_identities": tuple(_turn_tool_identities),
                 "reply_text": turn.assistant_text if isinstance(turn.assistant_text, str) else "",
-                "reply_flushed": _turn_flushed_visible_text,
+                "reply_flushed": turn._turn_flushed_visible_text,
                 "nudge_turn": _directive_self_wake and turn._turn_landed,
             },
         )

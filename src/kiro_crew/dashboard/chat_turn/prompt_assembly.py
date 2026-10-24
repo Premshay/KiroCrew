@@ -802,10 +802,10 @@ async def _turn_build_prompt(turn: _ChatTurn) -> None:
         # context, taking the skills index with it. Read-and-clear the flag
         # here so this turn re-injects the index exactly once.
         _needs_reinjection = consume_reinjection(state.sessions, session_key)
+        turn._needs_reinjection = _needs_reinjection
         _post_compaction_checkpoint = (
             slot.session_checkpoint_payload() if _needs_reinjection else None
         )
-        turn._needs_reinjection = _needs_reinjection
         # Folder steering directories, resolved LIVE from the committed
         # folder tree rather than from a value cached on the slot, so a
         # folder edit or a re-file reaches the chats already inside it at

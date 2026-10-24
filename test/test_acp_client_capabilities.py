@@ -59,7 +59,7 @@ def test_both_acp_transports_send_capabilities() -> None:
     # The standalone transport picks its set per backend, and must send it from
     # the per-backend helper; every harness names its constant directly.
     required = {
-        "src/kiro_crew/acp/client.py": '"clientCapabilities": acp_client_capabilities(self.backend)',
+        "src/kiro_crew/acp/client_start.py": '"clientCapabilities": acp_client_capabilities(self.backend)',
         "src/kiro_crew/acp/harness/kiro.py": "return ACP_CLIENT_CAPABILITIES\n",
         "src/kiro_crew/acp/harness/kas.py": "return KAS_CLIENT_CAPABILITIES\n",
     }

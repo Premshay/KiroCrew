@@ -20,7 +20,7 @@ Supported providers:
   CLI (https://github.com/OHF-Voice/piper1-gpl, published as the ``piper-tts``
   wheel). Produces WAV. Requires the ``piper`` binary and a voice model
   (.onnx + .onnx.json) on disk. Fully offline, and the best offline quality.
-- ``pocket``: Pocket TTS through KiroCrew's Piper-compatible local shim.
+- ``pocket``: Pocket TTS through Kiro Crew's Piper-compatible local shim.
   Dashboard replay streams progressive Ogg Opus; Slack delivery remains file-based.
 """
 
@@ -1029,7 +1029,7 @@ async def stream_pocket_speech(
         returncode = await proc.wait()
         stderr = await stderr_task
         if returncode != 0 or not yielded:
-            detail = stderr.decode(errors="replace").strip()[:500]
+            detail = redact_log_via_context(stderr.decode(errors="replace"))[-500:].strip()
             raise RuntimeError(f"Pocket stream failed (rc={returncode}): {detail}")
     except asyncio.TimeoutError as exc:
         raise RuntimeError("Pocket stream timed out") from exc
@@ -1326,7 +1326,11 @@ async def stitch_mp3s(paths: list[str], output: str | None = None) -> str | None
             except Exception:
                 logger.debug("ffmpeg reap after kill failed", exc_info=True)
             raise
-        if proc.returncode != 0 or not os.path.exists(output) or os.path.getsize(output) == 0:
+        if (
+            proc.returncode != 0
+            or not await asyncio.to_thread(os.path.exists, output)
+            or await asyncio.to_thread(os.path.getsize, output) == 0
+        ):
             return None
         succeeded = True
         return output

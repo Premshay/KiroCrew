@@ -690,7 +690,7 @@ export function collectRouteTable(text, absPath, relPath, extraSources = []) {
 }
 
 /**
- * The static `path` of every `<NavItem>` the shell draws (App.tsx): the pages
+ * The static `path` of every `<NavItem>` the shell draws: the pages
  * the navigation rail has an entry for, besides the registry's own rows
  * (Discover and Library are drawn by hand in the rail's Apps section). A page
  * whose route is here is a rail page: its guide points at that entry.

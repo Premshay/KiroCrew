@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import codex_session_mcp_helpers
 import pytest
@@ -486,14 +486,30 @@ class TestSpecDisabledToolRefusal:
         builds = source.count("self._build_permission_event(")
         # One per answering site; `_build_permission_event` is defined once more.
         assert builds == 3, "a site that answers a permission request was added or removed"
-        for site in ("_dispatch_events", "_handle_permission", "_collect_claude_autonomous_frame"):
+        for site in ("_dispatch_events", "_handle_permission"):
             body = inspect.getsource(getattr(client_mod.AcpClient, site))
             assert "_build_permission_event(" in body and "_deny_spec_disabled_tool(" in body, site
         claude_body = inspect.getsource(client_mod.AcpClient._collect_claude_autonomous_frame)
         assert "await self.reject_tool(permission.request_id)" in claude_body
-        source = inspect.getsource(client_mod)
         # The two other foreground loops answer only through _handle_permission.
         assert source.count("await self._handle_permission(msg)") == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("disabled", [False, True])
+    async def test_autonomous_claude_rejects_permissions_regardless_of_the_deny_set(
+        self, tmp_path, disabled
+    ):
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._spec_denied_tools = (
+            frozenset({("kirocrew-core", "spawn_run")}) if disabled else frozenset()
+        )
+        client.reject_tool = AsyncMock()
+        client.approve_tool = AsyncMock()
+
+        await client._collect_claude_autonomous_frame(_codex_mcp_approval(7, "autonomous"))
+
+        client.reject_tool.assert_awaited_once_with(7)
+        client.approve_tool.assert_not_awaited()
 
 
 class TestTheRuntimeApprovalPathHonoursTheDenySet:

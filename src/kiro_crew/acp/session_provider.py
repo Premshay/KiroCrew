@@ -1446,7 +1446,7 @@ class AcpSessionProvider(LLMProvider):
         return self._handle.get_valid_effort_levels()
 
     def effort_config_option_id(self) -> str | None:
-        """ACP id used to change reasoning effort on this backend."""
+        """ACP id for changing reasoning effort on this backend."""
         return self._handle.effort_config_option_id()
 
     def supports_config_option(self, config_id: str) -> bool:

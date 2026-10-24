@@ -17,6 +17,7 @@ field is an instruction. Those are judgements the page exists to make, and a tes
 that matched their wording would fail on every rewrite while catching nothing.
 """
 
+import inspect
 import re
 from pathlib import Path
 
@@ -151,12 +152,17 @@ def test_the_doc_quotes_the_real_title_cap(doc_text: str) -> None:
 def test_the_doc_lists_every_acceptance_kind_the_evaluator_handles(doc_text: str) -> None:
     """The three kinds are named, and the removed ``cmd`` kind is not offered.
 
-    Read out of the evaluator's own dispatch rather than from a list: the script is
-    the thing a conductor runs, so its branches are the real vocabulary.
+    Read the product evaluator's dispatch behind the skill's fixed CLI adapter.
     """
-    script = (
+    from kiro_crew import work_acceptance
+
+    adapter = (
         _REPO_ROOT / "src/kiro_crew/builtin_skills/goal-conductor/scripts/accept_eval.py"
     ).read_text(encoding="utf-8")
+    assert '"_acceptance-evaluate"' in adapter
+    cli = (_REPO_ROOT / "src/kiro_crew/cli.py").read_text(encoding="utf-8")
+    assert "from kiro_crew.work_acceptance import main" in cli
+    script = inspect.getsource(work_acceptance.evaluate)
     handled = {
         line.split('== "', 1)[1].split('"', 1)[0]
         for line in script.splitlines()

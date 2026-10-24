@@ -54,6 +54,7 @@ def _provider(backend: str, model: str, applied: list[tuple[str, str]]) -> AcpPr
     client.send_command = AsyncMock()
     client.supports_config_option = MagicMock(return_value=True)
     client.get_valid_effort_levels = MagicMock(return_value=["low", "medium", "high"])
+    client.effort_config_option_id = MagicMock(return_value=effort_config_option_id(backend))
 
     async def _set_model(wire: str) -> None:
         applied.append(("model", wire))
@@ -141,6 +142,10 @@ async def test_a_hop_through_an_effortless_model_keeps_the_override_on_restore()
     applied: list[tuple[str, str]] = []
     provider = _provider(ACP_BACKEND_CLAUDE, "claude-opus-4.7", applied)
     provider._effort_per_model["claude-opus-4.7"] = "high"
+    # The model switch withdraws the selector on the effortless model.
+    provider._client.effort_config_option_id.side_effect = lambda: (
+        None if provider._client._model == "deepseek-v4" else "effort"
+    )
 
     await provider.set_model("deepseek-v4")
     await provider.set_model("claude-opus-4.7")

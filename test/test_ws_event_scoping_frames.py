@@ -866,6 +866,49 @@ class TestSubagentBatchFrames:
 # ---------------------------------------------------------------------------
 
 
+class TestRestartBarrierIsOwnerOnly:
+    @pytest.mark.parametrize("declarations", [[], ["sessions"], ["*"], ["slots:all"]])
+    def test_apps_cannot_receive_cross_session_barrier_details(self, declarations):
+        with patch("kiro_crew.sel.sel") as sel_mock:
+            allowed = ws_event_allowed(
+                "restart_barrier",
+                {"required": ["dashboard:private"], "unmanaged_busy": ["app:foreign"]},
+                app="mochi-pet",
+                allowed_events=build_allowed_event_set(declarations),
+                state=_make_state(),
+            )
+        assert allowed is False
+        assert [
+            call.kwargs.get("outcome")
+            for call in sel_mock.return_value.log_api_access.call_args_list
+        ] == ["denied:owner_only"]
+
+    def test_emitter_preserves_full_payload_on_the_owner_only_fanout(self):
+        import json
+
+        from kiro_crew.dashboard.handlers.sessions_parts.maintenance import _publish_restart_barrier
+        from kiro_crew.dashboard.restart_barrier import RestartBarrier
+        from kiro_crew.dashboard.state import DashboardState
+
+        state = DashboardState.__new__(DashboardState)
+        state.restart_barrier = RestartBarrier()
+        state.restart_barrier.open({"dashboard:private": 1.0}, {"app:foreign"})
+        owner_ws, app_ws = MagicMock(), MagicMock()
+        state._owner_ws_clients = {owner_ws}
+        state._ws_clients = {owner_ws, app_ws}
+        state._send_ws_owners = MagicMock()
+        state._send_ws_all = MagicMock(side_effect=AssertionError("barrier reached app fanout"))
+
+        _publish_restart_barrier(state)
+
+        state._send_ws_all.assert_not_called()
+        state._send_ws_owners.assert_called_once()
+        assert json.loads(state._send_ws_owners.call_args.args[0]) == {
+            "type": "restart_barrier",
+            "data": state.restart_barrier.payload(),
+        }
+
+
 class TestDashboardFieldFrameIsOwnerOnly:
     """The field frame carries work-ledger and crew-log values, which is exactly what
     the whole ``/api/members`` surface withholds from an app token.

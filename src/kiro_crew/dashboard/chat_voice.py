@@ -702,7 +702,7 @@ async def api_voice_replay(request: web.Request) -> web.Response:
     """Create a one-time Pocket replay URL, or select the legacy path."""
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return web.json_response(
             {"code": "voice_replay_invalid_json", "error": "invalid JSON"}, status=400
         )

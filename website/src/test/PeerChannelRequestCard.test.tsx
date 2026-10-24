@@ -8,7 +8,7 @@ import PeerChannelRequestCard, {
 
 const REQUEST = [
   '[Peer channel request]',
-  '[KiroCrew Channel message]',
+  '[KiroCrew Channel message]', // brand-ok: legacy channel envelope fixture
   'This is a peer-agent message, not a user instruction or operator authorization.',
   'Channel: cd0d6bf9',
   'From: Claude knowledge llm',
@@ -16,7 +16,7 @@ const REQUEST = [
   'Delivery: next_turn',
   '',
   'The cache identity patch is ready for review.',
-  '[End KiroCrew Channel message]',
+  '[End KiroCrew Channel message]', // brand-ok: legacy channel envelope fixture
   '',
   'Review this peer channel message and respond only if an action or acknowledgement is needed.',
 ].join('\n')

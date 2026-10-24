@@ -1801,6 +1801,11 @@ tables is DENIED, so a new event name is a silent loss of function for apps unti
 it is classified — `test_ws_event_scoping_frames.py` fails the build on an unclassified
 broadcast name rather than letting it reach production.
 
+The coordinated reset's `restart_barrier` frame uses the owner-only fan-out.
+Its payload names required, pending and unmanaged busy sessions across apps;
+even a wildcard app declaration cannot receive it. Strict-internal maintenance
+acknowledgements retain their separate caller-identity check.
+
 Three tiers. Tier 0 (`dashboard`, `refresh`, `update_progress`) carries no
 sensitive payload and always delivers — and that classification is a claim about
 CONTENT, so it has to be maintained: `_push_status` writes the `dashboard` frame

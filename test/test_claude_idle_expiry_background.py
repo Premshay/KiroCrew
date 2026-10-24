@@ -3,7 +3,7 @@
 The defect these pin (observed live in chat-1918): a session worked through
 Claude background-task continuations until 09:31 and launched another
 background waiter, yet the sweep expired it at 09:43 as idle. ``last_used``
-moves only when KiroCrew dispatches a turn, and none of that work was one.
+moves only when Kiro Crew dispatches a turn, and none of that work was one.
 
 The shape is backend-neutral. Each transport stamps the last frame it routed
 for a session -- the Claude reader in ``AcpClient``, and ``AcpRuntime`` for
@@ -33,6 +33,7 @@ from kiro_crew.config import KiroCrewConfig
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.session import SessionManager
+from kiro_crew.testing.wait import async_wait_until
 
 
 def _client(tmp_path: Path) -> AcpClient:
@@ -170,9 +171,10 @@ async def _route(rt: AcpRuntime, reader: asyncio.StreamReader, *frames: dict) ->
         reader.feed_data((json.dumps(frame) + "\n").encode())
     task = asyncio.ensure_future(rt._reader_loop())
     try:
-        async with asyncio.timeout(10):
-            while rt.session_activity_at("sentinel") is None:
-                await asyncio.sleep(0.01)
+        await async_wait_until(
+            lambda: rt.session_activity_at("sentinel") is not None,
+            describe=lambda: "reader processes the session activity sentinel",
+        )
     finally:
         task.cancel()
         try:
@@ -205,9 +207,10 @@ class TestRuntimeActivityClock:
         reader.feed_data((json.dumps(_update("child")) + "\n").encode())
         task = asyncio.ensure_future(rt._reader_loop())
         try:
-            async with asyncio.timeout(10):
-                while rt.session_activity_at("owner") is None:
-                    await asyncio.sleep(0.01)
+            await async_wait_until(
+                lambda: rt.session_activity_at("owner") is not None,
+                describe=lambda: "reader stamps the background child's owner",
+            )
         finally:
             task.cancel()
             try:

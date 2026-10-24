@@ -1172,7 +1172,7 @@ def _macos_sandbox_state() -> bool | None:
 def nested_sandbox_passthrough() -> bool:
     """Whether :func:`wrap_argv` passes argv through because this process is nested.
 
-    True inside a KiroCrew sandbox unless the macOS kernel definitely says this
+    True inside a Kiro Crew sandbox unless the macOS kernel definitely says this
     process is not confined (see the marker/kernel note in :func:`wrap_argv`).
     Public so a refusal can name this cause instead of guessing at configuration.
     """

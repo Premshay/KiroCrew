@@ -208,9 +208,7 @@ def _sdk_result_frame(origin: str | None = None) -> JsonRpcMessage:
 
 
 class TestStretchTail:
-    """chat-1918, 2026-09-23 15:29: the tools finished and the model wrote its
-    reply, but the rows stayed "running" and the reply was held back until the
-    operator's next prompt drained both into that turn."""
+    """Render idle tool completions and replies without waiting for another prompt."""
 
     @pytest.mark.asyncio
     async def test_a_tool_completion_renders_instead_of_queueing(self, tmp_path):
@@ -276,10 +274,7 @@ class TestStretchTail:
 
     @pytest.mark.asyncio
     async def test_a_prompt_absorbed_by_an_autonomous_cycle_still_gets_its_response(self, tmp_path):
-        """chat-1979, 2026-10-09 03:42Z: a background task woke Claude between turns,
-        and an auto-nudge prompt sent during that cycle was absorbed into it. The
-        prompt's session/prompt response arrived while the cycle was still being
-        collected and was dropped, so the turn waited until the 14400 s ceiling."""
+        """Dispatch an absorbed prompt's response while collecting its autonomous cycle."""
         client = _client(tmp_path)
         _sink(client)
         notification = JsonRpcMessage(

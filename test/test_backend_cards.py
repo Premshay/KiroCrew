@@ -362,7 +362,7 @@ def test_core_counts_per_harness_are_pinned() -> None:
     assert counts == {
         "claude": 7,
         "codex": 6,
-        "deepseek": 5,
+        "deepseek": 6,
         "goose": 7,
         "kas": 7,
         "kiro": 6,
@@ -370,6 +370,14 @@ def test_core_counts_per_harness_are_pinned() -> None:
         "pi": 6,
     }
     assert counts["kas"] == len(cards_mod.USER_FACING_LINES)
+
+
+def test_deepseek_card_retains_its_measured_mid_turn_steering() -> None:
+    """The retained bridge capture adds steering to DeepSeek's core count."""
+    card = cards_mod.card_for(ACP_BACKEND_DEEPSEEK)
+    line = next(line for line in card.capabilities if line.id == cards_mod.LINE_MID_TURN_STEER)
+    assert line.available is True
+    assert line.measured is True
 
 
 def test_crew_tools_are_available_on_both_channels_and_absent_on_neither() -> None:

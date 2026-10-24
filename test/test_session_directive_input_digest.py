@@ -636,17 +636,31 @@ class TestPlantedRecordIsNotClaimedByADifferentTool:
     def test_a_shell_call_resolves_to_no_directive_tool(self):
         """A shell frame carries no _meta.kiro identity and a model-authored title;
         neither resolves, so it records no digest and can claim nothing."""
-        assert session_directive.directive_tool_from_call("", "execute_bash", "echo x") == ""
-        assert session_directive.directive_tool_from_call("", "", "monitor_start") == ""
-        assert session_directive.directive_tool_from_call("", "", "@other/monitor_start") == ""
+        assert (
+            session_directive.directive_tool_from_call("", "execute_bash", "echo x", trusted=False)
+            == ""
+        )
+        assert (
+            session_directive.directive_tool_from_call("", "", "monitor_start", trusted=False) == ""
+        )
+        assert (
+            session_directive.directive_tool_from_call(
+                "", "", "@other/monitor_start", trusted=False
+            )
+            == ""
+        )
 
     def test_kas_wire_title_and_kiro_cli_identity_both_resolve(self):
         assert (
-            session_directive.directive_tool_from_call("", "", "@kirocrew-core/monitor_start")
+            session_directive.directive_tool_from_call(
+                "", "", "@kirocrew-core/monitor_start", trusted=False
+            )
             == "monitor_start"
         )
         assert (
-            session_directive.directive_tool_from_call("kirocrew-core", "monitor_start", "x")
+            session_directive.directive_tool_from_call(
+                "kirocrew-core", "monitor_start", "x", trusted=True
+            )
             == "monitor_start"
         )
 
@@ -903,6 +917,8 @@ class TestOneRefusalPerFrame:
                 tool_kind="other",
                 tool_name="monitor_start",
                 mcp_server_name=session_directive.CORE_MCP_SERVER,
+                tool_identity_trusted=True,
+                mcp_identity_trusted=True,
                 raw_tool_params=FRAME_INPUT,
             ),
             AcpEvent(
@@ -959,7 +975,7 @@ class TestTheDisplayTitleCannotForgeTheTool:
         assert ev.wire_title == "Run Command", "the wire title is the backend's own field"
         assert (
             session_directive.directive_tool_from_call(
-                ev.mcp_server_name, ev.tool_name, ev.wire_title
+                ev.mcp_server_name, ev.tool_name, ev.wire_title, trusted=ev.mcp_identity_trusted
             )
             == ""
         )
@@ -1040,12 +1056,24 @@ class TestClaudeBackendResolvesTheTool:
 
     def test_resolver_accepts_the_raw_mcp_name(self):
         assert (
-            session_directive.directive_tool_from_call("", "", "mcp__kirocrew-core__monitor_start")
+            session_directive.directive_tool_from_call(
+                "", "", "mcp__kirocrew-core__monitor_start", trusted=False
+            )
             == "monitor_start"
         )
         # Server half still checked: another server's same-named tool is not ours.
-        assert session_directive.directive_tool_from_call("", "", "mcp__other__monitor_start") == ""
-        assert session_directive.directive_tool_from_call("", "", "mcp__kirocrew-core__nope") == ""
+        assert (
+            session_directive.directive_tool_from_call(
+                "", "", "mcp__other__monitor_start", trusted=False
+            )
+            == ""
+        )
+        assert (
+            session_directive.directive_tool_from_call(
+                "", "", "mcp__kirocrew-core__nope", trusted=False
+            )
+            == ""
+        )
 
     def test_legacy_tool_call_builder_carries_the_wire_title(self):
         from kiro_crew.acp.client import AcpClient
@@ -1067,7 +1095,7 @@ class TestClaudeBackendResolvesTheTool:
         assert ev.raw_tool_params == CALL_ARGS
         assert (
             session_directive.directive_tool_from_call(
-                ev.mcp_server_name, ev.tool_name, ev.wire_title
+                ev.mcp_server_name, ev.tool_name, ev.wire_title, trusted=ev.mcp_identity_trusted
             )
             == "monitor_start"
         )
@@ -1141,7 +1169,7 @@ class TestClaudeBackendResolvesTheTool:
         assert ev.wire_title == "Bash"
         assert (
             session_directive.directive_tool_from_call(
-                ev.mcp_server_name, ev.tool_name, ev.wire_title
+                ev.mcp_server_name, ev.tool_name, ev.wire_title, trusted=ev.mcp_identity_trusted
             )
             == ""
         )
@@ -1206,7 +1234,7 @@ class TestKasWireTitleCarriesTheBackendPrefix:
         ],
     )
     def test_prefixed_wire_title_resolves(self, title, expected):
-        assert session_directive.directive_tool_from_call("", "", title) == expected
+        assert session_directive.directive_tool_from_call("", "", title, trusted=False) == expected
 
     @pytest.mark.asyncio
     async def test_a_recorded_kas_frame_without_meta_arms(self, tmp_path, monkeypatch):
@@ -1631,7 +1659,10 @@ class TestOpenCodeBackendResolvesTheTool:
 
 
 @pytest.mark.asyncio
-async def test_codex_identified_call_can_claim_its_parked_result(tmp_path, monkeypatch):
+@pytest.mark.parametrize("trusted", [True, False])
+async def test_codex_identity_requires_attestation_to_claim_parked_result(
+    tmp_path, monkeypatch, trusted
+):
     state = _stub_state(tmp_path)
     slot = state.get_or_create_slot("codex-claim")
     slot._titled = True
@@ -1641,6 +1672,8 @@ async def test_codex_identified_call_can_claim_its_parked_result(tmp_path, monke
             tool_call_id="exec-native-mcp",
             mcp_server_name="kirocrew-core",
             tool_name="monitor_start",
+            tool_identity_trusted=True,
+            mcp_identity_trusted=trusted,
             raw_tool_params={
                 "server": "kirocrew-core",
                 "tool": "monitor_start",
@@ -1656,9 +1689,15 @@ async def test_codex_identified_call_can_claim_its_parked_result(tmp_path, monke
         AcpEvent(kind=EVENT_COMPLETE),
     ]
     spy = await _drive(state, slot, events, monkeypatch)
-    spy.assert_called_once()
-    assert spy.call_args.args[4] == VALIDATED_ARGS
-    assert directive_queue.depth(effective_session_key(slot)) == 0
+    if trusted:
+        spy.assert_awaited_once()
+        assert spy.call_args.args[4] == VALIDATED_ARGS
+        assert directive_queue.depth(effective_session_key(slot)) == 0
+    else:
+        # A trusted tool name alone cannot attest the core MCP server. The
+        # caller-supplied server/tool arguments cannot claim its parked record.
+        spy.assert_not_awaited()
+        assert directive_queue.depth(effective_session_key(slot)) == 1
 
 
 @pytest.mark.asyncio
@@ -1671,6 +1710,8 @@ async def test_unmatched_native_result_reports_application_failure(tmp_path, mon
             tool_call_id="native-failure",
             tool_name="monitor_start",
             mcp_server_name="kirocrew-core",
+            tool_identity_trusted=True,
+            mcp_identity_trusted=True,
             raw_tool_params=CALL_ARGS,
         ),
         AcpEvent(
@@ -1712,6 +1753,8 @@ async def test_unmatched_non_monitor_result_gets_no_monitor_advice(tmp_path, mon
             tool_call_id="native-reset",
             tool_name="reset_conversation",
             mcp_server_name="kirocrew-core",
+            tool_identity_trusted=True,
+            mcp_identity_trusted=True,
             raw_tool_params={},
         ),
         AcpEvent(

@@ -392,12 +392,18 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
 
             if "subagent_max_per_parent" in agent_settings:
                 val = agent_settings["subagent_max_per_parent"]
-                if isinstance(val, bool) or not isinstance(val, int) or not 0 <= val <= persisted_hard_cap:
-                    _validation_error.append((
-                        "subagent_max_per_parent must be 0 (unbounded) or an integer "
-                        f"between 1 and {persisted_hard_cap}",
-                        400,
-                    ))
+                if (
+                    isinstance(val, bool)
+                    or not isinstance(val, int)
+                    or not 0 <= val <= persisted_hard_cap
+                ):
+                    _validation_error.append(
+                        (
+                            "subagent_max_per_parent must be 0 (unbounded) or an integer "
+                            f"between 1 and {persisted_hard_cap}",
+                            400,
+                        )
+                    )
                     return None
                 agent["subagent_max_per_parent"] = val
                 applied.append("subagent_max_per_parent")

@@ -253,7 +253,10 @@ const shellRoutesTsx = path.join(path.dirname(appTsx), 'shell', 'routes.tsx')
 const routeTable = collectRouteTable(read(appTsx), appTsx, 'src/App.tsx', [{ text: read(shellRoutesTsx), absPath: shellRoutesTsx }])
 errors.push(...routeTable.errors)
 // The pages the rail draws a NavItem for by hand (see collectNavItemPaths).
-const navPaths = [...collectNavItemPaths(read(appTsx), appTsx)].sort()
+const navRailTsx = path.join(SRC, 'shell', 'nav', 'navRail.tsx')
+const navPaths = [...new Set([appTsx, navRailTsx].flatMap(file =>
+  [...collectNavItemPaths(read(file), file)],
+))].sort()
 
 const locales = SUPPORTED_LANGUAGES.filter((l) => !l.devOnly).map((l) => l.code)
 const catalogs = {}

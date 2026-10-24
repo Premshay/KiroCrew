@@ -123,9 +123,6 @@ from kiro_crew.stt.limits import MIN_PARTIAL_INTERVAL_MS as _STT_MIN_PARTIAL_INT
 from kiro_crew.stt.limits import MIN_SILENCE_MS as _STT_MIN_SILENCE_MS
 from kiro_crew.stt.limits import MIN_TIMEOUT_SECS as _STT_MIN_TIMEOUT_SECS
 
-AUTO_INGEST_CHUNK_BUDGET_MAX = 10000
-KNOWLEDGE_MAX_SOURCES_MAX = 1000
-
 # ---------------------------------------------------------------------------
 # Service sections (DTOs in ``config.service_sections``).
 # ---------------------------------------------------------------------------
@@ -272,10 +269,6 @@ def _build_knowledge_config(knowledge_data: dict) -> KnowledgeConfig:
         pool_idle_ttl_secs=section.read("pool_idle_ttl_secs", _safe_nonnegative_int),
         llm_timeout_secs=section.read("llm_timeout_secs", _safe_float),
         auto_add_documents=_read_auto_add_documents(knowledge_data),
-        auto_register_project_docs=section.read("auto_register_project_docs", _safe_bool),
-        auto_ingest_chunk_budget=section.read(
-            "auto_ingest_chunk_budget", _safe_nonnegative_int, AUTO_INGEST_CHUNK_BUDGET_MAX
-        ),
         folder_ingest_chunk_budget=section.read(
             "folder_ingest_chunk_budget", _safe_nonnegative_int, FOLDER_INGEST_CHUNK_BUDGET_MAX
         ),
@@ -291,7 +284,6 @@ def _build_knowledge_config(knowledge_data: dict) -> KnowledgeConfig:
         import_chunk_budget=section.read(
             "import_chunk_budget", _safe_nonnegative_int, IMPORT_CHUNK_BUDGET_MAX
         ),
-        max_sources=section.read("max_sources", _safe_nonnegative_int, KNOWLEDGE_MAX_SOURCES_MAX),
         embed_rate_limit=section.read(
             "embed_rate_limit", _safe_nonnegative_int, EMBED_RATE_LIMIT_MAX
         ),
@@ -303,8 +295,6 @@ def _build_knowledge_config(knowledge_data: dict) -> KnowledgeConfig:
                 section.read("extraction_pool_size", _safe_nonnegative_int),
             ),
         ),
-        auto_discover_folder=section.read("auto_discover_folder", _safe_bool),
-        auto_discover_dirname=str(section.get("auto_discover_dirname")).strip()[:128],
         extraction_effort=coerce_effort(section.get("extraction_effort")),
     )
 

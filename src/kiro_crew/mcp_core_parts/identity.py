@@ -305,6 +305,7 @@ REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
         "mcp_tools/apps.py",
         "mcp_tools/control.py",
         "mcp_tools/control_parts/monitor.py",
+        "mcp_tools/control_parts/session_tools.py",
         "mcp_tools/learn.py",
         "mcp_tools/ledger.py",
         "mcp_tools/logs.py",
@@ -315,6 +316,7 @@ REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
         # table-built server's strict checks route through.
         "mcp_tools/table.py",
         "mcp_tools/workflows.py",
+        "mcp_tools/work_items.py",
     }
 )
 

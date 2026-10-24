@@ -127,7 +127,7 @@ def _format_acp_error_worded(
         unentitled = _model_is_unentitled(data, available_models)
 
         # The fleet router admits requests before forwarding.  Its machine code
-        # tells interactive callers to rebuild from bounded KiroCrew history;
+        # tells interactive callers to rebuild from bounded Kiro Crew history;
         # do not leak the router's JSON error envelope to the user.
         if _CONVERSATION_PAYLOAD_EXCEEDED_RE.search(haystack):
             formatted = (

@@ -51,6 +51,10 @@ class TestTheWorkerBudgetIsMemoryBounded:
     def _pin_per_worker_reservation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import xdist_budget as budget
 
+        # Exercise memory division without the fixed host ceiling masking it.
+        # test_xdist_host_budget separately pins the real shared six-slot cap.
+        monkeypatch.setattr(budget, "_HOST_WORKER_CAP", 64)
+        monkeypatch.setattr(budget, "_DEFAULT_WORKER_CAP", 32)
         monkeypatch.setattr(budget, "_gib_per_worker", lambda: budget._GIB_PER_WORKER)
         monkeypatch.setattr(
             budget, "_gib_per_worker_available", lambda: budget._GIB_PER_WORKER_AVAILABLE

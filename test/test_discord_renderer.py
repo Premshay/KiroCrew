@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from discord_helpers import _drop_live_config_snapshot  # noqa: F401
 from discord_helpers import FakeClient
+from split_credential_boundary_helpers import HEAD, KEY, TAIL, _on_screen
 
 from conftest import CREDENTIAL_STRADDLE_SHAPES
 from kiro_crew.discord import renderer as discord_renderer
@@ -620,6 +621,78 @@ class TestApprovalDecider:
         # flake-ok: awaits a task the test resolved above; moved verbatim
         assert await task is False
         assert recorded == [], "a pressed deny must not count as an unanswered prompt"
+
+
+class TestProviderNoticeSafety:
+    @pytest.mark.asyncio
+    async def test_notice_redacts_and_tallies_only_landed_text(self) -> None:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        await r.on_notice(f"Provider reported {KEY}")
+        assert KEY not in cli.sent[0][0]
+        assert "[REDACTED: credential]" in cli.sent[0][0]
+        assert r._redacted_creds == 1
+        assert r._sent_tail == cli.sent[0][0]
+
+    @pytest.mark.asyncio
+    async def test_adjacent_notices_cannot_rejoin_a_credential(self) -> None:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        assert KEY in _on_screen([HEAD, TAIL])
+        await r.on_notice(HEAD)
+        await r.on_notice(TAIL)
+        assert KEY not in _on_screen([text for text, _ in cli.sent])
+        assert r._redacted_creds == 1
+
+    @pytest.mark.asyncio
+    async def test_answer_grades_against_the_delivered_notice(self) -> None:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        await r.on_notice(HEAD)
+        await r.on_text_chunk(TAIL + " is not safe to repeat.")
+        await r.on_done()
+        assert KEY not in _on_screen([text for text, _ in cli.sent])
+        assert any("Security notice" in text for text, _ in cli.sent)
+
+    @pytest.mark.asyncio
+    async def test_notice_below_an_open_bubble_tracks_only_the_fresh_send_predecessor(self) -> None:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        await r.on_text_chunk("The answer has already begun. ")
+        assert r._stream_mid is not None
+        bubble_tail = r._sent_tail
+        bubble_above = r._bubble_above
+        await r.on_notice(HEAD)
+        assert r._sent_tail == bubble_tail
+        assert r._bubble_above == bubble_above
+        assert r._pending_note_tail == HEAD
+        await r.on_notice(TAIL)
+        assert KEY not in _on_screen([text for text, _ in cli.sent])
+        assert r._redacted_creds == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raises", [False, True])
+    async def test_an_unlanded_notice_changes_neither_tally_nor_predecessor(
+        self, monkeypatch, raises
+    ) -> None:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        r._record_sent("previous")
+
+        async def not_delivered(*args, **kwargs):
+            if raises:
+                raise RuntimeError("notice delivery refused")
+            return None
+
+        monkeypatch.setattr(cli, "send_message", not_delivered)
+        if raises:
+            with pytest.raises(RuntimeError, match="notice delivery refused"):
+                await r.on_notice(KEY)
+        else:
+            await r.on_notice(KEY)
+        assert r._sent_tail == "previous"
+        assert r._pending_note_tail == ""
+        assert r._redacted_creds == 0
 
 
 class TestRedactionNotice:

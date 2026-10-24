@@ -636,7 +636,7 @@ class McpGatewayConfig:
             "Claude Session Servers",
             "Optional explicit MCP profile for Claude ACP sessions. A non-empty "
             "list suppresses user-level MCP discovery for those sessions and "
-            "injects only named, enabled servers from the selected KiroCrew "
+            "injects only named, enabled servers from the selected Kiro Crew "
             "agent spec. Empty preserves normal Claude Code behaviour.",
         ),
     )

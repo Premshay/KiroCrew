@@ -288,7 +288,9 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
 
 #: Class-level annotations the split adds: fields first set by a member an owner defines,
 #: declared in the class so type checkers know them. An annotation creates no attribute.
-_DECLARED = frozenset({"_compaction_terminal_seen", "_kas_compact_turn"})
+_DECLARED = frozenset(
+    {"_compaction_terminal_seen", "_kas_compact_turn", "_native_compaction_states"}
+)
 
 #: The owner modules, lowest layer first.
 _OWNERS = (
@@ -336,7 +338,7 @@ _BASE_IMPORTS = frozenset("""
     EntitlementRevalidating GrantDeadline GrantEnded INTERACTIVE_NARROWING_RISKS
     INTERACTIVE_NONE InFlightToolTracker InfraError InteractiveClassification
     JSONRPC_METHOD_NOT_FOUND JsonRpcMessage KasMcpReadiness LivenessOracle
-    MAX_ACP_SESSION_ID_LEN MAX_ACTIVE_TOOL_CALLS MAX_STEERING_ANSWERS
+    MAX_ACP_SESSION_ID_LEN MAX_ACTIVE_TOOL_CALLS MAX_STEERING_ANSWERS NativeCompactionStates
     MAX_STEERING_TEXT_CHARS METHOD_CANCEL METHOD_COMMANDS_EXECUTE
     METHOD_KAS_CHECKPOINT_REVERT METHOD_KAS_MCP_STATUS METHOD_KAS_SESSION_COMPACT
     METHOD_MCP_OAUTH_REQUEST METHOD_PROMPT METHOD_REQUEST_PERMISSION METHOD_SESSION_STEERING

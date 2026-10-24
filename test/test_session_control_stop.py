@@ -14,6 +14,7 @@ through a hard stop's settle, ``already_stopping``, and the window's keys and sw
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -33,6 +34,7 @@ from kiro_crew.dashboard import chat_delivery as cd
 from kiro_crew.dashboard import session_control as sc
 from kiro_crew.dashboard import stop_retry
 from kiro_crew.dashboard.handlers import session_control as handlers_sc
+from kiro_crew.testing.wait import await_until
 
 # ── Stopping ─────────────────────────────────────────────────────────────────
 
@@ -278,6 +280,27 @@ def _stoppable(state, slot):
     return slot
 
 
+@asynccontextmanager
+async def _running_turn(slot):
+    started = asyncio.Event()
+    pending = asyncio.get_running_loop().create_future()
+
+    async def turn():
+        started.set()
+        await pending
+
+    task = asyncio.create_task(turn())
+    slot.task = task
+    try:
+        await await_until(started, what="the target turn started")
+        yield task
+    finally:
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await await_until(task, what="the target turn stopped")
+
+
 def test_a_retried_stop_keeps_the_queue_instead_of_escalating(tmp_path, monkeypatch):
     """The defect: a timeout retry is read as a second press and discards work.
 
@@ -338,7 +361,8 @@ def test_a_repeat_still_stops_a_target_that_started_running_again(tmp_path, monk
     assert state.sessions.stop_turn.await_count == 2
 
 
-def test_a_stop_after_the_window_still_escalates(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_a_stop_after_the_window_still_escalates(tmp_path, monkeypatch):
     """Escalation is delayed, not removed.
 
     A stop that STILL finds the target winding down once the window has closed is
@@ -354,11 +378,12 @@ def test_a_stop_after_the_window_still_escalates(tmp_path, monkeypatch):
     target = _stoppable(state, _peer_target(state, "chat-2", caller))
     monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.sel", lambda: MagicMock())
 
-    asyncio.run(sc.stop_target(state, caller_session_key=_key(caller), target="chat-2"))
-    # The window closes, so the next stop is a decision rather than a retry.
-    monkeypatch.setattr(stop_retry, "WINDOW_SECS", 0.0)
-
-    asyncio.run(sc.stop_target(state, caller_session_key=_key(caller), target="chat-2"))
+    async with _running_turn(target) as task:
+        await sc.stop_target(state, caller_session_key=_key(caller), target="chat-2")
+        # The window closes, so the next stop is a decision rather than a retry.
+        monkeypatch.setattr(stop_retry, "WINDOW_SECS", 0.0)
+        await sc.stop_target(state, caller_session_key=_key(caller), target="chat-2")
+        assert task.cancelled()
 
     assert target._stop_state == "killing"
     assert list(target._queue) == [], "an escalation discards the queue, by design"
@@ -390,7 +415,8 @@ def test_a_withheld_escalation_is_recorded(tmp_path, monkeypatch):
     assert noop[-1]["metadata"].get("escalation_withheld") is True
 
 
-def test_the_stop_button_still_escalates_on_a_second_press(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_the_stop_button_still_escalates_on_a_second_press(tmp_path, monkeypatch):
     """The button's contract is unchanged, and that is the point of the default.
 
     A person pressing Stop again has watched the cooperative stop fail to take, so
@@ -406,10 +432,12 @@ def test_the_stop_button_still_escalates_on_a_second_press(tmp_path, monkeypatch
     slot = _stoppable(state, _slot(state, "chat-1"))
     monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.sel", lambda: MagicMock())
 
-    asyncio.run(stop_slot_turn(state, slot))
-    assert slot._stop_state == "soft_pending"
-
-    asyncio.run(stop_slot_turn(state, slot))
+    async with _running_turn(slot) as task:
+        await stop_slot_turn(state, slot)
+        assert slot._stop_state == "soft_pending"
+        assert not task.done()
+        await stop_slot_turn(state, slot)
+        assert task.cancelled()
 
     assert slot._stop_state == "killing"
     assert list(slot._queue) == []
@@ -470,7 +498,8 @@ def _slots_window_always_open(monkeypatch):
 
 
 @pytest.mark.usefixtures("_slots_window_always_open")
-def test_a_send_that_lands_while_a_hard_stop_settles_stays_queued(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_a_send_that_lands_while_a_hard_stop_settles_stays_queued(tmp_path, monkeypatch):
     """The hard kill discards what was queued when it was pressed and settles the
     sub-agent deliveries those entries owed. That settle can suspend, and a send
     that lands meanwhile takes the busy branch and is acknowledged as queued, so the
@@ -494,9 +523,12 @@ def test_a_send_that_lands_while_a_hard_stop_settles_stays_queued(tmp_path, monk
 
     state.subagents = _SettlingManager(during=_send)
 
-    asyncio.run(stop_slot_turn(state, slot))
-    assert slot._stop_state == "soft_pending"
-    asyncio.run(stop_slot_turn(state, slot))
+    async with _running_turn(slot) as task:
+        await stop_slot_turn(state, slot)
+        assert slot._stop_state == "soft_pending"
+        assert not task.done()
+        await stop_slot_turn(state, slot)
+        assert task.cancelled()
 
     assert slot._stop_state == "killing"
     assert sent, "precondition: the send landed during the settle"
@@ -507,7 +539,10 @@ def test_a_send_that_lands_while_a_hard_stop_settles_stays_queued(tmp_path, monk
 
 
 @pytest.mark.usefixtures("_slots_window_always_open")
-def test_a_hard_stop_still_discards_and_settles_what_was_queued_before_it(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_a_hard_stop_still_discards_and_settles_what_was_queued_before_it(
+    tmp_path, monkeypatch
+):
     """Control: the first press keeps the queue, and the hard kill clears what was
     queued before it and settles the sub-agent delivery the cleared entry owed."""
     from kiro_crew.dashboard.chat_handlers import stop_slot_turn
@@ -521,12 +556,14 @@ def test_a_hard_stop_still_discards_and_settles_what_was_queued_before_it(tmp_pa
     manager = _SettlingManager()
     state.subagents = manager
 
-    asyncio.run(stop_slot_turn(state, slot))
-    assert slot._stop_state == "soft_pending"
-    assert [entry["id"] for entry in slot._queue] == ["q-owed", "q2"]
-    assert manager.settled == []
-
-    asyncio.run(stop_slot_turn(state, slot))
+    async with _running_turn(slot) as task:
+        await stop_slot_turn(state, slot)
+        assert slot._stop_state == "soft_pending"
+        assert not task.done()
+        assert [entry["id"] for entry in slot._queue] == ["q-owed", "q2"]
+        assert manager.settled == []
+        await stop_slot_turn(state, slot)
+        assert task.cancelled()
     assert slot._stop_state == "killing"
     assert list(slot._queue) == []
     assert [delivery.agent_id for delivery in manager.settled] == ["a1"]

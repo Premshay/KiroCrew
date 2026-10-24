@@ -346,6 +346,10 @@ def _restore_log_record_factory():
 def _restore_log_queue_listener():
     """Stop the ``QueueListener`` a test leaves running, so no later test inherits it.
 
+    Restore both the file-listener slot and the per-logger listener list. Stop
+    newly installed listeners, remove their relays and exit callbacks, and retain
+    inherited listeners for higher-scoped fixtures.
+
     ``cli._LOG_QUEUE_LISTENER`` is ONE process-global slot, per worker, and the sibling of
     the record factory above: ``_setup_cli_logging`` installs BOTH in the same
     ``command in _LONG_LIVED_COMMANDS`` branch, so every test that drives the real
@@ -382,8 +386,8 @@ def _restore_log_queue_listener():
     starts it once per process and never undoes it. The damage is to OTHER tests, so
     stopping it propagating is the whole job.
 
-    HANDLERS stay untouched, the boundary ``_restore_logger_levels`` below draws and for
-    its reasons. The ``_CliLogQueueHandler`` left on the ``kiro_crew`` logger therefore
+    Apart from new per-logger queue relays, HANDLERS stay untouched, the boundary
+    ``_restore_logger_levels`` below draws. The ``_CliLogQueueHandler`` left on the ``kiro_crew`` logger therefore
     outlives the listener it fed, holding an unattended queue; it is the same handler
     accumulation that fixture already records as a separate defect, and
     ``test_cli_logging.py``'s ``_pristine_logging`` is what absorbs it today by clearing
@@ -396,20 +400,42 @@ def _restore_log_queue_listener():
     """
     cli = sys.modules.get("kiro_crew.cli")
     before = getattr(cli, "_LOG_QUEUE_LISTENER", None)
+    routed_before = list(getattr(cli, "_LOG_QUEUE_LISTENERS", ()))
+    inherited_handlers = {
+        logger: tuple(logger.handlers)
+        for logger in (logging.getLogger(), logging.getLogger("kiro_crew"))
+    }
     yield
     cli = sys.modules.get("kiro_crew.cli")
     if cli is None:
         return
     after = getattr(cli, "_LOG_QUEUE_LISTENER", None)
-    if after is before:
-        return
-    if after is not None:
+    if after is not before and after is not None:
         # Drains and joins the listener thread, then closes the file handler. Suppressed
         # because a floor must not fail a test for state it is only cleaning up, and the
         # restore below has to happen either way.
         with contextlib.suppress(Exception):
             cli._stop_log_queue_listener()
-    cli._LOG_QUEUE_LISTENER = before
+    if after is not before:
+        cli._LOG_QUEUE_LISTENER = before
+    routed_after = getattr(cli, "_LOG_QUEUE_LISTENERS", None)
+    if routed_after is None:
+        return
+    for listener in list(routed_after):
+        if listener in routed_before:
+            continue
+        with contextlib.suppress(Exception):
+            if getattr(listener, "_thread", None) is not None:
+                listener.stop()
+        atexit.unregister(listener.stop)
+        for logger, inherited in inherited_handlers.items():
+            for handler in logger.handlers[:]:
+                if getattr(handler, "queue", None) is listener.queue:
+                    logger.removeHandler(handler)
+            for handler in listener.handlers:
+                if handler in inherited and handler not in logger.handlers:
+                    logger.addHandler(handler)
+    routed_after[:] = routed_before
 
 
 # ── the hooks system's process-wide dispatcher goes back after every test ──

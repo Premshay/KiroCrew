@@ -45,6 +45,7 @@ def _state():
         restart_barrier=RestartBarrier(),
         _slots={},
         broadcast_ws=Mock(),
+        broadcast_ws_owners=Mock(),
     )
 
 
@@ -232,7 +233,7 @@ if os.environ.pop("PROBE_FIRST", ""):
         sessions=SimpleNamespace(close_all=AsyncMock(),
             restart_barrier_snapshot=AsyncMock(return_value=[])),
         restart_barrier=RestartBarrier(), _slots={},
-        broadcast_ws=lambda *a: None)
+        broadcast_ws=lambda *a: None, broadcast_ws_owners=lambda *a: None)
     chat.save_all_slots_to_history = lambda state: None
     updates.flush_breadcrumb_writes = lambda *a: None
     gateway.flush_breadcrumb_writes = lambda *a: None

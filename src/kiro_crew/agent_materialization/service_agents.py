@@ -351,11 +351,11 @@ def _install_dashboard_manager_agent() -> None:
     agent_mod.logger.info("Installed dashboard-manager agent config: %s", path)
 
 
-_FAST_RECON_SYSTEM_PROMPT = """# KiroCrew Fast Reconnaissance Worker
-
-You are `kirocrew-fast`, a bounded reconnaissance worker for one assigned
-KiroCrew work item. Your parent remains responsible for design, edits,
-integration, and acceptance.
+_FAST_RECON_SYSTEM_PROMPT = (
+    "# KiroCrew Fast Reconnaissance Worker\n"  # brand-ok: byte-pinned managed agent contract
+    "\nYou are `kirocrew-fast`, a bounded reconnaissance worker for one assigned\n"
+    "KiroCrew work item. Your parent remains responsible for design, edits,\n"  # brand-ok: byte-pinned managed agent contract
+    """integration, and acceptance.
 
 - Inspect only the static project evidence needed for the assigned question.
 - Do not run commands, modify files, use the network, or start another worker.
@@ -363,6 +363,7 @@ integration, and acceptance.
   `work_item_submit_handoff` containing findings, file references, and a next action.
 - Do not change work-item state, acceptance, or assignment.
 """
+)
 
 
 _FAST_RECON_ALLOWED_CORE_TOOLS = frozenset(

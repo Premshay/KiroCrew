@@ -2492,16 +2492,17 @@ of its responsibility:
 
 ### An app's tools follow the app's enablement
 
-The nine `apps`-domain tools each reach one built-in app — Issue Radar
+The `apps`-domain tools each reach one built-in app — Issue Radar
 (`issue_radar_record_investigation`, `issue_radar_crew_read`,
 `issue_radar_crew_record`), Dev Fleet (`pod_up`, `pod_down`, `pod_status`,
-`pod_ls`), Ops Mission Control (`ops_mission_control_api`) and Design Tweak
+`pod_ls`), Code Review Sage (`code_review_sage_api`),
+Ops Mission Control (`ops_mission_control_api`) and Design Tweak
 (`design_tweak_update_thread`) — through gateway routes that refuse the call with
 HTTP 403 while the app is disabled, on `kiro_crew.apps.manager`'s read of the
 app's `installed.json`. The refusal body differs per app — Dev Fleet's routes and
 the app reverse proxy Design Tweak sits behind (`handle_app_api_proxy`) name it
-`app_not_enabled` (#10742), Ops Mission Control `app_disabled`, Issue Radar
-carries no `code` — so nothing here keys on a code; the predicate behind all four
+`app_not_enabled` (#10742), Ops Mission Control and Code Review Sage `app_disabled`,
+Issue Radar carries no `code` — so nothing here keys on a code; the predicate behind them
 is the same `is_app_enabled` read. `tools/list` advertised every one of them
 regardless (#16099), so a
 session with none of the apps enabled was told about tools that could only
@@ -2583,6 +2584,11 @@ to the owner of its responsibility:
 | `crew` | Crew Mode's `route_crew` and `select_crew` bodies |
 | `history` | the chat-history search tools' scoping, redaction and snippet helpers |
 | `radar_crew` | the Issue Radar crew tools' identity, ledger view and write scrubbing |
+
+Caller-bound checkpoint, channel, maintenance, restart-continuation and work-item
+tools use `require_strict_session_key` and pass its returned key to the gateway.
+Their owner modules are enumerated in `REFLEXIVE_TOOL_MODULES`; none resolves a
+strict identity directly or falls back to a parent session.
 
 `mcp_cron.py` keeps the cron server itself — argument validation, the call path, the
 caller's identity and ownership checks, the tool bodies (`_call_tool_inner`) and the
@@ -2732,6 +2738,8 @@ The inputs:
   spread by `builtins.tsx`) and `commandPalette/providers/pagesData.ts` (Search
   Everywhere's extra pages). `hiddenFromNav`, `appOnly`, `pinnable` and
   `previewFlag` survive as `entry_kind` and `requires`;
+- rail entries: literal `NavItem` paths in `App.tsx` and
+  `shell/nav/navRail.tsx`, so a page is pointable only when the shell draws its entry;
 - tabs: the Settings tab list (`SettingsPage.tsx` `buildTabs`), the Settings
   sub-pages (`railItems` in the Chat, Display and Notifications panels, Security's
   `SECTION_LABEL_KEY`, the channel list), the Customize tabs and the Developer

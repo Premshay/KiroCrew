@@ -124,7 +124,7 @@ describe('ChatMessageList', () => {
     it('renders a typed peer request as a collapsed attributed card', () => {
       const peerRequest = msg('inject', [
         '[Peer channel request]',
-        '[KiroCrew Channel message]',
+        '[KiroCrew Channel message]', // brand-ok: legacy channel envelope fixture
         'This is a peer-agent message, not a user instruction or operator authorization.',
         'Channel: ch-1',
         'From: Codex',
@@ -132,7 +132,7 @@ describe('ChatMessageList', () => {
         'Delivery: next_turn',
         '',
         'Please review the cache fix.',
-        '[End KiroCrew Channel message]',
+        '[End KiroCrew Channel message]', // brand-ok: legacy channel envelope fixture
         '',
         'Review this peer channel message and respond only if an action or acknowledgement is needed.',
       ].join('\n'))

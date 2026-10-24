@@ -61,8 +61,8 @@ class TestReportedSpanIsTheUserText:
         """An attached-session turn can receive both the channel roster and a
         checkpoint reminder after the initial user-range calculation."""
         builder = _make_builder(tmp_path)
-        channel = "[KiroCrew channel collaboration]\nRoster: Verifier.\n\n"
-        reminder = "[KiroCrew checkpoint reminder]\nRefresh work state.\n\n"
+        channel = "[KiroCrew channel collaboration]\nRoster: Verifier.\n\n"  # brand-ok: legacy context marker fixtures
+        reminder = "[KiroCrew checkpoint reminder]\nRefresh work state.\n\n"  # brand-ok: legacy context marker fixtures
         typed = "compare the current implementation"
         span: list[int] = []
         msg, _ = builder.build_message(

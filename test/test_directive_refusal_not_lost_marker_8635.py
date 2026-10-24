@@ -456,6 +456,8 @@ def _drive(tool: str, tool_output: str) -> None:
                     title=tool,
                     tool_name=tool,
                     mcp_server_name=session_directive.CORE_MCP_SERVER,
+                    tool_identity_trusted=True,
+                    mcp_identity_trusted=True,
                 ),
                 AcpEvent(
                     kind=EVENT_TOOL_RESULT,

@@ -551,6 +551,7 @@ _OWNER_MODULES = frozenset(
         "project_lists",
         "prompt_queue",
         "resume",
+        "runtime_selection",
         "session_relaunch",
         "slot_approval",
         "slot_create",
@@ -842,7 +843,7 @@ app_admission | _reauthorize_after_await | function | (state: 'DashboardState', 
 turn_stop | _reject_pending_approvals | function | (slot: '_ChatSlot') -> 'None'
 turn_stop | _resolve_stop_event | function | (slot: '_ChatSlot', outcome: 'str') -> 'None'
 turn_stop | _rearm_stop_event | function | (slot: '_ChatSlot', stop_data: 'dict[str, Any]') -> 'bool'
-turn_stop | _open_stop_event_card | function | (slot: '_ChatSlot', state_label: 'str') -> 'str'
+turn_stop | _open_stop_event_card | function | (slot: '_ChatSlot', state_label: 'str', *, source: 'str' = '') -> 'str'
 turn_stop | _make_stop_resolver | function | (state: 'DashboardState', slot: '_ChatSlot', outcome: 'str', card_id: 'str | None') -> 'Callable[[], Awaitable[None]]'
 turn_stop | _cancel_target | function | (slot: '_ChatSlot') -> 'str'
 turn_stop | _settle_discarded_stage_deliveries | async function | (state: "'DashboardState'", slot: "'_ChatSlot'", contents: 'list[str]') -> 'None'

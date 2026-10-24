@@ -301,6 +301,45 @@ class TestTtsFailureLog:
         assert _MARKER_TAIL in line
 
 
+class TestPocketStreamFailureExcerpt:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stderr", [_straddling(500), _two_markers(500)], ids=["secret", "tail"]
+    )
+    async def test_failure_redacts_the_complete_stderr_then_keeps_the_tail(
+        self, monkeypatch, tmp_path, stderr
+    ):
+        model = tmp_path / "voice.onnx"
+        model.write_bytes(b"model")
+        stdin = MagicMock(drain=AsyncMock())
+        proc = MagicMock(
+            stdin=stdin,
+            stdout=MagicMock(read=AsyncMock(return_value=b"")),
+            stderr=MagicMock(read=AsyncMock(return_value=stderr.encode())),
+            returncode=1,
+            wait=AsyncMock(return_value=1),
+        )
+
+        async def identity(argv, **kwargs):
+            return list(argv), None
+
+        monkeypatch.setattr(voice_reply, "_resolve_piper_binary", lambda _configured: "/local/tts")
+        monkeypatch.setattr(voice_reply, "wrap_argv_async", identity)
+        monkeypatch.setattr(voice_reply, "cgroup_scope_argv", lambda argv: list(argv))
+        monkeypatch.setattr(voice_reply, "create_subprocess_limited", AsyncMock(return_value=proc))
+        with pytest.raises(RuntimeError, match="Pocket stream failed") as info:
+            async for _ in voice_reply.stream_pocket_speech(
+                "hello", voice_id="michael", piper_binary="/local/tts", piper_model=str(model)
+            ):
+                pytest.fail("the failed process produced no audio")
+        excerpt = str(info.value).removeprefix("Pocket stream failed (rc=1): ")
+        if stderr == _straddling(500):
+            assert "B" * 16 in stderr[-500:]
+            _assert_straddle_redacted(excerpt, 500)
+        else:
+            _assert_tail_anchored(excerpt)
+
+
 # ── hooks.run_script_hook: last_error anchor follows the exit code ──────────
 
 

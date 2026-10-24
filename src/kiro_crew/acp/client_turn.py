@@ -827,7 +827,7 @@ async def _dispatch_events(
     self._steering_turn_req = None if extract_agent_from_result else req_id
 
     async for action, msg in self._prompt_loop(req_id, timeout):
-        for notice in self._session_notices.drain(self._session_id or ""):
+        for notice in self._session_notices.pop_pending(self._session_id or ""):
             yield notice
         if action != "update":
             logger.debug(
@@ -1303,7 +1303,7 @@ async def _send_prompt(self: AcpClient, message: str, *, allow_image: bool = Tru
     blocks = await asyncio.to_thread(
         build_prompt_blocks,
         message,
-        allow_image=allow_image and agent_accepts_image,
+        allow_image=allow_image,
         agent_accepts_image=agent_accepts_image,
     )
     try:

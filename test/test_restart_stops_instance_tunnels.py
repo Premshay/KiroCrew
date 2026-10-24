@@ -37,6 +37,7 @@ import pytest
 
 from kiro_crew import platform_compat, pre_exec_stops
 from kiro_crew.dashboard.handlers import updates
+from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.pre_exec_stops import register_pre_exec_stop, run_pre_exec_stops
 from kiro_crew.slack import gateway as slack_gateway
 from kiro_crew.slack.gateway import GatewayOrchestrator
@@ -84,8 +85,15 @@ def _hang(cancelled: asyncio.Event):
 def _dashboard_state(seen: list[str]) -> SimpleNamespace:
     return SimpleNamespace(
         _gateway_restart_in_progress=False,
+        _slots={},
+        restart_barrier=RestartBarrier(),
+        broadcast_ws=Mock(),
+        broadcast_ws_owners=Mock(),
         push_update_progress=Mock(),
-        sessions=SimpleNamespace(close_all=_recorder(seen, "close_all")),
+        sessions=SimpleNamespace(
+            close_all=_recorder(seen, "close_all"),
+            restart_barrier_snapshot=AsyncMock(return_value=[]),
+        ),
         _mcp_gateway_stop=_recorder(seen, "broker"),
     )
 
@@ -235,7 +243,7 @@ class TestTheDashboardRestart:
             _dashboard_state(seen), resolver=lambda: _executable(tmp_path)
         )
 
-        assert restarted is True
+        assert restarted == updates.GatewayRestartResult(restarted=True)
         assert seen == ["close_all", "broker", "child", "exec"]
 
     @pytest.mark.asyncio
@@ -249,7 +257,7 @@ class TestTheDashboardRestart:
             _dashboard_state(seen), resolver=lambda: str(tmp_path / "pruned")
         )
 
-        assert restarted is False
+        assert restarted == updates.GatewayRestartResult(restarted=False)
         assert "child" not in seen
 
     @pytest.mark.asyncio
@@ -262,7 +270,7 @@ class TestTheDashboardRestart:
             _dashboard_state(seen), resolver=lambda: _executable(tmp_path)
         )
 
-        assert restarted is True
+        assert restarted == updates.GatewayRestartResult(restarted=True)
         assert seen == ["close_all", "broker", "exec"]
 
 
@@ -350,7 +358,7 @@ class TestTheSkillUsageLedgerJoinsTheSeam:
             _dashboard_state(seen), resolver=lambda: _executable(tmp_path)
         )
 
-        assert restarted is True
+        assert restarted == updates.GatewayRestartResult(restarted=True)
         assert seen[-1] == "exec"
         assert skill_usage.SkillUsageLedger(path).score("alpha")[0] == 1.0
         assert not ledger.dirty
@@ -385,7 +393,7 @@ class TestTheSkillUsageLedgerJoinsTheSeam:
                 _dashboard_state(seen), resolver=lambda: _executable(tmp_path)
             )
 
-        assert restarted is True
+        assert restarted == updates.GatewayRestartResult(restarted=True)
         assert seen[-1] == "exec"
         assert "did not fully flush before restart" in caplog.text
 

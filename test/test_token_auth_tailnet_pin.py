@@ -18,6 +18,7 @@ other siblings are ``test_token_auth_signing_secret.py``,
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -77,13 +78,14 @@ def _peer_request(
     forwarded: str | None = "100.64.0.5",
     query: dict | None = None,
     cookies: dict | None = None,
+    path: str = "/api/chat/slots",
 ):
     from multidict import CIMultiDict
 
     headers = CIMultiDict()
     if forwarded is not None:
         headers.add("X-Forwarded-For", forwarded)
-    return _make_request(query=query, cookies=cookies, remote=remote, headers=headers)
+    return _make_request(path=path, query=query, cookies=cookies, remote=remote, headers=headers)
 
 
 @pytest.mark.asyncio
@@ -124,8 +126,34 @@ async def test_node_scope_replay_from_another_node_denied_with_device_reason(
     mark_consumed(token)
     resp = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 403
-    assert b"device identity mismatch" in resp.body
+    assert json.loads(resp.text)["error"] == "device identity mismatch"
     assert b"IP mismatch" not in resp.body
+
+
+@pytest.mark.asyncio
+async def test_node_scope_browser_denial_preserves_private_signin_guidance(_tailnet_env) -> None:
+    from kiro_crew.dashboard.token_auth import bind_token_peer
+
+    _tailnet_env(_whois_payload(node="other-node.tail.ts.net"))
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token("tsuser", ttl_seconds=300)
+    bind_token_peer(token, "ts:node:you@example.com|phone.tail.ts.net")
+    mark_consumed(token)
+    resp = await mw(_peer_request(path="/dashboard", cookies={"mc_token_5476": token}), _ok_handler)
+    assert resp.status == 403
+    assert resp.content_type == "text/html"
+    assert "Sign in required" in resp.text
+    assert "Settings → Security → Sign in on mobile" in resp.text
+    assert not resp.cookies
+    for private in (
+        token,
+        "tsuser",
+        "you@example.com",
+        "phone.tail.ts.net",
+        "other-node.tail.ts.net",
+        "device identity mismatch",
+    ):
+        assert private not in resp.text
 
 
 @pytest.mark.asyncio
@@ -158,7 +186,7 @@ async def test_login_scope_replay_with_different_login_is_denied(_tailnet_env) -
     mark_consumed(token)
     resp = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 403
-    assert b"peer identity mismatch" in resp.body
+    assert json.loads(resp.text)["error"] == "peer identity mismatch"
 
 
 @pytest.mark.asyncio
@@ -170,7 +198,7 @@ async def test_verified_login_outside_allowlist_is_denied(_tailnet_env) -> None:
     token = generate_token("tsuser", ttl_seconds=300)
     resp = await mw(_peer_request(query={"token": token}), _ok_handler)
     assert resp.status == 403
-    assert b"tailnet login not allowed" in resp.body
+    assert json.loads(resp.text)["error"] == "tailnet login not allowed"
 
 
 @pytest.mark.asyncio
@@ -192,7 +220,7 @@ async def test_tagged_node_session_not_replayable_from_second_tagged_node(
     mark_consumed(token)
     resp = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 403
-    assert b"device identity mismatch" in resp.body
+    assert json.loads(resp.text)["error"] == "device identity mismatch"
 
 
 @pytest.mark.asyncio
@@ -239,7 +267,7 @@ async def test_require_peer_link_refuses_daemon_failure_before_cookie_exchange(
     token = generate_token("tsuser", ttl_seconds=300, extra={"require_peer": "1"})
     resp = await mw(_peer_request(query={"token": token}), _ok_handler)
     assert resp.status == 403
-    assert b"tailnet identity unverified" in resp.body
+    assert json.loads(resp.text)["error"] == "tailnet identity unverified"
     assert resp.cookies.get("mc_token_5476") is None
 
 
@@ -292,10 +320,12 @@ async def test_plain_ip_mismatch_reason_is_preserved(_tailnet_env) -> None:
     token = generate_token("user", ttl_seconds=300)
     bind_token_ip(token, "10.0.0.1")
     mark_consumed(token)
-    req = _make_request(cookies={"mc_token_5476": token}, remote="192.168.1.9")
+    req = _make_request(
+        path="/api/chat/slots", cookies={"mc_token_5476": token}, remote="192.168.1.9"
+    )
     resp = await mw(req, _ok_handler)
     assert resp.status == 403
-    assert b"IP mismatch" in resp.body
+    assert json.loads(resp.text)["error"] == "IP mismatch"
 
 
 # -- Review-round hardening (adversarial fleet findings) --
@@ -324,7 +354,7 @@ async def test_refresh_cookie_alone_still_reaches_the_allowlist_deny(_tailnet_en
     req.method = "POST"
     resp = await mw(req, _ok_handler)
     assert resp.status == 403
-    assert b"tailnet login not allowed" in resp.body
+    assert json.loads(resp.text)["error"] == "tailnet login not allowed"
 
 
 @pytest.mark.asyncio
@@ -346,7 +376,7 @@ async def test_internal_mixed_path_enforces_the_peer_pin(_tailnet_env) -> None:
     req.path = "/api/spawn"
     resp = await mw(req, _ok_handler)
     assert resp.status == 403
-    assert b"device identity mismatch" in resp.body
+    assert json.loads(resp.text)["error"] == "device identity mismatch"
 
 
 @pytest.mark.asyncio
@@ -383,7 +413,7 @@ async def test_identity_pinned_session_with_daemon_down_names_unavailability(
     mark_consumed(token)
     resp = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 403
-    assert b"tailnet identity unverified" in resp.body
+    assert json.loads(resp.text)["error"] == "tailnet identity unverified"
     assert b"device identity mismatch" not in resp.body
 
 
@@ -429,7 +459,7 @@ async def test_restart_require_peer_cookie_refuses_unverified_first_use(
     # No bind_token_peer call: simulates the post-restart in-memory state.
     resp = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 403
-    assert b"tailnet identity unverified" in resp.body
+    assert json.loads(resp.text)["error"] == "tailnet identity unverified"
     assert not _ta._state.has_binding(token)
 
 
@@ -466,7 +496,7 @@ async def test_restart_signed_require_peer_cookie_rehydrates_only_for_original_d
         _ok_handler,
     )
     assert replay.status == 403
-    assert b"device identity mismatch" in replay.body
+    assert json.loads(replay.text)["error"] == "device identity mismatch"
     assert not _ta._state.has_binding(token)
 
 
@@ -484,7 +514,7 @@ async def test_restart_legacy_claimless_require_peer_cookie_cannot_claim_device(
     )
     response = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert response.status == 403
-    assert b"tailnet session device binding missing" in response.body
+    assert json.loads(response.text)["error"] == "tailnet session device binding missing"
     assert not _ta._state.has_binding(token)
 
 
@@ -505,7 +535,7 @@ async def test_claimless_require_peer_link_cannot_enroll_on_mixed_internal_path(
     request.path = "/api/spawn"
     response = await mw(request, _ok_handler)
     assert response.status == 403
-    assert b"tailnet session device binding missing" in response.body
+    assert json.loads(response.text)["error"] == "tailnet session device binding missing"
     assert not response.cookies
     assert not _ta._state.has_binding(token)
 

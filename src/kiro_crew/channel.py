@@ -957,6 +957,7 @@ async def run_channel_agent(
                 f"✅ @{agent.role} is ready. Send a message to get started.",
                 from_role="System",
                 msg_type="system",
+                notify_members=False,
             )
 
         async for msg in channel.subscribe(agent.id):

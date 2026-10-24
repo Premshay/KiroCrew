@@ -53,6 +53,7 @@ def home(root: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """A writable home inside a root this user cannot write, like ``/home/<user>``."""
     home = root / "home"
     home.mkdir()
+    home.chmod(0o755)
     monkeypatch.setenv("HOME", str(home))
     _seal(root)
     yield home
@@ -102,6 +103,7 @@ def test_a_homebrew_prefix_outside_home_is_still_this_accounts_own(root: Path) -
     """
     prefix = root / "homebrew"
     real = _exe(prefix / "Cellar" / "node" / "24.1.0" / "bin")
+    prefix.chmod(0o755)
     bin_dir = prefix / "bin"
     bin_dir.mkdir()
     (bin_dir / "node").symlink_to(real)
@@ -189,6 +191,7 @@ def test_a_component_owned_by_another_account_is_not_own(
     root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tool = _exe(root / "theirs")
+    tool.parent.chmod(0o755)
     _seal(root)
     monkeypatch.setattr(mod.platform_compat, "process_owner_uid", lambda pid: -1)
     try:

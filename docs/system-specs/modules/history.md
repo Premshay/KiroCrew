@@ -2376,6 +2376,15 @@ a near-span head is prompted about `N` times (≈ 512 KB of one message) and
 content whose lines advance well under a span can take up to roughly `2 * N` — a
 small constant either way, far past any genuine conversation turn.
 
+**Receipt replay.** Ordinary whole-message receipts require an exact
+`source_total == offset + source_count` and digest match before their boundary
+may advance the marker. Sub-slice receipts have a six-part identity including
+the character offset and require an exact prompted-row count and digest match.
+Their `source_total` retains the historical raw boundary, including display-only
+notices; it never authorizes an advance. A later notice insertion can change
+that boundary without changing the slice. Replay advances only the validated
+current `AttemptedSpan`, under the existing lease and generation fences.
+
 **Every rewrite must drop a live sub-offset.** `consolidation_sub_offset`
 describes a character position inside ONE specific message — the head at
 `last_consolidated`. Anything that changes which message sits there, or changes
@@ -2410,6 +2419,9 @@ includes a sub-message character offset. Automatic scheduling leaves partial
 passes eligible for another round instead of setting a completion throttle.
 Every history pass checks the entire transcript for sensitive tool activity at
 its entry point, including idle, threshold, session-close and manual triggers.
+The eligibility scan uses `derive_messages` so the full transcript is read
+under its derivation hold with its current restricted-session policy validated.
+The later leased snapshot remains the authoritative extraction span.
 A sensitive session remains pending and supplies no history-extraction prompt.
 
 Prefs-only passes (`include_history=False`) keep the whole tail. Their window is

@@ -46,6 +46,7 @@ from kiro_crew.knowledge.llm_pool import (
     _read_config,
     _resolve_client_binding,
 )
+from kiro_crew.testing.wait import await_until
 
 # ---------------------------------------------------------------------------
 # Fixtures — mock workers that don't spawn real processes
@@ -1483,7 +1484,7 @@ class TestRuntimeWorkerForkContracts:
         worker._provider = provider
         worker._client = MagicMock()
         task = asyncio.create_task(worker.send_message("extract", timeout=0.05))
-        await asyncio.wait_for(entered.wait(), 1)
+        await await_until(entered, what="the runtime turn entered its provider")
         if failure == "cancel":
             task.cancel()
         error = {

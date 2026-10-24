@@ -60,6 +60,7 @@ MOVED_MEMBERS = {
         "_turn_footer",
         "_thinking_budget",
         "on_tool_call",
+        "on_notice",
         "on_compaction",
     ),
     "renderer_live": (
@@ -152,6 +153,7 @@ BASE_MEMBERS = {
         "(self, options: 'list[dict[str, Any]]', request_id: 'str | int', tool_title: 'str' = '', tool_purpose: 'str' = '', tool_input: 'str' = '') -> 'None'",
     ),
     "on_compaction": ("coroutine", "(self, context_usage_pct: 'float') -> 'None'"),
+    "on_notice": ("coroutine", "(self, text: 'str') -> 'None'"),
     "note_steer": ("function", "(self, text: 'str') -> 'None'"),
     "on_done": ("coroutine", "(self, stop_reason: 'str' = '') -> 'None'"),
     "_limit": ("function", "(self) -> 'int'"),

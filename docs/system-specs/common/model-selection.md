@@ -32,8 +32,10 @@ shell metacharacters are rejected, and so are empty, unbalanced, nested,
 repeated or non-trailing bracket qualifiers. The existing field length limit
 still applies. This format check does not establish entitlement or alter the
 separate `MODEL_ID_RE` grammar (the check `AcpRuntime` applies to a `model=`
-argument) or ACP
-runtime validation. The Settings model pins (`_MODEL_PIN_PATTERN`) build their
+argument) or ACP runtime validation. `AcpRuntime` accepts the single-segment
+spelling with one optional trailing effort/window qualifier, bounded to 128
+characters overall; slash-qualified and tagged names still use the separate
+advertised-model path. The Settings model pins (`_MODEL_PIN_PATTERN`) build their
 qualified branch from the same `QUALIFIED_MODEL_PATTERN`, so a picker cannot
 offer an id one boundary refuses and a sibling accepts.
 

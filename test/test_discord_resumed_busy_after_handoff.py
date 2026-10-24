@@ -858,6 +858,8 @@ async def _turn_emits_monitor_watch_after_a_steer(tmp_path, monkeypatch, *, chan
             title="Watching the pull request",
             tool_name="monitor_watch",
             mcp_server_name="kirocrew-core",
+            tool_identity_trusted=True,
+            mcp_identity_trusted=True,
         )
         # The turn is running (its task is live) while the steer is admitted; the
         # harness awaits ``_run_chat`` directly, so the liveness the gate reads is

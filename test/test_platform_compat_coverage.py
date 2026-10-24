@@ -1281,6 +1281,19 @@ class TestFlockOwnerPid:
         _fake_proc_locks(monkeypatch, _locks_row(lock, 39542))
         assert pc.flock_owner_pid(lock) == 39542
 
+    @pytest.mark.parametrize("pid", [0, -1])
+    @pytest.mark.parametrize("surface", ["proc_locks", "fdinfo"])
+    def test_nonpositive_acquirer_is_unknown(self, monkeypatch, tmp_path, pid, surface):
+        lock = tmp_path / "gateway.lock"
+        lock.write_text("")
+        row = _locks_row(lock, pid)
+        if surface == "proc_locks":
+            _fake_proc_locks(monkeypatch, row)
+            monkeypatch.setattr(pc, "_descriptors_on", lambda _target: iter(()))
+        else:
+            _fake_fdinfo(monkeypatch, [(43, "7")], {"/proc/43/fdinfo/7": f"lock:\t{row}"})
+        assert pc.flock_owner_pid(lock) is None
+
     def test_blocked_waiters_and_other_lock_types_are_skipped(self, monkeypatch, tmp_path):
         lock = tmp_path / "gateway.lock"
         lock.write_text("")

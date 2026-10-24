@@ -29,7 +29,8 @@ is defined in an owner module beside it. Import and patch every one as
   - `platform_compat_proctable`: the kernel's process table read directly (macOS
     `libproc` and `sysctl`, Linux `/proc`): a pid's parent, state, argv, environment,
     CPU time and footprint, its children and group members, and who holds a file or
-    its `flock`;
+  its `flock`; nonpositive kernel lock-owner fields mean the acquirer is unknown,
+  while contention still establishes that the lock is held;
   - `platform_compat_runtime`: the UTF-8 environment and console, the re-exec and exit
     seams, the process alarm and the boot and awake clocks, the open-file limit,
     `strftime`, interpreter discovery and the launcher hops, the desktop bundle's

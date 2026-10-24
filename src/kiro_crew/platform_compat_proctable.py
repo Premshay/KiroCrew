@@ -976,6 +976,8 @@ def flock_owner_pid(path: str | os.PathLike | os.stat_result) -> int | None:
 
     Returns ``None`` on non-Linux, when ``/proc`` is unreadable, or when no
     ``FLOCK`` entry matches the file. Blocked waiters (``->`` rows) are skipped.
+    A nonpositive owner field means the kernel does not name the acquirer;
+    it is unknown, never a process id.
 
     Matching is on the full ``major:minor:inode`` triple that ``/proc/locks``
     prints, because inode numbers are only unique WITHIN a filesystem -- an
@@ -1031,7 +1033,7 @@ def _flock_acquirer_row(fields: list[str], want: tuple[int, int, int]) -> int | 
         found = (int(major, 16), int(minor, 16), int(ino))
     except (ValueError, IndexError):
         return None
-    return pid if found == want else None
+    return pid if found == want and pid > 0 else None
 
 
 def _flock_acquirer_in_proc_locks(want: tuple[int, int, int]) -> int | None:

@@ -65,7 +65,6 @@ async def _on_compaction_status(turn: _ChatTurn, event) -> None:
     _compaction_dropped_leak = turn._compaction_dropped_leak
     _compaction_started = turn._compaction_started
     _deferred_cut_text = turn._deferred_cut_text
-    _turn_flushed_visible_text = turn._turn_flushed_visible_text
     _wsred = turn._wsred
     saw_compaction = turn.saw_compaction
     slot = turn.slot
@@ -117,8 +116,7 @@ async def _on_compaction_status(turn: _ChatTurn, event) -> None:
         turn.assistant_text = ""
         _deferred_cut_text = ""
         turn._deferred_cut_text = _deferred_cut_text
-        _turn_flushed_visible_text = True
-        turn._turn_flushed_visible_text = _turn_flushed_visible_text
+        turn._turn_flushed_visible_text = True
         _wsred.reset()
     if _broadcast_compaction_result(state, slot, event):
         saw_compaction = True
@@ -238,7 +236,6 @@ async def _on_agent_switched(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | N
     _spec_hooks_cwd: str | None
     _turn_project = turn._turn_project
     client = turn.client
-    needs_session_reset = turn.needs_session_reset
     private_member = turn.private_member
     selected_binding = turn.selected_binding
     session_key = turn.session_key
@@ -288,8 +285,7 @@ async def _on_agent_switched(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | N
             f"pinned to {pinned_member}. The next turn restarts on the pinned crew.",
             "msg msg-info",
         )
-        needs_session_reset = True
-        turn.needs_session_reset = needs_session_reset
+        turn.needs_session_reset = True
         # The vetoed turn DID produce visible output (the notice
         # above) — and more importantly, tool calls completed
         # BEFORE the switch event may have had real side effects.
@@ -309,8 +305,7 @@ async def _on_agent_switched(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | N
         # A live provider event can change a template selection.
         # Restore cannot infer that authority from a different
         # transcript name, including a partially persisted switch.
-        needs_session_reset = True
-        turn.needs_session_reset = needs_session_reset
+        turn.needs_session_reset = True
         turn._produced_visible_output = True
         # The switched-to agent's permissions were fixed when the
         # session started; if they auto-approve what its hooks cover,

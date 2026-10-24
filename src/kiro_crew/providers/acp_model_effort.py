@@ -246,9 +246,9 @@ def supports_effort(self: AcpProvider) -> bool:
     effort verbs below read -- a second copy of this question is how one of
     them comes to offer a control the others refuse.
 
-    WHICH fact answers is per harness. Where the level rides the MODEL --
-    kiro-cli refuses it per model, claude-agent-acp rebuilds the option from
-    the model's ``supportedEffortLevels`` -- the registry answers. Where the
+    The live config selector answers for config-option harnesses, including
+    Claude, which rebuilds it from the serving model's supported levels.
+    kiro-cli uses the model registry. Where the
     harness advertises the option per SESSION
     (``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION``) the option answers,
     because the registry carries no entry for the operator's own model ids and

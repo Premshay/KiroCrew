@@ -66,7 +66,7 @@ def _context_usage_payload(slot_key: str, client: Any) -> dict[str, Any]:
     denominator. In that case the payload ships ``used_tokens`` alone; the UI
     shows the measured count but no percentage or capacity estimate. When the
     used count itself is unavailable the payload carries ``reset: True`` so the
-    frontend drops counts that no longer describe this session.
+    frontend drops stale counts for this session.
     """
     pct = client.context_usage_pct()
     payload: dict[str, Any] = {"slot": slot_key, "pct": round(pct, 1)}

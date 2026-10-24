@@ -883,6 +883,10 @@ only, so after editing a part also run the floor's own tests
 (`test/test_host_isolation_floor*.py`, `test/test_host_service_guard.py`,
 `test/test_testing_determinism_helpers.py`, `test/test_conftest_parts_reach.py`).
 
+CLI logging tests must restore both the file-listener slot and per-logger queues.
+Drain queues before reading captured output. Retire new listener threads and exit
+callbacks at teardown while preserving listeners inherited from higher scopes.
+
 Host-side `PodConfig` paths do not derive from `KIROCREW_HOME`. Tests that publish
 pod state must set `pod_root`, `pods_dir` and `artifacts_dir` under `tmp_path` on
 their configuration object. Keep the real publisher and reader so the fixture

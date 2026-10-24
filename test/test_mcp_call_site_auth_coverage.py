@@ -179,7 +179,6 @@ _KNOWN_UNRESOLVED = frozenset(
         # attached (the feed is unauthenticated display metadata; the signed
         # manifest is verified by the wheel engine before anything installs).
         "cli_server_update.py:_update_wheel",
-        "review_driver.py:_api_request",
     }
 )
 
@@ -438,6 +437,46 @@ def _called_helper_name(func: ast.expr, wrappers: dict[str, int]) -> str | None:
     return None
 
 
+def _wrapper_path_bindings(
+    tree: ast.Module,
+    wrappers: dict[str, int],
+    module_scope: dict[str, list[str]],
+    core: dict[str, list[str]],
+) -> dict[str, dict[str, list[str]]]:
+    """Bind a local wrapper's path parameter from all its direct callers.
+
+    The call sites remain scanned independently. An unknown argument stays
+    unknown in the wrapper too; neither indirection nor the candidate ceiling
+    may hide an unresolvable transport path.
+    """
+    bindings: dict[str, dict[str, list[str]]] = {}
+
+    def visit(node: ast.AST, scopes: list[dict[str, list[str]]]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, [*scopes, _function_locals(child, scopes, core)])
+                continue
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id in wrappers
+            ):
+                name = child.func.id
+                expr = _path_expr(child, wrappers[name])
+                try:
+                    values = _resolve(expr, scopes, core) if expr is not None else [_UNKNOWN]
+                except _TooManyCandidates:
+                    values = [_UNKNOWN]
+                parameter = bindings.setdefault(name, {}).setdefault(_PATH_PARAM, [])
+                parameter[:] = list(dict.fromkeys([*parameter, *values]))
+                if len(parameter) > _MAX_CANDIDATES:
+                    parameter[:] = [_UNKNOWN]
+            visit(child, scopes)
+
+    visit(tree, [module_scope])
+    return bindings
+
+
 #: HTTP method each transport helper carries in its own name.
 _HELPER_METHODS = {
     "_post": "POST",
@@ -551,6 +590,7 @@ def _scan() -> tuple[dict[str, set[str]], set[str]]:
         wrappers = {} if src == _LOOPBACK_SRC else wrapper_index.get(src.name, {})
         module_scope = _str_assignments(tree.body)
         module_scope.update(_url_builders(tree, [module_scope], core))
+        wrapper_bindings = _wrapper_path_bindings(tree, wrappers, module_scope, core)
 
         def visit(
             node: ast.AST,
@@ -560,7 +600,11 @@ def _scan() -> tuple[dict[str, set[str]], set[str]]:
         ) -> None:
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    inner = [*scopes, _function_locals(child, scopes, core)]
+                    inner = [
+                        *scopes,
+                        wrapper_bindings.get(child.name, {}),
+                        _function_locals(child, scopes, core),
+                    ]
                     visit(child, inner, child.name, [*enclosing, child])
                     continue
                 if isinstance(child, ast.Call):
@@ -921,6 +965,30 @@ class TestMcpCallSiteAuthCoverage:
             "a call carrying no path must yield no expression, so the walker "
             "records it unresolved rather than silently finding nothing"
         )
+
+    @pytest.mark.parametrize("known", [True, False])
+    def test_local_wrapper_binds_known_paths_and_keeps_unknown_ones_unresolved(
+        self, monkeypatch, tmp_path, known
+    ):
+        mod = tmp_path / "wrapper_probe.py"
+        argument = '"/api/wrapper-probe"' if known else "runtime_path"
+        mod.write_text(
+            "from kiro_crew import mcp_core\n"
+            "def _get(path):\n"
+            "    return mcp_core._get(path)\n"
+            "def go(runtime_path):\n"
+            f"    return _get(path={argument})\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setitem(globals(), "_SOURCES", (_CORE, mod))
+        paths, unresolved = _scan()
+        if known:
+            assert "/api/wrapper-probe" in paths
+            assert "wrapper_probe.py:_get" not in unresolved
+            assert len(paths["/api/wrapper-probe"]) == 2, "both caller and wire are scanned"
+        else:
+            assert "wrapper_probe.py:_get" in unresolved
+            assert "/api/wrapper-probe" not in paths
 
     def test_the_walker_visits_a_keyword_only_transport_call(self, monkeypatch, tmp_path):
         """End-to-end: shape must not decide whether a call is examined.

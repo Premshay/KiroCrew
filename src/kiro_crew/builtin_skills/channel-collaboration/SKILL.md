@@ -1,6 +1,6 @@
 ---
 name: channel-collaboration
-description: Work safely in a persistent KiroCrew channel: read the live roster, address peers by channel-local ID, use typed peer delivery correctly, and understand dashboard checkpoint ownership.
+description: "Work safely in a persistent Kiro Crew channel: read the live roster, address peers by channel-local ID, use typed peer delivery correctly, and understand dashboard checkpoint ownership."
 ---
 
 # Channel collaboration

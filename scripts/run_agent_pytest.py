@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run pytest under KiroCrew's host-wide worker and memory budget.
+"""Run pytest under Kiro Crew's host-wide worker and memory budget.
 
 Two roles, one file. The LAUNCHER validates the requested worker count and
 starts a memory-bounded transient service; that service re-enters this script

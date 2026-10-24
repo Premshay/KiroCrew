@@ -823,7 +823,11 @@ def push_refresh(self: DashboardState, *kinds: str) -> None:
 
 
 def push_update_progress(
-    self: DashboardState, step: str, detail: str = "", *, maintenance: dict[str, object] | None = None
+    self: DashboardState,
+    step: str,
+    detail: str = "",
+    *,
+    maintenance: dict[str, object] | None = None,
 ) -> None:
     """Broadcast an update progress event to all connected clients.
 

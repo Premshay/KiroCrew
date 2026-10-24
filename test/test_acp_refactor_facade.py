@@ -52,6 +52,8 @@ from kiro_crew.acp import (
     runtime_models,
     runtime_process_tree,
     runtime_start,
+    transport_error_classification,
+    transport_error_messages,
     transport_errors,
     transport_framing,
 )
@@ -72,6 +74,8 @@ _OWNERS: dict[str, ModuleType] = {
     for m in (
         transport_framing,
         transport_errors,
+        transport_error_classification,
+        transport_error_messages,
         runtime_models,
         runtime_process_tree,
         runtime_start,
@@ -1481,7 +1485,8 @@ def test_each_function_that_reads_a_load_time_binding_imports_it_from_the_facade
 def test_the_owners_depend_on_each_other_one_way() -> None:
     """The owners form layers, read downward only.
 
-    ``transport_errors`` reads the model catalog. The launch tail reads the error
+    The error classifiers read the model catalog; error messages read the classifiers.
+    The error facade exports both owners. The launch tail reads the error
     family and the stdout bound. Each per-process host reads the launch helpers and
     the error family, and the DeepSeek host shares pi's sealed artifact directory.
     Nothing reads a host adapter except another host, and no owner reads back up.
@@ -1505,7 +1510,10 @@ def test_the_owners_depend_on_each_other_one_way() -> None:
     )
     hosts = {claude_harness, opencode_harness, goose_harness, pi_harness, deepseek_harness}
     expected = {
-        (errors, runtime_models.__name__),
+        (errors, transport_error_classification.__name__),
+        (errors, transport_error_messages.__name__),
+        (transport_error_classification.__name__, runtime_models.__name__),
+        (transport_error_messages.__name__, transport_error_classification.__name__),
         (the_launch, errors),
         (the_launch, framing),
         (deepseek_harness.__name__, pi_harness.__name__),

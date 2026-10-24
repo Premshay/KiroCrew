@@ -115,12 +115,16 @@ class TestCheckpointDirectiveDispatch:
 
     def test_refuses_a_checkpoint_without_a_verified_session_identity(self, monkeypatch) -> None:
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        diagnosis = " Fixture identity diagnosis."
+        monkeypatch.setattr(mcp_core, "strict_identity_diagnosis", lambda *_: diagnosis)
         post = MagicMock()
         monkeypatch.setattr(mcp_core, "_post", post)
 
         result = mcp_core._call_tool_inner("session_checkpoint", _checkpoint())
 
-        assert result == "Error: session_checkpoint requires a verified dashboard session identity."
+        assert result == (
+            "Error: session_checkpoint requires a verified dashboard session identity." + diagnosis
+        )
         post.assert_not_called()
 
     def test_reports_gateway_checkpoint_failure(self, monkeypatch) -> None:
@@ -588,7 +592,9 @@ class TestCheckpointInternalEndpoint:
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("consumer")
         state.sessions.restart_barrier_snapshot = AsyncMock(
-            return_value=[{"session_key": "dashboard:consumer", "busy": True}]
+            return_value=[
+                {"session_key": "dashboard:consumer", "busy": True, "activity_marker": 0.0}
+            ]
         )
         state.restart_barrier.open({"dashboard:consumer": 0.0}, set())
         request = MagicMock()

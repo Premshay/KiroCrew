@@ -256,15 +256,11 @@ def schemas() -> list[dict[str, Any]]:
 
 
 def _strict_session_key() -> tuple[str, str]:
-    sk = mcp_core._resolve_session_key_strict()
-    if not sk:
-        return "", (
-            "Error: this session's identity could not be verified strictly, so "
-            "coordinator work items are not reachable from here. Subagents "
-            "cannot inherit their parent's coordinator authority."
-            + mcp_core.strict_identity_diagnosis()
-        )
-    return sk, ""
+    return mcp_core.require_strict_session_key(
+        "Error: this session's identity could not be verified strictly, so "
+        "coordinator work items are not reachable from here. Subagents "
+        "cannot inherit their parent's coordinator authority."
+    )
 
 
 def _response(payload: dict[str, Any]) -> str:

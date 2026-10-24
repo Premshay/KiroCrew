@@ -17,6 +17,7 @@ sender and a reused key held by a different tab all write nothing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,6 +27,7 @@ from chat_test_helpers import _make_state
 from kiro_crew.dashboard import chat_handlers as ch
 from kiro_crew.dashboard import session_control as sc
 from kiro_crew.dashboard.chat_utils import slot_history_key
+from kiro_crew.testing.wait import await_until, finished
 
 
 @pytest.fixture(autouse=True)
@@ -89,10 +91,32 @@ def _cancel(state, slot, queue_id):
 def _hard_stop(state, slot):
     """Two Stop presses: the first is cooperative, the second hard-kills."""
     state.sessions.stop_turn = AsyncMock(return_value="cancelled")
-    asyncio.run(ch.stop_slot_turn(state, slot))
-    assert slot._stop_state == "soft_pending"
-    asyncio.run(ch.stop_slot_turn(state, slot))
-    assert slot._stop_state == "killing"
+
+    async def stop_twice():
+        started = asyncio.Event()
+        pending = asyncio.get_running_loop().create_future()
+
+        async def turn():
+            started.set()
+            await pending
+
+        task = asyncio.create_task(turn())
+        slot.task = task
+        try:
+            await await_until(started, what="started.wait()")
+            await ch.stop_slot_turn(state, slot)
+            assert slot._stop_state == "soft_pending"
+            assert not task.done()
+            await ch.stop_slot_turn(state, slot)
+            assert slot._stop_state == "killing"
+            assert task.cancelled()
+        finally:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await finished(task, "task")
+
+    asyncio.run(stop_twice())
 
 
 # ── A queue-card cancel ──────────────────────────────────────────────────────

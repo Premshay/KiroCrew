@@ -155,11 +155,13 @@ def test_reinjection_turn_re_delivers_under_its_own_header(tmp_path, home, stand
 
 def test_minimal_reinjection_withholds_folder_steering(tmp_path, home, standards):
     builder = _builder(tmp_path)
+    checkpoint = {"summary": "Retained full-session checkpoint context."}
     full, _ = builder.build_message(
         "next",
         False,
         "dashboard:full-reinjection",
         needs_reinjection=True,
+        post_compaction_checkpoint=checkpoint,
         steering_dirs=(str(standards),),
     )
     minimal, _ = builder.build_message(
@@ -168,13 +170,16 @@ def test_minimal_reinjection_withholds_folder_steering(tmp_path, home, standards
         "dashboard:minimal-reinjection",
         needs_reinjection=True,
         minimal_context=True,
+        post_compaction_checkpoint=checkpoint,
         steering_dirs=(str(standards),),
     )
 
     assert REINJECT_HEADER in full
     assert MARKER in full
+    assert checkpoint["summary"] in full
     assert REINJECT_HEADER not in minimal
     assert MARKER not in minimal
+    assert checkpoint["summary"] not in minimal
 
 
 def test_reinjection_neutralizes_forged_markers_inside_a_document(tmp_path, home, standards):

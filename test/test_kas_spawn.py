@@ -323,8 +323,13 @@ class TestCapabilities:
         assert KAS_CLIENT_CAPABILITIES["_meta"]["kiro"]["settings"] == {}
 
     def test_kas_keeps_the_standard_top_level_declarations(self):
-        for key, value in ACP_CLIENT_CAPABILITIES.items():
-            assert KAS_CLIENT_CAPABILITIES[key] == value
+        # Extension metadata is host-specific; fs and terminal stay shared.
+        assert {k: v for k, v in KAS_CLIENT_CAPABILITIES.items() if k != "_meta"} == {
+            k: v for k, v in ACP_CLIENT_CAPABILITIES.items() if k != "_meta"
+        }
+        assert KAS_CLIENT_CAPABILITIES["_meta"] == {
+            "kiro": {"settings": {}, "openExternalUrl": True}
+        }
 
     def test_callback_capabilities_stay_undeclared(self):
         """Crew implements none of KAS's client-callback capabilities.

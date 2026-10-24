@@ -12,6 +12,7 @@ other floor guards are in ``test_host_isolation_floor.py`` and the worker budget
 
 from __future__ import annotations
 
+import atexit
 import io
 import logging
 import os
@@ -368,6 +369,44 @@ class TestTheLogQueueListenerIsRestored:
     def test_this_test_starts_with_no_listener(self) -> None:
         """Which is only true if no earlier test on this worker left one running."""
         assert cli._LOG_QUEUE_LISTENER is None
+
+    @pytest.mark.parametrize("inherit", [False, True])
+    @pytest.mark.parametrize("logger_name", ["", "kiro_crew"])
+    def test_routed_listeners_drain_and_preserve_inherited_ones(
+        self, monkeypatch, inherit, logger_name
+    ):
+        inherited = QueueListener(queue.SimpleQueue())
+        if inherit:
+            inherited.start()
+        monkeypatch.setattr(cli, "_LOG_QUEUE_LISTENERS", [inherited] if inherit else [])
+        output = io.StringIO()
+        handler = logging.StreamHandler(output)
+        logger = logging.getLogger(logger_name)
+        logger.addHandler(handler)
+        cycle = _autouse_floor_generator("_restore_log_queue_listener")()
+        next(cycle)
+        transient = logging.StreamHandler(io.StringIO())
+        logger.addHandler(transient)
+        try:
+            cli._setup_cli_logging("gateway", 1)
+            added = [listener for listener in cli._LOG_QUEUE_LISTENERS if listener is not inherited]
+            assert added and all(_listener_thread_alive(listener) for listener in added)
+            logging.getLogger("kiro_crew").warning("routed queue drain")
+            with pytest.raises(StopIteration):
+                next(cycle)
+            assert "routed queue drain" in output.getvalue()
+            assert cli._LOG_QUEUE_LISTENERS == ([inherited] if inherit else [])
+            assert all(not _listener_thread_alive(listener) for listener in added)
+            assert _listener_thread_alive(inherited) is inherit
+            assert handler in logger.handlers
+            assert transient not in logger.handlers
+        finally:
+            cycle.close()
+            if _listener_thread_alive(inherited):
+                inherited.stop()
+            atexit.unregister(inherited.stop)
+            handler.close()
+            transient.close()
 
     def test_a_leaked_listener_is_removed_by_the_floors_own_teardown(self) -> None:
         """One full cycle of the real fixture: snapshot, leak a listener, restore.

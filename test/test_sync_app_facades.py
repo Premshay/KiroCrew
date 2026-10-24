@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 import pytest
-from sage_lib import learning, review_driver
 
 from kiro_crew import _facade_mirror
 from kiro_crew.apps.builtins import code_review_sage  # noqa: F401
@@ -16,6 +15,10 @@ from kiro_crew.apps.builtins.code_review_sage.sage_lib import learning as qualif
 from kiro_crew.apps.builtins.code_review_sage.sage_lib import (
     review_driver as qualified_review_driver,
 )
+
+# The app bootstrap installs its standalone import path before these aliases load.
+learning = importlib.import_module("sage_lib.learning")
+review_driver = importlib.import_module("sage_lib.review_driver")
 
 pytestmark = [
     pytest.mark.timeout(300),

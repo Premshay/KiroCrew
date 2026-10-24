@@ -18,6 +18,8 @@ runtime is not replaced by upstream's system/Polly choices. Upstream's Piper
 removal (RFC `rfc-remove-piper-tts.md`, issue #23154) is a product-policy change,
 not an equivalent local provider. New unconfigured setups follow upstream's
 system default; existing local selections and their runtime fields remain.
+Pocket subprocess failures redact the complete stderr before retaining its last
+500 characters, preserving the final diagnosis without exposing cut credentials.
 
 ## The built-in engine
 

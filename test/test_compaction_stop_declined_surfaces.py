@@ -15,7 +15,8 @@ from compaction_stop_declined_helpers import _clear_channel_decline_markers  # n
 from compaction_stop_declined_helpers import _dashboard_state, _run_slack_stop, _setup, _slack_orch
 
 
-def test_an_ordinary_second_press_escalation_still_discards_the_session_queue(
+@pytest.mark.asyncio
+async def test_an_ordinary_second_press_escalation_still_discards_the_session_queue(
     tmp_path, monkeypatch
 ):
     """Control: a hard kill that is NOT the escape from a compaction decline keeps
@@ -26,18 +27,22 @@ def test_an_ordinary_second_press_escalation_still_discards_the_session_queue(
 
     state = _dashboard_state(tmp_path)
     slot = state.get_or_create_slot("chat-14841")
-    task = MagicMock()
-    task.done.return_value = False
+    task = asyncio.create_task(asyncio.Event().wait())
     slot.task = task
     slot._stop_state = "soft_pending"  # a cooperative cancel is already pending
     state.sessions.is_compacting = MagicMock(return_value=False)
     state.sessions.stop_turn = AsyncMock(return_value="hard")
     monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.sel", lambda: MagicMock())
 
-    asyncio.run(stop_slot_turn(state, slot))
+    try:
+        await stop_slot_turn(state, slot)
 
-    assert state.sessions.stop_turn.await_args.kwargs["force"] is True
-    assert state.sessions.stop_turn.await_args.kwargs["preserve_queue"] is False
+        assert state.sessions.stop_turn.await_args.kwargs["force"] is True
+        assert state.sessions.stop_turn.await_args.kwargs["preserve_queue"] is False
+        assert task.cancelled(), "a hard Stop settles the runner before returning"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def test_a_stale_decline_does_not_turn_a_later_first_press_into_a_force_stop(tmp_path, monkeypatch):
@@ -440,7 +445,8 @@ async def test_detach_then_clear_only_drops_the_detached_entries_and_keeps_newer
     await mgr.close_all()
 
 
-def test_force_true_on_an_idle_stop_state_reaches_the_hard_stop_not_the_decline(
+@pytest.mark.asyncio
+async def test_force_true_on_an_idle_stop_state_reaches_the_hard_stop_not_the_decline(
     tmp_path, monkeypatch
 ):
     from unittest.mock import AsyncMock, MagicMock
@@ -449,20 +455,24 @@ def test_force_true_on_an_idle_stop_state_reaches_the_hard_stop_not_the_decline(
 
     state = _dashboard_state(tmp_path)
     slot = state.get_or_create_slot("chat-14841")
-    task = MagicMock()
-    task.done.return_value = False
+    task = asyncio.create_task(asyncio.Event().wait())
     slot.task = task
     state.sessions.is_compacting = MagicMock(return_value=True)
     state.sessions.stop_turn = AsyncMock(return_value="hard")
     monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.sel", lambda: MagicMock())
 
-    asyncio.run(stop_slot_turn(state, slot, force=True))
+    try:
+        await stop_slot_turn(state, slot, force=True)
 
-    state.sessions.stop_turn.assert_awaited_once()
-    assert state.sessions.stop_turn.await_args.kwargs["force"] is True
-    # The escape from a compaction decline keeps the SESSION queue (a linked
-    # channel's, on a linked slot); the slot's own queue is still discarded.
-    assert state.sessions.stop_turn.await_args.kwargs["preserve_queue"] is True
+        state.sessions.stop_turn.assert_awaited_once()
+        assert state.sessions.stop_turn.await_args.kwargs["force"] is True
+        # The escape from a compaction decline keeps the SESSION queue (a linked
+        # channel's, on a linked slot); the slot's own queue is still discarded.
+        assert state.sessions.stop_turn.await_args.kwargs["preserve_queue"] is True
+        assert task.cancelled(), "a hard Stop settles the runner before returning"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def test_force_true_on_an_idle_state_with_no_compaction_stays_cooperative(tmp_path, monkeypatch):

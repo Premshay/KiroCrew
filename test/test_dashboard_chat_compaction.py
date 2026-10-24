@@ -574,7 +574,7 @@ class TestRunChatCompactDeferredWait:
         """A backend without Kiro's notification protocol must finish the turn.
 
         Expressed through ``manual_compact_unsupported_backend`` rather than a
-        backend predicate: the runner no longer branches on which harness it is,
+        backend predicate: the runner relies on provider capability declarations,
         so a backend outside ``ACP_BACKENDS_COMPACT`` is refused at the pre-turn
         gate and never reaches the deferred wait at all.
         """

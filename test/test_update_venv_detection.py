@@ -281,7 +281,7 @@ class TestRestartGateway:
         state = _make_state(monkeypatch, tmp_path)
         state._slots = {"owner": _ChatSlot("owner")}
         state.sessions.restart_barrier_snapshot = AsyncMock(
-            return_value=[{"session_key": "dashboard:owner", "busy": True}]
+            return_value=[{"session_key": "dashboard:owner", "busy": True, "activity_marker": 1.0}]
         )
         execv_called: list[bool] = []
         monkeypatch.setattr("os.execv", lambda *a, **k: execv_called.append(True))
@@ -444,10 +444,11 @@ class TestApiUpdateApplyVenvDispatch:
         state = _make_state(monkeypatch, tmp_path)
         state._slots = {"owner": _ChatSlot("owner")}
         state.sessions.restart_barrier_snapshot = AsyncMock(
-            return_value=[{"session_key": "dashboard:owner", "busy": True}]
+            return_value=[{"session_key": "dashboard:owner", "busy": True, "activity_marker": 1.0}]
         )
         request = MagicMock(spec=web.Request)
         request.app = {"state": state}
+        _as_owner(request)
 
         response = await api_update_apply(request)
 
@@ -463,7 +464,7 @@ class TestApiUpdateApplyVenvDispatch:
         state = _make_state(monkeypatch, tmp_path)
         state._slots = {"owner": _ChatSlot("owner")}
         state.sessions.restart_barrier_snapshot = AsyncMock(
-            return_value=[{"session_key": "dashboard:owner", "busy": True}]
+            return_value=[{"session_key": "dashboard:owner", "busy": True, "activity_marker": 1.0}]
         )
         policy_calls: list[None] = []
 
@@ -476,6 +477,7 @@ class TestApiUpdateApplyVenvDispatch:
         )
         request = MagicMock(spec=web.Request)
         request.app = {"state": state}
+        _as_owner(request)
 
         response = await api_update_apply(request)
 

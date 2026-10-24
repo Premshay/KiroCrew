@@ -7,13 +7,13 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
-from aiohttp.test_utils import make_mocked_request
 
 from ..backend import routes, runner, store
 from ..profiles.github_repo import profile as gp
 from ..profiles.github_repo.environment import RunnerAdmissionError
 from ..spine.bug_gate import BugGate
 from ..spine.contracts import BugReproducingTest, Candidate
+from .request_helpers import owner_request
 
 
 def make_profile(tmp_path, monkeypatch, replies, selection=None):
@@ -169,7 +169,7 @@ def test_environment_is_repository_wide_and_restored():
 
 
 def request(body):
-    req = make_mocked_request("PUT", "/config")
+    req = owner_request("PUT", "/config")
 
     req._read_bytes = json.dumps(body).encode("utf-8")
     return req

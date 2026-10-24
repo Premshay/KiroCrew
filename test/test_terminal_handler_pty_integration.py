@@ -1334,6 +1334,19 @@ class TestTerminalWsIntegration:
         )
         assert b"BASHRC_WRONG" not in out
 
+    @pytest.fixture
+    def _plain_prompt_terminal(self, monkeypatch):
+        """Keep host prompt instrumentation out of prompt-shape assertions.
+
+        System profile hooks may append their own array elements. TERM=dumb is
+        the systemd OSC hook's opt-out; Bash still reads the real login profile
+        chain and the test's own profile and exported prompt command.
+        """
+        child_env = terminal._pty_child_env
+        monkeypatch.setattr(
+            terminal, "_pty_child_env", lambda extra: child_env({**extra, "TERM": "dumb"})
+        )
+
     @pytest.mark.skipif(
         terminal.platform_compat.IS_WINDOWS or not shutil.which("bash"),
         reason="POSIX login-shell semantics; needs a real bash on PATH",
@@ -1343,6 +1356,7 @@ class TestTerminalWsIntegration:
         self,
         monkeypatch,
         tmp_path,
+        _plain_prompt_terminal,
     ):
         """The readiness hook withdraws ITSELF, never the user's own prompt hook.
 
@@ -1553,6 +1567,7 @@ class TestTerminalWsIntegration:
         self,
         monkeypatch,
         tmp_path,
+        _plain_prompt_terminal,
     ):
         """An exported PROMPT_COMMAND in the GATEWAY's environment is preserved.
 

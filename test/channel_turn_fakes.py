@@ -76,6 +76,7 @@ def directive(tool: str = "autonudge_stop", tool_call_id: str = "d1") -> list[Ac
             title=tool,
             tool_name=tool,
             mcp_server_name=session_directive.CORE_MCP_SERVER,
+            mcp_identity_trusted=True,
         ),
         AcpEvent(
             kind=EVENT_TOOL_RESULT,

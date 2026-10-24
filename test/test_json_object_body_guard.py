@@ -161,6 +161,9 @@ _CAP_REASONS = {
 #: opt-out, ``"<default>"`` for the shared 64 KB ceiling, or the literal
 #: expression passed for a per-route cap.
 _CAP_REGISTER: dict[str, tuple[str, str]] = {
+    # Consult accepts a short task and a bounded model roster under the same
+    # shared request ceiling as the dashboard advice route.
+    "handlers/preference_advisor.py::api_preference_consult": ("<default>", _BOUNDED_BY_DEFAULT),
     "handlers/preference_advisor.py::api_preference_advice": ("<default>", _BOUNDED_BY_DEFAULT),
     "handlers/preference_advisor.py::api_preference_feedback": (
         "<default>",
@@ -341,6 +344,7 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     "chat_api/slot_lifecycle.py::api_chat_slots_cleanup": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_folder_cleanup.py::api_chat_folders_cleanup": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_api/agent_switch.py::api_chat_slot_agent": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "chat_api/runtime_selection.py::api_chat_slot_runtime": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_api/slot_model.py::api_chat_slot_model": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_api/slot_model.py::api_chat_slots_model": ("<default>", _BOUNDED_CONTROL_FIELDS),
     # The Settings follow-default confirm carries one field: the count's 64-hex digest.

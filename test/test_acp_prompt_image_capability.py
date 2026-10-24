@@ -177,9 +177,9 @@ class TestLiveModelImageCapability:
     def test_a_model_switch_makes_the_capability_unknown(self, tmp_path):
         """The answer belongs to the model the session handshook on.
 
-        After a live switch the harness has advertised for a model the session
-        no longer runs, and it re-negotiates nothing mid-connection, so the old
-        answer is evidence about neither. Unknown is not a refusal.
+        After a live switch the handshake describes a different model and the
+        harness does not renegotiate mid-connection. The handshake alone cannot
+        establish the selected model's capability. Unknown is not a refusal.
         """
         client = self._client(tmp_path, {"image": False})
         assert client.supports_image_prompt is False

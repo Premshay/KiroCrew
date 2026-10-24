@@ -52,6 +52,7 @@ def _real_manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[obje
     monkeypatch.setenv(fake_acp_backend.NATIVE_STORE_ENV, str(store))
     agent_mod.kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     _install_lite_agent_fallback()
+    agent_mod._install_consolidate_agent()
     cfg = KiroCrewConfig.load()
     # The fake backend is the only child these tests spawn, and CI hosts have no
     # OS sandbox backend (no user namespaces on Linux, none on Windows), so this
@@ -72,7 +73,12 @@ def _records(store: Path) -> list[str]:
 
 
 def _consolidator(sessions: object) -> SimpleNamespace:
-    return SimpleNamespace(_sessions=sessions, _logger=logging.getLogger("test.consolidation"))
+    return SimpleNamespace(
+        _sessions=sessions,
+        _logger=logging.getLogger("test.consolidation"),
+        _consolidation_endpoint="",
+        _consolidation_agent="kirocrew-consolidate",
+    )
 
 
 async def _run_jobs(sessions: object, store: Path, jobs: list[str]) -> list[list[str]]:
@@ -293,7 +299,8 @@ async def test_a_failed_turn_logs_the_model_and_the_prompt_size(caplog):
     async def fake_turn(_sessions, **_kwargs):
         yield SimpleNamespace(served_model="tiny-window-model")
 
-    consolidator = SimpleNamespace(_sessions=object(), _logger=logging.getLogger("t.fail"))
+    consolidator = _consolidator(object())
+    consolidator._logger = logging.getLogger("t.fail")
     with (
         patch.object(history_consolidation, "background_turn", fake_turn),
         patch.object(

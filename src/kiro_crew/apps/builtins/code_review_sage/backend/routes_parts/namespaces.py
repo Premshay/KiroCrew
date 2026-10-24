@@ -502,7 +502,7 @@ async def _consolidate_bg(
                 candidate_snapshot=snapshot,
                 namespace=ns,
             )
-        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, ValueError) as exc:
             # The worker finished and its proposal was refused, so this line is the
             # only account of why: without it a rejected merge is indistinguishable
             # from one that never ran.

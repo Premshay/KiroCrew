@@ -8,6 +8,7 @@ import pytest
 from aiohttp import web
 
 from kiro_crew.dashboard.handlers import preference_advisor as handler
+from kiro_crew.testing.wait import await_until
 
 
 @pytest.fixture
@@ -373,7 +374,7 @@ class TestPreferenceAdvisor:
         monkeypatch.setattr(handler, "_COMPUTE_SECONDS", 0.02)
         pending = asyncio.create_task(handler.api_preference_advice(request))
         try:
-            await asyncio.wait_for(entered.wait(), 1)
+            await await_until(entered, what="preference scoring entering its worker")
             assert (
                 json.loads((await handler.api_preference_advice(request)).body)["reason"]
                 == "advice_busy"
@@ -383,16 +384,20 @@ class TestPreferenceAdvisor:
             monkeypatch.setattr(log, "append", lambda row: True)
             body.clear()
             body.update(id=advice["id"], choice="keep", model="current")
+            feedback = asyncio.create_task(handler.api_preference_feedback(request))
             assert (
-                await asyncio.wait_for(handler.api_preference_feedback(request), 1)
+                await await_until(feedback, what="feedback finishing while scoring is blocked")
             ).status == 200
             assert (
-                json.loads((await asyncio.wait_for(pending, 1)).body)["reason"] == "advice_timeout"
+                json.loads((await await_until(pending, what="scoring budget expiring")).body)[
+                    "reason"
+                ]
+                == "advice_timeout"
             )
             assert not request.app[handler._WORK].done()
         finally:
             release.set()
-            await asyncio.wait_for(request.app[handler._WORK], 1)
+            await await_until(request.app[handler._WORK], what="released scoring worker finishing")
             await pending
 
 

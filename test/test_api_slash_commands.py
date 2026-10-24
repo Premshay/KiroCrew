@@ -137,8 +137,8 @@ class TestAdvertisedCommands:
     """The Claude backend forwards the CLI's own registry; the menu shows it.
 
     Which backend a session runs is per-agent routing, so these all use the
-    ``acp`` provider — the global setting under which the routed Claude seam
-    actually runs, and under which the menu previously showed only kiro's set.
+    ``acp`` provider. Its menu must reflect the routed backend rather than only
+    Kiro's static command set.
     """
 
     @pytest.mark.asyncio

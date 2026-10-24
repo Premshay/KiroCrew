@@ -121,7 +121,7 @@ class TestApiSessionsRestartMcpSync:
         request = _make_restart_request()
         request.app["state"]._slots = {"owner": _ChatSlot("owner")}
         request.app["state"].sessions.restart_barrier_snapshot = AsyncMock(
-            return_value=[{"session_key": "dashboard:owner", "busy": True}]
+            return_value=[{"session_key": "dashboard:owner", "busy": True, "activity_marker": 1.0}]
         )
 
         resp = await api_sessions_restart(request)
@@ -137,7 +137,7 @@ class TestApiSessionsRestartMcpSync:
 
         request = _make_restart_request()
         request.app["state"].sessions.restart_barrier_snapshot = AsyncMock(
-            return_value=[{"session_key": "subagent:worker", "busy": True}]
+            return_value=[{"session_key": "subagent:worker", "busy": True, "activity_marker": 1.0}]
         )
 
         resp = await api_sessions_restart(request)

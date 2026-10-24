@@ -786,8 +786,18 @@ class TestRuler:
     async def test_an_absent_ruler_reads_as_uncalibrated(self) -> None:
         assert _json_of(await routes._handle_ruler(_request())) == {"status": "uncalibrated"}
 
-    async def test_a_stored_ruler_is_returned(self) -> None:
-        store.write_json_atomic(store.ruler_dir() / "ruler.json", {"status": "calibrated"})
+    async def test_a_stored_ruler_is_returned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = store.read_json(store.config_path(), {}) or {}
+        provenance = {"sourceRevision": "calibration-fixture", "execution": {"kind": "gateway"}}
+        monkeypatch.setattr(store, "measurement_provenance", lambda _: provenance)
+        store.write_json_atomic(
+            store.ruler_dir() / "ruler.json",
+            {
+                "status": "calibrated",
+                "measurementConfig": store.measurement_identity(config),
+                "provenance": provenance,
+            },
+        )
         assert _json_of(await routes._handle_ruler(_request()))["status"] == "calibrated"
 
 

@@ -230,14 +230,15 @@ def _provider_factory(backend: str):
     from kiro_crew.providers.acp import AcpProvider
 
     def factory(session_key=None, agent=None, channel_id=None, **kwargs):
-        provider = object.__new__(AcpProvider)
+        provider = AcpProvider(
+            session_key=session_key, agent=agent, channel_id=channel_id, acp_backend=backend
+        )
         provider._client = MagicMock()
         provider._client._session_id = "forked-sid"
         provider._client._work_dir = "/workspace"
         provider._client._pid = None
         provider._client.backend = backend
         provider._client.resumed = True
-        provider._history_replay_needed = False
         provider.start = AsyncMock()
         provider.shutdown = AsyncMock()
         provider.context_usage_pct = MagicMock(return_value=0.0)
@@ -271,11 +272,12 @@ async def test_a_cold_start_hands_the_fork_to_a_claude_client() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_restricted_session_drops_the_fork(monkeypatch) -> None:
+@pytest.mark.parametrize("memory_mode", ["temporary", "incognito"])
+async def test_a_restricted_session_drops_the_fork(monkeypatch, memory_mode) -> None:
     """A temporary or incognito session restores no native history, forked or loaded."""
     monkeypatch.setattr(
         "kiro_crew.execution_context.read_session_execution",
-        lambda key, **_: SimpleNamespace(member_id=None, memory_mode="temporary"),
+        lambda key, **_: SimpleNamespace(member_id=None, memory_mode=memory_mode),
     )
     factory = _provider_factory(ACP_BACKEND_CLAUDE)
     mgr = _rewound_manager(factory)
@@ -283,6 +285,7 @@ async def test_a_restricted_session_drops_the_fork(monkeypatch) -> None:
     await mgr.get_or_create("thread1")
 
     factory.providers[0]._client.set_fork_request.assert_not_called()
+    factory.providers[0]._client.set_resume_session_id.assert_not_called()
     assert mgr._session_map.get_native_fork("thread1") is None
     await mgr.close_all()
 

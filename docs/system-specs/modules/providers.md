@@ -147,6 +147,13 @@ tool local-only (`task_run` and `workflow_run`, which start agents here) or
 reviewed remote-safe. `deploy_artifact` refuses only `local_dir`; the
 computer-use refusal is about placement, not governance.
 
+`session_channel_manage` and `code_review_sage_api` are local-only because their
+channel workers and app reviewer pool start on the gateway independently of the
+caller's placement. Channel status/posts, checkpoints, maintenance acknowledgements,
+preference advice and work-item records remain gateway coordination services.
+Work-item launch and retry pass the verified caller as `parent_session_key` to
+the subagent manager; those children inherit its remote environment before start.
+
 ### Transport
 
 A vendor tunnel is not assumed to deliver ACP byte for byte (an SSM port forward
@@ -650,7 +657,7 @@ harness can get wrong:
 default is empty. `set_resume_session_id()` is a safe no-op by default, while a resumable
 provider validates and retains its own opaque ID. `session_resumed` becomes true only when that
 provider accepted the exact prior ID. The session manager reads all three through the ABC, so
-an optional provider does not add a conditional to KiroCrew's ACP construction path.
+an optional provider does not add a conditional to Kiro Crew's ACP construction path.
 
 `discover_models()` is the account-scoped discovery seam for a selectable runtime. The
 dashboard exposes it through `GET /api/agents/{name}/models`, using a short-lived
@@ -929,7 +936,13 @@ Provider-level recovery mechanisms that fire automatically without user interven
 
 A transient 5xx that arrives *after* the turn already emitted output (the `_turn_emitted` guard is set once any assistant token streams or a tool call fires) does not drop the turn: it **RECOVERS ONCE**: the streamed partial is preserved as a finalized assistant message, a brief recovery notice is appended, and a *continue* instruction (not the original prompt) is re-queued onto the SAME live ACP session — which still holds the interrupted turn's context (original prompt, streamed partial, and any completed tool results) — so the model resumes from where it stopped rather than restarting. The recovery is one-shot per genuine user turn: the allowance is consumed only when a recovery is actually enqueued and is refreshed at the start of the next real user turn, never on the synthetic recovery turn, so a repeated post-token 5xx during recovery surfaces a clean error instead of looping. When Stop is active or the turn is nested (`_prompt_depth != 0`) the partial + notice are still shown but nothing is re-queued (the allowance is left unconsumed). This recovery **also applies to turns that already fired a tool call** — an ACCEPTED TRADEOFF (owner decision), rather than failing fast: a mid-stream 5xx is rare, and the continue instruction tells the model to resume and not re-run tools that already completed. A residual double-execution risk remains only for a side-effecting/destructive tool that was still *in flight* when the 5xx hit; the owner accepts that narrow risk in favor of recovering the turn.
 
-**Context-window recovery**: the local fleet router returns the machine code `context_window_exceeded` before forwarding a request that cannot fit the selected model's context. ACP maps that code to `AcpContextWindowExceeded`; the interactive runner then resets the live session **and clears its persisted native session ID**. Clearing the ID is essential: an ordinary reset resumes the same oversized native conversation. The next acquire starts a fresh native session, rebuilds it from KiroCrew's bounded replay, and retries the original request once. A second admission failure does not loop; it surfaces guidance to shorten the request or reduce tool output. Stop-active and nested turns still clear the unusable native resume, but require an explicit retry.
+**Context-window recovery**: the local fleet router returns the machine code `context_window_exceeded` before forwarding a request that cannot fit the selected model's context. ACP maps that code to `AcpContextWindowExceeded`; the interactive runner then resets the live session **and clears its persisted native session ID**. Clearing the ID is essential: an ordinary reset resumes the same oversized native conversation. The next acquire starts a fresh native session, rebuilds it from Kiro Crew's bounded replay, and retries the original request once. A second admission failure does not loop; it surfaces guidance to shorten the request or reduce tool output. Stop-active and nested turns still clear the unusable native resume, but require an explicit retry.
+
+The manual-compaction capability reader is `agent_sdk.capabilities.compact_unsupported_backend`;
+`providers.base` re-exports it for existing callers.
+`messaging.commands` re-exports it, and `session_compaction` imports the same
+function directly. Automatic policy and manual commands therefore share one
+predicate without making session management depend on channel command handlers.
 
 **Compaction-failure notice backoff** (dashboard-chat; `dashboard/chat_utils._broadcast_compaction_result`): repeated per-turn compaction failures are collapsed rather than repeated. Per slot, `_compaction_fail_streak` counts consecutive failures and the first `_COMPACTION_NOTICE_SHOW_FIRST_N` (=2) are shown verbatim ("❌ Compaction failed: …"); further failures within the `_COMPACTION_FAIL_COOLDOWN_SECS` (60s) `_compaction_fail_cooldown_until` window are suppressed, and when the cooldown elapses a single collapsed "failed Nx in a row … Consider `/compact` manually" message is shown with `/compact` guidance. A `completed` status resets the streak/cooldown. `acp/client_usage.py:_handle_compaction_status` logs the raw failed-compaction notification params at WARNING (kiro-cli carries no dedicated error field on failure). The reason a failed notice shows comes from ONE reader, `acp/transport_errors.compaction_failure_detail` — a ranked walk of the payload's reason-bearing keys, redacted and capped, falling back to the raw payload shape when none is named — so the notice and the retry verdict (`compaction_failure_is_transient`) read the same view of the frame. The streaming dispatch loops (`AcpClient`, `AcpSessionHandle` and its KAS `summarization_failed` branch) put that reason in the event's `title`, and both `wait_for_compaction()` implementations (`AcpClient` and `AcpSessionHandle`; `AcpProvider` and `AcpSessionProvider` pass the result through) put it in the result's `summary` when the notification's own `summary` is empty — kiro-cli populates `summary` on success but leaves it empty (or `null`) on failure, which otherwise left the manual `/compact` notice at a bare "Compaction failed." while the automatic one named the cause. A `failed` notification whose `summary` is non-empty is returned as-is (redacted), a `completed` result is unchanged, and a payload naming no reason yields the reader's own fallback text ("no reason reported by the agent (raw: …)") on both paths. This is a UX/spam guard only — the underlying compaction still runs every turn on kiro-cli's schedule — and is distinct from SessionManager's proactive auto-compact cooldown.
 

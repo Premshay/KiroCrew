@@ -448,7 +448,7 @@ ADVERTISED = {
 
 
 class TestAdvertisedTiers:
-    """The real function, over the lists this machine's adapters advertised on 2026-09-29."""
+    """Exercise the real function over captured adapter-advertised tier lists."""
 
     def _tiers(self, vendor):
         return REAL_ADVERTISED_TIERS(vendor, ADVERTISED.get(vendor, []))

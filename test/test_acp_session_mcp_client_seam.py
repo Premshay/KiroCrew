@@ -1556,10 +1556,8 @@ class TestClientSeam:
     def test_a_broker_only_backend_is_not_withheld(self, tmp_path, agents_dir, monkeypatch):
         """``no mirror`` is not ``refused``: a session-array backend still gets Crew's servers.
 
-        deepseek was BROKER_ONLY when this was written (it is mirrored now), so the
-        withheld verdict must not drop Crew's servers. Dropping it left every
-        deepseek session with none of Crew's tools, observed live 2026-09-17: no
-        broker stub process under the harness and no Crew tool on the session.
+        A withheld verdict must retain Crew's servers for DeepSeek. The broker
+        stub process and Crew tools must be available under the harness.
         """
         _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
         client = AcpClient(

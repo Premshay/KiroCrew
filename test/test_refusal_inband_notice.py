@@ -757,7 +757,8 @@ class TestEveryHostDenyCallSiteIsWired:
         assert "turn_aborted=(_stop_reason == STOP_REASON_CANCELLED)" in window
         # stop-hook continuation: outer gate and the recheck after the config load.
         hook_calls = re.findall(
-            r"should_queue_hook_continuation\(\s*needs_session_reset, user_stopped=_stop_pressed\(turn\)\s*\)",
+            r"should_queue_hook_continuation\(\s*(?:turn\.)?needs_session_reset, "
+            r"user_stopped=_stop_pressed\(turn\)\s*\)",
             src,
         )
         assert (

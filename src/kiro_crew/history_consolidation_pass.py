@@ -81,7 +81,10 @@ from kiro_crew.history_consolidation_span import (
 from kiro_crew.history_projection import DISPLAY_ONLY_ROLES
 from kiro_crew.lesson_validation import LESSON_APPLIES_INSTRUCTION
 from kiro_crew.llm_helpers import ToolApprovalPolicy, background_turn, parse_llm_json
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (  # noqa: F401 -- mirrored facade bindings
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.session import CONSOLIDATE_KEY as _CONSOLIDATE_SESSION_KEY
 from kiro_crew.vector_memory_constants import (
     _MAX_EPISODIC_PER_CONSOLIDATION,
@@ -184,7 +187,7 @@ async def _consolidate(
         if isinstance(metadata, dict) and is_incognito_transcript(metadata.get("memory_mode")):
             return _CONSOLIDATION_REFUSED
         if include_history:
-            messages = await asyncio.to_thread(self._log._read_messages, key)
+            messages = await asyncio.to_thread(self._log.derive_messages, key)
             if _session_touched_sensitive(messages):
                 return ConsolidationOutcome("skipped", detail="sensitive session", complete=False)
         # Acquire before reading the authoritative span: a peer may have
@@ -546,8 +549,13 @@ async def _consolidate(
                 if (
                     count < 1
                     or len(replay_source) < count
-                    or committed["source_total"]
-                    != attempted.offset + (len(chunk) if is_sub_slice else count)
+                    or (is_sub_slice and len(replay_source) != count)
+                    # A whole-message receipt authorizes this exact durable
+                    # boundary. A sub-slice's historical raw boundary can
+                    # move when display-only notices are inserted; it never
+                    # authorizes a marker advance. Its six-part identity,
+                    # exact prompted count and digest identify the slice.
+                    or (not is_sub_slice and committed["source_total"] != attempted.offset + count)
                     or await asyncio.to_thread(consolidation_source_digest, replay_source[:count])
                     != committed["source_digest"]
                 ):
@@ -911,7 +919,8 @@ async def _consolidate(
             # sub-slice the message marker does NOT move (``attempted.prompted``
             # is the unmoved ``offset``), so pass the head's own boundary
             # (``offset + len(chunk)`` == offset + 1) instead: it clears the
-            # guard, is reproducible on replay, and is never read as the
+            # guard and records the raw boundary at commit time. Later notice
+            # migrations may change that raw boundary; it is never read as the
             # durable advance — the sub-slice durable advance goes through
             # ``_advance_history_marker``, not ``source_total``.
             member_source_total = (
@@ -1394,8 +1403,10 @@ async def _call_llm(
             return None
         except Exception:
             self._logger.warning(
-                "LLM consolidation turn failed after %.1fs",
+                "LLM consolidation turn failed after %.1fs model=%s prompt_chars=%d",
                 _time.monotonic() - t_start,
+                getattr(client, "served_model", "") or "unknown",
+                len(prompt),
                 exc_info=True,
             )
             return None
@@ -1458,8 +1469,9 @@ async def _call_direct_endpoint(self, prompt: str) -> dict | None:
     except _ConsolidationLaneUnavailable:
         raise
     except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
-        detail, _ = redact_credentials(str(exc).strip() or exc.__class__.__name__)
-        detail, _ = redact_exfiltration_urls(detail)
+        from kiro_crew.security import redact
+
+        detail = redact(str(exc).strip() or exc.__class__.__name__)
         self._last_llm_error = detail[:300]
         self._logger.warning("Direct consolidation endpoint failed: %s", self._last_llm_error)
         return None

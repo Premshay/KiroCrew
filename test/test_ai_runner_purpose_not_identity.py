@@ -60,6 +60,10 @@ class _Provider:
         self._events = list(events)
         self.approved: list = []
         self.rejected: list = []
+        self.allowed_tools: list[str] | None = None
+
+    def restrict_tools(self, allowed_tools: list[str]) -> None:
+        self.allowed_tools = list(allowed_tools)
 
     async def start(self) -> None:
         return None
@@ -122,6 +126,7 @@ async def test_a_purpose_never_passes_the_read_only_allowlist(monkeypatch, quiet
         allowed_tools=["Read", "Grep", "Glob"],
     )
     assert res.ok is True
+    assert provider.allowed_tools == ["Read", "Grep", "Glob"]
     assert provider.approved == [], "the agent's purpose text was read as a Read tool"
     assert provider.rejected == [ev.request_id]
     assert _PURPOSE not in seen_kinds, "the governance gate was told the purpose is the tool"

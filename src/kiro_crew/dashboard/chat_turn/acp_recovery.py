@@ -271,8 +271,7 @@ async def _on_process_died(turn: _ChatTurn, exc) -> None:
     # here is what keeps `turn/failed` from reporting an unnamed failure.
     _crew_log_error = type(exc).__name__
     turn._crew_log_error = _crew_log_error
-    needs_session_reset = True
-    turn.needs_session_reset = needs_session_reset
+    turn.needs_session_reset = True
     if getattr(exc, "ambiguous_delivery", False) is True:
         # Every steer written into this turn sits in the same stalled pipe as
         # its prompt, so the teardown requeues each as possibly delivered.
@@ -375,8 +374,7 @@ async def _on_acp_retryable(turn: _ChatTurn, exc) -> None:
     # `_prompt_depth == 0` would let a depth>0 pipe-death fall through to
     # `_on_acp_error_card`: no reset (the next turn hits the dead process)
     # and the failure never counting toward the exhaustion threshold.
-    needs_session_reset = True  # checked in _run_chat's finally
-    turn.needs_session_reset = needs_session_reset
+    turn.needs_session_reset = True  # checked in _run_chat's finally
     await _persist_partial_reply(turn, "error: process died")
     # Option Y: pipe-death ("process exited"/"not running") shares the
     # _acp_pipe_death_retries counter with the AcpProcessDied handler;
@@ -498,8 +496,7 @@ async def _on_acp_session_not_found(turn: _ChatTurn, exc) -> None:
         "could not load its cloud credentials" if _creds else "lost the session",
         slot.key,
     )
-    needs_session_reset = True  # checked in _run_chat's finally
-    turn.needs_session_reset = needs_session_reset
+    turn.needs_session_reset = True  # checked in _run_chat's finally
     await _persist_partial_reply(
         turn,
         "error: cloud credentials not loaded" if _creds else "error: session not found",
@@ -574,8 +571,7 @@ async def _on_acp_binding_mismatch(turn: _ChatTurn, exc) -> None:
     # Not a transient outage cycle: no retry, fallback or streak
     # bookkeeping may leak into the rebuilt conversation.
     _escalation.arm_discard(clear_streak=True)
-    needs_conversation_discard = True
-    turn.needs_conversation_discard = needs_conversation_discard
+    turn.needs_conversation_discard = True
     slot._transient_5xx_retries = 0
     slot._infra_retries = 0
     slot._fallback_candidate_idx = 0
@@ -648,8 +644,7 @@ async def _on_acp_image_unsupported(turn: _ChatTurn, exc, _image_replay_owed) ->
     # already says to remove or re-encode the attachment.
     await _persist_partial_reply(turn, "error: terminal")
     _escalation.arm_discard(clear_streak=True)
-    needs_conversation_discard = True
-    turn.needs_conversation_discard = needs_conversation_discard
+    turn.needs_conversation_discard = True
     if _turn_emitted:
         # A tool or assistant output already landed. Continue from the
         # persisted transcript rather than replaying the original user

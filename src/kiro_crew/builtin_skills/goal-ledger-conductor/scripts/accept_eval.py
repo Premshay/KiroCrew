@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Stable skill adapter for KiroCrew's product-owned acceptance evaluator.
+"""Stable skill adapter for Kiro Crew's product-owned acceptance evaluator.
 
 The conductor NEVER judges whether a work item succeeded.  The product-owned
 evaluator does, and this adapter only preserves the installed skill's stable
-``python3 accept_eval.py`` interface.  It always invokes one fixed KiroCrew CLI
+``python3 accept_eval.py`` interface.  It always invokes one fixed Kiro Crew CLI
 verb: no field from stdin contributes to a command or argv.
 
 Usage:
@@ -32,7 +32,7 @@ input. A per-item problem is a verdict, never a crash - one bad spec must not
 hide the others' results.
 
 The adapter is stdlib-only because a bundled skill may run under the system
-``python3`` rather than KiroCrew's environment.  The product CLI then imports
+``python3`` rather than Kiro Crew's environment.  The product CLI then imports
 the installed package and owns all evaluation semantics.
 """
 

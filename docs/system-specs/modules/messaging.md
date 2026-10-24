@@ -668,6 +668,10 @@ info). The text is display-redacted and then mention-defanged for the target
 chunk carries a live broadcast mention. `Renderer.on_notice(text)` takes only the
 prepared text. Notice delivery is advisory: a failed send is logged
 and the answer continues. Muted conversations' `SilentRenderer` drops notices.
+Discord grades each notice against the preceding delivered message and counts
+its landed redactions. A delivered notice becomes the predecessor for a fresh
+answer send; edits to an older open bubble retain that bubble's own predecessor.
+Failed notice sends do not advance either record or redaction tally.
 WeCom uses only its independent proactive destination; an unavailable push does
 not consume the single-use response URL reserved for answer delivery.
 The dashboard stores a `notice` row with `meta.kind=provider_notice` and severity,

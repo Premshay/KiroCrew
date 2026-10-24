@@ -267,20 +267,30 @@ async def test_computer_use_config_allows_owner(monkeypatch) -> None:
 
 async def test_update_apply_allows_owner(monkeypatch) -> None:
     from kiro_crew.dashboard.handlers import updates
+    from kiro_crew.dashboard.restart_barrier import RestartBarrier
     from kiro_crew.platform import update_provider
+    from kiro_crew.platform.wheel_engine import respawn_executable
 
     applied = AsyncMock(return_value=True)
-    restarted = AsyncMock()
+    restarted = AsyncMock(return_value=updates.GatewayRestartResult(restarted=True))
+    snapshot = AsyncMock(return_value=[])
     monkeypatch.setattr(update_provider, "apply_policy_update", applied)
     monkeypatch.setattr(updates, "_restart_gateway", restarted)
     app = web.Application(middlewares=[_owner()])
-    app["state"] = SimpleNamespace(owner_id=OWNER)
+    state = SimpleNamespace(
+        owner_id=OWNER,
+        sessions=SimpleNamespace(restart_barrier_snapshot=snapshot),
+        _slots={},
+        restart_barrier=RestartBarrier(),
+    )
+    app["state"] = state
     app.router.add_post("/api/update", updates.api_update_apply)
     async with TestClient(TestServer(app)) as client:
         response = await client.post("/api/update", json={})
         assert response.status == 200, await response.text()
     applied.assert_awaited_once()
-    restarted.assert_awaited_once()
+    snapshot.assert_awaited_once_with()
+    restarted.assert_awaited_once_with(state, resolver=respawn_executable)
 
 
 async def test_side_turn_allows_owner(monkeypatch) -> None:

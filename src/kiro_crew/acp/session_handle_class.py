@@ -53,6 +53,7 @@ from kiro_crew.acp.types import (
     AcpEvent,
     AcpPromptStats,
     JsonRpcMessage,
+    effort_config_option_id,
 )
 from kiro_crew.recovery.ladder import InfraError
 
@@ -710,8 +711,12 @@ class AcpSessionHandle:
         return self._runtime.session_activity_at(self._session_id)
 
     def effort_config_option_id(self) -> str | None:
-        """Return the advertised option id used to change this session's effort."""
-        option = acp_config_option(self._config_options, *ACP_EFFORT_CONFIG_IDS)
+        """Return the advertised option id for changing this session's effort."""
+        option = acp_config_option(
+            self._config_options,
+            effort_config_option_id(self._runtime.acp_backend),
+            *ACP_EFFORT_CONFIG_IDS,
+        )
         return str(option["id"]) if option else None
 
     @property

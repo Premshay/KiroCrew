@@ -362,6 +362,7 @@ class TestEveryKasCapableConstructorThreadsTheSetting:
     async def test_the_background_runtime_is_built_with_the_setting(self, enabled):
         from kiro_crew.config import KiroCrewConfig
         from kiro_crew.session import BACKGROUND_AGENT, SessionManager
+        from kiro_crew.start_priority import StartPriority
 
         cfg = KiroCrewConfig()
         cfg.agent.acp_backend = ACP_BACKEND_KAS
@@ -386,11 +387,16 @@ class TestEveryKasCapableConstructorThreadsTheSetting:
                     "sandbox_mode": cfg.agent.sandbox,
                     "acp_backend": ACP_BACKEND_KAS,
                     "expect_mcp_reports": False,
+                    "shared_scratch": None,
                     "tool_search": ToolSearchSettings(enabled, 12, 4000),
                     **binding,
                 }
                 runtime.spawn.assert_awaited_once()
-                runtime.create_session.assert_awaited_once_with(agent=BACKGROUND_AGENT)
+                runtime.create_session.assert_awaited_once_with(
+                    agent=BACKGROUND_AGENT,
+                    start_priority=StartPriority.BACKGROUND,
+                    bg_runtime_start=True,
+                )
                 assert handle is runtime.create_session.return_value
             finally:
                 await manager.close_all()

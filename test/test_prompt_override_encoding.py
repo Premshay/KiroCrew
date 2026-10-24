@@ -58,6 +58,8 @@ def builder(tmp_path: Path, opened, monkeypatch: pytest.MonkeyPatch) -> ContextB
     # between the two on a busy xdist worker and fail a prompt that did degrade.
     # Pin it, as the composition contract does.
     monkeypatch.setattr(ContextBuilder, "_live_cap_figure", staticmethod(lambda: "4"))
+    # Encoding fallback must not depend on the host's installed browser executable.
+    monkeypatch.setattr("kiro_crew.context_assembly.agent_spec._live_browser_gate", lambda: False)
     return ContextBuilder(
         memory=MemoryStore(workspace=tmp_path / "ws"),
         skills=opened(SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)),

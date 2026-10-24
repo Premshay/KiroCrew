@@ -246,6 +246,7 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
             turn._current_replay_message = _current_replay_message
 
     session_key = effective_session_key(slot)
+    turn.session_key = session_key
     if turn._post_restart_continuation:
         pending = slot.post_restart_continuation()
         if not pending:
@@ -258,7 +259,6 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
             slot.arm_post_restart_continuation(pending)
             slot.append("error", "Post-restart verification could not be persisted.", "msg msg-err")
             return _Flow.END
-    turn.session_key = session_key
     sessions = getattr(state, "sessions", None)
     turn.sessions = sessions
 
@@ -469,8 +469,7 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     # `_produced_visible_output`, whose narrower meaning (only the paths that
     # reset the buffer WITHOUT a tool boundary — steer cut, compaction, clear,
     # agent switch) is load-bearing for the promise-only guard in _turn_ending_chain.
-    _turn_flushed_visible_text = False
-    turn._turn_flushed_visible_text = _turn_flushed_visible_text
+    turn._turn_flushed_visible_text = False
     # ── Content-free turn-end diagnostics (empty-response verdict) ──
     # Booleans only, by contract. _turn_settle_answer's empty-response branch reaches its
     # verdict from these, and a WARNING names the cause it derived; every field
@@ -724,8 +723,7 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     slot._native_subagent_output = _native_card_output
     _native_card_output_len: dict[str, int] = {}
     turn._native_card_output_len = _native_card_output_len
-    needs_session_reset = False
-    turn.needs_session_reset = needs_session_reset
+    turn.needs_session_reset = False
     # Poisoned-conversation escalation: unlike needs_session_reset (which
     # preserves the resume sid so the next turn session/loads the same native
     # conversation), discard_conversation CLEARS the sid so the next turn
@@ -734,8 +732,7 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     # by the poisoned-conversation canary in _on_acp_error_card, the typed
     # unsupported-history-image recovery or the thinking-binding rebuild in acp_recovery.py;
     # their cross-cycle streak and one-shot live in ``_escalation``.
-    needs_conversation_discard = False
-    turn.needs_conversation_discard = needs_conversation_discard
+    turn.needs_conversation_discard = False
     _escalation = PoisonedConversationEscalation(slot)
     turn._escalation = _escalation
     _auth_required = False

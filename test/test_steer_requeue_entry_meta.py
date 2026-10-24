@@ -12,6 +12,8 @@ with the queue.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,8 +22,31 @@ from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_state
 from steer_requeue_helpers import _running_slot
 
+from kiro_crew.testing.wait import await_until
+
 # The shared fixture, bound here by name so pytest registers it for this module.
 _patch_sel = steer_requeue_helpers._patch_sel
+
+
+@asynccontextmanager
+async def _running_turn(slot):
+    started = asyncio.Event()
+    pending = asyncio.get_running_loop().create_future()
+
+    async def turn():
+        started.set()
+        await pending
+
+    task = asyncio.create_task(turn())
+    slot.task = task
+    try:
+        await await_until(started, what="the steer turn started")
+        yield task
+    finally:
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await await_until(task, what="the steer turn stopped")
 
 
 class TestRequeuedThenCancelledSteer:
@@ -97,7 +122,7 @@ class TestHardKillDiscardsSteers:
         slot.queue_append("queued")
         slot._pending_steers = ["steered"]
 
-        async with TestClient(TestServer(_make_app(state))) as client:
+        async with _running_turn(slot), TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post("/api/chat/slots/test/stop?force=true")
             assert resp.status == 200
 
@@ -385,7 +410,7 @@ class TestSendIdMapLifecycle:
         slot._steer_delivery_ids = {self._TEXT: "did-1"}
         slot._steer_send_ids = {self._TEXT: self._SEND_ID}
 
-        async with TestClient(TestServer(_make_app(state))) as client:
+        async with _running_turn(slot), TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post("/api/chat/slots/test/stop?force=true")
             assert resp.status == 200
 

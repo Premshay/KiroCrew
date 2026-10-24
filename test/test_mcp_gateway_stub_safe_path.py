@@ -115,6 +115,7 @@ def test_fingerprint_records_the_written_interpreter_options(
         sandbox_mode="standard",
         approval_mode="interactive",
         stub_set=frozenset(),
+        shared_readonly_set=frozenset(),
         pooling_enabled=True,
         forward_env=False,
         identity_keys=(),

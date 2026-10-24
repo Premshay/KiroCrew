@@ -579,10 +579,16 @@ class TestTheCollaborators:
             audit.no_such_audit_method  # noqa: B018
 
     @pytest.mark.asyncio
-    async def test_with_autonudge_off_a_goal_is_refused_as_the_gateway_refuses_it(self) -> None:
-        record = await run_turn(TurnScript(message="/goal ship the release"))
+    async def test_with_autonudge_off_a_goal_is_declared_without_starting_a_loop(self) -> None:
+        slots = []
+
+        def capture_slot(ctx) -> None:
+            slots.append(ctx.slot)
+
+        record = await run_turn(TurnScript(message="/goal ship the release", setup=capture_slot))
         replies = [row["content"] for row in record.window if row["role"] != "user"]
-        assert any("Goal loops are unavailable" in reply for reply in replies)
+        assert any("Goal declared. Automatic goal loops are unavailable" in reply for reply in replies)
+        assert slots[0].declared_goal_payload() == "ship the release"
         assert record.autonudge_calls == ()
 
     @pytest.mark.asyncio

@@ -99,9 +99,7 @@ def _timeline_entry(self: _ChatSlot, value: object) -> dict[str, Any] | None:
     source = self._checkpoint_text(value.get("source"), _SESSION_TIMELINE_SOURCE_MAX)
     timestamp = value.get("timestamp")
     kind = self._checkpoint_text(value.get("kind"), _SESSION_TIMELINE_SOURCE_MAX) or source
-    consequence = self._checkpoint_text(
-        value.get("consequence"), SESSION_CHECKPOINT_MILESTONE_MAX
-    )
+    consequence = self._checkpoint_text(value.get("consequence"), SESSION_CHECKPOINT_MILESTONE_MAX)
     if not text or not source:
         return None
     raw_priority = value.get("priority")
@@ -152,9 +150,7 @@ def _cap_session_timeline(entries: list[dict[str, Any]]) -> list[dict[str, Any]]
     """
     capped = list(entries)
     while len(capped) > SESSION_CHECKPOINT_TRAIL_MAX:
-        remove_index = min(
-            range(len(capped)), key=lambda index: (capped[index]["priority"], index)
-        )
+        remove_index = min(range(len(capped)), key=lambda index: (capped[index]["priority"], index))
         capped.pop(remove_index)
     return capped
 
@@ -311,9 +307,7 @@ def declared_goal_payload(self: _ChatSlot) -> str:
 def set_session_checkpoint(self: _ChatSlot, checkpoint: dict[str, Any]) -> bool:
     """Replace the concise view and append one bounded milestone."""
     summary = self._checkpoint_text(checkpoint.get("summary"), SESSION_CHECKPOINT_SUMMARY_MAX)
-    milestone = self._checkpoint_text(
-        checkpoint.get("milestone"), SESSION_CHECKPOINT_MILESTONE_MAX
-    )
+    milestone = self._checkpoint_text(checkpoint.get("milestone"), SESSION_CHECKPOINT_MILESTONE_MAX)
     if not summary or not milestone:
         raise ValueError("checkpoint summary and milestone are required")
     raw_items = checkpoint.get("main_items")

@@ -18,6 +18,7 @@ from kiro_crew.member_memory_auth import (
     private_memory_store_for_session,
 )
 from kiro_crew.memory_stores import persist_member_config, provision_member_memory
+from kiro_crew.providers.base import LLMProvider
 from kiro_crew.session import SessionManager
 from kiro_crew.workflow_memory import (
     WorkflowScope,
@@ -36,13 +37,14 @@ async def workflow(ctx):
 """
 
 
-class Model:
+class Model(LLMProvider):
+    """Replace model I/O while retaining the provider's lifecycle defaults."""
+
     def __init__(self, key):
         self.key = key
         self._private_memory = bool(private_memory_store_for_session(key))
         self.prompts = []
         self.alive = True
-        self.cwd = ""
 
     async def start(self):
         pass
@@ -52,6 +54,16 @@ class Model:
 
     async def new_conversation(self):
         self.prompts.clear()
+
+    async def stream(self, message, **kwargs):
+        raise AssertionError("workflow model I/O must use the installed stream_and_collect fixture")
+        yield  # pragma: no cover - keep the provider's async-iterator contract
+
+    async def approve_tool(self, request_id, **kwargs):
+        raise AssertionError("workflow fixture does not request tool approval")
+
+    async def reject_tool(self, request_id):
+        raise AssertionError("workflow fixture does not request tool approval")
 
     def is_process_alive(self):
         return self.alive

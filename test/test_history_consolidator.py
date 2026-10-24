@@ -27,6 +27,8 @@ from kiro_crew.history import (
     ConversationLog,
     HistoryConsolidator,
 )
+from kiro_crew.testing.clock import ManualClock
+from kiro_crew.testing.wait import await_until, default_timeout
 
 # ---------------------------------------------------------------------------
 # Tests for consolidation offset only advances on success
@@ -70,6 +72,79 @@ class TestConsolidationToolPolicy:
             "background consolidation turn must reject tools (parity with kiro's "
             "tool-free lite agent; CC injects the full toolset otherwise)"
         )
+
+
+class TestInternalHistoryEligibility:
+    @pytest.fixture
+    def consolidator(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KIROCREW_AUTO_CONSOLIDATION_ENABLED", "true")
+        monkeypatch.setenv("KIROCREW_CONSOLIDATION_ENDPOINT", "")
+        monkeypatch.setenv("KIROCREW_CONSOLIDATION_AUTH_TOKEN", "")
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        log.init()
+        return HistoryConsolidator(log=log, memory=MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_internal_trigger_checks_sensitive_rows_before_the_pending_tail(
+        self, consolidator
+    ):
+        key = "dashboard:internal-sensitive"
+        log = consolidator._log
+        log.append(key, "assistant", "reading secrets", tools=["cat .aws/credentials"])
+        log.mark_consolidated(key, 1)
+        log.append(key, "user", "ordinary pending message")
+        consolidator._running.add(key)
+
+        with (
+            patch.object(log, "derive_messages", wraps=log.derive_messages) as read,
+            patch.object(consolidator, "_acquire_consolidation_lease") as acquire,
+            patch.object(consolidator, "_call_llm", new_callable=AsyncMock) as llm,
+        ):
+            outcome = await consolidator._consolidate(key)
+
+        assert outcome == ConsolidationOutcome(
+            "skipped", detail="sensitive session", complete=False
+        )
+        read.assert_called_once_with(key)
+        acquire.assert_not_called()
+        llm.assert_not_awaited()
+        assert log.get_metadata(key)["last_consolidated"] == 1
+        assert key not in consolidator._running
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["incognito", "temporary"])
+    async def test_restriction_between_metadata_and_eligibility_read_is_withheld(
+        self, consolidator, mode
+    ):
+        key = "dashboard:internal-tightened"
+        log = consolidator._log
+        log.append(key, "user", "private content")
+        metadata = log.get_metadata
+        tightened = []
+
+        def tighten_after_metadata(session_key):
+            observed = metadata(session_key)
+            if not tightened:
+                tightened.append(session_key)
+                log.update_metadata(session_key, {"memory_mode": mode})
+            return observed
+
+        consolidator._running.add(key)
+        with (
+            patch.object(log, "get_metadata", side_effect=tighten_after_metadata),
+            patch.object(log, "derive_messages", wraps=log.derive_messages) as read,
+            patch.object(consolidator, "_acquire_consolidation_lease") as acquire,
+            patch.object(consolidator, "_call_llm", new_callable=AsyncMock) as llm,
+        ):
+            outcome = await consolidator._consolidate(key)
+
+        assert outcome is history._CONSOLIDATION_REFUSED
+        assert tightened == [key]
+        read.assert_called_once_with(key)
+        acquire.assert_not_called()
+        llm.assert_not_awaited()
+        assert metadata(key)["memory_mode"] == mode
+        assert key not in consolidator._running
 
 
 class TestConsolidationOffset:
@@ -338,14 +413,15 @@ class TestConsolidateSession:
         key = "dashboard:chat-twice"
         conv_log.append(key, "user", "hello")
 
-        entered, release = threading.Event(), threading.Event()
+        entered, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
         calls: list[str] = []
         real = consolidator._session_end_eligibility
 
         def gated(k):
             calls.append(k)
-            entered.set()
-            assert release.wait(timeout=60), "eligibility worker was not released"
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(timeout=default_timeout()), "eligibility worker was not released"
             return real(k)
 
         with (
@@ -354,13 +430,14 @@ class TestConsolidateSession:
         ):
             try:
                 consolidator.consolidate_session(key)
-                assert await asyncio.to_thread(
-                    entered.wait, timeout=60
-                ), "eligibility worker did not enter"
+                await await_until(entered, what="the eligibility worker entered")
                 consolidator.consolidate_session(key)
             finally:
                 release.set()
-                await asyncio.wait_for(asyncio.gather(*list(consolidator._tasks)), timeout=60)
+                await await_until(
+                    asyncio.gather(*list(consolidator._tasks)),
+                    what="the scheduled eligibility checks finished",
+                )
 
         assert calls == [key]
         run.assert_awaited_once_with(key, include_history=True)
@@ -1449,7 +1526,7 @@ class TestConsolidationToolPolicyForkContracts:
             result = await consolidator._call_llm("some prompt")
 
         assert result is None
-        assert await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+        await await_until(cancelled, what="the timed-out consolidation stream was cancelled")
         sessions.cancel_current.assert_awaited_once_with(
             _CONSOLIDATE_SESSION_KEY, wait_ack_timeout=0.01
         )
@@ -1483,6 +1560,37 @@ class TestConsolidationToolPolicyForkContracts:
             180,
         )
 
+    @pytest.mark.asyncio
+    async def test_direct_endpoint_error_redacts_urls_and_credentials(self, caplog):
+        import urllib.error
+
+        consolidator = HistoryConsolidator(
+            log=MagicMock(),
+            memory=MagicMock(),
+            sessions=None,
+            consolidation_endpoint="http://router.example",
+            consolidation_model="consolidate-maintenance",
+        )
+        credential = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        detail = (
+            "https://collector.example/c?d=AKIAIOSFODNN7EXAMPLE" f"&s={credential}&pad=" + "x" * 40
+        )
+        with (
+            patch(
+                "kiro_crew.history_consolidation._post_consolidation_request",
+                side_effect=urllib.error.URLError(detail),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            assert await consolidator._call_direct_endpoint("summarize this") is None
+
+        assert consolidator._last_llm_error
+        for output in (consolidator._last_llm_error, caplog.text):
+            assert "collector.example/c?" not in output
+            assert "AKIAIOSFODNN7EXAMPLE" not in output
+            assert credential not in output
+            assert "suspicious URL to collector.example" in output
+
     def test_direct_request_requires_an_idle_local_fleet_lane(self) -> None:
         class _Response:
             def __enter__(self):
@@ -1505,7 +1613,11 @@ class TestConsolidationToolPolicyForkContracts:
         assert request.get_header("X-fleet-require-idle") == "true"
 
     @pytest.mark.asyncio
-    async def test_direct_lane_refusal_is_unbilled_and_uses_router_retry(self, tmp_path) -> None:
+    async def test_direct_lane_refusal_is_unbilled_and_uses_router_retry(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        clock = ManualClock()
+        clock.install(monkeypatch, history)
         log = ConversationLog(base_dir=tmp_path)
         log.append("session", "user", "summarize this after the active turn")
         consolidator = HistoryConsolidator(
@@ -1527,7 +1639,7 @@ class TestConsolidationToolPolicyForkContracts:
         assert outcome.detail == "fleet_lane_busy"
         assert meta.get("consolidation_attempts", 0) == 0
         assert meta["consolidation_env_failures"] == 1
-        assert 50 <= meta["consolidation_retry_at"] - time.time() <= 70
+        assert meta["consolidation_retry_at"] == clock.time() + 60.0
 
     @pytest.mark.asyncio
     async def test_direct_endpoint_admits_one_inflight_request(self):
@@ -1540,12 +1652,13 @@ class TestConsolidationToolPolicyForkContracts:
             consolidation_endpoint="http://router.example",
             consolidation_model="consolidate",
         )
-        started = threading.Event()
+        started = asyncio.Event()
         release = threading.Event()
+        loop = asyncio.get_running_loop()
 
         def blocked_request(*_args):
-            started.set()
-            assert release.wait(timeout=1)
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(timeout=default_timeout())
             return {"content": [{"type": "text", "text": '{"history_entry": "done"}'}]}
 
         with patch(
@@ -1553,10 +1666,13 @@ class TestConsolidationToolPolicyForkContracts:
             side_effect=blocked_request,
         ) as post:
             first = asyncio.create_task(consolidator._call_direct_endpoint("first"))
-            await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
-            second = await consolidator._call_direct_endpoint("second")
-            release.set()
-            assert await first == {"history_entry": "done"}
+            try:
+                await await_until(started, what="the first direct request entered its worker")
+                second = await consolidator._call_direct_endpoint("second")
+            finally:
+                release.set()
+                result = await await_until(first, what="the first direct request finished")
+            assert result == {"history_entry": "done"}
 
         assert second is None
         assert (

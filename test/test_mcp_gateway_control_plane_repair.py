@@ -413,6 +413,7 @@ def test_the_fingerprint_sees_the_managed_launch_so_an_upgrade_regenerates_overl
         sandbox_mode="auto",
         approval_mode="interactive",
         stub_set=frozenset({"kirocrew-core", "kirocrew-cron"}),
+        shared_readonly_set=frozenset(),
         pooling_enabled=True,
         forward_env=False,
         identity_keys=(),

@@ -58,10 +58,10 @@ def _knowledge_evaluate(args) -> None:
                 )
             except (json.JSONDecodeError, OSError):
                 raise GoldenSetError(
-                    "could not read KiroCrew configuration for the embedding backend"
+                    "could not read Kiro Crew configuration for the embedding backend"
                 ) from None
             if not isinstance(raw_config, dict):
-                raise GoldenSetError("KiroCrew configuration must be a JSON object")
+                raise GoldenSetError("Kiro Crew configuration must be a JSON object")
             embedder = create_embedder_from_config(raw_config)
             if not embedder.is_available():
                 raise GoldenSetError(

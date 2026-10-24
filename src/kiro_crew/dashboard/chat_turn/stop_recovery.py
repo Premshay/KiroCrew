@@ -75,7 +75,6 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
     _turn_emitted = turn._turn_emitted
     client = turn.client
     message = turn.message
-    needs_session_reset = turn.needs_session_reset
     slot = turn.slot
     # Turn stream ended: flush any withheld thinking tail (a thinking-final turn never
     # hit the loop-top flush in _run_chat's stream loop for a following non-thinking event).
@@ -93,8 +92,7 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
     # "start a new chat" instead of looping. Complementary to a companion guard,
     # which surfaces the stuck sessions this cannot recover.
     if _stop_reason == STOP_REASON_STALE_RECOVER:
-        needs_session_reset = True  # checked in _run_chat's finally (reset + resume)
-        turn.needs_session_reset = needs_session_reset
+        turn.needs_session_reset = True  # checked in _run_chat's finally (reset + resume)
         # This arm and the three below return before _turn_settle_answer's end-of-turn
         # flush, where the streamed text exists only as chunk rows, which a save
         # never writes. Keep it as the interrupted reply, with its footer,
@@ -199,8 +197,7 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
     # and dropping the user's message for it silently ends the turn on a
     # backend hiccup the very next attempt would clear.
     if _stop_reason == STOP_REASON_COMPACTION_FAILED:
-        needs_session_reset = True  # checked in _run_chat's finally
-        turn.needs_session_reset = needs_session_reset
+        turn.needs_session_reset = True  # checked in _run_chat's finally
         await _persist_partial_reply(turn, _stop_reason)
         if (
             # Attribute, not a stop-reason variant: the reason is the ACP

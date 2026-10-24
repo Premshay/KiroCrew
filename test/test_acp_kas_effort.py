@@ -53,6 +53,7 @@ def _kas_provider(*, override: str = "", defaults: dict[str, str] | None = None)
     client.send_command = AsyncMock()
     client.supports_config_option = MagicMock(side_effect=lambda cid: cid == "effortLevel")
     client.get_valid_effort_levels = MagicMock(return_value=list(LEVELS))
+    client.effort_config_option_id = MagicMock(return_value="effortLevel")
     provider._client = client
     provider._effort_per_model = {MODEL: override} if override else {}
     provider._effort_defaults = defaults or {}

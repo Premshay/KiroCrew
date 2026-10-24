@@ -1635,26 +1635,18 @@ class TestStreamingEndpointGate:
         assert "transcribe" in stt_stream._STREAMING_PROVIDERS
 
     def test_the_gate_offers_exactly_the_selectable_providers(self):
-        """Every RECOGNISER the loader can store produces partial results, so the
-        gate and the selectable set are the same set once ``off`` is set aside.
+        """Offer exactly the selectable providers with partial-result channels.
 
-        Pinned as an equality in both directions because each direction fails
-        differently and neither is visible from the endpoint: a selectable provider
-        missing from the tuple is a setting the user can choose and then get a 503
-        from, and a name in the tuple that the loader can never store (a retired
-        whole-file CLI with no partial-result channel) is a live path that would hang
-        a client until end of audio. Adding a provider without a partial channel has
-        to be a decision made here rather than inherited.
-
-        ``off`` is the one selectable value that is NOT a recogniser: it exists so
-        that "no speech" has a spelling, and the 503 it draws from this gate is the
-        intended answer. ``test_stt_provider_off`` pins that it never joins the tuple.
+        ``off`` disables recognition; ``bridge`` accepts whole recordings through
+        the batch endpoint. Neither may enter the streaming gate. Equality in
+        both directions refuses unsupported names and exposes missing providers.
         """
-        from kiro_crew.config.sections import STT_PROVIDER_OFF
+        from kiro_crew.config.sections import STT_PROVIDER_BRIDGE, STT_PROVIDER_OFF
         from kiro_crew.dashboard import stt_stream
 
         assert set(stt_stream._STREAMING_PROVIDERS) == set(_VALID_STT_PROVIDERS) - {
-            STT_PROVIDER_OFF
+            STT_PROVIDER_OFF,
+            STT_PROVIDER_BRIDGE,
         }
 
 

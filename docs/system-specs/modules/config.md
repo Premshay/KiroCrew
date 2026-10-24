@@ -10,6 +10,10 @@ Resolved bindings include a member's reasoning-effort pin in dispatch identity.
 to companion providers whenever servers are stubbed. The sharing toggle alone
 does not determine whether broker routing is needed.
 
+The retired knowledge discovery and source-limit settings stay absent from the
+DTO and schema; the loader purges their stored values. Live extraction effort
+and timeout settings remain available.
+
 Off-loop project-agent resolution labels hardened discovery reads with
 `project_declares_agent`; cached event-loop lookups retain their no-I/O path.
 

@@ -204,7 +204,7 @@ def session_tool_schemas() -> list[dict[str, Any]]:
             "name": "session_channel_status",
             "description": (
                 "List persistent-agent channels attached to this session and their peers. "
-                "Peer reports use the KiroCrew Channel envelope, never a user-message envelope."
+                "Peer reports use the channel-message envelope, never a user-message envelope."
             ),
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from prompts_helpers import _isolate_home  # noqa: F401
@@ -98,7 +98,12 @@ def test_workflow_error_records_its_credential_and_link() -> None:
     assert [r["domain"] for r in row["meta"]["blocked_links"]] == ["collect.example.com"]
 
 
-def test_goal_objective_echo_records_its_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("with_link", [False, True])
+def test_goal_objective_echo_records_its_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, with_link: bool
+) -> None:
+    from kiro_crew.dashboard.state import _ChatSlot
+
     svc = MagicMock()
 
     async def _add(*_a, **_kw):
@@ -106,13 +111,26 @@ def test_goal_objective_echo_records_its_credential(monkeypatch: pytest.MonkeyPa
 
     svc.add = _add
     monkeypatch.setattr(chat_runner, "get_instance", lambda: svc)
-    monkeypatch.setattr(chat_runner, "data_home", lambda: chat_runner.Path("/nonexistent-home"))
-    monkeypatch.setattr(chat_runner.Path, "unlink", lambda self, missing_ok=False: None)
-    slot = _Slot()
+    monkeypatch.setattr(chat_runner, "data_home", lambda: tmp_path)
+    save = AsyncMock()
+    monkeypatch.setattr(chat_runner, "save_slot_off_loop", save)
+    state, slot = _State(), _ChatSlot("slot-1")
 
-    asyncio.run(chat_runner._handle_goal_command(_State(), slot, f"/goal ship it with {_GH}"))
+    objective = f"ship it with {_GH}" + (f" see {_LINK}" if with_link else "")
+    asyncio.run(chat_runner._handle_goal_command(state, slot, f"/goal {objective}"))
 
-    _assert_credential_explained(_reply(slot))
+    replies = [row for row in slot.messages if row["role"] == "assistant"]
+    assert len(replies) == 1, replies
+    _assert_credential_explained(replies[0])
+    if with_link:
+        assert _LINK not in replies[0]["content"]
+        assert EXFILTRATION_REDACTION_TAG_PREFIX in replies[0]["content"]
+        assert [r["domain"] for r in replies[0]["meta"]["blocked_links"]] == ["collect.example.com"]
+        assert _LINK not in slot.declared_goal_payload()
+        assert _GH not in slot.declared_goal_payload()
+    else:
+        assert slot.declared_goal_payload() == f"ship it with {_TAG}"
+    save.assert_awaited_once_with(state, slot, force=True)
 
 
 def test_agent_refusal_records_its_credential(monkeypatch: pytest.MonkeyPatch) -> None:

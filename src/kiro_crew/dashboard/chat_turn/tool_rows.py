@@ -213,7 +213,6 @@ async def _on_tool_call(turn: _ChatTurn, event) -> None:
     _shell_tool_calls = turn._shell_tool_calls
     _tcid_collapsed = turn._tcid_collapsed
     _tcid_first_source = turn._tcid_first_source
-    _turn_flushed_visible_text = turn._turn_flushed_visible_text
     _turn_tool_calls = turn._turn_tool_calls
     _turn_tool_identities = turn._turn_tool_identities
     _wt_pending_coding = turn._wt_pending_coding
@@ -276,8 +275,7 @@ async def _on_tool_call(turn: _ChatTurn, event) -> None:
             )
         else:
             _cut_segment(turn, broadcast=False)
-            _turn_flushed_visible_text = True
-            turn._turn_flushed_visible_text = _turn_flushed_visible_text
+            turn._turn_flushed_visible_text = True
     # AFTER the flush, because seq is the order a reader folds on and
     # the model narrating before it calls a tool is the common case:
     # `_flush_segment` is what appends this turn's `message/sent`, so

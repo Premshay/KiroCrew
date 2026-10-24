@@ -140,7 +140,7 @@ class WorkItemAssignmentDenied(WorkItemError):
 
 
 class WorkItemAssignmentStale(WorkItemError):
-    """The assignment is no longer live for the calling worker."""
+    """The assignment is not live for the calling worker."""
 
 
 class WorkItemContractTooLarge(WorkItemError):
@@ -1039,7 +1039,7 @@ def render_contract(
     dispatch retry re-renders the same assignment under the same digest.
     """
     lines = [
-        "KiroCrew work item contract",
+        "KiroCrew work item contract",  # brand-ok: assignment-hashed contract heading
         f"Assignment: {assignment['id']}",
         f"Work item: {item['id']}",
         f"Worker run: {assignment['worker_run_id']}",

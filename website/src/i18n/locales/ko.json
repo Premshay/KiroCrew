@@ -1213,7 +1213,7 @@
           "retained_unselected": "유지됨(선택하지 않음)",
           "select_candidate": "{{title}} 선택",
           "selected": "선택됨",
-          "delete_confirm_other": "임시 저장된 학습 내용 {{count}}개를 삭제할까요? 아직 규칙 모음에 반영되지 않았으며 복구할 수 없습니다.",
+          "delete_confirm_other": "임시 저장된 학습 내용 {{count}}개를 삭제하시겠습니까? 아직 규칙 모음에 반영되지 않았으며 복구할 수 없습니다.",
           "preview_selected_count_other": "미리보기 · 후보 {{count}}개 선택됨",
           "selected_count_other": "{{count}}개 선택됨"
         },

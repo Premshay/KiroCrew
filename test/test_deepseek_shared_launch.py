@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -17,6 +18,8 @@ from kiro_crew.acp.transport_errors import AcpToolGateUnroutable
 async def test_shared_launch_supplies_the_native_preparation_surface(tmp_path, monkeypatch):
     harness = DeepseekHarness()
     seen = []
+    spawn = AsyncMock(side_effect=AssertionError("launch preparation must not spawn a client"))
+    monkeypatch.setattr(AcpClient, "_spawn", spawn)
 
     async def prepare(ctx):
         session = ctx.session
@@ -44,6 +47,7 @@ async def test_shared_launch_supplies_the_native_preparation_surface(tmp_path, m
     )
     assert len(seen) == 1
     assert plan.session_model == "selected-model"
+    spawn.assert_not_awaited()
 
 
 def test_shared_launch_injects_vault_values_and_releases_the_resolver_copy(monkeypatch):

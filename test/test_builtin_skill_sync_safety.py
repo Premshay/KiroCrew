@@ -1173,6 +1173,7 @@ class TestPermissionBitsInFingerprint:
     @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
     def test_child_dir_mode_change_diverges_fingerprint(self, tmp_path: Path) -> None:
         a = _make_skill(tmp_path, "a", "same", {"scripts/run.sh": "x"})
+        os.chmod(a / "scripts", 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
         before = _skill_tree_fingerprint(a)
         os.chmod(a / "scripts", 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
         os.chmod(a / "scripts", 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions

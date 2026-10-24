@@ -318,7 +318,6 @@ async def _on_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CONTIN
     _native_tracker = turn._native_tracker
     _refusal_notices = turn._refusal_notices
     _refusal_reasons = turn._refusal_reasons
-    _turn_flushed_visible_text = turn._turn_flushed_visible_text
     _wt_pending_coding = turn._wt_pending_coding
     client = turn.client
     session_key = turn.session_key
@@ -358,8 +357,7 @@ async def _on_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CONTIN
         )
     elif turn.assistant_text:
         _cut_segment(turn)
-        _turn_flushed_visible_text = True
-        turn._turn_flushed_visible_text = _turn_flushed_visible_text
+        turn._turn_flushed_visible_text = True
     _pre_tool_hooks_fired = False
     # "Not applied — approve this command explicitly" notices from a
     # rung that declined its grant. Held until the request actually

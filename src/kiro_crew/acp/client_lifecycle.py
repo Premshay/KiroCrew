@@ -1101,7 +1101,7 @@ async def new_conversation(self: AcpClient) -> None:
     if self._is_kiro:
         jsonl_path = kiro_sessions_dir() / f"{new_sid}.jsonl"
         try:
-            self._jsonl_pos = jsonl_path.stat().st_size if jsonl_path.exists() else 0
+            self._jsonl_pos = (await asyncio.to_thread(jsonl_path.stat)).st_size
         except OSError:
             self._jsonl_pos = 0
     self._last_activity = time.monotonic()

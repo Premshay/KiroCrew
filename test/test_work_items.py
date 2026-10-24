@@ -33,6 +33,20 @@ def _create(key: str = "dashboard_chat-1-111", **overrides) -> dict:
     )
 
 
+def _legacy_ledger(key: str, *, artifacts: dict[str, str]) -> None:
+    """Seed the pre-projection document that work-item migration must import.
+
+    The current ledger writer appends to a crew log. Migration tests must start
+    from the legacy document's on-disk format.
+    """
+    key = session_ledger.ledger_key(key)
+    directory = session_ledger.ledger_dir(key)
+    directory.mkdir(parents=True, exist_ok=True)
+    state = session_ledger._empty_state()
+    state["artifacts"] = artifacts
+    (directory / session_ledger._STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
+
+
 def test_distinct_channel_keys_have_distinct_coordinator_stores():
     a = wi.coordinator_dir("wecom:agent:direct:user_gen1")
     b = wi.coordinator_dir("wecom:agent:direct:user:gen1")
@@ -231,7 +245,7 @@ def test_purge_matching_removes_active_and_archived_state():
 
 def test_legacy_running_item_imports_once_as_waiting_with_provenance():
     key = "dashboard_chat-7-777"
-    session_ledger.record(
+    _legacy_ledger(
         session_ledger.ledger_key(key),
         artifacts={
             "item-1": json.dumps(
@@ -264,7 +278,7 @@ def test_legacy_running_item_imports_once_as_waiting_with_provenance():
 
 def test_legacy_terminal_items_become_one_closed_archive_and_bad_values_warn():
     key = "dashboard_chat-8-888"
-    session_ledger.record(
+    _legacy_ledger(
         session_ledger.ledger_key(key),
         artifacts={
             "item-1": json.dumps(

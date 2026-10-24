@@ -65,7 +65,7 @@ def mgr(cfg):
 
 
 def _provider(**attrs):
-    """A provider double carrying only the attributes a test names.
+    """A nonpersistent provider double with explicit per-test capabilities.
 
     ``SimpleNamespace`` rather than ``MagicMock``: the probe helpers
     (``_provider_has_unfinished_turn`` and friends) accept only an exact
@@ -76,6 +76,8 @@ def _provider(**attrs):
         "shutdown": AsyncMock(),
         "context_usage_pct": lambda: 0.0,
         "cwd": "",
+        "session_id": "",
+        "session_provider_label": "",
         "is_process_alive": lambda: True,
         # The registry calls this on a race loser before its shutdown.
         "disown_work_dir": lambda: None,

@@ -769,9 +769,8 @@ class TestAgentSliceMemoryHigh:
 
         The two values are derived from different inputs -- MemoryHigh from
         physical RAM, MemoryMax from config -- so setting a ceiling below 75%
-        of RAM used to leave memory.high ABOVE memory.max. The slice then went
-        straight from unbounded to hard cap, with no throttling step, which is
-        exactly the shape memory.high exists to prevent.
+        of RAM must keep memory.high BELOW memory.max, so throttling precedes
+        the hard cap.
         """
         import kiro_crew.sandbox as sb
 

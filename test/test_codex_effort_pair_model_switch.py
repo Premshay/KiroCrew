@@ -28,6 +28,7 @@ account. Available models: ..., gpt-6-astra[max], ...". A bare id typed by hand
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -304,10 +305,14 @@ def _effort_provider(backend: str, model: str, *, applied: list[tuple[str, str]]
     """A provider whose client records every ``set_config_option`` write."""
     with patch("kiro_crew.providers.acp.AcpClient"):
         provider = AcpProvider(acp_backend=backend)
-    provider._client = MagicMock()
-    provider._client.backend = backend
-    provider._client._model = model
-    provider._client._work_dir = MagicMock()
+    provider._client = AcpClient(acp_backend=backend, model=model)
+    provider._client._acp_config_options = [
+        {
+            "id": effort_config_option_id(backend),
+            "type": "select",
+            "options": [{"value": level} for level in ("high", "xhigh", "max")],
+        }
+    ]
     provider._client.send_command = AsyncMock()
     provider._client.supports_config_option = MagicMock(return_value=True)
 
@@ -343,16 +348,30 @@ class TestSlotEffortOverrideReachesCodex:
         assert applied == [(CLAUDE_EFFORT, "high")]
 
     @pytest.mark.asyncio
-    async def test_codex_effort_push_checks_the_codex_option_for_support(self) -> None:
-        """The capability precheck asks about the id it is about to write. Asking
-        about ``effort`` on codex answers False and skips a push that would have
-        worked."""
+    async def test_codex_effort_push_reads_the_advertised_selector(self) -> None:
+        """The capability precheck resolves the selector the session advertised."""
         applied: list[tuple[str, str]] = []
         provider = _effort_provider(ACP_BACKEND_CODEX, "openai.gpt-6-astra", applied=applied)
 
+        with patch.object(
+            provider._client,
+            "effort_config_option_id",
+            wraps=provider._client.effort_config_option_id,
+        ) as selector:
+            await provider._set_effort_config_option("high")
+
+        selector.assert_called_once_with()
+        assert applied == [(CODEX_EFFORT, "high")]
+
+    @pytest.mark.asyncio
+    async def test_codex_without_an_advertised_selector_skips_the_effort_push(self) -> None:
+        applied: list[tuple[str, str]] = []
+        provider = _effort_provider(ACP_BACKEND_CODEX, "openai.gpt-6-astra", applied=applied)
+        provider._client._acp_config_options = []
+
         await provider._set_effort_config_option("high")
 
-        provider._client.supports_config_option.assert_called_with(CODEX_EFFORT)
+        assert applied == []
 
     @pytest.mark.asyncio
     async def test_codex_change_effort_writes_the_codex_spelling(self) -> None:
@@ -521,9 +540,9 @@ class TestTheSessionHandleTakesTheSameSplit:
 
     @pytest.mark.asyncio
     async def test_a_codex_handle_applies_a_pair_as_two_writes(self) -> None:
-        handle = MagicMock()
-        handle._runtime = MagicMock()
-        handle._runtime.acp_backend = ACP_BACKEND_CODEX
+        runtime = MagicMock()
+        runtime.acp_backend = ACP_BACKEND_CODEX
+        handle = AcpSessionHandle("codex-sess-2", asyncio.Queue(), runtime)
         handle._config_options = CODEX_1_11_SESSION_NEW["configOptions"]
         handle._advertised_model_ids = MagicMock(return_value=["openai.gpt-6-astra[max]"])
         applied: list[tuple[str, str]] = []

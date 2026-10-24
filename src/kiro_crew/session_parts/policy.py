@@ -90,6 +90,7 @@ POOL_DECISIONS: frozenset[str] = frozenset(
         "hit",
         "miss_empty",
         "bypass_member_capabilities",
+        "bypass_runtime_agent",
         "bypass_resume",
         "bypass_stateless",
         "bypass_member",
@@ -432,7 +433,7 @@ _RecycleCallback.__module__ = "kiro_crew.session"
 def _session_crew_effort(cfg: "KiroCrewConfig", agent: str | None) -> "str | None":
     """Return a configured crew effort for non-dashboard session surfaces.
 
-    Slack, cron, and workflow callers pass the KiroCrew alias directly to
+    Slack, cron, and workflow callers pass the Kiro Crew alias directly to
     :meth:`SessionManager.get_or_create`; the dashboard resolves it first and
     supplies the same value explicitly. Keeping this resolver alias-only means
     a template session never accidentally inherits an unrelated crew's setting.

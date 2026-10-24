@@ -14,6 +14,7 @@ parse the TS source and assert equality, so EITHER side moving alone goes red.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -36,7 +37,9 @@ class TestTurnBoundaryMirrorsFrontendGrouping:
             r"export const TURN_OPENER_ROLES = new Set\(\[(?P<body>[^\]]*)\]\)", source
         )
         assert match, "TURN_OPENER_ROLES set literal not found — update this parser with it"
-        ts_roles = set(re.findall(r"'([^']+)'", match.group("body")))
+        roles = ast.literal_eval(f"[{match.group('body')}]")
+        assert isinstance(roles, list) and all(isinstance(role, str) for role in roles)
+        ts_roles = set(roles)
         assert ts_roles, "parsed an empty TS role set — the literal's shape changed"
         assert ts_roles == set(_TURN_OPENER_ROLES)
 
@@ -44,8 +47,8 @@ class TestTurnBoundaryMirrorsFrontendGrouping:
         """Both sides key the synthesis boundary on the same wire contract."""
         ts_source = _TS_GROUPING.read_text(encoding="utf-8")
         # The TS predicate: role === 'inject' plus meta.injectKind === 'synthesis'.
-        assert re.search(r"msg\.role === 'inject'", ts_source)
-        assert re.search(r"injectKind === 'synthesis'", ts_source)
+        assert re.search(r"msg\.role === (['\"])inject\1", ts_source)
+        assert re.search(r"injectKind === (['\"])synthesis\1", ts_source)
         py_source = (
             Path(__file__).resolve().parents[1]
             / "src"

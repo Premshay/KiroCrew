@@ -15,7 +15,6 @@ it. See their docstrings.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -25,6 +24,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from kiro_crew.dashboard import chat_handlers
 from kiro_crew.dashboard.chat import api_chat_slot_model, api_chat_slot_reload
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.testing.wait import await_until, until_parked
 
 # Registry aliases the model guard accepts, matching the ids the sibling
 # switch-atomicity tests use.
@@ -32,25 +32,6 @@ _MODEL_OLD = "claude-opus-4.8"
 _MODEL_NEW = "gpt-5.6-sol"
 _SLOT = "s1"
 _SESSION_KEY = f"dashboard:{_SLOT}"
-
-# Loop turns a bounded yield will spend before giving up. Turns, not seconds:
-# the cap exists only to bound a coroutine that can never make progress, and is
-# far above what any interleaving here needs.
-_MAX_TURNS = 500
-
-
-async def _yield_until(predicate: Callable[[], bool]) -> bool:
-    """Hand the loop back until *predicate* holds, then report whether it did.
-
-    Originally scheduler turns only, but the merged tree's switch paths do real
-    awaits (agent resolution, config reads), so poll with a real deadline. The
-    semantic asserts below are unchanged.
-    """
-    for _ in range(500):
-        if predicate():
-            return True
-        await asyncio.sleep(0.01)
-    return predicate()
 
 
 def _make_app(state: DashboardState) -> web.Application:
@@ -218,11 +199,11 @@ class TestReloadRacesSwitchCommitResetSpan:
                 switch = asyncio.create_task(
                     client.post(f"/api/chat/slots/{_SLOT}/model", json={"model": _MODEL_NEW})
                 )
-                blocked = not await _yield_until(lambda: switch is not None and switch.done())
+                await until_parked(slot._lock, describe=lambda: "switch waits behind reload")
                 # The switch is blocked on the session lock reload holds: it has
                 # made no progress past the lock, so none of its seam points
                 # have fired yet.
-                assert blocked, "switch completed while reload held the session lock"
+                assert not switch.done(), "switch completed while reload held the slot lock"
                 assert "switch:post_commit" not in order
 
             monkeypatch.setattr(chat_handlers, "_test_interleave", _interleave)
@@ -232,10 +213,7 @@ class TestReloadRacesSwitchCommitResetSpan:
             try:
                 # Reload has released its locks by now, so the switch that was
                 # blocked runs to completion in the serialized order.
-                assert await _yield_until(
-                    lambda: switch.done()
-                ), "switch never completed after reload released the locks"
-                switch_resp = switch.result()
+                switch_resp = await await_until(switch, what="switch completes after reload")
             finally:
                 switch.cancel()
                 await asyncio.gather(switch, return_exceptions=True)
@@ -285,17 +263,17 @@ class TestReloadRacesSwitchCommitResetSpan:
                 reload_task = asyncio.create_task(client.post(f"/api/chat/slots/{_SLOT}/reload"))
                 # Give the request a chance to read the (still-current) slot and
                 # queue on the lock this block already holds.
-                stuck = not await _yield_until(lambda: reload_task.done())
-                assert stuck, "reload completed without ever contending for slot._lock"
+                await until_parked(slot._lock, describe=lambda: "reload waits on the slot lock")
+                assert not reload_task.done(), "reload did not contend for slot._lock"
 
                 # The name is now a different slot object -- same shape a
                 # delete-then-recreate under the same key produces.
                 state._slots[_SLOT] = replacement
 
             try:
-                resp = await _yield_until(lambda: reload_task.done())
-                assert resp, "reload never completed after slot._lock was released"
-                reload_resp = reload_task.result()
+                reload_resp = await await_until(
+                    reload_task, what="reload completes after slot release"
+                )
                 reload_status = reload_resp.status
                 reload_body = await reload_resp.json()
             finally:
@@ -336,8 +314,10 @@ class TestReloadRacesSwitchCommitResetSpan:
                 # identity re-check (the slot is still current at this point),
                 # resolve session_key, and queue on the session lock this
                 # block already holds.
-                stuck = not await _yield_until(lambda: reload_task.done())
-                assert stuck, "reload completed without ever contending for the session lock"
+                await until_parked(
+                    session_lock, describe=lambda: "reload waits on the session lock"
+                )
+                assert not reload_task.done(), "reload did not contend for the session lock"
 
                 # The name is now a different slot object -- reload is queued
                 # past its first re-check with the OLD slot captured, so only
@@ -345,9 +325,9 @@ class TestReloadRacesSwitchCommitResetSpan:
                 state._slots[_SLOT] = replacement
 
             try:
-                resp = await _yield_until(lambda: reload_task.done())
-                assert resp, "reload never completed after the session lock was released"
-                reload_resp = reload_task.result()
+                reload_resp = await await_until(
+                    reload_task, what="reload completes after session release"
+                )
                 reload_status = reload_resp.status
                 reload_body = await reload_resp.json()
             finally:
@@ -386,17 +366,17 @@ class TestReloadRacesSwitchCommitResetSpan:
                 # Give the request a chance to pass slot._lock, its first
                 # identity re-check, resolve session_key = _SESSION_KEY, and
                 # queue on the session lock this block already holds.
-                stuck = not await _yield_until(lambda: reload_task.done())
-                assert stuck, "reload completed without ever contending for the session lock"
+                await until_parked(session_lock, describe=lambda: "reload waits before rebind")
+                assert not reload_task.done(), "reload did not contend for the session lock"
 
                 # The rebind: same slot object, new linked session. Reload's
                 # captured session_key (_SESSION_KEY) is now stale.
                 slot.linked_session_key = NEW_SESSION_KEY
 
             try:
-                resp = await _yield_until(lambda: reload_task.done())
-                assert resp, "reload never completed after the session lock was released"
-                reload_resp = reload_task.result()
+                reload_resp = await await_until(
+                    reload_task, what="reload observes the session rebind"
+                )
                 reload_status = reload_resp.status
                 reload_body = await reload_resp.json()
             finally:
@@ -532,12 +512,12 @@ class TestReloadRacesSwitchCommitResetSpan:
                 # proves it blocks rather than interleaves.
                 nonlocal reload_task
                 reload_task = asyncio.create_task(client.post(f"/api/chat/slots/{_SLOT}/reload"))
-                blocked = not await _yield_until(
-                    lambda: reload_task is not None and reload_task.done()
-                )
+                await until_parked(slot._lock, describe=lambda: "reload waits behind the switch")
                 # Reload is blocked on the session lock the switch holds: it has
                 # not reached its own pre-reset seam point.
-                assert blocked, "reload completed while the switch held the session lock"
+                assert (
+                    not reload_task.done()
+                ), "reload completed while the switch held the slot lock"
                 assert "reload:pre_reset" not in order
                 hook_completed.set()
 
@@ -550,10 +530,7 @@ class TestReloadRacesSwitchCommitResetSpan:
             try:
                 # The switch has released its locks by now, so the reload that
                 # was blocked runs to completion in the serialized order.
-                assert await _yield_until(
-                    lambda: reload_task.done()
-                ), "reload never completed after the switch released the locks"
-                reload_resp = reload_task.result()
+                reload_resp = await await_until(reload_task, what="reload completes after switch")
             finally:
                 reload_task.cancel()
                 await asyncio.gather(reload_task, return_exceptions=True)

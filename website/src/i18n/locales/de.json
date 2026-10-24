@@ -10237,7 +10237,7 @@
       "pending_sessions": "Chat-Sitzungen, die noch bestätigen müssen",
       "channel_workers": "Channel-Worker, die den Neustart aufhalten",
       "other_blockers": "Blockierende Sitzungen ohne Aktion hier",
-      "reason_not_a_channel_worker": "Kein Channel-Worker – warten Sie, bis er fertig ist",
+      "reason_not_a_channel_worker": "Kein Channel-Worker – warte, bis er fertig ist",
       "reason_attached_dashboard_session": "Eine angehängte Chat-Sitzung – sie bestätigt selbst",
       "clear_context": "Kontext löschen",
       "confirm_clear": "Kontext löschen",
@@ -19713,7 +19713,7 @@
     "stopping": "Wird angehalten…"
   },
   "testEnvironment": {
-    "absolutePath": "Geben Sie einen absoluten Pfad zum Python-Programm ein.",
+    "absolutePath": "Gib einen absoluten Pfad zum Python-Programm ein.",
     "blocked": "Blockiert",
     "check": "Umgebung prüfen",
     "checking": "Prüfung läuft…",
@@ -19729,7 +19729,7 @@
     "unchecked": "Ungeprüft",
     "unsaved": "Ungespeicherte Änderungen. Vor dem Start speichern.",
     "variables": "Nicht geheime Variablen (NAME=value, eine pro Zeile)",
-    "variablesInvalid": "Verwenden Sie ein NAME=value pro Zeile mit eindeutigen Namen. Keine Geheimnisse eingeben.",
+    "variablesInvalid": "Verwende ein NAME=value pro Zeile mit eindeutigen Namen. Keine Geheimnisse eingeben.",
     "runner": "Repository-Runner",
     "runnerExecutable": "Runner-Programm (absoluter Pfad)",
     "runnerPython": "Python-Programm (optional; Standard: python)",
