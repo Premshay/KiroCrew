@@ -782,6 +782,7 @@ _DASHBOARD_BOOT = tuple("""
     _reserve_dashboard_port subprocess_executor init_hooks_system safe_context_call
     current_context _register_dist_static_routes _dist_file_handler _dist_file_handler
     _dist_file_handler _dist_file_handler _dist_file_handler discover_app_window_entries
+    _window_entry_handler _window_entry_handler
     register_app_window_paths _install_asset_cache_control_finalizer
     tailnet_effective_allowed_logins tailnet_identity_unknown degraded_config_files
     build_allowed_origins _make_host_validation_middleware _make_csrf_middleware
@@ -961,6 +962,18 @@ async def _traced_dashboard(
     second loopback family left unbound so the boot takes one path on every host."""
     import test_dashboard_server_startup_coverage as harness
 
+    monkeypatch.setattr("kiro_crew.dashboard.token_auth._APP_WINDOW_EXCLUDED_PATHS", frozenset())
+    # A local build adds window bundles, so pin discovery for the boot call census.
+    monkeypatch.setattr(
+        server,
+        "discover_app_window_entries",
+        MagicMock(
+            return_value=[
+                ("/trace-one.html", tmp_path / "trace-app" / "one.html"),
+                ("/trace-two.html", tmp_path / "trace-app" / "two.html"),
+            ]
+        ),
+    )
     monkeypatch.setattr(server, "_start_secondary_loopback_site", AsyncMock(return_value=None))
     # The crewmate prune is kicked onto a worker thread a few steps before the boot
     # merges channel transcripts, and the merge kicks a deferred removal when the
