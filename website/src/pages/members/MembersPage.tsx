@@ -617,7 +617,11 @@ export default function MembersPage() {
     window.addEventListener('beforeunload', onUnload)
     return () => window.removeEventListener('beforeunload', onUnload)
   }, [anyDraftAtStake])
-  const threadView = useMembersPageThreadView({ layout, rosterView, thread, t, createOpen, active })
+  const threadView = useMembersPageThreadView({
+    layout, rosterView, thread, t, createOpen, active,
+    profileFloating: !!profile && profile.placement !== 'column',
+    rosterDrawerMounted,
+  })
   const rosterSignals = useMembersPageRosterSignals({ rosterRead, rosterView, slotKeyOf })
   const profileFlight = useMembersPageProfileFlight({ profileCard, rosterView, rosterSignals, thread, activeName, profile, active })
   const { faceFlight, endFaceFlight } = profileFlight
@@ -802,6 +806,7 @@ export default function MembersPage() {
         scrollActiveRowIntoView={scrollActiveRowIntoView} gone={gone} createOpen={createOpen}
         openAdvanced={openAdvanced} openQuick={openQuick} postCreateError={postCreateError}
         createHeld={createHeld} slotKeyOf={slotKeyOf}
+        faceOnStageFor={thread.entranceFaceHidden && active ? active.name : ''}
       />)}
 
       {/* DM thread */}

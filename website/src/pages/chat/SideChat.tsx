@@ -6,7 +6,7 @@ import { sendTurn, SEND_ABORT_MS, type SendReceipt } from '../../chat-core/trans
 import { sendFailureCopy, deliveryUnconfirmedCopy } from '../../chat-core/transport/receiptCopy'
 import { sideTurnWire } from './sideTurnWire'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { sideClose, sideOptimisticAppend, sideOptimisticRollback, restoreSideConversation, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, transcriptTsMs, type SideStandingNotice } from '../../store/chatSlice'
+import { sideClose, sideOptimisticAccepted, sideOptimisticAppend, sideOptimisticRollback, restoreSideConversation, awaitSideRestore, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, transcriptTsMs, type SideStandingNotice } from '../../store/chatSlice'
 import QueueStack from '../../components/QueueStack'
 import ChatMessageList from '../../app-sdk/ChatMessageList'
 import FollowUpBar from '../../components/FollowUpBar'
@@ -404,20 +404,16 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
     // it: a question sent ahead of it would join the gateway's conversation before
     // this panel shows it. A read in flight is shared, so this usually waits
     // milliseconds, and never longer than the send's own deadline. A read that
-    // fails or overruns sends nothing. Its receipt is `refused`, the status for a
-    // send that definitely did not go out, so the text is handed back. Its
-    // `reason` says the conversation has not loaded, which is true in both cases:
-    // after a failed read, the restore notice and its Retry sit beside it; while
-    // the read is still in flight past the deadline, nothing else says why the
-    // text came back.
+    // fails or overruns sends nothing, and one that overruns stops being shared,
+    // so the next send asks the gateway again (`awaitSideRestore`). Its receipt is
+    // `refused`, the status for a send that definitely did not go out, so the text
+    // is handed back. Its `reason` says the conversation has not loaded, which is
+    // true in both cases: after a failed read, the restore notice and its Retry sit
+    // beside it; while the read is still in flight past the deadline, nothing else
+    // says why the text came back.
     mutationFn: async ({ q, steer, slot: target }: SideSubmit): Promise<SendReceipt> => {
-      let timer: ReturnType<typeof setTimeout> | undefined
-      const restored = await Promise.race([
-        dispatch(restoreSideConversation(target)).unwrap().then(() => true, () => false),
-        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), SEND_ABORT_MS) }),
-      ])
-      clearTimeout(timer)
-      if (!restored) return { status: 'refused', body: {}, reason: i18nT('pages.chat.sideChat.send_blocked_not_loaded') }
+      const restored = await dispatch(awaitSideRestore({ slot: target, ms: SEND_ABORT_MS })).unwrap()
+      if (restored !== 'restored') return { status: 'refused', body: {}, reason: i18nT('pages.chat.sideChat.send_blocked_not_loaded') }
       return sendTurn({ message: q, slot: target, wire: sideTurnWire(target, steer) })
     },
     onMutate: ({ q, optimistic, slot: target, override }: SideSubmit) => {
@@ -500,6 +496,9 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
       // cancel. An older backend omits the field, so treat absent as true and
       // keep the round-4 behaviour rather than silently dropping the card.
       const stillQueued = res.still_queued ?? true
+      if (vars.optimistic && res.run_id && !res.queued) {
+        dispatch(sideOptimisticAccepted({ slot: vars.slot, content: vars.q, runId: res.run_id }))
+      }
       if (res.queued && res.queue_id) {
         // Record the raw text even when the entry has already drained: a cancel
         // racing the response still needs somewhere honest to restore from.
@@ -580,17 +579,14 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
       // dispatching the bubble flips the side to busy, so re-deriving it in this
       // callback would read the post-submit state and skip the rollback.
       if (vars.optimistic) dispatch(sideOptimisticRollback(vars.slot))
-      // Nothing was accepted, so hand the text back — merged, not chosen: the
-      // user may have started a new draft while the request was in flight.
-      // Back to the slot it was SUBMITTED for (`vars.slot`), not whichever slot
-      // this panel shows now: a host can re-bind the panel while the request
-      // is in flight (split view's Ask, a member switch), and handing A's
-      // question to B's draft would lose it for A and corrupt B.
-      // A paste that was collapsed goes back collapsed — token text plus its
-      // blocks (restoreSideChatDraft carries them in) — never as the expanded
-      // lines, which would lose the tokens' identity on the retry.
-      if (vars.pastes?.length && vars.display) restoreSideChatDraft(vars.slot, vars.display, vars.pastes)
-      else restoreDraftTo(vars.slot, vars.q)
+      // Nothing was accepted, so the text goes back exactly as a refusal's does:
+      // merged into the draft of the slot it was SUBMITTED for, a collapsed paste
+      // still collapsed, with a row saying it was not sent (`recoverFor`). A chip
+      // send never took the composer's text, so none goes back.
+      recoverFor(vars.slot, {
+        ...(vars.override ? {} : handBack(vars)),
+        error: sendFailureCopy(undefined, !vars.override),
+      })
     },
   })
 
@@ -863,10 +859,7 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
     sendMutation.mutate({ q, steer, optimistic: !isBusy, slot, override: override != null, ...(blocks.length ? { display: typed, pastes: blocks } : {}) })
   }, [draft, pasteBlocks, slot, sendMutation, isBusy, exceedsByteLimit])
 
-  const sendErr = sendMutation.error
-  const displayError = sendErr
-    ? (sendErr instanceof Error ? sendErr.message : String(sendErr))
-    : (sendStatus?.error ?? localError)
+  const displayError = sendStatus?.error ?? localError
 
   // A restored conversation opened before this page loaded, so its banner counts
   // the parent turns newer than its start, read when the panel renders: the parent

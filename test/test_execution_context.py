@@ -391,10 +391,17 @@ def test_every_binder_declares_whether_it_vouches():
     import ast
     from pathlib import Path
 
-    root = Path(execution.__file__).parent
+    from source_corpus import parsed_candidates
+
+    root = Path(execution.__file__).resolve().parent
     actual: dict[tuple[str, str], str] = {}
-    for path in sorted(root.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    # A matched call spells ``bind_session_execution`` as its Name or Attribute, so a
+    # file without that text cannot hold one, and the corpus parses only the ~20 that
+    # do. Parsing every module and mapping the parent of every node cost ~34 s of CPU
+    # on a fast host and passed the 120 s per-test timeout on a hosted runner.
+    for path, _source, tree in parsed_candidates(
+        require_any=("bind_session_execution",), skip_syntax_errors=False
+    ):
         parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -440,8 +447,14 @@ def test_every_binder_declares_whether_it_vouches():
     #
     # `rebind_cron_session_template` rebinds a `cron:` key, which is never the
     # caller slot of an own-store admission, so it publishes with `vouch=False`.
+    #
+    # `_repoint_member_threads` (the startup crewmate migration) rewrites only the
+    # `template_id` of a member DM thread's record. Its store comes from that same
+    # record, which the session can write, so it must not vouch: the thread's next
+    # gate-verified admission re-vouches from its DM key and config instead.
     expected = {
         ("cron_service/identity.py", "rebind_cron_session_template"): "False",
+        ("mate_config_migration.py", "_repoint_member_threads"): "False",
         ("dashboard/chat_fork.py", "_bind_fork_execution"): "ABSENT",
         (
             "dashboard/chat_persistence_parts/member_store.py",

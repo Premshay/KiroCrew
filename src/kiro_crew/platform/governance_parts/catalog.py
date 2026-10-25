@@ -79,6 +79,10 @@ class ScopeSpec:
 # validate`` reports a partially-governed ``capabilities`` block so the gap is
 # visible instead of implied.
 #
+# An ENTERPRISE build is the exception: there an unnamed scope is answered by the
+# built-in baseline (``baseline.py``, RFC D3), so a new row here also needs a row
+# in ``BASELINE_CONTROLS`` or ``BASELINE_UNGATED``; a test fails until it has one.
+#
 # The absent-key semantics below are verified by executing parse_policy + resolve,
 # not inferred from the comments.
 
@@ -324,7 +328,14 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # surface through ``vet_and_audit``, fail-closed, mirroring the
     # mobile_connect listing). Data row only — CONTRACT_VERSION and the
     # evaluator are untouched.
-    "capabilities.social_share": ScopeSpec(CAPABILITY, capability_default=True),
+    #
+    # Inner ``sites`` ruleset (``identifier`` matcher): which share sites the
+    # dialog may offer, by id -- ``x``, ``linkedin`` (``social_share.SHARE_SITES``).
+    # ``GET /api/dashboard/config`` reports the permitted ids as
+    # ``social_share_sites`` and the dialog draws only those buttons.
+    "capabilities.social_share": ScopeSpec(
+        CAPABILITY, capability_default=True, scope_matchers={"sites": "identifier"}
+    ),
     # Hosted feature-video clips: the gateway fetches a signed manifest from a
     # vendor CDN and then downloads media from it into the data home
     # (``feature_videos_manifest`` / ``feature_videos_cache``). That is outbound

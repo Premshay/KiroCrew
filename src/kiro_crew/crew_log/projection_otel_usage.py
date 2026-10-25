@@ -60,6 +60,9 @@ _AGENT_KIND_BY_STEM: Final[dict[str, str]] = {
     "kirocrew-dashboard-manager": "dashboard_manager",
     "kirocrew-fast": "fast",
     "kirocrew-consolidate": "consolidate",
+    # A crewmate's conductor and its own worker (Crewmate 2.0).
+    "kirocrew-mate-conductor": "mate_conductor",
+    "kirocrew-mate-worker": "mate_worker",
 }
 
 #: The ``agent_kind`` value a session whose opening entry this fold has not yet folded

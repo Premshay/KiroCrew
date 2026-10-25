@@ -396,6 +396,7 @@ from kiro_crew.voice_reply import (  # noqa: F401 - read by the owners
     DEFAULT_PROVIDER,
     PROVIDER_PIPER,
     PROVIDER_POCKET,
+    PROVIDER_POLLY,
     PROVIDER_SYSTEM,
 )
 from kiro_crew.voice_reply import is_available as _tts_available  # noqa: F401 - read by the owners
@@ -405,6 +406,7 @@ from kiro_crew.voice_reply import (  # noqa: F401 - read by the owners
 from kiro_crew.voice_reply import validate_length_scale as _validate_length_scale  # noqa: F401
 from kiro_crew.voice_reply import (  # noqa: F401 - read by the owners
     validated_config_string,
+    validated_language_code,
 )
 from kiro_crew.voice_reply import voice_reply as _voice_reply_fn  # noqa: F401 - read by the owners
 
@@ -665,6 +667,9 @@ class _VoiceConfig:
     # Built-in-engine voice. Empty means the OS default voice, which is the
     # right answer whenever the host language matches the reply language.
     system_voice: str = ""
+    # BCP-47 language for spoken replies, handed to edition TTS providers. Empty
+    # means each provider's own default language.
+    language_code: str = ""
     # If True, a message carrying voice input (a transcribed voice memo)
     # automatically receives a voice reply, even without `!voice on`. The
     # config-load default follows ``enabled`` (see ``set_orch_cfg``); the

@@ -5,7 +5,7 @@ another one, change its model, reload its agent process, and take another one un
 the sidebar. The tools come from the
 `kirocrew-dashboard` MCP server, so an agent that does not mount that server
 never has them — exactly like any other MCP server. This page is the reference
-for all 37 of its tools, written for the agent that is about to use them.
+for all 38 of its tools, written for the agent that is about to use them.
 
 The server is defined in `src/kiro_crew/mcp_dashboard.py` and its `mcp_dashboard_*`
 owner modules. Two halves:
@@ -13,7 +13,7 @@ owner modules. Two halves:
 - **Session control** — `session_create`, `session_fork`, `session_send`,
   `session_read_message`, `session_summary`, `session_stop`, `session_end_wait`, `session_retry`,
   `session_continue`, `session_set_model`, `session_reload`, `session_rename`, `session_generate_title`, `session_close`, `session_revive`,
-  `session_history_list`, `session_broadcast`, `session_status`, `session_adopt`, `session_release`,
+  `session_history_list`, `session_broadcast`, `session_status`, `session_adopt`, `session_handoff`, `session_release`,
   `session_move_to_column`. These reach another session.
 - **Sidebar shape** — `chat_folder_tree`, `chat_folder_create`,
   `chat_folder_move`, `chat_folder_update`, `chat_folder_move_session`, `chat_folder_delete`,
@@ -48,8 +48,8 @@ conductor: a session that can dispatch but cannot edit a file. Always pass
 | Argument | Required | Meaning |
 |---|---|---|
 | `title` | no | Short sidebar name. Say what the session is FOR. Follows `session_rename`'s character rules (`invalid_title`), then is cut to 200 characters; a title whose first 200 characters show nothing is refused |
-| `agent` | no (but always pass it) | Agent to bind the session to |
-| `agent_kind` | no | One value, `template`: run the shared template `agent` names on your own memory, even when a mate carries the same name. Omit for name-first resolution (a mate wins, with its own memory). A bare `kirocrew-worker` already means `template`, because that worker needs no memory of its own. Requires `agent` (`agent_kind_requires_agent` otherwise); a kind that does not resolve is refused `agent_unresolved` rather than falling back to whoever answers by default |
+| `agent` | no (but always pass it) | Agent to bind the session to. In a crewmate's own chat it is not used: the session is always the crewmate's own worker, on the crewmate's memory and workspace with the worker's own tools plus whatever the crewmate's settings add. Naming another crewmate there is refused like any cross-workspace agent |
+| `agent_kind` | no | One value, `template`: run the shared template `agent` names on your own memory, even when a crewmate carries the same name. Omit for name-first resolution (a crewmate wins, with its own memory). A bare `kirocrew-worker` already means `template`, because that worker needs no memory of its own. Requires `agent` (`agent_kind_requires_agent` otherwise); a kind that does not resolve is refused `agent_unresolved` rather than falling back to whoever answers by default |
 | `folder` | no | Sidebar folder id or `/`-separated path to file it into, atomically with creation. Missing path segments are created (`mkdir -p`). The create is checked first, so a create that would be refused normally leaves no new empty folder behind (a race can still leave one) |
 | `model` | no | Model the session starts on, pinned as if the person picked it in the model dropdown (same guard; refused with `model_rejected` when the picker would refuse it). Omitted, it is filled as below |
 | `reasoning_effort` | no | Reasoning effort the session starts at, one of the five standard levels: `low`, `medium`, `high`, `xhigh`, `max`. Any other value is refused with `effort_rejected` before anything is created. Omitted, it is filled as below |
@@ -403,6 +403,41 @@ holds stay with it: only its own edge upward goes.
 Both are recorded in the target's own crew log, on the side the creating edge is
 already written on, which is why the whole subtree follows with no entry of its
 own.
+
+### `session_handoff`
+
+Takes `target` and `to`. It makes `to` the session that MANAGES `target`: from then
+on `to` can send to, read, summarize, stop, close, adopt, release and hand on the
+target, and you cannot, unless it is handed back. Use it after opening a conductor
+and its workers: hand each worker to the conductor.
+
+Only the target's current manager may hand it over (the session that created it,
+until a handoff names another), and `to` must be a session you manage too. Who
+CREATED the target does not change, so `session_fork`, `session_rename` and
+`session_set_model` stay with the creator, and the new manager cannot open
+sessions against the creator's memory. The target moves under `to` in the
+sidebar, and its transcript gets one note saying who manages it now.
+
+| Refusal | Why |
+|---|---|
+| `not_manager` | You do not manage the target or `to`. Holds for every caller, so an agent in a person's own tab cannot hand another of the person's tabs, which has no manager, to anyone. |
+| `self_manager` | `to` is the target itself. |
+| `already_manager` | `to` already manages the target. |
+| `would_cycle` | The target manages `to`, directly or up the line, so the handoff would make a loop. |
+| `handoff_write_failed` | HTTP 500: the new manager could not be saved, so nothing changed. |
+
+With `agent.session_manager_chain` on (off by default), a session also reaches the
+sessions its own reports manage, all the way down the line, and closing a manager
+hands its sessions to the manager above it. Only a close does that: archiving an
+idle manager (the background idle sweep or the bulk cleanup) hands nothing up, on
+purpose, because reviving the manager brings it back to the sessions that still
+name it.
+
+A handed-over session counts against its manager's per-caller session cap and
+still counts against its creator's, so a handoff, or closing the manager, never
+frees room under the creator's cap. A handoff is refused with
+`creator_slot_cap_reached` (HTTP 429) when `to` already holds the cap.
+After an archive, the manager can `session_revive` the session and still manages it.
 
 ### `session_stop` vs `session_close`
 
@@ -999,6 +1034,7 @@ retry.
 | Knob | Default | Effect |
 |---|---|---|
 | `agent.session_control` | `true` | The whole surface. Turn it off to withdraw the capability from every agent at once without editing a spec |
+| `agent.session_manager_chain` | `false` | Let a session reach the whole line of sessions under it through `session_handoff`, and hand a closed manager's sessions up |
 | `agent.member_dispatch` | `true` | A crew member's DM session drives workers it created even when session control is off. Turn it off to put member callers back under the switch |
 | `agent.crew_panel` | `true` | A crew member publishes its own webview, shown in that member's drawer on the Crew page. Its own mount and its own switch, so withdrawing session control leaves the drawer alone and withdrawing the drawer leaves session control alone |
 

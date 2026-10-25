@@ -107,17 +107,17 @@ export interface ChatPaneProps {
    *  so it costs no model call and the model never reads it back. Only
    *  meaningful with `crewmate`. */
   crewmateGreeting?: React.ReactNode
+  /** Whether a person can see this crewmate's thread right now: the window is
+   *  visible AND focused and nothing covers the chat. The unread landing marks
+   *  a message read only while this is true; a reply landing in a parked or
+   *  covered window stays unseen, so the next visit still lands on it. Default
+   *  `true`. Only meaningful with `crewmate`. */
+  crewmateShown?: boolean
   /** Focus the crewmate's Work log tab (the side-panel tab that holds what
    *  the filter hid). When given, the quiet hint's "where the work went" line
    *  is a link that opens it, so the words that read as a destination are one;
    *  without it the line is plain text. Only meaningful with `crewmate`. */
   onOpenCrewWorkLog?: () => void
-  /** Open this host's Subagents view. The `spawn_run` launch card a crewmate's
-   *  chat draws offers "Open Subagents panel"; on the chat page the card opens
-   *  the chat store's panel itself, but a host with its own side-panel tab
-   *  model (the Members page) must pass this or the click opens nothing on the
-   *  page the reader is looking at. Only meaningful with `crewmate`. */
-  onOpenSubagents?: () => void
   /** Reply threads on this pane's messages. Only a host presenting a
    *  crewmate's chat (the Members page) passes it; absent, the rows draw no
    *  thread footer and no "Reply in thread" action. */

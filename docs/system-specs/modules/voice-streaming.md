@@ -2,6 +2,10 @@
 
 ## Overview
 
+`voice_reply_local.py` owns Piper/Pocket synthesis, streaming and model
+validation. `voice_reply.py` re-exports that surface through a shared module
+mirror so existing callers and patches keep using the public import path.
+
 Dashboard text-to-speech has four providers: local Piper, the host's built-in
 speech engine, a locally configured Pocket runtime, and Amazon Polly.
 `voice_reply.DEFAULT_PROVIDER` selects the built-in engine for new setups.
@@ -132,6 +136,15 @@ Telegram and dashboard paths. Three rules:
   Piper. That section is a working Piper install, and resolving it to the
   default would silently downgrade it to a lower-quality voice on upgrade. The
   branch preserves that setup while unconfigured installations use the built-in engine.
+
+### Registered providers
+
+A composed edition can add TTS providers through the `speech` slot on `PlatformContext` (`SpeechProviderRegistry.tts_providers()`; see `platform-context.md`). The default registry adds none, so a standalone install has exactly `VALID_PROVIDERS`. `voice_reply.valid_providers()` is the built-ins plus the registered names.
+
+- **Collision rule.** A registered name may not be a built-in (`polly`, `system`) or a removed provider (`piper`), may not be blank and may not repeat. `speech_providers.validate_speech_registry` refuses any of these at boot with `PlatformCompositionError`, so an edition can add a provider but never replace one.
+- **Default precedence.** A stored provider always wins. Only an absent, null or empty value takes `voice_reply.default_provider()`: the edition's `default_tts()` when it names a selectable provider, else `DEFAULT_PROVIDER`. An invalid stored value still falls back to `DEFAULT_PROVIDER`, never to the edition default, for the same reason it never falls back to Polly.
+
+`GET /api/voice/config` serves the same `providers` list the STT config does (`stt-streaming.md` § "The capability `providers` list"): a built-in row is `{name, builtin: true}` with no probe, a registered row carries `name`, `label`, `builtin`, `available`, `reason`, `action`, `error`; built-ins first in `system`, `polly` order. The Settings picker (`VoicePanel`) renders its options from it and falls back to its own `PROVIDER_OPTIONS` when the list is absent. A registered provider shows none of the built-in field sets; when it cannot run, `SpeechProviderNotice` shows its `reason` under the picker: through `ErrorNotice`, with the agent hand-off, when `error` says its check timed out or raised, and otherwise as status text with any sign-in hint.
 
 ## Components
 
@@ -370,6 +383,7 @@ running a value the file does not hold. A failed write answers non-2xx with a
 | `voice_id`, `engine`, `pitch` | Polly synthesis settings. The dashboard synthesis endpoint accepts per-request overrides on the Polly path only, as body fields `voice` (not `voice_id`), `engine`, `rate` and `pitch`. |
 | `rate` | Speech rate as a percentage. Shared by Polly and the built-in engine, which converts it to words per minute or to SAPI's `-10..10`. |
 | `system_voice` | The built-in engine's own voice selector; empty means the OS default voice. |
+| `language_code` | BCP-47 tag for spoken replies (`en-US`, `zh-CN`), checked by `voice_reply.validated_language_code()`; empty means each provider's own default language. Handed to edition providers as `voice_config["language_code"]`; Polly and the built-in engine ignore it and speak the language of the selected voice. A malformed stored value reads as empty; the PUT refuses one with 400 `voice_language_invalid`. The GET also serves `language_codes`, the picker's choices: `""`, `speech_languages.COMMON_LANGUAGE_CODES` (the list the STT picker offers), then a stored code outside it. |
 | `aws_profile`, `region` | Passed to the AWS CLI by the Polly provider. |
 | `piper_binary`, `piper_model`, `piper_model_config`, `piper_length_scale` | Piper executable, model, optional model configuration, and validated speed setting. `validate_length_scale()` rejects invalid or non-positive values. |
 | `provider` — Pocket | `pocket` is a locally supplied runtime reached through a Piper-compatible bridge, so it reuses `piper_binary` / `piper_model` and speaks the supplied local `michael` voice. It needs no AWS credential. |

@@ -250,6 +250,9 @@ export interface ChatSlot extends TurnIdentityFields {
    * before nesting a row that has no session-tree node yet — a child between
    * `session_create` and its first turn, which has no crew log to fold. */
   lineage_minted?: boolean
+  /** A worker tab's process: held (`live`) or stopped by the idle sweep
+   * (`released`); the conversation resumes on the next message either way. */
+  process?: 'live' | 'released'
   /** The user-owned "mute sessions it opens" rule. When true on a creating
    * session, every session it opens -- and anything those open, down the
    * `created_by` chain -- is muted for attention: no turn-done chime,
@@ -403,7 +406,9 @@ export interface SideSnapshot {
   /** A side turn is in flight, so a submit would steer or queue. */
   running?: boolean
   messages?: Array<{ id: string; run_id?: string; role: 'user' | 'assistant'; content: string; ts: string; steer?: boolean; is_error?: boolean }>
-  queue?: Array<{ id: string; content: string; ts: string }>
+  /** `rev` counts the entry's edits, as the edit frame reports it, so a reader
+   *  can tell which of two copies of the entry is newer. */
+  queue?: Array<{ id: string; content: string; ts: string; rev?: number }>
 }
 
 export interface ChatMessage {
@@ -588,6 +593,12 @@ export interface ContentBlock {
    * this to render the bookmark filled, link the title to /artifacts/<slug>,
    * and treat clicks as un-save rather than save. */
   slug?: string
+  /** This markdown block is one paragraph-bounded piece of the trailing
+   * markdown block. `from` is that block's startLine and `part` this piece's
+   * index, so a piece keeps its React key while lines above it are
+   * reclassified. Set while streaming, and after the stream ends in the view
+   * that streamed it; never on a message mounted already finished. */
+  split?: { from: number; part: number }
 }
 
 export interface Notification {

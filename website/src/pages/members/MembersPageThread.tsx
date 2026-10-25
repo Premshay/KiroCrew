@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type Dispatch, type SetStateAction, type RefObject } from 'react'
 import { type NavigateFunction, type Location, type SetURLSearchParams } from 'react-router-dom'
 import { RotateCw } from 'lucide-react'
+import { useReducedMotion } from 'framer-motion'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_CREW } from '../../utils/previewFlags'
 import { Btn } from '../../components/ui'
@@ -29,7 +30,7 @@ import { useTranslation } from 'react-i18next'
 import { api, type MemberRosterRow } from '../../api/client'
 import { ApiError } from '../../api/apiError'
 import { crewDisplayName } from '../../components/AgentSelector'
-import { isAssistantMember } from '../../lib/assistantMember'
+import { hasOtherMates, isAssistantMember } from '../../lib/assistantMember'
 import { useFirstGreeting } from './useFirstGreeting'
 import { MEMBERS_ROSTER_QUERY_KEY, memberThreadQueryKey, type MemberThreadOutcome } from '../../api/membersQuery'
 import { useMutation, type QueryClient } from '@tanstack/react-query'
@@ -47,6 +48,8 @@ import { useSlotActivity } from './useSlotActivity'
 import { AWAITING_REPLY_ACTIVITY } from '../../components/chat/useCrewmateAwaitingReply'
 import ChatPane from '../../components/ChatPane'
 import MateWelcomeCard from './MateWelcomeCard'
+import MateEntrance from './MateEntrance'
+import CrewmateImportDialog from './CrewmateImportDialog'
 import { useMateGreeting } from './mateGreeting'
 import CrewComposer from './CrewComposer'
 import ErrorBoundary from '../../components/ErrorBoundary'
@@ -179,11 +182,39 @@ export function useMembersPageThread({
   // or the goal question of a crewmate created with `first_greeting`), so this
   // is a no-op on every later open. Asked only for Mate (with the preview on)
   // and dashboard-created crewmates: no other row can be owed one.
+  // The first Mate's entrance (#23207): in the one tab whose greeting request
+  // the server answers `started`, Mate's face enters centre stage with a line,
+  // flies into the header pill's face slot, and only then does the greeting
+  // turn stream in. Keyed on that answer alone, so a reload, a second tab or a
+  // failed turn (`already_greeted`, `not_empty`, an error) never replays it:
+  // the server's own once-only claim is the entrance's once-only too. Mate
+  // only: a mate created on the New mate card already showed the person the
+  // face and name they picked, so there is no one new to meet there.
+  const reduceMotion = useReducedMotion()
+  const [entranceState, setEntrance] = useState<MateEntranceState | null>(null)
+  const startEntrance = useCallback((slot: string) => setEntrance({ slot, phase: 'stage' }), [])
+  const landEntrance = useCallback(
+    () => setEntrance((e) => (e && e.phase === 'stage' ? { ...e, phase: 'landed' } : e)),
+    [],
+  )
+  const endEntrance = useCallback(() => setEntrance(null), [])
   useFirstGreeting(
     active?.slug,
     activeSlot,
     !!active && ((crewPreview && isAssistantMember(active)) || active.dashboard_created === true),
+    isAssistantMember(active) ? startEntrance : undefined,
   )
+  // An entrance belongs to the thread it was answered for. Leaving that thread
+  // mid-entrance ends it (the stage unmounts with the column) and nothing
+  // brings it back: `started` is answered once per thread.
+  const entrance = entranceState && entranceState.slot === activeSlot ? entranceState : null
+  useEffect(() => {
+    if (entranceState && entranceState.slot !== activeSlot) setEntrance(null)
+  }, [entranceState, activeSlot])
+  // While the face is on stage the header pill's slot and the roster row hold
+  // their face unpainted, so there is one face on screen. Reduced motion has
+  // no face on stage, so both keep theirs from the start.
+  const entranceFaceHidden = !!entrance && entrance.phase === 'stage' && !reduceMotion
   // Two distinct verdicts with two different sentences: a collision is a
   // fact about the roster (the slug's thread belongs to another crew), a
   // failed POST is a transport error. Both render through ErrorNotice so
@@ -314,8 +345,15 @@ export function useMembersPageThread({
   return {
     activeSlot, freshStarts, freshStartError, setFreshStartError, freshStart, freshStartConfirmDialog,
     askFreshStart, crewPreview, mateLandedRef, activeCollision, activeThreadFailed, postThread, connected,
-    confirmedSlot,
+    confirmedSlot, entrance, entranceFaceHidden, landEntrance, endEntrance,
   }
+}
+
+/** The first Mate's entrance in progress (#23207): `stage` while the face is
+ *  centre stage or in flight, `landed` while the slot's own face pops. */
+export interface MateEntranceState {
+  slot: string
+  phase: 'stage' | 'landed'
 }
 
 export type MembersPageThreadState = ReturnType<typeof useMembersPageThread>
@@ -327,11 +365,17 @@ interface MembersPageThreadViewOptions {
   t: TFn
   createOpen: boolean
   active: MemberRosterRow | undefined
+  /** The Profile card is up as a FLOATING card over the thread column (its
+   *  docked placement sits beside the chat and covers nothing). */
+  profileFloating: boolean
+  /** The phone roster drawer is mounted over the thread column (opening, open
+   *  or closing); it covers the chat for all three. */
+  rosterDrawerMounted: boolean
 }
 
 /** The header's live readings, the greeting card, and read marking while the thread is on screen. */
 export function useMembersPageThreadView({
-  layout, rosterView, thread, t, createOpen, active,
+  layout, rosterView, thread, t, createOpen, active, profileFloating, rosterDrawerMounted,
 }: MembersPageThreadViewOptions) {
   const { isMobile, rosterBar } = layout
   const { isRunning, activeView } = rosterView
@@ -466,6 +510,14 @@ export function useMembersPageThreadView({
   // The New crewmate card hides the chat while it
   // stays mounted: hidden is not viewed, so it neither reads nor suppresses.
   const threadShown = pageVisible && !createOpen
+  // What the PANE may count as seen: the thread is shown AND nothing floats
+  // over the chat. An overlay side panel (a phone sheet, a desktop overlay
+  // under its scrim), a floating Profile card and the phone roster drawer all
+  // cover the transcript, while the docked placements sit beside it, so a reply
+  // landing behind any of them stays unseen. Narrower than `threadShown` on
+  // purpose: the roster's read marking above keeps its own meaning of a viewed
+  // thread.
+  const chatUncovered = threadShown && !(layout.panelVisible && !layout.beside) && !profileFloating && !rosterDrawerMounted
   useEffect(() => {
     // Viewing the thread is the read — but only a VISIBLE view is a view. A
     // hidden member tab neither clears its own badge nor relays one; on
@@ -507,6 +559,10 @@ export function useMembersPageThreadView({
   return {
     threadHeaderRef, setSwitcherOpenRequest, switcherOpenRequest, topbarSlot, headerInBar, headerInset,
     betweenHeaderH, betweenHeaderRef, dismissMateGreeting, mateGreeting, mateGreetingFailure, pillActivity,
+    // The same "a person can see the thread" the read marking above uses; the
+    // pane's unread landing marks a message read under the same condition.
+    threadShown,
+    chatUncovered,
   }
 }
 
@@ -567,10 +623,24 @@ export function MembersPageThreadColumn({
   const { activeRoster, crewmateIdentity, setStarError, starError } = rosterView
   const {
     activeSlot, freshStarts, freshStartError, setFreshStartError, activeCollision, activeThreadFailed,
-    connected,
+    connected, entrance, landEntrance, endEntrance,
   } = thread
+  const { pillFaceRef } = profileCard
+  const { reduceMotion } = profileFlight
+  // What Mate says on stage: "your first Mate" only while it IS the only mate
+  // on the roster, the same split the server's welcome kickoff makes
+  // (`FIRST_WELCOME` vs `FIRST_WELCOME_WITH_CREW`); the reserved `default`
+  // agent on every roster does not count.
+  const entranceText = active && entrance
+    ? hasOtherMates(members)
+      ? t('pages.membersPage.entrance_hello', { name: crewDisplayName(active) })
+      : t('pages.membersPage.entrance_first_mate')
+    : ''
+  // The pane is veiled while the face is on stage, so the greeting's first row
+  // cannot stream in under the entrance; it fades back as the face lands.
+  const entranceOnStage = !!entrance && entrance.phase === 'stage'
   const {
-    openMemberSideChat, openCrewWorkLog, openSubagentsView, sessionRoster, retryThreadsFlag, threadsFlagFailed,
+    openMemberSideChat, openCrewWorkLog, sessionRoster, retryThreadsFlag, threadsFlagFailed,
     threadsFlagRetrying, threadsOn, threadsQuery, threadHooks, actionError, setActionError, actionInfo,
     openFileGuarded, openSessionGuarded,
   } = sidePanel
@@ -580,6 +650,8 @@ export function MembersPageThreadColumn({
   const { patrol } = rosterSignals
   const { openMember, openArtifactInThread } = navigation
   const { closeTeamView, teamMembers } = teamView
+  // Import from file on the empty roster's hero (the switcher is not shown yet).
+  const [importing, setImporting] = useState(false)
   // The post-create notice (a failed roster re-read) with its retry, rendered
   // ONCE, in the chat column: below md a roster notice brings that column on
   // screen (see the two `className`s: this column's `<section>` below, and
@@ -663,8 +735,9 @@ export function MembersPageThreadColumn({
                 team view too: a team can exist before its first crewmate does,
                 and the pane is the team's then. */}
             {!active && !activeTeam && !postCreateError && loaded && !loadError && hasNoCrewmates(members) && (
-              <CrewmateEmptyHero onCreate={openQuick} onAdvanced={openAdvanced} held={createHeld} />
+              <CrewmateEmptyHero onCreate={openQuick} onAdvanced={openAdvanced} held={createHeld} onImport={() => setImporting(true)} />
             )}
+            {importing && <CrewmateImportDialog open onOpenChange={setImporting} />}
             {/* A failed roster read at md and up: the roster column shows its own
                 notice, but this column would otherwise be blank — no chat can
                 open (the URL sync waits on the roster) and the hero is gated on a
@@ -1012,8 +1085,28 @@ export function MembersPageThreadColumn({
                 )}
                 </div>
                 </div>
+                {entrance && crewmateIdentity && (
+                  <MateEntrance
+                    key={entrance.slot}
+                    crewmate={crewmateIdentity}
+                    slotKey={activeSlot}
+                    text={entranceText}
+                    stageRef={threadColumnRef}
+                    targetRef={pillFaceRef}
+                    reduceMotion={!!reduceMotion}
+                    onLanded={landEntrance}
+                    onDone={endEntrance}
+                  />
+                )}
                 {activeSlot ? (
-                  <div className="flex-1 min-h-0">
+                  <div
+                    // Veiled at once (a cut, so no "Working" row shows under the
+                    // face for a frame); unveiled with a fade as the face lands.
+                    className={entranceOnStage ? 'flex-1 min-h-0' : 'flex-1 min-h-0 transition-opacity duration-300 motion-reduce:transition-none'}
+                    style={entranceOnStage ? { opacity: 0 } : undefined}
+                    data-testid="member-thread-pane"
+                    data-entrance-veiled={entranceOnStage ? '' : undefined}
+                  >
                     <ErrorBoundary>
                       {/* Same reading measure as the main chat transcript — the
                           pane resolves the user's Content width setting itself
@@ -1033,17 +1126,17 @@ export function MembersPageThreadColumn({
                         // while a repair has failed; the pane's own "Session
                         // ready" would contradict it one line down.
                         // The crewmate's greeting already speaks for the empty chat.
-                        hideEmptyHint={activeThreadFailed || !!mateGreeting}
+                        hideEmptyHint={activeThreadFailed || !!mateGreeting || !!entrance}
                         foldBefore={freshStarts[activeSlot] ?? activeRoster?.reset_at}
                         // Under the floating header only when nothing sits between
                         // them (see the block above); a card between already paid.
                         topInset={betweenHeaderH > 0 ? 0 : headerInset}
                         crewmate={crewmateIdentity}
+                        crewmateShown={threadView.chatUncovered}
                         crewmateGreeting={mateGreeting && crewmateIdentity
                           ? <MateWelcomeCard recap={mateGreeting.recap} crewmate={crewmateIdentity} onDismiss={dismissMateGreeting} />
                           : null}
                         onOpenCrewWorkLog={openCrewWorkLog}
-                        onOpenSubagents={openSubagentsView}
                         openSideChat={openMemberSideChat}
                         threads={threadHooks}
                         onFileOpen={openFileGuarded}

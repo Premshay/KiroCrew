@@ -25,10 +25,13 @@ from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_REPORT_USAGE,
     ACP_BACKENDS_SESSION_EVICTION,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_CODEX,
@@ -46,6 +49,16 @@ from kiro_crew.session import SessionManager
 #: compared the property against that same frozenset would agree with itself no
 #: matter which harnesses were in it.
 ON_THE_ACP_RUNTIME = {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX}
+
+#: The backends whose turns land their spend in TurnUsage, spelled apart from the
+#: set ``reports_turn_usage`` reads for the same reason.
+REPORTS_TURN_USAGE = {
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_GOOSE,
+}
 
 
 def _build_provider(backend: str) -> AcpProvider:
@@ -116,6 +129,14 @@ class TestBackendPredicates:
         provider = _build_provider(backend)
         assert provider.is_acp_runtime_backend is (backend in ON_THE_ACP_RUNTIME)
         assert ON_THE_ACP_RUNTIME == set(ACP_BACKENDS_ACP_RUNTIME)
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
+    def test_reports_turn_usage_answers_positive_set_membership(self, backend):
+        """A provider answering True without reporting usage would let memory
+        consolidation take its billed empty replies as free and retry a span forever."""
+        provider = _build_provider(backend)
+        assert provider.reports_turn_usage is (backend in REPORTS_TURN_USAGE)
+        assert REPORTS_TURN_USAGE == set(ACP_BACKENDS_REPORT_USAGE)
 
     def test_a_harness_off_the_runtime_need_not_be_claude(self):
         """The backends where the negation and the membership disagree.
@@ -334,11 +355,36 @@ class TestConfigRoundTrip:
         assert cfg.to_dict()["agent"]["acp_backend"] == ACP_BACKEND_KAS
         assert "Ignoring agent." not in caplog.text
 
-    def test_member_backend_follows_the_same_mapping(self, tmp_path):
+    def test_a_stored_kiro_member_backend_reads_as_kas(self, tmp_path):
+        """Crewmates run on KAS: a member field set to "kiro" is KAS for every reader."""
         cfg = _load_agent_config({"member_acp_backend": KIRO_STORED}, tmp_path)
-        assert cfg.agent.member_acp_backend == ACP_BACKEND_KIRO
-        assert cfg.to_dict()["agent"]["member_acp_backend"] == KIRO_STORED
+        assert cfg.agent.member_acp_backend == ACP_BACKEND_KAS
+        assert cfg.to_dict()["agent"]["member_acp_backend"] == ACP_BACKEND_KAS
         assert _load_agent_config({}, tmp_path).agent.member_acp_backend == ACP_BACKEND_KAS
+
+    def test_the_member_remap_is_logged_once(self, tmp_path, monkeypatch, caplog):
+        """The remap is visible: one info line names the stored and the used value."""
+        from kiro_crew.config import loader_builders
+
+        monkeypatch.setattr(loader_builders, "_member_remap_logged", False)
+        with caplog.at_level("INFO", logger="kiro_crew.config.loader"):
+            _load_agent_config({"member_acp_backend": KIRO_STORED}, tmp_path)
+            _load_agent_config({"member_acp_backend": KIRO_STORED}, tmp_path)
+        lines = [r.getMessage() for r in caplog.records if "member_acp_backend" in r.getMessage()]
+        assert len(lines) == 1
+        assert repr(KIRO_STORED) in lines[0] and repr(ACP_BACKEND_KAS) in lines[0]
+
+    def test_a_kiro_member_backend_starts_the_member_dm_on_kas(self, tmp_path):
+        """The member DM gets KAS; a non-member session keeps the kiro-cli default."""
+        cfg = _load_agent_config(
+            {"acp_backend": KIRO_STORED, "member_acp_backend": KIRO_STORED}, tmp_path
+        )
+        assert cfg.agent.acp_backend == ACP_BACKEND_KIRO
+        factory = cfg.create_provider_factory()
+        member = factory(session_key="dashboard:member-oncall", agent="")
+        assert member.is_kas_backend is True
+        plain = factory(session_key="dashboard:chat-1", agent="")
+        assert plain.is_kiro_backend is True
 
     def test_the_runtime_kiro_id_never_reaches_a_config_reader(self, tmp_path):
         """A Kiro CLI harness set in memory reads back as "kiro", never "" (no choice)."""
@@ -448,6 +494,16 @@ class TestSaveKeepsAnAbsentChoiceAbsent:
         KiroCrewConfig.load().save()
         assert self._agent_on_disk(home)["acp_backend"] == KIRO_STORED
         assert KiroCrewConfig.load().agent.acp_backend == ACP_BACKEND_KIRO
+
+    def test_a_kiro_member_backend_stays_kiro_on_disk(self, home):
+        """Reading the member "kiro" as KAS never rewrites the stored value."""
+        (home / "config.json").write_text(
+            json.dumps({"agent": {"member_acp_backend": KIRO_STORED}}), encoding="utf-8"
+        )
+        cfg = KiroCrewConfig.load()
+        assert cfg.agent.member_acp_backend == ACP_BACKEND_KAS
+        cfg.save()
+        assert self._agent_on_disk(home)["member_acp_backend"] == KIRO_STORED
 
     def test_a_full_save_of_a_stored_empty_string_keeps_it(self, home):
         """save() never turns "" (no choice) into a stored pick."""

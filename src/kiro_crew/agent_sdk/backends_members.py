@@ -89,6 +89,44 @@ ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset(
 # it was saved.
 ACP_BACKENDS_MEMBER_TOOL_LIMITS = frozenset({ACP_BACKEND_KIRO})
 
+# Backends that honour a crewmate WORKER's single-tool limits. The worker's spec
+# is built per session (``mate_worker.worker_session_spec``), with every tool the
+# crewmate switches off rewritten into ``excludedTools``. KAS takes that whole
+# definition over the wire (``_meta.kiro.customAgents``) and projects
+# ``excludedTools``, so the limits hold. claude mounts the worker's servers
+# whole and reports ``excludedTools`` as a projection gap, so a worker with
+# single-tool limits is refused there before
+# spawn (``capability_tool_limits_unsupported``); without limits it runs.
+ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS = frozenset({ACP_BACKEND_KAS})
+
+# Backends that carry a crewmate WORKER's per-session spec (its kit): a spec built
+# per session from the worker base plus that crewmate's own file
+# (``mate_worker.worker_session_spec``), never one read off disk by name. KAS takes
+# it over the wire (``_meta.kiro.customAgents``); claude builds its ``session/new``
+# MCP array from ``session_mcp_projection``, which reads it by the session key.
+# codex and deepseek build theirs the same way but have no live capture of it, so
+# they are not here yet. kiro-cli is a member chat backend but is not here: it reads
+# ``--agent`` off disk at spawn from ``~/.kiro/agents/``, where the worker spec is not,
+# and has no per-session channel. A worker allocated anywhere else is refused before
+# spawn (``capability_harness_unsupported``).
+# KAS is captured live on KAS 0.66.58 (kiro-cli 2.33.1):
+# ``test/fixtures/acp_frames/kas/worker-kit-live.jsonl``. A worker base with
+# tools ``read`` and ``shell``, merged with a crewmate file that adds a prompt and
+# excludes ``shell``, ran with only the ``read`` tools and followed the added prompt.
+# claude is captured live on claude-agent-acp 0.94.0:
+# ``test/fixtures/acp_frames/claude/saved-spec-projection-live.jsonl``. The server a
+# spec declares, projected into the ``session/new`` array, ran in the session; the
+# worker's spec reaches claude through that same array.
+ACP_BACKENDS_MATE_WORKER_KIT = frozenset({ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE})
+
+# Backends of the set above whose worker gets its prompt only from the
+# ``[AGENT SYSTEM PROMPT]`` context block: their mirrors project no spec prompt
+# (``Concern.PROMPT`` is ``WITHHELD``), so the block carries the worker's own
+# principles and its crewmate's prompt (``context_assembly.agent_spec
+# ._crewmate_worker_prompt``). KAS is not here: its wire spec already carries both,
+# so its block stays the base.
+ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT = frozenset({ACP_BACKEND_CLAUDE})
+
 # Backends that can mount a DIFFERENT MCP tool set on one session than the
 # on-disk agent template declares — the capability crew-member dispatch rides
 # on. claude-agent-acp takes the whole server list as a per-session

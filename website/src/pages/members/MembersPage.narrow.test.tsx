@@ -654,6 +654,14 @@ describe('MembersPage default member, memory and URL', () => {
       expect(currentUrl()).toBe('/members?member=alpha')
     })
 
+    it('the empty roster offers Import from file, so the first mate can be a shared one', async () => {
+      const membersMock = api.members as ReturnType<typeof vi.fn>
+      membersMock.mockResolvedValue({ members: [defaultRow()], default_agent: 'kirocrew' })
+      renderFromElsewhere({ to: '/members' })
+      fireEvent.click((await screen.findAllByTestId('crewmate-empty-import'))[0])
+      expect(await screen.findByTestId('crewmate-import-dialog')).toBeTruthy()
+    })
+
     it('the first mate created from an empty roster opens on a replace, so one Back still leaves the page', async () => {
       // A pushed open would leave a bare /members under the chat, and the phone
       // lands a bare /members on a crewmate by itself: Back would bounce back in.
@@ -707,6 +715,28 @@ describe('MembersPage default member, memory and URL', () => {
         expect(header).toHaveAttribute('data-in-topbar')
         expect(within(slot).getByTestId('member-back')).toBeInTheDocument()
         expect(within(slot).getByTestId('member-identity-pill')).toBeInTheDocument()
+      } finally {
+        slot.remove()
+      }
+    })
+
+    it('wears the Sessions bar\'s bare drawer toggle and a bare panel toggle in the shell bar, not Glass chips', async () => {
+      const slot = document.createElement('div')
+      slot.id = 'mobile-topbar-slot'
+      document.body.appendChild(slot)
+      try {
+        await renderPage(alphaBeta(), 'kirocrew', { route: '/members?member=alpha' })
+        await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+        const back = await within(slot).findByTestId('member-back')
+        const panel = within(slot).getByTestId('member-panel-toggle')
+        for (const control of [back, panel]) {
+          expect(control.tagName).toBe('BUTTON')
+          expect(control.className).not.toMatch(/glass/)
+          expect(control.className).toMatch(/(^|\s)p-2(\s|$)/)
+        }
+        // The Sessions toggle's glyph at its bar size, and its pressed state.
+        expect(back.querySelector('svg')).toHaveAttribute('width', '18')
+        expect(back).toHaveAttribute('aria-expanded', 'false')
       } finally {
         slot.remove()
       }

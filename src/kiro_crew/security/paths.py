@@ -494,7 +494,7 @@ def is_sensitive_write_path(path_str: str, base_dir: str | None = None) -> bool:
 def sensitive_home_dirs() -> tuple[str, ...]:
     """Public, read-only view of the read+write-blocked home-relative paths.
 
-    Lets the security-posture surface (``security_posture.py``) enumerate what
+    Lets the security-posture surface (``security_posture_controls.py``) enumerate what
     :func:`is_sensitive_path` actually blocks without coupling to the private
     ``_SENSITIVE_HOME_DIRS`` name — the same rationale as
     :func:`get_credential_patterns`. Returned as a tuple so a caller cannot
@@ -739,6 +739,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _CREW_SECRET_LEAVES,
         _KIRO_AGENTS_DIR,
         _KIRO_CLI_WRITE_TIER_LEAVES,
+        _KIRO_MATE_AGENTS_DIR,
         _KIRO_SETTINGS_MCP_JSON,
         _LEAF_SEPARATOR,
         _NATIVE_ALLOW_STORE_LEAVES,

@@ -721,6 +721,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _agent_model_or_exit,
         _agent_reset_model,
         _handle_agent,
+        _kiro_agent_or_exit,
         _memory_store_or_exit,
     )
     from kiro_crew.cli_commands_app import (  # noqa: F401
@@ -757,7 +758,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.cli_commands_gateway_api import (  # noqa: F401
         _artifact,
+        _gateway_send,
         _internal_secret,
+        _peer_refusal,
         _spawn,
         _spawn_row_text,
         _spawn_run,

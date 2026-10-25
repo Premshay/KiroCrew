@@ -196,6 +196,7 @@ class TestVoiceConfig:
             aws_profile="",
             region="us-east-1",
             system_voice="",
+            language_code="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -227,6 +228,7 @@ class TestVoiceConfig:
             aws_profile="",
             region="",
             system_voice="",
+            language_code="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -281,6 +283,7 @@ class TestVoiceConfig:
             aws_profile="",
             region="",
             system_voice="",
+            language_code="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -310,6 +313,7 @@ class TestVoiceConfig:
             aws_profile="",
             region="",
             system_voice="",
+            language_code="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -337,6 +341,7 @@ class TestVoiceConfig:
             aws_profile="",
             region="",
             system_voice="",
+            language_code="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -405,6 +410,7 @@ class TestVoiceConfig:
             aws_profile="",
             region="",
             system_voice="",
+            language_code="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -434,6 +440,7 @@ class TestVoiceConfig:
             aws_profile="",
             region="",
             system_voice="",
+            language_code="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -463,6 +470,7 @@ class TestVoiceConfig:
             aws_profile="",
             region="",
             system_voice="",
+            language_code="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -494,6 +502,7 @@ class TestVoiceConfig:
             aws_profile="",
             region="",
             system_voice="",
+            language_code="",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -1581,6 +1590,7 @@ def test_every_body_field_the_config_put_reads_goes_through_a_validator():
     SANCTIONED = {
         "validated_config_bool",
         "validated_config_string",
+        "validated_language_code",
         "_validate_rate",
         "_validate_pitch",
         "validate_length_scale",
@@ -1604,8 +1614,13 @@ def test_every_body_field_the_config_put_reads_goes_through_a_validator():
     guarded: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Compare) and isinstance(node.ops[0], ast.In):
-            target = getattr(node.comparators[0], "id", "")
-            if target.startswith("VALID_"):
+            # A ``VALID_*`` set, or ``valid_providers()``: the built-in providers
+            # plus the edition's registered ones.
+            comparator = node.comparators[0]
+            if isinstance(comparator, ast.Call):
+                comparator = comparator.func
+            target = getattr(comparator, "id", "")
+            if target.startswith("VALID_") or target == "valid_providers":
                 for inner in ast.walk(node.left):
                     if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
                         guarded.add(inner.value)

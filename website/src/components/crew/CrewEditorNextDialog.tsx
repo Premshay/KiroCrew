@@ -28,6 +28,10 @@ import { useConfirm } from '../ConfirmDialog'
 import { effortLabel } from '../../lib/effort'
 import { crewCapabilitiesApi, crewCapabilitiesKey, type CapabilityRow, type CapabilityPreview } from '../../api/crewCapabilities'
 import CrewApprovalsEditor from './CrewApprovalsEditor'
+import WorkerKitPane from './WorkerKitPane'
+import { templateDisplayName, useBuiltFromName } from './builtFromName'
+import { skillLabel } from './workerKitLabels'
+import { crewDisplayName } from '../AgentSelector'
 import CrewWakeSection from '../CrewWakeSection'
 import CrewWebhookSection from '../CrewWebhookSection'
 import MemoryDocCard from '../../pages/overview/MemoryDocCard'
@@ -40,7 +44,7 @@ import { INHERIT_MODEL, type CrewEditorController } from './useCrewEditor'
 import CrewEditorNextRail from './CrewEditorNextRail'
 import { uiLocation } from '../../uiLocations/uiLocation'
 
-export type NextSection = 'general' | 'builtFrom' | 'approvals' | 'schedules' | 'webhooks' | 'memory' | 'danger'
+export type NextSection = 'general' | 'builtFrom' | 'approvals' | 'schedules' | 'webhooks' | 'memory' | 'advanced' | 'danger'
 type BuiltFromTab = 'details' | 'tools' | 'mcp' | 'skills'
 type MemoryTab = 'profile' | 'memories' | 'recovery'
 
@@ -329,7 +333,8 @@ function SkillRow({ row, showTemplateBadge }: { row: CapabilityRow; showTemplate
             aria-hidden
           />
           <div className="flex min-w-0 flex-col">
-            <span className="truncate text-[12.5px] text-text">{row.label || display}</span>
+            {/* A resource URI with no label (a pattern) is named as the kit preview names it. */}
+            <span className="truncate text-[12.5px] text-text">{row.label || (row.id.includes('://') ? skillLabel(row.id) : display)}</span>
             {owner && <span className="truncate font-mono text-[11px] text-muted">{owner}</span>}
           </div>
         </div>
@@ -465,6 +470,15 @@ export default function CrewEditorNextDialog({
     enabled: ctl.open,
     retry: false,
   })
+  // A crewmate that owns its config file is bound to that file, not to a
+  // template: its "Built from" names the template its worker kit was copied
+  // from, and the General switcher (which would repoint the binding away from
+  // the file) gives way to Advanced > Re-copy from template.
+  const ownsFile = capsQuery.data?.mode === 'mate'
+  // A crewmate that owns its file: its file holds only additions, so Built
+  // From's summary AND its lists read what its worker carries, one set.
+  const builtFromRows = (ownsFile ? capsQuery.data?.worker?.rows : null) ?? capsQuery.data?.rows ?? []
+  const { name: builtFromName, error: builtFromError } = useBuiltFromName({ member: ctl.editing, kiroAgent: ctl.kiroAgent, ownsFile, enabled: ctl.open })
   const { confirm, confirmDialog } = useConfirm()
 
   // The section a host sees: what the rail shows, which falls back to General
@@ -569,7 +583,7 @@ export default function CrewEditorNextDialog({
   const caps = capsQuery.data
   // Tools auto-approved to run without a prompt: present rows in `allowedTools`.
   const autoApprovedTools = new Set(
-    (caps?.rows ?? []).filter(r => r.section === 'allowedTools' && r.present).map(r => r.id),
+    builtFromRows.filter(r => r.section === 'allowedTools' && r.present).map(r => r.id),
   )
 
   const sections: { key: NextSection; label: string }[] = [
@@ -579,6 +593,9 @@ export default function CrewEditorNextDialog({
     { key: 'schedules', label: i18nT('crewEditorNext.tab_schedules') },
     { key: 'webhooks', label: i18nT('crewEditorNext.tab_webhooks') },
     { key: 'memory', label: i18nT('crewEditorNext.section_memory') },
+    // Advanced: the worker's extra kit. Only a crewmate that owns its config
+    // file has a worker to extend, so the section exists only then.
+    ...(caps?.mode === 'mate' ? [{ key: 'advanced' as NextSection, label: i18nT('crewWorkerKit.section_advanced') }] : []),
     // The default crewmate cannot be deleted — the backend rejects it with 409
     // — so the classic editor hid its Danger Zone. Keep that guard.
     ...(isDefaultCrew ? [] : [{ key: 'danger' as NextSection, label: i18nT('crewEditorNext.section_danger') }]),
@@ -712,9 +729,23 @@ export default function CrewEditorNextDialog({
                       label/hint. This is the layout these fields are built for. */}
                   <DisplayNameField value={displayName} onChange={setDisplayName} fallback={editing} />
 
+                  {ownsFile ? (
+                    <Field label={templateFieldLabel} hint={i18nT('crewEditorNext.built_from_mate_hint')}>
+                      <div className="flex items-center justify-between gap-3" data-testid="next-built-from-owned">
+                        <span className="text-[13px] text-text">{builtFromName}</span>
+                        {/* No hand-off: this dialog holds the unsaved crew draft, and
+                            "Ask the agent" would navigate away from it. */}
+                        {builtFromError && <ErrorNotice message={builtFromError} variant="inline" testId="next-built-from-error" />}
+                        <Btn onClick={() => guardNav(() => setSection('advanced'))} disabled={navBlocked} data-testid="next-open-advanced">
+                          {i18nT('crewEditorNext.open_advanced')}
+                        </Btn>
+                      </div>
+                    </Field>
+                  ) : (
                   <Field label={templateFieldLabel} hint={i18nT('crewEditorNext.built_from_hint')}>
                     <SimpleSelect
                       options={templateOptions}
+                      optionLabels={templateOptions.map(templateDisplayName)}
                       value={kiroAgent}
                       onChange={onTemplateSwitch}
                       disabled={templateSwitchLocked}
@@ -735,6 +766,7 @@ export default function CrewEditorNextDialog({
                       testId="next-template-switch-error"
                     />
                   </Field>
+                  )}
 
                   <WorkspaceField
                     options={workspaceOptions}
@@ -909,10 +941,12 @@ export default function CrewEditorNextDialog({
                                 {i18nT('crewEditorNext.read_only')}
                               </div>
                               <div className="text-[14px] text-text">
-                                {i18nT('crewEditorNext.built_from_headline')} <span className="font-mono font-semibold">{caps.template.name}</span>
+                                {i18nT('crewEditorNext.built_from_headline')} <span className="font-semibold" data-testid="next-builtfrom-name">{ownsFile ? builtFromName : templateDisplayName(caps.template.name)}</span>
+                                {/* No hand-off: the unsaved crew draft, as above. */}
+                                {ownsFile && builtFromError && <ErrorNotice message={builtFromError} variant="inline" testId="next-builtfrom-error" />}
                               </div>
                               <p className="m-0 text-[12px] leading-relaxed text-muted">
-                                {i18nT('crewEditorNext.built_from_body')}
+                                {i18nT(ownsFile ? 'crewEditorNext.built_from_body_mate' : 'crewEditorNext.built_from_body')}
                               </p>
                             </div>
 
@@ -926,9 +960,9 @@ export default function CrewEditorNextDialog({
                                 two-action cap. */}
                             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                               {([
-                                { tab: 'tools' as const, label: i18nT('crewEditorNext.tab_tools'), n: presentRows(caps.rows, 'tools').length },
-                                { tab: 'mcp' as const, label: i18nT('crewEditorNext.stat_mcp_servers'), n: presentRows(caps.rows, 'mcpServers').length },
-                                { tab: 'skills' as const, label: i18nT('crewEditorNext.tab_skills'), n: presentRows(caps.rows, 'skills').length },
+                                { tab: 'tools' as const, label: i18nT('crewEditorNext.tab_tools'), n: presentRows(builtFromRows, 'tools').length },
+                                { tab: 'mcp' as const, label: i18nT('crewEditorNext.stat_mcp_servers'), n: presentRows(builtFromRows, 'mcpServers').length },
+                                { tab: 'skills' as const, label: i18nT('crewEditorNext.tab_skills'), n: presentRows(builtFromRows, 'skills').length },
                               ]).map(stat => (
                                 <div
                                   key={stat.tab}
@@ -966,7 +1000,7 @@ export default function CrewEditorNextDialog({
                                 testId="next-builtfrom-unavailable"
                               />
                             )}
-                            {caps.template.available && caps.template.source !== 'builtin' && caps.template.source !== 'package' && (
+                            {!ownsFile && caps.template.available && caps.template.source !== 'builtin' && caps.template.source !== 'package' && (
                               <p className="m-0 text-[12px] text-muted" data-testid="next-builtfrom-authored">
                                 {i18nT('crewEditorNext.template_authored')}
                               </p>
@@ -975,18 +1009,18 @@ export default function CrewEditorNextDialog({
                         )}
                         {builtFromTab === 'tools' && (
                           <ToolsTab
-                            rows={presentRows(caps.rows, 'tools')}
+                            rows={presentRows(builtFromRows, 'tools')}
                             autoApproved={autoApprovedTools}
                             filter={toolFilter}
                             onFilter={setToolFilter}
                           />
                         )}
                         {builtFromTab === 'mcp' && (
-                          <McpServersTab rows={presentRows(caps.rows, 'mcpServers')} />
+                          <McpServersTab rows={presentRows(builtFromRows, 'mcpServers')} />
                         )}
                         {builtFromTab === 'skills' && (
                           <SkillsTab
-                            rows={presentRows(caps.rows, 'skills')}
+                            rows={presentRows(builtFromRows, 'skills')}
                             filter={skillFilter}
                             onFilter={setSkillFilter}
                           />
@@ -1153,6 +1187,14 @@ export default function CrewEditorNextDialog({
                   </div>
                   </>)}
                 </div>
+              )}
+
+              {effectiveSection === 'advanced' && (
+                <WorkerKitPane
+                  member={editing}
+                  name={displayName.trim() || (editingAgent ? crewDisplayName(editingAgent) : editing)}
+                  templates={kiroAgentOptions}
+                />
               )}
 
               {effectiveSection === 'danger' && !isDefaultCrew && (

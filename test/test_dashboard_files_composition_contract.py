@@ -44,6 +44,11 @@ from kiro_crew._facade_compose import compose as facade_compose
 from kiro_crew.dashboard import file_api
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
+# Kept in a tree_scan group (300 s, test/conftest.py): the tree-route check runs the
+# link-screen gate, whose resolver names come from a call graph over every module, so
+# no literal can narrow which files it parses.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_dashboard_files_composition_contract")
+
 _FACADE = files.__name__
 _FACADE_PATH = Path(files.__file__).resolve()
 _OWNER_PACKAGE = file_api.__name__
@@ -256,7 +261,8 @@ _OWNER_CONSTANTS = {"git_panel": ("_GIT_PANEL_STDOUT_CAP",)}
 #: Recaptured with the ``path_probe``, ``outbox``, ``channel_upload``, ``desktop`` and
 #: ``editor`` owners, from the base file, where each of their names had the same shape.
 #: Recaptured when ``_run_path_probe`` gained its keyword-only ``stall_path``.
-_BASE_SHAPE_DIGEST = "00b01a4e5eb247df7c73163e04a56f9bf00495f64187cd93a253fc958c3a9d8e"
+#: Recaptured when ``api_file_download`` began answering a ``web.StreamResponse``.
+_BASE_SHAPE_DIGEST = "b462dcc17ed8ba47197333e00c15ef7b63c8817837a43d28d4f582a720c3b788"
 #: Definitions that stay in the facade file: the seams the owners share -- the SEL
 #: accessor, the file-send audit, the sub-agent session mapping and the request-body
 #: error code -- the search walk's clock, the file viewer's owner-view verdict, whose

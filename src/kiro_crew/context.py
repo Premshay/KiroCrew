@@ -81,6 +81,7 @@ from kiro_crew.context_assembly import replay as _replay
 from kiro_crew.context_assembly import sections as _sections  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly import session_start as _session_start  # noqa: F401
 from kiro_crew.context_assembly import store_admission as _store_admission  # noqa: F401
+from kiro_crew.context_assembly import tool_names as _tool_names  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly import turn as _turn  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly import turn_message as _turn_message  # noqa: F401 - loaded eagerly
 from kiro_crew.context_assembly.agent_spec import (  # noqa: F401
@@ -1291,18 +1292,25 @@ def _skills_injection_plan(
     hand-copied second gate is exactly what let the re-injection path ship
     without scoping, handing a mapped agent the catalog its mapping excludes.
     """
+    from kiro_crew.agent_files import is_kirocrew_default_agent
+
     inherit = provider_type == PROVIDER_ACP
     pinned = pinned_skill_globs(session_key, project_dir=project_dir, inherit_defaults=inherit)
     globs = (
         pinned
         if pinned is not None
         else (
-            agent_skill_globs(agent, project_dir=project_dir, inherit_defaults=inherit)
+            agent_skill_globs(
+                agent,
+                project_dir=project_dir,
+                inherit_defaults=inherit,
+                session_key=session_key or "",
+            )
             if agent
             else []
         )
     )
-    is_custom = bool(agent) and agent != "kirocrew"
+    is_custom = bool(agent) and not is_kirocrew_default_agent(agent)
     return (bool(globs) or not is_custom), globs
 
 

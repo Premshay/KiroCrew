@@ -117,6 +117,33 @@ validation strictness, whether bookkeeping may live in-spec, its
 shadowing/selection rules, its hook-event vocabulary, whether it can resolve an
 `"auto"` model, and its protocol-version shape.
 
+**A spec built for one session.** A crewmate's worker runs a spec built per
+session: the source-defined `kirocrew-mate-worker` base (generated, with the
+conductor, into `~/.kiro/mates/agents/`, which kiro-cli does not list) plus that crewmate's
+own additions and the tools it switches off (`mate_worker.worker_session_spec`,
+the one harness-neutral seam; crew-mode.md, "The worker runs on its crewmate's
+backend"). It is carried the way a member chat's saved spec is, so it runs on the
+hosts in `ACP_BACKENDS_MATE_WORKER_KIT` and is refused with the member chat's
+codes elsewhere (harness-parity.md). KAS takes every agent over the wire per
+session, so its projection reads the seam. claude, the one mirrored host in the
+set, builds its `session/new` `mcpServers` array from `session_mcp_projection`,
+which reads the seam for a worker session by its key, so the worker's own servers
+reach it; a
+worker whose base is absent or unreadable is refused there (`WorkerKitUnreadable`),
+as on KAS, rather than run on the control plane alone. Its
+prompt reaches claude in the `[AGENT SYSTEM PROMPT]` block, which reads the same seam
+by the session key (`context_assembly.agent_spec._crewmate_worker_prompt`), so the
+worker's own principles and the crewmate's prompt follow the base there too. The
+crewmate's addition is measured against the on-disk worker base, as KAS's is, so a
+file that repeats that base (one copied from the default template) adds nothing. Only
+the hosts in `ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT`, whose mirrors project no
+spec prompt, get that addition; KAS's block stays the base, as its wire spec carries both. The
+rest of the spec reaches claude only as far as the member path carries it, and the
+columns above say what that is. kiro-cli reads `--agent` off disk at spawn, from
+`~/.kiro/agents/`, so it cannot find the worker spec and is not in the set. A
+stored `kiro` member backend reads as KAS, but a worker can still land on kiro-cli
+when KAS is not selectable on the host; it is refused there before spawn.
+
 ## 2. Session persistence
 
 | | kiro-cli | KAS | CC | Codex | OpenCode | Pi | goose | DeepSeek |
@@ -364,6 +391,16 @@ any) bypasses the permission callback, and its tool-reference grammar.
 | Consumer surface | `TurnUsage.credits` / `cost_usd` on each turn, `GET /api/usage/kiro` for session analytics and cached billing, and the credit pill, whose background fetch gates on `kiro-cli` being resolvable (`dashboard/handlers/sessions.py`) | same | `GET /api/usage/cost` returns `mode="cost"` vs `mode="kiro"`, plus a companion-side budget cap (companion) | none, and this is the one row in this bucket that is a gap rather than a seam: the credit pill's background fetch is not harness-aware — it gates on `kiro-cli` being resolvable, not on the session's backend (`dashboard/handlers/sessions.py`) — so a codex session on a host with kiro-cli installed still shows Kiro credits | the same chat surfaces every backend's usage reaches; no credit row, because there is no quota to report | none — no usage frame reaches Crew, so the chat surfaces show nothing for a pi turn and no credit row | the same chat surfaces every backend's usage reaches; no credit row, because there is no quota to report | the same chat surfaces every backend's usage reaches; no credit row, because there is no quota to report |
 
 Consumers read the turn's `TurnUsage` fields and the usage routes, not the harness's own endpoints.
+
+`ACP_BACKENDS_REPORT_USAGE` (`agent_sdk/backends_turns.py`) names the columns
+whose turns land billing or token counts in `TurnUsage`: kiro-cli and KAS in
+credits, CC, OpenCode and goose in token counts on the `session/prompt` result.
+On a member a turn that reports none billed none, which is what lets memory
+consolidation take an empty, unbilled reply as free; it reads the provider's
+`reports_turn_usage`. Codex and Pi are outside the set because this section
+establishes no usage for them, and DeepSeek because its `usage_update` carries
+context occupancy (`used`, `size`), which feeds the context meter rather than
+`TurnUsage`, and its captured `session/prompt` result carries no token counts.
 
 **A provider must declare:** its billing unit, its quota API (or none), how its
 token is discovered, and its unattributable-overhead model.

@@ -6,7 +6,7 @@ import { sseTodoUpdate, sseMcpReportUpdate, sseSlotTitle, triggerRefresh, fetchS
 import { addNotification, ackNotificationByTs, unackNotificationByTs, clearAllNotifications } from '../store/notificationsSlice'
 import { dispatchMcNotification, dispatchLiveNotification } from './notificationEvent'
 import {
-  fetchHistory, startRemoteTurn, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, refreshSlot, sseContextUsage, clearMessages, clearSlotCache, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, sseMcpAppRender, sseSideQueue, queueEntryAttachments, isTerminalWorkflowStatus,
+  fetchHistory, startRemoteTurn, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, refreshSlot, sseContextUsage, clearMessages, clearSlotCache, resolveByApprovalId, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, sseMcpAppRender, sseSideQueue, queueEntryAttachments, isTerminalWorkflowStatus,
 } from '../store/chatSlice'
 import { store } from '../store'
 import { TAB_ID } from '../api/tabId'
@@ -59,6 +59,7 @@ import { useTurnCompletion } from './websocket/turnCompletion'
 import { attachFocusRelay, focusedSlotForCurrentSurface } from './websocket/attention'
 import { emitAppReload, emitChannelEvent, emitComputerUseFrame, emitCronHistory } from './websocket/browserEvents'
 import { runFirstConnect, runReconnectCatchUp } from './websocket/reconnectCatchUp'
+import { batchedUnlessOpen } from '../lib/streamBatch'
 
 /* The dashboard's single multiplexed WebSocket. `useWebSocket` composes the
    owners under ./websocket — connection, stream buffers, voice, approvals,
@@ -421,6 +422,22 @@ export function useWebSocket() {
             // which the command center reads too.
             approvals.onApprovalResolved(data)
             break
+          case 'elicitation_resolved':
+            // An MCP server's question was answered (by the person, or cancelled
+            // when its window ran out): stamp the card's row so it stops offering
+            // buttons. Same row-by-approval_id write the permission rows take.
+            if (typeof data.id === 'string' && typeof data.slot === 'string') {
+              dispatch(resolveByApprovalId({
+                id: data.id,
+                slot: data.slot,
+                decision: String(data.action || 'cancel'),
+                ...(typeof data.mid === 'string' && data.mid ? { mid: data.mid } : {}),
+                // The accepted form's values, so the card's summary fills in
+                // without waiting for a transcript reload.
+                ...(data.answer && typeof data.answer === 'object' && !Array.isArray(data.answer) ? { answer: data.answer as Record<string, unknown> } : {}),
+              }))
+            }
+            break
           case 'refresh': {
             const kinds: string[] = data.kinds || []
             dispatch(triggerRefresh())
@@ -516,7 +533,7 @@ export function useWebSocket() {
             chatStream.onToolCall(data)
             break
           case 'tool_result':
-            dispatch(sseToolResult(data as { slot: string; output: string; tool_call_id?: string; final?: boolean }))
+            dispatch(batchedUnlessOpen(data.slot, sseToolResult(data as { slot: string; output: string; tool_call_id?: string; final?: boolean })))
             break
           case 'mcp_app_render':
             // MCP App (SEP-1865) render payload from the gateway. Stored by
@@ -775,11 +792,11 @@ export function useWebSocket() {
             break
           }
           case 'chat_status':
+            // Buffered with the slot's chunks: the label and the text around
+            // it land in the frame's one flush, in arrival order.
             if (data.slot && data.status) {
-              // The server emits this only after admitting the turn, ending
-              // the optimistic pre-send window for this slot.
               dispatch(startRemoteTurn(data.slot))
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', label: data.status, ts: Date.now() }))
+              buffers.bufferStatusLabel(data.slot, { kind: 'thinking', label: data.status })
             }
             // Repair a queue-pop frame missed during reconnect from the exact
             // IDs repeated on the successor turn's status frame.

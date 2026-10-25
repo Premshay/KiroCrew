@@ -315,6 +315,7 @@ from kiro_crew.dashboard.server_runtime.mcp_routes import (  # noqa: F401
 )
 from kiro_crew.dashboard.server_runtime.middleware_chain import (  # noqa: F401
     _dashboard_canonical_redirect,
+    _insert_enterprise_gate,
     _install_api_middlewares,
     _install_dashboard_middlewares,
     _resolve_tailnet_trust,
@@ -422,6 +423,7 @@ from kiro_crew.hooks import ScriptHookStore, set_global_hook_store
 from kiro_crew.instances import run_marker  # noqa: F401
 from kiro_crew.instances.registry import InstancesRegistry  # noqa: F401
 from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager, TunnelState  # noqa: F401
+from kiro_crew.mate_config_migration import migrate_existing_crewmates
 from kiro_crew.mcp_gateway.socketsec import chmod_socket_0600  # noqa: F401
 from kiro_crew.metrics.http_metrics import (  # noqa: F401
     make_route_latency_middleware,
@@ -816,6 +818,11 @@ async def start_dashboard(
         assume_ready=assume_kiro_ready,
     )
     state.kiro_prerequisite_service = app["kiro_prerequisite_service"]
+    # Enterprise build only: start CLOSED until a probe sees a kiro login. The
+    # middleware chain installed below reads the gate this puts on the app.
+    from kiro_crew.dashboard.enterprise_gate_middleware import install_enterprise_gate
+
+    install_enterprise_gate(app, app["kiro_prerequisite_service"])
     # A signed-out bundled kiro-cli-chat fails a prompt as a bare connection
     # error; the ACP layer asks this service's whoami verdict to tell it apart.
     from kiro_crew.kiro_prerequisite import register_turn_auth_service
@@ -1440,7 +1447,26 @@ async def start_dashboard(
     # Converge leftover channel transcript copies BEFORE the restores read them.
     await _converge_channel_transcripts(state)
 
+    # Move every existing crewmate still bound to an agent onto its worker and
+    # its own file, carrying that agent's kit, so the product never carries two
+    # kinds of crewmate at once. Additive and idempotent (see
+    # mate_config_migration.py), so a failure here is logged and left for the
+    # next boot rather than blocking startup.
+    # The move is one way: nothing undoes it.
+    try:
+        await asyncio.to_thread(migrate_existing_crewmates, cfg)
+    except Exception:
+        logger.warning("mate-owned-config migration failed", exc_info=True)
+
     await _restore_dashboard_sessions(state, cfg)
+
+    # A crewmate the migration above moved tells its user once, in its own
+    # thread; a thread not open yet is offered it at its next turn end.
+    from kiro_crew.dashboard.mate_thread_wakes import offer_upgrade_notices
+
+    _notice_task = asyncio.create_task(offer_upgrade_notices(state))
+    state._background_tasks.add(_notice_task)
+    _notice_task.add_done_callback(state._background_tasks.discard)
 
     # Relaunch agents in non-archived channels. A gateway defers this batch
     # until its restore/open task completes; a standalone dashboard preserves

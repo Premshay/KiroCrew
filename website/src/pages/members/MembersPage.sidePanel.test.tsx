@@ -69,7 +69,7 @@ vi.mock('../../api/client', () => ({
       get: vi.fn(() => Promise.resolve({
         slug: '', member: '', goals: [],
         key_results: [], reports: [], removed_key_result: null, removed_goal: null,
-        schedules: { time: '09:00', timezone: '', daily: false, weekly: false, weekday: 1, monthly: false, month_day: 1 },
+        schedules: { time: '09:00', timezone: '', daily: false, weekly: false, weekday: 1, monthly: false, month_day: 1, heartbeat: false, interval: 60 },
         limits: { goal_text_max_chars: 2000, key_result_text_max_chars: 200, key_result_value_max_chars: 40, key_result_reading_max_chars: 120 },
       })),
     },
@@ -465,8 +465,8 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     // team creation is hidden for the phase.
     fireEvent.pointerDown(screen.getByTestId('member-add'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
     const addMenu = await screen.findByTestId('member-add-menu')
-    // New crewmate only; no team door.
-    expect(within(addMenu).getAllByRole('menuitem')).toHaveLength(1)
+    // New crewmate and Import from file only; no team door.
+    expect(within(addMenu).getAllByRole('menuitem')).toHaveLength(2)
     expect(screen.queryByTestId('member-add-team')).toBeNull()
     await closeAddMenu()
 
@@ -805,7 +805,16 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(screen.getByTestId('crew-profile-face')).not.toHaveStyle({ visibility: 'hidden' })
   })
 
-  it("Goals' track row sends a visible message to the mate and closes the floating card", async () => {
+  /** The New goal modal's one button: the opening message into this mate's thread. */
+  const NEW_GOAL_MESSAGE = 'I want to set a goal for you. Ask me what matters, then write it down for me to approve.'
+  async function sendNewGoal() {
+    fireEvent.click(screen.getByRole('tab', { name: 'Goals' }))
+    fireEvent.click(await screen.findByTestId('crew-goals-add'))
+    const dialog = await screen.findByRole('dialog', { name: 'New goal' })
+    fireEvent.click(within(dialog).getByTestId('crew-goals-new-goal-send'))
+  }
+
+  it("Goals' New goal modal sends a visible message to the mate and closes the floating card", async () => {
     const sendMock = api.sendChat as ReturnType<typeof vi.fn>
     sendMock.mockClear()
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
@@ -813,20 +822,19 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     await screen.findByTestId('side-panel-root')
     fireEvent.click(await screen.findByTestId('member-identity-pill'))
     await screen.findByTestId('crew-profile-modal')
-    fireEvent.click(screen.getByRole('tab', { name: 'Goals' }))
-    fireEvent.click(await screen.findByTestId('crew-goals-track'))
-    fireEvent.change(await screen.findByTestId('crew-goals-track-input'), { target: { value: 'The release date' } })
-    fireEvent.click(screen.getByTestId('crew-goals-track-send'))
+    await sendNewGoal()
     await waitFor(() => expect(sendMock).toHaveBeenCalledTimes(1))
     const [message, slot, , , meta] = sendMock.mock.calls[0]
-    // The ordinary send path: the user's own words, no hidden nudge.
-    expect(message).toBe('Please track this for me: The release date')
+    // The ordinary send path: the message as the user's own, no hidden nudge.
+    expect(message).toBe(NEW_GOAL_MESSAGE)
     expect(slot).toBe('member-oncall')
     expect(meta).toBeUndefined()
+    // Delivered: the modal closes, and so does the card floating over the thread.
     await waitFor(() => expect(screen.queryByTestId('crew-profile-modal')).toBeNull(), { timeout: 3000 })
+    expect(screen.queryByRole('dialog', { name: 'New goal' })).toBeNull()
   })
 
-  it("Goals' track row leaves the docked card open", async () => {
+  it("Goals' New goal modal leaves the docked card open", async () => {
     const sendMock = api.sendChat as ReturnType<typeof vi.fn>
     sendMock.mockClear()
     localStorage.setItem(PANEL_OPEN_KEY, '0')
@@ -834,11 +842,13 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     fireEvent.click(await rosterRow('oncall'))
     fireEvent.click(await screen.findByTestId('member-identity-pill'))
     await screen.findByTestId('crew-profile-docked')
-    fireEvent.click(screen.getByRole('tab', { name: 'Goals' }))
-    fireEvent.click(await screen.findByTestId('crew-goals-track'))
-    fireEvent.change(await screen.findByTestId('crew-goals-track-input'), { target: { value: 'The release date' } })
-    fireEvent.click(screen.getByTestId('crew-goals-track-send'))
+    await sendNewGoal()
     await waitFor(() => expect(sendMock).toHaveBeenCalledTimes(1))
+    const [message, slot, , , meta] = sendMock.mock.calls[0]
+    expect(message).toBe(NEW_GOAL_MESSAGE)
+    expect(slot).toBe('member-oncall')
+    expect(meta).toBeUndefined()
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'New goal' })).toBeNull())
     expect(screen.getByTestId('crew-profile-docked')).toBeInTheDocument()
   })
 
@@ -1074,12 +1084,12 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(pill).toHaveAccessibleName(/oncall/)
   })
 
-  it('the "+" menu offers New mate only: no Advanced or guided-flow rows', async () => {
+  it('the "+" menu offers New mate and Import from file only: no Advanced or guided-flow rows', async () => {
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     await rosterRow('oncall')
     await openAddMenu()
     const menu = await screen.findByTestId('member-add-menu')
-    expect(within(menu).getAllByRole('menuitem').map(el => el.textContent?.trim())).toEqual(['New mate'])
+    expect(within(menu).getAllByRole('menuitem').map(el => el.textContent?.trim())).toEqual(['New mate', 'Import from file'])
   })
 
   it('the roster header "+" menu\'s New mate opens the card as a modal with Advanced settings folded, and they unfold inline — no trip to the crew manager', async () => {

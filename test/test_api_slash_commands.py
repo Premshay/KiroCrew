@@ -115,7 +115,14 @@ class TestApiSlashCommands:
         assert "/todos" not in names
 
     @pytest.mark.asyncio
-    async def test_claude_code_provider_filters_blocked_commands(self):
+    async def test_kiro_issue_is_not_advertised(self):
+        payload = await _get("kiro")
+        names = {item["name"] for item in payload}
+        assert "/issue" not in names
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend,supported", [("", False), ("claude", True)])
+    async def test_claude_code_provider_filters_blocked_commands(self, backend, supported):
         """The provider-reported path applies the same gate: a harness that
         reports a blocked command must not have it forwarded to the menu."""
         provider = _fake_provider(

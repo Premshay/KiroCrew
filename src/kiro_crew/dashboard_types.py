@@ -60,6 +60,7 @@ from kiro_crew.crew_log.projection import (
     _SLOT_FOLD_ROW_BYTES,
     _TREE_FOLD_ROW_BYTES,
     FOLD_NAMES,
+    INTERNAL_SLOT_PROJECTION_NAMES,
     OWNER_SERVED_SLOT_PROJECTION,
     SESSION_FOLD_NAMES,
     SLOT_PROJECTION_NAMES,
@@ -191,6 +192,7 @@ _NULLABLE: Final[dict[str, dict[str, Any]]] = {
 _OPAQUE: Final[dict[str, str]] = {
     "usage.by_model": "a model id",
     "usage.context.by_source": "a context source name",
+    "usage.context.measured_unknown": "a category name the agent engine reported",
     "tools.by_name": "a tool name",
     "approvals.by_decision": "a decision value",
     "subagents.by_id": "a subagent id",
@@ -220,6 +222,7 @@ def _row_keys() -> dict[str, dict[str, Any]]:
     from kiro_crew.crew_log.projection_crewmate import _MILESTONE_TEXT_KEYS, _WAITING_TEXT_KEYS
     from kiro_crew.crew_log.projection_side_panel import TIMELINE_MOMENT_KEYS
     from kiro_crew.crew_log.projection_subagents import SUBAGENT_ROW_KEYS
+    from kiro_crew.crew_log.projection_workers import WORKER_ROW_KEYS
 
     series = {
         "row_keys": ["hour", "credits", "accepted"],
@@ -262,6 +265,11 @@ def _row_keys() -> dict[str, dict[str, Any]]:
         "subagents.by_id": {
             "row_keys": list(SUBAGENT_ROW_KEYS),
             "names_the_row": "task",
+        },
+        "workers.items": {
+            "row_keys": list(WORKER_ROW_KEYS),
+            "names_the_row": "task",
+            "row_note": "current states, not completion percentages; timestamps are ISO strings",
         },
         "goal.goals": {"row_keys": ["text"], "names_the_row": "text"},
         "goal.milestones": {
@@ -441,7 +449,7 @@ def _keyed_by(name: str) -> str:
     """
     if name in TREE_PROJECTION_NAMES:
         return KEYED_BY_TREE
-    if name in SLOT_PROJECTION_NAMES:
+    if name in SLOT_PROJECTION_NAMES or name in INTERNAL_SLOT_PROJECTION_NAMES:
         return KEYED_BY_SLOT
     return KEYED_BY_SESSION
 

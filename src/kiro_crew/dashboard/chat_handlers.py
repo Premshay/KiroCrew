@@ -191,11 +191,13 @@ from kiro_crew.dashboard.chat_api.slot_approval import (  # noqa: F401
     _approval_target_required,
     _deny_approval_mode,
     _deny_trust_pattern,
+    _elicitation_not_an_approval,
     _end_trust_scope,
     _end_trust_scopes,
     _get_pattern_from_pending,
     _grant_deadline,
     _internal_session_approval_refusal,
+    _pending_elicitation_ids,
     _still_owning,
     api_chat_mode,
     api_chat_slot_approve,
@@ -207,6 +209,7 @@ from kiro_crew.dashboard.chat_api.slot_create import (  # noqa: F401
     _created_slot_row,
     _default_template_stamp,
     _persist_app_agent_owner,
+    _retract_failed_newborn,
     api_chat_slot_create,
 )
 from kiro_crew.dashboard.chat_api.slot_detail import (  # noqa: F401
@@ -238,6 +241,7 @@ from kiro_crew.dashboard.chat_api.slot_guards import (  # noqa: F401
     _record_explicit_agent_selection,
     _reset_slot_session_or_warn,
     _slot_replaced_while_queued,
+    _subagents_attached_detail,
     _subagents_attached_response,
     _switch_target_busy,
 )
@@ -621,7 +625,9 @@ _source_link_unlink_tasks: set[asyncio.Task] = set()
 #: assistant text reaches this endpoint — the client filters raw ``chunk`` itself.
 #: ``done`` is discarded by ``_prepare_messages`` regardless, and ``queued`` stays
 #: listed because the client rebuilds those bubbles from the payload's ``queue``.
-_UNOWED_WINDOW_ROLES = _TRANSIENT_ROLES - {"permission", "chunk", "streaming"}
+#: ``elicitation`` is carved out for the same reason as ``permission``: a pending
+#: ask is actionable and the client reads it out of the transcript.
+_UNOWED_WINDOW_ROLES = _TRANSIENT_ROLES - {"permission", "elicitation", "chunk", "streaming"}
 
 
 # Modes a slot may be CREATED with. A deliberate superset of the mode-SWITCH

@@ -19,6 +19,22 @@ import pytest
 from kiro_crew.config.loader import KiroCrewConfig
 
 
+@pytest.fixture(autouse=True)
+def _no_crewmate_files_from_other_tests(_floor_monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with no crewmate-owned names in the dispatch snapshot.
+
+    A crewmate's own file chats on the conductor
+    (``mate_worker.member_chat_agent``), so a name an earlier test in this worker
+    published (``atlas``, say) would read as a crewmate's file here.
+    """
+    from kiro_crew import mate_worker
+    from kiro_crew.config import loader
+
+    _floor_monkeypatch.setattr(loader, "_MATERIALIZED_MATE_ONLY", frozenset())
+    # A cold snapshot rescans the crewmate folder, which tests in this worker share.
+    _floor_monkeypatch.setattr(mate_worker, "is_mate_owned_agent", lambda name: False)
+
+
 class TestStarDefaultTemplateCarry:
     """A "Default for new sessions" pick from before plain sessions were template
     sessions -- an enrolled alias plus the roster's ``default_agent`` -- is carried
@@ -257,12 +273,24 @@ class TestDanglingDefaultAgentReset(unittest.TestCase):
     not evidence of a removal."""
 
     def setUp(self):
+        import gc
+
         import kiro_crew.config.loader as loader
+
+        # Drain any cyclic garbage created by the previous test before this one
+        # starts.  The workspace-aware tests below (_workspace_declares path)
+        # can leave a reference cycle involving a PosixPath; if the cycle is
+        # only collected during *this* test's body the unraisable exception is
+        # blamed on the innocent victim here rather than on the actual leaker.
+        # Two passes cover chains of cycles.
+        gc.collect()
+        gc.collect()
 
         loader._MATERIALIZED_AGENTS = frozenset()
         loader._MATERIALIZED_STEMS = {}
         loader._MATERIALIZED_SEEN.clear()
         loader._MATERIALIZED_LAST_DROPPED.clear()
+        loader._MATERIALIZED_MATE_ONLY = frozenset()
         loader._MATERIALIZED_COMPLETE = False
         loader._MATERIALIZED_AGENTS_READY = False
         loader._MATERIALIZED_AGENTS_GENERATION = 0
@@ -324,6 +352,73 @@ class TestDanglingDefaultAgentReset(unittest.TestCase):
         assert event.event_type == "default_agent_reset"
         assert event.resources == "agent:pkg"
         assert event.metadata == {"template": "captain", "reset_to": "default"}
+
+    def test_the_edition_lookup_with_no_context_does_not_re_enter_itself(self):
+        # With no installed context, the edition lookup builds one, which loads
+        # config, which can reach the lookup again. Unguarded, that runs to the
+        # recursion limit, where a GC finalizer fails whichever test is running.
+        import kiro_crew.config.loader as loader
+        import kiro_crew.platform.context as context
+
+        real = context.current_context
+        depth = [0]
+        peak = [0]
+
+        def counting():
+            depth[0] += 1
+            peak[0] = max(peak[0], depth[0])
+            try:
+                return real()
+            finally:
+                depth[0] -= 1
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "pkg": {"kiro_agent": "captain"}},
+                "pkg",
+                {"kirocrew.json": {"name": "kirocrew"}, "captain.json": {"name": "captain"}},
+            )
+            p1, p2 = self._patched(config, d)
+            with (
+                p1,
+                p2,
+                unittest.mock.patch("kiro_crew.sel.sel"),
+                unittest.mock.patch.object(context, "_ACTIVE", None),
+                unittest.mock.patch.object(context, "current_context", counting),
+            ):
+                loader.refresh_materialized_agents(heal_default=True)
+                (d / "captain.json").unlink()
+                with self.assertLogs("kiro_crew.config.loader", level="WARNING"):
+                    loader.refresh_materialized_agents(heal_default=True)
+            on_disk = self._on_disk(config)
+        assert on_disk["default_agent"] == "default"
+        assert peak[0] == 1
+
+    def test_an_unreadable_crewmate_file_is_not_removal_evidence(self):
+        # The default is a crewmate whose own file sits in the crewmate folder.
+        # That file turning unreadable leaves the user-level scan complete, but
+        # must not read as the crewmate's file being gone.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "ada": {"kiro_agent": "ada"}},
+                "ada",
+                {"kirocrew.json": {"name": "kirocrew"}},
+            )
+            mates = Path(td) / "mates"
+            mates.mkdir()
+            (mates / "ada.json").write_text(json.dumps({"name": "ada"}), encoding="utf-8")
+            p1, p2 = self._patched(config, d)
+            p3 = unittest.mock.patch.object(loader, "mate_agents_dir", lambda: mates)
+            with p1, p2, p3, unittest.mock.patch("kiro_crew.sel.sel"):
+                loader.refresh_materialized_agents(heal_default=True)
+                (mates / "ada.json").write_text("{torn", encoding="utf-8")
+                loader.refresh_materialized_agents(heal_default=True)
+                assert "ada" in loader._MATERIALIZED_AGENTS
+            assert self._on_disk(config)["default_agent"] == "ada"
 
     def test_file_name_binding_counts_as_the_declared_agent(self):
         # A row that recorded the FILE name is healthy while that file declares

@@ -377,11 +377,12 @@ class TestRunChatWakaTimeCodingAccounting:
         events = [_statusless_coding_tool_call(f"tc-wt-{i}") for i in range(500)]
         _set_stream(client, [*events, _complete()])
 
+        config = self._wakatime_config()
         with (
             patch.object(
                 chat_runner.KiroCrewConfig,
                 "load",
-                return_value=self._wakatime_config(),
+                return_value=config,
             ),
             patch.object(chat_runner, "note_coding_activity") as note_activity,
         ):
@@ -390,6 +391,7 @@ class TestRunChatWakaTimeCodingAccounting:
         # Per-call ids are not retained: any number of successful coding calls
         # collapses to one bounded bit and one turn-level heartbeat.
         note_activity.assert_called_once()
+        assert note_activity.call_args.kwargs["config"] is config
 
     @pytest.mark.asyncio
     async def test_auto_approved_coding_call_emits_one_cadence_heartbeat(self, tmp_path):
@@ -425,7 +427,7 @@ class TestRunChatWakaTimeCodingAccounting:
 
         client.approve_tool.assert_not_awaited()
         client.reject_tool.assert_not_awaited()
-        note_cadence.assert_called_once()
+        note_cadence.assert_called_once_with(slot.project or None)
 
     @pytest.mark.asyncio
     async def test_many_auto_approved_coding_results_emit_one_throttled_cadence(self, tmp_path):
@@ -455,7 +457,7 @@ class TestRunChatWakaTimeCodingAccounting:
             await _drive(state, slot)
 
         client.approve_tool.assert_not_awaited()
-        note_cadence.assert_called_once()
+        note_cadence.assert_called_once_with(slot.project or None)
 
     @pytest.mark.asyncio
     async def test_approved_coding_call_emits_one_cadence_heartbeat(self, tmp_path):
@@ -497,7 +499,8 @@ class TestRunChatWakaTimeCodingAccounting:
         ):
             await _drive(state, slot)
 
-        note_cadence.assert_called_once()
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+        note_cadence.assert_called_once_with(slot.project or None)
 
     @pytest.mark.asyncio
     async def test_denied_pending_id_is_drained_before_a_later_decision(self, tmp_path):
@@ -546,6 +549,8 @@ class TestRunChatWakaTimeCodingAccounting:
         ):
             await _drive(state, slot)
 
+        client.reject_tool.assert_awaited_once_with("req-wt-deny")
+        client.approve_tool.assert_awaited_once_with("req-wt-later")
         note_activity.assert_not_called()
 
     @pytest.mark.asyncio
@@ -636,6 +641,7 @@ class TestRunChatWakaTimeCodingAccounting:
             )
         await _settle(slot)
 
+        client.stream.assert_called_once()
         note_activity.assert_not_called()
 
     @pytest.mark.asyncio
@@ -685,6 +691,7 @@ class TestRunChatWakaTimeCodingAccounting:
             )
         await _settle(slot)
 
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
         note_cadence.assert_not_called()
 
     @pytest.mark.asyncio
@@ -708,9 +715,17 @@ class TestRunChatWakaTimeCodingAccounting:
             ],
         )
 
-        with patch.object(chat_runner, "note_coding_activity") as note_activity:
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
             await _drive(state, slot)
 
+        client.stream.assert_called_once()
         note_activity.assert_not_called()
 
     @pytest.mark.asyncio
@@ -740,8 +755,12 @@ class TestRunChatWakaTimeCodingAccounting:
             await _drive(state, slot)
 
         # Exactly one shed summary for the whole turn, not one line per dropped
-        # call — the amplified-log finding.
-        shed = [r for r in caplog.records if "wakatime pending-coding cap" in r.message]
+        # call.
+        shed = [
+            r
+            for r in caplog.records
+            if r.name == chat_runner.logger.name and "wakatime pending-coding cap" in r.message
+        ]
         assert len(shed) == 1
         assert "shed" in shed[0].message
         # Unguarded execution counts once for the turn.
@@ -764,17 +783,19 @@ class TestRunChatWakaTimeCodingAccounting:
             ],
         )
 
+        config = self._wakatime_config()
         with (
             patch.object(
                 chat_runner.KiroCrewConfig,
                 "load",
-                return_value=self._wakatime_config(),
+                return_value=config,
             ),
             patch.object(chat_runner, "note_coding_activity") as note_activity,
         ):
             await _drive(state, slot)
 
         note_activity.assert_called_once()
+        assert note_activity.call_args.kwargs["config"] is config
 
     @pytest.mark.asyncio
     async def test_heartbeat_uses_project_captured_at_turn_start(self, tmp_path):
@@ -822,6 +843,7 @@ class TestRunChatWakaTimeCodingAccounting:
         ):
             await _drive(state, slot, _turn_actor="cron")
 
+        client.stream.assert_called_once()
         note_activity.assert_not_called()
 
     @pytest.mark.asyncio
@@ -864,6 +886,7 @@ class TestRunChatWakaTimeCodingAccounting:
         ):
             await _drive(state, slot, _turn_actor="cron")
 
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
         note_cadence.assert_not_called()
 
 
@@ -1266,13 +1289,15 @@ class TestBlockedLinkCardRecords:
             assert all(token not in str(r) for r in links)
 
     def test_each_removed_value_is_checked_on_its_own(self):
-        """A link token right after ``.`` matches only at a delta start, and the
-        same delta also redacts a PAT: one span would cover both values, but
-        each is checked alone, so the token the whole-text pass would keep
-        withholds the segment and neither value is saved."""
-        token = "eyJ" + "a-b_" * 25 + "." + "c" * 21 + "-" + "d" * 21
+        """A token glued to the one before it is removed whole only by a
+        per-delta pass, and the same delta also redacts a PAT. The whole-text
+        pass's first match runs into the glued token and leaves its body in the
+        text, so the saved text shows more than the streamed redaction did: the
+        segment is withheld and neither value is saved."""
+        first = "ghp_" + "Ab1" * 12
+        token = "ghp_" + "Zq7" * 12
         pat = "ghp_" + "A1b2C3d4E5" * 3 + "f6G7h8"
-        deltas = ["prefix.", f"{token} and {pat}", " end"]
+        deltas = [f"tokens: {first}", f"{token} and {pat}", " end"]
         shown, removed = chat_runner._redact_delta(deltas[1])
         assert token not in shown and pat not in shown
         assert token in [value for value, _ in removed]
@@ -1281,10 +1306,27 @@ class TestBlockedLinkCardRecords:
         assert token not in content and pat not in content
 
     def test_a_record_holding_a_value_only_a_per_delta_pass_removed_fails_closed(self):
-        """A link token after ``.`` that only a per-delta
-        pass removes, inside a blocked link's query, must not be saved in the
-        link's record (``meta.blocked_links[].url``) any more than in the text.
-        Any record string holding such a value fails the flush closed."""
+        """A link token glued to a word, which only a per-delta pass removes
+        (the whole-text pass reads the letter before ``eyJ`` as part of a word),
+        inside a blocked link's query, must not be saved in the link's record
+        (``meta.blocked_links[].url``) any more than in the text. Any record
+        string holding such a value fails the flush closed."""
+        token = "eyJ" + "a-b_" * 25 + "." + "c" * 21 + "-" + "d" * 21
+        deltas = [f"https://{self.H}/r?q=prefix", token, "&padding=" + "z" * 80]
+        shown, removed = chat_runner._redact_delta(deltas[1])
+        assert token not in shown and token in [value for value, _ in removed]
+        content, links = self._flush(deltas)
+        assert token not in content
+        assert all(token not in str(r) for r in links)
+        assert (content, links) == (chat_runner._SEGMENT_UNCHECKED_TEXT, [])
+
+    def test_a_link_token_in_a_blocked_link_query_is_saved_in_neither_text_nor_record(self):
+        """A link token after ``.`` inside a blocked link's query, split across
+        deltas, is saved in neither the text nor the link's record
+        (``meta.blocked_links[].url``): the whole-text pass removes it, so the
+        segment saves the link's placeholder. The record check for a value only
+        a per-delta pass removed is covered by the
+        ``_records_hold_removed_credential`` tests below."""
         token = "eyJ" + "a-b_" * 25 + "." + "c" * 21 + "-" + "d" * 21
         deltas = [f"https://{self.H}/r?q=prefix.", token, "&padding=" + "z" * 80]
         shown, removed = chat_runner._redact_delta(deltas[1])
@@ -1292,7 +1334,7 @@ class TestBlockedLinkCardRecords:
         content, links = self._flush(deltas)
         assert token not in content
         assert all(token not in str(r) for r in links)
-        assert (content, links) == (chat_runner._SEGMENT_UNCHECKED_TEXT, [])
+        assert content == f"[REDACTED: suspicious URL to {self.H}]"
 
     def test_a_check_past_the_work_ceiling_fails_closed_without_scanning(self):
         """Tens of thousands of removed values would cost seconds of substring

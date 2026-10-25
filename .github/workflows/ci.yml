@@ -1802,6 +1802,7 @@ jobs:
             test/test_snapshot_read_only_real_view.py \
             test/test_pinned_order_real_sandbox.py \
             test/test_md_notebook_real_sandbox.py \
+            test/test_member_records_real_sandbox.py \
             src/kiro_crew/apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py \
             src/kiro_crew/apps/builtins/ops_mission_control/tests/test_schedule_file.py \
             src/kiro_crew/apps/builtins/auto_improvement/tests/test_dogfood_learnings.py \
@@ -2193,6 +2194,7 @@ jobs:
           pytest -v -n0 --no-cov --timeout=1200 -m real_adapter \
             --junitxml="$RUNNER_TEMP/real-adapter-results.xml" \
             test/test_codex_session_mcp.py \
+            test/test_codex_session_mcp_approval.py \
             test/test_opencode_session_mcp.py \
             test/test_per_tool_mcp_deny_single_binary.py \
             test/test_pi_gate_extension_mcp.py \
@@ -2293,18 +2295,18 @@ jobs:
         run: uv pip install --system coverage==7.10.6
 
       - name: Download shard coverage data
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: coverage-shard-*
           merge-multiple: true
 
       - name: Download required IPv6 coverage data
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: coverage-ipv6
 
       - name: Download required kernel lock owner coverage data
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: coverage-kernel-lock-owner
 
@@ -2553,14 +2555,14 @@ jobs:
 
       - name: Download backend coverage
         if: needs.coverage-combine.result == 'success'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: coverage-backend
           path: backend-cov
 
       - name: Download frontend coverage
         if: needs.changes.outputs.only_backend != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: coverage-frontend
           path: frontend-cov
@@ -3257,7 +3259,7 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Download shard blob reports
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: website/.vitest-reports
           pattern: frontend-blob-*

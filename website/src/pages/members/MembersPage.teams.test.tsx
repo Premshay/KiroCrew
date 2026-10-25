@@ -352,8 +352,8 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     // door returning is a revert rather than a rewrite.
     const item = await openAddMenu()
     expect(item).toBeInTheDocument()
-    // New crewmate only; no team door.
-    expect(within(screen.getByTestId('member-add-menu')).getAllByRole('menuitem')).toHaveLength(1)
+    // New crewmate and Import from file only; no team door.
+    expect(within(screen.getByTestId('member-add-menu')).getAllByRole('menuitem')).toHaveLength(2)
     expect(screen.queryByTestId('member-add-team')).toBeNull()
     await closeAddMenu()
     expect(screen.queryByTestId('team-dialog-body')).toBeNull()
@@ -583,6 +583,49 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     const counts = await within(await screen.findByTestId('team-view')).findByTestId('team-status-counts')
     expect(counts).toHaveTextContent('Runs: 1 today · 2 this week')
     expect(counts.className.split(/\s+/)).toEqual(expect.arrayContaining(['hidden', 'sm:inline']))
+  })
+
+  it('the status strip counts a routed delegation once, by its run', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date(2026, 8, 22, 12, 0, 0) })
+    const now = Date.now() / 1000
+    memberProjectionStore.apply('oncall', 'activity', {
+      recent: [
+        { ts: now - 60, via: 'spawn', project: '' },
+        { ts: now - 120, via: 'select_crew', project: '' },
+        { ts: now - 8 * 86400, via: 'spawn', project: '' },
+      ],
+      today: 2,
+      week: 2,
+    }, 1)
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Triage', members: ['oncall'] }] })
+    await renderPage([row({ name: 'oncall', slug: 'oncall' })])
+    await rosterRow('oncall')
+    fireEvent.click((await screen.findAllByTestId('team-group-header'))[0])
+    const counts = await within(await screen.findByTestId('team-view')).findByTestId('team-status-counts')
+    expect(counts).toHaveTextContent('Runs: 1 today · 1 this week')
+  })
+
+  it('the week feed names a delegated run as a run, not a chat', async () => {
+    const now = Date.now() / 1000
+    vi.mocked(api.memberActivity).mockResolvedValue({
+      slug: 'oncall',
+      member: 'oncall',
+      capped: false,
+      entries: [
+        { ts: now - 60, via: 'spawn', project: '' },
+        { ts: now - 120, via: 'spawn', project: '/home/me/crew/workspace' },
+      ],
+    })
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Triage', members: ['oncall'] }] })
+    await renderPage([row({ name: 'oncall', slug: 'oncall' })])
+    await rosterRow('oncall')
+    fireEvent.click((await screen.findAllByTestId('team-group-header'))[0])
+    const rows = await within(await screen.findByTestId('team-view')).findAllByTestId('team-week-row')
+    expect(rows.map((r) => r.textContent)).toEqual([
+      expect.stringContaining('Delegated run'),
+      expect.stringContaining('Delegated run in project workspace'),
+    ])
+    expect(rows.some((r) => /Chat/.test(r.textContent ?? ''))).toBe(false)
   })
 
   it('a team with no mates keeps its header and opens an empty team view', async () => {

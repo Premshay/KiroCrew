@@ -24,6 +24,7 @@ from kiro_crew import model_registry
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, is_valid_timezone, parse_time_string
 from kiro_crew.cron_service.model import validate_auto_pause_after_failures
 from kiro_crew.dashboard.cron_inject import chat_folder_exists, move_cron_job_tab
+from kiro_crew.dashboard.cron_timeout_field import timeout_secs_from_body
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.dashboard.handlers.cron_shared import (
     _CRON_BUSY_BODY,
@@ -446,6 +447,14 @@ async def api_crons_create(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid approval_mode"}, status=400)
     silent = body.get("silent", False)
     strict_schedule = body.get("strict_schedule", False)
+    # ``False`` creates the job already paused in the one locked write, so a
+    # caller that must never leave it running (an imported crewmate's cron)
+    # has no enabled-then-paused window. Only a real bool is honoured.
+    enabled = body.get("enabled", True)
+    if not isinstance(enabled, bool):
+        return web.json_response(
+            {"error": "enabled must be a boolean", "code": "invalid_enabled"}, status=400
+        )
     hide_in_chat = body.get("hide_in_chat", False)
     # A job created on a full context pays for memory, lessons, steering, skills
     # and prior history on every wake, whether or not the wake had anything to
@@ -458,6 +467,9 @@ async def api_crons_create(request: web.Request) -> web.Response:
     # here too, so a client that never sends the field keeps creating the same
     # persistent jobs it always did; only an explicit False opts a job out.
     persistent_session = body.get("persistent_session", True)
+    timeout_secs, timeout_err = timeout_secs_from_body(body)
+    if timeout_err is not None:
+        return timeout_err
     # Same folder_id contract as PATCH /api/crons/{id}: string or null → "",
     # anything else is a 400 so the two entry points cannot diverge.
     folder_id = body.get("folder_id", "")
@@ -534,6 +546,10 @@ async def api_crons_create(request: web.Request) -> web.Response:
     }
     if approval_mode:
         add_kwargs["approval_mode"] = approval_mode
+    if not enabled:
+        add_kwargs["enabled"] = False
+    if timeout_secs is not None:
+        add_kwargs["timeout_secs"] = timeout_secs
     # An app token's job is stamped as that app's, exactly as ``CronSDK`` stamps
     # it: without the stamp every later reader (the app's own PATCH/DELETE, the
     # cron session's scope, the disabled-app fire gate, uninstall cleanup) takes
@@ -592,7 +608,11 @@ async def api_crons_create(request: web.Request) -> web.Response:
             {"error": _redact_memory_field(str(exc)), "code": "invalid_cron"}, status=400
         )
     state.push_refresh("crons")
-    return web.json_response({"ok": True, "id": job.id})
+    from kiro_crew.dashboard.change_cards import cron_job_revision
+
+    # The fingerprint of the job as this write made it: a card step records it,
+    # so its Undo's baseline is what the card made, not a later edit.
+    return web.json_response({"ok": True, "id": job.id, "revision": cron_job_revision(job)})
 
 
 async def api_cron_delete(request: web.Request) -> web.Response:
@@ -751,6 +771,11 @@ async def api_cron_update(request: web.Request) -> web.Response:
     ):
         if key in body:
             kwargs[key] = body[key]
+    timeout_secs, timeout_err = timeout_secs_from_body(body)
+    if timeout_err is not None:
+        return timeout_err
+    if timeout_secs is not None:
+        kwargs["timeout_secs"] = timeout_secs
     # name routes through the same validator as POST (type check +
     # sanitize_string + length cap) so the two REST surfaces cannot diverge:
     # without it PATCH would pass the value through unvalidated, letting a

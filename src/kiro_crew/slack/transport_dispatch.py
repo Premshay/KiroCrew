@@ -938,6 +938,7 @@ async def handle_message_transport(
             audit_session_key=session_key,
             audit_agent=_agent or "kirocrew",
             closing_gate=turn_ceiling.gate(session_key, lambda: sessions.begin_turn(session_key)),
+            undelivered_watch_key=session_key,
         )
         # The thread's owner as of the moment the turn starts producing output.
         # A dashboard link landing during the run moves the conversation to a
@@ -1304,10 +1305,8 @@ async def handle_message_transport(
         # ── Rescue partial progress ──
         # A transient backend fault (the "died before streaming started" class,
         # a dropped stream) leaves the user row on disk and everything the model
-        # already produced in memory only. Nothing persisted it, so each retry
-        # re-read a transcript that ended at the question and started over: a
-        # 28-minute outage on 2026-09-02 burned five identical attempts that each
-        # re-derived the same ticket ids before dying again.
+        # already produced in memory only. Unpersisted, each retry re-reads a
+        # transcript that ends at the question and redoes the same work.
         #
         # Persisting the partial reply makes the next attempt resume — it reads
         # what was already established instead of rediscovering it. Guarded so
@@ -1457,20 +1456,31 @@ async def handle_message_transport(
         # wedge every later message in that conversation (and its queue drain)
         # until the gateway restarts, not merely lose this turn. Same guard as
         # Discord's dispatcher and the shared pipeline.
-        if renderer is not None:
-            try:
-                await renderer.close()
-            except Exception:
-                logger.warning(
-                    "Slack: renderer.close failed session=%s",
-                    session_key,
-                    exc_info=True,
-                )
-        if _acquired:
-            sessions.release(session_key)
-            # The release is what ends the turn for an open dashboard tab bound to
-            # this thread (it reads the lease as the turn running), and a release
-            # raises no slots push of its own. Refresh once more AFTER it, or the
-            # tab keeps showing the finished turn as running until the next
-            # background pass. Best-effort; never raises.
-            await _refresh_dashboard_tab(session_key)
+        #
+        # The release sits in a ``finally`` around the teardown, not after it:
+        # ``close()`` now awaits (it clears the thread status on a cancelled
+        # turn), so a ``!stop`` cancelling this task mid-close raises
+        # ``CancelledError`` -- which is not an ``Exception`` and would escape
+        # the guard below, skipping the release and leaking the semaphore. The
+        # ``finally`` gives the permit back on every exit path, matching the
+        # shared pipeline's own release guard.
+        try:
+            if renderer is not None:
+                try:
+                    await renderer.close()
+                except Exception:
+                    logger.warning(
+                        "Slack: renderer.close failed session=%s",
+                        session_key,
+                        exc_info=True,
+                    )
+        finally:
+            if _acquired:
+                sessions.release(session_key)
+                # The release is what ends the turn for an open dashboard tab
+                # bound to this thread (it reads the lease as the turn running),
+                # and a release raises no slots push of its own. Refresh once
+                # more AFTER it, or the tab keeps showing the finished turn as
+                # running until the next background pass. Best-effort; never
+                # raises.
+                await _refresh_dashboard_tab(session_key)

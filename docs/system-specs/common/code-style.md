@@ -255,7 +255,12 @@ family keeps two rules:
 that imports its facade or rebinds a shared global, fails a facade no test patches through,
 and executes only a few patches per facade. Each facade also gets a patch-reach test that
 executes every name the test trees patch through it (read with `test/facade_mirror_scan.py`)
-and proves the scan finds known seams (`test/test_session_pid_facade.py`).
+and proves the scan finds known seams (`test/test_session_pid_facade.py`). A check whose
+body is the same for every facade (the known-seam scan, the corpus-gate derivation, the
+layering, manifest and logger scans) is written once in `test/test_facade_shared_checks.py`
+and parametrized per module: a facade test file names the ones it needs in a module-level
+`SHARED_FACADE_CHECKS` tuple instead of copying their bodies, and keeps only the checks
+particular to its facade.
 
 **A large class keeps one class body**, in the facade or in one home module that sets
 `__module__` to the facade when a pickle, repr or test reads it. Members move to owners as
@@ -269,8 +274,8 @@ classes keep the facade's name because error text renders it, and a family-scope
 the original module's logger, `logging.getLogger("kiro_crew.<original>")`: the log format
 prints the logger name, and `caplog` tests filter on it.
 
-**Registries keyed by path follow the code.** A `_REDACTION_SINKS` row in
-`src/kiro_crew/security_posture.py` names the module that redacts that sink; when a split
+**Registries keyed by path follow the code.** A `_REDACTION_SINKS` row (in
+`src/kiro_crew/security_posture_sinks_*.py`) names the module that redacts that sink; when a split
 moves the redactor calls, re-key the row to the owner that now makes them. The sink test
 in `test/test_security_posture.py` also counts calls in the facade's declared owners, so a
 row left on the facade can stay green while it no longer tells an operator where the sink

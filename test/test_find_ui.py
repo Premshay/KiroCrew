@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from kiro_crew import mcp_guide, ui_index
+from kiro_crew import guide_catalog, mcp_guide, ui_index
 from kiro_crew.validation import ValidationError
 
 #: The packaged docs directory, wherever the index under test lives.
@@ -27,7 +27,11 @@ def _fresh_cache(_floor_monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     ui_index._cache.update(key=None, index=None)
     # The committed tiers only, whatever dashboard build this checkout has:
     # the build-time auto tier is pinned in test_find_ui_auto.py.
-    _floor_monkeypatch.setattr(ui_index, "AUTO_INDEX_PATH", tmp_path / "no-auto-tier.json")
+    no_auto = tmp_path / "no-auto-tier.json"
+    _floor_monkeypatch.setattr(ui_index, "AUTO_INDEX_PATH", no_auto)
+    # guide_catalog reads the same build-time file under its own name (the
+    # ui.find routes and guidable auto plans), so pin it too.
+    _floor_monkeypatch.setattr(guide_catalog, "_UI_AUTO_INDEX_PATH", no_auto)
     # Test seam only (the tool itself never reads a path from anywhere): point
     # every golden at an index written by `gen:ui --out <file>`, so parallel
     # area batches each validate their own index without touching the
@@ -411,7 +415,8 @@ def test_a_runtime_label_is_returned_as_a_description_never_as_a_label() -> None
         "session_open",
         # The shelf unmounts with a collapsed message box: Expand composer first.
         "Show the message input",
-        "no_response_running",
+        # The model chip stays enabled while a response runs, so the picker no
+        # longer requires no_response_running.
     ]
     # Matched by its description's own words, the basis says so (and is never
     # "exact_label": there is no label to match).
@@ -520,11 +525,9 @@ def test_a_label_covering_only_part_of_the_question_is_dropped(tmp_path: Path) -
         # chat" is one of its terms), never Voice > Model.
         ("chat model", "en", "settings.sub.chat.models", "setting:voice.model"),
         ("display language", "en", "setting:display.language", "setting:voice.language"),
-        ("voice language", "en", "setting:voice.language", "setting:display.language"),
         ("slack session folder", "en", "setting:channels.file-sessions-in-a-folder-slack", None),
         ("语音模型", "zh-CN", "setting:voice.model", "settings.sub.chat.models"),
         ("聊天模型", "zh-CN", "settings.sub.chat.models", "setting:voice.model"),
-        ("语音语言", "zh-CN", "setting:voice.language", "setting:display.language"),
         # Task phrases ("make a schedule", "新建提醒") now answer with the two
         # creation buttons; see test_slice1_newcomer_questions_find_the_creation_controls.
     ],
@@ -540,6 +543,20 @@ def test_context_words_disambiguate_instead_of_losing_the_match(
     # "change the model for all chats" item); never the rival in another place.
     assert set(ids) <= {target, "chat.model-picker", "sessions.list-menu.switch-model"}, ids
     assert d["ambiguous"] is False
+
+
+@pytest.mark.parametrize(("query", "lang"), [("voice language", "en"), ("语音语言", "zh-CN")])
+def test_voice_language_offers_both_voice_language_rows_and_not_display(
+    query: str, lang: str
+) -> None:
+    # Voice has two Language settings, dictation's and spoken replies', in the
+    # same place: the context word drops Display > Language and the answer stays
+    # an honest choice between the two Voice rows.
+    d = ui_index.find_ui(query, lang)
+    ids = [r["id"] for r in d["results"]]
+    assert set(ids) == {"setting:voice.language", "setting:voice.language-2"}, ids
+    assert "setting:display.language" not in ids
+    assert d["ambiguous"] is True
 
 
 @pytest.mark.parametrize(

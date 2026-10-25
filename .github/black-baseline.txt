@@ -110,7 +110,6 @@ src/kiro_crew/apps/builtins/workflows/server.py
 src/kiro_crew/apps/cron_sdk.py
 src/kiro_crew/apps/dependencies.py
 src/kiro_crew/apps/dependency_ledger.py
-src/kiro_crew/apps/dev_mode.py
 src/kiro_crew/apps/manifest.py
 src/kiro_crew/apps/module_loader.py
 src/kiro_crew/apps/permissions.py
@@ -176,7 +175,6 @@ src/kiro_crew/eval/bench/scorers.py
 src/kiro_crew/eval/runner.py
 src/kiro_crew/eval/scenario.py
 src/kiro_crew/frontend.py
-src/kiro_crew/gateway_shutdown_budget.py
 src/kiro_crew/imaging.py
 src/kiro_crew/knowledge/agent_fetch.py
 src/kiro_crew/knowledge/agent_source.py
@@ -215,7 +213,6 @@ src/kiro_crew/metrics/http_metrics.py
 src/kiro_crew/metrics/recorder.py
 src/kiro_crew/notifications/resource_pressure.py
 src/kiro_crew/perf_sampler.py
-src/kiro_crew/platform/update_layout.py
 src/kiro_crew/pod/launchd.py
 src/kiro_crew/publish_governance.py
 src/kiro_crew/publish_sync.py
@@ -496,7 +493,6 @@ test/test_frontend_edition_build.py
 test/test_frontmatter.py
 test/test_gateway_appkit_endpoints.py
 test/test_gitlab_client_coverage.py
-test/test_governance_policy_viewer.py
 test/test_handler_cron_list.py
 test/test_handlers_channel_clear_context.py
 test/test_handlers_channel_presets.py
@@ -591,7 +587,6 @@ test/test_mcp_shared_cancelled_bound.py
 test/test_mcp_skill_registry.py
 test/test_mcp_stub_freeze_ratchet.py
 test/test_mcp_stub_migration.py
-test/test_mcp_sync_agent.py
 test/test_meetings_agent_names.py
 test/test_meetings_dictionary.py
 test/test_meetings_providers.py
@@ -691,23 +686,15 @@ test/test_sel_dashboard_offload.py
 test/test_sel_prune_streaming.py
 test/test_service.py
 test/test_serving_loop_unified.py
-test/test_session_cleanup.py
-test/test_session_core_audit.py
-test/test_session_coverage.py
-test/test_session_end_interaction.py
 test/test_session_grid.py
 test/test_session_map_locking.py
 test/test_session_map_migration.py
 test/test_session_mtime_ordering.py
-test/test_session_pid_sig.py
-test/test_session_rss.py
-test/test_session_sharing.py
 test/test_session_spend_identity.py
 test/test_session_start_timeout_diagnostics.py
 test/test_session_summary_api.py
 test/test_session_summary_extract.py
 test/test_session_thread_map.py
-test/test_session_usage.py
 test/test_ship_report_issues.py
 test/test_side_context_cov80.py
 test/test_side_steer_queue.py
@@ -735,7 +722,6 @@ test/test_slack_render_pipeline.py
 test/test_slack_scope_probe.py
 test/test_slack_sessions_view.py
 test/test_slack_thread_session_binding.py
-test/test_slack_thread_sync.py
 test/test_slack_transport_integration.py
 test/test_slack_upload_binary.py
 test/test_slash_task_tracking.py

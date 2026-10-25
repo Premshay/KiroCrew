@@ -87,9 +87,11 @@ describe('ChatInput', () => {
       expect(screen.getByPlaceholderText(/Gateway offline/)).toBeInTheDocument()
     })
 
-    it('makes the mobile + control open the native file picker directly', () => {
-      mobileEnv.mobile = true
-      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+    it('makes the touch-device + control open the native file picker directly in a wide viewport', () => {
+      touchEnv.touch = true
+      // The collapsible host (the main chat): its overflow hosts Sketch, so "+"
+      // can open the picker directly.
+      renderWithProviders(<ChatInput {...defaultProps} collapsible onUploadFiles={vi.fn()} />)
 
       const input = screen.getAllByLabelText('Attach files').find((element) => element.tagName === 'INPUT')
       const mobilePlus = screen.getByTitle('Attach files').closest('label')
@@ -97,6 +99,16 @@ describe('ChatInput', () => {
       expect(mobilePlus).toHaveAttribute('for', input?.id)
       expect(screen.queryByRole('button', { name: 'Add files & options' })).not.toBeInTheDocument()
       expect(screen.queryByText('Upload file')).not.toBeInTheDocument()
+    })
+
+    it('keeps the touch-device + menu on a host without the collapse, with Sketch inside it', () => {
+      touchEnv.touch = true
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+      // One "+" and no second pencil button on the row.
+      expect(screen.queryByTitle('Sketch')).not.toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Add files & options' }))
+      expect(screen.getByText('Upload file')).toBeInTheDocument()
+      expect(screen.getByTitle('Sketch')).toBeInTheDocument()
     })
   })
 
@@ -1156,7 +1168,7 @@ describe('ChatInput', () => {
       },
     )
 
-    it('disabled while running', () => {
+    it('stays enabled while running and says a pick applies from the next message', () => {
       renderWithProviders(
         <ChatInput {...defaultProps}
           providerId="acp"
@@ -1167,11 +1179,16 @@ describe('ChatInput', () => {
           isRunning
         />
       )
-      // The chip still shows the level while running, so the title (the only
-      // readout on a narrow shelf) and the accessible name keep carrying it.
-      const btn = screen.getByTitle('Stop the current response to switch model · Reasoning effort: Medium')
-      expect(btn).toBeDisabled()
-      expect(btn).toHaveAccessibleName('Stop the current response to switch model · Reasoning effort: Medium')
+      // A pick during a response is committed and applied from the next
+      // message (the project chip's contract), so the chip is never disabled.
+      // It still shows the level while running, so the title (the only
+      // readout on a narrow shelf) and the accessible name keep carrying it,
+      // followed by the one line that matters then.
+      const label = 'Model: claude-opus-4.7 · Reasoning effort: Medium\nYour next message runs on the model you pick. This reply finishes on the model it started with.'
+      const btn = screen.getByTestId('composer-model-chip')
+      expect(btn).toBeEnabled()
+      expect(btn).toHaveAttribute('title', label)
+      expect(btn).toHaveAccessibleName(label)
     })
 
     it('carries the effort level on the routed chip too', () => {

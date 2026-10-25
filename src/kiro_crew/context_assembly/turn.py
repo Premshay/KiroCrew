@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 from kiro_crew.context_assembly import inclusion as _inclusion
 from kiro_crew.context_assembly import markers as _markers
 from kiro_crew.context_assembly import sections as _sections
+from kiro_crew.context_assembly import tool_names as _tool_names
 
 if TYPE_CHECKING:
     from kiro_crew.context import ContextBuilder
@@ -126,8 +127,16 @@ def post_compaction_parts(
     )
     if _agent_prompt:
         parts.append(f"[AGENT SYSTEM PROMPT]\n{_agent_prompt}\n[END AGENT SYSTEM PROMPT]\n\n")
-    # A minimal session start carries only the contract and reply style; restoring
-    # other session context here would expose it to shared or guest channel turns.
+    # The tool-name rule went with the session start too, and the contract just
+    # restored names the tools bare again. Minimal turns carried it as well.
+    _tool_names_part = _tool_names.tool_names_block(provider_type)
+    if _tool_names_part:
+        parts.append(_tool_names_part)
+    # The reply-style block is session-start context too, and unlike
+    # the skills index its loss is invisible: the model simply drifts
+    # back to default-length prose. Re-read the CURRENT setting so a
+    # level changed mid-session lands here as well. Trusted framing
+    # (config enum, no user text), so no payload scrub is needed.
     _prefs = (
         _sections._build_response_preferences_section(ctx.KiroCrewConfig.load())
         if _sections._response_preferences_apply(session_key or "", runtime_source)

@@ -7,24 +7,22 @@ import hashlib
 import logging
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.dashboard.chat_utils import slack_mirror_is_paused
+from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.egress import channel_egress_parts, send_channel_parts
+from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, parse_session_key
+from kiro_crew.messaging.renderer import split_options_trailer
+from kiro_crew.mirror_admission import admission_required, verify_mirror_admission
+from kiro_crew.platform import redact_via_context
+
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         _RECIPIENT_LOGGED,
         _RECIPIENT_LOGGED_CAP,
-        CHAT_TYPE_DIRECT,
         SLACK_NAMESPACE,
-        admission_required,
-        channel_egress_parts,
         logger,
         mirror_is_paused,
-        parse_session_key,
-        redact_for_display,
-        redact_via_context,
         sel,
-        send_channel_parts,
-        slack_mirror_is_paused,
-        split_options_trailer,
-        verify_mirror_admission,
     )
 
 
@@ -739,6 +737,9 @@ async def _deliver_cross_surface_user_message(
         logger.debug("Failed to mirror user message to %s", link.channel_type, exc_info=True)
 
 
+_MIRROR_ECHO_LIMIT = 500
+
+
 def _prepare_mirror_msg(raw_user_message: str) -> str:
     """Prepare a user message for the cross-surface / Slack mirror echo.
 
@@ -755,4 +756,8 @@ def _prepare_mirror_msg(raw_user_message: str) -> str:
     client renders the markup away.
     """
     safe, _ = redact_for_display(raw_user_message or "", redact_via_context)
-    return safe[:500]
+    if len(safe) <= _MIRROR_ECHO_LIMIT:
+        return safe
+    # Mark the cut. A bare slice ends mid-word with nothing after it, which
+    # reads as a message that broke rather than one that was shortened.
+    return safe[: _MIRROR_ECHO_LIMIT - 1] + "…"

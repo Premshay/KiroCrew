@@ -68,11 +68,15 @@ from kiro_crew.acp_backends import (
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_KIRO_FAMILY,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
+    ACP_BACKENDS_MATE_WORKER_KIT,
+    ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT,
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
+    ACP_BACKENDS_MCP_WIRE_REINJECT,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_MEMBER_TOOL_LIMITS,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_REPORT_USAGE,
     ACP_BACKENDS_SIDE_READONLY,
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
     BASELINE_SELECTABLE_BACKENDS,
@@ -290,6 +294,50 @@ def test_member_capabilities_are_opt_in() -> None:
     assert ACP_BACKENDS_MEMBER_TOOL_LIMITS == frozenset({ACP_BACKEND_KIRO})
 
 
+def test_the_mate_worker_takes_the_member_rule() -> None:
+    """H6: a crewmate's worker runs only where its per-session spec is carried.
+
+    The allocation refuses a worker with the member chat's two codes, so a harness
+    runs the worker only by being in ``ACP_BACKENDS_MATE_WORKER_KIT`` (member hosts
+    that carry the per-session spec; not kiro-cli, which reads ``--agent`` off disk)
+    and, for a crewmate whose file turns off single tools, in
+    ``ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS`` (KAS, which carries them as the
+    worker spec's ``excludedTools``).
+    """
+    from kiro_crew import mate_worker as mate_worker_mod
+    from kiro_crew.acp.session_provider import AcpSessionProvider
+    from kiro_crew.session_allocation_parts import get_or_create
+
+    for provider in (providers_acp.AcpProvider, AcpSessionProvider):
+        source = inspect.getsource(provider.mate_worker_kit_supported.fget)
+        assert "in ACP_BACKENDS_MATE_WORKER_KIT" in source
+    assert ACP_BACKENDS_MATE_WORKER_KIT == frozenset({ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE})
+    assert ACP_BACKENDS_MATE_WORKER_KIT <= ACP_BACKENDS_MEMBER_CAPABILITIES
+    assert ACP_BACKEND_KIRO not in ACP_BACKENDS_MATE_WORKER_KIT
+    # The worker's prompt rides the context block exactly where the host's mirror
+    # projects no spec prompt; KAS's wire spec carries it.
+    from kiro_crew.providers.mirrors.base import Concern, Disposition
+    from kiro_crew.providers.mirrors.registry import mirror_for
+
+    assert ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT <= ACP_BACKENDS_MATE_WORKER_KIT
+    for backend in ACP_BACKENDS_MATE_WORKER_KIT:
+        mirror = mirror_for(backend)
+        withheld = (
+            mirror is not None
+            and mirror.rulings()[Concern.PROMPT].disposition is Disposition.WITHHELD
+        )
+        assert withheld is (backend in ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT), backend
+    allocation = inspect.getsource(get_or_create)
+    assert "if is_crewmate_worker_session(key):" in allocation
+    assert "provider.mate_worker_kit_supported is not True" in allocation
+    assert 'CapabilityStartupError("capability_harness_unsupported")' in allocation
+    assert "if provider.mate_worker_tool_limits_supported is not True:" in allocation
+    assert 'CapabilityStartupError("capability_tool_limits_unsupported")' in allocation
+    for backend in ACP_BACKENDS_KNOWN:
+        refused = mate_worker_mod.worker_kit_backend_refusal(backend)
+        assert (refused is None) is (backend in ACP_BACKENDS_MATE_WORKER_KIT), backend
+
+
 def test_steer_is_opt_in() -> None:
     """H6: a mid-turn steer extension is claimed by membership.
 
@@ -320,6 +368,28 @@ def test_mcp_config_hot_reload_is_opt_in() -> None:
     assert ACP_BACKEND_KIRO in ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD
     assert ACP_BACKEND_KAS not in ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD
     assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD
+
+
+def test_mcp_wire_reinject_is_opt_in() -> None:
+    """H6: the OTHER way a dashboard MCP write skips the reset is its own membership.
+
+    KAS applies a config change by Crew re-sending its projection (close + load of
+    the same session id + set_mode), not by a file watcher, so it must not join
+    ``ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD`` and no other host inherits the
+    re-injection: both the provider's declaration and the writer's gate read the
+    set, and the mark that makes the skip correct is handed only to members.
+    """
+    from kiro_crew import mcp_hot_reload
+    from kiro_crew.acp import session_provider_mcp_reinject
+
+    assert ACP_BACKENDS_MCP_WIRE_REINJECT == frozenset({ACP_BACKEND_KAS})
+    assert not (ACP_BACKENDS_MCP_WIRE_REINJECT & ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD)
+    declaration = inspect.getsource(session_provider_mcp_reinject.mcp_config_wire_reinject)
+    assert "in ACP_BACKENDS_MCP_WIRE_REINJECT" in declaration
+    gate = inspect.getsource(mcp_hot_reload.live_sessions_apply_mcp_live)
+    assert "provider_reinjects_mcp" in gate
+    marker = inspect.getsource(mcp_hot_reload.mark_reinjecting_providers)
+    assert "provider_reinjects_mcp" in marker
 
 
 def test_steer_capability_declares_its_stamp() -> None:
@@ -432,6 +502,8 @@ def test_capability_sets_are_subsets_of_known_backends() -> None:
         ("selectable_backends()", selectable_backends()),
         ("ACP_BACKENDS_MEMBER_CAPABILITIES", ACP_BACKENDS_MEMBER_CAPABILITIES),
         ("ACP_BACKENDS_MEMBER_TOOL_LIMITS", ACP_BACKENDS_MEMBER_TOOL_LIMITS),
+        ("ACP_BACKENDS_MATE_WORKER_KIT", ACP_BACKENDS_MATE_WORKER_KIT),
+        ("ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT", ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT),
         ("ACP_BACKENDS_SESSION_SHARING", ACP_BACKENDS_SESSION_SHARING),
         ("ACP_BACKENDS_STEER", ACP_BACKENDS_STEER),
         ("ACP_BACKENDS_STEER_ADVERTISED", ACP_BACKENDS_STEER_ADVERTISED),
@@ -444,6 +516,7 @@ def test_capability_sets_are_subsets_of_known_backends() -> None:
         ("ACP_BACKENDS_STRUCTURED_REFUSAL", ACP_BACKENDS_STRUCTURED_REFUSAL),
         ("ACP_BACKENDS_HOST_AUTH_CALLBACK", ACP_BACKENDS_HOST_AUTH_CALLBACK),
         ("ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS", ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS),
+        ("ACP_BACKENDS_REPORT_USAGE", ACP_BACKENDS_REPORT_USAGE),
     ):
         assert members <= ACP_BACKENDS_KNOWN, f"{name} names an unknown backend"
 
@@ -1104,6 +1177,14 @@ _RUNTIME_PATH_MODULES = (
 #: comparison against an ``ACP_BACKEND_*`` constant that is not listed here fails
 #: :func:`test_every_runtime_path_identity_test_is_declared`.
 _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
+    (
+        "src/kiro_crew/acp/session_handle_turn.py",
+        "_build",
+    ): (
+        "the per-turn context breakdown and time-to-first-token opt-in is a "
+        "_meta.kiro key only the KAS engine defines; every other harness must be "
+        "sent a prompt without it"
+    ),
     (
         "src/kiro_crew/acp/runtime_remote_workspace.py",
         "check_remote_workspace_supported",

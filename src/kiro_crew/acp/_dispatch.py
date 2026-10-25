@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import _facade_mirror, mcp_apps_render, session_directive  # noqa: F401
+from kiro_crew.acp.elicitation import is_elicitation_request
 from kiro_crew.acp.harness_tool_names import (  # noqa: F401
     CLAUDE_READ_ONLY_BUILTINS,
     GOOSE_READ_ONLY_BUILTINS,
@@ -82,6 +83,7 @@ from kiro_crew.metrics.tool_calls import (  # noqa: F401
     note_tool_call_started,
     record_tool_call_finished,
 )
+from kiro_crew.platform.guest_paths import GuestPathParams  # noqa: F401
 from kiro_crew.platform.tool_paths import WRITE_PLANE_KINDS  # noqa: F401
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.security.credential_sources import tool_output_fingerprints  # noqa: F401
@@ -582,6 +584,12 @@ def classify_notification(msg: JsonRpcMessage) -> str:
         return "subagent_list"
     if msg.is_method(METHOD_KIRO_SESSION_UPDATE):
         return "subagent_activity"
+    # An MCP server's elicitation, on either wire (standard `elicitation/create`
+    # or KAS's `_kiro/mcp/elicitation`). Only a REQUEST (with an id) is one:
+    # a notification on the prefix (the standard `elicitation/complete`) falls
+    # through to "skip" like every other notification nothing reads.
+    if is_elicitation_request(msg):
+        return "elicitation"
     # Unknown server request — must be answered
     if msg.method is not None and msg.id is not None:
         return "server_request_unknown"

@@ -12,6 +12,7 @@ import type { ModelInfo } from '../providers/types'
  *  is a catalog key resolved where it renders, not an English literal living in
  *  a data module. */
 const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
+const EMPTY_MODELS: ModelInfo[] = []
 
 /**
  * What one catalog fetch carries.
@@ -116,16 +117,15 @@ export function useAvailableModelsQuery({
     enabled: (enabled ?? true) && canDiscover,
   })
   return {
-    ...query,
-    data: query.data?.models ?? (fallback === 'none' ? [] : PLACEHOLDER),
-    // Authoritative capability for the crew this catalog belongs to. `undefined`
-    // means the catalog is generic (no crew runtime answered), which callers
-    // read as "unknown -- fall back", never as "unsupported".
-    effortLevels: query.data?.effortLevels,
-    /** Same contract as effortLevels: undefined means the generic catalog
-     *  answered, so callers fall back rather than assume unsupported. */
-    supportsImages: query.data?.supportsImages,
-    isDegraded: selectableAgent ? query.isError : isDegraded,
+    get data() { return query.data?.models ?? (fallback === 'none' ? EMPTY_MODELS : PLACEHOLDER) },
+    get effortLevels() { return query.data?.effortLevels },
+    get supportsImages() { return query.data?.supportsImages },
+    get error() { return query.error },
+    get isError() { return query.isError },
+    get isFetching() { return query.isFetching },
+    get isSuccess() { return query.isSuccess },
+    refetch: query.refetch,
+    get isDegraded() { return selectableAgent ? query.isError : isDegraded },
   }
 }
 

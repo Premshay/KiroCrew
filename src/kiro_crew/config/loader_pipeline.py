@@ -691,6 +691,8 @@ def build_config(
         # could not read what they configured". Carry the observation
         # through so the caller can tell them apart.
         cfg = config_cls(_degraded_sections=frozenset(_OBSERVED_DEGRADED_SECTIONS))
+        # An absent key, so an edition's ``default_stt()`` applies here too.
+        cfg.stt.provider = _sections.default_stt_provider()
         agent_defaults = _sections.SectionReader(AgentConfig, {})
         cfg.agent.acp_backend = _read_backend_choice(agent_defaults, {}, "acp_backend")
         cfg.agent.member_acp_backend = _read_backend_choice(
@@ -906,6 +908,8 @@ def build_config(
                     # must not become a truthy star, so only a real bool
                     # is honoured and anything else reads as un-starred.
                     starred=crew.read("starred", _safe_bool),
+                    # Strictly a bool, like ``starred``: a stray string reads as off.
+                    dynamic_capabilities=crew.read("dynamic_capabilities", _safe_bool),
                     # Same guard family as model/triggers: config.json is
                     # hand-editable, so a junk value must collapse to 0
                     # (inherit the global window), never crash the load.
@@ -926,6 +930,7 @@ def build_config(
                     # internals are reached through the module, not
                     # re-exported from here.
                     avatar=_sections._safe_avatar(crew.get("avatar")),
+                    imported=_sections.safe_imported(crew.get("imported")),
                 )
 
     # Migrate workspaces from flat or structured format

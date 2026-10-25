@@ -18,7 +18,7 @@ import { i18nT } from '../i18n/t'
 import { fmtRelative, toDate } from '../i18n/format'
 import { cardsApi, CARD_FINISHED_STATUSES, type Card } from '../api/cards'
 import { CardChanges, reachNames } from './CardChanges'
-import { cardChanges, cardTitle, FALLBACK_ICON, specFor } from './cardRegistry'
+import { cardChanges, cardTitle, FALLBACK_ICON, isToolAccessCard, specFor } from './cardRegistry'
 import { oneShotRunAt } from './oneShot'
 import { CardRow, UserInputs } from './kindBodies'
 import CardResultLine from './CardResultLine'
@@ -292,7 +292,18 @@ export default function ChangeCard({ card, store, refresh, remove }: ChangeCardP
               <span className="min-w-0 break-words">{spec?.label() ?? card.kind}</span>
             </div>
             <div className="mt-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5">
-              <h3 id={headingId} className="m-0 min-w-0 flex-1 basis-[14rem] text-[14px] font-semibold leading-5 text-text break-words">{title}</h3>
+              <h3 id={headingId} className="m-0 min-w-0 flex-1 basis-[14rem] text-[14px] font-semibold leading-5 text-text break-words">
+                {title}
+                {isToolAccessCard(card) && (
+                  // A preview opt-in: the same badge the Profile card's switch wears.
+                  <span
+                    className="ml-2 inline-block rounded-md bg-accent/15 px-1.5 py-0.5 align-middle text-[10px] font-medium uppercase tracking-wide text-accent"
+                    data-testid="change-card-preview"
+                  >
+                    {i18nT('pages.membersPage.profile_preview_tag')}
+                  </span>
+                )}
+              </h3>
               {runAt !== null && !timePassed && !expired && card.status === 'pending' ? (
                 <span className="text-[12px] leading-5 text-muted @min-[480px]:ml-auto" data-testid="change-card-due">
                   {i18nT('components.changeCards.due', { when: fmtRelative(runAt, { now, style: 'long' }) })}
@@ -310,6 +321,10 @@ export default function ChangeCard({ card, store, refresh, remove }: ChangeCardP
                   <AlertTriangle size={14} className="mt-[3px] shrink-0 text-warn" aria-hidden="true" />
                   <span>{card.risk === 'widen' ? widenText(card) : i18nT('components.changeCards.risk_code_exec')}</span>
                 </div>
+                {/* What the press does, read beside the warning, before any code. */}
+                {spec?.pressNote && card.status === 'pending' && !expired && (
+                  <p className="m-0 mt-1 pl-[22px]" data-testid="change-card-press-note">{spec.pressNote()}</p>
+                )}
                 {widen && (
                   <label className="mt-1 flex min-h-11 items-center gap-2 cursor-pointer">
                     <input
@@ -325,6 +340,10 @@ export default function ChangeCard({ card, store, refresh, remove }: ChangeCardP
                   </label>
                 )}
               </div>
+            )}
+
+            {spec?.pressNote && card.risk !== 'widen' && card.risk !== 'code_exec' && card.status === 'pending' && !expired && (
+              <p className="m-0 mt-3 text-[13px] leading-5 text-text" data-testid="change-card-press-note">{spec.pressNote()}</p>
             )}
 
             <div className="mt-2 [&>[data-card-row]+[data-card-row]]:border-t [&>[data-card-row]+[data-card-row]]:border-border" data-testid="change-card-rows">
@@ -385,7 +404,9 @@ export default function ChangeCard({ card, store, refresh, remove }: ChangeCardP
                 disabled={busy}
                 data-testid="change-card-cancel"
               >
-                {i18nT('components.changeCards.cancel')}
+                {isToolAccessCard(card)
+                  ? i18nT('components.changeCards.tool_access_not_now')
+                  : spec?.decline?.() ?? i18nT('components.changeCards.cancel')}
               </Btn>
             )}
             {(card.status === 'failed' || expired) && (
@@ -405,6 +426,7 @@ export default function ChangeCard({ card, store, refresh, remove }: ChangeCardP
               {running === 'apply' && <LoaderCircle size={14} className="animate-spin" aria-hidden="true" />}
               {stranded ? i18nT('components.changeCards.continue_apply')
                 : card.status === 'failed' ? i18nT('components.changeCards.retry')
+                : isToolAccessCard(card) ? i18nT('components.changeCards.tool_access_turn_on')
                 : spec?.primary(card) ?? i18nT('components.changeCards.apply_fallback')}
             </Btn>}
           </div>

@@ -181,12 +181,12 @@ const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
   ['slotRefresh', slotRefresh, ['refreshSlot', 'warmSlotCache']],
   ['runState', runState, ['wireTurnIdentity']],
   ['windowWalk', windowWalk, ['WINDOW_WALK_MAX_PAGES']],
-  ['lifecycle', lifecycle, ['captureForkOrigin', 'clearHistorySessions', 'createSlot', 'deleteHistorySession', 'fetchHistory', 'forkMayOpen', 'forkSlot', 'listForkedSlot', 'resumeFromHistory']],
+  ['lifecycle', lifecycle, ['PENDING_OPEN_LEASE_MS', 'captureForkOrigin', 'clearHistorySessions', 'createSlot', 'deleteHistorySession', 'fetchHistory', 'forkMayOpen', 'forkSlot', 'listForkedSlot', 'resumeFromHistory', 'resumeStillOpening']],
   ['openCreatedSlot', openCreatedSlot, ['openCreatedSlot']],
 ]
 
 /** Names the facade itself defines rather than re-exports. */
-const FACADE_OWN = ['batchedTextAboveFloor', 'default', 'deleteSlot', 'loadOlderMessages', 'loadOlderSlotMessages', 'missedChunkMarker', 'reconcileGoneSubagent', 'requestStop', 'restoreSideConversation']
+const FACADE_OWN = ['awaitSideRestore', 'batchedTextAboveFloor', 'default', 'deleteSlot', 'loadOlderMessages', 'loadOlderSlotMessages', 'missedChunkMarker', 'reconcileGoneSubagent', 'requestStop', 'restoreSideConversation', 'resyncWaitingSideConversations']
 
 describe('facade re-exports', () => {
   const surface = facade as unknown as Record<string, unknown>

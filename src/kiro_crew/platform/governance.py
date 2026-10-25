@@ -50,6 +50,7 @@ from typing import (
     Tuple,
 )
 
+from kiro_crew import edition
 from kiro_crew.config.paths import config_dir  # noqa: F401 - re-export
 from kiro_crew.mcp_provenance import is_marked
 from kiro_crew.platform.admission import (  # noqa: F401 - re-export
@@ -60,6 +61,13 @@ from kiro_crew.platform.admission import (  # noqa: F401 - re-export
 )
 from kiro_crew.platform.context import PlatformCompositionError
 from kiro_crew.platform.governance_health import mark_governance_incident  # noqa: F401 - re-export
+from kiro_crew.platform.guest_paths import (  # noqa: F401 - re-export
+    GuestPath,
+    guest_also_local,
+    guest_norm,
+    guest_root,
+    guest_unverifiable,
+)
 from kiro_crew.platform.tool_paths import (  # noqa: F401 - re-export
     TARGET_PATH_KEYS,
     edit_target_candidates,
@@ -80,7 +88,7 @@ from kiro_crew.platform.governance_parts.archetypes import (
 )
 from kiro_crew.platform.governance_parts.carriers import GovernanceCeiling, Profile
 from kiro_crew.platform.governance_parts.catalog import ORDINAL, SCOPE_CATALOG
-from kiro_crew.platform.governance_parts.evaluator import gate_decision
+from kiro_crew.platform.governance_parts.evaluator import gate_decision, policy_level_control
 from kiro_crew.platform.governance_parts.tiers import _POLICY_CACHE_LEAF
 
 logger = logging.getLogger("kiro_crew.platform.governance")
@@ -179,9 +187,7 @@ def _ceiling_mentions_mcp_server(ceiling: Optional[GovernanceCeiling], server: s
     test for the scope-level question. Do not "fix" this function to return True
     on an empty ruleset: that would tax every server for a rule about one.
     """
-    if ceiling is None:
-        return False
-    ruleset = ceiling.get("mcp")
+    ruleset = policy_level_control(ceiling, "mcp")
     if not isinstance(ruleset, RulesetLike):
         return False
     prefix = f"@{server}".casefold()
@@ -278,7 +284,9 @@ def may_skip_gate(ref: str, ceiling: Optional[GovernanceCeiling]) -> bool:
         BUILTIN_TOOL_SCOPES.get(ref, ())
     ):
         return False
-    if ceiling is None:
+    # An enterprise build has no ungoverned host: an unnamed scope is answered by
+    # the built-in baseline, read through ``policy_level_control`` below.
+    if ceiling is None and not edition.is_enterprise():
         return True
     try:
         if ref.startswith("@"):
@@ -301,7 +309,7 @@ def may_skip_gate(ref: str, ceiling: Optional[GovernanceCeiling]) -> bool:
             # gate, so if the ceiling has an opinion on ANY argument-derived scope,
             # withhold and let the gate apply it against the real path/host.
             arg_scopes = ("filesystem.read", "filesystem.write", "network.egress")
-            if any(_ruleset_has_an_opinion(ceiling.get(_s)) for _s in arg_scopes):
+            if any(_ruleset_has_an_opinion(policy_level_control(ceiling, _s)) for _s in arg_scopes):
                 return False
             return True
 
@@ -312,10 +320,10 @@ def may_skip_gate(ref: str, ceiling: Optional[GovernanceCeiling]) -> bool:
         # bypassed a `tools`-scope ceiling (e.g. tools.deny=["report"]). The
         # capability scopes it DOES map to add path/host granularity on top.
         scopes = ("tools",) + tuple(BUILTIN_TOOL_SCOPES.get(ref, ()))
-        if any(_ruleset_has_an_opinion(ceiling.get(scope)) for scope in scopes):
+        if any(_ruleset_has_an_opinion(policy_level_control(ceiling, scope)) for scope in scopes):
             return False
         capability = BUILTIN_TOOL_CAPABILITIES.get(ref)
-        return not (capability and _capability_restricts(ceiling.get(capability)))
+        return not (capability and _capability_restricts(policy_level_control(ceiling, capability)))
     except Exception:  # noqa: BLE001 — see the fail-closed note above
         logger.warning("ceiling probe failed for %r; not auto-approving", ref, exc_info=True)
         return False
@@ -1055,6 +1063,7 @@ __all__ = [
 #   ``tool_calls`` -- the governed (scope, item) pairs one tool call touches
 #   ``archetypes`` -- the decision record, the four archetypes and their composition
 #   ``catalog`` -- which scopes exist, and which archetype each one is
+#   ``baseline`` -- the enterprise built-in baseline: each scope's minimal set
 #   ``carriers`` -- ``GovernanceCeiling``, ``Profile`` and their policy-only blocks
 #   ``parsing`` -- a policy or profile document into its carrier
 #   ``signature`` -- proving a policy's ``identity.signature``
@@ -1066,6 +1075,7 @@ _OWNERS = (
     "kiro_crew.platform.governance_parts.tool_calls",
     "kiro_crew.platform.governance_parts.archetypes",
     "kiro_crew.platform.governance_parts.catalog",
+    "kiro_crew.platform.governance_parts.baseline",
     "kiro_crew.platform.governance_parts.carriers",
     "kiro_crew.platform.governance_parts.parsing",
     "kiro_crew.platform.governance_parts.signature",
@@ -1091,6 +1101,13 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _dedup,
         _reject_unknown_keys,
         _str_tuple,
+    )
+    from kiro_crew.platform.governance_parts.baseline import (  # noqa: F401
+        _CAPABILITY_OFF,
+        _DEFAULT_WORKSPACE_ROOTS,
+        _OFF,
+        BASELINE_CONTROLS,
+        BASELINE_UNGATED,
     )
     from kiro_crew.platform.governance_parts.carriers import (  # noqa: F401
         _AGENTCORE_POLICY_ONLY,
@@ -1118,6 +1135,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _apply_agentcore_workload_name,
         _capability_raw_for_gate,
         _command_deny_patterns,
+        _is_enterprise,
         _version_tuple,
         active_policy_distribution,
         active_update_pins,
@@ -1137,7 +1155,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         register_scope,
     )
     from kiro_crew.platform.governance_parts.evaluator import (  # noqa: F401
+        _BASELINE_REASON,
+        _DENY_UNLISTED,
         _PERMIT_NOT_GOVERNED,
+        _policy_level,
         _query_level,
         resolve,
         resolve_ordinal,
@@ -1170,6 +1191,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _parse_control,
         _parse_controls,
         _read_json_file,
+        baseline_controls,
         parse_policy,
         parse_profile,
     )
@@ -1196,6 +1218,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _declared_distribution,
         _intersect_ceilings,
         _intersect_update_pins,
+        _load_security_policy,
+        _LoadStage,
         _policy_home_path,
         _process_state,
         _read_env_policy,
@@ -1204,6 +1228,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _TierProcessState,
         _warn_env_beneath_central_once,
         _warn_home_unreadable_beneath_authority_once,
+        _with_enterprise_baseline,
         compose_installed_ceiling,
         compose_tier_ladder,
         last_composed_ceiling,
@@ -1216,6 +1241,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _CU_ACTION_TOOL_PREFIX,
         _CU_TITLE_PREFIX,
         _CU_UNKNOWN_ACTION_CLASSES,
+        _GUEST_UNVERIFIABLE_ITEM,
         _KIND_EDIT,
         _KIND_FETCH,
         _KIND_READ,
@@ -1232,6 +1258,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         CU_CLASS_TEXT_ENTRY,
         CU_MCP_SERVER,
         _cu_action_key,
+        _governed_targets,
         _tool_arg_paths,
         classify_tool_args,
         classify_tool_title,

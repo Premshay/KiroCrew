@@ -66,6 +66,7 @@ _OWNER_MODULES = frozenset(
         "deny_chokepoints",
         "directives",
         "eager_spawn",
+        "elicitation_prompt",
         "file_changes",
         "mcp_session",
         "model_fallback",
@@ -84,6 +85,7 @@ _OWNER_MODULES = frozenset(
         "slash_commands",
         "steer_queue",
         "stop_recovery",
+        "stream_chunks",
         "tool_approval",
         "tool_results",
         "tool_rows",
@@ -414,8 +416,9 @@ def test_the_chat_facade_reexports_the_runner_objects() -> None:
 #: file, and the stall test below proves the reach for each. ``_run_chat``'s row is the
 #: exit guard's ``guarded`` (``_hands_off_queue_on_exit``), the coroutine every turn task
 #: runs; ``_arm_pending_reset_retry`` and ``_arm_synthesis_recheck`` define the coroutines
-#: they start, ``_launch_synthesis`` starts the pending synthesis, and
-#: ``_finish_queue_cycle`` starts it and the title and summary passes.
+#: they start, ``_launch_synthesis`` starts the pending synthesis,
+#: ``_finish_queue_cycle`` starts it and the title and summary passes, and
+#: ``_prewarm_startup_query`` starts a first message's early embed and memory reads.
 _RUNNER_HOME = "dashboard/chat_runner.py"
 _TASK_ENTRY_HOMES: dict[str, str] = {
     "_run_chat": _RUNNER_HOME,
@@ -427,6 +430,8 @@ _TASK_ENTRY_HOMES: dict[str, str] = {
     "_arm_synthesis_recheck": "dashboard/chat_turn/queue_cycle.py",
     "_launch_synthesis": "dashboard/chat_turn/queue_cycle.py",
     "_finish_queue_cycle": "dashboard/chat_turn/queue_cycle.py",
+    "_embed_startup_query_off_loop": "dashboard/chat_turn/prompt_assembly.py",
+    "_prefetch_session_memory_off_loop": "dashboard/chat_turn/prompt_assembly.py",
 }
 
 
@@ -452,7 +457,9 @@ def test_a_stalled_task_entry_reads_as_a_dashboard_chat_turn(name: str) -> None:
 #: and its body still runs without a suspension point: the check-then-mutate a queue
 #: drain or a consume gate makes stays atomic on the event loop, as the inline block
 #: was. An ``await`` added to one would let another task change the slot between the
-#: check and the mutation.
+#: check and the mutation. The ``finally``'s phases before ``_turn_release_session`` are
+#: await-free too: they run before its ``try``, so an ``await`` added to one would let a
+#: cancel skip the session permit's release.
 _AWAIT_FREE_PHASES = (
     "_refresh_genuine_turn_allowances",
     "_rearm_turn_episode",
@@ -471,9 +478,14 @@ _AWAIT_FREE_PHASES = (
     "_on_compaction_status",
     "_on_clear_status",
     "_on_steer_consumed",
+    "_on_thinking_chunk",
     "_turn_context_usage",
     "_on_app_agent_not_loaded",
     "_on_session_closing",
+    "_turn_record_outcome",
+    "_turn_close_crew_log",
+    "_turn_release_handles",
+    "_turn_settle_debts",
 )
 _SUSPENDING_OPS = frozenset(
     {"GET_AWAITABLE", "SEND", "YIELD_VALUE", "GET_AITER", "GET_ANEXT", "BEFORE_ASYNC_WITH"}
@@ -1276,6 +1288,7 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/claude_background.py",
         "dashboard/chat_turn/deny_chokepoints.py",
         "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/elicitation_prompt.py",
         "dashboard/chat_turn/file_changes.py",
         "dashboard/chat_turn/mcp_session.py",
         "dashboard/chat_turn/model_fallback.py",
@@ -1287,6 +1300,7 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/segment_flush.py",
         "dashboard/chat_turn/session_events.py",
         "dashboard/chat_turn/slash_commands.py",
+        "dashboard/chat_turn/stream_chunks.py",
         "dashboard/chat_turn/tool_approval.py",
         "dashboard/chat_turn/tool_results.py",
         "dashboard/chat_turn/tool_rows.py",
@@ -1298,7 +1312,7 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/turn_stats.py",
     ),
     r"StreamRedactor": (
-        _RUNNER_HOME,
+        "dashboard/chat_turn/stream_chunks.py",
         "dashboard/chat_turn/turn_entry.py",
         "dashboard/chat_turn/turn_locals.py",
     ),
@@ -1369,8 +1383,8 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/queue_drain.py",
     ),
     r"create_task\(": (
-        _RUNNER_HOME,
         "dashboard/chat_turn/eager_spawn.py",
+        "dashboard/chat_turn/prompt_assembly.py",
         "dashboard/chat_turn/queue_cycle.py",
         "dashboard/chat_turn/queue_drain.py",
         "dashboard/chat_turn/segment_flush.py",
@@ -1396,7 +1410,6 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/slash_commands.py",
     ),
     r"capabilities_of\(": (
-        _RUNNER_HOME,
         "dashboard/chat_turn/model_fallback.py",
         "dashboard/chat_turn/slash_commands.py",
         "dashboard/chat_turn/tool_rows.py",
@@ -1427,7 +1440,6 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/turn_failures.py",
     ),
     r"\bmemory_store=": (
-        _RUNNER_HOME,
         "dashboard/chat_turn/prompt_assembly.py",
         "dashboard/chat_turn/turn_admission.py",
     ),

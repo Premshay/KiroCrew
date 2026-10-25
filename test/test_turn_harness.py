@@ -587,7 +587,9 @@ class TestTheCollaborators:
 
         record = await run_turn(TurnScript(message="/goal ship the release", setup=capture_slot))
         replies = [row["content"] for row in record.window if row["role"] != "user"]
-        assert any("Goal declared. Automatic goal loops are unavailable" in reply for reply in replies)
+        assert any(
+            "Goal declared. Automatic goal loops are unavailable" in reply for reply in replies
+        )
         assert slots[0].declared_goal_payload() == "ship the release"
         assert record.autonudge_calls == ()
 

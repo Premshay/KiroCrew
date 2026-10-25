@@ -351,7 +351,11 @@ Each cycle:
    read too large for the tool-result limit
    comes back trimmed with `truncated: true` and says what it left out. An item is never `stale` on the strength of silence alone: its worker
    also has to be not running, and its last word has to have left the next move
-   with the worker, so a `done` item waiting on you is not flagged.
+   with the worker, so a `done` item waiting on you is not flagged. An item whose
+   `report_undelivered` is set had a worker that TRIED to report or read its brief
+   and the harness never delivered the call: check that worker's `session_status`
+   and its pull request, and tell the user what you find ("couldn't send its
+   report") instead of calling it stalled.
 2. **Act on three statuses, and only three:**
 
    | status | what it means | what you do |
@@ -452,7 +456,14 @@ Each cycle:
    `session_close` that child session in the same cycle — a finished worker
    has nothing left to re-arm. `session_close` archives (reopenable); it never
    deletes. Never close a child that still has a pending human question or an
-   unmerged PR it is actively driving. `action=decide` records an
+   unmerged PR it is actively driving. **Closing an item cuts its worker's
+   report channel**: from then on its `work_report` is refused `item_closed`,
+   and it cannot `session_send` to you. The close reply warns when that
+   worker's session is still open. If the worker still has work for you,
+   `create` a new item and `bind` it to the SAME session, then `session_send`
+   it the new item's goal; its `work_brief` and `work_report` resolve to the
+   new item. A session holds one open item at a time, so binding one whose
+   item is still open is refused `worker_already_dispatched`. `action=decide` records an
    instruction you want the worker to read out of `work_brief`; it is the ONE
    field the worker treats as an instruction, so keep it to a decision.
 5. `session_read_message` for detail the record does not carry — a question's

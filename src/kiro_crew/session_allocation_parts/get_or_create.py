@@ -683,13 +683,15 @@ async def _get_or_create_impl(
         pool_decision = "bypass_resume"
     elif is_stateless:
         pool_decision = "bypass_stateless"
-    elif self._is_member_key(key):
+    elif self._is_member_key(key) or _is_crewmate_worker_key(key):
         # A pooled child was spawned with no session key, so it runs the
         # factory's DEFAULT backend and none of the member construction
         # route (per-session dispatch-tool mount, member backend). A warm
         # hit would silently hand a member DM a session that cannot mount
         # its tools; cold-starting through the factory is what makes the
-        # member route real. String check — as cheap as the arms above.
+        # member route real. String check — as cheap as the arms above. A
+        # crewmate's own worker takes the member backend too, so it bypasses
+        # for the same reason (an in-memory set lookup).
         pool_decision = "bypass_member"
     elif app_launch_agent:
         # A pooled child was spawned as the pool's agent, never as this copy.
@@ -966,6 +968,30 @@ async def _get_or_create_impl(
                     if provider.process_instance:
                         raise CapabilityStartupError("capability_runtime_not_fresh")
                     await asyncio.to_thread(verify_saved, preparation, provider.cwd)
+                # A crewmate's worker runs with its per-session spec, or not at
+                # all, under the member chat's two codes (H6 opt-in): a backend
+                # that cannot carry that spec (``ACP_BACKENDS_MATE_WORKER_KIT``),
+                # and, for a crewmate whose file turns off single tools, one that
+                # cannot honour them for a worker (``ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS``:
+                # KAS carries them as the worker spec's ``excludedTools``).
+                from kiro_crew.members import is_crewmate_worker_session
+
+                if is_crewmate_worker_session(key):
+                    from kiro_crew.session_capabilities import CapabilityStartupError
+
+                    if provider.mate_worker_kit_supported is not True:
+                        raise CapabilityStartupError("capability_harness_unsupported")
+                    # The prompt channel is this provider's, fixed for the session.
+                    from kiro_crew.members import note_crewmate_worker_prompt_channel
+
+                    note_crewmate_worker_prompt_channel(
+                        key, provider.mate_worker_prompt_in_context is True
+                    )
+                    # A fast path: the projection refuses on the spec it builds too.
+                    if provider.mate_worker_tool_limits_supported is not True:
+                        limited = await asyncio.to_thread(_worker_tool_limited_servers, key)
+                        if limited:
+                            raise CapabilityStartupError("capability_tool_limits_unsupported")
                 # The key may have been fenced while this call waited for the
                 # semaphore or the reads above: refuse before a process is
                 # spawned that the registration door would only refuse later.
@@ -1272,3 +1298,20 @@ def _record_scratch_tree(self: SessionAllocationService, key: str, tree: Path) -
         )
     except RuntimeError:
         pass  # executor shut down: the gateway is stopping
+
+
+def _worker_tool_limited_servers(key: str) -> tuple[str, ...]:
+    """The servers whose single tools worker *key*'s crewmate file turns off. Blocking."""
+    from kiro_crew.execution_context import read_session_execution
+    from kiro_crew.mate_worker import crewmate_tool_limited_servers
+
+    execution = read_session_execution(key)
+    member_id = str(getattr(execution, "member_id", "") or "") if execution is not None else ""
+    return crewmate_tool_limited_servers(member_id)
+
+
+def _is_crewmate_worker_key(key: str) -> bool:
+    """Whether *key* is a crewmate's own worker session (``members.is_crewmate_worker_session``)."""
+    from kiro_crew.members import is_crewmate_worker_session
+
+    return is_crewmate_worker_session(key)

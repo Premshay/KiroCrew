@@ -22,6 +22,7 @@ import { attendArrival } from './attention'
 import { markFirstToken } from '../../utils/voiceTurnMetrics'
 import { emitToolCall } from './browserEvents'
 import type { StreamBuffers } from './streamBuffers'
+import { batchedUnlessOpen } from '../../lib/streamBatch'
 import type { VoicePlayback } from './voicePlayback'
 import type { FrameData } from './frames'
 
@@ -44,7 +45,7 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
   return useMemo<ChatStream>(() => ({
     onChatMessage(data) {
       buffers.flushChunks()
-      dispatch(sseChatMessage(data))
+      dispatch(batchedUnlessOpen(data.slot, sseChatMessage(data)))
       // Approval-blocked chime for an INTERACTIVE chat. The chat runner
       // parks its turn on this `permission` row and emits no `approval`
       // frame for it (that frame is the coordinator registry's, and chimes
@@ -119,7 +120,7 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
         // A terminal error row is exempt: the worker has stopped, and a
         // silenced failure stalls it unseen just as a silenced approval would.
         if (marks && (!isSlotMuted(slots, slot) || isTerminalErrorRow(data))) {
-          dispatch(markSlotUnread({ slot, ts: unreadWatermarkTs(data.role, data.ts), localTs: data.ts || undefined }))
+          dispatch(batchedUnlessOpen(slot, markSlotUnread({ slot, ts: unreadWatermarkTs(data.role, data.ts), localTs: data.ts || undefined })))
         }
       })
       // Theme audio: an agent reply arriving is the `message-received`
@@ -133,7 +134,7 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
         voice.resetForNewTurn()
       }
       if (!isPassiveNote && data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
-        dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', ts: Date.now() }))
+        dispatch(batchedUnlessOpen(data.slot, setSlotStatusDetail({ slot: data.slot, kind: 'thinking' })))
         // A new turn starts clean: an error row appended outside a turn (an
         // archive that failed after cancelling the turn) has no chat_done of
         // its own to take it, and must not break the mute on this turn.
@@ -195,9 +196,6 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
         if (cs === store.getState().chat.activeSlot) markFirstToken()
         const entry = buffers.bufferChunk(cs, data.seq, data.content ?? '', data.gen)
         if (!entry) return
-        if (store.getState().chat.slotStatusDetail[cs]?.kind !== 'streaming') {
-          dispatch(setSlotStatusDetail({ slot: cs, kind: 'streaming', ts: Date.now() }))
-        }
         buffers.drainOrScheduleChunks(entry)
       }
     },
@@ -208,25 +206,15 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
       // dispatch recomputes the O(N) displayItems on each.
       const thinkSlot = data.slot as string | undefined
       const thinkText = (data as { content?: string }).content || ''
+      // The flush moves the status to 'thinking' only on a genuine kind
+      // TRANSITION (from neither 'streaming' nor 'thinking'), so a long
+      // reasoning stream does not rewrite the entry, and with it the
+      // slotStatusDetail map identity, on every frame.
       if (thinkSlot && thinkText) buffers.bufferThinking(thinkSlot, thinkText)
-      // Dispatch the status detail only on a genuine kind TRANSITION into
-      // 'thinking'. Guarding merely on `!== 'streaming'` would not
-      // self-limit — 'thinking' is itself `!== 'streaming'`, so it would
-      // re-dispatch on EVERY thought frame with a fresh `ts`. Because
-      // setSlotStatusDetail replaces slotStatusDetail[slot] wholesale, that
-      // bumps the map identity per frame and re-renders every whole-map
-      // subscriber (ChatSidebar, CommandPalette) for the duration of the
-      // model's reasoning. The sibling chat_chunk guard writes 'streaming'
-      // and so is naturally idempotent; this is the same shape, made
-      // explicit.
-      const detailKind = data.slot ? store.getState().chat.slotStatusDetail[data.slot]?.kind : undefined
-      if (data.slot && detailKind !== 'streaming' && detailKind !== 'thinking') {
-        dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', ts: Date.now() }))
-      }
     },
     onToolCall(data) {
       emitToolCall(data)
-      dispatch(sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string; is_shell?: boolean; tool_name?: string; mcp_server?: string }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true, is_shell: (data as Record<string, unknown>).is_shell === true }))
+      dispatch(batchedUnlessOpen(data.slot, sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string; is_shell?: boolean; tool_name?: string; mcp_server?: string }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true, is_shell: (data as Record<string, unknown>).is_shell === true })))
       if (data.slot) {
         // A refinement (`is_update`) carries only the fields it refines,
         // so merge it into the live status the way sseToolActivity merges
@@ -271,11 +259,16 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
         // is not localized, is stored as a string.
         const derivedAction = derivedInfo.action
         const derivedTitle = derivedInfo.derived && !derivedAction ? sanitizeLlmOutput(derivedInfo.title) : ''
-        const prev = store.getState().chat.slotStatusDetail[data.slot]
+        // A buffered label or chunk since the tool call has moved the line
+        // off this tool, so a refinement then has nothing to merge into.
+        const prev = buffers.hasPendingStatus(data.slot) ? undefined : store.getState().chat.slotStatusDetail[data.slot]
         const mergeInto = isUpdate && tcid && prev?.kind === 'tool' && prev.toolCallId === tcid
           ? prev
           : undefined
-        dispatch(setSlotStatusDetail({
+        // This write is newer than everything buffered for the slot, even
+        // when it equals the stored entry and so leaves its identity alone.
+        buffers.supersedePendingStatus(data.slot)
+        dispatch(batchedUnlessOpen(data.slot, setSlotStatusDetail({
           slot: data.slot,
           kind: 'tool',
           purpose: purpose || mergeInto?.purpose || '',
@@ -287,8 +280,7 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
               ? { derivedAction: mergeInto.derivedAction, derivedMore: mergeInto.derivedMore || 0 }
               : {}),
           ...(tcid ? { toolCallId: tcid } : {}),
-          ts: Date.now(),
-        }))
+        })))
       }
       // Note: do NOT dispatch sseChatMessage here. The backend persists the
       // tool message via slot.append and broadcasts it as 'chat_message'.

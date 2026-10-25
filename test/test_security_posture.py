@@ -554,9 +554,12 @@ class TestDisclosureContract:
         # Pinning the module as governance-free is the property that actually
         # holds the boundary: if this module cannot reach the governance
         # machinery, it cannot republish its rules under any key name.
+        import importlib
         import inspect
 
-        src = inspect.getsource(security_posture)
+        src = inspect.getsource(security_posture) + "".join(
+            inspect.getsource(importlib.import_module(owner)) for owner in security_posture._OWNERS
+        )
         for forbidden in (
             "platform.governance",
             "platform import governance",
@@ -761,7 +764,12 @@ class TestOmissionDetection:
         # The ``security`` package DEFINES the redactors; the posture registry and
         # its inventory owner only name them. The whole package is skipped because the
         # definitions are spread across its submodules.
-        self_referential = {"security_posture.py", "security_posture_redaction.py"}
+        self_referential = {
+            "security_posture.py",
+            "security_posture_controls.py",
+            "security_posture_sinks_delivery.py",
+            "security_posture_sinks_gateway.py",
+        }
 
         unclassified: list[str] = []
         for path in sorted(pkg.rglob("*.py")):
@@ -930,7 +938,13 @@ class TestOmissionDetection:
         pkg = Path(security_posture.__file__).resolve().parent
         explicit: set[str] = set()
         for path in pkg.rglob("*.py"):
-            if path.name in {"sel.py", "security_posture.py"}:
+            if path.name in {
+                "sel.py",
+                "security_posture.py",
+                "security_posture_controls.py",
+                "security_posture_sinks_delivery.py",
+                "security_posture_sinks_gateway.py",
+            }:
                 continue
             explicit |= set(
                 re.findall(
@@ -1084,7 +1098,13 @@ class TestRedactionSinkRegistry:
         assert _sink_module_calls_a_redactor(tmp_path, "calls.py")
 
     def test_a_facade_counts_only_through_the_owners_it_declares(self, tmp_path):
-        """A split module's facade keeps its sink row; its declared owners must call."""
+        """A facade's sink row counts only through the owners it declares.
+
+        An owner listed in ``_OWNERS`` or imported as ``_owner_<name>`` that calls a
+        redactor makes the row pass; a plain import does not. This covers rows
+        already keyed to a facade. A new split re-keys its ``_REDACTION_SINKS`` row
+        to the owner module that makes the call, instead of leaving it on the facade.
+        """
         pkg = tmp_path / "kiro_crew"
         (pkg / "fam").mkdir(parents=True)
         (pkg / "fam" / "owner.py").write_text(

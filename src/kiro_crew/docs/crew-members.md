@@ -191,13 +191,46 @@ tools, MCP servers and skills (`request_capabilities`); each ask is a change
 card with a button, and nothing changes until you press it. Its workspace,
 memory store and template are not the mate's to ask for.
 
+When its worker needs a tool or a skill it does not have, the crewmate looks up
+what this gateway or the MCP registry offers and asks you for the addition on a
+card. The card says where each server comes from and exactly which of its tools
+would run without asking. Pressing it adds the server or skill to this
+crewmate's own settings only, not to your MCP config. A worker that is already
+running is reloaded with it, keeping its conversation, as soon as it is idle;
+adding one yourself in the crewmate's advanced settings does the same.
+
+Asking for tools this way is a preview, off by default for each crewmate. While
+it is off, the crewmate asks you once, on a card marked **Preview**, whether it
+may ask you for tools its worker needs. Turning it on only lets it ask: each tool
+still needs your approval on its own card. If you decline, it does not ask again,
+and you add what its worker needs in its advanced settings.
+
+### Its worker
+
+A crewmate hands longer work to a **worker**: a session it opens with
+`session_create`, which runs on the crewmate's own memory and workspace with
+the worker's built-in tools plus whatever that crewmate's settings add. To give
+the worker a ready-made set of instructions, connections and skills, open the
+crew editor, choose **Advanced**, pick an agent template under **Worker's extra
+kit**, press **Copy into the worker**, review the list of changes and press
+**Apply**. The kit is copied once; later edits to the template do not reach the
+crewmate. **Re-copy from template** brings a newer version in the same way,
+showing what would change first, and asks whether to keep anything added since
+the last copy. Nothing the kit carries can lift the worker past your security
+policy and profile. **Advanced** appears for a crewmate that owns its own
+config.
+
 ### Goals
 
 A mate's **Goals** tab (Profile card) holds what it works toward:
 
 - **Goals.** As many as you like, each one paragraph, numbered and coloured on
-  the tab. Add one with **+**, open one to edit or remove it, or confirm one the
-  mate proposes (`set_goal` puts a card in its chat). The mate is
+  the tab. A new goal starts as a conversation: **Create a goal** (the last
+  row of the list) explains in a few words how the mate uses a goal and offers
+  one button, **Tell {name} what to aim for**, which sends an opening message
+  to its chat; the mate asks what matters, writes the goal down and puts it on
+  a card (`set_goal`) for you to confirm. Open an existing goal to edit or
+  remove its text. The mate is
   encouraged to keep the list short and to suggest merging goals that overlap;
   you decide.
 - **Milestones.** Key results that show how far it is from its goals, one
@@ -221,7 +254,8 @@ A mate's **Goals** tab (Profile card) holds what it works toward:
   readings. To keep a PDF, choose **Download** in the report's **More actions**
   menu, open the file in your browser and print it.
 - **Heartbeat.** A fourth switch, off by default and only available once a goal
-  is set, shown as a full-width row under the three check-ins. While it is on,
+  is set. It lives on the mate's **Schedules** tab, the first row there, since
+  it is what wakes the mate on its own rather than a goal check-in. While it is on,
   the mate wakes in its own chat every 30 minutes, hour (the default),
   2 hours or 4 hours, looks for what it can move forward toward its goals,
   and does it. It works quietly: what it did shows on its **Dashboard** tab and
@@ -230,10 +264,6 @@ A mate's **Goals** tab (Profile card) holds what it works toward:
   now. When it has nothing to move, it ends the wake without a word. Anything
   it does write during a wake shows in the chat. A wake is skipped while the chat is busy or a monitor loop is running in it. Each run uses credits. The
   mate can suggest turning it on with a card; only you can press it.
-- **Track something in chat.** Sends "I'd like you to track something for me."
-  to the mate's chat as your own message. Tell it what to track there; it
-  keeps that item up to date on its task list, which the Crew board shows. Tracked
-  items do not appear on the Goals tab.
 - **Reports.** The newest weekly reports and monthly reviews, each linking its
   artifact.
   When the monthly review finds the goal or its key results no longer fit the
@@ -241,11 +271,10 @@ A mate's **Goals** tab (Profile card) holds what it works toward:
   press it.
 
 The goal is stored in the mate's goal record,
-`trust/member-goals/<slug>.json` in Kiro Crew's data folder, apart from its
-rules, with the same protection as its rules: the mate's file-editing tools
-are refused there, so it changes the goal or its key results only through a card
-you press (a shell command it runs can still reach the folder, as with its
-rules). A mate made from chat on a **Create mate** card starts with the
+`member-records/member-goals/<slug>.json` in Kiro Crew's data folder, apart
+from its rules, with the same protection as its rules: nothing the mate runs
+can read or change that folder, so it changes the goal or its key results only
+through a card you press. A mate made from chat on a **Create mate** card starts with the
 card's goal as its goal; its description stays empty until it or you write one.
 What the mate is working on right now is its task list on the Crew board,
 not part of the goal.

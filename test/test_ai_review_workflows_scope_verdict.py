@@ -29,6 +29,7 @@ from ai_review_workflows_helpers import (
     _step_script,
     _workflow,
 )
+from git_maintenance_helpers import git_maintenance_off_entries
 
 
 @functools.lru_cache(maxsize=1)
@@ -551,10 +552,10 @@ class TestTheForkLaneNamesARemedyThatClearsAForkPullRequest:
 
     def test_the_fork_lane_offers_it_where_a_row_was_redacted(self) -> None:
         fork = _workflow("fork-security-scope-review.yml")
-        assert "/ai-review override scope <sha>: <reason>" in _step_script(
+        assert "/ai-review override scope <sha> <class>: <reason>" in _step_script(
             fork, "Fold the reports into one verdict"
         )
-        assert "/ai-review override scope $HEAD: <reason>" in _step_script(
+        assert "/ai-review override scope $HEAD <class>: <reason>" in _step_script(
             fork, "Assemble the comment body"
         )
 
@@ -979,10 +980,19 @@ class TestScopeConclusionLadderLivesInOnePlace:
         gitconfig.touch()
         git_env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
         git_env["GIT_CONFIG_NOSYSTEM"] = "1"
+        # Stripping GIT_* drops the suite's maintenance entries.
+        git_env.update(git_maintenance_off_entries(git_env))
 
         def git(*args: str) -> str:
             return subprocess.run(
-                ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                [
+                    "git",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    *args,
+                ],
                 check=True,
                 capture_output=True,
                 text=True,

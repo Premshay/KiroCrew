@@ -419,6 +419,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     jiraSourceHostsRef,
     githubSourceHostsRef,
     bitbucketServerSourceHostsRef,
+    gerritSourceHostsRef,
     panelSources,
     panelIssues,
     selectedSourceUrl,
@@ -937,7 +938,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     sidebarOnScreen, flyoutTriggerRef, flyoutSurfaceRef, flyoutEligible, flyout, expandFrom, expandSidebar,
   } = useSessionsDrawer({
     embedded, embedMode, dispatch, navigate, navigationType, location, isMobile, filteredSlots, slotsLoaded, activeSlot, splitMode, crewWindow, activityOpen, showActionError, githubSourceHostsRef, hasBrowserTab,
-    hasLiveAppTab, jiraSourceHostsRef, bitbucketServerSourceHostsRef, search, selectSource, setRevealedSources, sourceHostsRef, tabsCtl, drawerPopRef, chatFolders, setSidebarPinned, sidebarPinned, sidebarPinnedRef,
+    hasLiveAppTab, jiraSourceHostsRef, bitbucketServerSourceHostsRef, gerritSourceHostsRef, search, selectSource, setRevealedSources, sourceHostsRef, tabsCtl, drawerPopRef, chatFolders, setSidebarPinned, sidebarPinned, sidebarPinnedRef,
     sidebarAutoHidden, toggleAct,
   })
   // "Open Sidebar Sessions in a Session Tab" (Settings > Chat > Sessions). A
@@ -945,10 +946,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // after their `switchSlot`, so one handler covers each; the flyout below is
   // the same list while the sidebar is collapsed.
   const sidebarClickOpensTab = chatConfig.sidebarClickOpensTab
+  // On a phone a row pick is the user asking for that conversation, so it
+  // dismisses the drawer here as well as through the drawer's `activeSlot`
+  // effect. That effect cannot see a pick of the session already active,
+  // which is what a close leaves behind the list: its neighbour, or the
+  // blank session made for an empty list.
   const selectFromSidebar = useCallback((key: string) => {
     clearSplitOnSelect()
     if (sidebarClickOpensTab) ensureSlotTab(key)
-  }, [clearSplitOnSelect, sidebarClickOpensTab, ensureSlotTab])
+    if (isMobile) closeSidebar()
+  }, [clearSplitOnSelect, sidebarClickOpensTab, ensureSlotTab, isMobile, closeSidebar])
   const flyoutSwitch = useCallback((key: string) => {
     // User gesture on a listed session row (collapsed-sidebar flyout): the
     // announced class, same as the expanded sidebar's own rows.

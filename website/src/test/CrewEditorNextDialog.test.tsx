@@ -32,7 +32,7 @@ import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-quer
 import dashboardReducer from '../store/dashboardSlice'
 import chatReducer from '../store/chatSlice'
 import notificationsReducer from '../store/notificationsSlice'
-import type { CapabilityView, CapabilityPreview } from '../api/crewCapabilities'
+import type { CapabilityRow, CapabilityView, CapabilityPreview } from '../api/crewCapabilities'
 import { i18nT } from '../i18n/t'
 
 /* Render framer-motion elements as plain DOM (same rationale as the sibling
@@ -88,9 +88,14 @@ const mockCaps = vi.hoisted(() => ({
   preview: vi.fn(),
   save: vi.fn(),
 }))
+const mockKit = vi.hoisted(() => ({
+  get: vi.fn(),
+  preview: vi.fn(),
+  apply: vi.fn(),
+}))
 vi.mock('../api/crewCapabilities', async (orig) => {
   const real = await orig<typeof import('../api/crewCapabilities')>()
-  return { ...real, crewCapabilitiesApi: mockCaps }
+  return { ...real, crewCapabilitiesApi: mockCaps, crewWorkerKitApi: mockKit }
 })
 
 /* Plain-DOM stand-in for SimpleSelect (same as the sibling test). */
@@ -232,7 +237,9 @@ function Host({ memberId, openCrew }: { memberId?: string; openCrew?: string } =
   return (
     <>
       <button data-testid="open-editor" onClick={() => setEditingCrew(openCrew ?? 'oncall')}>edit</button>
-      {/* Direct controller save drive and computed collision readout. */}
+      {/* Direct controller drives for handlers the modal UI does not surface
+          (save flow) and a readout of a computed value, so the hook's
+          save/collision paths are exercised. */}
       <button data-testid="ctl-save" onClick={() => ctl.save()}>save</button>
       <div data-testid="ctl-colliding">{ctl.collidingCrews.join(',')}</div>
       <CrewEditorModal ctl={ctl} />
@@ -302,6 +309,113 @@ describe('CrewEditorNextDialog — section rail', () => {
       await waitFor(() => expect(within(dialog).getByTestId(`next-rail-${key}`)).toHaveAttribute('aria-selected', 'true'))
       if (pane) expect(await within(dialog).findByTestId(pane)).toBeInTheDocument()
     }
+  })
+
+  it('offers no Advanced section to a crewmate that does not own its config', async () => {
+    const dialog = await openNew()
+    await waitFor(() => expect(mockCaps.get).toHaveBeenCalled())
+    await waitFor(() => expect(within(dialog).getByTestId('next-rail-builtFrom')).toBeInTheDocument())
+    expect(within(dialog).queryByTestId('next-rail-advanced')).toBeNull()
+  })
+
+  it('shows the worker kit in Advanced for a crewmate that owns its config', async () => {
+    mockCaps.get.mockResolvedValue({ ...CAPS_VIEW, mode: 'mate', template: { ...CAPS_VIEW.template, scope: 'mate' } })
+    mockKit.get.mockResolvedValue({ member: 'oncall', template: '', revision: 'r1', has_additions_since: false })
+    const dialog = await openNew()
+    fireEvent.click(await within(dialog).findByTestId('next-rail-advanced'))
+    expect(await within(dialog).findByTestId('next-pane-advanced')).toBeInTheDocument()
+    expect(within(dialog).getByTestId('worker-kit-current')).toHaveTextContent('No template copied yet')
+  })
+
+  it('gives a crewmate that owns its config no Built from switcher, only the way to Advanced', async () => {
+    mockCaps.get.mockResolvedValue({ ...CAPS_VIEW, mode: 'mate', template: { ...CAPS_VIEW.template, name: 'c0ffee12', scope: 'mate' } })
+    mockKit.get.mockResolvedValue({ member: 'oncall', template: 'release-captain', revision: 'r1', has_additions_since: false })
+    const dialog = await openNew()
+    const owned = await within(dialog).findByTestId('next-built-from-owned')
+    // The switcher would repoint the binding away from the crewmate's own file.
+    expect(within(dialog).queryByRole('combobox', { name: /built from/i })).toBeNull()
+    // The template's name, never the file's id.
+    await waitFor(() => expect(owned).toHaveTextContent('release-captain'))
+    expect(owned).not.toHaveTextContent('c0ffee12')
+    fireEvent.click(within(dialog).getByTestId('next-open-advanced'))
+    expect(await within(dialog).findByTestId('next-pane-advanced')).toBeInTheDocument()
+  })
+
+  it('names the default template, not the file id, for an owned config never copied from another', async () => {
+    mockCaps.get.mockResolvedValue({ ...CAPS_VIEW, mode: 'mate', template: { ...CAPS_VIEW.template, name: 'c0ffee12', scope: 'mate' } })
+    mockKit.get.mockResolvedValue({ member: 'oncall', template: '', revision: 'r1', has_additions_since: false })
+    const dialog = await openNew()
+    fireEvent.click(await within(dialog).findByTestId('next-rail-builtFrom'))
+    const name = await within(dialog).findByTestId('next-builtfrom-name')
+    await waitFor(() => expect(name).toHaveTextContent('kirocrew (default)'))
+    expect(name).not.toHaveTextContent('c0ffee12')
+  })
+
+  it('preselects the template a private copy came from and says the kit is switched in Advanced', async () => {
+    mockCaps.get.mockResolvedValue({ ...CAPS_VIEW, mode: 'mate', template: { ...CAPS_VIEW.template, name: 'c0ffee12', scope: 'mate', source: 'custom', available: true } })
+    mockKit.get.mockResolvedValue({
+      member: 'oncall', template: 'crew-5eed01', origin: 'oncall-agent', private_copy: true, revision: 'r1', has_additions_since: false,
+    })
+    const dialog = await openNew()
+    fireEvent.click(await within(dialog).findByTestId('next-rail-builtFrom'))
+    await within(dialog).findByTestId('next-builtfrom-details')
+    // An owned file's kit does not follow the template: no "edit it on the Agents page".
+    expect(within(dialog).queryByTestId('next-builtfrom-authored')).toBeNull()
+    expect(within(dialog).getByTestId('next-builtfrom-details')).toHaveTextContent('open Advanced')
+    fireEvent.click(within(dialog).getByTestId('next-rail-advanced'))
+    await within(dialog).findByTestId('next-pane-advanced')
+    await waitFor(() => expect(within(dialog).getByRole('combobox', { name: 'Template' })).toHaveTextContent('oncall-agent'))
+    expect(within(dialog).getByTestId('worker-kit-preview')).toHaveTextContent('Re-copy from template')
+  })
+
+  it("counts and lists the same set: what an owned config's worker carries", async () => {
+    const row = (section: CapabilityRow['section'], id: string, value: unknown = true): CapabilityRow => ({
+      section, id, label: section === 'skills' ? '' : id, state: 'inherited', present: true, value, managed: false, shared_reference: section === 'skills',
+    })
+    mockCaps.get.mockResolvedValue({
+      ...CAPS_VIEW, mode: 'mate', template: { ...CAPS_VIEW.template, name: 'c0ffee12', scope: 'mate' },
+      worker: {
+        rows: [
+          row('tools', 'fs_read'), row('tools', 'execute_bash'), row('tools', '@platform'),
+          row('mcpServers', 'platform', { command: 'plat' }),
+          row('skills', 'release-notes'),
+        ],
+      },
+    })
+    mockKit.get.mockResolvedValue({ member: 'oncall', template: 'release-captain', revision: 'r1', has_additions_since: false })
+    const dialog = await openNew()
+    fireEvent.click(await within(dialog).findByTestId('next-rail-builtFrom'))
+    expect(await within(dialog).findByTestId('next-builtfrom-stat-skills')).toHaveTextContent('1')
+    expect(within(dialog).getByTestId('next-builtfrom-stat-tools')).toHaveTextContent('3')
+    expect(within(dialog).getByTestId('next-builtfrom-stat-mcp')).toHaveTextContent('1')
+    fireEvent.click(within(dialog).getByTestId('next-builtfrom-tab-tools'))
+    const tools = await within(dialog).findByTestId('next-builtfrom-tools')
+    // The file's own rows (CAPS_VIEW's fs_write) are not what the worker runs.
+    expect(within(tools).getByText('execute_bash')).toBeInTheDocument()
+    expect(within(tools).queryByText('fs_write')).toBeNull()
+    fireEvent.click(within(dialog).getByTestId('next-builtfrom-tab-mcp'))
+    const mcp = await within(dialog).findByTestId('next-builtfrom-mcp')
+    expect(within(mcp).getByTestId('next-mcp-row-platform')).toBeInTheDocument()
+    expect(within(mcp).queryByTestId('next-mcp-row-github')).toBeNull()
+    fireEvent.click(within(dialog).getByTestId('next-builtfrom-tab-skills'))
+    expect(within(await within(dialog).findByTestId('next-builtfrom-skills')).getByText('Release Notes')).toBeInTheDocument()
+  })
+
+  it("names a worker's skill URI as the kit preview does: its folder, or the folder a pattern covers", async () => {
+    const glob = 'skill://.kiro/skills/**/SKILL.md'
+    const one = 'skill:///home/x/skills/release-notes/SKILL.md'
+    const skill = (id: string): CapabilityRow => ({ section: 'skills', id, label: '', state: 'inherited', present: true, value: id, managed: false, shared_reference: true })
+    mockCaps.get.mockResolvedValue({
+      ...CAPS_VIEW, mode: 'mate', template: { ...CAPS_VIEW.template, name: 'c0ffee12', scope: 'mate' },
+      worker: { rows: [skill(glob), skill(one)] },
+    })
+    mockKit.get.mockResolvedValue({ member: 'oncall', template: 'release-captain', revision: 'r1', has_additions_since: false })
+    const dialog = await openNew()
+    fireEvent.click(await within(dialog).findByTestId('next-rail-builtFrom'))
+    fireEvent.click(await within(dialog).findByTestId('next-builtfrom-tab-skills'))
+    const skills = await within(dialog).findByTestId('next-builtfrom-skills')
+    expect(within(skills).getByText('Skills in skills')).toBeInTheDocument()
+    expect(within(skills).getByText('release-notes')).toBeInTheDocument()
   })
 
   it('renders the General pane fields (name, built-from, workspace, color)', async () => {
@@ -742,7 +856,6 @@ describe('CrewEditorNextDialog — save, chat hand-off, and sharing collisions',
     fireEvent.click(discard)
     await waitFor(() => expect(leaveSpy).toHaveBeenCalled())
   })
-
   it('reports mates sharing the edited crew\u2019s workspace or memory store', async () => {
     // A third crew shares oncall's workspace AND a fourth shares its store, so
     // collidingCrews is their de-duplicated union.

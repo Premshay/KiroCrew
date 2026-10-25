@@ -9,11 +9,20 @@ import AwsConsentGate from '../../components/AwsConsentGate'
 import { i18nT } from '../../i18n/t'
 import { Info } from 'lucide-react'
 import ErrorNotice from '../../components/ErrorNotice'
+import SpeechProviderNotice from '../../components/SpeechProviderNotice'
+import { parseSpeechProviders, speechProviderNotice, speechProviderOptions } from '../../lib/speechProviders'
+import { languageOptionLabel } from '../../lib/sttProviders'
 type VoiceConfig = {
   enabled: boolean; provider: string; voice: string; engine: string; rate: string
   autoSpeak: boolean; aws_profile: string; region: string
   piper_binary: string; piper_model: string; piper_model_config: string; piper_length_scale: number
   system_voice: string
+  /** BCP-47 tag for spoken replies; `''` is the provider's own default. Absent on an older gateway. */
+  language_code?: string
+  /** The Language picker's codes, `''` first; absent on an older gateway. */
+  language_codes?: string[]
+  /** Served provider entries (see lib/speechProviders); absent on an older gateway. */
+  providers?: unknown
 }
 
 const PROVIDER_OPTIONS = ['system', 'pocket', 'piper', 'polly']
@@ -54,6 +63,8 @@ const PIPER_SPEED_LABEL_KEY: Record<string, string> = {
   '1.3': 'pages.settings.voicePanel.slow',
   '1.5': 'pages.settings.voicePanel.slowest',
 }
+/** Sentinel for "the provider's own default language", what an empty `language_code` means. */
+const LANGUAGE_PROVIDER_DEFAULT = ''
 
 /**
  * Offline stand-in for `aws polly describe-voices` (non-Polly users have no AWS
@@ -124,6 +135,10 @@ export function VoicePanel() {
     if (isPocket) setLocalPocketVoice(voiceCfg.voice || '')
   }, [isPocket, voiceCfg.voice])
   const isSystem = voiceCfg.provider === 'system'
+  const servedProviders = parseSpeechProviders(voiceCfg.providers)
+  const providerChoices = speechProviderOptions(servedProviders, PROVIDER_OPTIONS, p =>
+    Object.prototype.hasOwnProperty.call(PROVIDER_LABEL_KEY, p) ? i18nT(PROVIDER_LABEL_KEY[p]) : p)
+  const providerNotice = speechProviderNotice(servedProviders, voiceCfg.provider)
   // A host with no built-in engine is a real state the user has to act on
   // (install one, or switch provider), so it is surfaced rather than left to a
   // failed synthesis. Only claimed once the probe has actually answered.
@@ -143,6 +158,12 @@ export function VoicePanel() {
     ? voicesQ.data.voices.map(v => ({ value: v.id, label: `${v.name} (${v.languageCode} ${v.gender[0]})`, engines: v.engines }))
     : VOICE_OPTIONS_FALLBACK.map(v => ({ ...v, engines: ENGINE_OPTIONS }))
   const selectedVoiceEngines = voiceOptions.find(v => v.value === voiceCfg.voice)?.engines ?? ENGINE_OPTIONS
+  // An older gateway serves no list; offering only the default keeps the select
+  // from naming a language it cannot save.
+  const languageCodes = voiceCfg.language_codes?.length ? voiceCfg.language_codes : [LANGUAGE_PROVIDER_DEFAULT]
+  const languageLabels = languageCodes.map(code => code === LANGUAGE_PROVIDER_DEFAULT
+    ? i18nT('pages.settings.voicePanel.language_provider_default')
+    : languageOptionLabel(code))
 
   const voiceMut = useMutation({
     mutationFn: (patch: Partial<VoiceConfig>) => api.updateVoiceConfig(patch),
@@ -207,7 +228,10 @@ export function VoicePanel() {
           ) : (
             <>
               <SettingsToggle label={i18nT('pages.settings.voicePanel.auto_speak_responses')} hint={i18nT('pages.settings.voicePanel.speak_every_assistant_reply_automatically')} checked={voiceCfg.autoSpeak} onChange={v => setVoice({ autoSpeak: v, ...(v ? { enabled: true } : {}) })} disabled={voiceDisabled} />
-              <SettingsSelect settingId="voice.provider-2" label={i18nT('pages.settings.voicePanel.provider')} description={voiceCfg.provider === 'pocket' ? i18nT('pages.settings.voicePanel.pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay') : i18nT('pages.settings.voicePanel.the_built_in_engine_needs_no_setup_piper_is_offlin')} value={voiceCfg.provider} options={PROVIDER_OPTIONS} optionLabels={PROVIDER_OPTIONS.map(p => i18nT(PROVIDER_LABEL_KEY[p]))} onChange={v => setVoice({ provider: v, ...(v === 'pocket' ? { voice: 'michael' } : {}) })} disabled={voiceDisabled} />
+              <SettingsSelect settingId="voice.provider-2" label={i18nT('pages.settings.voicePanel.provider')} description={voiceCfg.provider === 'pocket' ? i18nT('pages.settings.voicePanel.pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay') : i18nT('pages.settings.voicePanel.the_built_in_engine_needs_no_setup_piper_is_offlin')} value={voiceCfg.provider} options={providerChoices.options} optionLabels={providerChoices.labels} onChange={v => setVoice({ provider: v, ...(v === 'pocket' ? { voice: 'michael' } : {}) })} disabled={voiceDisabled} />
+              {/* Hand-off on: with a registered provider selected, no Polly
+                  field is mounted, and every control left commits on change. */}
+              {providerNotice && <SpeechProviderNotice entry={providerNotice} testId="tts-provider-notice" askAgent />}
               {isSystem ? (
                 <>
                   {systemUnavailable && (
@@ -263,12 +287,17 @@ export function VoicePanel() {
                 </>
               ) : isPocket ? (
                 <SettingsInput label={i18nT('pages.settings.voicePanel.voice')} value={localPocketVoice} onChange={setLocalPocketVoice} onBlur={() => setVoice({ voice: localPocketVoice.trim() })} placeholder="michael" disabled={voiceDisabled} />
-              ) : (
+              ) : voiceCfg.provider === 'piper' ? (
                 <>
                   <SettingsInput label={i18nT('pages.settings.voicePanel.piper_model')} description={i18nT('pages.settings.voicePanel.path_to_the_piper_voice_model_onnx_required_down')} value={localPiperModel} onChange={setLocalPiperModel} onBlur={() => setVoice({ piper_model: localPiperModel.trim() })} placeholder={i18nT('pages.settings.voicePanel.piper_en_us_lessac_medium_onnx')} disabled={voiceDisabled} />
                   <SettingsInput label={i18nT('pages.settings.voicePanel.piper_binary')} description={i18nT('pages.settings.voicePanel.path_to_the_piper_executable_leave_blank_to_auto')} value={localPiperBinary} onChange={setLocalPiperBinary} onBlur={() => setVoice({ piper_binary: localPiperBinary.trim() })} placeholder={i18nT('pages.settings.voicePanel.auto_detect')} disabled={voiceDisabled} />
                   <SettingsSelect label={i18nT('pages.settings.voicePanel.speed')} hint={i18nT('pages.settings.voicePanel.piper_speech_speed_length_scale')} value={String(voiceCfg.piper_length_scale)} options={PIPER_SPEED_OPTIONS} optionLabels={PIPER_SPEED_OPTIONS.map(v => i18nT(PIPER_SPEED_LABEL_KEY[v]))} onChange={v => setVoice({ piper_length_scale: Number(v) })} disabled={voiceDisabled} />
                 </>
+              ) : (
+                /* Edition providers only: Polly and the built-in engine speak
+                   the language of the voice picked above, so a Language select
+                   on their branches would be a control that changes nothing. */
+                <SettingsSelect settingId="voice.language-2" label={i18nT('pages.settings.voicePanel.language')} hint={i18nT('pages.settings.voicePanel.language_for_spoken_replies')} value={voiceCfg.language_code ?? LANGUAGE_PROVIDER_DEFAULT} options={languageCodes} optionLabels={languageLabels} onChange={v => setVoice({ language_code: v })} disabled={voiceDisabled} />
               )}
             </>
           )}

@@ -49,6 +49,8 @@ export interface MemberRosterRow {
   worker_model?: string
   /** Same for the reasoning effort; '' = the crewmate's own level. */
   worker_reasoning_effort?: string
+  /** The per-crewmate Dynamic capabilities preview (default off). */
+  dynamic_capabilities?: boolean
   /** Optional presentation label shown in place of `name`. `name` stays the
    *  identity every per-member route and binding is keyed on. */
   display_name?: string
@@ -82,13 +84,14 @@ export interface MemberRosterRow {
 }
 
 /** One entry of GET /api/members/{slug}/activity — a recorded engagement.
- *  `via` distinguishes a session the user opened with the member ('chat')
- *  from an orchestrator routing decision ('select_crew'); the latter records
- *  intent, not a run. */
+ *  `via` distinguishes a session the user opened with the member ('chat'),
+ *  an orchestrator routing decision ('select_crew', intent, not a run), a
+ *  delegated `spawn_run(crew=...)` run ('spawn') and an auto-improvement
+ *  run ('auto-improvement'). */
 export interface MemberActivityEntry {
   /** Epoch seconds (UTC) the engagement was recorded. */
   ts: number
-  via: 'chat' | 'select_crew' | string
+  via: 'chat' | 'select_crew' | 'spawn' | 'auto-improvement' | string
   project?: string
 }
 

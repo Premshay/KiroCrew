@@ -1234,6 +1234,14 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     <>
     <DetailPanel
       embedded={embedded}
+      // Mark this panel as the current Escape owner while its own document
+      // handler (above) will answer Escape by closing: embedded, visible
+      // (active + not hidden behind a remote Crew), and not already deferring
+      // to a surface that carries its own role="dialog" (the discard confirm,
+      // the fullscreen overlay). The composer's Escape-to-stop gate reads this
+      // marker and yields, so one Escape closes the preview without also
+      // stopping the running turn (#22315).
+      escapeOwner={!!embedded && active && !crewHidden && !confirmOpen && !fullscreen}
       title={fileName}
       onClose={guardedClose}
       initialWidth={480}
@@ -1335,9 +1343,9 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           </div>
           {lastCopy && <MissingFileBanner onDownload={downloadLastCopy} onCopy={() => { void copyLastCopy() }} copied={lastCopyCopied} partial={partialCopy} />}
           {/* In markdown preview the scroll box runs flush to the panel's right
-              border so the overlay scrollbar and outline rail share that edge;
-              pr-6 keeps the text clear of the ticks. */}
-          <div ref={sidePanelScrollRef} onScroll={scrollMemory.onScroll} className={`flex-1 min-h-0 overflow-auto ${isMarkdown && !editing ? 'scrollbar-overlay pr-6' : ''}`}>
+              border so the outline rail sits on that edge; pr-6 keeps the text
+              clear of the ticks. */}
+          <div ref={sidePanelScrollRef} onScroll={scrollMemory.onScroll} className={`flex-1 min-h-0 overflow-auto ${isMarkdown && !editing ? 'pr-6' : ''}`}>
             {showBinaryCard && <BinaryFileCard filePath={filePath} />}
             {!showBinaryCard && zeroDiff && <ZeroDiffNotice message={zeroDiffText} onExitDiff={readOnly ? undefined : toggleDiffMode} />}
             {!showBinaryCard && diffErrorText && !editing && (

@@ -14,20 +14,22 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 
+from kiro_crew.agent_capabilities import CapabilityError
+from kiro_crew.dashboard.chat_utils import TRANSIENT_RETRY_KIND
+from kiro_crew.security import redact
+from kiro_crew.session_capabilities import CapabilityStartupError
+
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         _PROJECT_CHANGED_OTHER_TEXT,
         _SESSION_START_REFUSAL_TEXT,
         STOP_REASON_CANCELLED,
         SYNTHETIC_RECOVERY_KIND,
-        TRANSIENT_RETRY_KIND,
-        CapabilityError,
-        CapabilityStartupError,
+        KiroCrewConfig,
         _member_capable_backend_names,
         _MemoryUnavailable,
         acp_error_is_transient,
         logger,
-        redact,
         run_bg_oneliner,
     )
     from kiro_crew.dashboard.chat_turn.account_identity import _mark_kiro_signed_out
@@ -158,7 +160,8 @@ async def _on_prompt_busy(turn: _ChatTurn) -> None:
     _turn_emitted = turn._turn_emitted
     message = turn.message
     logger.info("Prompt busy exhausted in slot %s — resetting session", slot.key)
-    turn.needs_session_reset = True  # checked in _run_chat's finally
+    needs_session_reset = True  # checked in _turn_release_session (chat_turn/session_reset.py)
+    turn.needs_session_reset = needs_session_reset
     await _persist_partial_reply(turn, "error: prompt busy exhausted")
     slot._prompt_busy_retries += 1
     await _requeue_after_prompt_busy(
@@ -358,7 +361,8 @@ async def _on_acp_error_card(turn: _ChatTurn, exc) -> None:
         # enqueued (mirrors _posttoken_retry_used accounting). The
         # streak stays: this discard came from it.
         _escalation.arm_discard(clear_streak=False)
-        turn.needs_conversation_discard = True  # checked in _run_chat's finally
+        needs_conversation_discard = True  # checked in _turn_release_session (session_reset)
+        turn.needs_conversation_discard = needs_conversation_discard
         slot.append(
             "error",
             "⟳ The backend keeps rejecting this conversation — "
@@ -505,8 +509,9 @@ async def _on_session_closing(turn: _ChatTurn) -> None:
     # This arm carries no `as exc` binding, so the class is named literally
     # -- the same shape as _on_cancelled. It is read only when the turn had
     # already opened; the documented raise happens in turn prep, which leaves
-    # `_crew_log_turn_open` False and _run_chat's finally emits nothing at
-    # all. Naming it here is what keeps a turn closed by a shutdown from
+    # `_crew_log_turn_open` False and _turn_close_crew_log
+    # (chat_turn/crew_log_attribution.py) emits nothing at all. Naming it here
+    # is what keeps a turn closed by a shutdown from
     # being recorded as an unnamed failure.
     _crew_log_error = "SessionClosingError"
     turn._crew_log_error = _crew_log_error
@@ -569,6 +574,18 @@ async def _on_error(turn: _ChatTurn, exc) -> None:
             f"{_member_capable_backend_names()}, or reset the member's "
             "Capabilities page, then start a new chat."
         )
+        from kiro_crew.members import is_crewmate_worker_session
+
+        if is_crewmate_worker_session(session_key):
+            # A crewmate's worker is refused for its kit, which only some
+            # member backends carry, so the member card's remedy does not fit.
+            from kiro_crew.mate_worker import crewmate_worker_backend, worker_kit_backend_refusal
+
+            _worker_reason = worker_kit_backend_refusal(
+                crewmate_worker_backend(KiroCrewConfig.load().agent)
+            )
+            if _worker_reason:
+                _err_text = "capability_harness_unsupported: " + _worker_reason
         _err_meta = _terminal_error_meta(exc)
     elif (
         isinstance(exc, CapabilityStartupError) and str(exc) == "capability_tool_limits_unsupported"
@@ -578,8 +595,8 @@ async def _on_error(turn: _ChatTurn, exc) -> None:
             "capabilities turn off single tools on an MCP server. The backend "
             "its chats run on (agent.member_acp_backend) cannot turn off single "
             "tools, so they would be on. On the member's Capabilities page, turn "
-            "the whole server off or turn those tools back on, or set "
-            "agent.member_acp_backend to kiro, then start a new chat."
+            "the whole server off or turn those tools back on, then start a new "
+            "chat."
         )
         _err_meta = _terminal_error_meta(exc)
     else:

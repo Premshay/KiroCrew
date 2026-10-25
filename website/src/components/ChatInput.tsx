@@ -2,7 +2,7 @@ import { useRef, useEffect, useLayoutEffect, useMemo, useCallback, useId, useSta
 import { GUIDE_KEEP_CLEAR } from '../guide/trustRoot'
 import { useGuidePredicate } from '../guide/guidePredicates'
 import { markComposerResize } from '../utils/composerResize'
-import { ArrowUp, Loader2, RotateCw, Sparkles, Target, CheckCircle, Lock, FolderOpen, ClipboardList, PenLine, MoreHorizontal, Terminal, Clock } from 'lucide-react'
+import { ArrowUp, Loader2, RotateCw, Sparkles, Target, CheckCircle, Lock, FolderOpen, ClipboardList, PenLine, MoreHorizontal, Terminal, Clock, X } from 'lucide-react'
 import SketchDialog from './SketchDialog'
 import QuoteCard from '../pages/chat/QuoteCard'
 import CopyBranchButton from './CopyBranchButton'
@@ -14,6 +14,7 @@ import { useBranding } from '../hooks/useBranding'
 import { useAppStore, useAppDispatch } from '../store'
 import { switchSlot } from '../store/chatSlice'
 import { useSlotId } from '../providers/SlotContext'
+import { emitComposeIntent } from '../lib/composeIntent'
 import { ToolDetails } from '../pages/chat/ToolDetails'
 import { safeSetItem } from '../utils/safeStorage'
 import { offlineProps } from '../utils/offline'
@@ -68,6 +69,7 @@ import { BusySendControls, CompactingIndicator, useComposerSend } from './chat-i
 import { CollapsedComposerBar, collapseMenuRowElement, useComposerCollapse } from './chat-input/collapse'
 import { useGuideRevealScope } from '../guide/GuideRevealScope'
 import { useComposerFocus, useComposerKeyDown, useEditorInput } from './chat-input/keyboard'
+import { useComposerStopKey } from './chat-input/stopKey'
 import { INPUT_DRAG_MIN_H, useManualHeight, useStripHeights, useTextareaAutosize } from './chat-input/sizing'
 import { usePromptHistory } from './chat-input/draftHistory'
 import { useUndoHistory } from '../chat-core/composer/undoHistory'
@@ -108,6 +110,14 @@ const AUDIO_ACCEPT = '.mp3,.m4a,.wav,.ogg,.oga,.opus,.flac'
 const COMPOSER_ROW_SPRING = { type: 'spring', stiffness: 520, damping: 38, mass: 0.8 } as const
 // Half the one-row box: the 44px text line plus its 1px border each side.
 const COMPOSER_ONE_ROW_RADIUS = 23
+// The one-row text line's padding, equal above and below so the line sits on
+// the buttons' centre whatever its height. INPUT_TYPO's 12px over 4px puts it
+// lower by half of (line height - 20px): 2px at the 16px touch floor. Set on
+// the text column, so the textarea, its paste mirror and the Lexical editor
+// all take it; `1.5em` is INPUT_TYPO's `leading-normal` line, and resolves on
+// each of them at its own font size. Not `1lh`: Safari before 16.4 has no
+// such unit, and an invalid value would drop the padding to 0.
+const ONE_ROW_TEXT_PAD = '[--composer-pt:max(0px,calc((44px_-_1.5em)_/_2))] [--composer-pb:max(0px,calc((44px_-_1.5em)_/_2))]'
 // How long after a shape flip the text column still slides rather than jumps:
 // the spring above is settled well inside this.
 const SHAPE_FLIP_WINDOW_MS = 450
@@ -505,7 +515,7 @@ function ChatInput({
   // first open or Browse focuses later, so the guard cancels nothing there.
   const bindProjectPress = usePressActivation()
   const gitBadgeTitle = useGitBadgeTitle(projectGitDirty, projectGitDirtyTruncated, projectGitAhead, projectGitBehind)
-  const plus = usePlusMenu({ pickers, value, onChange, composerControl, fileInputRef })
+  const plus = usePlusMenu({ pickers, value, onChange, composerControl, fileInputRef, isTouchInput: () => touchInput })
   const { setPlusOpen, sketchOpen, setSketchOpen } = plus
   // Client-side `accept` is a UX hint only (input-validation guidance: server enforces type via
   // magic bytes, size, and malware scanning — never trust the extension/MIME here).
@@ -547,8 +557,16 @@ function ChatInput({
   }, [onFollowUpSelect, fireFollowUp])
   const { botName } = useBranding()
   const isMobile = useIsMobile()
-  const directFilePicker = isMobile || isTouchDevice()
-  // The "+" menu is drawn for a mouse; on touch the file picker opens directly.
+  // Touch opens the file picker straight from "+" only where the row already
+  // carries an overflow for Sketch and the collapse (`collapsible`). Anywhere
+  // else (the Crewmates DM, a split pane, the side chat) "+" opens its menu on
+  // touch too, so Sketch is a row in it instead of a second pencil button.
+  const touchInput = isMobile || isTouchDevice()
+  const directFilePicker = touchInput && collapsible
+  // The "+" menu is drawn for a mouse, and on touch for every host except the
+  // collapsible one, where the file picker opens directly. The guide's
+  // predicate stays keyed on the device: its locations sit on the main chat,
+  // which is that collapsible host.
   useGuidePredicate('mouse_input', !isTouchDevice())
   const [attachControlRow, controlRowEdges, remeasureControlRow] = useScrollEdges<HTMLDivElement>()
   // The control row's chips are prop-driven (the auto-nudge loop chip, the
@@ -648,9 +666,10 @@ function ChatInput({
     setTextareaRef(textarea)
     attachListContinuation(textarea)
   }, [setTextareaRef, attachListContinuation])
-  const { optimizeError, setOptimizeError, optimizePending, optimizing, optimizePrompt } = usePromptOptimizer({
+  const { optimizeError, setOptimizeError, optimizePending, optimizing, optimizePrompt, cancelOptimize } = usePromptOptimizer({
     slotId, chatStore, valueRef, pasteBlocks, onChange, onOptimizeResult, lexicalComposer, lexicalLoadFailed, composerControl, inputRef,
     valueFromUserRef, optimizingRef, appendUndoBoundary: appendBoundary, terminalCommands, optimizerMentionGuard,
+    composerDisabled: disabled,
   })
   useEffect(() => { onOptimizingChange?.(optimizing) }, [optimizing, onOptimizingChange])
   // A locked composer (a memory-mode switch is moving its draft) must not
@@ -681,9 +700,16 @@ function ChatInput({
     () => (promptOptimizer ? () => { if (connected) optimizeUnlessLocked() } : undefined),
     [promptOptimizer, connected, optimizeUnlessLocked],
   )
+  // Escape stops the running turn when the prompt box is focused (issue #22315),
+  // yielding to a picker, dictation, an approval, a dialog, IME composition or
+  // an Escape that stopped voice read-back. Wired into BOTH editors: the textarea's keydown and the rich-text editor's
+  // Escape command, so the binding holds with "Style Markdown While Typing" on.
+  const stopTurnOnEscape = useComposerStopKey({
+    isRunning, onStop, anyPickerOpenRef, voiceRecording, voiceDrainCancellable, hasApproval, approvalNudgeActive,
+  })
   const handleKeyDown = useComposerKeyDown({
     rawPasteRef, handleUndoKey, endUndoBurst, handleTokenKey, onMentionKey, promptOptimizer: promptOptimizer && !terminal.active, connected, optimizePrompt: optimizeUnlessLocked, sendOnEnter, onChange, valueFromUserRef, optimizingRef,
-    fireComposer, ime, sentMessages, onEditLastRequest, anyPickerOpenRef, promptHistory, valueRef, inputRef, pasteBlocksRef,
+    fireComposer, ime, sentMessages, onEditLastRequest, anyPickerOpenRef, promptHistory, valueRef, inputRef, pasteBlocksRef, stopTurnOnEscape,
   })
   const { handleTextareaChange, handleLexicalChange, beforeInputRef } = useEditorInput({ onChange, valueFromUserRef, openPickersForText, recordCaret, lexicalControlRef, voiceCaretRef, mentionEditRange, inputRef })
   // Compose the textarea ref: the existing wiring (autosize + list continuation)
@@ -838,6 +864,53 @@ function ChatInput({
   // including a caller's own `placeholder`, which `resolvedPlaceholder` carries.
   const placeholderIsHint = !placeholder && activePlaceholder === resolvedPlaceholder
   const { handleInput } = useTextareaAutosize({ inputRef, mirrorRef, value, prefillHint, manualHeight, dragging, textareaParked, activePlaceholder })
+  // The send slot's busy branch: a turn runs (or a stop is under way) and there
+  // is a stop or steer path. Read by the cluster below and by the "+" menu row.
+  const compactingSlot = busyMode !== 'responsive' && compacting && !isRunning && !composerHasDraft && (!stopState || stopState === 'idle')
+  const busySendSlot = busyMode !== 'responsive' && (isRunning || stopState === 'soft_pending' || stopState === 'killing') && !!(onStop || (!terminal.active && canSteer && onSteer))
+  const optimizeOffered = promptOptimizer && !terminal.active
+  const optimizeBlocked = !value.trim() || optimizePending || !connected || disabled
+  // "Optimize prompt" rewrites the draft in place and never sends, so it is
+  // still offered while a turn runs: that is when the next steer or queued
+  // prompt is written (issue #23572). Mid-turn it is a row in the "+" menu,
+  // not a button: the busy send cluster already holds its cap of controls
+  // (max-two-buttons-per-row), and Optimize would be one more beside them.
+  const busyOptimizeOffered = optimizeOffered && busySendSlot && !compactingSlot
+  const optimizeRowLabel = optimizePending && !optimizing
+    ? i18nT('components.chatInput.optimize_prompt_busy_optimizing_another_chat')
+    : i18nT('components.chatInput.optimize_prompt')
+  const busyOptimizeRow = busyOptimizeOffered ? (
+    <button
+      type="button"
+      onClick={() => { plus.setPlusOpen(false); optimizeUnlessLocked() }}
+      disabled={optimizeBlocked}
+      title={i18nT('components.chatInput.optimize_prompt_2', { shortcut: platformShortcut('Cmd+Shift+Enter') })}
+      data-testid="composer-menu-optimize"
+      className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+    >
+      <Sparkles size={14} className="w-4 shrink-0 text-muted lucide-inline" />
+      <div className="min-w-0 text-[12px] font-medium text-text">{optimizeRowLabel}</div>
+    </button>
+  ) : null
+  const optimizeButton = optimizeOffered ? (
+    <button
+      className={`w-8 h-8 rounded-lg border-none flex items-center justify-center cursor-pointer transition-all disabled:cursor-not-allowed ${optimizing ? 'bg-accent/20 text-accent animate-pulse' : 'bg-transparent text-muted hover:text-accent hover:bg-accent/10 disabled:opacity-40 disabled:hover:text-muted disabled:hover:bg-transparent'}`}
+      onClick={(e) => { e.stopPropagation(); e.preventDefault(); optimizeUnlessLocked() }}
+      // A single mutation backs this instance, so only one optimize can
+      // run at a time. Disable on the RAW pending flag (not the
+      // slot-scoped `optimizing`) so the button also reads as busy on a
+      // *different* session while the originating session's optimize is
+      // still in flight — matching the re-entrancy guard in
+      // optimizePrompt(). optimizing ⊂ optimizePending, so this stays
+      // disabled on the originating session too.
+      disabled={optimizeBlocked}
+      aria-label={optimizePending && !optimizing ? i18nT('components.chatInput.optimize_prompt_busy_optimizing_another_chat') : i18nT('components.chatInput.optimize_prompt')}
+      title={optimizePending && !optimizing ? i18nT('components.chatInput.optimizing_another_chat_please_wait') : i18nT('components.chatInput.optimize_prompt_2', { shortcut: platformShortcut('Cmd+Shift+Enter') })}
+      {...offlineProps(connected, i18nT('utils.offline.optimize'), i18nT('components.chatInput.optimize_prompt'))}
+    >
+      {optimizing ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
+    </button>
+  ) : null
 
   return (
     // 'input-area' is a stable theming hook — see website/docs/theming-contract.md
@@ -1199,13 +1272,13 @@ function ChatInput({
         enabled={inlineToolbarWhileFits}
         height={sizerPinned ? box.height : null}
         animate={!!(sizerPinned && box.animate && !reduceMotion)}
-        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : inlineToolbar ? 'rounded-full' : 'rounded-2xl'} overflow-hidden flex flex-col justify-end transition-[border-radius] duration-200`}
+        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : inlineToolbar ? 'rounded-[23px]' : 'rounded-2xl'} overflow-hidden flex flex-col justify-end transition-[border-radius] duration-200`}
       >
       {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
       <div
         data-testid="input-wrapper"
         ref={wrapperRef}
-        className={`@container/composer ${hasApproval ? 'rounded-b-2xl rounded-t-none' : inlineToolbar ? 'rounded-full' : 'rounded-2xl'} relative transition-[color,background-color,border-color,border-radius] overflow-hidden ${inlineToolbarWhileFits ? 'shrink-0 ' : ''}${manualHeight !== null ? 'flex flex-col min-h-0' : inlineToolbar ? 'flex items-center' : ''} ${(memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} bg-transparent ${memoryMode === 'temporary' ? 'border-aim' : memoryMode === 'incognito' ? 'border-warn' : 'border-transparent'}`}
+        className={`@container/composer ${hasApproval ? 'rounded-b-2xl rounded-t-none' : inlineToolbar ? 'rounded-[23px]' : 'rounded-2xl'} relative transition-[color,background-color,border-color,border-radius] overflow-hidden ${inlineToolbarWhileFits ? 'shrink-0 ' : ''}${manualHeight !== null ? 'flex flex-col min-h-0' : inlineToolbar ? 'flex items-center' : ''} ${(memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} bg-transparent ${memoryMode === 'temporary' ? 'border-aim' : memoryMode === 'incognito' ? 'border-warn' : 'border-transparent'}`}
 
         data-inline-toolbar={inlineToolbar ? 'true' : undefined}
         data-tree-drop-active={treeDrop.state === 'accept' ? 'true' : undefined}
@@ -1275,7 +1348,16 @@ function ChatInput({
           micHeldElsewhere={micHeldElsewhere} micHeldElsewhereLabel={micHeldElsewhereLabel} micHeldElsewhereAction={micHeldElsewhereAction} voiceHeldLanded={voiceHeldLanded} handsFreePhase={handsFreePhase}
         />
 
-        {optimizing && <span className="optimize-overlay absolute inset-0 flex items-center justify-center backdrop-blur-md pointer-events-none z-10 rounded-2xl"><span className="optimize-overlay-pill inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium text-text"><Sparkles size={15} className="text-accent animate-pulse shrink-0" /> {i18nT('components.chatInput.optimizing_prompt')}</span></span>}
+        {/* The overlay itself lets taps through; only the pill's Cancel takes
+            them. Without Cancel a mis-tap on Optimize (it sits beside Send on
+            a phone) leaves the draft read-only until the request settles. */}
+        {optimizing && <span className="optimize-overlay absolute inset-0 flex items-center justify-center backdrop-blur-md pointer-events-none z-10 rounded-2xl"><span className="optimize-overlay-pill inline-flex items-center gap-2 pl-4 pr-1.5 py-1.5 rounded-full text-sm font-medium text-text"><Sparkles size={15} className="text-accent animate-pulse shrink-0" /> {i18nT('components.chatInput.optimizing_prompt')}<button
+          type="button"
+          className="optimize-overlay-cancel pointer-events-auto w-7 h-7 shrink-0 rounded-full border-none flex items-center justify-center cursor-pointer bg-transparent text-muted hover:text-text hover:bg-text/10 focus-visible:outline-2 focus-visible:outline-accent"
+          onClick={(e) => { e.stopPropagation(); e.preventDefault(); cancelOptimize() }}
+          aria-label={i18nT('components.chatInput.cancel_optimizing')}
+          title={i18nT('components.chatInput.cancel_optimizing')}
+        ><X size={15} className="shrink-0" /><span className="optimize-overlay-cancel-label">{i18nT('components.chatInput.cancel_optimizing_short')}</span></button></span></span>}
         {/* The textarea fallback is seamless for typing (draft intact), but the
             failure itself must be user-visible, not only a console line: the
             person who opted into the editor should know they are no longer in
@@ -1301,13 +1383,20 @@ function ChatInput({
         <motion.div
           layout={inlineToolbarWhileFits && !reduceMotion && manualHeight === null ? 'position' : false}
           transition={shapeAnimating ? COMPOSER_ROW_SPRING : { duration: 0 }}
-          className={`relative ${showDictation || voiceHoldMode ? 'sr-only' : ''} ${manualHeight !== null ? 'flex-1 min-h-0 flex flex-col' : inlineToolbar ? 'flex-1 min-w-0 -ml-2.5' : ''}`}
+          className={`relative ${showDictation || voiceHoldMode ? 'sr-only' : ''} ${manualHeight !== null ? 'flex-1 min-h-0 flex flex-col' : inlineToolbar ? `flex-1 min-w-0 -ml-2.5 ${ONE_ROW_TEXT_PAD}` : ''}`}
+          // Composing in either editor (textarea or rich text) re-arms a
+          // reclaimed session's resume prefetch; the sender throttles.
+          onFocusCapture={() => emitComposeIntent(slotId)}
+          onKeyDownCapture={() => emitComposeIntent(slotId)}
         >
         {/* The one-row fit probe: the textarea's type and horizontal padding,
             no vertical padding, wrapping as the textarea wraps, measured at the
-            single row's column width (see `textFitsOneRow`). Never painted. */}
+            single row's column width (see `textFitsOneRow`). Never painted.
+            `data-composer-typo` gives it the textarea's touch font floor
+            (16px): without it the probe measured at 14px, the textarea
+            wrapped first, and the pill grew tall before the box changed shape. */}
         {inlineToolbarWhileFits && (
-          <div ref={oneRowProbeRef} aria-hidden="true" data-testid="composer-one-row-probe" className="absolute left-0 top-0 invisible pointer-events-none whitespace-pre-wrap break-words px-4 mc-message-font-text font-body leading-normal [scrollbar-gutter:stable] overflow-y-auto" />
+          <div ref={oneRowProbeRef} aria-hidden="true" data-composer-typo="" data-testid="composer-one-row-probe" className="absolute left-0 top-0 invisible pointer-events-none whitespace-pre-wrap break-words px-4 mc-message-font-text font-body leading-normal [scrollbar-gutter:stable] overflow-y-auto" />
         )}
         {/* The staged quote sits inside the text area, above the caret: the
             quoted message is the first thing the reply says, so it is drawn
@@ -1351,6 +1440,7 @@ function ChatInput({
                 spellCheck={spellCheck}
                 inlineMarkdown={inlineMarkdown}
                 onMentionKey={onMentionKey}
+                onEscapeStop={stopTurnOnEscape}
                 className={manualHeight !== null ? 'flex-1 min-h-0' : ''}
               />
             </Suspense>
@@ -1440,7 +1530,7 @@ function ChatInput({
             still and the text column opens above them. */}
         <div data-testid="composer-bottom-row" className={inlineToolbar ? 'contents' : `flex items-center justify-between px-2.5 pb-2 pt-0.5${terminal.active ? ' flex-wrap gap-y-1' : ''}`}>
           <div ref={leftClusterRef} className={`flex items-center gap-0.5 min-w-0${inlineToolbar ? ' order-first pl-1.5 shrink-0 relative z-[1]' : ' flex-1'}`}>
-            <AttachMenu plus={plus} onUploadFiles={onUploadFiles} uploading={uploading} onCancelUpload={onCancelUpload} uploadCount={uploadCount} directFilePicker={directFilePicker} collapsible={collapsible} fileInputId={fileInputId} openPicker={openPicker} isMac={isMac} isMobile={isMobile} onScreenshot={onScreenshot} collapseMenuRow={collapseMenuRow} typedCommandMenus={typedCommandMenus && !terminal.active} onFileSelect={terminal.active ? undefined : onFileSelect} />
+            <AttachMenu plus={plus} onUploadFiles={onUploadFiles} uploading={uploading} onCancelUpload={onCancelUpload} uploadCount={uploadCount} directFilePicker={directFilePicker} fileInputId={fileInputId} openPicker={openPicker} isMac={isMac} touchInput={touchInput} onScreenshot={onScreenshot} collapseMenuRow={collapseMenuRow} typedCommandMenus={typedCommandMenus && !terminal.active} onFileSelect={terminal.active ? undefined : onFileSelect} optimizeRow={busyOptimizeRow} />
             {directFilePicker && collapsible && (
               /* The repo's own overflow mechanism, not a second spelling of it.
                  `max-two-buttons-per-row` names the two files to copy for exactly
@@ -1499,6 +1589,15 @@ function ChatInput({
                   {collapseMenuRow && (
                     <DropdownMenuItem asChild>
                       {collapseMenuRow}
+                    </DropdownMenuItem>
+                  )}
+                  {/* Mid-turn Optimize, as in the "+" menu (`busyOptimizeRow`). */}
+                  {busyOptimizeOffered && (
+                    <DropdownMenuItem asChild disabled={optimizeBlocked} onSelect={() => optimizeUnlessLocked()}>
+                      <div data-testid="composer-more-optimize" className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg cursor-pointer text-left data-[disabled]:opacity-40 data-[disabled]:cursor-not-allowed">
+                        <Sparkles size={14} className="w-4 shrink-0 text-muted lucide-inline" />
+                        <div className="min-w-0 text-[12px] font-medium text-text">{optimizeRowLabel}</div>
+                      </div>
                     </DropdownMenuItem>
                   )}
                 </DropdownMenuContent>
@@ -1564,9 +1663,14 @@ function ChatInput({
               // the idle Send queues the message behind the compaction, so a
               // user with something to say is never left without a send.
               <CompactingIndicator />
-            ) : busyMode !== 'responsive' && (isRunning || stopState === 'soft_pending' || stopState === 'killing') && (onStop || (!terminal.active && canSteer && onSteer)) ? (
-              <BusySendControls stopState={stopState} killingEscaped={killingEscaped} stopWithTap={stopWithTap} isQueued={isQueued && !terminal.active} composerHasDraft={composerHasDraft && !terminal.active} canSteer={canSteer} onSteer={onSteer} steerOnly={steerOnly} fireComposer={fireComposer} disabled={disabled} holdSend={holdSend} holdSendReason={holdSendReason} connected={connected} effectiveBusyMode={effectiveBusyMode} setBusySendMode={setBusySendMode} onBusyModePicked={focusComposerAfterPick} sendOnEnter={sendOnEnter} jevAutoAvailable={jevAutoAvailable} onStop={onStop} terminalActive={terminal.active} stopDeclinedArmed={stopDeclinedArmed} />
-            ) : busyMode === 'responsive' && onStop && ((isRunning && !composerHasDraft) || stopState === 'soft_pending' || stopState === 'killing') ? (
+            ) : busySendSlot ? (<>
+              {/* No Optimize button here: this row is at its button cap, so
+                  mid-turn Optimize is a row in the "+" menu (`busyOptimizeRow`).
+                  Steer and queue wait out an in-flight optimize, like the idle
+                  Send: the draft is being rewritten under them. Enter already
+                  waits (the keydown checks `optimizingRef`). Stop is not gated. */}
+              <BusySendControls stopState={stopState} killingEscaped={killingEscaped} stopWithTap={stopWithTap} isQueued={isQueued && !terminal.active} composerHasDraft={composerHasDraft && !terminal.active} canSteer={canSteer} onSteer={onSteer} steerOnly={steerOnly} fireComposer={fireComposer} disabled={disabled || optimizing} holdSend={holdSend} holdSendReason={holdSendReason} connected={connected} effectiveBusyMode={effectiveBusyMode} setBusySendMode={setBusySendMode} onBusyModePicked={focusComposerAfterPick} sendOnEnter={sendOnEnter} jevAutoAvailable={jevAutoAvailable} onStop={onStop} terminalActive={terminal.active} stopDeclinedArmed={stopDeclinedArmed} />
+            </>) : busyMode === 'responsive' && onStop && ((isRunning && !composerHasDraft) || stopState === 'soft_pending' || stopState === 'killing') ? (
               // Responsive (crewmate) mode keeps the Stop control: an empty
               // composer mid-turn is Stop, and a stop in progress keeps its
               // escalation states. Once the person types, the plain Send below
@@ -1574,23 +1678,7 @@ function ChatInput({
               // decides how that send reaches the running turn.
               <BusySendControls stopState={stopState} killingEscaped={killingEscaped} stopWithTap={stopWithTap} isQueued={false} composerHasDraft={false} canSteer={false} steerOnly={false} fireComposer={fireComposer} disabled={disabled} holdSend={holdSend} holdSendReason={holdSendReason} connected={connected} effectiveBusyMode={effectiveBusyMode} setBusySendMode={setBusySendMode} sendOnEnter={sendOnEnter} jevAutoAvailable={false} onStop={onStop} terminalActive={terminal.active} stopDeclinedArmed={stopDeclinedArmed} />
             ) : !terminal.active && (<>
-              {promptOptimizer && <button
-                className={`w-8 h-8 rounded-lg border-none flex items-center justify-center cursor-pointer transition-all disabled:cursor-not-allowed ${optimizing ? 'bg-accent/20 text-accent animate-pulse' : 'bg-transparent text-muted hover:text-accent hover:bg-accent/10 disabled:opacity-40 disabled:hover:text-muted disabled:hover:bg-transparent'}`}
-                onClick={(e) => { e.stopPropagation(); e.preventDefault(); optimizeUnlessLocked() }}
-                // A single mutation backs this instance, so only one optimize can
-                // run at a time. Disable on the RAW pending flag (not the
-                // slot-scoped `optimizing`) so the button also reads as busy on a
-                // *different* session while the originating session's optimize is
-                // still in flight — matching the re-entrancy guard in
-                // optimizePrompt(). optimizing ⊂ optimizePending, so this stays
-                // disabled on the originating session too.
-                disabled={!value.trim() || optimizePending || !connected || disabled}
-                aria-label={optimizePending && !optimizing ? i18nT('components.chatInput.optimize_prompt_busy_optimizing_another_chat') : i18nT('components.chatInput.optimize_prompt')}
-                title={optimizePending && !optimizing ? i18nT('components.chatInput.optimizing_another_chat_please_wait') : i18nT('components.chatInput.optimize_prompt_2', { shortcut: platformShortcut('Cmd+Shift+Enter') })}
-                {...offlineProps(connected, i18nT('utils.offline.optimize'), i18nT('components.chatInput.optimize_prompt'))}
-              >
-                {optimizing ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
-              </button>}
+              {optimizeButton}
               {/* 'primary' is a stable theming hook (button.primary) — see website/docs/theming-contract.md */}
               {/*
                 Sixth state of this button. The first five are send / stop /
@@ -1729,9 +1817,10 @@ function ChatInput({
                the next one starts in the new one. The dashboard reads
                slot.project live, so the running reply's file links follow the
                new project at once; the tooltip names the reply's start project
-               and says so. The agent and model
-               chips stay locked: their routes answer 409 turn_in_flight
-               instead of staging. A composer busy only with attached
+               and says so. The model chip follows the same contract (its
+               route commits the pick and answers deferred: true, see
+               ModelChip); the agent chip stays locked: its route answers 409
+               turn_in_flight instead of staging. A composer busy only with attached
                sub-agents keeps the chip locked too: the deferred reset stays
                armed while children share the runtime, so a pick there would
                not land at the next turn. */

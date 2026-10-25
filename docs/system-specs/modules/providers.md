@@ -25,7 +25,6 @@ fields the harness cannot enforce remain explicitly unverified. Codex records th
 spec from the same parse that built its session MCP array, rather than re-reading
 the file after the session has started.
 
-Retention mode is established before provider startup. Restricted sessions bypass
 Retention mode is established before provider startup. A restricted session is
 one whose `memory_mode` is `incognito` or `temporary` (any non-persistent mode;
 [session.md](session.md) owns the term). Restricted sessions bypass
@@ -131,7 +130,9 @@ of `@workspace`; an empty or read-only allowlist stays one, `_workspace_grants`)
 Built-in exclusions also exclude their replacements, and core wildcards keep the
 complete requested pattern. Workspace tools cannot skip the gateway gate: shell
 arguments meet command policy and the deny floor, and file tools carry their
-read/write scopes. The link stops reading (so acknowledging) while the session's
+read/write scopes, matched as the guest's POSIX paths on any gateway OS
+(`platform/guest_paths.py`; governance.md, "Path matcher — remote-workspace
+targets"), so a Windows gateway attaches a workspace too. The link stops reading (so acknowledging) while the session's
 reader is behind, holding the guest at its unacked window. The fence needs a
 host whose tool allowlist travels over the wire; only KAS qualifies, so any
 other backend is refused before a workspace is touched

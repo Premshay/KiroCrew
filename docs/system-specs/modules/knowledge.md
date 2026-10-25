@@ -60,7 +60,6 @@ This is the boundary the agent's write path (§2b) captures against: verbatim, l
 ## Success criteria
 
 The Knowledge Library's job — surface the exact, cited chunk when memory's recall falls short — is judged on **two tiers**. Tier 1 has a deterministic in-tree harness (`kirocrew bench kb-retrieval`) alongside the private golden-set ruler `kirocrew knowledge evaluate` (both under "What is measured today"); no Tier 2 harness exists in-tree yet, so Tier 2 remains an explicit task-lift experiment. This section defines the target so a retrieval change (recency weighting, a reranker, content-typed TTL) can be judged against a fixed bar rather than by eye.
-The Knowledge Library's job — surface the exact, cited chunk when memory's recall falls short — is judged on **two tiers**. Tier 1 has a deterministic in-tree harness (`kirocrew bench kb-retrieval`, see "What is measured today"); no Tier 2 harness exists in-tree yet. This section defines the target so a retrieval change (recency weighting, a reranker, content-typed TTL) can be judged against a fixed bar rather than by eye.
 
 ### Tier 1 — intrinsic retrieval quality
 
@@ -179,6 +178,7 @@ The remaining gap is therefore an **A/B task-lift harness** (Tier 2), plus a flo
 | `dashboard/handlers/knowledge_agent_context.py` | the chat context-injection search (`GET /api/knowledge/search-for-context`) and the agent's `POST /api/knowledge/agent-document` |
 | `dashboard/handlers/knowledge_lifecycle.py` | `setup_knowledge_routes`, the source watcher, artifact auto-ingest, live config reloads, the pools' shutdown |
 | `agent_materialization/service_agents.py:_install_knowledge_agent` | Installs the `kirocrew-knowledge` kiro-cli agent used by the pool |
+| `agent_materialization/service_agents.py:repair_knowledge_agent_spec` | Rewrites that spec from the same template before each pool worker spawn when the file on disk is not it |
 
 `KnowledgeStore`'s behaviour lives in the `knowledge/store_parts/` owners in the table above,
 one responsibility each. A member's body is a module-level function there whose first
@@ -561,6 +561,11 @@ Entity extraction (`EntityExtractor`) and internal-URL fetch (`agent_fetch.fetch
   A knowledge turn must be text-only. `AcpWorker.start()` refuses a backend whose `SessionCapabilities.honors_zero_tool_ban` is false, except Claude when the client accepts `restrict_tools([])` **before** startup; that native empty-tool list also removes MCP servers. Codex has no verified zero-tool enforcement on its shared runtime, so a Codex binding is refused before spawn. Kiro uses `AcpClient` directly and confirms the authored zero-tool spec before startup and the effective spec after startup, including a project-level shadow. A KAS shared runtime must expose the consumed spec with `tools: []`; an unconfirmed view closes the provider and refuses the worker. Other directly spawned ACP backends must expose `spec_zero_tools` from the consumed projection after startup. A shared-runtime text turn additionally uses `ToolApprovalPolicy.REJECT_ALL`. There is no silent backend fallback when a binding or its tool restriction fails.
 
   Effort follows the backend's advertised capability. `send_message()` closes a worker after a failed or timed-out turn before it can be reused, and the pool keeps its subprocess PID shielded from the orphan sweep while live.
+
+  Before either a bound or unbound worker starts, repair the installed spec
+  through `service_agents.repair_knowledge_agent_spec`, then confirm its
+  effective zero-tool view. A prepared Kiro projection also checks the published
+  alias after startup; an unconfirmed ban refuses the worker.
 
   Without an edition binding, use upstream's configured-backend selection,
   pre-spawn authored-spec check and consumed-spec confirmation. A harness that

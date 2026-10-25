@@ -604,6 +604,25 @@ payloads. Widening that regex or its key scope is a security change — the same
 constant also decides which paths are treated as local file reads, so the two
 decisions must stay on the one exported copy in `urlTransform.ts`.
 
+A root-relative image (`/images/a.png`) inside a previewed file (a
+`BasePathCtx` is set) is tried as an absolute path first, then against each
+directory above the file, nearest first, up to eight levels
+(`siteRootImageCandidates`). The leading `/` there usually names the root of the
+repository or site the markdown belongs to — GitHub, Zenn and Docusaurus all
+write images that way (issue #23623) — and nothing in the file says where that
+root is. A same-named image in a nearer directory therefore wins over one at
+the real root. Every candidate still goes through `/api/file-raw`, so the fallback
+reads nothing the absolute path could not already ask for. When every candidate
+fails, the broken-image fallback names and probes the path as written, as it
+does for any other image, so its "no longer exists" wording speaks for that path
+alone. That fallback states the failure through an inline `ErrorNotice` beside
+a chip that copies the on-disk path. The notice offers no agent hand-off: the
+renderer also previews unsaved drafts (the meeting note's Preview), and the
+navigation would unmount one. Every surface that
+provides `BasePathCtx` gets this (the file preview, the file explorer, the
+meeting notes sidebar); outside them (chat, artifacts) a leading-slash path
+stays absolute only.
+
 To SHOW a gateway path's file name, use `pathBasename` (and
 `stripTrailingSeparators` for a directory) from `utils/pathBasename.ts`, never
 `.split('/').pop()`: a Windows gateway reports `C:\repo\a.ts`, which a `/`-only
@@ -861,7 +880,8 @@ files own it:
   `var(--border)`, placeholder colour `var(--muted)`, `cursor: pointer` on
   enabled buttons). Then the imports of `font-faces.css`, `design-tokens.css` and
   `theme-palettes.css`; then the `@layer base` element defaults (box model, the
-  global `:focus-visible` ring, the reduced-motion cut, the global scrollbar)
+  global `:focus-visible` ring, the reduced-motion cut, the scroll-only
+  scrollbar)
   and, unlayered, the ambient backdrop and the app-icon tints; then the imports
   of the other eight partials. Tailwind inlines each `@import` where it stands,
   so the import order IS the cascade order: never reorder the imports, and put a
@@ -879,8 +899,8 @@ files own it:
     card's indeterminate progress bar, `.animate-shimmer`, the custom-font
     ligature toggle, the Kiro-theme overrides of nav, session-row and shell
     chrome, and the workspace-tree token mapping.
-  - `scrollbars-and-touch-hit.css` owns the auto-hiding scrollbar classes and the
-    44px touch hit areas. Strays: the send-button sweep (`.btn-sweep`), the card
+  - `scrollbars-and-touch-hit.css` owns the horizontal edge-fade mask for code
+    and diff blocks and the 44px touch hit areas. Strays: the send-button sweep (`.btn-sweep`), the card
     hover glow (`.card-glow`) and the stat top-line accent (`.stat-accent`).
   - `shell-chrome.css` owns the top bar and its collapse ladder, the frameless
     Electron window chrome and focus mode. Stray: `.scrollbar-none`.
@@ -923,6 +943,32 @@ semantic roles `--aim`, `--clarify`, and the `--diff-*` family. Never a hardcode
 `text-danger` / `text-info`, and a running state is `text-accent`. See
 [theming-contract](theming-contract.md) for the variable set, the stable class
 hooks, and the checkers.
+
+No scrollbar is visible at rest, anywhere in the dashboard
+([decision](../../docs/decisions/2026-10-23-scrollbars-are-never-always-visible.md)).
+A scroll box either hides its scrollbar entirely (`scrollbar-none`: the sidebar
+lanes, the nav rail, the tab strips) or shows a thin thumb only while it is being
+scrolled, in a column it reserves anyway so the reveal moves no content. The
+second form is the default and needs no class: the base layer in `index.css`
+keeps the 6px WebKit column with a transparent thumb and paints it under
+`[data-scrolling]`, which `lib/scrollReveal.ts` sets on the scrolling element
+and clears after a short linger (Firefox takes the same two states through
+`scrollbar-width: thin` and `scrollbar-color`, fenced behind the `-moz-appearance`
+probe because Blink drops the pseudo-elements once those are set). Never add a
+`::-webkit-scrollbar-thumb` colour or a `scrollbar-color` whose selector lacks
+`[data-scrolling]`, never `scrollbar-width: auto`, and never a hover-revealed
+thumb: the pointer rests over the chat transcript most of the time, so hover is
+"at rest" there. The global rule and the document scroll listener both stop at a
+shadow boundary; Pierre's code, diff and tree surfaces are reached through
+`unsafeCSS` keyed on the same attribute (`PIERRE_SCROLL_REVEAL_CSS`, folded into
+both option factories in `src/pierre/config.ts`, and the tree's
+`PIERRE_TREE_STATE_ROW_CSS`), and `scrollReveal` attaches to those hosts' shadow
+roots itself (`SHADOW_SCROLL_HOSTS`). When a box's edge does not make it obvious
+that it scrolls, the cue is an edge-fade mask (`.edge-fade-x`, `useScrollEdges`)
+or a "more below" affordance (`MORE_BELOW_MASK`, `JumpToBottomButton`), never a
+resting thumb. `src/test/scrollbarRevealOnly.test.ts` scans `src/` for every
+shape that paints one at rest and measures the revealed thumb's contrast per
+theme; the `no-scrollbar-at-rest` rule in `AUTOSDE.yaml` blocks it in review.
 
 Three of those rules are enforced by `@shadcn/lint` inside the blocking
 `eslint src/ --max-warnings 0` gate (configured in `eslint.config.js`, the

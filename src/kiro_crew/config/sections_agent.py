@@ -101,7 +101,10 @@ class AgentConfig:
             "(agent.model) and then to the provider default, so an unpinned "
             "role stays usable on every subscription tier. Pin a cheaper model "
             "here to run background / sub-agent work on it without changing the "
-            "interactive chat default.",
+            "interactive chat default. A 'subagent' pin runs each spawned "
+            "sub-agent in its own runtime (its own agent process and MCP "
+            "servers, about 0.55 GB of memory each) where it could otherwise "
+            "share the parent chat's.",
         ),
     )
     role_efforts: dict[str, str] = field(
@@ -111,7 +114,10 @@ class AgentConfig:
             "Optional per-task-class reasoning effort, paired with role_models "
             "(keys: 'background', 'subagent'). Empty for a role inherits the chat "
             "default (agent.reasoning_effort) and then the provider/model default. "
-            "Only applies on reasoning-capable models.",
+            "Only applies on reasoning-capable models. Like a model pin, a "
+            "'subagent' effort runs each spawned sub-agent in its own runtime "
+            "(about 0.55 GB of memory each) where it could otherwise share the "
+            "parent chat's.",
         ),
     )
     model_context_tokens: dict[str, int] = field(
@@ -230,12 +236,10 @@ class AgentConfig:
         metadata=_meta(
             "Crew member ACP backend",
             "Backend for crew-member DM sessions: 'kas' (default when omitted or '') "
-            "or another dispatch-capable backend (claude, codex, opencode, goose); "
-            "'kiro' selects kiro-cli. "
-            "Members dispatch work into worker sessions through session-control "
-            "tools mounted per session over the wire, which the kiro-cli v2 "
-            "backend cannot carry — a value resolving to kiro leaves member "
-            "threads as plain chat (no dispatch tools), logged at session start.",
+            "or another dispatch-capable backend (claude, codex, opencode, goose). "
+            "Crewmates run on KAS as their Kiro backend, so 'kiro' here also "
+            "selects KAS. Members dispatch work into worker sessions through "
+            "session-control tools mounted per session over the wire.",
             # Same no-enum reasoning as acp_backend above: the live selectable
             # set comes from the registry via resolve_selected_backend, never a
             # frozen literal.
@@ -1107,6 +1111,16 @@ class AgentConfig:
             "the same workspace; incognito, app-scoped and scheduled sessions are "
             "never addressable, and a crew member or a scheduled run reaches only "
             "sessions it created itself.",
+        ),
+    )
+    session_manager_chain: bool = field(
+        default=False,
+        metadata=_meta(
+            "Session Manager Chain",
+            "Let a session reach the whole line of sessions under it, not only the "
+            "ones it manages directly. With it on, a lead that handed a worker to a "
+            "conductor can still send to, read, stop and close that worker, and "
+            "closing the conductor hands its workers to the lead. Off by default.",
         ),
     )
     member_dispatch: bool = field(

@@ -42,6 +42,10 @@ from kiro_crew.dashboard.state import _ChatSlot
 
 pytestmark = pytest.mark.xdist_group(name="tree_scan_state_parts_facade")
 
+#: Checks ``test_facade_shared_checks.py`` runs against this module's helpers; each is
+#: the same for every facade, so it is written once there and parametrized per module.
+SHARED_FACADE_CHECKS = ("class_body_check_can_fail",)
+
 _SRC = Path(kiro_crew.__file__).resolve().parent
 _PARTS = Path(state_parts.__file__).resolve().parent
 _PARTS_PKG = "kiro_crew.dashboard.state_parts"
@@ -518,6 +522,7 @@ _BASE_SLOT_DEFAULTS: dict[str, tuple[str, str | None]] = {
     "_cycle_reached_provider": ("value", "False"),
     "_dashboard_card_exempt": ("value", "False"),
     "_dashboard_card_identity": ("type", "builtins.str"),
+    "_deferred_model_switch_key": ("value", "''"),
     "_deferred_notes": ("value", "[]"),
     "_detail_render_lock": ("type", "asyncio.locks.Lock"),
     "_dirty_flag": ("value", "False"),
@@ -583,6 +588,7 @@ _BASE_SLOT_DEFAULTS: dict[str, tuple[str, str | None]] = {
     "_lazy_window": ("value", "None"),
     "_lineage_minted": ("value", "False"),
     "_linked_session_busy": ("value", "None"),
+    "_reports_to_creator": ("value", "False"),
     "_lock": ("type", "asyncio.locks.Lock"),
     "_mcp_report": ("value", "None"),
     "_mcp_report_session_id": ("value", "''"),
@@ -1004,13 +1010,6 @@ def test_no_bound_member_depends_on_the_class_body_it_left() -> None:
         if (deps := _class_body_dependencies(inspect.getsource(inspect.unwrap(fn))))
     }
     assert offenders == {}
-
-
-def test_the_class_body_check_can_fail() -> None:
-    source = (
-        "def f(self):\n" "    super().f()\n" "    print(__class__)\n" "    return self.__hidden\n"
-    )
-    assert sorted(_class_body_dependencies(source)) == ["__class__", "mangled __hidden", "super()"]
 
 
 def test_a_fresh_slot_has_every_base_default() -> None:

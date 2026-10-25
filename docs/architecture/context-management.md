@@ -57,6 +57,7 @@ begin on its own line; the assembly newline-terminates the caller's
 | 2 | `[CRITICAL RULES]` | `_critical_rules_for` (runtime-conditional) | unless the agent sets `includeCrewContext: false` |
 | 3 | `[CURRENT DATE]` | `get_local_tz` + `KiroCrewConfig.timezone` | always |
 | 4 | `[CURRENT AGENT]` / `[RUNTIME]` | `_runtime_display_name`, trusted `runtime_source` from the dispatcher | when a session key exists |
+| 4a | `[TOOL NAMES]` | `context_assembly/tool_names.py` → `tool_names_block`; the spelling rule in `agent_sdk/kas_tool_names.py` | KAS sessions only (`provider_type` is KAS's label); also in a minimal start and re-sent after a compaction. KAS resolves an MCP call only by `mcp_<server>_<tool>` or `@<server>/<tool>`, and Crew's prompts name tools bare |
 | 5 | `[CREW MEMBER OPERATING MODE]` | constant prose | member DM slot, and `_member_dispatch_held`: the live session's `member_dispatch_mounted` (whether its composer actually appended the session-control entry), falling back to `_member_backend_can_dispatch` only when no provider evidence reached the build |
 | 6 | `[MEMBER IDENTITY]` … | `_build_member_section` (see §5) | V1 member sessions |
 | 7 | `[UI LANGUAGE]` | `_build_ui_language_section`, the configured language | only when set explicitly |
@@ -496,6 +497,10 @@ it (steering, below, is the one block the backend does gate).
 | custom | none | **nothing** | the agent is expected to bring its own |
 | custom | mapped | only the mapped set, on **either** backend | bounded directory and scoped activation |
 
+The plan hands `agent_skill_globs` the session's key, so a crewmate's worker
+is scoped by its merged kit, the worker base plus its crewmate's additions
+(`mate_worker.mate_service_scope_spec`), in its context as in `skill_search`.
+
 The mapping is read by `agent_discovery_parts/skill_scope.py` → `agent_skill_globs`, which pulls the
 `skill://` entries out of the spec's `resources` (`skill_resource_uris`) and
 expands each into an fnmatch glob over real paths (`expand_skill_uri`:
@@ -589,7 +594,7 @@ order — earlier outranks later, with one stated exception:
 |--:|---|---|---|
 | 1 `[MEMBER IDENTITY]` | product, derived | the crew's `description` + `triggers` in `config.json` | dashboard |
 | 2 `[HOW YOU WORK]` | product | `_MEMBER_HOW_YOU_WORK`, identical for every member except item 6 (below) | nobody |
-| 3 `[PERMANENT RULES]` | the user | `<data home>/trust/member-rules/<slug>.json` | dashboard only |
+| 3 `[PERMANENT RULES]` | the user | `<data home>/member-records/member-rules/<slug>.json` | dashboard only |
 | 4 `[CURRENT ASSIGNMENT]` | the member, or the user when the member's spec mounts no file tool | `<data home>/members/<slug>/briefing.md` | the member's own file tools, when its spec mounts one; otherwise the user, by hand |
 
 The exception: layer 3's own header claims precedence over the whole section,
@@ -715,11 +720,11 @@ member writes one, and `[CURRENT ASSIGNMENT]` renders
 |---|---|---|
 | Per-member markdown separate from `~/.kiro/agents/*.json` | **Not as a member-private file** | The only member-owned markdown is `briefing.md` (`members_parts/prompt_layers.py` → `member_briefing_path`), which is working memory, not a persona. Persona lives in the agent spec — and `agent_spec_format.py` does support a markdown spec (`<name>.md`, YAML frontmatter + body as the prompt, JSON wins when both exist) — but that file sits in the agents directory shared with every other tool, not in the member's private space. |
 | Per-member working memory (briefing) | **Implemented** | `members_parts/prompt_layers.py` → `member_briefing_path`, `read_member_briefing`, `member_briefing_supported`; injected as layer 4 by `context_assembly/member.py` → `build_member_section`. Agent-writable by design, with no dashboard endpoint — the member edits it with its own file tools, and a member whose spec mounts none is told it cannot, so its briefing is the user's to edit or delete by hand. Capped at `MEMBER_BRIEFING_MAX_CHARS` on read. |
-| Per-member permanent rules | **Implemented** | `members_parts/prompt_layers.py` → `member_rules_path`, `read_member_rules`, `write_member_rules`; stored under `trust/member-rules/` so the member's file tools cannot rewrite its own boundary. `MEMBER_RULES_MAX_CHARS` cap enforced on write (a human dashboard action), never truncated on read. |
+| Per-member permanent rules | **Implemented** | `members_parts/prompt_layers.py` → `member_rules_path`, `read_member_rules`, `write_member_rules`; stored under `member-records/member-rules/`, a directory the OS sandbox masks and the file tools refuse, so nothing the member runs can rewrite its own boundary. `MEMBER_RULES_MAX_CHARS` cap enforced on write (a human dashboard action), never truncated on read. |
 | Private per-member memory | **Implemented for explicitly created members** | Memory V2: one SQLite database per immutable `member_id`, resolved by `config/loader_agents.py` → `resolve_agent_bindings` and `execution_context.py` → `member_config_for_id`; bounded essentials from `member_essential_context.py`, recall through `memory_recall`. **Gap:** legacy and auto-discovered members remain on Global V1 and are not migrated, and a member cannot choose or rebind a shared store. |
 | Per-member activity log | **Implemented** | `members_parts/member_activity.py` → `record_activity`, `read_activity`, backed by the per-member event log (`eventlog/log.py`, a `member`-kind crew log); each record is one `activity/record` event under the caps that module applies per append. There is NO rotation, because a sequence-ordered reader cannot survive a file renamed out from under it or a dropped oldest row; the log is bounded per row and per value and accumulates over a member's lifetime. A legacy `activity.jsonl` is folded in once and retired to `activity.jsonl.migrated`. |
 | Per-member permission control | **Partial** | Real and enforced, but keyed on the **template**, not the member: `agent_capabilities.py` resolves owner-reviewed intent over `agent_state.CAPABILITY_SECTIONS` (`mcpServers`, `tools`, `allowedTools`, `autoApprove`, `skills`, `prompt`, `model`, `resources`). A member gets its own permissions only through a **private copy** of its template (`private_to` lineage; `dashboard/agent_admin/template_lineage.py` → `_foreign_private_copy_owner`, `dashboard/agent_admin/crew_removal.py` → `_prune_private_copy_of_deleted_crew`), which is refused to a second crew. **Gaps:** two members sharing one template share its permissions; `[PERMANENT RULES]` is prompt-level guidance, not an enforced gate; and `agent.member_dispatch` is one global ceiling rather than a per-member one. |
-| Per-member DM binding | **Implemented** | `members_parts/dm_bindings.py` → `dm_binding_path`, `read_dm_binding`, `write_dm_binding`; under `trust/member-bindings/`, because the binding is the thread's identity authority. |
+| Per-member DM binding | **Implemented** | `members_parts/dm_bindings.py` → `dm_binding_path`, `read_dm_binding`, `write_dm_binding`; under `member-records/member-bindings/`, because the binding is the thread's identity authority. |
 
 The stated purpose of the private-file direction is per-member private memory plus
 per-member permission control; both exist today, in the forms above.

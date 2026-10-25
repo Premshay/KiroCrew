@@ -92,6 +92,15 @@ with no row here.
    * - ``ACP_BACKENDS_MEMBER_TOOL_LIMITS``
      - pre-session registry query (whether a saved spec's per-tool ``disabledTools``
        is honoured, or the spec is refused before spawn)
+   * - ``ACP_BACKENDS_MATE_WORKER_KIT``
+     - pre-session registry query (whether a crewmate's worker runs with its kit,
+       or is refused before spawn)
+   * - ``ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT``
+     - context assembly (whether a crewmate worker's principles and its crewmate's
+       prompt ride the ``[AGENT SYSTEM PROMPT]`` block)
+   * - ``ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS``
+     - pre-session registry query (whether a crewmate worker's single-tool limits
+       are honoured, or a worker with limits is refused before spawn)
    * - ``ACP_BACKENDS_MEMBER_DISPATCH``
      - driver-internal (whether a per-session tool set can be mounted)
    * - ``ACP_BACKENDS_MEMBER_PANEL``
@@ -159,6 +168,8 @@ with no row here.
      - driver-internal (which ``configId`` carries the reasoning effort)
    * - ``effort_config_option_value``
      - driver-internal (which VALUE that option spells a Crew effort level with)
+   * - ``effort_config_option_levels``
+     - driver-internal (which advertised values are levels, not "no override")
    * - ``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION``
      - driver-internal (whether the ADVERTISED option, rather than Crew's model
        registry, answers that this session takes an effort level and which ones)
@@ -186,11 +197,17 @@ with no row here.
      - driver-internal (whether ``initialize`` carries ``_meta.kiro.settings``)
    * - ``ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD``
      - pre-session registry query (whether the dashboard may skip a session reset)
+   * - ``ACP_BACKENDS_MCP_WIRE_REINJECT``
+     - pre-session registry query (whether the dashboard may skip a session reset
+       because Crew re-sends the projection at the next turn boundary)
    * - ``ACP_BACKENDS_STRUCTURED_REFUSAL``
      - driver-internal (whether the metadata refusal parser is consulted)
    * - ``ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR``
      - driver-internal (whether an adapter-authored text chunk that ends a turn
        is the turn's provider failure rather than an answer)
+   * - ``ACP_BACKENDS_REPORT_USAGE``
+     - semantic question (whether a turn that reports no usage billed nothing,
+       read through the provider's ``reports_turn_usage``)
    * - ``ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL``
      - driver-internal (whether a kindless permission frame takes the preceding
        tool_call's ``kind``; read per frame by the session handle's wire accessor)
@@ -815,6 +832,7 @@ from kiro_crew.agent_sdk.backends_mcp import (  # noqa: E402,F401 - re-exported 
     ACP_BACKENDS_HONOR_ZERO_TOOL_BAN,
     ACP_BACKENDS_MARKDOWN_AGENT_SPECS,
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
+    ACP_BACKENDS_MCP_WIRE_REINJECT,
     ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
@@ -823,6 +841,9 @@ from kiro_crew.agent_sdk.backends_mcp import (  # noqa: E402,F401 - re-exported 
     overlay_project_scope,
 )
 from kiro_crew.agent_sdk.backends_members import (  # noqa: E402,F401 - re-exported vocabulary
+    ACP_BACKENDS_MATE_WORKER_KIT,
+    ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT,
+    ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MEMBER_PANEL,
@@ -840,8 +861,10 @@ from kiro_crew.agent_sdk.backends_models import (  # noqa: E402,F401 - re-export
     CC_PERMISSION_MODE_ENV,
     DEFAULT_EFFORT_CONFIG_OPTION_ID,
     EFFORT_CONFIG_OPTION_IDS,
+    EFFORT_CONFIG_OPTION_NO_OVERRIDE_VALUES,
     EFFORT_CONFIG_OPTION_VALUES,
     effort_config_option_id,
+    effort_config_option_levels,
     effort_config_option_value,
     model_refusal_phrase,
     model_registry_namespace,
@@ -889,6 +912,7 @@ from kiro_crew.agent_sdk.backends_turns import (  # noqa: E402,F401 - re-exporte
     ACP_BACKENDS_LOCAL_CLEAR,
     ACP_BACKENDS_NATIVE_COMPACTION,
     ACP_BACKENDS_NATIVE_TODOS,
+    ACP_BACKENDS_REPORT_USAGE,
     ACP_BACKENDS_SESSION_NOTICES,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STEER_ADVERTISED,

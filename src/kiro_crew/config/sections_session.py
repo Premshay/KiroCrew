@@ -271,6 +271,17 @@ class KiroCrewAgentConfig:
             "standard levels. An explicit effort on the call wins.",
         ),
     )
+    dynamic_capabilities: bool = field(
+        default=False,
+        metadata=_meta(
+            "Dynamic capabilities",
+            "Preview, per crewmate: this crewmate can find "
+            "new skills or tools for its worker and ask for them on a card in its "
+            "chat. Off (the default): only you add them, in this crewmate's "
+            "advanced settings, and it tells you when its worker lacks one. "
+            "Read per request, so a change reaches the crewmate's next session.",
+        ),
+    )
     approval_mode: str = field(
         default="",
         metadata=_meta(
@@ -393,6 +404,16 @@ class KiroCrewAgentConfig:
             "ghost traits chosen in the avatar builder; {'kind': 'image'} "
             "means an uploaded picture served from the per-crew avatar "
             "endpoint.",
+        ),
+    )
+    imported: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Imported",
+            "Provenance stamp of a mate imported from a .crewmate file: "
+            "{'format_version', 'sender_label', 'sha256', 'imported_at'}. Empty "
+            "for a mate made here. The sender label is self-declared; nothing "
+            "reads the stamp to reach the sender.",
         ),
     )
 

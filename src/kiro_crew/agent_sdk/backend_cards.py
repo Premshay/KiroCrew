@@ -366,6 +366,18 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "ACP_BACKENDS_STEER; this set only gates use of that path for adapters "
         "whose installed version might lack the extension"
     ),
+    "ACP_BACKENDS_MATE_WORKER_KIT": (
+        "whether a crewmate's worker may run here with its kit. A worker always runs "
+        "on its crewmate's backend, so the choice it depends on is the member "
+        "backend, and a non-member refuses the hand-off with an error that names "
+        "the backends that can carry it. Nothing runs without its kit, so a card "
+        "line would describe a refusal the user meets with its own remedy"
+    ),
+    "ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT": (
+        "which channel carries a crewmate worker's prompt: the context block or the "
+        "wire spec. The worker gets the same prompt either way, so there is nothing "
+        "for a user choosing a harness to weigh"
+    ),
     "ACP_BACKENDS_SERIAL_SESSION_STARTS": (
         "which backend's process answers session starts and mode switches one at a "
         "time. It decides only what a timed-out start's error says about the "
@@ -452,6 +464,12 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "non-member refuses such a spec before spawn with an error naming the fix, "
         "so nothing runs wider than it was saved; the card's saved-agent line already "
         "says whether the spec loads at all"
+    ),
+    "ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS": (
+        "whether a crewmate worker's single-tool switch-offs are honoured. A worker "
+        "with such limits on a non-member is refused before spawn with an error naming "
+        "the fix, so it never runs wider than its crewmate saved; a worker without "
+        "them runs, and the card's saved-agent line already says whether it loads"
     ),
     "ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE": (
         "which channel carries the agent spec's own servers to the session, read by the "
@@ -557,6 +575,13 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "wrong membership either shows a failure as an answer or an answer as a "
         "failure, which is a defect"
     ),
+    "ACP_BACKENDS_REPORT_USAGE": (
+        "whether a turn that reports no usage billed nothing, read by memory consolidation "
+        "to decide whether an empty reply spends one of its attempts. The chat surfaces "
+        "already show what each harness reports, so a reader choosing a harness loses "
+        "nothing; a wrong membership either charges a throttled turn or retries a span "
+        "without end, which is a defect"
+    ),
     "ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL": (
         "whether a kindless permission frame takes its tool_call's kind so the "
         "gate's kind-keyed tiers see the harness's classification. Both states are "
@@ -612,6 +637,14 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "no version -- so an available mark would promise a session the runtime "
         "still resets on a build below that floor, and two levels cannot say "
         "on a recent enough release"
+    ),
+    "ACP_BACKENDS_MCP_WIRE_REINJECT": (
+        "the OTHER half of the same fact -- whether a freshly installed MCP server "
+        "reaches a RUNNING session, here by Crew re-sending the projection rather "
+        "than by the harness watching a file. Its membership is not version-gated, "
+        "but a card that stated this half for KAS beside an off-card hot-reload set "
+        "would read as kiro-cli lacking what it has; one fact needs one line, and "
+        "that line cannot be projected while the other half cannot"
     ),
 }
 

@@ -176,9 +176,9 @@
     "hide_full_changelog": "▾ Hide Full Changelog",
     "i_d_like_to_request_a_feature": "I’d like to request a feature!",
     "iam_identity_center": "IAM Identity Center",
-    "kiro_credit_usage_api_key": "Kiro credit usage — not available with API key authentication",
-    "kiro_credit_usage_signin_required": "Kiro credit usage — no live Kiro sign-in could be read; sign in again to restore it",
-    "kiro_credit_usage_unavailable": "Kiro credit usage — unavailable",
+    "kiro_credit_usage_api_key": "Kiro account & credits — not available with API key authentication",
+    "kiro_credit_usage_signin_required": "Kiro account & credits — no live Kiro sign-in could be read; sign in again to restore it",
+    "kiro_credit_usage_unavailable": "Kiro account & credits — unavailable",
     "memory_unavailable": "Memory: unavailable",
     "n_more_one": "{{count}} more",
     "n_more_other": "{{count}} more",
@@ -220,9 +220,10 @@
     "focus_mode_title": "Focus mode · Alt+Shift+M",
     "focus_mode_title_mac": "Focus mode · ⌥⇧M",
     "connect_your_phone": "Connect your phone",
-    "kiro_credit_usage_no_reading": "Kiro credit usage — no balance reading yet; open to refresh",
-    "kiro_credit_usage_sign_in_type": "Kiro credit usage — balance isn’t available for this sign-in",
-    "kiro_credit_usage_config_unreadable": "Kiro credit usage — could not read the backend setting; open to retry",
+    "kiro_credit_usage_no_reading": "Kiro account & credits — no balance reading yet; open to refresh",
+    "kiro_credit_usage_sign_in_type": "Kiro account & credits — balance isn’t available for this sign-in",
+    "kiro_credit_usage_config_unreadable": "Kiro account & credits — could not read the backend setting; open to retry",
+    "kiro_account_credits": "Kiro account & credits — view usage, manage subscription",
     "notifications_ask_agent_help": "Leaves this page and opens a new chat with this error's report already filled in, ready for you to send",
     "metrics_card_old_data": "Last updated more than 90 seconds ago",
     "metrics_card_fetch_failed": "The last metrics update failed",
@@ -1390,7 +1391,10 @@
     },
     "designCritique": {
       "askLayer": {
-        "answer_failed_ask_again_below": "Answer failed — ask again below"
+        "answer_failed_ask_again_below": "Answer failed — ask again below",
+        "ask_a_follow_up": "Ask a follow-up…",
+        "ask_again": "Ask again…",
+        "what_dont_you_understand_about_this": "What don’t you understand about this?"
       },
       "constants": {
         "blocked_figma_app_missing_hint": "Open the file in Figma desktop and try again, or export the frames as PNGs and drop them here.",
@@ -1545,9 +1549,17 @@
     },
     "warmBriefCard": {
       "asked": "You asked",
+      "done": "Done so far",
       "label": "Catch-up",
       "needs_you": "Needs you",
-      "next": "Next"
+      "next": "Next",
+      "progress": "Progress",
+      "progress_count": "{{accepted}} of {{total}} done",
+      "remaining": "Left",
+      "status_blocked": "Blocked",
+      "status_done": "Done",
+      "status_needs_you": "Waiting on you",
+      "status_on_track": "On track"
     },
     "filePathMenu": {
       "open_in_side_panel": "Open in side panel",
@@ -2073,6 +2085,7 @@
       "agent_cycle_hint": "Next agent: Alt+Shift+A · Previous: Alt+Shift+Z",
       "agent_cycle_hint_mac": "Next agent: ⌥⇧A · Previous: ⌥⇧Z",
       "model_inherited_default": "This session runs on the default model ({{name}}). It has no model of its own, so it changes if the default does. Click to pin one.",
+      "model_switch_applies_next_turn": "Your next message runs on the model you pick. This reply finishes on the model it started with.",
       "approve_sub_agent": "Approve sub-agent: {{name}}",
       "branch": "Branch: {{branch}}",
       "detached_head_at": "Detached HEAD at {{branch}}",
@@ -2105,7 +2118,6 @@
       "steer_act_on_this_as_soon_as_possible_enter": "Steer — act on this as soon as possible (Enter)",
       "stop_recording": "Stop recording",
       "stop_the_current_response_to_switch_agents": "Stop the current response to switch agents",
-      "stop_the_current_response_to_switch_model": "Stop the current response to switch model",
       "switch_not_confirmed": "Switch not confirmed yet — it will apply if the connection recovers.",
       "dictation_added": "Dictation added to your message",
       "mic_in_use_elsewhere": "Microphone in use in another chat",
@@ -2136,6 +2148,8 @@
       "agent_default_source": "Set per agent in config.json (agents.{{agent}}.autocompact_pct). Moving the slider overrides it for this session.",
       "optimize_failed": "Couldn't optimize the prompt. Your original text was restored.",
       "optimize_failed_elsewhere": "Couldn't optimize the prompt you started in another session. Its original text was restored there.",
+      "cancel_optimizing": "Cancel optimizing",
+      "cancel_optimizing_short": "Cancel",
       "session_control_needs_attention": "Needs attention",
       "session_control_ready": "Ready",
       "session_control_chip_label": "{{label}} — {{detail}}",
@@ -4132,6 +4146,24 @@
       "left_avatar": "Picture",
       "left_model": "Model preference",
       "left_dashboard": "Dashboard layout",
+      "field_rules": "Rules",
+      "field_model_hint": "Model (sender's pick, not applied)",
+      "field_import_skills": "Skills it uses from your apps",
+      "field_import_crons": "Schedule",
+      "field_dashboard_template": "Dashboard",
+      "import_cron_paused": "{{name}}: {{when}} (arrives paused)\n{{detail}}",
+      "import_cron_timezone": "time zone {{tz}}",
+      "import_skill_app": "{{name}} (from the {{app}} app)",
+      "field_carried_skills": "Skills included in the file",
+      "field_carried_scripts": "Scheduled scripts",
+      "field_carried_files": "Files",
+      "field_carried_avatar": "Picture",
+      "carried_avatar_kind": "{{type}} picture",
+      "carried_skill": "Skill {{name}}",
+      "carried_skill_files": "{{name}} (files: {{count}})",
+      "carried_script": "Scheduled script",
+      "carried_loading": "Loading the files…",
+      "carried_unavailable": "The files are no longer kept; pick the file again to see them.",
       "not_included_private": "Its memory, chat history, saved credentials, and the sender's approval settings",
       "field_timezone": "Time zone",
       "field_value": "New value",
@@ -4198,6 +4230,14 @@
       "scope_count_other": "Affects {{count}} members",
       "scope_label": "Affects",
       "scope_only_this": "Only this mate changes.",
+      "addition_server": "Give {{name}}’s worker {{server}}.",
+      "addition_from_gateway": "This gateway already runs it, so no new code comes in.",
+      "addition_from_registry": "It is installed from the MCP registry ({{id}}) for {{name}} only.",
+      "addition_from_card": "It is set up on this card for {{name}} only.",
+      "addition_runs_unasked": "Runs without asking you: {{tools}}.",
+      "addition_no_new_grants": "Adds no new grant to run a tool without asking; your current approval settings still apply.",
+      "addition_runs_all_unasked": "Every tool runs without asking you.",
+      "addition_skill": "Give {{name}}’s worker the {{skill}} skill.",
       "secret_hint": "Goes straight to your secrets. {{name}} never sees it.",
       "secret_label": "Value",
       "status_applying": "Applying…",
@@ -4229,9 +4269,11 @@
       "field_model": "Model",
       "field_reasoning_effort": "Reasoning effort",
       "field_approval_mode": "Approval mode",
+      "field_dynamic_capabilities": "Can ask you for tools",
       "approval_mode_hint_normal": "Asks you before doing anything.",
       "approval_mode_hint_trust_reads": "Runs read-only shell commands on its own, asks you for everything else.",
       "approval_mode_hint_trust": "Works in its chat without asking you first.",
+      "dynamic_capabilities_hint": "It can ask you on a card for tools and skills its worker needs. Each one still needs your approval.",
       "kind_crewmate_goal": "Mate goal",
       "primary_crewmate_goal": "Set goal",
       "kind_crewmate_key_results": "Milestones",
@@ -4240,7 +4282,16 @@
       "kind_crewmate_dashboard_page": "Dashboard page",
       "primary_crewmate_dashboard_page": "Yes, build my page",
       "primary_crewmate_check_ins": "Turn on these check-ins",
-      "field_key_results": "Milestones"
+      "field_key_results": "Milestones",
+      "decline_crewmate_import": "Don't import",
+      "note_crewmate_import": "Nothing runs when you import: it asks before each tool, schedules arrive switched off, and skills wait until you trust the mate's workspace folder. After the press, Undo on this card removes it.",
+      "title_crewmate_import": "Import mate “{{name}}”",
+      "carried_show_code": "Show code",
+      "tool_access_title": "Allow {{name}} to ask you for tools its worker needs? Each one still needs your approval.",
+      "tool_access_allowed": "Allowed",
+      "tool_access_not_allowed": "Not allowed",
+      "tool_access_turn_on": "Turn on",
+      "tool_access_not_now": "Not now"
     },
     "assistantWelcome": {
       "default_name": "Mate"
@@ -4389,6 +4440,11 @@
       "nothing_blocking": "Nothing is holding up a restart.",
       "load_failed": "Couldn't read what is holding up the restart",
       "clear_failed": "Couldn't clear the workers' context"
+    },
+    "unscannedDownload": {
+      "title": "Too large to scan",
+      "body": "{{name}} is {{size}}. Files over {{limit}} are not checked for secrets before download.",
+      "download_anyway": "Download anyway"
     }
   },
   "hooks": {
@@ -4995,7 +5051,8 @@
       },
       "messageContextMenu": {
         "copy_link_text": "Copy link text",
-        "copy_link_address": "Copy link address"
+        "copy_link_address": "Copy link address",
+        "open_link_new_tab": "Open link in new tab"
       },
       "chatNavPanel": {
         "link": "Link"
@@ -5369,6 +5426,7 @@
         "sensitive_in_card": "Before you share — the card contains: {{kinds}}",
         "sensitive_in_caption": "Before you share — the post text contains: {{kinds}}",
         "withdrawn_by_policy": "Sharing was turned off by policy. Copy your text now if you want to keep it — it is not saved when you close this dialog.",
+        "sites_unavailable": "Couldn't check which sites you may share to, so none are offered. Try again later.",
         "copy_text_only": "Copy text",
         "copied_text": "Copied",
         "copy_text_failed": "Copy failed",
@@ -5625,6 +5683,7 @@
       },
       "toolRiskBadge": {
         "annotation_title": "Jev looked at this call and flagged it. That changed nothing about whether the call was allowed: this session's own permission setting decided that, and the call may still have been refused.",
+        "annotation_note": "flag only, did not allow or block",
         "confidence_title": "Jev's confidence in its own answer, from 0 to 1",
         "labelled_tier": "Jev: {{tier}}",
         "rate_jev": "Jev",
@@ -5996,6 +6055,7 @@
       "unlink_source_link_failed": "Could not hide. Try again.",
       "waiting_for_memory": "Waiting for free RAM",
       "muted": "Muted: no chime, toast or badge",
+      "process_released": "Asleep: wakes on the next message",
       "chat_with_folder": "Chat with {{folder}} folder",
       "chat_with_folder_desc": "The chat that started this folder's other chats",
       "conductor_tag": "conductor"
@@ -6099,6 +6159,10 @@
       "kind_ruling": "decision",
       "kind_stale": "stale",
       "kind_orphaned": "orphaned",
+      "report_undelivered": "couldn't send its report",
+      "brief_undelivered": "couldn't read its brief",
+      "undelivered_detail": "{{item}}: Its last call failed before reaching the ledger because the harness couldn't resolve the tool name, so the conductor hasn't heard from it. This clears once a call gets through.",
+      "ask_about_item": "Ask the agent about {{title}}",
       "no_report": "no report",
       "role_worker": "worker",
       "role_conductor": "conductor",
@@ -6864,6 +6928,7 @@
       "skillsTab": {
         "adds_new_requirements_to": "Adds new requirements to {{target}} — {{description}}",
         "approve_failed_generic": "Approval refused ({{reason}}).",
+        "approve_failed_changed": "Approval refused: this candidate changed after you read it. It has been read again. Review it, then approve.",
         "approve_failed_live_exists": "Approval refused: a live skill with this name already exists.",
         "approve_failed_not_found": "This candidate is no longer pending — it was approved or dismissed in another window or by your {{productName}} agent, so there was nothing left to approve.",
         "approve_failed_not_found_approved_named": "Candidate “{{name}}” is no longer pending — it was already approved in another window or by your {{productName}} agent and now appears in the Skills list below, so there was nothing left to approve.",
@@ -7688,6 +7753,8 @@
         "double_click_to_edit_desc": "When off, a double-click on your message selects a word as in any text.",
         "sidebar_click_opens_tab": "Open Sidebar Sessions in a Session Tab",
         "sidebar_click_opens_tab_desc": "A click opens the session in its own session tab instead of replacing the active tab's session.",
+        "copy_on_select": "Copy on select",
+        "copy_on_select_desc": "Copy text to the clipboard as soon as you select it in the conversation with the mouse. The Quote, Ask about this and Copy row still opens.",
         "failed_to_save_selectable_models": "Failed to save selectable models",
         "model_picker_all_models": "All models ({{count}})",
         "model_picker_selected_models": "Selected {{selected}} / {{total}}",
@@ -7708,6 +7775,7 @@
         "subagent_model": "Subagent Model",
         "model_for_background_lite_heartbeat_work": "Model for background work — title generation, history compaction, and heartbeat polling.",
         "model_for_spawned_sub_agents": "Model for spawned subagents.",
+        "subagent_pin_runtime_cost": "Setting Subagent Model or Subagent Effort to anything but its default runs each subagent in its own process, about 0.55 GB of memory each, which can slow a machine with 16 GB or less. With both on their defaults, subagents can share the chat's process.",
         "role_model_auto_hint": "'Auto' lets the provider pick — it does not inherit your Default Model. Pin a model to run this work on it.",
         "failed_to_save_role_model": "Failed to save role model",
         "disabled_by_instance_config_tips_enabled_false": "Disabled by instance config (tips_enabled: false)",
@@ -7901,6 +7969,7 @@
         "adding": "Adding…",
         "connect": "Connect",
         "connect_failed": "Connect to {{id}} failed: {{error}}",
+        "connect_disabled_needs_restart": "The gateway is on but not active yet — restart it to connect.",
         "connect_needs_restart": "Connect to {{id}} failed: the gateway needs a restart first. See the note below.",
         "connected_switch_from_tab_strip": "Connected “{{name}}”. Switch to it from the tab strip in the top header.",
         "connecting": "Connecting…",
@@ -8354,6 +8423,7 @@
         "unavailable_disabled": "Speech-to-text is turned off. Switch it on above.",
         "status_provider_off": "Not listening",
         "status_not_working": "not working",
+        "status_unavailable_provider": "unavailable",
         "unavailable_provider_off": "Voice is on, but the provider is set to Off, so nothing is listening. Pick another provider from the Provider menu below.",
         "unavailable_extra_missing": "The voice packages are not installed in the gateway's Python environment.",
         "unavailable_no_wheel": "There is no prebuilt speech recogniser for this platform. Install a C++ compiler and CMake, then reinstall the voice packages.",
@@ -8969,6 +9039,11 @@
     },
     "membersPage": {
       "drawer_delegated_working": "Delegated work running",
+      "profile_dynamic_capabilities": "Dynamic capabilities",
+      "profile_dynamic_capabilities_switch": "Let {{name}} ask you for tools",
+      "profile_dynamic_capabilities_hint": "{{name}} can ask you on a card in this chat for skills or tools its worker needs. Each one still needs your approval. Off: only you add them, in {{name}}'s advanced settings.",
+      "profile_preview_tag": "Preview",
+      "profile_dynamic_capabilities_failed": "Could not save this setting. Try again.",
       "toggle_roster": "Toggle mates",
       "fresh_start": "Fresh start",
       "fresh_start_failed": "Fresh start didn't finish. The conversation was kept.",
@@ -8977,7 +9052,21 @@
       "fresh_start_confirm_action": "Fresh start",
       "fresh_start_failed_queued": "Messages are still queued. Wait for them to finish, then try Fresh start again.",
       "fresh_start_failed_busy": "The mate is still working and didn't stop. Stop it first, then try Fresh start again.",
-      "fresh_start_unsaved_fold": "It forgot this conversation and the messages are folded away, but the fold time wasn't saved. They unfold again after a reload."
+      "fresh_start_unsaved_fold": "It forgot this conversation and the messages are folded away, but the fold time wasn't saved. They unfold again after a reload.",
+      "import_from_file": "Import from file",
+      "import_title": "Import a mate",
+      "import_hint": "Pick a .crewmate file someone shared with you. Nothing is created until you press Import mate on the next screen.",
+      "import_checking": "Checking the file…",
+      "import_pick": "Choose a file",
+      "import_refused": "This file can't be imported.",
+      "import_refused_newer": "This file needs a newer {{productName}}.",
+      "import_refused_too_large": "This file is too large.",
+      "import_refused_grant": "This file tries to let the mate run tools without asking you, so it can't be imported.",
+      "import_refused_mcp": "This file brings MCP servers, which can't be imported yet.",
+      "import_refused_user_template": "This file names a custom dashboard only its sender has.",
+      "import_refused_text": "This file holds text that looks like a password or key, so it can't be imported.",
+      "import_keep_hint": "Decide later keeps this import waiting here until it expires. Don't import throws it away.",
+      "import_later": "Decide later"
     }
   },
   "privacyDisclosure": {
@@ -9044,6 +9133,10 @@
     "secrets": {
       "managed_title": "Used automatically by {{productName}}",
       "managed_description": "Credentials {{productName}} recognizes and uses automatically. Add or rotate their values here.",
+      "gerrit_http_credential_label": "Gerrit HTTP credential",
+      "gerrit_http_credential_description": "Authenticates Gerrit change lookups for one configured host. Enter it as username:HTTP password, generated under that server’s HTTP Credentials settings.",
+      "gerrit_global_unused_multi_host": "Not used by Gerrit while multiple hosts are configured. Set each host’s credential above, or delete this entry.",
+      "gerrit_global_unused_host_credential": "Not used because the host-specific Gerrit credential takes precedence. Delete this entry if you no longer need the fallback.",
       "jira_api_token_label": "Jira API token",
       "jira_api_token_description": "Authenticates Jira issue lookups for the configured instance.",
       "jira_global_unused_multi_host": "Not used by Jira while multiple hosts are configured. Set each host’s credential above, or delete this entry.",
@@ -9149,7 +9242,8 @@
   },
   "utils": {
     "agentSwitchFeedback": {
-      "turn_in_flight": "A turn is running — try again when it finishes."
+      "turn_in_flight": "A turn is running — try again when it finishes.",
+      "model_deferred": "{{model}} takes over from your next message. This reply finishes on the model it started with."
     },
     "cronUtils": {
       "create": "Create",
@@ -9347,6 +9441,10 @@
       "stream_error_session_failed": "The dictation session failed. Try recording again.",
       "stream_error_vocabulary_rejected": "Amazon Transcribe could not use your custom vocabulary. Choose another one, or None, in the speech-to-text settings, then try again.",
       "stream_error_sdk_outdated": "Mixed languages need amazon-transcribe 0.6.3 or newer in the gateway. Upgrade it with the command in the gateway log, or clear Mixed languages in the speech-to-text settings, then try again."
+    },
+    "speechProviders": {
+      "unavailable_no_reason": "This provider can't run right now.",
+      "sign_in_hint": "Sign in with your {{account}} to use it."
     },
     "templateSource": {
       "built_in": "Built-in",
@@ -9630,6 +9728,9 @@
     "read_only": "Read-only",
     "built_from_headline": "Built from",
     "built_from_body": "This mate’s tools, MCP servers and skills come from this template — see the tabs above for exactly what it includes. These are inherited and can’t be changed here; edit the template on the Agents page, or switch this mate to a different one in General.",
+    "built_from_mate_hint": "This crewmate's worker kit is a copy of this template. To switch to another template or take this one's latest version, open Advanced.",
+    "built_from_body_mate": "This crewmate's worker kit is a copy of this template, so editing the template does not change it. To switch to another template or take this one's latest version, open Advanced.",
+    "open_advanced": "Open Advanced",
     "template_unavailable": "This template isn’t installed on this machine right now, so the mate falls back to defaults. Install or restore {{name}} to give it back its full capabilities.",
     "template_authored": "You authored this template, so you can edit it directly on the Agents page.",
     "schedules_heading": "Schedules",
@@ -9739,5 +9840,47 @@
     "focusedTestPaths": "Focused pytest paths (one per line)",
     "fullRegressionTimeoutSeconds": "Full regression timeout (seconds)",
     "hint": "Save and check before calibrating. The control checks measurement sensitivity. Focused finalists must pass the full suite within the run budget before acceptance. Manual queued publication is unavailable for focused finalists."
+  },
+  "crewWorkerKit": {
+    "section_advanced": "Advanced",
+    "loading": "Loading the worker kit…",
+    "title": "Worker's extra kit",
+    "body": "{{name}} hands work to a worker. Pick one agent template to copy its instructions, connections, skills and auto-approvals into that worker. It is copied once: later changes to the template do not reach it.",
+    "copied_from": "Copied from {{template}}",
+    "copied_from_own_copy": "Copied from its own copy of a template",
+    "none_copied": "No template copied yet",
+    "template_label": "Template",
+    "pick_template": "Choose a template",
+    "keep_additions": "Keep what was added since the last copy",
+    "copy": "Copy into the worker",
+    "recopy": "Re-copy from template",
+    "preview_title": "Copying {{template}} would make these changes",
+    "no_changes": "Nothing would change.",
+    "section_prompt": "Instructions",
+    "section_excluded": "Turned off",
+    "skills_in_folder": "Skills in {{folder}}",
+    "approval_tool_on_server": "{{tool}} on {{server}}",
+    "approval_every_tool": "Every {{server}} tool",
+    "change_added": "Added",
+    "change_removed": "Removed",
+    "change_changed": "Changed",
+    "cancel": "Cancel",
+    "apply": "Apply",
+    "error_stale_revision": "This mate's config or the template changed after the preview. Press “{{action}}” again to see the new changes.",
+    "error_revision_required": "Press “{{action}}” to see the changes first, then apply them.",
+    "error_template_required": "Choose a template first.",
+    "error_template_unreadable": "That template can't be read. Choose another one, or check that it still exists.",
+    "error_template_restrictions_uncarried": "That template sets permission rules, tool settings or hooks the worker can't keep. Choose another template.",
+    "error_invalid_spec": "This mate's config file can't be read. Fix or restore the file, then try again.",
+    "error_not_a_mate_file": "This mate has no config file of its own, so it has no worker kit.",
+    "error_invalid_request": "The request couldn't be read. Reload the page and try again.",
+    "group_connections": "Connections",
+    "group_tool_access": "Tool access",
+    "group_skills": "Skills",
+    "group_approvals": "Auto-approvals",
+    "change_turns_off": "Turns off",
+    "change_turns_on": "Turns back on",
+    "tool_access_every_tool": "Can use every {{server}} tool",
+    "tool_access_tool_on_server": "Can use {{tool}} on {{server}}"
   }
 }

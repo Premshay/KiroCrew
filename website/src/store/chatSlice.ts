@@ -11,7 +11,9 @@
  *  that dispatch this slice's own actions (`deleteSlot`, `requestStop`), and
  *  `loadOlderMessages` with its reducers, whose slot capture `chatPins.test.tsx`
  *  reads from this file. */
-import { createSlice, createAsyncThunk, type PayloadAction } from '@reduxjs/toolkit'
+import { createSlice, createAsyncThunk, isDraft, original, type PayloadAction } from '@reduxjs/toolkit'
+import { streamFlush, type StreamFlushPayload } from './streamFlush'
+import { jsonEqual } from '../utils/structuralEqual'
 import { whenScrollQuiet } from '../lib/scrollQuiet'
 import { nextActiveAfterClose } from '../lib/sessionTabs'
 import { api } from '../api/client'
@@ -863,6 +865,38 @@ export const requestStop = createAsyncThunk<StopFailure, { slotId: string; force
   },
 )
 
+/** Apply one frame of buffered stream traffic (see `store/streamFlush.ts`):
+ *  per slot the reasoning, then the content, then the status line those
+ *  events imply, then the sub-agent text. The dashboard slice applies the
+ *  same action's recency bumps. */
+function applyStreamFlush(state: ChatState, p: StreamFlushPayload): void {
+  // The entries as they stood before this action, to compare against what the
+  // hook saw when each slot's newest event arrived.
+  const statusBefore = (state.slotStatusDetail && isDraft(state.slotStatusDetail) ? original(state.slotStatusDetail) : state.slotStatusDetail) ?? {}
+  for (const s of p.slots) {
+    if (s.thinking) messageReducers.sseThinkingChunk(state, { type: sseThinkingChunk.type, payload: { slot: s.slot, content: s.thinking } })
+    if (s.content) {
+      const { text, seq, gen, parts } = s.content
+      const frame: ChatFrame = { slot: s.slot, role: 'chunk', content: text, seq, gen, batched: true, parts }
+      if (s.slot !== state.activeSlot) applyNonActiveFrame(state, frame)
+      else applyActiveFrame(state, frame)
+    }
+    const st = s.status
+    if (!st || isUnsafeKey(s.slot)) continue
+    const k = safeKey(s.slot)
+    // Written directly since the newest buffered event, so newer than all of them.
+    if (statusBefore[k] !== st.seen) continue
+    const start = st.label ?? st.seen
+    const kind = start?.kind
+    let next = st.label
+    if (st.content && kind !== 'streaming') next = { kind: 'streaming' }
+    else if (st.thinking && kind !== 'streaming' && kind !== 'thinking') next = { kind: 'thinking' }
+    // Same equal-write skip as setSlotStatusDetail: an unchanged line keeps its identity.
+    if (next && !jsonEqual(state.slotStatusDetail?.[k], next)) (state.slotStatusDetail ??= {})[k] = next
+  }
+  if (p.subagents.length) subagentReducers.sseSubagentBatchChunks(state, { type: sseSubagentBatchChunks.type, payload: { chunks: p.subagents } })
+}
+
 const chatSlice = createSlice({
   name: 'chat',
   initialState,
@@ -936,6 +970,7 @@ const chatSlice = createSlice({
     addSlotRefreshCases(builder)
     addLifecycleCases(builder)
     builder
+      .addCase(streamFlush, (state, action) => { applyStreamFlush(state, action.payload) })
       .addCase(deleteSlot.fulfilled, (state, action) => {
         // A 404 close closed nothing: the close that did pop the key can still
         // fail and restore the slot, so its caches stay until an authoritative
@@ -1023,7 +1058,7 @@ export const {
   sseSubagentSnapshot, sseToolActivity, sseToolResult, sseActivityEvent,
   sseMcpAppRender,
   sseWorkflowEvent, clearWorkflowRun, reconcileWorkflowRuns,
-  sseSideResult, sseSideQueue, sideSendStatus, sideReleaseConsumed, sideClose, sideRestore, sideOptimisticAppend, sideOptimisticRollback,
+  sseSideResult, sseSideQueue, sideSendStatus, sideReleaseConsumed, sideClose, sideRestore, sideRestoreReading, sideResync, sideOptimisticAccepted, sideOptimisticAppend, sideOptimisticRollback,
 } = chatSlice.actions
 
 /** The `GET /api/spawn` read in flight, shared by every gone card that asks
@@ -1050,28 +1085,141 @@ export const reconcileGoneSubagent = createAsyncThunk<void, { slot: string; id: 
  *  `/side` command so one reload costs one read. */
 const sideRestoreReads = new Map<string, Promise<SideSnapshot>>()
 
+/** Reads a question stopped waiting on at its deadline, per slot, until each
+ *  lands. A later question waits on them as well as on its own read. */
+const retiredSideRestoreReads = new Map<string, Set<Promise<SideSnapshot>>>()
+
+function retireSideRead(slot: string, read: Promise<SideSnapshot>): void {
+  const retired = retiredSideRestoreReads.get(slot) ?? new Set<Promise<SideSnapshot>>()
+  retiredSideRestoreReads.set(slot, retired)
+  retired.add(read)
+  const forget = () => {
+    retired.delete(read)
+    if (!retired.size && retiredSideRestoreReads.get(slot) === retired) retiredSideRestoreReads.delete(slot)
+  }
+  read.then(forget, forget)
+}
+
+/** The slot's side read in flight, started when there is none. A 404 is nothing
+ *  to restore: the slot is gone, or the gateway predates the read. A read leaves
+ *  the map when it settles, unless a newer read has taken its place. */
+function sharedSideRead(slot: string): Promise<SideSnapshot> {
+  const inFlight = sideRestoreReads.get(slot)
+  if (inFlight) return inFlight
+  const read: Promise<SideSnapshot> = api.sideState(slot)
+    .catch((e: unknown): SideSnapshot => {
+      if (isNotFoundError(e)) return { open: false }
+      throw e
+    })
+    .finally(() => { if (sideRestoreReads.get(slot) === read) sideRestoreReads.delete(slot) })
+  sideRestoreReads.set(slot, read)
+  return read
+}
+
 /**
  * Settle a slot's Side Chat against the gateway's copy of its side conversation,
- * once per page (`sideRestore`). A 404 is nothing to restore: the slot is gone, or
- * the gateway predates the read. Any other failure rejects and settles nothing, so
- * the caller can hold a question back instead of sending it into a conversation
- * the panel cannot show.
+ * once per page (`sideRestore`). Any failure other than a 404 rejects and settles
+ * nothing, so the caller can hold a question back instead of sending it into a
+ * conversation the panel cannot show.
  */
 export const restoreSideConversation = createAsyncThunk<void, string, { state: RootState }>(
   'chat/restoreSideConversation',
   async (slot, { dispatch, getState }) => {
     if (getState().chat.slotSideRestored?.[slot]) return
-    let read = sideRestoreReads.get(slot)
-    if (!read) {
-      read = api.sideState(slot)
-        .catch((e: unknown): SideSnapshot => {
-          if (isNotFoundError(e)) return { open: false }
-          throw e
-        })
-        .finally(() => { sideRestoreReads.delete(slot) })
-      sideRestoreReads.set(slot, read)
+    const read = sharedSideRead(slot)
+    // From here an edit to a queued question this tab has no card for is kept,
+    // because the read may be answered before it.
+    dispatch(sideRestoreReading({ slot, reading: true }))
+    let snapshot: SideSnapshot
+    try {
+      snapshot = await read
+    } catch (e: unknown) {
+      // Another read can still answer for this slot: a newer one after this read was
+      // retired at a question's deadline, or a retired one when this is the newer.
+      // The window stays open for it.
+      const stillAnswering = [sideRestoreReads.get(slot), ...(retiredSideRestoreReads.get(slot) ?? [])]
+        .some(other => other !== undefined && other !== read)
+      if (!stillAnswering) dispatch(sideRestoreReading({ slot, reading: false }))
+      throw e
     }
-    dispatch(sideRestore({ slot, snapshot: await read }))
+    dispatch(sideRestore({ slot, snapshot }))
+  },
+)
+
+/**
+ * `restoreSideConversation` for a question about to be sent, which waits at most
+ * `ms`: 'restored' once the conversation is settled, 'failed' when the read fails,
+ * 'timeout' when it is still outstanding then. That read then stops being shared,
+ * so the next question asks the gateway again instead of waiting on the same
+ * request. It still lands, and the once-per-page `sideRestore` takes whichever
+ * read lands first, so the next question waits on it too: whichever lands first
+ * settles that question as well.
+ */
+export const awaitSideRestore = createAsyncThunk<'restored' | 'failed' | 'timeout', { slot: string; ms: number }, { state: RootState }>(
+  'chat/awaitSideRestore',
+  async ({ slot, ms }, { dispatch, getState }) => {
+    if (getState().chat.slotSideRestored?.[slot]) return 'restored'
+    const read = sharedSideRead(slot)
+    const landedEarlier = [...(retiredSideRestoreReads.get(slot) ?? [])].map(retired => retired.then(
+      snapshot => {
+        dispatch(sideRestore({ slot, snapshot }))
+        return 'restored' as const
+      },
+      // Only this question's own read can fail it.
+      () => new Promise<never>(() => {}),
+    ))
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const outcome = await Promise.race([
+      dispatch(restoreSideConversation(slot)).unwrap().then(() => 'restored' as const, () => 'failed' as const),
+      ...landedEarlier,
+      new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), ms) }),
+    ])
+    clearTimeout(timer)
+    if (outcome === 'timeout' && sideRestoreReads.get(slot) === read) {
+      sideRestoreReads.delete(slot)
+      retireSideRead(slot, read)
+    }
+    return outcome
+  },
+)
+
+/** The newest socket-open re-read sent per slot. */
+const latestSideResyncRead = new Map<string, object>()
+
+/**
+ * A side turn can end while this tab cannot hear it: before its socket first
+ * connects, when the restore read was answered first, or while the socket is
+ * down. Its final frame then reaches no socket of this tab, and a panel waiting
+ * on the turn would wait until the next reload. So each time the socket opens,
+ * every restored panel still waiting on a turn reads the gateway's copy again
+ * (`sideResync`), once any restore read still in flight has landed. A 404 means
+ * the slot is gone, so nothing of it still runs. A conversation closed and
+ * replaced while the read was out keeps to its own frames. Only the newest read
+ * sent for a slot is applied: an older one can answer after it, and would undo
+ * what the newer one learned.
+ */
+export const resyncWaitingSideConversations = createAsyncThunk<void, void, { state: RootState }>(
+  'chat/resyncWaitingSideConversations',
+  async (_, { dispatch, getState }) => {
+    const slots = new Set([...Object.keys(getState().chat.slotSide), ...sideRestoreReads.keys()])
+    await Promise.all([...slots].map(async slot => {
+      await sideRestoreReads.get(slot)?.catch(() => undefined)
+      const { slotSide, slotSideRestored } = getState().chat
+      const side = slotSide[slot]
+      if (!slotSideRestored?.[slot] || !side || !(side.pending || side.streaming || side.awaitingFinalRunId)) return
+      const thisRead = {}
+      latestSideResyncRead.set(slot, thisRead)
+      let snapshot: SideSnapshot | undefined
+      try {
+        snapshot = await api.sideState(slot)
+      } catch (e: unknown) {
+        if (isNotFoundError(e)) snapshot = { open: false }
+      }
+      const newest = latestSideResyncRead.get(slot) === thisRead
+      if (newest) latestSideResyncRead.delete(slot)
+      if (!newest || !snapshot) return
+      dispatch(sideResync({ slot, snapshot, readFor: side }))
+    }))
   },
 )
 
@@ -1103,7 +1251,7 @@ export { clearSwitchSlotGone, switchSlot, switchSlotNoticeCopy, type SwitchSlotA
 export { refreshSlot, warmSlotCache } from './chat/slotRefresh'
 export { wireTurnIdentity } from './chat/runState'
 export { WINDOW_WALK_MAX_PAGES } from './chat/windowWalk'
-export { captureForkOrigin, clearHistorySessions, createSlot, deleteHistorySession, fetchHistory, forkMayOpen, forkSlot, listForkedSlot, resumeFromHistory, type ForkOrigin } from './chat/lifecycle'
+export { PENDING_OPEN_LEASE_MS, captureForkOrigin, clearHistorySessions, createSlot, deleteHistorySession, fetchHistory, forkMayOpen, forkSlot, listForkedSlot, resumeFromHistory, resumeStillOpening, type ForkOrigin } from './chat/lifecycle'
 export { openCreatedSlot } from './chat/openCreatedSlot'
 
 export default withRefreshRevision(chatSlice.reducer)

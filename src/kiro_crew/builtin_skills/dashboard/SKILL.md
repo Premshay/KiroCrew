@@ -43,6 +43,16 @@ a missing field, null or wrong type is still a case the page needs to handle.
 A pass means the first paint raised no script errors: later pushes, small
 screens, visual quality and colour contrast still need their own checks.
 
+**Look at the page.** `dashboard_snapshot` draws your applied page in the
+same offline run, over your real data, and returns a PNG file path; open it
+with your file-read tool. It is one 1280x800 view of the top of the page, as
+the person's tab shows it in the default light theme, so judge what it says as
+well as layout, colour, type and fit; their own theme pack or dark mode can
+show other colours. A page you only saved has no picture: apply it first. When the
+run cannot start it answers "no image" with the reason and no file; an
+earlier picture is not the page as it is now. A template page has no picture.
+The file holds real values: leave it where it is.
+
 The gateway's secret filter also processes markup and script. A note reports
 how many places changed and the first line, without revealing the replaced
 text. A long identifier-like string can trigger it; shorter pieces joined in
@@ -123,8 +133,8 @@ known target or a defined total. A state without a measure can still have
 a vivid visual presence and motion that means active, waiting or finished.
 Choose the form that helps this work make sense, with detail available
 where it is useful. A count can be part of a larger picture as well as a
-readable number. A distribution of task states is a measured comparison,
-not a claim that each task has completed a fraction of its work.
+readable number. A distribution of worker states is a measured comparison,
+not a claim that each worker has completed a fraction of its task.
 
 **Make it feel alive.** Subtle ambient motion and animation run constantly
 while the page is in view, not only when a value changes, and lift the whole
@@ -190,14 +200,14 @@ The page has both visual character and a useful view of the work:
 | Question | Available evidence |
 |---|---|
 | Where does the work stand? | work items, workstreams, relevant goal readings |
-| What is running right now? | workstreams, helpers in this session |
+| What is running right now? | workers, workstreams, helpers in this session |
 | What is stuck? | blocked work, failed helpers, outstanding dependencies |
 | What needs me? | waiting items and approvals |
 
 Anything waiting on the person is easy to find, never hidden. When nothing
 waits, the page says so. Include `waiting.count` and `waiting.items` in the
 model so a request arriving after the first paint is visible too. Choose
-vocabulary that keeps sessions,
+vocabulary that keeps worker sessions,
 accepted work items and project outcomes distinct. A closed session does not
 establish that its task was accepted. Decisions use the real `ask_question`
 and approval surfaces; a drawn control carries no approval authority.
@@ -211,6 +221,7 @@ repeating the Profile form is different from drawing a useful project view.
 
 | Evidence | Fold and shape |
 |---|---|
+| worker sessions and current states | `workers.items`, `counts`, `total`, `omitted` |
 | work items and their outcomes | `work`, `workstreams.items` |
 | hourly accepted work and measured spend | `workstreams.series`: `hour`, `accepted`, `credits` |
 | parallel work and task spans | each workstream's `tasks`: `created_at`, `closed_at`, `status` |
@@ -225,7 +236,7 @@ script. Array length is a useful derived count, not the only possible binding.
 A map is read by its published keys. `folded_through` reports how far a fold
 has consumed its log; it is not a sample count or proof of nonempty data.
 
-A task's state is not a completion percentage. `goal` keeps a
+`workers` has states, not per-worker completion percentages. `goal` keeps a
 latest snapshot: its `target` and `current` strings may be prose rather than
 numbers. Show each milestone's reading beside its target, as text. Whether a
 milestone is reached is what you recorded in its reading with

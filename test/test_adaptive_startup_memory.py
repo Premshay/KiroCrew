@@ -35,10 +35,7 @@ from kiro_crew.testing.wait import await_until
 def test_startup_memory_guard_uses_native_host_reader(monkeypatch, platform, free, ok):
     for name in ("LINUX", "WINDOWS", "MACOS"):
         monkeypatch.setattr(subagent_mod.platform_compat, "IS_" + name, name == platform)
-    reader = (
-        "_windows_available_memory_gb" if platform == "WINDOWS" else "_macos_available_memory_gb"
-    )
-    monkeypatch.setattr(subagent_mod, reader, lambda: free)
+    monkeypatch.setattr(subagent_mod, "_host_available_gb", lambda: free)
     assert subagent_mod.check_memory_available(min_gb=4.5) == (ok, free)
 
 
@@ -244,14 +241,16 @@ async def test_startup_cost_cannot_lower_enabled_floor_on_exhausted_cgroup(
             assert info.id not in mgr._tasks
             worker.assert_not_called()
         else:
-            await asyncio.wait_for(mgr._tasks[info.id], 5)
+            await await_until(mgr._tasks[info.id], what="the spawned worker task finishes")
             worker.assert_awaited_once()
     finally:
         mgr._shutting_down = True
         tasks = [task for task in mgr._tasks.values() if not task.done()]
         for task in tasks:
             task.cancel()
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 5)
+        await await_until(
+            asyncio.gather(*tasks, return_exceptions=True), what="the cancelled tasks drain"
+        )
         mgr._taskq.close()
 
 
@@ -345,7 +344,7 @@ async def test_delayed_dedicated_rss_does_not_spend_the_startup_reserve(
         mgr._drain_queue()
         task = getattr(mgr, "_drain_task", None)
         if task is not None:
-            await asyncio.wait_for(asyncio.shield(task), 5)
+            await await_until(task, what="the queue drain task finishes")
         # Registration schedules the worker; a loop barrier lets it expose
         # its start before the next virtual host observation.
         await asyncio.sleep(0)
@@ -366,7 +365,7 @@ async def test_delayed_dedicated_rss_does_not_spend_the_startup_reserve(
                 # remain resident.
                 oldest = next(agent_id for agent_id in starts if not mgr._agents[agent_id].done)
                 finishes[oldest].set_result(None)
-                await asyncio.wait_for(asyncio.shield(mgr._tasks[oldest]), 5)
+                await await_until(mgr._tasks[oldest], what="the finished worker's task ends")
             if step % 20 == 0:
                 decisions.append((await ctl.tick()).action)
             if step == 40:
@@ -410,7 +409,9 @@ async def test_delayed_dedicated_rss_does_not_spend_the_startup_reserve(
             tasks.append(drain)
         for task in tasks:
             task.cancel()
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 5)
+        await await_until(
+            asyncio.gather(*tasks, return_exceptions=True), what="the cancelled tasks drain"
+        )
         mgr._taskq.close()
 
 

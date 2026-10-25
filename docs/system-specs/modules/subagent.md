@@ -304,6 +304,7 @@ figure and the unreadable-host fallback), dispatched per operating system (see
 - **macOS** — reclaimable memory (free + inactive + speculative + purgeable
   pages) via the Mach `host_statistics64` syscall through `ctypes`/`libSystem`
   (`_macos_vm_reclaimable_pages`), combined with the `os.sysconf` page size.
+  The spawn floor reads a tighter figure instead (below).
   This is **in-process, non-blocking, no subprocess** — required because the
   probe runs on the gateway event loop at startup and the spawn-audit guard
   rejects unrouted subprocess spawns. A reload re-runs it off the loop
@@ -325,6 +326,19 @@ uses the same cgroup headroom on Linux and native memory readers on macOS and
 Windows. A known cgroup bound still applies when the Linux host reading fails;
 readings fail open only when neither host memory nor a finite cgroup limit is
 available.
+
+On macOS the gate does NOT read the reclaimable sum above. It reads
+`platform_compat.host_available_mib` in GiB (`_host_available_gb`, the reader Windows uses too):
+free + purgeable + `min(inactive, external_page_count)` pages, with speculative
+not re-added because `free_count` already holds it. The floor promises what
+stays free after a start, so it compares against what a new process can
+really take; the looser sum read about 3.5 GiB (about 32%) above it on a loaded
+Apple silicon host, because it counted dirty anonymous inactive pages as free
+(#21574). Only the gate moved: the auto cap's disabled-floor fallback and the
+TaskRunner figure (`compute_memory_sized_parallel_cap`) and the memory posture
+(`resource_status`) still read `_available_memory_gb`, the reclaimable sum. So
+on a loaded Mac the floor defers more starts than before at the same
+`spawn_min_memory_gb`; `test_subagent_macos_probe.py` pins both readings.
 
 #### Memory guard: what must remain after the start
 
@@ -516,7 +530,7 @@ RSS figure stands in only where PSS cannot be read. Not captured: a shared run,
 whose pid's tree holds the other tenants and the parent's own tools, and a
 dedicated run whose own children share its runtime, whose tree holds their
 per-session servers. `_record_cost` writes it as the cost record's `settled_gb`
-beside the whole-run peak `mem_gb`, which the auto cap still reads unchanged. The
+beside the whole-run peak `mem_gb`, which only the TaskRunner's auto value reads. The
 admission side reads the per-bucket p90 of dedicated `settled_gb` (at least three
 readings, the newest no older than `SETTLED_SAMPLE_MAX_AGE_SECS`) from
 `_learned_settled_gb`, which the reaper refreshes off the loop at start, after a
@@ -896,7 +910,7 @@ contract.
 The level never rewrites the figure and never moves the posture, which stays
 figure-based. It is reported beside them: `summary_lines` (the
 `resource_status` tool, whose guidance then names the pressure instead of
-"heavy work is fine"), the `[RESOURCES]` context line, and the diagnostics
+"ample headroom right now"), the `[RESOURCES]` context line, and the diagnostics
 bundle. The eager-spawn admission (`chat_turn.eager_spawn._pressure_hold_blocks_prewarm`)
 admits no new speculative pre-warm while the hold applies, and leaves the idle
 ones already live to the host bands; the re-probe after a
@@ -3561,8 +3575,12 @@ subagent ID. `--crew NAME` runs the task as that crew member (its memory store a
 template) and `--agent NAME` under that agent template; they are sent as the same
 `crew` / `agent` request fields `spawn_run` uses, so an unknown name is refused by
 the gateway (`unknown_member`, `agent_not_found`) and the CLI exits 1 rather than
-running the default. A blank name is refused before any request. `kirocrew spawn
-list` lists current runs.
+running the default. `--model ID` is sent as `spawn_run`'s `model` field: the
+gateway judges it on shape only, it outranks the member's and the template's pin,
+and it is never routed (`subagent_parts/model_choice.py` skips tier routing for
+any run that names a model). A name or model that sanitizes to empty (only
+whitespace or hidden characters) is refused before any request.
+`kirocrew spawn list` lists current runs.
 
 ### MCP Tool: `spawn_run`
 

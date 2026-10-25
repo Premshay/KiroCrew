@@ -567,10 +567,8 @@ export default function SkillsTab() {
         /* List-detail: skill list (pane 1) on the left, then the directory
          *  browser (panes 2+3: file tree + file content) on the right. */
         <div className={PANE_SHELL_CLASS}>
-          {/* Pane 1 — skill list.  ``scrollbar-overlay`` keeps the scrollbar
-           *  hidden until hover and overlays it so the row width never shifts
-           *  between scrollable and non-scrollable states. */}
-          {showList && <div className={`${isMobile ? 'w-full' : 'w-[240px]'} shrink-0 overflow-y-auto scrollbar-overlay border border-border rounded-md p-2`} role="listbox" aria-label={i18nT('pages.overview.skillsTab.skills')}>
+          {/* Pane 1 — skill list. */}
+          {showList && <div className={`${isMobile ? 'w-full' : 'w-[240px]'} shrink-0 overflow-y-auto border border-border rounded-md p-2`} role="listbox" aria-label={i18nT('pages.overview.skillsTab.skills')}>
             {localSkills.map(renderRow)}
             {packageSkills.length > 0 && (
               <div className="mt-2">
@@ -830,6 +828,9 @@ interface PendingDetail {
   /** True when the live skill advanced past the version this was merged from. */
   stale_base?: boolean
   script_validation?: SkillScriptValidation
+  /** sha256 of the candidate as this read served it. Approve sends it back and
+   *  the server refuses (409 `pending_skill_changed`) if the file moved since. */
+  content_sha256?: string
 }
 
 /** A refused approve, parsed from the ApiError body (code + findings report). */
@@ -876,7 +877,7 @@ function PendingCandidateRow({ p, autoOpen, approveRefusal, mixedQueue, onApprov
   /** True when the queue holds a flagged candidate — the only shape where the
       disabled fade can be misread as a validation state. */
   mixedQueue?: boolean
-  onApprove: (slug: string) => void
+  onApprove: (slug: string, contentSha256: string) => void
   onDismiss: (slug: string) => void
 }) {
   const [open, setOpen] = useState(false)
@@ -955,7 +956,7 @@ function PendingCandidateRow({ p, autoOpen, approveRefusal, mixedQueue, onApprov
           // while it flies -- and stays there when it fails. Either way what is
           // shown is not known to be the file Approve would promote.
           const detailUnconfirmed = detailFetchStatus !== 'idle' || !!detailReadError
-          const approveDisabled = !open || !detail || detailUnconfirmed || (isUpdate && (!detail.diff || !!detail.stale_base))
+          const approveDisabled = !open || !detail || !detail.content_sha256 || detailUnconfirmed || (isUpdate && (!detail.diff || !!detail.stale_base))
           return (
             <Btn
               /* Non-primary while the candidate is flagged AND the button is
@@ -970,7 +971,7 @@ function PendingCandidateRow({ p, autoOpen, approveRefusal, mixedQueue, onApprov
                  it would restate the already-visible hint. */
               primary={approveDisabled || p.script_validation?.ok !== false}
               disabled={approveDisabled}
-              onClick={() => onApprove(p.slug)}
+              onClick={() => { if (detail?.content_sha256) onApprove(p.slug, detail.content_sha256) }}
             >{i18nT('pages.overview.skillsTab.approve')}</Btn>
           )
         })()}
@@ -1273,8 +1274,9 @@ function PendingSkillsPanel() {
     })
   }, [pending, isSuccess])
   const approve = useMutation({
-    mutationFn: (slug: string) => api.approvePendingSkill(slug),
-    onMutate: (slug: string) => {
+    mutationFn: ({ slug, contentSha256 }: { slug: string; contentSha256: string }) =>
+      api.approvePendingSkill(slug, contentSha256),
+    onMutate: ({ slug }) => {
       // A retry starts clean; a stale refusal must not outlive the click that
       // supersedes it. The panel-level notice is cleared ONLY when it is about
       // THIS candidate: approving row A must not erase an unresolved failure
@@ -1288,7 +1290,7 @@ function PendingSkillsPanel() {
         return next
       })
     },
-    onError: (err, slug) => {
+    onError: (err, { slug }) => {
       let code: string | undefined
       let reason: string | undefined
       const report: Record<string, string[]> = {}
@@ -1313,6 +1315,8 @@ function PendingSkillsPanel() {
           ? i18nT('pages.overview.skillsTab.approve_failed_script_validation')
           : code === 'live_skill_exists'
             ? i18nT('pages.overview.skillsTab.approve_failed_live_exists')
+            : code === 'pending_skill_changed'
+            ? i18nT('pages.overview.skillsTab.approve_failed_changed')
             : code === 'pending_skill_not_found'
               ? i18nT('pages.overview.skillsTab.approve_failed_not_found')
               : i18nT('pages.overview.skillsTab.approve_failed_generic', {
@@ -1338,6 +1342,11 @@ function PendingSkillsPanel() {
           candidateCreatedAt: pending.find(p => p.slug === slug)?.created_at,
         },
       }))
+      // The file changed after the read the user approved: read it again so the
+      // panel shows what is on disk now; Approve waits for that read to land.
+      if (code === 'pending_skill_changed') {
+        qc.invalidateQueries({ queryKey: ['skills-pending-detail', slug] })
+      }
       // A refused approve can mean the queue moved under us (approved/dismissed
       // elsewhere) — refetch so a not-found card disappears instead of lingering.
       // The refetch UNMOUNTS the row and its per-row notice with it, which
@@ -1379,7 +1388,7 @@ function PendingSkillsPanel() {
         qc.invalidateQueries({ queryKey: ['skills'] })
       }
     },
-    onSuccess: (_data, slug) => {
+    onSuccess: (_data, { slug }) => {
       setApproveRefusals(prev => {
         if (!(slug in prev)) return prev
         const next = { ...prev }
@@ -1608,7 +1617,7 @@ function PendingSkillsPanel() {
                 autoOpen={p.slug === reviewSlug}
                 approveRefusal={approveRefusals[p.slug]}
                 mixedQueue={pending.some(c => c.script_validation?.ok === false)}
-                onApprove={s => approve.mutate(s)}
+                onApprove={(slug, contentSha256) => approve.mutate({ slug, contentSha256 })}
                 onDismiss={s => dismiss.mutate(s)}
               />
             ))}

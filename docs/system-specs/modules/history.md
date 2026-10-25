@@ -407,6 +407,93 @@ lands at the end: a tail row streaming, and the host's chrome below the rows
 watches, so the working footer mounting under a reply that went quiet carries a
 followed reader down to it instead of leaving them its height short of the end).
 
+**Re-entering a crewmate's chat lands on the last message the reader saw.** The
+persisted reading position above answers a reader who left mid-transcript and is
+cleared at the bottom on purpose, so on its own the common crewmate return -- caught
+up, left, the crewmate kept talking -- opened at the live end with every new message
+above the fold. The crewmate thread (`ChatPane` with a `crewmate` identity; a split
+pane is not) adds the missing fact as a HOST-level layer over the virtualizer,
+`components/chat/useUnreadLanding.ts`, which never touches the hook's own entry
+placement:
+
+- The **caught-up marker** (`chat-core/transcript/caughtUpMarker.ts`, localStorage
+  `vc_seen_<slot key>`, swept by `storageGc` with the slot's other entries) is the
+  `durableMessageId` -- the server-minted `meta.mid` ALONE when the row has one, else
+  the row's `ts`; never the client-side `clientTs`, which a reload does not round-trip.
+  The mid is not paired with `ts` because the reader's own send keeps its client `ts`
+  after confirmation stamps the mid (a dashboard user row is not echoed) while the next
+  visit's hydrated copy carries the server's `ts`: the mid is the one identity both
+  sides share -- of the newest message while the reader is at the bottom. It is written from the pane's `isAtBottom`, not
+  from the scroll path, so a transcript too short to scroll still records it.
+- On entry the marker the PREVIOUS visit left is read once and resolved ONCE, against
+  the slot's HYDRATED transcript (`findUnreadRun`, after the pane's slot-detail page has
+  landed in the store -- a live frame can seed a partial list first, whose missing marker
+  row would otherwise lock in "no run"), then held for the visit. The hydrated page is
+  bounded (`PANE_HYDRATE_LIMIT`), and a crewmate that spoke more than a page since the
+  last visit is the long absence this exists for: a marker row not on hand while older
+  history remains is PAGED BACK TO, one page at a time through the pane's own
+  older-history loader, up to `MARKER_WALK_MAX_PAGES`, and the decision waits for the
+  last page asked for to land; a walk spent with history still above leaves the stored
+  marker alone (a row not loaded is not a row gone) until the reader first reaches the
+  bottom on their own this visit -- they have then seen the newest row, the old marker is
+  beyond reach and no longer needed, and saving resumes, so one long absence cannot
+  freeze a thread's marker for good. No marker (a first visit), a marker whose row is
+  gone (a reset or truncated thread, with no older history left to hold it: a boundary is
+  never guessed), or a marker that IS the newest row (caught up) all answer "no run",
+  and the default bottom placement stands. Otherwise the run is the message after the
+  marker and the count of messages after it, over the rows with a server identity only:
+  the reader's own queued or optimistic send is theirs, not unseen. The run is a fact about the ENTRY: a
+  message that arrives while the reader is present is live, not unseen -- it never
+  opens a run, grows the count, moves the divider or lands the reader, whatever they
+  were doing at the time.
+- `ChatMessageList` draws the **divider** ("N new messages", `--accent`, hairlines
+  either side; a start marker, never a status colour) INSIDE the first unseen
+  message's own output, ahead of it, so a turn row holding both seen and unseen
+  messages is split at the right message and the row's measured height carries the
+  line. It stays for the visit as the landmark, after the reader has read through and
+  after the marker in storage has moved on.
+- The **landing** runs once per slot entry, after the virtualizer's own entry pin
+  (a layout effect of the host, so before paint): the divider's live rect is placed
+  `UNREAD_LANDING_PAD_PX` below the scroller's own top padding (read from its computed
+  style, where ChatPane pays the floating DM header) through a scrollTop write on the
+  scroller -- the same host-level write the pinned prompt's jump makes, exact whatever
+  the rows above are still priced at. The follow policy reads the resulting scroll
+  event as a reader leaving the bottom, so follow releases and the jump pill shows,
+  carrying the count (`JumpToBottomButton.unreadCount`: "N new · Jump to latest", one
+  element in both states) until the reader has reached the bottom once in the visit,
+  when it returns to the plain arrow. A start row outside the mounted window is
+  pointed at first (`mountIndex`) and landed on the commit that mounts it, within a
+  bounded number of frames; a start the list holds no row for is not landed on.
+  **The reader's own position outranks the landing**: a saved reading anchor for the
+  same transcript (they left mid-history) is restored by the virtualizer as always, the
+  landing stands down, and the divider still marks the run.
+- The marker is the newest row with a SERVER identity (`newestDurableMessage`): an
+  optimistic send awaiting its echo, a queued send drawn as a bubble or a row still
+  streaming is renamed when the server's copy lands, so a marker saved from one would
+  match nothing on the next visit, and a client-only row with no `ts` (a local
+  send-failure notice) is passed over rather than blocking the row before it. It is written only while a person can SEE the thread
+  (`crewmateShown`: the Crewmates page's "window visible and focused" read condition
+  AND nothing floating over the chat -- an overlay side panel, a floating Profile card or
+  the phone roster drawer covers it, the docked placements sit beside it) -- a reply landing at the bottom of a parked or covered window is not
+  read, and the window coming back or the overlay closing is what reads it -- and from
+  the scroller's LIVE geometry, with the host's `isAtBottom` only as the trigger: that value is the entry's default until the
+  virtualizer's report lands a render later, and a slot switch that keeps the pane
+  mounted carries the previous slot's value over. It is **not** written while the
+  landing is still owed, nor while the virtualizer's own anchored entry still owns the
+  position (`restoreGate`: a reader who left mid-history is being put back there), nor
+  on the at-bottom value a landing write has not yet corrected: the first report of the
+  reader OFF the bottom retires that wait, and their next arrival at the bottom saves
+  the newest message as the next visit's marker. Read-through, and with it the count
+  coming off the pill, is a fact about the visit: a later visit to the same thread with
+  a new run starts with the count on.
+  That wait is armed only by a write that really took the reader off the bottom band
+  (`DEFAULT_BOTTOM_THRESHOLD`) while the host still reports them at it -- a settle
+  write landing after the host has already reported the move has nothing stale to wait
+  out, and arming then would leave the wait armed for good: a write the browser clamped (the whole transcript fits)
+  or one that stayed inside the band (a short run already visible below the line)
+  leaves the reader at the bottom, the transcript may never report otherwise, and the
+  save proceeds.
+
 The rows themselves come from the chat store, not the hook.
 `website/src/store/chatSlice.ts` is the facade of the one `chat` slice (the
 slot-lifecycle and UI-state owners are in
@@ -435,7 +522,7 @@ walked window leave the tab and are one page-back away.
 
 `loadOlderMessages` stays in the facade. The chat host answers the hook's
 older-page request with it; it reads the page before `slotOldestIndex` and lands
-it only while the slot it was read for is still active. A BACKGROUND pane (a mate DM on the Members page, a split pane) pages its OWN older history with the separate `loadOlderSlotMessages` thunk, which reads from that pane's own cursor (`slotPaneNextBefore`, written beside the page by `writeSlotPage`) and tracks its in-flight / failed state per slot in `slotPaneLoadingOlder` / `slotPaneOlderError`, so one pane's walk never blocks or reddens another's; `loadOlderMessages` walks only the active slot. None of these owners filters rows by memory
+it only while the slot it was read for is still active. A BACKGROUND pane (a mate DM on the Members page, a split pane) pages its OWN older history with the separate `loadOlderSlotMessages` thunk, which reads from that pane's own cursor (`slotPaneNextBefore`, written beside the page by `writeSlotPage`) and tracks its in-flight / failed state per slot in `slotPaneLoadingOlder` / `slotPaneOlderError`, so one pane's walk never blocks or reddens another's; `loadOlderMessages` walks only the active slot. Either thunk reaches a pane through the `earlier` model `ChatPane` hands `VirtualTranscript`, and supplying that model arms the automatic walk as well as the bar: `chat-core/transcript/useEarlierHistoryWalk.ts` polls the host's `onLoad` in under the main page's gates (the bar on screen, a real gesture on the scroller within `REAL_GESTURE_AUTH_MS` buying `OLDER_WALK_MAX_PAGES_PER_INPUT` pages, the scroller settled but the reader recently scrolling or gesturing, not bottom-followed, every mounted row measured, the no-gesture fill only for a transcript too short to scroll and within the same page budget). Those predicates and tunings are the ones `pages/chat/pagination.ts` exports and the page's `transcriptPaging.ts` reads, so a crewmate DM pages back exactly as the main page does, and the bar remains the visible affordance, the control for a scroll method the walk cannot see, and the retry after a failed page (#23541). None of these owners filters rows by memory
 mode, so a restricted transcript is cached and paged like any other.
 
 ### Warm task brief rows
@@ -445,8 +532,10 @@ ordinary `assistant` rows. `warm_task_brief_claim` contains only the fingerprint
 and is suppressed by transcript renderers. Its `ts` also counts as owner
 presence when the next return measures time away. The deterministic opener row and
 the model-written result carry normal mate message roles and classes. The
-result row's `meta.brief` holds the validated, redacted fields (`asked`, `now`,
-`needs_you`, `next`) that the transcript draws as a fixed plain-text card; its
+result row's `meta.brief` holds the validated, redacted fields (`status`,
+`headline`, `asked`, `remaining`, `done`, `needs_you`, `next`, `extra`, and the
+gateway-counted `progress`; an older row holds `asked`, `now`, `needs_you` and
+`next`) that the transcript draws as a fixed plain-text card; its
 `content` is the same brief as plain text, for export and any reader without
 the card.
 Their metadata marks them only for fingerprint and model-input
@@ -2132,7 +2221,13 @@ kiro-cli terminate plus the guarded `sessions/cli/<sid>` unlink). When the
 provider has no `new_conversation` or it raises, the key is `reset` instead,
 so the next job starts on a new process with no history. INFO names the path
 taken, once per job, and the context-driven recycle does not run for this key.
-A failed turn's warning names the served model and the prompt size.
+A failed turn's warning names the served model and the prompt size. A reply
+with no usable JSON object logs those two facts and the reason its attempt is
+charged with, `unparsable reply (<n> chars[, no closing brace])`, and none of
+the reply's text, which can quote the chat being consolidated. An empty reply
+is free only on a backend in `ACP_BACKENDS_REPORT_USAGE` whose turn billed
+nothing; an empty reply that billed, or any empty reply from a backend outside
+that set, is charged as `empty reply`.
 Private V2 extraction retains its per-store `memory-consolidation:` session and
 cleanup path. Acquisition timing includes startup and semaphore acquisition;
 it is not a measurement of queue wait alone.

@@ -1689,6 +1689,7 @@ class TestWorkerAppliesBindingForkContracts:
                 "kiro_crew.knowledge.llm_pool._resolve_client_binding",
                 return_value=({}, ""),
             ),
+            patch("kiro_crew.knowledge.llm_pool._repair_agent_spec"),
             patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls,
         ):
             client_cls.return_value = _zero_tool_client()

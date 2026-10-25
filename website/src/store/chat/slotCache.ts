@@ -182,10 +182,13 @@ export const slotCacheReducers = {
     const { slot, pct, used_tokens, window_tokens, reset } = action.payload
     if (isUnsafeKey(slot)) return
     state.slotContextPct[safeKey(slot)] = pct
-    if (used_tokens != null && used_tokens > 0) {
-      state.slotContextTokens[safeKey(slot)] = { used: used_tokens, ...(window_tokens && window_tokens > 0 ? { window: window_tokens } : {}) }
-    } else if (window_tokens && window_tokens > 0) {
-      state.slotContextTokens[safeKey(slot)] = { used: 0, window: window_tokens }
+    if ((used_tokens != null && used_tokens > 0) || (window_tokens && window_tokens > 0)) {
+      const prev = state.slotContextTokens[safeKey(slot)]
+      const used = used_tokens ?? 0
+      const window = window_tokens && window_tokens > 0 ? window_tokens : undefined
+      if (prev?.used !== used || prev.window !== window) {
+        state.slotContextTokens[safeKey(slot)] = { used, ...(window ? { window } : {}) }
+      }
     } else if (reset) {
       // Model switch / compaction / session reset: the stored counts belong
       // to a window that no longer describes the session. Deleting re-enables

@@ -16,6 +16,7 @@ from typing import Any
 from kiro_crew.acp import kas_wire
 from kiro_crew.acp import session_handle_compaction as _sh_compaction
 from kiro_crew.acp import session_handle_dispatch as _sh_dispatch
+from kiro_crew.acp import session_handle_elicitation as _sh_elicitation
 from kiro_crew.acp import session_handle_kas as _sh_kas
 from kiro_crew.acp import session_handle_lifecycle as _sh_lifecycle
 from kiro_crew.acp import session_handle_mcp as _sh_mcp
@@ -32,6 +33,7 @@ from kiro_crew.acp._dispatch import (
     SessionNoticeState,
 )
 from kiro_crew.acp.client_model_selection import ACP_EFFORT_CONFIG_IDS, acp_config_option
+from kiro_crew.acp.elicitation import ElicitationRequest
 from kiro_crew.acp.liveness import (
     InFlightToolTracker,
     InteractiveClassification,
@@ -207,6 +209,10 @@ class AcpSessionHandle:
     _audit_handle_reject = _sh_permissions._audit_handle_reject
     apply_session_permission_routing = _sh_permissions.apply_session_permission_routing
     _build_permission_event = _sh_permissions._build_permission_event
+    _handle_elicitation_request = _sh_elicitation._handle_elicitation_request
+    _audit_elicitation_decision = _sh_elicitation._audit_elicitation_decision
+    answer_elicitation = _sh_elicitation.answer_elicitation
+    cancel_pending_elicitations = _sh_elicitation.cancel_pending_elicitations
     # ``session/update`` frames as ``AcpEvent`` values: ``kiro_crew.acp.session_handle_updates``.
     _report_evicted_attributions = _sh_updates._report_evicted_attributions
     _no_tool_in_flight = _sh_updates._no_tool_in_flight
@@ -472,6 +478,16 @@ class AcpSessionHandle:
         # a child on agent-authored context. Full-fidelity child events flow to
         # every consumer unchanged (mode parity everywhere).
         self.child_fidelity_aware: bool = False
+        # Consumers that can put an MCP elicitation to a person (the dashboard
+        # chat runner) opt IN. For everyone else the handle declines the
+        # request itself before it would be yielded, so a consumer that does
+        # not read EVENT_ELICITATION_REQUEST can never leave the tool call
+        # waiting on an answer nobody will give.
+        self.accepts_elicitation: bool = False
+        # Request id -> the parsed ask, for every elicitation yielded and not
+        # yet answered. answer_elicitation validates against it; the per-turn
+        # reset and teardown cancel whatever is left.
+        self._pending_elicitations: dict[str | int, ElicitationRequest] = {}
         # User-visible notices for permission requests this handle answered
         # itself (fail-close gate below, pre-turn drain): flushed as
         # EVENT_SUBAGENT_ACTIVITY at the next dispatch so the rejection shows

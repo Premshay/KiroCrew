@@ -75,7 +75,6 @@ class TestInitializeSession:
 
         client._send_request = send
 
-        # Create the session file
         session_dir = Path.home() / ".kiro" / "sessions" / "cli"
         session_dir.mkdir(parents=True, exist_ok=True)
         session_file = session_dir / "old-sess.json"
@@ -385,8 +384,12 @@ class TestDrainNotifications:
             return None
 
         client._read_message = fake_read
+        recorded = []
+        client._mcp_report.record_frame = lambda msg, owned: recorded.append((msg, owned))
 
         await client._drain_notifications(duration=0.2)
+
+        assert recorded == [(live_msg, True)]
         # Should have processed the live message without error
 
     @pytest.mark.asyncio
@@ -396,6 +399,8 @@ class TestDrainNotifications:
         client._read_message = AsyncMock(side_effect=AcpError("process died"))
 
         await client._drain_notifications(duration=0.1)  # should not raise
+        # The error ends the drain; it does not keep reading a dead process.
+        client._read_message.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_captures_buffered_mcp_oauth_request(self, tmp_path):

@@ -789,8 +789,9 @@ describe('CrewChatWindow', () => {
     // through the store-free default instead of reading this hub's own state.
     const ids = createTranscriptRenderers({}).map(r => r.id)
     // A guide offer row reads the local guide store, which a peer's window has none of.
-    // The local peer-channel card has not been opted into a remote crew's transcript.
-    const decided = new Set([...PEER_SAFE_ROWS, 'workflow_run_tool', 'subagent_run_tool', 'file', 'conversation_card', 'peer_channel_request'])
+    // An elicitation card answers through THIS hub's slot route; the peer's ask lives
+    // on the peer, so the window leaves it to the SDK default, which draws it read-only.
+    const decided = new Set([...PEER_SAFE_ROWS, 'workflow_run_tool', 'subagent_run_tool', 'file', 'conversation_card', 'elicitation', 'peer_channel_request'])
     expect(ids.filter(id => !decided.has(id))).toEqual([])
     const crew = createCrewWindowRenderers({ instanceId: 'cd-1', key: 'k1', name: 'devbox', canRewind: () => false, onRewind: () => {}, rewindDisabled: false }).map(r => r.id)
     expect(crew).not.toContain('workflow_run_tool')
@@ -798,6 +799,7 @@ describe('CrewChatWindow', () => {
     expect(crew).not.toContain('conversation_card')
     expect(PEER_SAFE_ROWS.has('peer_channel_request')).toBe(false)
     expect(crew).not.toContain('peer_channel_request')
+    expect(crew).not.toContain('elicitation')
   })
 
   it('draws a peer code fence copy-only, with no Run into this machine', async () => {

@@ -526,6 +526,13 @@
       "configKey": "agent.refusal_fallback_model"
     },
     {
+      "id": "chat.copy-on-select",
+      "label": "Copy on select",
+      "tab": "chat",
+      "route": "/settings/chat/transcript?highlight=chat.copy-on-select",
+      "hint": "Copy text to the clipboard as soon as you select it in the conversation with the mouse. The Quote, Ask about this and Copy row still opens."
+    },
+    {
       "id": "chat.default-memory-mode",
       "label": "Default Memory Mode",
       "tab": "chat",
@@ -1649,6 +1656,13 @@
       "route": "/settings/voice?highlight=key%3Astt.language_code",
       "hint": "BCP-47 language code for speech recognition",
       "configKey": "stt.language_code"
+    },
+    {
+      "id": "voice.language-2",
+      "label": "Language",
+      "tab": "voice",
+      "route": "/settings/voice?highlight=voice.language-2",
+      "hint": "Language for spoken replies"
     },
     {
       "id": "voice.microphone",

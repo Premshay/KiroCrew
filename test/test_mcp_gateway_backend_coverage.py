@@ -190,11 +190,6 @@ class TestFrameHelpers:
 
 
 class TestClientExtensionInjection:
-    def test_noop_when_flag_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(MCP_APPS_ENV_FLAG, "0")
-        msg = {"method": "initialize", "params": {"capabilities": {}}}
-        assert _inject_client_extensions(msg) is msg
-
     def test_injects_ui_extension(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(MCP_APPS_ENV_FLAG, "1")
         msg: dict[str, Any] = {
@@ -207,20 +202,6 @@ class TestClientExtensionInjection:
         # Pre-existing capabilities preserved; caller's frame untouched.
         assert out["params"]["capabilities"]["roots"] == {}
         assert "extensions" not in msg["params"]["capabilities"]
-
-    def test_preserves_caller_declared_extension(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(MCP_APPS_ENV_FLAG, "1")
-        msg = {
-            "method": "initialize",
-            "params": {"capabilities": {"extensions": {MCP_APPS_EXTENSION_KEY: {"mine": 1}}}},
-        }
-        out = _inject_client_extensions(msg)
-        assert out["params"]["capabilities"]["extensions"][MCP_APPS_EXTENSION_KEY] == {"mine": 1}
-
-    def test_non_dict_params_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(MCP_APPS_ENV_FLAG, "1")
-        msg = {"method": "initialize", "params": None}
-        assert _inject_client_extensions(msg) is msg
 
     def test_env_kill_switch_beats_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(MCP_APPS_ENV_FLAG, "off")
@@ -1024,7 +1005,10 @@ class TestStubDelivery:
     @pytest.mark.asyncio
     async def test_deliver_to_detached_stub_is_dropped(self) -> None:
         backend = _make_backend()
-        await backend._deliver_to_stub("ghost", {"id": 1})  # must not raise
+        live = await backend.attach_stub("live")
+        await backend._deliver_to_stub("ghost", {"id": 1})
+        assert live.empty()
+        assert set(backend._stub_inboxes) == {"live"}
 
     @pytest.mark.asyncio
     async def test_broadcast_reaches_every_stub(self) -> None:

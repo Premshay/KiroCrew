@@ -77,6 +77,7 @@ through it reaches every owner binding the same object (`kiro_crew._facade_mirro
 | `acp/client_seed_ownership.py` | proving and handing back Crew's ownership of the seed on disk: bounded no-follow reads, move-aside and restore, settle, discard and release |
 | `acp/client_model_selection.py` | the session's model: advertised list and entitlement re-probe, served-default correction, `set_model`, the config-option push ladder (`_push_model_via_effort_split`, `_is_config_value_rejection`) and effort levels |
 | `acp/client_permissions.py` | permission requests and in-band tool restrictions: the permission event, approve and reject, the auto-approve identity gate, zero-tool and spec-disabled refusals, identity-drift refusals, the pi, DeepSeek and goose-mode tripwires and the routing read-back |
+| `acp/client_elicitation.py` | an MCP server's elicitation on this client: the parse-or-decline of a request on either wire, the decline without a consumer or on a text-only prompt API, `answer_elicitation` with its form validation, and the cancel of what is still pending at a turn boundary (see *MCP elicitation*) |
 | `acp/client_mcp_array.py` | the session's `mcpServers` array: member mounts, pooled broker stubs, the per-harness translations, the pi handoff, pruning of servers that cannot start, the MCP registration report and the spec's zero-tools answer |
 | `acp/client_transport.py` | JSON-RPC over the child's stdio: request ids, bounded request and response writes, frame reads, waiting for a response while deferring other frames, and draining notifications |
 | `acp/client_tool_events.py` | tool-call frames: text chunk, tool call, update and refinement extraction with their provenance caches, the ACP-layer SEL audit record, the Pre/PostToolUse hook fires and the tool results read back from kiro-cli's session JSONL |
@@ -136,6 +137,7 @@ inventory, the binding, the reach and the import inventory.
 | `acp/session_handle_lifecycle.py` | the session outside its turn loop: awaited control requests and slash commands, cancel, death attribution, `destroy` and transcript cleanup |
 | `acp/session_handle_compaction.py` | compaction on every backend (`compact`, the KAS compaction verb, codex and claude inline compaction, `wait_for_compaction`) and the usage and metadata frames it is measured by |
 | `acp/session_handle_permissions.py` | permission requests and in-band refusals: the permission event, approve and reject, the spec-disabled deny and tripwire, the unidentifiable, unreadable and unretained MCP identity refusals, the reject audit (`_audit_handle_reject`) and session permission routing |
+| `acp/session_handle_elicitation.py` | an MCP server's elicitation on the multiplexed handle: the same parse-or-decline, consumer gate, `answer_elicitation` and pending cancel as `client_elicitation.py`, over the shared runtime's `send_response` |
 | `acp/session_handle_updates.py` | `session/update` frames as `AcpEvent` values: tool calls and the per-tool-call caches they keep, child-tool frames and structured status frames |
 | `acp/session_handle_turn.py` | one turn end to end: `prompt`, `stream_command`, the per-turn reset and pre-turn drain in `_run_turn`, the abandoned-turn close and `wait_turn_done` |
 | `acp/session_handle_class.py` | the class statement: the constructor, the properties, the class default, the member table that binds every owner's members, and `_own_methods` |
@@ -875,11 +877,19 @@ on POSIX, where locks are advisory. Finalization releases the lock and removes
 both identity-verified sidecars, then prunes EAGERLY: a projection that ends --
 `NativeSkillProjection.release()`, which the direct client calls when its process
 is dead, or the finalizer of a projection that was merely dropped -- runs the same
-bounded prune, under the same lock and gates (lease scan, `_per_spawn_prune_due`
-spacing, time budget), so this home's now-unleased views leave the agents
-directory at once instead of waiting for the next spawn. The eager prune never
-queues behind this process's own in-process lock (a start holding it runs its
-own prune), and when the end runs on an event-loop thread the lease release and
+bounded prune, under the same lock and gates (lease scan, time budget), so this
+home's now-unleased views leave the agents directory at once instead of waiting
+for the next spawn. A per-spawn eager prune honours the `_per_spawn_prune_due`
+spacing and never queues behind this process's own in-process lock (a start
+holding it runs its own prune). An end has no other party covering it, so it
+skips the spacing and queues for the lock -- but ends are COALESCED per agents
+directory and home (`_coalesced_end_prune`): while one end's prune runs, a later
+end only records a request and returns, and once the running pass finishes one
+daemon thread makes the follow-up passes, so the end that ran first is not held
+for the length of a wave. Because an end releases its lease before it asks, that later
+pass covers it. Without this a subagent fan-out queued one full prune per ended
+projection on the lock set_mode re-preparation waits on, and starts ran out
+their in-process wait and were refused. When the end runs on an event-loop thread the lease release and
 the prune both go to a daemon thread, so no session start is stalled behind a
 file-lock wait. A finalizer the cyclic collector runs does none of that work on
 the collecting thread: the collector fires on whatever thread allocated, possibly
@@ -1139,7 +1149,7 @@ cancelled caller still lets the worker settle).
   "params": { "sessionId": "...", "options": [PermissionOption], "toolCall": ToolCallUpdate } }
 ```
 
-**Unknown server→client requests are answered, never dropped.** `session/request_permission` is the only inbound *request* `AcpClient` implements. `AcpSessionHandle` serves three more, all KAS-specific: `_kiro/hooks/list`, `_kiro/hooks/sessionStart` and `_kiro/hooks/executeHook`, answered from `acp/kas_wire.py` (see agent-host-contract.md, which states the four gates `executeHook` passes before anything spawns). `_kiro/hooks/executeHook` is routed there only while hooks are announced in the handshake (`kas_wire.hooks_announced()`); `KAS_CLIENT_CAPABILITIES` announces none today, so it is answered `-32601`. They are matched in that handle's own dispatch loop, ahead of the shared classifier, precisely so the classifier keeps reporting them as unknown on the `AcpClient` path — which serves no hooks surface, and where naming an action no branch handles would leave the request unanswered instead of refused. Any other server→client request (method **and** id — e.g. `fs/read_text_file`, `terminal/create`) is classified by `_process_message` as `"server_request_unknown"`. Every prompt dispatch site (`send_message_stream`, `_dispatch_events`, `_read_prompt_response`) handles that action by calling `_reject_unknown_server_request`, which replies with a JSON-RPC `-32601` (`JSONRPC_METHOD_NOT_FOUND`, "Method not found") error via `_send_error`. Without this, JSON-RPC semantics leave the agent blocked forever on an unanswered request — the turn hangs. Notifications (method, no id) are unaffected and still classified `"skip"`.
+**Unknown server→client requests are answered, never dropped.** `session/request_permission` and the elicitation request (`elicitation/create`, and on KAS `_kiro/mcp/elicitation`; see *MCP elicitation*) are the inbound *requests* `AcpClient` implements. `AcpSessionHandle` serves three more, all KAS-specific: `_kiro/hooks/list`, `_kiro/hooks/sessionStart` and `_kiro/hooks/executeHook`, answered from `acp/kas_wire.py` (see agent-host-contract.md, which states the four gates `executeHook` passes before anything spawns). `_kiro/hooks/executeHook` is routed there only while hooks are announced in the handshake (`kas_wire.hooks_announced()`); `KAS_CLIENT_CAPABILITIES` announces none today, so it is answered `-32601`. They are matched in that handle's own dispatch loop, ahead of the shared classifier, precisely so the classifier keeps reporting them as unknown on the `AcpClient` path — which serves no hooks surface, and where naming an action no branch handles would leave the request unanswered instead of refused. Any other server→client request (method **and** id — e.g. `fs/read_text_file`, `terminal/create`) is classified by `_process_message` as `"server_request_unknown"`. Every prompt dispatch site (`send_message_stream`, `_dispatch_events`, `_read_prompt_response`) handles that action by calling `_reject_unknown_server_request`, which replies with a JSON-RPC `-32601` (`JSONRPC_METHOD_NOT_FOUND`, "Method not found") error via `_send_error`. Without this, JSON-RPC semantics leave the agent blocked forever on an unanswered request — the turn hangs. Notifications (method, no id) are unaffected and still classified `"skip"`.
 
 `PermissionOption` field names differ between backends — kiro-cli uses `id`/`label`, claude-agent-acp uses `optionId`/`name` (per the public ACP spec). `_build_permission_event` reads both and remembers the optionIds keyed by `kind` (`allow_once`/`allow_always`/`reject_once`/`reject_always`) on the request id — recording an entry when **either** an allow option (for `approve_tool`) **or** a reject option (for a clean `reject_tool`) was advertised. `approve_tool(request_id, *, always=False)` echoes the matching allow id back, so the host doesn't need to know whether it's talking to kiro (`"allow_once"`/`"allow_always"`) or claude-agent-acp (`"allow"`/`"allow_always"`). `reject_tool` prefers a **clean reject**: if a reject optionId was advertised it sends `outcome: "selected"` with that id. Both backends advertise one — claude-agent-acp as `{kind:"reject_once", optionId:"reject"}` (→ `behavior:"deny"`), kiro-cli as `{kind:"reject_once", optionId:"reject_once"}` — and the fallback to `outcome: "cancelled"` therefore only applies to a backend that advertises no reject option at all. The distinction is load-bearing, not cosmetic: a clean reject resolves the tool call to `status:"failed"` with kiro-cli's fixed content `"User denied tool execution"` and the turn continues to the next model-inference boundary (`stopReason: "end_turn"`), whereas `cancelled` ends the turn immediately with `stopReason: "refusal"` and no text — and drops any queued `_session/steer` as `AgentExecutionUserMessageCleared`. That is why the host's in-band deny notice (`_steer_policy_notice`) can only be folded in on the clean-reject path, and why `stopReason: "refusal"` is NOT by itself evidence of a model-side content refusal.
 
@@ -1358,7 +1368,7 @@ not mounted.
 |---|---|---|
 | `fs.readTextFile` / `fs.writeTextFile` | `false` | We serve no `fs/*` handler; advertising them would invite requests that hit `_reject_unknown_server_request`. |
 | `terminal` | `false` | Same — the agent uses its own tools. |
-| `elicitation` | *(absent)* | **Withdrawn forward-bet.** It was declared while kiro-cli 2.14.0 compiled the `elicitation/create` schema but did not yet route an MCP server's request out over ACP, on the reasoning that declaring it cost nothing until a handler existed. It costs something. A client that sees the capability sends its human-in-the-loop prompts as `elicitation/create` **instead of** falling back to `session/request_permission` — codex-acp gates on `clientCapabilities.elicitation.form` exactly that way — so the declaration does not wait inertly for a handler, it diverts a working path onto one that answers `-32601`, which that client turns into a cancellation of the tool call the human was approving. Absent, every affected client returns to the fallback that works. Re-add the key **in the same change** that registers the handler: `test_elicitation_is_not_advertised_without_a_handler` fails the moment it reappears. Handler work is tracked in #891. |
+| `elicitation` | `{"form": {}, "url": {}}` | **Declared together with its handler, never ahead of it.** The ACP schema gates `elicitation/create` on this capability, so a standard harness forwards an MCP server's elicitation only when the client declares it; an advertised-but-unserved key would turn that ask into a `-32601` the harness reports as a cancelled tool call. Both drivers classify and answer the method (*MCP elicitation* below); `test_acp_client_capabilities.py` pins the declaration to that classification so the two cannot drift apart. The key does not move tool approvals: codex-acp (`@agentclientprotocol/codex-acp`, its `CodexElicitationHandler.ts` module: `createMcpElicitationContext`, `shouldUseAcpElicitation`, `canUsePermissionFallback`) recognises a tool approval as a message-only form and routes it through `session/request_permission` whatever the client declared; only a form WITH fields and a URL ask consult `clientCapabilities.elicitation.form` / `.url`, and the same gate decides whether codex's own `tool/requestUserInput` reaches the client at all. Measured live, not only read off the source: `test_codex_session_mcp_approval.py` drives the pinned codex-acp with this dict declared and the command approval arrives as `session/request_permission` (fixture `codex/command-approval-elicitation-declared-live.jsonl`); codex's own command approvals never pass through its elicitation handler (`handleCommandExecution` → `requestPermission`). Without the key codex answers a URL ask through `session/request_permission` (where a trust tier could approve it) and cancels a form with fields — with it, a URL ask on a consumer that cannot put it to a person (a channel, a cron) is declined, which is the intended answer: no trust tier answers an elicitation. opencode's ACP server routes tool permissions through `requestPermission` and never calls the SDK's `unstable_createElicitation`; pi's gated `bash` call is measured in `test_pi_real_adapter.py` under Crew's own handshake and arrives as `session/request_permission`; kiro-cli, KAS, claude-agent-acp and goose never send `elicitation/create`. Both modes are declared because both are rendered: a form from the requested schema, and a URL the person is sent to. |
 
 Claude ACP 0.74 dynamic workflows and background tasks instead emit standard
 `async_task_spawned`, `async_task_progress`, and `async_task_state_update`
@@ -1371,6 +1381,163 @@ provider-owned workflow.
 **Request-id namespaces are independent.** Our outbound requests (prompt, initialize, set_model, ...) use `_next_req_id()`; the agent's inbound server→client requests (`session/request_permission`) carry their own id counter. The two collide on small integers, so `JsonRpcMessage.is_response_for(req_id)` requires both `id == req_id` **and** `method is None` — a response never has a `method`. Without the `method is None` guard, a permission request whose id equals the in-flight prompt's `req_id` was misclassified as that prompt's completion in `_process_message`, ending the turn early and leaving the tool's permission unanswered → the agent turn hangs on follow-up messages (the agent waits forever for a `session/request_permission` response that never comes).
 
 This same method-aware discipline is enforced in `_wait_for_response()`. While it awaits a specific `req_id`, an inbound server→client **request** (method + id — e.g. a colliding `session/request_permission`) or a **foreign-id response** (id ≠ req_id, no method) must not be misread as the awaited response, must not be dropped, and must not be re-appended to `self._buffer` and `continue`-d. The last is the critical hazard: `_read_message()` pops `self._buffer` first, so re-buffering + looping immediately re-reads the same frame and **spins until the deadline** (the original bug — stuck `init`/`load`/`set_config_option` ending in `AcpTimeoutError`). Instead, non-matching survivable frames are collected into a **local `deferred` list** and re-injected at the **front** of `self._buffer` *in arrival order* once the matching response arrives (or on timeout/shutdown), so a later `_prompt_loop`/`_process_message` can still answer a deferred permission request. Notifications (method, no id) continue to go to `_mcp_notifications` for `_drain_notifications`.
+
+### MCP elicitation (`acp/elicitation.py`)
+
+An MCP server that needs the person to confirm or fill something in before a tool
+call may go on sends its agent an `elicitation/create`. The agent cannot answer it;
+the harness turns it around as a **server→client request** that Crew answers:
+
+| Harness | Method | Shape |
+|---|---|---|
+| every ACP harness that honours `clientCapabilities.elicitation` | `elicitation/create` (`METHOD_ELICITATION_CREATE`) | the elicitation fields FLAT on `params` — `mode` (`form` or `url`), `message`, and `requestedSchema` or `elicitationId` + `url` — next to `sessionId` and an optional `toolCallId` |
+| KAS (the engine, relayed by `kiro-cli acp --agent-engine v3`) | `_kiro/mcp/elicitation` (`METHOD_KAS_MCP_ELICITATION`) | the same fields NESTED under `params.elicitation`, next to `sessionId` and `toolCallId`; `mode` is filled in even when the MCP server omitted it |
+
+Both expect the same answer: `{"action": "accept" | "decline" | "cancel"}` plus
+`"content"` (the person's answers) for an accepted form. kiro-cli's own engine
+(`--agent-engine v1`/`v2`) does not route an elicitation at all — it answers the MCP
+server `-32601` itself — so on that harness nothing reaches Crew. The standard
+`elicitation/complete` NOTIFICATION (a URL ask finished out of band) shares the
+prefix and carries no id; the classifiers leave it to `skip`.
+
+`acp/elicitation.py` owns the shape on both wires. `parse_elicitation_request`
+reads either into one `ElicitationRequest` **fail-closed**: a shape this client
+cannot render (a non-primitive property, an enum of non-strings, more than
+`PROPERTIES_MAX` fields, a URL that is not http(s), no session, a numeric bound past the
+float range, an offered choice longer than `STRING_VALUE_MAX_CHARS` — a choice is sent back
+verbatim as the answer, so it is refused rather than cut) raises
+`ElicitationParseError`. `validate_form_content` checks a person's answers against
+the requested fields — type, `required`, `enum` membership, and `minItems` /
+`maxItems` on a multi-select — and raises `ElicitationContentError` on a value the
+schema refuses, so a server never receives content its own schema would reject.
+`elicitation_response` builds the result; `content` rides only with `accept`.
+
+**Every decision is SEL-audited** as a tool invocation named `ELICITATION_AUDIT_TOOL`
+(`mcp_elicitation`), outcome the action sent, metadata the reason (`consumer` for a
+person's answer, else the driver's own ground: unrenderable, no consumer, cancelled,
+stranded; the dashboard runner tracks its exit path explicitly — `resolved`,
+`window_expired`, `turn_cancelled`, `no_turn_budget`, `stopped` — because `wait_for`
+cancels the future on timeout and `fut.done()` is true on every exit; a Stop's mark in
+`slot._approval_stopped` is read and discarded by this path as the permission path
+discards its own, since ACP request ids are reused and a stale mark would brand a later
+person's permission answer as the host's) — both drivers (`_audit_elicitation_decision`) and the dashboard runner
+(`_audit_runner_decline`), off-loop and before the wire write like
+`_audit_handle_reject`, so the record lands whether or not the answer reaches the
+engine.
+
+**Three outcomes, none of which leaves the request unanswered.** Both drivers
+(`client_elicitation.py`, `session_handle_elicitation.py`) take the request off the
+`elicitation` action the two classifiers return (`classify_notification`,
+`_process_message`) and:
+
+1. a request that cannot be rendered is answered `decline` — never a JSON-RPC
+   error, which the KAS engine reports to the MCP server as `cancel`;
+2. a request on a driver whose consumer never set `accepts_elicitation` is answered
+   `decline` before it would be yielded, so a consumer that predates
+   `EVENT_ELICITATION_REQUEST` (a cron, a subagent, a channel bridge, the text-only
+   prompt APIs) can never leave the tool call hanging on an event kind it does not
+   read;
+3. otherwise the request is recorded in `_pending_elicitations` and yielded as
+   `EVENT_ELICITATION_REQUEST` (`AcpEvent.elicitation` carries
+   `ElicitationRequest.as_dict()`; `request_id` and `tool_call_id` the ids). The
+   consumer answers through `answer_elicitation(request_id, action, content)`,
+   which validates form content first — a refused value leaves the ask pending for
+   a corrected answer. Whatever is still pending at the per-turn reset, on
+   `session/cancel` (`AcpClient.cancel_session`, `AcpSessionHandle.cancel`: the
+   notification first, then the open request it leaves behind, the order the ACP
+   spec gives for permission requests) and at teardown (`destroy`) is answered
+   `cancel` (`cancel_pending_elicitations`): the engine holds the tool call open
+   until then. `test_acp_elicitation.py` pins each exit on both drivers.
+   The pre-turn drain in `session_handle_turn.py` treats a stranded elicitation
+   request (one that arrived while no turn was reading, from an abandoned turn's
+   still-running tool) like a stranded permission: answered `cancel`, never dropped
+   with the frames around it.
+
+The yield is parked like a permission (`_awaiting_permission` / `_parked_on_permission`):
+the human's time is not a stall. `AcpProvider._to_llm_event` forwards the `elicitation`
+field (pinned by `test_acp_provider.py`'s field-parity test); the replay corpus carries
+one synthesized fixture per wire (`kas/mcp-elicitation.jsonl`, `codex/mcp-elicitation.jsonl`)
+so a change to either parser shows up as an event diff.
+
+**No trust tier answers an elicitation, and never will.** Trust, hooks and grants
+answer Crew's OWN tool gate. An elicitation is the SERVER's statement that a person
+must decide; a `yolo` session auto-accepting it would defeat the compliance gate the
+server declared. With no person reachable the answer is `decline`.
+
+The dashboard chat runner is the one consumer today (`chat_turn/elicitation_prompt.py`,
+opted in at turn admission beside `child_fidelity_aware` and reset with it): it appends an
+`elicitation` row (transient, like `permission`), registers the request in the slot's
+approval registry so the Board's Blocked lane, Continue's 409 and a Stop treat it as the
+open question it is, and waits the same window as a permission. `POST
+/api/chat/slots/{slot}/elicitation` (`dashboard/handlers/chat_elicitation.py`) answers
+it — the dashboard owner's browser only; an internal-secret or app caller is refused
+403, because an agent answering is exactly the automation the server asked to exclude,
+and so is a non-owner dashboard session (a Telegram, Teams or Webex allowlist link with
+the same empty app claim), through `require_owner_dashboard_request` (403 `owner_only`),
+because an answer is the owner's consent to the server's operation.
+The route validates a form's content against the row's fields BEFORE resolving the
+future (a refused value is a 400 the card shows inline, the ask stays open) and writes
+the validated answer onto the row, which the runner reads back and sends; its body cap
+(`ELICITATION_BODY_MAX_BYTES`) is sized from `PROPERTIES_MAX` × `STRING_VALUE_MAX_CHARS`,
+so every form the card can draw is answerable. Every other
+resolver of that registry speaks the permission vocabulary, and `read_elicitation_answer`
+lets none of its words mean `accept`: a reject button declines, and an approval CANCELS,
+URL ask or form, because it is not a person answering this question. A Stop rejects every
+pending future on the slot, but the runner reads its `_approval_stopped` mark and sends
+`cancel` too: ending the turn is nobody refusing the server.
+The app token's `/api/approvals/{id}/{action}` route leaves an elicitation's future out of
+its candidates (the id reads as not found, like every other refusal there); the tool approve
+route refuses an elicitation's id outright (409
+`elicitation_not_an_approval`) — checked on the RESOLVED `(owner, request_id)` after the
+owner scan, so a shared slot's open question is refused too — its bare-approve fallback
+(no `request_id`, resolve the slot's sole pending future) leaves elicitation futures out
+of the pick, and the trust/yolo sweep skips those futures, so neither an app holding the
+session-approval grant nor a mode switch can stand in for the person. The elicitation
+route itself binds the answer to the row the person READ: the card posts the row's
+`request_mid` beside `request_id`, and the handler resolves only when
+`slot.approval_instance(request_id, row)` equals it — an ACP request id is
+connection-scoped and a backend may reuse one once the earlier ask expired, so a delayed
+POST from the old card is a 404, never an `accept` for a question nobody saw.
+What the person reads is server-authored and takes display redaction: the message, the
+URL, field titles and descriptions, option labels. The server's opaque URL-ask token
+(`elicitation_id`) is dropped before the row is appended: the card never reads it, the
+driver answers by request id, and it is the one server string no redaction would touch. A string
+field's `format` is kept only when it is one the MCP schema names (`STRING_FORMATS`: `email`,
+`uri`, `date`, `date-time`) and dropped otherwise, so that unredacted type hint cannot carry
+free text. A value the answer is validated
+against or keyed by (a field `name`, an option value, a default) cannot be rewritten
+and still be sent back, so a request whose redaction would change one of those is
+declined, as is one whose URL it would change. The runner stamps the row it appended
+(not the oldest row carrying the request id, which a backend may reuse) and the
+`elicitation_resolved` frame carries that row's `mid` and, for an accept, the
+display-redacted answer, so the live card's summary fills in without a transcript reload; the frontend resolves by that
+`mid` alone and never falls back to another row. The row keeps its stored `mid`
+through display redaction (`chat_utils_display.py`) for the same reason. An
+`elicitation` row is transient like `permission` (`_TRANSIENT_ROLES`, which the
+persistence builder `_build_message_entry_uncached` reads directly, so the row is never
+written to the transcript) but, like it, is carved out of `_UNOWED_WINDOW_ROLES` and counted by `_is_answered_permission`:
+a bounded transcript read hands the open question back, and an answered one reads
+as answered; the dashboard's refresh merge re-seats the client's own copy of an answered
+card (keyed by its `mid`) into a refreshed page that omits it, as it does a permission
+card, and retires a still-PENDING local card the page no longer lists as `stale` (the
+gateway keeps an open ask in its tail, so absence means answered or expired while this
+tab was away), and the unread-on-attention predicates count a pending card as the wait it is. The runner also stamps WHO is asking — `mcp_server` and `tool_name` read from the turn's
+trusted identity for the ask's `tool_call_id` (`_seen_tool_identity`, the same `_meta.kiro`
+pair a permission row carries), never from the server's own text — and the card names
+them in its title ("probe · delete_file is asking you") and shows the link's host before a
+URL, because a person sent off the app rightly refuses a link whose sender it cannot name.
+The frontend card (`pages/chat/ElicitationCard.tsx`) is drawn by the shared
+`createTranscriptRenderers` entry, which hands it the surface's slot (the SDK default
+registry draws it read-only with no slot, and a peer's crew window keeps that default
+because the ask lives on the peer, not behind this hub's slot route); it draws the schema's primitive fields, or the
+URL, on the `bg-card ring-1 ring-border` notice surface — an unset enum is handed a value
+no option carries so `''` stays a real choice, a fraction in an integer field and an
+integer past the safe range are each refused before submission with their own hint rather
+than sent changed, and every field input carries a per-instance `useId` so two cards on one
+page cannot share a label target;
+once resolved it retitles ("A tool asked you") and shows the answer that was sent;
+a refused answer renders through the shared `ErrorNotice`, a required-field hint as
+status text.
 
 ## Agent Configuration
 
@@ -1636,6 +1803,25 @@ attempts `session/load` instead of `session/new`:
 
 The resume ID is consumed on attempt (no retry loop). After successful load,
 `client.resumed` returns `True` — callers use this to skip thread history injection.
+
+`AcpRuntime.load_session` has a second caller on KAS: applying a dashboard MCP
+config change to a LIVE session (`acp/session_provider_mcp_reinject.py`,
+membership `ACP_BACKENDS_MCP_WIRE_REINJECT`). The engine registers a session's
+`_meta.kiro.customAgents` batch once and ignores a re-sent `set_mode` or a
+`session/load` of a session it still holds, so the provider first sends
+`AcpRuntime.evict_session` -- the standard `session/close` as a bounded request
+plus the local unregister, which frees the resident copy and KEEPS the stored
+record (KAS's teardown verb, `_kiro/session/delete`, removes it) -- and then
+`load_session` on the same id with no transcript path, inside
+`AcpRuntime.keep_record_on_teardown(sid)`: the load's failure arms end the
+session through `terminate_session`, whose KAS verb deletes the stored record,
+and inside that scope the call evicts instead. The engine replays the
+conversation, the load re-projects the batch from the spec as it now is, and the
+returned handle replaces the provider's. Measured:
+`test/fixtures/acp_frames/kas/mcp-live-apply-live.jsonl`,
+`mcp-live-remove-live.jsonl`. The decision and the mark are the dashboard's
+(`docs/architecture/mcp.md`, "Live reconcile"); the apply runs at the session's
+next turn boundary under the shared-turn claim, never mid-turn.
 
 Step 3 (`set_mode`) is **conditional**: sent for all kiro-cli backend agents.
 Skipped for claude-agent-acp, whose `session/set_mode` takes permission modes
@@ -1921,13 +2107,29 @@ never the spec's `command` / `args`: KAS spawns it directly, so
 `daemon/control_plane.py::_spawns_own_control_plane` never vets it, and a hand-edited spec
 must not hand the token to another binary. Its env keeps only the projected
 `KIROCREW_PORT` / `KIROCREW_SESSION_KEY` plus the managed env; a name whose
-managed invocation does not resolve is hoisted as projected with no token. The move is bounded: only managed names, only the active
-agent, never a name the caller's array already carries (a broker stub or the
-member dispatch entry stays authoritative and a name appears once), and only a
-stdio entry whose keys are drawn only from `command`, `args`, `env`, `type` — a
-`disabled`, `disabledTools` or `timeout` customization, a registry marker, a
-remote URL or a command-less entry keeps the agent-block path where that field
-is honoured. The agent's `tools`, `excludedTools` and `permissions` are
+managed invocation does not resolve is hoisted as projected with no token. On `session/new` the move covers the active agent's managed names only; on
+`session/load` it additionally hoists remaining user-declared names
+(`resume=True` in `hoist_managed_servers`): kiro-cli re-initialises MCP servers
+from the session-level array only on load — not from agent-block declarations —
+so a spec edit adding a new MCP server is silently ignored on resume without the
+wider hoist. That load-only launch set was probed on released kiro-cli 2.31.0
+(the #17781 repro: `session/load` with a spec adding `@probe/beta` exposed no
+`beta` tool, `session/new` with the same spec did); the 2.18.0 and 2.20.0
+captures above did not probe which declaration site `session/load` launches
+from, so the premise is pinned to 2.31.0 alone. Exception: a user-declared server whose name a settings file
+kiro-cli reads also declares — the user's global `~/.kiro/settings/mcp.json` or
+the session cwd's `.kiro/settings/mcp.json`
+(`reserved_names=settings_server_names(session_work_dir)` at the `load_session`
+call site in `runtime_session_load.py`) — stays in the agent block, so the
+resumed session resolves that name by kiro-cli's own precedence, exactly as
+`session/new` did; a session-level injection would outrank both files.
+`session/new` (`create_session`) is unchanged. Non-managed entries hoisted on
+load travel as projected with no session token. On both paths: a name
+the caller's array already carries is skipped (a broker stub or member dispatch
+entry stays authoritative and a name appears once), and only a stdio entry whose
+keys are drawn only from `command`, `args`, `env`, `type` — a `disabled`,
+`disabledTools` or `timeout` customization, a registry marker, a remote URL or a
+command-less entry keeps the agent-block path where that field is honoured. The agent's `tools`, `excludedTools` and `permissions` are
 untouched: refs resolve wherever the server was declared, and on 2.18.0 an
 allowlist-only or `excludedTools` restriction on the hoisted server still
 yields readiness with only the permitted tag advertised. Exact legacy
@@ -2537,11 +2739,13 @@ startup retention, session isolation and unchanged ordinary assistant text.
 - `agent_message_chunk` — standard text/content. Detects `type: "thinking"` or `"reasoning"` content blocks for extended thinking (kiro-cli style).
 - `agent_thought_chunk` — dedicated reasoning update emitted by `claude-agent-acp`. Always treated as thinking content.
 
-`_track_usage_update()` tracks context window usage from `usage_update` session events, reconciling the frame via the shared `parse_usage_update()` (flat `update.used`/`update.size` primary, nested `update.usage.*` fallback) so `AcpClient` and `AcpRuntime` read the same shape regardless of which kiro emits. A `KNOWN_SESSION_UPDATES` frozenset in `acp/types.py` suppresses false "unhandled session update" logs for plumbing-only update kinds (`plan`, `available_commands_update`, `current_mode_update`, `config_option_update`, `session_info_update`, `user_message_chunk`, `tool_call_update`). Only genuinely unknown kinds are logged. On the **KAS backend**, three of these are not plumbing-only: `current_mode_update`, `config_option_update`, and `session_info_update` are consumed as display signals. KAS folds signals that kiro-cli sends as separate top-level `_kiro.dev/*` methods (agent switch, per-turn metadata, compaction status) into these `session/update` discriminants, so a KAS-gated branch in `AcpSessionHandle._handle_update` maps `current_mode_update` → agent-switch echo, `config_option_update` → effort-option state, and the `session_info_update` `_meta.kiro` union (`context_usage` → context meter, `turn_completion` → per-turn credits, `summarization_*` → compaction status). kiro-cli never emits these discriminants, so the branch is gated to KAS only and the kiro path is untouched.
+`_track_usage_update()` tracks context window usage from `usage_update` session events, reconciling the frame via the shared `parse_usage_update()` (flat `update.used`/`update.size` primary, nested `update.usage.*` fallback) so `AcpClient` and `AcpRuntime` read the same shape regardless of which kiro emits. A `KNOWN_SESSION_UPDATES` frozenset in `acp/types.py` suppresses false "unhandled session update" logs for plumbing-only update kinds (`plan`, `available_commands_update`, `current_mode_update`, `config_option_update`, `session_info_update`, `user_message_chunk`, `tool_call_update`). Only genuinely unknown kinds are logged. On the **KAS backend**, three of these are not plumbing-only: `current_mode_update`, `config_option_update`, and `session_info_update` are consumed as display signals. KAS folds signals that kiro-cli sends as separate top-level `_kiro.dev/*` methods (agent switch, per-turn metadata, compaction status) into these `session/update` discriminants, so a KAS-gated branch in `AcpSessionHandle._handle_update` maps `current_mode_update` → agent-switch echo, `config_option_update` → effort-option state, and the `session_info_update` `_meta.kiro` union (`context_usage` → context meter, `turn_completion` → per-turn credits, `summarization_*` → compaction status). kiro-cli never emits these discriminants, so the branch is gated to KAS only and the kiro path is untouched. Every KAS `session/prompt` also carries `_meta.kiro = {contextBreakdown: "summary", ttft: true}` (`acp/kas_profile.py`, `PROMPT_META`; no other backend is sent a `_meta`), so the engine measures the turn: `turn_completion` then carries `contextBreakdown` (the turn's LAST model request split into categories, in characters) and the turn's first displayed `agent_message_chunk` / `agent_thought_chunk` carries `ttft` (four epoch-ms stamps). While a prompt is in flight the handle keeps only their numbers on `AcpPromptStats.kas_profile`, which `carry_over()` drops at the next prompt; a frame outside a turn, one marked `replay: true` (every recorded turn is replayed on `session/load`) and a sub-agent's frame (`agentSubtaskId`) are not kept. Summary mode, not detailed: detailed only adds named items (steering files by path, MCP servers, tools), about 3 KB a frame against 1 KB, and nothing reads them. The dashboard turn's closer writes the profile as `context/measured` (see the crew log emitter spec).
 
 **Context-window backfill.** kiro 2.10+ metadata may carry only a context-usage *percentage* (no absolute token counts). `_backfill_context_window(pct)` derives the window and used-token counts from the central `model_registry.model_window(self._resolved_model_id or self._model)` authority (gated on `has_known_window` so an unknown model is never backfilled with a guessed window) and the percentage, so the dashboard token text still renders when only a percentage arrives. `_resolved_model_id` begins as `models.currentModelId`, then becomes a successfully dispatched non-default startup override or explicit switch, whether it uses `session/set_model` or `session/set_config_option`; a policy-substitution advisory on the latter records the model actually served for that request only. Automatic and unusable routes retain the backend-reported default.
 
 **Per-turn kiro billing credits.** `_track_metadata()` parses each `_kiro.dev/metadata` notification via the shared `parse_metadata()`, capturing `meteringUsage` entries with `unit=="credit"` (kiro bills in credits; token fields are 0 for the acp provider) into `AcpPromptStats.credits`, accumulated across the turn and surfaced on `EVENT_COMPLETE`. Credits read between turns by `wait_for_compaction()` and `_drain_post_compaction_metadata()` (`between_turns=True`) are held in `_between_turn_credits` and added once to the next turn's stats right after `carry_over()` in `send_message_stream()`, `_dispatch_events()` and `_read_prompt_response()`. `rekey()` drops the held amount.
+
+**Per-call context readings (kiro).** kiro-cli sends one `_kiro.dev/metadata` frame after every model call, carrying the `contextUsagePercentage` that call left, and closes the turn with a frame whose `meteringUsage` lists one credit entry per call and repeats the last percentage; a session also sends one frame when it opens, before its first call (live-probe confirmed, kiro-cli 2.27.1). Both `_track_metadata()` paths (`AcpClient`, `AcpSessionHandle`) hand every frame to the shared `AcpPromptStats.note_metadata_frame(pct, metering)` after the percentage is applied: a frame with `meteringUsage` adds its credit entries to `metered_calls` and records nothing else, and any other frame adds the call's context in tokens (percentage × known window) to a running sum, counted in `call_readings`, with the turn's first reading kept beside them (fixed size, however many calls the turn makes). Nothing is recorded with the window unknown, or while a real `usage_update` holds the meter. `to_turn_usage()` reports the call count as `TurnUsage.num_turns` (`metered_calls`, else the number of readings) and the sum as `TurnUsage.context_sum_tokens`; a turn with exactly one reading more than it metered calls leaves out its first reading, which is the session-open frame. Any other mismatch keeps every reading, as does a turn that ended before its metering frame (a cancelled first turn then counts the session-open reading), and a turn that compacts mid-way records kiro-cli's post-compaction report like a call's reading, so those sums are approximate. All of it is per-turn and dropped by `carry_over()`. A backend that sends no metadata keeps both at 0, so its `TurnUsage` is unchanged.
 
 **Per-turn cost and token counts (claude seam).** The `claude-agent-acp` adapter bills in cost/tokens instead of credits: a session-cumulative `cost: {amount, currency}` rides `usage_update`, and turn-scoped token counts (`inputTokens`/`outputTokens`/`cachedReadTokens`/`cachedWriteTokens`) ride the PromptResponse. Both are validated at the shared `_dispatch.py` chokepoints (`parse_usage_cost`, `parse_prompt_token_usage` — same defensive posture as `parse_usage_update`). `parse_usage_cost` additionally drops the whole cost when a `currency` is present and not exactly `"USD"`, since every consumer stores the result in USD-denominated fields; an absent currency stays accepted for adapters that omit it. Validated readings are folded into `AcpPromptStats`: the cumulative cost is converted to a per-turn delta by `apply_cost_cumulative`, and the baseline belongs to one ACP session. `session/new` starts it at a known zero (`begin_cost_session`). A restore (`session/load` or `session/resume`, on both `AcpClient` and `AcpRuntime.load_session`) calls `restore_cost_session`, because the claude harness brings a resumed session's cost ledger back from its own transcript: the counter carries the session's whole lifetime spend, not zero. A baseline measured on that same session survives the adapter-process restart (`_reset_state` leaves it alone) and keeps billing deltas; any other baseline is marked unknown, and the next reading is adopted as the baseline and bills $0. A reading below a known baseline also rebases and bills $0 rather than being taken whole, which would re-bill a restored lifetime. Both rebases log a WARNING naming the session and the readings, so a gap in the usage rows explains itself: Crew under-counts at most one turn after a restore and never re-bills earlier spend. The baseline survives `carry_over()` like the context fields and is zeroed by `reset_context_state()`. The token counts accumulate via `apply_prompt_token_usage` (`_track_prompt_usage` on both `AcpClient` and `AcpSessionHandle`). Every `EVENT_COMPLETE` construction site builds its `TurnUsage` through the single `AcpPromptStats.to_turn_usage()` helper, so `cost_usd` and the token dimensions populate uniformly and the per-turn persist gate fires on the claude seam. kiro-cli sends neither signal, so on the kiro path the new dimensions stay 0 and `credits` flows exactly as before (harness parity — no `_is_claude` branch anywhere on this wiring).
 
@@ -2787,7 +2991,8 @@ reference is withheld, because the KAS environment also holds credentials such a
 the CLI's `KIRO_API_KEY`.
 
 The provider factory selects `agent.member_acp_backend` for member-DM session
-keys and the configured default backend otherwise. Ordinary backend governance,
+keys and the configured default backend otherwise; a stored `kiro` in the member
+field has already been read as KAS by the config loader. Ordinary backend governance,
 selectability, member-capability checks and host sandbox rules remain independent
 requirements; memory version adds no direct-MCP refusal.
 
@@ -3529,7 +3734,9 @@ runs. `kirocrew doctor` reports the route when selected (`_report_kas_bundle`:
 installed version, the exact spawn argv, the vault as the only owner) and never
 mentions kiro-cli there; `kirocrew kas status` is the same facts alone.
 
-**Setup and the install probe follow the route.** With `agent.kas_bundle` on, KAS never runs kiro-cli, so the two places that decide "is KAS usable on this host" ask the installed engine instead of the binary: `agent_sdk.backend_install._probe_kas` answers `installed` when `installed_bundle()` finds the pinned engine and `missing` with the one component `COMPONENT_KAS_BUNDLE` (and `kirocrew kas install` as the install command) when it does not, consulting kiro's resolver on neither path; and `KiroPrerequisiteService.record_independent_backend_setup("kas")` records first-run completion on the same reader, spawning no `--version` / `acp --help` probe. A host with no kiro-cli at all therefore completes setup once the engine is installed, which is what the switch's help text promises. The dashboard's install handler evicts the KAS probe (`forget_probe`) when an install lands, so the Agent Harness row flips without waiting out the probe TTL. With the switch off both checks are unchanged: KAS is kiro-cli's relay and its verdict is a copy of kiro's. The spec `permissions` block is still gated on kiro-cli's version on this route (#20730); `kirocrew doctor`'s bundle branch says so instead of reporting a kiro-cli fault.
+**Setup and the install probe follow the route.** With `agent.kas_bundle` on, KAS never runs kiro-cli, so the two places that decide "is KAS usable on this host" ask the installed engine instead of the binary: `agent_sdk.backend_install._probe_kas` answers `installed` when `installed_bundle()` finds the pinned engine and `missing` with the one component `COMPONENT_KAS_BUNDLE` (and `kirocrew kas install` as the install command) when it does not, consulting kiro's resolver on neither path; and `KiroPrerequisiteService.record_independent_backend_setup("kas")` records first-run completion on the same reader, spawning no `--version` / `acp --help` probe. A host with no kiro-cli at all therefore completes setup once the engine is installed, which is what the switch's help text promises. The dashboard's install handler evicts the KAS probe (`forget_probe`) when an install lands, so the Agent Harness row flips without waiting out the probe TTL. With the switch off both checks are unchanged: KAS is kiro-cli's relay and its verdict is a copy of kiro's. **The spec `permissions` block follows the route too.** Crew's auto-approve list reaches KAS's policy engine as the spec's `permissions` block, and the one writer (`agent_materialization/auto_approve._write_derived_permissions`, gate `_spec_permissions_accepted`) writes it only when every program that may read the spec accepts it. With the switch off that is the installed kiro-cli alone (`kiro_cli.spec_permissions_supported(installed_kiro_cli_version())`, floor 2.23.0). With `agent.kas_bundle` on it is the installed engine bundle (`installed_bundle().version` through `kas_pin.engine_spec_permissions_supported`, floor `KAS_SPEC_PERMISSIONS_MIN_ENGINE_VERSION` (0.66.33, the pinned release the block was measured against; `test_kas_pin` keeps the floor at or below the pin so a stock install always passes)), and also kiro-cli whenever one is installed (`kiro_cli.kiro_cli_installed`: a `resolve_kiro_cli` stat, never a spawn; a lookup that raises counts as installed; the doctor row reads the same predicate): the switch changes only the kas backend, and kiro-cli reads the same `~/.kiro/agents` files for a native Kiro session, a member on kiro, or a hand-run `kiro-cli`, where a release below its floor refuses the whole spec. A kiro-cli-free host is never version-probed and gets the block from the engine alone. The gate fails closed the way kiro-cli's does: no engine installed, or an engine below the floor (one selected through `KIROCREW_KAS_VERSION`), is an unknown reader and the block is withheld (an inherited block is removed, as on the relay route). `kirocrew doctor`'s bundle branch (`_report_kas_bundle_spec_permissions`) prints the `auto-approve:` row from the same predicates — written when the engine accepts and no installed kiro-cli refuses, withheld with the floor and the remedy when the engine is below it, withheld without a second issue when nothing is installed, and withheld naming kiro-cli and its update when an installed kiro-cli is old or unprobeable. The switch is read on every spec write through the install probe's own reader (`agent_sdk.backend_install._kas_bundle_route`) and never cached by the writer; a config that cannot be loaded selects the relay gate.
+
+**Hooks on the bundle route: the same events, in the same shapes (#20729).** Kiro Crew's PreToolUse gate (`HookManager.on_tool_call`, reached through `hook_gate_kwargs`) and its SEL tool records are fed by three engine frames -- the `tool_call` update, the `session/request_permission` request and the `tool_call_update` frames through `completed` -- not by the `_kiro/hooks/*` surface, which the handshake announces on neither route: `KasHarness.client_capabilities` is the one `KAS_CLIENT_CAPABILITIES` constant with no route branch, so the engine asks for no hook on either and `kas_wire.hooks_announced()` is false for both. Measured live (2026-10-17) on the pinned 0.66.33 engine spawned by the bundle argv through a gateway with `agent.kas_bundle = true` and `KIROCREW_ACP_RECORD_FRAMES` set, one shell call (`run_command`) produced: a `tool_call` with `kind: execute`, `rawInput.command` and `_meta.kiro.toolOrigin: default`; a `session/request_permission` whose `_meta.kiro` carries `toolId: run_command`, `command`, `consent {capability: shell, resource, askType: implicit, triggeringResource, workspaceRoot}` and `consentRound`, with the four options `accept` / `always-accept` / `reject` / `always-reject`; and `tool_call_update` frames `in_progress`, `in_progress`, `completed` with `rawOutput {output, exitCode, message}`. Key path by key path those are the relay capture's shapes (`test/fixtures/acp_frames/kas/session.jsonl`, 0.63.3 through `kiro-cli acp --agent-engine v3`). Replayed through the same dispatch, both routes hand the gate the same permission event (`harness_tool_id` and trusted `mcp_tool_name` `run_command`, `is_shell`, `shell_classified`, `raw_params_trusted`, the same option ids) and the gate reaches the same decision; on the live run the SEL recorded the call through the dashboard dispatcher as `tool_invocation` `invoked`, `auto_approved`, then `refined` for each update, and the engine ran the command only after Crew answered the request. Nothing was adapted: the bundle route reaches the existing seam unchanged. The capture is `test/fixtures/acp_frames/kas/bundle-tool-path.jsonl` (its `_meta` names the spawn and the id reduction) and `test/test_kas_bundle_hooks_parity.py` pins the parity frame class by frame class, through `hook_gate_kwargs`, and through the gate's decision. Two differences from the 0.63.3 capture are engine-version, not route -- the relay forwards session frames byte for byte, so neither can be the relay's doing: 0.66.33 emits an engine-internal `tool_call` of `kind: other` with `_meta.kiro.toolId: fetch_cloud_config` before the first prompt, and the completed update's `content[].text` is the `rawOutput.message` text rather than the JSON rendering of `rawOutput`; the parsed `tool_result` event has the same fields either way. The agent-spec `postToolUse` matcher is compared with the call's title on both routes, because the finished call names no tool (the same `spec_hooks` warning the relay logs).
 
 **Off-loop answers are bounded.** The off-loop answers — the unroutable-permission
 auto-reject, the KAS access-token answer and the MCP sign-in answer

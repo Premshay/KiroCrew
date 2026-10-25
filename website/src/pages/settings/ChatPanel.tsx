@@ -5,6 +5,7 @@ import { SettingsCard, SettingsToggle, SettingsSelect, SettingsInput, SettingsBu
 import { SettingsSubNav, type SubNavItem } from '../../components/SettingsSubNav'
 import { Btn } from '../../components/ui'
 import { MessageSquare, PenLine, Layers, PanelRight, Bot, UserRound, Sparkles, SlidersHorizontal } from 'lucide-react'
+import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { loadChatConfig, saveChatConfig, MIN_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE, type ChatConfig, type ContentWidth, type DashboardConfig, type MemoryMode, type SendMode } from '../chat/ChatSettings'
 import { api } from '../../api/client'
 import { useOptimisticConfigPaths, setConfigPathValue } from './useOptimisticConfigPaths'
@@ -268,6 +269,13 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
   // backed by the same client-local `mc-diff-split` preference the surfaces
   // read. Browser-local for the same reason as plain diffs above.
   const [diffSplit, setDiffSplit] = useDiffSplit()
+
+  // Copy on select lives under its own key, not in `mc-chat-config`: that blob
+  // is backed up to the host and restored into every browser of the same
+  // owner, and this setting overwrites the clipboard. `mc-chat-copy-on-select`
+  // is not in DURABLE_PREF_KEYS, so it stays on this device, like the diff
+  // layout toggle above. The transcript reads the same key.
+  const [copyOnSelect, setCopyOnSelect] = usePersistedBool('mc-chat-copy-on-select', false)
 
   // ── Local chat config (localStorage) ──
   const setChat = useCallback(<K extends keyof ChatConfig>(k: K, v: ChatConfig[K]) => {
@@ -591,6 +599,11 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
         <div className="mb-8">
         <h4 className="text-base font-semibold text-text-strong">{i18nT('pages.settings.chatPanel.role_subagents')}</h4>
         <div className="text-[12px] text-muted mb-1">{i18nT('pages.settings.chatPanel.model_for_spawned_sub_agents')}</div>
+        {/* The memory cost of a pin, at the place the pin is chosen: a pinned
+            subagent cannot share its parent chat's runtime. */}
+        <div className="text-[12px] text-muted mb-1" data-testid="subagent-pin-runtime-cost">
+          {i18nT('pages.settings.chatPanel.subagent_pin_runtime_cost')}
+        </div>
         <SettingsCard index={2}>
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.subagent_model')}
@@ -900,6 +913,10 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
               Default off: the gesture takes the double-click that otherwise
               selects a word in the bubble (#7908). */}
           <SettingsToggle label={i18nT('pages.settings.chatPanel.double_click_to_edit')} hint={i18nT('pages.settings.chatPanel.double_click_to_edit_desc')} checked={chatCfg.doubleClickToEdit} onChange={v => setChat('doubleClickToEdit', v)} />
+          {/* This device only (its own key, not the backed-up chat config): it
+              acts on this browser's clipboard. Default off, since it
+              overwrites the clipboard on every drag. */}
+          <SettingsToggle label={i18nT('pages.settings.chatPanel.copy_on_select')} hint={i18nT('pages.settings.chatPanel.copy_on_select_desc')} checked={copyOnSelect} onChange={setCopyOnSelect} />
           <SettingsButtonGroup label={i18nT('pages.settings.chatPanel.content_width')} hint={i18nT('pages.settings.chatPanel.compact_is_the_original_view_comfortable_and_ful')} value={chatCfg.contentWidth} options={[{ value: "compact", label: i18nT('pages.settings.chatPanel.compact') }, { value: "comfortable", label: i18nT('pages.settings.chatPanel.comfortable') }, { value: "full", label: i18nT('pages.settings.chatPanel.full') }]} onChange={v => setChat('contentWidth', v as ContentWidth)} />
           <SettingsStepper
             label={i18nT('pages.settings.chatPanel.message_font_size')}

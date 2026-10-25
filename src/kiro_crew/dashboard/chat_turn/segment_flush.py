@@ -16,58 +16,57 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.constants import reflow_and_label_glued_option_marker
+from kiro_crew.dashboard.chat_utils import (
+    _ACTIVITY_NO_REPLY_CONTINUE_MSG,
+    _COMPACTION_CONTINUE_MSG,
+    _EMPTY_AUTO_CONTINUE_MSG,
+    EMPTY_RUNG_CONTINUE,
+    EMPTY_RUNG_GIVE_UP,
+    EMPTY_RUNG_REPLAY,
+    EMPTY_TURN_NOTICE_KIND,
+    EmptyTurnActivity,
+    RecoveryPayload,
+    classify_empty_turn,
+    is_false_current_tool_blocker_near_miss,
+    normalize_stop_reason,
+    payload_for_replay,
+    should_continue_after_compaction,
+    tool_calls_are_read_only_preparation,
+    with_bounded_redaction_records,
+)
+from kiro_crew.dashboard.recovery_replays import replays_of
+from kiro_crew.dashboard.state import chat_message_note, row_mid
+from kiro_crew.messaging.empty_turn_copy import EMPTY_TURN_NOTICE, EMPTY_TURN_NOTICE_AFTER_WORK
+
 # Read when the module loads (the placeholder pattern), so imported plainly.
-from kiro_crew.security import EXFILTRATION_REDACTION_TAG_PREFIX
+from kiro_crew.security import EXFILTRATION_REDACTION_TAG_PREFIX, redact, redact_and_truncate
+from kiro_crew.security.credential_sources import credential_records
+from kiro_crew.security.redaction import redact_credentials_with_records
+from kiro_crew.sel import SecurityEvent
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
-        _ACTIVITY_NO_REPLY_CONTINUE_MSG,
-        _COMPACTION_CONTINUE_MSG,
-        _EMPTY_AUTO_CONTINUE_MSG,
-        EMPTY_RUNG_CONTINUE,
-        EMPTY_RUNG_GIVE_UP,
-        EMPTY_RUNG_REPLAY,
-        EMPTY_TURN_NOTICE,
         EMPTY_TURN_NOTICE_AFTER_RECOVERY,
-        EMPTY_TURN_NOTICE_AFTER_WORK,
-        EMPTY_TURN_NOTICE_KIND,
         REDACTED_CREDENTIAL_TAG,
         STOP_REASON_CANCELLED,
         STOP_REASON_END_TURN,
         STOP_REASON_REFUSAL,
         SYNTHETIC_RECOVERY_KIND,
         DashboardState,
-        EmptyTurnActivity,
-        RecoveryPayload,
         ReplayFamily,
-        SecurityEvent,
         _ChatSlot,
-        chat_message_note,
-        classify_empty_turn,
-        credential_records,
         crew_log_emit,
         effective_session_key,
-        is_false_current_tool_blocker_near_miss,
         logger,
-        normalize_stop_reason,
-        payload_for_replay,
-        redact,
-        redact_and_truncate,
         redact_credentials,
-        redact_credentials_with_records,
         redact_exfiltration_urls,
         redact_exfiltration_urls_with_records,
-        reflow_and_label_glued_option_marker,
         register_images_off_loop,
         register_widgets_off_loop,
-        replays_of,
-        row_mid,
         sel,
         sel_is_warm,
-        should_continue_after_compaction,
         telemetry_channel_of,
-        tool_calls_are_read_only_preparation,
-        with_bounded_redaction_records,
     )
     from kiro_crew.dashboard.chat_turn.decisions_hooks import _decisions_strip_meta
     from kiro_crew.dashboard.chat_turn.file_changes import _note_reply_row
@@ -975,7 +974,7 @@ async def _turn_settle_answer(turn: _ChatTurn) -> None:
         # the runner's — the turn still ends cleanly and recovery stays
         # off (re-arming it would turn a quiet end into a notice card),
         # so this is reported once and nowhere else. Late text was dropped
-        # at arrival (see _run_chat's text-chunk branch), so this count is the
+        # at arrival (see _on_text_chunk in stream_chunks), so this count is the
         # only trace it leaves. Counts only, by contract: no text, no tool
         # names.
         logger.warning(
@@ -1096,8 +1095,8 @@ async def _turn_settle_answer(turn: _ChatTurn) -> None:
     elif not turn._terminal_directive_applied and should_continue_after_compaction(
         # A turn that ended on an applied terminal directive is answered by
         # that directive, whatever compaction happened before it: the empty
-        # segment that _run_chat's late-text drop leaves is the quiet end, not
-        # an abandoned request, so no continuation — same guard as the
+        # segment that the late-text drop in _on_text_chunk (stream_chunks) leaves is
+        # the quiet end, not an abandoned request, so no continuation — same guard as the
         # empty-response arm below.
         # The context window filled mid-turn, the backend summarized, and the
         # turn then ended without finishing the request — the "hangs after

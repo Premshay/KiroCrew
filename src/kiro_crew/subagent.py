@@ -268,6 +268,7 @@ from kiro_crew.subagent_parts.agent_policy import (  # noqa: F401
     _vet_parent_available_agents,
     _vet_spawn_governance,
     agent_matches_allowlist,
+    conductor_spawn_refusal,
     parent_project_dirs,
     parent_spawn_allowlists,
     parent_spawn_policy,
@@ -308,6 +309,7 @@ from kiro_crew.subagent_parts.host_memory import (  # noqa: F401
     _cgroup_memory_roots,
     _configured_max_subagents,
     _container_cgroup_available_gb,
+    _host_available_gb,
     _host_mem_term,
     _macos_available_memory_gb,
     _macos_vm_reclaimable_pages,
@@ -316,7 +318,6 @@ from kiro_crew.subagent_parts.host_memory import (  # noqa: F401
     _read_inactive_file_bytes,
     _read_int_file,
     _subtree_cpu_jiffies,
-    _windows_available_memory_gb,
     _working_set,
     check_memory_available,
     compute_max_subagents,
@@ -327,6 +328,7 @@ from kiro_crew.subagent_parts.host_memory import (  # noqa: F401
 )
 from kiro_crew.subagent_parts.manager import SubagentManager
 from kiro_crew.subagent_parts.model_choice import (  # noqa: F401
+    PINNED_RUNTIME_NOTE,
     _effort_channel,
     _effort_judged_at_session_start,
     _resolved_model_of,

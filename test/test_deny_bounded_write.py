@@ -1640,6 +1640,7 @@ class TestEveryBackendIdLogSiteIsSanitized:
         "src/kiro_crew/acp/session_handle_compaction.py": [],
         "src/kiro_crew/acp/session_handle_turn.py": [
             "rejected permission request id=%s stranded in the ",
+            "cancelled elicitation request id=%s stranded in the ",
         ],
         "src/kiro_crew/acp/session_handle_dispatch.py": [
             "Dropping stray response frame id=%s (no waiter)",

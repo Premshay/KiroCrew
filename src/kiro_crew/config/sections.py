@@ -178,6 +178,7 @@ from kiro_crew.config.sections_agent_fields import (  # noqa: F401
     coerce_role_models,
     coerce_subagent_max_per_parent_by_agent,
     normalize_agent_model,
+    safe_imported,
     worker_session_defaults,
 )
 from kiro_crew.config.sections_channels import (  # noqa: F401
@@ -233,6 +234,7 @@ from kiro_crew.config.sections_dashboard_hosts import (  # noqa: F401
     _GITHUB_PUBLIC_HOSTS,
     _GITLAB_HOST_NAME_RE,
     _coerce_bitbucket_server_hosts,
+    _coerce_gerrit_hosts,
     _coerce_github_hosts,
     _coerce_gitlab_hosts,
     _coerce_jira_hosts,
@@ -352,6 +354,7 @@ from kiro_crew.config.sections_slack import (  # noqa: F401
     _validate_tracking_channels,
 )
 from kiro_crew.config.sections_stt import (  # noqa: F401
+    _DEFERRED_STT_PROVIDERS,
     _RETIRED_STT_PROVIDERS,
     _TRANSCRIBE_LANGUAGE_RE,
     _TRANSCRIBE_VOCABULARY_NAME_RE,
@@ -375,10 +378,13 @@ from kiro_crew.config.sections_stt import (  # noqa: F401
     _validated_stt_threads,
     _validated_transcribe_languages,
     _validated_transcribe_vocabulary,
+    default_stt_provider,
     stt_provider_is_coerced,
     stt_provider_resolution,
     transcribe_language_options,
     transcribe_vocabulary_name,
+    valid_stt_providers,
+    warn_deferred_stt_providers,
 )
 from kiro_crew.config.sections_tailnet import (  # noqa: F401
     TailscaleConfig,

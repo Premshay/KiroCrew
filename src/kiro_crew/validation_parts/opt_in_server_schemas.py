@@ -502,6 +502,11 @@ DASHBOARD_ROLLBACK_SCHEMA = ToolSchema(
     ],
 )
 
+#: Empty and registered, for ``PANEL_TEMPLATES_SCHEMA``'s reason. The page drawn is the
+#: calling crewmate's own page in force, resolved from the session, so there is no
+#: argument that could point it at another page or another crewmate.
+DASHBOARD_SNAPSHOT_SCHEMA = ToolSchema(tool_name="dashboard_snapshot")
+
 MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
     "panel_publish": PANEL_PUBLISH_SCHEMA,
     "panel_templates": PANEL_TEMPLATES_SCHEMA,
@@ -513,6 +518,7 @@ MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
     "dashboard_preview": DASHBOARD_PREVIEW_SCHEMA,
     "dashboard_apply": DASHBOARD_APPLY_SCHEMA,
     "dashboard_rollback": DASHBOARD_ROLLBACK_SCHEMA,
+    "dashboard_snapshot": DASHBOARD_SNAPSHOT_SCHEMA,
 }
 
 
@@ -642,6 +648,10 @@ MCP_MATE_SCHEMAS: dict[str, ToolSchema] = {
             FieldSpec("reason", str, max_len=500),
         ],
     ),
+    "find_capabilities": ToolSchema(
+        tool_name="find_capabilities",
+        fields=[FieldSpec("query", str, max_len=200)],
+    ),
     "request_capabilities": ToolSchema(
         tool_name="request_capabilities",
         fields=[
@@ -701,5 +711,9 @@ MCP_MATE_SCHEMAS: dict[str, ToolSchema] = {
             FieldSpec("markdown", str, max_len=_goals.REPORT_MAX_CHARS),
             FieldSpec("html", str, max_len=_goals.REPORT_HTML_MAX_BYTES),
         ],
+    ),
+    "save_notes": ToolSchema(
+        tool_name="save_notes",
+        fields=[FieldSpec("text", str, required=True, max_len=_goals.NOTES_MAX_CHARS)],
     ),
 }

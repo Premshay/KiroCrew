@@ -93,11 +93,16 @@ class ClaudeCodeMirror(AgentConfigMirror):
                 _D.DELIVERED,
                 "settings.local.json `model` when the session pinned one, plus the "
                 "session/set_config_option verb. DEFAULT_MODEL ('auto') is omitted "
-                "so the adapter picks the allowlist head",
+                "so the adapter takes the user's own model setting",
             ),
             Concern.MODEL_ALLOWLIST: Ruling(
                 _D.DELIVERED,
-                "settings.local.json `availableModels` from model_registry. Not "
+                "settings.local.json `availableModels` from "
+                "model_registry.seed_available_models: the provider-advertised ids, "
+                "never the static registry. The key is written only when that cache "
+                "is warm AND another settings source (user, project or managed) "
+                "defines availableModels, since a specific id disables the family "
+                "alias wildcard; otherwise it is omitted. Not "
                 "cosmetic: the adapter merges availableModels across every settings "
                 "source, so a user ~/.claude carrying a short list collapses a "
                 "versioned [1m] id back to the 200K window",
@@ -231,13 +236,13 @@ class ClaudeCodeMirror(AgentConfigMirror):
 
         ``denied_tools`` stays empty: the deny channel is the settings file, not
         a client-side refusal. ``kwargs`` may carry ``session_key`` /
-        ``channel_id``, which this backend ignores -- a claude MCP child inherits
-        the adapter's process env, so identity needs no element-level carry.
+        ``channel_id``; only the key is read, and only to find a crewmate's worker
+        spec -- a claude MCP child inherits the adapter's process env, so identity
+        needs no element-level carry.
 
         Same blocking allowance and the same wiring obligation as
         :meth:`session_params` (H13).
         """
-        del kwargs
         if not permission_surface_owned:
             logger.warning(
                 "session MCP: withholding the whole mcpServers array, pooled broker stubs "
@@ -252,6 +257,7 @@ class ClaudeCodeMirror(AgentConfigMirror):
             agent,
             stub_server_names=stub_server_names,
             work_dir=work_dir,  # type: ignore[arg-type]
+            session_key=str(kwargs.get("session_key") or ""),
         )
         out: list[dict[str, Any]] = list(projection.servers)
         for stub in stub_elements:

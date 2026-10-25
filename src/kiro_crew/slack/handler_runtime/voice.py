@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         DEFAULT_POCKET_VOICE,
         PROVIDER_PIPER,
         PROVIDER_POCKET,
+        PROVIDER_POLLY,
         PROVIDER_SYSTEM,
         KiroCrewConfig,
         SlackClientOps,
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
         read_config_text,
         resolve_configured_provider,
         validated_config_string,
+        validated_language_code,
     )
 
 
@@ -67,7 +69,6 @@ def load_voice_reply_config(cfg: "KiroCrewConfig | None" = None) -> None:
     restores persisted voice settings — every restart silently resets TTS to
     disabled while the dashboard's settings PUT keeps reporting success.
     """
-    # Load voice_reply defaults from config
     _vr: dict = cfg.raw.get("voice_reply", {}) if (cfg is not None and hasattr(cfg, "raw")) else {}
     if not _vr:
         try:
@@ -104,6 +105,8 @@ def load_voice_reply_config(cfg: "KiroCrewConfig | None" = None) -> None:
     if _vc.provider == PROVIDER_POCKET:
         _vc.default_voice = _str_or_default(_vr.get("voice_id"), DEFAULT_POCKET_VOICE)
     _vc.system_voice = _str_or_default(_vr.get("system_voice"))
+    # A malformed tag reads as no preference, like any other hand-edited typo here.
+    _vc.language_code = validated_language_code(_vr.get("language_code")) or ""
 
 
 async def _safe_voice_reply(
@@ -135,6 +138,7 @@ async def _safe_voice_reply(
             piper_model_config=_vc.piper_model_config,
             length_scale=_vc.piper_length_scale,
             system_voice=_vc.system_voice,
+            language_code=_vc.language_code,
         )
     except Exception:
         logger.debug("Voice reply failed", exc_info=True)
@@ -192,6 +196,10 @@ async def _reply_by_voice(
                         "Install the host speech engine (`espeak-ng`) or pick "
                         "another provider in Voice settings."
                     )
+                elif _vc.provider != PROVIDER_POLLY:
+                    # An edition-registered provider: its own check() said no,
+                    # and the Voice settings row carries its reason.
+                    hint = "Check the voice provider in Voice settings."
                 else:
                     hint = "Run `ada credentials update` and ensure `aws` CLI " "is on PATH."
                 if voice_auto_reply:

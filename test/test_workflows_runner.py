@@ -17,6 +17,7 @@ import types
 
 import pytest
 
+from kiro_crew.testing.wait import async_wait_until, await_until
 from kiro_crew.workflows.runner import RunResult, WorkflowRunner
 
 pytestmark = pytest.mark.asyncio
@@ -404,7 +405,7 @@ async def _run_within(coro, guard: float = 5.0):
         return task.result()
     task.cancel()
     with contextlib.suppress(BaseException):
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task, what="the cancelled run drains")
     return None
 
 
@@ -478,10 +479,10 @@ async def test_cancel_during_in_run_authoring_returns_a_result() -> None:
             "", run_id="wf_ac3", now=NOW, intent="x", author_fn=_hung_author
         )
     )
-    await asyncio.wait_for(author_started.wait(), timeout=5)
+    await await_until(author_started, what="the hung author starts")
     run_task.cancel()
     try:
-        res = await asyncio.wait_for(run_task, timeout=5)
+        res = await await_until(run_task, what="run() returns after the cancel")
     except asyncio.CancelledError:
         pytest.fail("CancelledError escaped run() during authoring")
     assert res.ok is False
@@ -666,11 +667,10 @@ async def test_author_in_run_publishes_source_before_execution() -> None:
             on_source=published.append,
         )
     )
-    # Yield until the blocked agent step is reached; source must already be set.
-    for _ in range(50):
-        if published:
-            break
-        await asyncio.sleep(0.01)
+    # Wait until the blocked agent step is reached; source must already be set.
+    await async_wait_until(
+        lambda: published, describe=lambda: "source not published before execution blocked"
+    )
     assert published == [authored], "source not published before execution blocked"
     gate.set()
     res = await task

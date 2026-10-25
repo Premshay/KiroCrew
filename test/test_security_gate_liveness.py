@@ -482,7 +482,32 @@ def _url_payload_command(n: int) -> str:
 #: (``169.254.169.$o`` in a loop is benign), so the gate adds no new over-block. This
 #: replaces an earlier presence-based attempt that was larger and over-blocked, so the
 #: package shrank here (prior head pinned 32,485).
-_PACKAGE_LINE_BUDGET = 32_438
+#:
+#: Raised by 9, from 32,438, for one ``_WRITE_PROTECTED_HOME_PATHS`` entry in
+#: ``paths_lists``: the Meetings app's per-meeting user notes tree, write-denied to
+#: the agent file tools and read-allowed so the dashboard can serve pasted images.
+#: Data, not rule logic: the matcher and every other entry are unchanged.
+#:
+#: Raised again for the ``rm_floor`` reads of a backtick body inside
+#: double quotes and of a redirection glued to an operand, and for the floor-error
+#: path naming ``rm`` as a word (``_names_rm_word``, on the raw text and with
+#: ``${X:-…}`` defaults resolved). One helper pair, two branches in the existing
+#: segment walk and one regex; no floor widened beyond ``rm`` itself. A live
+#: redirection is kept as ONE segment word -- its fd prefix (``2>``), a ``{fd}``,
+#: a two-character operator (``>>``) and an fd-dup (``2>&1``) all stay together --
+#: so the program-word scan can step over a leading redirection (and its separate
+#: target) the way it steps over a ``VAR=val`` assignment, using the shared
+#: ``shell_normalizer._push_token_redirection`` recognizer. A redirect before
+#: ``rm`` cannot hide the program word.
+#:
+#: Raised by 8, from 32,518, for one ``_WRITE_PROTECTED_HOME_PATHS`` entry in
+#: ``paths_lists``: the crewmate agent folder, write-denied to the agent file tools
+#: like ``~/.kiro/agents``. Data, not rule logic: the matcher is unchanged.
+#:
+#: Raised by 1, from 32,526, for one ``_CREW_SECRET_LEAVES`` entry in ``paths_lists``:
+#: ``member-records``, the gateway-only leaf a crewmate's rules, goals and DM binding
+#: live in. Data, not rule logic.
+_PACKAGE_LINE_BUDGET = 32_527
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

@@ -53,6 +53,7 @@ from kiro_crew.dashboard.cron_inject import (
 )
 from kiro_crew.dashboard.handlers.cron import api_cron_update, api_crons, api_crons_create
 from kiro_crew.session_surface import set_dashboard_surfaced
+from kiro_crew.testing.wait import await_until
 
 FOLDER = "f00dcafe"
 OTHER_FOLDER = "beadfeed"
@@ -991,7 +992,11 @@ class TestMovingTheTabAtTheSave:
 
     @pytest.mark.asyncio
     async def test_a_job_with_no_tab_at_all_is_a_no_op(self) -> None:
-        await move_cron_job_tab(_make_state(), _job(), FOLDER, "")
+        state = _make_state()
+        await move_cron_job_tab(state, _job(), FOLDER, "")
+        # No tab is conjured up for the job, and the sidebar is not told anything moved.
+        assert state._slots == {}
+        state.push_slots_update.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_a_refused_write_restores_the_prior_folder(self, monkeypatch) -> None:
@@ -1030,7 +1035,7 @@ class TestMovingTheTabAtTheSave:
 
         async def _save(state, slot, *a, **kw):
             started.set()
-            await asyncio.wait_for(release.wait(), timeout=5)
+            await await_until(release, what="the test releases the held save")
             raise OSError("disk full")
 
         monkeypatch.setattr(persistence, "save_slot_off_loop", _save)
@@ -1039,13 +1044,13 @@ class TestMovingTheTabAtTheSave:
         state.push_slots_update.reset_mock()
         move = asyncio.create_task(move_cron_job_tab(state, _job(), FOLDER, ""))
         try:
-            await asyncio.wait_for(started.wait(), timeout=5)
+            await await_until(started, what="the held save starts")
             assert slot.folder_id == ""
             state.push_slots_update.assert_not_called()
             slot.folder_id = OTHER_FOLDER
         finally:
             release.set()
-            await asyncio.wait_for(move, timeout=5)
+            await await_until(move, what="the move finishes")
         assert slot.folder_id == OTHER_FOLDER
         state.push_slots_update.assert_called_once_with()
 
@@ -1103,7 +1108,7 @@ class TestMovingTheTabAtTheSave:
                 await asyncio.sleep(0)
             save.assert_not_awaited()
             assert slot.folder_id == FOLDER
-        await asyncio.wait_for(move, timeout=5)
+        await await_until(move, what="the move finishes once the lock is released")
         save.assert_awaited_once()
         assert slot.folder_id == OTHER_FOLDER
 
@@ -1323,7 +1328,7 @@ class TestRestUpdate:
     async def test_the_handler_makes_no_extra_read_of_its_own(self, monkeypatch) -> None:
         """The store reports the transition, so a second query would only re-open the
         race the sink exists to close."""
-        self._capture_unfile(monkeypatch)
+        calls = self._capture_unfile(monkeypatch)
         get_job = AsyncMock(return_value=_job(chat_folder_id=FOLDER))
         app = _app(
             api_cron_update,
@@ -1332,8 +1337,11 @@ class TestRestUpdate:
             get_job_async=get_job,
         )
         async with TestClient(TestServer(app)) as client:
-            await client.patch("/api/crons/job42", json={"chat_folder_id": ""})
+            resp = await client.patch("/api/crons/job42", json={"chat_folder_id": ""})
+            assert resp.status == 200
         get_job.assert_not_awaited()
+        # The move still runs, on the prior folder the store reported.
+        assert calls == [("job42", FOLDER, "")]
 
     async def test_the_handler_passes_a_sink_of_its_own(self, monkeypatch) -> None:
         """One sink per request is the property that makes concurrent folder edits

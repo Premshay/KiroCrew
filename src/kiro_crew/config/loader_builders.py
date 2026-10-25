@@ -13,7 +13,11 @@ from datetime import datetime, timezone
 
 from kiro_crew import platform_compat
 from kiro_crew.config import sections as _sections
-from kiro_crew.config.loader_document import _raw_agent_section, unsandboxed_exec_platform_default
+from kiro_crew.config.loader_document import (
+    _raw_agent_section,
+    _raw_stt_provider,
+    unsandboxed_exec_platform_default,
+)
 from kiro_crew.config.loader_locations import config_path
 from kiro_crew.config.sections import (
     _DEFAULT_CHAT_TURN_TIMEOUT_SECS,
@@ -464,14 +468,50 @@ def _read_backend_choice(section: _sections.SectionReader, agent_data: dict, key
     to the gate as is, so an unusable explicit pick still degrades with its
     warning (harness-parity H3). ``validate_config_data`` replaces a present
     non-string with the stored floor before this runs.
+
+    For ``agent.member_acp_backend`` a stored ``"kiro"`` reads as KAS: crewmates
+    run on KAS, the Kiro backend that carries the per-session dispatch tools a
+    member thread needs. Mapping here, before the gate, gives every reader of the
+    field the backend the member thread actually gets, and the mapped value still
+    crosses the gate like any other pick.
     """
-    from kiro_crew.acp_backends import backend_from_stored, selectable_backends
+    from kiro_crew.acp_backends import (
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_KIRO,
+        backend_from_stored,
+        selectable_backends,
+    )
 
     value = backend_from_stored(agent_data.get(key))
     if value is None:
         default = section.default(key)
         value = default if default in selectable_backends() else None
+    elif key == _MEMBER_HARNESS_KEY and value == ACP_BACKEND_KIRO:
+        value = ACP_BACKEND_KAS
+        _note_member_remap(agent_data.get(key), value)
     return _normalize_acp_backend(value)
+
+
+#: Whether the member-backend remap was logged in this process (see below).
+_member_remap_logged = False
+
+
+def _note_member_remap(stored: object, used: str) -> None:
+    """Say once per process that a stored ``member_acp_backend`` runs as another backend."""
+    global _member_remap_logged
+    if _member_remap_logged:
+        return
+    _member_remap_logged = True
+    logger.info(
+        "agent.member_acp_backend is stored as %r; crewmate DMs run on %r, the Kiro "
+        "backend that carries their dispatch tools (config.json is left as it is)",
+        stored,
+        used,
+    )
+
+
+#: The harness field crewmate DM sessions run on (see :func:`_read_backend_choice`).
+_MEMBER_HARNESS_KEY = "member_acp_backend"
 
 
 #: The ``agent`` fields that hold a harness id, spelled in the config-file
@@ -516,6 +556,35 @@ def _restore_stored_harness_fields(doc: dict) -> None:
             agent_section[key] = stored_agent[key]
         else:
             agent_section.pop(key, None)
+
+
+def _restore_stored_stt_provider(doc: dict) -> None:
+    """In place: keep a stored edition STT provider the snapshot could not see.
+
+    A config loaded before boot, or by a command that never boots, resolves
+    ``stt.provider`` against the built-ins alone, so a stored edition name such as
+    ``acme`` reads as ``off``. Publishing that snapshot would turn a valid choice
+    into ``off`` for good. So when the stored value is such a name (a string that
+    is neither built-in nor retired), the snapshot holds the loader's degraded
+    ``off``, and the edition registry is still pending or registers the name,
+    the stored value is written back instead.
+
+    A standalone host has no pending registry and no registered names, so this
+    never changes what it writes: an unknown name there still saves as ``off``.
+    """
+    stt_section = doc.get("stt")
+    if not isinstance(stt_section, dict) or stt_section.get("provider") != "off":
+        return
+    stored = _raw_stt_provider(config_path())
+    if not isinstance(stored, str) or not stored:
+        return
+    if stored in _sections._VALID_STT_PROVIDERS or stored in _sections._RETIRED_STT_PROVIDERS:
+        return
+    # Imported here: this module sits below the platform context it reads.
+    from kiro_crew import speech_providers
+
+    if speech_providers.registry_pending() or stored in speech_providers.registered_stt_names():
+        stt_section["provider"] = stored
 
 
 # Build each section in its own frame: the large inline constructor amplifies
@@ -635,6 +704,8 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         # true; see the normalization above the `_validate_config_data`
         # call. `_safe_bool` here is the final guard for a real bool.
         session_control=section.read("session_control", _safe_bool),
+        # Default false: a missing key and a malformed one both leave it off.
+        session_manager_chain=section.read("session_manager_chain", _safe_bool),
         # Default true preserves the zero-configuration member-dispatch
         # grant (today's behaviour) for a MISSING key. A present-but-
         # malformed value was already coerced to False upstream, BEFORE
@@ -938,6 +1009,10 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
     github_hosts = _sections._coerce_github_hosts(
         section.get("github_hosts"), claimed=(*gitlab_hosts, *jira_hosts)
     )
+    bitbucket_server_hosts = _sections._coerce_bitbucket_server_hosts(
+        section.get("bitbucket_server_hosts"),
+        claimed=(*gitlab_hosts, *jira_hosts, *github_hosts),
+    )
     return DashboardConfig(
         url=section.get("url"),
         tailscale=_tailscale_config_from(
@@ -1081,9 +1156,10 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         github_hosts=github_hosts,
         gitlab_hosts=gitlab_hosts,
         jira_hosts=jira_hosts,
-        bitbucket_server_hosts=_sections._coerce_bitbucket_server_hosts(
-            section.get("bitbucket_server_hosts"),
-            claimed=(*gitlab_hosts, *jira_hosts, *github_hosts),
+        bitbucket_server_hosts=bitbucket_server_hosts,
+        gerrit_hosts=_sections._coerce_gerrit_hosts(
+            section.get("gerrit_hosts"),
+            claimed=(*gitlab_hosts, *jira_hosts, *github_hosts, *bitbucket_server_hosts),
         ),
         # These two parse raw JSON entries into DTOs, so they are handed only a
         # stored value; an omitted key is the field default as built.

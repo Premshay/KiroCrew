@@ -170,6 +170,7 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # whole subtree under another one.
     "session_adopt",
     "session_release",
+    "session_handoff",
     # Pinning belongs with the tree verbs: it moves another session to or from
     # the top of the person's sidebar, and a channel agent names that session
     # from thread text other people wrote. This entry covers the permission

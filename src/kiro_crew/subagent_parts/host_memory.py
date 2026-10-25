@@ -70,16 +70,17 @@ def check_memory_available(
     ``platform_compat._linux_available_mib`` reads the same file the same
     way. The ``path`` keyword is keyword-only and exists for tests only;
     production callers always take the constant.
-    Native macOS/Windows readers handle the production path on those hosts.
+    Native macOS/Windows readers handle the production path on those hosts:
+    on both, the floor compares against ``platform_compat.host_available_mib``
+    through ``_host_available_gb`` (see it for why macOS does not use the
+    looser sum the auto cap and the posture read).
     Linux production reads also respect cgroup headroom. An explicit test path
     always exercises the file reader. With no readable host memory or finite
     cgroup limit, returns (True, -1.0).
     """
     if path == "/proc/meminfo" and not platform_compat.IS_LINUX:
-        if platform_compat.IS_MACOS:
-            avail = _macos_available_memory_gb()
-        elif platform_compat.IS_WINDOWS:
-            avail = _windows_available_memory_gb()
+        if platform_compat.IS_MACOS or platform_compat.IS_WINDOWS:
+            avail = _host_available_gb()
         else:
             avail = -1.0
         return (True, -1.0) if avail < 0 else (avail >= min_gb, round(avail, 2))
@@ -225,22 +226,36 @@ def _available_memory_gb() -> float:
     if platform_compat.IS_MACOS:
         return _macos_available_memory_gb()
     if platform_compat.IS_WINDOWS:
-        return _windows_available_memory_gb()
+        return _host_available_gb()
     # Unsupported platform: no probe yet → fail open.
     return -1.0
 
 
-def _windows_available_memory_gb() -> float:
-    """Available memory (GB) on Windows, or ``-1.0`` when it cannot be read.
+def _host_available_gb() -> float:
+    """``platform_compat.host_available_mib`` in GB, or ``-1.0`` when it cannot be read.
 
-    Delegates to ``platform_compat.host_available_mib`` instead of calling
-    ``GlobalMemoryStatusEx`` here. That shim is the single place the MiB unit
-    and the "0 means unreadable, never zero memory" contract are defined, and a
-    second reader would have to restate both to stay correct.
+    Delegates instead of calling ``GlobalMemoryStatusEx`` or the Mach counters
+    here. That shim is the single place the MiB unit and the "0 means
+    unreadable, never zero memory" contract are defined, and a second reader
+    would have to restate both to stay correct.
 
-    Without this branch the cap loses its memory term on Windows entirely and
-    falls open to ``_LEGACY_DEFAULT_MAX``, so a host with tens of GB free is
-    held to the same three concurrent sub-agents as an unmeasurable one.
+    Readers:
+
+    * Windows, everywhere: without it the cap loses its memory term on Windows
+      entirely and falls open to ``_LEGACY_DEFAULT_MAX``, so a host with tens of
+      GB free is held to the same three concurrent sub-agents as an
+      unmeasurable one.
+    * macOS, the spawn floor only (``check_memory_available``). There the shim
+      counts free plus purgeable pages plus ``min(inactive,
+      external_page_count)``. The floor promises that
+      ``agent.spawn_min_memory_gb`` stays free AFTER a start, so it reads what a
+      new process can really take. The looser ``_macos_available_memory_gb``
+      adds speculative pages a second time (``free_count`` already holds them)
+      and counts dirty anonymous inactive pages as free; on a loaded Apple
+      silicon host it reads about 3.5 GiB above this figure, so a floor compared
+      against it admits starts with less headroom than the operator set. The
+      auto cap's memory-sized fallback, the TaskRunner's memory-sized auto value
+      and the memory posture keep reading ``_macos_available_memory_gb``.
     """
     available_mib = platform_compat.host_available_mib()
     if available_mib <= 0:
@@ -264,11 +279,12 @@ def _macos_vm_reclaimable_pages() -> Optional[int]:
 
     This sum is knowingly looser than ``platform_compat.host_available_mib``,
     which bounds ``inactive`` by ``external_page_count`` and does not re-add
-    ``speculative`` (``free_count`` already contains it). The two are not
-    interchangeable: tightening this one moves the spawn memory floor's macOS
-    reading and the TaskRunner's memory-sized auto value
-    (``compute_memory_sized_parallel_cap``), figures that are documented and
-    that operators tune against.
+    ``speculative`` (``free_count`` already contains it). The spawn floor does
+    not read it: it reads the tight figure (``_host_available_gb``).
+    This sum feeds the TaskRunner's memory-sized auto value, the auto
+    cap's disabled-floor fallback (``compute_memory_sized_parallel_cap``) and
+    the memory posture, figures that are documented and that operators tune
+    against.
     """
     probe = platform_compat.macos_vm_statistics()
     if probe is None:
@@ -604,7 +620,7 @@ def compute_max_subagents(cfg: KiroCrewConfig) -> int:
     except (AttributeError, TypeError, ValueError):
         floor_off = False
     if floor_off:
-        cap = compute_memory_sized_parallel_cap(cfg)
+        cap = compute_memory_sized_parallel_cap(cfg, settled=True)
         logger.info(
             "subagent auto cap = %d (agent.spawn_min_memory_gb disables the spawn "
             "floor, so the count is sized from host memory)",
@@ -622,7 +638,7 @@ def compute_max_subagents(cfg: KiroCrewConfig) -> int:
     return ceiling
 
 
-def compute_memory_sized_parallel_cap(cfg: KiroCrewConfig) -> int:
+def compute_memory_sized_parallel_cap(cfg: KiroCrewConfig, *, settled: bool = False) -> int:
     """A parallel-step count sized from host memory, for the TaskRunner's auto value.
 
     TaskRunner steps run on the runner lane, which no per-start memory floor
@@ -632,17 +648,23 @@ def compute_memory_sized_parallel_cap(cfg: KiroCrewConfig) -> int:
     agent.subagent_auto_max]``. CPU is deliberately not a term: over-committing
     memory ends in the OOM killer, while over-committing CPU only slows work
     down. Fails safe to the legacy 3 when memory cannot be read.
+
+    ``settled`` prices from the settled runtime instead of the whole run (see
+    :func:`_host_mem_term`): the subagent cap's disabled-floor fallback passes
+    it, since it stands in for a floor that prices starts that way. The
+    TaskRunner never does: nothing re-checks memory when a step starts, so its
+    figure keeps the whole-run reserve for what its steps build and test.
     """
     agent = cfg.agent
     hard_cap = max(_LEGACY_DEFAULT_MAX, agent.subagent_auto_max)
     lo = _LEGACY_DEFAULT_MAX
-    mem_term = _host_mem_term(cfg)
+    mem_term = _host_mem_term(cfg, settled=settled)
     if mem_term is None:
         return lo
     return max(lo, min(mem_term, hard_cap))
 
 
-def _host_mem_term(cfg: KiroCrewConfig) -> int | None:
+def _host_mem_term(cfg: KiroCrewConfig, *, settled: bool = False) -> int | None:
     """How many agents fit in this host's available memory, or None when unreadable.
 
     The one place the memory arithmetic lives, for
@@ -650,17 +672,31 @@ def _host_mem_term(cfg: KiroCrewConfig) -> int | None:
     when the spawn floor is disabled.
 
     ``floor((avail * buf - pool_size * typical - heavy_peak) / typical)``:
-    every slot is priced at a typical run (median across agents of each
+    every slot is priced at a typical agent (median across agents of each
     agent's p50), and the heaviest agent's p90 (``heavy_peak``) is reserved
-    once. The reserve is what covers that agent's growth after it starts,
-    which no per-start price models.
+    once. By default both come from the whole-run peak ``mem_gb``, so the
+    reserve covers that agent's growth after it starts, which no per-start
+    price models. With ``settled`` they come from ``settled_gb`` instead: the
+    agent's own processes -- kiro-cli and the MCP servers up once its session
+    answered, idle -- read from dedicated runs only and aged out after
+    ``SETTLED_SAMPLE_MAX_AGE_SECS``, exactly the figure the spawn floor prices
+    a start at. A run's builds and test suites are not in it, so one 132 GB
+    whole-run sample does not hold that count at its floor; growth after start
+    is left to the buffer, as the floor leaves it.
     """
     agent = cfg.agent
     avail_gb = _available_memory_gb()
     if avail_gb <= 0:
         return None
     buf = 1.0 - agent.subagent_mem_buffer_pct / 100.0
-    typical, heavy_peak = read_cap_costs("mem_gb")
+    if settled:
+        from kiro_crew.subagent_cost import SETTLED_SAMPLE_MAX_AGE_SECS
+
+        typical, heavy_peak = read_cap_costs(
+            "settled_gb", dedicated_only=True, max_age_secs=SETTLED_SAMPLE_MAX_AGE_SECS
+        )
+    else:
+        typical, heavy_peak = read_cap_costs("mem_gb")
     mem_cost = typical or agent.subagent_cost_gb or DEFAULT_SUBAGENT_COST_GB
     heavy_peak = heavy_peak or 0.0
     pool_size = cfg.session.pool_size

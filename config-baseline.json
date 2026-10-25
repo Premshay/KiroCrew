@@ -92,6 +92,7 @@
         "session_start_timeout_secs": 90,
         "tool_approval_timeout_secs": 600,
         "session_control": true,
+        "session_manager_chain": false,
         "member_dispatch": true,
         "crew_panel": true,
         "subagent_cost_gb": 0.5,
@@ -171,7 +172,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Per-role models",
-      "help": "Optional per-task-class model overrides. Keys: 'background' (lite / heartbeat background workers) and 'subagent' (spawned sub-agents). An empty value or 'auto' defers to the chat default (agent.model) and then to the provider default, so an unpinned role stays usable on every subscription tier. Pin a cheaper model here to run background / sub-agent work on it without changing the interactive chat default.",
+      "help": "Optional per-task-class model overrides. Keys: 'background' (lite / heartbeat background workers) and 'subagent' (spawned sub-agents). An empty value or 'auto' defers to the chat default (agent.model) and then to the provider default, so an unpinned role stays usable on every subscription tier. Pin a cheaper model here to run background / sub-agent work on it without changing the interactive chat default. A 'subagent' pin runs each spawned sub-agent in its own runtime (its own agent process and MCP servers, about 0.55 GB of memory each) where it could otherwise share the parent chat's.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {}
@@ -199,7 +200,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Per-role reasoning effort",
-      "help": "Optional per-task-class reasoning effort, paired with role_models (keys: 'background', 'subagent'). Empty for a role inherits the chat default (agent.reasoning_effort) and then the provider/model default. Only applies on reasoning-capable models.",
+      "help": "Optional per-task-class reasoning effort, paired with role_models (keys: 'background', 'subagent'). Empty for a role inherits the chat default (agent.reasoning_effort) and then the provider/model default. Only applies on reasoning-capable models. Like a model pin, a 'subagent' effort runs each spawned sub-agent in its own runtime (about 0.55 GB of memory each) where it could otherwise share the parent chat's.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {}
@@ -362,7 +363,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Crew member ACP backend",
-      "help": "Backend for crew-member DM sessions: 'kas' (default when omitted or '') or another dispatch-capable backend (claude, codex, opencode, goose); 'kiro' selects kiro-cli. Members dispatch work into worker sessions through session-control tools mounted per session over the wire, which the kiro-cli v2 backend cannot carry — a value resolving to kiro leaves member threads as plain chat (no dispatch tools), logged at session start.",
+      "help": "Backend for crew-member DM sessions: 'kas' (default when omitted or '') or another dispatch-capable backend (claude, codex, opencode, goose). Crewmates run on KAS as their Kiro backend, so 'kiro' here also selects KAS. Members dispatch work into worker sessions through session-control tools mounted per session over the wire.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "kas"
@@ -1424,6 +1425,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
+    },
+    {
+      "path": "agent.session_manager_chain",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Session Manager Chain",
+      "help": "Let a session reach the whole line of sessions under it, not only the ones it manages directly. With it on, a lead that handed a worker to a conductor can still send to, read, stop and close that worker, and closing the conductor hands its workers to the lead. Off by default.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "agent.member_dispatch",
@@ -7946,6 +7961,7 @@
         "gitlab_hosts": [],
         "jira_hosts": [],
         "bitbucket_server_hosts": [],
+        "gerrit_hosts": [],
         "jira_auth": [],
         "link_patterns": []
       }
@@ -9341,6 +9357,34 @@
       "defaultValue": null
     },
     {
+      "path": "dashboard.gerrit_hosts",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Gerrit Hosts",
+      "help": "Exact hostnames (optionally host:port) of Gerrit Code Review instances whose change URLs the Changes panel and session source links may read, read-only, over the instance's REST API. Empty = none (deny-by-default): a /c/<project>/+/<number> URL is only fetched when its host is an exact member of this list. Suffixes and wildcards are not matched. A host that is also listed in gitlab_hosts, jira_hosts, github_hosts or bitbucket_server_hosts is refused. Gerrit refuses anonymous REST reads on most instances, so the gateway authenticates with the HTTP credential of the listed host only: the vault secret GERRIT_HTTP_CREDENTIAL, holding <username>:<HTTP password> as generated under the Gerrit account's HTTP Credentials settings, serves a single listed host, and GERRIT_HTTP_CREDENTIAL_<HEX> (the host's hex encoding) serves one host of several. Settings > Secrets offers one labelled row per listed host, so the name is never typed by hand.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "dashboard.gerrit_hosts.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
       "path": "dashboard.jira_auth",
       "kind": "core",
       "type": "array",
@@ -9806,6 +9850,20 @@
       "defaultValue": ""
     },
     {
+      "path": "agents.*.dynamic_capabilities",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Dynamic capabilities",
+      "help": "Preview, per crewmate: this crewmate can find new skills or tools for its worker and ask for them on a card in its chat. Off (the default): only you add them, in this crewmate's advanced settings, and it tells you when its worker lacks one. Read per request, so a change reaches the crewmate's next session.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
       "path": "agents.*.approval_mode",
       "kind": "core",
       "type": "string",
@@ -9969,6 +10027,20 @@
       "tags": [],
       "label": "Avatar",
       "help": "Per-crew avatar override. Empty means the face is derived from the crew's name. {'kind': 'ghost', 'traits': {...}} pins explicit ghost traits chosen in the avatar builder; {'kind': 'image'} means an uploaded picture served from the per-crew avatar endpoint.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "agents.*.imported",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Imported",
+      "help": "Provenance stamp of a mate imported from a .crewmate file: {'format_version', 'sender_label', 'sha256', 'imported_at'}. Empty for a mate made here. The sender label is self-declared; nothing reads the stamp to reach the sender.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {}
