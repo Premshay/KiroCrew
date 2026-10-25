@@ -60,6 +60,10 @@ hand-rolling:
 `FormSkeleton`, `EmptyState`, `PanelSectionHeader`, `PageHeader`, `Toggle`,
 `Slider`, `Checkbox`, `FilteredEmpty`.
 
+`SimpleSelect` owns `appearance="compact"` and `appearance="pill"` for dense
+form rows and toolbar controls. Both its native touch control and Radix trigger
+use the same appearance definition; keep layout sizing at the call site.
+
 There is deliberately no `Select` primitive: use `SimpleSelect`,
 `SettingsSelect`, `SearchableSelect`, or `SettingsMultiSelect` for a searchable
 checkbox list in Settings.

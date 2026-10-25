@@ -18,7 +18,7 @@
  * Selecting opens the toolbar's type-first composer (the same box the file
  * viewer uses); its `onOpen` is where the page resolves the anchor.
  * The suite uses a MARKDOWN artifact because that is the kind that renders to a
- * DOM tree behind `previewRef`; text/json render as a highlighted <pre>, while
+ * DOM tree behind `previewRef`; text uses native code shadow rows, while
  * SVG uses its sanitized native viewer. Every commentable surface must attach
  * that ref or selection creates a dead comment affordance.
  */
@@ -31,8 +31,21 @@ import { api } from '../api/client'
 import type { Artifact } from '../types'
 import type { ReactNode } from 'react'
 import { MORE_ACTIONS, chooseMore, commentsShown, findMoreItem } from './artifactMoreMenu'
+import { fillCodeBlock, tokens } from './pierreDom'
 
 vi.mock('../api/client')
+// Render stable native shadow rows instead of racing the lazy fallback swap.
+vi.mock('../pierre', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  PierreCode: ({ file }: { file: { contents: string } }) => (
+    <div ref={node => {
+      if (!node || node.firstChild) return
+      const host = document.createElement('diffs-container')
+      fillCodeBlock(host, file.contents.split('\n').map(tokens))
+      node.append(host)
+    }} />
+  ),
+}))
 vi.mock('../pages/ChatPage', () => ({
   default: () => <div data-testid="chat-page" />,
   PREFILL_STORAGE_KEY: 'kirocrew_prefill',
@@ -90,6 +103,21 @@ function selectInBody(word: string): boolean {
     const t = walker.currentNode.textContent ?? ''
     if (t.includes(word) && t.includes(BODY)) { node = walker.currentNode; break }
   }
+  let shadow = false
+  if (!node) {
+    for (const host of document.querySelectorAll('diffs-container')) {
+      if (!host.shadowRoot) continue
+      const codeWalker = document.createTreeWalker(host.shadowRoot, NodeFilter.SHOW_TEXT)
+      while (codeWalker.nextNode()) {
+        if (codeWalker.currentNode.textContent?.includes(word)) {
+          node = codeWalker.currentNode
+          shadow = true
+          break
+        }
+      }
+      if (node) break
+    }
+  }
   if (!node) return false
   const text = node.textContent ?? ''
   const start = text.indexOf(word)
@@ -103,10 +131,11 @@ function selectInBody(word: string): boolean {
   }) as DOMRect
 
   vi.spyOn(window, 'getSelection').mockReturnValue({
-    isCollapsed: false,
+    isCollapsed: shadow,
     anchorNode: node,
     rangeCount: 1,
     getRangeAt: () => range,
+    getComposedRanges: () => [range],
     removeAllRanges: () => undefined,
     addRange: () => undefined,
     toString: () => word,
@@ -287,9 +316,7 @@ describe('ArtifactDetailPage anchored comments', () => {
   })
 
   it('anchors a comment on a text artifact', async () => {
-    // text bodies render as a highlighted <pre> that carries previewRef, so a
-    // selection there has a root to map back to source. Without that ref the
-    // tip shows but the composer opens with a quote-only anchor — a dead affordance.
+    // Native text selections must carry a source anchor, not only the quote.
     vi.mocked(api).artifact = vi.fn().mockResolvedValue(mkArtifact({ kind: 'text' }))
     renderPage()
     await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())

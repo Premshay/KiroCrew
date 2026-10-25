@@ -1,10 +1,47 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
-import { codePassagePosition, codeQuoteRange, codeShadowRoots, matchRanges, searchRuns, shadowSelectionRange, watchText } from './pierreShadow'
+import { codePassagePosition, codeQuoteRange, codeShadowRoots, codeSourceAnchor, codeSourceQuoteRange, matchRanges, searchRuns, shadowSelectionRange, watchText } from './pierreShadow'
 import { codeBlock, codeBlockUnit, diffFence, multiFileDiffFence, page, para, parked, plainCopy } from '../test/pierreDom'
 import { stubManualFrames } from '../test/manualFrames'
 
 const asText = (runs: Text[][]) => runs.map(run => run.map(node => node.data).join(''))
 const lines = (root: Element) => asText(searchRuns(root))
+
+describe('whole-file source anchors', () => {
+  it('captures and restores a repeated quote in an absolute virtualized row', () => {
+    const source = 'same\nbetween\nsame'
+    const host = codeBlock([['same']], 3)
+    const root = page(host)
+    const text = host.shadowRoot!.querySelector('[data-line] span')!.firstChild!
+    const range = document.createRange()
+    range.setStart(text, 0)
+    range.setEnd(text, 4)
+    const anchor = codeSourceAnchor(root, range, source)
+    expect(anchor).toEqual({ quote: 'same', startOffset: 13, endOffset: 17,
+      prefix: 'same\nbetween\n', suffix: '', line: 3, column: 1 })
+    const restored = codeSourceQuoteRange(root, source, 'same', anchor!.startOffset)
+    expect(restored?.startContainer).toBe(text)
+    expect(restored?.startOffset).toBe(0)
+    expect(codeSourceQuoteRange(root, source, 'same', 0)).toBeNull()
+    expect(codeSourceQuoteRange(root, source, 'same')).toBeNull()
+    expect(codeSourceQuoteRange(root, 'different', 'same')).toBeNull()
+  })
+
+  it('keeps newlines and trims boundary whitespace across shadow rows', () => {
+    const source = '  first\nsecond  '
+    const host = codeBlock([['  first'], ['second  ']])
+    const root = page(host)
+    const nodes = host.shadowRoot!.querySelectorAll('[data-line] span')
+    const range = document.createRange()
+    range.setStart(nodes[0].firstChild!, 0)
+    range.setEnd(nodes[1].firstChild!, 8)
+    expect(codeSourceAnchor(root, range, source)).toMatchObject({ quote: 'first\nsecond', startOffset: 2, endOffset: 14, line: 1, column: 3 })
+    expect(codeSourceAnchor(root, range, '  other\nsecond  ')).toBeNull()
+    const windowsSource = source.replace('\n', '\r\n')
+    const windowsAnchor = codeSourceAnchor(root, range, windowsSource)!
+    expect(windowsAnchor.quote).toBe('first\r\nsecond')
+    expect(codeSourceQuoteRange(root, windowsSource, windowsAnchor.quote, windowsAnchor.startOffset)).not.toBeNull()
+  })
+})
 
 describe('codeShadowRoots', () => {
   it('lists the open roots in document order and skips a host with no root', () => {

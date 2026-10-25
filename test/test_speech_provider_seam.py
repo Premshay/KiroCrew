@@ -98,9 +98,7 @@ _STANDALONE_STT_WARNING = (
     "'kirocrew config set stt.provider <provider>' to choose one, or "
     "'kirocrew config defaults --adopt stt.provider' to drop the stored value."
 )
-_STANDALONE_TTS_WARNING = (
-    "voice_reply.provider 'ploly' not in ['piper', 'pocket', 'polly', 'system'], defaulting to 'system'"
-)
+_STANDALONE_TTS_WARNING = "voice_reply.provider 'ploly' not in ['piper', 'pocket', 'polly', 'system'], defaulting to 'system'"
 
 
 class TestStandaloneIsUnchanged:
@@ -112,7 +110,13 @@ class TestStandaloneIsUnchanged:
             _install(DefaultSpeechProviderRegistry())
 
     def test_valid_sets_are_the_builtins(self, standalone) -> None:
-        assert sections_stt.valid_stt_providers() == ("local", "bridge", "apple", "transcribe", "off")
+        assert sections_stt.valid_stt_providers() == (
+            "local",
+            "bridge",
+            "apple",
+            "transcribe",
+            "off",
+        )
         assert sections_stt.valid_stt_providers() is sections_stt._VALID_STT_PROVIDERS
         assert voice_reply.valid_providers() == frozenset({"piper", "pocket", "polly", "system"})
         assert voice_reply.valid_providers() is voice_reply.VALID_PROVIDERS
@@ -153,7 +157,12 @@ class TestRegisteredProvider:
 
     def test_valid_sets_include_it(self) -> None:
         assert sections_stt.valid_stt_providers() == (
-            "local", "bridge", "apple", "transcribe", "acme", "off"
+            "local",
+            "bridge",
+            "apple",
+            "transcribe",
+            "acme",
+            "off",
         )
         assert "acme" in voice_reply.valid_providers()
 

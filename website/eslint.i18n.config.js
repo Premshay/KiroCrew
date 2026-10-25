@@ -1423,6 +1423,13 @@ export default [
     },
   },
 
+  // Peer-envelope protocol only: gateway delimiters, trust notice and field names
+  // are matched byte-for-byte. Rendered copy lives in PeerChannelRequestCard.
+  {
+    files: ['src/pages/chat/peerChannelRequest.ts'],
+    rules: { 'i18next/no-literal-string': 'off' },
+  },
+
   // STORAGE FORMAT ONLY: the view-state record's own serialization. Every literal
   // in this module is compared or written BY VALUE and none is ever rendered --
   // the four outcome tags (`absent`, `restored`, `revision-mismatch`,

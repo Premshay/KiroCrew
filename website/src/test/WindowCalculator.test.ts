@@ -307,116 +307,29 @@ describe('OffsetIndex: sync (rebuild / extend / refine)', () => {
   })
 })
 
-describe('OffsetIndex: sub-linear scaling benchmark', () => {
-  // Wall-clock micro-benchmarks are noisy, so this test is built to be robust:
-  //  • min-of-N trials (min rejects positive scheduler/GC spikes),
-  //  • enough iterations per trial that each measurement is comfortably
-  //    above timer resolution,
-  //  • assertions are RELATIVE and self-calibrating against the known-linear
-  //    free function measured on the SAME machine — no absolute ms budget that
-  //    could flake on a slow/fast CI box.
-  const makeHeights = (n: number): number[] =>
-    Array.from({ length: n }, (_, i) => 20 + ((i * 131) % 780))
-
-  // Deterministic probe offsets so timing reflects the algorithm, not RNG.
-  const makeProbes = (count: number, span: number): number[] =>
-    Array.from({ length: count }, (_, i) => ((i * 2654435761) % span))
-
-  const bestOf = (trials: number, fn: () => void): number => {
-    let best = Infinity
-    for (let t = 0; t < trials; t++) {
-      const t0 = performance.now()
-      fn()
-      const dt = performance.now() - t0
-      if (dt < best) best = dt
-    }
-    return best
-  }
-
-  it('OffsetIndex.indexAt is far cheaper than the O(N) scan at N=5000', () => {
-    const N = 5000
-    const heights = makeHeights(N)
-    const getH = (i: number) => heights[i]
-    const total = getTotalHeight(N, getH)
-    const oi = new OffsetIndex(N, getH)
-    const ITER = 2000
-    const probes = makeProbes(ITER, total)
-
-    // Warm up both paths (JIT).
-    for (const p of probes) { oi.indexAt(p); getIndexAtOffset(p, N, getH) }
-
-    const oiTime = bestOf(5, () => {
-      for (let i = 0; i < ITER; i++) oi.indexAt(probes[i])
+describe('OffsetIndex: lookup work', () => {
+  it.each([500, 2000, 5000])('bounds row-storage reads logarithmically at N=%i', N => {
+    const heights = Array.from({ length: N }, (_, i) => 20 + ((i * 131) % 780))
+    let reads = 0
+    const index = new OffsetIndex(N, i => { reads++; return heights[i] })
+    // Count numeric storage accesses rather than scheduler-dependent elapsed time.
+    const storage = index as unknown as { tree: number[]; heights: number[] }
+    const measured = (values: number[]) => new Proxy(values, {
+      get(target, property, receiver) {
+        if (typeof property === 'string' && /^\d+$/.test(property)) reads++
+        return Reflect.get(target, property, receiver)
+      },
     })
-    const naiveTime = bestOf(5, () => {
-      for (let i = 0; i < ITER; i++) getIndexAtOffset(probes[i], N, getH)
-    })
-
-    // Fenwick does ~log2(5000)≈12 steps vs the scan's up-to-5000; even with a
-    // generous 3× cushion for constant-factor/noise the tree must win big.
-    expect(oiTime * 3).toBeLessThan(naiveTime)
-  })
-
-  it('per-call cost grows sub-linearly (logarithmically) with N', () => {
-    const sizes = [500, 2000, 5000]
-    // OffsetIndex is so cheap it needs a large iteration count to rise well
-    // above performance.now() resolution — that's what keeps the ratio stable.
-    // Keep iteration counts modest so the test completes well within the 15s
-    // timeout even under parallel CI load.
-    const ITER = 20_000
-    // The O(N) baseline is expensive PER CALL, so a much smaller count already
-    // yields a stable, well-above-floor measurement (and keeps the test fast).
-    const NAIVE_ITER = 5_000
-
-    // One full measurement pass. Returns the two ratios being compared.
-    const measure = () => {
-      const perCall: Record<number, number> = {}
-      const naivePerCall: Record<number, number> = {}
-      for (const N of sizes) {
-        const heights = makeHeights(N)
-        const getH = (i: number) => heights[i]
-        const total = getTotalHeight(N, getH)
-        const oi = new OffsetIndex(N, getH)
-        const probes = makeProbes(ITER, total)
-        // Warm up.
-        for (let i = 0; i < ITER; i++) oi.indexAt(probes[i])
-        perCall[N] = bestOf(5, () => {
-          for (let i = 0; i < ITER; i++) oi.indexAt(probes[i])
-        }) / ITER
-        // Only measure the linear baseline at the two endpoints we compare.
-        if (N === 500 || N === 5000) {
-          for (let i = 0; i < NAIVE_ITER; i++) getIndexAtOffset(probes[i], N, getH)
-          naivePerCall[N] = bestOf(2, () => {
-            for (let i = 0; i < NAIVE_ITER; i++) getIndexAtOffset(probes[i], N, getH)
-          }) / NAIVE_ITER
-        }
-      }
-      // Self-calibrating: the naive scan is O(N), so its 500→5000 ratio is the
-      // machine's "what linear looks like" (~10×). OffsetIndex (O(log N)) must
-      // scale dramatically better — its 500→5000 ratio should be ~1.4×.
-      return {
-        oiRatio: perCall[5000] / Math.max(perCall[500], 1e-9),
-        naiveRatio: naivePerCall[5000] / Math.max(naivePerCall[500], 1e-9),
-      }
+    storage.tree = measured(storage.tree)
+    storage.heights = measured(storage.heights)
+    const total = getTotalHeight(N, i => heights[i])
+    for (let step = 0; step <= 32; step++) {
+      const offset = total * step / 32
+      reads = 0
+      const result = index.indexAt(offset)
+      const lookupReads = reads
+      expect(result).toBe(getIndexAtOffset(offset, N, i => heights[i]))
+      expect(lookupReads).toBeLessThanOrEqual(2 * Math.ceil(Math.log2(N)) + 2)
     }
-
-    // A wall-clock ratio can be distorted when the suite runs in parallel and
-    // an unrelated worker steals CPU mid-measurement. Retry a bounded number of
-    // times and require only that ONE clean pass agrees: a genuine O(N)
-    // regression fails every attempt, while transient contention does not.
-    // The assertions themselves are unchanged.
-    let last = measure()
-    for (let attempt = 1; attempt < 3; attempt++) {
-      if (last.oiRatio < last.naiveRatio && last.oiRatio < 6) break
-      last = measure()
-    }
-    const { oiRatio, naiveRatio } = last
-
-    // Primary, machine-independent signal: OffsetIndex grows far slower than
-    // the known-linear baseline on the SAME hardware.
-    expect(oiRatio).toBeLessThan(naiveRatio)
-    // Absolute backstop: nowhere near linear (which would be ~10×). Generous
-    // enough (6×) to never flake, tight enough to fail an O(N) regression.
-    expect(oiRatio).toBeLessThan(6)
   })
 })

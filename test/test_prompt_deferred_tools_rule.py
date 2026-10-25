@@ -39,7 +39,7 @@ def test_prompt_explains_the_deferred_tool_error(name: str) -> None:
     # The model must be able to recognise the error it will actually receive.
     assert "A tool with the name" in text
     # ... and read it as deferral rather than absence.
-    assert "DEFERRED, not missing" in text
+    assert "means DEFERRED:" in text
 
 
 @pytest.mark.parametrize("name", PROMPTS)
@@ -48,10 +48,11 @@ def test_prompt_gives_the_exact_recovery_call(name: str) -> None:
     # An exact tool_id is the reliable path; a keyword query can fall under the
     # match threshold and return nothing, which reinforces the wrong diagnosis.
     assert 'tool_search(tool_id="<server>::<name>")' in text
-    assert "keyword `query` can score below the match threshold" in text
+    assert "keyword `query` may miss the threshold" in text
+    assert "then retry" in text
 
 
 @pytest.mark.parametrize("name", PROMPTS)
 def test_prompt_forbids_the_dead_server_conclusion(name: str) -> None:
     text = (CONFIG_DIR / name).read_text(encoding="utf-8")
-    assert "Never read that error as the MCP server being down" in text
+    assert "This error means neither server failure nor tool removal" in text

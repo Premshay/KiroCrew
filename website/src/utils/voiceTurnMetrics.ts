@@ -47,7 +47,8 @@ export function markFirstToken(): void {
   marks.firstTokenAt = now()
   // eslint-disable-next-line no-console -- debug-level latency instrumentation
   console.debug(
-    `[voice-turn] end-of-speech -> first token: ${Math.round(marks.firstTokenAt - marks.endOfSpeechAt)}ms`,
+    '[voice-turn] end-of-speech -> first token (ms):',
+    Math.round(marks.firstTokenAt - marks.endOfSpeechAt),
   )
 }
 
@@ -58,7 +59,8 @@ export function markFirstAudio(): void {
   marks.firstAudioAt = now()
   // eslint-disable-next-line no-console -- debug-level latency instrumentation
   console.debug(
-    `[voice-turn] end-of-speech -> first audio: ${Math.round(marks.firstAudioAt - marks.endOfSpeechAt)}ms`,
+    '[voice-turn] end-of-speech -> first audio (ms):',
+    Math.round(marks.firstAudioAt - marks.endOfSpeechAt),
   )
 }
 

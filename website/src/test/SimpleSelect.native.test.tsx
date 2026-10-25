@@ -39,6 +39,19 @@ afterEach(() => { restore?.(); restore = null })
 const LANGS = ['en-US', 'en-GB', 'fr-FR', 'zh-CN']
 
 describe('SimpleSelect on a touch device', () => {
+  it.each([
+    ['pill', ['h-6', 'rounded-full', 'bg-transparent', 'text-[12px]']],
+    ['compact', ['text-[12.5px]', 'px-2', 'py-1']],
+  ] as const)('keeps the %s appearance and chevron clearance on touch', (appearance, classes) => {
+    render(<SimpleSelect appearance={appearance} options={['a']} value="a" disabled onChange={() => {}} aria-label="Appearance" />)
+    const control = screen.getByRole('combobox', { name: 'Appearance' }) as HTMLSelectElement
+    expect(control.tagName).toBe('SELECT')
+    expect(control).toHaveClass(...classes)
+    expect(control.style.paddingInlineEnd).toBe('2.25rem')
+    expect(control).toBeDisabled()
+    expect(control).not.toHaveAttribute('appearance')
+  })
+
   it('shows the selected identity beside the native control while keeping native options text-only', () => {
     const icons = [<img key="reviewer" src="/reviewer.png" alt="" />, <img key="writer" src="/writer.png" alt="" />]
     const { container, rerender } = render(<SimpleSelect options={['reviewer', 'writer']} optionIcons={icons} value="reviewer" onChange={() => {}} aria-label="Member" />)

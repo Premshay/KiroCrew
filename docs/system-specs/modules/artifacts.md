@@ -2243,6 +2243,13 @@ effect: the host route `/artifacts/:slug` owns the URL, and an in-place
 sessionStorage channel ChatPage already consumes on slot activation (the
 slot-change restore in `website/src/pages/chat/page/composerDrafts.ts`).
 
+Text artifacts retain selection comments after the lazy native code renderer
+loads. Capture reads composed shadow ranges and absolute source row numbers;
+stored offsets and context identify repeated quotes. The overlay watches the
+native rows and restores those source anchors after rendering or scrolling.
+An off-screen source position never falls back to a different visible copy.
+CRLF source offsets are preserved while highlights match rendered line endings.
+
 **Selection comment composer** — selecting a passage opens a type-first comment
 composer on the artifact page, the remote artifact page and the side panel's
 file view on the chat page and the mate page. A draft is kept per passage
@@ -2252,7 +2259,7 @@ in `sessionStorage` (`utils/composerDraftStore.ts`) under
 `mc-comment-composer-draft:<path>`. Closing a non-empty draft asks before
 discarding it. Posting shows a saving state; a failed post keeps the text in the
 box for a retry; a post refused after the composer closed shows a banner quoting
-the passage. Kinds that cannot anchor a comment (`json`, `svg`, images) get Copy
+the passage. Kinds that cannot anchor a comment (`json`, images) get Copy
 only on a selection.
 
 ## Roadmap

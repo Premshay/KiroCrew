@@ -116,7 +116,7 @@ export default function NamespaceScopePanel({
                   onChange={(v) => chooseScope(name, v)}
                   clearLabel={i18nT('apps.codeReviewSage.components.namespaceScopePanel.option_unscoped')}
                   disabled={saving}
-                  className="text-[12.5px] px-2 py-1 rounded-md bg-bg-elevated text-text border border-border outline-none focus:border-accent cursor-pointer"
+                  appearance="compact"
                 />
               </div>
 
@@ -129,7 +129,7 @@ export default function NamespaceScopePanel({
                     onChange={(value) => chooseRepository(name, value)}
                     triggerFallback={i18nT('pages.settings.postureDisclosure.unavailable')}
                     disabled={saving || repositoryOptions.length === 0}
-                    className="text-[12.5px] px-2 py-1 rounded-md bg-bg-elevated text-text border border-border outline-none focus:border-accent cursor-pointer"
+                    appearance="compact"
                   />
                 </div>
               )}

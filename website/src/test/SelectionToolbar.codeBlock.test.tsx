@@ -99,9 +99,14 @@ afterEach(() => {
 })
 
 describe('SelectionToolbar — text selected inside a code block', () => {
-  it('opens the comment box and tells the host the selected text', async () => {
+  it.each([true, false])('opens the comment box for a shadow selection with isCollapsed=%s', async collapsed => {
     render(<CodeHarness actions={actions} composer={composer} />)
-    dragInCode(addCode())
+    const selection = dragInCode(addCode())
+    if (!collapsed) {
+      const [range] = selection.getComposedRanges!()
+      selection.isCollapsed = false
+      selection.getRangeAt = () => range
+    }
     expect(await screen.findByLabelText('Comment on the selected text')).toBeInTheDocument()
     expect(composer.onOpen).toHaveBeenCalledWith(SELECTED)
   })

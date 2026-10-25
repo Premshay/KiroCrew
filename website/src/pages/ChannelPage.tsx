@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
+import { FALLBACK_PRESETS, channelTaskPrompt } from '../prompts/channelPresets'
 import AgentSelector from '../components/AgentSelector'
 import DetailPanel from '../components/DetailPanel'
 import ErrorNotice from '../components/ErrorNotice'
@@ -42,44 +43,8 @@ export type { ApprovalMeta } from './ChannelActors'
 
 // ── Team Presets ──
 
-/**
- * Client-side mirror of the built-in team presets.
- *
- * Only a FALLBACK: the picker normally renders what `GET /api/channels/presets`
- * returns (`handlers_channel.py`), and this array is what is left on screen when
- * that request fails. So the display copy cannot live here — a translation of
- * this literal would be invisible on the healthy path and appear only on the
- * error path. `PRESET_LABEL_KEY` below is keyed on the preset `id`, which both
- * paths agree on, so one catalog key localises both.
- *
- * `role` and `task` stay verbatim on purpose, and are the same strings the
- * backend sends. `role` is an IDENTIFIER as much as a label — it is posted to
- * `POST /api/channels`, echoed back as `msg.fromRole`, and is what `@mention`
- * matches on, so translating it would make an agent's handle locale-dependent.
- * `task` is the seed PROMPT sent to that agent; `eslint.i18n.config.js` states
- * the same boundary for `src/prompts/**` — translating it changes agent
- * behaviour rather than localising a surface. Localising either properly is a
- * backend-side change (the API would have to emit keys), tracked separately.
- */
-const FALLBACK_PRESETS = [
-  {
-    id: 'incident',
-    agents: [
-      {
-        role: 'Orchestrator',
-        is_orchestrator: true,
-        task: 'Coordinate investigation of {topic}',
-      },
-      { role: 'Logs Agent', task: 'Search logs related to {topic}' },
-      {
-        role: 'Code Agent',
-        task: 'Check recent code changes related to {topic}',
-      },
-    ],
-  },
-  { id: 'custom', agents: [] },
-]
-
+// Preset labels localize by stable API id on both healthy and fallback paths.
+// Roles and task prompts remain gateway identifiers and model instructions.
 /** Catalog KEY for each built-in preset's display name, by stable preset id. */
 const PRESET_LABEL_KEY: Record<string, string> = {
   incident: 'pages.channelPage.preset_incident_response',
@@ -886,7 +851,7 @@ export default function ChannelPage() {
         topic,
         (tmpl?.agents || []).map((a) => ({
           role: a.role,
-          task: (a.task || '{topic}').replace('{topic}', topic),
+          task: channelTaskPrompt(a.task, topic),
           is_orchestrator: a.is_orchestrator || false,
         })),
         sessionOnly,

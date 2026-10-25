@@ -158,7 +158,7 @@ describe('ChatInput', () => {
 
     it('makes the touch-device + control open the native file picker directly in a wide viewport', () => {
       touchEnv.touch = true
-      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+      renderWithProviders(<ChatInput {...defaultProps} collapsible onUploadFiles={vi.fn()} />)
 
       const input = screen.getAllByLabelText('Attach files').find((element) => element.tagName === 'INPUT')
       const mobilePlus = screen.getByTitle('Attach files').closest('label')

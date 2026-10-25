@@ -186,7 +186,7 @@ describe('ChannelPage narrow viewport', () => {
     expect(s).toMatch(/key="channel-agents-panel"[\s\S]*?storageKey="mc-channel-agents-width"/)
     // The shared panel owns its narrow layout; keep checking its full-width branch.
     const panel = await readFile(join(__dirname, '..', 'components', 'DetailPanel.tsx'), 'utf8')
-    expect(panel).toMatch(/if \(embedded \|\| isMobile\)\s*\{\s*return \(\s*<div className="h-full w-full min-w-0/)
+    expect(panel).toMatch(/if \(embedded \|\| isMobile\)\s*\{\s*return \(\s*<div\s+className="h-full w-full min-w-0/)
     expect(s).not.toMatch(/className="w-64 shrink-0 border-l border-border flex flex-col bg-bg-elevated"/)
   })
 

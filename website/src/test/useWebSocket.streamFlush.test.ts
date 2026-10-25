@@ -15,7 +15,7 @@ import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { store as globalStore } from '../store'
-import { setActiveSlot, clearSlotState } from '../store/chatSlice'
+import { setActiveSlot, clearSlotState, startRemoteTurn } from '../store/chatSlice'
 import { sseSlots } from '../store/dashboardSlice'
 import type { ChatSlot } from '../types'
 
@@ -173,7 +173,10 @@ describe('useWebSocket lands each frame as one stream flush', () => {
       ws.simulateMessage(chunk(BG[0], 'step', 1))
       ws.simulateMessage(chatStatus(BG[1], 'Working step 6'))
     })
-    expect(spy).not.toHaveBeenCalled()
+    expect(dispatchedTypes(spy)).toEqual([startRemoteTurn.type, startRemoteTurn.type])
+    expect(status(BG[0])).toBeUndefined()
+    expect(status(BG[1])).toBeUndefined()
+    spy.mockClear()
     runFrames()
     expect(dispatchedTypes(spy)).toEqual(['stream/flush'])
     expect(status(BG[0])?.kind).toBe('streaming')

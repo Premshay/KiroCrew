@@ -62,6 +62,9 @@ def _quiet_end(note: str | None) -> list[AcpEvent]:
             title="nothing_to_do",
             tool_name="nothing_to_do",
             mcp_server_name=session_directive.CORE_MCP_SERVER,
+            tool_identity_trusted=True,
+            mcp_identity_trusted=True,
+            raw_tool_params=payload,
         ),
         AcpEvent(
             kind=EVENT_TOOL_RESULT, tool_call_id="tc-quiet", tool_output=marker, tool_final=True

@@ -1406,6 +1406,7 @@ describe('useWebSocket frame router', () => {
     })
 
     expect(chat().messages.filter(m => m.role === 'queued').map(m => m.meta?.queueId)).toEqual(['q2'])
+    act(() => { rafCbs.splice(0).forEach(cb => cb(0)) })
     expect(chat().slotStatusDetail[ACTIVE]?.kind).toBe('thinking')
   })
 

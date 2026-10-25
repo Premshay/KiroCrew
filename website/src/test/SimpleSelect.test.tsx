@@ -9,6 +9,18 @@ import SimpleSelect from '../components/SimpleSelect'
  * jsdom (unlike DropdownMenu), so no mock is needed here.
  */
 describe('SimpleSelect', () => {
+  it.each([
+    ['pill', ['h-6', 'rounded-full', 'bg-transparent', 'text-[12px]']],
+    ['compact', ['text-[12.5px]', 'px-2', 'py-1']],
+  ] as const)('keeps the %s trigger appearance and disabled state on desktop', (appearance, classes) => {
+    render(<SimpleSelect appearance={appearance} options={['a']} value="a" disabled onChange={() => {}} aria-label="Appearance" />)
+    const control = screen.getByRole('combobox', { name: 'Appearance' })
+    expect(control.tagName).toBe('BUTTON')
+    expect(control).toHaveClass(...classes)
+    expect(control).toBeDisabled()
+    expect(control).not.toHaveAttribute('appearance')
+  })
+
   it('shows unsupported choices without permitting selection', async () => {
     const onChange = vi.fn()
     render(<SimpleSelect options={['claude', 'deepseek']} optionDisabled={[false, true]} value="claude" onChange={onChange} aria-label="Backend" />)

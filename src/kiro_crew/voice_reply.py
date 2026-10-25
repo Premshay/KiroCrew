@@ -79,13 +79,13 @@ from kiro_crew.voice_reply_registered import (  # noqa: F401 - re-exported
 if TYPE_CHECKING:
     from kiro_crew.slack.client import SlackClientOps
     from kiro_crew.voice_reply_local import (  # noqa: F401 - facade manifest
-        DEFAULT_LENGTH_SCALE,
-        POCKET_STREAM_READ_TIMEOUT,
         _PIPER_CHUNK_SECONDS,
         _PIPER_MAX_CONFIG_BYTES,
         _PIPER_MAX_PHRASE_CHARS,
         _PIPER_MAX_STDERR_BYTES,
         _PIPER_REAP_TIMEOUT_SECONDS,
+        DEFAULT_LENGTH_SCALE,
+        POCKET_STREAM_READ_TIMEOUT,
     )
 
 logger = logging.getLogger(__name__)

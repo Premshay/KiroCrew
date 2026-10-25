@@ -4,6 +4,7 @@
  * the card can show the sender and exact body that the model received.
  */
 import { memo } from 'react'
+import { useTranslation } from 'react-i18next'
 import { ChevronRight, MessageCircle } from 'lucide-react'
 
 import MarkdownRenderer from '../../components/MarkdownRenderer'
@@ -25,7 +26,8 @@ export default memo(function PeerChannelRequestCard({
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
   // Delivery remains in the durable envelope for diagnostics, but transport
   // field names and values are not dashboard copy.
-  const label = parsed.delivery === 'interrupt' ? 'Urgent' : 'Message'
+  const { t } = useTranslation()
+  const label = parsed.delivery === 'interrupt' ? t('designSync.urgent') : t('designSync.message')
 
   return (
     <div

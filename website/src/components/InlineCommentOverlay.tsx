@@ -1,6 +1,7 @@
-import { useLayoutEffect, useMemo, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useState } from 'react'
 import type { ArtifactComment } from '../types'
 import { indexTextNodes, rangeForAnchor } from '../hooks/useMarkdownCommentHighlights'
+import { CODE_RENDER_EVENT, codeSourceQuoteRange, watchText } from '../utils/pierreShadow'
 
 import { i18nT } from '../i18n/t'
 /**
@@ -46,12 +47,14 @@ function mergeByLine(rects: Rect[]): Rect[] {
 }
 
 export function InlineCommentOverlay({
-  scrollRef, textRef, comments, activeId, scrollNonce, unreadRootIds, onActivate,
+  scrollRef, textRef, comments, activeId, scrollNonce, unreadRootIds, onActivate, sourceContent,
 }: {
   /** The overflow-auto scroll container (must be position:relative). */
   scrollRef: React.RefObject<HTMLElement | null>
   /** The rendered markdown/text root used for range matching. */
   textRef: React.RefObject<HTMLElement | null>
+  /** Whole-file text uses source offsets inside Pierre's shadow rows. */
+  sourceContent?: string
   comments: ArtifactComment[]
   /** Persistently-highlighted comment (drives the active rect style). */
   activeId: string | null
@@ -81,7 +84,9 @@ export function InlineCommentOverlay({
     [anchored],
   )
 
-  useLayoutEffect(() => {
+  // The scroll root is a parent ref; its attachment follows child layout
+  // effects when the body and overlay mount together on a reload.
+  useEffect(() => {
     const scroller = scrollRef.current
     const textRoot = textRef.current
     if (!scroller || !textRoot) { setBoxes([]); setBubbles([]); return }
@@ -92,7 +97,7 @@ export function InlineCommentOverlay({
       const nb: Box[] = []
       const nbubbles: Bubble[] = []
       for (const c of anchored) {
-        const r = rangeForAnchor(idx, {
+        const r = (sourceContent === undefined ? null : codeSourceQuoteRange(textRoot, sourceContent, c.anchor!.quote ?? '', c.anchor!.start_offset)) ?? rangeForAnchor(idx, {
           id: c.id, quote: c.anchor!.quote ?? '', prefix: c.anchor!.prefix ?? '', suffix: c.anchor!.suffix ?? '',
           startOffset: c.anchor!.start_offset,
         })
@@ -123,8 +128,16 @@ export function InlineCommentOverlay({
     const ro = new ResizeObserver(() => { cancelAnimationFrame(raf); raf = requestAnimationFrame(compute) })
     ro.observe(textRoot)
     ro.observe(scroller)
-    return () => { cancelAnimationFrame(raf); ro.disconnect() }
-  }, [scrollRef, textRef, sig, anchored, replyCounts, unreadRootIds])
+    const rendered = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(compute) }
+    textRoot.addEventListener(CODE_RENDER_EVENT, rendered)
+    textRoot.addEventListener('scroll', rendered, true)
+    const unwatch = sourceContent === undefined ? () => {} : watchText(textRoot, () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(compute) })
+    return () => {
+      cancelAnimationFrame(raf); ro.disconnect(); unwatch()
+      textRoot.removeEventListener(CODE_RENDER_EVENT, rendered)
+      textRoot.removeEventListener('scroll', rendered, true)
+    }
+  }, [scrollRef, textRef, sig, anchored, replyCounts, unreadRootIds, sourceContent])
 
   // Sidebar → body: scroll the active anchor into view when asked.
   useLayoutEffect(() => {

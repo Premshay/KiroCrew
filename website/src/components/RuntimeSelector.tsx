@@ -52,7 +52,8 @@ function SlotRuntimeSelector({ slot, value, running, remote = false }: RuntimeSe
         option ("Label — reason" rows included), not the selected one; the
         field-sizing rule fits it to the selected value instead. */}
     <SimpleSelect
-      className="h-6 w-auto max-w-[13rem] field-sizing-content rounded-full border-transparent bg-transparent px-2 py-0 text-[12px]"
+      appearance="pill"
+      className="w-auto max-w-[13rem] field-sizing-content"
       contentClassName="w-60 max-w-[22rem]"
       aria-label={i18nT('components.webAppArtifactCard.backend')}
       clearLabel={i18nT('components.modelDropdownList.auto_default')}

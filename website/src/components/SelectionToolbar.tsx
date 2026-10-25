@@ -628,9 +628,11 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     const container = containerRef.current
     // Text selected inside a code block's shadow root is reported collapsed (both
     // ends move to the host's parent) while `toString()` still holds it; the
-    // composed range is where it really is. Only a host that opts in takes it, and
-    // only that odd shape pays for the lookup.
-    const inCode = codeSelectionRef.current && sel && container && sel.isCollapsed && sel.toString().trim() ? shadowSelectionRange(sel, container) : null
+    // composed range is where it really is. Engines also expose noncollapsed
+    // shadow selections, so opted-in hosts check both shapes.
+    const inCode = codeSelectionRef.current && sel && container &&
+      (sel.isCollapsed || (sel.rangeCount > 0 && sel.getRangeAt(0).startContainer.getRootNode() instanceof ShadowRoot)) &&
+      sel.toString().trim() ? shadowSelectionRange(sel, container) : null
     if (!sel || (sel.isCollapsed && !inCode) || !sel.toString().trim()) {
       // Only dismiss if toolbar was shown by DOM selection (not external/editor).
       // An OPEN composer is the exception: its selection is collapsed by design

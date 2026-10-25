@@ -21,6 +21,7 @@
  */
 
 const CODE_HOST = 'diffs-container'
+export const CODE_RENDER_EVENT = 'kc:code-render'
 const CODE_LINE = '[data-line]'
 const CODE_BLOCK = '.code-block'
 const DIFF_SECTION = '[data-diff-section]'
@@ -32,6 +33,52 @@ const CODE_UNIT = [CODE_BLOCK, DIFF_SECTION].join(',')
 // the shared fallback slot, so two such passages with the same text share one slot.
 const CODE_LINE_SPAN = 1e5
 const CODE_BLOCK_SPAN = 1e12
+
+/** Source offsets for a selection in a whole-file code view; row numbers remain
+ * absolute when Pierre virtualizes the lines above the viewport. */
+export function codeSourceAnchor(root: Element, range: Range, source: string) {
+  const start = codePassagePosition(root, range)
+  const tail = range.cloneRange()
+  tail.collapse(false)
+  const end = codePassagePosition(root, tail)
+  if (start == null || end == null || start >= CODE_BLOCK_SPAN || end >= CODE_BLOCK_SPAN) return null
+  const lines = source.split('\n')
+  const offset = (position: number) => {
+    const line = Math.floor(position / CODE_LINE_SPAN)
+    const column = position % CODE_LINE_SPAN
+    if (line < 1 || line > lines.length || column > lines[line - 1].length) return null
+    return lines.slice(0, line - 1).reduce((total, text) => total + text.length + 1, 0) + column
+  }
+  const from = offset(start)
+  const to = offset(end)
+  if (from == null || to == null || to <= from) return null
+  const raw = source.slice(from, to)
+  const quote = raw.trim()
+  if (!quote) return null
+  if (quote.replace(/\r?\n/g, '') !== range.toString().trim().replace(/\r?\n/g, '')) return null
+  const startOffset = from + raw.length - raw.trimStart().length
+  const endOffset = startOffset + quote.length
+  return { quote, startOffset, endOffset,
+    prefix: source.slice(Math.max(0, startOffset - 32), startOffset),
+    suffix: source.slice(endOffset, endOffset + 32),
+    line: Math.floor(start / CODE_LINE_SPAN), column: start % CODE_LINE_SPAN + 1 }
+}
+
+/** Restore a whole-file source anchor without choosing the wrong repeated quote. */
+export function codeSourceQuoteRange(root: Element, source: string, quote: string, offset?: number): Range | null {
+  const displayed = quote.replace(/\r\n/g, '\n')
+  if (offset != null && offset >= 0 && source.startsWith(quote, offset)) {
+    const prefix = source.slice(0, offset)
+    const line = prefix.split('\n').length
+    const column = offset - prefix.lastIndexOf('\n') - 1
+    const position = packedCodePosition(0, line, column)
+    if (position != null) {
+      const range = codeQuoteRange(root, displayed, position)
+      return range && codePassagePosition(root, range) === position ? range : null
+    }
+  }
+  return source.includes(quote) && source.indexOf(quote) === source.lastIndexOf(quote) ? codeQuoteRange(root, displayed) : null
+}
 
 function packedCodePosition(ordinal: number, line: number, column: number): number | null {
   if (column >= CODE_LINE_SPAN || line >= CODE_BLOCK_SPAN / CODE_LINE_SPAN) return null

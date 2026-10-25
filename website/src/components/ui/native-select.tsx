@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { ChevronDown } from 'lucide-react'
 import { cn } from '../../lib/utils'
+import { selectAppearanceClasses, type SelectAppearance } from './selectAppearance'
 
 /**
  * A styled native `<select>` — shadcn's `native-select` primitive, in this
@@ -22,6 +23,7 @@ import { cn } from '../../lib/utils'
  * options, and an unused export is API to maintain for no caller.
  */
 interface NativeSelectProps extends React.ComponentPropsWithoutRef<'select'> {
+  appearance?: SelectAppearance
   /** Inline style for the positioning wrapper — where a caller's sizing belongs. */
   wrapperStyle?: React.CSSProperties
 }
@@ -40,7 +42,7 @@ const NativeSelect = React.forwardRef<HTMLSelectElement, NativeSelectProps>(
   // React infers the devtools name from the function, and the assignment form would
   // add a bare string literal that the i18n gate counts (eslint-rules/i18n-strict.js
   // re-surfaces literals the upstream rule exempts).
-  function NativeSelect({ className, wrapperStyle, children, ...props }, ref) {
+  function NativeSelect({ className, appearance = 'default', wrapperStyle, children, ...props }, ref) {
     return (
       // The wrapper is the layout box: it owns the chevron's positioning context,
       // so a caller's sizing (a flex basis, a min-width) has to land HERE to have
@@ -60,6 +62,7 @@ const NativeSelect = React.forwardRef<HTMLSelectElement, NativeSelectProps>(
             'flex items-center justify-between w-full pl-3 py-2 rounded-md text-base border border-border bg-bg-elevated text-text truncate',
             'hover:border-border-strong transition-all cursor-pointer outline-hidden appearance-none',
             'focus-visible:border-accent disabled:opacity-40 disabled:pointer-events-none',
+            selectAppearanceClasses[appearance],
             className
           )}
           // The gutter the chevron below sits in. It is a constant of THIS

@@ -550,7 +550,7 @@ export function ArtifactDetailPageBody({
                   submit the previous artifact's draft through this one's callbacks. */}
               {/* `externalSelection` carries a code-block line range (Pierre's
                   shadow DOM holds no light-DOM selection to read). */}
-              {commentable && <SelectionToolbar key={`${slug}:${composerResetNonce}`} containerRef={previewRef} actions={selectionActions} composer={selectionComposer} externalSelection={iframeSelection} suspended={narrowPanelOpen} />}
+              {commentable && <SelectionToolbar key={`${slug}:${composerResetNonce}`} containerRef={previewRef} actions={selectionActions} composer={selectionComposer} externalSelection={iframeSelection} suspended={narrowPanelOpen} codeSelection={artifact.kind === 'text'} />}
             </div>
           )}
         </div>

@@ -17,7 +17,8 @@ import {
   SAMPLE_SCREENS
 } from "./constants";
 import { useNarrow, useReduceMotion, useToasts } from "./hooks";
-import { ASK_CONTEXT, ASK_PROMPT, IMAGES_PROMPT } from "./prompts";
+import { fmtNumber } from "../../i18n/format";
+import { ASK_CONTEXT, ASK_FOLLOW_UP, ASK_PROMPT, IMAGES_PROMPT } from "./prompts";
 import type {
   Ask,
   Blocked,
@@ -310,7 +311,7 @@ function DesignCritiquePageContent() {
       setErr(
         error instanceof Error
           ? error.message
-          : "Could not prepare the Claude Design round.",
+          : i18nT("designSync.prepare_failed"),
       );
     } finally {
       setDesignRoundBusy(false);
@@ -333,7 +334,7 @@ function DesignCritiquePageContent() {
       setErr(
         error instanceof Error
           ? error.message
-          : "Could not update the Claude Design round.",
+          : i18nT("designSync.update_failed"),
       );
     } finally {
       setDesignRoundBusy(false);
@@ -739,7 +740,7 @@ function DesignCritiquePageContent() {
     else
       setJustFinished({
         slotKey,
-        read: rep.overallRead || "Critique ready",
+        read: rep.overallRead || i18nT("apps.designCritique.designCritiquePage.critique_ready"),
         screens,
         report: rep,
       });
@@ -784,7 +785,7 @@ function DesignCritiquePageContent() {
         ...prev.filter((f) => f.slotKey !== slotKey),
         { slotKey, message },
       ]);
-    notify("Critique failed: " + (e instanceof Error ? e.message : String(e)), {
+    notify(i18nT("designSync.critique_failed", { error: e instanceof Error ? e.message : String(e) }), {
       type: "error",
     });
   };
@@ -863,7 +864,7 @@ function DesignCritiquePageContent() {
       if (!paths || !paths.length) throw new Error("no file paths returned");
       const uploaded = paths.map((p, i) => ({
         step: i + 1,
-        label: "Screen " + (i + 1),
+        label: i18nT("designSync.screen_number", { value: fmtNumber(i + 1) }),
         url: fileUrl(p),
       }));
       // Do the slow method fetch BEFORE deciding ownership, then re-check the run
@@ -1565,9 +1566,7 @@ function DesignCritiquePageContent() {
         askAgentRef.current,
         seedWith
           ? ASK_PROMPT(seedWith, question)
-          : "Follow-up on the same highlighted text: " +
-              (question || "Say more.") +
-              "\n\nSame rules: 2-4 plain sentences, no bullets, no headings.",
+          : ASK_FOLLOW_UP(question),
       );
       const text = await pollForText(askSlotRef.current, seen);
       setAsks((prev) => {
@@ -1587,8 +1586,8 @@ function DesignCritiquePageContent() {
     } catch (e) {
       const flag = e as Flagged
       if (flag && flag.cancelled) return
-      const msg = flag && flag.timeout ? 'That took too long — ask again.'
-        : (e instanceof Error) ? e.message : 'Something went wrong.'
+      const msg = flag && flag.timeout ? i18nT("designSync.ask_timeout")
+        : (e instanceof Error) ? e.message : i18nT("apps.designCritique.designCritiquePage.something_went_wrong")
       setAsks(prev => prev.map(a => a.id === askId
         ? { ...a, turns: a.turns.map(t => (t.t === stamp ? { ...t, a: msg, pending: false, failed: true } : t)) }
         : a))
@@ -1791,7 +1790,7 @@ function DesignCritiquePageContent() {
       e.screens && e.screens.length
         ? e.screens
         : e.thumbUrl
-          ? [{ step: 1, label: "Screen 1", url: e.thumbUrl }]
+          ? [{ step: 1, label: i18nT("designSync.screen_number", { value: fmtNumber(1) }), url: e.thumbUrl }]
           : [];
     showReport(e.report, scr, e);
   };

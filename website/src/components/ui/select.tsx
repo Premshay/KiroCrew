@@ -3,6 +3,7 @@ import { useGuideTrustRootAttrs } from '../../guide/trustRoot'
 import * as SelectPrimitive from '@radix-ui/react-select'
 import { Check, ChevronDown, ChevronUp } from 'lucide-react'
 import { cn } from '../../lib/utils'
+import { selectAppearanceClasses, type SelectAppearance } from './selectAppearance'
 import { MountAfterCommit, useCloseWhenCrewHidden, useOverlayRoot } from '../overlayRoot'
 
 /**
@@ -34,8 +35,8 @@ const SelectValue = SelectPrimitive.Value
 
 const SelectTrigger = React.forwardRef<
   React.ComponentRef<typeof SelectPrimitive.Trigger>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Trigger>
->(({ className, children, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Trigger> & { appearance?: SelectAppearance }
+>(({ className, appearance = 'default', children, ...props }, ref) => (
   <SelectPrimitive.Trigger
     ref={ref}
     className={cn(
@@ -47,6 +48,7 @@ const SelectTrigger = React.forwardRef<
       'focus-visible:border-accent data-[disabled]:opacity-40 data-[disabled]:pointer-events-none',
       'disabled:opacity-40 disabled:pointer-events-none',
       '[&>span]:truncate [&>span]:text-left [&>span]:min-w-0',
+      selectAppearanceClasses[appearance],
       className
     )}
     {...props}

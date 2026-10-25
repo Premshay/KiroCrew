@@ -52,6 +52,7 @@ import {
 } from "./utils";
 import WaitingScreen from "./WaitingScreen";
 
+import { fmtNumber } from "../../i18n/format";
 import { i18nT } from "../../i18n/t";
 
 type StateSetter<T> = React.Dispatch<React.SetStateAction<T>>;
@@ -427,7 +428,7 @@ export function renderCritiquePresentation({
   const entryMeta = (e: HistoryEntry) => {
     const n = (e.screens && e.screens.length) || (e.thumbUrl ? 1 : 0);
     return (
-      (n > 1 ? n + " screens · " : n === 1 ? "1 screen · " : "") + relTime(e.ts)
+      (n ? i18nT("designSync.screens", { value: fmtNumber(n) }) + " · " : "") + relTime(e.ts)
     );
   };
 
@@ -492,7 +493,7 @@ export function renderCritiquePresentation({
                 "apps.designCritique.designCritiquePage.switch_critique",
               )}
             >
-              {"History (" + critiques.length + ")"}
+              {i18nT("designSync.history", { value: fmtNumber(critiques.length) })}
               <ChevronDown size={12} />
             </button>
             {menuOpen ? (
@@ -525,7 +526,7 @@ export function renderCritiquePresentation({
                           ? i18nT(
                               "apps.designCritique.designCritiquePage.running",
                             )
-                          : e.read || "Critique"}
+                          : e.read || i18nT("apps.designCritique.designCritiquePage.design_critique")}
                       </div>
                       <div style={S.menuTime}>{entryMeta(e)}</div>
                     </div>
@@ -645,7 +646,7 @@ export function renderCritiquePresentation({
                     "apps.designCritique.designCritiquePage.show_this_screen",
                   )}
                 >
-                  <span>{"Step " + sc.step + " · "}</span>
+                  <span>{i18nT("designSync.step", { value: fmtNumber(sc.step) }) + " · "}</span>
                   <span style={S.stepName} title={sc.label}>
                     {shortLabel(sc.label)}
                   </span>
@@ -658,9 +659,8 @@ export function renderCritiquePresentation({
                   ) : (
                     <span style={{ ...S.stepCount, color: "var(--muted)" }}>
                       {mine.length
-                        ? mine.length +
-                          (mine.length === 1 ? " finding" : " findings")
-                        : "nothing flagged"}
+                        ? i18nT("designSync.findings", { value: fmtNumber(mine.length) })
+                        : i18nT("designSync.nothing_flagged")}
                     </span>
                   )}
                 </Clickable>
@@ -685,7 +685,7 @@ export function renderCritiquePresentation({
     railBody = (
       <>
         <p key="read" style={S.readLine}>
-          {withMarks(report.overallRead || "Design critique")}
+          {withMarks(report.overallRead || i18nT("apps.designCritique.designCritiquePage.design_critique"))}
         </p>
         {report.health || isFlow ? (
           <div key="hh" style={S.health}>
@@ -763,25 +763,21 @@ export function renderCritiquePresentation({
     railBody = (
       <>
         <p key="w" style={S.readLine}>
-          {phase === "uploading" ? "Uploading…" : "Reading your design…"}
+          {phase === "uploading" ? i18nT("designSync.uploading") : i18nT("designSync.reading")}
         </p>
         <div key="sub" style={S.health}>
           {screens.length > 1
-            ? "A flow of " +
-              screens.length +
-              " screens — I’ll also check the jumps between them."
+            ? i18nT("designSync.flow", { value: fmtNumber(screens.length) })
             : screens.length
-              ? "One screen."
+              ? i18nT("designSync.one_screen")
               : pendingKind
-                ? "A " +
-                  (KIND_LABEL[pendingKind] || "design") +
-                  " — rendering it before judging it."
-                : "Getting the screens ready."}
+                ? i18nT("designSync.rendering", { kind: KIND_LABEL[pendingKind] || i18nT("designSync.design") })
+                : i18nT("designSync.getting_ready")}
         </div>
         {screens.length ? (
           <div key="l">
             <div style={S.sectionH}>
-              {screens.length > 1 ? "Screens in order" : "Screen"}
+              {screens.length > 1 ? i18nT("designSync.screens_in_order") : i18nT("designSync.screen")}
             </div>
             {screens.map((sc, i) => (
               <div
@@ -805,7 +801,7 @@ export function renderCritiquePresentation({
                     whiteSpace: "nowrap",
                   }}
                 >
-                  {sc.label || "Screen " + (i + 1)}
+                  {sc.label || i18nT("designSync.screen_number", { value: fmtNumber(i + 1) })}
                 </span>
               </div>
             ))}
@@ -816,9 +812,9 @@ export function renderCritiquePresentation({
             {i18nT("apps.designCritique.designCritiquePage.what_you_ll_get")}
           </div>
           {[
-            "An overall read of how it’s doing",
-            "What’s working, so it survives the next pass",
-            "The top things to tighten, with pins on the screen",
+            i18nT("designSync.overall_read"),
+            i18nT("designSync.keep_working"),
+            i18nT("designSync.tighten"),
           ].map((tx, i) => (
             <div key={i} style={S.seeItem}>
               {"· " + tx}
@@ -870,7 +866,7 @@ export function renderCritiquePresentation({
                   >
                     {e.pending
                       ? i18nT("apps.designCritique.designCritiquePage.running")
-                      : e.read || "Critique"}
+                      : e.read || i18nT("apps.designCritique.designCritiquePage.design_critique")}
                   </div>
                   <div style={S.listTime}>{entryMeta(e)}</div>
                 </div>
@@ -887,10 +883,7 @@ export function renderCritiquePresentation({
           </div>
         ) : (
           <div key="empty" style={S.emptyList}>
-            {"No critiques yet." +
-              (narrow
-                ? " Drop a screenshot below."
-                : " Drop a screenshot in the panel →")}
+            {narrow ? i18nT("designSync.empty_below") : i18nT("designSync.empty_panel")}
           </div>
         )}
       </>
@@ -990,7 +983,7 @@ export function renderCritiquePresentation({
                 setScreenIdx(i);
                 setActive(null);
               }}
-              title={"Step " + sc.step + " · " + sc.label}
+              title={i18nT("designSync.step", { value: fmtNumber(sc.step) }) + " · " + sc.label}
               aria-current={on ? "true" : "false"}
             >
               <div style={{ ...S.thumbBox, ...(on ? S.thumbBoxOn : {}) }}>
@@ -1044,17 +1037,15 @@ export function renderCritiquePresentation({
             <img
               src={thumbUrl}
               style={S.previewImg}
-              alt={shown ? shown.label : "the design"}
+              alt={shown ? shown.label : i18nT("designSync.design")}
             />
             {markers}
           </Clickable>
           <div style={S.pvbar}>
             <Maximize2 size={12} />
-            {"Click to enlarge" +
-              (markers.length
-                ? " · numbered pins mark issues on this screen"
-                : "") +
-              (isFlow ? " · pick a step above" : "")}
+            {i18nT("designSync.enlarge") +
+              (markers.length ? " · " + i18nT("designSync.pins") : "") +
+              (isFlow ? " · " + i18nT("designSync.pick_step") : "")}
           </div>
         </div>
       </>

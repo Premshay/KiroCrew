@@ -12,6 +12,7 @@
  * is a behaviour change even when every test of the moved code still passes.
  */
 import { safeSetItem } from '../utils/safeStorage'
+import { codeSourceAnchor, shadowSelectionRange } from '../utils/pierreShadow'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { type IframeSelection } from '../hooks/useCommentBridge'
@@ -80,9 +81,16 @@ export function useArtifactDetailPageComments({
    *  null when there is none (collapsed, blank, or outside the preview). */
   const resolveSelectionAnchor = useCallback((highlightOwner: object): PendingAnchor | null => {
     const sel = window.getSelection()
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null
     const root = previewRef.current
-    if (!root) return null
+    if (!sel || !root || sel.rangeCount === 0) return null
+    const inCode = !isMarkdown ? shadowSelectionRange(sel, root) : null
+    if (inCode) {
+      const derived = codeSourceAnchor(root, inCode, sourceContent)
+      if (!derived) return null
+      paintAnnotationHighlight(highlightOwner, inCode)
+      return { ...derived, anchor: derived.quote }
+    }
+    if (sel.isCollapsed) return null
     // The SAME containment predicate the toolbar opened the composer with, so
     // a selection it accepted is never rejected here (a triple-click on the
     // last block ends at a boundary point OUTSIDE the preview); the returned

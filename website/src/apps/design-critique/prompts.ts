@@ -1,6 +1,11 @@
 import type { Report, ReviewBrief, Screen } from './types'
 import { mdImageDest } from '../../utils/fileTokens'
 
+export const ASK_FOLLOW_UP = (question: string): string =>
+  "Follow-up on the same highlighted text: " +
+  (question || "Say more.") +
+  "\n\nSame rules: 2-4 plain sentences, no bullets, no headings."
+
 const CRITIC =
   "You are an experienced designer running a heuristic design critique — a fellow designer " +
   "looking over someone’s work, not a title on a review panel.\n\n" +

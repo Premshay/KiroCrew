@@ -394,7 +394,7 @@ class TestRunnerBranch:
         # must settle too, not re-prepend history every warm turn).
         # A rewind's builder-less fallback excludes replay; that extra guard
         # still arms the debt on ordinary fresh context-bearing turns.
-        arm = r"if _context_is_new and not _provider_has_history(?: and not turn\.rewound)?:"
+        arm = r"if _context_is_new and not _provider_has_history(?: and not (?:turn\.)?rewound)?:"
         flagged = [
             m.start()
             for m in re.finditer(arm, src)

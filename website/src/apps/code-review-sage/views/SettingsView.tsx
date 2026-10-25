@@ -32,11 +32,6 @@ function Field({ label, hint, children }: {
   )
 }
 
-// One literal, not a `+` concatenation: the design-system lint reads a const's
-// string initializer but not an expression built from several.
-const SELECT_CLASS =
-  'text-[12.5px] px-2 py-1 rounded-md bg-bg-elevated text-text border border-border outline-hidden focus:border-accent cursor-pointer'
-
 export default function SettingsView() {
   const qc = useQueryClient()
   const settingsQuery = useQuery({
@@ -99,7 +94,7 @@ export default function SettingsView() {
                 value={s.agent ?? ''}
                 onChange={(v) => saveMut.mutate({ agent: v || null })}
                 clearLabel={i18nT('apps.codeReviewSage.views.settingsView.default_agent_config')}
-                className={SELECT_CLASS}
+                appearance="compact"
               />
             </Field>
             <Field
@@ -113,7 +108,7 @@ export default function SettingsView() {
                   value={s.model ?? ''}
                   onChange={(v) => saveMut.mutate({ model: v || null })}
                   clearLabel={i18nT('apps.codeReviewSage.views.settingsView.default_agent_config')}
-                  className={SELECT_CLASS}
+                  appearance="compact"
                 />
               ) : (
                 <div className="text-[12.5px] text-muted text-right max-w-[360px]">
@@ -133,7 +128,7 @@ export default function SettingsView() {
                 value={s.effort ?? ''}
                 onChange={(v) => saveMut.mutate({ effort: v })}
                 clearLabel={i18nT('apps.codeReviewSage.views.settingsView.default_model_provider')}
-                className={SELECT_CLASS}
+                appearance="compact"
               />
             </Field>}
 
@@ -149,7 +144,7 @@ export default function SettingsView() {
                 )}
                 value={String(s.max_concurrent ?? 5)}
                 onChange={(v) => saveMut.mutate({ max_concurrent: Number(v) })}
-                className={SELECT_CLASS}
+                appearance="compact"
               />
             </Field>
           </div>

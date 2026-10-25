@@ -1,5 +1,6 @@
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from './ui/select'
 import { NativeSelect, NativeSelectOption } from './ui/native-select'
+import type { SelectAppearance } from './ui/selectAppearance'
 import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
 import { SourceBadge } from './ui'
 import { forwardRef, type ForwardedRef } from 'react'
@@ -77,6 +78,8 @@ export interface SimpleSelectProps {
    *  (SettingsField pairs this with its label association). Optional: the
    *  standalone dropdowns keep naming themselves via aria-label. */
   id?: string
+  /** Trigger density and shape, shared by the native and Radix controls. */
+  appearance?: SelectAppearance
   /** Extra classes for the TRIGGER. For a caller whose surrounding rows are
    *  denser than the default `px-3 py-2 text-sm` — the dev config table runs at
    *  `h-7 text-[13px]`, and a taller control there would change every row's
@@ -102,7 +105,7 @@ export interface SimpleSelectProps {
   'data-ui-location'?: string
 }
 
-const SimpleSelect = forwardRef(function SimpleSelect({ options, optionLabels, optionDisabled, optionIcons, value, onChange, action, clearLabel, triggerFallback, labelsInListOnly, optionBadges, disabled, style, id, className, contentClassName, 'aria-label': ariaLabel, 'aria-describedby': ariaDescribedBy, title, 'data-ui-location': uiLocationId }: SimpleSelectProps, forwardedRef: ForwardedRef<HTMLElement>) {
+const SimpleSelect = forwardRef(function SimpleSelect({ options, optionLabels, optionDisabled, optionIcons, value, onChange, action, clearLabel, triggerFallback, labelsInListOnly, optionBadges, disabled, style, id, appearance, className, contentClassName, 'aria-label': ariaLabel, 'aria-describedby': ariaDescribedBy, title, 'data-ui-location': uiLocationId }: SimpleSelectProps, forwardedRef: ForwardedRef<HTMLElement>) {
   const isTouch = useIsTouchDevice()
   // Spread, not a `data-ui-location={...}` attribute: the find_ui generator
   // reads every such attribute as a render site and needs a literal id there.
@@ -141,6 +144,7 @@ const SimpleSelect = forwardRef(function SimpleSelect({ options, optionLabels, o
         // basis, a min-width), and on this path the `<select>` is `w-full` inside
         // the wrapper — a flex rule placed on it is simply inert.
         wrapperStyle={selectedIcon ? { flex: '1 1 0', minWidth: 0 } : style}
+        appearance={appearance}
         className={className}
         value={toRadix(value)}
         onChange={e => {
@@ -183,7 +187,7 @@ const SimpleSelect = forwardRef(function SimpleSelect({ options, optionLabels, o
         }}
         disabled={disabled}
       >
-        <SelectTrigger id={id} aria-label={ariaLabel} aria-describedby={ariaDescribedBy} title={title} {...marker} className={className}>
+        <SelectTrigger id={id} aria-label={ariaLabel} aria-describedby={ariaDescribedBy} title={title} {...marker} appearance={appearance} className={className}>
           <SelectValue placeholder={triggerFallback ?? clearLabel ?? (value || '—')}>
             {/* Children override the selected item's text. Passed only when there
                 IS a selectable non-empty value, so an unset control still falls

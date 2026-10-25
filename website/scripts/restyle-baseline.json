@@ -1,7 +1,6 @@
 {
   "website/src/apps/auto-improvement/SetupPanel.tsx": 1,
   "website/src/apps/code-review-sage/components/RepoSwitcher.tsx": 6,
-  "website/src/apps/code-review-sage/views/SettingsView.tsx": 30,
   "website/src/apps/crew-companion/SpriteImporter.tsx": 12,
   "website/src/apps/design-tweak/DesignTweakPage.tsx": 1,
   "website/src/apps/file-explorer/FileExplorerPage.tsx": 10,

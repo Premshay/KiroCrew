@@ -194,6 +194,7 @@ export const ArtifactBodyNative = memo(function ArtifactBodyNative({
         <InlineCommentOverlay
           scrollRef={scrollerRef}
           textRef={previewRef}
+          sourceContent={kind === 'text' ? content : undefined}
           comments={comments ?? []}
           activeId={activeCommentId ?? null}
           scrollNonce={scrollNonce}

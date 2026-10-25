@@ -2,6 +2,9 @@
 
 ## Overview
 
+The speech language pickers share `speech_languages.COMMON_LANGUAGE_CODES`,
+including Hebrew (`he-IL`). Both routes also retain a stored custom language code.
+
 Live speech-to-text for the dashboard composer. The browser streams 16 kHz mono Int16 PCM over a WebSocket and the server relays partial hypotheses, one or more final transcripts, and (when enabled) an auto-submit signal.
 
 Streaming providers are explicitly listed by `stt_stream._STREAMING_PROVIDERS`:

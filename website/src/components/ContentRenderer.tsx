@@ -24,6 +24,7 @@ export { CodeEditor } from './CodeEditor'
 import { i18nT } from '../i18n/t'
 import { highlightLanguageForExtension } from '../utils/highlightLanguages'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+import { CODE_RENDER_EVENT } from '../utils/pierreShadow'
 
 export const MD_EXTS = new Set(['.md', '.markdown', '.mdx', '.txt', ''])
 
@@ -106,8 +107,9 @@ export const ContentRenderer = memo(function ContentRenderer({
     () => ({
       disableLineNumbers: !lineNums,
       overflow: (wordWrap ? 'wrap' : 'scroll') as 'wrap' | 'scroll',
+      onPostRender: () => previewRef.current?.dispatchEvent(new Event(CODE_RENDER_EVENT)),
     }),
-    [lineNums, wordWrap],
+    [lineNums, wordWrap, previewRef],
   )
   const inner = (
     <>

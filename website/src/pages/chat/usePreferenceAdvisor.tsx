@@ -23,15 +23,15 @@ type Options = {
 type Pending = { slot: string | null; scope?: string; task: string; advice: PreferenceAdvice }
 type Response = { choice: 'use' | 'keep' | 'choose'; model: string }
 const noSubscription = () => () => {}
-const BUDGET_LABEL_KEYS = {
-  fast: 'preference_advisor.budget_fast',
-  balanced: 'preference_advisor.budget_balanced',
-  frontier: 'preference_advisor.budget_frontier',
-} as const
 const taskKey = (slot: string | null, scope: string | undefined, task: string) => JSON.stringify([slot, scope, task])
 
 export function usePreferenceAdvisor(options: Options) {
   const { t } = useTranslation()
+  const budgetLabels = {
+    fast: t('preference_advisor.budget_fast'),
+    balanced: t('preference_advisor.budget_balanced'),
+    frontier: t('preference_advisor.budget_frontier'),
+  }
   const latest = useRef(options)
   latest.current = options
   const inFlight = useRef(false)
@@ -217,7 +217,7 @@ export function usePreferenceAdvisor(options: Options) {
 
   const visible = pending && matches(pending) ? pending : null
   const recommendation = visible?.advice.model || (visible?.advice.budget
-    ? t(BUDGET_LABEL_KEYS[visible.advice.budget]) : undefined)
+    ? budgetLabels[visible.advice.budget] : undefined)
   const ownsAttempt = attempted.current === taskKey(options.slot, options.scope, options.readDraft().trim())
   const error = ownsAttempt ? advice.error || feedback.error : null
   const saved = notice !== null && notice === options.slot && options.eligible
