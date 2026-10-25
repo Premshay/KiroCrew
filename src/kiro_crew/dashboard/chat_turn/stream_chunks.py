@@ -51,8 +51,7 @@ async def _on_text_chunk(turn: _ChatTurn, event) -> None:
             )
         elif turn.assistant_text:
             _cut_segment(turn)
-            _turn_flushed_visible_text = True
-            turn._turn_flushed_visible_text = _turn_flushed_visible_text
+            turn._turn_flushed_visible_text = True
         else:
             # No accumulated text, but still tell frontend to
             # finalize any streaming message before tools.

@@ -7,6 +7,10 @@ results, never as a new user message. Dismissal, composer replies, expiry and
 withdrawal settle the pending ask explicitly. Only `nothing_to_do` sanctions
 a silent terminal turn.
 
+Turn phases read and write shared reset, conversation-discard and flushed-text
+flags directly on the turn object, so provider callbacks and finalization use
+the same state rather than a phase-local copy.
+
 Agent model edits prefer a fresh catalog discovered for the edited agent. When
 that catalog is unavailable, entitlement is checked only against the backend
 namespace that will run the member; another harness's catalog cannot reject it.

@@ -690,7 +690,6 @@ def _note_failed_before_the_try(slot: _ChatSlot, turn_exit: _TurnExit) -> None:
 async def _turn_record_outcome(turn: _ChatTurn) -> None:
     """Hand back the session-switch lock and record the turn's outcome for its tail."""
     _directive_self_wake = turn._directive_self_wake
-    _turn_flushed_visible_text = turn._turn_flushed_visible_text
     _turn_priority = turn._turn_priority
     _turn_tool_calls = turn._turn_tool_calls
     _turn_tool_identities = turn._turn_tool_identities
@@ -726,7 +725,7 @@ async def _turn_record_outcome(turn: _ChatTurn) -> None:
             "tool_calls": _turn_tool_calls,
             "tool_identities": tuple(_turn_tool_identities),
             "reply_text": turn.assistant_text if isinstance(turn.assistant_text, str) else "",
-            "reply_flushed": _turn_flushed_visible_text,
+            "reply_flushed": turn._turn_flushed_visible_text,
             "nudge_turn": _directive_self_wake and turn._turn_landed,
         },
     )

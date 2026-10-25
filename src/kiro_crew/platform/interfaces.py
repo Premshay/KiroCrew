@@ -82,8 +82,9 @@ class ProviderRegistry(Protocol):
         The key is the agent the member RUNS: its ``kiro_agent`` through
         ``config.loader.dispatch_kiro_agent``, so a row that recorded an agent's
         file name keys on the name that file declares, falling back to its
-        roster alias when the binding is empty. Only owner-visible member rows
-        request this metadata.
+        roster alias when the binding is empty. Owner-visible member rows use
+        this metadata; startup migration also checks source and alias bindings
+        before replacing an engine-bound template with conductor/worker agents.
         """
         ...
 

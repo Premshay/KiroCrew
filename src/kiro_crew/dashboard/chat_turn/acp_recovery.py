@@ -380,8 +380,7 @@ async def _on_acp_retryable(turn: _ChatTurn, exc) -> None:
     # `_prompt_depth == 0` would let a depth>0 pipe-death fall through to
     # `_on_acp_error_card`: no reset (the next turn hits the dead process)
     # and the failure never counting toward the exhaustion threshold.
-    needs_session_reset = True  # checked in _turn_release_session (chat_turn/session_reset.py)
-    turn.needs_session_reset = needs_session_reset
+    turn.needs_session_reset = True
     await _persist_partial_reply(turn, "error: process died")
     # Option Y: pipe-death ("process exited"/"not running") shares the
     # _acp_pipe_death_retries counter with the AcpProcessDied handler;
@@ -503,8 +502,7 @@ async def _on_acp_session_not_found(turn: _ChatTurn, exc) -> None:
         "could not load its cloud credentials" if _creds else "lost the session",
         slot.key,
     )
-    needs_session_reset = True  # checked in _turn_release_session (chat_turn/session_reset.py)
-    turn.needs_session_reset = needs_session_reset
+    turn.needs_session_reset = True
     await _persist_partial_reply(
         turn,
         "error: cloud credentials not loaded" if _creds else "error: session not found",

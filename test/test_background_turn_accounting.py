@@ -656,19 +656,13 @@ class TestBilledAttemptsSurviveARetry(unittest.IsolatedAsyncioTestCase):
         # Cleared even though it was rejected, so a third read cannot see it.
         self.assertFalse(hasattr(provider, _TURN_BILLED_ATTR))
 
-    async def test_a_consolidation_turn_that_checks_its_billing_still_writes_its_row(self):
-        """Consolidation reads an empty reply's billing before ``background_turn``
-        records the turn. Consuming the total there would leave the recording read
-        only the retry's live stats, so the abandoned attempt's spend would never
-        reach the usage store."""
+    async def test_consolidation_records_a_billed_failure_without_hidden_retry(self):
+        """The consolidator owns retry accounting; a billed failure still writes usage."""
         from kiro_crew.acp.client import AcpError
-        from kiro_crew.history_consolidation import (
-            HistoryConsolidator,
-            _ConsolidationReplyUnusable,
-        )
+        from kiro_crew.history_consolidation import HistoryConsolidator
         from kiro_crew.providers.base import EVENT_COMPLETE
 
-        class _RetriedClient(_Client):
+        class _RetryableClient(_Client):
             # A backend in ACP_BACKENDS_REPORT_USAGE, where the billing read decides the charge.
             reports_turn_usage = True
 
@@ -683,15 +677,22 @@ class TestBilledAttemptsSurviveARetry(unittest.IsolatedAsyncioTestCase):
                     raise AcpError("transient error (http 5xx)")
                 yield SimpleNamespace(kind=EVENT_COMPLETE, text="")
 
-        consolidator = HistoryConsolidator.__new__(HistoryConsolidator)
-        consolidator._sessions = _Sessions(_RetriedClient())
+        client = _RetryableClient()
+        consolidator = HistoryConsolidator(
+            MagicMock(),
+            MagicMock(),
+            sessions=_Sessions(client),
+            consolidation_endpoint="",
+            consolidation_model="",
+            consolidation_auth_token="",
+        )
         with (
             patch(_USAGE_TARGET) as persist,
             patch("kiro_crew.llm_helpers.transient_retry_delay", return_value=0),
-            self.assertRaises(_ConsolidationReplyUnusable),
         ):
-            await consolidator._call_llm("extract")
+            self.assertIsNone(await consolidator._call_llm("extract"))
 
+        self.assertEqual(client.calls, 1)
         self.assertEqual([call.args[2].credits for call in persist.await_args_list], [2.0])
 
 
