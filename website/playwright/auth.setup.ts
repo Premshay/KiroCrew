@@ -24,6 +24,9 @@ setup('authenticate', async ({ page }) => {
   }
   await page.goto(`/?token=${encodeURIComponent(token)}`, { waitUntil: 'domcontentloaded', timeout: 30000 })
   await page.waitForLoadState('load', { timeout: 30000 })
+  // The root router can navigate after the initial document has loaded.
+  await page.waitForURL(url => url.pathname !== '/', { waitUntil: 'load' })
+  await expect(page.locator('#main-content')).toBeVisible()
   if (process.env.KIROCREW_E2E_EPHEMERAL === '1') {
     const configResponse = await page.request.get('/api/config/kirocrew')
     expect(configResponse.ok(), await configResponse.text()).toBeTruthy()

@@ -249,11 +249,10 @@ async def test_channel_notice_is_separate_from_answer(channel):
     from kiro_crew.slack.renderer import SlackRenderer
 
     if channel == "discord":
-        renderer = object.__new__(DiscordRenderer)
-        renderer._client = MagicMock()
-        renderer._client.send_message = AsyncMock()
-        renderer._channel_id = "channel-a"
-        send = renderer._client.send_message
+        client = MagicMock()
+        client.send_message = AsyncMock()
+        renderer = DiscordRenderer(client, "channel-a", TransportCapabilities())
+        send = client.send_message
         target = "channel-a"
     else:
         renderer = object.__new__(SlackRenderer)

@@ -11,7 +11,17 @@ import { test, expect } from '@playwright/test'
  * The launch flag is worker-scoped, so this case lives in its own file:
  * composer-paste-highlight.spec.ts keeps the default hidden scrollbars.
  */
-test.use({ launchOptions: { ignoreDefaultArgs: ['--hide-scrollbars'] } })
+test.use({
+  launchOptions: async ({ launchOptions }, use) => {
+    await use({
+      ...launchOptions,
+      ignoreDefaultArgs: [
+        ...(Array.isArray(launchOptions.ignoreDefaultArgs) ? launchOptions.ignoreDefaultArgs : []),
+        '--hide-scrollbars',
+      ],
+    })
+  },
+})
 
 test('paste chip mirror wraps at the textarea width when the textarea scrolls', async ({ page }) => {
   await page.goto('/chat')
