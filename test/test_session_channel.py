@@ -1022,6 +1022,41 @@ class TestAttachedSessionWake:
         assert "stopped by this channel message" not in slot._queue[0]["content"]
 
     @pytest.mark.asyncio
+    async def test_a_held_steer_queues_the_interrupt_first_without_a_stop(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        slot.task = MagicMock()
+        slot.task.done.return_value = False
+        slot._acp_client = SimpleNamespace(supports_steer=True, steer=AsyncMock(return_value=False))
+        slot.queue_append("later")
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="interrupt6",
+            from_id="peer",
+            from_role="Baton",
+            mention=["codex"],
+            msg_type="mention",
+            delivery="interrupt",
+            content="Hold the push.",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock())
+
+        outcome = await deliver_attached_channel_message(
+            state, SimpleNamespace(id="deadbeef"), member, message
+        )
+
+        assert outcome == "queued"
+        state.sessions.stop_turn.assert_not_awaited()
+        assert slot._stop_state == "idle"
+        assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
+        assert "stopped by this channel message" not in slot._queue[0]["content"]
+        assert slot._queue[1]["content"] == "later"
+        assert slot._pending_steers == []
+
+    @pytest.mark.asyncio
     async def test_interrupt_mention_preempts_after_expected_steer_failure(
         self, monkeypatch, tmp_path
     ) -> None:

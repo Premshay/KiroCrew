@@ -509,11 +509,24 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
     await save_slot_off_loop(state, slot, force=True, best_effort=False)
 
     if message.msg_type == "mention":
+        # Whether an interrupt that is not steered stops the running turn. A
+        # session that cannot steer at all is stopped so the peer runs next; one
+        # whose steer was refused (claude holds steers while a tool call is open)
+        # gets the request first in its queue instead, so the running tool is
+        # not killed and the agent is not told the user interrupted it.
+        preempt = True
         if message.delivery == "interrupt" and slot.turn_running:
             client = slot._acp_client
-            if client is not None and getattr(client, "supports_steer", False):
+            if client is None or not getattr(client, "supports_steer", False):
+                logger.info(
+                    "peer interrupt for slot %s: %s, stopping the turn",
+                    slot.key,
+                    "no live client" if client is None else "backend cannot steer",
+                )
+            else:
                 interrupt_text = _peer_interrupt_text(channel, message, content)
                 slot._pending_steers.append(interrupt_text)
+                steer_raised = False
                 try:
                     steered = await client.steer(interrupt_text)
                 except Exception as exc:
@@ -523,6 +536,7 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
                         "peer interrupt steer failed for slot %s", slot.key, exc_info=True
                     )
                     steered = False
+                    steer_raised = True
                 if steered:
                     slot.append(
                         "inject",
@@ -538,6 +552,16 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
                 except ValueError:
                     state.push_slots_update()
                     return "queued"
+                if steer_raised:
+                    logger.info(
+                        "peer interrupt for slot %s: steer failed, stopping the turn", slot.key
+                    )
+                else:
+                    preempt = False
+                    logger.info(
+                        "peer interrupt for slot %s: steer held, queued first without a stop",
+                        slot.key,
+                    )
 
         queue = slot.queue_insert if message.delivery == "interrupt" else slot.queue_append
         queue_index = 0 if message.delivery == "interrupt" else None
@@ -551,6 +575,7 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
 
         if (
             message.delivery == "interrupt"
+            and preempt
             and slot.running
             and channel_interrupt_stops_turn(state, slot)
         ):
@@ -572,7 +597,7 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
         if slot.running:
             await save_slot_off_loop(state, slot, force=True, best_effort=False)
             state.push_slots_update()
-            if message.delivery == "interrupt":
+            if message.delivery == "interrupt" and preempt:
                 from kiro_crew.dashboard.chat_handlers import preempt_slot_for_channel_interrupt
 
                 return await preempt_slot_for_channel_interrupt(state, slot)
