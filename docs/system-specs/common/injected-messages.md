@@ -41,6 +41,10 @@ runner consumes that one delivery without draining later peer messages.
   after the envelope stays folded out of the card.
 - The envelope states that it is neither user instruction nor operator
   authorization.
+- An `interrupt` mention that cannot be steered stops the running turn and is
+  queued first. Its instruction then opens with a line naming the sender and
+  channel as the stopper, not the user, because the harness records the
+  cancelled tool call as rejected or "interrupted by user".
 
 **How to treat it:** review the peer report, then respond or acknowledge only
 when the named request needs action.

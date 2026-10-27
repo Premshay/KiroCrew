@@ -61,6 +61,19 @@ async def _cancel_terminal_stop_task(
         logger.warning("Stopped turn task did not settle within 2 seconds for slot %s", slot.key)
 
 
+def channel_interrupt_stops_turn(state: DashboardState, slot: _ChatSlot) -> bool:
+    """Whether :func:`preempt_slot_for_channel_interrupt` would stop *slot*'s turn now.
+
+    Its own guard plus the compaction decline inside :func:`stop_slot_turn`, read
+    before the request is queued so the request can say who stopped the turn.
+    """
+    return bool(
+        slot.turn_running
+        and slot._stop_state == "idle"
+        and not _compaction_in_flight(state, _cancel_target(slot))
+    )
+
+
 async def preempt_slot_for_channel_interrupt(state: DashboardState, slot: _ChatSlot) -> str:
     """Cooperatively cancel a live turn so an urgent peer request runs next."""
     if not slot.turn_running or slot._stop_state != "idle":

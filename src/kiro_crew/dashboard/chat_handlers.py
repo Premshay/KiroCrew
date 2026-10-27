@@ -313,6 +313,7 @@ from kiro_crew.dashboard.chat_api.turn_stop import (  # noqa: F401
     _settle_discarded_stage_deliveries,
     api_chat_slot_interrupt,
     api_chat_slot_stop,
+    channel_interrupt_stops_turn,
     preempt_slot_for_channel_interrupt,
     stop_slot_turn,
 )

@@ -932,6 +932,96 @@ class TestAttachedSessionWake:
         assert slot.peer_channel_inbox_payload()[0]["message_id"] == "interrupt2"
 
     @pytest.mark.asyncio
+    async def test_preempting_interrupt_tells_the_agent_who_stopped_it(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        slot.task = MagicMock()
+        slot.task.done.return_value = False
+        slot._acp_client = SimpleNamespace(supports_steer=False)
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="interrupt4",
+            from_id="peer",
+            from_role="Baton",
+            mention=["codex"],
+            msg_type="mention",
+            delivery="interrupt",
+            content="Hold the push.",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock())
+
+        outcome = await deliver_attached_channel_message(
+            state, SimpleNamespace(id="deadbeef"), member, message
+        )
+
+        assert outcome == "interrupted"
+        queued = slot._queue[0]["content"]
+        # The notice sits after the envelope, so the dashboard still parses the card.
+        end_marker = "[End KiroCrew Channel message]"  # brand-ok: legacy channel envelope
+        notice = queued[queued.index(end_marker) :]
+        assert "stopped by this channel message from Baton (channel deadbeef)" in notice
+        assert "not by the user" in notice
+
+    @pytest.mark.asyncio
+    async def test_interrupt_during_compaction_claims_no_stop(self, monkeypatch, tmp_path) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        slot.task = MagicMock()
+        slot.task.done.return_value = False
+        slot._acp_client = SimpleNamespace(supports_steer=False)
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="interrupt5",
+            from_id="peer",
+            from_role="Baton",
+            mention=["codex"],
+            msg_type="mention",
+            delivery="interrupt",
+            content="Hold the push.",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock())
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers._compaction_in_flight", lambda *_: True
+        )
+
+        outcome = await deliver_attached_channel_message(
+            state, SimpleNamespace(id="deadbeef"), member, message
+        )
+
+        assert outcome == "queued"
+        assert "stopped by this channel message" not in slot._queue[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_queued_mention_that_stops_nothing_carries_no_stop_notice(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        slot.task = MagicMock()
+        slot.task.done.return_value = False
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="request03",
+            from_id="peer",
+            from_role="Baton",
+            mention=["codex"],
+            msg_type="mention",
+            content="When you are done, rebase.",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock())
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._start_next_queued_turn", AsyncMock())
+
+        await deliver_attached_channel_message(
+            state, SimpleNamespace(id="deadbeef"), member, message
+        )
+
+        assert "stopped by this channel message" not in slot._queue[0]["content"]
+
+    @pytest.mark.asyncio
     async def test_interrupt_mention_preempts_after_expected_steer_failure(
         self, monkeypatch, tmp_path
     ) -> None:

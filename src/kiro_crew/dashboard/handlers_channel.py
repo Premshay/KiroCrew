@@ -449,6 +449,16 @@ def _peer_interrupt_text(channel, message, content: str) -> str:
     )
 
 
+def _peer_stop_notice(channel, message) -> str:
+    """Attribute a preempting stop to the peer that caused it, for the stopped agent."""
+    return (
+        f"Your previous turn was stopped by this channel message from "
+        f"{message.from_role} (channel {channel.id}), not by the user. A tool call "
+        'shown as rejected or "interrupted by user" was cancelled by this stop and '
+        "may already have taken effect; check before repeating it."
+    )
+
+
 def _peer_channel_request_text(channel, message, content: str, instruction: str) -> str:
     """Build the one durable peer-request envelope for the model and transcript."""
     return (
@@ -531,13 +541,21 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
 
         queue = slot.queue_insert if message.delivery == "interrupt" else slot.queue_append
         queue_index = 0 if message.delivery == "interrupt" else None
-        request_text = _peer_channel_request_text(
-            channel,
-            message,
-            content,
+        instruction = (
             "Review this peer channel message and respond only if an action or "
-            "acknowledgement is needed.",
+            "acknowledgement is needed."
         )
+        # The harness records a preempting stop as "interrupted by user", so
+        # without this line the agent blames the owner for a stop a peer caused.
+        from kiro_crew.dashboard.chat_handlers import channel_interrupt_stops_turn
+
+        if (
+            message.delivery == "interrupt"
+            and slot.running
+            and channel_interrupt_stops_turn(state, slot)
+        ):
+            instruction = f"{_peer_stop_notice(channel, message)}\n\n{instruction}"
+        request_text = _peer_channel_request_text(channel, message, content, instruction)
         from kiro_crew.dashboard.session_control import containment_meta
 
         queue_meta = containment_meta(state, slot)
