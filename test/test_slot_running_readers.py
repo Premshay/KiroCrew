@@ -346,6 +346,8 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
             for site in {
                 ("channel_slots.py", "_window_refresh_is_safe"),
                 ("chat_api/turn_stop.py", "preempt_slot_for_channel_interrupt"),
+                # The same guard, read first so the peer request can name the stop.
+                ("chat_api/turn_stop.py", "channel_interrupt_stops_turn"),
                 ("chat_slack.py", "drain_slack_backfill"),
                 # The synthesis outage re-check fires only on an idle slot: a
                 # running TURN, not a reservation, is what it must not overlap.
