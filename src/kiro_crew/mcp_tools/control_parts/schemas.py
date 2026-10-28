@@ -247,7 +247,9 @@ def session_tool_schemas() -> list[dict[str, Any]]:
             "name": "session_channel_manage",
             "description": (
                 "As the current channel coordinator only, add a bounded channel-owned agent, "
-                "remove a terminal member, or request_attach an existing open dashboard "
+                "remove a member (one still working, including an attached session, needs "
+                "force=true; a done or failed one does not), or request_attach an existing "
+                "open dashboard "
                 "session (name it by the key list_sessions shows; give a short reason). A "
                 "request only files an approval card: the dashboard user approves or declines "
                 "it in the channel UI, and the outcome arrives as a channel system message. "

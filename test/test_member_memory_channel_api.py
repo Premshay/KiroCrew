@@ -118,25 +118,93 @@ async def test_crewmate_that_is_not_coordinator_cannot_request_attach(env):
 
 
 @pytest.mark.asyncio
-async def test_crewmate_coordinator_still_cannot_add_agents_directly(env):
+async def test_crewmate_coordinator_adds_an_agent(env):
+    from kiro_crew.dashboard.handlers import sessions
+    from kiro_crew.dashboard.handlers.sessions_parts import channels as channel_handlers
+
+    channel, _member = _crewmate_channel(env, coordinator=True)
+    with mock.patch.object(channel_handlers, "_spawn_channel_member", mock.AsyncMock()):
+        response = await sessions.api_session_channel(
+            request(
+                env,
+                internal=True,
+                session="dashboard:alice",
+                body={
+                    "action": "add_agent",
+                    "channel_id": channel.id,
+                    "role": "Worker",
+                    "task": "Run checks.",
+                },
+            )
+        )
+    assert response.status == 200, response.text
+    assert len(channel.members) == 3
+
+
+@pytest.mark.asyncio
+async def test_crewmate_coordinator_removes_an_attached_session(env):
     from kiro_crew.dashboard.handlers import sessions
 
     channel, _member = _crewmate_channel(env, coordinator=True)
+    target = next(m for m in channel.members.values() if m.role == "Helper")
     response = await sessions.api_session_channel(
         request(
             env,
             internal=True,
             session="dashboard:alice",
             body={
-                "action": "add_agent",
+                "action": "remove_member",
                 "channel_id": channel.id,
-                "role": "Worker",
-                "task": "Run checks.",
+                "member_id": target.id,
+                "force": True,
+            },
+        )
+    )
+    assert response.status == 200, response.text
+    assert target.id not in channel.members
+
+
+@pytest.mark.asyncio
+async def test_crewmate_coordinator_removing_an_active_member_still_needs_force(env):
+    from kiro_crew.dashboard.handlers import sessions
+
+    channel, _member = _crewmate_channel(env, coordinator=True)
+    target = next(m for m in channel.members.values() if m.role == "Helper")
+    response = await sessions.api_session_channel(
+        request(
+            env,
+            internal=True,
+            session="dashboard:alice",
+            body={"action": "remove_member", "channel_id": channel.id, "member_id": target.id},
+        )
+    )
+    assert response.status == 409
+    assert json.loads(response.text)["code"] == "channel_member_active"
+    assert target.id in channel.members
+
+
+@pytest.mark.asyncio
+async def test_crewmate_that_is_not_coordinator_cannot_remove_members(env):
+    from kiro_crew.dashboard.handlers import sessions
+
+    channel, _member = _crewmate_channel(env, coordinator=False)
+    target = next(m for m in channel.members.values() if m.role == "Helper")
+    response = await sessions.api_session_channel(
+        request(
+            env,
+            internal=True,
+            session="dashboard:alice",
+            body={
+                "action": "remove_member",
+                "channel_id": channel.id,
+                "member_id": target.id,
+                "force": True,
             },
         )
     )
     assert response.status == 403
-    assert json.loads(response.text)["code"] == "member_scope_denied"
+    assert json.loads(response.text)["code"] == "channel_coordinator_required"
+    assert target.id in channel.members
 
 
 @pytest.mark.asyncio

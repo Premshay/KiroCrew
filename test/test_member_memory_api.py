@@ -1742,6 +1742,8 @@ async def test_session_callbacks_use_the_ordinary_transport_identity(
         ("api_session_channel", {"action": "status"}),
         ("api_session_channel", {"action": "post", "channel_id": "c1"}),
         ("api_session_channel", {"action": "request_attach", "channel_id": "c1"}),
+        ("api_session_channel", {"action": "add_agent", "channel_id": "c1"}),
+        ("api_session_channel", {"action": "remove_member", "channel_id": "c1"}),
     ],
 )
 async def test_member_reaches_its_own_session_callbacks(env, handler_name, body):
@@ -1760,13 +1762,11 @@ async def test_member_reaches_its_own_session_callbacks(env, handler_name, body)
 @pytest.mark.parametrize(
     ("handler_name", "body"),
     [
-        ("api_session_channel", {"action": "add_agent", "channel_id": "c1"}),
-        ("api_session_channel", {"action": "remove_member", "channel_id": "c1"}),
         ("api_session_maintenance", {"action": "status"}),
     ],
 )
-async def test_member_cannot_manage_channels_or_read_maintenance(env, handler_name, body):
-    """Membership changes and the all-session reset barrier stay owner-only."""
+async def test_member_cannot_read_maintenance(env, handler_name, body):
+    """The all-session reset barrier stays owner-only."""
     from kiro_crew.dashboard.handlers import sessions
 
     env.state._slots = {}

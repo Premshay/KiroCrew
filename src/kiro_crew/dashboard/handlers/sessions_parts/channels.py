@@ -26,7 +26,9 @@ _ATTACH_REQUEST_REFUSALS = {
     "invalid_listen_mode": ("listen must be all, mention, or silent", 400),
 }
 
-_MEMBER_CHANNEL_ACTIONS = frozenset({"status", "post", "request_attach"})
+_MEMBER_CHANNEL_ACTIONS = frozenset(
+    {"status", "post", "request_attach", "add_agent", "remove_member"}
+)
 
 
 def _channel_memberships(state: DashboardState, session_key: str) -> list[tuple[Any, Any]]:
@@ -393,13 +395,12 @@ async def api_session_channel(request: web.Request) -> web.Response:
 
 
 async def _member_channel_report_guard(request: web.Request) -> web.Response | None:
-    """Let a member read, post and request attaches in its own channels.
+    """Let a member read, post and manage membership in its own channels.
 
-    ``request_attach`` only files a card the dashboard user approves, and the
-    handler still requires the caller to be that channel's coordinator, so a
-    crewmate coordinator can assemble its channel without changing membership
-    itself. ``add_agent`` and ``remove_member`` change membership directly and
-    stay owner-only.
+    Membership changes (``request_attach``, ``add_agent``, ``remove_member``)
+    still require the caller to be that channel's active coordinator, and
+    removing a member that is not done or failed still requires ``force``.
+    Every other action stays owner-only.
     """
     scope, refusal = await internal_memory_scope(request, "api_session_channel")
     if refusal is not None or scope is None:
