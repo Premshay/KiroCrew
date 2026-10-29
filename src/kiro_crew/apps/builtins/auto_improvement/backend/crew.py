@@ -46,6 +46,11 @@ ROLES = {
         "auto-improvement-engineer",
         "Implements the Scout's candidates; deterministic tests decide what is kept.",
     ),
+    "assessment": Role(
+        "auto-improvement-assessor",
+        "auto-improvement-discovery",
+        "Assesses sampled repository evidence without tools; model settings apply to assessment only.",
+    ),
 }
 _team_lock = threading.Lock()
 

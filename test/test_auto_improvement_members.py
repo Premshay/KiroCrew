@@ -54,12 +54,12 @@ def _isolated_app_data_home(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "data_dir", lambda: tmp_path / "app-data")
 
 
-def test_enable_creates_two_private_members_and_preserves_edits():
+def test_enable_creates_private_members_and_preserves_edits():
     identities = crew.ensure_team()
     config = KiroCrewConfig.load()
     members = [config.agents[role.name] for role in crew.ROLES.values()]
-    assert len(set(identities.values())) == 2
-    assert len({member.memory_store for member in members}) == 2
+    assert len(set(identities.values())) == 3
+    assert len({member.memory_store for member in members}) == 3
     assert all(config.memory_stores[m.memory_store].memory_version == 2 for m in members)
     assert all(m.memory_store != "default" for m in members)
 
@@ -504,7 +504,11 @@ async def test_assignments_build_real_context_from_only_their_private_store(tmp_
     monkeypatch.setattr(context_module, "_memory_stores", {})
     monkeypatch.setattr(context_module, "_vector_stores", {})
     for role, spec in crew.ROLES.items():
-        filename = "scout.json" if role == "discovery" else "engineer.json"
+        filename = {
+            "discovery": "scout.json",
+            "implementation": "engineer.json",
+            "assessment": "discovery.json",
+        }[role]
         source = Path(crew.__file__).parent.parent / "agents" / filename
         (agents / f"auto-improvement--{spec.template}.json").write_bytes(source.read_bytes())
     identities = await asyncio.to_thread(crew.ensure_team)
@@ -838,6 +842,7 @@ def test_owner_recovery_preserves_healthy_role(tmp_path, damage):
     assert recovered == {
         "discovery": scout.member_id,
         "implementation": identities["implementation"],
+        "assessment": identities["assessment"],
     }
     assert crew.ensure_team() == recovered
     assert crew.resolve_role("implementation", identities["implementation"])[1] == "my-engineer"

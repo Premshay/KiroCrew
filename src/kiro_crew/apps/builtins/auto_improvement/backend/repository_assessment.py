@@ -68,15 +68,31 @@ def read_assessment(area_path: str = "") -> dict:
 def _build_runner():
     import kiro_crew.acp  # noqa: F401 — initialize before the provider factory
 
+    from kiro_crew.config.loader import build_provider_factory
+    from kiro_crew.execution_context import bind_session_execution, resolve_member_execution
+
     from ..spine.agent_runner import SessionAgentRunner
+    from . import crew
     from .runner import _credentials_are_unconfined
 
     reason = _credentials_are_unconfined()
     if reason:
         raise ValueError("Repository assessment refused: " + reason)
-    if not SessionAgentRunner.available():
-        raise ValueError("No provider-backed assessment agent is available")
-    runner = SessionAgentRunner(default_timeout_s=_TIMEOUT_S, stop_check=_stop.is_set)
+    identity = crew.ensure_team()["assessment"]
+    config, name, member = crew.resolve_role("assessment", identity)
+    execution = resolve_member_execution(config, name, app=store.APP_NAME)
+    factory = build_provider_factory(config)
+
+    def member_factory(session_key, **kwargs):
+        bind_session_execution(session_key, execution)
+        return factory(session_key, crew_agent=name, model_override=member.model or None, **kwargs)
+
+    runner = SessionAgentRunner(
+        agent_name=crew.ROLES["assessment"].template,
+        provider_factory=member_factory,
+        default_timeout_s=_TIMEOUT_S,
+        stop_check=_stop.is_set,
+    )
     if not runner.ensure_agent_registered():
         raise ValueError("The restricted assessment agent could not be registered")
     return runner

@@ -116,6 +116,46 @@ def worker(monkeypatch, tmp_path, evidence):
     return identity, config, calls, notices
 
 
+@pytest.mark.parametrize("model", ["chosen-model", ""])
+def test_assessment_uses_member_model_and_identity(monkeypatch, model):
+    from kiro_crew import execution_context
+    from kiro_crew.config import loader
+
+    from ..backend import crew, runner
+    from ..spine.agent_runner import SessionAgentRunner
+
+    provider = object()
+    calls = []
+    bindings = []
+    config, execution = object(), object()
+    member = SimpleNamespace(model=model)
+    monkeypatch.setattr(crew, "ensure_team", lambda: {"assessment": "member-id"})
+    monkeypatch.setattr(crew, "resolve_role", lambda *args: (config, "renamed-assessor", member))
+    monkeypatch.setattr(execution_context, "resolve_member_execution", lambda *a, **kw: execution)
+    monkeypatch.setattr(execution_context, "bind_session_execution", lambda *a: bindings.append(a))
+
+    def factory(key, **kwargs):
+        calls.append((key, kwargs))
+        return provider
+
+    monkeypatch.setattr(loader, "build_provider_factory", lambda cfg: factory)
+    monkeypatch.setattr(SessionAgentRunner, "ensure_agent_registered", lambda self: True)
+    monkeypatch.setattr(runner, "_credentials_are_unconfined", lambda: "")
+    built = assessment._build_runner()
+    assert built._provider_factory("assessment-session", agent=built.agent_name) is provider
+    assert bindings == [("assessment-session", execution)]
+    assert calls == [
+        (
+            "assessment-session",
+            {
+                "crew_agent": "renamed-assessor",
+                "model_override": model or None,
+                "agent": "auto-improvement-discovery",
+            },
+        )
+    ]
+
+
 def test_worker_no_tools_no_repo_cwd_and_does_not_save_config(worker):
     identity, config, calls, notices = worker
     assessment._work({**identity, "state": "assessing"}, config)

@@ -23,8 +23,8 @@ You need:
 The app is **disabled by default** (`defaultEnabled: false`). Enable it from the Apps
 page, then open **Auto-Improve** in the left nav.
 
-Enabling the app also creates two Crew Members: **auto-improvement-scout** and
-**auto-improvement-engineer**. Open Crew Members to edit their permanent rules,
+Enabling the app creates **auto-improvement-assessor**, **auto-improvement-scout** and
+**auto-improvement-engineer**. Open Crew Members to edit their model settings,
 talk to either member, or inspect its private memory. Each has its own memory;
 the Scout's candidate report is the handoff to the Engineer.
 
@@ -200,6 +200,16 @@ restores the saved settings. Changing the workload requires a new environment
 check, and performance work also requires calibration. Selecting a bug scope
 clears the previous benchmark commands. Your runner, image variables and run
 budget are preserved.
+
+Repository assessment uses **auto-improvement-assessor**. Change its model in
+**Crew Members → Edit member → Model** before starting the next assessment.
+Provider-seat assignments follow the installation's engine policy for the member
+and its `auto-improvement-discovery` template. This chat's model and the Scout's
+model do not change assessment. The assessor uses a dedicated tool-free provider
+session; backends that cannot enforce the native whitelist are refused before
+running. Currently this requires the Claude ACP backend (including local fleet
+seats). It does not execute repository commands or load member memory into the
+sampled-evidence prompt.
 
 For uncertain mappings or performance leads, request an agent assessment of the
 repository or a selected area. This uses the configured provider and can incur
