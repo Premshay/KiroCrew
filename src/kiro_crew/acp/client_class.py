@@ -503,6 +503,9 @@ class AcpClient:
         self._claude_folded_message_break = False
         self._claude_idle_handler: Callable[[AcpEvent], Awaitable[None]] | None = None
         self._claude_idle_text: list[str] = []
+        # The native id of the message the idle text belongs to; an edit rewind
+        # forks the native session at it.
+        self._claude_idle_message_id = ""
         self._claude_live_background_tasks: set[str] = set()
         self._session_activity_at: float | None = None
         # What THIS session's MCP servers reported at init. The frames arrive

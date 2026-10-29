@@ -237,6 +237,19 @@ class TestStretchTail:
         assert seen[0].text == "Both are merged into v2."
 
     @pytest.mark.asyncio
+    async def test_flushed_prose_carries_its_native_message_id(self, tmp_path):
+        client = _client(tmp_path)
+        seen = _sink(client)
+        frame = _text_frame("Boards re-shot.")
+        frame.params["update"]["messageId"] = "msg_idle_1"
+
+        await client._route_claude_frame(frame)
+        await client._route_claude_frame(_sdk_result_frame())
+
+        assert seen[0].message_id == "msg_idle_1"
+        assert client._claude_idle_message_id == ""
+
+    @pytest.mark.asyncio
     async def test_a_turn_result_does_not_flush_idle_prose(self, tmp_path):
         """A dispatch's own result belongs to the turn consumer."""
         client = _client(tmp_path)

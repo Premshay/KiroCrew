@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from kiro_crew.acp._dispatch_parts.session_update_parser import parse_message_id
 from kiro_crew.acp.types import (
     EVENT_TEXT_CHUNK,
     METHOD_REQUEST_PERMISSION,
@@ -151,6 +152,9 @@ async def _emit_claude_idle_frame(self: AcpClient, msg: JsonRpcMessage) -> bool:
         chunk, is_thinking = self._extract_text_chunk(msg)
         if chunk and not is_thinking:
             self._claude_idle_text.append(chunk)
+            message_id = parse_message_id((msg.params or {}).get("update"))
+            if message_id:
+                self._claude_idle_message_id = message_id
             return True
     except Exception:
         logger.warning("idle frame render failed; leaving it for dispatch", exc_info=True)
@@ -164,8 +168,10 @@ async def _flush_claude_idle_text(
         return
     text = "".join(self._claude_idle_text)
     self._claude_idle_text.clear()
+    message_id = self._claude_idle_message_id
+    self._claude_idle_message_id = ""
     if text.strip():
-        await handler(AcpEvent(kind=EVENT_TEXT_CHUNK, text=text))
+        await handler(AcpEvent(kind=EVENT_TEXT_CHUNK, text=text, message_id=message_id))
 
 
 async def _handle_claude_sdk_message(self: AcpClient, msg: JsonRpcMessage) -> None:

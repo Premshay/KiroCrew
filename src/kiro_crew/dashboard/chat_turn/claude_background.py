@@ -76,6 +76,8 @@ async def _render_claude_idle_event(
             text, credential_warnings = redact_credentials(text)
             for warning in credential_warnings:
                 logger.warning("Credential redacted in idle Claude output: %s", warning)
+            if event.message_id:
+                slot.segment_message_id = event.message_id
             _flush_segment(
                 state,
                 slot,

@@ -1231,6 +1231,29 @@ class TestClaudeIdleEvent:
         assert results == [{"slot": "s1", "tool_call_id": "toolu_1", "output": "merged"}]
 
     @pytest.mark.asyncio
+    async def test_idle_text_keeps_its_native_message_id(self, tmp_path, monkeypatch):
+        """An edit rewind forks at the last kept reply, so idle prose must carry its id."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.providers.base import EVENT_TEXT_CHUNK, LLMEvent
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(chat_runner, "save_slot_off_loop", AsyncMock())
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.broadcast_ws = MagicMock()
+        slot = state.get_or_create_slot("s1")
+
+        await chat_runner._render_claude_idle_event(
+            state,
+            slot,
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="Boards re-shot.", message_id="msg_idle_1"),
+        )
+
+        row = next(m for m in slot.messages if m.get("role") == "assistant")
+        assert row["meta"]["native_message_id"] == "msg_idle_1"
+        assert row["meta"]["between_turn"] is True
+
+    @pytest.mark.asyncio
     async def test_idle_text_has_a_durable_turn_boundary(self, tmp_path, monkeypatch):
         """Idle output must not be grouped with the previous user reply."""
         from kiro_crew.dashboard import chat_runner
