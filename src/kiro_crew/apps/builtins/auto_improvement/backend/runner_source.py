@@ -3,8 +3,9 @@
 A runner environment may name its recipe by ``runnerPath`` inside the target repository
 instead of an absolute ``runnerExecutable``. The app then fetches the configured branch into
 its own bare mirror, pins the commit it resolved, and extracts that commit into a read-only
-snapshot under the app's data directory. Nothing outside the app owns these files, so no
-worktree cleanup can remove the runner, and a missing snapshot is rebuilt from the pin.
+snapshot under ``store.runner_snapshot_path()``, outside the crew data home that the
+strict sandbox masks. Nothing outside the app owns these files, so no worktree cleanup
+can remove the runner, and a missing snapshot is rebuilt from the pin.
 
 The pin moves only when the test environment is saved without a commit. A runner that
 followed the branch would let a merged change alter how measurements execute between two
@@ -49,8 +50,12 @@ def _runners_root() -> Path:
     return store.data_dir() / "runners"
 
 
+def _snapshots_root() -> Path:
+    return store.runner_snapshot_path()
+
+
 def _snapshot_dir(commit: str) -> Path:
-    return _runners_root() / "snapshots" / commit
+    return _snapshots_root() / commit
 
 
 def managed_runner_executable(environment: dict) -> Path:
@@ -229,7 +234,7 @@ def _referenced_commits(config: dict) -> set[str]:
 
 def prune_snapshots(config: dict) -> None:
     """Remove snapshots no saved environment references, including interrupted extractions."""
-    root = _runners_root() / "snapshots"
+    root = _snapshots_root()
     if not root.is_dir():
         return
     keep = _referenced_commits(config)

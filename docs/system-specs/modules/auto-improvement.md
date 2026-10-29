@@ -1506,7 +1506,9 @@ verification path. Legacy container configurations fail explicitly.
   (`backend/runner_source.py`). Saving the environment without `runnerCommit` fetches
   the configured branch into the app's bare mirror under `data/runners/mirrors/` and
   pins the commit it resolves. The commit is extracted read-only to
-  `data/runners/snapshots/<commit>/`, outside every checkout. Runs, calibration,
+  `~/.autoimprove-runners/<commit>/` (`AUTO_IMPROVEMENT_RUNNERS` overrides it). That
+  root is outside every checkout and outside the crew data home, which the strict
+  sandbox masks, so the runner stays executable inside the sandbox. Runs, calibration,
   environment checks and publication regression prepare the snapshot first and
   rebuild a missing one from the pinned commit, never from the branch tip. A run
   refuses an unpinned runner. The Setup panel's update action saves the environment

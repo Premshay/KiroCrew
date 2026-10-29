@@ -42,6 +42,7 @@ def upstream(tmp_path, monkeypatch):
     _git(work, "config", "user.name", "t")
     (tmp_path / "data").mkdir()
     monkeypatch.setattr(store, "data_dir", lambda: tmp_path / "data")
+    monkeypatch.setenv("AUTO_IMPROVEMENT_RUNNERS", str(tmp_path / "runners"))
     monkeypatch.setattr(clone_setup, "resolve_origin_url", lambda _config: remote.as_uri())
     monkeypatch.setattr(pr_recipe, "_prefer_authenticated_remote", lambda url: url)
     return work
@@ -140,7 +141,7 @@ def test_prune_keeps_only_referenced_snapshots(upstream):
     _commit_runner(upstream, "echo two")
     new = _config()
     runner_source.prepare_runner(new, pin=True)
-    snapshots = store.data_dir() / "runners" / "snapshots"
+    snapshots = store.runner_snapshot_path()
     assert len(list(snapshots.iterdir())) == 2
 
     runner_source.prune_snapshots(new)
@@ -157,7 +158,7 @@ def test_prune_keeps_only_referenced_snapshots(upstream):
     ],
 )
 def test_a_missing_runner_is_an_admission_error_not_a_crash(tmp_path, monkeypatch, environment):
-    monkeypatch.setattr(store, "data_dir", lambda: tmp_path / "data")
+    monkeypatch.setenv("AUTO_IMPROVEMENT_RUNNERS", str(tmp_path / "runners"))
     with pytest.raises(env_mod.RunnerAdmissionError, match="Runner not found"):
         env_mod.TestEnvironment(environment, tmp_path / "clones" / "repo", None)
 
@@ -213,3 +214,16 @@ async def test_a_runner_that_cannot_be_pinned_leaves_config_unchanged(upstream, 
 
     assert response.status == 400
     assert store.read_json(store.config_path()) == original
+
+
+def test_snapshots_are_not_masked_from_the_measurement_sandbox(monkeypatch):
+    from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo.profile_execution import (
+        _write_protected_targets,
+    )
+
+    monkeypatch.delenv("AUTO_IMPROVEMENT_RUNNERS", raising=False)
+    root = store.runner_snapshot_path()
+    masked = [Path(target) for target in _write_protected_targets()]
+    assert masked, "the executor masks the crew home; this test needs that list"
+    assert not any(root.is_relative_to(target) for target in masked)
+    assert not root.is_relative_to(store.scratch_path())

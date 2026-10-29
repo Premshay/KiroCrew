@@ -64,6 +64,17 @@ def scratch_path() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".autoimprove-scratch"
 
 
+def runner_snapshot_path() -> Path:
+    """Root of app-managed runner snapshots, without touching the filesystem.
+
+    Outside the crew data home, which the strict sandbox masks, so a runner extracted
+    here stays executable inside it; and outside the scratch root, so no candidate
+    checkout can contain it.
+    """
+    override = os.environ.get("AUTO_IMPROVEMENT_RUNNERS")
+    return Path(override).expanduser() if override else Path.home() / ".autoimprove-runners"
+
+
 def scratch_dir() -> Path:
     """Disposable clone/worktree root — outside ``data/`` on purpose."""
     root = scratch_path()
