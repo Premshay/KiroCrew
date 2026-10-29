@@ -264,6 +264,8 @@ describe('test environment setup', () => {
     expect(screen.getByLabelText(/Runner executable/)).toHaveValue('/tools/draft')
     fireEvent.click(check())
     await screen.findByText('Checking…')
+    expect(check().querySelector('.animate-spin')).not.toBeNull()
+    expect(save().querySelector('.animate-spin')).toBeNull()
     expect(screen.getByLabelText(/Runner executable/)).toBeDisabled()
     expect(screen.getByLabelText(/Python executable/)).toBeDisabled()
     expect(screen.getByLabelText('Test environment')).toBeDisabled()
@@ -275,6 +277,7 @@ describe('test environment setup', () => {
     expect(diagnostic).toHaveClass('max-h-40', 'overflow-auto', 'select-text')
     expect(screen.getByLabelText(/Runner executable/)).toHaveValue('/tools/draft')
     expect(save()).not.toBeDisabled()
+    expect(check().querySelector('.animate-spin')).toBeNull()
   })
 
   it.each(['running', 'calibrating', 'stopping'])('locks the runner while %s', async (active) => {

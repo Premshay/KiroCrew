@@ -245,7 +245,7 @@ function RepositorySetup({ config, repo }: { config?: Record<string, unknown>; r
               saveConfig.mutate({ branch: v }, { onSuccess: () => setBranch(v) })
             }}
             clearLabel={i18nT('autoImprovement.branchDefault')}
-            className="h-7 text-[13px]"
+            className="text-[13px]"
             aria-label={i18nT('autoImprovement.branchLabel')}
           />
 

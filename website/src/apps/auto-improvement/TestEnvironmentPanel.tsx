@@ -1,4 +1,5 @@
 import { useEffect, useId, useState } from "react";
+import { Loader2 } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import ErrorNotice from "../../components/ErrorNotice";
@@ -494,6 +495,9 @@ export default function TestEnvironmentPanel({
             if (value) save.mutate(value);
           }}
         >
+          {save.isPending ? (
+            <Loader2 className="lucide-inline animate-spin" aria-hidden="true" />
+          ) : null}
           {t("testEnvironment.save")}
         </Btn>
         <Btn
@@ -503,6 +507,9 @@ export default function TestEnvironmentPanel({
             if (value) check.mutate({ environment: value, context });
           }}
         >
+          {check.isPending ? (
+            <Loader2 className="lucide-inline animate-spin" aria-hidden="true" />
+          ) : null}
           {t("testEnvironment.check")}
         </Btn>
         <span role="status" aria-live="polite">
@@ -528,6 +535,9 @@ export default function TestEnvironmentPanel({
           aria-describedby={calibrationHintId}
           onClick={() => calibrate.mutate()}
         >
+          {calibrate.isPending ? (
+            <Loader2 className="lucide-inline animate-spin" aria-hidden="true" />
+          ) : null}
           {t("autoImprovementCalibration.action")}
         </Btn>
         <p id={calibrationHintId} className="text-[12px] text-muted">
