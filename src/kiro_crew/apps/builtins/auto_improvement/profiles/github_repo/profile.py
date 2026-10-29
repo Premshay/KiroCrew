@@ -1471,14 +1471,15 @@ class GitHubRepoProfile(ProfileFieldAliases):
     def check_environment(self) -> dict:
         root = self.clone_path.resolve()
         result = {"ok": False, "environment": self.environment.identity, "diagnostic": None}
+        # One call proves both the interpreter and pytest: in runner mode every call
+        # pays for a fresh isolated environment.
         checks = [
             (
                 "interpreter",
-                self.environment.python_argv("-c", "import sys; print(sys.executable)"),
-            ),
-            (
-                "pytest",
-                self.environment.python_argv("-c", "import pytest; print(pytest.__version__)"),
+                self.environment.python_argv(
+                    "-c",
+                    "import sys; print(sys.executable); import pytest; print(pytest.__version__)",
+                ),
             ),
             (
                 "collection",
@@ -1491,7 +1492,7 @@ class GitHubRepoProfile(ProfileFieldAliases):
             ),
         ]
         if self.ruler.benchmark_cmd:
-            checks = checks[:2]
+            checks = checks[:1]
         for stage, argv in checks:
             try:
                 proc = self.environment.run(
@@ -1501,6 +1502,8 @@ class GitHubRepoProfile(ProfileFieldAliases):
                 result["diagnostic"] = _diagnostic(stage, exc)
                 return result
             if proc.returncode != 0:
+                if stage == "interpreter" and "pytest" in (proc.stderr or ""):
+                    stage = "pytest"
                 result["diagnostic"] = _diagnostic(stage, proc)
                 return result
             if stage == "collection":

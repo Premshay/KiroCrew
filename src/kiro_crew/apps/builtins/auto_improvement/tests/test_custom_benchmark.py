@@ -200,7 +200,7 @@ def test_factory_readiness_and_protected_harness(monkeypatch, tmp_path):
 
     monkeypatch.setattr(profile.environment, "_sandbox_run", execute)
     assert profile.check_environment()["ok"]
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert profile.ruler.benchmark_result_mode == "structured"
     assert profile.calibration.canary_id == "custom_slowed_control_sensitivity"
     assert profile.build_gate.environment is profile.ruler.environment

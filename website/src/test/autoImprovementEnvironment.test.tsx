@@ -25,6 +25,21 @@ let publication: string | undefined
 let writeResponse: Response
 let checkResponse: () => Promise<Response>
 let writes: Array<{ path: string; body: Record<string, unknown> }>
+let checkRecord: Record<string, unknown>
+
+/** The server's check: the POST keeps a record of the outcome that GET returns. */
+async function recordCheck(body: Record<string, unknown>): Promise<Response> {
+  const reply = await checkResponse()
+  if (reply.status === 409) return reply
+  const result = await reply.json()
+  const ok = reply.ok && result.ok !== false
+  checkRecord = {
+    state: ok ? 'ready' : 'blocked',
+    fingerprint: body.fingerprint,
+    result: ok ? result : { ok: false, diagnostic: result.diagnostic ?? result.error },
+  }
+  return response(checkRecord, 202)
+}
 
 function mount(initial: Record<string, unknown> | undefined = config) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
@@ -48,12 +63,15 @@ beforeEach(() => {
   writeResponse = response({ ok: true })
   checkResponse = async () => response({ ok: true, tests_collected: 4 })
   writes = []
+  checkRecord = { state: 'none' }
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     if (init?.method === 'POST' || init?.method === 'PUT') {
-      writes.push({ path, body: JSON.parse(String(init.body)) })
-      return path.endsWith('/environment/check') ? checkResponse() : writeResponse
+      const body = JSON.parse(String(init.body))
+      writes.push({ path, body })
+      return path.endsWith('/environment/check') ? recordCheck(body) : writeResponse
     }
+    if (path.endsWith('/environment/check')) return response(checkRecord)
     if (path.endsWith('/branches')) return response({ branches: ['main', 'feature'] })
     if (path.endsWith('/run')) return response({ status, stats: { publication }, ...(status === 'error' ? { error: 'Previous run failed' } : {}) })
     return response(config)
@@ -122,18 +140,56 @@ describe('test environment setup', () => {
     expect(save()).toBeDisabled()
   })
 
-  it('checks a draft without saving or starting a run and invalidates after edits, including reverting', async () => {
+  it('checks a draft without saving or starting a run and applies the result only to that draft', async () => {
     mount()
     await readyToEdit()
     fireEvent.click(check())
     await screen.findByText('Ready')
     expect(writes.map((w) => w.path)).toEqual(['/api/apps/auto-improvement/environment/check'])
     fireEvent.change(executable(), { target: { value: '/other/python' } })
-    fireEvent.change(executable(), { target: { value: '/env/a/bin/python' } })
     expect(screen.getByText('Unchecked')).toBeInTheDocument()
+    fireEvent.change(executable(), { target: { value: '/env/a/bin/python' } })
+    expect(screen.getByText('Ready')).toBeInTheDocument()
   })
 
-  it('ignores a late check result after branch changes and does not revive it on switching back', async () => {
+  it('shows the last check after the page is opened again', async () => {
+    const first = mount()
+    await readyToEdit()
+    fireEvent.click(check())
+    await screen.findByText('Ready')
+    expect(screen.getByText('4 tests collected')).toBeInTheDocument()
+    first.unmount()
+    mount()
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Calibrate/ })).not.toBeDisabled()
+  })
+
+  it('keeps the form busy while the server is still checking and says so', async () => {
+    const first = mount()
+    await readyToEdit()
+    fireEvent.click(check())
+    await screen.findByText('Ready')
+    first.unmount()
+    checkRecord = { ...checkRecord, state: 'checking' }
+    mount()
+    expect(await screen.findByText(/keeps running if you leave this page/)).toBeInTheDocument()
+    expect(screen.getByText('Checking…')).toBeInTheDocument()
+    expect(check()).toBeDisabled()
+    expect(check().querySelector('.animate-spin')).not.toBeNull()
+  })
+
+  it('reports a check cut off by a restart', async () => {
+    const first = mount()
+    await readyToEdit()
+    fireEvent.click(check())
+    await screen.findByText('Ready')
+    first.unmount()
+    checkRecord = { ...checkRecord, state: 'interrupted' }
+    mount()
+    expect(await screen.findByText(/cut off before it finished/)).toBeInTheDocument()
+  })
+
+  it('applies a late check result only to the branch it checked', async () => {
     let resolve!: (result: Response) => void
     checkResponse = () => new Promise((done) => { resolve = done })
     const view = mount()
@@ -142,9 +198,10 @@ describe('test environment setup', () => {
     await screen.findByText('Checking…')
     view.setConfig({ ...config, branch: 'feature' })
     await act(async () => resolve(response({ ok: true })))
-    view.setConfig(config)
-    expect(screen.getByText('Unchecked')).toBeInTheDocument()
+    expect(await screen.findByText('Unchecked')).toBeInTheDocument()
     expect(screen.queryByText('Ready')).not.toBeInTheDocument()
+    view.setConfig(config)
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
   })
 
   it('keeps the draft and shows backend check and save failures', async () => {
@@ -198,6 +255,7 @@ describe('test environment setup', () => {
     await screen.findByText('Ready')
     expect(writes).toEqual([{ path: '/api/apps/auto-improvement/environment/check', body: {
       testEnvironment: { kind: 'runner', runnerExecutable: '/tools/check', pythonExecutable: 'python3', variables: {}, metadata },
+      fingerprint: expect.any(String),
     } }])
     fireEvent.click(save())
     await waitFor(() => expect(writes).toHaveLength(2))
@@ -346,6 +404,7 @@ describe('test environment setup', () => {
     await readyToEdit()
     fireEvent.click(check())
     await screen.findByText('Ready')
+    checkRecord = { state: 'none' } // the server clears it when the run starts
     act(() => { view.client.setQueryData(['auto-improvement-run'], { status: 'running' }) })
     await waitFor(() => expect(check()).toBeDisabled())
     act(() => { view.client.setQueryData(['auto-improvement-run'], { status: 'idle' }) })

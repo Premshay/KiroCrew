@@ -1,6 +1,6 @@
 import { useEffect, useId, useState } from "react";
 import { Loader2 } from "lucide-react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import ErrorNotice from "../../components/ErrorNotice";
 import SimpleSelect from "../../components/SimpleSelect";
@@ -50,6 +50,16 @@ interface CheckResult {
   diagnostic?: string | { stdout?: string; stderr?: string };
   tests_collected?: number;
 }
+
+/** The server's record of the last environment check, which outlives this page. */
+interface CheckRecord {
+  state:
+    "none" | "checking" | "ready" | "blocked" | "interrupted" | "cancelled";
+  fingerprint?: string;
+  result?: CheckResult;
+}
+
+const CHECK_KEY = ["auto-improvement-environment-check"];
 
 function diagnosticText(value: unknown): string | undefined {
   if (typeof value === "string") return value;
@@ -154,7 +164,6 @@ export default function TestEnvironmentPanel({
       .join("\n"),
   );
   const [dirty, setDirty] = useState(false);
-  const [revision, setRevision] = useState(0);
   const [validation, setValidation] = useState<string | null>(null);
   if (measurementSource !== settingsSource) {
     setMeasurementSource(settingsSource);
@@ -164,7 +173,6 @@ export default function TestEnvironmentPanel({
   function editMeasurement(patch: Partial<typeof measurement>) {
     setMeasurement((current) => ({ ...current, ...patch }));
     setDirty(true);
-    setRevision((r) => r + 1);
   }
   if (source !== persisted) {
     setSource(persisted);
@@ -183,26 +191,43 @@ export default function TestEnvironmentPanel({
   const [previousScope, setPreviousScope] = useState(scope);
   if (previousScope !== scope) {
     setPreviousScope(scope);
-    setRevision((r) => r + 1);
     setValidation(null);
   }
-  const context = JSON.stringify([scope, revision]);
+  // What a check result applies to: the repository, the branch, the selection with its
+  // variables and the saved measurement settings the server reads. Anything else is stale.
+  const fingerprint = JSON.stringify([
+    String(config.clone ?? ""),
+    branch,
+    draft,
+    variables,
+    settingsSource,
+  ]);
+  const checkRecord = useQuery({
+    queryKey: CHECK_KEY,
+    queryFn: () =>
+      requestJson<CheckRecord>("/environment/check", undefined, "GET"),
+    refetchInterval: (query) =>
+      query.state.data?.state === "checking" ? 2000 : false,
+  });
+  const record = checkRecord.data;
+  // A run clears the server's record when it starts; read it again around a run.
+  useEffect(() => {
+    qc.invalidateQueries({ queryKey: CHECK_KEY });
+  }, [disabled, qc]);
+  const serverChecking = record?.state === "checking";
   const check = useMutation({
-    mutationFn: async ({
+    mutationFn: ({
       environment,
+      fingerprint,
     }: {
       environment: TestEnvironment;
-      context: string;
-    }) => {
-      const result = await requestJson<CheckResult>("/environment/check", {
+      fingerprint: string;
+    }) =>
+      requestJson<CheckRecord>("/environment/check", {
         testEnvironment: environment,
-      });
-      if (result.ok !== true)
-        throw new Error(
-          diagnosticText(result.diagnostic) || i18nT("testEnvironment.blocked"),
-        );
-      return result;
-    },
+        fingerprint,
+      }),
+    onSuccess: (started) => qc.setQueryData(CHECK_KEY, started),
   });
   const save = useMutation({
     mutationFn: (environment: TestEnvironment) =>
@@ -227,7 +252,6 @@ export default function TestEnvironmentPanel({
       ),
     onSuccess: () => {
       setDirty(false);
-      setRevision((r) => r + 1);
       qc.invalidateQueries({ queryKey: ["auto-improvement-config"] });
       qc.invalidateQueries({ queryKey: ["auto-improvement-ruler"] });
     },
@@ -241,7 +265,8 @@ export default function TestEnvironmentPanel({
       qc.invalidateQueries({ queryKey: ["auto-improvement-ruler"] });
     },
   });
-  const pending = save.isPending || check.isPending || calibrate.isPending;
+  const checking = check.isPending || serverChecking;
+  const pending = save.isPending || checking || calibrate.isPending;
   const locked = disabled || pending;
   useEffect(() => {
     onBusyChange(dirty || pending);
@@ -250,7 +275,6 @@ export default function TestEnvironmentPanel({
   function edit(patch: Partial<TestEnvironment>) {
     setDraft((value) => ({ ...value, ...patch }));
     setDirty(true);
-    setRevision((r) => r + 1);
     setValidation(null);
     save.reset();
   }
@@ -299,23 +323,31 @@ export default function TestEnvironmentPanel({
     };
   }
 
-  const currentCheck = check.variables?.context === context;
+  const refused = check.isError && check.variables?.fingerprint === fingerprint;
+  const matching = record?.fingerprint === fingerprint;
   const status =
-    validation || save.isError
+    validation || save.isError || refused
       ? "blocked"
-      : currentCheck
-        ? check.isPending
-          ? "checking"
-          : check.isError
+      : checking && (check.isPending || matching)
+        ? "checking"
+        : matching && record?.state === "ready"
+          ? "ready"
+          : matching && record && record.state !== "none"
             ? "blocked"
-            : check.isSuccess
-              ? "ready"
-              : "unchecked"
-        : "unchecked";
+            : "unchecked";
+  const checkDiagnostic = !matching
+    ? null
+    : record?.state === "blocked"
+      ? diagnosticText(record.result?.diagnostic) ||
+        t("testEnvironment.blocked")
+      : record?.state === "interrupted"
+        ? t("testEnvironment.interrupted")
+        : null;
   const diagnostic =
     calibrate.error?.message ||
     save.error?.message ||
-    (currentCheck ? check.error?.message : null);
+    (refused ? check.error?.message : null) ||
+    checkDiagnostic;
 
   return (
     <section className="mt-4 min-w-0 space-y-3">
@@ -496,7 +528,10 @@ export default function TestEnvironmentPanel({
           }}
         >
           {save.isPending ? (
-            <Loader2 className="lucide-inline animate-spin" aria-hidden="true" />
+            <Loader2
+              className="lucide-inline animate-spin"
+              aria-hidden="true"
+            />
           ) : null}
           {t("testEnvironment.save")}
         </Btn>
@@ -504,11 +539,14 @@ export default function TestEnvironmentPanel({
           disabled={locked || measurementDirty}
           onClick={() => {
             const value = environment();
-            if (value) check.mutate({ environment: value, context });
+            if (value) check.mutate({ environment: value, fingerprint });
           }}
         >
-          {check.isPending ? (
-            <Loader2 className="lucide-inline animate-spin" aria-hidden="true" />
+          {checking ? (
+            <Loader2
+              className="lucide-inline animate-spin"
+              aria-hidden="true"
+            />
           ) : null}
           {t("testEnvironment.check")}
         </Btn>
@@ -525,7 +563,20 @@ export default function TestEnvironmentPanel({
             {t(STATUS_LABEL_KEYS[status])}
           </Badge>
         </span>
+        {status === "ready" &&
+        typeof record?.result?.tests_collected === "number" ? (
+          <span className="text-[12px] text-muted">
+            {t("testEnvironment.collected", {
+              count: record.result.tests_collected,
+            })}
+          </span>
+        ) : null}
       </div>
+      {checking ? (
+        <p className="text-[12px] text-muted">
+          {t("testEnvironment.background")}
+        </p>
+      ) : null}
       <p className="text-[12px] text-muted">
         {t(dirty ? "testEnvironment.unsaved" : "testEnvironment.saved")}
       </p>
@@ -536,7 +587,10 @@ export default function TestEnvironmentPanel({
           onClick={() => calibrate.mutate()}
         >
           {calibrate.isPending ? (
-            <Loader2 className="lucide-inline animate-spin" aria-hidden="true" />
+            <Loader2
+              className="lucide-inline animate-spin"
+              aria-hidden="true"
+            />
           ) : null}
           {t("autoImprovementCalibration.action")}
         </Btn>

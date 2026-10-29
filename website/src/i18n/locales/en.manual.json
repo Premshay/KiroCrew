@@ -9825,6 +9825,9 @@
     "runnerPinned": "Pinned to commit {{commit}}. The app keeps its own copy of the runner at this commit.",
     "runnerUnpinned": "Saving pins the runner to the current commit of {{branch}}.",
     "runnerUpdate": "Update runner to {{branch}}",
+    "interrupted": "The check was cut off before it finished, for example by a gateway restart. Check again.",
+    "collected": "{{count}} tests collected",
+    "background": "The check keeps running if you leave this page. Kiro Crew notifies you when it ends.",
     "runnerHint": "The selected runner runs checks on each isolated checkout and must provide the target repository’s test environment, including service setup and teardown. Container isolation depends on the runner."
   },
   "boundedMeasurement": {

@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
+import time
 from functools import wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -26,7 +28,7 @@ from aiohttp import web
 from kiro_crew.apps import teardown
 from kiro_crew.apps.manager import app_lifecycle_lock, is_app_enabled
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
-from kiro_crew.platform.app_execution import authenticated_app_execution
+from kiro_crew.platform.app_execution import authenticated_app_execution, capture_app_execution
 from kiro_crew.security import redact
 
 from ..profiles.github_repo.pr_recipe import GitHubPRRecipe
@@ -43,6 +45,7 @@ from . import (
     profile_normalize,
     progress,
     runner,
+    notify,
     runner_source,
     sse,
     store,
@@ -441,13 +444,115 @@ async def _handle_environment_check(request: web.Request) -> web.StreamResponse:
                     },
                 }
 
-    result = await asyncio.to_thread(check)
-    if result is None:
+    if _run_is_active():
         return web.json_response(
             {"code": "run_in_progress", "error": "a run started while the check was waiting"},
             status=409,
         )
-    return web.json_response(result)
+    fingerprint = patch.get("fingerprint", "")
+    if not isinstance(fingerprint, str) or len(fingerprint) > _MAX_CHECK_FINGERPRINT:
+        return web.json_response(
+            {"code": "invalid_config", "error": "fingerprint must be a short string"}, status=400
+        )
+    notify.bind(request)
+    record = {"state": "checking", "fingerprint": fingerprint, "startedAt": time.time()}
+
+    def job() -> None:
+        try:
+            result = check()
+        except Exception as exc:  # noqa: BLE001 — the record must leave `checking`
+            from kiro_crew.platform.context import redact_via_context
+
+            result = {
+                "ok": False,
+                "diagnostic": {
+                    "stage": "internal",
+                    "returncode": None,
+                    "stdout": "",
+                    "stderr": redact_via_context(str(exc))[:4000],
+                },
+            }
+        _finish_environment_check(record, result)
+
+    started = _start_environment_check(record, job)
+    if not started:
+        return web.json_response(
+            {"code": "check_in_progress", "error": "an environment check is already running"},
+            status=409,
+        )
+    return web.json_response(record, status=202)
+
+
+#: The Setup panel's opaque key for the selection it checked; never interpreted.
+_MAX_CHECK_FINGERPRINT = 16384
+_check_lock = threading.Lock()
+_check_thread: threading.Thread | None = None
+
+
+def _environment_check_path() -> Path:
+    return store.data_dir() / "environment-check.json"
+
+
+def _environment_check_running() -> bool:
+    with _check_lock:
+        return _check_thread is not None and _check_thread.is_alive()
+
+
+def _start_environment_check(record: dict, job: Callable[[], None]) -> bool:
+    """Persist ``record`` and run ``job`` on a worker that outlives the request."""
+    global _check_thread
+    with _check_lock:
+        if _check_thread is not None and _check_thread.is_alive():
+            return False
+        store.write_json_atomic(_environment_check_path(), record)
+        _check_thread = threading.Thread(
+            target=capture_app_execution(job),
+            name="auto-improvement-environment-check",
+            daemon=True,
+        )
+        _check_thread.start()
+    return True
+
+
+def _finish_environment_check(record: dict, result: dict | None) -> None:
+    finished = {**record, "finishedAt": time.time()}
+    if result is None:
+        finished["state"] = "cancelled"
+    else:
+        finished["state"] = "ready" if result.get("ok") is True else "blocked"
+        finished["result"] = result
+    store.write_json_atomic(_environment_check_path(), finished)
+    if result is None:
+        return
+    config = store.read_json(store.config_path(), {}) or {}
+    target = str(config.get("target_display") or "the repository")
+    if finished["state"] == "ready":
+        count = result.get("tests_collected")
+        detail = f"{count} tests collected." if isinstance(count, int) else "All checks passed."
+        notify.task_finished(f"Environment ready · {target}", detail, group_key="environment-check")
+        return
+    diagnostic = result.get("diagnostic") or {}
+    reason = str(diagnostic.get("stderr") or diagnostic.get("stdout") or "").strip()
+    reason = reason.splitlines()[-1] if reason else "no diagnostic output"
+    notify.task_finished(
+        f"Environment check failed · {target}",
+        f"Stopped at {diagnostic.get('stage') or 'an unknown stage'}: {reason}",
+        group_key="environment-check",
+    )
+
+
+async def _handle_environment_check_status(_request: web.Request) -> web.StreamResponse:
+    """The last environment check; a ``checking`` record whose worker is gone was cut off."""
+
+    def read() -> dict:
+        record = store.read_json(_environment_check_path(), {}) or {}
+        if not isinstance(record, dict) or not record:
+            return {"state": "none"}
+        if record.get("state") == "checking" and not _environment_check_running():
+            return {**record, "state": "interrupted"}
+        return record
+
+    return web.json_response(await asyncio.to_thread(read))
 
 
 async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
@@ -1439,6 +1544,7 @@ async def _handle_calibrate(request: web.Request) -> web.StreamResponse:
     perf track. Building the profile touches git and the test suite, so the whole
     call runs off the event loop and the work itself continues on a worker thread.
     """
+    notify.bind(request)
     owner_denied = await require_owner_dashboard_request(request, "auto_improvement.calibrate")
     if owner_denied is not None:
         return owner_denied
@@ -1660,6 +1766,7 @@ async def _handle_run_start(request: web.Request) -> web.StreamResponse:
     repo or a wider budget than what the config endpoints allow. Building the driver
     is blocking (git, provider probe), so the whole call runs off the event loop.
     """
+    notify.bind(request)
     owner_denied = await require_owner_dashboard_request(request, "auto_improvement.run_start")
     if owner_denied is not None:
         return owner_denied
@@ -1702,6 +1809,8 @@ async def _handle_run_start(request: web.Request) -> web.StreamResponse:
         # "the request conflicts with current state", all three are user-fixable, and the
         # message is the actionable part, so it goes through verbatim.
         return web.json_response({"code": "session_conflict", "error": str(exc)}, status=409)
+    # A run can commit to the branch, so a check made before it no longer describes it.
+    await asyncio.to_thread(_environment_check_path().unlink, missing_ok=True)
     return web.json_response(result)
 
 
@@ -1749,6 +1858,11 @@ def register_routes(app: web.Application) -> None:
     add("GET", f"{_PREFIX}/config", _require_enabled(_handle_get_config))
     add("PUT", f"{_PREFIX}/config", _require_enabled(_handle_put_config))
     add("POST", f"{_PREFIX}/environment/check", _require_enabled(_handle_environment_check))
+    add(
+        "GET",
+        f"{_PREFIX}/environment/check",
+        _require_enabled(_handle_environment_check_status),
+    )
     add("POST", f"{_PREFIX}/setup-clone", _require_enabled(_handle_setup_clone))
     add("GET", f"{_PREFIX}/branches", _require_enabled(_handle_branches))
     add("GET", f"{_PREFIX}/pr-status", _require_enabled(_handle_pr_status))

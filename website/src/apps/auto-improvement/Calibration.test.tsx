@@ -50,15 +50,26 @@ async function ready() {
   fireEvent.click(check());
   await waitFor(() => expect(calibrate()).toBeEnabled());
 }
+/** The server's last environment check, as POST records it and GET returns it. */
+let checkRecord: Record<string, unknown>;
+function checkHandlers(outcome: Record<string, unknown>) {
+  return [
+    http.post(`${API}/environment/check`, async ({ request }) => {
+      const { fingerprint } = (await request.json()) as { fingerprint: string };
+      checkRecord = { ...outcome, fingerprint };
+      return HttpResponse.json(checkRecord, { status: 202 });
+    }),
+    http.get(`${API}/environment/check`, () => HttpResponse.json(checkRecord)),
+  ];
+}
 beforeEach(() => {
   run = { status: "idle" };
   requests = [];
+  checkRecord = { state: "none" };
   server.use(
+    ...checkHandlers({ state: "ready", result: { ok: true } }),
     http.get(`${API}/branches`, () => HttpResponse.json({ branches: [] })),
     http.get(`${API}/run`, () => HttpResponse.json(run)),
-    http.post(`${API}/environment/check`, () =>
-      HttpResponse.json({ ok: true }),
-    ),
     http.put(`${API}/config`, () => HttpResponse.json({ ok: true })),
     http.post(`${API}/calibrate`, async ({ request }) => {
       requests.push(await request.json());
@@ -96,10 +107,10 @@ it("requires a saved, checked environment and describes workload cost without an
   fireEvent.click(check());
   await screen.findByText("Ready");
   expect(calibrate()).toBeDisabled();
+  // Saving exactly the selection that was checked keeps its result.
   fireEvent.click(screen.getByRole("button", { name: "Save environment" }));
-  await screen.findByText("Unchecked");
-  expect(calibrate()).toBeDisabled();
-  await ready();
+  await waitFor(() => expect(calibrate()).toBeEnabled());
+  expect(screen.getByText("Ready")).toBeInTheDocument();
 });
 
 it("posts once, displays calibration progress, refreshes the ruler and stops through the existing flow", async () => {
@@ -124,7 +135,8 @@ it("posts once, displays calibration progress, refreshes the ruler and stops thr
       queryKey: ["auto-improvement-ruler"],
     }),
   );
-  expect(calibrate()).toBeDisabled();
+  // A calibration changes no code, so the environment check still applies.
+  await waitFor(() => expect(calibrate()).toBeEnabled());
 });
 
 it.each(["running", "calibrating", "stopping"])(
@@ -209,9 +221,10 @@ it("does not offer calibration before a repository is configured", async () => {
 
 it("blocks calibration when the environment check fails", async () => {
   server.use(
-    http.post(`${API}/environment/check`, () =>
-      HttpResponse.json({ ok: false, error: "Environment unavailable" }),
-    ),
+    ...checkHandlers({
+      state: "blocked",
+      result: { ok: false, diagnostic: "Environment unavailable" },
+    }),
   );
   mount();
   await waitFor(() => expect(check()).toBeEnabled());

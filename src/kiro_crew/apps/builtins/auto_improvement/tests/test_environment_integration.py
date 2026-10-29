@@ -44,9 +44,7 @@ def make_profile(tmp_path, monkeypatch, replies, selection=None):
     ],
 )
 def test_readiness_refuses_incomplete_collection(tmp_path, monkeypatch, reply, stage):
-    replies = [(0, "python", "")]
-    if stage == "collection":
-        replies.append((0, "pytest", ""))
+    replies = [] if stage == "pytest" else [(0, "python\npytest", "")]
     replies.append(reply)
     profile, calls = make_profile(tmp_path, monkeypatch, replies)
     result = profile.check_environment()
@@ -60,7 +58,7 @@ def test_selected_python_is_shared_and_collection_is_required(tmp_path, monkeypa
     profile, calls = make_profile(
         tmp_path,
         monkeypatch,
-        [(0, "", ""), (0, "", ""), (0, "2 tests collected", "")],
+        [(0, "", ""), (0, "2 tests collected", "")],
         {"kind": "python", "pythonExecutable": "/opt/test/bin/python"},
     )
     assert profile.check_environment()["tests_collected"] == 2
@@ -269,8 +267,12 @@ async def test_check_uses_selected_environment_without_saving(tmp_path, monkeypa
     response = await routes._handle_environment_check(
         request({"testEnvironment": override} if override else {})
     )
-    assert response.status == 200
-    assert json.loads(response.text)["tests_collected"] == 7
+    assert response.status == 202
+    assert json.loads(response.text)["state"] == "checking"
+    routes._check_thread.join(10)
+    record = json.loads((await routes._handle_environment_check_status(request({}))).text)
+    assert record["state"] == "ready"
+    assert record["result"]["tests_collected"] == 7
     assert store.read_json(store.config_path()) == cfg
 
 

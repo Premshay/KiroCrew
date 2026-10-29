@@ -1546,6 +1546,32 @@ configured filesystem or egress restrictions that this adapter cannot enforce
 across delegation refuse execution, naming the scope. The app does not grant daemon
 access or relax platform policy. See [governance](governance.md#repository-runner-admission).
 
+## Background tasks and notifications
+
+`POST /environment/check` answers 202 and runs the check on a worker thread that
+outlives the request, so the operator may leave Setup. The body carries the
+selection to check and an opaque `fingerprint` (at most 16384 characters) that
+Setup derives from the repository, branch, selection, variables and saved
+measurement settings. A second check while one runs answers 409
+`check_in_progress`.
+
+`GET /environment/check` returns the last record from
+`data/environment-check.json`: `state` is `none`, `checking`, `ready`, `blocked`,
+`cancelled` or `interrupted`, with the `fingerprint`, timestamps and the check
+`result`. A `checking` record with no live worker reads as `interrupted`. Setup
+applies a record only when its fingerprint matches the current form, polls while
+it is `checking`, and enables Calibrate on a matching `ready` record. Starting a
+run deletes the record, because a run can commit to the branch.
+
+The check proves the interpreter and pytest in one call, then collects tests: in
+runner mode each call starts a fresh isolated environment.
+
+Environment checks, calibrations and runs push a note on the `task-finished`
+channel declared in `app.json` when they end (`backend/notify.py`). Start routes
+bind the event loop and gateway state; worker threads hand the push to that loop.
+Pushes pass the producer route's gates: the app is enabled, the channel declared,
+the payload valid, and the per-app rate limiter allows it.
+
 ## Bounded measurements and finalist regression
 
 `profiles/github_repo/profile.py` remains the profile API and patch surface.

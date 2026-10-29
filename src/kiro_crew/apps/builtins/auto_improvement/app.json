@@ -61,6 +61,15 @@
     "network": true,
     "storage": true
   },
+  "notifications": {
+    "channels": [
+      {
+        "id": "task-finished",
+        "name": "Checks, calibrations and runs that finish",
+        "icon": "CircleCheck"
+      }
+    ]
+  },
   "dependencies": {
     "commands": ["git", "gh"]
   },

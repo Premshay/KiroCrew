@@ -43,12 +43,13 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from kiro_crew.dashboard.crash_dump_store import current_process_identity, pid_identity_alive
 from kiro_crew.platform.app_execution import capture_app_execution
 
-from . import clone_setup, deps, runner_source, store
+from . import clone_setup, deps, notify, runner_source, store
 
 logger = logging.getLogger(__name__)
 
@@ -946,7 +947,7 @@ class RunSupervisor:
                     }
                 )
             thread = threading.Thread(
-                target=capture_app_execution(self._run_loop),
+                target=capture_app_execution(self._notifying(self._run_loop, "Run")),
                 args=(driver, run_id),
                 name=f"auto-improvement-{run_id}",
                 daemon=True,  # never block gateway shutdown on a long measurement
@@ -1112,7 +1113,7 @@ class RunSupervisor:
                 {"t": time.time(), "note": f"calibration {run_id} starting"}
             )
             thread = threading.Thread(
-                target=capture_app_execution(self._calibrate_loop),
+                target=capture_app_execution(self._notifying(self._calibrate_loop, "Calibration")),
                 args=(dict(config or {}),),
                 name=f"auto-improvement-{run_id}",
                 daemon=True,
@@ -1363,6 +1364,41 @@ class RunSupervisor:
         """
         if self._stop_check():
             raise _CalibrationStopped
+
+    def _notifying(self, loop: Callable[..., None], task: str) -> Callable[..., None]:
+        """Wrap a worker loop so its terminal state is pushed as a notification."""
+
+        def run(*args: Any) -> None:
+            try:
+                loop(*args)
+            finally:
+                self._notify_finished(task)
+
+        return run
+
+    def _notify_finished(self, task: str) -> None:
+        with self._lock:
+            status, error, stats = self._state.status, self._state.error, dict(self._state.stats)
+            kept, drafted = self._state.kept, self._state.drafted
+        config = store.read_json(store.config_path(), {}) or {}
+        target = str(config.get("target_display") or "the repository")
+        if status == STATUS_ERROR:
+            title = f"{task} failed · {target}"
+            body = (error or "No error detail was recorded.").splitlines()[0]
+        elif task == "Calibration":
+            ruler = store.read_json(store.ruler_dir() / "ruler.json", {}) or {}
+            if ruler.get("status") == "calibrated":
+                title = f"Calibration finished · {target}"
+                body = "The ruler is calibrated; runs can start."
+            else:
+                title = f"Calibration stopped · {target}"
+                body = "No ruler was written."
+        else:
+            title = f"Run finished · {target}"
+            body = f"Kept {kept}, drafted {drafted}."
+            if stats.get("publication"):
+                body += f" Publication: {stats['publication']}."
+        notify.task_finished(title, body, group_key=task.lower())
 
     def _mark_stopped(self) -> None:
         """Record a cooperative calibration stop as a clean terminal state (no error)."""
