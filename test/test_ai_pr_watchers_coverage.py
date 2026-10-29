@@ -162,6 +162,7 @@ def _isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("KIROCREW_HOME", str(home))
     monkeypatch.setenv("AUTO_IMPROVEMENT_SCRATCH", str(tmp_path / "scratch"))
+    monkeypatch.setenv("AUTO_IMPROVEMENT_RUNNERS", str(tmp_path / "runners"))
     monkeypatch.setattr(store, "data_dir", lambda: data)
     return data
 

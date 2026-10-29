@@ -14,13 +14,11 @@ samples the ruler compares.
 
 from __future__ import annotations
 
-import io
 import os
 import re
 import shutil
 import stat
 import subprocess
-import tarfile
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
@@ -38,6 +36,7 @@ __all__ = [
 ]
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+_STAGING_RE = re.compile(r"\.[0-9a-f]{12}-.+")
 _PIN_REF = "refs/auto-improvement/runner-pin"
 _FETCH_TIMEOUT_S = 300
 
@@ -68,6 +67,8 @@ def _mirror(config: dict) -> Path:
     if not (path / "HEAD").is_file():
         path.mkdir(parents=True, exist_ok=True)
         _git(path, "init", "--quiet", "--bare", check=True)
+    # Snapshots fetch their pinned commit from here by id.
+    _git(path, "config", "uploadpack.allowAnySHA1InWant", "true", check=True)
     return path
 
 
@@ -76,21 +77,28 @@ def _git(
     *args: str,
     network_protocol: str = "",
     check: bool = False,
-    text: bool = True,
+) -> subprocess.CompletedProcess:
+    return _run_git(
+        [f"--git-dir={mirror}", *args], mirror, network_protocol=network_protocol, check=check
+    )
+
+
+def _run_git(
+    args: list[str], cwd: Path, *, network_protocol: str = "", check: bool = False
 ) -> subprocess.CompletedProcess:
     from .clone_setup import _GIT_SAFE_CONFIG, _git_env
 
     proc = subprocess.run(
-        ["git", f"--git-dir={mirror}", *_GIT_SAFE_CONFIG, *args],
+        ["git", *_GIT_SAFE_CONFIG, *args],
         capture_output=True,
         timeout=_FETCH_TIMEOUT_S,
         shell=False,
         env=_git_env(network_protocol=network_protocol),
-        cwd=str(mirror),
-        **(UTF8_TEXT if text else {}),
+        cwd=str(cwd),
+        **UTF8_TEXT,
     )
     if check and proc.returncode:
-        raise RuntimeError(f"git {args[0]} failed in the runner mirror")
+        raise RuntimeError(f"git {args[0]} failed for the managed runner")
     return proc
 
 
@@ -167,18 +175,46 @@ def _remove(root: Path) -> None:
 
 
 def _extract(config: dict, mirror: Path, commit: str) -> None:
+    """Check *commit* out into its own depth-one repository.
+
+    The runner reads its own ``HEAD`` and tree, so the snapshot is a Git checkout. Its
+    ``.git`` is self-contained: the mirror sits under the crew home the measurement
+    sandbox masks, so nothing in the snapshot may refer back to it.
+    """
     present = _git(mirror, "cat-file", "-e", f"{commit}^{{commit}}")
     if present.returncode:
         _fetch(config, mirror, commit)
-    archive = _git(mirror, "archive", "--format=tar", commit, text=False)
-    if archive.returncode:
-        raise ValueError(f"could not read runner commit {commit[:12]} from the mirror")
     target = _snapshot_dir(commit)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{commit[:12]}-", dir=target.parent))
     try:
-        with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as tar:
-            tar.extractall(staging, filter="data")
+        _run_git(["init", "--quiet", str(staging)], target.parent, check=True)
+        _run_git(
+            [
+                "-C",
+                str(staging),
+                "fetch",
+                "--quiet",
+                "--depth=1",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-auto-maintenance",
+                mirror.as_uri(),
+                commit,
+            ],
+            staging,
+            network_protocol="file",
+            check=True,
+        )
+        _run_git(
+            ["-C", str(staging), "-c", "advice.detachedHead=false", "checkout", "--quiet", commit],
+            staging,
+            check=True,
+        )
+        (staging / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
+        head = _run_git(["-C", str(staging), "rev-parse", "HEAD"], staging, check=True)
+        if head.stdout.strip() != commit:
+            raise ValueError(f"runner checkout is not at {commit[:12]}")
         _make_read_only(staging)
         staging.rename(target)
     except BaseException:
@@ -239,5 +275,7 @@ def prune_snapshots(config: dict) -> None:
         return
     keep = _referenced_commits(config)
     for entry in root.iterdir():
-        if entry.name not in keep:
+        # Only names this module creates: a commit id, or an interrupted staging directory.
+        ours = is_commit(entry.name) or bool(_STAGING_RE.fullmatch(entry.name))
+        if ours and entry.name not in keep:
             _remove(entry)

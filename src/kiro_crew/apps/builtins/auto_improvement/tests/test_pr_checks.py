@@ -146,8 +146,8 @@ class TestCountUnresolved:
         """
         pr = {
             "comments": [
-                {"resolvable": True, "resolved": False},   # an open thread
-                {"resolvable": True, "resolved": True},    # settled
+                {"resolvable": True, "resolved": False},  # an open thread
+                {"resolvable": True, "resolved": True},  # settled
                 {"resolvable": False, "resolved": False},  # a plain comment, not a thread
                 {},  # no thread state at all
                 "not-a-dict",

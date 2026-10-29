@@ -23,7 +23,7 @@ from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo.profile impor
 )
 
 _needs_sandbox = pytest.mark.skipif(
-    not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(),
+    not __import__("kiro_crew.sandbox", fromlist=["userns_available"]).userns_available(),
     reason="requires unprivileged user namespaces (sandbox backend)",
 )
 

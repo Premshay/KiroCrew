@@ -672,7 +672,10 @@ def test_summarize_stream_event_falls_back_through_the_hint_keys():
 
 
 def test_summarize_stream_event_surfaces_assistant_text_truncated():
-    obj = {"type": "assistant", "message": {"content": [{"type": "text", "text": "  " + "t" * 300}]}}
+    obj = {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": "  " + "t" * 300}]},
+    }
     act = R._summarize_stream_event(obj)
     assert act["kind"] == "text" and len(act["detail"]) == 200
 
@@ -692,9 +695,7 @@ def test_summarize_stream_event_skips_uninteresting_lines(obj):
     assert R._summarize_stream_event(obj) is None
 
 
-@pytest.mark.parametrize(
-    "is_error,detail", [(False, "done"), (True, "error")]
-)
+@pytest.mark.parametrize("is_error,detail", [(False, "done"), (True, "error")])
 def test_summarize_stream_event_reports_the_result_line(is_error, detail):
     obj = {"type": "result", "is_error": is_error}
     assert R._summarize_stream_event(obj) == {"kind": "result", "detail": detail}
@@ -1189,9 +1190,7 @@ def test_ensure_agent_registered_writes_the_apps_own_spec(monkeypatch, tmp_path)
     assert runner.ensure_agent_registered() is True
     dest = tmp_path / "kiro" / "agents" / f"{runner.agent_name}.json"
     assert dest.is_file()
-    src = (
-        Path(R.__file__).resolve().parent.parent / "agents" / "discovery.json"
-    )
+    src = Path(R.__file__).resolve().parent.parent / "agents" / "discovery.json"
     assert dest.read_bytes() == src.read_bytes()
     assert runner.ensure_agent_registered() is True  # idempotent re-register
 
@@ -1915,9 +1914,7 @@ def test_adopt_authored_test_picks_the_shortest_path_then_lexicographically(tmp_
     for name in ("test_bug_b.py", "test_bug_a.py", "test_bug_longer.py"):
         (tmp_path / "test" / name).write_text("", newline="\n")
     repro = _ReproTest()
-    porcelain = (
-        "?? test/test_bug_longer.py\n?? test/test_bug_b.py\n?? test/test_bug_a.py\nxx\n"
-    )
+    porcelain = "?? test/test_bug_longer.py\n?? test/test_bug_b.py\n?? test/test_bug_a.py\nxx\n"
     R._adopt_authored_test(_candidate(repro), tmp_path, porcelain)
     assert repro.test_path == "test/test_bug_a.py"
 

@@ -95,6 +95,20 @@ def test_saving_pins_the_branch_and_extracts_a_read_only_snapshot(upstream):
     assert identity["runnerCommit"] == head
 
 
+def test_the_snapshot_is_a_self_contained_checkout_of_the_pin(upstream):
+    head = _commit_runner(upstream, "echo one")
+    config = _config()
+    runner_source.prepare_runner(config, pin=True)
+    root = runner_source.managed_runner_executable(config["testEnvironment"]).parents[2]
+
+    assert _git(root, "rev-parse", "HEAD") == head
+    assert _RUNNER in _git(root, "ls-tree", "-r", "--name-only", head).splitlines()
+    mirror = str(store.data_dir())
+    for path in (root / ".git").rglob("*"):
+        if path.is_file():
+            assert mirror.encode() not in path.read_bytes(), path
+
+
 def test_a_run_never_pins_an_unpinned_runner(upstream):
     _commit_runner(upstream, "echo one")
     with pytest.raises(env_mod.RunnerAdmissionError, match="not pinned"):
@@ -144,9 +158,12 @@ def test_prune_keeps_only_referenced_snapshots(upstream):
     snapshots = store.runner_snapshot_path()
     assert len(list(snapshots.iterdir())) == 2
 
+    (snapshots / "notes.txt").write_text("not a snapshot")
     runner_source.prune_snapshots(new)
 
-    assert [p.name for p in snapshots.iterdir()] == [new["testEnvironment"]["runnerCommit"]]
+    assert sorted(p.name for p in snapshots.iterdir()) == sorted(
+        [new["testEnvironment"]["runnerCommit"], "notes.txt"]
+    )
     assert first != new["testEnvironment"]["runnerCommit"]
 
 

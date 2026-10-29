@@ -370,9 +370,7 @@ class Gate:
             for p in non_test:
                 # Base content from the ORIGINAL worktree's git (bug restored). A path
                 # absent at base (a NEW source file the fix added) is removed instead.
-                show = subprocess.run(
-                    _git_argv(wt, "show", f"{base_sha}:{p}"), capture_output=True
-                )
+                show = subprocess.run(_git_argv(wt, "show", f"{base_sha}:{p}"), capture_output=True)
                 dest = base_tree / p
                 if show.returncode == 0:
                     dest.parent.mkdir(parents=True, exist_ok=True)

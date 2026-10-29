@@ -114,6 +114,7 @@ def _isolated_app_data_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("KIROCREW_HOME", str(home))
     monkeypatch.setattr(store, "data_dir", lambda: data)
     monkeypatch.setenv("AUTO_IMPROVEMENT_SCRATCH", str(tmp_path / "app-scratch"))
+    monkeypatch.setenv("AUTO_IMPROVEMENT_RUNNERS", str(tmp_path / "runners"))
     return data
 
 

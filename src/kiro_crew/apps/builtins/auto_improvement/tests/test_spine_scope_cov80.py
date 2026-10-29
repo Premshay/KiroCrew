@@ -43,7 +43,9 @@ class TestUnscopedDegradations:
     def test_a_nonzero_git_exit_degrades_to_unscoped(self, tmp_path: Path) -> None:
         """An unresolvable base ref cannot yield a scope, so it must not yield an
         empty one — that would fence the run down to editing nothing."""
-        out = scoped_relpaths(tmp_path, "no/such/ref", runner=lambda argv, **kw: _proc(returncode=128))
+        out = scoped_relpaths(
+            tmp_path, "no/such/ref", runner=lambda argv, **kw: _proc(returncode=128)
+        )
         assert out is None
 
 

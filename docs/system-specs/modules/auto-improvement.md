@@ -1505,8 +1505,10 @@ verification path. Legacy container configurations fail explicitly.
 - `runnerPath`: a path inside the target repository; the app manages the runner
   (`backend/runner_source.py`). Saving the environment without `runnerCommit` fetches
   the configured branch into the app's bare mirror under `data/runners/mirrors/` and
-  pins the commit it resolves. The commit is extracted read-only to
-  `~/.autoimprove-runners/<commit>/` (`AUTO_IMPROVEMENT_RUNNERS` overrides it). That
+  pins the commit it resolves. The commit is checked out read-only, as a self-contained
+  depth-one repository, to `~/.autoimprove-runners/<commit>/`
+  (`AUTO_IMPROVEMENT_RUNNERS` overrides it). A runner may read its own `HEAD` and tree
+  there; nothing in the checkout refers to the mirror. That
   root is outside every checkout and outside the crew data home, which the strict
   sandbox masks, so the runner stays executable inside the sandbox. Runs, calibration,
   environment checks and publication regression prepare the snapshot first and

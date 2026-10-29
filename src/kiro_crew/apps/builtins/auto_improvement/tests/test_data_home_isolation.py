@@ -46,24 +46,20 @@ class TestTheDataHomeIsRedirected:
 class TestAProductionConfigWriteStaysInTheTempDir:
     """The exact shape that leaked: a test writing config through the production helper."""
 
-    def test_write_json_atomic_to_config_path_lands_in_the_temp_dir(
-        self, tmp_path: Path
-    ) -> None:
+    def test_write_json_atomic_to_config_path_lands_in_the_temp_dir(self, tmp_path: Path) -> None:
         target = store.config_path()
         # Checked BEFORE writing, deliberately. A test that verifies isolation must not
         # depend on isolation to be harmless: asserting after the write would clobber the
         # operator's config on the very run where the redirect is broken — the failure it
         # exists to report.
-        assert target.is_relative_to(tmp_path), (
-            f"refusing to write {target}: outside {tmp_path}, so the redirect is broken"
-        )
+        assert target.is_relative_to(
+            tmp_path
+        ), f"refusing to write {target}: outside {tmp_path}, so the redirect is broken"
         store.write_json_atomic(target, {"clone": str(tmp_path / "clone"), "branch": "work"})
         assert target.is_file()
         assert (store.read_json(target, {}) or {}).get("branch") == "work"
 
-    def test_the_redirect_is_per_test_so_writes_do_not_accumulate(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_redirect_is_per_test_so_writes_do_not_accumulate(self, tmp_path: Path) -> None:
         # A fresh temp root per test is what keeps one test's config from being read as
         # another's fixture state; a session-scoped redirect would still isolate the
         # operator but let tests see each other's writes.

@@ -697,9 +697,9 @@ class TestAllAgentAuthoredFieldsAreRedacted:
             }
         }
         out = _redact_tree(tree)
-        assert "glpat-IOSFODNN7EXAMPLE" not in str(out), (
-            "a credential-shaped profiler frame name reached the browser unredacted"
-        )
+        assert "glpat-IOSFODNN7EXAMPLE" not in str(
+            out
+        ), "a credential-shaped profiler frame name reached the browser unredacted"
         # Numeric timing fields must survive so the flame/sunburst view still renders.
         assert out["profile"]["children"][0]["self_ms"] == 1.2
 
@@ -764,9 +764,9 @@ class TestEveryReaderOfRunEvidenceRedacts:
             # Require the CALL form (`redactor(`), not a bare mention — a docstring or comment
             # that merely names the redactor must not satisfy this guard. (A reverted wrap that
             # left an explanatory comment behind slipped past the bare-substring check once.)
-            assert f"{redactor}(" in body[:cut], (
-                f"{rel}::{func} serves evidence without calling {redactor}"
-            )
+            assert (
+                f"{redactor}(" in body[:cut]
+            ), f"{rel}::{func} serves evidence without calling {redactor}"
 
     def test_the_progress_series_redacts_a_credential_in_a_description(self) -> None:
         """The seventh reader, found by the GPT review. A progress point's `description`
