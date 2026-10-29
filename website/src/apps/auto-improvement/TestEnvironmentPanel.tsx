@@ -21,6 +21,8 @@ export interface TestEnvironment {
   kind: "gateway" | "python" | "runner";
   pythonExecutable?: string;
   runnerExecutable?: string;
+  runnerPath?: string;
+  runnerCommit?: string;
   variables?: Record<string, string>;
 }
 
@@ -59,6 +61,39 @@ function diagnosticText(value: unknown): string | undefined {
       )
       .join("\n") || undefined
   );
+}
+
+const ABSOLUTE_PATH = /^(\/|[A-Za-z]:[\\/]|\\\\)/;
+
+/** An absolute path names an installed runner; anything else is a path in the repository. */
+function runnerLocation(value: string): Partial<TestEnvironment> {
+  return ABSOLUTE_PATH.test(value.trim())
+    ? {
+        runnerExecutable: value,
+        runnerPath: undefined,
+        runnerCommit: undefined,
+      }
+    : {
+        runnerPath: value,
+        runnerExecutable: undefined,
+        runnerCommit: undefined,
+      };
+}
+
+function runnerSource(draft: TestEnvironment): Partial<TestEnvironment> | null {
+  const executable = draft.runnerExecutable?.trim();
+  if (executable)
+    return ABSOLUTE_PATH.test(executable)
+      ? { runnerExecutable: executable }
+      : null;
+  const path = draft.runnerPath?.trim();
+  if (
+    !path ||
+    path.includes("\\") ||
+    path.split("/").some((part) => ["", ".", ".."].includes(part))
+  )
+    return null;
+  return { runnerPath: path, runnerCommit: draft.runnerCommit };
 }
 
 export async function requestJson<T>(
@@ -245,11 +280,8 @@ export default function TestEnvironmentPanel({
       setValidation(t("testEnvironment.absolutePath"));
       return null;
     }
-    const runnerExecutable = draft.runnerExecutable?.trim();
-    if (
-      draft.kind === "runner" &&
-      (!runnerExecutable || !/^(\/|[A-Za-z]:[\\/]|\\\\)/.test(runnerExecutable))
-    ) {
+    const runner = runnerSource(draft);
+    if (draft.kind === "runner" && !runner) {
       setValidation(t("testEnvironment.runnerPath"));
       return null;
     }
@@ -258,7 +290,10 @@ export default function TestEnvironmentPanel({
       ...draft,
       pythonExecutable:
         draft.kind === "gateway" ? undefined : pythonExecutable || "python",
-      runnerExecutable: draft.kind === "runner" ? runnerExecutable : undefined,
+      runnerExecutable: undefined,
+      runnerPath: undefined,
+      runnerCommit: undefined,
+      ...(draft.kind === "runner" ? runner : {}),
       variables: values,
     };
   }
@@ -298,6 +333,8 @@ export default function TestEnvironmentPanel({
             kind: kind as TestEnvironment["kind"],
             pythonExecutable: undefined,
             runnerExecutable: undefined,
+            runnerPath: undefined,
+            runnerCommit: undefined,
           })
         }
         disabled={locked}
@@ -309,12 +346,35 @@ export default function TestEnvironmentPanel({
             <label className="block text-[13px]">
               {t("testEnvironment.runnerExecutable")}
               <Input
-                value={draft.runnerExecutable ?? ""}
-                onChange={(e) => edit({ runnerExecutable: e.target.value })}
+                value={draft.runnerPath ?? draft.runnerExecutable ?? ""}
+                onChange={(e) => edit(runnerLocation(e.target.value))}
                 disabled={locked}
                 className="mt-1 w-full"
               />
             </label>
+          ) : null}
+          {draft.kind === "runner" && draft.runnerPath !== undefined ? (
+            <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted">
+              <span>
+                {draft.runnerCommit
+                  ? t("testEnvironment.runnerPinned", {
+                      commit: draft.runnerCommit.slice(0, 12),
+                    })
+                  : t("testEnvironment.runnerUnpinned", { branch })}
+              </span>
+              {draft.runnerCommit && !dirty ? (
+                <Btn
+                  disabled={locked}
+                  onClick={() => {
+                    const value = environment();
+                    if (value)
+                      save.mutate({ ...value, runnerCommit: undefined });
+                  }}
+                >
+                  {t("testEnvironment.runnerUpdate", { branch })}
+                </Btn>
+              ) : null}
+            </div>
           ) : null}
           <label className="block text-[13px]">
             {t(

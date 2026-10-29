@@ -48,7 +48,7 @@ from typing import Any
 from kiro_crew.dashboard.crash_dump_store import current_process_identity, pid_identity_alive
 from kiro_crew.platform.app_execution import capture_app_execution
 
-from . import clone_setup, deps, store
+from . import clone_setup, deps, runner_source, store
 
 logger = logging.getLogger(__name__)
 
@@ -786,6 +786,8 @@ class RunSupervisor:
                     f"would operate on the wrong revision{extra}"
                 )
             logger.info("%s: %s", store.APP_NAME, note)
+        if runner_note := runner_source.prepare_runner(config):
+            logger.info("%s: %s", store.APP_NAME, runner_note)
 
         profile = build_profile(config)  # raises ValueError when no clone is configured
 
@@ -1176,6 +1178,7 @@ class RunSupervisor:
                             f"refusing to calibrate: could not check out {branch} ({note}) — "
                             "the ruler would be proven against the wrong revision"
                         )
+                runner_source.prepare_runner(config)
 
                 profile = build_profile(config)
                 if not profile.isolation.push_disabled():

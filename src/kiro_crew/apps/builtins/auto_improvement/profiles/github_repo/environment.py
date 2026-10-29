@@ -22,7 +22,8 @@ from ...spine.push_policy import strip_credential_env
 
 __all__ = ["RunnerAdmissionError", "TestEnvironment", "normalize_test_environment"]
 
-_KEYS = {"kind", "pythonExecutable", "runnerExecutable", "variables"}
+_KEYS = {"kind", "pythonExecutable", "runnerExecutable", "runnerPath", "runnerCommit", "variables"}
+_RUNNER_KEYS = ("runnerExecutable", "runnerPath", "runnerCommit")
 _RUNNER_CLEANUP_SECONDS = 30
 
 
@@ -74,8 +75,8 @@ def normalize_test_environment(value: object) -> dict:
     if not isinstance(kind, str) or kind not in {"gateway", "python", "runner"}:
         raise ValueError("test environment kind must be gateway, python, or runner")
     out: dict = {"kind": kind}
-    if kind != "runner" and "runnerExecutable" in value:
-        raise ValueError("runnerExecutable applies only to runner environments")
+    if kind != "runner" and any(key in value for key in _RUNNER_KEYS):
+        raise ValueError("runner settings apply only to runner environments")
     if kind == "gateway" and "pythonExecutable" in value:
         raise ValueError("select python kind to configure an interpreter")
     if kind in {"python", "runner"}:
@@ -93,12 +94,35 @@ def normalize_test_environment(value: object) -> dict:
             raise ValueError("runner Python must be an executable name or an absolute path")
         out["pythonExecutable"] = executable
     if kind == "runner":
+        out.update(_runner_source(value))
+    if "variables" in value:
+        out["variables"] = _variables(value["variables"])
+    return out
+
+
+def _runner_source(value: dict) -> dict:
+    """Either an operator-installed ``runnerExecutable`` or an app-managed ``runnerPath``."""
+    if "runnerPath" not in value:
+        if "runnerCommit" in value:
+            raise ValueError("runnerCommit applies only with runnerPath")
         executable = _text(value.get("runnerExecutable", ""))
         if not Path(executable).is_absolute() or ".." in Path(executable).parts:
             raise ValueError("runnerExecutable must be an absolute path")
-        out["runnerExecutable"] = executable
-    if "variables" in value:
-        out["variables"] = _variables(value["variables"])
+        return {"runnerExecutable": executable}
+    if "runnerExecutable" in value:
+        raise ValueError("set runnerPath or runnerExecutable, not both")
+    path = _text(value["runnerPath"]).strip()
+    parts = path.split("/")
+    if "\\" in path or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("runnerPath must be a relative path inside the repository")
+    out = {"runnerPath": path}
+    commit = _text(value.get("runnerCommit", "")).strip()
+    if commit:
+        from ...backend.runner_source import is_commit
+
+        if not is_commit(commit):
+            raise ValueError("runnerCommit must be a full 40-character commit id")
+        out["runnerCommit"] = commit
     return out
 
 
@@ -171,7 +195,7 @@ class TestEnvironment:
         source = self._source(cwd)
         if argv[0] != self.python_argv()[0]:
             raise ValueError("runner commands must use the configured Python executable")
-        command = [self._config["runnerExecutable"], "--source", str(source), "--", *argv]
+        command = [str(self._runner_path()), "--source", str(source), "--", *argv]
         # A Python runner must not import its control code from the candidate's
         # PYTHONPATH. The recipe sets target import paths after selecting its source.
         merged["PYTHONPATH"] = ""
@@ -188,8 +212,21 @@ class TestEnvironment:
         finally:
             self._validate_runner()
 
+    def _runner_path(self) -> Path:
+        if "runnerPath" not in self._config:
+            return Path(self._config["runnerExecutable"])
+        if "runnerCommit" not in self._config:
+            raise RunnerAdmissionError(
+                "The runner commit is not pinned; save the test environment to pin it"
+            )
+        from ...backend.runner_source import managed_runner_executable
+
+        return managed_runner_executable(self._config)
+
     def _identify_runner(self) -> dict:
-        runner = Path(self._config["runnerExecutable"])
+        runner = self._runner_path()
+        if not runner.exists():
+            raise RunnerAdmissionError(f"Runner not found: {runner}")
         if runner.resolve(strict=True) != runner or not runner.is_file():
             raise RunnerAdmissionError("Runner must be a regular file without symlink aliases")
         # All candidate checkouts share this managed scratch tree. A repository

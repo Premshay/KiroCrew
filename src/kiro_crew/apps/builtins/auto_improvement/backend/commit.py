@@ -129,8 +129,10 @@ def safe_rollback(clone: Path, base: str) -> None:
 
 def run_publication_regression(config: dict, stop_check):
     from ..profiles import build_profile
+    from .runner_source import prepare_runner
 
     clone = Path(config["clone"])
+    prepare_runner(config)
     profile = build_profile({**config, "focusedTestPaths": config.get("focusedTestPaths") or ["."]})
     timeout = profile.full_regression_timeout_s
     deadline = time.monotonic() + timeout + 30

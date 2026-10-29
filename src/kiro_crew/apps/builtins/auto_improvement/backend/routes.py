@@ -43,6 +43,7 @@ from . import (
     profile_normalize,
     progress,
     runner,
+    runner_source,
     sse,
     store,
 )
@@ -336,6 +337,10 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
             from ..profiles.github_repo.profile import normalize_measurement_config
 
             current.update(normalize_measurement_config(current))
+            try:
+                runner_source.prepare_runner(current, pin=True)
+            except RuntimeError as exc:
+                raise ValueError(str(exc)) from exc
             store.remember_test_environment(current)
             if store.measurement_identity(previous) != store.measurement_identity(
                 current
@@ -349,6 +354,7 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
                     {"status": "uncalibrated"},
                 )
             store.write_json_atomic(store.config_path(), current)
+            runner_source.prune_snapshots(current)
             return current
 
     try:
@@ -415,6 +421,8 @@ async def _handle_environment_check(request: web.Request) -> web.StreamResponse:
                 )
                 if not ok:
                     raise ValueError(f"could not check out the selected branch: {note}")
+                stage = "runner"
+                runner_source.prepare_runner(config, pin=True)
                 stage = "profile"
                 profile = build_profile(config)
                 environment = profile.environment.identity

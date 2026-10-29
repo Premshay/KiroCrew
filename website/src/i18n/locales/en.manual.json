@@ -9819,9 +9819,12 @@
     "saved": "Check validates this selection without saving or starting a run.",
     "failed": "Request failed (HTTP {{status}}).",
     "runner": "Repository runner",
-    "runnerExecutable": "Runner executable (absolute path)",
+    "runnerExecutable": "Runner executable (repository path or absolute path)",
     "runnerPython": "Python executable (optional; default: python)",
-    "runnerPath": "Enter an absolute path to the runner executable.",
+    "runnerPath": "Enter the runner's path in the repository, or an absolute path to an installed runner.",
+    "runnerPinned": "Pinned to commit {{commit}}. The app keeps its own copy of the runner at this commit.",
+    "runnerUnpinned": "Saving pins the runner to the current commit of {{branch}}.",
+    "runnerUpdate": "Update runner to {{branch}}",
     "runnerHint": "The selected runner runs checks on each isolated checkout and must provide the target repository’s test environment, including service setup and teardown. Container isolation depends on the runner."
   },
   "boundedMeasurement": {

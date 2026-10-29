@@ -13,6 +13,8 @@ BENIGN_APP_SPAWNS: frozenset[str] = frozenset(
     {
         # Test-only Git fixture setup in pytest temporary repositories.
         "apps/builtins/auto_improvement/tests/test_clone_setup_idempotent.py::git",
+        "apps/builtins/auto_improvement/tests/test_managed_runner.py::_git",
+        "apps/builtins/auto_improvement/tests/test_managed_runner.py::upstream",
         "apps/builtins/auto_improvement/tests/test_environment.py::repository_runner",
         "apps/builtins/auto_improvement/tests/test_environment.py::sandbox_run",
         "apps/builtins/auto_improvement/tests/test_environment.py::test_runner_forwards_literal_argv_and_exact_linked_checkout",
@@ -103,6 +105,11 @@ BENIGN_APP_SPAWNS: frozenset[str] = frozenset(
         # Was keyed to `commit_finding` until the checkout+apply block was extracted here so
         # the draft-PR route could reuse it (the detector keys by the ENCLOSING function).
         "apps/builtins/auto_improvement/backend/commit.py::materialize_queued_diff",
+        # Fixed git subcommands (init, fetch, rev-parse, cat-file, archive) against the
+        # app-owned bare runner mirror. The remote is the validated origin URL; the
+        # refspec is a validated branch name or a 40-hex commit. Hooks, fsmonitor and
+        # global/system config are off, and the bare mirror has no checkout to filter.
+        "apps/builtins/auto_improvement/backend/runner_source.py::_git",
         "apps/builtins/auto_improvement/backend/deps.py::_gh_authenticated",
         # `<running interpreter> -m pytest --version` from an empty temp dir: a literal
         # argv, no repo or agent input, so no conftest can load. It asks whether the gate's

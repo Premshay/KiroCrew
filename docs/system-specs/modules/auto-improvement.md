@@ -1498,8 +1498,23 @@ retains offline branch selection for callers that explicitly need cached refs.
 
 `testEnvironment.kind` is `gateway` (default), `python`, or `runner`. Python mode
 requires an absolute `pythonExecutable`; runner mode defaults it to `python` and
-requires an absolute `runnerExecutable`. Non-secret `variables` are shared by every
+names its runner in one of two ways. Non-secret `variables` are shared by every
 verification path. Legacy container configurations fail explicitly.
+
+- `runnerExecutable`: an absolute path to a runner the operator installs and keeps.
+- `runnerPath`: a path inside the target repository; the app manages the runner
+  (`backend/runner_source.py`). Saving the environment without `runnerCommit` fetches
+  the configured branch into the app's bare mirror under `data/runners/mirrors/` and
+  pins the commit it resolves. The commit is extracted read-only to
+  `data/runners/snapshots/<commit>/`, outside every checkout. Runs, calibration,
+  environment checks and publication regression prepare the snapshot first and
+  rebuild a missing one from the pinned commit, never from the branch tip. A run
+  refuses an unpinned runner. The Setup panel's update action saves the environment
+  without its commit, which pins the branch's current commit and invalidates the
+  ruler. Snapshots no saved environment references are removed after each save.
+
+Only the gateway environment runs gates on the gateway's interpreter, so only it
+requires pytest there (`deps.gates_use_gateway_python`).
 
 The runner receives `--source ABSOLUTE_CHECKOUT -- PYTHON_EXECUTABLE ARG...` as
 literal argv, with the exact base or linked candidate checkout as cwd and source.

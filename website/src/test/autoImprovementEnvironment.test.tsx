@@ -178,7 +178,7 @@ describe('test environment setup', () => {
     mount()
     await readyToEdit()
     fireEvent.change(screen.getByLabelText('Test environment'), { target: { value: 'runner' } })
-    fireEvent.change(screen.getByLabelText('Runner executable (absolute path)'), { target: { value: '/tools/repo-check' } })
+    fireEvent.change(screen.getByLabelText(/Runner executable/), { target: { value: '/tools/repo-check' } })
     fireEvent.change(screen.getByLabelText(/Nonsecret variables/), { target: { value: 'MODE=test\nURL=http://db:5432?a=b' } })
     expect(screen.getByRole('button', { name: /start|run/i })).toBeDisabled()
     fireEvent.click(save())
@@ -204,15 +204,53 @@ describe('test environment setup', () => {
     expect(writes[1].body.testEnvironment).toEqual(writes[0].body.testEnvironment)
   })
 
-  it.each(['', 'tools/check'])('rejects runner path %j without making a request', async (path) => {
-    mount({ ...config, testEnvironment: { kind: 'runner', runnerExecutable: path } })
+  it.each([
+    { runnerExecutable: '' },
+    { runnerExecutable: 'tools/check' },
+    { runnerPath: '../check' },
+    { runnerPath: 'tools//check' },
+  ])('rejects runner location %j without making a request', async (location) => {
+    mount({ ...config, testEnvironment: { kind: 'runner', ...location } })
     await readyToEdit()
     fireEvent.click(check())
-    const hint = await screen.findByText('Enter an absolute path to the runner executable.')
+    const hint = await screen.findByText(
+      "Enter the runner's path in the repository, or an absolute path to an installed runner.",
+    )
     expect(hint).toHaveAttribute('role', 'status')
     expect(hint).toHaveAttribute('aria-live', 'polite')
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     expect(writes).toHaveLength(0)
+  })
+
+  it('saves a repository runner path for the app to pin', async () => {
+    mount()
+    await readyToEdit()
+    fireEvent.change(screen.getByLabelText('Test environment'), { target: { value: 'runner' } })
+    fireEvent.change(screen.getByLabelText(/Runner executable/), { target: { value: 'scripts/dev/run_full_suite.sh' } })
+    expect(screen.getByText('Saving pins the runner to the current commit of main.')).toBeInTheDocument()
+    fireEvent.click(save())
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0].body.testEnvironment).toEqual({ kind: 'runner', pythonExecutable: 'python', runnerPath: 'scripts/dev/run_full_suite.sh', variables: {} })
+  })
+
+  it('shows the pinned runner commit and unpins it to update', async () => {
+    const commit = 'a'.repeat(40)
+    mount({ ...config, testEnvironment: { kind: 'runner', runnerPath: 'scripts/run.sh', runnerCommit: commit } })
+    await readyToEdit()
+    expect(screen.getByText(/Pinned to commit aaaaaaaaaaaa\./)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Update runner to main' }))
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0].body.testEnvironment).toEqual({ kind: 'runner', pythonExecutable: 'python', runnerPath: 'scripts/run.sh', variables: {} })
+  })
+
+  it('drops the pin when the runner path changes', async () => {
+    mount({ ...config, testEnvironment: { kind: 'runner', runnerPath: 'scripts/run.sh', runnerCommit: 'b'.repeat(40) } })
+    await readyToEdit()
+    fireEvent.change(screen.getByLabelText(/Runner executable/), { target: { value: 'scripts/other.sh' } })
+    expect(screen.queryByRole('button', { name: /Update runner/ })).not.toBeInTheDocument()
+    fireEvent.click(save())
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0].body.testEnvironment).toEqual({ kind: 'runner', pythonExecutable: 'python', runnerPath: 'scripts/other.sh', variables: {} })
   })
 
   it('retains runner edits through refresh and locks the form while checking', async () => {
