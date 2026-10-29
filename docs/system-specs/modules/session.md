@@ -2262,7 +2262,9 @@ interrupted is handled one layer down: `SessionMap.get` prunes a sid whose
 Dashboard Edit + Send replaces the ACP session and rebuilds context from the
 retained canonical history. The discarded suffix is excluded from session
 replay, stop recovery, and persisted-history context; stable memory, rules,
-skills, and project context remain available.
+skills, and project context remain available. The retained history reaches the
+fresh session as the cold-start session replay of the rewritten transcript, so
+the rewound turn is not exempt from that replay.
 
 The native conversation is discarded before the retained history rewrite, and
 the cleared resume pointer is flushed durably before the rewrite is committed,

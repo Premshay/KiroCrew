@@ -622,13 +622,18 @@ async def _turn_build_prompt(turn: _ChatTurn) -> None:
         if _context_is_new and not _provider_has_history:
             _first_turn_history_assembled = True
             turn._first_turn_history_assembled = _first_turn_history_assembled
+        # A rewound turn is replayed like any other cold start. The rewind has
+        # already rewritten the transcript to the retained prefix, so the replay
+        # carries that prefix and nothing of the discarded suffix; it is the
+        # only history the fresh native session will receive, because
+        # ``include_session_history`` below is off for this turn.
         compressed = await _session_replay_history(
             state,
             state.context_builder,
             slot,
             client,
             session_key,
-            _context_is_new=_context_is_new and not turn.rewound,
+            _context_is_new=_context_is_new,
             _provider_has_history=_provider_has_history,
             _current_replay_message=_current_replay_message,
         )
@@ -972,7 +977,7 @@ async def _turn_build_prompt(turn: _ChatTurn) -> None:
     else:
         full_message = _request_prefix_context + message
         turn.full_message = full_message
-        if _context_is_new and not _provider_has_history and not turn.rewound:
+        if _context_is_new and not _provider_has_history:
             # Mirror the builder arm (above): this is the one place a
             # context-bearing turn in the builder-less fallback handles its
             # history, so settle the FRESH first-turn debt here too. A reset
