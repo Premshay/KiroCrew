@@ -29,9 +29,13 @@ made, are recorded in
 `GET /repository/survey` reads the configured local branch's committed tree under
 the clone lock after checking isolation. It does not fetch, execute repository
 code, install dependencies or change configuration. Its `revision` identifies the
-snapshot inspected. It reports framework/service references, matched Python
-source/test areas and possible performance files; names alone never establish a
-working benchmark or a runtime estimate. Errors are visible without partial apply.
+snapshot inspected. It inventories source areas, including areas without a test
+mapping and frontend areas the Python improvement loop cannot edit. Test mappings
+report their evidence: directory correspondence or static imports from tests.
+Neither establishes coverage or identifies a defect. Inventory and read limits
+are returned explicitly; an incomplete scan must not imply that omitted code has
+no tests. Names alone never establish a working benchmark or a runtime estimate.
+Errors are visible without partial apply.
 
 An optional `.kirocrew/auto-improvement.json` declaration supplies `version: 1`,
 `environment` and `workloads`. Each workload has `id`, `label`, `description` and
@@ -43,13 +47,37 @@ paths. A declared runner is a tracked executable `runnerPath`, not a host path o
 pin. Saving through the existing configuration route pins it. Repository content
 is a suggestion, never execution authorization.
 
-Setup stages a selected workload for review before Save. Switching to a bug
+Setup separates bug scopes from performance workloads. No alphabetically first
+area is a recommendation, and an unverified performance file is not a runnable
+workload. Setup stages an explicitly selected workload for review before Save. Switching to a bug
 workload clears the previous benchmark/control settings. Environment suggestions
 are separate from workload selection so an installed runner and its variables are
 not silently replaced. Edit paths, budgets and measurement settings are remembered
 per repository; switching repositories clears the branch and diff-base ref, which
 must be selected together again. The measured objective remains runtime in seconds; query/write limits
 belong in protected correctness tests. Test consolidation is outside this loop.
+
+`POST /repository/assessment` starts an owner-authorized, provider-backed review
+of committed evidence. An optional `areaPath` focuses the review; no caller prompt
+or executable command is accepted. Start pins the revision under the clone lock;
+the worker reads a bounded, redacted sample from that commit's immutable objects
+without retaining the lock and gives the sample to `SessionAgentRunner`
+with no tools, one turn, a 300-second limit and a temporary working directory.
+The existing credential isolation and agent registration guards apply. Repository
+text is data; the model cannot execute it or change saved settings.
+
+`GET /repository/assessment?areaPath=...` returns the saved result for the current
+clone, branch, revision and area. Results report their partial sample and contain
+review-only test mappings, performance hypotheses or existing benchmark command
+candidates. Validation bounds output, checks tracked paths and requires citations
+to supplied content. A benchmark command must occur literally in its cited
+content; this does not prove it safe, runnable or suitable for calibration.
+No agent assessment result becomes a workload automatically.
+
+Assessment continues after navigation and notifies on completion. Stop, app
+disable and gateway cleanup signal cancellation; a saved in-progress record
+without its worker is reported as interrupted. A changed repository identity
+cannot reuse the prior result as current evidence.
 
 `suiteTimeoutSeconds` bounds routine tests, reproduction, collection, benchmark
 samples and profiling. It defaults to 900 and accepts finite positive values up
@@ -83,7 +111,7 @@ refuse the runner rather than assuming credentials are isolated.
 All routes live under `/api/apps/auto-improvement/` and are registered by
 `apps/builtins/auto_improvement/backend/routes.py:register_routes`, mounted
 in-process on the gateway's own aiohttp app. Every handler is wrapped in
-`_require_enabled` (403 when the app is disabled). The 17 routes marked `owner`
+`_require_enabled` (403 when the app is disabled). The routes marked `owner`
 also call `require_owner_dashboard_request` first: a dashboard subject that is
 not the owner, and any app token, gets 403 `owner_only`, and an allowed call
 writes an SEL row (`_audit_owner_route_allowed`, because the owner gate audits
@@ -103,11 +131,14 @@ hooks, the disable path has to spell it out.
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | GET | `/health` | enabled | liveness; echoes the app name |
+| GET | `/repository/survey` | enabled | committed source inventory and workload suggestions |
+| POST | `/repository/assessment` | owner | start a bounded agent assessment |
+| GET | `/repository/assessment` | enabled | current revision's saved assessment |
+| POST | `/repository/assessment/stop` | owner | request assessment cancellation |
 | GET | `/config` | enabled | current run configuration |
 | PUT | `/config` | owner | update configuration (allowlisted keys only) |
 | POST | `/setup-clone` | owner | clone or re-point the working repository the run operates on |
 | GET | `/branches` | enabled | branches available in that clone, for choosing a base |
-| GET | `/repository/survey` | enabled | committed repository evidence and suggested workloads; no execution |
 | POST | `/environment/check` | enabled | start the authenticated background environment check |
 | GET | `/environment/check` | enabled | read its saved result |
 | GET | `/pr-status?url=&refresh=` | owner | live PR status, CI checks, watcher verdict |

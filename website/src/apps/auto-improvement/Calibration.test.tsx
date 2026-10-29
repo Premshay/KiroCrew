@@ -68,6 +68,7 @@ beforeEach(() => {
   requests = [];
   checkRecord = { state: "none" };
   server.use(
+    http.get(`${API}/repository/assessment`, () => HttpResponse.json({ state: "none" })),
     http.get(`${API}/repository/survey`, () => HttpResponse.json({ revision: "abc", workloads: [], evidence: [], warnings: [], environment: null })),
     ...checkHandlers({ state: "ready", result: { ok: true } }),
     http.get(`${API}/branches`, () => HttpResponse.json({ branches: [] })),
@@ -110,7 +111,7 @@ it("requires a saved, checked environment and describes workload cost without an
   await screen.findByText("Ready");
   expect(calibrate()).toBeDisabled();
   // Saving exactly the selection that was checked keeps its result.
-  fireEvent.click(screen.getByRole("button", { name: "Save environment" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save setup" }));
   await waitFor(() => expect(calibrate()).toBeEnabled());
   expect(screen.getByText("Ready")).toBeInTheDocument();
 });
@@ -284,7 +285,7 @@ it("saves measurement settings and resets them when switching repositories", asy
   });
   expect(check()).toBeDisabled();
   expect(calibrate()).toBeDisabled();
-  fireEvent.click(screen.getByRole("button", { name: "Save environment" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save setup" }));
   await waitFor(() =>
     expect(payload).toMatchObject({
       benchmarkCommand: "python bench.py",

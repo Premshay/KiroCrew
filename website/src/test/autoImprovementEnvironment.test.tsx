@@ -27,6 +27,7 @@ let checkResponse: () => Promise<Response>
 let writes: Array<{ path: string; body: Record<string, unknown> }>
 let checkRecord: Record<string, unknown>
 let survey: Record<string, unknown>
+let assessmentRecord: Record<string, unknown>
 
 /** The server's check: the POST keeps a record of the outcome that GET returns. */
 async function recordCheck(body: Record<string, unknown>): Promise<Response> {
@@ -54,7 +55,7 @@ function mount(initial: Record<string, unknown> | undefined = config) {
   return { ...result, client, setConfig: (value: Record<string, unknown> | undefined) => result.rerender(tree(value)) }
 }
 const executable = () => screen.getByLabelText('Python executable (absolute path)')
-const save = () => screen.getByRole('button', { name: 'Save environment' })
+const save = () => screen.getByRole('button', { name: 'Save setup' })
 const check = () => screen.getByRole('button', { name: 'Check environment' })
 async function readyToEdit() { await waitFor(() => expect(check()).not.toBeDisabled()) }
 
@@ -65,16 +66,22 @@ beforeEach(() => {
   checkResponse = async () => response({ ok: true, tests_collected: 4 })
   writes = []
   checkRecord = { state: 'none' }
+  assessmentRecord = { state: 'none' }
   survey = { revision: 'abc123', evidence: ['pytest.ini'], warnings: [], workloads: [], environment: null }
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     if (init?.method === 'POST' || init?.method === 'PUT') {
       const body = JSON.parse(String(init.body))
       writes.push({ path, body })
+      if (path.endsWith('/repository/assessment')) {
+        assessmentRecord = { state: 'assessing' }
+        return response(assessmentRecord, 202)
+      }
       return path.endsWith('/environment/check') ? recordCheck(body) : writeResponse
     }
     if (path.endsWith('/environment/check')) return response(checkRecord)
     if (path.endsWith('/repository/survey')) return response(survey)
+    if (path.includes('/repository/assessment')) return response(assessmentRecord)
     if (path.endsWith('/branches')) return response({ branches: ['main', 'feature'] })
     if (path.endsWith('/run')) return response({ status, stats: { publication }, ...(status === 'error' ? { error: 'Previous run failed' } : {}) })
     return response(config)
@@ -83,12 +90,97 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('test environment setup', () => {
+  it('starts an explicit scoped assessment and shows proposals without applying or executing them', async () => {
+    survey.areas = [{ id: 'customers', path: 'customers', label: 'Customers', sourceFiles: 1, testPaths: [], mappingConfidence: 'unmapped', evidence: [] }]
+    const view = mount()
+    await readyToEdit()
+    await screen.findByRole('option', { name: 'Customers' })
+    expect(writes).toEqual([])
+    fireEvent.change(screen.getByRole('combobox', { name: 'Repository areas' }), { target: { value: 'customers' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Assess repository' }))
+    await screen.findByText('Assessing in background…')
+    expect(writes).toEqual([{ path: '/api/apps/auto-improvement/repository/assessment', body: { areaPath: 'customers' } }])
+    assessmentRecord = { state: 'ready', revision: 'abc123', result: { partial: true, summary: 'One hypothesis', findings: [{ kind: 'benchmark_candidate', title: 'Review repeated queries', detail: 'Unmeasured', sourcePaths: ['customers/service.py'], testPaths: [], evidencePaths: ['customers/service.py'], command: 'python proposed.py' }] } }
+    await act(async () => { await view.client.invalidateQueries({ queryKey: ['auto-improvement-repository-assessment'] }) })
+    expect(await screen.findByText('Review repeated queries')).toBeInTheDocument()
+    expect(screen.getByText('Unvalidated command proposal:')).toBeInTheDocument()
+    expect(screen.getByText('python proposed.py')).toBeInTheDocument()
+    expect(screen.getByText('Partial scan; some evidence is omitted')).toBeInTheDocument()
+    expect(writes).toHaveLength(1)
+    expect(save()).toBeDisabled()
+  })
+
+  it('keeps polling after a stop acknowledgement until the worker reports cancellation', async () => {
+    const view = mount()
+    await readyToEdit()
+    fireEvent.click(screen.getByRole('button', { name: 'Assess repository' }))
+    expect(await screen.findByText('Assessing in background…')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Stop assessment' }))
+    await waitFor(() => expect(writes.at(-1)?.path).toBe('/api/apps/auto-improvement/repository/assessment/stop'))
+    expect(screen.getByText('Assessing in background…')).toBeInTheDocument()
+    assessmentRecord = { state: 'cancelled' }
+    await act(async () => { await view.client.invalidateQueries({ queryKey: ['auto-improvement-repository-assessment'] }) })
+    expect(await screen.findByText('Assessment cancelled')).toBeInTheDocument()
+  })
+
+  it('keeps a delayed assessment start attached to its original branch', async () => {
+    let resolveStart!: (value: Response) => void
+    const pending = new Promise<Response>((resolve) => { resolveStart = resolve })
+    const original = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation((input, init) =>
+      String(input).endsWith('/repository/assessment') && init?.method === 'POST'
+        ? pending : original(input, init))
+    const view = mount()
+    await readyToEdit()
+    fireEvent.click(screen.getByRole('button', { name: 'Assess repository' }))
+    view.setConfig({ ...config, branch: 'feature' })
+    await waitFor(() => expect(view.client.getQueryData(['auto-improvement-repository-assessment', config.clone, 'feature', 'abc123', ''])).toEqual({ state: 'none' }))
+    await act(async () => { resolveStart(response({ state: 'assessing', revision: 'abc123' }, 202)) })
+    await waitFor(() => expect(view.client.getQueryData(['auto-improvement-repository-assessment', config.clone, 'main', 'abc123', ''])).toMatchObject({ state: 'assessing' }))
+    expect(view.client.getQueryData(['auto-improvement-repository-assessment', config.clone, 'feature', 'abc123', ''])).toEqual({ state: 'none' })
+    expect(screen.queryByText('Assessing in background…')).not.toBeInTheDocument()
+  })
+
+  it('keeps unmapped and unsupported areas visible and filters the inventory without editing setup', async () => {
+    survey.areas = [
+      { id: 'customers', path: 'customers', label: 'Customers', kind: 'django-app', sourceFiles: 42, testPaths: [], mappingConfidence: 'unmapped', pythonSupported: true, evidence: ['No static test imports found'] },
+      { id: 'spa', path: 'spa', label: 'Frontend', kind: 'source-area', sourceFiles: 20, testPaths: [], mappingConfidence: 'unmapped', pythonSupported: false, evidence: ['Tracked TypeScript files'] },
+    ]
+    survey.performanceCandidates = [{ path: 'scripts/benchmark.py', evidence: ['Filename only'], status: 'unverified' }]
+    mount()
+    await screen.findByText('No static test imports found')
+    expect(screen.getByText('Outside Python improvement support')).toBeInTheDocument()
+    expect(screen.getByText(/Unmeasured candidates/)).toBeInTheDocument()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search areas' }), { target: { value: 'customers' } })
+    expect(screen.queryByText('Tracked TypeScript files')).not.toBeInTheDocument()
+    expect(screen.getByText('No static test imports found')).toBeInTheDocument()
+    expect(writes).toEqual([])
+  })
+
+  it('discards a staged workload and restores the saved track, benchmark and environment', async () => {
+    survey.workloads = [{ id: 'bugs', label: 'Import bugs', description: 'Check imports', source: 'detected', config: { track: 'bug', editAllowlist: ['imports/**'] } }]
+    mount({ ...config, track: 'perf', benchmarkCommand: 'python benchmark.py' })
+    await readyToEdit()
+    fireEvent.change(screen.getByRole('combobox', { name: 'Bug fixes' }), { target: { value: 'bugs' } })
+    expect(screen.getByText(/python benchmark.py →/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Apply to draft' }))
+    expect(screen.getByText(/Unsaved setup · Bug fixes/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Discard changes' }))
+    expect(screen.getByLabelText('Track')).toHaveValue('perf')
+    expect(screen.getByLabelText(/Benchmark command/)).toHaveValue('python benchmark.py')
+    expect(executable()).toHaveValue('/env/a/bin/python')
+    expect(save()).toBeDisabled()
+    expect(writes).toEqual([])
+  })
+
   it('stages a suggested bug scope without executing anything or replacing the environment', async () => {
     survey.workloads = [{ id: 'bugs', label: 'Import bugs', description: 'Check imports', source: 'declaration', config: { track: 'bug', editAllowlist: ['imports/**'], focusedTestPaths: ['tests/imports'] } }]
     survey.environment = { kind: 'runner', runnerPath: 'scripts/tests.sh', variables: { IMAGE: 'suggested' } }
     const view = mount({ ...config, track: 'perf', benchmarkCommand: 'old benchmark', benchmarkCanaryCommand: 'old control', benchmarkProtectedPaths: ['old'], maxHours: 3 })
     await readyToEdit()
-    const apply = await screen.findByRole('button', { name: 'Use workload' })
+    expect(screen.queryByRole('button', { name: 'Apply to draft' })).not.toBeInTheDocument()
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Bug fixes' }), { target: { value: 'bugs' } })
+    const apply = screen.getByRole('button', { name: 'Apply to draft' })
     expect(writes).toEqual([])
     fireEvent.click(apply)
     expect(screen.getByLabelText(/Files the agent may edit/)).toHaveValue('imports/**')
@@ -114,7 +206,8 @@ describe('test environment setup', () => {
     survey.workloads = [{ id: 'perf', label: 'Import throughput', description: 'Measure fixed imports', source: 'declaration', config: { track: 'perf', benchmarkCommand: 'python bench.py', benchmarkCanaryCommand: 'python bench.py --slow', benchmarkProtectedPaths: ['bench.py'], benchmarkResultMode: 'structured', editAllowlist: ['imports/**'] } }]
     mount({ ...config, scopeDiffBase: 'HEAD~20', benchmarkCommand: 'stale' })
     await readyToEdit()
-    fireEvent.click(await screen.findByRole('button', { name: 'Use workload' }))
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Performance' }), { target: { value: 'perf' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply to draft' }))
     expect(screen.getByLabelText(/Review changes since/)).toHaveValue('')
     expect(screen.getByLabelText(/Benchmark command/)).toHaveValue('python bench.py')
     expect(screen.getByLabelText(/Protected benchmark files/)).toHaveValue('bench.py')
@@ -157,7 +250,8 @@ describe('test environment setup', () => {
     await screen.findByText(/No workload found/)
     survey = { ...survey, workloads: [{ id: 'new', label: 'Newly discovered area', description: 'Latest local revision', source: 'detected', config: { track: 'bug' } }] }
     fireEvent.click(screen.getByRole('button', { name: 'Refresh suggestions' }))
-    expect(await screen.findByText('Latest local revision')).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: 'Newly discovered area' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Apply to draft' })).not.toBeInTheDocument()
     expect(writes).toEqual([])
   })
 
@@ -168,11 +262,11 @@ describe('test environment setup', () => {
     survey = { ...survey, workloads: [{ id: 'bugs', label: 'Other area', description: '', source: 'detected', config: { editAllowlist: ['other/**'] } }] }
     await act(async () => { await view.client.invalidateQueries({ queryKey: ['auto-improvement-repository-survey'] }) })
     expect(screen.getByLabelText(/Files the agent may edit/)).toHaveValue('my-area/**')
-    expect(await screen.findByRole('button', { name: 'Use workload' })).toBeDisabled()
+    expect(await screen.findByRole('combobox', { name: 'Bug fixes' })).toBeDisabled()
     view.unmount()
     status = 'running'
     mount()
-    expect(await screen.findByRole('button', { name: 'Use workload' })).toBeDisabled()
+    expect(await screen.findByRole('combobox', { name: 'Bug fixes' })).toBeDisabled()
     expect(writes).toEqual([])
   })
 

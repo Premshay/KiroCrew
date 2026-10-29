@@ -180,11 +180,41 @@ Both operations refuse during an active run; checks also hold the clone lock.
 
 ### Configure measurements and focused tests
 
-Start with the repository recommendations in Setup. The survey reads the selected
-local Git revision without running code. Review its evidence, choose a workload,
-then save the staged settings. Detected bug areas match source and test folders;
-they are suggestions, not a complete coverage map. A performance filename alone
-is not enough to infer a trustworthy benchmark command.
+Start with the repository inventory in Setup. The survey reads the selected
+local Git revision without running code. It shows source areas even when it cannot
+map their tests. A directory match means tests share the area's name or live
+inside it; an import match means a parsed test imports one of its source modules.
+Neither proves coverage, a defect or a performance bottleneck. Areas appear by
+name, not by priority. Frontend areas remain visible but the improvement loop
+currently edits Python only.
+
+Inspect the mapping evidence and scan limits before choosing a scope. Large
+repositories can exceed the bounded import scan; an unmapped area may still have
+tests. Performance candidates are separate from configured workloads: a filename
+containing "benchmark" is a lead to investigate, not a verified command or timing.
+
+Choose a bug scope or a declared performance workload, review the settings it will
+change, then apply it to the form. Applying does not run tests or start an
+improvement cycle. It creates an unsaved draft; Save persists it and Discard
+restores the saved settings. Changing the workload requires a new environment
+check, and performance work also requires calibration. Selecting a bug scope
+clears the previous benchmark commands. Your runner, image variables and run
+budget are preserved.
+
+For uncertain mappings or performance leads, request an agent assessment of the
+repository or a selected area. This uses the configured provider and can incur
+usage charges. It reviews a bounded sample of committed source and documentation
+without tools or repository execution, for at most five minutes. You can leave
+the page, return to the saved result, or stop it; completion sends a notification.
+An interrupted assessment is identified when you return.
+
+Assessment findings cite the files supplied to the model. They remain proposals:
+path validation proves that files exist, not that the model's interpretation is
+correct. A proposed benchmark command is copied from cited repository content,
+not verified by execution. Review it, choose representative inputs and a slowed
+control, and check and calibrate before using it for performance acceptance.
+The assessment never rewrites configuration or promotes a hypothesis to a
+measured bottleneck. Results are scoped to their repository revision and area.
 
 Maintainers can declare tested recipes once in `.kirocrew/auto-improvement.json`.
 For example, adapt these paths and commands to tracked files in your repository:

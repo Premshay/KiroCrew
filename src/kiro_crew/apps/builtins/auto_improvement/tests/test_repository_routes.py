@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -92,3 +94,60 @@ async def test_survey_normalizes_a_bare_branch(survey_route, monkeypatch):
     )
     assert response.status == 200
     assert seen == ["refs/heads/feature"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler", ["handle_repository_assessment", "handle_repository_assessment_stop"]
+)
+async def test_assessment_mutations_require_owner(handler, monkeypatch):
+    from aiohttp import web
+
+    from kiro_crew.dashboard.handlers import _shared
+
+    async def denied(*args):
+        return web.json_response({"error": "owner required"}, status=403)
+
+    monkeypatch.setattr(_shared, "require_owner_dashboard_request", denied)
+    response = await getattr(repository_routes, handler)(
+        owner_request("POST", "/repository/assessment")
+    )
+    assert response.status == 403
+
+
+@pytest.mark.asyncio
+async def test_assessment_start_refuses_active_run(monkeypatch):
+    from aiohttp import web
+
+    async def audit(*args):
+        pass
+
+    async def busy(*args):
+        return web.json_response({"error": "run busy"}, status=409)
+
+    monkeypatch.setattr(routes, "_audit_owner_route_allowed", audit)
+    monkeypatch.setattr(routes, "_refuse_while_running", busy)
+    response = await repository_routes.handle_repository_assessment(
+        owner_request("POST", "/repository/assessment")
+    )
+    assert response.status == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [b"{", b"[]", b"null", b" " * 4097])
+async def test_assessment_rejects_invalid_body_before_start(monkeypatch, raw):
+    async def noop(*args):
+        return None
+
+    async def readexactly(size):
+        if len(raw) < size:
+            raise asyncio.IncompleteReadError(raw, size)
+        return raw[:size]
+
+    monkeypatch.setattr(routes, "_audit_owner_route_allowed", noop)
+    monkeypatch.setattr(routes, "_refuse_while_running", noop)
+    request = owner_request(
+        "POST", "/repository/assessment", payload=SimpleNamespace(readexactly=readexactly)
+    )
+    response = await repository_routes.handle_repository_assessment(request)
+    assert response.status == 400

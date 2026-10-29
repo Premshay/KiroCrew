@@ -1786,9 +1786,29 @@ def register_routes(app: web.Application) -> None:
     )
     add("POST", f"{_PREFIX}/setup-clone", _require_enabled(_handle_setup_clone))
     add("GET", f"{_PREFIX}/branches", _require_enabled(_handle_branches))
-    from .repository_routes import handle_repository_survey
+    from .repository_routes import (
+        handle_repository_assessment,
+        handle_repository_assessment_status,
+        handle_repository_assessment_stop,
+        handle_repository_survey,
+    )
 
     add("GET", f"{_PREFIX}/repository/survey", _require_enabled(handle_repository_survey))
+    add(
+        "POST",
+        f"{_PREFIX}/repository/assessment",
+        _require_enabled(authenticated_app_execution(store.APP_NAME)(handle_repository_assessment)),
+    )
+    add(
+        "GET",
+        f"{_PREFIX}/repository/assessment",
+        _require_enabled(handle_repository_assessment_status),
+    )
+    add(
+        "POST",
+        f"{_PREFIX}/repository/assessment/stop",
+        _require_enabled(handle_repository_assessment_stop),
+    )
     add("GET", f"{_PREFIX}/pr-status", _require_enabled(_handle_pr_status))
     add("POST", f"{_PREFIX}/run", _require_enabled(_handle_run_start))
     add("GET", f"{_PREFIX}/run", _require_enabled(_handle_run_status))
@@ -1885,6 +1905,9 @@ def register_routes(app: web.Application) -> None:
         gets that independence free by holding two hooks; here one failing
         signal must not swallow the other.
         """
+        from .repository_assessment import stop_assessment
+
+        stop_assessment()
         try:
             # Off the loop: ``stop_all`` only sets flags, but it takes the registry
             # lock, and the orphan-clone sweep (``_delete_clone_if_unowned``) holds that
@@ -1905,12 +1928,18 @@ def register_routes(app: web.Application) -> None:
         except Exception:  # pragma: no cover - defensive
             logger.warning("%s: run stop on disable failed", store.APP_NAME, exc_info=True)
 
+    async def _stop_assessment(_app: web.Application) -> None:
+        from .repository_assessment import stop_assessment
+
+        stop_assessment()
+
     # Guarded: register_routes runs before the runner freezes its signal lists,
     # so appending is safe — but a failure here must never break gateway startup.
     try:
         app.on_startup.append(_bind_watcher_loop)
         app.on_cleanup.append(_stop_watchers)
         app.on_cleanup.append(_stop_run)
+        app.on_cleanup.append(_stop_assessment)
     except Exception:  # pragma: no cover - defensive
         logger.warning("%s: could not register lifecycle hooks", store.APP_NAME)
 

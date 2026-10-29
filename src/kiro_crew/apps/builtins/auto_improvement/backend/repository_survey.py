@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from ..profiles.github_repo.environment import normalize_test_environment
 from ..profiles.github_repo.measurement_settings import normalize_measurement_config
+from .repository_inventory import repository_inventory
 from .runner_source import _run_git
 
 _DECLARATION = ".kirocrew/auto-improvement.json"
@@ -194,66 +195,6 @@ def _declaration(root: Path, entries: dict) -> tuple[dict | None, list[dict]]:
     return environment, workloads
 
 
-def _detected_workloads(entries: dict) -> list[dict]:
-    regular = {p for p, entry in entries.items() if entry[0] in {"100644", "100755"}}
-    tests = {
-        p
-        for p in regular
-        if p.endswith(".py")
-        and (PurePosixPath(p).name.startswith("test_") or PurePosixPath(p).name == "tests.py")
-    }
-    roots = set()
-    for path in regular:
-        parts = path.split("/")
-        if (
-            len(parts) > 1
-            and path.endswith(".py")
-            and path not in tests
-            and not any(part in {"test", "tests"} for part in parts[:-1])
-        ):
-            if parts[0] == "src" and len(parts) > 2:
-                roots.add("/".join(parts[:2]))
-            elif parts[0] not in {"test", "tests", "scripts", "benchmarks", "docs"} and not parts[
-                0
-            ].startswith("."):
-                roots.add(parts[0])
-    result = []
-    for source in sorted(roots)[:200]:
-        name = source.split("/")[-1]
-        candidates = [source + "/tests", source + "/tests.py", "tests/" + name, "test/" + name]
-        candidates.extend(
-            sorted(
-                {
-                    "/".join(parts[: index + 1])
-                    for test in tests
-                    for parts in [test.split("/")]
-                    for index in range(1, len(parts) - 1)
-                    if parts[0] in {"test", "tests"} and parts[index] == name
-                }
-                - set(candidates)
-            )
-        )
-        focused = [p for p in candidates if any(t == p or t.startswith(p + "/") for t in tests)]
-        if not focused or any(
-            entries[p][0] == "120000" for p in entries if p.startswith(source + "/")
-        ):
-            continue
-        result.append(
-            {
-                "id": "bugs-" + source.replace("/", "-"),
-                "label": f"Find bugs in {name}",
-                "description": f"Matched tracked Python source in {source} with tests in {', '.join(focused)}. Review scope before applying.",
-                "source": "detected",
-                "config": {
-                    "track": "bug",
-                    "editAllowlist": [source + "/**"],
-                    "focusedTestPaths": focused,
-                },
-            }
-        )
-    return result[:40]
-
-
 def survey_repository(root: Path, ref: str = "HEAD") -> dict:
     """Read a local ref; malformed declarations fail without partial application."""
     root = Path(root)
@@ -263,6 +204,7 @@ def survey_repository(root: Path, ref: str = "HEAD") -> dict:
     if not re.fullmatch(r"[0-9a-f]{40,64}", revision):
         raise ValueError("Repository survey requires a committed revision")
     entries = _entries(root, revision)
+    inventory = repository_inventory(entries, lambda path: _blob(root, entries, path))
     evidence = []
     warnings = [
         "Test collection does not measure runtime. Check the environment and calibrate performance workloads before running.",
@@ -310,8 +252,45 @@ def survey_repository(root: Path, ref: str = "HEAD") -> dict:
             "Repository declarations are untrusted suggestions. Review commands and environment before saving; survey executes nothing."
         )
     ids = {item["id"] for item in declared}
-    workloads = declared + [item for item in _detected_workloads(entries) if item["id"] not in ids]
+    workloads = list(declared)
+    for area in inventory["areas"]:
+        identifier = "bugs-" + area["id"]
+        focused = [
+            path for path in area["testPaths"] if path.endswith(".py") or path not in entries
+        ]
+        if (
+            identifier in ids
+            or not area["pythonSupported"]
+            or not focused
+            or area["testPathsTruncated"]
+        ):
+            continue
+        try:
+            _path(area["path"], entries)
+            for path in focused:
+                _path(path, entries)
+        except ValueError:
+            area["evidence"].append(
+                "Source or test mapping contains unsafe paths; no automatic workload is offered"
+            )
+            continue
+        workloads.append(
+            {
+                "id": identifier,
+                "label": f"Find bugs in {area['label']}",
+                "description": f"Matched tracked Python source in {area['path']} with tests in {', '.join(focused)}. Review scope before applying.",
+                "source": "detected",
+                "config": {
+                    "track": "bug",
+                    "editAllowlist": [
+                        area["path"] if area["path"] in entries else area["path"] + "/**"
+                    ],
+                    "focusedTestPaths": focused,
+                },
+            }
+        )
     return {
+        **inventory,
         "revision": revision,
         "declarationPath": _DECLARATION if _DECLARATION in entries else None,
         "evidence": evidence,

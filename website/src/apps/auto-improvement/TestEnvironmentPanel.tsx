@@ -351,6 +351,7 @@ export default function TestEnvironmentPanel({
         branch={branch}
         locked={locked}
         dirty={dirty}
+        measurement={measurement}
         onWorkload={(suggestion) =>
           editMeasurement(workloadSettings(measurement, suggestion))
         }
@@ -628,8 +629,28 @@ export default function TestEnvironmentPanel({
               aria-hidden="true"
             />
           ) : null}
-          {t("testEnvironment.save")}
+          {t("repositoryAssessment.save")}
         </Btn>
+        {dirty ? (
+          <Btn
+            disabled={locked}
+            onClick={() => {
+              const saved = JSON.parse(persisted) as TestEnvironment;
+              setDraft(saved);
+              setVariables(
+                Object.entries(saved.variables ?? {})
+                  .map(([key, value]) => `${key}=${value}`)
+                  .join("\n"),
+              );
+              setMeasurement(measurementSettings(config));
+              setDirty(false);
+              setValidation(null);
+              save.reset();
+            }}
+          >
+            {t("repositoryAssessment.discard")}
+          </Btn>
+        ) : null}
         <Btn
           disabled={locked || measurementDirty}
           onClick={() => {
@@ -682,7 +703,11 @@ export default function TestEnvironmentPanel({
         </p>
       ) : null}
       <p className="text-[12px] text-muted">
-        {t(dirty ? "testEnvironment.unsaved" : "testEnvironment.saved")}
+        {dirty
+          ? t("repositoryAssessment.unsaved", {
+              track: t(`boundedMeasurement.${measurement.track}`),
+            })
+          : t("testEnvironment.saved")}
       </p>
       {measurement.track === "perf" ? (
         <div className="space-y-2">

@@ -5,8 +5,16 @@ import ErrorNotice from "../../components/ErrorNotice";
 import SimpleSelect from "../../components/SimpleSelect";
 import { Btn, PanelSectionHeader } from "../../components/ui";
 import type { TestEnvironment } from "./TestEnvironmentPanel";
+import {
+  workloadSettings,
+  type MeasurementSettings,
+} from "./measurementSettings";
+import RepositoryInventory, {
+  type RepositoryInventoryData,
+} from "./RepositoryInventory";
+import RepositoryAssessment from "./RepositoryAssessment";
 
-interface RepositorySurvey {
+interface RepositorySurvey extends RepositoryInventoryData {
   revision: string;
   declarationPath?: string | null;
   evidence: string[];
@@ -26,6 +34,7 @@ export default function WorkloadRecommendations({
   branch,
   locked,
   dirty,
+  measurement,
   onWorkload,
   onEnvironment,
 }: {
@@ -33,6 +42,7 @@ export default function WorkloadRecommendations({
   branch: string;
   locked: boolean;
   dirty: boolean;
+  measurement: MeasurementSettings;
   onWorkload: (config: Record<string, unknown>) => void;
   onEnvironment: (environment: TestEnvironment) => void;
 }) {
@@ -55,9 +65,17 @@ export default function WorkloadRecommendations({
     enabled: Boolean(repository),
   });
   const workloads = survey.data?.workloads ?? [];
-  const workload =
-    workloads.find((item) => item.id === selected) ?? workloads[0];
+  const workload = workloads.find((item) => item.id === selected);
+  const preview = workload
+    ? workloadSettings(measurement, workload.config)
+    : null;
   const environment = survey.data?.environment;
+  const display = (key: keyof MeasurementSettings, value: string) =>
+    key === "track"
+      ? t(`boundedMeasurement.${value}`)
+      : key === "benchmarkResultMode"
+        ? t(`boundedMeasurement.${value}`)
+        : value || "∅";
   return (
     <section className="space-y-2">
       <div className="flex flex-wrap items-center gap-2">
@@ -81,28 +99,53 @@ export default function WorkloadRecommendations({
       ) : null}
       {/* No hand-off: the environment and workload forms may contain unsaved edits. */}
       <ErrorNotice message={survey.error?.message} />
-      {workload ? (
+      {(["bug", "perf"] as const).map((track) => {
+        const matching = workloads.filter(
+          (item) => (item.config.track ?? "bug") === track,
+        );
+        return (
+          <label key={track} className="block space-y-1 text-[13px]">
+            <span>{t(`boundedMeasurement.${track}`)}</span>
+            <SimpleSelect
+              options={["", ...matching.map((item) => item.id)]}
+              optionLabels={[
+                t("repositoryAssessment.choose"),
+                ...matching.map((item) => item.label),
+              ]}
+              value={
+                matching.some((item) => item.id === selected) ? selected : ""
+              }
+              onChange={setSelected}
+              disabled={locked || dirty || !matching.length}
+              aria-label={t(`boundedMeasurement.${track}`)}
+            />
+            {track === "perf" && !matching.length && survey.isSuccess ? (
+              <p className="text-[12px] text-muted">
+                {t("repositoryAssessment.noPerformance")}
+              </p>
+            ) : null}
+          </label>
+        );
+      })}
+      {workload && preview ? (
         <>
-          <SimpleSelect
-            options={workloads.map((item) => item.id)}
-            optionLabels={workloads.map((item) => item.label)}
-            value={workload.id}
-            onChange={setSelected}
-            disabled={locked || dirty}
-            aria-label={t("guidedWorkloads.title")}
-          />
           <p className="text-[13px]">{workload.description}</p>
+          <p className="text-[12px]">{t("repositoryAssessment.preview")}</p>
           <dl className="max-h-40 space-y-2 overflow-auto break-words text-[12px] select-text">
-            {(["benchmarkCommand", "benchmarkCanaryCommand"] as const).map(
+            {(Object.keys(preview) as Array<keyof MeasurementSettings>).map(
               (key) =>
-                typeof workload.config[key] === "string" &&
-                workload.config[key] ? (
+                preview[key] !== measurement[key] ? (
                   <div key={key}>
                     <dt className="text-muted">
-                      {t(`boundedMeasurement.${key}`)}
+                      {t(
+                        `${["editAllowlist", "scopeDiffBase", "suiteTimeoutSeconds", "maxCycles", "maxHours", "maxCostUsd", "calibrationReps", "measureReps"].includes(key) ? "guidedWorkloads" : "boundedMeasurement"}.${key === "benchmarkResultMode" ? "resultMode" : key}`,
+                      )}
                     </dt>
                     <dd>
-                      <code>{String(workload.config[key])}</code>
+                      <code className="whitespace-pre-wrap">
+                        {display(key, measurement[key])} →{" "}
+                        {display(key, preview[key])}
+                      </code>
                     </dd>
                   </div>
                 ) : null,
@@ -112,12 +155,21 @@ export default function WorkloadRecommendations({
             disabled={locked || dirty}
             onClick={() => onWorkload(workload.config)}
           >
-            {t("guidedWorkloads.apply")}
+            {t("repositoryAssessment.apply")}
           </Btn>
         </>
-      ) : survey.isSuccess ? (
+      ) : survey.isSuccess && !workloads.length ? (
         <p className="text-[12px] text-muted">{t("guidedWorkloads.empty")}</p>
       ) : null}
+      {survey.data ? <RepositoryInventory data={survey.data} /> : null}
+      <RepositoryAssessment
+        key={survey.data?.revision}
+        revision={survey.data?.revision ?? ""}
+        repository={repository}
+        branch={branch}
+        locked={locked}
+        areas={survey.data?.areas ?? []}
+      />
       {dirty ? (
         <p className="text-[12px] text-muted">
           {t("guidedWorkloads.saveFirst")}

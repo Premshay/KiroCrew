@@ -250,6 +250,48 @@ def test_detects_centralized_nested_test_directories(repo):
     assert all(item["id"] != "bugs-tests" for item in result["workloads"])
 
 
+def test_import_mapping_offers_reviewable_exact_file_scope_and_unmapped_inventory(repo):
+    _write(repo, "conversion.py", "pass\n")
+    _write(repo, "unmapped/service.py", "pass\n")
+    _write(repo, "tests/test_result.py", "import conversion\n")
+    _commit(repo)
+    result = survey_repository(repo)
+    workload = next(item for item in result["workloads"] if item["id"] == "bugs-conversion.py")
+    assert workload["config"]["editAllowlist"] == ["conversion.py"]
+    assert workload["config"]["focusedTestPaths"] == ["tests/test_result.py"]
+    assert any(
+        a["path"] == "unmapped" and a["mappingConfidence"] == "unmapped" for a in result["areas"]
+    )
+
+
+def test_named_test_directory_retains_cross_module_import_mappings(repo):
+    _write(repo, "tests/test_checkout.py", "from orders.models import Order\n")
+    _commit(repo)
+    result = survey_repository(repo)
+    workloads = [item for item in result["workloads"] if item["id"] == "bugs-orders"]
+    assert len(workloads) == 1
+    assert workloads[0]["config"]["focusedTestPaths"] == ["orders/tests", "tests/test_checkout.py"]
+
+
+def test_oversized_uncompactable_mapping_never_becomes_partial_workload(repo):
+    for index in range(101):
+        _write(repo, f"tests/test_{index}.py", "import orders.models\n")
+    _commit(repo)
+    result = survey_repository(repo)
+    assert not any(item["id"] == "bugs-orders" for item in result["workloads"])
+    area = next(item for item in result["areas"] if item["path"] == "orders")
+    assert area["testPathsTruncated"] is True
+    assert any("no automatic workload" in line for line in area["evidence"])
+
+
+def test_detected_mapping_containing_symlink_is_visible_but_not_executable(repo):
+    (repo / "orders/tests/link").symlink_to("/etc/passwd")
+    _commit(repo)
+    result = survey_repository(repo)
+    assert any(item["path"] == "orders" for item in result["areas"])
+    assert not any(item["id"] == "bugs-orders" for item in result["workloads"])
+
+
 @pytest.mark.parametrize(
     "branch", ["feature", "origin/feature", "feature/nested", "origin/feature/nested"]
 )
