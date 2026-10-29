@@ -1,6 +1,7 @@
 """A gate interpreter without pytest is a preflight failure, not an invalid agent test.
 
-Every gate step runs ``sys.executable -m pytest``. The packaged app's bundled interpreter
+With the gateway test environment every gate step runs ``sys.executable -m pytest``.
+The packaged app's bundled interpreter
 has no pytest, so without a preflight each candidate fails T2 "reproducing test does not
 collect" while no test runs. The run must refuse up front and say why.
 """
@@ -123,3 +124,31 @@ def test_a_stop_during_the_probe_cancels_the_calibration(monkeypatch: pytest.Mon
     with pytest.raises(RuntimeError, match="stopped before it started"):
         supervisor.calibrate({})
     assert supervisor.status()["status"] == R.STATUS_IDLE
+
+
+_RUNNER_ENVIRONMENT = {"kind": "runner", "runnerExecutable": "/opt/recipes/run_suite.sh"}
+
+
+def test_a_runner_environment_does_not_need_pytest_in_the_gateway(
+    gate_without_pytest: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kiro_crew.apps.builtins.auto_improvement.backend import store
+
+    store.write_json_atomic(store.config_path(), {"testEnvironment": _RUNNER_ENVIRONMENT})
+    monkeypatch.setattr(deps, "_gh_authenticated", lambda: (True, "authenticated"))
+    report = deps.check_deps()
+    entry = next(d for d in report["deps"] if d["id"] == "pytest")
+    assert entry["required"] is False
+    assert "pytest" not in report["blocking"]
+
+
+def test_a_runner_environment_run_is_not_refused_for_gateway_pytest(
+    gate_without_pytest: str,
+) -> None:
+    supervisor = R.RunSupervisor()
+    try:
+        supervisor.start({"testEnvironment": _RUNNER_ENVIRONMENT})
+    except Exception as exc:  # the run fails later: no repository is configured
+        assert "pytest is not installed" not in str(exc)
+    finally:
+        supervisor.stop()

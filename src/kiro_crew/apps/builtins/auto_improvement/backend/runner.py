@@ -242,12 +242,16 @@ def _unsandboxed_agent_accepted() -> bool:
     return bool(config.get("acceptUnsandboxedAgentRisk") is True)
 
 
-def _refuse_without_gate_pytest() -> None:
+def _refuse_without_gate_pytest(config: dict[str, Any]) -> None:
     """Refuse a run or calibration when the gate interpreter cannot run pytest.
 
     Otherwise every candidate is recorded as the agent's invalid test while no test
     ever ran. ``RuntimeError`` so the start route answers 409 with the message.
+    Only the gateway environment runs gates on this interpreter; python and runner
+    environments name their own, and their readiness check covers it.
     """
+    if not deps.gates_use_gateway_python(config):
+        return
     problem = deps.gate_pytest_problem()
     if problem:
         raise RuntimeError(f"refusing to start: {problem}")
@@ -726,7 +730,7 @@ class RunSupervisor:
         """The body of :meth:`_build_driver`, which owns the clone lock. Split out so the
         lock acquisition is a single visible statement rather than an indent over 100
         lines — and so a future edit cannot add an early ``return`` that skips it."""
-        _refuse_without_gate_pytest()
+        _refuse_without_gate_pytest(config)
 
         # Put the clone on the CONFIGURED branch BEFORE building the profile. A fresh
         # clone sits on the repo default (main); a run targeting another branch would
@@ -1086,7 +1090,7 @@ class RunSupervisor:
             if self._in_flight():
                 raise RuntimeError(f"a run is already active (run_id={self._state.run_id})")
             admitted_at = self._stop_seq
-        _refuse_without_gate_pytest()
+        _refuse_without_gate_pytest(config)
 
         run_id = f"cal-{int(time.time())}"
         with self._lock:

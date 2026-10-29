@@ -59,6 +59,17 @@ def _gh_authenticated() -> tuple[bool, str]:
     return True, "authenticated"
 
 
+def gates_use_gateway_python(config: dict[str, Any]) -> bool:
+    """Whether test gates run on this interpreter rather than a configured environment."""
+    from ..profiles.github_repo.environment import normalize_test_environment
+
+    try:
+        kind = normalize_test_environment(config.get("testEnvironment"))["kind"]
+    except ValueError:
+        return True
+    return kind == "gateway"
+
+
 def gate_pytest_problem() -> str:
     """Why the gate's interpreter cannot run pytest, or ``""`` when it can.
 
@@ -100,7 +111,10 @@ def check_deps() -> dict[str, Any]:
     git_path = _which("git")
     gh_ok, gh_detail = _gh_authenticated()
     ruff_path = _which("ruff")
-    pytest_problem = gate_pytest_problem()
+    from . import store
+
+    gateway_gates = gates_use_gateway_python(store.read_json(store.config_path(), {}) or {})
+    pytest_problem = gate_pytest_problem() if gateway_gates else ""
 
     deps: list[dict[str, Any]] = [
         {
@@ -124,9 +138,10 @@ def check_deps() -> dict[str, Any]:
         {
             "id": "pytest",
             "name": "pytest (runs the target's tests)",
-            "required": True,
+            "required": gateway_gates,
             "ok": not pytest_problem,
-            "detail": pytest_problem or sys.executable,
+            "detail": pytest_problem
+            or (sys.executable if gateway_gates else "the selected test environment runs pytest"),
             "fix": "run Kiro Crew from a Python environment that has pytest installed",
             "installable": False,
         },
