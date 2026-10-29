@@ -250,10 +250,9 @@ def session_tool_schemas() -> list[dict[str, Any]]:
                 "remove a member (one still working, including an attached session, needs "
                 "force=true; a done or failed one does not), or request_attach an existing "
                 "open dashboard "
-                "session (name it by the key list_sessions shows; give a short reason). A "
-                "request only files an approval card: the dashboard user approves or declines "
-                "it in the channel UI, and the outcome arrives as a channel system message. "
-                "Other channel members may inspect and report but cannot change membership."
+                "session (name it by the key list_sessions shows; give a short reason); "
+                "the session is attached at once. Other channel members may inspect and "
+                "report but cannot change membership."
             ),
             "inputSchema": {
                 "type": "object",

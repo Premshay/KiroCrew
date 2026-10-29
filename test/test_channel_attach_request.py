@@ -1,4 +1,4 @@
-"""Coordinator-requested, user-approved attachment of existing dashboard sessions."""
+"""Coordinator attachment of existing dashboard sessions, and the owner's resolve route."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ def _session_request(state, body, session_key="dashboard:lead"):
     request.app = {"state": state}
     request.headers = {"X-Session-Key": session_key}
     request.json = AsyncMock(return_value=body)
+    request.get = MagicMock(return_value="")
     return request
 
 
@@ -70,6 +71,20 @@ def _setup(tmp_path):
     return state, channel, lead, helper, events
 
 
+def _pending(channel, slot="review-lane", **extra):
+    """A pending request as the channel model files it, for the owner's resolve route."""
+    request, code = channel.request_attach(
+        requested_by=channel.orchestrator_id,
+        slot=slot,
+        title=extra.pop("title", "Review lane"),
+        role=extra.pop("role", "Review lane"),
+        listen_mode=extra.pop("listen_mode", "all"),
+        reason="",
+    )
+    assert request is not None, code
+    return request.to_dict()
+
+
 async def _file(state, channel, session="review-lane", session_key="dashboard:lead", **extra):
     return await api_session_channel(
         _session_request(
@@ -87,7 +102,7 @@ async def _file(state, channel, session="review-lane", session_key="dashboard:le
 
 class TestRequestAttach:
     @pytest.mark.asyncio
-    async def test_coordinator_files_a_request_without_changing_membership(self, tmp_path):
+    async def test_coordinator_attaches_a_session_at_once(self, tmp_path):
         state, channel, _lead, _helper, events = _setup(tmp_path)
 
         response = await _file(
@@ -95,13 +110,25 @@ class TestRequestAttach:
         )
 
         body = json.loads(response.text)
-        assert response.status == 200
+        assert response.status == 200, response.text
         assert body["request"]["slot"] == "review-lane"
-        assert body["request"]["role"] == "Review lane"
-        assert body["request"]["listen_mode"] == "all"
-        assert len(channel.members) == 2
-        assert channel.to_dict()["attach_requests"][0]["reason"] == "Needs the review lane."
+        assert body["agent"]["role"] == "Review lane"
+        assert body["agent"]["listen_mode"] == "all"
+        assert body["agent"]["session_key"] == "dashboard:review-lane"
+        assert len(channel.members) == 3
+        assert channel.attach_requests == {}
         assert events[-1][0] == "channel_attach_requests"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("listen", ["all", "mention", "silent"])
+    async def test_requested_listen_mode_reaches_the_member(self, tmp_path, listen):
+        state, channel, _lead, _helper, _events = _setup(tmp_path)
+
+        response = await _file(state, channel, listen=listen, role="Reviewer")
+
+        agent = json.loads(response.text)["agent"]
+        assert agent["role"] == "Reviewer"
+        assert channel.members[agent["id"]].listen_mode.value == listen
 
     @pytest.mark.asyncio
     async def test_non_coordinator_member_is_refused(self, tmp_path):
@@ -111,7 +138,7 @@ class TestRequestAttach:
 
         assert response.status == 403
         assert json.loads(response.text)["code"] == "channel_coordinator_required"
-        assert channel.attach_requests == {}
+        assert len(channel.members) == 2
 
     @pytest.mark.asyncio
     async def test_payload_cannot_name_the_requester(self, tmp_path):
@@ -125,10 +152,10 @@ class TestRequestAttach:
             requested_by=lead.id,
             member_id=lead.id,
         )
-        filed = await _file(state, channel, requested_by=helper.id)
+        attached = await _file(state, channel, requested_by=helper.id)
 
         assert refused.status == 403
-        request = json.loads(filed.text)["request"]
+        request = json.loads(attached.text)["request"]
         assert request["requested_by"] == lead.id == channel.orchestrator_id
 
     @pytest.mark.asyncio
@@ -139,7 +166,7 @@ class TestRequestAttach:
         response = await _file(state, channel, session_key="dashboard:lead")
 
         assert response.status == 403
-        assert channel.attach_requests == {}
+        assert len(channel.members) == 2
 
     @pytest.mark.asyncio
     async def test_refuses_unknown_desk_and_self_targets(self, tmp_path):
@@ -156,23 +183,24 @@ class TestRequestAttach:
             "invalid_attach_target",
             "already_attached",
         }
-        assert channel.attach_requests == {}
+        assert len(channel.members) == 2
 
     @pytest.mark.asyncio
-    async def test_pending_requests_count_against_capacity_and_duplicates(self, tmp_path):
+    async def test_an_attached_session_is_not_attached_twice_and_capacity_holds(self, tmp_path):
         state, channel, _lead, _helper, _events = _setup(tmp_path)
         state.get_or_create_slot("fourth").title = "Fourth"
 
         first = await _file(state, channel)
-        duplicate = await _file(state, channel)
+        again = await _file(state, channel)
         overflow = await _file(state, channel, session="fourth")
 
         assert first.status == 200
-        assert json.loads(duplicate.text)["code"] == "already_requested"
-        assert json.loads(overflow.text)["code"] == "channel_full"
+        assert again.status != 200
+        assert overflow.status != 200
+        assert len(channel.members) == 3
 
     @pytest.mark.asyncio
-    async def test_a_changeover_can_file_ten_requests(self, tmp_path):
+    async def test_a_changeover_can_attach_ten_sessions(self, tmp_path):
         state, channel, _lead, _helper, _events = _setup(tmp_path)
         channel._max_agents = 12
         for i in range(10):
@@ -181,7 +209,7 @@ class TestRequestAttach:
         statuses = [(await _file(state, channel, session=f"next-{i}")).status for i in range(10)]
 
         assert statuses == [200] * 10
-        assert len(channel.attach_requests) == 10
+        assert len(channel.members) == 12
 
     def test_tool_advertises_request_attach(self):
         manage = next(t for t in mcp_core._list_tools() if t["name"] == "session_channel_manage")
@@ -189,13 +217,17 @@ class TestRequestAttach:
         assert "request_attach" in properties["action"]["enum"]
         assert {"session", "listen", "reason"} <= set(properties)
 
-    def test_tool_reports_that_membership_did_not_change(self, monkeypatch):
+    def test_tool_reports_the_attached_member(self, monkeypatch):
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:lead")
         monkeypatch.setattr(
             mcp_core,
             "_post",
             MagicMock(
-                return_value={"ok": True, "request": {"id": "cafebabe", "title": "Review lane"}}
+                return_value={
+                    "ok": True,
+                    "request": {"id": "cafebabe", "title": "Review lane"},
+                    "agent": {"id": "f00dfeed", "role": "Reviewer"},
+                }
             ),
         )
 
@@ -204,29 +236,14 @@ class TestRequestAttach:
             {"action": "request_attach", "channel_id": "deadbeef", "session": "review-lane"},
         )
 
-        assert "cafebabe" in result
-        assert "Membership has not changed" in result
+        assert "Attached Review lane as Reviewer (f00dfeed)" in result
 
 
 class TestResolveAttachRequest:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("listen", ["all", "mention", "silent"])
-    async def test_requested_listen_mode_reaches_the_member(self, tmp_path, listen):
-        state, channel, _lead, _helper, _events = _setup(tmp_path)
-        filed = json.loads((await _file(state, channel, listen=listen)).text)["request"]
-        assert filed["listen_mode"] == listen
-
-        response = await api_channel_resolve_attach_request(
-            _operator_request(state, channel.id, filed["id"], {"action": "approve"})
-        )
-
-        member = channel.members[json.loads(response.text)["agent"]["id"]]
-        assert member.listen_mode.value == listen
-
-    @pytest.mark.asyncio
     async def test_approve_attaches_and_notifies_the_coordinator(self, tmp_path):
         state, channel, lead, _helper, _events = _setup(tmp_path)
-        filed = json.loads((await _file(state, channel, role="Reviewer")).text)["request"]
+        filed = _pending(channel, role="Reviewer")
 
         response = await api_channel_resolve_attach_request(
             _operator_request(state, channel.id, filed["id"], {"action": "approve"})
@@ -246,7 +263,7 @@ class TestResolveAttachRequest:
     @pytest.mark.asyncio
     async def test_decline_leaves_membership_and_notifies(self, tmp_path):
         state, channel, lead, _helper, _events = _setup(tmp_path)
-        filed = json.loads((await _file(state, channel)).text)["request"]
+        filed = _pending(channel)
 
         response = await api_channel_resolve_attach_request(
             _operator_request(state, channel.id, filed["id"], {"action": "decline"})
@@ -261,7 +278,7 @@ class TestResolveAttachRequest:
     @pytest.mark.asyncio
     async def test_approve_of_a_closed_session_keeps_the_request(self, tmp_path):
         state, channel, _lead, _helper, _events = _setup(tmp_path)
-        filed = json.loads((await _file(state, channel)).text)["request"]
+        filed = _pending(channel)
         del state._slots["review-lane"]
 
         response = await api_channel_resolve_attach_request(
@@ -275,7 +292,7 @@ class TestResolveAttachRequest:
     @pytest.mark.asyncio
     async def test_rejects_unknown_action_and_request(self, tmp_path):
         state, channel, _lead, _helper, _events = _setup(tmp_path)
-        filed = json.loads((await _file(state, channel)).text)["request"]
+        filed = _pending(channel)
 
         bad_action = await api_channel_resolve_attach_request(
             _operator_request(state, channel.id, filed["id"], {"action": "trust"})
@@ -291,8 +308,8 @@ class TestResolveAttachRequest:
 class TestAttachRequestLifecycle:
     @pytest.mark.asyncio
     async def test_coordinator_transfer_withdraws_old_requests(self, tmp_path):
-        state, channel, _lead, helper, _events = _setup(tmp_path)
-        await _file(state, channel)
+        _state_, channel, _lead, helper, _events = _setup(tmp_path)
+        _pending(channel)
 
         channel.set_coordinator(helper.id)
 
@@ -300,8 +317,8 @@ class TestAttachRequestLifecycle:
 
     @pytest.mark.asyncio
     async def test_requests_persist_and_stale_ones_are_dropped_on_load(self, tmp_path):
-        state, channel, _lead, helper, _events = _setup(tmp_path)
-        await _file(state, channel)
+        _state_, channel, _lead, helper, _events = _setup(tmp_path)
+        _pending(channel)
 
         restored = Channel.deserialize(channel.serialize())
         assert list(restored.attach_requests) == list(channel.attach_requests)

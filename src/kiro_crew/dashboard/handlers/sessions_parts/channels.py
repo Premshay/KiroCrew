@@ -93,13 +93,19 @@ def _attach_target_slot_name(value: object) -> str | None:
 
 
 async def _request_channel_attach(
-    state: DashboardState, channel: Any, member: Any, caller_slot: Any, body: dict
+    request: web.Request,
+    state: DashboardState,
+    channel: Any,
+    member: Any,
+    caller_slot: Any,
+    body: dict,
 ) -> web.Response:
-    """File a coordinator's attach request; only the dashboard user can grant it.
+    """Attach an open dashboard session to the coordinator's channel.
 
     ``member`` is the caller's own membership, resolved from its verified session
-    key and already checked against ``channel.orchestrator_id``. The requester is
-    always that member: nothing in the body can name a different one.
+    key and already checked against ``channel.orchestrator_id``. The request is
+    recorded and granted in the same call, through the attach the dashboard
+    user's approval runs, so the coordinator needs no separate approval.
     """
     slot_name = _attach_target_slot_name(body.get("session"))
     if slot_name is None:
@@ -143,7 +149,7 @@ async def _request_channel_attach(
         )
     listen_mode = body.get("listen", "all")
     title = sanitize_string(slot.title or slot.key).strip()
-    request, code = channel.request_attach(
+    pending, code = channel.request_attach(
         requested_by=member.id,
         slot=slot_name,
         title=title,
@@ -151,11 +157,26 @@ async def _request_channel_attach(
         listen_mode=listen_mode if isinstance(listen_mode, str) else "",
         reason=sanitize_string(reason).strip(),
     )
-    if request is None:
+    if pending is None:
         error, status = _ATTACH_REQUEST_REFUSALS.get(code, ("attach request refused", 409))
         return web.json_response({"error": error, "code": code}, status=status)
+    from kiro_crew.dashboard.handlers_channel import _attach_slot
+
+    # Capacity counted the request while it was pending; release it first so the
+    # attach sees the place it reserved.
+    channel.attach_requests.pop(pending.id, None)
+    attached, refusal = _attach_slot(
+        request, channel, pending.slot, pending.role, pending.listen_mode.value
+    )
+    channel._broadcast_attach_requests()
+    if refusal is not None:
+        state.push_slots_update()
+        return refusal
+    channel._save()
     state.push_slots_update()
-    return web.json_response({"ok": True, "request": request.to_dict()})
+    return web.json_response(
+        {"ok": True, "request": pending.to_dict(), "agent": attached.to_dict()}
+    )
 
 
 async def api_session_channel(request: web.Request) -> web.Response:
@@ -244,7 +265,7 @@ async def api_session_channel(request: web.Request) -> web.Response:
             )
         if action == "request_attach":
             caller_slot = slots[0] if slots else None
-            return await _request_channel_attach(state, channel, member, caller_slot, body)
+            return await _request_channel_attach(request, state, channel, member, caller_slot, body)
         if action == "add_agent":
             role = body.get("role")
             task = body.get("task")

@@ -128,11 +128,10 @@ def session_channel_manage(name: str, args: dict[str, Any]) -> str:
         return f"Channel agent added: {agent.get('role', 'Agent')} ({agent.get('id', 'unknown')})."
     if action == "request_attach":
         pending = result.get("request") or {}
+        agent = result.get("agent") or {}
         return (
-            f"Attach request {pending.get('id', 'recorded')} filed for "
-            f"{pending.get('title') or pending.get('slot', 'the session')}. Membership has not "
-            "changed: the dashboard user decides in the channel UI, and the outcome arrives "
-            "as a channel system message."
+            f"Attached {pending.get('title') or pending.get('slot', 'the session')} as "
+            f"{agent.get('role', 'Agent')} ({agent.get('id', 'unknown')})."
         )
     return f"Channel member removed: {result.get('removed_member_id', 'unknown')}."
 

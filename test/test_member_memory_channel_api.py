@@ -56,6 +56,7 @@ def _crewmate_channel(env, *, coordinator: bool):
         return SimpleNamespace(
             key=key,
             title=title,
+            agent="",
             mode="",
             _app="",
             linked_session_key="",
@@ -80,8 +81,8 @@ def _crewmate_channel(env, *, coordinator: bool):
 
 
 @pytest.mark.asyncio
-async def test_crewmate_coordinator_files_an_attach_request(env):
-    """The point of request_attach: a crewmate coordinator assembles its channel."""
+async def test_crewmate_coordinator_attaches_a_session(env):
+    """A crewmate coordinator assembles its channel without a separate approval."""
     from kiro_crew.dashboard.handlers import sessions
 
     channel, member = _crewmate_channel(env, coordinator=True)
@@ -94,9 +95,10 @@ async def test_crewmate_coordinator_files_an_attach_request(env):
         )
     )
     assert response.status == 200, response.text
-    filed = json.loads(response.text)["request"]
-    assert filed["requested_by"] == member.id
-    assert len(channel.members) == 2
+    body = json.loads(response.text)
+    assert body["request"]["requested_by"] == member.id
+    assert body["agent"]["session_key"] == "dashboard:review-lane"
+    assert len(channel.members) == 3
 
 
 @pytest.mark.asyncio

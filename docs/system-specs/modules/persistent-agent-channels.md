@@ -84,28 +84,26 @@ user chat transcript.
 
 ### Coordinator Attach Requests
 
-Attaching an existing dashboard session stays a dashboard-user grant. The
-active coordinator may ask for one with `session_channel_manage`
-`action: request_attach`, naming an open chat-page session (slot name,
-`dashboard:<slot>` key, or the `dashboard_<slot>` history key `list_sessions`
-returns), an optional role, `listen` mode (default `all`, carried through to the attach) and a short
-reason. The gateway records an `AttachRequest` on the channel, persists it, and
-broadcasts `channel_attach_requests`; membership does not change. The
-requester is the caller's own membership, checked against the channel record's
-coordinator; no payload field names it. Pending requests count against channel
-capacity (the only bound on how many can be pending), a session can have one
-pending request,
-and the target must be an open chat-page slot in the caller's app — the same
-set the picker offers, so a crewmate desk or cron slot cannot be requested.
+The active coordinator attaches an existing dashboard session with
+`session_channel_manage` `action: request_attach`, naming an open chat-page
+session (slot name, `dashboard:<slot>` key, or the `dashboard_<slot>` history key
+`list_sessions` returns), an optional role, `listen` mode (default `all`) and a
+short reason. The gateway records an `AttachRequest`, then grants it in the same
+call through the picker's attach path, so membership changes at once and the
+reply names the new member. The requester is the caller's own membership,
+checked against the channel record's coordinator; no payload field names it.
+Capacity and the one-request-per-session rule apply as the request is recorded,
+and the target must be an open chat-page slot in the caller's app — the same set
+the picker offers, so a crewmate desk or cron slot cannot be attached.
 
-The dashboard renders each request as a card with Approve and Decline. The card
-calls the operator-authenticated
-`POST /api/channels/{id}/attach-requests/{rid}`, which is on neither internal
-path list, so an agent's internal-secret credential cannot resolve its own
-request. Approval runs the picker's attach path; if the slot has closed the
-request stays pending and the error is returned. Either outcome posts a
-system message mentioning the coordinator. A coordinator transfer or removal
-withdraws requests the new coordinator did not file, and a reload drops
+If the attach fails (the slot closed, or the channel is full), the error is
+returned and no request is left pending. A request pending from an earlier
+build renders as a card with Approve and Decline. The card calls the
+operator-authenticated `POST /api/channels/{id}/attach-requests/{rid}`, which is
+on neither internal path list. Approval runs the picker's attach path; if the
+slot has closed the request stays pending and the error is returned. Either
+outcome posts a system message mentioning the coordinator. A coordinator transfer
+or removal withdraws requests the new coordinator did not file, and a reload drops
 requests whose author is no longer coordinator.
 
 ### Prompt-Busy Recovery
