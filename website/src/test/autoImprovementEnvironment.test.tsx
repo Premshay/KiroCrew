@@ -26,6 +26,7 @@ let writeResponse: Response
 let checkResponse: () => Promise<Response>
 let writes: Array<{ path: string; body: Record<string, unknown> }>
 let checkRecord: Record<string, unknown>
+let survey: Record<string, unknown>
 
 /** The server's check: the POST keeps a record of the outcome that GET returns. */
 async function recordCheck(body: Record<string, unknown>): Promise<Response> {
@@ -64,6 +65,7 @@ beforeEach(() => {
   checkResponse = async () => response({ ok: true, tests_collected: 4 })
   writes = []
   checkRecord = { state: 'none' }
+  survey = { revision: 'abc123', evidence: ['pytest.ini'], warnings: [], workloads: [], environment: null }
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     if (init?.method === 'POST' || init?.method === 'PUT') {
@@ -72,6 +74,7 @@ beforeEach(() => {
       return path.endsWith('/environment/check') ? recordCheck(body) : writeResponse
     }
     if (path.endsWith('/environment/check')) return response(checkRecord)
+    if (path.endsWith('/repository/survey')) return response(survey)
     if (path.endsWith('/branches')) return response({ branches: ['main', 'feature'] })
     if (path.endsWith('/run')) return response({ status, stats: { publication }, ...(status === 'error' ? { error: 'Previous run failed' } : {}) })
     return response(config)
@@ -80,6 +83,121 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('test environment setup', () => {
+  it('stages a suggested bug scope without executing anything or replacing the environment', async () => {
+    survey.workloads = [{ id: 'bugs', label: 'Import bugs', description: 'Check imports', source: 'declaration', config: { track: 'bug', editAllowlist: ['imports/**'], focusedTestPaths: ['tests/imports'] } }]
+    survey.environment = { kind: 'runner', runnerPath: 'scripts/tests.sh', variables: { IMAGE: 'suggested' } }
+    const view = mount({ ...config, track: 'perf', benchmarkCommand: 'old benchmark', benchmarkCanaryCommand: 'old control', benchmarkProtectedPaths: ['old'], maxHours: 3 })
+    await readyToEdit()
+    const apply = await screen.findByRole('button', { name: 'Use workload' })
+    expect(writes).toEqual([])
+    fireEvent.click(apply)
+    expect(screen.getByLabelText(/Files the agent may edit/)).toHaveValue('imports/**')
+    expect(screen.getByLabelText(/Benchmark command/)).toHaveValue('')
+    expect(screen.getByLabelText(/Slowed control command/)).toHaveValue('')
+    expect(screen.getByLabelText(/Protected benchmark files/)).toHaveValue('')
+    expect(executable()).toHaveValue('/env/a/bin/python')
+    expect(screen.queryByRole('button', { name: 'Calibrate' })).not.toBeInTheDocument()
+    expect(writes).toEqual([])
+    expect(apply).toBeDisabled()
+    fireEvent.click(save())
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0]).toMatchObject({ path: '/api/apps/auto-improvement/config', body: { track: 'bug', editAllowlist: ['imports/**'], focusedTestPaths: ['tests/imports'], benchmarkCommand: '', scopeDiffBase: '', maxHours: 3, measureReps: null, testEnvironment: { kind: 'python', pythonExecutable: '/env/a/bin/python' } } })
+    const saved = { ...config, ...writes[0].body }
+    view.unmount()
+    mount(saved)
+    await readyToEdit()
+    expect(screen.getByLabelText(/Files the agent may edit/)).toHaveValue('imports/**')
+    expect(screen.getByLabelText(/Focused pytest paths/)).toHaveValue('tests/imports')
+  })
+
+  it('applies a performance workload with its own protected benchmark and clears old diff scope', async () => {
+    survey.workloads = [{ id: 'perf', label: 'Import throughput', description: 'Measure fixed imports', source: 'declaration', config: { track: 'perf', benchmarkCommand: 'python bench.py', benchmarkCanaryCommand: 'python bench.py --slow', benchmarkProtectedPaths: ['bench.py'], benchmarkResultMode: 'structured', editAllowlist: ['imports/**'] } }]
+    mount({ ...config, scopeDiffBase: 'HEAD~20', benchmarkCommand: 'stale' })
+    await readyToEdit()
+    fireEvent.click(await screen.findByRole('button', { name: 'Use workload' }))
+    expect(screen.getByLabelText(/Review changes since/)).toHaveValue('')
+    expect(screen.getByLabelText(/Benchmark command/)).toHaveValue('python bench.py')
+    expect(screen.getByLabelText(/Protected benchmark files/)).toHaveValue('bench.py')
+    expect(screen.getByRole('button', { name: 'Calibrate' })).toBeDisabled()
+    expect(writes).toEqual([])
+    fireEvent.click(save())
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0].body).toMatchObject({ track: 'perf', benchmarkCommand: 'python bench.py', benchmarkResultMode: 'structured', scopeDiffBase: '' })
+  })
+
+  it('requires an explicit action to stage a suggested environment', async () => {
+    survey.environment = { kind: 'runner', runnerPath: 'scripts/tests.sh', variables: { IMAGE: 'suggested' } }
+    mount()
+    await readyToEdit()
+    fireEvent.click(await screen.findByText('Suggested test environment'))
+    expect(executable()).toHaveValue('/env/a/bin/python')
+    fireEvent.click(screen.getByRole('button', { name: 'Use environment' }))
+    expect(screen.getByLabelText(/Nonsecret variables/)).toHaveValue('IMAGE=suggested')
+    expect(writes).toEqual([])
+    fireEvent.click(save())
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0].body.testEnvironment).toMatchObject({ kind: 'runner', runnerPath: 'scripts/tests.sh', variables: { IMAGE: 'suggested' } })
+  })
+
+  it('preserves the current runner pin and host variables when applying suggested defaults', async () => {
+    survey.environment = { kind: 'runner', runnerPath: 'scripts/tests.sh', variables: { ATLAS_TEST_TIMEOUT_SECONDS: '2400', ATLAS_TEST_IMAGE: 'untrusted-suggestion' } }
+    mount({ ...config, testEnvironment: { kind: 'runner', runnerPath: 'scripts/tests.sh', runnerCommit: 'a'.repeat(40), pythonExecutable: 'python3', variables: { ATLAS_TEST_IMAGE: 'sha256:approved' } } })
+    await readyToEdit()
+    fireEvent.click(await screen.findByText('Suggested test environment'))
+    fireEvent.click(screen.getByRole('button', { name: 'Use environment' }))
+    expect(screen.getByLabelText(/Nonsecret variables/)).toHaveValue('ATLAS_TEST_TIMEOUT_SECONDS=2400\nATLAS_TEST_IMAGE=sha256:approved')
+    fireEvent.click(save())
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0].body.testEnvironment).toMatchObject({ runnerCommit: 'a'.repeat(40), pythonExecutable: 'python3', variables: { ATLAS_TEST_IMAGE: 'sha256:approved', ATLAS_TEST_TIMEOUT_SECONDS: '2400' } })
+  })
+
+  it('refreshes repository evidence without executing or applying a workload', async () => {
+    mount()
+    await readyToEdit()
+    await screen.findByText(/No workload found/)
+    survey = { ...survey, workloads: [{ id: 'new', label: 'Newly discovered area', description: 'Latest local revision', source: 'detected', config: { track: 'bug' } }] }
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh suggestions' }))
+    expect(await screen.findByText('Latest local revision')).toBeInTheDocument()
+    expect(writes).toEqual([])
+  })
+
+  it('protects unsaved edits from late survey data and refuses applying a preset during a run', async () => {
+    const view = mount()
+    await readyToEdit()
+    fireEvent.change(screen.getByLabelText(/Files the agent may edit/), { target: { value: 'my-area/**' } })
+    survey = { ...survey, workloads: [{ id: 'bugs', label: 'Other area', description: '', source: 'detected', config: { editAllowlist: ['other/**'] } }] }
+    await act(async () => { await view.client.invalidateQueries({ queryKey: ['auto-improvement-repository-survey'] }) })
+    expect(screen.getByLabelText(/Files the agent may edit/)).toHaveValue('my-area/**')
+    expect(await screen.findByRole('button', { name: 'Use workload' })).toBeDisabled()
+    view.unmount()
+    status = 'running'
+    mount()
+    expect(await screen.findByRole('button', { name: 'Use workload' })).toBeDisabled()
+    expect(writes).toEqual([])
+  })
+
+  it('saves numeric budgets and timeouts and rejects invalid counts without a request', async () => {
+    mount()
+    await readyToEdit()
+    fireEvent.click(screen.getByText('Advanced settings'))
+    fireEvent.change(screen.getByLabelText('Maximum cycles'), { target: { value: '1.5' } })
+    fireEvent.click(save())
+    expect(await screen.findByText(/Maximum cycles must be between/)).toBeInTheDocument()
+    expect(writes).toEqual([])
+    fireEvent.change(screen.getByLabelText('Maximum cycles'), { target: { value: '7' } })
+    fireEvent.change(screen.getByLabelText('Candidate check timeout (seconds)'), { target: { value: '2400' } })
+    fireEvent.click(save())
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0].body).toMatchObject({ maxCycles: 7, suiteTimeoutSeconds: 2400, measureReps: null })
+  })
+
+  it('shows measured check duration without claiming collection predicts suite execution', async () => {
+    checkResponse = async () => response({ ok: true, tests_collected: 4, duration_seconds: 42, timings: { interpreter: 2, collection: 40 } })
+    mount()
+    await readyToEdit()
+    fireEvent.click(check())
+    expect(await screen.findByText(/Last check:.*Collection time is not suite execution time/)).toBeInTheDocument()
+  })
   it.each([
     ['running', 'pending', 'Checking full regression before publication'],
     ['done', 'published', 'Published'],
@@ -152,6 +270,27 @@ describe('test environment setup', () => {
     expect(screen.getByText('Ready')).toBeInTheDocument()
   })
 
+  it('hides readiness and measured results after changing the workload, restoring them when undone', async () => {
+    checkResponse = async () => response({ ok: true, tests_collected: 4, duration_seconds: 42 })
+    mount({ ...config, track: 'perf', focusedTestPaths: ['tests/imports'] })
+    await readyToEdit()
+    fireEvent.click(check())
+    await screen.findByText('Ready')
+    expect(screen.getByText('4 tests collected')).toBeInTheDocument()
+    expect(screen.getByText(/Last check:/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Calibrate' })).toBeEnabled()
+    fireEvent.change(screen.getByLabelText(/Focused pytest paths/), { target: { value: 'tests/other' } })
+    expect(screen.getByText('Unchecked')).toBeInTheDocument()
+    expect(screen.queryByText('Ready')).not.toBeInTheDocument()
+    expect(screen.queryByText('4 tests collected')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Last check:/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Calibrate' })).toBeDisabled()
+    fireEvent.change(screen.getByLabelText(/Focused pytest paths/), { target: { value: 'tests/imports' } })
+    expect(screen.getByText('Ready')).toBeInTheDocument()
+    expect(screen.getByText('4 tests collected')).toBeInTheDocument()
+    expect(screen.getByText(/Last check:/)).toBeInTheDocument()
+  })
+
   it('shows the last check after the page is opened again', async () => {
     const first = mount()
     await readyToEdit()
@@ -161,7 +300,7 @@ describe('test environment setup', () => {
     first.unmount()
     mount()
     expect(await screen.findByText('Ready')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Calibrate/ })).not.toBeDisabled()
+    expect(screen.queryByRole('button', { name: /Calibrate/ })).not.toBeInTheDocument()
   })
 
   it('keeps the form busy while the server is still checking and says so', async () => {

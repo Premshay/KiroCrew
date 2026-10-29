@@ -40,16 +40,17 @@ from . import commit as commit_mod
 from . import (
     deps,
     ledger_admin,
+    notify,
     pr_checks,
     pr_watchers,
     profile_normalize,
     progress,
     runner,
-    notify,
     runner_source,
     sse,
     store,
 )
+from .run_settings import WRITABLE_CONFIG_KEYS as _CONFIG_WRITABLE
 
 logger = logging.getLogger(__name__)
 
@@ -61,77 +62,6 @@ Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 #: trusting the producer. Truncation is reported, never silent.
 _MAX_DIFF_CHARS = 200_000
 _MAX_BODY_CHARS = 40_000
-
-#: Config keys a client may set. An allowlist, not a merge: the original learned
-#: this the hard way — ``clone``/``target_url`` must not be settable through the
-#: generic config PUT, because they decide which repository the agent is turned
-#: loose on. Those move only through the dedicated setup endpoint.
-_CONFIG_WRITABLE = frozenset(
-    {
-        "branch",
-        "profile",
-        "scopeDiffBase",
-        "directCommit",
-        "measureReps",
-        "calibrationReps",
-        "testEnvironment",
-        "track",
-        "benchmarkCommand",
-        "benchmarkCanaryCommand",
-        "benchmarkResultMode",
-        "benchmarkProtectedPaths",
-        "focusedTestPaths",
-        "fullRegressionTimeoutSeconds",
-        "bandCapMs",
-        "forceBugSeeds",
-        "autoDraftPr",
-        # Opt-in: mark a fully-green DRAFT pull request ready-for-review. Safe to
-        # expose because it can only ever flip a draft to ready — it never merges,
-        # never enables auto-merge, and the gate (pr_watchers.auto_publish_gate) is
-        # fail-closed and not configurable. Default OFF.
-        "autoPublish",
-        # Opt-in: let a polled GET /watchers PROMOTE watchers for filed pull requests whose
-        # checks went red later. Default OFF, and deliberately so — a watcher's prompt is
-        # built from pull-request comment text an outsider can write, it runs with an
-        # auto-approved shell, and the strict sandbox hides credential stores but does NOT
-        # isolate the network. Auto-starting that from a READ meant the operator never had a
-        # consent moment. With this off, reading the list is read-only. Raised by the GPT
-        # review; the auto-start path was found while re-deriving D-105's own claim.
-        "watcherAutoStart",
-        # Opt-in: acknowledge the watcher's residual NETWORK-EGRESS risk before any watcher
-        # agent is allowed to run. Default OFF, fail-closed. The watcher agent is UNATTENDED,
-        # its prompt embeds outsider-writable PR-comment text, and it needs `gh` (host auth +
-        # network) to read PR state — so it CANNOT be run under a strict credential+network
-        # sandbox without deleting the feature (D-84). The provider-runner path confirms the
-        # sandbox hides credential DIRECTORIES but does NOT isolate the network (D-105), so an
-        # injected instruction could read an exposed credential and send it out. Rather than
-        # weaken the sandbox or silently accept that, `_make_runner` REFUSES to build a runner
-        # unless this flag is set — the operator states, once and explicitly, that they point
-        # watchers only at repositories whose PR comments they would be willing to execute.
-        # Same opt-in shape as `watcherAutoStart`. Raised by the GPT review.
-        "watcherAcceptEgressRisk",
-        # Explicit consent for unattended repository execution when the gateway's
-        # effective sandbox is below strict and credential stores remain visible.
-        # Default OFF. The runner checks this before creating member assignments.
-        "acceptUnsandboxedAgentRisk",
-        # Run budget. Safe to expose: these only ever SHRINK or grow how much work
-        # one run does; none of them can retarget the repository or relax a gate.
-        # A slow suite makes the defaults expensive, so an operator needs to be
-        # able to bound a run without editing config.json by hand.
-        "maxCycles",
-        "quiesceAfter",
-        "maxHours",
-        "maxCostUsd",
-        "proposerWide",
-        "proposerDeep",
-        "reproduceReps",
-        "canaryAdvisory",
-        # Confine edits to specific globs (blast-radius control). Safe to expose:
-        # it can only NARROW what the agent may touch, never widen past the
-        # off-limits fence, and never retarget the repository.
-        "editAllowlist",
-    }
-)
 
 
 def _require_enabled(handler: Handler) -> Handler:
@@ -313,23 +243,11 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
         except ValueError as exc:
             return web.json_response({"code": "invalid_config", "error": str(exc)}, status=400)
 
-    # Refuse while a run is live: `branch` is WRITABLE and `store.workspace_key()` reads config
-    # FRESH, keying on `target_url` + `branch` — so a mid-run edit moves the whole artifact set
-    # (ruler, results, PR queue, profiles) to a different key while the loop is still writing to
-    # it. Measured: flipping `branch` from `origin/main` to `origin/feature` moved the key from
-    # `..._repoa__main` to `..._repoa__feature`. The calibrate path was already pinned to its
-    # LAUNCHED config for this reason; this is the write side of the same hazard.
-    # Raised by the GPT review of this branch.
+    # Config determines artifact paths, so it must remain fixed throughout a run.
     if busy := await _refuse_while_running("changing config would move the run's workspace."):
         return busy
 
-    # Under the clone lock with an in-lock RE-CHECK, exactly like `_handle_setup_clone`. The
-    # guard above only proves no run was live when the request arrived; a run that starts while
-    # this write is in flight would have its workspace moved underneath it, because
-    # `store.workspace_key()` reads config FRESH on every path lookup — so the ruler, results,
-    # ledger and PR queue can end up in DIFFERENT workspaces within one run. Fourth handler to
-    # need this pattern, so it reuses the same helper rather than hand-rolling a copy.
-    # Raised by the GPT review.
+    # Recheck under the clone lock: a run can start while this request waits.
     def _apply() -> dict[str, Any] | None:
         with commit_mod.clone_lock():
             if _run_is_active():
@@ -338,8 +256,10 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
             previous = dict(current)
             current.update({k: v for k, v in patch.items() if k in _CONFIG_WRITABLE})
             from ..profiles.github_repo.profile import normalize_measurement_config
+            from .run_settings import normalize_run_settings
 
             current.update(normalize_measurement_config(current))
+            current.update(normalize_run_settings(current))
             try:
                 runner_source.prepare_runner(current, pin=True)
             except RuntimeError as exc:
@@ -452,7 +372,8 @@ async def _handle_environment_check(request: web.Request) -> web.StreamResponse:
     fingerprint = patch.get("fingerprint", "")
     if not isinstance(fingerprint, str) or len(fingerprint) > _MAX_CHECK_FINGERPRINT:
         return web.json_response(
-            {"code": "invalid_config", "error": "fingerprint must be a short string"}, status=400
+            {"code": "invalid_config", "error": "fingerprint must be a short string"},
+            status=400,
         )
     notify.bind(request)
     record = {"state": "checking", "fingerprint": fingerprint, "startedAt": time.time()}
@@ -1865,6 +1786,9 @@ def register_routes(app: web.Application) -> None:
     )
     add("POST", f"{_PREFIX}/setup-clone", _require_enabled(_handle_setup_clone))
     add("GET", f"{_PREFIX}/branches", _require_enabled(_handle_branches))
+    from .repository_routes import handle_repository_survey
+
+    add("GET", f"{_PREFIX}/repository/survey", _require_enabled(handle_repository_survey))
     add("GET", f"{_PREFIX}/pr-status", _require_enabled(_handle_pr_status))
     add("POST", f"{_PREFIX}/run", _require_enabled(_handle_run_start))
     add("GET", f"{_PREFIX}/run", _require_enabled(_handle_run_status))

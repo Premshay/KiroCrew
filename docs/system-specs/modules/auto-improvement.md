@@ -24,6 +24,40 @@ made, are recorded in
 
 ## Discovery targeting
 
+### Guided repository setup
+
+`GET /repository/survey` reads the configured local branch's committed tree under
+the clone lock after checking isolation. It does not fetch, execute repository
+code, install dependencies or change configuration. Its `revision` identifies the
+snapshot inspected. It reports framework/service references, matched Python
+source/test areas and possible performance files; names alone never establish a
+working benchmark or a runtime estimate. Errors are visible without partial apply.
+
+An optional `.kirocrew/auto-improvement.json` declaration supplies `version: 1`,
+`environment` and `workloads`. Each workload has `id`, `label`, `description` and
+`config`. Configuration uses existing measurement fields plus `editAllowlist`;
+unknown keys, duplicate IDs, unsafe/untracked paths, symlinks and declarations over
+64 KiB are refused. At most 40 workloads and 100 paths per field are accepted.
+Declared performance workloads require a benchmark, slowed control and protected
+paths. A declared runner is a tracked executable `runnerPath`, not a host path or
+pin. Saving through the existing configuration route pins it. Repository content
+is a suggestion, never execution authorization.
+
+Setup stages a selected workload for review before Save. Switching to a bug
+workload clears the previous benchmark/control settings. Environment suggestions
+are separate from workload selection so an installed runner and its variables are
+not silently replaced. Edit paths, budgets and measurement settings are remembered
+per repository; switching repositories clears the branch and diff-base ref, which
+must be selected together again. The measured objective remains runtime in seconds; query/write limits
+belong in protected correctness tests. Test consolidation is outside this loop.
+
+`suiteTimeoutSeconds` bounds routine tests, reproduction, collection, benchmark
+samples and profiling. It defaults to 900 and accepts finite positive values up
+to 86400, excluding booleans. It is included in the measurement identity, so a
+change invalidates calibration. `fullRegressionTimeoutSeconds` remains independent.
+Environment results expose actual step `timings` and total `duration_seconds`,
+including on failure. Collection duration is never a suite-runtime estimate.
+
 Without a diff scope or edit allowlist, discovery lists all Git-tracked product
 Python files, including flat and Django layouts. It uses the same value ordering,
 per-cycle rotation, complete focus-list rendering, and eight-read budget as scoped
@@ -73,6 +107,9 @@ hooks, the disable path has to spell it out.
 | PUT | `/config` | owner | update configuration (allowlisted keys only) |
 | POST | `/setup-clone` | owner | clone or re-point the working repository the run operates on |
 | GET | `/branches` | enabled | branches available in that clone, for choosing a base |
+| GET | `/repository/survey` | enabled | committed repository evidence and suggested workloads; no execution |
+| POST | `/environment/check` | enabled | start the authenticated background environment check |
+| GET | `/environment/check` | enabled | read its saved result |
 | GET | `/pr-status?url=&refresh=` | owner | live PR status, CI checks, watcher verdict |
 | POST | `/run` | owner | start an improvement run |
 | GET | `/run` | enabled | the in-flight run's state |
@@ -101,7 +138,7 @@ hooks, the disable path has to spell it out.
 | PUT | `/sessions/{key}` | owner | link/update a session (drives resume) |
 | DELETE | `/sessions/{key}` | owner | forget a session link |
 
-`register_routes` mounts exactly these 32 routes. No test asserts the mounted set
+`register_routes` mounts the routes above. No test asserts the mounted set
 against this table, so an added endpoint has to be added here by hand in the same
 change. Beside the routes, `register_routes` appends three gateway lifecycle
 hooks: `_bind_watcher_loop` on startup (it binds the watcher registry to the
@@ -1556,7 +1593,8 @@ measurement settings. A second check while one runs answers 409
 `check_in_progress`.
 
 `GET /environment/check` returns the last record from
-`data/environment-check.json`: `state` is `none`, `checking`, `ready`, `blocked`,
+the runtime `environment-check.json` file in the app data directory: `state` is
+`none`, `checking`, `ready`, `blocked`,
 `cancelled` or `interrupted`, with the `fingerprint`, timestamps and the check
 `result`. A `checking` record with no live worker reads as `interrupted`. Setup
 applies a record only when its fingerprint matches the current form, polls while
@@ -1588,7 +1626,8 @@ explicit accessible names.
 They are remembered per repository. Changes invalidate calibration and the UI's
 readiness result. The benchmark control proves sensitivity, not correctness.
 
-Explicit focused paths only narrow iteration checks. An opted-in finalist is
+Explicit focused paths and test scope inferred from the edit allowlist only narrow
+iteration checks. A finalist from either narrowed scope is
 provisionally committed, then runs unrestricted `pytest .` through the selected
 isolated environment before any kept record, queue entry or publication. Only
 exit zero qualifies; there are no baseline-failure waivers or serial retries.
@@ -1598,8 +1637,8 @@ and checks Stop, budget, isolation and unchanged tree afterward. Stop does not
 interrupt the subprocess, but prevents acceptance when it returns.
 
 Direct-push rebases repeat full regression on the changed tree. Publication
-rechecks the verified tree and budget. Profiles without explicit focused paths
-retain their existing checks without an extra full-suite invocation.
+rechecks the verified tree and budget. Profiles without narrowed test scope retain
+their existing checks without an extra full-suite invocation.
 The PR recipe contract declares its durable queue directory. GitHub recipes expose
 an optional typed publication guard; when supplied, only literal `True` permits
 publication, and exceptions never authorize it.

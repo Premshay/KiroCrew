@@ -190,6 +190,11 @@ def remember_test_environment(config: dict) -> None:
     measurements = dict(config.get("repositoryMeasurements") or {})
     measurements[repository_key(config)] = normalize_measurement_config(config)
     config["repositoryMeasurements"] = measurements
+    from .run_settings import normalize_run_settings
+
+    plans = dict(config.get("repositoryRunSettings") or {})
+    plans[repository_key(config)] = normalize_run_settings(config)
+    config["repositoryRunSettings"] = plans
 
 
 def restore_test_environment(config: dict) -> None:
@@ -201,6 +206,10 @@ def restore_test_environment(config: dict) -> None:
 
     measurements = config.get("repositoryMeasurements") or {}
     config.update(normalize_measurement_config(measurements.get(repository_key(config), {})))
+    from .run_settings import normalize_run_settings
+
+    plans = config.get("repositoryRunSettings") or {}
+    config.update(normalize_run_settings(plans.get(repository_key(config), {})))
 
 
 def workspace_dir() -> Path:

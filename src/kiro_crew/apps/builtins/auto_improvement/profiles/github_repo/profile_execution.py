@@ -438,7 +438,11 @@ def _time_suite(
 
 
 def _collected_count(
-    tree: Path, environment: TestEnvironment | None = None, run: Callable | None = None
+    tree: Path,
+    environment: TestEnvironment | None = None,
+    run: Callable | None = None,
+    *,
+    timeout: float = _QUICK_TIMEOUT_S,
 ) -> int:
     """Number of tests pytest collects in ``tree``, or -1 when it cannot be read.
 
@@ -450,7 +454,7 @@ def _collected_count(
         proc = (run or (environment.run if environment else _run))(
             _pytest_argv("-q", "--collect-only", environment=environment),
             cwd=root,
-            timeout=_QUICK_TIMEOUT_S,
+            timeout=timeout,
             env=_measure_env(root),
         )
     except (OSError, subprocess.SubprocessError, ValueError):

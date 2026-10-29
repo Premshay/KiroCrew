@@ -107,9 +107,15 @@ def clone_lock() -> threading.RLock:
 
 
 def manual_regression_required(config: dict, fp: str) -> bool:
+    from ..profiles.github_repo.profile import _suite_scope_for_globs
+
     return bool(
         config.get("focusedTestPaths")
         or (store.pr_queue_dir() / f"{fp}.regression-required").exists()
+        or (
+            config.get("clone")
+            and _suite_scope_for_globs(Path(config["clone"]), config.get("editAllowlist"))
+        )
     )
 
 

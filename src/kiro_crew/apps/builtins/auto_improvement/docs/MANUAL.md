@@ -141,7 +141,12 @@ source collects at least one baseline test with a successful exit. Partial colle
 followed by an import error is a failure. Runs and calibration repeat this check
 before spending agent work. This is collection readiness, not proof all tests pass.
 
-Install the runner outside the app's managed checkout tree, without symlink aliases
+Enter a repository-relative runner path to have the app pin and maintain its own
+copy. Save pins the selected branch commit; updating that pin requires saving the
+runner update explicitly and recalibrating performance workloads. An existing
+absolute runner path remains supported.
+
+Install an absolute-path runner outside the app's managed checkout tree, without symlink aliases
 or hard links. Keep its code and dependencies operator-controlled; do not load
 measurement control logic from candidate files. Its recorded hash and file identity
 must remain unchanged throughout a run. A runner's Docker client sandbox does not
@@ -160,11 +165,13 @@ variables are rejected. No shell interpolation or template language is supported
 
 API: `PUT /api/apps/auto-improvement/config` accepts `testEnvironment` with `kind`
 (`gateway`, `python`, or `runner`), `pythonExecutable` (absolute in Python mode,
-`python` by default in runner mode), absolute `runnerExecutable` (runner only),
+`python` by default in runner mode), absolute `runnerExecutable` or repository-relative `runnerPath` (runner only),
 and `variables`. Legacy container selections and invalid values reject the whole
 patch. `POST /api/apps/auto-improvement/environment/check` accepts `{}` for the saved
 selection or `{"testEnvironment": {...}}` to check an unsaved selection. It returns
-`ok`, `environment`, `diagnostic`, and, on successful collection, `tests_collected`.
+202 while the background job runs. `GET` on the same endpoint returns its saved
+state and result: `ok`, `environment`, `diagnostic`, measured `timings`,
+`duration_seconds` and, on successful collection, `tests_collected`.
 Failure diagnostics include stage, return code, and bounded redacted stdout/stderr.
 Both operations refuse during an active run; checks also hold the clone lock.
 
@@ -172,6 +179,68 @@ Both operations refuse during an active run; checks also hold the clone lock.
 
 
 ### Configure measurements and focused tests
+
+Start with the repository recommendations in Setup. The survey reads the selected
+local Git revision without running code. Review its evidence, choose a workload,
+then save the staged settings. Detected bug areas match source and test folders;
+they are suggestions, not a complete coverage map. A performance filename alone
+is not enough to infer a trustworthy benchmark command.
+
+Maintainers can declare tested recipes once in `.kirocrew/auto-improvement.json`.
+For example, adapt these paths and commands to tracked files in your repository:
+
+```json
+{
+  "version": 1,
+  "environment": {
+    "kind": "runner",
+    "runnerPath": "scripts/test_runner.sh"
+  },
+  "workloads": [{
+    "id": "import-performance",
+    "label": "Speed up imports",
+    "description": "Measure a fixed import fixture while retaining correctness tests.",
+    "config": {
+      "track": "perf",
+      "editAllowlist": ["imports/**"],
+      "focusedTestPaths": ["tests/imports"],
+      "benchmarkCommand": "python benchmarks/imports.py --mode normal",
+      "benchmarkCanaryCommand": "python benchmarks/imports.py --mode slowed-control",
+      "benchmarkResultMode": "structured",
+      "benchmarkProtectedPaths": ["benchmarks"],
+      "suiteTimeoutSeconds": 900,
+      "fullRegressionTimeoutSeconds": 2400
+    }
+  }]
+}
+```
+
+A bug recipe needs `track: "bug"`, edit paths and focused tests; omit benchmark
+fields. Declarations must be committed to appear in the survey. The survey checks
+the selected local ref, so refresh after the environment check fetches a newer
+branch. It never executes a declaration. Applying a recommendation stages the
+form; saving, checking and running remain explicit actions. Keep machine-specific
+image IDs in saved environment settings, not in the repository declaration.
+
+Choose the task by the outcome you need:
+
+| Goal | Configure | Acceptance |
+|---|---|---|
+| Fix bugs in one area | Bug track, edit paths and focused tests | Reproducing test fails on the original and passes on the fix; regression stays green |
+| Review recent changes | Bug track and a diff-base ref, optionally narrowed to an area | Same bug proof, restricted to changed code |
+| Speed up a job or request | Performance track, fixed workload, slower control and protected benchmark files | Calibrated runtime improvement plus unchanged correctness |
+| Speed up test execution | Performance track on a stable test selection | Same tests and assertions pass faster; removing or weakening tests is not an accepted optimization |
+
+For database work, keep query-count, write-count and tenant-isolation assertions
+in protected tests. The performance metric is duration in seconds; it does not
+accept an arbitrary count as seconds. Fixes may span files inside the edit scope,
+but large architectural changes still need human design and review.
+
+Use the run budget to bound cycles, time and reported cost. Cost limits depend on
+the backend reporting monetary usage; time and cycle limits still apply when it
+does not. Advanced settings retain explicit commands and paths for repositories
+that need them. An environment suggestion is applied separately and must not
+replace a configured runner or variables without review.
 
 The **Measurements** section selects bug fixes or performance work. To measure a
 specific workload, enter its Python or pytest benchmark command and a separate
@@ -197,15 +266,19 @@ per line, under **Focused pytest paths**. These narrow iteration checks only.
 Before accepting a finalist, the app commits it provisionally and runs unrestricted
 `pytest .` in the selected environment. All tests must pass; pre-existing failures
 are not waived. The separate **Full regression timeout** defaults to 900 seconds.
+The routine check timeout also defaults to 900 seconds and can be changed in
+Setup. If the repository runner imposes its own lower timeout, raise that limit
+too. A larger timeout does not make a noisy workload suitable for measurement.
 Remove `PYTEST_ADDOPTS` from environment variables when using focused paths;
 otherwise it could silently narrow the final suite and the configuration is refused.
 Choose a timeout appropriate to your repository and allow room for it plus runner
 cleanup within the run budget. Insufficient budget refuses the finalist.
 
-Save the settings, check the environment, then calibrate. Settings are remembered
+Save the settings and check the environment; calibrate only for performance work. Settings are remembered
 per repository; changing them invalidates readiness and calibration. Without
 focused paths, the app retains its existing verification flow without an extra
-full regression. With a custom benchmark, the readiness check runs that workload
+full regression unless the edit allowlist also infers a narrower test selection.
+With a custom benchmark, the readiness check runs that workload
 instead of collecting the suite.
 
 Stop prevents acceptance after the running regression returns; it does not kill
@@ -219,11 +292,10 @@ for an existing marked finalist. Source revision or runner/interpreter identity
 changes invalidate calibration, including when provenance cannot be read.
 
 
-## 3. Calibrate the ruler (do this first)
+## 3. Calibrate the ruler for performance work
 
 A run takes the **bug track** by default; it needs no ruler (see the end of this
-section). The **perf track** runs only when `config.json` sets `track` to `"perf"` by
-hand — `track` is not settable through the config API or the UI. For a perf run, click
+section). Select the **perf track** in Setup. For a perf run, click
 **Calibrate** before your first run.
 
 Calibration measures your suite repeatedly to learn two things:
@@ -242,12 +314,15 @@ app exists to refuse. The bug track is unaffected — it skips ruler pre-flight 
 because its RED→GREEN regression gate is the verdict and it has no noise band.
 
 > A repository whose suite runs in about the time its own collection takes cannot prove a
-> perf win this way. Use the app for the bug track only, or set `canaryAdvisory` to
-> warn-and-continue if you accept that the resulting perf numbers come from an instrument
-> that was never proven on this repo. A custom `benchmarkCommand` (set by editing
-> `config.json`; the config API does not accept it) is never canary-certified, so with the
-> default strict canary a perf run that uses it halts; it is usable only together with
-> `canaryAdvisory: true`.
+> perf win this way. Prefer a representative benchmark with an explicit slower control.
+> Custom benchmarks support strict calibration through the control command in Setup.
+> Keep `canaryAdvisory` off: a failed sensitivity check should stop performance work.
+
+Environment checks and calibration continue when you leave the page and notify you
+when they finish. Setup shows the saved matching check result when reopened.
+Check durations are measured, not predictions. Test collection time does not tell
+you how long execution or calibration will take. Start with one small workload;
+increase the scope only after observing its actual cost and noise.
 
 ---
 
@@ -344,8 +419,9 @@ at least one check actually run**, no unresolved comments.
 | `watcherAcceptEgressRisk` | off | Acknowledge a watcher's residual network-egress risk; no watcher runs without it (§8). |
 | `acceptUnsandboxedAgentRisk` | off | The explicit risk decision for unattended assignments outside a `strict` sandbox (§1). |
 
-The UI sets the repository, branch and a few run controls; most keys in this table are
-set through `PUT /api/apps/auto-improvement/config`. Some keys are deliberately **not**
+Setup exposes goals, edit paths, diff base, test paths, timeouts and run budgets.
+Additional keys remain available through `PUT /api/apps/auto-improvement/config`.
+Some keys are deliberately **not**
 settable through the config API — `clone` and
 `target_url` decide which repository the agent is turned loose on, so they move only
 through Connect. Rejected keys are echoed back rather than silently dropped.

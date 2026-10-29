@@ -6,6 +6,15 @@ import ErrorNotice from "../../components/ErrorNotice";
 import SimpleSelect from "../../components/SimpleSelect";
 import { Badge, Btn, Input, PanelSectionHeader } from "../../components/ui";
 import { i18nT } from "../../i18n/t";
+import { fmtUnit } from "../../i18n/format";
+import WorkloadRecommendations from "./WorkloadRecommendations";
+import {
+  invalidNumber,
+  measurementSettings,
+  NUMBER_SETTINGS,
+  settingsPayload,
+  workloadSettings,
+} from "./measurementSettings";
 
 const STATUS_LABEL_KEYS = {
   blocked: "testEnvironment.blocked",
@@ -27,28 +36,12 @@ export interface TestEnvironment {
   variables?: Record<string, string>;
 }
 
-function measurementSettings(config: Record<string, unknown>) {
-  return {
-    track: String(config.track ?? "bug"),
-    benchmarkCommand: String(config.benchmarkCommand ?? ""),
-    benchmarkCanaryCommand: String(config.benchmarkCanaryCommand ?? ""),
-    benchmarkResultMode: String(config.benchmarkResultMode ?? "wall"),
-    benchmarkProtectedPaths: (
-      (config.benchmarkProtectedPaths as string[] | undefined) ?? []
-    ).join("\n"),
-    focusedTestPaths: (
-      (config.focusedTestPaths as string[] | undefined) ?? []
-    ).join("\n"),
-    fullRegressionTimeoutSeconds: String(
-      config.fullRegressionTimeoutSeconds ?? 900,
-    ),
-  };
-}
-
 interface CheckResult {
   ok: boolean;
   diagnostic?: string | { stdout?: string; stderr?: string };
   tests_collected?: number;
+  duration_seconds?: number;
+  timings?: Record<string, number>;
 }
 
 /** The server's record of the last environment check, which outlives this page. */
@@ -235,18 +228,7 @@ export default function TestEnvironmentPanel({
         "/config",
         {
           testEnvironment: environment,
-          ...measurement,
-          benchmarkProtectedPaths: measurement.benchmarkProtectedPaths
-            .split("\n")
-            .map((path) => path.trim())
-            .filter(Boolean),
-          focusedTestPaths: measurement.focusedTestPaths
-            .split("\n")
-            .map((path) => path.trim())
-            .filter(Boolean),
-          fullRegressionTimeoutSeconds: Number(
-            measurement.fullRegressionTimeoutSeconds,
-          ),
+          ...settingsPayload(measurement),
         },
         "PUT",
       ),
@@ -280,6 +262,17 @@ export default function TestEnvironmentPanel({
   }
 
   function environment(): TestEnvironment | null {
+    const invalid = invalidNumber(measurement);
+    if (invalid) {
+      setValidation(
+        t("guidedWorkloads.invalidNumber", {
+          field: t(`guidedWorkloads.${invalid}`),
+          min: NUMBER_SETTINGS[invalid].min,
+          max: NUMBER_SETTINGS[invalid].max,
+        }),
+      );
+      return null;
+    }
     const values: Record<string, string> = {};
     for (const line of variables.split("\n").filter((line) => line.trim())) {
       const separator = line.indexOf("=");
@@ -324,7 +317,9 @@ export default function TestEnvironmentPanel({
   }
 
   const refused = check.isError && check.variables?.fingerprint === fingerprint;
-  const matching = record?.fingerprint === fingerprint;
+  // The saved check covers the persisted measurement settings, not a staged workload.
+  // Comparing values also restores its evidence when an edit is undone.
+  const matching = !measurementDirty && record?.fingerprint === fingerprint;
   const status =
     validation || save.isError || refused
       ? "blocked"
@@ -351,99 +346,42 @@ export default function TestEnvironmentPanel({
 
   return (
     <section className="mt-4 min-w-0 space-y-3">
-      <PanelSectionHeader label={t("testEnvironment.title")} />
-      <p className="text-[12px] text-muted">{t("testEnvironment.isolation")}</p>
-      <SimpleSelect
-        options={["gateway", "python", "runner"]}
-        optionLabels={[
-          t("testEnvironment.gateway"),
-          t("testEnvironment.python"),
-          t("testEnvironment.runner"),
-        ]}
-        value={draft.kind}
-        onChange={(kind) =>
-          edit({
-            kind: kind as TestEnvironment["kind"],
-            pythonExecutable: undefined,
-            runnerExecutable: undefined,
-            runnerPath: undefined,
-            runnerCommit: undefined,
-          })
+      <WorkloadRecommendations
+        repository={String(config.clone ?? "")}
+        branch={branch}
+        locked={locked}
+        dirty={dirty}
+        onWorkload={(suggestion) =>
+          editMeasurement(workloadSettings(measurement, suggestion))
         }
-        disabled={locked}
-        aria-label={t("testEnvironment.title")}
+        onEnvironment={(suggestion) => {
+          const sameRunner =
+            draft.kind === "runner" &&
+            suggestion.kind === "runner" &&
+            (draft.runnerPath ?? draft.runnerExecutable) ===
+              (suggestion.runnerPath ?? suggestion.runnerExecutable);
+          const next = {
+            ...suggestion,
+            ...(sameRunner
+              ? {
+                  runnerCommit: draft.runnerCommit,
+                  pythonExecutable:
+                    draft.pythonExecutable ?? suggestion.pythonExecutable,
+                }
+              : {}),
+            variables: { ...suggestion.variables, ...draft.variables },
+          };
+          setDraft(next);
+          setVariables(
+            Object.entries(next.variables)
+              .map(([key, value]) => `${key}=${value}`)
+              .join("\n"),
+          );
+          setDirty(true);
+          setValidation(null);
+        }}
       />
-      {draft.kind !== "gateway" ? (
-        <>
-          {draft.kind === "runner" ? (
-            <label className="block text-[13px]">
-              {t("testEnvironment.runnerExecutable")}
-              <Input
-                value={draft.runnerPath ?? draft.runnerExecutable ?? ""}
-                onChange={(e) => edit(runnerLocation(e.target.value))}
-                disabled={locked}
-                className="mt-1 w-full"
-              />
-            </label>
-          ) : null}
-          {draft.kind === "runner" && draft.runnerPath !== undefined ? (
-            <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted">
-              <span>
-                {draft.runnerCommit
-                  ? t("testEnvironment.runnerPinned", {
-                      commit: draft.runnerCommit.slice(0, 12),
-                    })
-                  : t("testEnvironment.runnerUnpinned", { branch })}
-              </span>
-              {draft.runnerCommit && !dirty ? (
-                <Btn
-                  disabled={locked}
-                  onClick={() => {
-                    const value = environment();
-                    if (value)
-                      save.mutate({ ...value, runnerCommit: undefined });
-                  }}
-                >
-                  {t("testEnvironment.runnerUpdate", { branch })}
-                </Btn>
-              ) : null}
-            </div>
-          ) : null}
-          <label className="block text-[13px]">
-            {t(
-              draft.kind === "python"
-                ? "testEnvironment.executable"
-                : "testEnvironment.runnerPython",
-            )}
-            <Input
-              value={draft.pythonExecutable ?? ""}
-              onChange={(e) => edit({ pythonExecutable: e.target.value })}
-              disabled={locked}
-              className="mt-1 w-full"
-            />
-          </label>
-          {draft.kind === "runner" ? (
-            <p className="text-[12px] text-muted">
-              {t("testEnvironment.runnerHint")}
-            </p>
-          ) : null}
-        </>
-      ) : null}
-      <label className="block text-[13px]">
-        {t("testEnvironment.variables")}
-        <textarea
-          aria-label={t("testEnvironment.variables")}
-          value={variables}
-          onChange={(e) => {
-            setVariables(e.target.value);
-            edit({});
-          }}
-          disabled={locked}
-          rows={3}
-          className="mt-1 w-full rounded border border-border bg-bg-elevated p-2 font-mono text-[13px] text-text"
-        />
-      </label>
-      <PanelSectionHeader label={t("boundedMeasurement.title")} />
+      <PanelSectionHeader label={t("guidedWorkloads.goal")} />
       <SimpleSelect
         options={["bug", "perf"]}
         optionLabels={[
@@ -451,44 +389,37 @@ export default function TestEnvironmentPanel({
           t("boundedMeasurement.perf"),
         ]}
         value={measurement.track}
-        onChange={(track) => editMeasurement({ track })}
+        onChange={(track) =>
+          editMeasurement(
+            track === "bug"
+              ? {
+                  track,
+                  benchmarkCommand: "",
+                  benchmarkCanaryCommand: "",
+                  benchmarkProtectedPaths: "",
+                  benchmarkResultMode: "wall",
+                }
+              : { track },
+          )
+        }
         disabled={locked}
         aria-label={t("boundedMeasurement.track")}
       />
-      {(["benchmarkCommand", "benchmarkCanaryCommand"] as const).map((key) => (
-        <label key={key} className="block text-[13px]">
-          {t(BENCHMARK_LABEL_KEYS[key])}
-          <Input
-            value={measurement[key]}
-            onChange={(e) => editMeasurement({ [key]: e.target.value })}
-            disabled={locked}
-            className="mt-1 w-full"
-          />
-        </label>
-      ))}
-      <SimpleSelect
-        options={["wall", "structured"]}
-        optionLabels={[
-          t("boundedMeasurement.wall"),
-          t("boundedMeasurement.structured"),
-        ]}
-        value={measurement.benchmarkResultMode}
-        onChange={(benchmarkResultMode) =>
-          editMeasurement({ benchmarkResultMode })
-        }
-        disabled={locked}
-        aria-label={t("boundedMeasurement.resultMode")}
-      />
+      <p className="text-[12px] text-muted">
+        {t(
+          measurement.track === "perf"
+            ? "guidedWorkloads.perfHint"
+            : "guidedWorkloads.bugHint",
+        )}
+      </p>
       <label className="block text-[13px]">
-        {t("boundedMeasurement.benchmarkProtectedPaths")}
+        {t("guidedWorkloads.editAllowlist")}
         <textarea
-          aria-label={t("boundedMeasurement.benchmarkProtectedPaths")}
-          value={measurement.benchmarkProtectedPaths}
-          onChange={(e) =>
-            editMeasurement({ benchmarkProtectedPaths: e.target.value })
-          }
+          aria-label={t("guidedWorkloads.editAllowlist")}
+          value={measurement.editAllowlist}
+          onChange={(e) => editMeasurement({ editAllowlist: e.target.value })}
           disabled={locked}
-          rows={3}
+          rows={2}
           className="mt-1 w-full rounded border border-border bg-bg-elevated p-2 font-mono text-[13px] text-text"
         />
       </label>
@@ -501,24 +432,188 @@ export default function TestEnvironmentPanel({
             editMeasurement({ focusedTestPaths: e.target.value })
           }
           disabled={locked}
-          rows={3}
+          rows={2}
           className="mt-1 w-full rounded border border-border bg-bg-elevated p-2 font-mono text-[13px] text-text"
         />
       </label>
       <label className="block text-[13px]">
-        {t("boundedMeasurement.fullRegressionTimeoutSeconds")}
+        {t("guidedWorkloads.scopeDiffBase")}
         <Input
-          type="number"
-          min="1"
-          value={measurement.fullRegressionTimeoutSeconds}
-          onChange={(e) =>
-            editMeasurement({ fullRegressionTimeoutSeconds: e.target.value })
-          }
+          value={measurement.scopeDiffBase}
+          onChange={(e) => editMeasurement({ scopeDiffBase: e.target.value })}
           disabled={locked}
           className="mt-1 w-full"
         />
       </label>
-      <p className="text-[12px] text-muted">{t("boundedMeasurement.hint")}</p>
+      <details>
+        <summary className="cursor-pointer text-[13px] text-muted">
+          {t("guidedWorkloads.advanced")}
+        </summary>
+        <div className="mt-3 max-h-[32rem] space-y-3 overflow-auto pr-1">
+          <PanelSectionHeader label={t("testEnvironment.title")} />
+          <p className="text-[12px] text-muted">
+            {t("testEnvironment.isolation")}
+          </p>
+          <SimpleSelect
+            options={["gateway", "python", "runner"]}
+            optionLabels={[
+              t("testEnvironment.gateway"),
+              t("testEnvironment.python"),
+              t("testEnvironment.runner"),
+            ]}
+            value={draft.kind}
+            onChange={(kind) =>
+              edit({
+                kind: kind as TestEnvironment["kind"],
+                pythonExecutable: undefined,
+                runnerExecutable: undefined,
+                runnerPath: undefined,
+                runnerCommit: undefined,
+              })
+            }
+            disabled={locked}
+            aria-label={t("testEnvironment.title")}
+          />
+          {draft.kind !== "gateway" ? (
+            <>
+              {draft.kind === "runner" ? (
+                <label className="block text-[13px]">
+                  {t("testEnvironment.runnerExecutable")}
+                  <Input
+                    value={draft.runnerPath ?? draft.runnerExecutable ?? ""}
+                    onChange={(e) => edit(runnerLocation(e.target.value))}
+                    disabled={locked}
+                    className="mt-1 w-full"
+                  />
+                </label>
+              ) : null}
+              {draft.kind === "runner" && draft.runnerPath !== undefined ? (
+                <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted">
+                  <span>
+                    {draft.runnerCommit
+                      ? t("testEnvironment.runnerPinned", {
+                          commit: draft.runnerCommit.slice(0, 12),
+                        })
+                      : t("testEnvironment.runnerUnpinned", { branch })}
+                  </span>
+                  {draft.runnerCommit && !dirty ? (
+                    <Btn
+                      disabled={locked}
+                      onClick={() => {
+                        const value = environment();
+                        if (value)
+                          save.mutate({ ...value, runnerCommit: undefined });
+                      }}
+                    >
+                      {t("testEnvironment.runnerUpdate", { branch })}
+                    </Btn>
+                  ) : null}
+                </div>
+              ) : null}
+              <label className="block text-[13px]">
+                {t(
+                  draft.kind === "python"
+                    ? "testEnvironment.executable"
+                    : "testEnvironment.runnerPython",
+                )}
+                <Input
+                  value={draft.pythonExecutable ?? ""}
+                  onChange={(e) => edit({ pythonExecutable: e.target.value })}
+                  disabled={locked}
+                  className="mt-1 w-full"
+                />
+              </label>
+              {draft.kind === "runner" ? (
+                <p className="text-[12px] text-muted">
+                  {t("testEnvironment.runnerHint")}
+                </p>
+              ) : null}
+            </>
+          ) : null}
+          <label className="block text-[13px]">
+            {t("testEnvironment.variables")}
+            <textarea
+              aria-label={t("testEnvironment.variables")}
+              value={variables}
+              onChange={(e) => {
+                setVariables(e.target.value);
+                edit({});
+              }}
+              disabled={locked}
+              rows={3}
+              className="mt-1 w-full rounded border border-border bg-bg-elevated p-2 font-mono text-[13px] text-text"
+            />
+          </label>
+          <PanelSectionHeader label={t("boundedMeasurement.title")} />
+          {(["benchmarkCommand", "benchmarkCanaryCommand"] as const).map(
+            (key) => (
+              <label key={key} className="block text-[13px]">
+                {t(BENCHMARK_LABEL_KEYS[key])}
+                <Input
+                  value={measurement[key]}
+                  onChange={(e) => editMeasurement({ [key]: e.target.value })}
+                  disabled={locked}
+                  className="mt-1 w-full"
+                />
+              </label>
+            ),
+          )}
+          <SimpleSelect
+            options={["wall", "structured"]}
+            optionLabels={[
+              t("boundedMeasurement.wall"),
+              t("boundedMeasurement.structured"),
+            ]}
+            value={measurement.benchmarkResultMode}
+            onChange={(benchmarkResultMode) =>
+              editMeasurement({ benchmarkResultMode })
+            }
+            disabled={locked}
+            aria-label={t("boundedMeasurement.resultMode")}
+          />
+          <label className="block text-[13px]">
+            {t("boundedMeasurement.benchmarkProtectedPaths")}
+            <textarea
+              aria-label={t("boundedMeasurement.benchmarkProtectedPaths")}
+              value={measurement.benchmarkProtectedPaths}
+              onChange={(e) =>
+                editMeasurement({ benchmarkProtectedPaths: e.target.value })
+              }
+              disabled={locked}
+              rows={3}
+              className="mt-1 w-full rounded border border-border bg-bg-elevated p-2 font-mono text-[13px] text-text"
+            />
+          </label>
+          <PanelSectionHeader label={t("guidedWorkloads.budget")} />
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {(
+              Object.keys(NUMBER_SETTINGS) as Array<
+                keyof typeof NUMBER_SETTINGS
+              >
+            ).map((key) => (
+              <label key={key} className="block text-[13px]">
+                {t(`guidedWorkloads.${key}`)}
+                <Input
+                  type="number"
+                  min={NUMBER_SETTINGS[key].min}
+                  max={NUMBER_SETTINGS[key].max}
+                  step={NUMBER_SETTINGS[key].integer ? 1 : "any"}
+                  value={measurement[key]}
+                  onChange={(e) => editMeasurement({ [key]: e.target.value })}
+                  disabled={locked}
+                  className="mt-1 w-full"
+                />
+              </label>
+            ))}
+          </div>
+          <p className="text-[12px] text-muted">
+            {t("guidedWorkloads.budgetHint")}
+          </p>
+          <p className="text-[12px] text-muted">
+            {t("boundedMeasurement.hint")}
+          </p>
+        </div>
+      </details>
       <div className="flex flex-wrap items-center gap-2">
         <Btn
           disabled={locked || !dirty}
@@ -572,6 +667,15 @@ export default function TestEnvironmentPanel({
           </span>
         ) : null}
       </div>
+      {matching && typeof record?.result?.duration_seconds === "number" ? (
+        <p className="text-[12px] text-muted">
+          {t("guidedWorkloads.checkDuration", {
+            duration: fmtUnit(record.result.duration_seconds, "second", {
+              maximumFractionDigits: 1,
+            }),
+          })}
+        </p>
+      ) : null}
       {checking ? (
         <p className="text-[12px] text-muted">
           {t("testEnvironment.background")}
@@ -580,24 +684,26 @@ export default function TestEnvironmentPanel({
       <p className="text-[12px] text-muted">
         {t(dirty ? "testEnvironment.unsaved" : "testEnvironment.saved")}
       </p>
-      <div className="space-y-2">
-        <Btn
-          disabled={locked || dirty || status !== "ready"}
-          aria-describedby={calibrationHintId}
-          onClick={() => calibrate.mutate()}
-        >
-          {calibrate.isPending ? (
-            <Loader2
-              className="lucide-inline animate-spin"
-              aria-hidden="true"
-            />
-          ) : null}
-          {t("autoImprovementCalibration.action")}
-        </Btn>
-        <p id={calibrationHintId} className="text-[12px] text-muted">
-          {t("autoImprovementCalibration.warning")}
-        </p>
-      </div>
+      {measurement.track === "perf" ? (
+        <div className="space-y-2">
+          <Btn
+            disabled={locked || dirty || status !== "ready"}
+            aria-describedby={calibrationHintId}
+            onClick={() => calibrate.mutate()}
+          >
+            {calibrate.isPending ? (
+              <Loader2
+                className="lucide-inline animate-spin"
+                aria-hidden="true"
+              />
+            ) : null}
+            {t("autoImprovementCalibration.action")}
+          </Btn>
+          <p id={calibrationHintId} className="text-[12px] text-muted">
+            {t("autoImprovementCalibration.warning")}
+          </p>
+        </div>
+      ) : null}
       <p role="status" aria-live="polite" className="text-[13px] text-muted">
         {validation}
       </p>

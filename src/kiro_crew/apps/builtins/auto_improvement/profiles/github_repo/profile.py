@@ -105,13 +105,14 @@ from ...spine.contracts import (
     StageBreakdown,
 )
 from ...spine.profile import CalibrationParams, ProfileFieldAliases
-from .benchmark_result import (
+from .benchmark_result import (  # noqa: F401 — preserve the facade surface
     BenchmarkResult,
     benchmark_harness_globs,
     normalize_benchmark_protected_paths,
     parse_benchmark_result,
 )
 from .environment import TestEnvironment, normalize_test_environment
+from .measurement_settings import normalize_measurement_config, normalize_suite_timeout
 from .pr_recipe import GitHubPRRecipe
 
 #: The metric's unit. Wall-clock seconds of the repo's own suite — the one number
@@ -238,6 +239,7 @@ from .profile_execution import (  # noqa: E402,F401 — preserve the facade surf
 
 
 class _EnvironmentAdapter:
+    suite_timeout_s: float = _SUITE_TIMEOUT_S
     environment: TestEnvironment | None = None
     diagnostic: dict | None = None
 
@@ -306,7 +308,9 @@ class SuiteRuler(_EnvironmentAdapter):
         benchmark_canary_cmd: str = "",
         benchmark_result_mode: str = "wall",
         environment: TestEnvironment | None = None,
+        suite_timeout_s: float = _SUITE_TIMEOUT_S,
     ) -> None:
+        self.suite_timeout_s = normalize_suite_timeout(suite_timeout_s)
         self.environment = environment
         #: Optional repo-supplied benchmark command (config ``benchmarkCommand``).
         #: When set it replaces the suite as the timed workload; it is split on
@@ -339,6 +343,7 @@ class SuiteRuler(_EnvironmentAdapter):
             ),
             "benchmarkResultMode": benchmark_result_mode,
             "sensitivity_control": self.benchmark_canary_cmd,
+            "suiteTimeoutSeconds": str(self.suite_timeout_s),
             "environment": json.dumps(
                 environment.identity if environment else {"kind": "gateway"}, sort_keys=True
             ),
@@ -363,7 +368,13 @@ class SuiteRuler(_EnvironmentAdapter):
                 return float("nan"), False
             return result.value, True
         extra = ("--collect-only",) if collect_only else ()
-        return _time_suite(tree, extra=extra, environment=self.environment, run=self._execute)
+        return _time_suite(
+            tree,
+            extra=extra,
+            timeout=self.suite_timeout_s,
+            environment=self.environment,
+            run=self._execute,
+        )
 
     def _benchmark_once(self, tree: Path, command: str) -> BenchmarkResult:
         root = _repo_root(tree)
@@ -379,7 +390,7 @@ class SuiteRuler(_EnvironmentAdapter):
         else:
             raise ValueError("benchmark commands must start with Python or pytest")
         started = time.perf_counter()
-        proc = self._execute(argv, cwd=root, timeout=_SUITE_TIMEOUT_S, env=_measure_env(root))
+        proc = self._execute(argv, cwd=root, timeout=self.suite_timeout_s, env=_measure_env(root))
         result = parse_benchmark_result(
             proc, time.perf_counter() - started, self.benchmark_result_mode
         )
@@ -491,8 +502,8 @@ class SuiteRuler(_EnvironmentAdapter):
         # NOT ok, because an unverifiable RH guard is indistinguishable from a
         # defeated one and this is the highest-value cheat against a suite ruler.
         base_n, cand_n = _collected_count(
-            base_src, self.environment, self._execute
-        ), _collected_count(cand_src, self.environment)
+            base_src, self.environment, self._execute, timeout=self.suite_timeout_s
+        ), _collected_count(cand_src, self.environment, self._execute, timeout=self.suite_timeout_s)
         rh_capability_ok = base_n >= 0 and cand_n >= 0 and cand_n >= base_n
 
         return Measurement(
@@ -654,8 +665,13 @@ class PytestBuildGate(_EnvironmentAdapter):
     single_environment = True
 
     def __init__(
-        self, *, suite_scope: list[str] | None = None, environment: TestEnvironment | None = None
+        self,
+        *,
+        suite_scope: list[str] | None = None,
+        environment: TestEnvironment | None = None,
+        suite_timeout_s: float = _SUITE_TIMEOUT_S,
     ) -> None:
+        self.suite_timeout_s = normalize_suite_timeout(suite_timeout_s)
         self.environment = environment
         #: Repo-relative test paths to run instead of the whole tree. Set when the
         #: operator narrowed the edit allowlist — see _suite_scope_for_globs.
@@ -678,11 +694,13 @@ class PytestBuildGate(_EnvironmentAdapter):
             proc = self._execute(
                 self._pytest("-q", *xdist, *self.suite_scope),
                 cwd=root,
-                timeout=_SUITE_TIMEOUT_S,
+                timeout=self.suite_timeout_s,
                 env=_measure_env(root),
             )
         except subprocess.TimeoutExpired:
-            return GateResult(passed=False, detail=f"suite timed out after {_SUITE_TIMEOUT_S:.0f}s")
+            return GateResult(
+                passed=False, detail=f"suite timed out after {self.suite_timeout_s:.0f}s"
+            )
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             return GateResult(passed=False, detail=f"could not run the suite: {exc}")
         # Retry serially if xdist itself failed to start, so a missing/broken plugin
@@ -696,12 +714,12 @@ class PytestBuildGate(_EnvironmentAdapter):
                 proc = self._execute(
                     self._pytest("-q", *self.suite_scope),
                     cwd=root,
-                    timeout=_SUITE_TIMEOUT_S,
+                    timeout=self.suite_timeout_s,
                     env=_measure_env(root),
                 )
             except subprocess.TimeoutExpired:
                 return GateResult(
-                    passed=False, detail=f"suite timed out after {_SUITE_TIMEOUT_S:.0f}s"
+                    passed=False, detail=f"suite timed out after {self.suite_timeout_s:.0f}s"
                 )
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
                 return GateResult(passed=False, detail=f"could not run the suite: {exc}")
@@ -731,8 +749,13 @@ class PytestBugRunner(_EnvironmentAdapter):
     """
 
     def __init__(
-        self, *, suite_scope: list[str] | None = None, environment: TestEnvironment | None = None
+        self,
+        *,
+        suite_scope: list[str] | None = None,
+        environment: TestEnvironment | None = None,
+        suite_timeout_s: float = _SUITE_TIMEOUT_S,
     ) -> None:
+        self.suite_timeout_s = normalize_suite_timeout(suite_timeout_s)
         self.environment = environment
         #: Repo-relative test paths the STAYGREEN full-suite run is confined to, when
         #: the operator narrowed the edit allowlist. See _suite_scope_for_globs.
@@ -858,7 +881,7 @@ class PytestBugRunner(_EnvironmentAdapter):
             proc = self._execute(
                 self._pytest("-q", "--collect-only", target),
                 cwd=root,
-                timeout=_QUICK_TIMEOUT_S,
+                timeout=self.suite_timeout_s,
                 env=_measure_env(root),
             )
         except (OSError, subprocess.SubprocessError, ValueError):
@@ -884,7 +907,7 @@ class PytestBugRunner(_EnvironmentAdapter):
             proc = self._execute(
                 self._pytest("-q", nodeid),
                 cwd=root,
-                timeout=_QUICK_TIMEOUT_S,
+                timeout=self.suite_timeout_s,
                 env=_measure_env(root),
             )
         except (OSError, subprocess.SubprocessError, ValueError):
@@ -926,7 +949,7 @@ class PytestBugRunner(_EnvironmentAdapter):
                 # serial run when the plugin is missing (a bare target repo).
                 self._pytest("-q", *xdist, *self.suite_scope),
                 cwd=root,
-                timeout=_SUITE_TIMEOUT_S,
+                timeout=self.suite_timeout_s,
                 env=_measure_env(root),
             )
         except (OSError, subprocess.SubprocessError, ValueError):
@@ -941,7 +964,7 @@ class PytestBugRunner(_EnvironmentAdapter):
                 proc = self._execute(
                     self._pytest("-q", *self.suite_scope),
                     cwd=root,
-                    timeout=_SUITE_TIMEOUT_S,
+                    timeout=self.suite_timeout_s,
                     env=_measure_env(root),
                 )
             except (OSError, subprocess.SubprocessError, ValueError):
@@ -1234,59 +1257,6 @@ class RepoIsolation:
 # ── the assembled profile ───────────────────────────────────────────────────
 
 
-def normalize_measurement_config(config: dict) -> dict:
-    paths = config.get("focusedTestPaths", [])
-    if not isinstance(paths, list) or any(
-        not isinstance(path, str)
-        or not path
-        or path.startswith("-")
-        or Path(path).is_absolute()
-        or ".." in Path(path).parts
-        or any(char in path for char in "\\:*?[]\n\r\x00")
-        for path in paths
-    ):
-        raise ValueError(
-            "focusedTestPaths must contain explicit repository-relative pytest paths, not options, globs or node IDs"
-        )
-    if paths:
-        variables = normalize_test_environment(config.get("testEnvironment")).get("variables", {})
-        if any(key.upper() == "PYTEST_ADDOPTS" and value for key, value in variables.items()):
-            raise ValueError(
-                "focusedTestPaths requires empty PYTEST_ADDOPTS; remove it from test-environment variables so full regression cannot be narrowed"
-            )
-    timeout = config.get("fullRegressionTimeoutSeconds", 900)
-    if (
-        isinstance(timeout, bool)
-        or not isinstance(timeout, (int, float))
-        or not 0 < timeout <= sys.float_info.max
-    ):
-        raise ValueError("fullRegressionTimeoutSeconds must be positive and finite")
-    track = config.get("track", "bug")
-    if track not in ("bug", "perf"):
-        raise ValueError("track must be bug or perf")
-    mode = config.get("benchmarkResultMode", "wall")
-    if mode not in ("wall", "structured"):
-        raise ValueError("benchmarkResultMode must be wall or structured")
-    commands = {}
-    for key in ("benchmarkCommand", "benchmarkCanaryCommand"):
-        command = config.get(key, "")
-        if not isinstance(command, str) or any(ord(c) < 32 for c in command):
-            raise ValueError(f"{key} must be a single-line command")
-        commands[key] = command.strip()
-    if not commands["benchmarkCommand"] and (commands["benchmarkCanaryCommand"] or mode != "wall"):
-        raise ValueError("custom benchmark options require benchmarkCommand")
-    return dict(
-        commands,
-        track=track,
-        benchmarkResultMode=mode,
-        benchmarkProtectedPaths=normalize_benchmark_protected_paths(
-            config.get("benchmarkProtectedPaths", [])
-        ),
-        focusedTestPaths=list(paths),
-        fullRegressionTimeoutSeconds=float(timeout),
-    )
-
-
 class GitHubRepoProfile(ProfileFieldAliases):
     """The reference Target Profile: any Python GitHub repo with a pytest suite.
 
@@ -1321,6 +1291,7 @@ class GitHubRepoProfile(ProfileFieldAliases):
         test_environment: dict | None = None,
         focused_test_paths: list[str] | None = None,
         full_regression_timeout_s: float = 900,
+        suite_timeout_s: float = _SUITE_TIMEOUT_S,
     ) -> None:
         self.clone_path = Path(clone_path)
         self.environment = TestEnvironment(
@@ -1333,13 +1304,14 @@ class GitHubRepoProfile(ProfileFieldAliases):
                     [] if benchmark_protected_paths is None else benchmark_protected_paths
                 ),
                 "fullRegressionTimeoutSeconds": full_regression_timeout_s,
+                "suiteTimeoutSeconds": suite_timeout_s,
                 "testEnvironment": test_environment,
             }
         )
         self.benchmark_protected_paths = settings["benchmarkProtectedPaths"]
         self.focused_test_paths = settings["focusedTestPaths"]
         self.full_regression_timeout_s = settings["fullRegressionTimeoutSeconds"]
-        self.final_regression_required = bool(self.focused_test_paths)
+        self.suite_timeout_s = settings["suiteTimeoutSeconds"]
         self.track = track
         #: The ``scopeDiffBase`` ref: when set, discovery and the edit fence are both
         #: narrowed to the change set this branch introduced.
@@ -1377,6 +1349,7 @@ class GitHubRepoProfile(ProfileFieldAliases):
             benchmark_canary_cmd=benchmark_canary_cmd,
             benchmark_result_mode=benchmark_result_mode,
             environment=self.environment,
+            suite_timeout_s=self.suite_timeout_s,
         )
         self.ruler.require_environment = self.require_environment
         # Confine the gate's FULL-suite runs (T0 build smoke + STAYGREEN) to the test
@@ -1388,6 +1361,11 @@ class GitHubRepoProfile(ProfileFieldAliases):
         suite_scope = self.focused_test_paths or _suite_scope_for_globs(
             self.clone_path, allowed_globs
         )
+        # Derived test scopes must preserve the same unrestricted finalist contract.
+        normalize_measurement_config(
+            {"focusedTestPaths": suite_scope, "testEnvironment": test_environment}
+        )
+        self.final_regression_required = bool(suite_scope)
         if suite_scope:
             logger.info(
                 "%s: gate suite scoped to %s (edit allowlist is narrowed); "
@@ -1396,10 +1374,14 @@ class GitHubRepoProfile(ProfileFieldAliases):
                 ", ".join(suite_scope),
             )
         self.build_gate = PytestBuildGate(
-            suite_scope=suite_scope, environment=self.environment
+            suite_scope=suite_scope,
+            environment=self.environment,
+            suite_timeout_s=self.suite_timeout_s,
         )  # ②
         self.bug_runner = PytestBugRunner(
-            suite_scope=suite_scope, environment=self.environment
+            suite_scope=suite_scope,
+            environment=self.environment,
+            suite_timeout_s=self.suite_timeout_s,
         )  # ②b
         # ``allowed_globs`` narrows WHICH files the agent may edit — e.g. confine a
         # run to one subdirectory so it cannot touch the rest of a large repo (the
@@ -1470,63 +1452,77 @@ class GitHubRepoProfile(ProfileFieldAliases):
 
     def check_environment(self) -> dict:
         root = self.clone_path.resolve()
-        result = {"ok": False, "environment": self.environment.identity, "diagnostic": None}
-        # One call proves both the interpreter and pytest: in runner mode every call
-        # pays for a fresh isolated environment.
-        checks = [
-            (
-                "interpreter",
-                self.environment.python_argv(
-                    "-c",
-                    "import sys; print(sys.executable); import pytest; print(pytest.__version__)",
+        result: dict = {"ok": False, "environment": self.environment.identity, "diagnostic": None}
+        started = time.perf_counter()
+        result["timings"] = {}
+        try:
+            # One call proves both the interpreter and pytest: in runner mode every call
+            # pays for a fresh isolated environment.
+            checks = [
+                (
+                    "interpreter",
+                    self.environment.python_argv(
+                        "-c",
+                        "import sys; print(sys.executable); import pytest; print(pytest.__version__)",
+                    ),
                 ),
-            ),
-            (
-                "collection",
-                _pytest_argv(
-                    "-q",
-                    "--collect-only",
-                    *self.bug_runner.suite_scope,
-                    environment=self.environment,
+                (
+                    "collection",
+                    _pytest_argv(
+                        "-q",
+                        "--collect-only",
+                        *self.bug_runner.suite_scope,
+                        environment=self.environment,
+                    ),
                 ),
-            ),
-        ]
-        if self.ruler.benchmark_cmd:
-            checks = checks[:1]
-        for stage, argv in checks:
-            try:
-                proc = self.environment.run(
-                    argv, cwd=root, timeout=_QUICK_TIMEOUT_S, env=_measure_env(root)
-                )
-            except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-                result["diagnostic"] = _diagnostic(stage, exc)
-                return result
-            if proc.returncode != 0:
-                if stage == "interpreter" and "pytest" in (proc.stderr or ""):
-                    stage = "pytest"
-                result["diagnostic"] = _diagnostic(stage, proc)
-                return result
-            if stage == "collection":
-                output = _ANSI_RE.sub("", proc.stdout or "")
-                match = _COLLECTED_RE.search(output)
-                count = (
-                    int(match.group(1))
-                    if match
-                    else sum("::" in line for line in output.splitlines())
-                )
-                result["tests_collected"] = count
-                if count <= 0:
+            ]
+            if self.ruler.benchmark_cmd:
+                checks = checks[:1]
+            for stage, argv in checks:
+                step_started = time.perf_counter()
+                try:
+                    proc = self.environment.run(
+                        argv,
+                        cwd=root,
+                        timeout=self.suite_timeout_s if stage == "collection" else _QUICK_TIMEOUT_S,
+                        env=_measure_env(root),
+                    )
+                except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+                    result["diagnostic"] = _diagnostic(stage, exc)
+                    return result
+                finally:
+                    result["timings"][stage] = time.perf_counter() - step_started
+                if proc.returncode != 0:
+                    if stage == "interpreter" and "pytest" in (proc.stderr or ""):
+                        stage = "pytest"
                     result["diagnostic"] = _diagnostic(stage, proc)
                     return result
-        if self.ruler.benchmark_cmd:
-            try:
-                self.ruler._benchmark_once(root, self.ruler.benchmark_cmd)
-            except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-                result["diagnostic"] = _diagnostic("benchmark", exc)
-                return result
-        result["ok"] = True
-        result["environment"] = self.environment.identity
-        return result
+                if stage == "collection":
+                    output = _ANSI_RE.sub("", proc.stdout or "")
+                    match = _COLLECTED_RE.search(output)
+                    count = (
+                        int(match.group(1))
+                        if match
+                        else sum("::" in line for line in output.splitlines())
+                    )
+                    result["tests_collected"] = count
+                    if count <= 0:
+                        result["diagnostic"] = _diagnostic(stage, proc)
+                        return result
+            if self.ruler.benchmark_cmd:
+                step_started = time.perf_counter()
+                try:
+                    self.ruler._benchmark_once(root, self.ruler.benchmark_cmd)
+                except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+                    result["diagnostic"] = _diagnostic("benchmark", exc)
+                    return result
+                finally:
+                    result["timings"]["benchmark"] = time.perf_counter() - step_started
+            result["ok"] = True
+            result["environment"] = self.environment.identity
+            return result
+        finally:
+            result["duration_seconds"] = time.perf_counter() - started
 
     def require_environment(self) -> None:
         result = self.check_environment()
@@ -1737,7 +1733,7 @@ class GitHubRepoProfile(ProfileFieldAliases):
                         *self.suite_scope_for_profiling,
                     ),
                     cwd=root,
-                    timeout=_SUITE_TIMEOUT_S,
+                    timeout=self.suite_timeout_s,
                     env=_measure_env(root),
                 )
                 encoded = next(
@@ -1753,7 +1749,7 @@ class GitHubRepoProfile(ProfileFieldAliases):
                 raw.write_bytes(base64.b64decode(encoded, validate=True))
             else:
                 self.environment.run(
-                    argv, cwd=root, timeout=_SUITE_TIMEOUT_S, env=_measure_env(root)
+                    argv, cwd=root, timeout=self.suite_timeout_s, env=_measure_env(root)
                 )
             if not raw.is_file() or raw.stat().st_size == 0:
                 return None
@@ -1829,14 +1825,16 @@ def build_profile(config: dict) -> GitHubRepoProfile:
         test_environment=cfg.get("testEnvironment"),
         focused_test_paths=cfg["focusedTestPaths"],
         full_regression_timeout_s=cfg["fullRegressionTimeoutSeconds"],
+        suite_timeout_s=cfg["suiteTimeoutSeconds"],
     )
 
 
 # Keep the original module as the import and monkeypatch surface.
 from kiro_crew import _facade_mirror  # noqa: E402 — preserve the facade surface
 
+from . import measurement_settings as _settings  # noqa: E402 — preserve the facade surface
 from . import profile_execution as _profile_execution  # noqa: E402 — preserve the facade surface
 
-_OWNERS = (_profile_execution.__name__,)
+_OWNERS = (_profile_execution.__name__, _settings.__name__)
 _facade_mirror.install(sys.modules[__name__], _OWNERS)
 sys.modules[__name__].__class__ = _facade_mirror.MirroredModule

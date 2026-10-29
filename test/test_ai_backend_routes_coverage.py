@@ -617,7 +617,10 @@ class TestSetupClone:
         config = _json_of(response)["config"]
         assert "branch" not in config
         assert "scopeDiffBase" not in config
-        assert config["measureReps"] == 9, "unrelated settings survive a retarget"
+        assert config["measureReps"] is None, "a new repository uses its own measurement budget"
+        saved = config["repositoryRunSettings"]
+        old_key = store.repository_key({"target_url": "https://github.com/owner/old"})
+        assert saved[old_key]["measureReps"] == 9
 
     async def test_setting_the_same_url_again_keeps_the_branch(
         self, data_root: Path, monkeypatch: pytest.MonkeyPatch
@@ -643,7 +646,9 @@ class TestBranches:
     ) -> None:
         _config(data_root, clone="/scratch/repo")
         monkeypatch.setattr(
-            clone_setup, "list_clone_branches", lambda _clone, **_kw: ([], "git ls-remote failed")
+            clone_setup,
+            "list_clone_branches",
+            lambda _clone, **_kw: ([], "git ls-remote failed"),
         )
         response = await routes._handle_branches(_request())
         assert response.status == 502
@@ -1348,7 +1353,9 @@ class TestWatcherStart:
     ) -> None:
         registry.status_result = None
         monkeypatch.setattr(
-            progress, "read_findings", lambda: [{"fp": FP, "pr": "https://github.com/o/r/pull/1"}]
+            progress,
+            "read_findings",
+            lambda: [{"fp": FP, "pr": "https://github.com/o/r/pull/1"}],
         )
         monkeypatch.setattr(pr_watchers, "is_watchable_pr", lambda _url: True)
         response = await routes._handle_watcher_start(_request("POST", match_info={"fp": FP}))

@@ -19,6 +19,7 @@ const config = {
   clone: "/clones/example",
   target_url: "https://github.com/example/repo",
   branch: "main",
+  track: "perf",
 };
 let client: QueryClient;
 let run: { status: string; activity?: { note: string }[]; error?: string };
@@ -67,6 +68,7 @@ beforeEach(() => {
   requests = [];
   checkRecord = { state: "none" };
   server.use(
+    http.get(`${API}/repository/survey`, () => HttpResponse.json({ revision: "abc", workloads: [], evidence: [], warnings: [], environment: null })),
     ...checkHandlers({ state: "ready", result: { ok: true } }),
     http.get(`${API}/branches`, () => HttpResponse.json({ branches: [] })),
     http.get(`${API}/run`, () => HttpResponse.json(run)),
@@ -297,6 +299,7 @@ it("saves measurement settings and resets them when switching repositories", asy
   view.setConfig({
     clone: "/clones/other",
     target_url: "https://github.com/example/other",
+    track: "perf",
   });
   expect(screen.getByLabelText("Benchmark command (optional)")).toHaveValue("");
   expect(
