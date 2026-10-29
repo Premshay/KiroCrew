@@ -1408,6 +1408,7 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
     r"is_claude_code\(": (
         "dashboard/chat_turn/model_fallback.py",
         "dashboard/chat_turn/slash_commands.py",
+        "dashboard/chat_turn/turn_admission.py",
     ),
     r"capabilities_of\(": (
         "dashboard/chat_turn/model_fallback.py",

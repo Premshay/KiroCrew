@@ -57,7 +57,7 @@ def _advertised_commands(
             provider = None
         if provider is not None:
             providers = [provider]
-    if not providers:
+    if not slot:
         providers = state.sessions.active_providers()
 
     for provider in providers:

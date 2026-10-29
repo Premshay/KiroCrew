@@ -58,6 +58,15 @@ global-settings gap below.
 
 ## The Claude harness
 
+The dashboard slash picker requests the active chat's advertised command registry
+with `GET /api/slash-commands?slot=...` and caches it per slot. Opening the picker
+refreshes the registry, including commands such as `/design` discovered after
+startup. A cold or missing named session never borrows another session's commands.
+After session acquisition, command forwarding also uses that provider's identity,
+so a per-member Claude route does not depend on the global provider setting.
+Commands remain supplied by Claude's ACP adapter; KiroCrew does not synthesize
+Claude Design access or consent.
+
 `acp/harness/claude.py` owns the whole Claude launch, and it is a live path on a
 plain public build:
 

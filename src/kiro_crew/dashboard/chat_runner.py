@@ -959,6 +959,7 @@ async def _run_chat(
         client = turn.client
         is_new = turn.is_new
         resumed = turn.resumed
+        is_slash = turn.is_slash
         await _turn_dispatch_prep(turn)
         await _turn_build_prompt(turn)
         message = turn.message

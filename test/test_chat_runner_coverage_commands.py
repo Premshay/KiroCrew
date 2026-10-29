@@ -40,6 +40,19 @@ from kiro_crew.testing.wait import await_until
 # ── model backfill / pin guards ───────────────────────────────────────────
 
 
+@pytest.mark.asyncio
+async def test_routed_claude_design_is_forwarded_as_a_command(tmp_path):
+    state, client = _runner_state(tmp_path)
+    client.capabilities = capabilities_for("claude")
+    _set_stream(client, [_complete()])
+    slot = _slot("claude-design-command")
+    cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+    cfg.agent.provider = "acp"
+    with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
+        await _drive(state, slot, "/design")
+    client.stream_command.assert_called_once_with("/design")
+
+
 class TestModelBackfill:
     @pytest.mark.parametrize(
         "model,expected",

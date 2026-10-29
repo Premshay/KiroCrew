@@ -34,6 +34,15 @@ function shrinkDeadline(ms: number, record?: (asked: number) => void) {
 }
 
 describe('api.slashCommands is bounded at the client, so every call site inherits it', () => {
+  it('requests the named chat registry with an encoded slot', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response('[]', { status: 200 }))
+    vi.stubGlobal('fetch', fetch)
+    await api.slashCommands(undefined, 'chat/a b')
+    expect(fetch).toHaveBeenCalledWith('/api/slash-commands?slot=chat%2Fa%20b', {
+      signal: expect.any(AbortSignal),
+    })
+  })
+
   it('rejects with TimeoutError when NO signal is passed — the previously-unbounded shape', async () => {
     // Pre-fix this promise never settled at all, so the menu spun forever.
     shrinkDeadline(20)

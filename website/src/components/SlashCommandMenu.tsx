@@ -105,6 +105,7 @@ const FALLBACK_COMMAND_NAMES = [
 const FALLBACK_COMMANDS: SlashCommand[] = FALLBACK_COMMAND_NAMES.map(name => ({ name }))
 
 interface Props {
+  slotId?: string
   input: string
   anchorRef: React.RefObject<HTMLElement | null>
   onSelect: (command: string) => void
@@ -140,13 +141,14 @@ const FRONTEND_COMMAND_NAMES = ['/btw', '/kb', '/onboarding', '/plain'] as const
 
 const FRONTEND_COMMANDS: SlashCommand[] = FRONTEND_COMMAND_NAMES.map(name => ({ name }))
 
-export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, open = true, sendOnEnter = 'enter', hidden }: Props) {
+export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, open = true, sendOnEnter = 'enter', hidden, slotId }: Props) {
   const source = usePickerSource()
   const load = source.slashCommands
   const { data: apiCommands = FALLBACK_COMMANDS, isFetching, isError } = useQuery<SlashCommand[]>({
-    queryKey: pickerQueryKey(source, ['slash-commands']),
-    queryFn: ({ signal }) => load!(signal),
-    enabled: typeof load === 'function',
+    queryKey: pickerQueryKey(source, slotId ? ['slash-commands', slotId] : ['slash-commands']),
+    queryFn: ({ signal }) => load!(signal, slotId),
+    enabled: typeof load === 'function' && open && input.startsWith('/'),
+    staleTime: 0,
   })
   const allCommands = useMemo(() => {
     const names = new Set(apiCommands.map(c => c.name))

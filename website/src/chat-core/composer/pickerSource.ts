@@ -71,7 +71,7 @@ export interface ComposerPickerSource {
   /** Prefix for every picker query key, so two sources never share a cache
    *  entry. Empty for the dashboard, whose keys other code invalidates. */
   scope: string
-  slashCommands?: (signal?: AbortSignal) => Promise<SlashCommand[]>
+  slashCommands?: (signal?: AbortSignal, slot?: string) => Promise<SlashCommand[]>
   fileSearch?: (q: string, project: string | undefined, signal?: AbortSignal) => Promise<FileSearchResponse>
   pathComplete?: (project: string, dir: string, q: string, signal?: AbortSignal) => Promise<FileSearchResponse>
   /** The raw `/api/skills` payload (a bare array or the agent-scoped envelope). */

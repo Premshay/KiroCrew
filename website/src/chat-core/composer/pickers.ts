@@ -137,7 +137,7 @@ export function useComposerPickers({ source, project, onFileSelect, typedCommand
     source, slashOn, fileOn, skillOn, pathOn,
     slashMenuOpen, setSlashMenuOpen, filePickerOpen, setFilePickerOpen, fileQuery, setFileQuery,
     pathPickerOpen, setPathPickerOpen, pathQuery, setPathQuery, skillPickerOpen, setSkillPickerOpen, skillQuery, setSkillQuery,
-    nextTrustRequestIdRef, activeTrustRequestIdRef, trustPrompt, setTrustPrompt, skillSlotKey, skillSlotKeyRef, skillProjectRef,
+    nextTrustRequestIdRef, activeTrustRequestIdRef, trustPrompt, setTrustPrompt, skillSlotKey, skillSlotKeyRef, skillProjectRef, slotId,
     anyPickerOpenRef, closePickers, openPickersForText, prefetchSkills, applyPickedToken,
   }
 }

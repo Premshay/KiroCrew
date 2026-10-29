@@ -41,6 +41,29 @@ beforeEach(() => {
 })
 
 describe('SlashCommandMenu (shared-hook migration)', () => {
+  it('isolates each chat registry and refreshes when the menu reopens', async () => {
+    mockApi.slashCommands.mockImplementation((_signal, slot) => Promise.resolve(
+      slot === 'claude-slot' ? [{ name: '/design' }] : [{ name: '/other-command' }],
+    ))
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const anchor = { current: document.createElement('div') }
+    const view = (slotId: string, open = true) => (
+      <QueryClientProvider client={qc}>
+        <SlashCommandMenu slotId={slotId} input="/" open={open} anchorRef={anchor} onSelect={vi.fn()} onClose={vi.fn()} />
+      </QueryClientProvider>
+    )
+    const { rerender } = render(view('other-slot'))
+    expect(await screen.findByText('/other-command')).toBeInTheDocument()
+    rerender(view('claude-slot'))
+    expect(await screen.findByText('/design')).toBeInTheDocument()
+    expect(screen.queryByText('/other-command')).not.toBeInTheDocument()
+    expect(mockApi.slashCommands).toHaveBeenLastCalledWith(expect.any(AbortSignal), 'claude-slot')
+    rerender(view('claude-slot', false))
+    mockApi.slashCommands.mockResolvedValue([{ name: '/newly-discovered' }])
+    rerender(view('claude-slot'))
+    expect(await screen.findByText('/newly-discovered')).toBeInTheDocument()
+  })
+
   it('renders commands when input is a bare slash', async () => {
     render(<Harness input="/" />)
     expect(await screen.findByText('/aa')).toBeInTheDocument()

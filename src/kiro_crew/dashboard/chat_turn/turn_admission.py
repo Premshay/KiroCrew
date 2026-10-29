@@ -8,12 +8,14 @@ import asyncio
 import functools
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import normalize_agent_model
 from kiro_crew.context import discard_memory_prefetch
 from kiro_crew.dashboard.chat_utils import (
     _KIRO_ONLY_BLOCKED_SLASH_COMMANDS,
     APP_AGENT_REFUSED_KIND,
     _normalize_model,
+    is_harness_slash_command,
     slot_history_key,
     tighten_live_slot_memory_mode,
 )
@@ -1067,6 +1069,12 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     from kiro_crew.skill_scope_pin import pin_session_skill_spec
 
     pin_session_skill_spec(session_key, _pinned_spec)
+    # Routing can select Claude even when the installation's provider is ACP.
+    # Reclassify against the claimed session before assembling the prompt.
+    is_slash = is_harness_slash_command(
+        first_word, cc_provider=is_claude_code(capabilities_of(client).provider_seam)
+    )
+    turn.is_slash = is_slash
     # The acquired provider is the final authority for harness-specific slash
     # gates. A dead live row can be replaced during the get_or_create call
     # above. The positive capability fails closed for unknown adapters and

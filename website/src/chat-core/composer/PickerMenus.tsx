@@ -27,7 +27,7 @@ export function ComposerPickerMenus({ pickers, value, onChange, composerAnchorRe
   filePathTail?: boolean
 }) {
   const {
-    source, slashOn, fileOn, skillOn, pathOn,
+    source, slashOn, fileOn, skillOn, pathOn, slotId,
     slashMenuOpen, setSlashMenuOpen, filePickerOpen, setFilePickerOpen, fileQuery, setFileQuery,
     pathPickerOpen, setPathPickerOpen, pathQuery, setPathQuery, skillPickerOpen, setSkillPickerOpen, skillQuery, setSkillQuery,
     nextTrustRequestIdRef, activeTrustRequestIdRef, trustPrompt, setTrustPrompt, skillSlotKey, skillSlotKeyRef, skillProjectRef,
@@ -35,7 +35,7 @@ export function ComposerPickerMenus({ pickers, value, onChange, composerAnchorRe
   } = pickers
   return (
     <ComposerPickerSourceProvider value={source}>
-      {slashOn && <SlashCommandMenu input={value} anchorRef={composerAnchorRef} open={slashMenuOpen} hidden={hiddenCommands} sendOnEnter={sendOnEnter} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />}
+      {slashOn && <SlashCommandMenu slotId={slotId ?? undefined} input={value} anchorRef={composerAnchorRef} open={slashMenuOpen} hidden={hiddenCommands} sendOnEnter={sendOnEnter} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />}
 
       {fileOn && onFileSelect && (
         <FilePickerMenu

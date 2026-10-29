@@ -195,6 +195,21 @@ class TestAdvertisedCommands:
         assert "/design" in {item["name"] for item in payload}
 
     @pytest.mark.asyncio
+    async def test_missing_slot_never_borrows_another_sessions_commands(self):
+        claude = _fake_provider([{"name": "other-private-command", "description": ""}])
+        claude.capabilities = capabilities_for(ACP_BACKEND_CLAUDE)
+        app = _make_app()
+        app["state"] = _fake_state([claude])
+        with patch(
+            "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
+            return_value=_fake_config("acp"),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                response = await client.get("/api/slash-commands?slot=cold-slot")
+                payload = await response.json()
+        assert "/other-private-command" not in {item["name"] for item in payload}
+
+    @pytest.mark.asyncio
     async def test_multiline_description_collapses_to_one_row(self):
         """A skill's body would otherwise ship kilobytes to render an ellipsis."""
         provider = _fake_provider(
