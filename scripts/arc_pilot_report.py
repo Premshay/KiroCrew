@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """arc_pilot_report.py -- compare a pilot arc's coordination and product cost with a baseline.
 
+Duplication is checked against each PR's ``baseRefOid`` read through git in ``--base-dir``
+(a git checkout of the repo that holds that commit), so a merged PR never matches itself.
 Board-derived rows read the arc store; PR-derived rows come from ``gh``. A baseline arc has
 no board, so it is reported from ``--baseline-prs`` alone and its board rows print ``n/a``.
 
 Usage::
 
     python3 scripts/arc_pilot_report.py --arc arc_<id> --since 2026-10-01T00:00:00+00:00 \\
-        --until 2026-10-08T00:00:00+00:00 --base-dir /path/to/checkout --baseline-prs 12,13
+        --until 2026-10-08T00:00:00+00:00 --base-dir /path/to/git/checkout --baseline-prs 12,13
 """
 
 from __future__ import annotations
@@ -32,6 +34,12 @@ _PULL_RE = re.compile(r"/pull/(\d+)")
 
 def _ts(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _aware(value: str) -> str:
+    if _ts(value).tzinfo is None:
+        raise argparse.ArgumentTypeError(f"{value!r} needs a UTC offset, e.g. 2026-10-01T00:00:00Z")
+    return value
 
 
 def _minutes(delta_secs: float) -> float:
@@ -145,7 +153,7 @@ def gh_text(args: list[str]) -> str:
 
 
 def pr_view(number: int, repo: str) -> dict[str, Any]:
-    fields = "number,additions,deletions,files,mergedAt,reviews"
+    fields = "number,additions,deletions,files,mergedAt,reviews,baseRefOid"
     return gh_json(["pr", "view", str(number), "-R", repo, "--json", fields])
 
 
@@ -200,24 +208,48 @@ def added_runs(diff: str) -> tuple[list[list[str]], set[str]]:
     return runs, exts
 
 
-def base_hashes(base_dir: Path, exts: set[str]) -> set[str]:
+def git_ls_tree(base_dir: Path, oid: str) -> list[str]:
+    out = subprocess.run(
+        ["git", "-C", str(base_dir), "ls-tree", "-r", "--name-only", oid],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return out.splitlines()
+
+
+def git_show(base_dir: Path, oid: str, path: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(base_dir), "show", f"{oid}:{path}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+def base_hashes(base_dir: Path, oid: str, exts: set[str]) -> set[str]:
     hashes: set[str] = set()
-    for path in base_dir.rglob("*"):
-        if ".git" in path.parts or "node_modules" in path.parts:
+    for path in git_ls_tree(base_dir, oid):
+        if Path(path).suffix not in exts:
             continue
-        if path.is_file() and path.suffix in exts:
-            try:
-                hashes.update(_block_hashes(path.read_text(encoding="utf-8").splitlines()))
-            except (UnicodeDecodeError, OSError):
-                continue
+        try:
+            hashes.update(_block_hashes(git_show(base_dir, oid, path).splitlines()))
+        except (UnicodeDecodeError, subprocess.CalledProcessError):
+            continue
     return hashes
 
 
-def duplicated_blocks(diff: str, base_dir: Path | None) -> int | str:
-    if base_dir is None:
+def duplicated_blocks(diff: str, base_dir: Path | None, base_oid: str | None) -> int | str:
+    if base_dir is None or not base_oid:
         return NA
     runs, exts = added_runs(diff)
-    known = base_hashes(base_dir, exts)
+    try:
+        known = base_hashes(base_dir, base_oid, exts)
+    except (subprocess.CalledProcessError, OSError):
+        print(
+            f"base commit {base_oid} not available in {base_dir}; duplication n/a", file=sys.stderr
+        )
+        return NA
     return sum(1 for run in runs for h in _block_hashes(run) if h in known)
 
 
@@ -228,7 +260,9 @@ def pr_guards(pr: dict[str, Any], repo: str, base_dir: Path | None) -> dict[str,
         "additions": pr["additions"],
         "deletions": pr["deletions"],
         "new_files": sum(1 for f in files if f.get("changeType") == "ADDED"),
-        "duplicated_blocks": duplicated_blocks(pr_diff(pr["number"], repo), base_dir),
+        "duplicated_blocks": duplicated_blocks(
+            pr_diff(pr["number"], repo), base_dir, pr.get("baseRefOid")
+        ),
     }
 
 
@@ -312,12 +346,12 @@ def _numbers(value: str) -> list[int]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--arc")
-    p.add_argument("--since")
-    p.add_argument("--until")
+    p.add_argument("--since", type=_aware)
+    p.add_argument("--until", type=_aware)
     p.add_argument("--prs", type=_numbers, default=[])
     p.add_argument("--baseline-prs", type=_numbers, default=[])
     p.add_argument("--repo", default="Atlogit/Atlomy-Atlas")
-    p.add_argument("--base-dir", type=Path)
+    p.add_argument("--base-dir", type=Path, help="git checkout of the repo")
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
     if args.arc and not (args.since and args.until):
