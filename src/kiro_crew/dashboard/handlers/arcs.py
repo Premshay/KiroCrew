@@ -57,11 +57,6 @@ def _member_arc(arc_id: str, key: str) -> dict[str, Any]:
     return arc
 
 
-def _mark_latest_seen(arc_id: str, key: str, entries: list[dict[str, Any]]) -> None:
-    if entries:
-        arcs.mark_seen(arc_id, key, entries[-1]["id"])
-
-
 async def _run(request: web.Request, operation: str, work: Any) -> web.Response:
     key, refusal = await _resolve_ledger_key(request, operation)
     if refusal is not None:
@@ -105,7 +100,7 @@ async def api_arc_brief(request: web.Request) -> web.Response:
 
 
 async def api_arc_entries_read(request: web.Request) -> web.Response:
-    """GET /api/arcs/{arc_id}/entries?after=&q= — read or grep, then mark seen."""
+    """GET /api/arcs/{arc_id}/entries?after=&q= — read or grep; never moves the seen cursor."""
     arc_id = request.match_info.get("arc_id", "")
     query = request.query.get("q", "")
     after = request.query.get("after") or None
@@ -116,7 +111,6 @@ async def api_arc_entries_read(request: web.Request) -> web.Response:
             entries = arcs.grep_entries(arc_id, query)
         else:
             entries = arcs.read_entries(arc_id, after=after)
-        _mark_latest_seen(arc_id, key, entries)
         return {
             "entries": [_public(e) for e in entries],
             "open_asks": [_public(e) for e in arcs.open_asks(arc_id)],
@@ -126,7 +120,7 @@ async def api_arc_entries_read(request: web.Request) -> web.Response:
 
 
 def _urgent_unseen(arc_id: str, key: str) -> list[dict[str, Any]]:
-    """Unseen peer entries the caller must not miss, marked seen once returned."""
+    """Unseen peer entries the caller must not miss; the seen cursor is left to the turn prefix."""
     unseen = arcs.unseen_entries(arc_id, key)
     everything = arcs.read_entries(arc_id, limit=10**9)
     my_asks = {e["id"] for e in everything if e["kind"] == "ASK" and e["author"] == key}
@@ -137,7 +131,6 @@ def _urgent_unseen(arc_id: str, key: str) -> list[dict[str, Any]]:
     urgent = [
         e for e in unseen if e["kind"] == "FAIL" or e["reply_to"] in my_asks or e["id"] in colliding
     ]
-    _mark_latest_seen(arc_id, key, urgent)
     return urgent
 
 

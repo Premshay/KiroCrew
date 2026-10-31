@@ -106,7 +106,7 @@ async def test_member_reads_brief_and_entries(routes, arc):
     payload = json.loads(read.text)
     assert [e["id"] for e in payload["entries"]] == [entry["id"]]
     assert payload["open_asks"] == []
-    assert arcs.unseen_entries(arc["id"], MEMBER) == []
+    assert [e["id"] for e in arcs.unseen_entries(arc["id"], MEMBER)] == [entry["id"]]
 
 
 @pytest.mark.asyncio
@@ -192,7 +192,23 @@ async def test_write_returns_unseen_for_caller(routes, arc):
     )
     unseen = json.loads(response.text)["unseen"]
     assert [e["id"] for e in unseen] == [fail["id"]]
-    assert arcs.unseen_entries(arc["id"], MEMBER) == []
+    assert len(arcs.unseen_entries(arc["id"], MEMBER)) == 2
+
+
+@pytest.mark.asyncio
+async def test_write_leaves_cursor_to_turn_prefix(routes, arc):
+    from kiro_crew import arc_brief, arcs
+
+    for kind, text in (("FACT", "first fact"), ("FAIL", "it broke"), ("FACT", "last fact")):
+        arcs.append_entry(arc["id"], PEER, {"kind": kind, "text": text})
+    response = await routes.api_arc_entries_write(
+        _post(arc["id"], {"kind": "FACT", "text": "mine"})
+    )
+    assert [e["text"] for e in json.loads(response.text)["unseen"]] == ["it broke"]
+    await routes.api_arc_entries_read(_get(arc["id"], "entries"))
+    prefix = arc_brief.arc_turn_prefix(MEMBER)
+    for text in ("first fact", "it broke", "last fact"):
+        assert text in prefix
 
 
 @pytest.mark.asyncio
