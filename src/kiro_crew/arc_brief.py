@@ -47,6 +47,11 @@ def _one_line(text: str) -> str:
     return _CONTROL_RE.sub(" ", text).strip()
 
 
+def safe_line(text: str) -> str:
+    """One redacted line with frame markers defanged, for text that enters a prompt."""
+    return _defang(redact(_one_line(text)))
+
+
 def _bullets(items: list[str]) -> str:
     return "\n".join(f"- {item}" for item in items) if items else "- none"
 

@@ -8,12 +8,14 @@ is a member of, and only as itself.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
 from aiohttp import web
 
 from kiro_crew import arc_brief, arcs
+from kiro_crew.dashboard.arc_delivery import deliver_entry
 from kiro_crew.dashboard.handlers.session_ledger import _resolve_ledger_key
 from kiro_crew.security.text_redaction import redact
 from kiro_crew.validation import ARC_ENTRY_ROUTE_SCHEMA, ValidationError, validate_tool_args
@@ -154,4 +156,15 @@ async def api_arc_entries_write(request: web.Request) -> web.Response:
             "unseen": [_public(e) for e in _urgent_unseen(arc_id, key)],
         }
 
-    return await _run(request, "arc_entries_write", work)
+    response = await _run(request, "arc_entries_write", work)
+    if response.status != 200:
+        return response
+    payload = json.loads(response.text)
+    stored = payload["entry"]
+    try:
+        delivery = await deliver_entry(request.app.get("state"), arcs.read_arc(arc_id), stored)
+    except Exception:
+        logger.warning("arc delivery failed for %s", arc_id, exc_info=True)
+        delivery = {"recipients": [], "outcome": "failed"}
+    payload["delivery"] = delivery
+    return web.json_response(payload)
