@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.agent_discovery import served_provider_label
+from kiro_crew.arc_brief import arc_turn_prefix
 from kiro_crew.context import (
     discard_memory_prefetch,
     prepare_store_vectors,
@@ -727,6 +728,10 @@ async def _turn_build_prompt(turn: _ChatTurn) -> None:
         peer_prefix = drain_peer_channel_inbox(slot, keep=pending_peer_request_refs)
         if peer_prefix:
             message = peer_prefix + message
+            turn.message = message
+        arc_prefix = await asyncio.to_thread(arc_turn_prefix, session_key)
+        if arc_prefix:
+            message = arc_prefix + message
             turn.message = message
         # Use resolved kiro agent name (e.g. "kirocrew"), not the slot
         # name (e.g. "default"), so build_message's is_custom check
