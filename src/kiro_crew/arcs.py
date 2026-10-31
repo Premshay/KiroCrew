@@ -104,17 +104,24 @@ def _load_cursors(dir_path: Path) -> dict[str, str]:
         return {}
 
 
+def _parse_entry(raw: bytes) -> dict[str, Any]:
+    value = json.loads(raw.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("entry line is not an object")
+    return value
+
+
 def _load_entries(dir_path: Path) -> list[dict[str, Any]]:
     try:
-        text = (dir_path / "entries.jsonl").read_text(encoding="utf-8")
+        data = (dir_path / "entries.jsonl").read_bytes()
     except FileNotFoundError:
         return []
-    lines = [line for line in text.splitlines() if line.strip()]
+    lines = [line for line in data.split(b"\n") if line.strip()]
     entries = []
     for index, line in enumerate(lines):
         try:
-            entries.append(json.loads(line))
-        except json.JSONDecodeError:
+            entries.append(_parse_entry(line))
+        except ValueError:
             if index != len(lines) - 1:
                 raise
             logger.warning("ignoring torn trailing line in %s", dir_path / "entries.jsonl")
@@ -122,14 +129,22 @@ def _load_entries(dir_path: Path) -> list[dict[str, Any]]:
 
 
 def _drop_torn_tail(path: Path) -> None:
-    """Truncate a partial final line left by an interrupted append."""
+    """Repair an unterminated final line: keep it if it is a whole entry, else truncate."""
     try:
         data = path.read_bytes()
     except FileNotFoundError:
         return
-    if data and not data.endswith(b"\n"):
-        with open(path, "r+b") as handle:
-            handle.truncate(data.rfind(b"\n") + 1)
+    if not data or data.endswith(b"\n"):
+        return
+    start = data.rfind(b"\n") + 1
+    with open(path, "r+b") as handle:
+        try:
+            _parse_entry(data[start:])
+        except ValueError:
+            handle.truncate(start)
+        else:
+            handle.seek(0, os.SEEK_END)
+            handle.write(b"\n")
 
 
 def _str(value: Any, limit: int, field: str, *, required: bool = False) -> str:

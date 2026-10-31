@@ -251,3 +251,24 @@ def test_corrupt_middle_line_still_raises(tmp_path):
     path.write_text("garbage\n" + good, encoding="utf-8")
     with pytest.raises(ValueError):
         arcs.read_entries(arc_id)
+
+
+def test_torn_tail_inside_multibyte_character(tmp_path):
+    arc_id = _arc("a")
+    first = arcs.append_entry(arc_id, "a", {"kind": "FACT", "text": "café"})
+    path = tmp_path / "home" / "arcs" / arc_id / "entries.jsonl"
+    with open(path, "ab") as handle:
+        handle.write(b'{"kind": "FACT", "text": "' + "é".encode()[:1])
+    assert [e["id"] for e in arcs.read_entries(arc_id)] == [first["id"]]
+    second = arcs.append_entry(arc_id, "a", {"kind": "FACT", "text": "two"})
+    assert [e["id"] for e in arcs.read_entries(arc_id)] == [first["id"], second["id"]]
+
+
+def test_complete_entry_missing_only_newline_is_kept(tmp_path):
+    arc_id = _arc("a")
+    first = arcs.append_entry(arc_id, "a", {"kind": "FACT", "text": "one"})
+    path = tmp_path / "home" / "arcs" / arc_id / "entries.jsonl"
+    path.write_bytes(path.read_bytes().rstrip(b"\n"))
+    assert [e["id"] for e in arcs.read_entries(arc_id)] == [first["id"]]
+    second = arcs.append_entry(arc_id, "a", {"kind": "FACT", "text": "two"})
+    assert [e["id"] for e in arcs.read_entries(arc_id)] == [first["id"], second["id"]]
