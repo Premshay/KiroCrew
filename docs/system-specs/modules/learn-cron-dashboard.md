@@ -19,7 +19,15 @@ Dashboard command discovery and dispatch route the Claude command registry throu
 the SDK session capability record
 (`capabilities_of(provider).provider_seam`), preserving the curated command list
 for other provider seams. Turn usage records also retain the slot's app identity,
-independently of the resolved agent and linked-session surface.
+independently of the resolved agent and linked-session surface. Owner-only
+`GET` and `POST /api/chat/slots/{slot}/account` (`api_chat_slot_account` in
+`dashboard/chat_api/session_relaunch.py`, gated by `require_owner_dashboard_request`)
+inspect and switch a slot's subscription account via `ProviderRegistry.session_account_state`
+and `ProviderRegistry.set_session_account`, reloading an idle session immediately
+via `reload_slot_session` or deferring the relaunch via `slot._pending_reset_history_key`
+when a turn is in flight; `SessionAccountSubmenu` (`website/src/components/SessionAccountMenu.tsx`)
+surfaces the `"Claude account"` submenu in both the sidebar session menu and the
+in-session header title chevron menu (`SessionActionsMenu.tsx`).
 
 Phase 5 adds self-learning from corrections, scheduled cron jobs, and a web dashboard.
 This module covers self-learning from corrections, scheduled cron jobs, and the web dashboard.

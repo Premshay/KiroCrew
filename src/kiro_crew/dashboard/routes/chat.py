@@ -134,6 +134,8 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/chat/slots/{slot}/agent", chat.api_chat_slot_agent)
     app.router.add_get("/api/chat/slots/{slot}/runtime", chat.api_chat_slot_runtime)
     app.router.add_post("/api/chat/slots/{slot}/runtime", chat.api_chat_slot_runtime)
+    app.router.add_get("/api/chat/slots/{slot}/account", chat.api_chat_slot_account)
+    app.router.add_post("/api/chat/slots/{slot}/account", chat.api_chat_slot_account)
 
     # Optimizer
     app.router.add_post("/api/optimizer/optimize", handlers.handle_optimize)

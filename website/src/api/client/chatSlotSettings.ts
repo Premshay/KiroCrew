@@ -22,6 +22,28 @@ export interface SlotTurnTimeout {
   max: number
 }
 
+export interface SlotAccountOption {
+  id: string
+  label: string
+}
+
+export interface SlotAccountState {
+  available: boolean
+  eligible: boolean
+  reason: string
+  current: string
+  default: string
+  default_label: string
+  accounts: SlotAccountOption[]
+}
+
+export interface SlotAccountSwitchResult extends SlotAccountState {
+  ok: boolean
+  account: string
+  deferred: boolean
+  warning?: string
+}
+
 /** What `GET /api/chat/slots/follow-default` answers. */
 export interface FollowDefaultCount {
   count: number
@@ -91,6 +113,10 @@ export function createChatSlotSettingsEndpoints({ post, j, jfetch: fetch }: Clie
     /** Give this slot its own turn time limit (whole seconds), or null to follow the global. */
     setChatSlotTurnTimeout: (slot: string, secs: number | null) =>
       post('/api/chat/slots/' + encodeURIComponent(slot) + '/turn-timeout', { secs }).then(j) as Promise<SlotTurnTimeout & { ok?: boolean }>,
+    chatSlotAccount: (slot: string) =>
+      fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/account').then(j) as Promise<SlotAccountState>,
+    setChatSlotAccount: (slot: string, account: string) =>
+      post('/api/chat/slots/' + encodeURIComponent(slot) + '/account', { account }).then(j) as Promise<SlotAccountSwitchResult>,
     chatSlotsModel: (model: string, skip_running: boolean) =>
       post('/api/chat/slots/model', { model, skip_running }).then(j) as Promise<{ ok: boolean; model: string; switched: string[]; skipped_running: string[]; unchanged: string[]; failed: string[] }>,
     /** How many chats a person started keep a model of their own, and a digest of

@@ -10521,6 +10521,19 @@
       "title": "Demasiado grande para analizar",
       "body": "{{name}} ocupa {{size}}. Los archivos de más de {{limit}} no se revisan en busca de secretos antes de descargarlos.",
       "download_anyway": "Descargar de todos modos"
+    },
+    "sessionAccount": {
+      "cancel_button": "Cancelar",
+      "confirm_button": "Cambiar",
+      "confirm_switch": "¿Cambiar a {{account}}? La sesión reinicia su agente y conserva la conversación",
+      "default_for_new_sessions": "Predeterminado para nuevas sesiones: {{account}}",
+      "deferred_toast": "Cambiará después del turno actual",
+      "hint": "Elige con qué cuenta de suscripción de Claude se ejecuta esta sesión.",
+      "ineligible_default": "No es un puesto de suscripción de Claude",
+      "label": "Cuenta de Claude",
+      "load_failed": "No se pudo cargar la cuenta de Claude de esta sesión",
+      "save_failed": "No se pudo cambiar la cuenta de Claude",
+      "switched_toast": "Cambiado a {{account}}"
     }
   },
   "hooks": {

@@ -10521,6 +10521,19 @@
       "title": "Grande demais para verificar",
       "body": "{{name}} tem {{size}}. Arquivos acima de {{limit}} não são verificados em busca de segredos antes do download.",
       "download_anyway": "Baixar mesmo assim"
+    },
+    "sessionAccount": {
+      "cancel_button": "Cancelar",
+      "confirm_button": "Alternar",
+      "confirm_switch": "Alternar para {{account}}? A sessão reinicia seu agente e mantém a conversa",
+      "default_for_new_sessions": "Padrão para novas sessões: {{account}}",
+      "deferred_toast": "Alternará após o turno atual",
+      "hint": "Escolha sob qual login de assinatura Claude esta sessão será executada.",
+      "ineligible_default": "Não é um assento de assinatura Claude",
+      "label": "Conta Claude",
+      "load_failed": "Não foi possível carregar a conta Claude desta sessão",
+      "save_failed": "Não foi possível alternar a conta Claude",
+      "switched_toast": "Alternado para {{account}}"
     }
   },
   "hooks": {

@@ -10521,6 +10521,19 @@
       "title": "Troppo grande per essere analizzato",
       "body": "{{name}} pesa {{size}}. I file oltre {{limit}} non vengono controllati alla ricerca di segreti prima del download.",
       "download_anyway": "Scarica comunque"
+    },
+    "sessionAccount": {
+      "cancel_button": "Annulla",
+      "confirm_button": "Cambia",
+      "confirm_switch": "Passare a {{account}}? La sessione riavvia il proprio agente e mantiene la conversazione",
+      "default_for_new_sessions": "Predefinito per le nuove sessioni: {{account}}",
+      "deferred_toast": "Cambierà dopo il turno corrente",
+      "hint": "Scegli con quale accesso di abbonamento Claude viene eseguita questa sessione.",
+      "ineligible_default": "Non è una postazione con abbonamento Claude",
+      "label": "Account Claude",
+      "load_failed": "Impossibile caricare l'account Claude di questa sessione",
+      "save_failed": "Impossibile cambiare l'account Claude",
+      "switched_toast": "Passato a {{account}}"
     }
   },
   "hooks": {

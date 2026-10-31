@@ -6142,6 +6142,19 @@
       "session_queued": "This session: {{queued}} queued",
       "session_queued_hint": "Agents this session started are waiting for a free slot while fewer run at once.",
       "load_failed": "Could not check for queued agents"
+    },
+    "sessionAccount": {
+      "cancel_button": "Cancel",
+      "confirm_button": "Switch",
+      "confirm_switch": "Switch to {{account}}? The session restarts its agent and keeps the conversation",
+      "default_for_new_sessions": "Default for new sessions: {{account}}",
+      "deferred_toast": "Will switch after the current turn",
+      "hint": "Choose which Claude subscription login this session runs under.",
+      "ineligible_default": "Not a Claude subscription seat",
+      "label": "Claude account",
+      "load_failed": "Could not load this session's Claude account",
+      "save_failed": "Could not switch the Claude account",
+      "switched_toast": "Switched to {{account}}"
     }
   },
   "hooks": {

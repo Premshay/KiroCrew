@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
         SESSION_RELOAD_KIND,
         AcpProvider,
         DashboardState,
+        KiroCrewConfig,
         LLMProvider,
         _app_cancel_denied,
         _append_session_switch_notice,
@@ -34,7 +36,9 @@ if TYPE_CHECKING:
         _switch_target_busy,
         _test_interleave,
         default_project_dir,
+        default_template,
         deny_app_slot_access,
+        dispatch_kiro_agent,
         effective_session_key,
         is_sensitive_path,
         logger,
@@ -43,6 +47,7 @@ if TYPE_CHECKING:
         relay_archive_refusal,
         schedule_eager_spawn,
         sel,
+        session_agent_selection_name,
         slot_not_found,
         voice_runtime_workspace_conflict,
     )
@@ -798,3 +803,187 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
                 slot._pending_reset_history_key = session_key
     state.push_slots_update()
     return web.json_response({"ok": True, "project": project})
+
+
+async def api_chat_slot_account(request: web.Request) -> web.Response:
+    """GET/POST /api/chat/slots/{slot}/account -- owner-only per-session provider account."""
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+    from kiro_crew.platform.context import current_context
+
+    denied = await require_owner_dashboard_request(request, "chat.slot_account")
+    if denied is not None:
+        return denied
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if slot is None:
+        return _slot_not_found()
+
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    session_key = effective_session_key(slot)
+
+    candidates: list[str] = []
+    if slot.runtime_agent:
+        rb = cfg.agents.get(slot.runtime_agent)
+        if rb and rb.kiro_agent:
+            candidates.append(rb.kiro_agent)
+        candidates.append(slot.runtime_agent)
+    elif slot.agent:
+        ab = cfg.agents.get(slot.agent)
+        if ab and ab.kiro_agent:
+            candidates.append(ab.kiro_agent)
+        candidates.append(slot.agent)
+    else:
+        persisted = await asyncio.to_thread(session_agent_selection_name, session_key)
+        if persisted:
+            pb = cfg.agents.get(persisted)
+            if pb and pb.kiro_agent:
+                candidates.append(pb.kiro_agent)
+            candidates.append(persisted)
+        tmpl = default_template(cfg)
+        dispatched = dispatch_kiro_agent(tmpl)
+        if dispatched:
+            candidates.append(dispatched)
+        if tmpl and tmpl not in candidates:
+            candidates.append(tmpl)
+
+    providers = current_context().providers
+    policy_getter = getattr(providers, "agent_runtime_policy", None)
+    engine_identity = candidates[0] if candidates else ""
+    if callable(policy_getter):
+        for candidate in candidates:
+            if candidate and isinstance(policy_getter(candidate), dict):
+                engine_identity = candidate
+                break
+
+    def _read_state() -> dict[str, Any] | None:
+        return current_context().providers.session_account_state(session_key, engine_identity)
+
+    account_info = await asyncio.to_thread(_read_state)
+    empty_payload: dict[str, Any] = {
+        "available": False,
+        "eligible": False,
+        "reason": "",
+        "current": "",
+        "default": "",
+        "default_label": "",
+        "accounts": [],
+    }
+    if not isinstance(account_info, dict):
+        account_info = empty_payload
+
+    if request.method == "GET":
+        return web.json_response(account_info)
+
+    body, err = await read_bounded_json(request)
+    if err is not None:
+        return err
+    assert body is not None
+    raw_account = body.get("account")
+    if not isinstance(raw_account, str) or not raw_account.strip():
+        return web.json_response(
+            {"error": "account must be a non-empty string", "code": "invalid_session_account"},
+            status=400,
+        )
+    account = raw_account.strip()
+
+    if not account_info.get("available"):
+        return web.json_response(
+            {
+                "error": "session account switching is not available",
+                "code": "account_switching_unavailable",
+            },
+            status=409,
+        )
+    if not account_info.get("eligible"):
+        reason = str(
+            account_info.get("reason") or "this session does not run on a subscription account seat"
+        )
+        return web.json_response(
+            {"error": reason, "code": "session_account_ineligible"},
+            status=409,
+        )
+    valid_ids = {
+        str(entry.get("id"))
+        for entry in (account_info.get("accounts") or [])
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    if account not in valid_ids:
+        return web.json_response(
+            {"error": f"unknown account: {account}", "code": "invalid_session_account"},
+            status=400,
+        )
+
+    if account_info.get("current") == account:
+        return web.json_response(
+            {**account_info, "ok": True, "account": account, "deferred": False}
+        )
+
+    def _write_account() -> dict[str, Any]:
+        return current_context().providers.set_session_account(
+            session_key, account, engine_identity
+        )
+
+    try:
+        updated = await asyncio.to_thread(_write_account)
+    except ValueError as exc:
+        return web.json_response(
+            {"error": str(exc), "code": "invalid_session_account"},
+            status=400,
+        )
+
+    accounts_by_id = {
+        str(entry.get("id")): str(entry.get("label") or entry.get("id"))
+        for entry in (updated.get("accounts") or account_info.get("accounts") or [])
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    label = accounts_by_id.get(account, account)
+    notice = (
+        f"Claude account switched to {label} — agent process relaunched; conversation preserved"
+    )
+    reload_resp = await reload_slot_session(
+        state,
+        slot,
+        name,
+        still_ours=lambda in_lock: (
+            _slot_replaced_while_queued(state, slot, name, request, "slot_account")
+            if in_lock
+            else state._slots.get(name) is not slot
+        ),
+        denied=lambda sk: _app_cancel_denied(request, slot, "slot_account", sk),
+        busy=lambda sk: _switch_target_busy(
+            state, slot, sk, state.sessions.get_provider(sk), own_turn=True
+        ),
+        notice=notice,
+    )
+    if reload_resp.status == 200:
+        reload_data: dict[str, Any] = {}
+        if reload_resp.text:
+            with contextlib.suppress(Exception):
+                reload_data = json.loads(reload_resp.text)
+        result: dict[str, Any] = {
+            **updated,
+            "ok": True,
+            "account": account,
+            "deferred": False,
+        }
+        if "warning" in reload_data:
+            result["warning"] = reload_data["warning"]
+        return web.json_response(result)
+
+    if reload_resp.status == 409:
+        reload_err: dict[str, Any] = {}
+        if reload_resp.text:
+            with contextlib.suppress(Exception):
+                reload_err = json.loads(reload_resp.text)
+        if reload_err.get("code") in ("turn_in_flight", "slot_subagents_running"):
+            slot._pending_reset_history_key = effective_session_key(slot)
+            return web.json_response(
+                {
+                    **updated,
+                    "ok": True,
+                    "account": account,
+                    "deferred": True,
+                }
+            )
+    return reload_resp

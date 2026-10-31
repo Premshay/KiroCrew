@@ -40,7 +40,12 @@ empty. Redacted requests neither query nor emit this metadata; template
 rows never carry it. The public adapter returns `None`; companion policy is
 advisory metadata, not an enforcement boundary or a public picker behavior.
 Composition failures propagate, while other lookup failures log at debug and
-omit the policy.
+omit the policy. `ProviderRegistry.session_account_state(session_key, agent_name=...)`
+and `ProviderRegistry.set_session_account(session_key, account, agent_name=...)`
+likewise let an edition companion expose per-session subscription-account
+switching (such as `personal` vs `atlomy` Claude subscription seats) to the
+owner-only `/api/chat/slots/{slot}/account` endpoint; `DefaultProviderRegistry`
+returns `{"available": False}` and raises `ValueError` on mutation.
 
 ## PlatformContext
 

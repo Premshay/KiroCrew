@@ -132,6 +132,30 @@ class ProviderRegistry(Protocol):
         """
         ...
 
+    def session_account_state(
+        self, session_key: str, engine_identity: str = ""
+    ) -> dict[str, Any] | None:
+        """Return per-session provider account choices and eligibility, or None.
+
+        WIRED: ``dashboard/chat_api/session_relaunch.py::api_chat_slot_account``
+        reads this seam to populate the session menu's account switch and to
+        verify eligibility before switching. The public Default returns ``None``
+        (no account switching offered in the standalone edition).
+        """
+        ...
+
+    def set_session_account(
+        self, session_key: str, account: str, engine_identity: str = ""
+    ) -> dict[str, Any]:
+        """Record a per-session provider account choice and return updated state.
+
+        WIRED: ``dashboard/chat_api/session_relaunch.py::api_chat_slot_account``
+        calls this seam on ``POST /api/chat/slots/{slot}/account`` before
+        relaunching the session's agent process (or arming a deferred reset if a
+        turn is in flight).
+        """
+        ...
+
 
 #: Keys a consumer of :meth:`ProviderRegistry.agent_client_binding` may apply to
 #: an ACP client or runtime constructor. Deliberately narrow: these four describe

@@ -10373,6 +10373,19 @@
       "title": "Zu groß zum Prüfen",
       "body": "{{name}} ist {{size}} groß. Dateien über {{limit}} werden vor dem Download nicht auf Geheimnisse geprüft.",
       "download_anyway": "Trotzdem herunterladen"
+    },
+    "sessionAccount": {
+      "cancel_button": "Abbrechen",
+      "confirm_button": "Wechseln",
+      "confirm_switch": "Zu {{account}} wechseln? Die Sitzung startet ihren Agenten neu und behält das Gespräch bei",
+      "default_for_new_sessions": "Standard für neue Sitzungen: {{account}}",
+      "deferred_toast": "Wechselt nach dem aktuellen Zug",
+      "hint": "Wählen Sie aus, unter welchem Claude-Abonnement-Login diese Sitzung läuft.",
+      "ineligible_default": "Kein Claude-Abonnement-Platz",
+      "label": "Claude-Konto",
+      "load_failed": "Claude-Konto dieser Sitzung konnte nicht geladen werden",
+      "save_failed": "Claude-Konto konnte nicht gewechselt werden",
+      "switched_toast": "Gewechselt zu {{account}}"
     }
   },
   "hooks": {

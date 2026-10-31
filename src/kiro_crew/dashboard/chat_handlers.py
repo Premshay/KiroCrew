@@ -182,6 +182,7 @@ from kiro_crew.dashboard.chat_api.resume import (  # noqa: F401
 )
 from kiro_crew.dashboard.chat_api.runtime_selection import api_chat_slot_runtime  # noqa: F401
 from kiro_crew.dashboard.chat_api.session_relaunch import (  # noqa: F401
+    api_chat_slot_account,
     api_chat_slot_project,
     api_chat_slot_reload,
     api_chat_slot_workspace,

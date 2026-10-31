@@ -81,6 +81,18 @@ class DefaultProviderRegistry:
         """Public Kiro-ACP binds every agent to the native kiro-cli path."""
         return None
 
+    def session_account_state(
+        self, session_key: str, engine_identity: str = ""
+    ) -> dict[str, Any] | None:
+        """Public edition contributes no per-session provider accounts."""
+        return None
+
+    def set_session_account(
+        self, session_key: str, account: str, engine_identity: str = ""
+    ) -> dict[str, Any]:
+        """Public edition contributes no per-session provider accounts."""
+        return {"ok": False, "available": False}
+
 
 class DefaultPublishRegistry:
     """Registers the personal cloud drive as an OPT-IN publish destination.

@@ -10225,6 +10225,19 @@
       "title": "大きすぎてスキャンできません",
       "body": "{{name}} のサイズは {{size}} です。{{limit}} を超えるファイルは、ダウンロード前に機密情報のチェックが行われません。",
       "download_anyway": "それでもダウンロード"
+    },
+    "sessionAccount": {
+      "cancel_button": "キャンセル",
+      "confirm_button": "切り替える",
+      "confirm_switch": "{{account}} に切り替えますか？セッションは会話を保持したままエージェントを再起動します",
+      "default_for_new_sessions": "新規セッションのデフォルト: {{account}}",
+      "deferred_toast": "現在のターンの終了後に切り替わります",
+      "hint": "このセッションが使用する Claude サブスクリプションのログインを選択します。",
+      "ineligible_default": "Claude サブスクリプションのシートではありません",
+      "label": "Claude アカウント",
+      "load_failed": "このセッションの Claude アカウントを読み込めませんでした",
+      "save_failed": "Claude アカウントを切り替えられませんでした",
+      "switched_toast": "{{account}} に切り替えました"
     }
   },
   "hooks": {

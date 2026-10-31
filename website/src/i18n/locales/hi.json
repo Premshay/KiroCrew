@@ -10373,6 +10373,19 @@
       "title": "स्कैन करने के लिए बहुत बड़ी",
       "body": "{{name}} का आकार {{size}} है। {{limit}} से बड़ी फ़ाइलों को डाउनलोड से पहले गोपनीय जानकारी के लिए जाँचा नहीं जाता।",
       "download_anyway": "फिर भी डाउनलोड करो"
+    },
+    "sessionAccount": {
+      "cancel_button": "रद्द करें",
+      "confirm_button": "बदलें",
+      "confirm_switch": "{{account}} पर स्विच करें? यह सत्र बातचीत को सुरक्षित रखते हुए अपने एजेंट को पुनः आरंभ करता है",
+      "default_for_new_sessions": "नए सत्रों के लिए डिफ़ॉल्ट: {{account}}",
+      "deferred_toast": "वर्तमान टर्न के बाद स्विच किया जाएगा",
+      "hint": "चुनें कि यह सत्र किस Claude सदस्यता लॉगिन के अंतर्गत चलता है।",
+      "ineligible_default": "Claude सदस्यता सीट नहीं है",
+      "label": "Claude खाता",
+      "load_failed": "इस सत्र का Claude खाता लोड नहीं हो सका",
+      "save_failed": "Claude खाता बदला नहीं जा सका",
+      "switched_toast": "{{account}} पर स्विच किया गया"
     }
   },
   "hooks": {

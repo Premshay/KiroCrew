@@ -76,6 +76,9 @@ standalone provider and no multi-provider dispatch factory, because a second
 `agent.provider` value would route around every harness-parity invariant.
 
 The Claude Code harness has its own page: [claude-code-provider.md](claude-code-provider.md).
+Edition companions that manage multiple subscription accounts per seat expose
+per-session inspection and switching through `ProviderRegistry.session_account_state`
+and `ProviderRegistry.set_session_account`.
 
 
 ## Session Environments contract

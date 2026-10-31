@@ -10225,6 +10225,19 @@
       "title": "文件太大，无法扫描",
       "body": "{{name}} 大小为 {{size}}。超过 {{limit}} 的文件在下载前不会检查其中是否含有密钥等机密信息。",
       "download_anyway": "仍要下载"
+    },
+    "sessionAccount": {
+      "cancel_button": "取消",
+      "confirm_button": "切换",
+      "confirm_switch": "切换到 {{account}}？会话将重启其智能体并保留对话内容",
+      "default_for_new_sessions": "新会话默认账号：{{account}}",
+      "deferred_toast": "将在当前回合结束后切换",
+      "hint": "选择此会话运行所使用的 Claude 订阅登录账号。",
+      "ineligible_default": "非 Claude 订阅席位",
+      "label": "Claude 账号",
+      "load_failed": "无法加载此会话的 Claude 账号",
+      "save_failed": "无法切换 Claude 账号",
+      "switched_toast": "已切换到 {{account}}"
     }
   },
   "hooks": {
