@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -54,13 +55,21 @@ def _notify_owner(state: Any, arc: dict[str, Any], entry: dict[str, Any], conten
     return {"recipients": [arcs.OWNER], "outcome": "posted"}
 
 
-async def deliver_entry(state: Any, arc: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+def _plan(arc_id: str, entry: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """The arc and the urgent recipients; takes the store lock, so it runs off the loop."""
+    arc = arcs.read_arc(arc_id)
+    if entry["kind"] == "ASK" and entry.get("to") == arcs.OWNER:
+        return arc, []
+    return arc, urgent_recipients(arc_id, entry)
+
+
+async def deliver_entry(state: Any, arc_id: str, entry: dict[str, Any]) -> dict[str, Any]:
     """Post an urgent entry to its recipients; never raises."""
     try:
+        arc, keys = await asyncio.to_thread(_plan, arc_id, entry)
         content = _content(arc, entry)
         if entry["kind"] == "ASK" and entry.get("to") == arcs.OWNER:
             return _notify_owner(state, arc, entry, content)
-        keys = urgent_recipients(arc["id"], entry)
         if not keys:
             return {"recipients": [], "outcome": "skipped"}
         channel = state.channel_manager.get(arc["channel_id"])

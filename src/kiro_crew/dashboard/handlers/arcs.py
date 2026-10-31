@@ -23,6 +23,7 @@ from kiro_crew.validation import ARC_ENTRY_ROUTE_SCHEMA, ValidationError, valida
 logger = logging.getLogger(__name__)
 
 _ENTRY_TEXT_FIELDS = ("text", "step", "link")
+_PAGE = 200
 
 
 def _error_response(exc: Exception, operation: str) -> web.Response:
@@ -109,14 +110,20 @@ async def api_arc_entries_read(request: web.Request) -> web.Response:
 
     def work(key: str) -> dict[str, Any]:
         _member_arc(arc_id, key)
+        more = False
         if query:
             entries = arcs.grep_entries(arc_id, query)
         else:
-            entries = arcs.read_entries(arc_id, after=after)
-        return {
+            entries = arcs.read_entries(arc_id, after=after, limit=_PAGE + 1)
+            more = len(entries) > _PAGE
+            entries = entries[:_PAGE]
+        payload: dict[str, Any] = {
             "entries": [_public(e) for e in entries],
             "open_asks": [_public(e) for e in arcs.open_asks(arc_id)],
         }
+        if more:
+            payload.update(truncated=True, next_after=entries[-1]["id"])
+        return payload
 
     return await _run(request, "arc_entries_read", work)
 
@@ -162,7 +169,7 @@ async def api_arc_entries_write(request: web.Request) -> web.Response:
     payload = json.loads(response.text)
     stored = payload["entry"]
     try:
-        delivery = await deliver_entry(request.app.get("state"), arcs.read_arc(arc_id), stored)
+        delivery = await deliver_entry(request.app.get("state"), arc_id, stored)
     except Exception:
         logger.warning("arc delivery failed for %s", arc_id, exc_info=True)
         delivery = {"recipients": [], "outcome": "failed"}
@@ -179,13 +186,12 @@ async def api_arc_deliver(request: web.Request) -> web.Response:
     arc_id = request.match_info.get("arc_id", "")
     entry_id = request.match_info.get("entry_id", "")
 
-    def work() -> tuple[dict[str, Any], dict[str, Any] | None]:
-        arc = arcs.read_arc(arc_id)
+    def work() -> dict[str, Any] | None:
         found = [e for e in arcs.read_entries(arc_id, limit=10**9) if e["id"] == entry_id]
-        return arc, (found[0] if found else None)
+        return found[0] if found else None
 
     try:
-        arc, entry = await asyncio.to_thread(work)
+        entry = await asyncio.to_thread(work)
     except (arcs.ArcError, OSError) as exc:
         return _error_response(exc, "arc_deliver")
     if entry is None:
@@ -194,5 +200,5 @@ async def api_arc_deliver(request: web.Request) -> web.Response:
             status=404,
         )
     return web.json_response(
-        {"delivery": await deliver_entry(request.app.get("state"), arc, entry)}
+        {"delivery": await deliver_entry(request.app.get("state"), arc_id, entry)}
     )

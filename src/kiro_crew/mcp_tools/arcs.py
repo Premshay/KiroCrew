@@ -40,7 +40,8 @@ def schemas() -> list[dict[str, Any]]:
             "name": "arc_board_read",
             "description": (
                 "Read the arc board's entries (optionally only those after an entry id) "
-                f"and its open asks. {_PEER_DATA}"
+                "and its open asks; when the reply has truncated true, call again with "
+                f"after set to next_after. {_PEER_DATA}"
             ),
             "inputSchema": {
                 "type": "object",

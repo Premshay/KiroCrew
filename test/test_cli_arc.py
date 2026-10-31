@@ -97,6 +97,19 @@ def test_answer_too_long_exits_1(arc, capsys):
     assert len(arcs.open_asks(arc["id"])) == 1
 
 
+def test_answer_to_unknown_or_non_ask_id_exits_1_and_writes_nothing(arc, capsys):
+    ask = _ask(arc)
+    fact = arcs.append_entry(arc["id"], "chat-a", {"kind": "FACT", "text": "note"})
+    before = len(arcs.read_entries(arc["id"]))
+    for bad in (ask["id"] + "x", fact["id"]):
+        with pytest.raises(SystemExit) as exc:
+            cli_arc._arc(_ns(arc_action="answer", arc_id=arc["id"], ask_id=bad, text="staging"))
+        assert exc.value.code == 1
+        assert "is not an ASK" in capsys.readouterr().err
+    assert len(arcs.read_entries(arc["id"])) == before
+    assert len(arcs.open_asks(arc["id"])) == 1
+
+
 def test_show_lists_open_asks_with_age(arc, capsys):
     ask = _ask(arc)
     arcs.append_entry(

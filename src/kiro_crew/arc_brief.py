@@ -86,10 +86,11 @@ def render_brief(arc: dict[str, Any], member_key: str) -> str:
     else:
         current = "all milestones accepted"
     claims = [
-        f"{c['step']} ({_author_label(arc, c['author'])})" for c in arcs.open_claims(arc["id"])
+        _one_line(f"{c['step']} ({_author_label(arc, c['author'])})")
+        for c in arcs.open_claims(arc["id"])
     ]
     asks = [
-        f"{a['text']} (asked {a['age_secs']}s ago)"
+        _one_line(f"{a['text']} (asked {a['age_secs']}s ago)")
         for a in arcs.open_asks(arc["id"])
         if a["to"] == key
     ]
@@ -129,18 +130,17 @@ def _arc_block(arc: dict[str, Any], session_key: str, budget: int) -> tuple[str,
     unseen = arcs.unseen_entries(arc["id"], session_key, ENTRY_LIMIT)
     lines = [_entry_line(arc, e) for e in unseen]
     kept: list[int] = []
-    for i in range(len(lines) - 1, -1, -1):
-        cost = len(lines[i]) + 1
+    for i, line in enumerate(lines):
+        cost = len(line) + 1
         if cost + 1 > room:
             break
         room -= cost
         kept.append(i)
-    kept.reverse()
     if not kept:
         return head + brief + tail, None
     body = "\n\nNew entries:\n" + "\n".join(lines[i] for i in kept)
     if len(kept) < len(lines):
-        body += f"\n({len(lines) - len(kept)} older entries omitted)"
+        body += f"\n({len(lines) - len(kept)} more entries follow on later turns)"
     block = head + brief + body + tail
     if len(block) > budget:
         return head + brief + tail, None

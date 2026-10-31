@@ -132,6 +132,29 @@ async def test_entries_grep_and_after(routes, arc):
 
 
 @pytest.mark.asyncio
+async def test_entries_read_signals_truncation_and_pages(routes, arc, monkeypatch):
+    from kiro_crew import arcs
+
+    monkeypatch.setattr(routes, "_PAGE", 2)
+    ids = [
+        arcs.append_entry(arc["id"], PEER, {"kind": "FACT", "text": f"fact {i}"})["id"]
+        for i in range(3)
+    ]
+    first = json.loads((await routes.api_arc_entries_read(_get(arc["id"], "entries"))).text)
+    assert [e["id"] for e in first["entries"]] == ids[:2]
+    assert first["truncated"] is True
+    assert first["next_after"] == ids[1]
+    request = _request(
+        "GET",
+        f"/api/arcs/{arc['id']}/entries?after={first['next_after']}",
+        match_info={"arc_id": arc["id"]},
+    )
+    rest = json.loads((await routes.api_arc_entries_read(request)).text)
+    assert [e["id"] for e in rest["entries"]] == ids[2:]
+    assert "truncated" not in rest and "next_after" not in rest
+
+
+@pytest.mark.asyncio
 async def test_entry_text_is_redacted(routes, arc):
     from kiro_crew import arcs
 

@@ -122,6 +122,11 @@ def _arc(args: argparse.Namespace) -> None:
         elif action == "show":
             print(_show(args.arc_id))
         elif action == "answer":
+            known = {
+                e["id"] for e in arcs.read_entries(args.arc_id, limit=10**9) if e["kind"] == "ASK"
+            }
+            if args.ask_id not in known:
+                _fail(f"{args.ask_id} is not an ASK in arc {args.arc_id}")
             entry = arcs.append_entry(
                 args.arc_id,
                 arcs.OWNER,

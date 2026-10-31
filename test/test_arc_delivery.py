@@ -208,3 +208,30 @@ async def test_unreachable_when_no_orchestrator_to_post_as(world):
     assert delivery["recipients"] == [A]
     assert delivery["unreachable"] == [B]
     assert [key for key, _ in delivered] == [f"dashboard:{A}"]
+
+
+@pytest.mark.asyncio
+async def test_delivery_store_reads_stay_off_the_event_loop(world, monkeypatch):
+    import threading
+
+    from kiro_crew import arcs
+
+    loop_thread = threading.current_thread()
+    seen: list[threading.Thread] = []
+    real_read_arc, real_read_entries = arcs.read_arc, arcs.read_entries
+
+    def read_arc(*args, **kwargs):
+        seen.append(threading.current_thread())
+        return real_read_arc(*args, **kwargs)
+
+    def read_entries(*args, **kwargs):
+        seen.append(threading.current_thread())
+        return real_read_entries(*args, **kwargs)
+
+    monkeypatch.setattr(arcs, "read_arc", read_arc)
+    monkeypatch.setattr(arcs, "read_entries", read_entries)
+    ask = arcs.append_entry(world.arc["id"], A, {"kind": "ASK", "text": "which?", "to": B})
+    await _write(world, A, {"kind": "FAIL", "text": "boom"})
+    await _write(world, B, {"kind": "FACT", "text": "this one", "reply_to": ask["id"]})
+    assert seen
+    assert loop_thread not in seen
