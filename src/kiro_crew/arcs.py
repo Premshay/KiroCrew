@@ -413,12 +413,19 @@ def claim_collisions(arc_id: str, entry: dict[str, Any]) -> list[dict[str, Any]]
     milestone = entry.get("milestone")
     if milestone is None:
         milestone = read_arc(arc_id)["milestone_index"]
+    return collides(open_claims(arc_id), {**entry, "author": author, "milestone": milestone})
+
+
+def collides(
+    open_claim_entries: list[dict[str, Any]], entry: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The collision rule: open claims by another author on the entry's milestone and step."""
     step = _normalize_step(str(entry.get("step") or ""))
     return [
         c
-        for c in open_claims(arc_id)
-        if c["author"] != author
-        and c["milestone"] == milestone
+        for c in open_claim_entries
+        if c["author"] != entry.get("author")
+        and c["milestone"] == entry.get("milestone")
         and _normalize_step(c["step"]) == step
     ]
 
