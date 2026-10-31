@@ -551,6 +551,14 @@ from kiro_crew.dashboard.handlers.teams import (  # noqa: E402, F401
     api_teams_update,
 )
 
+# ── Arc board (handlers/arcs.py) ──
+from kiro_crew.dashboard.handlers.arcs import (  # noqa: E402, F401
+    api_arc_brief,
+    api_arc_entries_read,
+    api_arc_entries_write,
+    api_arcs_mine,
+)
+
 # ── Coordinator work items (handlers/work_items.py) ──
 from kiro_crew.dashboard.handlers.work_items import (  # noqa: E402, F401
     api_work_cycle_archive_list,

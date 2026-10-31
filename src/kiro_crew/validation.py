@@ -129,6 +129,7 @@ _OWNERS = (
     "kiro_crew.validation_parts.dashboard_route_schemas",
     "kiro_crew.validation_parts.messaging_session_schemas",
     "kiro_crew.validation_parts.work_item_schemas",
+    "kiro_crew.validation_parts.arc_schemas",
     "kiro_crew.validation_parts.server_registries",
     "kiro_crew.validation_parts.computer_use_schemas",
     "kiro_crew.validation_parts.opt_in_server_schemas",
@@ -591,6 +592,13 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         validate_jsonrpc_request,
         validate_jsonrpc_response,
         validate_string_field,
+    )
+    from kiro_crew.validation_parts.arc_schemas import (  # noqa: F401
+        ARC_BOARD_GREP_SCHEMA,
+        ARC_BOARD_READ_SCHEMA,
+        ARC_BOARD_WRITE_SCHEMA,
+        ARC_BRIEF_SCHEMA,
+        ARC_ENTRY_ROUTE_SCHEMA,
     )
     from kiro_crew.validation_parts.work_item_schemas import (  # noqa: F401
         _WORK_ITEM_HANDOFF_FIELDS,

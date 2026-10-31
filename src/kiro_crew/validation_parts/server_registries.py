@@ -139,6 +139,13 @@ from kiro_crew.validation_parts.messaging_session_schemas import (
     SESSION_SUMMARY_SCHEMA,
     WAIT_SCHEMA,
 )
+from kiro_crew.validation_parts.arc_schemas import (  # noqa: F401 - preserved facade exports
+    ARC_BOARD_GREP_SCHEMA,
+    ARC_BOARD_READ_SCHEMA,
+    ARC_BOARD_WRITE_SCHEMA,
+    ARC_BRIEF_SCHEMA,
+    ARC_ENTRY_ROUTE_SCHEMA,
+)
 from kiro_crew.validation_parts.work_item_schemas import (  # noqa: F401 - preserved facade exports
     WORK_CYCLE_ARCHIVE_LIST_SCHEMA,
     WORK_CYCLE_ARCHIVE_READ_SCHEMA,
@@ -182,6 +189,10 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "learn_remove": LEARN_REMOVE_SCHEMA,
     "session_ledger_read": SESSION_LEDGER_READ_SCHEMA,
     "session_ledger_record": SESSION_LEDGER_RECORD_SCHEMA,
+    "arc_brief": ARC_BRIEF_SCHEMA,
+    "arc_board_read": ARC_BOARD_READ_SCHEMA,
+    "arc_board_grep": ARC_BOARD_GREP_SCHEMA,
+    "arc_board_write": ARC_BOARD_WRITE_SCHEMA,
     "work_cycle_open": WORK_CYCLE_OPEN_SCHEMA,
     "work_item_create": WORK_ITEM_CREATE_SCHEMA,
     "work_item_update": WORK_ITEM_UPDATE_SCHEMA,

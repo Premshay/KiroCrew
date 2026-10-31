@@ -100,6 +100,11 @@ def render_brief(arc: dict[str, Any], member_key: str) -> str:
     return "\n\n".join(f"{title}:\n{body}" for title, body in sections)
 
 
+def brief_for(arc: dict[str, Any], member_key: str) -> str:
+    """The member's brief, defanged and redacted for a model or an API reader."""
+    return _defang(redact(render_brief(arc, member_key)))
+
+
 def _arc_block(arc: dict[str, Any], session_key: str, budget: int) -> tuple[str, str | None]:
     """Return the block for one arc within ``budget`` chars and the last entry id it shows."""
     head = f"[Arc board: {_defang(redact(_one_line(arc['title'])))}]\n{_FRAME}\n\n"

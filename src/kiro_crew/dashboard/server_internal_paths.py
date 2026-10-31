@@ -27,6 +27,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/session-maintenance",
         "/api/preference-consult",
         "/api/work-items",
+        "/api/arcs",
         "/api/send-message",
         "/api/delete-message",
         "/api/update-message",

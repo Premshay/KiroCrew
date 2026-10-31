@@ -1,0 +1,164 @@
+"""Member routes for the durable per-arc board.
+
+Identity comes only from the session-ledger boundary and no route takes a
+target-session or author field, so a caller can read and write only the arcs it
+is a member of, and only as itself.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+from aiohttp import web
+
+from kiro_crew import arc_brief, arcs
+from kiro_crew.dashboard.handlers.session_ledger import _resolve_ledger_key
+from kiro_crew.security.text_redaction import redact
+from kiro_crew.validation import ARC_ENTRY_ROUTE_SCHEMA, ValidationError, validate_tool_args
+
+logger = logging.getLogger(__name__)
+
+_ENTRY_TEXT_FIELDS = ("text", "step", "link")
+
+
+def _error_response(exc: Exception, operation: str) -> web.Response:
+    if isinstance(exc, arcs.ArcNotFound):
+        return web.json_response({"error": str(exc), "code": "arc_not_found"}, status=404)
+    if isinstance(exc, arcs.ArcAccessDenied):
+        logger.warning("arc access denied during %s", operation)
+        return web.json_response({"error": str(exc), "code": "arc_access_denied"}, status=403)
+    if isinstance(exc, arcs.ArcError):
+        return web.json_response({"error": str(exc), "code": "arc_validation"}, status=400)
+    if isinstance(exc, OSError):
+        logger.warning("arc store unavailable during %s", operation, exc_info=True)
+        return web.json_response(
+            {"error": "arc store is busy; try again", "code": "arc_store_busy"}, status=503
+        )
+    raise exc
+
+
+def _public(entry: dict[str, Any]) -> dict[str, Any]:
+    """An entry as a model may see it: every free-text field redacted."""
+    out = dict(entry)
+    for name in _ENTRY_TEXT_FIELDS:
+        if isinstance(out.get(name), str):
+            out[name] = redact(out[name])
+    if isinstance(out.get("checked"), list):
+        out["checked"] = [redact(str(c)) for c in out["checked"]]
+    return out
+
+
+def _member_arc(arc_id: str, key: str) -> dict[str, Any]:
+    arc = arcs.read_arc(arc_id)
+    if key not in arc["members"]:
+        raise arcs.ArcAccessDenied(f"caller is not a member of arc {arc_id}")
+    return arc
+
+
+def _mark_latest_seen(arc_id: str, key: str, entries: list[dict[str, Any]]) -> None:
+    if entries:
+        arcs.mark_seen(arc_id, key, entries[-1]["id"])
+
+
+async def _run(request: web.Request, operation: str, work: Any) -> web.Response:
+    key, refusal = await _resolve_ledger_key(request, operation)
+    if refusal is not None:
+        return refusal
+    try:
+        payload = await asyncio.to_thread(work, key)
+    except (arcs.ArcError, OSError) as exc:
+        return _error_response(exc, operation)
+    return web.json_response(payload)
+
+
+async def api_arcs_mine(request: web.Request) -> web.Response:
+    """GET /api/arcs/mine — the arcs the caller belongs to."""
+
+    def work(key: str) -> dict[str, Any]:
+        found = []
+        for arc in arcs.arcs_for_member(key):
+            milestones = arc["milestones"]
+            index = arc["milestone_index"]
+            found.append(
+                {
+                    "id": arc["id"],
+                    "title": arc["title"],
+                    "goal": arc["goal"],
+                    "milestone": milestones[index]["name"] if index < len(milestones) else "",
+                }
+            )
+        return {"arcs": found}
+
+    return await _run(request, "arc_mine", work)
+
+
+async def api_arc_brief(request: web.Request) -> web.Response:
+    """GET /api/arcs/{arc_id}/brief — the caller's standing brief."""
+    arc_id = request.match_info.get("arc_id", "")
+
+    def work(key: str) -> dict[str, Any]:
+        return {"brief": arc_brief.brief_for(_member_arc(arc_id, key), key)}
+
+    return await _run(request, "arc_brief", work)
+
+
+async def api_arc_entries_read(request: web.Request) -> web.Response:
+    """GET /api/arcs/{arc_id}/entries?after=&q= — read or grep, then mark seen."""
+    arc_id = request.match_info.get("arc_id", "")
+    query = request.query.get("q", "")
+    after = request.query.get("after") or None
+
+    def work(key: str) -> dict[str, Any]:
+        _member_arc(arc_id, key)
+        if query:
+            entries = arcs.grep_entries(arc_id, query)
+        else:
+            entries = arcs.read_entries(arc_id, after=after)
+        _mark_latest_seen(arc_id, key, entries)
+        return {
+            "entries": [_public(e) for e in entries],
+            "open_asks": [_public(e) for e in arcs.open_asks(arc_id)],
+        }
+
+    return await _run(request, "arc_entries_read", work)
+
+
+def _urgent_unseen(arc_id: str, key: str) -> list[dict[str, Any]]:
+    """Unseen peer entries the caller must not miss, marked seen once returned."""
+    unseen = arcs.unseen_entries(arc_id, key)
+    everything = arcs.read_entries(arc_id, limit=10**9)
+    my_asks = {e["id"] for e in everything if e["kind"] == "ASK" and e["author"] == key}
+    colliding: set[str] = set()
+    for claim in arcs.open_claims(arc_id):
+        if claim["author"] == key:
+            colliding.update(c["id"] for c in arcs.claim_collisions(arc_id, claim))
+    urgent = [
+        e for e in unseen if e["kind"] == "FAIL" or e["reply_to"] in my_asks or e["id"] in colliding
+    ]
+    _mark_latest_seen(arc_id, key, urgent)
+    return urgent
+
+
+async def api_arc_entries_write(request: web.Request) -> web.Response:
+    """POST /api/arcs/{arc_id}/entries — append as the verified caller."""
+    try:
+        raw = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    try:
+        body = validate_tool_args(raw, ARC_ENTRY_ROUTE_SCHEMA)
+    except ValidationError as exc:
+        return web.json_response({"error": str(exc), "code": "validation_error"}, status=400)
+    arc_id = request.match_info.get("arc_id", "")
+
+    def work(key: str) -> dict[str, Any]:
+        _member_arc(arc_id, key)
+        stored = arcs.append_entry(arc_id, key, body)
+        return {
+            "entry": _public(stored),
+            "unseen": [_public(e) for e in _urgent_unseen(arc_id, key)],
+        }
+
+    return await _run(request, "arc_entries_write", work)
