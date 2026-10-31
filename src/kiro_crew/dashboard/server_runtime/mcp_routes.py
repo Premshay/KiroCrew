@@ -179,6 +179,7 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_get("/api/arcs/{arc_id}/brief", handlers.api_arc_brief)
     app.router.add_get("/api/arcs/{arc_id}/entries", handlers.api_arc_entries_read)
     app.router.add_post("/api/arcs/{arc_id}/entries", handlers.api_arc_entries_write)
+    app.router.add_post("/api/arcs/{arc_id}/deliver/{entry_id}", handlers.api_arc_deliver)
     app.router.add_get("/api/work-ledger", _deferred_work_ledger("api_work_ledger_get"))
     app.router.add_post("/api/work-ledger/record", _deferred_work_ledger("api_work_ledger_record"))
     app.router.add_get("/api/work-ledger/brief", _deferred_work_ledger("api_work_brief"))

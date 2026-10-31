@@ -510,6 +510,37 @@ Examples:
     )
 
 
+def register_arc_parser(sub: _Commands) -> None:
+    arc_parser = cli_help.add_command(
+        sub,
+        "arc",
+        epilog="""
+Examples:
+  kirocrew arc create --file arc.json
+  kirocrew arc add-member ARC_ID SESSION_KEY --role builder
+  kirocrew arc show ARC_ID
+  kirocrew arc answer ARC_ID ASK_ID "use the staging key"
+  kirocrew arc accept ARC_ID
+""",
+        formatter_class=_fmt,
+    )
+    arc_sub = arc_parser.add_subparsers(dest="arc_action")
+    arc_create = arc_sub.add_parser("create", help="Create an arc from a JSON file")
+    arc_create.add_argument("--file", required=True, help="Path to the arc spec (JSON)")
+    arc_member = arc_sub.add_parser("add-member", help="Add a session to an arc")
+    arc_member.add_argument("arc_id", help="Arc id")
+    arc_member.add_argument("session_key", help="Session key of the new member")
+    arc_member.add_argument("--role", required=True, help="Role the member plays")
+    arc_show = arc_sub.add_parser("show", help="Show milestone, open claims and asks, entries")
+    arc_show.add_argument("arc_id", help="Arc id")
+    arc_answer = arc_sub.add_parser("answer", help="Answer an open ASK as the owner")
+    arc_answer.add_argument("arc_id", help="Arc id")
+    arc_answer.add_argument("ask_id", help="Id of the ASK entry")
+    arc_answer.add_argument("text", help="Answer text (up to 100 characters)")
+    arc_accept = arc_sub.add_parser("accept", help="Accept the current milestone")
+    arc_accept.add_argument("arc_id", help="Arc id")
+
+
 def register_artifact_parser(sub: _Commands) -> None:
     art_parser = cli_help.add_command(
         sub,

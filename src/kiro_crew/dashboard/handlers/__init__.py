@@ -553,6 +553,7 @@ from kiro_crew.dashboard.handlers.teams import (  # noqa: E402, F401
 
 # ── Arc board (handlers/arcs.py) ──
 from kiro_crew.dashboard.handlers.arcs import (  # noqa: E402, F401
+    api_arc_deliver,
     api_arc_brief,
     api_arc_entries_read,
     api_arc_entries_write,

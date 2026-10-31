@@ -77,6 +77,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("learn", "Save or manage learned corrections"),
             ("consolidate", "Force history consolidation (triggers skill extraction)"),
             ("artifact", "Manage saved artifacts (LLM-generated UI)"),
+            ("arc", "Coordinate lanes on a durable per-arc board (owner)"),
         ),
     ),
     (

@@ -528,6 +528,7 @@ def main() -> None:
     cli_parser_agent.register_computer_parser(sub)
     cli_parser_agent.register_learn_parser(sub)
     cli_parser_agent.register_artifact_parser(sub)
+    cli_parser_agent.register_arc_parser(sub)
     cli_parser_agent.register_memory_parser(sub)
     cli_parser_agent.register_agent_parser(sub)
     cli_parser_agent.register_workspace_parser(sub)
@@ -846,6 +847,10 @@ def main() -> None:
         from kiro_crew.cli_commands import _learn
 
         _learn(args)
+    elif args.command == "arc":
+        from kiro_crew.cli_commands import _arc
+
+        _arc(args)
     elif args.command == "artifact":
         from kiro_crew.cli_commands import _artifact
 

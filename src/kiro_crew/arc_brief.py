@@ -71,6 +71,11 @@ def _entry_line(arc: dict[str, Any], entry: dict[str, Any]) -> str:
     return _defang(redact(_one_line(line)))[:_ENTRY_LINE_CAP]
 
 
+def entry_line(arc: dict[str, Any], entry: dict[str, Any]) -> str:
+    """One entry as a redacted, defanged ``[KIND] role (ts): text — link`` line."""
+    return _entry_line(arc, entry)
+
+
 def render_brief(arc: dict[str, Any], member_key: str) -> str:
     """Render the arc's standing brief for one member."""
     key = ledger_key(member_key)

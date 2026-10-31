@@ -701,6 +701,7 @@ _OWNERS = (
     "kiro_crew.cli_commands_security",
     "kiro_crew.cli_commands_eval",
     "kiro_crew.cli_commands_learn",
+    "kiro_crew.cli_commands_arc",
 )
 for _owner in _OWNERS:
     importlib.import_module(_owner)
@@ -765,6 +766,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _spawn_row_text,
         _spawn_run,
     )
+    from kiro_crew.cli_commands_arc import _arc  # noqa: F401
     from kiro_crew.cli_commands_learn import (  # noqa: F401
         _LEARN_DEDUP_NOTE,
         _LEARN_EMBED_NOTE,

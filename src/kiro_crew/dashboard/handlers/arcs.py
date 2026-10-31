@@ -168,3 +168,31 @@ async def api_arc_entries_write(request: web.Request) -> web.Response:
         delivery = {"recipients": [], "outcome": "failed"}
     payload["delivery"] = delivery
     return web.json_response(payload)
+
+
+async def api_arc_deliver(request: web.Request) -> web.Response:
+    """POST /api/arcs/{arc_id}/deliver/{entry_id} — re-deliver a stored entry; takes no content."""
+    if request.get("internal_auth") is not True:
+        return web.json_response(
+            {"error": "internal secret required", "code": "internal_auth_required"}, status=403
+        )
+    arc_id = request.match_info.get("arc_id", "")
+    entry_id = request.match_info.get("entry_id", "")
+
+    def work() -> tuple[dict[str, Any], dict[str, Any] | None]:
+        arc = arcs.read_arc(arc_id)
+        found = [e for e in arcs.read_entries(arc_id, limit=10**9) if e["id"] == entry_id]
+        return arc, (found[0] if found else None)
+
+    try:
+        arc, entry = await asyncio.to_thread(work)
+    except (arcs.ArcError, OSError) as exc:
+        return _error_response(exc, "arc_deliver")
+    if entry is None:
+        return web.json_response(
+            {"error": f"no entry {entry_id} in arc {arc_id}", "code": "arc_entry_not_found"},
+            status=404,
+        )
+    return web.json_response(
+        {"delivery": await deliver_entry(request.app.get("state"), arc, entry)}
+    )
