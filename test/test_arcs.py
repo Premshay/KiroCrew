@@ -201,3 +201,53 @@ def test_claim_collisions_normalizes_step():
         arc_id, "a", {"kind": "DONE", "text": "x", "link": "l", "reply_to": mine["id"]}
     )
     assert arcs.claim_collisions(arc_id, candidate) == []
+
+
+def test_unknown_arc_id_creates_no_directory(tmp_path):
+    ghost = "arc_" + "1" * 32
+    fact = {"kind": "FACT", "text": "x"}
+    for call in (
+        lambda: arcs.append_entry(ghost, "a", fact),
+        lambda: arcs.add_member(ghost, "a", "w"),
+        lambda: arcs.accept_milestone(ghost),
+        lambda: arcs.mark_seen(ghost, "a", "ae_" + "0" * 32),
+        lambda: arcs.unseen_entries(ghost, "a"),
+        lambda: arcs.seen_by(ghost, "ae_" + "0" * 32),
+    ):
+        with pytest.raises(arcs.ArcNotFound):
+            call()
+    assert not (tmp_path / "home" / "arcs" / ghost).exists()
+    arc_id = _arc("a")
+    assert [a["id"] for a in arcs.list_arcs()] == [arc_id]
+    assert [a["id"] for a in arcs.arcs_for_member("a")] == [arc_id]
+
+
+def test_owner_cannot_be_impersonated_by_key_folding():
+    arc_id = _arc("a")
+    for author in ("dashboard_owner", "dashboard:owner"):
+        assert arcs.ledger_key(author) == arcs.OWNER
+        with pytest.raises(arcs.ArcAccessDenied):
+            arcs.append_entry(arc_id, author, {"kind": "FACT", "text": "x"})
+    assert arcs.read_entries(arc_id) == []
+
+
+def test_torn_trailing_line_is_ignored_and_truncated(tmp_path):
+    arc_id = _arc("a")
+    first = arcs.append_entry(arc_id, "a", {"kind": "FACT", "text": "one"})
+    path = tmp_path / "home" / "arcs" / arc_id / "entries.jsonl"
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write('{"kind": "FACT", "te')
+    assert [e["id"] for e in arcs.read_entries(arc_id)] == [first["id"]]
+    second = arcs.append_entry(arc_id, "a", {"kind": "FACT", "text": "two"})
+    assert [e["id"] for e in arcs.read_entries(arc_id)] == [first["id"], second["id"]]
+    assert path.read_text(encoding="utf-8").count("\n") == 2
+
+
+def test_corrupt_middle_line_still_raises(tmp_path):
+    arc_id = _arc("a")
+    arcs.append_entry(arc_id, "a", {"kind": "FACT", "text": "one"})
+    path = tmp_path / "home" / "arcs" / arc_id / "entries.jsonl"
+    good = path.read_text(encoding="utf-8")
+    path.write_text("garbage\n" + good, encoding="utf-8")
+    with pytest.raises(ValueError):
+        arcs.read_entries(arc_id)

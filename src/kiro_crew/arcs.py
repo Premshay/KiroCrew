@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import re
 import time
@@ -36,6 +37,8 @@ _ARC_ID_RE = re.compile(r"arc_[0-9a-f]{32}\Z")
 _ENTRY_ID_RE = re.compile(r"ae_[0-9a-f]{32}\Z")
 _LOCK_TIMEOUT_SECS = 5.0
 _LOCK_POLL_SECS = 0.05
+
+logger = logging.getLogger(__name__)
 
 
 class ArcError(ValueError):
@@ -66,7 +69,8 @@ def _arc_dir(arc_id: str) -> Path:
 
 @contextmanager
 def _locked(dir_path: Path) -> Iterator[None]:
-    dir_path.mkdir(parents=True, exist_ok=True)
+    if not dir_path.is_dir():
+        raise ArcNotFound(f"arc {dir_path.name!r} was not found")
     fd = os.open(str(dir_path / ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         deadline = time.monotonic() + _LOCK_TIMEOUT_SECS
@@ -105,7 +109,27 @@ def _load_entries(dir_path: Path) -> list[dict[str, Any]]:
         text = (dir_path / "entries.jsonl").read_text(encoding="utf-8")
     except FileNotFoundError:
         return []
-    return [json.loads(line) for line in text.splitlines() if line.strip()]
+    lines = [line for line in text.splitlines() if line.strip()]
+    entries = []
+    for index, line in enumerate(lines):
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            if index != len(lines) - 1:
+                raise
+            logger.warning("ignoring torn trailing line in %s", dir_path / "entries.jsonl")
+    return entries
+
+
+def _drop_torn_tail(path: Path) -> None:
+    """Truncate a partial final line left by an interrupted append."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return
+    if data and not data.endswith(b"\n"):
+        with open(path, "r+b") as handle:
+            handle.truncate(data.rfind(b"\n") + 1)
 
 
 def _str(value: Any, limit: int, field: str, *, required: bool = False) -> str:
@@ -167,6 +191,7 @@ def create_arc(spec: dict[str, Any]) -> dict[str, Any]:
         "created_at": _now().isoformat(timespec="seconds"),
     }
     dir_path = _arc_dir(arc["id"])
+    dir_path.mkdir(parents=True, exist_ok=True)
     with _locked(dir_path):
         _write_json(dir_path / "arc.json", arc)
     return copy.deepcopy(arc)
@@ -186,7 +211,11 @@ def list_arcs() -> list[dict[str, Any]]:
     root = _root()
     if not root.is_dir():
         return []
-    found = [read_arc(p.name) for p in root.iterdir() if _ARC_ID_RE.fullmatch(p.name)]
+    found = [
+        read_arc(p.name)
+        for p in root.iterdir()
+        if _ARC_ID_RE.fullmatch(p.name) and (p / "arc.json").is_file()
+    ]
     return sorted(found, key=lambda arc: (arc["created_at"], arc["id"]))
 
 
@@ -260,6 +289,8 @@ def _validate_entry(entry: dict[str, Any], members: dict[str, Any]) -> dict[str,
 def append_entry(arc_id: str, author: str, entry: dict[str, Any]) -> dict[str, Any]:
     """Validate and append one entry authored by a member or the owner."""
     key = author if author == OWNER else ledger_key(author)
+    if key == OWNER and author != OWNER:
+        raise ArcAccessDenied("only the owner may author as owner")
     dir_path = _arc_dir(arc_id)
     with _locked(dir_path):
         arc = _load_arc(dir_path)
@@ -277,6 +308,7 @@ def append_entry(arc_id: str, author: str, entry: dict[str, Any]) -> dict[str, A
             "milestone": milestone,
         }
         line = json.dumps(stored, ensure_ascii=False, sort_keys=True) + "\n"
+        _drop_torn_tail(dir_path / "entries.jsonl")
         with open(dir_path / "entries.jsonl", "a", encoding="utf-8") as handle:
             handle.write(line)
             handle.flush()
