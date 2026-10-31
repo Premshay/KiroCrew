@@ -97,6 +97,8 @@ async def test_collision_mentions_both_claimants(world):
     delivery = json.loads((await _write(world, B, _claim("wire the route"))).text)["delivery"]
     assert sorted(delivery["recipients"]) == [A, B]
     assert sorted(world.channel.post.await_args.kwargs["mention"]) == [f"m-{A}", f"m-{B}"]
+    assert world.channel.post.await_args.args[0] == "m-orch"
+    assert world.channel.post.await_args.kwargs["from_role"] == "reviewer"
 
 
 @pytest.mark.asyncio
@@ -166,3 +168,43 @@ async def test_reply_to_owner_ask_is_not_delivered(world):
     assert delivery == {"recipients": [], "outcome": "skipped"}
     world.channel.post.assert_not_awaited()
     world.state.notify.assert_not_called()
+
+
+def _real_channel(orchestrator: str | None = "orch"):
+    from kiro_crew.channel import Channel
+
+    channel = Channel(id="ch1", topic="arc")
+    delivered: list[tuple[str, str]] = []
+
+    async def _deliver(_channel, agent, msg):
+        delivered.append((agent.session_key, msg.content))
+        return "delivered"
+
+    channel._delivery_fn = _deliver
+    ids = {}
+    for slot in (A, B, "orch"):
+        ids[slot] = channel.attach_session(f"dashboard:{slot}", slot).id
+    channel.orchestrator_id = ids[orchestrator] if orchestrator else None
+    return channel, delivered
+
+
+@pytest.mark.asyncio
+async def test_collision_reaches_both_claimants_through_a_real_channel(world):
+    channel, delivered = _real_channel()
+    world.manager.get = lambda cid: channel
+    await _write(world, A, _claim("wire route"))
+    delivery = json.loads((await _write(world, B, _claim("wire route"))).text)["delivery"]
+    assert sorted(delivery["recipients"]) == [A, B]
+    assert sorted(key for key, _ in delivered) == [f"dashboard:{A}", f"dashboard:{B}"]
+    assert all(text.startswith("CLAIM from reviewer:") for _, text in delivered)
+
+
+@pytest.mark.asyncio
+async def test_unreachable_when_no_orchestrator_to_post_as(world):
+    channel, delivered = _real_channel(orchestrator=None)
+    world.manager.get = lambda cid: channel
+    await _write(world, A, _claim("wire route"))
+    delivery = json.loads((await _write(world, B, _claim("wire route"))).text)["delivery"]
+    assert delivery["recipients"] == [A]
+    assert delivery["unreachable"] == [B]
+    assert [key for key, _ in delivered] == [f"dashboard:{A}"]

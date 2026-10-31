@@ -69,14 +69,21 @@ async def deliver_entry(state: Any, arc: dict[str, Any], entry: dict[str, Any]) 
         by_key = {ledger_key(m.session_key): mid for mid, m in channel.members.items()}
         reachable = [k for k in keys if k in by_key]
         unreachable = [k for k in keys if k not in by_key]
+        # Channel.post never delivers to its own sender, so a recipient who is also the
+        # sender cannot be reached: the colliding author posts as the orchestrator.
+        sender = channel.orchestrator_id
+        if sender is None or entry["author"] not in reachable:
+            sender = by_key.get(entry["author"]) or sender
+        if sender is None:
+            raise LookupError("arc channel has no sender")
+        for key in [k for k in reachable if by_key[k] == sender]:
+            reachable.remove(key)
+            unreachable.append(key)
         result: dict[str, Any] = {"recipients": reachable, "outcome": "skipped"}
         if unreachable:
             result["unreachable"] = unreachable
         if not reachable:
             return result
-        sender = by_key.get(entry["author"]) or channel.orchestrator_id
-        if sender is None:
-            raise LookupError("arc channel has no sender")
         await channel.post(
             sender,
             content,
