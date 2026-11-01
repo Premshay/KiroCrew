@@ -38,9 +38,7 @@ async def client():
     # truthy and flip the gate to the 401 stale-owner branch. Delivery needs the
     # arc's channel (the owner's answer is posted to the asking lane through it).
     lane = SimpleNamespace(session_key=MEMBER, role="builder")
-    channel = SimpleNamespace(
-        members={"m-1": lane}, orchestrator_id="m-orch", post=AsyncMock()
-    )
+    channel = SimpleNamespace(members={"m-1": lane}, orchestrator_id="m-orch", post=AsyncMock())
     manager = MagicMock()
     manager.get = lambda cid: channel if cid == "ch1" else None
     app = web.Application()
@@ -65,7 +63,10 @@ async def _make_arc(client: TestClient, **over: Any) -> dict[str, Any]:
         "lineage": "owner's product goal",
         "autonomy": 2,
         "channel_id": "ch1",
-        "milestones": [{"name": "m1", "criteria": "works"}, {"name": "m2", "criteria": "proven"}],
+        "milestones": [
+            {"name": "m1", "criteria": "works"},
+            {"name": "m2", "criteria": "proven"},
+        ],
     }
     spec.update(over)
     response = await client.post("/api/arc-board/arcs", json=spec)
@@ -84,7 +85,10 @@ async def test_list_is_empty_until_an_arc_exists(client: TestClient) -> None:
 async def test_create_adds_members_and_lists_the_arc(client: TestClient) -> None:
     arc = await _make_arc(
         client,
-        members=[{"session_key": MEMBER, "role": "builder"}, {"session_key": PEER, "role": "reviewer"}],
+        members=[
+            {"session_key": MEMBER, "role": "builder"},
+            {"session_key": PEER, "role": "reviewer"},
+        ],
     )
     assert set(arc["members"]) == {MEMBER, PEER}
     response = await client.get("/api/arc-board/arcs")
@@ -115,13 +119,22 @@ async def test_detail_covers_brief_entries_asks_and_claims(client: TestClient) -
     arcs.append_entry(
         arc["id"],
         MEMBER,
-        {"kind": "CLAIM", "text": "on the feed", "step": "feed", "checked": ["board spec"]},
+        {
+            "kind": "CLAIM",
+            "text": "on the feed",
+            "step": "feed",
+            "checked": ["board spec"],
+        },
     )
     response = await client.get(f"/api/arc-board/arcs/{arc['id']}")
     assert response.status == 200
     body = await response.json()
     assert body["arc"]["id"] == arc["id"]
-    assert body["brief"].startswith("Goal lineage")
+    assert body["briefs"][MEMBER].startswith("Goal lineage")
+    assert [lane["key"] for lane in body["lanes"]] == [MEMBER]
+    assert body["lanes"][0]["claim"]["step"] == "feed"
+    assert body["lanes"][0]["entries"] == 2
+    assert body["collisions"] == []
     assert [e["kind"] for e in body["entries"]] == ["ASK", "CLAIM"]
     assert [a["to"] for a in body["open_asks"]] == [arcs.OWNER]
     assert [c["author"] for c in body["open_claims"]] == [MEMBER]
@@ -166,7 +179,8 @@ async def test_add_member_and_re_role(client: TestClient) -> None:
 async def test_add_member_refuses_the_owner_key(client: TestClient) -> None:
     arc = await _make_arc(client)
     response = await client.post(
-        f"/api/arc-board/arcs/{arc['id']}/members", json={"session_key": "owner", "role": "x"}
+        f"/api/arc-board/arcs/{arc['id']}/members",
+        json={"session_key": "owner", "role": "x"},
     )
     assert response.status == 400
     assert (await response.json())["code"] == "arc_validation"
@@ -209,17 +223,196 @@ async def test_answer_to_an_unknown_ask_is_400(client: TestClient) -> None:
     assert (await response.json())["code"] == "arc_validation"
 
 
+async def _accept(client: TestClient, arc_id: str, expected: int) -> web.Response:
+    return await client.post(
+        f"/api/arc-board/arcs/{arc_id}/accept", json={"expected_index": expected}
+    )
+
+
 @pytest.mark.asyncio
 async def test_accept_advances_then_refuses_when_complete(client: TestClient) -> None:
     arc = await _make_arc(client)
-    response = await client.post(f"/api/arc-board/arcs/{arc['id']}/accept")
+    response = await _accept(client, arc["id"], 0)
     assert response.status == 200
     assert (await response.json())["arc"]["milestone_index"] == 1
-    response = await client.post(f"/api/arc-board/arcs/{arc['id']}/accept")
+    response = await _accept(client, arc["id"], 1)
     assert (await response.json())["arc"]["milestone_index"] == 2
-    response = await client.post(f"/api/arc-board/arcs/{arc['id']}/accept")
+    response = await _accept(client, arc["id"], 2)
     assert response.status == 409
-    assert (await response.json())["code"] == "arc_complete"
+    assert (await response.json())["code"] == "arc_conflict"
+
+
+@pytest.mark.asyncio
+async def test_a_second_accept_of_the_same_milestone_does_not_skip_one(
+    client: TestClient,
+) -> None:
+    """A double click sends the displayed index twice; only the first advances."""
+    from kiro_crew import arcs
+
+    arc = await _make_arc(client)
+    assert (await _accept(client, arc["id"], 0)).status == 200
+    response = await _accept(client, arc["id"], 0)
+    assert response.status == 409
+    assert (await response.json())["code"] == "arc_conflict"
+    assert arcs.read_arc(arc["id"])["milestone_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_accept_requires_the_displayed_index(client: TestClient) -> None:
+    arc = await _make_arc(client)
+    response = await client.post(f"/api/arc-board/arcs/{arc['id']}/accept", json={})
+    assert response.status == 400
+
+
+@pytest.mark.asyncio
+async def test_create_with_a_bad_lane_creates_nothing(client: TestClient) -> None:
+    response = await client.post(
+        "/api/arc-board/arcs",
+        json={
+            "title": "t",
+            "milestones": [{"name": "m1"}],
+            "members": [
+                {"session_key": MEMBER, "role": "ok"},
+                {"session_key": "owner", "role": "x"},
+            ],
+        },
+    )
+    assert response.status == 400
+    assert (await (await client.get("/api/arc-board/arcs")).json())["arcs"] == []
+
+
+@pytest.mark.asyncio
+async def test_remove_member_keeps_its_entries(client: TestClient) -> None:
+    from kiro_crew import arcs
+
+    arc = await _make_arc(
+        client,
+        members=[
+            {"session_key": MEMBER, "role": "builder"},
+            {"session_key": PEER, "role": "r"},
+        ],
+    )
+    arcs.append_entry(arc["id"], PEER, {"kind": "FACT", "text": "found it"})
+    response = await client.post(
+        f"/api/arc-board/arcs/{arc['id']}/members/remove", json={"session_key": PEER}
+    )
+    assert response.status == 200
+    assert set((await response.json())["arc"]["members"]) == {MEMBER}
+    assert [e["author"] for e in arcs.read_entries(arc["id"])] == [PEER]
+    response = await client.post(
+        f"/api/arc-board/arcs/{arc['id']}/members/remove", json={"session_key": PEER}
+    )
+    assert response.status == 400
+
+
+@pytest.mark.asyncio
+async def test_autonomy_changes_and_validates(client: TestClient) -> None:
+    arc = await _make_arc(client)
+    url = f"/api/arc-board/arcs/{arc['id']}/autonomy"
+    response = await client.post(url, json={"autonomy": 3})
+    assert (await response.json())["arc"]["autonomy"] == 3
+    assert (await client.post(url, json={"autonomy": 4})).status == 400
+    assert (await client.post(url, json={"autonomy": True})).status == 400
+
+
+@pytest.mark.asyncio
+async def test_note_posts_an_owner_fact(client: TestClient) -> None:
+    from kiro_crew import arcs
+
+    arc = await _make_arc(client, members=[{"session_key": MEMBER, "role": "builder"}])
+    response = await client.post(
+        f"/api/arc-board/arcs/{arc['id']}/note", json={"text": "M1 needs the 360 walk"}
+    )
+    assert response.status == 200, await response.text()
+    entry = (await response.json())["entry"]
+    assert (entry["author"], entry["kind"]) == (arcs.OWNER, "FACT")
+    assert arcs.read_entries(arc["id"])[-1]["text"] == "M1 needs the 360 walk"
+
+
+@pytest.mark.asyncio
+async def test_detail_reports_collisions_and_milestone_reports(
+    client: TestClient,
+) -> None:
+    from kiro_crew import arcs
+
+    arc = await _make_arc(
+        client,
+        members=[
+            {"session_key": MEMBER, "role": "builder"},
+            {"session_key": PEER, "role": "r"},
+        ],
+    )
+    a = arcs.append_entry(
+        arc["id"],
+        MEMBER,
+        {"kind": "CLAIM", "text": "x", "step": "Feed", "checked": ["s"]},
+    )
+    b = arcs.append_entry(
+        arc["id"],
+        PEER,
+        {"kind": "CLAIM", "text": "y", "step": "feed ", "checked": ["s"]},
+    )
+    arcs.append_entry(
+        arc["id"],
+        MEMBER,
+        {"kind": "DONE", "text": "m1 done", "link": "https://x/pull/1"},
+    )
+    body = await (await client.get(f"/api/arc-board/arcs/{arc['id']}")).json()
+    assert [sorted(g) for g in body["collisions"]] == [sorted([a["id"], b["id"]])]
+    assert [e["text"] for e in body["milestone_reports"]] == ["m1 done"]
+
+
+@pytest.mark.asyncio
+async def test_report_counts_the_board(client: TestClient) -> None:
+    from kiro_crew import arcs
+
+    arc = await _make_arc(client, members=[{"session_key": MEMBER, "role": "builder"}])
+    arcs.append_entry(arc["id"], MEMBER, {"kind": "ASK", "text": "q?", "to": arcs.OWNER})
+    arcs.append_entry(arc["id"], MEMBER, {"kind": "FAIL", "text": "dead end"})
+    response = await client.get(f"/api/arc-board/arcs/{arc['id']}/report")
+    assert response.status == 200
+    body = await response.json()
+    assert body["entries"] == 2
+    assert body["by_kind"] == {"ASK": 1, "FAIL": 1}
+    assert body["by_lane"] == {MEMBER: {"ASK": 1, "FAIL": 1}}
+    assert body["ask_age"]["open_asks"] == 1
+    assert body["reading_load_words"] == 1
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "javascript:alert(1)",
+        "  JavaScript:x",
+        "java\tscript:x",
+        "data:text/html,x",
+        "vbscript:x",
+    ],
+)
+def test_store_refuses_an_executable_link(link: str) -> None:
+    from kiro_crew import arcs
+
+    arc = arcs.create_arc(
+        {"title": "t", "milestones": [{"name": "m"}]},
+        members=[{"session_key": MEMBER, "role": "b"}],
+    )
+    with pytest.raises(arcs.ArcError):
+        arcs.append_entry(arc["id"], MEMBER, {"kind": "FACT", "text": "x", "link": link})
+
+
+@pytest.mark.parametrize(
+    "link",
+    ["https://github.com/o/r/pull/1 — note", "Branch tenon/m1: see notes", "/home/x/y"],
+)
+def test_store_keeps_evidence_links(link: str) -> None:
+    from kiro_crew import arcs
+
+    arc = arcs.create_arc(
+        {"title": "t", "milestones": [{"name": "m"}]},
+        members=[{"session_key": MEMBER, "role": "b"}],
+    )
+    entry = arcs.append_entry(arc["id"], MEMBER, {"kind": "FACT", "text": "x", "link": link})
+    assert entry["link"] == link
 
 
 @pytest.mark.asyncio
@@ -242,9 +435,25 @@ async def test_every_owner_route_is_gated() -> None:
             ("GET", "/api/arc-board/arcs", None),
             ("POST", "/api/arc-board/arcs", {"title": "t"}),
             ("GET", f"/api/arc-board/arcs/{MEMBER}", None),
-            ("POST", f"/api/arc-board/arcs/{MEMBER}/members", {"session_key": MEMBER, "role": "r"}),
-            ("POST", f"/api/arc-board/arcs/{MEMBER}/answer", {"ask_id": "ae_" + "0" * 32, "text": "t"}),
-            ("POST", f"/api/arc-board/arcs/{MEMBER}/accept", None),
+            (
+                "POST",
+                f"/api/arc-board/arcs/{MEMBER}/members",
+                {"session_key": MEMBER, "role": "r"},
+            ),
+            (
+                "POST",
+                f"/api/arc-board/arcs/{MEMBER}/answer",
+                {"ask_id": "ae_" + "0" * 32, "text": "t"},
+            ),
+            ("POST", f"/api/arc-board/arcs/{MEMBER}/accept", {"expected_index": 0}),
+            ("GET", f"/api/arc-board/arcs/{MEMBER}/report", None),
+            (
+                "POST",
+                f"/api/arc-board/arcs/{MEMBER}/members/remove",
+                {"session_key": MEMBER},
+            ),
+            ("POST", f"/api/arc-board/arcs/{MEMBER}/autonomy", {"autonomy": 2}),
+            ("POST", f"/api/arc-board/arcs/{MEMBER}/note", {"text": "t"}),
         ):
             if method == "GET":
                 response = await client.get(path, headers=headers)

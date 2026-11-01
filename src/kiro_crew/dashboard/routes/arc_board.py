@@ -21,12 +21,23 @@ def register(app: web.Application) -> None:
     """Register the owner's arc board routes on *app*."""
     app.router.add_get("/api/arc-board/arcs", arc_board_handlers.api_arc_board_list)
     app.router.add_post("/api/arc-board/arcs", arc_board_handlers.api_arc_board_create)
+    app.router.add_get("/api/arc-board/arcs/{arc_id}", arc_board_handlers.api_arc_board_detail)
+    app.router.add_post(
+        "/api/arc-board/arcs/{arc_id}/members",
+        arc_board_handlers.api_arc_board_add_member,
+    )
     app.router.add_get(
-        "/api/arc-board/arcs/{arc_id}", arc_board_handlers.api_arc_board_detail
+        "/api/arc-board/arcs/{arc_id}/report", arc_board_handlers.api_arc_board_report
     )
     app.router.add_post(
-        "/api/arc-board/arcs/{arc_id}/members", arc_board_handlers.api_arc_board_add_member
+        "/api/arc-board/arcs/{arc_id}/members/remove",
+        arc_board_handlers.api_arc_board_remove_member,
     )
+    app.router.add_post(
+        "/api/arc-board/arcs/{arc_id}/autonomy",
+        arc_board_handlers.api_arc_board_autonomy,
+    )
+    app.router.add_post("/api/arc-board/arcs/{arc_id}/note", arc_board_handlers.api_arc_board_note)
     app.router.add_post(
         "/api/arc-board/arcs/{arc_id}/answer", arc_board_handlers.api_arc_board_answer
     )

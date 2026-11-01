@@ -29,6 +29,8 @@ _PAGE = 200
 def _error_response(exc: Exception, operation: str) -> web.Response:
     if isinstance(exc, arcs.ArcNotFound):
         return web.json_response({"error": str(exc), "code": "arc_not_found"}, status=404)
+    if isinstance(exc, arcs.ArcConflict):
+        return web.json_response({"error": str(exc), "code": "arc_conflict"}, status=409)
     if isinstance(exc, arcs.ArcAccessDenied):
         logger.warning("arc access denied during %s", operation)
         return web.json_response({"error": str(exc), "code": "arc_access_denied"}, status=403)

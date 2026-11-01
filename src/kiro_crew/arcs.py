@@ -53,6 +53,15 @@ class ArcAccessDenied(ArcError):
     """The caller is not a member of the arc."""
 
 
+class ArcConflict(ArcError):
+    """The arc moved since the caller read it (for example, a milestone was already accepted)."""
+
+
+# A link is free evidence text ("https://... -- note", a branch, a path); only a
+# scheme a browser would EXECUTE is refused, so a link can never be a script.
+_UNSAFE_LINK_RE = re.compile(r"^\s*(javascript|data|vbscript)\s*:", re.IGNORECASE)
+
+
 def _now() -> datetime:
     return datetime.now().astimezone()
 
@@ -168,17 +177,43 @@ def _str_list(value: Any, field: str) -> list[str]:
     return [_str(item, _MAX_FIELD, field, required=True) for item in value]
 
 
-def create_arc(spec: dict[str, Any]) -> dict[str, Any]:
-    """Create an arc from its spec and return it."""
+def _autonomy(value: Any) -> int:
+    if value not in (1, 2, 3) or isinstance(value, bool):
+        raise ArcError("autonomy must be 1, 2 or 3")
+    return int(value)
+
+
+def _member_key(session_key: Any) -> str:
+    key = ledger_key(session_key) if isinstance(session_key, str) else ""
+    if not key or key == OWNER:
+        raise ArcError("invalid member session key")
+    return key
+
+
+def _member_records(members: Any) -> dict[str, dict[str, str]]:
+    """Validate ``[{session_key, role}]`` up front, so a bad lane creates nothing."""
+    if not isinstance(members, list):
+        raise ArcError("members must be a list")
+    joined = _now().isoformat(timespec="seconds")
+    out: dict[str, dict[str, str]] = {}
+    for member in members:
+        if not isinstance(member, dict):
+            raise ArcError("each member needs a session_key and a role")
+        key = _member_key(member.get("session_key"))
+        out[key] = {"role": _str(member.get("role"), 200, "role"), "joined_at": joined}
+    return out
+
+
+def create_arc(spec: dict[str, Any], members: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Create an arc from its spec (and its first members, in the same write) and return it."""
     if not isinstance(spec, dict):
         raise ArcError("spec must be an object")
-    autonomy = spec.get("autonomy", 1)
-    if autonomy not in (1, 2, 3) or isinstance(autonomy, bool):
-        raise ArcError("autonomy must be 1, 2 or 3")
+    autonomy = _autonomy(spec.get("autonomy", 1))
+    member_records = _member_records(members or [])
     milestones = spec.get("milestones") or []
     if not isinstance(milestones, list):
         raise ArcError("milestones must be a list")
-    arc = {
+    arc: dict[str, Any] = {
         "id": f"arc_{uuid.uuid4().hex}",
         "title": _str(spec.get("title"), _MAX_FIELD, "title", required=True),
         "goal": _str(spec.get("goal"), _MAX_FIELD, "goal"),
@@ -189,10 +224,15 @@ def create_arc(spec: dict[str, Any]) -> dict[str, Any]:
         "milestones": [
             {
                 "name": _str(
-                    m.get("name") if isinstance(m, dict) else None, 200, "name", required=True
+                    m.get("name") if isinstance(m, dict) else None,
+                    200,
+                    "name",
+                    required=True,
                 ),
                 "criteria": _str(
-                    m.get("criteria") if isinstance(m, dict) else None, _MAX_FIELD, "criteria"
+                    m.get("criteria") if isinstance(m, dict) else None,
+                    _MAX_FIELD,
+                    "criteria",
                 ),
             }
             for m in milestones
@@ -201,7 +241,7 @@ def create_arc(spec: dict[str, Any]) -> dict[str, Any]:
         "rules": _str_list(spec.get("rules"), "rules"),
         "reuse": _str_list(spec.get("reuse"), "reuse"),
         "channel_id": _str(spec.get("channel_id"), 512, "channel_id"),
-        "members": {},
+        "members": member_records,
         "milestone_index": 0,
         "created_at": _now().isoformat(timespec="seconds"),
     }
@@ -242,9 +282,7 @@ def arcs_for_member(session_key: str) -> list[dict[str, Any]]:
 
 def add_member(arc_id: str, session_key: str, role: str) -> dict[str, Any]:
     """Add (or re-role) a member and return the arc."""
-    key = ledger_key(session_key)
-    if not key or key == OWNER:
-        raise ArcError("invalid member session key")
+    key = _member_key(session_key)
     dir_path = _arc_dir(arc_id)
     with _locked(dir_path):
         arc = _load_arc(dir_path)
@@ -257,14 +295,54 @@ def add_member(arc_id: str, session_key: str, role: str) -> dict[str, Any]:
         return arc
 
 
-def accept_milestone(arc_id: str) -> dict[str, Any]:
-    """Advance the arc to its next milestone and return the arc."""
+def remove_member(arc_id: str, session_key: str) -> dict[str, Any]:
+    """Remove a member; its entries stay on the board. Return the arc."""
+    key = _member_key(session_key)
     dir_path = _arc_dir(arc_id)
     with _locked(dir_path):
         arc = _load_arc(dir_path)
-        arc["milestone_index"] += 1
+        if key not in arc["members"]:
+            raise ArcError(f"{key!r} is not a member of arc {arc_id}")
+        del arc["members"][key]
         _write_json(dir_path / "arc.json", arc)
         return arc
+
+
+def set_autonomy(arc_id: str, autonomy: Any) -> dict[str, Any]:
+    """Change the arc's autonomy level (owner only) and return the arc."""
+    level = _autonomy(autonomy)
+    dir_path = _arc_dir(arc_id)
+    with _locked(dir_path):
+        arc = _load_arc(dir_path)
+        arc["autonomy"] = level
+        _write_json(dir_path / "arc.json", arc)
+        return arc
+
+
+def accept_milestone(arc_id: str, expected_index: int | None = None) -> dict[str, Any]:
+    """Advance the arc to its next milestone and return the arc.
+
+    The bound and the ``expected_index`` check run under the arc lock, so two
+    accepts of the same milestone (a double click, the CLI racing the console)
+    advance it once: the second raises :class:`ArcConflict`.
+    """
+    dir_path = _arc_dir(arc_id)
+    with _locked(dir_path):
+        arc = _load_arc(dir_path)
+        index = arc["milestone_index"]
+        if index >= len(arc["milestones"]):
+            raise ArcConflict("every milestone is already accepted")
+        if expected_index is not None and expected_index != index:
+            raise ArcConflict(f"milestone {expected_index + 1} is no longer the current one")
+        arc["milestone_index"] = index + 1
+        _write_json(dir_path / "arc.json", arc)
+        return arc
+
+
+def _safe_link(link: str) -> str:
+    if _UNSAFE_LINK_RE.match(re.sub(r"[\x00-\x1f]", "", link)):
+        raise ArcError("link must not be a javascript:, data: or vbscript: URL")
+    return link
 
 
 def _validate_entry(entry: dict[str, Any], members: dict[str, Any]) -> dict[str, Any]:
@@ -277,7 +355,7 @@ def _validate_entry(entry: dict[str, Any], members: dict[str, Any]) -> dict[str,
     clean: dict[str, Any] = {
         "kind": kind,
         "text": _str(entry.get("text"), limit, "text", required=True),
-        "link": _str(entry.get("link"), _MAX_FIELD, "link"),
+        "link": _safe_link(_str(entry.get("link"), _MAX_FIELD, "link")),
         "reply_to": _str(entry.get("reply_to"), 64, "reply_to"),
     }
     if kind == "CLAIM":
