@@ -6,13 +6,15 @@
  */
 
 import { useState } from 'react'
+import type React from 'react'
 import { Check, Plus, X } from 'lucide-react'
 import { Badge, Btn, Card, CardTitle } from '../../components/ui'
 import { i18nT } from '../../i18n/t'
 import { fmtRelative } from '../../i18n/format'
-import type { ArcBoardArc, ArcBoardSummary } from '../../api/client/arcBoard'
+import type { ArcBoardArc, ArcBoardChannel, ArcBoardSummary } from '../../api/client/arcBoard'
 import type { ChatSlot } from '../../types'
-import type { LaneView } from './arcBoardModel'
+import type { LaneSpec, LaneView } from './arcBoardModel'
+import type { LaneNote } from './laneActions'
 import ClampText from './ClampText'
 import LanePicker from './LanePicker'
 import { C } from './theme'
@@ -46,6 +48,12 @@ export default function ArcRail({
   onRemoveLane,
   laneError,
   lanePending,
+  laneNotes,
+  channel,
+  onOpenChannel,
+  channelPending,
+  channelError,
+  milestoneControl,
 }: {
   arcs: ArcBoardSummary[]
   arcId: string
@@ -55,10 +63,18 @@ export default function ArcRail({
   selectedLane: string | null
   onSelectLane: (key: string) => void
   slots: ChatSlot[]
-  onAddLane: (lane: { session_key: string; role: string }) => Promise<boolean>
+  onAddLane: (lane: LaneSpec) => Promise<boolean>
   onRemoveLane: (key: string) => void
   laneError: string | null
   lanePending: boolean
+  /** What reached each lane the owner just added (channel, kickoff, nudge). */
+  laneNotes: LaneNote[]
+  channel: ArcBoardChannel | null
+  onOpenChannel: () => void
+  channelPending: boolean
+  channelError: string | null
+  /** The current milestone's sign-off control, under the milestone track. */
+  milestoneControl: React.ReactNode
 }) {
   const [picking, setPicking] = useState(false)
   const [removing, setRemoving] = useState<string | null>(null)
@@ -138,6 +154,35 @@ export default function ArcRail({
               )
             })}
           </ol>
+          {milestoneControl}
+        </Card>
+      ) : null}
+
+      {arc && channel ? (
+        <Card className="p-3">
+          <CardTitle>{i18nT('pages.arcBoard.channel')}</CardTitle>
+          {channel.open ? (
+            <div className="text-[12px]" style={{ color: C.text }}>
+              <ClampText text={channel.topic || channel.id} />
+              <div className="mt-0.5 text-[11px]" style={{ color: C.dim }}>
+                {channel.owned ? i18nT('pages.arcBoard.channel_own') : i18nT('pages.arcBoard.channel_shared')}
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="text-[12px]" style={{ color: C.warn }}>
+                {i18nT('pages.arcBoard.channel_none')}
+              </div>
+              <Btn type="button" primary disabled={channelPending} onClick={onOpenChannel} className="mt-2 px-2 py-1 text-[11px]">
+                {i18nT('pages.arcBoard.open_channel')}
+              </Btn>
+              {channelError ? (
+                <div className="mt-1 text-[11px]" style={{ color: C.warn }}>
+                  {channelError}
+                </div>
+              ) : null}
+            </>
+          )}
         </Card>
       ) : null}
 
@@ -152,6 +197,15 @@ export default function ArcRail({
               </Btn>
             ) : null}
           </div>
+          {laneNotes.length > 0 ? (
+            <div className="px-3 pt-2">
+              {laneNotes.map((n, i) => (
+                <div key={i} className="text-[11px]" style={{ color: n.tone === 'ok' ? C.ok : C.warn }}>
+                  {n.text}
+                </div>
+              ))}
+            </div>
+          ) : null}
           {picking ? (
             <div className="px-3 pt-2">
               <LanePicker
@@ -193,6 +247,11 @@ export default function ArcRail({
                   >
                     {l.role}
                   </button>
+                  {channel?.open && l.in_channel === false ? (
+                    <Badge variant="warn" className="px-1.5 text-[10px]">
+                      {i18nT('pages.arcBoard.not_in_channel')}
+                    </Badge>
+                  ) : null}
                   <StateDot state={l.state} />
                   {removing === l.key ? (
                     <>

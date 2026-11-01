@@ -91,16 +91,19 @@ function AskCard({
   )
 }
 
-/** The current milestone: criteria, what lanes reported, and the owner's call.
- *  Accept is two-step (it cannot be undone) and sends the index the owner saw. */
-function MilestoneCard({
+/** The current milestone: criteria, the lanes' sign-off requests, and the
+ *  owner's call. Marking it done is two-step (it cannot be undone) and sends the
+ *  index the owner saw. `compact` is the version under the milestone track. */
+export function MilestoneCard({
   detail,
   onAccept,
   onSendBack,
+  compact = false,
 }: {
   detail: ArcBoardDetail
   onAccept: (expectedIndex: number) => Promise<void>
   onSendBack: (text: string) => Promise<void>
+  compact?: boolean
 }) {
   const { arc, milestone_reports: reports } = detail
   const index = arc.milestone_index
@@ -110,7 +113,7 @@ function MilestoneCard({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   if (!m) {
-    return (
+    return compact ? null : (
       <div className="px-3 py-2 text-[12px]" style={{ color: C.ok }}>
         {i18nT('pages.arcBoard.all_accepted')}
       </div>
@@ -133,10 +136,12 @@ function MilestoneCard({
     }
   }
   return (
-    <div className="border-b px-3 py-2" style={{ borderColor: C.border }}>
+    <div className={compact ? 'mt-3' : 'border-b px-3 py-2'} style={compact ? undefined : { borderColor: C.border }}>
       <div className="flex items-center gap-2">
         <span className="text-[12px] font-semibold" style={{ color: C.text }}>
-          {i18nT('pages.arcBoard.milestone_n', { n: index + 1, name: m.name })}
+          {compact
+            ? i18nT('pages.arcBoard.signoff_title', { name: m.name })
+            : i18nT('pages.arcBoard.milestone_n', { n: index + 1, name: m.name })}
         </span>
         {reports.length > 0 ? (
           <Badge variant="ok" className="px-1.5 text-[10px]">
@@ -144,7 +149,7 @@ function MilestoneCard({
           </Badge>
         ) : null}
       </div>
-      {m.criteria ? (
+      {m.criteria && !compact ? (
         <div className="mt-1 whitespace-pre-wrap text-[11px]" style={{ color: C.dim }}>
           {i18nT('pages.arcBoard.criteria')}: {m.criteria}
         </div>
@@ -189,7 +194,9 @@ function MilestoneCard({
       ) : confirming ? (
         <div className="mt-2">
           <div className="text-[11px]" style={{ color: C.warn }}>
-            {i18nT('pages.arcBoard.accept_confirm', { name: m.name })}
+            {detail.arc.milestones[index + 1]
+              ? i18nT('pages.arcBoard.accept_confirm', { name: m.name, next: detail.arc.milestones[index + 1].name })
+              : i18nT('pages.arcBoard.accept_confirm_last', { name: m.name })}
           </div>
           <div className="mt-1 flex gap-1.5">
             <Btn
@@ -273,7 +280,15 @@ export default function ControlRail({
           {ownerAsks.map(a => (
             <AskCard key={a.id} arc={arc} ask={a} onAnswer={onAnswer} />
           ))}
-          <MilestoneCard key={`${arc.id}:${arc.milestone_index}`} detail={detail} onAccept={onAccept} onSendBack={onSendBack} />
+          {/* A milestone needs the owner only once a lane asks for sign-off. */}
+          {detail.milestone_reports.length > 0 ? (
+            <MilestoneCard key={`${arc.id}:${arc.milestone_index}`} detail={detail} onAccept={onAccept} onSendBack={onSendBack} />
+          ) : null}
+          {ownerAsks.length === 0 && detail.milestone_reports.length === 0 ? (
+            <div className="px-3 pb-3 text-[12px]" style={{ color: C.dim }}>
+              {i18nT('pages.arcBoard.nothing_pending')}
+            </div>
+          ) : null}
           {open_asks.length > ownerAsks.length ? (
             <div className="px-3 py-2 text-[11px]" style={{ color: C.dim }}>
               {i18nT('pages.arcBoard.other_asks', { n: open_asks.length - ownerAsks.length })}

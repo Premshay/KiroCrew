@@ -218,7 +218,8 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'pages.devFleetPage.remove_name', // ASCII quotes → locale pair #5725
   'pages.overview.agentTemplatesTab.delete_confirm', // quoted in all catalogs at introduction (#12481)
   'pages.overview.promptsTab.delete_confirm', // quoted in all catalogs at introduction (#4634)
-  'pages.arcBoard.accept_confirm', // {{name}} = the milestone being accepted, quoted in all catalogs at introduction
+  'pages.arcBoard.accept_confirm', // {{name}}/{{next}} = the milestone being marked done and the next one, quoted in all catalogs
+  'pages.arcBoard.accept_confirm_last', // {{name}} = the last milestone being marked done, quoted in all catalogs at introduction
   'pages.overview.skillsTab.delete_confirm',
   'pages.overview.skillsTab.dismiss_confirm',
   'pages.overview.steeringTab.delete_confirm',

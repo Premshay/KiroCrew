@@ -58,6 +58,8 @@ export interface ArcBoardEntry {
   checked?: string[]
   to?: string
   milestone?: number
+  /** A DONE that says it finishes the current milestone: a sign-off request. */
+  completes_milestone?: boolean
 }
 
 /** An open ask: its age and who has seen it, for the "needs you" rail. */
@@ -79,6 +81,10 @@ export interface ArcBoardArc {
   rules: string[]
   reuse: string[]
   channel_id: string
+  /** The arc opened this channel for itself; absent on arcs made before it existed. */
+  channel_owned?: boolean
+  /** Where new lane sessions start; empty keeps each session's default. */
+  project?: string
   members: Record<string, ArcBoardMember>
   milestone_index: number
   created_at: string
@@ -93,6 +99,26 @@ export interface ArcBoardLane {
   last_ts: string | null
   last_kind: string | null
   claim: ArcBoardEntry | null
+  /** Whether the lane's session is in the arc's channel (urgent entries reach it). */
+  in_channel?: boolean
+}
+
+export interface ArcBoardChannel {
+  id: string
+  owned: boolean
+  open: boolean
+  topic: string
+  members: string[]
+}
+
+/** What reached a lane when it was added: the channel, its kickoff, its nudge. */
+export interface ArcBoardLaneJoin {
+  key: string
+  attached: boolean
+  kickoff: 'posted' | 'skipped'
+  reason?: 'no_channel' | 'session_not_found' | 'channel_full' | 'failed' | string
+  nudge?: 'set' | 'failed'
+  nudge_error?: string
 }
 
 /** `GET /api/arc-board/arcs/{id}`: the arc, its lanes, redacted entries and each lane's brief. */
@@ -106,8 +132,9 @@ export interface ArcBoardDetail {
   open_asks: ArcBoardAsk[]
   /** Groups of open-claim ids by different lanes on one milestone and step. */
   collisions: string[][]
-  /** DONE entries on the current milestone: what the lanes report as ready. */
+  /** DONE entries that finish the current milestone: the lanes asking for sign-off. */
   milestone_reports: ArcBoardEntry[]
+  channel: ArcBoardChannel
 }
 
 export interface ArcBoardMedianMax {
@@ -148,8 +175,11 @@ export interface ArcBoardCreateSpec {
   decisions?: string[]
   rules?: string[]
   reuse?: string[]
+  project?: string
+  /** `new` (default) opens a channel for the arc; `existing` shares an open one. */
+  channel?: { mode: 'new' } | { mode: 'existing'; id: string } | { mode: 'none' }
   /** First lanes for the arc, written with it in one store write. */
-  members?: { session_key: string; role: string }[]
+  members?: { session_key: string; role: string; nudge?: boolean }[]
 }
 
 export interface ArcBoardDelivery {
@@ -167,12 +197,21 @@ export function createArcBoardEndpoints({ get, post, j }: ClientTransport) {
       arcBoardDetail: (arcId: string) =>
         get('/api/arc-board/arcs/' + id(arcId)).then(j) as Promise<ArcBoardDetail>,
       arcBoardCreate: (spec: ArcBoardCreateSpec) =>
-        post('/api/arc-board/arcs', spec).then(j) as Promise<{ arc: ArcBoardArc }>,
-      arcBoardAddMember: (arcId: string, sessionKey: string, role: string) =>
+        post('/api/arc-board/arcs', spec).then(j) as Promise<{ arc: ArcBoardArc; lanes: ArcBoardLaneJoin[] }>,
+      /** Adds the lane, joins it to the arc's channel and sends its kickoff. */
+      arcBoardAddMember: (arcId: string, sessionKey: string, role: string, opts?: { nudge?: boolean; kickoff?: boolean }) =>
         post('/api/arc-board/arcs/' + id(arcId) + '/members', {
           session_key: sessionKey,
           role,
-        }).then(j) as Promise<{ arc: ArcBoardArc }>,
+          ...(opts?.nudge ? { nudge: true } : {}),
+          ...(opts?.kickoff === false ? { kickoff: false } : {}),
+        }).then(j) as Promise<{ arc: ArcBoardArc; lane: ArcBoardLaneJoin }>,
+      /** Gives an arc with no open channel its own and joins every lane to it. */
+      arcBoardOpenChannel: (arcId: string) =>
+        post('/api/arc-board/arcs/' + id(arcId) + '/channel', {}).then(j) as Promise<{
+          arc: ArcBoardArc
+          lanes: ArcBoardLaneJoin[]
+        }>,
       arcBoardAnswer: (arcId: string, askId: string, text: string) =>
         post('/api/arc-board/arcs/' + id(arcId) + '/answer', {
           ask_id: askId,

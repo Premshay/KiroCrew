@@ -142,3 +142,41 @@ export function newEntries(prevIds: ReadonlySet<string> | null, entries: ArcBoar
 
 /** The per-turn brief cap (`arc_brief.PREFIX_CAP`): the meter's denominator. */
 export const BRIEF_CAP = 4000
+
+/** A lane the owner picked: an open session, or a new session on an agent. */
+export type LaneSpec =
+  | { mode: 'existing'; session_key: string; role: string; nudge: boolean; label: string }
+  | { mode: 'new'; agent: string; agent_kind: 'member' | 'template'; role: string; nudge: boolean; label: string }
+
+export interface PickerAgent {
+  name: string
+  label: string
+  kind: 'member' | 'template'
+  group: SessionGroup
+  role: string
+}
+
+/** Every agent a new lane can run on, grouped like the sessions: crewmates
+ *  (configured members), mission kits (`kit-*`) and the other agents. */
+export function pickerAgents(
+  agents: { name: string; display_name?: string; selection_kind?: 'member' | 'template' }[],
+): Record<SessionGroup, PickerAgent[]> {
+  const out: Record<SessionGroup, PickerAgent[]> = { mates: [], kits: [], other: [] }
+  const seen = new Set<string>()
+  for (const a of agents) {
+    const kind = a.selection_kind === 'member' ? 'member' : 'template'
+    const id = `${kind}:${a.name}`
+    if (!a.name || seen.has(id)) continue
+    seen.add(id)
+    const group: SessionGroup = a.name.startsWith('kit-') ? 'kits' : kind === 'member' ? 'mates' : 'other'
+    out[group].push({
+      name: a.name,
+      label: a.display_name || a.name,
+      kind,
+      group,
+      role: suggestedRole({ key: a.name, agent: a.name, agent_kind: kind, title: a.display_name }),
+    })
+  }
+  for (const g of Object.keys(out) as SessionGroup[]) out[g].sort((x, y) => x.label.localeCompare(y.label))
+  return out
+}

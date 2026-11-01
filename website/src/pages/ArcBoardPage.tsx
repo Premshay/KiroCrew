@@ -40,11 +40,12 @@ import ArcRail from './arcBoard/ArcRail'
 import ArcStage from './arcBoard/ArcStage'
 import ClampText from './arcBoard/ClampText'
 import BoardFeed from './arcBoard/BoardFeed'
-import ControlRail from './arcBoard/ControlRail'
+import ControlRail, { MilestoneCard } from './arcBoard/ControlRail'
 import NewArcForm from './arcBoard/NewArcForm'
 import ReportTab from './arcBoard/ReportTab'
 import { useSessionSlots } from './arcBoard/LanePicker'
-import { laneViews, newEntries } from './arcBoard/arcBoardModel'
+import { laneViews, newEntries, type LaneSpec } from './arcBoard/arcBoardModel'
+import { addLaneToArc, laneJoinNote, type LaneNote } from './arcBoard/laneActions'
 import { C } from './arcBoard/theme'
 
 function Counter({ label, value, tone }: { label: string; value: React.ReactNode; tone?: string }) {
@@ -67,6 +68,9 @@ export default function ArcBoardPage() {
   const [formError, setFormError] = useState<string | null>(null)
   const [tab, setTab] = useState<'board' | 'report'>('board')
   const [lanePick, setLanePick] = useState<string | null>(null)
+  const [laneNotes, setLaneNotes] = useState<LaneNote[]>([])
+  const [laneError, setLaneError] = useState<string | null>(null)
+  const [lanePending, setLanePending] = useState(false)
   const needsRef = useRef<HTMLDivElement>(null)
 
   const list = useQuery({
@@ -132,20 +136,63 @@ export default function ArcBoardPage() {
     }
   }
 
+  // Create the arc with its open-session lanes in one write (the server joins
+  // them to the channel and kicks them off), then start each new-session lane.
   const createMut = useMutation({
-    mutationFn: (spec: ArcBoardCreateSpec) => api.arcBoardCreate(spec),
+    mutationFn: async ({ spec, lanes: picked }: { spec: ArcBoardCreateSpec; lanes: LaneSpec[] }) => {
+      const existing = picked.flatMap(l =>
+        l.mode === 'existing' ? [{ session_key: l.session_key, role: l.role, nudge: l.nudge }] : [],
+      )
+      const res = await api.arcBoardCreate({ ...spec, members: existing })
+      const roleOf = (key: string) => res.arc.members[key]?.role ?? key
+      const notes = res.lanes.map(l => laneJoinNote(roleOf(l.key), l))
+      for (const lane of picked) {
+        if (lane.mode !== 'new') continue
+        try {
+          notes.push(laneJoinNote(lane.role, await addLaneToArc(res.arc, lane)))
+        } catch (e) {
+          notes.push({
+            tone: 'warn',
+            text: i18nT('pages.arcBoard.lane_create_failed', { lane: lane.role, error: errMessage(e) || '' }),
+          })
+        }
+      }
+      return { arc: res.arc, notes }
+    },
     onSuccess: res => {
       setShowForm(false)
       setFormError(null)
+      setLaneNotes(res.notes)
       setParams({ arc: res.arc.id }, { replace: true })
       void queryClient.invalidateQueries({ queryKey: arcBoardListKey })
+      void slots.refetch()
     },
     onError: e => setFormError(errMessage(e) || i18nT('pages.arcBoard.create_failed')),
   })
-  const addLaneMut = useMutation({
-    mutationFn: (lane: { session_key: string; role: string }) =>
-      api.arcBoardAddMember(arcId, lane.session_key, lane.role),
-    onSuccess: refresh,
+  const addLane = async (lane: LaneSpec): Promise<boolean> => {
+    if (!data) return false
+    setLanePending(true)
+    setLaneError(null)
+    try {
+      const joined = await addLaneToArc(data.arc, lane)
+      setLaneNotes(n => [laneJoinNote(lane.role, joined), ...n].slice(0, 4))
+      return true
+    } catch (e) {
+      setLaneError(errMessage(e) || i18nT('pages.arcBoard.lane_failed'))
+      return false
+    } finally {
+      setLanePending(false)
+      refresh()
+      void slots.refetch()
+    }
+  }
+  const openChannelMut = useMutation({
+    mutationFn: () => api.arcBoardOpenChannel(arcId),
+    onSuccess: res => {
+      const roleOf = (key: string) => res.arc.members[key]?.role ?? key
+      setLaneNotes(res.lanes.map(l => laneJoinNote(roleOf(l.key), l)))
+      refresh()
+    },
   })
   const removeLaneMut = useMutation({
     mutationFn: (key: string) => api.arcBoardRemoveMember(arcId, key),
@@ -229,7 +276,7 @@ export default function ArcBoardPage() {
               setShowForm(false)
               setFormError(null)
             }}
-            onCreate={spec => createMut.mutate(spec)}
+            onCreate={(spec, lanes) => createMut.mutate({ spec, lanes })}
             pending={createMut.isPending}
             error={formError}
           />
@@ -241,6 +288,7 @@ export default function ArcBoardPage() {
               onSelectArc={id => {
                 setParams({ arc: id }, { replace: true })
                 setLanePick(null)
+                setLaneNotes([])
                 setTab('board')
               }}
               arc={data?.arc ?? null}
@@ -248,21 +296,33 @@ export default function ArcBoardPage() {
               selectedLane={selectedLane}
               onSelectLane={toggleLane}
               slots={slots.data ?? []}
-              onAddLane={async lane => {
-                try {
-                  await addLaneMut.mutateAsync(lane)
-                  return true
-                } catch {
-                  return false
-                }
-              }}
+              onAddLane={addLane}
               onRemoveLane={key => removeLaneMut.mutate(key)}
               laneError={
-                addLaneMut.isError || removeLaneMut.isError
-                  ? errMessage(addLaneMut.error ?? removeLaneMut.error) || i18nT('pages.arcBoard.lane_failed')
+                laneError ??
+                (removeLaneMut.isError ? errMessage(removeLaneMut.error) || i18nT('pages.arcBoard.lane_failed') : null)
+              }
+              lanePending={lanePending}
+              laneNotes={laneNotes}
+              channel={data?.channel ?? null}
+              onOpenChannel={() => openChannelMut.mutate()}
+              channelPending={openChannelMut.isPending}
+              channelError={
+                openChannelMut.isError
+                  ? errMessage(openChannelMut.error) || i18nT('pages.arcBoard.channel_open_failed')
                   : null
               }
-              lanePending={addLaneMut.isPending}
+              milestoneControl={
+                data ? (
+                  <MilestoneCard
+                    compact
+                    key={`${data.arc.id}:${data.arc.milestone_index}`}
+                    detail={data}
+                    onAccept={expected => settle(api.arcBoardAccept(arcId, expected))}
+                    onSendBack={text => settle(api.arcBoardNote(arcId, text))}
+                  />
+                ) : null
+              }
             />
 
             <div className="flex min-w-0 flex-col gap-3">

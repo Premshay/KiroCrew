@@ -16,6 +16,9 @@ vi.mock('../api/client', () => ({
     arcBoardAccept: vi.fn(),
     arcBoardAddMember: vi.fn(),
     arcBoardReport: vi.fn(),
+    agentCatalog: vi.fn(),
+    createChatSlot: vi.fn(),
+    chatSlotProject: vi.fn(),
     chatSlots: vi.fn(),
     autonudgeList: vi.fn(),
   },
@@ -47,7 +50,7 @@ const arc = {
 }
 const entries = [
   { id: 'ae_1', ts: '2026-11-01T10:01:00+00:00', author: 'chat-1', kind: 'FACT', text: 'rendered', link: 'javascript:alert(1)' },
-  { id: 'ae_2', ts: '2026-11-01T10:02:00+00:00', author: 'chat-1', kind: 'DONE', text: 'm1 ready', link: 'https://github.com/o/r/pull/9 — done' },
+  { id: 'ae_2', ts: '2026-11-01T10:02:00+00:00', author: 'chat-1', kind: 'DONE', text: 'm1 ready', link: 'https://github.com/o/r/pull/9 — done', completes_milestone: true },
   { id: 'ae_3', ts: '2026-11-01T10:03:00+00:00', author: 'chat-1', kind: 'ASK', text: 'Short form or Siglum?', to: 'owner' },
 ]
 
@@ -74,13 +77,27 @@ beforeEach(() => {
   } as never)
   vi.mocked(api.arcBoardDetail).mockResolvedValue({
     arc,
-    lanes: [{ key: 'chat-1', role: 'Tenon', joined_at: arc.created_at, entries: 3, last_ts: entries[2].ts, last_kind: 'ASK', claim: null }],
+    lanes: [{ key: 'chat-1', role: 'Tenon', joined_at: arc.created_at, entries: 3, last_ts: entries[2].ts, last_kind: 'ASK', claim: null, in_channel: true }],
     briefs: { 'chat-1': 'BRIEF for Tenon' },
     entries,
     open_claims: [],
     open_asks: [{ ...entries[2], age_secs: 60, seen_by: [] }],
     collisions: [],
     milestone_reports: [entries[1]],
+    channel: { id: 'ch', owned: true, open: true, topic: 'Arc: Classics references', members: ['chat-1'] },
+  } as never)
+  vi.mocked(api.agentCatalog).mockResolvedValue({
+    agents: [
+      { name: 'atelier', selection_kind: 'member', description: '' },
+      { name: 'kit-import', selection_kind: 'template', description: '' },
+      { name: 'crew-claude', selection_kind: 'template', description: '' },
+    ],
+    default_agent: 'crew-claude',
+  } as never)
+  vi.mocked(api.createChatSlot).mockResolvedValue({ key: 'chat-9-9', messages: 0, running: false } as never)
+  vi.mocked(api.arcBoardAddMember).mockResolvedValue({
+    arc,
+    lane: { key: 'chat-9-9', attached: true, kickoff: 'posted', nudge: 'set' },
   } as never)
   vi.mocked(api.chatSlots).mockResolvedValue([
     { key: 'dashboard:chat-1', running: true, agent: 'tenon', agent_kind: 'member', title: 'Tenon', messages: 1 },
@@ -97,6 +114,8 @@ describe('ArcBoardPage', () => {
     expect(await screen.findAllByText('Classics references')).not.toHaveLength(0)
     expect((await screen.findAllByText('Short form or Siglum?')).length).toBe(2)
     expect(screen.queryByText('BRIEF for Tenon')).toBeNull()
+    // A lane completed M1, so its sign-off is waiting on the owner.
+    expect(screen.getByText('Milestone 1: M1 short form')).toBeTruthy()
     fireEvent.click(screen.getAllByRole('button', { name: 'Tenon' })[0])
     expect(screen.getByText('BRIEF for Tenon')).toBeTruthy()
     expect(screen.getAllByText('Tenon').length).toBeGreaterThan(0)
@@ -113,24 +132,49 @@ describe('ArcBoardPage', () => {
   it('accepts only after confirming, with the index the owner saw', async () => {
     renderPage()
     await screen.findByText('Short form or Siglum?', { selector: '.whitespace-pre-wrap' })
-    const accept = screen.getAllByRole('button', { name: /accept/i })[0]
+    const accept = screen.getAllByRole('button', { name: /mark milestone done/i })[0]
     fireEvent.click(accept)
     expect(api.arcBoardAccept).not.toHaveBeenCalled()
-    const confirm = screen.getAllByRole('button', { name: /accept/i })[0]
+    const confirm = screen.getAllByRole('button', { name: /mark milestone done/i })[0]
     fireEvent.click(confirm)
     await waitFor(() => expect(api.arcBoardAccept).toHaveBeenCalledWith(ARC, 0))
   })
 
-  it('offers mates and mission kits that are not yet lanes', async () => {
+  it('offers open mates and kits that are not yet lanes', async () => {
     renderPage()
-    await screen.findByText('Short form or Siglum?', { selector: '.whitespace-pre-wrap' })
-    const lanesCard = screen.getAllByRole('button', { name: /add lane/i })[0]
-    fireEvent.click(lanesCard)
+    await screen.findAllByText('Short form or Siglum?')
+    fireEvent.click(screen.getAllByRole('button', { name: /add lane/i })[0])
+    fireEvent.click(await screen.findByRole('tab', { name: 'Open session' }))
     const search = await screen.findByLabelText(/search sessions/i)
     const picker = search.parentElement as HTMLElement
     await within(picker).findByText('Baton')
     expect(within(picker).getByText('Gate')).toBeTruthy()
     expect(within(picker).queryByText('kit-evaluation')).toBeTruthy()
+  })
+
+  it('starts a new session on an agent, then adds it with its nudge', async () => {
+    renderPage()
+    await screen.findAllByText('Short form or Siglum?')
+    fireEvent.click(screen.getAllByRole('button', { name: /add lane/i })[0])
+    const picker = (await screen.findByLabelText(/search agents/i)).parentElement as HTMLElement
+    expect(await within(picker).findByText('Mission kits · 1')).toBeTruthy()
+    fireEvent.click(within(picker).getByText('kit-import'))
+    expect((within(picker).getByLabelText('role') as HTMLInputElement).value).toBe('Import')
+    fireEvent.click(within(picker).getByRole('button', { name: 'Start lane' }))
+    await waitFor(() => expect(api.arcBoardAddMember).toHaveBeenCalledWith(ARC, 'chat-9-9', 'Import', { nudge: true }))
+    expect(vi.mocked(api.createChatSlot).mock.calls[0][1]).toBe('kit-import')
+    expect(vi.mocked(api.createChatSlot).mock.calls[0][8]).toBe('template')
+    expect(await screen.findByText(/Import joined the channel and got its kickoff\. Idle nudge on\./)).toBeTruthy()
+  })
+
+  it('asks for sign-off only when a lane completes the milestone', async () => {
+    vi.mocked(api.arcBoardDetail).mockResolvedValueOnce({
+      ...(await (api.arcBoardDetail as unknown as () => Promise<object>)()),
+      milestone_reports: [],
+    } as never)
+    renderPage()
+    await screen.findAllByText('Short form or Siglum?')
+    expect(screen.queryByText('Milestone 1: M1 short form')).toBeNull()
   })
 
   it('selects a lane only when picked, and clears it on a second click or Escape', async () => {
