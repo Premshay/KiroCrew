@@ -39,6 +39,9 @@ const GuideLayer = lazy(() => import('./guide/GuideLayer'))
 // Lazy for the same reason: the crew work-item board is opened from a conductor
 // session or the Crew page, never at startup.
 const CrewBoardPage = lazy(() => import('./pages/CrewBoardPage'))
+// The owner's console over the durable arc boards; opened by the owner, not at
+// startup, so it shares the crew board's lazy treatment.
+const ArcBoardPage = lazy(() => import('./pages/ArcBoardPage'))
 const SessionDashboardsPage = lazy(() => import('./pages/chat/command-center/SessionDashboardsPage'))
 import ArtifactDetailPage from './pages/ArtifactDetailPage'
 import { ChangelogModal } from './shell/updates/updateFlow'
@@ -806,6 +809,7 @@ export default function App() {
             <Route path="/members" element={<ErrorBoundary><Suspense fallback={null}><MembersPage /></Suspense></ErrorBoundary>} />
             <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
             <Route path="/crew-board" element={<ErrorBoundary><Suspense fallback={null}><CrewBoardPage /></Suspense></ErrorBoundary>} />
+            <Route path="/arc-board" element={<ErrorBoundary><Suspense fallback={null}><ArcBoardPage /></Suspense></ErrorBoundary>} />
             <Route path="/schedule" element={<SchedulePage />} />
             {/* Agents and Connections live in the Agent Capabilities panel. */}
             <Route path="/agents" element={<Navigate to="/capabilities" replace />} />

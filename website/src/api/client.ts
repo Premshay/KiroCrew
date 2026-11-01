@@ -46,6 +46,7 @@ import { createSessionsEndpoints } from './client/sessions'
 import { createMcpEndpoints } from './client/mcp'
 import { createAgentsEndpoints } from './client/agents'
 import { createChatSlotSettingsEndpoints } from './client/chatSlotSettings'
+import { createArcBoardEndpoints } from './client/arcBoard'
 import { createFilesEndpoints } from './client/files'
 import { createCronEndpoints } from './client/cron'
 import { createHooksEndpoints } from './client/hooks'
@@ -1326,6 +1327,7 @@ const instances = createInstancesEndpoints(transport)
 const cloud = createCloudEndpoints(transport)
 const memory = createMemoryEndpoints(transport)
 const sessions = createSessionsEndpoints(transport)
+const arcBoard = createArcBoardEndpoints(transport)
 const mcp = createMcpEndpoints(transport)
 const agents = createAgentsEndpoints(transport)
 const chatSlotSettings = createChatSlotSettingsEndpoints(transport)
@@ -1362,6 +1364,7 @@ export const api = {
   ...system.statusAndStorage,
   ...telemetry.usageReadouts,
   ...sessions.crewBoard,
+  ...arcBoard.board,
   // Defined here rather than in ./client/telemetry: it reads
   // `api.wakatimeExportUrl` at call time, so replacing that member reroutes the
   // download.
