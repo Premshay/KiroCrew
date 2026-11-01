@@ -10960,7 +10960,9 @@
       "tab_board": "बोर्ड",
       "tab_report": "रिपोर्ट",
       "waiting": "{{ago}} से प्रतीक्षा",
-      "you": "तुम"
+      "you": "तुम",
+      "show_more": "पूरा दिखाओ",
+      "show_less": "कम दिखाओ"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/माह",

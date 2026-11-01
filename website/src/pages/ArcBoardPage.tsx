@@ -38,6 +38,7 @@ import {
 } from '../api/client/arcBoard'
 import ArcRail from './arcBoard/ArcRail'
 import ArcStage from './arcBoard/ArcStage'
+import ClampText from './arcBoard/ClampText'
 import BoardFeed from './arcBoard/BoardFeed'
 import ControlRail from './arcBoard/ControlRail'
 import NewArcForm from './arcBoard/NewArcForm'
@@ -100,7 +101,17 @@ export default function ArcBoardPage() {
       ),
     [data, slots.data, nudges.data],
   )
-  const selectedLane = lanes.some(l => l.key === lanePick) ? lanePick : (lanes[0]?.key ?? null)
+  // Nothing is selected until the owner picks a lane; picking it again, an
+  // empty part of the stage, or Escape clears it.
+  const selectedLane = lanes.some(l => l.key === lanePick) ? lanePick : null
+  const toggleLane = (key: string) => setLanePick(k => (k === key ? null : key))
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setLanePick(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
   const laneLabel = lanes.find(l => l.key === selectedLane)?.role ?? ''
 
   // What arrived since the previous poll of THIS arc: the stage animates it.
@@ -235,7 +246,7 @@ export default function ArcBoardPage() {
               arc={data?.arc ?? null}
               lanes={lanes}
               selectedLane={selectedLane}
-              onSelectLane={setLanePick}
+              onSelectLane={toggleLane}
               slots={slots.data ?? []}
               onAddLane={async lane => {
                 try {
@@ -275,19 +286,28 @@ export default function ArcBoardPage() {
                       {data.arc.title}
                     </div>
                     {data.arc.goal ? (
-                      <div className="mt-0.5 text-[12px]" style={{ color: C.dim }}>
-                        {i18nT('pages.arcBoard.goal')}: {data.arc.goal}
-                      </div>
+                      <ClampText
+                        lines={2}
+                        className="mt-0.5 text-[12px]"
+                        style={{ color: C.dim }}
+                        text={`${i18nT('pages.arcBoard.goal')}: ${data.arc.goal}`}
+                      />
                     ) : null}
                     {data.arc.lineage ? (
-                      <div className="text-[12px]" style={{ color: C.dim }}>
-                        {i18nT('pages.arcBoard.form_lineage')}: {data.arc.lineage}
-                      </div>
+                      <ClampText
+                        lines={2}
+                        className="text-[12px]"
+                        style={{ color: C.dim }}
+                        text={`${i18nT('pages.arcBoard.form_lineage')}: ${data.arc.lineage}`}
+                      />
                     ) : null}
                     {data.arc.reason ? (
-                      <div className="text-[12px]" style={{ color: C.dim }}>
-                        {i18nT('pages.arcBoard.reason')}: {data.arc.reason}
-                      </div>
+                      <ClampText
+                        lines={2}
+                        className="text-[12px]"
+                        style={{ color: C.dim }}
+                        text={`${i18nT('pages.arcBoard.reason')}: ${data.arc.reason}`}
+                      />
                     ) : null}
                     <div className="mt-3 flex flex-wrap gap-2">
                       <Counter
@@ -342,7 +362,8 @@ export default function ArcBoardPage() {
                           ownerAsks={ownerAsks}
                           collisions={collisionPairs}
                           selected={selectedLane}
-                          onSelect={setLanePick}
+                          onSelect={toggleLane}
+                          onClear={() => setLanePick(null)}
                           onOwner={() => needsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
                         />
                       </Card>

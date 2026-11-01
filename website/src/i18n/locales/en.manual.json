@@ -4861,7 +4861,9 @@
       "tab_board": "Board",
       "tab_report": "Report",
       "waiting": "waiting {{ago}}",
-      "you": "You"
+      "you": "You",
+      "show_more": "Show all",
+      "show_less": "Show less"
     },
     "artifactDeployPage": {
       "aws_profiles_count": "AWS Profiles ({{count}})",

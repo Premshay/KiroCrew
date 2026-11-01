@@ -11118,7 +11118,9 @@
       "tab_board": "Panel",
       "tab_report": "Informe",
       "waiting": "esperando {{ago}}",
-      "you": "Tú"
+      "you": "Tú",
+      "show_more": "Mostrar todo",
+      "show_less": "Mostrar menos"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/mes",

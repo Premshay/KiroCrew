@@ -13,6 +13,7 @@ import { fmtRelative } from '../../i18n/format'
 import type { ArcBoardArc, ArcBoardSummary } from '../../api/client/arcBoard'
 import type { ChatSlot } from '../../types'
 import type { LaneView } from './arcBoardModel'
+import ClampText from './ClampText'
 import LanePicker from './LanePicker'
 import { C } from './theme'
 
@@ -68,10 +69,8 @@ export default function ArcRail({
         <CardTitle className="px-3 pt-3">{i18nT('pages.arcBoard.arcs')}</CardTitle>
         <div className="flex flex-col pb-1">
           {arcs.map(a => (
-            <button
+            <div
               key={a.id}
-              type="button"
-              onClick={() => onSelectArc(a.id)}
               className="border-l-2 px-3 py-2 text-left"
               style={
                 a.id === arcId
@@ -80,18 +79,27 @@ export default function ArcRail({
               }
             >
               <div className="flex items-baseline justify-between gap-2">
-                <span className="truncate text-[13px] font-medium" style={{ color: C.text }}>
+                <button
+                  type="button"
+                  onClick={() => onSelectArc(a.id)}
+                  className="min-w-0 flex-1 text-left text-[13px] font-medium"
+                  style={{ color: C.text }}
+                >
                   {a.title}
-                </span>
+                </button>
                 <span className="shrink-0 text-[11px] tabular-nums" style={{ color: C.dim }}>
                   {a.milestone_index}/{a.milestones_total}
                 </span>
               </div>
-              <div className="mt-0.5 truncate text-[11px]" style={{ color: C.dim }}>
-                {a.milestone
-                  ? i18nT('pages.arcBoard.on_milestone', { m: a.milestone })
-                  : i18nT('pages.arcBoard.all_accepted')}
-              </div>
+              <ClampText
+                className="mt-0.5 text-[11px]"
+                style={{ color: C.dim }}
+                text={
+                  a.milestone
+                    ? i18nT('pages.arcBoard.on_milestone', { m: a.milestone })
+                    : i18nT('pages.arcBoard.all_accepted')
+                }
+              />
               <div className="mt-1 flex flex-wrap items-center gap-1.5">
                 {a.open_asks > 0 ? (
                   <Badge variant="warn" className="px-1.5 text-[10px]">
@@ -102,7 +110,7 @@ export default function ArcRail({
                   {i18nT('pages.arcBoard.lanes_n', { n: a.members })}
                 </span>
               </div>
-            </button>
+            </div>
           ))}
         </div>
       </Card>
@@ -216,13 +224,20 @@ export default function ArcRail({
                     </button>
                   )}
                 </div>
-                <div className="mt-0.5 truncate text-[11px]" style={{ color: C.dim }}>
-                  {l.title}
-                  {l.agent ? ` · ${l.agent}` : ''}
-                </div>
-                <div className="mt-0.5 truncate text-[11px]" style={{ color: l.claim ? C.aim : C.dim }}>
-                  {l.claim ? i18nT('pages.arcBoard.claiming', { step: l.claim.step || l.claim.text }) : i18nT('pages.arcBoard.no_claim')}
-                </div>
+                <ClampText
+                  className="mt-0.5 text-[11px]"
+                  style={{ color: C.dim }}
+                  text={l.agent ? `${l.title} · ${l.agent}` : l.title}
+                />
+                <ClampText
+                  className="mt-0.5 text-[11px]"
+                  style={{ color: l.claim ? C.aim : C.dim }}
+                  text={
+                    l.claim
+                      ? i18nT('pages.arcBoard.claiming', { step: l.claim.step || l.claim.text })
+                      : i18nT('pages.arcBoard.no_claim')
+                  }
+                />
                 <div className="mt-0.5 flex flex-wrap gap-x-2 text-[10px]" style={{ color: C.dim }}>
                   <span>{i18nT('pages.arcBoard.active_ago', { ago: fmtRelative(l.activeTs) })}</span>
                   <span>{i18nT('pages.arcBoard.entries_n', { n: l.entries })}</span>

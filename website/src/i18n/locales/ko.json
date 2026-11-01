@@ -10802,7 +10802,9 @@
       "tab_board": "보드",
       "tab_report": "보고서",
       "waiting": "{{ago}}부터 대기",
-      "you": "나"
+      "you": "나",
+      "show_more": "모두 보기",
+      "show_less": "접기"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/월",

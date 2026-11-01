@@ -6,7 +6,7 @@
  * arc id, so a cursor never carries over to a different arc.
  */
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Btn, Card, CardTitle } from '../../components/ui'
 import { i18nT } from '../../i18n/t'
 import type { ArcBoardArc, ArcBoardEntry } from '../../api/client/arcBoard'
@@ -31,6 +31,9 @@ export default function BoardFeed({
   const [kinds, setKinds] = useState<Set<string>>(() => new Set(ENTRY_KINDS))
   const [onlyLane, setOnlyLane] = useState(false)
   const [cursor, setCursor] = useState<number | null>(null)
+  // The lane filter belongs to the lane it was turned on for: a new pick, or
+  // clearing the pick, starts unfiltered.
+  useEffect(() => setOnlyLane(false), [lane])
   const total = entries.length
   const shown = feedView(entries, { kinds, lane: onlyLane ? lane : null, cursor })
   const at = cursor === null ? total : Math.min(cursor, total)

@@ -11276,7 +11276,9 @@
       "tab_board": "Панель",
       "tab_report": "Отчёт",
       "waiting": "ждёт {{ago}}",
-      "you": "Ты"
+      "you": "Ты",
+      "show_more": "Показать полностью",
+      "show_less": "Свернуть"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/мес",

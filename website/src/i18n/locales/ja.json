@@ -10802,7 +10802,9 @@
       "tab_board": "ボード",
       "tab_report": "レポート",
       "waiting": "{{ago}} から待機",
-      "you": "あなた"
+      "you": "あなた",
+      "show_more": "すべて表示",
+      "show_less": "折りたたむ"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/月",

@@ -10960,7 +10960,9 @@
       "tab_board": "Board",
       "tab_report": "Bericht",
       "waiting": "wartet {{ago}}",
-      "you": "Du"
+      "you": "Du",
+      "show_more": "Alles zeigen",
+      "show_less": "Weniger zeigen"
     },
     "artifactDeployPage": {
       "0_00_mo": "~0,00 $/Mon.",

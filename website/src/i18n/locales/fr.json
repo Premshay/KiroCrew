@@ -11118,7 +11118,9 @@
       "tab_board": "Tableau",
       "tab_report": "Rapport",
       "waiting": "en attente {{ago}}",
-      "you": "Toi"
+      "you": "Toi",
+      "show_more": "Tout afficher",
+      "show_less": "Afficher moins"
     },
     "artifactDeployPage": {
       "0_00_mo": "~0,00 $/mois",

@@ -10960,7 +10960,9 @@
       "tab_board": "বোর্ড",
       "tab_report": "রিপোর্ট",
       "waiting": "অপেক্ষায় {{ago}}",
-      "you": "তুমি"
+      "you": "তুমি",
+      "show_more": "সবটা দেখাও",
+      "show_less": "কম দেখাও"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/মাস",

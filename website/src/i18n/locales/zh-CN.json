@@ -10802,7 +10802,9 @@
       "tab_board": "面板",
       "tab_report": "报告",
       "waiting": "已等待 {{ago}}",
-      "you": "你"
+      "you": "你",
+      "show_more": "显示全部",
+      "show_less": "收起"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/月",

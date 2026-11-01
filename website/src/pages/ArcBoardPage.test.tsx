@@ -96,13 +96,15 @@ describe('ArcBoardPage', () => {
     renderPage()
     expect(await screen.findAllByText('Classics references')).not.toHaveLength(0)
     expect((await screen.findAllByText('Short form or Siglum?')).length).toBe(2)
+    expect(screen.queryByText('BRIEF for Tenon')).toBeNull()
+    fireEvent.click(screen.getAllByRole('button', { name: 'Tenon' })[0])
     expect(screen.getByText('BRIEF for Tenon')).toBeTruthy()
     expect(screen.getAllByText('Tenon').length).toBeGreaterThan(0)
   })
 
   it('never renders a lane script link as an href', async () => {
     const { container } = renderPage()
-    await screen.findByText('BRIEF for Tenon')
+    await screen.findByText('Short form or Siglum?', { selector: '.whitespace-pre-wrap' })
     const hrefs = Array.from(container.querySelectorAll('a')).map(a => a.getAttribute('href'))
     expect(hrefs.some(h => h?.toLowerCase().startsWith('javascript'))).toBe(false)
     expect(hrefs).toContain('https://github.com/o/r/pull/9')
@@ -110,7 +112,7 @@ describe('ArcBoardPage', () => {
 
   it('accepts only after confirming, with the index the owner saw', async () => {
     renderPage()
-    await screen.findByText('BRIEF for Tenon')
+    await screen.findByText('Short form or Siglum?', { selector: '.whitespace-pre-wrap' })
     const accept = screen.getAllByRole('button', { name: /accept/i })[0]
     fireEvent.click(accept)
     expect(api.arcBoardAccept).not.toHaveBeenCalled()
@@ -121,7 +123,7 @@ describe('ArcBoardPage', () => {
 
   it('offers mates and mission kits that are not yet lanes', async () => {
     renderPage()
-    await screen.findByText('BRIEF for Tenon')
+    await screen.findByText('Short form or Siglum?', { selector: '.whitespace-pre-wrap' })
     const lanesCard = screen.getAllByRole('button', { name: /add lane/i })[0]
     fireEvent.click(lanesCard)
     const search = await screen.findByLabelText(/search sessions/i)
@@ -129,5 +131,23 @@ describe('ArcBoardPage', () => {
     await within(picker).findByText('Baton')
     expect(within(picker).getByText('Gate')).toBeTruthy()
     expect(within(picker).queryByText('kit-evaluation')).toBeTruthy()
+  })
+
+  it('selects a lane only when picked, and clears it on a second click or Escape', async () => {
+    renderPage()
+    await screen.findAllByText('Short form or Siglum?')
+    expect(screen.queryByRole('button', { name: /only Tenon/ })).toBeNull()
+    const lane = () => screen.getAllByRole('button', { name: 'Tenon' })[0]
+    fireEvent.click(lane())
+    const pill = screen.getByRole('button', { name: /only Tenon/ })
+    fireEvent.click(pill)
+    expect(pill.getAttribute('aria-pressed')).toBe('true')
+    fireEvent.click(lane())
+    expect(screen.queryByRole('button', { name: /only Tenon/ })).toBeNull()
+    fireEvent.click(lane())
+    // A fresh pick starts unfiltered.
+    expect(screen.getByRole('button', { name: /only Tenon/ }).getAttribute('aria-pressed')).toBe('false')
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('button', { name: /only Tenon/ })).toBeNull())
   })
 })

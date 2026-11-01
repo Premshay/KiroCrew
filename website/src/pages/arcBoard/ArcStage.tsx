@@ -50,6 +50,7 @@ export default function ArcStage({
   collisions,
   selected,
   onSelect,
+  onClear,
   onOwner,
 }: {
   lanes: LaneView[]
@@ -60,6 +61,8 @@ export default function ArcStage({
   collisions: [string, string][]
   selected: string | null
   onSelect: (key: string) => void
+  /** A click on empty stage clears the lane selection. */
+  onClear: () => void
   onOwner: () => void
 }) {
   const pos = lanePositions(lanes.length)
@@ -105,6 +108,9 @@ export default function ArcStage({
         }
 
       `}</style>
+
+      {/* Empty stage: a click here clears the lane selection. */}
+      <rect x={0} y={0} width={W} height={H} fill="transparent" onClick={onClear} />
 
       {/* Spokes: each lane to the board. */}
       {lanes.map((l, i) => (
