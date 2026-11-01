@@ -241,6 +241,11 @@ def create_arc(spec: dict[str, Any], members: list[dict[str, Any]] | None = None
         "rules": _str_list(spec.get("rules"), "rules"),
         "reuse": _str_list(spec.get("reuse"), "reuse"),
         "channel_id": _str(spec.get("channel_id"), 512, "channel_id"),
+        # The arc made this channel for itself (the console's default), so lanes
+        # leave it when they leave the arc; a shared channel is never touched.
+        "channel_owned": spec.get("channel_owned") is True,
+        # Where new lane sessions start; empty keeps each session's default.
+        "project": _str(spec.get("project"), _MAX_FIELD, "project"),
         "members": member_records,
         "milestone_index": 0,
         "created_at": _now().isoformat(timespec="seconds"),
@@ -304,6 +309,18 @@ def remove_member(arc_id: str, session_key: str) -> dict[str, Any]:
         if key not in arc["members"]:
             raise ArcError(f"{key!r} is not a member of arc {arc_id}")
         del arc["members"][key]
+        _write_json(dir_path / "arc.json", arc)
+        return arc
+
+
+def set_channel(arc_id: str, channel_id: str, *, owned: bool) -> dict[str, Any]:
+    """Point the arc at a channel (owner only) and return the arc."""
+    channel = _str(channel_id, 512, "channel_id", required=True)
+    dir_path = _arc_dir(arc_id)
+    with _locked(dir_path):
+        arc = _load_arc(dir_path)
+        arc["channel_id"] = channel
+        arc["channel_owned"] = owned
         _write_json(dir_path / "arc.json", arc)
         return arc
 
@@ -374,6 +391,13 @@ def _validate_entry(entry: dict[str, Any], members: dict[str, Any]) -> dict[str,
         clean["to"] = to
     if kind == "DONE" and not clean["link"]:
         raise ArcError("DONE requires a link")
+    completes = entry.get("completes_milestone", False)
+    if not isinstance(completes, bool):
+        raise ArcError("completes_milestone must be a boolean")
+    if completes and kind != "DONE":
+        raise ArcError("only a DONE entry can complete a milestone")
+    if completes:
+        clean["completes_milestone"] = True
     if clean["reply_to"] and not _ENTRY_ID_RE.fullmatch(clean["reply_to"]):
         raise ArcError("reply_to must be an entry id")
     return clean

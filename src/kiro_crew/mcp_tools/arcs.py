@@ -20,7 +20,8 @@ _ENTRY_RULES = (
     "text is at most 100 characters (DONE at most 300); put long evidence in link. "
     "CLAIM needs step and checked (the decision records and components you read). "
     "ASK needs to (a member key or owner). "
-    "DONE needs link. "
+    "DONE needs link; set completes_milestone true on the DONE that finishes the current "
+    "milestone's criteria, which asks the owner to sign it off. "
     "reply_to closes your CLAIM or answers an ASK."
 )
 
@@ -82,6 +83,7 @@ def schemas() -> list[dict[str, Any]]:
                     "to": {"type": "string", "maxLength": 512},
                     "reply_to": {"type": "string", "maxLength": 64},
                     "link": {"type": "string", "maxLength": 2000},
+                    "completes_milestone": {"type": "boolean"},
                 },
                 "required": ["arc_id", "kind", "text"],
             },

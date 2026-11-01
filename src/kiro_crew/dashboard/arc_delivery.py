@@ -80,8 +80,12 @@ async def deliver_entry(state: Any, arc_id: str, entry: dict[str, Any]) -> dict[
         unreachable = [k for k in keys if k not in by_key]
         # Channel.post never delivers to its own sender, so a recipient who is also the
         # sender cannot be reached: the colliding author posts as the orchestrator.
+        # The owner posts as the channel's human, like the channel composer does, so
+        # an answer reaches every lane, the orchestrator included.
         sender = channel.orchestrator_id
-        if sender is None or entry["author"] not in reachable:
+        if entry["author"] == arcs.OWNER:
+            sender = "human"
+        elif sender is None or entry["author"] not in reachable:
             sender = by_key.get(entry["author"]) or sender
         if sender is None:
             raise LookupError("arc channel has no sender")

@@ -37,6 +37,9 @@ def register(app: web.Application) -> None:
         "/api/arc-board/arcs/{arc_id}/autonomy",
         arc_board_handlers.api_arc_board_autonomy,
     )
+    app.router.add_post(
+        "/api/arc-board/arcs/{arc_id}/channel", arc_board_handlers.api_arc_board_open_channel
+    )
     app.router.add_post("/api/arc-board/arcs/{arc_id}/note", arc_board_handlers.api_arc_board_note)
     app.router.add_post(
         "/api/arc-board/arcs/{arc_id}/answer", arc_board_handlers.api_arc_board_answer

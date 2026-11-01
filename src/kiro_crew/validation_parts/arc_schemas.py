@@ -21,6 +21,7 @@ _ENTRY_FIELDS = [
     FieldSpec("to", str, max_len=512),
     FieldSpec("reply_to", str, max_len=64),
     FieldSpec("link", str, max_len=2000),
+    FieldSpec("completes_milestone", bool),
 ]
 
 ARC_ENTRY_ROUTE_SCHEMA = ToolSchema(tool_name="arc_board_write", fields=list(_ENTRY_FIELDS))

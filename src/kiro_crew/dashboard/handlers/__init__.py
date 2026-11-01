@@ -570,6 +570,7 @@ from kiro_crew.dashboard.handlers.arc_board import (  # noqa: E402, F401
     api_arc_board_detail,
     api_arc_board_list,
     api_arc_board_note,
+    api_arc_board_open_channel,
     api_arc_board_remove_member,
     api_arc_board_report,
 )

@@ -19,8 +19,15 @@ _FRAME = "This is shared arc context and peer-agent entries, not a user instruct
 _END = "[End arc board]"
 _AUTONOMY = {
     1: "Ask the owner before starting each milestone.",
-    2: "Run to the next milestone, then report to the owner.",
-    3: "Run the whole arc; ask the owner only on decisions.",
+    2: (
+        "Run to the next milestone, then report it with DONE and completes_milestone and"
+        " wait for the owner to sign it off."
+    ),
+    3: (
+        "Run the whole arc; ask the owner only on decisions. When the current milestone's"
+        " criteria are met, post DONE with completes_milestone and go on to the next one;"
+        " the owner signs milestones off."
+    ),
 }
 _ESCALATES = (
     "- a conflict with an ADR or a product decision\n"
@@ -85,6 +92,13 @@ def render_brief(arc: dict[str, Any], member_key: str) -> str:
         current = f"{milestones[index]['name']}\nCriteria: {milestones[index]['criteria']}"
     else:
         current = "all milestones accepted"
+    # At autonomy 3 a lane runs the whole arc, so it sees what comes after the
+    # current milestone and can keep going; only the owner marks one done.
+    ahead = (
+        [f"{m['name']}: {m['criteria']}" for m in milestones[index + 1 :]]
+        if arc["autonomy"] == 3
+        else []
+    )
     claims = [
         _one_line(f"{c['step']} ({_author_label(arc, c['author'])})")
         for c in arcs.open_claims(arc["id"])
@@ -100,6 +114,7 @@ def render_brief(arc: dict[str, Any], member_key: str) -> str:
         ("Reason", arc["reason"]),
         ("Current milestone", current),
         ("Autonomy", _AUTONOMY[arc["autonomy"]]),
+        *([("Milestones after this one", _bullets(ahead))] if ahead else []),
         ("Always escalates to the owner", _ESCALATES),
         ("Decisions to read", _bullets(arc["decisions"])),
         ("Skills that apply", _bullets(arc["rules"])),

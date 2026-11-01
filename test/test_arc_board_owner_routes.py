@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -20,6 +19,7 @@ from dashboard_owner_helpers import as_owner
 
 MEMBER = "chat-arc-member"
 PEER = "chat-arc-peer"
+NEW = "chat-arc-new"
 SECRET = "sk-ant-api03-" + "A" * 40
 
 
@@ -28,23 +28,81 @@ def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
 
 
+class FakeChannel:
+    """Just enough of ``Channel`` for the arc routes: attach, post, remove."""
+
+    def __init__(self, cid: str, topic: str = "") -> None:
+        from types import SimpleNamespace
+
+        self.id, self.topic = cid, topic
+        self.members: dict[str, Any] = {}
+        self.orchestrator_id: str | None = None
+        self.posts: list[dict[str, Any]] = []
+        self._ns = SimpleNamespace
+
+    def attach_session(self, session_key, role, agent_name="", listen_mode="all"):
+        if any(m.session_key == session_key for m in self.members.values()):
+            return None
+        mid = f"m{len(self.members) + 1}"
+        member = self._ns(id=mid, session_key=session_key, role=role, listen_mode=listen_mode)
+        self.members[mid] = member
+        self.orchestrator_id = self.orchestrator_id or mid
+        return member
+
+    async def post(self, from_id, content, **kwargs):
+        self.posts.append({"from_id": from_id, "content": content, **kwargs})
+
+    def remove_agent(self, agent_id, reason=""):
+        return self.members.pop(agent_id, None) is not None
+
+
+class FakeChannels:
+    def __init__(self) -> None:
+        self.channels: dict[str, FakeChannel] = {}
+        self.closed: list[str] = []
+
+    def create(self, topic: str) -> FakeChannel:
+        ch = FakeChannel(f"c{len(self.channels) + 1:07d}", topic)
+        self.channels[ch.id] = ch
+        return ch
+
+    def get(self, cid: str) -> FakeChannel | None:
+        return self.channels.get(cid)
+
+    def close(self, cid: str) -> bool:
+        self.closed.append(cid)
+        return self.channels.pop(cid, None) is not None
+
+
+@pytest.fixture()
+def channels() -> FakeChannels:
+    manager = FakeChannels()
+    # The shared channel the pilot arcs use, with the member lane already in it.
+    shared = FakeChannel("ch1", "shared")
+    shared.attach_session(f"dashboard:{MEMBER}", "builder")
+    manager.channels["ch1"] = shared
+    return manager
+
+
 @pytest_asyncio.fixture()
-async def client():
+async def client(channels: FakeChannels):
     from types import SimpleNamespace
 
     from kiro_crew.dashboard.routes import arc_board as routes
 
     # The gate reads state.owner_id (must stay ""); a raw MagicMock would make it
-    # truthy and flip the gate to the 401 stale-owner branch. Delivery needs the
-    # arc's channel (the owner's answer is posted to the asking lane through it).
-    lane = SimpleNamespace(session_key=MEMBER, role="builder")
-    channel = SimpleNamespace(members={"m-1": lane}, orchestrator_id="m-orch", post=AsyncMock())
-    manager = MagicMock()
-    manager.get = lambda cid: channel if cid == "ch1" else None
+    # truthy and flip the gate to the 401 stale-owner branch.
+    slots = {
+        key: SimpleNamespace(key=key, agent="tenon", linked_session_key="")
+        for key in (MEMBER, PEER, NEW)
+    }
     app = web.Application()
     as_owner(app)
     app["state"] = SimpleNamespace(
-        owner_id="", channel_manager=manager, notify=lambda *args, **kwargs: None
+        owner_id="",
+        channel_manager=channels,
+        _slots=slots,
+        notify=lambda *args, **kwargs: None,
     )
     routes.register(app)
     async with TestClient(TestServer(app)) as client:
@@ -62,7 +120,7 @@ async def _make_arc(client: TestClient, **over: Any) -> dict[str, Any]:
         "reason": "the pilot",
         "lineage": "owner's product goal",
         "autonomy": 2,
-        "channel_id": "ch1",
+        "channel": {"mode": "existing", "id": "ch1"},
         "milestones": [
             {"name": "m1", "criteria": "works"},
             {"name": "m2", "criteria": "proven"},
@@ -355,7 +413,15 @@ async def test_detail_reports_collisions_and_milestone_reports(
     arcs.append_entry(
         arc["id"],
         MEMBER,
-        {"kind": "DONE", "text": "m1 done", "link": "https://x/pull/1"},
+        {
+            "kind": "DONE",
+            "text": "m1 done",
+            "link": "https://x/pull/1",
+            "completes_milestone": True,
+        },
+    )
+    arcs.append_entry(
+        arc["id"], MEMBER, {"kind": "DONE", "text": "a step", "link": "https://x/pull/0"}
     )
     body = await (await client.get(f"/api/arc-board/arcs/{arc['id']}")).json()
     assert [sorted(g) for g in body["collisions"]] == [sorted([a["id"], b["id"]])]
@@ -465,3 +531,199 @@ async def test_every_owner_route_is_gated() -> None:
             assert (await response.json())["code"] == "owner_only"
     finally:
         await client.close()
+
+
+# ── The arc's channel, kickoffs, sign-off and autonomy ──
+
+
+async def _create(client: TestClient, **over: Any):
+    spec: dict[str, Any] = {"title": "Own channel", "milestones": [{"name": "m1"}, {"name": "m2"}]}
+    spec.update(over)
+    return await client.post("/api/arc-board/arcs", json=spec)
+
+
+@pytest.mark.asyncio
+async def test_create_opens_an_own_channel_and_kicks_off_each_lane(
+    client: TestClient, channels: FakeChannels
+) -> None:
+    response = await _create(client, members=[{"session_key": PEER, "role": "reviewer"}])
+    assert response.status == 200, await response.text()
+    body = await response.json()
+    arc = body["arc"]
+    assert arc["channel_owned"] is True
+    ch = channels.get(arc["channel_id"])
+    assert ch is not None and ch.topic == "Arc: Own channel"
+    assert [m.session_key for m in ch.members.values()] == [f"dashboard:{PEER}"]
+    assert body["lanes"] == [{"key": PEER, "attached": True, "kickoff": "posted"}]
+    (post,) = ch.posts
+    assert post["from_id"] == "human" and post["mention"] == ["m1"]
+    assert "Own channel" in post["content"] and "reviewer" in post["content"]
+
+
+@pytest.mark.asyncio
+async def test_create_without_a_channel(client: TestClient, channels: FakeChannels) -> None:
+    response = await _create(
+        client, channel={"mode": "none"}, members=[{"session_key": PEER, "role": "r"}]
+    )
+    body = await response.json()
+    assert body["arc"]["channel_id"] == ""
+    assert body["lanes"][0]["reason"] == "no_channel"
+    assert set(channels.channels) == {"ch1"}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_create_closes_the_channel_it_opened(
+    client: TestClient, channels: FakeChannels
+) -> None:
+    response = await _create(client, autonomy=9)
+    assert response.status == 400
+    assert len(channels.closed) == 1 and set(channels.channels) == {"ch1"}
+
+
+@pytest.mark.asyncio
+async def test_create_refuses_an_unknown_existing_channel(client: TestClient) -> None:
+    response = await _create(client, channel={"mode": "existing", "id": "nope"})
+    assert response.status == 400
+
+
+@pytest.mark.asyncio
+async def test_add_lane_joins_and_kickoff_is_optional(
+    client: TestClient, channels: FakeChannels
+) -> None:
+    arc = (await (await _create(client)).json())["arc"]
+    ch = channels.get(arc["channel_id"])
+    url = f"/api/arc-board/arcs/{arc['id']}/members"
+    body = await (await client.post(url, json={"session_key": NEW, "role": "kit"})).json()
+    assert body["lane"]["attached"] is True and body["lane"]["kickoff"] == "posted"
+    body = await (
+        await client.post(url, json={"session_key": PEER, "role": "r", "kickoff": False})
+    ).json()
+    assert body["lane"] == {"key": PEER, "attached": True, "kickoff": "skipped"}
+    assert len(ch.posts) == 1 and len(ch.members) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_lane_with_no_live_session_stays_on_the_arc(client: TestClient) -> None:
+    arc = (await (await _create(client)).json())["arc"]
+    response = await client.post(
+        f"/api/arc-board/arcs/{arc['id']}/members", json={"session_key": "chat-gone", "role": "r"}
+    )
+    body = await response.json()
+    assert "chat-gone" in body["arc"]["members"]
+    assert body["lane"]["reason"] == "session_not_found"
+
+
+@pytest.mark.asyncio
+async def test_removing_a_lane_leaves_only_an_own_channel(
+    client: TestClient, channels: FakeChannels
+) -> None:
+    created = await _create(client, members=[{"session_key": PEER, "role": "r"}])
+    own = (await created.json())["arc"]
+    shared = await _make_arc(client, members=[{"session_key": MEMBER, "role": "b"}])
+    url = "/api/arc-board/arcs/{}/members/remove"
+    body = await (await client.post(url.format(own["id"]), json={"session_key": PEER})).json()
+    assert body["left_channel"] is True
+    assert channels.get(own["channel_id"]).members == {}
+    body = await (await client.post(url.format(shared["id"]), json={"session_key": MEMBER})).json()
+    assert body["left_channel"] is False
+    assert len(channels.get("ch1").members) == 1
+
+
+@pytest.mark.asyncio
+async def test_open_channel_gives_a_channelless_arc_its_own(
+    client: TestClient, channels: FakeChannels
+) -> None:
+    created = await _create(
+        client, channel={"mode": "none"}, members=[{"session_key": PEER, "role": "r"}]
+    )
+    arc = (await created.json())["arc"]
+    url = f"/api/arc-board/arcs/{arc['id']}/channel"
+    body = await (await client.post(url, json={})).json()
+    ch = channels.get(body["arc"]["channel_id"])
+    assert body["arc"]["channel_owned"] is True
+    assert body["lanes"] == [{"key": PEER, "attached": True, "kickoff": "skipped"}]
+    assert ch.posts == []
+    response = await client.post(url, json={})
+    assert response.status == 409
+
+
+@pytest.mark.asyncio
+async def test_detail_shows_the_channel_and_who_is_in_it(client: TestClient) -> None:
+    arc = await _make_arc(
+        client,
+        members=[{"session_key": MEMBER, "role": "b"}, {"session_key": "chat-gone", "role": "x"}],
+    )
+    body = await (await client.get(f"/api/arc-board/arcs/{arc['id']}")).json()
+    assert body["channel"]["id"] == "ch1" and body["channel"]["open"] is True
+    assert body["channel"]["owned"] is False
+    assert {lane["key"]: lane["in_channel"] for lane in body["lanes"]} == {
+        MEMBER: True,
+        "chat-gone": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_owner_answer_posts_as_the_channel_human(
+    client: TestClient, channels: FakeChannels
+) -> None:
+    from kiro_crew import arcs
+
+    created = await _create(client, members=[{"session_key": PEER, "role": "r"}])
+    arc = (await created.json())["arc"]
+    ch = channels.get(arc["channel_id"])
+    # PEER is the channel's orchestrator, which a non-human sender could never reach.
+    assert ch.orchestrator_id == "m1"
+    ask = arcs.append_entry(arc["id"], PEER, {"kind": "ASK", "text": "q?", "to": arcs.OWNER})
+    response = await client.post(
+        f"/api/arc-board/arcs/{arc['id']}/answer", json={"ask_id": ask["id"], "text": "yes"}
+    )
+    assert (await response.json())["delivery"]["recipients"] == [PEER]
+    assert ch.posts[-1]["from_id"] == "human" and ch.posts[-1]["mention"] == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_autonomy_change_leaves_one_board_note(client: TestClient) -> None:
+    from kiro_crew import arcs
+
+    arc = await _make_arc(client)
+    url = f"/api/arc-board/arcs/{arc['id']}/autonomy"
+    body = await (await client.post(url, json={"autonomy": 3})).json()
+    assert body["note"]["text"] == "Autonomy is now 3 (was 2)."
+    body = await (await client.post(url, json={"autonomy": 3})).json()
+    assert body["note"] is None
+    assert [e["text"] for e in arcs.read_entries(arc["id"])] == ["Autonomy is now 3 (was 2)."]
+
+
+def test_only_a_done_can_complete_a_milestone() -> None:
+    from kiro_crew import arcs
+
+    arc = arcs.create_arc(
+        {"title": "t", "milestones": [{"name": "m"}]},
+        members=[{"session_key": MEMBER, "role": "b"}],
+    )
+    with pytest.raises(arcs.ArcError):
+        arcs.append_entry(
+            arc["id"], MEMBER, {"kind": "FACT", "text": "x", "completes_milestone": True}
+        )
+    with pytest.raises(arcs.ArcError):
+        arcs.append_entry(
+            arc["id"],
+            MEMBER,
+            {"kind": "DONE", "text": "x", "link": "https://x", "completes_milestone": "yes"},
+        )
+
+
+@pytest.mark.parametrize("autonomy,shown", [(2, False), (3, True)])
+def test_autonomy_three_brief_lists_the_milestones_ahead(autonomy: int, shown: bool) -> None:
+    from kiro_crew import arc_brief, arcs
+
+    arc = arcs.create_arc(
+        {
+            "title": "t",
+            "autonomy": autonomy,
+            "milestones": [{"name": "first", "criteria": "a"}, {"name": "second", "criteria": "b"}],
+        },
+        members=[{"session_key": MEMBER, "role": "b"}],
+    )
+    brief = arc_brief.render_brief(arc, MEMBER)
+    assert ("Milestones after this one:\n- second: b" in brief) is shown
