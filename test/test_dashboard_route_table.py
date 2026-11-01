@@ -52,6 +52,7 @@ def test_registrar_tuple_is_explicit_and_not_alphabetical() -> None:
         "sessions",
         "taskrunner",
         "connections",
+        "arc_board",
         "system",
     )
     assert list(routes_pkg.REGISTRAR_NAMES) != sorted(routes_pkg.REGISTRAR_NAMES), (

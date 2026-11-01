@@ -26,6 +26,7 @@ from aiohttp import web
 from kiro_crew.dashboard.routes import (
     agent_config,
     agents,
+    arc_board,
     chat,
     connections,
     memory,
@@ -51,6 +52,9 @@ _REGISTRARS: tuple[tuple[str, object], ...] = (
     ("sessions", sessions.register),
     ("taskrunner", taskrunner.register),
     ("connections", connections.register),
+    # Owner's arc board console: a new /api/arc-board prefix, before "system" so
+    # nothing in the table's tail can shadow its literals.
+    ("arc_board", arc_board.register),
     ("system", system.register),
 )
 

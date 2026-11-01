@@ -560,6 +560,16 @@ from kiro_crew.dashboard.handlers.arcs import (  # noqa: E402, F401
     api_arcs_mine,
 )
 
+# ── Arc board console, owner routes (handlers/arc_board.py) ──
+from kiro_crew.dashboard.handlers.arc_board import (  # noqa: E402, F401
+    api_arc_board_accept,
+    api_arc_board_add_member,
+    api_arc_board_answer,
+    api_arc_board_create,
+    api_arc_board_detail,
+    api_arc_board_list,
+)
+
 # ── Coordinator work items (handlers/work_items.py) ──
 from kiro_crew.dashboard.handlers.work_items import (  # noqa: E402, F401
     api_work_cycle_archive_list,
