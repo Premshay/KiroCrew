@@ -15,6 +15,7 @@ export const ARC_BOARD_POLL_MS = 10_000
 /** One stable key per arc, so polling the selected arc never invalidates the rail. */
 export const arcBoardListKey = ['arc-board'] as const
 export const arcBoardQueryKey = (arcId: string) => ['arc-board', arcId]
+export const arcBoardReportKey = (arcId: string) => ['arc-board', arcId, 'report']
 
 export interface ArcBoardMilestone {
   name: string
@@ -83,13 +84,58 @@ export interface ArcBoardArc {
   created_at: string
 }
 
-/** `GET /api/arc-board/arcs/{id}`: the arc, its redacted entries and the owner's brief. */
+/** One member as the store sees it: its board activity and open claim. */
+export interface ArcBoardLane {
+  key: string
+  role: string
+  joined_at: string
+  entries: number
+  last_ts: string | null
+  last_kind: string | null
+  claim: ArcBoardEntry | null
+}
+
+/** `GET /api/arc-board/arcs/{id}`: the arc, its lanes, redacted entries and each lane's brief. */
 export interface ArcBoardDetail {
   arc: ArcBoardArc
-  brief: string
+  lanes: ArcBoardLane[]
+  /** Each member's per-turn brief, keyed by member key, exactly as the lane reads it. */
+  briefs: Record<string, string>
   entries: ArcBoardEntry[]
   open_claims: ArcBoardEntry[]
   open_asks: ArcBoardAsk[]
+  /** Groups of open-claim ids by different lanes on one milestone and step. */
+  collisions: string[][]
+  /** DONE entries on the current milestone: what the lanes report as ready. */
+  milestone_reports: ArcBoardEntry[]
+}
+
+export interface ArcBoardMedianMax {
+  median: number | null
+  max: number | null
+}
+
+/** `GET /api/arc-board/arcs/{id}/report`: board-only pilot metrics (minutes). */
+export interface ArcBoardReport {
+  as_of: string
+  since: string | null
+  entries: number
+  by_kind: Record<string, number>
+  by_lane: Record<string, Record<string, number>>
+  done_links: string[]
+  idle_gaps: {
+    overall: ArcBoardMedianMax
+    per_member: Record<string, ArcBoardMedianMax>
+    open_gaps_min: Record<string, number>
+  }
+  ask_age: {
+    time_to_reply_min: ArcBoardMedianMax
+    open_asks: number
+    oldest_open_ask_min: number | null
+  }
+  collisions: number
+  repeated_fails: number
+  reading_load_words: number
 }
 
 export interface ArcBoardCreateSpec {
@@ -102,7 +148,7 @@ export interface ArcBoardCreateSpec {
   decisions?: string[]
   rules?: string[]
   reuse?: string[]
-  /** First lanes for the arc; each is added as a member after creation. */
+  /** First lanes for the arc, written with it in one store write. */
   members?: { session_key: string; role: string }[]
 }
 
@@ -132,8 +178,24 @@ export function createArcBoardEndpoints({ get, post, j }: ClientTransport) {
           ask_id: askId,
           text,
         }).then(j) as Promise<{ entry: ArcBoardEntry; delivery: ArcBoardDelivery }>,
-      arcBoardAccept: (arcId: string) =>
-        post('/api/arc-board/arcs/' + id(arcId) + '/accept', {}).then(j) as Promise<{ arc: ArcBoardArc }>,
+      arcBoardRemoveMember: (arcId: string, sessionKey: string) =>
+        post('/api/arc-board/arcs/' + id(arcId) + '/members/remove', {
+          session_key: sessionKey,
+        }).then(j) as Promise<{ arc: ArcBoardArc }>,
+      arcBoardAutonomy: (arcId: string, autonomy: 1 | 2 | 3) =>
+        post('/api/arc-board/arcs/' + id(arcId) + '/autonomy', { autonomy }).then(j) as Promise<{ arc: ArcBoardArc }>,
+      arcBoardNote: (arcId: string, text: string) =>
+        post('/api/arc-board/arcs/' + id(arcId) + '/note', { text }).then(j) as Promise<{
+          entry: ArcBoardEntry
+          delivery: ArcBoardDelivery
+        }>,
+      arcBoardReport: (arcId: string) =>
+        get('/api/arc-board/arcs/' + id(arcId) + '/report').then(j) as Promise<ArcBoardReport>,
+      /** `expectedIndex` is the milestone the console showed; a stale one answers 409. */
+      arcBoardAccept: (arcId: string, expectedIndex: number) =>
+        post('/api/arc-board/arcs/' + id(arcId) + '/accept', { expected_index: expectedIndex }).then(j) as Promise<{
+          arc: ArcBoardArc
+        }>,
     },
   }
 }

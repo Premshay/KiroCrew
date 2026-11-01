@@ -7,7 +7,7 @@
  * Order in this file = order in the rail (within each group). Add new
  * built-in surfaces here; do not add hardcoded badge logic to `App.tsx`.
  */
-import { MessageSquare, Bell, Component, CalendarDays, Settings, ClipboardCheck, Compass, Webhook, BookOpen, Link2, Library, MessageSquareText, Workflow, ScrollText, Bot } from 'lucide-react'
+import { MessageSquare, Bell, Component, CalendarDays, Settings, ClipboardCheck, Compass, Webhook, BookOpen, Link2, Library, MessageSquareText, Workflow, ScrollText, Bot, Waypoints } from 'lucide-react'
 import type { ReactElement } from 'react'
 import { createSelector } from '@reduxjs/toolkit'
 import { KiroGhostMark } from '../components/KiroGhostMark'
@@ -89,6 +89,13 @@ registerBuiltinSurface({
   // and `NavBadge` picks it up via the appBadges fallback. The label here
   // is what the fallback path's aria-label uses.
   badgeLabel: 'approvals needed',
+})
+
+// The owner's console over the durable arc boards: arcs, lanes, the live board,
+// what is waiting on the owner, and the pilot report.
+registerBuiltinSurface({
+  ...BUILTIN_SURFACE_NAV.arcBoard,
+  icon: <Waypoints size={16} />,
 })
 
 registerBuiltinSurface({

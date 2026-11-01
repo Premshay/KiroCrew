@@ -52,6 +52,10 @@ export const BUILTIN_SURFACE_NAV = {
     navId: 'members', route: '/members', label: surfaceMachineValue('Mates'), labelKey: 'nav.crew_members',
     group: surfaceMachineValue('Main'), slotMode: 'member', previewFlag: PREVIEW_CREW,
   },
+  arcBoard: {
+    navId: 'arcBoard', route: '/arc-board', label: surfaceMachineValue('Arc board'), labelKey: 'nav.arc_board',
+    group: surfaceMachineValue('Main'),
+  },
   notifications: {
     navId: 'notifications', route: '/notifications', label: surfaceMachineValue('Notifications'),
     labelKey: 'nav.notifications', group: surfaceMachineValue('Main'), hiddenFromNav: true,
