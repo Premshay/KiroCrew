@@ -132,6 +132,47 @@ async def _join_lane(
     return out
 
 
+_NUDGE_IDLE_SECS = 600
+_NUDGE_MAX_CYCLES = 48
+
+
+def _nudge_text(arc: dict[str, Any]) -> str:
+    return arc_brief.safe_line(
+        f"Arc nudge (\u201c{arc['title']}\u201d): you have been idle. Read your arc brief, then"
+        " claim the next step or post DONE, FAIL or ASK on the board. If the arc is waiting"
+        " on the owner, say so on the board and stop."
+    )
+
+
+async def _arm_nudge(state: Any, arc: dict[str, Any], key: str) -> dict[str, Any]:
+    """Arm an idle nudge on a lane's session; an existing loop is never replaced."""
+    from kiro_crew.autonudge import get_instance
+    from kiro_crew.autonudge_authz import authorize_and_add_nudge
+
+    svc = get_instance()
+    if svc is None:
+        return {"nudge": "failed", "nudge_error": "auto-nudge is disabled on this host"}
+    try:
+        _loop, error, _status = await authorize_and_add_nudge(
+            svc=svc,
+            state=state,
+            slot_key=key,
+            message=_nudge_text(arc),
+            idle_secs=_NUDGE_IDLE_SECS,
+            max_cycles=_NUDGE_MAX_CYCLES,
+            banner="Arc nudge",
+            source="dashboard",
+            caller="arc_board",
+            replace_existing=False,
+        )
+    except Exception:
+        logger.warning("arc nudge failed for %s", key, exc_info=True)
+        return {"nudge": "failed", "nudge_error": "the nudge could not be set"}
+    if error is not None:
+        return {"nudge": "failed", "nudge_error": str(error)}
+    return {"nudge": "set"}
+
+
 def _leave_channel(state: Any, arc: dict[str, Any], key: str) -> bool:
     """Take a removed lane out of the arc's OWN channel; a shared channel is left alone."""
     if not arc.get("channel_owned"):
@@ -333,10 +374,17 @@ async def api_arc_board_create(request: web.Request) -> web.Response:
         if opened is not None:
             state.channel_manager.close(opened.id)
         return _error_response(exc, "arc_board.create")
-    lanes = [
-        await _join_lane(state, arc, key, m["role"], kickoff=True)
-        for key, m in arc["members"].items()
-    ]
+    nudged = {
+        ledger_key(m["session_key"])
+        for m in members
+        if isinstance(m, dict) and isinstance(m.get("session_key"), str) and m.get("nudge") is True
+    }
+    lanes = []
+    for key, m in arc["members"].items():
+        lane = await _join_lane(state, arc, key, m["role"], kickoff=True)
+        if key in nudged:
+            lane.update(await _arm_nudge(state, arc, key))
+        lanes.append(lane)
     return web.json_response({"arc": arc, "lanes": lanes})
 
 
@@ -353,18 +401,20 @@ async def api_arc_board_add_member(request: web.Request) -> web.Response:
     arc_id = request.match_info.get("arc_id", "")
     session_key, role = body.get("session_key"), body.get("role")
     kickoff = body.get("kickoff", True)
+    nudge = body.get("nudge", False)
     if not isinstance(session_key, str) or not isinstance(role, str):
         return _invalid("session_key and role are required")
-    if not isinstance(kickoff, bool):
-        return _invalid("kickoff must be a boolean")
+    if not isinstance(kickoff, bool) or not isinstance(nudge, bool):
+        return _invalid("kickoff and nudge must be booleans")
     try:
         arc = await asyncio.to_thread(arcs.add_member, arc_id, session_key, role)
     except (arcs.ArcError, OSError) as exc:
         return _error_response(exc, "arc_board.add_member")
     key = ledger_key(session_key)
-    lane = await _join_lane(
-        request.app.get("state"), arc, key, arc["members"][key]["role"], kickoff=kickoff
-    )
+    state = request.app.get("state")
+    lane = await _join_lane(state, arc, key, arc["members"][key]["role"], kickoff=kickoff)
+    if nudge:
+        lane.update(await _arm_nudge(state, arc, key))
     return web.json_response({"arc": arc, "lane": lane})
 
 

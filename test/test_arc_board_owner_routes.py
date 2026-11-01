@@ -727,3 +727,46 @@ def test_autonomy_three_brief_lists_the_milestones_ahead(autonomy: int, shown: b
     )
     brief = arc_brief.render_brief(arc, MEMBER)
     assert ("Milestones after this one:\n- second: b" in brief) is shown
+
+
+@pytest.mark.asyncio
+async def test_nudge_is_armed_only_when_asked(client: TestClient, monkeypatch) -> None:
+    import kiro_crew.autonudge as autonudge
+    import kiro_crew.autonudge_authz as authz
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_add(**kwargs: Any):
+        calls.append(kwargs)
+        return object(), None, 200
+
+    monkeypatch.setattr(autonudge, "get_instance", lambda: object())
+    monkeypatch.setattr(authz, "authorize_and_add_nudge", fake_add)
+    arc = (await (await _create(client)).json())["arc"]
+    url = f"/api/arc-board/arcs/{arc['id']}/members"
+    body = await (await client.post(url, json={"session_key": PEER, "role": "r"})).json()
+    assert "nudge" not in body["lane"] and calls == []
+    body = await (
+        await client.post(url, json={"session_key": NEW, "role": "r", "nudge": True})
+    ).json()
+    assert body["lane"]["nudge"] == "set"
+    (call,) = calls
+    assert call["slot_key"] == NEW and call["replace_existing"] is False
+    assert call["idle_secs"] == 600 and call["max_cycles"] > 0
+    assert "Own channel" in call["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_nudge_is_reported_not_raised(client: TestClient, monkeypatch) -> None:
+    import kiro_crew.autonudge as autonudge
+    import kiro_crew.autonudge_authz as authz
+
+    async def refuse(**kwargs: Any):
+        return None, "a loop is already armed on this session", 409
+
+    monkeypatch.setattr(autonudge, "get_instance", lambda: object())
+    monkeypatch.setattr(authz, "authorize_and_add_nudge", refuse)
+    response = await _create(client, members=[{"session_key": PEER, "role": "r", "nudge": True}])
+    assert response.status == 200
+    (lane,) = (await response.json())["lanes"]
+    assert lane["nudge"] == "failed" and "already armed" in lane["nudge_error"]
