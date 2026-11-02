@@ -10842,7 +10842,19 @@
       "lane_not_joined_channel_full": "{{lane}} 레인은 아크에 있지만 채널이 가득 차, 긴급 항목은 다음 브리프에서만 전달됩니다.",
       "lane_not_joined_failed": "{{lane}} 레인은 아크에 있지만 채널 참여에 실패해, 긴급 항목은 다음 브리프에서만 전달됩니다.",
       "answer_delivered": "채널에서 {{lane}} 레인에 보냈습니다. 턴 도중에 전달됩니다.",
-      "answer_saved_brief": "답변을 저장했습니다. {{lane}} 레인은 다음 브리프에서 확인합니다(지금은 채널로 전달하지 못했습니다)."
+      "answer_saved_brief": "답변을 저장했습니다. {{lane}} 레인은 다음 브리프에서 확인합니다(지금은 채널로 전달하지 못했습니다).",
+      "github": "GitHub",
+      "verified_by": "검증됨: {{who}}",
+      "not_verified": "검증 안 됨",
+      "signed_off": "승인됨",
+      "settings": "아크 설정",
+      "settings_repo": "GitHub 저장소",
+      "settings_repo_hint": "설명에 ‘{{tag}}’ 줄이 있는 병합된 PR은 여기에 자동으로 기록됩니다.",
+      "settings_coordinator": "코디네이터",
+      "settings_no_coordinator": "코디네이터 없음",
+      "settings_coordinator_hint": "질문을 전달하고, 직접 확인한 마일스톤을 승인할 수 있는 레인입니다.",
+      "settings_save": "설정 저장",
+      "settings_failed": "설정을 저장하지 못했습니다"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/월",

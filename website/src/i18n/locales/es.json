@@ -11158,7 +11158,19 @@
       "lane_not_joined_channel_full": "{{lane}} está en el arco, pero el canal está lleno; las entradas urgentes solo le llegan en su siguiente brief.",
       "lane_not_joined_failed": "{{lane}} está en el arco, pero no pudo unirse al canal; las entradas urgentes solo le llegan en su siguiente brief.",
       "answer_delivered": "Enviada a {{lane}} en el canal; le llega en pleno turno.",
-      "answer_saved_brief": "Respuesta guardada. {{lane}} la verá en su siguiente brief (el canal no pudo alcanzarla ahora)."
+      "answer_saved_brief": "Respuesta guardada. {{lane}} la verá en su siguiente brief (el canal no pudo alcanzarla ahora).",
+      "github": "GitHub",
+      "verified_by": "Verificada: {{who}}",
+      "not_verified": "Sin verificar",
+      "signed_off": "Aprobado",
+      "settings": "Ajustes del arco",
+      "settings_repo": "Repositorio de GitHub",
+      "settings_repo_hint": "Las PR fusionadas cuya descripción tiene la línea “{{tag}}” se registran aquí automáticamente.",
+      "settings_coordinator": "Coordinación",
+      "settings_no_coordinator": "Sin coordinación",
+      "settings_coordinator_hint": "La lane que te plantea las preguntas y puede aprobar un hito cuando lo confirmes con ella.",
+      "settings_save": "Guardar ajustes",
+      "settings_failed": "No se pudieron guardar los ajustes"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/mes",

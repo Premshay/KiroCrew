@@ -27,7 +27,7 @@ const API_KEY_ORDER = [
   'sessionInventory', 'sessionInventoryDetail', 'sessionInventoryTrash', 'sessionCrewLogProjections', 'sessionWorkProjection',
   'telemetryStartup', 'telemetryContextTrace', 'usageTurns', 'usageSeries', 'wakatimeStats',
   'wakatimeExportUrl', 'crewBoard', 'crewBoardAction',
-  'arcBoardArcs', 'arcBoardDetail', 'arcBoardCreate', 'arcBoardAddMember', 'arcBoardOpenChannel',
+  'arcBoardArcs', 'arcBoardDetail', 'arcBoardCreate', 'arcBoardAddMember', 'arcBoardSettings', 'arcBoardOpenChannel',
   'arcBoardAnswer', 'arcBoardRemoveMember', 'arcBoardAutonomy', 'arcBoardNote', 'arcBoardReport', 'arcBoardAccept',
   'wakatimeExportDownload',
   'sessionSummary', 'dashboardCard', 'generateSessionSummary',

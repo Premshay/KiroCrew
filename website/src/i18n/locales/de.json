@@ -11000,7 +11000,19 @@
       "lane_not_joined_channel_full": "{{lane}} ist im Arc, aber der Kanal ist voll; dringende Einträge erreichen die Lane erst im nächsten Briefing.",
       "lane_not_joined_failed": "{{lane}} ist im Arc, aber der Kanalbeitritt ist fehlgeschlagen; dringende Einträge erreichen die Lane erst im nächsten Briefing.",
       "answer_delivered": "An {{lane}} im Kanal gesendet; die Antwort kommt mitten in der Runde an.",
-      "answer_saved_brief": "Antwort gespeichert. {{lane}} sieht sie im nächsten Briefing (der Kanal hat die Lane gerade nicht erreicht)."
+      "answer_saved_brief": "Antwort gespeichert. {{lane}} sieht sie im nächsten Briefing (der Kanal hat die Lane gerade nicht erreicht).",
+      "github": "GitHub",
+      "verified_by": "Geprüft: {{who}}",
+      "not_verified": "Nicht geprüft",
+      "signed_off": "Freigegeben",
+      "settings": "Arc-Einstellungen",
+      "settings_repo": "GitHub-Repository",
+      "settings_repo_hint": "Gemergte PRs mit der Zeile „{{tag}}“ in der Beschreibung werden hier automatisch erfasst.",
+      "settings_coordinator": "Koordination",
+      "settings_no_coordinator": "Keine Koordination",
+      "settings_coordinator_hint": "Die Lane, die dir Fragen vorlegt und einen Meilenstein freigeben darf, sobald du ihn mit ihr bestätigt hast.",
+      "settings_save": "Einstellungen speichern",
+      "settings_failed": "Einstellungen konnten nicht gespeichert werden"
     },
     "artifactDeployPage": {
       "0_00_mo": "~0,00 $/Mon.",

@@ -4901,7 +4901,19 @@
       "lane_not_joined_channel_full": "{{lane}} is on the arc, but the channel is full, so urgent entries reach it only in its next brief.",
       "lane_not_joined_failed": "{{lane}} is on the arc, but joining the channel failed; urgent entries reach it only in its next brief.",
       "answer_delivered": "Sent to {{lane}} in the channel; it reaches them mid-turn.",
-      "answer_saved_brief": "Answer saved. {{lane}} sees it in their next brief (the channel could not reach them now)."
+      "answer_saved_brief": "Answer saved. {{lane}} sees it in their next brief (the channel could not reach them now).",
+      "github": "GitHub",
+      "verified_by": "Verified: {{who}}",
+      "not_verified": "Not verified",
+      "signed_off": "Signed off",
+      "settings": "Arc settings",
+      "settings_repo": "GitHub repository",
+      "settings_repo_hint": "Merged PRs whose description has the line “{{tag}}” are recorded here automatically.",
+      "settings_coordinator": "Coordinator",
+      "settings_no_coordinator": "No coordinator",
+      "settings_coordinator_hint": "The lane that puts questions to you and may sign a milestone off once you confirm it with them.",
+      "settings_save": "Save settings",
+      "settings_failed": "Could not save the settings"
     },
     "artifactDeployPage": {
       "aws_profiles_count": "AWS Profiles ({{count}})",

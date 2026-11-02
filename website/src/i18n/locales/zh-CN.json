@@ -10842,7 +10842,19 @@
       "lane_not_joined_channel_full": "{{lane}} 在弧线中，但频道已满，紧急条目只能在下一份简报中送达。",
       "lane_not_joined_failed": "{{lane}} 在弧线中，但加入频道失败，紧急条目只能在下一份简报中送达。",
       "answer_delivered": "已在频道中发送给 {{lane}}，会在轮次中途送达。",
-      "answer_saved_brief": "回答已保存。{{lane}} 会在下一份简报中看到（频道暂时无法送达）。"
+      "answer_saved_brief": "回答已保存。{{lane}} 会在下一份简报中看到（频道暂时无法送达）。",
+      "github": "GitHub",
+      "verified_by": "已验证：{{who}}",
+      "not_verified": "未验证",
+      "signed_off": "已确认",
+      "settings": "弧线设置",
+      "settings_repo": "GitHub 仓库",
+      "settings_repo_hint": "说明中含有“{{tag}}”这一行的已合并 PR 会自动记录在这里。",
+      "settings_coordinator": "协调者",
+      "settings_no_coordinator": "无协调者",
+      "settings_coordinator_hint": "负责向你转达问题的泳道；你与其确认后，它可以确认里程碑。",
+      "settings_save": "保存设置",
+      "settings_failed": "无法保存设置"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/月",

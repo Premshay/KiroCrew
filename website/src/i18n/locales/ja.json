@@ -10842,7 +10842,19 @@
       "lane_not_joined_channel_full": "{{lane}} はアークにいますが、チャンネルが満員のため、緊急のエントリは次のブリーフでしか届きません。",
       "lane_not_joined_failed": "{{lane}} はアークにいますが、チャンネルへの参加に失敗したため、緊急のエントリは次のブリーフでしか届きません。",
       "answer_delivered": "チャンネルで {{lane}} に送信しました。ターンの途中で届きます。",
-      "answer_saved_brief": "回答を保存しました。{{lane}} は次のブリーフで確認します（今はチャンネルで届けられませんでした）。"
+      "answer_saved_brief": "回答を保存しました。{{lane}} は次のブリーフで確認します（今はチャンネルで届けられませんでした）。",
+      "github": "GitHub",
+      "verified_by": "検証済み：{{who}}",
+      "not_verified": "未検証",
+      "signed_off": "承認済み",
+      "settings": "アークの設定",
+      "settings_repo": "GitHub リポジトリ",
+      "settings_repo_hint": "説明に「{{tag}}」の行があるマージ済み PR は、ここに自動で記録されます。",
+      "settings_coordinator": "コーディネーター",
+      "settings_no_coordinator": "コーディネーターなし",
+      "settings_coordinator_hint": "あなたに質問を届け、あなたが確認したマイルストーンを承認できるレーンです。",
+      "settings_save": "設定を保存",
+      "settings_failed": "設定を保存できませんでした"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/月",

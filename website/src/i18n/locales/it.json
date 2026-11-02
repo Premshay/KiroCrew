@@ -11158,7 +11158,19 @@
       "lane_not_joined_channel_full": "{{lane}} è nell’arco, ma il canale è pieno; le voci urgenti la raggiungono solo nel prossimo brief.",
       "lane_not_joined_failed": "{{lane}} è nell’arco, ma l’ingresso nel canale non è riuscito; le voci urgenti la raggiungono solo nel prossimo brief.",
       "answer_delivered": "Inviata a {{lane}} nel canale; arriva a metà turno.",
-      "answer_saved_brief": "Risposta salvata. {{lane}} la vedrà nel prossimo brief (il canale non l’ha raggiunta ora)."
+      "answer_saved_brief": "Risposta salvata. {{lane}} la vedrà nel prossimo brief (il canale non l’ha raggiunta ora).",
+      "github": "GitHub",
+      "verified_by": "Verificata: {{who}}",
+      "not_verified": "Non verificata",
+      "signed_off": "Approvato",
+      "settings": "Impostazioni dell’arco",
+      "settings_repo": "Repository GitHub",
+      "settings_repo_hint": "Le PR unite la cui descrizione ha la riga «{{tag}}» vengono registrate qui automaticamente.",
+      "settings_coordinator": "Coordinamento",
+      "settings_no_coordinator": "Nessun coordinamento",
+      "settings_coordinator_hint": "La lane che ti pone le domande e può approvare una pietra miliare dopo che l’hai confermata con lei.",
+      "settings_save": "Salva impostazioni",
+      "settings_failed": "Impossibile salvare le impostazioni"
     },
     "artifactDeployPage": {
       "0_00_mo": "~0,00 $/mese",

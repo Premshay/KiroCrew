@@ -37,6 +37,7 @@ import {
   type ArcBoardSummary,
 } from '../api/client/arcBoard'
 import ArcRail from './arcBoard/ArcRail'
+import ArcSettings from './arcBoard/ArcSettings'
 import ArcStage from './arcBoard/ArcStage'
 import ClampText from './arcBoard/ClampText'
 import BoardFeed from './arcBoard/BoardFeed'
@@ -197,6 +198,10 @@ export default function ArcBoardPage() {
   })
   const removeLaneMut = useMutation({
     mutationFn: (key: string) => api.arcBoardRemoveMember(arcId, key),
+    onSuccess: refresh,
+  })
+  const settingsMut = useMutation({
+    mutationFn: (settings: { repo: string; coordinator: string }) => api.arcBoardSettings(arcId, settings),
     onSuccess: refresh,
   })
   const autonomyMut = useMutation({
@@ -446,7 +451,7 @@ export default function ArcBoardPage() {
             </div>
 
             {data ? (
-              <div className="lg:col-span-2 2xl:col-span-1">
+              <div className="flex flex-col gap-3 lg:col-span-2 2xl:col-span-1">
                 <ControlRail
                   detail={data}
                   laneKey={selectedLane}
@@ -469,6 +474,15 @@ export default function ArcBoardPage() {
                   autonomyPending={autonomyMut.isPending}
                   autonomyError={
                     autonomyMut.isError ? errMessage(autonomyMut.error) || i18nT('pages.arcBoard.autonomy_failed') : null
+                  }
+                />
+                <ArcSettings
+                  key={`${data.arc.id}:${data.arc.repo ?? ''}:${data.arc.coordinator ?? ''}`}
+                  arc={data.arc}
+                  onSave={settings => settingsMut.mutate(settings)}
+                  pending={settingsMut.isPending}
+                  error={
+                    settingsMut.isError ? errMessage(settingsMut.error) || i18nT('pages.arcBoard.settings_failed') : null
                   }
                 />
               </div>

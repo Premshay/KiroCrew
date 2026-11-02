@@ -11158,7 +11158,19 @@
       "lane_not_joined_channel_full": "{{lane}} fait partie de l’arc, mais le canal est plein : les entrées urgentes ne l’atteignent qu’à son prochain brief.",
       "lane_not_joined_failed": "{{lane}} fait partie de l’arc, mais l’adhésion au canal a échoué : les entrées urgentes ne l’atteignent qu’à son prochain brief.",
       "answer_delivered": "Envoyée à {{lane}} dans le canal ; la réponse arrive en plein tour.",
-      "answer_saved_brief": "Réponse enregistrée. {{lane}} la verra dans son prochain brief (le canal ne l’a pas atteinte pour l’instant)."
+      "answer_saved_brief": "Réponse enregistrée. {{lane}} la verra dans son prochain brief (le canal ne l’a pas atteinte pour l’instant).",
+      "github": "GitHub",
+      "verified_by": "Vérifiée : {{who}}",
+      "not_verified": "Non vérifiée",
+      "signed_off": "Validé",
+      "settings": "Paramètres de l’arc",
+      "settings_repo": "Dépôt GitHub",
+      "settings_repo_hint": "Les PR fusionnées dont la description contient la ligne « {{tag}} » sont enregistrées ici automatiquement.",
+      "settings_coordinator": "Coordination",
+      "settings_no_coordinator": "Aucune coordination",
+      "settings_coordinator_hint": "La lane qui te pose les questions et peut valider un jalon une fois que tu l’as confirmé avec elle.",
+      "settings_save": "Enregistrer les paramètres",
+      "settings_failed": "Impossible d’enregistrer les paramètres"
     },
     "artifactDeployPage": {
       "0_00_mo": "~0,00 $/mois",
