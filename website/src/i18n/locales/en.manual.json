@@ -4899,7 +4899,9 @@
       "lane_not_joined_no_channel": "{{lane}} is on the arc, but the arc has no channel, so urgent entries reach it only in its next brief.",
       "lane_not_joined_session_not_found": "{{lane}} is on the arc, but its session is not open, so it is not in the channel yet.",
       "lane_not_joined_channel_full": "{{lane}} is on the arc, but the channel is full, so urgent entries reach it only in its next brief.",
-      "lane_not_joined_failed": "{{lane}} is on the arc, but joining the channel failed; urgent entries reach it only in its next brief."
+      "lane_not_joined_failed": "{{lane}} is on the arc, but joining the channel failed; urgent entries reach it only in its next brief.",
+      "answer_delivered": "Sent to {{lane}} in the channel; it reaches them mid-turn.",
+      "answer_saved_brief": "Answer saved. {{lane}} sees it in their next brief (the channel could not reach them now)."
     },
     "artifactDeployPage": {
       "aws_profiles_count": "AWS Profiles ({{count}})",

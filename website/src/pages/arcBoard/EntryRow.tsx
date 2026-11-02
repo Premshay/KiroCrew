@@ -3,6 +3,7 @@ import { i18nT } from '../../i18n/t'
 import { fmtRelative } from '../../i18n/format'
 import type { ArcBoardArc, ArcBoardEntry } from '../../api/client/arcBoard'
 import { splitLink } from './arcBoardModel'
+import ClampText from './ClampText'
 import { C, kindVariant } from './theme'
 
 /** The owner is an author like any lane; the others are named by their role. */
@@ -27,7 +28,9 @@ export function EntryLink({ link }: { link: string }) {
           {href}
         </a>
       ) : null}
-      {text ? <span>{href ? ' — ' : ''}{text}</span> : null}
+      {/* Free evidence text can run long (a lane's options for the owner):
+          two lines, a click shows the rest. */}
+      {text ? <ClampText lines={2} text={(href ? '— ' : '') + text} /> : null}
     </div>
   )
 }

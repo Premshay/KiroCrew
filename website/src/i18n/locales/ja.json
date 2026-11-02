@@ -10840,7 +10840,9 @@
       "lane_not_joined_no_channel": "{{lane}} はアークにいますが、アークにチャンネルがないため、緊急のエントリは次のブリーフでしか届きません。",
       "lane_not_joined_session_not_found": "{{lane}} はアークにいますが、セッションが開いていないため、まだチャンネルに参加していません。",
       "lane_not_joined_channel_full": "{{lane}} はアークにいますが、チャンネルが満員のため、緊急のエントリは次のブリーフでしか届きません。",
-      "lane_not_joined_failed": "{{lane}} はアークにいますが、チャンネルへの参加に失敗したため、緊急のエントリは次のブリーフでしか届きません。"
+      "lane_not_joined_failed": "{{lane}} はアークにいますが、チャンネルへの参加に失敗したため、緊急のエントリは次のブリーフでしか届きません。",
+      "answer_delivered": "チャンネルで {{lane}} に送信しました。ターンの途中で届きます。",
+      "answer_saved_brief": "回答を保存しました。{{lane}} は次のブリーフで確認します（今はチャンネルで届けられませんでした）。"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/月",

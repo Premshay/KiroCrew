@@ -10998,7 +10998,9 @@
       "lane_not_joined_no_channel": "{{lane}} ist im Arc, aber der Arc hat keinen Kanal; dringende Einträge erreichen die Lane erst im nächsten Briefing.",
       "lane_not_joined_session_not_found": "{{lane}} ist im Arc, aber die Sitzung ist nicht offen, deshalb ist die Lane noch nicht im Kanal.",
       "lane_not_joined_channel_full": "{{lane}} ist im Arc, aber der Kanal ist voll; dringende Einträge erreichen die Lane erst im nächsten Briefing.",
-      "lane_not_joined_failed": "{{lane}} ist im Arc, aber der Kanalbeitritt ist fehlgeschlagen; dringende Einträge erreichen die Lane erst im nächsten Briefing."
+      "lane_not_joined_failed": "{{lane}} ist im Arc, aber der Kanalbeitritt ist fehlgeschlagen; dringende Einträge erreichen die Lane erst im nächsten Briefing.",
+      "answer_delivered": "An {{lane}} im Kanal gesendet; die Antwort kommt mitten in der Runde an.",
+      "answer_saved_brief": "Antwort gespeichert. {{lane}} sieht sie im nächsten Briefing (der Kanal hat die Lane gerade nicht erreicht)."
     },
     "artifactDeployPage": {
       "0_00_mo": "~0,00 $/Mon.",

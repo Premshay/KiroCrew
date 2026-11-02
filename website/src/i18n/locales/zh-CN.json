@@ -10840,7 +10840,9 @@
       "lane_not_joined_no_channel": "{{lane}} 在弧线中，但弧线没有频道，紧急条目只能在下一份简报中送达。",
       "lane_not_joined_session_not_found": "{{lane}} 在弧线中，但其会话未打开，所以还不在频道里。",
       "lane_not_joined_channel_full": "{{lane}} 在弧线中，但频道已满，紧急条目只能在下一份简报中送达。",
-      "lane_not_joined_failed": "{{lane}} 在弧线中，但加入频道失败，紧急条目只能在下一份简报中送达。"
+      "lane_not_joined_failed": "{{lane}} 在弧线中，但加入频道失败，紧急条目只能在下一份简报中送达。",
+      "answer_delivered": "已在频道中发送给 {{lane}}，会在轮次中途送达。",
+      "answer_saved_brief": "回答已保存。{{lane}} 会在下一份简报中看到（频道暂时无法送达）。"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/月",

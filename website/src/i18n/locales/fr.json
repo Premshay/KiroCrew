@@ -11156,7 +11156,9 @@
       "lane_not_joined_no_channel": "{{lane}} fait partie de l’arc, mais l’arc n’a pas de canal : les entrées urgentes ne l’atteignent qu’à son prochain brief.",
       "lane_not_joined_session_not_found": "{{lane}} fait partie de l’arc, mais sa session n’est pas ouverte : elle n’est pas encore dans le canal.",
       "lane_not_joined_channel_full": "{{lane}} fait partie de l’arc, mais le canal est plein : les entrées urgentes ne l’atteignent qu’à son prochain brief.",
-      "lane_not_joined_failed": "{{lane}} fait partie de l’arc, mais l’adhésion au canal a échoué : les entrées urgentes ne l’atteignent qu’à son prochain brief."
+      "lane_not_joined_failed": "{{lane}} fait partie de l’arc, mais l’adhésion au canal a échoué : les entrées urgentes ne l’atteignent qu’à son prochain brief.",
+      "answer_delivered": "Envoyée à {{lane}} dans le canal ; la réponse arrive en plein tour.",
+      "answer_saved_brief": "Réponse enregistrée. {{lane}} la verra dans son prochain brief (le canal ne l’a pas atteinte pour l’instant)."
     },
     "artifactDeployPage": {
       "0_00_mo": "~0,00 $/mois",

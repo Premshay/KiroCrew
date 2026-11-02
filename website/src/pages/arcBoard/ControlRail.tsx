@@ -50,6 +50,7 @@ function AskCard({
       <div className="text-[12px] leading-5" style={{ color: C.text }}>
         {ask.text}
       </div>
+      {ask.link ? <EntryLink link={ask.link} /> : null}
       <div className="mt-1 flex flex-wrap items-baseline gap-x-2 text-[11px]" style={{ color: C.dim }}>
         <span>{authorLabel(arc, ask.author)}</span>
         <span>{i18nT('pages.arcBoard.waiting', { ago: fmtRelative(ask.ts) })}</span>
@@ -239,6 +240,7 @@ export default function ControlRail({
   laneKey,
   laneLabel,
   onAnswer,
+  answerNote,
   onAccept,
   onSendBack,
   onAutonomy,
@@ -250,6 +252,8 @@ export default function ControlRail({
   laneKey: string | null
   laneLabel: string
   onAnswer: (askId: string, text: string) => Promise<void>
+  /** What happened to the last answer the owner sent; the card itself is gone. */
+  answerNote: { tone: 'ok' | 'warn'; text: string } | null
   onAccept: (expectedIndex: number) => Promise<void>
   onSendBack: (text: string) => Promise<void>
   onAutonomy: (level: 1 | 2 | 3) => void
@@ -277,6 +281,11 @@ export default function ControlRail({
               </Badge>
             ) : null}
           </CardTitle>
+          {answerNote ? (
+            <div className="px-3 pt-1 text-[11px]" style={{ color: answerNote.tone === 'ok' ? C.ok : C.warn }}>
+              {answerNote.text}
+            </div>
+          ) : null}
           {ownerAsks.map(a => (
             <AskCard key={a.id} arc={arc} ask={a} onAnswer={onAnswer} />
           ))}

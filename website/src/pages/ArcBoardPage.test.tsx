@@ -14,6 +14,7 @@ vi.mock('../api/client', () => ({
     arcBoardArcs: vi.fn(),
     arcBoardDetail: vi.fn(),
     arcBoardAccept: vi.fn(),
+    arcBoardAnswer: vi.fn(),
     arcBoardAddMember: vi.fn(),
     arcBoardReport: vi.fn(),
     agentCatalog: vi.fn(),
@@ -51,7 +52,7 @@ const arc = {
 const entries = [
   { id: 'ae_1', ts: '2026-11-01T10:01:00+00:00', author: 'chat-1', kind: 'FACT', text: 'rendered', link: 'javascript:alert(1)' },
   { id: 'ae_2', ts: '2026-11-01T10:02:00+00:00', author: 'chat-1', kind: 'DONE', text: 'm1 ready', link: 'https://github.com/o/r/pull/9 — done', completes_milestone: true },
-  { id: 'ae_3', ts: '2026-11-01T10:03:00+00:00', author: 'chat-1', kind: 'ASK', text: 'Short form or Siglum?', to: 'owner' },
+  { id: 'ae_3', ts: '2026-11-01T10:03:00+00:00', author: 'chat-1', kind: 'ASK', text: 'Short form or Siglum?', to: 'owner', link: 'Options: (A) linked records (B) text columns' },
 ]
 
 function renderPage() {
@@ -193,5 +194,18 @@ describe('ArcBoardPage', () => {
     expect(screen.getByRole('button', { name: /only Tenon/ }).getAttribute('aria-pressed')).toBe('false')
     fireEvent.keyDown(window, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByRole('button', { name: /only Tenon/ })).toBeNull())
+  })
+
+  it('shows the options a question carries and says where the answer went', async () => {
+    vi.mocked(api.arcBoardAnswer).mockResolvedValue({
+      entry: {},
+      delivery: { recipients: ['chat-1'], outcome: 'posted' },
+    } as never)
+    renderPage()
+    // Once in the feed and once on the question card in Needs you.
+    await waitFor(() => expect(screen.getAllByText(/Options: \(A\) linked records/)).toHaveLength(2))
+    fireEvent.change(screen.getByLabelText(/your answer/i), { target: { value: 'A' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(await screen.findByText(/Sent to Tenon in the channel/)).toBeTruthy()
   })
 })

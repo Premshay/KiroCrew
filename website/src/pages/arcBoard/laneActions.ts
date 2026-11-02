@@ -73,3 +73,11 @@ export function laneJoinNote(role: string, lane: ArcBoardLaneJoin): LaneNote {
   }
   return { tone, text: parts.join(' ') }
 }
+
+/** Where the owner's answer went: mid-turn through the channel, or the asker's next brief. */
+export function answerDeliveryNote(asker: string, delivery: { outcome: string; recipients: string[] }): LaneNote {
+  if (delivery.outcome === 'posted' && delivery.recipients.length > 0) {
+    return { tone: 'ok', text: i18nT('pages.arcBoard.answer_delivered', { lane: asker }) }
+  }
+  return { tone: 'warn', text: i18nT('pages.arcBoard.answer_saved_brief', { lane: asker }) }
+}

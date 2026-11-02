@@ -11156,7 +11156,9 @@
       "lane_not_joined_no_channel": "{{lane}} está no arco, mas o arco não tem canal; as entradas urgentes só chegam no próximo brief.",
       "lane_not_joined_session_not_found": "{{lane}} está no arco, mas a sessão dela não está aberta, então ainda não está no canal.",
       "lane_not_joined_channel_full": "{{lane}} está no arco, mas o canal está cheio; as entradas urgentes só chegam no próximo brief.",
-      "lane_not_joined_failed": "{{lane}} está no arco, mas a entrada no canal falhou; as entradas urgentes só chegam no próximo brief."
+      "lane_not_joined_failed": "{{lane}} está no arco, mas a entrada no canal falhou; as entradas urgentes só chegam no próximo brief.",
+      "answer_delivered": "Enviada para {{lane}} no canal; chega no meio do turno.",
+      "answer_saved_brief": "Resposta salva. {{lane}} vai vê-la no próximo brief (o canal não a alcançou agora)."
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/mês",

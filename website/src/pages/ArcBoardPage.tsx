@@ -45,7 +45,7 @@ import NewArcForm from './arcBoard/NewArcForm'
 import ReportTab from './arcBoard/ReportTab'
 import { useSessionSlots } from './arcBoard/LanePicker'
 import { laneViews, newEntries, type LaneSpec } from './arcBoard/arcBoardModel'
-import { addLaneToArc, laneJoinNote, type LaneNote } from './arcBoard/laneActions'
+import { addLaneToArc, answerDeliveryNote, laneJoinNote, type LaneNote } from './arcBoard/laneActions'
 import { C } from './arcBoard/theme'
 
 function Counter({ label, value, tone }: { label: string; value: React.ReactNode; tone?: string }) {
@@ -69,6 +69,7 @@ export default function ArcBoardPage() {
   const [tab, setTab] = useState<'board' | 'report'>('board')
   const [lanePick, setLanePick] = useState<string | null>(null)
   const [laneNotes, setLaneNotes] = useState<LaneNote[]>([])
+  const [answerNote, setAnswerNote] = useState<LaneNote | null>(null)
   const [laneError, setLaneError] = useState<string | null>(null)
   const [lanePending, setLanePending] = useState(false)
   const needsRef = useRef<HTMLDivElement>(null)
@@ -289,6 +290,7 @@ export default function ArcBoardPage() {
                 setParams({ arc: id }, { replace: true })
                 setLanePick(null)
                 setLaneNotes([])
+                setAnswerNote(null)
                 setTab('board')
               }}
               arc={data?.arc ?? null}
@@ -450,7 +452,17 @@ export default function ArcBoardPage() {
                   laneKey={selectedLane}
                   laneLabel={laneLabel}
                   needsRef={needsRef}
-                  onAnswer={(askId, text) => settle(api.arcBoardAnswer(arcId, askId, text))}
+                  onAnswer={async (askId, text) => {
+                    const ask = data.open_asks.find(a => a.id === askId)
+                    const asker = ask ? (data.arc.members[ask.author]?.role ?? ask.author) : ''
+                    try {
+                      const res = await api.arcBoardAnswer(arcId, askId, text)
+                      setAnswerNote(answerDeliveryNote(asker, res.delivery))
+                    } finally {
+                      refresh()
+                    }
+                  }}
+                  answerNote={answerNote}
                   onAccept={expected => settle(api.arcBoardAccept(arcId, expected))}
                   onSendBack={text => settle(api.arcBoardNote(arcId, text))}
                   onAutonomy={level => autonomyMut.mutate(level)}
