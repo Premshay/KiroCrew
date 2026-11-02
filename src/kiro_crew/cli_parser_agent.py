@@ -521,6 +521,8 @@ Examples:
   kirocrew arc show ARC_ID
   kirocrew arc answer ARC_ID ASK_ID "use the staging key"
   kirocrew arc accept ARC_ID
+  kirocrew arc settings ARC_ID --repo OWNER/NAME --coordinator SESSION_KEY
+  kirocrew arc sync [ARC_ID]
 """,
         formatter_class=_fmt,
     )
@@ -539,6 +541,18 @@ Examples:
     arc_answer.add_argument("text", help="Answer text (up to 100 characters)")
     arc_accept = arc_sub.add_parser("accept", help="Accept the current milestone")
     arc_accept.add_argument("arc_id", help="Arc id")
+    arc_settings = arc_sub.add_parser(
+        "settings", help="Set the arc's GitHub repo and the coordinator who signs off for you"
+    )
+    arc_settings.add_argument("arc_id", help="Arc id")
+    arc_settings.add_argument("--repo", help="owner/name whose merged arc PRs are recorded")
+    arc_settings.add_argument(
+        "--coordinator", help="Member session key that may sign milestones off ('' clears it)"
+    )
+    arc_sync = arc_sub.add_parser(
+        "sync", help="Record merged PRs tagged 'Arc: <id>' on the board (all arcs if no id)"
+    )
+    arc_sync.add_argument("arc_id", nargs="?", help="Arc id")
 
 
 def register_artifact_parser(sub: _Commands) -> None:

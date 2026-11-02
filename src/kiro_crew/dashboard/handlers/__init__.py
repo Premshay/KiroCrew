@@ -573,6 +573,7 @@ from kiro_crew.dashboard.handlers.arc_board import (  # noqa: E402, F401
     api_arc_board_open_channel,
     api_arc_board_remove_member,
     api_arc_board_report,
+    api_arc_board_settings,
 )
 
 # ── Coordinator work items (handlers/work_items.py) ──

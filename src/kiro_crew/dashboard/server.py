@@ -1188,6 +1188,10 @@ async def start_dashboard(
     # request until it settles.
     _kick_crewmate_prune(state)
     _kick_pinned_order_load(state)
+    # Record each arc's merged, tagged PRs on its board (server_runtime/arc_github_sync).
+    from kiro_crew.dashboard.server_runtime.arc_github_sync import kick_arc_github_sync
+
+    kick_arc_github_sync(state)
     # (No _export_bound_port republish here: the reservation above already
     # exported this same socket's name before the spawn pass — the one
     # authoritative write on this path. The headless entrypoint, which binds

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -141,8 +142,27 @@ def _arc(args: argparse.Namespace) -> None:
                 )
         elif action == "accept":
             arcs.accept_milestone(args.arc_id)
+        elif action == "settings":
+            if args.repo is None and args.coordinator is None:
+                _fail("give --repo and/or --coordinator")
+            arc = arcs.update_settings(args.arc_id, repo=args.repo, coordinator=args.coordinator)
+            print(f"repo={arc['repo'] or '-'} coordinator={arc['coordinator'] or '-'}")
+        elif action == "sync":
+            from kiro_crew import arc_github
+
+            if args.arc_id:
+                found = arc_github.sync_arc(args.arc_id)
+                for entry in found:
+                    print(safe_terminal_line(entry["text"]))
+                print(f"recorded {len(found)}")
+            else:
+                for arc_id, count in arc_github.sync_all().items():
+                    print(f"{arc_id}: {'failed' if count < 0 else f'recorded {count}'}")
         else:
-            print("Usage: kirocrew arc {create|add-member|show|answer|accept}", file=sys.stderr)
+            print(
+                "Usage: kirocrew arc {create|add-member|show|answer|accept|settings|sync}",
+                file=sys.stderr,
+            )
             sys.exit(1)
-    except (arcs.ArcError, OSError, ValueError) as exc:
+    except (arcs.ArcError, OSError, ValueError, subprocess.SubprocessError) as exc:
         _fail(str(exc))
