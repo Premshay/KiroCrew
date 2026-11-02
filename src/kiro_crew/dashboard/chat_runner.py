@@ -256,6 +256,7 @@ from kiro_crew.dashboard.chat_turn.tool_approval import (  # noqa: F401
     _slot_is_trusted,
 )
 from kiro_crew.dashboard.chat_turn.tool_results import _on_tool_result
+from kiro_crew.dashboard.peer_interrupt_retry import retry_after_tool_result
 from kiro_crew.dashboard.chat_turn.tool_rows import (
     _MAX_TCID_SOURCES,
     _on_tool_call,
@@ -1073,6 +1074,8 @@ async def _run_chat(
                 await _on_tool_call_update(turn, event)
             elif event.kind == EVENT_TOOL_RESULT:
                 await _on_tool_result(turn, event)
+                # A peer interrupt held while this tool ran may steer now.
+                await retry_after_tool_result(turn.state, turn.slot)
             elif event.kind == EVENT_PERMISSION_REQUEST:
                 _flow = await _on_permission_request(turn, event)
                 if _flow is _Flow.CONTINUE:

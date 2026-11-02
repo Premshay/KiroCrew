@@ -515,6 +515,7 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
         # gets the request first in its queue instead, so the running tool is
         # not killed and the agent is not told the user interrupted it.
         preempt = True
+        held_text = ""
         if message.delivery == "interrupt" and slot.turn_running:
             client = slot._acp_client
             if client is None or not getattr(client, "supports_steer", False):
@@ -558,8 +559,10 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
                     )
                 else:
                     preempt = False
+                    held_text = interrupt_text
                     logger.info(
-                        "peer interrupt for slot %s: steer held, queued first without a stop",
+                        "peer interrupt for slot %s: steer held, queued first without a stop;"
+                        " retried at the next tool boundary",
                         slot.key,
                     )
 
@@ -593,7 +596,23 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
         if queue_index is None:
             queue(request_text, **kwargs)
         else:
-            queue(queue_index, request_text, **kwargs)
+            queue_id = queue(queue_index, request_text, **kwargs)
+            if held_text and isinstance(queue_id, str):
+                from kiro_crew.dashboard.peer_interrupt_retry import (
+                    HeldInterrupt,
+                    remember_held_interrupt,
+                )
+
+                remember_held_interrupt(
+                    slot,
+                    HeldInterrupt(
+                        queue_id=queue_id,
+                        channel_id=channel.id,
+                        message_id=message.id,
+                        member_id=getattr(member, "id", ""),
+                        text=held_text,
+                    ),
+                )
         if slot.running:
             await save_slot_off_loop(state, slot, force=True, best_effort=False)
             state.push_slots_update()
@@ -601,7 +620,9 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
                 from kiro_crew.dashboard.chat_handlers import preempt_slot_for_channel_interrupt
 
                 return await preempt_slot_for_channel_interrupt(state, slot)
-            return "queued"
+            # A held interrupt is first in the queue AND retried at the next tool
+            # boundary; "held" tells the sender it is waiting on a running tool.
+            return "held" if held_text else "queued"
 
     if message.msg_type == "mention" and not slot.running:
         from kiro_crew.dashboard.chat_runner import _start_next_queued_turn

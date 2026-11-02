@@ -320,6 +320,7 @@ class _ChatSlot:
         "_native_subagent_output",
         "_steer_confirmed",
         "_pending_steers",
+        "_held_peer_interrupts",
         "_steer_delivery_ids",
         "_steer_send_ids",
         "_steer_user_origin",

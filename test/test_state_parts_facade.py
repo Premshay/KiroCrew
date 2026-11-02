@@ -620,6 +620,7 @@ _BASE_SLOT_DEFAULTS: dict[str, tuple[str, str | None]] = {
     "_pending_reset_history_key": ("value", "None"),
     "_pending_rewrite": ("value", "False"),
     "_pending_steers": ("value", "[]"),
+    "_held_peer_interrupts": ("value", "[]"),
     "_pending_subagent_failures": ("value", "[]"),
     "_pending_synthesis": ("value", "False"),
     "_pending_variants": ("value", "[]"),

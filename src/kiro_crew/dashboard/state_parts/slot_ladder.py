@@ -328,6 +328,9 @@ def init_ladder_fields(self: _ChatSlot) -> None:
     # STOP, error). Without this, a steer swallowed by a dying turn
     # vanished with no trace (see the requeue site).
     self._pending_steers = []
+    # Peer interrupts claude held while a tool ran: retried at the next tool
+    # boundary by dashboard.peer_interrupt_retry (their queued copy is the fallback).
+    self._held_peer_interrupts = []
     # Opaque id per in-flight steer, keyed by its text (the one-per-text
     # rule in chat_delivery makes that key unique). The requeue moves the id
     # onto the queue entry and the drain unions entry meta onto the row it
