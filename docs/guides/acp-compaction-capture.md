@@ -1,5 +1,17 @@
 # Capturing a harness's `/compact` evidence
 
+The diagnostic workflow `codex-native-capture.yml` measures Codex ACP 2.3.0
+with Codex 0.164.0 and SDK 2.0.2 on a clean Linux runner. Its model endpoint is
+a loopback SSE stub, and its homes and placeholder API key are generated for
+the probe. It uses no account credentials or cloud model calls. Both sessions
+run an acknowledgement and `/compact`; one negotiates compaction and notices,
+and the other negotiates notices only to measure the adapter's compaction
+notice fallback. The latter does not establish a warning under Crew's default
+negotiation. Only actual inbound native frames become candidate JSONL evidence;
+the workflow fails if an expected native frame is absent. Review artifacts and
+generate replay snapshots before adding captures to the corpus. This diagnostic
+does not replace the normal authenticated provider acceptance check.
+
 `ACP_BACKENDS_COMPACT` in `src/kiro_crew/agent_sdk/backends_turns.py` decides whether Kiro
 Crew offers a manual `/compact` on a backend at all. A harness joins that set on a
 DRIVEN capture, never on its source: the bar opencode and goose met is a live session

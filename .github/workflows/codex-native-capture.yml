@@ -1,0 +1,29 @@
+name: Codex native capture
+on:
+  push:
+    branches: [verification/codex-native-20261106]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install measured releases
+        run: npm install --prefix "$RUNNER_TEMP/measured" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.3.0 @openai/codex@0.164.0 @agentclientprotocol/sdk@2.0.2
+      - name: Capture genuine ACP frames
+        run: python3 .github/scripts/capture-codex-native.py --entry "$RUNNER_TEMP/measured/node_modules/@agentclientprotocol/codex-acp/dist/index.js" --output "$RUNNER_TEMP/codex-native-evidence"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: codex-native-evidence
+          path: ${{ runner.temp }}/codex-native-evidence
+          if-no-files-found: error
+          retention-days: 7
