@@ -99,7 +99,9 @@ replaced by another identity. With no accounts configured, nothing changes.
 ## Non-goals
 
 - **Named accounts for kiro-cli-owned sign-in.** Its store cannot move per process
-  on macOS. Kiro accounts go through KAS or a per-account API key (§4).
+  on macOS. Kiro accounts go through KAS (§4).
+- **Named API-key accounts**, for kiro or any harness. The key would reach the
+  child in its environment, which the credential promise below rules out (§4).
 - **Automatic failover on a usage limit.** It needs cooldowns, replay, per-harness
   limit wording and an answer on provider terms. It goes to a follow-up RFC. The
   owner switch (§5) is the manual form.
@@ -245,26 +247,53 @@ Every flow is owner-only.
   selection). "Signed in" means the credential leaf exists; Crew never reads it,
   as with `ENTITLEMENT_OWN_CREDENTIAL_FILE`. A keychain-held credential reads as
   `unknown`, never `false`.
-- **kiro (kiro-cli owns sign-in).** No named accounts. An account can be an API
-  key from Crew's vault, injected as `KIRO_API_KEY` for that spawn.
+- **kiro (kiro-cli owns sign-in).** No named accounts in v1, API-key ones
+  included: injecting a vault key as `KIRO_API_KEY` would put a credential in the
+  child's environment. A named Kiro account is a KAS account. `system` keeps
+  today's behaviour, including the `KIRO_API_KEY` a kiro-cli child already
+  receives (`receives_kiro_cli_api_key`, `kiro_prerequisite_spawn_identity.py`);
+  this RFC changes no current auth path.
 - **Sign-out** removes that account's credential and retires only its processes.
   Today `_retire_runtimes_after_sign_out` retires every KAS and Kiro process.
 
 ### 5. Live switch
 
 `POST /api/chat/slots/{slot}/account {account}` joins `/model` and `/agent` in
-`dashboard/routes/chat.py` as a fifth commit-before-reset switch handler, under
-the same lock order:
+`dashboard/routes/chat.py` as a fifth commit-before-reset switch handler. It does
+**not** call `reload_slot_session`: that function takes `slot._lock` itself
+(`dashboard/chat_api/session_relaunch.py`), and the lock is not reentrant. The
+handler copies the reasoning-effort handler's transaction
+(`api_chat_slot_reasoning_effort`, `dashboard/chat_api/slot_effort.py`), which
+has no live-switch path either:
 
-1. Validate the account exists and is signed in, else 409 `account_unavailable`.
-2. Commit `slot.account`.
-3. Call `reload_slot_session` with the reload route's callbacks.
-4. The new process resolves its account (§2) and resumes from the shared store, or
-   falls to the replay in §3.
+1. **Locks.** One `AsyncExitStack` takes `slot._lock`, resolves
+   `effective_session_key(slot)` inside it, then takes
+   `_slot_switch_session_lock` for that key. `_slot_replaced_while_queued`
+   re-checks the slot after each acquisition.
+2. **Pre-commit refusals**, which change nothing: 409 `account_unavailable` for a
+   missing or signed-out account, `_subagents_attached_response`
+   (`slot_subagents_running`), then, after that await, `_switch_target_busy`
+   (`turn_in_flight`).
+3. **Commit.** Record `prior_account`, write `slot.account`, set `slot._dirty`.
+4. **Teardown** through `_reset_slot_session_or_warn(..., switch_kind="account")`
+   (`dashboard/chat_api/slot_guards.py`), the reset `reload_slot_session`
+   reaches, with the model handler's decline ladder: one retry on an idle decline,
+   then `turn_in_flight`; then the rebind check
+   `effective_session_key(slot) != session_key` (`session_rebound`).
+5. **Rollback** on every refusal after the commit: the 409s in step 4 and a
+   pre-pop teardown raise (500). It is compare-and-swap, as `_rollback_pick`
+   (`slot_model.py`): `prior_account` is restored only while `slot.account` still
+   holds this request's value, so a write that superseded it is kept. It then sets
+   `slot._dirty` unconditionally, as `agent_switch.py`'s rollback does, so a flush
+   that already persisted the provisional account is overwritten. A post-pop
+   teardown raise is a committed switch: no rollback, 200 with
+   `_TEARDOWN_INCOMPLETE_WARNING`.
+6. **Success.** `push_slots_update`, `_append_session_switch_notice`, a SEL row
+   (Security). The next process resolves its account (§2) and resumes from the
+   shared store, or falls to the replay in §3.
 
-The switch inherits reload's 409s. On a session with history, the dialog says the
-conversation so far, file contents included, goes to the other account's provider,
-and the owner confirms first.
+On a session with history, the dialog says the conversation so far, file contents
+included, goes to the other account's provider, and the owner confirms first.
 
 ### 6. Warm pool, background runtime, identity sweeps
 
@@ -305,7 +334,10 @@ or `sessions/`, and which entries it rewrites by rename; (c) whether a transcrip
 with thinking blocks resumes under another account, and the rejection wording if
 not; (d) on macOS, where Claude keeps its credential under `CLAUDE_CONFIG_DIR` and
 where `.claude.json` lands; (e) each private-entry list; (f) whether each sandbox
-backend can re-expose one read-write directory inside a masked tree.
+backend can re-expose one read-write directory inside a masked tree; (g) for
+Claude Code, which credential sources outrank the `CLAUDE_CONFIG_DIR` home
+(Security, "Ambient Claude credentials") and whether a named home signs in as
+its own identity when none is present.
 *Exit:* verdicts recorded here with harness versions.
 
 **Phase 1: model, resolution, spawn, fences, CLI.** No harness offers accounts yet
@@ -321,10 +353,12 @@ account is refused.
 out of A retires only A's processes; an empty named account is refused with a chat
 card and never spawns kiro-cli-owned.
 
-**Phase 3: Claude Code and Codex homes.** Blocked on Phase 0 for the harness.
+**Phase 3: Claude Code and Codex homes.** Blocked on Phase 0 for the harness;
+named Claude accounts also on 0g.
 *Exit:* a child on a second Claude account has `CLAUDE_CONFIG_DIR` set to its
 home; under every masking tier, a child on A cannot read B's credential file; a
-named spawn under a tier that drops masks is refused; a diverged `settings.json` is
+named spawn under a tier that drops masks is refused; a named Claude spawn with an
+ambient credential source present is refused; a diverged `settings.json` is
 reported, not overwritten; Crew-managed `mcpServers` reach an account session.
 
 **Phase 4: dashboard accounts.**
@@ -334,7 +368,9 @@ leaves A unchanged; the login PTY reaches no agent-readable surface.
 **Phase 5: live switch.**
 *Exit:* after a switch the next turn runs on the new account with the prior
 transcript in context, by session id or an announced replay; the route answers 409
-for a turn in flight, attached subagents and `account_unavailable`.
+for a turn in flight, attached subagents, a rebind and `account_unavailable`; a
+switch refused after its commit leaves `slot.account` and its persisted metadata on
+the prior value, and keeps a write that superseded it during the request.
 
 **Phase 6: more harnesses.** A declaration plus a Phase 0 row each.
 
@@ -360,7 +396,9 @@ kiro-cli-owned fallback, and `kirocrew kas` acts on `system` unless given
   `account_expose_dir`, re-exposes exactly one directory read-write inside the
   masked tree, for every harness that offers accounts.
   - **Masking tier:** a child reads its own account's home and no other. Phase 0f
-    confirms each backend can do this.
+    confirms each backend can do this. This bounds which credential files a child
+    can read. It does not prove which identity the harness signs in as; see
+    "Ambient Claude credentials".
   - **Tier that drops masks** (`off`, or an opted-in unsandboxed host): any child
     could read every account home under the owner's uid, so exposure grows from
     one credential to N. **A named-account spawn there is refused** in v1.
@@ -377,8 +415,20 @@ kiro-cli-owned fallback, and `kirocrew kas` acts on `system` unless given
 - **Provider terms.** Several consumer subscriptions of one provider, with work
   moved between them, may conflict with its terms. Not verified. This RFC adds no
   automatic switching; the failover RFC must settle terms first.
-- **No credential in config or env.** Config holds ids and labels; the env holds a
-  masked path.
+- **Ambient Claude credentials.** A named home moves only what Claude Code reads
+  from `CLAUDE_CONFIG_DIR`. It does not isolate a credential the harness finds
+  elsewhere: an `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` in the child env
+  (the gateway's, or an `agent.env` `secret://` mapping, applied before the
+  account variable in §2), an `apiKeyHelper` or `env` block in `settings.json`
+  (§3 links it into every account), or a macOS keychain entry not scoped by the
+  home (open question 2). Where one of these wins, a named session runs as the
+  `system` identity, the silent change Goal 6 forbids. So named Claude accounts
+  stay off until Phase 0g records which sources win, per harness version and OS,
+  and Phase 3 refuses a named Claude spawn when one is present.
+- **No credential added to config or env.** Config holds ids and labels; for a
+  named account Crew adds one variable, a masked path. Credentials already in the
+  env on `system` paths, such as kiro-cli's `KIRO_API_KEY` or an `agent.env`
+  `secret://` mapping, are unchanged and not covered by this promise.
 - **Owner-only.** Every account route uses `is_owner_dashboard_request`
   (`dashboard/handlers/source_providers.py`). No MCP verb, and change cards cannot
   target account keys. An agent's `session_reload` cannot change the account.
