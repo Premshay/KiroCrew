@@ -41,9 +41,9 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any
 
 from kiro_crew.dashboard.crash_dump_store import current_process_identity, pid_identity_alive

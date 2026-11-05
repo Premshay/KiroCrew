@@ -106,6 +106,31 @@ from kiro_crew.dashboard.handlers.appearances import (  # noqa: E402, F401
     api_appearances_petdex_fetch,
 )
 
+# ── Arc board console, owner routes (handlers/arc_board.py) ──
+from kiro_crew.dashboard.handlers.arc_board import (  # noqa: E402, F401
+    api_arc_board_accept,
+    api_arc_board_add_member,
+    api_arc_board_answer,
+    api_arc_board_autonomy,
+    api_arc_board_create,
+    api_arc_board_detail,
+    api_arc_board_list,
+    api_arc_board_note,
+    api_arc_board_open_channel,
+    api_arc_board_remove_member,
+    api_arc_board_report,
+    api_arc_board_settings,
+)
+
+# ── Arc board (handlers/arcs.py) ──
+from kiro_crew.dashboard.handlers.arcs import (  # noqa: E402, F401
+    api_arc_brief,
+    api_arc_deliver,
+    api_arc_entries_read,
+    api_arc_entries_write,
+    api_arcs_mine,
+)
+
 # ── Browser Harness: Settings -> Browser status, install job, test, disconnect
 # (handlers/browser_harness_status.py). Owner-only; the internal secret is refused. ──
 from kiro_crew.dashboard.handlers.browser_harness_status import (  # noqa: E402, F401
@@ -545,31 +570,6 @@ from kiro_crew.dashboard.handlers.teams import (  # noqa: E402, F401
     api_teams_delete,
     api_teams_list,
     api_teams_update,
-)
-
-# ── Arc board (handlers/arcs.py) ──
-from kiro_crew.dashboard.handlers.arcs import (  # noqa: E402, F401
-    api_arc_deliver,
-    api_arc_brief,
-    api_arc_entries_read,
-    api_arc_entries_write,
-    api_arcs_mine,
-)
-
-# ── Arc board console, owner routes (handlers/arc_board.py) ──
-from kiro_crew.dashboard.handlers.arc_board import (  # noqa: E402, F401
-    api_arc_board_accept,
-    api_arc_board_add_member,
-    api_arc_board_answer,
-    api_arc_board_autonomy,
-    api_arc_board_create,
-    api_arc_board_detail,
-    api_arc_board_list,
-    api_arc_board_note,
-    api_arc_board_open_channel,
-    api_arc_board_remove_member,
-    api_arc_board_report,
-    api_arc_board_settings,
 )
 
 # ── Coordinator work items (handlers/work_items.py) ──

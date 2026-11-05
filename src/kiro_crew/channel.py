@@ -419,7 +419,14 @@ class Channel:
                 # acknowledged to its sender and never read; `None` lets the caller say so.
                 return None
             return await self._append(
-                from_id, content, from_role, mention, msg_type, thread_id, meta, notify_members,
+                from_id,
+                content,
+                from_role,
+                mention,
+                msg_type,
+                thread_id,
+                meta,
+                notify_members,
                 delivery=delivery,
             )
 

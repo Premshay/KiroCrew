@@ -656,7 +656,9 @@ class AcpWorker(Worker):
                 AGENT_NAME,
                 POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
             )
-            self._client, authored_before_spawn = await self._spawn_client(acp_backend, sandbox_mode)
+            self._client, authored_before_spawn = await self._spawn_client(
+                acp_backend, sandbox_mode
+            )
             # A zero-tool spec must be CONFIRMED, not assumed. A backend that is not
             # routed through Routing.AGENT_SPEC relies on the session's consumed
             # projection (spec_zero_tools: the mirror's, or pi's mirror-less parse). If the spec was missing, malformed, or
@@ -734,7 +736,9 @@ class AcpWorker(Worker):
                 try:
                     await self._client.shutdown()
                 except Exception:
-                    logger.debug("AcpWorker: unconfirmed-spec client shutdown failed", exc_info=True)
+                    logger.debug(
+                        "AcpWorker: unconfirmed-spec client shutdown failed", exc_info=True
+                    )
                 self._client = None
                 raise RuntimeError(
                     f"knowledge agent {AGENT_NAME!r} could not be confirmed to declare a "

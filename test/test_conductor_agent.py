@@ -26,8 +26,8 @@ import sys
 from io import StringIO
 from pathlib import Path
 
-import pytest
 import conductor_agent_checks
+import pytest
 from skill_script_helpers import load_skill_script
 
 from kiro_crew import agent, work_acceptance

@@ -331,11 +331,12 @@ def runtime_preflight() -> str:
         backend = review_backend()
     except ReviewHarnessDenied as exc:
         return str(exc)
-    if (resolve_kiro_cli is not None and backend == ACP_BACKEND_KIRO
-            and resolve_kiro_cli() is None):
-        return ("the reviewer cannot run: no kiro-cli executable was found on "
-                "this host (the reviewer session is driven by kiro-cli — "
-                "install it or add it to PATH)")
+    if resolve_kiro_cli is not None and backend == ACP_BACKEND_KIRO and resolve_kiro_cli() is None:
+        return (
+            "the reviewer cannot run: no kiro-cli executable was found on "
+            "this host (the reviewer session is driven by kiro-cli — "
+            "install it or add it to PATH)"
+        )
     return ""
 
 
@@ -984,10 +985,14 @@ class ReviewPool:
         """Close a review batch — kills the runtime once the last batch drains."""
         await self._holder.end_batch()
 
-    async def send(self, task: str, timeout: float = DEFAULT_TASK_TIMEOUT,
-                   on_activity: Callable[[str, int], None] | None = None,
-                   keep_session_key: str | None = None,
-                   on_resolution: Callable[[dict], None] | None = None) -> str:
+    async def send(
+        self,
+        task: str,
+        timeout: float = DEFAULT_TASK_TIMEOUT,
+        on_activity: Callable[[str, int], None] | None = None,
+        keep_session_key: str | None = None,
+        on_resolution: Callable[[dict], None] | None = None,
+    ) -> str:
         """:meth:`_send` through Shared Crew fair admission, charged to Crew automation.
 
         A refusal raises ``TurnRefused`` (a ``RuntimeError`` naming the limit)
@@ -1004,10 +1009,14 @@ class ReviewPool:
             operation=OperationKind.BACKGROUND,
         )
 
-    async def _send(self, task: str, timeout: float = DEFAULT_TASK_TIMEOUT,
-                    on_activity: Callable[[str, int], None] | None = None,
-                    keep_session_key: str | None = None,
-                   on_resolution: Callable[[dict], None] | None = None) -> str:
+    async def _send(
+        self,
+        task: str,
+        timeout: float = DEFAULT_TASK_TIMEOUT,
+        on_activity: Callable[[str, int], None] | None = None,
+        keep_session_key: str | None = None,
+        on_resolution: Callable[[dict], None] | None = None,
+    ) -> str:
         """Run one review task on its own session of the shared runtime and return
         the final assistant text. Auto-approves every tool permission (the reviewer
         runs the `gh` CLI + shell) and emits a per-tool SEL audit.

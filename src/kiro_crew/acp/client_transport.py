@@ -49,6 +49,7 @@ from kiro_crew.acp.runtime_models import (
     _substitute_model_from_advisory,
 )
 from kiro_crew.acp.stale_compaction import consume_stale_compaction_status
+from kiro_crew.acp.stderr_tail import safe_stderr_tail
 from kiro_crew.acp.transport_errors import AcpError, AcpProcessDied, AcpTimeoutError
 from kiro_crew.acp.transport_framing import (
     RequestWriteResult,
@@ -1132,12 +1133,11 @@ async def _read_message_from_stdout(
             # pipe, and every later settle on this failure would wait on it
             # again.
             await settle_drain(self._stderr_task, 0.5, shield=False)
-            stderr_tail = "; ".join(self._stderr_lines) if self.memory_mode == "persistent" else ""
-            if stderr_tail:
-                from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-
-                stderr_tail, _ = redact_exfiltration_urls(stderr_tail)
-                stderr_tail, _ = redact_credentials(stderr_tail)
+            stderr_tail = (
+                safe_stderr_tail(self._stderr_lines, "; ")
+                if self.memory_mode == "persistent"
+                else ""
+            )
             detail = f" — {stderr_tail}" if stderr_tail else ""
             code = self._process.returncode
             origin = _exit_origin(code, self._kill_sent)

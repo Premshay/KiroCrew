@@ -108,7 +108,9 @@ class TestTurnTeardownRelease:
         client.stream_command = _empty
         client.client.set_claude_autonomous_turn_handler = None
         state.kiro_prerequisite_service = _HungIdentityService()
-        monkeypatch.setattr(chat_runner, "_IDENTITY_RECONCILE_READ_TIMEOUT_SECS", 0.01)
+        monkeypatch.setattr(
+            chat_runner, "_IDENTITY_RECONCILE_READ_TIMEOUT_SECS", 0.01
+        )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
 
         await _run_chat(state, slot, "test message")
 

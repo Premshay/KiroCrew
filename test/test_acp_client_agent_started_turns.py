@@ -36,7 +36,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_AGENT_STARTED_TURNS,
 )
-from kiro_crew.testing.wait import async_wait_until, await_until
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, async_wait_until, await_until
 
 _ACP_DIR = Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "acp"
 # AcpClient binds members its owner modules define, so a stdout reader can live in any of them.
@@ -82,11 +82,16 @@ async def test_background_task_metadata_uses_the_single_stdout_reader(backend: s
             "jsonrpc": "2.0",
             "method": "_claude/sdkMessage",
             "params": {
-                "message": {"type": "system", "subtype": subtype, "task_id": "task-1", "patch": patch}
+                "message": {
+                    "type": "system",
+                    "subtype": subtype,
+                    "task_id": "task-1",
+                    "patch": patch,
+                }
             },
         }
         reader.feed_data(_line(frame))
-        msg = await client._read_message(timeout=1)
+        msg = await client._read_message(timeout=FALLBACK_TIMEOUT_SECS)
         assert msg is not None and msg.params == frame["params"]
         assert client.has_background_work is (expected and backend == ACP_BACKEND_CLAUDE)
         assert client._claude_reader_task is None

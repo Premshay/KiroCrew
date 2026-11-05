@@ -612,24 +612,27 @@ class HybridRetriever:
             )
             source_params = [source_id, source_id]
         select = (
-            "SELECT m.item_id, COUNT(*) as cnt FROM mentions m "
-            "JOIN items i ON i.id = m.item_id "
+            "SELECT m.item_id, COUNT(*) as cnt FROM mentions m " "JOIN items i ON i.id = m.item_id "
         )
         if _has_json1(self.store.db):
             rows = self.store.db.execute(
-                select + "WHERE m.entity_id IN (SELECT value FROM json_each(?))"
-                + source_filter + " GROUP BY m.item_id ORDER BY cnt DESC, m.item_id LIMIT ?",
+                select
+                + "WHERE m.entity_id IN (SELECT value FROM json_each(?))"
+                + source_filter
+                + " GROUP BY m.item_id ORDER BY cnt DESC, m.item_id LIMIT ?",
                 [json.dumps(entity_ids), *source_params, limit],
             ).fetchall()
             return {row["item_id"]: row["cnt"] for row in rows}
 
         merged: dict[str, int] = defaultdict(int)
         for start in range(0, len(entity_ids), _MENTIONS_IN_CHUNK):
-            batch = entity_ids[start:start + _MENTIONS_IN_CHUNK]
+            batch = entity_ids[start : start + _MENTIONS_IN_CHUNK]
             placeholders = ",".join("?" * len(batch))
             rows = self.store.db.execute(
-                select + f"WHERE m.entity_id IN ({placeholders})"  # noqa: S608
-                + source_filter + " GROUP BY m.item_id",
+                select
+                + f"WHERE m.entity_id IN ({placeholders})"  # noqa: S608
+                + source_filter
+                + " GROUP BY m.item_id",
                 [*batch, *source_params],
             ).fetchall()
             for row in rows:

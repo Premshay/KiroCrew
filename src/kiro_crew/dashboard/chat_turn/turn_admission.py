@@ -8,8 +8,8 @@ import asyncio
 import functools
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew import turn_timing
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import normalize_agent_model
 from kiro_crew.context import discard_memory_prefetch
 from kiro_crew.dashboard.chat_utils import (

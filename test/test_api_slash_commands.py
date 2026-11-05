@@ -238,6 +238,7 @@ class TestAdvertisedCommands:
         names = {item["name"] for item in payload}
         assert "/compact" in names and "/security-review" in names
         assert {"/side", "/goal", "/prompts"} <= names
+
     @pytest.mark.asyncio
     async def test_claude_backend_lists_claude_commands_not_kiro_cli_ones(self):
         """acp_backend claude runs its own commands, so the menu offers them.

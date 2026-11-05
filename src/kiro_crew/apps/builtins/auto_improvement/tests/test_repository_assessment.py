@@ -230,6 +230,7 @@ def test_background_start_refuses_duplicate_and_accepts_stop(worker, monkeypatch
     try:
         first = assessment.start_assessment()
         assert entered.wait(30), "Assessment worker did not start"
+        assert first is not None
         assert first["state"] == "assessing"
         assert assessment.start_assessment() is None
         assessment.stop_assessment()

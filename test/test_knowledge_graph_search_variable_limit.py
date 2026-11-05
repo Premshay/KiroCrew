@@ -90,7 +90,9 @@ class TestGraphSearchVariableLimit:
             store.graph.add_edge(hub, f"neighbour-{index}", relation_type="uses")
 
         with _capped_variable_limit(store):
-            results = HybridRetriever(store)._graph_search("hub-entity", limit=5, source_id=selected)
+            results = HybridRetriever(store)._graph_search(
+                "hub-entity", limit=5, source_id=selected
+            )
 
         assert {item for item, _rank in results} == {own, located}
 

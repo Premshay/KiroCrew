@@ -101,7 +101,9 @@ async def test_failing_hook_is_isolated_and_logged(caplog) -> None:
 
 @pytest.mark.asyncio
 async def test_slow_hook_times_out_without_blocking_others(monkeypatch, caplog) -> None:
-    monkeypatch.setattr(teardown, "SESSION_END_HOOK_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(
+        teardown, "SESSION_END_HOOK_TIMEOUT_S", 0.05
+    )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
 
     async def hang(event: dict) -> None:
         await asyncio.Event().wait()
@@ -203,7 +205,7 @@ async def _report(info: SubagentInfo, *, shutting_down: bool = False) -> None:
     mgr._shutting_down = shutting_down
     await mgr._report_terminal(
         info, source="test", injection_timeout_reason="x", mark_delivered_on_success=False
-    )
+    )  # flake-ok: The timeout reason is diagnostic text, not a duration.
 
 
 def _info(**kw) -> SubagentInfo:

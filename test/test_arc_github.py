@@ -16,8 +16,8 @@ HEAD = "c4978e364f41029eccefed06f64fb420cfb3e486"
 
 
 @pytest.fixture(autouse=True)
-def _isolated_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+def _isolated_home(tmp_path, _floor_monkeypatch):
+    _floor_monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
 
 
 def _arc(**over: Any) -> dict[str, Any]:

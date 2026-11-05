@@ -740,9 +740,7 @@ def code_review_sage_api(name: str, args: dict[str, Any]) -> str:
     if _crs_query:
         _crs_url += "?" + _crs_query
     _crs_resp = (
-        mcp_core._get(_crs_url)
-        if _crs_method == "GET"
-        else mcp_core._post(_crs_url, _crs_body)
+        mcp_core._get(_crs_url) if _crs_method == "GET" else mcp_core._post(_crs_url, _crs_body)
     )
     # Redact BEFORE truncating: slicing first can cut a credential in half at the
     # cap, leaving a fragment outside the redaction pattern's matches.
@@ -750,8 +748,7 @@ def code_review_sage_api(name: str, args: dict[str, Any]) -> str:
     _crs_cap = 60_000
     if len(_crs_text) > _crs_cap:
         _crs_text = (
-            _crs_text[:_crs_cap]
-            + f"\n… truncated ({len(_crs_text)} chars total). Read one run "
+            _crs_text[:_crs_cap] + f"\n… truncated ({len(_crs_text)} chars total). Read one run "
             "(/runs/<run_id>) to see the rest."
         )
     return _crs_text

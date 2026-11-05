@@ -1163,7 +1163,7 @@ class TestApiChatDurableAdmission:
         state = _make_state(tmp_path)
         entered = asyncio.Event()
 
-        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin, _directive_owner_origin):
             rows = st.conversation_log.read_messages_chained("dashboard:s1")
             assert any(row.get("content") == "save this first" for row in rows)
             entered.set()
@@ -1378,6 +1378,8 @@ class TestClaudeIdleEvent:
         assert chat_frames == []
         # chat_segment finalize still fires on the broadcast path.
         assert any(call.args[0] == "chat_segment" for call in state.broadcast_ws.call_args_list)
+
+
 # ── A fallback-served turn's usage row names the model that ran ──
 #
 # The served id is on the slot as ``_active_fallback_model``, written only after

@@ -28,8 +28,8 @@ from kiro_crew.session_map import SessionMap
 
 
 @pytest.fixture(autouse=True)
-def _enable_auto_consolidation(monkeypatch):
-    monkeypatch.setenv("KIROCREW_AUTO_CONSOLIDATION_ENABLED", "true")
+def _enable_auto_consolidation(_floor_monkeypatch):
+    _floor_monkeypatch.setenv("KIROCREW_AUTO_CONSOLIDATION_ENABLED", "true")
 
 
 STEM = "dashboard_chat-left-behind"

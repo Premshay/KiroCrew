@@ -237,7 +237,9 @@ class TestActivityClockSeparation:
         provider._last_activity = time.monotonic() - 10_000
         provider.is_responsive = lambda stale_threshold=600.0: False
 
-        await mgr._expire_idle(timeout_secs=1)
+        await mgr._expire_idle(
+            timeout_secs=1
+        )  # flake-ok: Idle threshold is test data; session activity timestamps are set explicitly.
 
         assert "thread1" in mgr._sessions, "the idle sweep reaped on the responsiveness clock"
         await mgr.close_all()

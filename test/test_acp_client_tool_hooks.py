@@ -13,7 +13,12 @@ from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401
 
 import kiro_crew.acp.client as acp_client
 from kiro_crew.acp.client import AcpClient
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_OPENCODE, JsonRpcMessage
+from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_OPENCODE,
+    JsonRpcMessage,
+)
 
 
 class TestAcpClientToolAudit:

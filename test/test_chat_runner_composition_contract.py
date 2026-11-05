@@ -1395,6 +1395,7 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/agent_started.py",
         "dashboard/chat_turn/eager_spawn.py",
         "dashboard/chat_turn/queue_cycle.py",
+        "dashboard/chat_turn/queue_drain.py",
         "dashboard/chat_turn/session_reset.py",
     ),
     r"is_claude_code\(": (

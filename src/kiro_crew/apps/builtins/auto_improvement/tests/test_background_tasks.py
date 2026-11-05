@@ -8,6 +8,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
 
 from .. import profiles
 from ..backend import notify, routes, runner, store
@@ -21,7 +22,10 @@ def _request(body: dict):
 
 
 async def _status() -> dict:
-    return json.loads((await routes._handle_environment_check_status(_request({}))).text)
+    status_response = await routes._handle_environment_check_status(_request({}))
+    assert isinstance(status_response, web.Response)
+    assert status_response.text is not None
+    return json.loads(status_response.text)
 
 
 @pytest.fixture
@@ -69,6 +73,7 @@ async def test_a_failed_check_is_kept_and_announced(check_route):
     )
     response = await routes._handle_environment_check(_request({"fingerprint": "draft-1"}))
     assert response.status == 202
+    assert routes._check_thread is not None
     routes._check_thread.join(10)
 
     record = await _status()
@@ -84,6 +89,7 @@ async def test_a_failed_check_is_kept_and_announced(check_route):
 async def test_a_passing_check_reports_its_test_count(check_route):
     sent = check_route(lambda: {"ok": True, "tests_collected": 8253})
     await routes._handle_environment_check(_request({}))
+    assert routes._check_thread is not None
     routes._check_thread.join(10)
 
     assert (await _status())["state"] == "ready"
@@ -102,6 +108,7 @@ async def test_a_second_check_waits_for_the_first(check_route):
     first = await routes._handle_environment_check(_request({}))
     second = await routes._handle_environment_check(_request({}))
     release.set()
+    assert routes._check_thread is not None
     routes._check_thread.join(10)
 
     assert first.status == 202

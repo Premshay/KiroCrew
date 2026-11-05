@@ -1454,7 +1454,11 @@ class TestRuntimeWorkerForkContracts:
         worker = AcpWorker()
         worker._provider = provider
         worker._client = MagicMock()
-        task = asyncio.create_task(worker.send_message("extract", timeout=0.05))
+        task = asyncio.create_task(
+            worker.send_message(
+                "extract", timeout=0.05
+            )  # flake-ok: Blocked fake worker timeout path.
+        )
         await await_until(entered, what="the runtime turn entered its provider")
         if failure == "cancel":
             task.cancel()
@@ -1806,7 +1810,9 @@ class TestBoundTimeoutFloorForkContracts:
         worker = _TimeoutRecordingWorker()
         pool._workers[0] = worker
 
-        await pool.send("p", timeout=30.0)
+        await pool.send(
+            "p", timeout=30.0
+        )  # flake-ok: Tests budget forwarding or timeout cleanup with a controlled fake worker.
 
         assert worker.timeouts == [300.0]
 
@@ -1817,7 +1823,9 @@ class TestBoundTimeoutFloorForkContracts:
         worker = _TimeoutRecordingWorker()
         pool._workers[0] = worker
 
-        await pool.send("p", timeout=600.0)
+        await pool.send(
+            "p", timeout=600.0
+        )  # flake-ok: Tests budget forwarding or timeout cleanup with a controlled fake worker.
 
         assert worker.timeouts == [600.0]
 
@@ -1827,7 +1835,9 @@ class TestBoundTimeoutFloorForkContracts:
         worker = _TimeoutRecordingWorker()
         pool._workers[0] = worker
 
-        await pool.send("p", timeout=30.0)
+        await pool.send(
+            "p", timeout=30.0
+        )  # flake-ok: Tests budget forwarding or timeout cleanup with a controlled fake worker.
 
         assert worker.timeouts == [30.0]
 
@@ -1838,7 +1848,9 @@ class TestBoundTimeoutFloorForkContracts:
         worker = _TimeoutRecordingWorker()
         pool._workers[0] = worker
 
-        await pool.send_batch(["a", "b"], timeout=60.0)
+        await pool.send_batch(
+            ["a", "b"], timeout=60.0
+        )  # flake-ok: Tests budget forwarding or timeout cleanup with a controlled fake worker.
 
         assert worker.timeouts == [300.0, 300.0]
 

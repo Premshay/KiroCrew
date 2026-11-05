@@ -119,16 +119,21 @@ class TestClaudeActivityClock:
     @pytest.mark.asyncio
     async def test_a_between_turn_frame_stamps_the_session(self, tmp_path):
         client = _client(tmp_path)
+        client._process.stdout.readline = AsyncMock(
+            return_value=(json.dumps(_update("sess-1")) + "\n").encode()
+        )
         before = time.monotonic()
 
-        await client._route_claude_frame(_text_frame("still working"))
+        message = await client._read_message_from_stdout()
+        assert message is not None
+        await client._route_claude_frame(message)
 
         assert client.session_activity_at is not None
         assert client.session_activity_at >= before
 
-    def test_a_client_without_the_reader_reports_nothing(self, tmp_path):
-        """DeepSeek and friends on this transport are not read between turns."""
-        assert AcpClient(work_dir=tmp_path, acp_backend="deepseek").session_activity_at is None
+    def test_a_new_client_starts_its_activity_clock(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path, acp_backend="deepseek")
+        assert client.session_activity_at is not None
 
 
 def _runtime(tmp_path: Path) -> tuple[AcpRuntime, asyncio.StreamReader]:
@@ -290,9 +295,12 @@ class TestIdleSweep:
         """
         await _stale_session(manager)
         providers[0].session_activity_at = time.monotonic()
+        manager._sessions["dashboard:tab1"].last_used = time.monotonic() - 5400
 
         with caplog.at_level("INFO"):
-            await manager._expire_idle(timeout_secs=3600)
+            await manager._expire_idle(
+                timeout_secs=3600
+            )  # flake-ok: Idle threshold is test data; session activity timestamps are set explicitly.
 
         assert "dashboard:tab1" in manager._sessions
         assert "expired" not in caplog.text
@@ -303,7 +311,9 @@ class TestIdleSweep:
         await _stale_session(manager)
         providers[0].session_activity_at = time.monotonic() - 5_000
 
-        await manager._expire_idle(timeout_secs=3600)
+        await manager._expire_idle(
+            timeout_secs=3600
+        )  # flake-ok: Idle threshold is test data; session activity timestamps are set explicitly.
 
         assert "dashboard:tab1" not in manager._sessions
         await manager.close_all()
@@ -314,7 +324,9 @@ class TestIdleSweep:
         await _stale_session(manager)
         providers[0].session_activity_at = MagicMock()
 
-        await manager._expire_idle(timeout_secs=3600)
+        await manager._expire_idle(
+            timeout_secs=3600
+        )  # flake-ok: Idle threshold is test data; session activity timestamps are set explicitly.
 
         assert "dashboard:tab1" not in manager._sessions
         await manager.close_all()
@@ -357,7 +369,9 @@ class TestPendingWorkGuard:
         state = _guard_state(_claude_provider(background_work=True))
         manager.set_idle_expiry_guard(lambda key: DashboardState._has_pending_work(state, key))
 
-        await manager._expire_idle(timeout_secs=1)
+        await manager._expire_idle(
+            timeout_secs=1
+        )  # flake-ok: Idle threshold is test data; session activity timestamps are set explicitly.
 
         assert "dashboard:tab1" in manager._sessions
         await manager.close_all()

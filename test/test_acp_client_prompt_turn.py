@@ -15,6 +15,7 @@ from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401
 
 from kiro_crew.acp.client import AcpClient, AcpError, AcpProcessDied
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE, AcpPromptStats
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
 
 # ── Phase 1: stop_reason and turn_done tests ──
 
@@ -1045,7 +1046,10 @@ class TestDispatchSubagentEvents:
                 yield frame
 
         client._prompt_loop = _fake_loop  # type: ignore[assignment]
-        events = [event async for event in client._dispatch_events(req_id=1, timeout=1.0)]
+        events = [
+            event
+            async for event in client._dispatch_events(req_id=1, timeout=FALLBACK_TIMEOUT_SECS)
+        ]
         children = [
             event.provider_child
             for event in events
@@ -1118,7 +1122,10 @@ class TestDispatchSubagentEvents:
                 yield frame
 
         client._prompt_loop = _fake_loop  # type: ignore[assignment]
-        events = [event async for event in client._dispatch_events(req_id=1, timeout=1.0)]
+        events = [
+            event
+            async for event in client._dispatch_events(req_id=1, timeout=FALLBACK_TIMEOUT_SECS)
+        ]
         children = [
             event.provider_child for event in events if event.kind == EVENT_SUBAGENT_ACTIVITY
         ]
@@ -1188,7 +1195,10 @@ class TestDispatchSubagentEvents:
                 yield frame
 
         client._prompt_loop = _fake_loop  # type: ignore[assignment]
-        events = [event async for event in client._dispatch_events(req_id=1, timeout=1.0)]
+        events = [
+            event
+            async for event in client._dispatch_events(req_id=1, timeout=FALLBACK_TIMEOUT_SECS)
+        ]
         children = [
             event.provider_child for event in events if event.kind == EVENT_SUBAGENT_ACTIVITY
         ]

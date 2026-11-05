@@ -103,6 +103,8 @@ def _monitor_start_events():
             title="Arming a patrol",
             tool_name="monitor_start",
             mcp_server_name="kirocrew-core",
+            tool_identity_trusted=True,
+            mcp_identity_trusted=True,
         ),
         LLMEvent(
             kind=EVENT_TOOL_RESULT,

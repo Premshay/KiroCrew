@@ -937,12 +937,19 @@ def _flush_segment(
             # afterwards so the frame this call broadcasts carries them too -- see
             # _decisions_strip_meta for why that matters.
             meta={
-                **(_segment_row_meta(
-                    slot, blocked_links, redactions,
-                    links_ordered=links_ordered == [True], text=redacted,
-                ) or {}),
+                **(
+                    _segment_row_meta(
+                        slot,
+                        blocked_links,
+                        redactions,
+                        links_ordered=links_ordered == [True],
+                        text=redacted,
+                    )
+                    or {}
+                ),
                 **(message_meta or {}),
-            } or None,
+            }
+            or None,
         ),
     )
     last_msg: dict = slot.messages[-1]
@@ -971,7 +978,7 @@ def _flush_segment(
         text=redacted,
         interrupted=interrupted,
     )
-    last_msg: dict = slot.messages[-1]
+    last_msg = slot.messages[-1]
     # Stashed variants outside a Regenerate turn attach to this fresh assistant
     # message. A turn that owns a Regenerate target leaves them stashed: they hold
     # the previous reply, and a dirty save of this row would persist it as a

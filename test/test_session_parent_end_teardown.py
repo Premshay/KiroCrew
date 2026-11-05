@@ -938,6 +938,7 @@ class TestParentEndCancelsItsChildrenTeardownRules(_TestParentEndCancelsItsChild
         assert found == {
             # A cancelled cron job's conversation is over.
             "cron_service/service/run_kill.py",
+            "dashboard/handlers_channel.py",
             # Cancel cleanup ends every step conversation of the run.
             "taskrunner_parts/run_scope.py",
             # The pool starts a NEW conversation on a pooled key.

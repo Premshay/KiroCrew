@@ -391,7 +391,9 @@ class TestLatchNarrowingPolicy:
                 await asyncio.Event().wait()
 
         sessions = self._Sessions()
-        monkeypatch.setattr(chat_runner, "_IDENTITY_RECONCILE_READ_TIMEOUT_SECS", 0.01)
+        monkeypatch.setattr(
+            chat_runner, "_IDENTITY_RECONCILE_READ_TIMEOUT_SECS", 0.01
+        )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
 
         await chat_runner._retire_sessions_on_identity_change(self._State(_HungService(), sessions))
 

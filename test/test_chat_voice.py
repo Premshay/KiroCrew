@@ -14,12 +14,10 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
+from chat_voice_test_helpers import _make_voice_app
 
 from kiro_crew.slack.handler import _VoiceConfig
 from kiro_crew.testing.wait import await_until
-
-
-from chat_voice_test_helpers import _make_voice_app
 
 
 class TestVoiceConfig:

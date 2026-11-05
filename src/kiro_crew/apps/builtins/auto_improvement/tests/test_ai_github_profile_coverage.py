@@ -246,7 +246,9 @@ def test_xdist_argv_present(tmp_path):
 
 
 def test_xdist_argv_absent_runs_serially(tmp_path):
-    environment = gh.TestEnvironment(None, tmp_path, lambda *a, **kw: _Proc(3, "KIRO_XDIST_ABSENT"))
+    environment = gh.TestEnvironment(
+        None, tmp_path, lambda *a, **kw: subprocess.CompletedProcess([], 3, "KIRO_XDIST_ABSENT", "")
+    )
     assert gh._xdist_argv(environment, tmp_path) == ()
 
 
@@ -490,7 +492,9 @@ def test_ruler_measure_returns_a_signed_delta_and_stage_breakdown(tmp_path, monk
             (cand, True): (2.0, True),
         },
     )
-    monkeypatch.setattr(gh, "_collected_count", lambda tree, environment=None, run=None: 100)
+    monkeypatch.setattr(
+        gh, "_collected_count", lambda tree, environment=None, run=None, timeout=None: 100
+    )
     m = ruler.measure(base_src=base, cand_src=cand, commit_sha="deadbeefcafe", scenario="")
     assert m.ok is True
     assert m.primary_delta == pytest.approx(-3.0)
@@ -518,7 +522,9 @@ def test_ruler_measure_flags_a_red_candidate_suite(tmp_path, monkeypatch):
             (cand, True): (2.0, True),
         },
     )
-    monkeypatch.setattr(gh, "_collected_count", lambda tree, environment=None, run=None: 10)
+    monkeypatch.setattr(
+        gh, "_collected_count", lambda tree, environment=None, run=None, timeout=None: 10
+    )
     m = ruler.measure(base_src=base, cand_src=cand, commit_sha="abcdef1234", scenario="suite")
     assert m.guardrails[gh.GUARDRAIL_TESTS_PASS] == 1.0
     assert m.rh_functional_ok is False
@@ -569,7 +575,9 @@ def test_ruler_measure_rh_guard_on_collected_test_counts(
     )
     counts = {base: base_n, cand: cand_n}
     monkeypatch.setattr(
-        gh, "_collected_count", lambda tree, environment=None, run=None: counts[Path(tree)]
+        gh,
+        "_collected_count",
+        lambda tree, environment=None, run=None, timeout=None: counts[Path(tree)],
     )
     m = ruler.measure(base_src=base, cand_src=cand, commit_sha="0123456789", scenario="")
     assert m.rh_capability_ok is expected

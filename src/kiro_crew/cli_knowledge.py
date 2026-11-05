@@ -205,7 +205,9 @@ def _knowledge(args) -> int:
     if action == "evaluate":
         return _knowledge_evaluate(args)
     if action != "dedup":
-        print("Usage: kirocrew knowledge dedup [--apply] | kirocrew knowledge stats [--json] | kirocrew knowledge evaluate")
+        print(
+            "Usage: kirocrew knowledge dedup [--apply] | kirocrew knowledge stats [--json] | kirocrew knowledge evaluate"
+        )
         return 2
     apply = bool(getattr(args, "apply", False))
     db_path = config_dir() / "workspace" / "knowledge" / "knowledge.db"

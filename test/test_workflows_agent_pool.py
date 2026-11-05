@@ -1521,6 +1521,7 @@ async def test_a_worker_without_conversation_reset_is_reused_by_respawn_and_says
     for in the default log.
     """
     from types import SimpleNamespace
+
     from kiro_crew.agent_sdk.backends import ACP_BACKEND_CLAUDE
     from kiro_crew.providers.acp import AcpProvider
 

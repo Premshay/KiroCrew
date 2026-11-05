@@ -1303,8 +1303,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _FdTrackingRotatingFileHandler,
         _prune_older_boot_logs,
         _redirect_fds_to,
-        _route_logging_through_queue,
         _rotate_boot_logs,
+        _route_logging_through_queue,
         _stop_log_queue_listener,
         drain_log_queue_before_hard_exit,
     )

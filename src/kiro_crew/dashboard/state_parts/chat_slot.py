@@ -37,6 +37,7 @@ from kiro_crew.security.credential_sources import CredentialEvidence
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.git_repo_touches import TouchCandidates
+    from kiro_crew.dashboard.peer_interrupt_retry import HeldInterrupt
     from kiro_crew.dashboard.state_parts.dashboard_state import DashboardState
     from kiro_crew.dashboard.steer_retract import SteerClear, SteerRetract
     from kiro_crew.dashboard.transcript_binding import TranscriptBinding
@@ -579,6 +580,7 @@ class _ChatSlot:
     _question_pending: dict[str, dict]
 
     # Initialised by state_parts/slot_ladder.py.
+    _held_peer_interrupts: list[HeldInterrupt]
     _pending_subagent_failures: list[str]
     _pending_synthesis: bool
     _synthesis_armers: set[str]

@@ -8,11 +8,11 @@ from aiohttp import web
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.handlers.agents import (
-        ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
         _BLOCKED_SLASH_COMMANDS,
         _DASHBOARD_COMMANDS,
         _MAX_COMMAND_DESCRIPTION_CHARS,
         _SLASH_COMMANDS,
+        ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
         SLASH_COMMAND_DESCRIPTIONS,
         DashboardState,
         KiroCrewConfig,
@@ -134,8 +134,5 @@ async def api_slash_commands(request: web.Request) -> web.Response:
     if cfg.agent.acp_backend in ACP_BACKENDS_LOCAL_HARNESS_COMMANDS:
         offered = offered & local_harness_menu(cfg.agent.acp_backend)
     return web.json_response(
-        [
-            {"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")}
-            for c in sorted(offered)
-        ]
+        [{"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")} for c in sorted(offered)]
     )

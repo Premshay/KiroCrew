@@ -698,6 +698,8 @@ class TestProviderNoticeSafety:
         assert r._sent_tail == "previous"
         assert r._pending_note_tail == ""
         assert r._redacted_creds == 0
+
+
 # ── an approval press that lands before the waiter is registered ─────────
 #
 # ``TurnDriver`` dispatches ``PROMPT_CHOICE`` to the renderer and only then awaits

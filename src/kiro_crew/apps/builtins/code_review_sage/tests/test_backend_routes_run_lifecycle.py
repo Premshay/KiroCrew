@@ -25,6 +25,7 @@ from sage_lib.review_driver import _all_delivered
 from kiro_crew.apps.builtins.code_review_sage.tests.backend_routes_helpers import (
     _load_routes_module,
 )
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
 
 
 async def _noop_save() -> None:
@@ -576,7 +577,7 @@ class TestIndependentRunsOverlap:
         inside = 0
         maximum_inside = 0
         counter_lock = threading.Lock()
-        all_entered = threading.Barrier(3, timeout=5)
+        all_entered = threading.Barrier(3, timeout=FALLBACK_TIMEOUT_SECS)
 
         def fake_run_review(changes, **kw):
             nonlocal inside, maximum_inside

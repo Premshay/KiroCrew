@@ -4,6 +4,16 @@ from __future__ import annotations
 
 from typing import Sequence
 
+from kiro_crew.acp.image_dimension_wedge import (
+    format_many_image_dimension_message,
+    is_many_image_dimension,
+)
+from kiro_crew.acp.model_registry_errors import (
+    MODEL_REGISTRY_UNAVAILABLE_TEXT,
+    is_model_registry_unavailable,
+)
+from kiro_crew.acp.oversized_request_errors import _is_request_size_exceeded
+from kiro_crew.acp.structured_error_data import provider_data_text, structured_data_prose
 from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facade compatibility surface
     _PROMPT_BUSY_RE,
     _RE_5XX_HINT,
@@ -13,6 +23,7 @@ from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facad
     _RE_ADAPTER_INPUT_TOO_LONG,
     _RE_AUTH,
     _RE_CONNECTION,
+    _RE_CONNECTOR_FAILURE,
     _RE_CONTEXT_WINDOW_OVERFLOW,
     _RE_GENERATE_FAILED,
     _RE_IMAGE_FORMAT_UNSUPPORTED,
@@ -49,18 +60,6 @@ from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facad
     redact_credentials,
     redact_exfiltration_urls,
 )
-
-from kiro_crew.acp.image_dimension_wedge import (
-    format_many_image_dimension_message,
-    is_many_image_dimension,
-)
-from kiro_crew.acp.model_registry_errors import (
-    MODEL_REGISTRY_UNAVAILABLE_TEXT,
-    is_model_registry_unavailable,
-)
-from kiro_crew.acp.oversized_request_errors import _is_request_size_exceeded
-from kiro_crew.acp.structured_error_data import provider_data_text, structured_data_prose
-from kiro_crew.acp.transport_error_classification import _RE_CONNECTOR_FAILURE
 
 
 def _auto_remedy(available_models: Sequence[str] | None) -> str:

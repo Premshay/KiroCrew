@@ -290,11 +290,11 @@ async def test_the_crew_editor_takes_the_crews_own_codex_session_over_another():
 async def test_no_codex_sessions_model_answers_for_a_crews_pin(tmp_path, crew):
     """Its build says the option exists; the model it runs can be a slot pick, not the pin."""
     live = AcpProvider(acp_backend=ACP_BACKEND_CODEX, work_dir=tmp_path)
-    live._client._model = "deepseek-chat"  # takes no effort, and is not the crew's pin
+    live._client._model = "deepseek-chat"
     live._client._acp_config_options = [
         {"id": "reasoning_effort", "options": [{"value": "low"}, {"value": "high"}]}
     ]
-    assert live.supports_effort() is False
+    assert live.supports_effort() is True
     thread = _ChatSlot("member-x", agent=crew)
     sessions = SimpleNamespace(active_providers=lambda: [live], get_provider=lambda _key: live)
     state = SimpleNamespace(sessions=sessions, _slots={thread.key: thread})

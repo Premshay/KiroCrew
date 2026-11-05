@@ -458,6 +458,7 @@ class TestChannelAgentFailures:
         assert posted.content.startswith("❌ Orchestrator stopped: Monthly usage limit reached")
         assert "AKIAABCDEFGHIJKLMNOP" not in posted.content
 
+
 class TestAClosedChannelIsNotResurrected:
     """`close` unlinks the channel's file, so nothing may persist it afterwards.
 

@@ -100,7 +100,6 @@ from kiro_crew.agent_sdk.drivers.acp import (  # noqa: F401 - preserved facade e
     settings_default_model,
 )
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
-from kiro_crew.dashboard.kas_local_commands import local_harness_menu  # noqa: F401
 from kiro_crew.agent_spec_format import (  # noqa: F401
     agent_spec_candidates,
     is_markdown_spec,
@@ -343,6 +342,7 @@ from kiro_crew.dashboard.handlers.models_kas_bundle import api_models_kas_bundle
 from kiro_crew.dashboard.handlers.source_providers import (  # noqa: F401
     owner_view_for_request,
 )
+from kiro_crew.dashboard.kas_local_commands import local_harness_menu  # noqa: F401
 from kiro_crew.dashboard.kiro_readiness import (
     KIRO_PREREQUISITE_REQUIRED_CODE,
     kiro_latched_ready,

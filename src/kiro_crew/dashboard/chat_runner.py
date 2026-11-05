@@ -63,8 +63,8 @@ from kiro_crew.acp.types import (
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
-    EVENT_NOTICE,
     EVENT_MODEL_FALLBACK,
+    EVENT_NOTICE,
     EVENT_STEER_CONSUMED,
     EVENT_STEER_DROPPED,
     STOP_CLASS_FAILED,
@@ -286,7 +286,6 @@ from kiro_crew.dashboard.chat_turn.tool_approval import (  # noqa: F401
     _slot_is_trusted,
 )
 from kiro_crew.dashboard.chat_turn.tool_results import _on_tool_result
-from kiro_crew.dashboard.peer_interrupt_retry import retry_after_tool_result
 from kiro_crew.dashboard.chat_turn.tool_rows import (
     _MAX_TCID_SOURCES,
     _on_tool_call,
@@ -297,12 +296,12 @@ from kiro_crew.dashboard.chat_turn.tool_rows import (
 )
 from kiro_crew.dashboard.chat_turn.turn_admission import (
     _channels_judging_turn,
-    _refuse_channel_turn,
-    _source_channel_mismatch,
     _check_owner,
     _current_binding,
+    _refuse_channel_turn,
     _release_dispatch_lock,
     _require_current_binding,
+    _source_channel_mismatch,
     _turn_admit,
 )
 from kiro_crew.dashboard.chat_turn.turn_context import (  # noqa: F401
@@ -348,8 +347,8 @@ from kiro_crew.dashboard.chat_turn.turn_marker import (  # noqa: F401
 )
 from kiro_crew.dashboard.chat_turn.turn_reply_seams import (  # noqa: F401
     _flush_thinking_stream,
-    _persist_partial_reply,
     _notify_turn_died,
+    _persist_partial_reply,
 )
 from kiro_crew.dashboard.chat_turn.turn_spec_hooks import _turn_stop_hook
 from kiro_crew.dashboard.chat_turn.turn_stats import (  # noqa: F401
@@ -397,6 +396,7 @@ from kiro_crew.dashboard.handlers.usage import (
     read_turn_model,
 )
 from kiro_crew.dashboard.mate_thread_wakes import note_turn_end as _note_mate_wakes
+from kiro_crew.dashboard.peer_interrupt_retry import retry_after_tool_result
 from kiro_crew.dashboard.poisoned_escalation import POISONED_SESSION_CYCLES  # noqa: F401
 from kiro_crew.dashboard.recovery_replays import SESSION_NOT_FOUND_CANCELLED_TEXT  # noqa: F401
 from kiro_crew.dashboard.recovery_replays import ReplayFamily

@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from aiohttp import web
 
 from ..backend import routes, runner, store
 from ..profiles.github_repo import profile as gp
@@ -268,9 +269,15 @@ async def test_check_uses_selected_environment_without_saving(tmp_path, monkeypa
         request({"testEnvironment": override} if override else {})
     )
     assert response.status == 202
+    assert isinstance(response, web.Response)
+    assert response.text is not None
     assert json.loads(response.text)["state"] == "checking"
+    assert routes._check_thread is not None
     routes._check_thread.join(10)
-    record = json.loads((await routes._handle_environment_check_status(request({}))).text)
+    status_response = await routes._handle_environment_check_status(request({}))
+    assert isinstance(status_response, web.Response)
+    assert status_response.text is not None
+    record = json.loads(status_response.text)
     assert record["state"] == "ready"
     assert record["result"]["tests_collected"] == 7
     assert store.read_json(store.config_path()) == cfg

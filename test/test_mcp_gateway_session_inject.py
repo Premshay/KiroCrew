@@ -148,6 +148,8 @@ def test_explicit_profile_does_not_widen_an_empty_allowlist(tmp_path):
     overlay = _write_overlay(tmp_path, "kirocrew", {"context7": _stub()})
 
     assert explicit_session_servers(overlay, "kirocrew", set()) == []
+
+
 @pytest.mark.parametrize("vendor", ["creds-agent", "local-creds-agent-mcp"])
 def test_a_stale_overlay_never_injects_a_credential_vendor(tmp_path, vendor):
     """An overlay written before the vendors joined ``UNPOOLABLE_SERVERS`` (or kept

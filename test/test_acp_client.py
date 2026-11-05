@@ -18,7 +18,7 @@ from kiro_crew.acp.client import (
 )
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, JSONRPC_METHOD_NOT_FOUND, JsonRpcMessage
 from kiro_crew.agent_sdk import host_auth
-from kiro_crew.testing.wait import await_until
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, await_until
 
 
 def _scripted_process(lines, *, returncode=None):
@@ -1231,7 +1231,7 @@ class TestClaudeAutonomousReader:
         assert [(turn.text, turn.origin, turn.message_id) for turn in delivered] == [
             ("Routine: still working. ", "task-notification", "msg-native-routine")
         ]
-        assert await client._read_message(timeout=0.01) is foreground
+        assert await client._read_message(timeout=FALLBACK_TIMEOUT_SECS) is foreground
 
     @pytest.mark.asyncio
     async def test_autonomous_turn_captures_the_slot_that_owned_its_raw_cycle(self, tmp_path):

@@ -561,9 +561,6 @@ async def _decide_permission_request(turn: _ChatTurn, event) -> Literal[_Flow.CO
             slot.key,
             _open_construct,
         )
-    elif turn.assistant_text:
-        _cut_segment(turn)
-        turn._turn_flushed_visible_text = True
     _pre_tool_hooks_fired = False
     # "Not applied — approve this command explicitly" notices from a
     # rung that declined its grant. Held until the request actually

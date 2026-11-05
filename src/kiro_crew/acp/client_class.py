@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from kiro_crew import pinned_fs
-from kiro_crew.acp import client_claude_reader as _client_claude_reader
 from kiro_crew.acp import batch_guard
+from kiro_crew.acp import client_claude_reader as _client_claude_reader
 from kiro_crew.acp import client_claude_seed as _client_claude_seed
 from kiro_crew.acp import client_claude_session as _client_claude_session
 from kiro_crew.acp import client_copilot as _client_copilot

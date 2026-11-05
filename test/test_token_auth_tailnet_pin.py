@@ -592,7 +592,9 @@ async def test_restart_repin_covers_internal_mixed_paths(_tailnet_env) -> None:
     mw = token_auth_middleware(
         mixed_internal_paths=frozenset({"/api/spawn"}), tailnet_trust=_tailnet_trust()
     )
-    token = generate_token("tsuser", ttl_seconds=300)
+    token = generate_token(
+        "tsuser", ttl_seconds=300
+    )  # flake-ok: Token claim lifetime is protocol data, not a test wait.
     mark_consumed(token)
     req = _peer_request(cookies={"mc_token_5476": token})
     req.path = "/api/spawn"

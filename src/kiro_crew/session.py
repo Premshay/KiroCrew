@@ -94,8 +94,8 @@ from kiro_crew.messaging.link import (  # noqa: F401
 )
 from kiro_crew.metrics.events import SESSION_IDLE_EXPIRED, emit_counter  # noqa: F401
 from kiro_crew.metrics.provider import get_recorder
-from kiro_crew.platform.acp_binding import apply_runtime_client_binding, runtime_client_binding
 from kiro_crew.parent_turns import ParentTurnLedger as _ParentTurnLedger
+from kiro_crew.platform.acp_binding import apply_runtime_client_binding, runtime_client_binding
 from kiro_crew.providers.base import CancelOutcome, LLMProvider
 from kiro_crew.pycache_gc import PYCACHE_GC_INTERVAL_SECS, prune_pycache  # noqa: F401
 from kiro_crew.runtime_ownership import PidRefcount  # noqa: F401

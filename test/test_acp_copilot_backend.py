@@ -1294,14 +1294,19 @@ def test_a_copilot_directive_call_resolves_to_its_directive(tmp_path, monkeypatc
     tool_call["params"]["update"]["title"] = "kirocrew-core-reset_conversation"
     client = _client_with_placed(tmp_path, ["kirocrew-core", "probe"], monkeypatch)
     event = _feed(client, tool_call)
-    assert session_directive.directive_tool_from_call("", "", event.wire_title) == ""
+    assert session_directive.directive_tool_from_call("", "", event.wire_title, trusted=False) == ""
     assert (
         session_directive.directive_tool_from_call(
-            event.mcp_server_name, event.tool_name, event.wire_title
+            event.mcp_server_name,
+            event.tool_name,
+            event.wire_title,
+            trusted=event.mcp_identity_trusted,
         )
         == "reset_conversation"
     )
-    assert session_directive.directive_tool_for(event.mcp_server_name, event.tool_name)
+    assert session_directive.directive_tool_for(
+        event.mcp_server_name, event.tool_name, trusted=event.mcp_identity_trusted
+    )
 
 
 @pytest.mark.parametrize(

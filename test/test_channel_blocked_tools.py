@@ -60,7 +60,10 @@ def test_blocked_tools_cover_both_messaging_tools():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool", ["send_message", "send_notification"])
+@pytest.mark.parametrize(
+    "tool",
+    ["send_message", "send_notification", "work_dispatch", "pod_restart", "session_set_color"],
+)
 async def test_blocked_tool_rejected_even_on_trusted_channel(monkeypatch, tool):
     sel_mock = MagicMock()
     monkeypatch.setattr("kiro_crew.sel.sel", lambda: sel_mock)

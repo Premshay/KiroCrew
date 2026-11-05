@@ -6,7 +6,6 @@ from collections.abc import Callable, MutableMapping
 from typing import TYPE_CHECKING, TypeAlias
 
 if TYPE_CHECKING:
-    from kiro_crew.providers.base import LLMProvider
     from kiro_crew.session_cleanup import SessionEntry
 
 
@@ -20,7 +19,7 @@ def _no_pending_injection(key: str) -> bool:
     return False
 
 
-def _no_background_launch(provider: LLMProvider) -> tuple[float, str] | None:
+def _no_background_launch(provider: object) -> tuple[float, str] | None:
     """Default background-launch probe: no provider reports a launch."""
     return None
 

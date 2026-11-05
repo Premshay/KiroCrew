@@ -103,6 +103,7 @@ def is_unpoolable(name: str) -> bool:
     """
     return name in UNPOOLABLE_SERVERS or mcp_server_alias(name) in UNPOOLABLE_SERVERS
 
+
 # Explicitly shared read-only servers use one credential-free pool identity.
 _SHARED_READONLY_AGENT = "kirocrew-shared-readonly"
 

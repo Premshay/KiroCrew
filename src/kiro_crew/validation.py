@@ -193,6 +193,13 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _validate_omc_api,
         code_review_sage_call_allowed,
     )
+    from kiro_crew.validation_parts.arc_schemas import (  # noqa: F401
+        ARC_BOARD_GREP_SCHEMA,
+        ARC_BOARD_READ_SCHEMA,
+        ARC_BOARD_WRITE_SCHEMA,
+        ARC_BRIEF_SCHEMA,
+        ARC_ENTRY_ROUTE_SCHEMA,
+    )
     from kiro_crew.validation_parts.artifact_schemas import (  # noqa: F401
         _ARTIFACT_COMMENT_ID_RE,
         _ARTIFACT_FOLDER_NAME_MAX,
@@ -599,13 +606,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         validate_jsonrpc_request,
         validate_jsonrpc_response,
         validate_string_field,
-    )
-    from kiro_crew.validation_parts.arc_schemas import (  # noqa: F401
-        ARC_BOARD_GREP_SCHEMA,
-        ARC_BOARD_READ_SCHEMA,
-        ARC_BOARD_WRITE_SCHEMA,
-        ARC_BRIEF_SCHEMA,
-        ARC_ENTRY_ROUTE_SCHEMA,
     )
     from kiro_crew.validation_parts.work_item_schemas import (  # noqa: F401
         _WORK_ITEM_HANDOFF_FIELDS,

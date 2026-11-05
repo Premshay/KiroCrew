@@ -1106,8 +1106,10 @@ async def _close_slot(
             # per-slot cards on it can never be pruning a slot that comes back.
             state.push_slot_removed(name)
             fire_session_ended(
-                session_key=closing_key, reason="user_closed",
-                provider=ended_provider, provider_session_id=ended_sid,
+                session_key=closing_key,
+                reason="user_closed",
+                provider=ended_provider,
+                provider_session_id=ended_sid,
             )
     finally:
         SlotRegistry.close_takeover_basis(state, _teardown_basis)

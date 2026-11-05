@@ -30,8 +30,8 @@ from . import ledger as L
 from . import pr_description as D
 from .contracts import Proposal
 from .driver_git import _full_head_id, _git
-from .keeper import KEPT
 from .git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned
+from .keeper import KEPT
 from .push_policy import normalize_branch
 
 if TYPE_CHECKING:

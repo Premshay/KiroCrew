@@ -1532,8 +1532,12 @@ class TestConsolidationToolPolicyForkContracts:
         # These constants are read as module globals of history_consolidation;
         # kiro_crew.history only re-exports them, so patching the facade binds a
         # name nothing reads and the turn would run to the real 180s timeout.
-        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01)
-        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(
+            consolidation_mod, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01
+        )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
+        monkeypatch.setattr(
+            consolidation_mod, "_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S", 0.01
+        )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
         with patch("kiro_crew.history.stream_and_collect_json", side_effect=_stalled_stream):
             result = await consolidator._call_llm("some prompt")
 
@@ -1541,7 +1545,7 @@ class TestConsolidationToolPolicyForkContracts:
         await await_until(cancelled, what="the timed-out consolidation stream was cancelled")
         sessions.cancel_current.assert_awaited_once_with(
             _CONSOLIDATE_SESSION_KEY, wait_ack_timeout=0.01
-        )
+        )  # flake-ok: Checks a recorded timeout argument on a mock; no real wait occurs.
         sessions.remove.assert_awaited_once_with(_CONSOLIDATE_SESSION_KEY)
         sessions.release.assert_called_once_with(_CONSOLIDATE_SESSION_KEY)
         assert consolidator._last_llm_error == "consolidation turn timed out after 0s"
@@ -1710,7 +1714,9 @@ class TestConsolidationToolPolicyForkContracts:
             assert release.wait(timeout=30)
             return {"content": []}
 
-        monkeypatch.setattr(history_consolidation, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(
+            history_consolidation, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01
+        )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
         with patch.object(history_consolidation, "_post_consolidation_request", blocked_request):
             try:
                 assert await consolidator._call_direct_endpoint("first") is None

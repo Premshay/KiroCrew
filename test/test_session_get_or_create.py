@@ -1399,6 +1399,8 @@ class TestProviderOwnedSessionMapping:
         assert mgr._session_map.get("dashboard:slot0") == "conversation-created-during-stream"
         assert mgr._session_map.get_provider("dashboard:slot0") == "external-test"
         mgr.release("dashboard:slot0")
+
+
 class TestRealClaimJoinsAnInFlightEagerStart:
     """A real claim that arrives while the key's eager (speculative) start is
     still starting waits for that start and claims its session, instead of

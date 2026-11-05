@@ -9,6 +9,7 @@ import pytest
 
 from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import environment as mod
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
 
 
 @pytest.mark.parametrize(
@@ -61,7 +62,9 @@ def test_identity_only_environment_refuses_execution(tmp_path, kind):
     adapter = mod.TestEnvironment(config, tmp_path, None)
     assert adapter.identity["kind"] == kind
     with pytest.raises(mod.RunnerAdmissionError, match="identity-only"):
-        adapter.run(["python", "-V"], cwd=tmp_path, timeout=1)
+        adapter.run(
+            ["python", "-V"], cwd=tmp_path, timeout=1
+        )  # flake-ok: Tests exact adapter budget forwarding with a mocked executor; no wait occurs.
 
 
 def test_gateway_default_and_lexical_python(tmp_path):
@@ -75,10 +78,12 @@ def test_gateway_default_and_lexical_python(tmp_path):
         runner,
     )
     assert adapter.python_argv("-m", "pytest") == [str(target), "-m", "pytest"]
-    adapter.run(adapter.python_argv(), cwd=tmp_path, timeout=2, env={"LANG": "C"})
+    adapter.run(
+        adapter.python_argv(), cwd=tmp_path, timeout=2, env={"LANG": "C"}
+    )  # flake-ok: Tests exact adapter budget forwarding with a mocked executor; no wait occurs.
     runner.assert_called_once_with(
         [str(target)], cwd=tmp_path, timeout=2, env={"LANG": "C", "TEST_MODE": "yes"}
-    )
+    )  # flake-ok: Checks a recorded timeout argument on a mock; no real wait occurs.
     identity = adapter.identity
     identity["variables"]["TEST_MODE"] = "changed"
     assert adapter.identity["variables"]["TEST_MODE"] == "yes"
@@ -89,7 +94,9 @@ def test_python_path_with_spaces_is_forwarded_as_one_argument(tmp_path):
     executable = str(tmp_path / "Test Environment" / "python")
     run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
     adapter = mod.TestEnvironment({"kind": "python", "pythonExecutable": executable}, tmp_path, run)
-    adapter.run(adapter.python_argv("-c", "pass"), cwd=tmp_path, timeout=5)
+    adapter.run(
+        adapter.python_argv("-c", "pass"), cwd=tmp_path, timeout=5
+    )  # flake-ok: Tests exact adapter budget forwarding with a mocked executor; no wait occurs.
     assert run.call_args.args[0] == [executable, "-c", "pass"]
 
 
@@ -121,7 +128,9 @@ def repository_runner(tmp_path, monkeypatch):
         pytest.skip("executable script fixture uses a POSIX shebang")
     clone = tmp_path / "managed" / "clone"
     clone.mkdir(parents=True)
-    subprocess.run(["git", "init", str(clone)], check=True, capture_output=True, timeout=10)
+    subprocess.run(
+        ["git", "init", str(clone)], check=True, capture_output=True, timeout=FALLBACK_TIMEOUT_SECS
+    )
     executable = tmp_path / "operator runner"
     atomic_write(
         executable,
@@ -183,7 +192,7 @@ def authenticated_run(state, *arguments, cwd=None, timeout=5, principal=None, en
     async def handler(request):
         return state.adapter.run(
             state.adapter.python_argv(*arguments), cwd=cwd or state.clone, timeout=timeout, env=env
-        )
+        )  # flake-ok: Exercises the requested workload deadline and cleanup contract, not a test barrier.
 
     return asyncio.run(
         handler(
@@ -199,14 +208,17 @@ def test_runner_forwards_literal_argv_and_exact_linked_checkout(repository_runne
     (state.clone / "marker").write_text("base", encoding="utf-8")
     for args in (["add", "."], ["commit", "-m", "fixture"]):
         subprocess.run(
-            ["git", "-C", str(state.clone), *args], check=True, capture_output=True, timeout=10
+            ["git", "-C", str(state.clone), *args],
+            check=True,
+            capture_output=True,
+            timeout=FALLBACK_TIMEOUT_SECS,
         )
     candidate = state.clone.parent / "candidate"
     subprocess.run(
         ["git", "-C", str(state.clone), "worktree", "add", "--detach", str(candidate)],
         check=True,
         capture_output=True,
-        timeout=10,
+        timeout=FALLBACK_TIMEOUT_SECS,
     )
     (candidate / "marker").write_text("candidate", encoding="utf-8")
     code = "import json,os,pathlib,sys; print(json.dumps([pathlib.Path('marker').read_text(),sys.argv[1:],os.getenv('TEST_MODE')]))"
@@ -319,7 +331,9 @@ def test_runner_tampering_during_workload_rejects_result(repository_runner):
 
 
 def test_real_runner_exit_and_timeout(repository_runner, monkeypatch):
-    monkeypatch.setattr(mod, "_RUNNER_CLEANUP_SECONDS", 0.1)
+    monkeypatch.setattr(
+        mod, "_RUNNER_CLEANUP_SECONDS", 0.1
+    )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
     result = authenticated_run(
         repository_runner,
         "-c",
@@ -332,7 +346,7 @@ def test_real_runner_exit_and_timeout(repository_runner, monkeypatch):
             "-c",
             "import time; print('started', flush=True); time.sleep(60)",
             timeout=0.5,
-        )
+        )  # flake-ok: Exercises the requested workload deadline and cleanup contract, not a test barrier.
     assert b"started" in caught.value.output
 
 
@@ -350,7 +364,9 @@ def test_runner_can_cleanup_between_work_deadline_and_hard_timeout(repository_ru
         encoding="utf-8",
     )
     state.adapter = mod.TestEnvironment(state.config, state.clone, state.adapter._sandbox_run)
-    result = authenticated_run(state, "-c", "pass", timeout=0.2)
+    result = authenticated_run(
+        state, "-c", "pass", timeout=0.2
+    )  # flake-ok: Exercises the requested workload deadline and cleanup contract, not a test barrier.
     assert result.returncode == 124
     assert receipt.read_text(encoding="utf-8") == "cleaned"
     assert state.calls[-1][1]["timeout"] == 30.2
@@ -452,8 +468,12 @@ def test_runner_refuses_unrelated_checkout(repository_runner, tmp_path):
 def test_gateway_default_keeps_existing_executor(tmp_path):
     run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
     adapter = mod.TestEnvironment(None, tmp_path, run)
-    adapter.run(adapter.python_argv("-m", "pytest"), cwd=tmp_path, timeout=5)
-    run.assert_called_once_with([sys.executable, "-m", "pytest"], cwd=tmp_path, timeout=5, env=None)
+    adapter.run(
+        adapter.python_argv("-m", "pytest"), cwd=tmp_path, timeout=5
+    )  # flake-ok: Tests exact adapter budget forwarding with a mocked executor; no wait occurs.
+    run.assert_called_once_with(
+        [sys.executable, "-m", "pytest"], cwd=tmp_path, timeout=5, env=None
+    )  # flake-ok: Checks a recorded timeout argument on a mock; no real wait occurs.
 
 
 @pytest.mark.asyncio

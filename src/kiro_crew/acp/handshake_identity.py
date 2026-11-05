@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from kiro_crew.acp.transport_errors import AcpToolGateUnroutable
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
@@ -14,7 +15,6 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_STRANDS,
     POLICY_ID_BY_BACKEND,
 )
-from kiro_crew.acp.transport_errors import AcpToolGateUnroutable
 
 _REPORTED_BACKENDS = {
     "Kiro CLI Agent": ACP_BACKEND_KIRO,

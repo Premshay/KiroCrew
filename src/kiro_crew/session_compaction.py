@@ -28,7 +28,10 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
 
 from kiro_crew.agent_sdk import stale_compaction
-from kiro_crew.agent_sdk.capabilities import UNKNOWN_BACKEND_CAPABILITIES, capabilities_of
+from kiro_crew.agent_sdk.capabilities import (
+    UNKNOWN_BACKEND_CAPABILITIES,
+    capabilities_of,
+)
 from kiro_crew.agent_sdk.capabilities import (
     compact_unsupported_backend as _compact_unsupported_backend,
 )

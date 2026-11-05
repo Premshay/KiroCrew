@@ -19,6 +19,7 @@ from kiro_crew.apps.builtins.auto_improvement.backend.clone_setup import (
     CloneSpec,
 )
 from kiro_crew.platform_compat import rmtree_force
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
 
 
 def _seeded_bare(tmp_path: Path) -> Path:
@@ -83,7 +84,7 @@ def test_refresh_same_branch_preserves_work_and_disabled_remotes(
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=30,
+            timeout=FALLBACK_TIMEOUT_SECS,
         ).stdout.strip()
 
     old = git(clone, "rev-parse", "HEAD")
@@ -160,7 +161,7 @@ def test_refresh_cannot_run_repository_maintenance_hook(tmp_path, monkeypatch):
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=30,
+            timeout=FALLBACK_TIMEOUT_SECS,
             **kwargs,
         ).stdout.strip()
 

@@ -36,7 +36,9 @@ GhRunner = Callable[[list[str]], Any]
 
 
 def _gh_json(args: list[str]) -> Any:
-    out = subprocess.run(["gh", *args], check=True, capture_output=True, text=True, timeout=120)
+    out = subprocess.run(
+        ["gh", *args], check=True, capture_output=True, text=True, encoding="utf-8", timeout=120
+    )
     return json.loads(out.stdout or "null")
 
 

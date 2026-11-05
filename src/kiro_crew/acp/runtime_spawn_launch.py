@@ -52,6 +52,7 @@ from kiro_crew.acp.client import (
     apply_pod_bundle_spawn,
     finish_suspended_spawn,
 )
+from kiro_crew.acp.handshake_identity import refuse_conflicting_handshake
 from kiro_crew.acp.harness import SpawnContext, SpawnPlan
 from kiro_crew.acp.launch import LaunchRequest, LaunchTools, launch
 from kiro_crew.acp.runtime_process_tree import ChildRecord, _kill_escaped_children
@@ -67,7 +68,6 @@ from kiro_crew.agent_sdk.tool_search import (
     spec_grants_tool_search,
     with_client_meta_settings,
 )
-from kiro_crew.acp.handshake_identity import refuse_conflicting_handshake
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.constants import (
     INITIALIZE_TIMEOUT_SECS,

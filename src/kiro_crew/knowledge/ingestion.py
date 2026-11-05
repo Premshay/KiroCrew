@@ -589,8 +589,9 @@ class IngestionPipeline:
         except Exception:
             logger.debug("Post-ingest dedup skipped", exc_info=True)
 
-    def _record_harness_refusal(self, job_id: str, source_id: str,
-                                content_hash: str, exc: BaseException) -> None:
+    def _record_harness_refusal(
+        self, job_id: str, source_id: str, content_hash: str, exc: BaseException
+    ) -> None:
         """Fail *job_id* on the enterprise pool's harness refusal (RFC D6).
 
         The job ends ``failed`` with the refusal's remedy in ``error``, and the source
@@ -602,15 +603,16 @@ class IngestionPipeline:
         db = self.store.db
         db.execute(
             "UPDATE ingestion_jobs SET status = 'failed', error = ?, updated_at = ? WHERE id = ?",
-            (str(exc)[:2000], datetime.now().isoformat(), job_id))
+            (str(exc)[:2000], datetime.now().isoformat(), job_id),
+        )
         db.commit()
 
         # A delta under the store's write lock, never a snapshot rewrite: a
         # concurrent pause or scan stamp on the same row must survive.
         def _forget_hash(props: dict) -> str:
-            if props.get('content_hash') == content_hash:
-                props.pop('content_hash')
-            return 'error'
+            if props.get("content_hash") == content_hash:
+                props.pop("content_hash")
+            return "error"
 
         self.store.revise_source_properties(source_id, _forget_hash)
 
@@ -1014,8 +1016,11 @@ class IngestionPipeline:
         except Exception as exc:
             if _is_harness_refusal(exc):
                 try:
-                    await run_to_completion(functools.partial(
-                        self._record_harness_refusal, job_id, source_id, content_hash, exc))
+                    await run_to_completion(
+                        functools.partial(
+                            self._record_harness_refusal, job_id, source_id, content_hash, exc
+                        )
+                    )
                 except Exception:  # noqa: BLE001 - never mask the original error
                     logger.warning("failed to mark ingestion job %s failed", job_id, exc_info=True)
                 raise
@@ -1090,7 +1095,7 @@ class IngestionPipeline:
         await asyncio.to_thread(_set_total)
 
         # 5. Extract all chunks in batch via pool
-        chunk_contents = [chunk['content'] for chunk in chunks]
+        chunk_contents = [chunk["content"] for chunk in chunks]
         with extraction_source(source_id):
             extractions = await self.extractor.extract_batch(chunk_contents)
 
@@ -1260,8 +1265,11 @@ class IngestionPipeline:
             try:
                 await self.generate_source_summary(source_id)
             except Exception as exc:
-                logger.warning("Source summary generation failed for source_id=%s: %s",
-                               source_id, type(exc).__name__)
+                logger.warning(
+                    "Source summary generation failed for source_id=%s: %s",
+                    source_id,
+                    type(exc).__name__,
+                )
         # Cross-source dedup for whole-source ingests (upload / remote / chat). Folder-file
         # ingests (old_item_ids is a list) are swept by FolderWatcher at end of scan.
         if processed == total and old_item_ids is None:
@@ -1411,7 +1419,7 @@ class IngestionPipeline:
         chunks = await asyncio.to_thread(self.chunker.chunk, text)
         total = len(chunks)
 
-        chunk_contents = [chunk['content'] for chunk in chunks]
+        chunk_contents = [chunk["content"] for chunk in chunks]
         try:
             with extraction_source(source_id):
                 extractions = await self.extractor.extract_batch(chunk_contents)
@@ -1419,8 +1427,11 @@ class IngestionPipeline:
             # The enterprise harness refusal fails the job (see ingest_file); any
             # other extraction error keeps its existing path.
             if _is_harness_refusal(exc):
-                await run_to_completion(functools.partial(
-                    self._record_harness_refusal, job_id, source_id, content_hash, exc))
+                await run_to_completion(
+                    functools.partial(
+                        self._record_harness_refusal, job_id, source_id, content_hash, exc
+                    )
+                )
             raise
 
         # What THIS call wrote, collected at the write itself rather than
@@ -1523,8 +1534,11 @@ class IngestionPipeline:
             try:
                 await self.generate_source_summary(source_id)
             except Exception as exc:
-                logger.warning("Source summary generation failed for source_id=%s: %s",
-                               source_id, type(exc).__name__)
+                logger.warning(
+                    "Source summary generation failed for source_id=%s: %s",
+                    source_id,
+                    type(exc).__name__,
+                )
         # Cross-source dedup for whole-source ingests (upload / remote / chat).
         # Group-level replaces (old_item_ids provided -- e.g. a single artifact's
         # group within the aggregate Artifacts source) defer to the folder-scan
@@ -1695,13 +1709,18 @@ class IngestionPipeline:
                 # The reply is never logged: it is model output over document text.
                 logger.warning(
                     "Source summary for source_id=%s got %s reply; the source keeps "
-                    "no topic or themes", source_id,
-                    "an empty" if not (response or "").strip() else "an unusable")
+                    "no topic or themes",
+                    source_id,
+                    "an empty" if not (response or "").strip() else "an unusable",
+                )
         except Exception as exc:
             # The type only: the message can echo the prompt, which carries the
             # document's section summaries.
-            logger.warning("Source summary generation failed for source_id=%s: %s",
-                           source_id, type(exc).__name__)
+            logger.warning(
+                "Source summary generation failed for source_id=%s: %s",
+                source_id,
+                type(exc).__name__,
+            )
 
 
 # This module is the facade of the ingestion owners and keeps the pipeline itself:
