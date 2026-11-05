@@ -198,7 +198,11 @@ a cost, where data goes, a status such as "disabled by instance config". `hint`
 renders an `InfoTip` beside the label; it is for what the control IS, which a
 reader wants once and never again. A row that always shows two lines of prose
 spends attention whether or not it is being read, so the default for an
-explanatory sentence is `hint`, one catalog string per tip. An error is neither: it renders through
+explanatory sentence is `hint`, one catalog string per tip. A long choice-making
+paragraph becomes one short `description` sentence with the full paragraph as the
+`hint`. `SecretField` and `TagListEditor` take the same `hint`, and a
+`SettingsSection` takes one for its introduction, drawn beside the heading instead
+of as a paragraph above the first card. An error is neither: it renders through
 `ErrorNotice` (`AUTOSDE.yaml`, `errors-use-error-notice`), never behind a tip.
 
 `InfoTip` is accessible by construction — keyboard focusable, named by a short
@@ -272,6 +276,8 @@ so the panel's effects keep one order.
 | `markdownPanelSourcePos.ts` | where a selection sits in the source (`resolveSourcePos`, `findCoords`) |
 | `useMarkdownPanelFind.ts` | the CSS Custom Highlight registry and preview find (Cmd+F) |
 | `useMarkdownPanelDisk.ts` | the disk truth (the panel's reads, the catch-up latch, the watch, the missing-file retry, the last-copy rescue) and the working-tree diff against HEAD |
+| `useImageBoxComments.tsx` | image box comments: the box draft and its typed text (`useImageBoxDraft`), and the host the rendered images read plus the box composer (`useImageBoxHost`) |
+| `useCommentHint.ts` | who sees the comment hint, with which wording, and its New badge |
 | `ChatPane.tsx` | the pane's layout and dock, its store reads, the follow-up chips, the queue-card actions, and the transcript mount (`transcript={{ … }}`) |
 | `ChatPaneProps.ts` | the props interface and `PaneLeading` |
 | `useChatPaneDraft.ts` | the pane-local composer draft, parked and restored per slot |
@@ -326,8 +332,8 @@ navigation rail apart from a filter pill, and the System page stacks both.
 ### The About, Chat and MCP settings panels
 
 `pages/settings/AboutPanel.tsx` (Settings ▸ About), `pages/settings/ChatPanel.tsx`
-(Settings ▸ Chat) and `pages/settings/McpManagement.tsx` (the Developer page's MCP
-pool) are facades over sibling owners in `pages/settings/`. Each facade keeps its
+(Settings ▸ Chat) and `pages/settings/McpManagement.tsx` (Settings ▸ Developer ▸
+MCP Management) are facades over sibling owners in `pages/settings/`. Each facade keeps its
 module id and every export, so hosts and the specs that mock a panel keep naming the
 facade. Nothing outside a panel's own files imports one of its owners, and no owner
 imports its facade; the only edges between owners are `AboutPanelGatewayUpdate.tsx` to
@@ -347,9 +353,9 @@ fixed order.
 | `useChatPanelDashboard.ts` | the `dashboardConfig` read and writes, Feature Tips and the feature-video readout |
 | `useChatPanelTypedFields.ts` | the draft-backed number and path fields (Advanced, Sessions) |
 | `useChatPanelModels.ts` | the Model page: fallback models, defaults, selectable models, the agent-pin notice, per-role rows |
-| `McpManagement.tsx` | the page: the view tabs, the sharing and pre-resolve cards, the servers table, both dialogs |
+| `McpManagement.tsx` | the page: the view tabs, the sharing and pre-resolve cards, the servers table, the Share all list |
 | `mcpManagementModel.ts` | wire types, error-key tables, the row-state derivation and the sharing-evidence verdict |
-| `McpManagementLaunchReview.tsx` | the launch lines, the review a STUB switch opens, the refused-row panel |
+| `McpManagementLaunchReview.tsx` | a row's share button, its Details (the agents that declare it), and its hint |
 | `McpManagementAssessment.tsx` | the Sharing assessment view and its Measure control |
 
 New work for a responsibility in the table goes to its owner, and work that belongs
@@ -374,7 +380,7 @@ component moved whole, so each one registers its hooks in its BASE order.
 |---|---|
 | `SecurityPanel.tsx` | the rail: `SECURITY_SECTIONS`, `SECTION_LABEL_KEY` (read by `gen-ui-index.mjs`), `SECTION_GROUP_KEY`, the rail summaries, the panel, and the Documentation section |
 | `SecurityPanelPosture.tsx` | Live security posture, and the status row and chip the tailnet card reuses |
-| `SecurityPanelApprovals.tsx` | the ad-hoc auto-approve duration card and the flagged-file delivery consent card |
+| `SecurityPanelApprovals.tsx` | the ad-hoc auto-approve duration card |
 | `SecurityPanelDeniedCommands.tsx` | Denied commands: the built-in rules by category, the custom deny patterns, the pinned and floor tooltip keys |
 | `SecurityPanelTailnet.tsx` | the tailnet origin card and `TAILNET_STATE_KEY`, which the rail summary reads |
 | `SecurityPanelTrust.tsx` | third-party app trust grants, per-registry Git-identity trust grants, and their failure messages |
@@ -589,6 +595,12 @@ Add a new protocol to `ALLOWED_PROTOCOLS` in that file, and only there. Each
 addition widens what a model-authored or user-pasted link can launch on the host,
 so treat it as a security change, not a formatting one.
 
+In a desktop-app pane (`isDesktopAppPane`), `MdAnchor` opens an editor link
+with `window.open` on a plain click, because the frame's CSP `frame-src`
+refuses an in-place navigation to a custom scheme. Other pages keep in-place
+navigation. In the desktop app that call reaches the window-open handler in
+`website/electron/external-scheme.js`, which asks the user before opening it.
+
 How a refused destination RENDERS is part of the contract (issue #9925): the
 transform's rejection sentinel is `''`, and `MdAnchor`'s `!href` guard renders
 the label as inert text with **no anchor** — never `<a href="">`, whose empty
@@ -724,6 +736,7 @@ family imports an owner. A module beside them in `src/types/` that is not named
 | `index.chat.ts` | the chat slot row (`ChatSlot`) with its turn identity and the `chat_done` payload, its todo list, MCP report and channel links; sidebar folders, tags and board lanes; transcript messages and the slot detail read; subagent and tool activity; content blocks; notifications and their channels; approvals; history session rows |
 | `index.sources.ts` | pull requests, issues, the source provider id, an app repository's contributors |
 | `index.artifacts.ts` | artifacts and their publication, publishing providers, forks, remote listings, session docs, folders, events, comments, web-app metadata |
+| `index.sharedCrew.ts` | Shared Crew attribution: the browser-facing principal and its display snapshot, a session's creator, availability and trigger |
 
 Redux Toolkit (`src/store/index.ts`) holds the cross-page shell state in **four**
 slices:
@@ -784,12 +797,10 @@ is finalized within the same scope, so an untouched row resolves back to its bas
 object and keeps its identity.
 
 This is a convention for new and touched code, not a description of the current
-store. Two dashboard collections still assign wholesale and are known gaps rather
-than counterexamples: `sseSubagentStatus` rebuilds its `agents` array every frame,
-and `sseStatus` replaces `state.status` as a whole object that several panels
-subscribe to entirely. Converting them is worthwhile but is its own change —
-`state.status` in particular needs its consumers narrowed first, or the merge buys
-nothing.
+store. One dashboard collection still assigns wholesale and is a known gap rather
+than a counterexample: `sseStatus` replaces `state.status` as a whole object that
+several panels subscribe to entirely. Converting it is worthwhile but is its own
+change: its consumers need narrowing first, or the merge buys nothing.
 
 Two habits belong to the same concern:
 
@@ -870,8 +881,9 @@ files own it:
   the same rule through `hooks/useTouchReplay.ts`: spread its `pointerProps` on
   the anchor and return early while `fromTouch()` is true, as `useNavTip`,
   `useHoverIntent`, `RefLink` and `MarkdownToc` do), and
-  emits the iOS safe-area utilities (`p-safe`, `top-safe-offset-*`, …) as
-  `@utility` blocks. Adding a utility for a new token means adding one
+  emits the iOS safe-area utilities (`p-safe`, `p-safe-or-*`, `top-safe-offset-*`, …) as
+  `@utility` blocks; `--safe-area-x` in `src/styles/design-tokens.css` is the wider
+  side inset, for a width taken from the viewport. Adding a utility for a new token means adding one
   `--color-<token>: var(--<token>)` line here; `scripts/check-phantom-classes.mjs`
   compiles against this file to catch a utility whose token was never declared.
 - `src/index.css` — the entry, read top to bottom in cascade order. First the
@@ -1076,7 +1088,12 @@ To add one:
 2. Export it as the module default.
 3. Add one entry to `BUILTIN_COMPONENT_REGISTRY` (a `BuiltinAppEntry`):
    `'/my-app': { component: lazy(() => import('./my-app/MyAppPage')), appId: '<app.json name>' }`.
-   `appId` must equal the `name` in the app's `app.json` manifest.
+   `appId` must equal the `name` in the app's `app.json` manifest. A page that
+   opens an absolute path handed to it in its URL also sets `opensPathParam` to
+   the query parameter it reads (`<route>?<param>=<path>`). The file viewer's ⋯
+   menu then offers "Open in <app>" for it through `src/apps/pathOpener.ts`,
+   which names no app: it takes the first such entry whose app is enabled and
+   routed natively.
 4. Declare `ui.pages` in the app's `app.json` manifest, and its `ui.icon` name.
 5. If the icon is not already in `src/apps/builtinIcons.tsx`, add it to
    `BUILTIN_ICON_REGISTRY` (Lucide element, `size={16}`).

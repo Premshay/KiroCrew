@@ -26,9 +26,15 @@ from kiro_crew.session_ledger import ledger_key
 
 KINDS = ("CLAIM", "FACT", "FAIL", "ASK", "DONE")
 OWNER = "owner"
+#: The system author of entries recorded from GitHub (a merged arc PR). No
+#: session can write as it: only :func:`record_merged_pr` does.
+GITHUB = "github"
 
 _MAX_TEXT = 100
 _MAX_DONE_TEXT = 300
+# A FACT carries owner rulings a coordinator relays, so it gets DONE's room.
+_LONG_TEXT_KINDS = ("DONE", "FACT")
+_SHORT_ID_RE = re.compile(r"ae_[0-9a-f]{8,31}\Z")
 _MAX_STEP = 100
 _MAX_CHECKED = 8
 _MAX_CHECKED_ITEM = 200
@@ -185,7 +191,7 @@ def _autonomy(value: Any) -> int:
 
 def _member_key(session_key: Any) -> str:
     key = ledger_key(session_key) if isinstance(session_key, str) else ""
-    if not key or key == OWNER:
+    if not key or key in (OWNER, GITHUB):
         raise ArcError("invalid member session key")
     return key
 
@@ -202,6 +208,21 @@ def _member_records(members: Any) -> dict[str, dict[str, str]]:
         key = _member_key(member.get("session_key"))
         out[key] = {"role": _str(member.get("role"), 200, "role"), "joined_at": joined}
     return out
+
+
+_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+
+
+def _repo(value: Any) -> str:
+    repo = _str(value, 200, "repo")
+    if repo and not _REPO_RE.fullmatch(repo):
+        raise ArcError("repo must be owner/name")
+    return repo
+
+
+def arc_tag(arc_id: str) -> str:
+    """The line a PR body carries to count toward the arc."""
+    return f"Arc: {arc_id}"
 
 
 def create_arc(spec: dict[str, Any], members: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -241,6 +262,11 @@ def create_arc(spec: dict[str, Any], members: list[dict[str, Any]] | None = None
         "rules": _str_list(spec.get("rules"), "rules"),
         "reuse": _str_list(spec.get("reuse"), "reuse"),
         "channel_id": _str(spec.get("channel_id"), 512, "channel_id"),
+        # GitHub repository (owner/name) whose merged PRs tagged "Arc: <id>" are
+        # recorded on the board; empty records nothing.
+        "repo": _repo(spec.get("repo")),
+        # A member key the owner trusts to sign milestones off for them.
+        "coordinator": "",
         # The arc made this channel for itself (the console's default), so lanes
         # leave it when they leave the arc; a shared channel is never touched.
         "channel_owned": spec.get("channel_owned") is True,
@@ -325,6 +351,26 @@ def set_channel(arc_id: str, channel_id: str, *, owned: bool) -> dict[str, Any]:
         return arc
 
 
+def update_settings(arc_id: str, *, repo: Any = None, coordinator: Any = None) -> dict[str, Any]:
+    """Set the arc's GitHub repo and/or its coordinator (owner only); return the arc.
+
+    The coordinator must be a member; an empty value clears it.
+    """
+    dir_path = _arc_dir(arc_id)
+    with _locked(dir_path):
+        arc = _load_arc(dir_path)
+        if repo is not None:
+            arc["repo"] = _repo(repo)
+        if coordinator is not None:
+            key = _str(coordinator, 512, "coordinator")
+            key = ledger_key(key) if key else ""
+            if key and key not in arc["members"]:
+                raise ArcError("the coordinator must be a member of the arc")
+            arc["coordinator"] = key
+        _write_json(dir_path / "arc.json", arc)
+        return arc
+
+
 def set_autonomy(arc_id: str, autonomy: Any) -> dict[str, Any]:
     """Change the arc's autonomy level (owner only) and return the arc."""
     level = _autonomy(autonomy)
@@ -362,13 +408,51 @@ def _safe_link(link: str) -> str:
     return link
 
 
-def _validate_entry(entry: dict[str, Any], members: dict[str, Any]) -> dict[str, Any]:
+def _resolve_to(value: str, arc: dict[str, Any]) -> str:
+    """A member key, ``owner``, ``coordinator``, or a member's role (case-insensitive)."""
+    if value == OWNER:
+        return OWNER
+    members = arc["members"]
+    if value.casefold() == "coordinator":
+        if not arc.get("coordinator"):
+            raise ArcError("this arc has no coordinator; address a member or owner")
+        return arc["coordinator"]
+    key = ledger_key(value)
+    if key in members:
+        return key
+    wanted = value.strip().casefold()
+    by_role = [
+        k
+        for k, m in members.items()
+        if (m.get("role") or "").casefold() == wanted
+        or (m.get("role") or "").casefold().split(" ")[0] == wanted
+    ]
+    if len(by_role) == 1:
+        return by_role[0]
+    if len(by_role) > 1:
+        raise ArcError(f"{value!r} names more than one member; use the member key")
+    raise ArcError("to must be a member key, a member's role, coordinator or owner")
+
+
+def _resolve_reply_to(value: str, entries: list[dict[str, Any]]) -> str:
+    """A full entry id, or a unique short form such as ``ae_2c524baf``."""
+    if not value or _ENTRY_ID_RE.fullmatch(value):
+        return value
+    if not _SHORT_ID_RE.fullmatch(value):
+        raise ArcError("reply_to must be an entry id")
+    found = [e["id"] for e in entries if e["id"].startswith(value)]
+    if len(found) != 1:
+        raise ArcError(f"reply_to {value!r} matches {len(found)} entries; give more of the id")
+    return found[0]
+
+
+def _validate_entry(entry: dict[str, Any], arc: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(entry, dict):
         raise ArcError("entry must be an object")
     kind = entry.get("kind")
     if kind not in KINDS:
         raise ArcError(f"kind must be one of {', '.join(KINDS)}")
-    limit = _MAX_DONE_TEXT if kind == "DONE" else _MAX_TEXT
+    limit = _MAX_DONE_TEXT if kind in _LONG_TEXT_KINDS else _MAX_TEXT
     clean: dict[str, Any] = {
         "kind": kind,
         "text": _str(entry.get("text"), limit, "text", required=True),
@@ -384,11 +468,7 @@ def _validate_entry(entry: dict[str, Any], members: dict[str, Any]) -> dict[str,
     else:
         clean["step"] = _str(entry.get("step"), _MAX_STEP, "step")
     if kind == "ASK":
-        to = _str(entry.get("to"), 512, "to", required=True)
-        to = to if to == OWNER else ledger_key(to)
-        if to != OWNER and to not in members:
-            raise ArcError("to must be a member key or owner")
-        clean["to"] = to
+        clean["to"] = _resolve_to(_str(entry.get("to"), 512, "to", required=True), arc)
     if kind == "DONE" and not clean["link"]:
         raise ArcError("DONE requires a link")
     completes = entry.get("completes_milestone", False)
@@ -398,8 +478,13 @@ def _validate_entry(entry: dict[str, Any], members: dict[str, Any]) -> dict[str,
         raise ArcError("only a DONE entry can complete a milestone")
     if completes:
         clean["completes_milestone"] = True
-    if clean["reply_to"] and not _ENTRY_ID_RE.fullmatch(clean["reply_to"]):
-        raise ArcError("reply_to must be an entry id")
+    signoff = entry.get("signoff", False)
+    if not isinstance(signoff, bool):
+        raise ArcError("signoff must be a boolean")
+    if signoff:
+        if kind != "FACT":
+            raise ArcError("only a FACT can sign a milestone off")
+        clean["signoff"] = True
     return clean
 
 
@@ -413,10 +498,25 @@ def append_entry(arc_id: str, author: str, entry: dict[str, Any]) -> dict[str, A
         arc = _load_arc(dir_path)
         if key != OWNER and key not in arc["members"]:
             raise ArcAccessDenied(f"{author!r} is not a member of arc {arc_id}")
-        clean = _validate_entry(entry, arc["members"])
+        clean = _validate_entry(entry, arc)
+        if clean["reply_to"]:
+            clean["reply_to"] = _resolve_reply_to(clean["reply_to"], _load_entries(dir_path))
         milestone = entry.get("milestone", arc["milestone_index"])
         if not isinstance(milestone, int) or isinstance(milestone, bool) or milestone < 0:
             raise ArcError("milestone must be a non-negative integer")
+        if clean.get("signoff"):
+            # The coordinator signs the CURRENT milestone off for the owner, who
+            # confirmed it in the coordinator's session; the arc advances in the
+            # same locked write, so the entry and the pointer cannot disagree.
+            if key == OWNER or key != arc.get("coordinator"):
+                raise ArcAccessDenied("only the arc's coordinator may sign a milestone off")
+            index = arc["milestone_index"]
+            if index >= len(arc["milestones"]):
+                raise ArcConflict("every milestone is already accepted")
+            if milestone != index:
+                raise ArcConflict(f"milestone {milestone + 1} is not the current one")
+            arc["milestone_index"] = index + 1
+            _write_json(dir_path / "arc.json", arc)
         stored = {
             **clean,
             "id": f"ae_{uuid.uuid4().hex}",
@@ -430,6 +530,55 @@ def append_entry(arc_id: str, author: str, entry: dict[str, Any]) -> dict[str, A
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+        return stored
+
+
+def _append_line(dir_path: Path, stored: dict[str, Any]) -> None:
+    line = json.dumps(stored, ensure_ascii=False, sort_keys=True) + "\n"
+    _drop_torn_tail(dir_path / "entries.jsonl")
+    with open(dir_path / "entries.jsonl", "a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def record_merged_pr(arc_id: str, pr: dict[str, Any]) -> dict[str, Any] | None:
+    """Record one merged arc PR as a DONE by :data:`GITHUB`; None if already recorded.
+
+    ``pr``: ``number``, ``title``, ``url``, ``head``, ``merge_sha``, ``merged_at``,
+    ``reviewers`` (who reviewed the exact head clean), ``lane`` (member key or "").
+    """
+    number = pr.get("number")
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        raise ArcError("pr number must be a positive integer")
+    dir_path = _arc_dir(arc_id)
+    with _locked(dir_path):
+        arc = _load_arc(dir_path)
+        if any(e.get("pr") == number for e in _load_entries(dir_path)):
+            return None
+        reviewers = [str(r)[:64] for r in (pr.get("reviewers") or [])][:8]
+        lane = str(pr.get("lane") or "")
+        stored = {
+            "kind": "DONE",
+            "text": _str(f"#{number} merged: {pr.get('title') or ''}", 10**6, "text")[
+                :_MAX_DONE_TEXT
+            ],
+            "link": _safe_link(_str(pr.get("url"), _MAX_FIELD, "url")),
+            "reply_to": "",
+            "step": "",
+            "id": f"ae_{uuid.uuid4().hex}",
+            "ts": _now().isoformat(timespec="seconds"),
+            "author": GITHUB,
+            "milestone": arc["milestone_index"],
+            "pr": number,
+            "head": _str(pr.get("head"), 64, "head"),
+            "merge_sha": _str(pr.get("merge_sha"), 64, "merge_sha"),
+            "merged_at": _str(pr.get("merged_at"), 64, "merged_at"),
+            "reviewers": reviewers,
+            "verified": bool(reviewers),
+            "lane": lane if lane in arc["members"] else "",
+        }
+        _append_line(dir_path, stored)
         return stored
 
 

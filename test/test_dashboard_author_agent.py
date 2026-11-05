@@ -889,7 +889,9 @@ def test_the_hook_sweep_does_not_follow_a_symlink_at_an_owned_stem(
     target = rig.agents / DASHBOARD_AUTHOR_AGENT_FILENAME
     secret = tmp_path / "outside" / "config.json"
     secret.parent.mkdir()
-    secret.write_text(json.dumps({"hooks": {"auto_approve_tools": ["x"]}, "secret": "sh"}))
+    secret.write_text(
+        json.dumps({"hooks": {"auto_approve_tools": ["x"]}, "secret": "sh"}), encoding="utf-8"
+    )
     target.symlink_to(secret)
     before = secret.read_text(encoding="utf-8")
 
@@ -999,7 +1001,6 @@ def test_every_managed_writer_calls_begin_and_finalize(
     agent.rebuild_agent_config()
     assert target.exists()
 
-    # Patch to record calls.
     calls: list[str] = []
     real_begin = agent_state.begin_managed_write
     real_finalize = agent_state.finalize_managed_write

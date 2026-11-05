@@ -24,8 +24,8 @@ from kiro_crew.dashboard.chat_utils import (
 )
 
 
-def _fake_config(provider: str):
-    return SimpleNamespace(agent=SimpleNamespace(provider=provider, acp_backend=""))
+def _fake_config(provider: str, backend: str = ""):
+    return SimpleNamespace(agent=SimpleNamespace(provider=provider, acp_backend=backend))
 
 
 def _make_app() -> web.Application:
@@ -36,7 +36,7 @@ def _make_app() -> web.Application:
     return app
 
 
-async def _get(provider: str, *, state=None, claude_providers=()):
+async def _get(provider: str, backend: str = "", *, state=None, claude_providers=()):
     """Fetch the menu, optionally against a fake live session.
 
     *claude_providers* declares the live Claude sessions through the same SDK
@@ -50,7 +50,7 @@ async def _get(provider: str, *, state=None, claude_providers=()):
     with (
         patch(
             "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
-            return_value=_fake_config(provider),
+            return_value=_fake_config(provider, backend),
         ),
     ):
         async with TestClient(TestServer(app)) as client:
@@ -238,3 +238,34 @@ class TestAdvertisedCommands:
         names = {item["name"] for item in payload}
         assert "/compact" in names and "/security-review" in names
         assert {"/side", "/goal", "/prompts"} <= names
+    @pytest.mark.asyncio
+    async def test_claude_backend_lists_claude_commands_not_kiro_cli_ones(self):
+        """acp_backend claude runs its own commands, so the menu offers them.
+
+        The public schema only admits provider "acp"; the backend decides.
+        """
+        payload = await _get("acp", "claude")
+        by_name = {item["name"]: item["description"] for item in payload}
+
+        assert {"/init", "/review", "/security-review"} <= set(by_name)
+        assert not set(by_name) & {
+            "/hooks",
+            "/code",
+            "/experiment",
+            "/logdump",
+            "/changelog",
+            "/tools",
+        }
+        # The commands the dashboard answers itself stay offered on claude.
+        assert {"/agent", "/goal", "/prompts", "/side", "/workflow"} <= set(by_name)
+        assert not set(by_name) & (_BLOCKED_SLASH_COMMANDS - {"/todos"})
+        for name, desc in by_name.items():
+            assert desc == SLASH_COMMAND_DESCRIPTIONS[name], name
+        assert len(payload) == len(by_name)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend", ["", "kiro", "kas"])
+    async def test_non_member_backends_keep_the_kiro_cli_menu(self, backend):
+        """Only a backend that runs its own commands gets the claude list."""
+        names = {item["name"] for item in await _get("acp", backend)}
+        assert not names & {"/init", "/review", "/security-review"}

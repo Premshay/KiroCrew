@@ -25,6 +25,7 @@ agent loads only the one it needs.
 | [session-summary.md](session-summary.md) | Intent-level session summaries: the sidecar cache, extraction, and the turn-end pass. |
 | [member-event-log.md](member-event-log.md) | Per-member append-only event log, its four projections, the whole-value push frames, and load-time closers behind the Members page. |
 | [session-work-ledger.md](session-work-ledger.md) | Per-session durable work state (goal, phase, tried, artifacts) on disk, its MCP tools, and monitor-loop snapshot injection. |
+| [shared-crew.md](shared-crew.md) | Multi-person Crews. So far: the `dashboard.shared_crew` config section and its defaults. |
 | [crew-log-core.md](crew-log-core.md) | Append-only per-crew and per-session crew logs: the wire format, type ownership and guest namespacing, the torn-tail rule, and the session-log compatibility rule. |
 | [crew-log-emitter.md](crew-log-emitter.md) | The flag-gated writer that turns the ACP turn lifecycle into an append-only per-session `log.jsonl`: which facts are recorded, from which call site, and which are deliberately not. |
 | [crew-log-projection.md](crew-log-projection.md) | The six session folds (`status`, `usage`, `timeline`, `tools`, `approvals`, `subagents`), their resumable checkpoints, the paged `crew-log` reads with refs resolved, and the `session_projection` push. |
@@ -109,7 +110,7 @@ agent loads only the one it needs.
 | [themes.md](themes.md) | The theme tier model and the CSS variable contract. |
 | [md-notebook.md](md-notebook.md) | The inline markdown viewer and editor. |
 | [side.md](side.md) | The chat side panel. |
-| [browser.md](browser.md) | Website browsing through the native Browser-panel MCP transport, with `playwright-cli` as the fallback path. |
+| [browser.md](browser.md) | The agent's browser: Browser Harness behind a gateway CDP relay, streamed into the chat as a live card the person can take over; the `browser` MCP tool's ops, the Preview tab, and the retired keys. |
 
 ## Built-in apps
 

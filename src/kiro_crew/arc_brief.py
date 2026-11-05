@@ -70,8 +70,11 @@ def _author_label(arc: dict[str, Any], author: str) -> str:
 
 
 def _entry_line(arc: dict[str, Any], entry: dict[str, Any]) -> str:
+    # The short id is what a lane quotes in reply_to (the store resolves it).
+    short = str(entry.get("id", ""))[:11]
     line = (
-        f"[{entry['kind']}] {_author_label(arc, entry['author'])} ({entry['ts']}): {entry['text']}"
+        f"[{entry['kind']} {short}] {_author_label(arc, entry['author'])} ({entry['ts']}):"
+        f" {entry['text']}"
     )
     if entry.get("link"):
         line += f" — {entry['link']}"
@@ -116,6 +119,17 @@ def render_brief(arc: dict[str, Any], member_key: str) -> str:
         ("Autonomy", _AUTONOMY[arc["autonomy"]]),
         *([("Milestones after this one", _bullets(ahead))] if ahead else []),
         ("Always escalates to the owner", _ESCALATES),
+        *(
+            [
+                (
+                    "Questions for the owner",
+                    f"ASK to=coordinator ({_author_label(arc, arc['coordinator'])}), who puts"
+                    " them to the owner and posts the ruling here.",
+                )
+            ]
+            if arc.get("coordinator")
+            else []
+        ),
         ("Decisions to read", _bullets(arc["decisions"])),
         ("Skills that apply", _bullets(arc["rules"])),
         ("Machinery to reuse", _bullets(arc["reuse"])),

@@ -22,13 +22,16 @@ Writes: ``_acp_client``, ``_active_turn_session_key``, ``_approval_futures``,
 ``_on_question_retired``, ``_on_row``, ``_pending``, ``_preparing_count``, ``_pending_consumers``,
 ``_pending_context``, ``_pending_release_deferred``, ``_pending_variants``,
 ``_question_pending``, ``_queue``, ``_queue_persist_inflight``, ``_queue_persist_owed``,
-``_queue_persisted_sig``, ``_queue_repository``, ``_responsive``, ``_side``,
+``_queue_persisted_sig``, ``_queue_repository``, ``_regenerate_target``,
+``_responsive``, ``_side``,
 ``_stop_declined_at``, ``_stop_escalated_card_id``, ``_stop_event_id``,
-``_stop_generation``, ``_stop_state_raw``, ``_subagent_delivery_pending``,
+``_stop_generation``, ``_stop_state_raw``, ``_subagent_delivery_pending``, ``_swap_in_flight``,
 ``_synthesis_recheck``, ``_task``, ``_trust``, ``_trust_reads``, ``_trust_scope``,
 ``_trusted_pattern_deadlines``, ``_trusted_patterns``, ``_turn_admission_reserved``,
 ``_turn_generation``, ``_turn_in_flight_generation``, ``_turn_in_flight_prompt``,
-``_turn_reply_mids``, ``_wake_starting_task``, ``credential_evidence``, ``event``,
+``_turn_reply_mids``, ``_unstarted_generation``, ``_wake_starting_task``,
+``_window_swap_applying``, ``_window_swap_epoch``, ``credential_evidence``,
+``event``,
 ``linked_session_key``, ``segment_message_id``, ``segment_raw_text``,
 ``segment_removed``, ``segment_shown_sha``.
 
@@ -270,6 +273,12 @@ def init_turns_fields(self: _ChatSlot) -> None:
     # None after teardown, so consumers that span awaits cannot distinguish
     # "stayed idle" from "ran and finished" by comparing task references.
     self._turn_generation = 0
+    # The ``_turn_generation`` of a dispatch that ended without starting its
+    # turn (``turn_dispatch.mark_turn_unstarted``), so no tail hands off the
+    # queue a send built behind it; its done callback does
+    # (``chat_turn.queue_cycle._hand_off_unstarted_turn``). -1: none, since a
+    # published ``task`` is generation 1 or later.
+    self._unstarted_generation = -1
     # The turn a structured monitor wake started, until the runner accepts it
     # and the wake's ``nudge`` row is written. Until then the transcript cannot
     # say who opened the running turn, so the projection's ``wake_starting``
@@ -324,6 +333,11 @@ def init_turns_fields(self: _ChatSlot) -> None:
     # attribution. Ids rather than a flag, for exactly that reason.
     self._approval_stopped = set()
     self._trust = False  # auto-approve tools for this slot
+    # True when ``_trust`` came from a Crew Mode conductor's approval card
+    # ("Trust this crew member"). That grant covers this slot and the subagents it
+    # spawns; the sessions and forks it creates later are born asking
+    # (``approval_posture.trust_carries``). Any direct trust of this slot clears it.
+    self._trust_card_scoped = False
     # SafetyOverride scope key holding an EXPIRING, SEL-audited auto-approve
     # grant, for an unattended app worker with no human present to click
     # "trust this session". Empty on an ordinary session, and empty is what
@@ -332,6 +346,11 @@ def init_turns_fields(self: _ChatSlot) -> None:
     # the decision — ``safety_override().is_scope_active()`` is.
     self._trust_scope = ""
     self._trust_reads = False  # auto-approve read-only bash commands
+    # True while this slot's posture (``_trust`` / ``_trust_reads``) is the one its
+    # creator handed it, at birth or by a later change on the creator
+    # (``approval_inheritance``). A person setting this slot's own mode clears it,
+    # and from then on the creator's changes leave this slot alone.
+    self._posture_inherited = False
     # A crewmate thread took its profile's approval mode (members handler).
     self._member_approval_seeded = False
     self._trusted_patterns = set()  # session-scoped fnmatch globs
@@ -341,6 +360,11 @@ def init_turns_fields(self: _ChatSlot) -> None:
     # In memory only, so a restart drops timed grants along with every other
     # grant on the slot.
     self._trusted_pattern_deadlines = {}
+    # Deny-rule refusal keys a person overrode "for this session" on the
+    # dashboard approval card (``kiro_crew.dashboard.deny_override``). In memory
+    # only, never persisted and never written to ``denied_commands.json``: it
+    # ends with this slot or a gateway restart.
+    self._deny_waivers = set()
     # Depth of the current unbroken Stop-hook continuation run: 0 on a normal
     # turn, incremented on each consecutive hook-continuation turn, reset by
     # any turn that is not a hook continuation. Surfaced to Stop hooks as
@@ -451,6 +475,14 @@ def init_turns_fields(self: _ChatSlot) -> None:
     self._dropped_note_ids = set()
     # Regenerate feature: variants pending attachment to next finalized assistant message
     self._pending_variants = []
+    # The previous reply a running Regenerate will replace at its turn end
+    # (``chat_turn.regenerate_swap``); ``None`` outside a Regenerate.
+    self._regenerate_target = None
+    # Committed Regenerate swaps, so a save whose window copy predates one
+    # re-takes it instead of writing the old reply back.
+    self._window_swap_epoch = 0
+    self._swap_in_flight = False
+    self._window_swap_applying = None
     self._lock = asyncio.Lock()
     self._file_changes = (
         []
@@ -488,6 +520,10 @@ def init_turns_fields(self: _ChatSlot) -> None:
     # mid-turn (a workflow or sub-agent completion) is never this turn's
     # reply, whatever its position. Reset where the turn's start is captured.
     self._turn_reply_mids = []
+    # The turn-end file-change flush while it runs off the loop
+    # (``_flush_file_changes_off_loop``), so a close that gave up waiting
+    # for the cancelled turn can still drain it before archiving.
+    self._file_changes_flush = None
     self.linked_session_key = ""  # when set, _run_chat uses this as session key
     # Where the turn CURRENTLY in flight actually started, as opposed to
     # where the slot would route a new one. The two diverge whenever the
@@ -511,6 +547,11 @@ def init_turns_fields(self: _ChatSlot) -> None:
     # ceiling cut the turn (kirocrew.turn.timeout.cause).
     self._last_turn_awaiting_permission = False
     self._last_turn_children_announced = False
+    # No Crew Mode dispatch notice written on this slot yet. Stamped with the
+    # ``_turn_generation`` whenever one is written, so a turn's later dispatches
+    # write no second notice (crew_dispatch_notice.py). -1 never equals a real
+    # generation, so the first dispatch of the first turn always writes.
+    self._crew_dispatch_notice_turn_gen = -1
     # Agent questions this slot has not answered yet, keyed by the ask's
     # identity: ``{card_id: {"ts": float, "blocking": bool}}``, empty when the
     # agent is not waiting on anything.
@@ -657,9 +698,13 @@ def deferred_context_count(self: _ChatSlot) -> int:
     return self._buffers.deferred_context_count(self)
 
 
-def flush_deferred_notes(self: _ChatSlot) -> int:
+def flush_deferred_notes(
+    self: _ChatSlot, *, broadcast: bool = True, retain: bool | None = None
+) -> int:
     """Flush held notes in order, restoring the unwritten suffix on failure."""
-    return self._buffers.flush_deferred_notes(self, logger=logger)
+    return self._buffers.flush_deferred_notes(
+        self, logger=logger, broadcast=broadcast, retain=retain
+    )
 
 
 def register_approval(
@@ -712,6 +757,7 @@ def queue_append(
     peer_channel_id: str = "",
     peer_message_id: str = "",
     directive_channel_origin: bool = False,
+    directive_owner_origin: bool = False,
 ) -> str:
     return self._queue_repository.queue_append(
         self,
@@ -722,6 +768,7 @@ def queue_append(
         peer_channel_id=peer_channel_id,
         peer_message_id=peer_message_id,
         directive_channel_origin=directive_channel_origin,
+        directive_owner_origin=directive_owner_origin,
     )
 
 
@@ -742,6 +789,7 @@ def queue_insert(
     peer_channel_id: str = "",
     peer_message_id: str = "",
     directive_channel_origin: bool = False,
+    directive_owner_origin: bool = False,
 ) -> str:
     return self._queue_repository.queue_insert(
         self,
@@ -756,6 +804,7 @@ def queue_insert(
         peer_channel_id=peer_channel_id,
         peer_message_id=peer_message_id,
         directive_channel_origin=directive_channel_origin,
+        directive_owner_origin=directive_owner_origin,
     )
 
 
@@ -790,6 +839,7 @@ def queue_edit_by_id(
     *,
     directive_user_origin: bool = False,
     directive_channel_origin: bool = False,
+    directive_owner_origin: bool = False,
 ) -> bool:
     return self._queue_repository.queue_edit_by_id(
         self,
@@ -797,6 +847,7 @@ def queue_edit_by_id(
         content,
         directive_user_origin=directive_user_origin,
         directive_channel_origin=directive_channel_origin,
+        directive_owner_origin=directive_owner_origin,
     )
 
 

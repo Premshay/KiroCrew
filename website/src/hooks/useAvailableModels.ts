@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { api } from '../api/client'
 import { useProvider } from '../providers'
-import { modelListRefetchInterval, useModelsDegraded } from '../providers/modelListHealth'
+import { modelHealthKey, modelListRefetchInterval, useModelsDegraded } from '../providers/modelListHealth'
 import { withAutoFirst } from '../providers/modelList'
 import type { ModelInfo } from '../providers/types'
 
@@ -56,7 +56,16 @@ type ModelCatalog = { models: ModelInfo[]; effortLevels?: string[]; supportsImag
  * `false` until its panel opens so merely rendering the sidebar does not spawn
  * kiro-cli. Other mounted observers still fetch normally — `enabled` gates who
  * *triggers* a fetch, not what lands in the cache.
+ *
+ * `backend` is the `models_backend` the server names for a session or crew on
+ * another harness than the configured one: that harness's list gets its own key,
+ * so it never replaces the configured list the other pickers read.
  */
+/** The cache key of the configured list, or of `backend`'s own list. */
+export function modelsQueryKey(providerId: string, backend?: string): readonly unknown[] {
+  return backend === undefined ? ['available-models', providerId] : ['available-models', providerId, backend]
+}
+
 type ModelPickerAgent = {
   name: string
   runtime_policy?: { model?: 'selectable' | 'managed' | 'unsupported' } | null
@@ -68,10 +77,12 @@ type ModelPickerAgent = {
  */
 export function useAvailableModelsQuery({
   enabled,
+  backend,
   agent,
   fallback = 'global',
 }: {
   enabled?: boolean
+  backend?: string
   agent?: ModelPickerAgent
   /** Suppress generic provider discovery when no resolved crew owns this picker. */
   fallback?: 'global' | 'none'
@@ -79,12 +90,12 @@ export function useAvailableModelsQuery({
   const provider = useProvider()
   const selectableAgent = agent?.runtime_policy?.model === 'selectable' ? agent : undefined
   const canDiscover = Boolean(selectableAgent) || fallback === 'global'
-  const isDegraded = useModelsDegraded(provider.id)
+  const isDegraded = useModelsDegraded(modelHealthKey(provider.id, backend))
   const query = useQuery({
     queryKey: selectableAgent
       ? ['available-models', provider.id, 'agent', selectableAgent.name]
       : fallback === 'global'
-        ? ['available-models', provider.id]
+        ? modelsQueryKey(provider.id, backend)
         : ['available-models', provider.id, 'none'],
     queryFn: async (): Promise<ModelCatalog> => {
       if (selectableAgent) {
@@ -111,7 +122,7 @@ export function useAvailableModelsQuery({
               : undefined,
         }
       }
-      return { models: withAutoFirst(await provider.fetchAvailableModels()) }
+      return { models: withAutoFirst(await provider.fetchAvailableModels(backend)) }
     },
     refetchInterval: selectableAgent ? false : modelListRefetchInterval,
     enabled: (enabled ?? true) && canDiscover,

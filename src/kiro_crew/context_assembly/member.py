@@ -285,8 +285,9 @@ _MEMBER_BRIEFING_ITEM_UNAVAILABLE = _prompt("conductor.briefing_item_unavailable
 # that file any more, so it is the USER's note now, and the text says so: it can
 # be out of date, the thread wins where the two disagree, and a stale one is the
 # member's to report and the user's to edit or delete (the header names the
-# file). No ``kirocrew-mate`` tool writes the briefing (``update_self`` takes a
-# name, a description and a face), so there is no tool to name instead. The text
+# file). A crewmate with the ``kirocrew-mate`` tools keeps its briefing through
+# ``save_notes``, so ``briefing_writable`` holds wherever the layer is read and
+# it never gets this item: a crewmate this item reaches has no tool to name. The text
 # speaks of the TEMPLATE, not of what the session can reach: a harness that does
 # not enforce a spec's ``tools`` (claude, codex) still offers its own writers,
 # and the template's no-write charter holds there too.
@@ -309,15 +310,14 @@ _MEMBER_BRIEFING_ITEM_NO_FILE_TOOLS = _prompt("conductor.briefing_item_no_file_t
 # ``test_dashboard_manager_agent.py::test_the_base_prompt_names_the_agent_the_installer_writes``
 # reads the name off the installed spec and asserts it appears in this prompt.
 #
-# THE CREWMATE drives its own page, which is a correction. An earlier wording sent
-# every page request to the `kirocrew-dashboard-manager` subagent and told the
-# crewmate it had no tools for it -- while ``_MEMBER_PANEL_GRANTS`` grants it all six
-# verbs. The crewmate is also the only one of the two whose identity the panel's
-# tools can resolve: they go through ``mcp_core.require_strict_session_key``, which
-# resolves the CALLING session and never a parent through a ``/proc`` walk, because
-# that walk is how a subagent would reach a page that is not its own. A member DM
-# session has that identity; a subagent is a weaker place to stand. So the subagent is
-# extra capacity for a long page job, and the crewmate's own hands are the path.
+# THE CREWMATE drives its own page: ``_MEMBER_PANEL_GRANTS`` grants it every tool
+# this item names. The crewmate is also the only one of the two whose identity the
+# panel's tools can resolve: they go through ``mcp_core.require_strict_session_key``,
+# which resolves the CALLING session and never a parent through a ``/proc`` walk,
+# because that walk is how a subagent would reach a page that is not its own. A
+# member DM session has that identity; a subagent is a weaker place to stand. So the
+# subagent is extra capacity for a long page job, and the crewmate's own hands are
+# the path.
 _MEMBER_DASHBOARD_ITEM = _prompt("conductor.dashboard_item")
 
 
@@ -517,14 +517,21 @@ def build_member_section(
 
         # This crewmate's own Dynamic capabilities preview, off by default.
         manual = crewmate_dynamic_capabilities.restricted_for(member)
-        identity.append(
-            (
-                (_MATE_TOOLS_IDENTITY_MANUAL if manual else _MATE_TOOLS_IDENTITY)
-                if has_mate_tools
-                else _NO_MATE_TOOLS_IDENTITY
-            )
-            + _prompt("conductor.tracking")
+        if not has_mate_tools:
+            mate_tools_identity = _NO_MATE_TOOLS_IDENTITY
+        elif manual:
+            mate_tools_identity = _MATE_TOOLS_IDENTITY_MANUAL
+        else:
+            mate_tools_identity = _MATE_TOOLS_IDENTITY
+        # The ledger tools are named only where this chat's spec mounts and grants
+        # them (``member_mate_tools.binding_has_ledger_tools``); elsewhere the
+        # sentence stays the one every crewmate had before they could be mounted.
+        from kiro_crew.member_mate_tools import binding_has_ledger_tools
+
+        tracking = (
+            "conductor.tracking_ledger" if binding_has_ledger_tools(crew) else "conductor.tracking"
         )
+        identity.append(mate_tools_identity + _prompt(tracking))
 
     parts = ["\n".join(identity)]
     if not desk_withheld:
@@ -609,7 +616,7 @@ def build_member_section(
         # every build.
         from kiro_crew import dashboard_agentic
 
-        dashboard = dashboard_agentic.turn_block(slug)
+        dashboard = dashboard_agentic.turn_block(slug, member)
         if dashboard:
             parts.append("\n\n" + dashboard)
     parts.append("\n[END MEMBER IDENTITY]\n\n")
@@ -623,6 +630,7 @@ def build_v2_essentials(
     member: str,
     member_is_id: bool,
     project: str | None,
+    template_dir: str | None = None,
     workspace: str | None,
     blocks_reads: bool,
     context_groups: frozenset[str] | None,
@@ -651,6 +659,9 @@ def build_v2_essentials(
     the harness is not known to be kiro-cli, so the opt-out is not read and
     the snapshot keeps inheriting: a caller that omits it can never drop the
     global steering on a harness that has nothing delivering it instead.
+
+    ``template_dir`` is a directory whose ``.kiro/agents`` is searched for the
+    templates when ``project`` is ``None``; no project guide is read from it.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
     from kiro_crew.member_essential_context import (
@@ -711,6 +722,7 @@ def build_v2_essentials(
         include_project=include_project,
         inherits_default_resources=inherits_default_resources,
         core_sources_out=core_sources,
+        template_dir=template_dir,
     )
     if execution_template and execution_template != template:
         sources = dict(documents)
@@ -723,6 +735,7 @@ def build_v2_essentials(
             include_project=include_project,
             inherits_default_resources=inherits_default_resources,
             core_sources_out=core_sources,
+            template_dir=template_dir,
         ):
             if source in sources and sources[source] != body:
                 raise MemberEssentialContextError(
@@ -834,7 +847,7 @@ def build_v2_essentials(
     return envelope
 
 
-def operating_mode_block(agent_label: str) -> str:
+def operating_mode_block(agent_label: str, *, ledger: bool = False) -> str:
     """The ``[CREW MEMBER OPERATING MODE]`` block for a member's pinned DM session.
 
     The member is a CONTROLLER: its DM thread stays the identity/management loop
@@ -844,8 +857,35 @@ def operating_mode_block(agent_label: str) -> str:
     and the server authorizes member callers automatically
     (``dashboard/session_control_parts/caller_access.py``), bounded to sessions the member created
     itself -- so the instructions hold with zero configuration.
+
+    *ledger* is :func:`kiro_crew.member_mate_tools.binding_has_ledger_tools` for
+    the crewmate: only then is ``conductor.patrol`` appended, which teaches the
+    record-create-bind-seed dispatch for tracked work and the gated
+    ``watch="work-ledger"`` patrol with its renewal. Without it the block is the
+    one a crewmate had before the ledger could be mounted: the worker report is the
+    patrol and no loop is armed.
     """
-    return _fill("conductor.operating_mode", agent_label=agent_label)
+    block = _fill("conductor.operating_mode", agent_label=agent_label)
+    if ledger:
+        block += ledger_rules_block("conductor.patrol")
+    return block
+
+
+def ledger_rules_block(key: str) -> str:
+    """Crewmate piece *key* with each placeholder filled by the ledger-conductor rule
+    of that name (``agent_parts/spec_prompts.py`` ``_LEDGER_CONDUCTOR_RULES``).
+
+    Those rules are the one copy the root conductor's charter is assembled from as
+    well, so a rule both conductors carry cannot drift between them. A placeholder
+    that names no rule raises ``KeyError``, so a renamed rule fails at the first
+    render rather than reaching a crewmate as a hole. The charter's own outer
+    spacing is stripped; the piece lays its rules out itself.
+    """
+    from kiro_crew import agent as agent_mod
+    from kiro_crew import crewmate_prompts
+
+    rules = agent_mod._LEDGER_CONDUCTOR_RULES
+    return _fill(key, **{name: rules[name].strip() for name in crewmate_prompts.placeholders(key)})
 
 
 def resolve_turn_owner(

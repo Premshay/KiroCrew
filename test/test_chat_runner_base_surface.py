@@ -132,7 +132,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_emit_mcp_oauth_request",
             "function",
-            "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\", server_name: 'str', oauth_url: 'str', card_owned: 'bool' = False, minted_by: 'str' = '') -> 'None'",
+            "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\", server_name: 'str', oauth_url: 'str', card_owned: 'bool' = False, minted_by: 'str' = '', session_id: 'str' = '') -> 'None'",
         ),
         (
             "_supersede_open_mcp_oauth_banners",
@@ -295,7 +295,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_drop_stale_admissions",
             "function",
-            "(state: 'DashboardState', slot: '_ChatSlot') -> 'None'",
+            "(state: 'DashboardState', slot: '_ChatSlot', *, selected_id: 'str | None' = None) -> 'None'",
         ),
         ("_has_user_queued_followup", "function", "(slot: \"'_ChatSlot'\") -> 'bool'"),
         (
@@ -399,7 +399,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_attach_turn_stats",
             "function",
-            "(slot: \"'_ChatSlot'\", elapsed_ms: 'int', credits: 'float', cost_usd: 'float', turn_boundary: 'int' = 0, model: 'str' = '', ttft_ms: 'int' = 0) -> 'bool'",
+            "(slot: \"'_ChatSlot'\", elapsed_ms: 'int', credits: 'float', cost_usd: 'float', turn_boundary: 'int' = 0, model: 'str' = '', ttft_ms: 'int' = 0, turn_start_mid: 'str | None' = None, retries: 'int' = 0) -> 'bool'",
         ),
         (
             "_context_usage_payload",
@@ -419,7 +419,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_emit_turn_metric",
             "function",
-            "(duration_ms: 'int | float | None', stop_reason: 'str | None', slot_key: 'str', *, elapsed_ms: 'int | float | None' = None, exhausted: 'bool' = False, usage: 'object' = None, model: 'str' = '', provider: 'str' = '') -> 'None'",
+            "(duration_ms: 'int | float | None', stop_reason: 'str | None', slot_key: 'str', *, elapsed_ms: 'int | float | None' = None, exhausted: 'bool' = False, usage: 'object' = None, model: 'str' = '', provider: 'str' = '', harness: 'str' = 'unknown', trigger: 'str' = 'other') -> 'None'",
         ),
         (
             "_emit_recovery_outcome",
@@ -528,7 +528,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_native_subagent_close_all",
             "function",
-            "(state, slot, tracker, card_output=None) -> 'None'",
+            "(state, slot, tracker, card_output=None, error: 'str | None' = None) -> 'None'",
         ),
         (
             "_retain_terminal_native",
@@ -765,7 +765,9 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_segment_row_meta",
             "function",
-            "(slot: '_ChatSlot', blocked_links: 'list[dict]', redactions: 'list[dict] | None' = None) -> 'dict | None'",
+            # links_ordered and text: keyword-only and defaulted, so every old caller keeps its shape.
+            "(slot: '_ChatSlot', blocked_links: 'list[dict]', redactions: 'list[dict] | None' = None,"
+            " *, links_ordered: 'bool' = False, text: 'str | None' = None) -> 'dict | None'",
         ),
         ("_SEGMENT_RAW_MAX_CHARS", "value", "int"),
         (
@@ -776,14 +778,19 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_redact_segment",
             "function",
-            "(slot: '_ChatSlot', text: 'str') -> 'tuple[str, list[dict], list[dict]]'",
+            # _ordered_out: keyword-only and defaulted, so every old caller keeps its shape.
+            "(slot: '_ChatSlot', text: 'str', *, _ordered_out: 'list[bool] | None' = None)"
+            " -> 'tuple[str, list[dict], list[dict]]'",
         ),
         (
             "_redact_segment_text",
             "function",
-            # keep_sri_digests: defaulted, so every old caller keeps its shape.
-            "(slot: '_ChatSlot', text: 'str', keep_sri_digests: 'bool' = True)"
-            " -> 'tuple[str, list[dict], list[dict]]'",
+            # judged_sri_values: defaulted, so every old caller keeps its shape.
+            # _ordered_out: keyword-only and defaulted, likewise.
+            # _reveal_pending: keyword-only and defaulted, likewise.
+            "(slot: '_ChatSlot', text: 'str', judged_sri_values: 'Collection[str]' = (),"
+            " *, _ordered_out: 'list[bool] | None' = None,"
+            " _reveal_pending: 'dict[str, str] | None' = None) -> 'tuple[str, list[dict], list[dict]]'",
         ),
         ("_append_command_reply", "function", "(slot: '_ChatSlot', text: 'str') -> 'None'"),
         ("_TOOL_GROUP_ROLES", "value", "frozenset"),
@@ -810,7 +817,8 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_consume_pending_reset",
             "async function",
-            "(state: 'DashboardState', slot: '_ChatSlot', *, allow_discard: 'bool' = False) -> 'bool'",
+            "(state: 'DashboardState', slot: '_ChatSlot', *, allow_discard: 'bool' = False,"
+            " own_turn: 'bool' = False) -> 'bool'",
         ),
     ),
     "slash_commands": (
@@ -822,7 +830,8 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_answer_slash_without_channel",
             "async function",
-            "(state: 'DashboardState', slot: '_ChatSlot', session_key: 'str', command: 'str') -> 'str'",
+            "(state: 'DashboardState', slot: '_ChatSlot', session_key: 'str', command: 'str', "
+            "message: 'str' = '') -> 'str'",
         ),
         (
             "_handle_workflow_command",
@@ -948,6 +957,11 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
         ("_REPLAYS_COMPLETION_KEY", "value", "str"),
         (
+            "idle_slot_admits_drain",
+            "function",
+            "(state: 'DashboardState', slot: '_ChatSlot') -> 'bool'",
+        ),
+        (
             "subagents_hold_user_messages",
             "function",
             "(state: 'DashboardState', session_key: 'str') -> 'bool'",
@@ -962,7 +976,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_turn_start_priority",
             "function",
-            "(*, user_origin: 'bool', crew_log_actor: 'str', provenance_restored: 'bool') -> 'StartPriority'",
+            "(*, user_origin: 'bool', crew_log_actor: 'str', provenance_restored: 'bool', start_background: 'bool' = False) -> 'StartPriority'",
         ),
     ),
     "turn_reply_seams": (

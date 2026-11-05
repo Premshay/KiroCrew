@@ -24,6 +24,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import math
 import socket
 import time
 import urllib.parse
@@ -775,7 +776,17 @@ class TeamsClient:
         Validates the bearer token (401 on failure) BEFORE processing, parses
         the Activity (400 on malformed), fast-acks with 200, and runs the turn
         in a background task so a long turn never times out the POST.
+
+        A CLOSED client refuses with 503 before any processing: the webhook
+        route is pre-registered and outlives the client, so a credential removal
+        that closes this client (``restart_channel`` leaving Teams
+        uncredentialed) must not keep running turns for authenticated,
+        allow-listed senders. The host also clears ``state.teams_on_activity``
+        on close, so this is defence in depth for a request already dispatched
+        to this bound method.
         """
+        if self._closed:
+            return web.Response(status=503, text="Teams channel is not running")
         auth = request.headers.get("Authorization", "")
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         # request.remote is the peer IP when present (real aiohttp request); the
@@ -864,6 +875,14 @@ class TeamsClient:
             )
             return web.Response(status=200)
 
+        # Re-check closed AFTER every processing await (JWT verify, body read):
+        # a request that passed the entry guard can still be mid-flight when the
+        # client closes on a credential removal, and it is not yet in
+        # ``_handler_tasks`` so ``close()``'s cancel sweep cannot reach it.
+        # Without this recheck it would create and register the turn after close,
+        # running an agent turn for an allow-listed sender on a revoked channel.
+        if self._closed:
+            return web.Response(status=503, text="Teams channel is not running")
         task = asyncio.create_task(self._dispatch_activity(activity, claims))
         self._handler_tasks.add(task)
         task.add_done_callback(self._handler_tasks.discard)
@@ -1515,13 +1534,17 @@ class TeamsClient:
         otherwise backs off exponentially. Deliberately unjittered: the retry
         budget is 2 attempts against a per-conversation limit, so there is no
         thundering herd to spread, and a deterministic delay keeps the wait
-        assertable in tests.
+        assertable in tests. A non-finite value (``nan``, ``inf``) counts as
+        absent: NaN passes through ``min``/``max`` unchanged and would make
+        ``asyncio.sleep`` wait forever.
         """
         if retry_after:
             try:
-                return min(max(float(retry_after), 0.5), _RETRY_AFTER_CAP_SECS)
+                value = float(retry_after)
             except (TypeError, ValueError):
-                pass
+                value = math.nan
+            if math.isfinite(value):
+                return min(max(value, 0.5), _RETRY_AFTER_CAP_SECS)
         return min(0.5 * (2**attempt), _RETRY_AFTER_CAP_SECS)
 
     def _record_send_success(self) -> None:

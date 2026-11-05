@@ -15,7 +15,7 @@ behind one per-device switch:
 
 **Settings > Developer > Feature Previews** — switch **Webhooks** on. A
 **Webhooks** row appears in the sidebar immediately (and an "Open Webhooks"
-link on the feature's own card). Developer Mode is NOT required.
+link on the feature's own card).
 
 Nothing about the API changes either way — tokens, the kill switch, and delivery
 all behave the same whether the page is visible or not. The one consequence is
@@ -398,7 +398,7 @@ message:
 ```
 
 `register_hook` takes `hook_id` and `context_summary` and returns the session key
-(`hook:<hook_id>`; from a crew member's session, `hook:<store_id>:<hook_id>`) and
+(`hook:<hook_id>`; from a Bot's session, `hook:<store_id>:<hook_id>`) and
 the webhook URL to hand to the external system. An Incognito or Temporary session
 is refused: `hook registration is disabled for Incognito and Temporary sessions`.
 Registrations live in `~/.kiro/crew/hooks.json`, written under an exclusive lock

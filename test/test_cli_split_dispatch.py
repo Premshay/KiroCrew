@@ -138,7 +138,6 @@ def test_a_command_hands_its_namespace_to_its_handler(
 
 # Commands whose handler the facade binds, and which take the parsed namespace.
 _FACADE_HANDLERS = [
-    (("knowledge", "stats"), "_knowledge"),
     (("consolidate",), "_consolidate_cmd"),
     (("config", "get"), "_config_cmd"),
 ]
@@ -198,6 +197,7 @@ _EXIT_HANDLERS = [
     (("sandbox", "status"), "kiro_crew.cli_server", "_sandbox_cmd"),
     (("kas", "status"), "kiro_crew.cli_kas", "kas_cmd"),
     (("cloud", "list"), None, "handle_cloud"),
+    (("knowledge", "stats"), None, "_knowledge"),
 ]
 
 
@@ -335,12 +335,11 @@ def test_computer_forwards_its_remaining_arguments(
         (("update",), "_update", ((), {"force": False})),
         (("update", "--force"), "_update", ((), {"force": True})),
         (("update", "approve"), "_update_approve", ((), {})),
-        (("file-delivery", "approve"), "_file_delivery_approve", ((), {})),
         (("stop", "--port", "7001"), "_stop", ((7001,), {"expect_pid": None})),
         (("restart", "--port", "7002"), "_restart", ((7002,), {})),
         (("gateway-pid",), "_gateway_pid", ((), {})),
     ],
-    ids=["update", "update-force", "update-approve", "file-delivery", "stop", "restart", "pid"],
+    ids=["update", "update-force", "update-approve", "stop", "restart", "pid"],
 )
 def test_a_gateway_control_command_reaches_its_server_handler(
     booted: list[str],

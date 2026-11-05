@@ -333,6 +333,18 @@ def _is_windows_system_dir(p: Path) -> bool:
     return False
 
 
+#: Process-lifetime pin for :func:`_valid_override_home`: ``(raw KIROCREW_HOME,
+#: validated result)``. ``data_home()`` asks for the override on every call, and a
+#: fresh ``realpath`` each time costs tens of microseconds -- one ``Path.resolve``
+#: per row on a listing route. Keyed on the raw env string like
+#: ``_scratch_root_override_pin``: a CHANGED value is resolved and validated afresh,
+#: while a repoint of the SAME string's symlink target is frozen out, so every
+#: caller in the process agrees on one home. A relative or ``~`` value is likewise
+#: anchored to the cwd and ``HOME`` of the first call. ``None`` means "not yet
+#: computed"; tests reset it with ``_resolved_home``.
+_override_home_pin: tuple[str, Path | None] | None = None
+
+
 def _valid_override_home() -> Path | None:
     """Return the resolved ``KIROCREW_HOME`` override iff it is set AND valid.
 
@@ -340,14 +352,19 @@ def _valid_override_home() -> Path | None:
     POSIX system directory (``/usr``, ``/System``, ``/etc``) is refused —
     ``config_dir()`` ignores it and falls back to the default home. Shared by
     ``config_dir()`` and ``data_home()`` so both agree on when an override is
-    actually selected.
+    actually selected. Resolved once per distinct raw value; see
+    :data:`_override_home_pin`.
     """
+    global _override_home_pin
     override = os.environ.get("KIROCREW_HOME")
     if not override:
         return None
-    p = Path(override).expanduser().resolve()
-    if _is_unsafe_home(p):
-        return None
+    pin = _override_home_pin
+    if pin is not None and pin[0] == override:
+        return pin[1]
+    resolved = Path(override).expanduser().resolve()
+    p = None if _is_unsafe_home(resolved) else resolved
+    _override_home_pin = (override, p)
     return p
 
 
@@ -721,10 +738,19 @@ def _validate_scratch_root_override() -> tuple[Path | None, str | None]:
     # to inherit (allocation creates it owner-only), so only an existing one is checked.
     # Fail-closed: an owner that cannot be read is an owner that cannot be trusted. A lazy,
     # in-function import keeps this module an import-time leaf (see the module docstring).
-    if p.exists():
-        reason = scratch_root_owner_refusal(p)
-        if reason is not None:
-            return None, reason
+    #
+    # ``Path.exists()`` swallows only "not found" errors, so a value whose stat is denied
+    # (on Windows a ``::$DATA`` spelling of a real directory raises ``WinError 5``) would
+    # escape here and out of ``scratch_root()`` on every call. A root that cannot be
+    # stat'ed cannot have its owner verified either, so it is refused the same fail-closed
+    # way as an unreadable owner, and the caller pins the default and logs once.
+    try:
+        if p.exists():
+            reason = scratch_root_owner_refusal(p)
+            if reason is not None:
+                return None, reason
+    except OSError:
+        return None, "unreadable"
     return p, None
 
 

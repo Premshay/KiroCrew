@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from kiro_crew import arcs
 from kiro_crew.arc_metrics import (  # noqa: F401  (re-exported for the report's callers and tests)
     _median_max,
     _minutes,
@@ -51,12 +52,12 @@ def _aware(value: str) -> str:
 
 
 def gh_json(args: list[str]) -> Any:
-    out = subprocess.run(["gh", *args], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     return json.loads(out)
 
 
 def gh_text(args: list[str]) -> str:
-    return subprocess.run(["gh", *args], capture_output=True, text=True, check=True).stdout
+    return subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", check=True).stdout
 
 
 def pr_view(number: int, repo: str) -> dict[str, Any]:
@@ -69,18 +70,17 @@ def pr_diff(number: int, repo: str) -> str:
 
 
 def verified_prs(entries: list[dict[str, Any]], repo: str) -> list[dict[str, Any]]:
+    """Merged arc PRs the board recorded from GitHub with a clean reviewer-lane review
+    of their exact final head (see ``kiro_crew.arc_github``), fetched for their guards.
+
+    A GitHub approval is not the gate here: reviews are ``ke-review`` comments.
+    """
     numbers: list[int] = []
     for entry in entries:
-        match = _PULL_RE.search(entry.get("link") or "") if entry["kind"] == "DONE" else None
-        if match and int(match.group(1)) not in numbers:
-            numbers.append(int(match.group(1)))
-    verified = []
-    for number in numbers:
-        pr = pr_view(number, repo)
-        approved = any(r.get("state") == "APPROVED" for r in pr.get("reviews") or [])
-        if pr.get("mergedAt") and approved:
-            verified.append(pr)
-    return verified
+        if entry.get("author") == arcs.GITHUB and entry.get("verified") and entry.get("pr"):
+            if entry["pr"] not in numbers:
+                numbers.append(int(entry["pr"]))
+    return [pr_view(number, repo) for number in numbers]
 
 
 def _norm_line(line: str) -> str:
@@ -120,6 +120,7 @@ def git_ls_tree(base_dir: Path, oid: str) -> list[str]:
         ["git", "-C", str(base_dir), "ls-tree", "-r", "--name-only", oid],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     ).stdout
     return out.splitlines()
@@ -130,6 +131,7 @@ def git_show(base_dir: Path, oid: str, path: str) -> str:
         ["git", "-C", str(base_dir), "show", f"{oid}:{path}"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     ).stdout
 

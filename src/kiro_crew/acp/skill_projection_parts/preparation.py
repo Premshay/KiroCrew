@@ -31,6 +31,7 @@ from kiro_crew.acp.skill_projection_parts.inheritance_overlay import (
     _INHERIT_SOURCE,
     _MANAGED_SETTING,
     _PREVIOUS_INHERITANCE,
+    _UNREADABLE_SETTINGS_ERRORS,
     _inheritance_preference,
     _restore_inheritance,
     _settings,
@@ -72,6 +73,7 @@ from kiro_crew.acp.skill_projection_parts.view_sources import (
 )
 from kiro_crew.agent_discovery import (
     SCOPE_PROJECT,
+    WHOLE_CATALOG_TEMPLATES,
     _read_agent_spec,
     can_inherit_skills,
     inherited_skill_globs,
@@ -112,6 +114,32 @@ logger = logging.getLogger("kiro_crew.acp.skill_projection")
 # ceiling is tripped in this process and never reset.
 _CEILING_FALLBACK_WARNED = False
 _CEILING_FALLBACK_WARNED_LOCK = threading.Lock()
+
+
+def _projection_enabled() -> bool:
+    """Whether a spawn that did not specify ``enabled`` projects at all.
+
+    Either control turns it off: ``KIROCREW_NATIVE_SKILL_PROJECTION=0`` in the
+    process environment, or ``agent.native_skill_projection: false`` in
+    ``config.json``. The config key exists because a GUI-launched gateway never
+    sees an environment variable set after login. A config file with bad JSON
+    still loads, with this key at its default. If loading the config raises,
+    projection is off, as ``mcp_gateway.apps_enabled`` does: the spawn still
+    runs, under the authored agent, and nothing is written to the shared kiro
+    files for an operator who may have opted out.
+    Blocking on a config cache miss; the caller is already off the loop.
+    """
+    if os.environ.get("KIROCREW_NATIVE_SKILL_PROJECTION", "1") == "0":
+        return False
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return bool(KiroCrewConfig.load().agent.native_skill_projection)
+    except Exception:  # noqa: BLE001 - config must never break a spawn
+        logger.warning(
+            "skill projection: config could not be loaded; projection off", exc_info=True
+        )
+        return False
 
 
 def _count_projected_aliases(directory: Path) -> int:
@@ -216,9 +244,12 @@ def project_agent_view(
     # one keeps the view it had and gets no search: it never relied on it, and
     # it is not a search agent, so no session of it is refused either.
     inherited_only = (
-        agent_name != "kirocrew" and not mapped and inherits_skills and can_inherit_skills(spec)
+        agent_name not in WHOLE_CATALOG_TEMPLATES
+        and not mapped
+        and inherits_skills
+        and can_inherit_skills(spec)
     )
-    if agent_name == "kirocrew" or mapped or inherited_only:
+    if agent_name in WHOLE_CATALOG_TEMPLATES or mapped or inherited_only:
         refusal = skill_search_refusal(view)
         if refusal is not None:
             return None, False, refusal
@@ -293,6 +324,59 @@ def project_agent_view(
     return view, search, None
 
 
+def _contested_names(directory: Path) -> frozenset[str]:
+    """The declared names two or more specs in *directory* claim, from the parsed-spec
+    snapshot (stat-revalidated, so no extra read of an unchanged directory)."""
+    from kiro_crew.agent_discovery import parsed_agent_specs
+
+    counts: dict[str, int] = {}
+    try:
+        rows = parsed_agent_specs(directory, operation="native_skill_projection", source="acp")
+    except OSError:
+        return frozenset()
+    for data, _path in rows:
+        name = data.get("name") if isinstance(data, dict) else None
+        if isinstance(name, str):
+            counts[name] = counts.get(name, 0) + 1
+    return frozenset(name for name, count in counts.items() if count > 1)
+
+
+def _has_spec_pin(name: str) -> bool:
+    """Whether ``agent.spec_pins`` pins *name* (read at call time)."""
+    from kiro_crew import agent_spec_pins
+
+    return agent_spec_pins.spec_pin_for(name) is not None
+
+
+def _pinned_source(
+    directory: Path, name: str, errors: dict[str, str], refusals: dict[str, ValueError]
+) -> str | None:
+    """The file name *name*'s view is built from when several specs declare it.
+
+    ``""`` keeps the roster's file (identical claimants, no pin); the pinned file's
+    name when ``agent.spec_pins`` chooses; ``None`` when the resolver refuses
+    (differing claimants with no pin, or a broken pin), with the refusal recorded
+    in *errors* so the name gets no view, and the resolver's exception in *refusals*
+    so the start's error still carries the claimants the file chooser lists.
+    """
+    from kiro_crew.agent_discovery import AmbiguousAgentSpecError, declared_spec_claim
+
+    try:
+        claim = declared_spec_claim(
+            directory, name, operation="native_skill_projection", source="acp"
+        )
+    except AmbiguousAgentSpecError as exc:
+        errors[name] = str(exc)
+        refusals[name] = exc
+        return None
+    except OSError as exc:
+        errors[name] = f"the agents directory could not be read ({exc})"
+        return None
+    if claim is None:
+        return ""
+    return claim.path.name if claim.pinned else ""
+
+
 def prepare_native_skill_projection(
     work_dir: Path,
     *,
@@ -335,7 +419,7 @@ def prepare_native_skill_projection(
     # next boot drain.
     ceiling_tripped = False
     if enabled is None:
-        enabled = os.environ.get("KIROCREW_NATIVE_SKILL_PROJECTION", "1") != "0"
+        enabled = _projection_enabled()
         # The ceiling is a spawn-time admission decision, applied ONLY on this
         # ``enabled is None`` path -- the one that chooses whether to project at
         # all. An explicit ``enabled=True`` is NOT a request to re-decide: the
@@ -393,14 +477,37 @@ def prepare_native_skill_projection(
             return None
         try:
             with workspace_cli_settings_lock(work_dir) as locked_settings:
-                _restore_inheritance(locked_settings, _settings(locked_settings, may_pause=False))
+                try:
+                    local = _settings(locked_settings, may_pause=False)
+                except _UNREADABLE_SETTINGS_ERRORS as exc:
+                    # Nothing proves what the file says, so the rollback is
+                    # skipped and the file left as it is.
+                    logger.warning(
+                        "skill projection: workspace settings unreadable during rollback (%s); "
+                        "leaving them unchanged",
+                        exc,
+                    )
+                    return None
+                _restore_inheritance(locked_settings, local)
         except OSError:
             logger.warning(
                 "skill projection: workspace settings lock unavailable during rollback",
                 exc_info=True,
             )
         return None
-    global_settings = _settings(kiro_home() / "settings" / "cli.json")
+    try:
+        global_settings = _settings(kiro_home() / "settings" / "cli.json")
+    except _UNREADABLE_SETTINGS_ERRORS as exc:
+        # A present but unreadable file (an absent one reads ``{}``) is not a
+        # reason to abort the spawn: fall back to the authored agent and write
+        # nothing, the answer inherits_default_resources gives for the same file.
+        # A caller that needs a view (set_mode's re-preparation)
+        # refuses on ``None`` as it does for a busy lock.
+        logger.warning(
+            "skill projection: global Kiro settings unreadable (%s); using authored agents",
+            exc,
+        )
+        return None
     # Whether kirocrew-core's per-session element can be mounted is decided
     # from the agent spec HERE and from the settings files BY THE MOUNT at each
     # session start (:func:`session_mcp.kiro_control_plane_servers`, whose
@@ -417,25 +524,56 @@ def prepare_native_skill_projection(
     specs: dict[str, dict[str, Any]] = {}
     sources: dict[str, str] = {}
     errors: dict[str, str] = {}
+    refusals: dict[str, ValueError] = {}
     search_agents: set[str] = set()
     display_sizes: dict[str, tuple[int, str]] = {}
     # The skill trees an unmapped custom agent inherits. Crew supplies them through
     # its bounded directory, so such an agent needs the same search tool a mapped
     # one gets -- see agent_discovery.inherited_skill_globs.
     inherited_globs = inherited_skill_globs(work_dir, kiro_home_dir=kiro_home())
+    # Call-time: a module-level name here would be served by the facade as well.
+    from kiro_crew import agent as agent_mod
+    from kiro_crew.acp.default_crew_servers import with_default_crew_servers
+
+    # A crew-bound spec's view carries only the grants the governance ceiling
+    # permits: kiro-cli runs the view, not the authored file, which is never written.
+    governed_names = agent_mod.governed_view_names()
+    # Names two or more user-level specs declare. ``list_agents`` keeps one row per
+    # name, so for these the view's source is the declared-name resolver's answer
+    # (``agent.spec_pins`` applied), and a name it refuses gets no view: kiro-cli is
+    # never handed a name whose file it would choose itself.
+    contested = _contested_names(directory)
+
     for agent in list_agents(project_dir=str(work_dir)):
         if not agent.filename:
             continue
         source_dir = (
             project_agents_dir(str(work_dir)) if agent.scope == SCOPE_PROJECT else directory
         )
-        source = source_dir / agent.filename
+        filename = agent.filename
+        # A pinned name goes through the resolver even with one file left: the pin
+        # may name a file that is gone, which refuses rather than view another one.
+        if agent.scope != SCOPE_PROJECT and (agent.name in contested or _has_spec_pin(agent.name)):
+            chosen = _pinned_source(directory, agent.name, errors, refusals)
+            if chosen is None:
+                continue
+            filename = chosen or filename
+        source = source_dir / filename
         spec = _read_agent_spec(source, operation="native_skill_projection", source="acp")
         if spec is None:
             # A spec ``list_agents`` yielded but the reader refuses here changed
             # between the two reads; skip it, exactly as an absent spec is skipped.
             continue
         display_sizes[agent.name] = (_display_text_bytes(spec), source.absolute().as_posix())
+        if agent.scope != SCOPE_PROJECT:
+            # The knowledge agent must run with zero tools. When the only change to its
+            # file is an injection a filter registered by the edition removes exactly
+            # (the tool writes it back on every launch), the view is built from the
+            # template instead of the file being rewritten.
+            spec = agent_mod.knowledge_view_without_registered_injection(agent.name, spec, source)
+            # A user-level custom agent gets Crew's default servers in its view; the
+            # KAS projection applies the same helper (acp/default_crew_servers.py).
+            spec = with_default_crew_servers(agent.name, spec)
         view, search, refusal = project_agent_view(
             spec,
             source,
@@ -447,6 +585,8 @@ def prepare_native_skill_projection(
         if view is None:
             errors[agent.name] = refusal or ""
             continue
+        if governed_names is None or agent.name in governed_names:
+            agent_mod.govern_shared_template_view(agent.name, view)
         if search:
             search_agents.add(agent.name)
         specs[agent.name] = view
@@ -483,7 +623,17 @@ def prepare_native_skill_projection(
                 # the write below. Every in-product workspace cli.json writer uses
                 # the same sidecar lock, so no effort or Tool Search update can land
                 # between this read and commit.
-                local = _settings(locked_settings, may_pause=False)
+                try:
+                    local = _settings(locked_settings, may_pause=False)
+                except _UNREADABLE_SETTINGS_ERRORS as exc:
+                    # Same fallback as the global read above: no view is
+                    # published and the file is left byte-for-byte.
+                    logger.warning(
+                        "skill projection: workspace Kiro settings unreadable (%s); using "
+                        "authored agents",
+                        exc,
+                    )
+                    return None
                 inherited, preference_source, overlaid = _inheritance_preference(
                     local, global_settings
                 )
@@ -586,6 +736,7 @@ def prepare_native_skill_projection(
                         specs,
                         errors,
                         search_agents,
+                        refusals=refusals,
                     )
                     _remember_view_sources(aliases)
                     # Releases the lease and prunes this home's unleased views

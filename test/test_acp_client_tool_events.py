@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 from acp_client_helpers import _native_projection_for_fake_processes  # noqa: F401 - fixture
@@ -176,6 +176,32 @@ class TestExtractToolEvent:
         assert event is not None
         assert event.kind == EVENT_TOOL_CALL
         assert event.title == "Read"
+
+    def test_the_debug_frame_line_is_redacted(self, caplog):
+        """The raw frame is logged at DEBUG; a credential in the tool's arguments
+        must not reach the log in the clear."""
+        import logging
+
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        token = "ghp_" + "a1B2" * 9
+        msg = JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "Shell",
+                    "kind": "execute",
+                    "toolCallId": "tc-9",
+                    "rawInput": {"command": f"git push https://x:{token}@github.com/o/r"},
+                }
+            },
+        )
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp"):
+            AcpClient()._extract_tool_event(msg)
+        lines = [r.getMessage() for r in caplog.records if "ACP tool_call raw" in r.getMessage()]
+        assert lines, "the debug frame line was not logged"
+        assert all(token not in line for line in lines)
 
     def test_tool_call_with_diff_content(self):
         client = AcpClient()
@@ -768,8 +794,7 @@ class TestApproveTool:
     """Tests for approve_tool always= and recorded-option dispatch."""
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in this module calls monkeypatch.undo()
-    def _recorded_requests(self, monkeypatch):
+    def _recorded_requests(self, _floor_monkeypatch):
         """Every id approved here stands for a request the client built an event for."""
         from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
 
@@ -783,7 +808,7 @@ class TestApproveTool:
             original(self, *args, **kwargs)
             self._permission_gate_events = _Recorded()
 
-        monkeypatch.setattr(AcpClient, "__init__", _init)
+        _floor_monkeypatch.setattr(AcpClient, "__init__", _init)
 
     @pytest.mark.asyncio
     async def test_always_uses_recorded_optionid(self, tmp_path):
@@ -806,11 +831,11 @@ class TestApproveTool:
         client = AcpClient(work_dir=tmp_path)
         client._permission_options[43] = {"once": "allow", "always": "allow_always"}
         client._send_response = AsyncMock()
-        await client.approve_tool(43)
-        client._send_response.assert_awaited_once_with(
-            43,
-            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "allow"}},
-        )
+        assert await client.approve_tool(43) is True
+        assert client._send_response.await_args_list == [
+            call(43, {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": "allow"}})
+        ]
+        assert 43 not in client._permission_options
 
     @pytest.mark.asyncio
     async def test_no_recorded_falls_back_to_literal(self, tmp_path):
@@ -822,16 +847,12 @@ class TestApproveTool:
 
         client = AcpClient(work_dir=tmp_path)
         client._send_response = AsyncMock()
-        await client.approve_tool(44)
-        client._send_response.assert_awaited_with(
-            44,
-            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ONCE}},
-        )
-        await client.approve_tool(45, always=True)
-        client._send_response.assert_awaited_with(
-            45,
-            {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ALWAYS}},
-        )
+        assert await client.approve_tool(44) is True
+        assert await client.approve_tool(45, always=True) is True
+        assert client._send_response.await_args_list == [
+            call(44, {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ONCE}}),
+            call(45, {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": OPTION_ALLOW_ALWAYS}}),
+        ]
 
     @pytest.mark.asyncio
     async def test_explicit_option_id_skips_recorded_pop(self, tmp_path):
@@ -922,11 +943,13 @@ class TestRejectTool:
 
         client = AcpClient(work_dir=tmp_path)
         client._send_response = AsyncMock()
+        assert client._turn_permission_denied is False
         await client.reject_tool(62)
-        client._send_response.assert_awaited_once_with(
-            62,
-            {"outcome": {"outcome": OUTCOME_CANCELLED}},
-        )
+        assert client._send_response.await_args_list == [
+            call(62, {"outcome": {"outcome": OUTCOME_CANCELLED}})
+        ]
+        # The denial can end the turn, which the steer settle reads.
+        assert client._turn_permission_denied is True
 
 
 class TestHandlePermission:
@@ -942,20 +965,23 @@ class TestHandlePermission:
             method="session/requestPermission",
             params={"toolCall": {"title": "bash"}, "options": []},
         )
-        client.approve_tool = AsyncMock()
+        client.approve_tool = AsyncMock(return_value=True)
+        client.reject_tool = AsyncMock()
+        client._send_error = AsyncMock()
 
-        await client._handle_permission(msg)
-        client.approve_tool.assert_awaited_once_with(55)
+        assert await client._handle_permission(msg) is None
+        assert client.approve_tool.await_args_list == [call(55)]
+        assert client.reject_tool.await_count == 0
+        assert client._send_error.await_count == 0
 
 
 class TestReadNewToolResultsSync:
     """Tests for _read_new_tool_results_sync."""
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in this module calls monkeypatch.undo()
-    def _isolate_home(self, tmp_path, monkeypatch):
+    def _isolate_home(self, tmp_path, _floor_monkeypatch):
         """Redirect Path.home to tmp_path so JSONL writes are isolated."""
-        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        _floor_monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     @pytest.mark.parametrize(
         "session_id",

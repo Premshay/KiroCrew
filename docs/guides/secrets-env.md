@@ -43,7 +43,7 @@ with a missing credential.
 ### Route the server through the gateway
 
 The gateway is the only place a reference is resolved, so **route the server
-through the gateway**: in **Developer → MCP Management**, turn routing on for
+through the gateway**: in **Customize → Connections → MCP Servers** (MCP Management), turn routing on for
 the server (this adds it to `mcp_gateway.stub_servers`). For the servers the
 default agent mounts (from either `mcp.json` above), an unrouted server with a
 `secret://` value is not started at all, and a warning names the env key —
@@ -156,7 +156,7 @@ of the file, delete that plaintext copy once you have verified the migration.
 
 ### Channel tokens and the vault
 
-A channel token saved from the dashboard (Settings > Channels) is stored in the
+A channel token saved from the dashboard (Settings > Messaging Channels) is stored in the
 vault under its key name, and its `.env` line is written as
 `KEY=secret://KEY`. A token already in `.env` as plaintext keeps working as it
 is: every channel reader accepts either form, and a hand-edited
@@ -168,8 +168,9 @@ that its `secret://KEY` line pointed at.
 
 A release that predates this behaviour reads a `KEY=secret://KEY` line as the
 token itself, so after a downgrade the channels saved this way fail to
-authenticate. To go back, re-enter each channel token under Settings > Channels
-on the older release (vault values cannot be read back), or put the plaintext
+authenticate. To go back, re-enter each channel token under Settings > Messaging
+Channels on the older release (named Channels before 2026-09-21; vault values
+cannot be read back), or put the plaintext
 token on its `.env` line by hand before downgrading.
 
 ### Jira uses the vault automatically

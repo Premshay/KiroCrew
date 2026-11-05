@@ -39,7 +39,12 @@ from chat_mode_security_helpers import (  # noqa: F401 -- fixtures are requested
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard import chat_persistence, chat_runner, session_control
-from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY, queue_for_next_turn
+from kiro_crew.dashboard.chat_delivery import (
+    BACKGROUND_START_TASKS,
+    START_BACKGROUND_META_KEY,
+    TURN_ACTOR_META_KEY,
+    queue_for_next_turn,
+)
 from kiro_crew.dashboard.chat_title import (
     _counts_as_user_turn,
     _maybe_auto_title,
@@ -258,7 +263,21 @@ async def test_app_on_its_own_slot_keeps_agent_and_theme_writes(state) -> None:
 #: app's send never creates a user slot). A settings-bearing field names a value
 #: the slot keeps; the sample is one that would change ``_user_slot``.
 _TURN_ONLY_BODY_KEYS = frozenset(
-    {"message", "slot", "meta", "steer", "memory_mode", "mode", "responsive"}
+    {
+        "message",
+        "slot",
+        "meta",
+        "steer",
+        "memory_mode",
+        "mode",
+        "responsive",
+        # First submit wins: the revision the send is based on, and Send now
+        # (which only turns steering off). Neither changes a slot setting.
+        "base_revision",
+        "send_now",
+        # A display label for this send's row; the slot keeps nothing.
+        "banner",
+    }
 )
 _SETTINGS_BODY_KEYS: dict[str, object] = {
     "agent": "researcher",
@@ -309,7 +328,8 @@ def test_every_api_chat_body_key_is_classified() -> None:
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    read = _body_keys_read(functions["api_chat"], "body", functions)
+    # The body is read by ``_api_chat_send``; ``api_chat`` wraps it (Crew Mode steer).
+    read = _body_keys_read(functions["_api_chat_send"], "body", functions)
     assert not _TURN_ONLY_BODY_KEYS & _SETTINGS_BODY_KEYS.keys()
     assert read == _TURN_ONLY_BODY_KEYS | _SETTINGS_BODY_KEYS.keys()
 
@@ -512,7 +532,7 @@ async def test_title_refresh_counts_only_the_users_turns(state, actor: str, refr
     slot.title, slot._titled, slot._title_origin = "Old", True, "auto"
     slot._title_low_signal = True  # due at the first user turn
     slot.append("user", "x", "msg msg-u", meta={TURN_ACTOR_META_KEY: actor} if actor else None)
-    generate = AsyncMock(return_value="")
+    generate = AsyncMock(return_value="Fresh title")
 
     with (
         patch("kiro_crew.dashboard.chat_title._generate_refreshed_title", new=generate),
@@ -522,6 +542,7 @@ async def test_title_refresh_counts_only_the_users_turns(state, actor: str, refr
         await maybe_refresh_title(state, slot)
 
     assert generate.called is refreshed
+    assert slot.title == ("Fresh title" if refreshed else "Old")
 
 
 def _app_then_user_turns(slot) -> None:
@@ -1050,7 +1071,8 @@ async def test_a_restored_queue_entry_is_never_a_cron_notification(state) -> Non
     slot._queue = sanitize_restored_queue(durable_queue_entries(live._queue))
     assert slot._queue, "a plain queued send must survive the restart"
 
-    row = await _drain_once(state, slot)
+    # A restored card runs only when the user sends it.
+    row = await _drain_once(state, slot, required_queue_id=slot._queue[0]["id"])
 
     assert row["role"] == "user"
     assert "injectKind" not in (row.get("meta") or {})
@@ -1091,9 +1113,44 @@ async def test_restored_recovery_identity_cannot_continue_a_live_stream(state) -
     )
     slot._queue[0][RESTORED_QUEUE_KEY] = True
 
-    await _drain_once(state, slot, predecessor_actor="app", predecessor_turn_id="turn-a")
+    await _drain_once(
+        state,
+        slot,
+        predecessor_actor="app",
+        predecessor_turn_id="turn-a",
+        required_queue_id=slot._queue[0]["id"],
+    )
 
     assert slot.drain()[0]["cls"] == TURN_END_WIRE_CLS
+
+
+@pytest.mark.parametrize("stamped", [False, True])
+@pytest.mark.asyncio
+async def test_a_background_start_stamp_reaches_the_turn_and_not_the_row(state, stamped) -> None:
+    """The bulk Resume's stamp lowers the turn's start priority and nothing else:
+    the person's origin rides through, and the row's meta never carries it."""
+    slot = _user_slot(state)
+    slot.queue_insert(
+        0,
+        "pick up where you left off",
+        kind=SYNTHETIC_RECOVERY_KIND,
+        meta={START_BACKGROUND_META_KEY: True} if stamped else {},
+        directive_user_origin=True,
+    )
+    run_chat = MagicMock()
+    with (
+        patch.object(chat_runner, "spawn_guarded_turn", side_effect=_spawn_closing_the_turn),
+        patch.object(chat_runner, "_run_chat", new=run_chat),
+    ):
+        assert await chat_runner._start_next_queued_turn(state, slot) is True
+
+    (call,) = run_chat.call_args_list
+    assert call.kwargs["_directive_user_origin"] is True
+    assert call.kwargs.get("_turn_start_background", False) is stamped
+    # The turn task is marked as a background start exactly then, which is how a
+    # bulk Resume tells its own retry from a person's message on the same slot.
+    assert (slot.task in BACKGROUND_START_TASKS) is stamped
+    assert START_BACKGROUND_META_KEY not in (slot.messages[-1].get("meta") or {})
 
 
 @pytest.mark.parametrize("owned", [False, True])
@@ -1104,7 +1161,7 @@ async def test_restored_app_turn_titles_only_an_app_owned_slot(state, owned: boo
     slot = _user_slot(state)
     slot._queue = sanitize_restored_queue(durable_queue_entries(live._queue))
     assert TURN_ACTOR_META_KEY not in slot._queue[0].get("meta", {})
-    row = await _drain_once(state, slot)
+    row = await _drain_once(state, slot, required_queue_id=slot._queue[0]["id"])
     # Exercise the titler's owner exemption independently of queue admission:
     # an app-bound restore may itself be held by containment revalidation.
     slot._app = "crew-keyboard" if owned else ""
@@ -1129,6 +1186,44 @@ async def test_restored_app_turn_titles_only_an_app_owned_slot(state, owned: boo
         assert slot.title != "restored app request"
 
 
+@pytest.mark.asyncio
+async def test_resume_runs_only_the_recovery_and_leaves_restored_cards_queued(state) -> None:
+    slot = _user_slot(state)
+    slot._queue = sanitize_restored_queue([{"id": "old", "content": "restored request"}])
+    slot.queue_insert(0, "[Continue the interrupted turn]", kind=SYNTHETIC_RECOVERY_KIND)
+
+    row = await _drain_once(state, slot)
+    slot.append("assistant", "recovered reply")
+
+    assert row["content"] != "restored request"
+    assert [entry["content"] for entry in slot._queue] == ["restored request"]
+    # The recovery's turn end hands off to the queue; the restored card waits.
+    with (
+        patch.object(chat_runner, "spawn_guarded_turn", side_effect=_spawn_closing_the_turn),
+        patch.object(chat_runner, "_run_chat", new=MagicMock()),
+    ):
+        assert await chat_runner._start_next_queued_turn(state, slot) is False
+    assert [entry["content"] for entry in slot._queue] == ["restored request"]
+
+
+@pytest.mark.asyncio
+async def test_a_restored_card_chosen_while_a_turn_ran_drains_at_the_turn_end(state) -> None:
+    from kiro_crew.dashboard.slot_queue_repository import RESTORED_SEND_CHOSEN_KEY
+
+    slot = _user_slot(state)
+    slot._queue = sanitize_restored_queue(
+        [{"id": "picked", "content": "picked request"}, {"id": "other", "content": "other"}]
+    )
+    slot.queue_append("fresh user request", directive_user_origin=True)
+    # What "run this next" on a running turn leaves: the card promoted and marked.
+    slot._queue[0][RESTORED_SEND_CHOSEN_KEY] = True
+
+    row = await _drain_once(state, slot)
+
+    assert row["content"] == "picked request"
+    assert [entry["content"] for entry in slot._queue] == ["other", "fresh user request"]
+
+
 @pytest.mark.parametrize("restored_first", [False, True])
 @pytest.mark.asyncio
 async def test_restored_and_fresh_queue_rows_never_merge(state, restored_first: bool) -> None:
@@ -1141,20 +1236,28 @@ async def test_restored_and_fresh_queue_rows_never_merge(state, restored_first: 
     config = KiroCrewConfig()
     config.dashboard.merge_queued_messages = True
     with patch.object(KiroCrewConfig, "load", return_value=config):
-        first = await _drain_once(state, slot)
+        # The fresh entry drains on its own, wherever it sits; the restored
+        # card waits for the user, even at the head of the queue.
+        fresh = await _drain_once(state, slot)
         slot.append("assistant", "first reply")
         assert slot.queue_depth == 1
-        second = await _drain_once(state, slot)
+        assert slot._queue[0]["content"] == "restored app request"
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", side_effect=_spawn_closing_the_turn),
+            patch.object(chat_runner, "_run_chat", new=MagicMock()),
+        ):
+            assert await chat_runner._start_next_queued_turn(state, slot) is False
+        assert slot.queue_depth == 1
+        restored_row = await _drain_once(state, slot, required_queue_id=slot._queue[0]["id"])
         slot.append("assistant", "second reply")
     assert slot.queue_depth == 0
-    fresh, restored_row = (second, first) if restored_first else (first, second)
     assert fresh["content"] == "fresh user request"
     assert restored_row["content"] == "restored app request"
     assert _counts_as_user_turn(slot, fresh)
     assert not _counts_as_user_turn(slot, restored_row)
     assert [row["content"] for row in _titling_messages(slot)] == [
         "fresh user request",
-        "second reply" if restored_first else "first reply",
+        "first reply",
     ]
     # Keep the count above the fixed-milestone floor, so counting the restored
     # row incorrectly changes the rebase result instead of hiding under it.

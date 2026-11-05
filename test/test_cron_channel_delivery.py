@@ -1,27 +1,13 @@
 """A cron job's output reaches the channel that scheduled it, not Slack alone.
 
-Delivering an unattended run to Slack and nowhere else leaves a job created
-from Discord (or any other transport) invisible on the surface its owner
-actually watches. Routing is keyed off the job's ORIGIN session key -- the
-session that created it -- because a ``cron:{id}`` key carries no channel
-namespace of its own and so can never name the surface the job belongs to.
+Routing is keyed off the job's ORIGIN session key, because a ``cron:{id}`` key carries
+no channel namespace. Legs: the agent result in ``_cron_callback``,
+``_deliver_cron_response``, ``_alert_cron_failure`` and the agent-job crash alert.
+Also pinned: Slack delivery unchanged, the fail-closed ``channels`` gate on the path,
+credential redaction, and a dashboard fallback when no channel is reachable.
 
-Pinned here, one leg at a time:
-
-* the agent-result delivery in ``_cron_callback``;
-* the post-subagent response (``_deliver_cron_response``);
-* the script/command run-failure alert (``_alert_cron_failure``);
-* the agent-job crash alert.
-
-plus the four properties that make the routing safe and complete: Slack keeps
-its existing delivery untouched, the fail-closed ``channels`` governance gate is
-genuinely on the path, the egress redacts credentials, and a job with no
-reachable channel still lands on the dashboard notification path instead of
-being dropped.
-
-Every collaborator is a double (transport, governance seam, SEL, cron service,
-session manager), so no socket, no subprocess and no write outside the per-test
-``KIROCREW_HOME`` pinned by ``test/conftest.py`` happens.
+Every collaborator is a double, so no socket, subprocess or write outside the per-test
+``KIROCREW_HOME`` happens.
 """
 
 from __future__ import annotations
@@ -95,11 +81,9 @@ def _sessions(
 ) -> MagicMock:
     """A SessionManager double keyed by session key, not by a single return value.
 
-    Two different keys are read on the cron path -- the job's ORIGIN key for the
-    channel leg and the ``cron:{id}`` key for Slack's stored thread -- so a
-    flat ``return_value`` would let one leg answer for the other. ``origin`` is
-    shorthand for binding the Discord key; ``origins`` binds arbitrary keys, so a
-    guard can be tested against a link it would otherwise happily send to.
+    The cron path reads the ORIGIN key and the ``cron:{id}`` key, so a flat
+    ``return_value`` would let one leg answer for the other. ``origin`` binds the
+    Discord key; ``origins`` binds arbitrary keys.
     """
     stored = channels or {}
     links = dict(origins or {})
@@ -138,6 +122,21 @@ def _slack_double() -> MagicMock:
     return slack
 
 
+class _SlackOutbox(MagicMock):
+    """A Slack client that keeps every ``(channel, text)`` it was asked to post."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.posts: list[tuple[str, str]] = []
+
+    async def open_dm(self, user: str) -> str:
+        return "D_OWNER"
+
+    async def post_message(self, channel: str, text: str, *args: Any, **kwargs: Any) -> str:
+        self.posts.append((channel, text))
+        return "111.1"
+
+
 def _job(**overrides: Any) -> CronJob:
     defaults: dict[str, Any] = dict(
         id="j1",
@@ -157,14 +156,9 @@ def _job(**overrides: Any) -> CronJob:
 def _governance(*, permitted: bool = True, deny_sessions: tuple[str, ...] = ()) -> Iterator[Any]:
     """Stub the audited governance seam BOTH gates resolve at call time.
 
-    Two profiles govern one cron send: the cron surface (vetted against
-    ``cron:{id}``) and the destination conversation (vetted against the origin
-    key, inside ``_resolve_channel_target``). ``deny_sessions`` denies only the
-    named session keys, which is what makes the two gates separable -- a single
-    boolean would let either one alone account for a refusal.
-
-    ``_resolve_channel_target`` imports ``vet_and_audit`` inside its own body and
-    the gateway imports it at module load, so both bindings are patched.
+    The cron surface is vetted against ``cron:{id}`` and the destination against the
+    origin key; ``deny_sessions`` denies only named keys so the two gates separate.
+    ``vet_and_audit`` is bound in two places, so both are patched.
     """
     denied = set(deny_sessions)
 
@@ -618,13 +612,13 @@ class TestRunFailureAlertChannelLeg:
         stands the Slack leg down -- so the alert lands on the origin conversation
         and never on the destination the user named.
         """
-        slack = _slack_double()
+        slack = _SlackOutbox()
         orch, tr = _discord_orch(slack=slack)
         job = _job(script="raise SystemExit(1)", message="", channel="C_PINNED")
         await _alert_run_failure(orch, job, "boom")
-        tr.send_message.assert_not_awaited()
-        slack.post_message.assert_awaited()
-        assert slack.post_message.await_args.args[0] == "C_PINNED"
+        assert _sent(tr) == ""
+        assert [channel for channel, _ in slack.posts] == ["C_PINNED"]
+        assert "boom" in slack.posts[0][1]
 
     @pytest.mark.asyncio
     async def test_a_pinned_alert_that_throws_leaves_dedup_alone(self):
@@ -661,13 +655,13 @@ class TestRunFailureAlertChannelLeg:
     @pytest.mark.asyncio
     async def test_an_escaping_channel_error_still_leaves_the_slack_alert(self):
         """The alert's outer guard would swallow the whole rest of the alert."""
-        slack = _slack_double()
+        slack = _SlackOutbox()
         orch, _tr = _discord_orch(slack=slack)
         orch._deliver_cron_to_channel = AsyncMock(side_effect=RuntimeError("transport imploded"))
         job = _job(script="raise SystemExit(1)", message="", channel="C_SLACK")
         await _alert_run_failure(orch, job, "boom")
-        slack.post_message.assert_awaited()
-        assert "boom" in slack.post_message.await_args.args[1]
+        assert [channel for channel, _ in slack.posts] == ["C_SLACK"]
+        assert "boom" in slack.posts[0][1]
 
 
 class TestAgentCrashAlertChannelLeg:
@@ -708,13 +702,13 @@ class TestAgentCrashAlertChannelLeg:
     @pytest.mark.asyncio
     async def test_a_pinned_channel_takes_the_crash_alert_too(self):
         """Same pin rule as the run-failure and result legs."""
-        slack = _slack_double()
+        slack = _SlackOutbox()
         orch, tr = _discord_orch(slack=slack)
         job = _job(channel="C_PINNED")
         await self._crash(orch, job)
-        tr.send_message.assert_not_awaited()
-        slack.post_message.assert_awaited()
-        assert slack.post_message.await_args.args[0] == "C_PINNED"
+        assert _sent(tr) == ""
+        assert [channel for channel, _ in slack.posts] == ["C_PINNED"]
+        assert "context assembly exploded" in slack.posts[0][1]
 
     @pytest.mark.asyncio
     async def test_silent_job_crashes_quietly(self):
@@ -786,13 +780,8 @@ class TestSlackStandsDownOnlyOnConfirmedDelivery:
 class TestFailureAuditNamesOnlyLandedSurfaces:
     """The SEL trail names the surfaces an alert LEFT ON, not the ones configured.
 
-    ``self.slack`` being set means a Slack client exists, which is a different
-    claim from "this alert went out over Slack": the one-surface rule stands the
-    owner DM down whenever the originating channel already heard, and the post can
-    also resolve no channel or raise on the wire. Recording a Slack egress that
-    never happened corrupts the one question the record is kept to answer -- where
-    did this content go -- and it does so silently, in the direction that
-    overstates exposure.
+    A set ``self.slack`` does not mean the alert went over Slack: the owner DM stands
+    down when the origin channel heard, and the post can find no channel or raise.
     """
 
     @staticmethod
@@ -889,12 +878,8 @@ class TestFailureAuditNamesOnlyLandedSurfaces:
 class TestChannelEgressMeetsTheDisplayFloor:
     """`_deliver_channel_reply` is where every proactive channel egress converges.
 
-    Cron results, run-failure alerts, crash alerts and subagent completions all
-    land here, and NONE of them passes a renderer -- a renderer is where a turn
-    gets the display-form floor. So a literal-only scan at this chokepoint is a
-    gap every one of those callers inherits: neither `AKIA**<rest>**` nor
-    `[AKIA](https://x)<rest>` matches a credential pattern as written, and the
-    client renders the markup away and shows the reader an intact key.
+    None of its callers passes a renderer, so a literal-only scan misses
+    `AKIA**<rest>**` and `[AKIA](https://x)<rest>`, which the client renders as a key.
     """
 
     _COLLAPSING = "AKIA**IOSFODNN7EXAMPLE**"

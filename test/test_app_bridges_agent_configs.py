@@ -27,12 +27,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 class TestBuiltinAgentNamesAreNamespaced:
     """Builtin app agents must not squat a generic global agent name.
 
-    kiro-cli resolves an agent by the ``name`` field INSIDE the JSON, not by the
-    namespaced link filename ``_register_agents`` writes into ~/.kiro/agents/
-    (``<app>--<agent>.json``).  Agent names are therefore ONE FLAT GLOBAL
-    namespace: two installed agents claiming the same name collide, and kiro-cli
-    only warns and picks one.  Prefixing with the app id (app ids are unique in
-    the registry) is what makes a public install collision-proof.
+    kiro-cli resolves an agent by the ``name`` field inside the JSON, not the link
+    filename, so names are one flat global namespace; the unique app id prefix avoids
+    collisions.
     """
 
     def _builtin_dirs(self):
@@ -67,12 +64,8 @@ class TestBuiltinAgentNamesAreNamespaced:
 class TestUserAgentEditsSurviveRefresh:
     """App agent JSONs are re-materialized every boot; user edits must survive.
 
-    Registration rewrites these files from the packaged template on each
-    registration (that is what lets a template change land without a reinstall),
-    but a wholesale write silently reverted anything the user had tuned by hand
-    — `model`, extra `toolsSettings` — on every gateway start. Same split as the
-    managed-MCP refresh: framework-derived keys are refreshed (a stale one is a
-    bug), everything else on disk is the user's and wins.
+    Framework-derived keys are refreshed from the template; everything else on disk
+    (`model`, extra `toolsSettings`) is the user's and wins.
     """
 
     def test_user_keys_win_and_owned_keys_are_refreshed(self) -> None:
@@ -109,12 +102,8 @@ class TestUserAgentEditsSurviveRefresh:
     def test_containment_keys_are_refreshed_not_preserved(self) -> None:
         """`managedToolPolicy` / `includeMcpJson` are the framework's, not the user's.
 
-        Preserving them is wrong in BOTH directions, which is why they are owned:
-        a template that later tightens the exclude list would never reach an
-        already-enabled install, and anything that edited the file could drop the
-        exclude list — which the old rule then preserved forever. There is no
-        provenance here to tell a hand edit from last boot's template copy, so the
-        line is drawn by meaning: containment is refreshed, preference is kept.
+        They mean containment, so they are refreshed: a tightened exclude list must reach
+        existing installs, and a file edit must not drop it for good.
         """
         from kiro_crew.apps.bridges import _preserve_user_agent_edits
 
@@ -150,14 +139,8 @@ class TestUserAgentEditsSurviveRefresh:
         """A field the framework computes but forgets to list here would be
         frozen at whatever the on-disk file happened to hold.
 
-        The set is spelled out rather than derived because the rule is a JUDGEMENT
-        per key, not a property of the data: there is no provenance recording what
-        the last template wrote, so a key is owned when it means CONTAINMENT (the
-        framework must be able to tighten it, and nothing may loosen it by editing
-        the file) and unowned when it means PREFERENCE (the user's choice
-        outranks the template's default). Adding a key below is a security
-        decision; adding one to the template without deciding is the bug this
-        guard exists to surface.
+        The set is spelled out because ownership is a judgement per key: CONTAINMENT keys
+        are owned, PREFERENCE keys are the user's. Adding a key is a security decision.
         """
         from kiro_crew.apps.bridges import _FRAMEWORK_OWNED_AGENT_KEYS
 
@@ -188,18 +171,9 @@ class TestUserAgentEditsSurviveRefresh:
 
         from kiro_crew.apps.bridges import _FRAMEWORK_OWNED_AGENT_KEYS
 
-        # Keys a user is MEANT to be able to pin by hand.
-        # Keys a user is MEANT to be able to pin by hand. `welcomeMessage` is
-        # user-facing copy with no containment role, so a reworded greeting must
-        # survive a template refresh — the same reasoning as `description`.
-        #
-        # `skills` belongs here too, not in `_FRAMEWORK_OWNED_AGENT_KEYS`: it is a live field
-        # (`agent_discovery_parts/agent_roster.py` reads `row.get("skills")` into
-        # `AgentInfo.skills`) naming which
-        # skills an agent loads, which is exactly the kind of choice an operator should be able
-        # to change and keep across a refresh — same category as `model`. Framework ownership is
-        # reserved for identity and CONTAINMENT keys, which this is not. Added when the
-        # auto-improvement builtin became the first template to declare it.
+        # Keys a user is MEANT to be able to pin by hand. `welcomeMessage` is user-facing
+        # copy, like `description`. `skills` (read into `AgentInfo.skills`) is a preference
+        # like `model`, not a containment key.
         preferences = {
             "description",
             "model",
@@ -226,16 +200,9 @@ class TestUserAgentEditsSurviveRefresh:
 class TestBuiltinDeclaredResourcesActuallyRegister:
     """A builtin that declares agents/skills must get them registered.
 
-    Two independent framework bugs made this silently fail, and BOTH are
-    silent-by-construction (registration only logs a warning), so they need
-    executable pins rather than review vigilance:
-
-    1. ``_manifest_to_builtin_dict`` (discovery.py) hand-copied a subset of
-       AppManifest fields into the dict that register_builtin_apps() persists as
-       the data-home app.json snapshot. ``agents`` and ``skills`` were not in
-       that subset, so they never reached the snapshot that register_app() reads.
-    2. ``register_app`` resolved manifest-relative paths against the data-home
-       app dir. A builtin's code lives in the PACKAGE, so every path missed.
+    Registration only logs a warning on failure, so two traps are pinned here:
+    ``_manifest_to_builtin_dict`` must copy ``agents`` and ``skills`` into the snapshot,
+    and paths resolve against the PACKAGE, where a builtin's code lives.
     """
 
     def test_builtin_dict_carries_every_declarative_manifest_field(self):
@@ -283,6 +250,7 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
                 "setup": {"onEnable": "echo hi"},
                 "publishProvider": {"id": "p", "label": "P"},
                 "notifications": {"channels": [{"id": "n", "name": "N"}]},
+                "l10n": {"de": {"displayName": "Sonde"}},
                 "contributes": {
                     "commands": [
                         {
@@ -343,12 +311,8 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
 class TestNeutralizeEntryShape:
     """A neutralize entry must be a complete server spec, not a bare deny.
 
-    kiro-cli's agent loader parses strictly: one mcpServers entry without a
-    command makes it reject the WHOLE agent file — the agent then vanishes from
-    the ACP mode list ("Mode not found" at session time) while `agent list` and
-    `agent validate` still show it, because those use a lenient parser. A bare
-    {"disabledTools": [...]} therefore does not deny a server; it silently
-    unregisters the agent.
+    kiro-cli rejects the WHOLE agent file for an mcpServers entry with no command
+    ("Mode not found"), while `agent list` and `agent validate` still show it.
     """
 
     def test_neutralize_copies_the_full_spec_from_the_global_file(self, monkeypatch):
@@ -426,14 +390,243 @@ class TestNeutralizeEntryShape:
         assert missing == [], f"entries without command: {missing}"
 
 
+class TestDeclaredMcpToolsAreEnforced:
+    """``permissions.mcpTools`` scopes an app agent's managed tools.
+
+    Managed servers mount into every agent, so the declaration becomes a
+    ``managedToolPolicy.exclude`` of every undeclared managed tool.
+    """
+
+    @staticmethod
+    def _manifest(tools, name="app"):
+        from kiro_crew.apps.manifest import AppManifest, Permissions
+
+        return AppManifest(
+            name=name,
+            version="1.0.0",
+            displayName="A",
+            description="A",
+            permissions=Permissions(mcpTools=list(tools)),
+        )
+
+    def test_undeclared_managed_tools_are_excluded(self):
+        from kiro_crew.apps import bridges
+
+        out = bridges._enforce_declared_mcp_tools(
+            {"name": "app--a", "tools": []}, self._manifest(["cron_add"])
+        )
+        excl = out["managedToolPolicy"]["exclude"]
+        assert "spawn_run" in excl, "an undeclared managed tool must be withheld"
+        assert "cron_add" not in excl, "a declared managed tool must stay reachable"
+
+    def test_empty_declaration_is_a_no_op(self):
+        from kiro_crew.apps import bridges
+
+        agent = {"name": "app--a", "tools": ["@app:x"]}
+        out = bridges._enforce_declared_mcp_tools(agent, self._manifest([]))
+        assert out is agent, "an unrestricted app must not get a policy at all"
+        assert "managedToolPolicy" not in out
+
+    def test_an_app_authored_exclude_is_preserved(self):
+        """A union, not a replacement: an app that already hand-excludes a managed
+        tool keeps it alongside the derived exclusions."""
+        from kiro_crew.apps import bridges
+
+        agent = {"name": "app--a", "managedToolPolicy": {"exclude": ["task_run"]}}
+        out = bridges._enforce_declared_mcp_tools(agent, self._manifest(["cron_add"]))
+        excl = out["managedToolPolicy"]["exclude"]
+        assert "task_run" in excl, "the app's own exclusion must survive"
+        assert "spawn_run" in excl, "the derived exclusion must be added too"
+
+    def test_a_present_include_key_is_preserved(self):
+        from kiro_crew.apps import bridges
+
+        agent = {"name": "app--a", "managedToolPolicy": {"include": {"srv": ["t"]}}}
+        out = bridges._enforce_declared_mcp_tools(agent, self._manifest(["cron_add"]))
+        assert out["managedToolPolicy"]["include"] == {"srv": ["t"]}
+        assert "spawn_run" in out["managedToolPolicy"]["exclude"]
+
+    def test_skill_search_is_never_derived_into_the_exclusion(self):
+        """App agents reach their own mapped skills through ``skill_search``, so an
+        app that declares only its own server tools must keep it."""
+        from kiro_crew.apps import bridges
+
+        out = bridges._enforce_declared_mcp_tools(
+            {"name": "app--a"}, self._manifest(["@app/own_tool"])
+        )
+        excl = out["managedToolPolicy"]["exclude"]
+        assert "spawn_run" in excl
+        assert "skill_search" not in excl, "the framework's skill path must stay reachable"
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            "not-an-object",
+            None,
+            ["exclude"],
+            {"exclude": "cron_add"},
+            {"exclude": None},
+            {"exclude": ["task_run", 7]},
+        ],
+    )
+    def test_a_malformed_authored_policy_is_left_for_the_gate_to_refuse(self, policy):
+        """A malformed policy fails closed at the session gate (``policy_unreadable``,
+        every managed tool refused). Rewriting it into a valid exclude would turn that
+        refusal into an allow of the declared tools, so it is returned untouched."""
+        from kiro_crew.apps import bridges
+
+        agent = {"name": "app--a", "managedToolPolicy": policy}
+        out = bridges._enforce_declared_mcp_tools(agent, self._manifest(["cron_add"]))
+        assert out is agent
+        assert out["managedToolPolicy"] == policy
+
+    def test_the_materialized_file_carries_the_exclusion(self, app_env, tmp_path, monkeypatch):
+        """End to end through ``_register_agents``: an app declaring one managed
+        tool gets a materialized agent whose ``managedToolPolicy.exclude`` holds
+        every OTHER managed tool, and never its own declared one."""
+        from kiro_crew.apps import bridges
+        from kiro_crew.apps.manifest import AppManifest
+
+        src = _make_app_source(
+            tmp_path,
+            name="scoped-app",
+            permissions={"cron": True, "mcpTools": ["cron_add"]},
+        )
+        manifest = AppManifest.from_dict(json.loads((src / APP_MANIFEST_FILENAME).read_text()))
+
+        bridges._register_agents("scoped-app", manifest, src)
+
+        written = json.loads((app_env["kiro_agents"] / "scoped-app--my-agent.json").read_text())
+        excl = written["managedToolPolicy"]["exclude"]
+        assert "cron_add" not in excl, "the declared tool stays reachable"
+        assert "spawn_run" in excl and "cron_remove" in excl, "undeclared ones are withheld"
+
+    def test_an_unreadable_server_is_withheld_whole(self, monkeypatch):
+        """A managed server whose tool declaration reads ``None`` has no names to
+        exclude, so it goes to ``excludeServers`` rather than being left out."""
+        import kiro_crew.mcp_discovery_managed as managed
+        from kiro_crew.apps import bridges
+
+        real = managed.managed_tool_names_for_policy
+        monkeypatch.setattr(
+            managed,
+            "managed_tool_names_for_policy",
+            lambda name: None if name == "kirocrew-cron" else real(name),
+        )
+        out = bridges._enforce_declared_mcp_tools({"name": "app--a"}, self._manifest(["spawn_run"]))
+        policy = out["managedToolPolicy"]
+        assert policy["excludeServers"] == ["kirocrew-cron"]
+        assert "cron_remove" not in policy["exclude"], "its names were never read"
+
+    def test_a_readable_universe_writes_no_server_withhold(self):
+        from kiro_crew.apps import bridges
+
+        out = bridges._enforce_declared_mcp_tools({"name": "app--a"}, self._manifest(["cron_add"]))
+        assert "excludeServers" not in out["managedToolPolicy"]
+
+    @pytest.mark.parametrize("value", ["kirocrew-cron", None, ["kirocrew-cron", 3]])
+    def test_a_malformed_authored_exclude_servers_is_left_for_the_gate(self, monkeypatch, value):
+        import kiro_crew.mcp_discovery_managed as managed
+        from kiro_crew.apps import bridges
+
+        monkeypatch.setattr(managed, "managed_tool_names_for_policy", lambda name: None)
+        agent = {"name": "app--a", "managedToolPolicy": {"excludeServers": value}}
+        out = bridges._enforce_declared_mcp_tools(agent, self._manifest(["cron_add"]))
+        assert out is agent
+
+    def test_an_unreadable_server_stays_blocked_end_to_end(self, app_env, tmp_path, monkeypatch):
+        """Materialize with one managed server's declaration unreadable, then ask
+        the gateway's policy read what the session gets: an undeclared tool on that
+        server must be refused, not left callable until a later refresh."""
+        import kiro_crew.mcp_discovery_managed as managed
+        import kiro_crew.mcp_shared as mcp_shared
+        from kiro_crew.apps import bridges
+        from kiro_crew.apps.manifest import AppManifest
+        from kiro_crew.dashboard.handlers import sessions as sessions_mod
+
+        real = managed.managed_tool_names_for_policy
+        monkeypatch.setattr(
+            managed,
+            "managed_tool_names_for_policy",
+            lambda name: None if name == "kirocrew-cron" else real(name),
+        )
+        src = _make_app_source(
+            tmp_path,
+            name="scoped-app",
+            permissions={"mcpTools": ["spawn_run"]},
+        )
+        manifest = AppManifest.from_dict(json.loads((src / APP_MANIFEST_FILENAME).read_text()))
+        bridges._register_agents("scoped-app", manifest, src)
+
+        agents_dir = app_env["kiro_agents"]
+        written = json.loads((agents_dir / "scoped-app--my-agent.json").read_text())
+        answer = sessions_mod._read_managed_tool_policy_uncached(agents_dir, written["name"])
+        assert answer is not None
+        policy = mcp_shared.ToolPolicy(
+            frozenset(answer.get("exclude", [])),
+            "",
+            included={s: frozenset(t) for s, t in answer.get("include", {}).items()},
+        )
+
+        def refused(server: str, tool: str) -> bool:
+            included = policy.include_for(server)
+            return tool in policy.excluded or (included is not None and tool not in included)
+
+        assert refused("kirocrew-cron", "cron_remove"), "an undeclared tool must stay blocked"
+        assert refused("kirocrew-cron", "cron_add")
+        assert not refused("kirocrew-core", "spawn_run"), "the declared tool stays reachable"
+
+    def test_the_restriction_is_recorded_in_sel(self, app_env, tmp_path, monkeypatch):
+        """Deriving the restriction is a permission decision, so materialization
+        records one bounded SEL event naming the app, agent and what is withheld."""
+        from unittest.mock import MagicMock
+
+        import kiro_crew.mcp_discovery_managed as managed
+        from kiro_crew.apps import bridges
+
+        real = managed.managed_tool_names_for_policy
+        monkeypatch.setattr(
+            managed,
+            "managed_tool_names_for_policy",
+            lambda name: None if name == "kirocrew-cron" else real(name),
+        )
+        recorder = MagicMock()
+        monkeypatch.setattr(bridges, "sel", lambda: recorder)
+        src = _make_app_source(tmp_path, name="scoped-app", permissions={"mcpTools": ["spawn_run"]})
+        manifest = AppManifest.from_dict(json.loads((src / APP_MANIFEST_FILENAME).read_text()))
+        bridges._register_agents("scoped-app", manifest, src)
+
+        events = [
+            c.kwargs
+            for c in recorder.log_api_access.call_args_list
+            if c.kwargs.get("operation") == "app_mcp_tools_restricted"
+        ]
+        assert len(events) == 1
+        text = events[0]["resources"]
+        assert "app scoped-app agent my-agent" in text
+        assert "withheld whole: [kirocrew-cron]" in text
+        assert "more]" in text, "the tool list is bounded"
+        assert len(text) < 1000
+
+    def test_an_unrestricted_app_records_nothing(self, app_env, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from kiro_crew.apps import bridges
+
+        recorder = MagicMock()
+        monkeypatch.setattr(bridges, "sel", lambda: recorder)
+        src = _make_app_source(tmp_path, name="open-app", permissions={"mcpTools": []})
+        manifest = AppManifest.from_dict(json.loads((src / APP_MANIFEST_FILENAME).read_text()))
+        bridges._register_agents("open-app", manifest, src)
+        ops = [c.kwargs.get("operation") for c in recorder.log_api_access.call_args_list]
+        assert "app_mcp_tools_restricted" not in ops
+
+
 class TestAppPromptPathIsContained:
     """An app's prompt path is app-controlled and read verbatim as the SYSTEM
     prompt — so it must resolve inside the app's own directories.
 
-    Without the bound, an app writing ``file:///Users/me/.ssh/id_rsa`` into its
-    policy hands a credential file to kiro-cli as the persona, and its contents
-    reach the model. The path is only ever legitimately shipped inside the app or
-    rendered into the app's data dir, so anything else is dropped.
+    Otherwise ``file:///Users/me/.ssh/id_rsa`` would reach the model as the persona.
     """
 
     def _call(self, tmp_path, raw):
@@ -625,15 +818,8 @@ class TestPruneAbortsOnUnreadableAgent:
 class TestShippedAgentTemplatesAreRenderedByTheGateway:
     """A shipped template is rendered BY THE GATEWAY, from values it computes itself.
 
-    An earlier version of this took the app's own provisioned copy from its install dir
-    and verified it was "the template with only placeholders substituted". A reviewer
-    pointed out why that is unsound and they were right: the check constrained WHERE a
-    substitution could appear but not WHAT it could contain — and `{UV_BIN}` is an
-    executable path, so an agent with write access to the engine directory could
-    substitute its own binary and kiro-cli would run it.
-
-    Every value is computable in the gateway, so nothing is read back from the mutable
-    side at all: the bytes come from the immutable package, the values from here.
+    Nothing is read back from the app's install dir: `{UV_BIN}` is an executable path,
+    so a provisioned copy could substitute its own binary for kiro-cli to run.
     """
 
     def test_placeholders_resolve_to_gateway_computed_values(self, tmp_path, app_env):
@@ -810,11 +996,8 @@ class TestRegisterAgentsSnapshotUpkeep:
 class TestRefreshAppAgentsReportsIoFailures:
     """A partial agent rewrite is not a reconciled one.
 
-    `_register_agents` skips a failing agent and continues, so a write that hit ENOSPC
-    left the agent JSON holding the dead MCP url while the caller was told the refresh
-    succeeded. Only the I/O class is collected: this function returns an empty list for
-    several PERMANENT reasons — a self-managed app, a denied one, no declared agents —
-    and a caller that retried on emptiness would spin forever on any of them.
+    `_register_agents` skips a failing agent, so I/O failures are collected. An empty
+    list has PERMANENT causes too, so a caller retrying on emptiness would spin forever.
     """
 
     def _wire(self, monkeypatch, brmod, tmp_path, *, agents=("a.json",)):

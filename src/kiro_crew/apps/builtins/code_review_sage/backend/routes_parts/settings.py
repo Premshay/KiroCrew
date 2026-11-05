@@ -20,8 +20,10 @@ if TYPE_CHECKING:
         atomic_write,
         discovery,
         learning,
+        loads_user_json,
         logger,
         model_registry,
+        read_bytes_with_retry,
         require_owner_dashboard_request,
         review_pool,
         store,
@@ -112,12 +114,12 @@ def _write_review_section(patch: dict) -> dict:
     with _review_settings_lock():
         cfg_path = store.data_dir() / "config.json"
         try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg = loads_user_json(read_bytes_with_retry(cfg_path).decode("utf-8"))
             if not isinstance(cfg, dict):
                 cfg = {}
         except (json.JSONDecodeError, OSError, FileNotFoundError):
             store.ensure_layout()
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg = loads_user_json(read_bytes_with_retry(cfg_path).decode("utf-8"))
         review = cfg.get("review")
         if not isinstance(review, dict):
             review = {}

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncContextManager, TypeGuard
 
 from kiro_crew import _facade_mirror, model_scope  # noqa: F401
+from kiro_crew.acp import relaunch_reload as _relaunch_reload
 from kiro_crew.acp.client import (  # noqa: F401
     DEFAULT_MODEL,
     AcpAuthRequired,
@@ -44,12 +45,14 @@ from kiro_crew.acp.session_mcp import agent_spec_snapshot  # noqa: F401
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (  # noqa: F401
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
@@ -65,6 +68,7 @@ from kiro_crew.acp.types import (  # noqa: F401
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_MATE_WORKER_KIT,
+    ACP_BACKENDS_MATE_WORKER_MCP_TOOL_LIMITS,
     ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT,
     ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
@@ -81,10 +85,14 @@ from kiro_crew.acp.types import (  # noqa: F401
     effort_config_option_id,
     effort_config_option_value,
 )
-from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND  # noqa: F401
+from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.backends import model_registry_namespace  # noqa: F401
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKENDS_EFFORT_AT_LAUNCH,
+    ACP_BACKENDS_MODEL_AT_LAUNCH,
+)
 from kiro_crew.agent_sdk.capabilities import SessionCapabilities, capabilities_for
 from kiro_crew.agent_sdk.tool_search import (  # noqa: F401
     TOOL_SEARCH_DEFAULT_MIN_PCT,
@@ -153,6 +161,7 @@ class AcpProvider(LLMProvider):
         acp_backend: str = "",
         effort_per_model: dict[str, str] | None = None,
         unbound_effort: str = "",
+        inherited_effort: str = "",
         effort_defaults: object = None,
         tool_search: bool | None = None,
         tool_search_min_pct: object = None,
@@ -211,6 +220,15 @@ class AcpProvider(LLMProvider):
         # copy, ``apps.agent_launch``), set by session allocation; ``agent``
         # stays the session's identity. Read by the Kiro runtime start only.
         self.app_launch_agent = ""
+        # The app that owns this session, set by session allocation from the chat
+        # slot's own app (never from transcript metadata). The remote git proxy's
+        # egress check and the cloud start pass it to governance so an app-bound
+        # profile applies.
+        self.owning_app = ""
+        # A Kiro Cloud start's (session_key, agent, app), which every later turn
+        # re-checks governance against (``acp_turns._readmit_cloud_session``);
+        # None for every other session, which then skips the check.
+        self._cloud_governance_scope: tuple[str, str, str] | None = None
         # Kept on the provider, not only on the placeholder client: on the kiro
         # path ``_start_kiro_runtime_impl`` replaces that client with an
         # ``AcpRuntime`` it constructs itself, and a dedicated subagent's
@@ -275,6 +293,10 @@ class AcpProvider(LLMProvider):
         # and bound to that model on every (re)start (``_bind_unbound_effort``).
         self._unbound_effort: str = unbound_effort or ""
         self._unbound_effort_drop_logged: bool = False
+        # The crew/role/chat level a session with no slot pick resolves to,
+        # carried only for a harness that clears effort live (the factory's
+        # ``inherited_effort``): such a clear must land where a cold start does.
+        self._inherited_effort: str = inherited_effort or ""
         self._effort_defaults = effort_defaults
         # The spelling the factory keyed ``effort_per_model`` under.
         self._configured_model: str = model or ""
@@ -465,17 +487,58 @@ class AcpProvider(LLMProvider):
         return str(getattr(self._client, "agent_version", "") or "")
 
     @property
-    def steer_upgrade_notice(self) -> str:
-        """The upgrade notice when this session's adapter is too old to steer, else ``""``.
+    def prompts_written(self) -> int | None:
+        """Prompts this session's turns have written to the backend, or ``None``.
 
-        Read off :attr:`agent_version`, so ``""`` before the handshake and for an
-        adapter that reported no readable version.
+        Forwarded from ``AcpSessionProvider``; a raw ``AcpClient`` keeps no such
+        count, and ``None`` tells a caller that it cannot know whether a turn's
+        prompt went out.
         """
-        from kiro_crew.acp.client_turn_control import steer_version_issue
+        value = getattr(self._client, "prompts_written", None)
+        return value if isinstance(value, int) else None
 
-        return steer_version_issue(
-            str(getattr(self._client, "backend", "") or ""), self.agent_version
+    @property
+    def steer_upgrade_notice(self) -> str:
+        """The notice when this session's adapter cannot steer, else ``""``.
+
+        Too old (:attr:`agent_version` below the steer floor), or its handshake left
+        out the field the steer is gated on (the session card, ``card_for`` with the
+        ``initialize`` result, withdraws ``mid_turn_steer``). ``""`` before the
+        handshake and for an adapter that reported no readable version.
+        """
+        from kiro_crew.acp.client_turn_control import (
+            steer_unadvertised_issue,
+            steer_version_issue,
         )
+
+        backend = str(getattr(self._client, "backend", "") or "")
+        return steer_version_issue(backend, self.agent_version) or steer_unadvertised_issue(
+            backend, getattr(self._client, "initialize_result", None)
+        )
+
+    @property
+    def tested_version_notice(self) -> str:
+        """The notice when this session's harness reports a release outside the one
+        Crew tested it on (goose and codex today), else ``""``. A warning, never a refusal."""
+        from kiro_crew.acp.client_turn_control import untested_version_issue
+
+        backend = str(getattr(self._client, "backend", "") or "")
+        return untested_version_issue(backend, self.agent_version)
+
+    @property
+    def agent_prompt_upgrade_notice(self) -> str:
+        """The upgrade notice when the KAS this session runs drops its agent's prompt,
+        else ``""``. Recorded when the session registered its ``customAgents``."""
+        notice = getattr(self._client, "kas_agent_prompt_notice", "")
+        return notice if isinstance(notice, str) else ""
+
+    @property
+    def withheld_credentials_notice(self) -> str:
+        """The notice naming MCP servers this session started without part of their
+        ``env`` or ``headers``, by key name only, else ``""``. Recorded when the
+        session registered its ``customAgents``."""
+        notice = getattr(self._client, "kas_withheld_credentials_notice", "")
+        return notice if isinstance(notice, str) else ""
 
     @property
     def cwd(self) -> str:
@@ -595,6 +658,18 @@ class AcpProvider(LLMProvider):
         return value if isinstance(value, str) else ""
 
     @property
+    def kas_registered_agents(self) -> list[dict[str, Any]] | None:
+        """The agent batch this session registered with KAS, or ``None`` with no batch."""
+        value = getattr(self._client, "kas_registered_agents", None)
+        return value if isinstance(value, list) else None
+
+    @property
+    def kas_active_mode_id(self) -> str:
+        """The last mode id KAS reported for this session, or ``""``."""
+        value = getattr(self._client, "kas_active_mode_id", "")
+        return value if isinstance(value, str) else ""
+
+    @property
     def is_codex_backend(self) -> bool:
         """True when this ACP provider talks to codex-acp (vs kiro-cli)."""
         return self._client.backend == ACP_BACKEND_CODEX
@@ -618,6 +693,16 @@ class AcpProvider(LLMProvider):
     def is_deepseek_backend(self) -> bool:
         """True when this ACP provider talks to DeepSeek Harness (vs kiro-cli)."""
         return self._client.backend == ACP_BACKEND_DEEPSEEK
+
+    @property
+    def is_copilot_backend(self) -> bool:
+        """True when this ACP provider talks to GitHub Copilot CLI (vs kiro-cli)."""
+        return self._client.backend == ACP_BACKEND_COPILOT
+
+    @property
+    def is_strands_backend(self) -> bool:
+        """True when this ACP provider talks to the Strands CLI (vs kiro-cli)."""
+        return self._client.backend == ACP_BACKEND_STRANDS
 
     @property
     def is_kas_backend(self) -> bool:
@@ -727,6 +812,18 @@ class AcpProvider(LLMProvider):
         return backend
 
     @property
+    def harness_compact_verb_advertised(self) -> bool:
+        """Whether the engine advertised the compaction verb Crew sends for ``/compact``.
+
+        Answered by the inner session provider (``AcpSessionProvider``, from the
+        KAS session handle's ``initialize`` record). Before startup
+        ``self._client`` is the placeholder ``AcpClient``, which has no such
+        attribute, so this reads False. Only a literal ``True`` passes, so a mock
+        never reads as advertised.
+        """
+        return getattr(self._client, "harness_compact_verb_advertised", False) is True
+
+    @property
     def compaction_unmanaged_backend(self) -> str | None:
         """Backend id when neither Crew nor the harness compacts, else ``None``.
 
@@ -781,6 +878,11 @@ class AcpProvider(LLMProvider):
         return self._client.backend in ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS
 
     @property
+    def mate_worker_mcp_tool_limits_supported(self) -> bool:
+        """The MCP half of a crewmate worker's single-tool limits, by opt-in (H6)."""
+        return self._client.backend in ACP_BACKENDS_MATE_WORKER_MCP_TOOL_LIMITS
+
+    @property
     def loaded_capability_template(self) -> str:
         return self._client.loaded_capability_template
 
@@ -817,9 +919,24 @@ class AcpProvider(LLMProvider):
         """
         return getattr(self._client, "mcp_config_wire_reinject", False) is True
 
+    @property
+    def mcp_config_relaunch_reload(self) -> bool:
+        """True when an MCP write reaches this session by relaunch + ``session/load``.
+
+        Answered for the direct ``AcpClient`` from ``ACP_BACKENDS_MCP_RELAUNCH_RELOAD``
+        membership (harness-parity H6/H14); a runtime-backed provider's inner
+        session provider is not an ``AcpClient`` and answers False.
+        """
+        client = self._client
+        return isinstance(client, AcpClient) and _relaunch_reload.mcp_config_relaunch_reload(client)
+
     def mark_mcp_config_changed(self) -> None:
-        """Hand the mark to the inner session provider; nothing to mark before startup."""
-        mark = getattr(self._client, "mark_mcp_config_changed", None)
+        """Hand the mark to the inner session provider, or set it on the direct client."""
+        client = self._client
+        if isinstance(client, AcpClient):
+            _relaunch_reload.mark_mcp_config_changed(client)
+            return
+        mark = getattr(client, "mark_mcp_config_changed", None)
         if callable(mark):
             mark()
 
@@ -886,6 +1003,12 @@ class AcpProvider(LLMProvider):
             return self._client.native_context_documents
         return {}
 
+    def note_user_message(self, text: str) -> None:
+        # Only the shared runtime's session starts a KAS sign-in; the direct
+        # client gets the engine's own OAuth requests and has no trigger.
+        if isinstance(self._client, AcpSessionProvider):
+            self._sign_in_ask: str = text
+
     @property
     def member_dispatch_mounted(self) -> bool | None:
         # Both transports answer from the composition that built THIS session's
@@ -912,17 +1035,25 @@ class AcpProvider(LLMProvider):
         always: bool = False,
         deadline: GrantDeadline | None = None,
         withdraw_if: Callable[[], bool] | None = None,
+        deny_waivers: frozenset[str] = frozenset(),
     ) -> bool:
-        # Passed on only when given, so a call without it reaches the client
-        # exactly as before.
+        # Passed on only when given, so a call without them reaches the client
+        # exactly as before. ``deny_waivers`` are the deny-rule keys a person
+        # overrode on the dashboard card (see ``AcpClient.approve_tool``).
         withdrawal: dict[str, Any] = {}
         if withdraw_if is not None:
             withdrawal["withdraw_if"] = withdraw_if
+        if deny_waivers:
+            withdrawal["deny_waivers"] = deny_waivers
         if deadline is None:
             return await self._client.approve_tool(request_id, always=always, **withdrawal)
         return await self._client.approve_tool(
             request_id, always=always, deadline=deadline, **withdrawal
         )
+
+    def take_batch_refusal(self, request_id: str | int) -> str | None:
+        """The client's batch-guard refusal reason for *request_id*, taken once."""
+        return self._client.take_batch_refusal(request_id)
 
     async def reject_tool(self, request_id: str | int) -> None:
         await self._client.reject_tool(request_id)
@@ -1002,16 +1133,35 @@ class AcpProvider(LLMProvider):
     async def new_conversation(self) -> None:
         """Clean-slate reset on the SAME warm process (no cold start).
 
-        Delegates to the backing client — ``AcpSessionProvider.new_conversation``
-        on the kiro path (``self._client`` is swapped to the session provider by
-        ``start()``), which issues a fresh ``session/new`` on the already-running
+        Delegates to the backing client. Only ``AcpSessionProvider`` has one: a
+        member of ``ACP_BACKENDS_ACP_RUNTIME`` gets it as ``self._client`` from
+        ``start()``, and it issues a fresh ``session/new`` on the already-running
         process, skipping subprocess spawn + the ``initialize`` handshake. This is
         the primitive a warm session pool uses to reuse one worker across
-        independent tasks without leaking context between them. The claude backend
-        would delegate to its own client-side reset the same way (its ``AcpClient``
-        does not ship one — hence the type ignore).
+        independent tasks without leaking context between them.
+
+        A backend on its own ``AcpClient`` (claude and every other per-session
+        adapter) has no such reset, so this raises ``NotImplementedError`` naming
+        the backend, and the caller falls back to killing and respawning the
+        process (``WorkerPool.reset``, ``_start_fresh_conversation``).
         """
-        await self._client.new_conversation()  # type: ignore[attr-defined]
+        new_conversation = getattr(self._client, "new_conversation", None)
+        if new_conversation is None:
+            backend = POLICY_ID_BY_BACKEND.get(self._client.backend, self._client.backend)
+            raise NotImplementedError(
+                f"the {backend!r} backend has no fresh-conversation reset on its live "
+                "process; it is reset by kill and respawn"
+            )
+        await new_conversation()
+
+    def set_delete_delay(self, seconds: float) -> None:
+        """Keep the session's record for ``seconds`` after it ends, then delete it.
+
+        Only a session on the shared runtime can be released and deleted later,
+        so the per-session client ends its sessions as before.
+        """
+        if isinstance(self._client, AcpSessionProvider):
+            self._client.set_delete_delay(seconds)
 
     def is_alive(self) -> bool:
         """Whether the shared client is responsive.
@@ -1046,11 +1196,29 @@ class AcpProvider(LLMProvider):
         """True if a prompt is in flight (and not yet cancelled) on the client."""
         return bool(self._client) and self._client.has_active_turn()
 
+    @property
+    def switches_by_relaunch(self) -> bool:
+        """Whether a model or effort change relaunches this session's process (Strands).
+
+        Such a switch either lands on the same chat or raises with the prior values
+        back in force, so a caller answers the raise as a refusal: it keeps the old
+        setting and does not reset the session, which would cold-start on the refused
+        value and fail the same way.
+        """
+        backend = getattr(self._client, "backend", "")
+        return backend in ACP_BACKENDS_MODEL_AT_LAUNCH or backend in ACP_BACKENDS_EFFORT_AT_LAUNCH
+
     def background_launch(self) -> tuple[float, str] | None:
         """The client's newest background launch, or ``None`` (see base)."""
         if not self._client:
             return None
         return self._client.background_launch()
+
+    @property
+    def turn_survives_disconnect(self) -> bool:
+        return (
+            isinstance(self._client, AcpSessionProvider) and self._client.turn_survives_disconnect
+        )
 
     def has_unfinished_turn(self) -> bool:
         """True if the client reports a native turn that has NOT reached its
@@ -1157,6 +1325,9 @@ class AcpProvider(LLMProvider):
     _ready_confirmed_session = _acp_turns._ready_confirmed_session
     stream = _acp_turns.stream
     stream_command = _acp_turns.stream_command
+    watch_agent_turns = _acp_turns.watch_agent_turns
+    agent_turn_pending = _acp_turns.agent_turn_pending
+    stream_unsolicited = _acp_turns.stream_unsolicited
     compact = _acp_turns.compact
     cancel = _acp_turns.cancel
     steer = _acp_turns.steer
@@ -1177,6 +1348,57 @@ def is_claude_backend(provider: Any) -> TypeGuard[AcpProvider]:
 def is_kiro_backend(provider: Any) -> TypeGuard[AcpProvider]:
     """Check whether the provider implements kiro-cli's deferred protocol."""
     return isinstance(provider, AcpProvider) and provider.is_kiro_backend
+
+
+def _provider_backend(provider: Any) -> Any:
+    """The backend id *provider* talks to, or ``None`` for a shape that carries none.
+
+    Private on purpose: ``llm_helpers.provider_backend`` is the public reader
+    and answers ``""`` for a miss, while this one must keep a miss (``None``)
+    apart from kiro-cli's ``""``. Its only caller is the ``harness`` metric
+    attribute, through the driver delegate.
+
+    For the two provider shapes this is the check :func:`provider_label`
+    resolves through, so a caller that needs the raw id (the ``harness`` metric
+    attribute) reads the same answer the session map persists. It also reads a
+    bare ``AcpSessionHandle`` and an ``AcpRuntime``, which the background
+    one-liner path passes in place of a provider. ``None`` keeps "not a provider" apart from
+    kiro-cli, whose own id is the empty string (see
+    ``agent_sdk.backend_identity`` for why a blind ``getattr`` default of
+    ``""`` would conflate them). The value is returned as found, so a caller
+    decides what a non-string means.
+    """
+    backend = _provider_shape_backend(provider)
+    if backend is not None:
+        return backend
+    # The two shapes a background one-liner hands out as its turn's
+    # ``model_source``: a runtime-owned session handle, and the runtime itself.
+    # Neither is a provider, so ``provider_label`` (which keys the session map)
+    # deliberately does not read them; only this attribution read does.
+    if isinstance(provider, AcpSessionHandle):
+        runtime = getattr(provider, "_runtime", None)
+        return None if runtime is None else getattr(runtime, "acp_backend", None)
+    if isinstance(provider, AcpRuntime):
+        return provider.acp_backend
+    return None
+
+
+def _provider_shape_backend(provider: Any) -> Any:
+    """The backend of the two PROVIDER shapes, or ``None``.
+
+    The shape check :func:`provider_label` resolves through. An ``AcpProvider``
+    with no client yet carries no backend, so it is ``None`` here rather than
+    kiro-cli's ``""``; the label maps both to the default, so its answer is
+    unchanged.
+    """
+    if isinstance(provider, AcpSessionProvider):
+        return provider.backend
+    if isinstance(provider, AcpProvider):
+        client = getattr(provider, "client", None)
+        if client is None:
+            return None
+        return getattr(client, "backend", "")
+    return None
 
 
 def provider_label(provider: Any) -> str:
@@ -1201,11 +1423,8 @@ def provider_label(provider: Any) -> str:
     override = getattr(provider, "_session_provider_label", "")
     if isinstance(override, str) and override:
         return override
-    if isinstance(provider, AcpSessionProvider):
-        backend = provider.backend
-    elif isinstance(provider, AcpProvider):
-        backend = getattr(getattr(provider, "client", None), "backend", "")
-    else:
+    backend = _provider_shape_backend(provider)
+    if backend is None:
         return PROVIDER_LABEL_DEFAULT
     # The claude test stays a NAME check ahead of the mapping rather than folding
     # into it: ``is_claude_backend_name`` accepts every spelling this build treats

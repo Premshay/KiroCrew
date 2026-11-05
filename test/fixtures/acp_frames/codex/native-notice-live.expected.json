@@ -1,0 +1,20 @@
+[
+  {
+    "agent_version": "2.3.0",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "notice",
+        "notice_severity": "warning",
+        "title": "Model metadata for `gpt-5-codex` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "notice"
+  }
+]

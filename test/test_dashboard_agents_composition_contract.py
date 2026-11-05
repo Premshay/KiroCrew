@@ -48,6 +48,14 @@ from kiro_crew._facade_compose import compose as facade_compose
 from kiro_crew.dashboard import agent_admin
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
+# One worker per file, so the shared checks run beside the tests that load this module.
+pytestmark = pytest.mark.xdist_group(name="dashboard_agents_composition_contract")
+
+SHARED_FACADE_CHECKS = (
+    "the_globstar_matcher_reads_patterns_as_the_reviewers_do",
+    "the_owner_set_is_the_package",
+)
+
 _FACADE = agents.__name__
 _FACADE_PATH = Path(agents.__file__).resolve()
 _OWNER_PACKAGE = agent_admin.__name__
@@ -198,6 +206,7 @@ _BASE_OWNERS: dict[str, tuple[str, ...]] = {
         """.split()),
     "crew_update": ("_effort_inputs", "api_kirocrew_agent_update"),
     "model_discovery": (
+        "_normalize_model_key",
         "_shared_agent_model_discovery",
         "_discover_agent_models",
         "_agent_runtime_policy",
@@ -236,7 +245,6 @@ _FACADE_DEFS = (
     "_require_owner",
     "_supply_live_enum",
     "api_config_schema",
-    "_normalize_model_key",
     "_advertised_cc_models",
     "_entitled_kiro_models",
     "_cc_models",
@@ -474,10 +482,6 @@ def test_a_star_import_carries_the_moved_public_names(tmp_path: Path) -> None:
 # ── the composition ───────────────────────────────────────────────────────────
 
 
-def test_the_owner_set_is_the_package() -> None:
-    assert {info.name for info in pkgutil.iter_modules([str(_OWNER_DIR)])} == set(_BASE_OWNERS)
-
-
 def _shape(obj: Any) -> str:
     if inspect.isclass(obj):
         return "class"
@@ -496,19 +500,19 @@ def test_every_moved_name_is_one_object_in_its_owner() -> None:
     ]
     assert strays == []
     names = [name for group in _BASE_OWNERS.values() for name in group]
-    assert len(names) == len(set(names)) == 100
+    assert len(names) == len(set(names)) == 101
 
 
 def test_the_moved_names_keep_their_base_shapes() -> None:
     lines = sorted(f"{name} {_shape(getattr(agents, name))}" for name in _MOVED)
-    assert len(lines) == 100
+    assert len(lines) == 101
     extension_names = set(_BASE_OWNERS["model_discovery"] + _BASE_OWNERS["slash_commands"])
     base_lines = [line for line in lines if line.split()[0] not in extension_names]
     assert len(base_lines) == 93
     assert hashlib.sha256("\n".join(base_lines).encode()).hexdigest() == _BASE_SHAPE_DIGEST
     # Pin the fork's moved contracts separately while retaining upstream's digest.
     assert hashlib.sha256("\n".join(lines).encode()).hexdigest() == (
-        "6288616d1862a87b4a822a7a597a6b6976c1417980abaf9394f7903c278f5c12"
+        "b3a3d3ba8347e4353c69cf38485c09772cb78910772c6e03988415a04aab31b1"
     ), "\n".join(lines)
 
 
@@ -1581,13 +1585,6 @@ def _rules_missing_owners(rules: list[dict]) -> tuple[set[str], dict[str, list[s
         if gaps:
             missing[rule["id"]] = gaps
     return matched, missing
-
-
-def test_the_globstar_matcher_reads_patterns_as_the_reviewers_do() -> None:
-    assert _globstar("src/a/**/*.py").match("src/a/b.py")
-    assert _globstar("src/a/**/*.py").match("src/a/x/y/b.py")
-    assert not _globstar("src/a/*.py").match("src/a/x/b.py")
-    assert _globstar("src/a/**").match("src/a/x/b.py")
 
 
 def test_every_review_rule_on_the_facade_also_covers_its_owners() -> None:

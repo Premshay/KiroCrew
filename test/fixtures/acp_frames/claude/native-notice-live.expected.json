@@ -1,0 +1,21 @@
+[
+  {
+    "agent_version": "0.94.0",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "notice",
+        "notice_severity": "warning",
+        "text": "[<hook-command>]: Measured native warning.\n\nOriginal prompt: Exercise the isolated measured-version warning.",
+        "title": "UserPromptSubmit operation blocked by hook:"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "notice"
+  }
+]

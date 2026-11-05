@@ -1048,7 +1048,7 @@ class TestAttachedSessionWake:
             state, SimpleNamespace(id="deadbeef"), member, message
         )
 
-        assert outcome == "queued"
+        assert outcome == "held"
         state.sessions.stop_turn.assert_not_awaited()
         assert slot._stop_state == "idle"
         assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND

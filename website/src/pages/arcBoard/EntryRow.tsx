@@ -9,6 +9,7 @@ import { C, kindVariant } from './theme'
 /** The owner is an author like any lane; the others are named by their role. */
 export function authorLabel(arc: ArcBoardArc, author: string): string {
   if (author === 'owner') return i18nT('pages.arcBoard.owner')
+  if (author === 'github') return i18nT('pages.arcBoard.github')
   return arc.members[author]?.role ?? author
 }
 
@@ -86,6 +87,26 @@ export function EntryRow({
         </div>
       ) : null}
       {entry.link ? <EntryLink link={entry.link} /> : null}
+      {entry.author === 'github' ? (
+        <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]" style={{ color: C.dim }}>
+          {entry.lane ? <span>{authorLabel(arc, entry.lane)}</span> : null}
+          {entry.head ? <span className="font-mono">{entry.head.slice(0, 10)}</span> : null}
+          {entry.verified ? (
+            <Badge variant="ok" className="px-1.5 text-[10px]">
+              {i18nT('pages.arcBoard.verified_by', { who: (entry.reviewers ?? []).join(', ') })}
+            </Badge>
+          ) : (
+            <Badge variant="warn" className="px-1.5 text-[10px]">
+              {i18nT('pages.arcBoard.not_verified')}
+            </Badge>
+          )}
+        </div>
+      ) : null}
+      {entry.signoff ? (
+        <Badge variant="ok" className="mt-1 px-1.5 text-[10px]">
+          {i18nT('pages.arcBoard.signed_off')}
+        </Badge>
+      ) : null}
     </div>
   )
 }

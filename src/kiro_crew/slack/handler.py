@@ -61,8 +61,10 @@ from kiro_crew.config.loader import (  # noqa: F401 - read by the owners
     KIRO_CLI_BUILTIN_AGENTS,
     ConfigReadError,
     KiroCrewConfig,
+    config_local_path,
     config_path,
     read_config_text,
+    read_merged_config_files,
     update_config_locked,
 )
 from kiro_crew.config.paths import kiro_agents_dir, peek_data_home
@@ -154,6 +156,7 @@ from kiro_crew.messaging.session_trust import (  # noqa: F401 - read by the owne
     is_session_trusted,
 )
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
+from kiro_crew.parent_turns import note_turn_landed, settle_turn
 from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 from kiro_crew.platform import current_context
 from kiro_crew.providers.base import (
@@ -194,11 +197,23 @@ from kiro_crew.session_lifecycle import (  # noqa: F401 - read by the owners
     consume_stop_declined,
     decline_stop,
 )
+from kiro_crew.slack import script_hooks as slack_script_hooks  # noqa: F401 - read by the owners
+from kiro_crew.slack.agent_sessions.fence import (  # noqa: F401 - read by the owners
+    _Reset as _TurnScopeReset,
+)
+from kiro_crew.slack.agent_sessions.fence import (
+    enter_turn,
+    exit_turn,
+)
 from kiro_crew.slack.blocks import (  # noqa: F401 - read by the owners
     build_working_blocks,
     deprecation_warning_block,
 )
-from kiro_crew.slack.channel_crew import resolve_channel_crew  # noqa: F401 - read by the owners
+from kiro_crew.slack.channel_crew import (  # noqa: F401 - read by the owners
+    context_template,
+    resolve_channel_crew,
+)
+from kiro_crew.slack.channel_policy import channel_refusal
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.format import (  # noqa: F401 - read by the owners
     SLACK_MSG_LIMIT,
@@ -295,6 +310,9 @@ from kiro_crew.slack.handler_runtime.delivery import (  # noqa: F401
 from kiro_crew.slack.handler_runtime.dispatch import (  # noqa: F401
     _dispatch_before_turn,
     _handle_sessions_command,
+    _is_bang_command,
+    _is_control_message,
+    _message_command_text,
     maybe_handle_keyword_command,
 )
 from kiro_crew.slack.handler_runtime.finalize import (  # noqa: F401
@@ -308,6 +326,7 @@ from kiro_crew.slack.handler_runtime.finalize import (  # noqa: F401
     build_timing_footer,
 )
 from kiro_crew.slack.handler_runtime.inbound import (  # noqa: F401
+    LinkedRoute,
     _apply_privacy_mode,
     _get_agent_for_session,
     _get_default_agent,
@@ -317,13 +336,22 @@ from kiro_crew.slack.handler_runtime.inbound import (  # noqa: F401
     _is_slack_restricted,
     _persist_channel_config,
     _read_thread_overrides,
+    _recorded_selection,
     _set_default_agent,
     adopt_default_agent,
+    channel_agent_mismatch,
+    channel_pinned_agent,
+    closed_dashboard_owner_refused,
+    link_agent_mismatch,
+    linked_slot_channel_mismatch,
     maybe_apply_privacy_modifiers,
     maybe_route_linked_thread,
+    read_link_record,
+    route_linked_thread,
 )
 from kiro_crew.slack.handler_runtime.permission_ladder import (  # noqa: F401
     _answer_permission_request,
+    _batch_refusal_outcome,
     _reject_orphaned_tool,
     _request_approval,
     _screen_tool_call,
@@ -333,8 +361,6 @@ from kiro_crew.slack.handler_runtime.permission_ladder import (  # noqa: F401
 )
 from kiro_crew.slack.handler_runtime.reactions import (  # noqa: F401
     StatusReactionController,
-    _add_phase_reaction,
-    _tool_to_phase,
     phase_emojis,
     refresh_phase_emojis,
 )
@@ -539,17 +565,21 @@ _pending_approvals: dict[str, _PendingApproval] = {}
 # exactly while the loop is unwinding.
 _orphan_rejects: "set[asyncio.Task[bool]]" = set()
 
-# ── Phase-aware reaction constants ──────────────────────────────────────
+# ── Status reaction constants ───────────────────────────────────────────
 
+# A Slack turn wears at most ONE reaction on the message it answers: the
+# ``queued`` ack while it works, and only where Slack shows no native thread
+# status, then nothing once the reply lands (the reply is the done signal) --
+# or the ``error`` reaction when the turn failed.
 _DEFAULT_PHASE_EMOJIS: dict[str, str] = {
     "queued": "eyes",
-    "thinking": "thinking_face",
-    "coding": "man_technologist",
-    "browsing": "globe_with_meridians",
-    "tool": "wrench",
-    "done": "lobster",
     "error": "scream",
 }
+
+# ``slack.reactions`` keys of the retired per-phase trail (thinking, coding,
+# browsing, tool) and its ``done`` reaction. A config written for that trail
+# still loads: these are accepted and ignored rather than reported as unknown.
+_RETIRED_PHASES: frozenset[str] = frozenset({"thinking", "coding", "browsing", "tool", "done"})
 
 
 def _build_phase_emojis(
@@ -557,19 +587,19 @@ def _build_phase_emojis(
 ) -> tuple[dict[str, str | None], list[str]]:
     """Return ``(phase_emoji_dict, unknown_keys)`` with optional overrides applied.
 
-    A phase value may be ``None`` to suppress that phase entirely (no emoji
-    will be added or swapped in for it).  Stall emojis and transitions from
-    other phases are unaffected.
+    A phase value may be ``None`` to suppress that reaction entirely.
 
     Unknown keys are collected and returned so callers can surface them
     to the user (e.g. startup warning) rather than silently dropping them.
+    Keys of the retired trail (``_RETIRED_PHASES``) are neither applied nor
+    reported.
     """
     result: dict[str, str | None] = dict(_DEFAULT_PHASE_EMOJIS)
     unknown: list[str] = []
     for key, value in (overrides or {}).items():
         if key in _DEFAULT_PHASE_EMOJIS:
             result[key] = value
-        else:
+        elif key not in _RETIRED_PHASES:
             unknown.append(key)
     return result, unknown
 
@@ -596,25 +626,6 @@ if _unknown_phases:
         ", ".join(sorted(_DEFAULT_PHASE_EMOJIS)),
     )
 del _unknown_phases
-
-
-_STALL_EMOJI_SOFT = "yawning_face"
-_STALL_EMOJI_HARD = "fearful"
-
-_STALL_SOFT_SECS = 15.0
-_STALL_HARD_SECS = 45.0
-_PHASE_DEBOUNCE_SECS = 0.7
-
-_TERMINAL_PHASES = frozenset({"done", "error"})
-_IMMEDIATE_PHASES = frozenset({"queued"})
-
-_CODING_TOOLS: frozenset[str] = frozenset(
-    {"Bash", "Write", "Edit", "Read", "Glob", "Grep", "NotebookEdit"}
-)
-_WEB_TOOLS: frozenset[str] = frozenset({"WebFetch", "WebSearch", "Browser"})
-
-_CODING_KINDS: frozenset[str] = frozenset(t.lower() for t in _CODING_TOOLS)
-_WEB_KINDS: frozenset[str] = frozenset(t.lower() for t in _WEB_TOOLS)
 
 
 # Trust/YOLO state
@@ -759,6 +770,9 @@ class _CompactionReplay:
     # Set on the one replay that follows a lost backend session; a second loss
     # inside it ends on a clear error instead of replaying again.
     session_reloaded: bool = False
+    # The first attempt's Hooks-page turn, so a replay neither fires
+    # UserPromptSubmit again nor drops the context it added.
+    hook_turn: Any = None
 
 
 # The privacy-mode machinery lives in ``messaging.privacy_mode`` so a second
@@ -931,6 +945,7 @@ async def handle_message(
     spool_attachments: int = 0,
     _compaction_replay: _CompactionReplay | None = None,
     start_priority: StartPriority = StartPriority.BACKGROUND,
+    user_meta: dict[str, Any] | None = None,
 ) -> None:
     """Route a Slack message through ACP with streaming and tool approval.
 
@@ -963,6 +978,19 @@ async def handle_message(
     attachment files the original text refers to -- their cleanup runs when the
     OUTER call's task ends, after this nested call has returned.
     """
+    # Shared Crew fair admission: with it on, a model message re-enters this
+    # handler inside its admitted run. Control commands keep their sender gates.
+    _sc_args = dict(locals())
+    from kiro_crew.shared_crew import turn_gate as _sc_turn_gate
+
+    if (
+        _compaction_replay is None
+        and not _is_control_message(text)
+        and not _sc_turn_gate.in_channel_turn()
+        and await _sc_turn_gate.admission_on()
+    ):
+        await _sc_turn_gate.run_slack_message(handle_message, _sc_args)
+        return
     Stats().inc_message_received()
     _t0 = time.monotonic()
     # reply_ts is the true Slack thread timestamp (used for posting replies and
@@ -983,7 +1011,9 @@ async def handle_message(
     # hot-reloads by mtime). Default OSS build (no policy) permits, so behavior is
     # unchanged. Silently drop on deny — matching how an unauthorized user is
     # ignored — before any hook/command/turn processing.
-    if not await channel_inbound_permitted("slack"):
+    if not (
+        await channel_inbound_permitted("slack") and not channel_refusal(channel, caller=user_id)
+    ):
         logger.info("slack inbound dropped: denied by channels governance policy")
         return
 
@@ -1039,12 +1069,27 @@ async def handle_message(
         spool_attachments=spool_attachments,
         _compaction_replay=_compaction_replay,
         start_priority=start_priority,
+        user_meta=user_meta,
         _t0=_t0,
         reply_ts=reply_ts,
         session_key=session_key,
     )
-    if await _dispatch_before_turn(turn) and await _run_turn(turn):
-        await _deliver_answer(turn)
+    try:
+        if await _dispatch_before_turn(turn) and await _run_turn(turn):
+            await _deliver_answer(turn)
+            await turn.fire_stop_hooks()
+    except asyncio.CancelledError:
+        # A cancel (``!stop``, warm-pool reclaim, shutdown) can land at any await
+        # in any phase, and ``CancelledError`` passes every ``except Exception``
+        # arm, so the hand-listed clears in the turn and delivery phases never
+        # run. This is the one exit every phase shares. The clear is a tracked
+        # task, not an await, so the cancel re-raises at once; at gateway
+        # shutdown ``cancel_background_tasks`` may stop it, best-effort.
+        track_background_task(asyncio.create_task(turn.clear_working_indicators()))
+        raise
+    finally:
+        # Native Stop's write fence, opened by _run_turn, closes after the answer.
+        turn.close_turn_scope()
 
 
 # ── Slack thread auto-title ─────────────────────────────────────────────

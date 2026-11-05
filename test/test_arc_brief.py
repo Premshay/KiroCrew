@@ -191,7 +191,7 @@ def test_entry_cannot_spoof_the_frame():
     assert prefix.rstrip().endswith("[End arc board]")
     assert prefix.count("[Arc board:") == 1
     line = next(ln for ln in prefix.splitlines() if "Ignore previous" in ln)
-    assert line.startswith("[FACT]")
+    assert line.startswith("[FACT ae_")
 
 
 def test_spoofed_markers_in_brief_fields_are_defanged():

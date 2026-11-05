@@ -1,5 +1,5 @@
 import type { AppDispatch, RootState } from '../store'
-import { createSlot } from '../store/chatSlice'
+import { createSlot, stageToMainComposer } from '../store/chatSlice'
 import type { ChatSlot } from '../types'
 import { isChatPath } from '../hooks/notificationBanner'
 import { appPathname } from './basePath'
@@ -19,6 +19,10 @@ export interface CreatedChatView {
   opened: boolean
   /** The app route the user was on when the create started. */
   from: string
+  /** The create's `prefill` was staged for the new session's composer. False
+   *  when none was asked for, or when storage refused the write: only then may
+   *  the caller hand the prompt over another way. */
+  prefillStaged: boolean
 }
 
 /** The chat pages whose `/<prefix>/<slug>` follows `activeSlot`, so a create
@@ -74,7 +78,29 @@ export async function createChatForView(
   const slot = await pending.unwrap()
   const { lastCreatedActivation, activeSlot } = getState().chat
   const opened = !!slot?.key && lastCreatedActivation?.requestId === pending.requestId && activeSlot === slot.key
-  return { slot, opened, shown: opened && pageOf(appPathname()) === pageOf(from), from }
+  const shown = opened && pageOf(appPathname()) === pageOf(from)
+  // `.unwrap()` drops the meta that says whether the prefill was staged, so read
+  // it from the settled action, after everything above has read the state at the
+  // same moment it always did. Already settled, so this adds no wait.
+  // Only a fulfilled create gets here (`.unwrap()` threw otherwise), and its
+  // action carries the flag on `meta`.
+  const settled = (await pending) as { meta?: { prefillStaged?: boolean } } | undefined
+  const prefillStaged = settled?.meta?.prefillStaged === true
+  return { slot, opened, shown, from, prefillStaged }
+}
+
+/**
+ * Put `prompt` in the composer of `slot`, the session a create just showed,
+ * when the create could not stage it as `prefill`. A staged prefill is
+ * delivered by the slot restore, merged with anything typed while the create
+ * ran; handing it over in memory as well would add it twice, so the in-memory
+ * channel is only the fallback for a storage write that was refused. That
+ * channel is the slot-scoped composer hand-off (`stageToMainComposer`), which
+ * the composer showing `slot` appends to its live draft: text the user typed
+ * while the new session loaded is kept, never replaced.
+ */
+export function handOffUnstagedPrefill(dispatch: AppDispatch, slot: string, prompt: string, staged: boolean): void {
+  if (!staged) dispatch(stageToMainComposer({ slot, text: prompt }))
 }
 
 /**
@@ -84,9 +110,15 @@ export async function createChatForView(
  * on instead of the session the user came from. A popout or embed frame never
  * navigates to `/chat` from any of its pages: its router would redirect that
  * out of the chat, and the frame shows the session on its own. Returns `shown`.
+ *
+ * The page the user stayed on may have started holding a draft while the
+ * create ran, so `navigate` must ask the leave guard when it is called
+ * (`useAskingNavigate`), not before the create. A `navigate` that returns
+ * `false` was refused: the created chat is kept, the user stays put, and this
+ * returns `false` so the caller stages nothing for a session not on screen.
  */
-export function showCreatedChat(view: CreatedChatView, navigate: (route: string) => void): boolean {
+export function showCreatedChat(view: CreatedChatView, navigate: (route: string) => boolean | void): boolean {
   const framed = FRAME_PREFIXES.some(p => view.from.startsWith(p))
-  if (view.shown && !framed && !isChatPath(view.from)) navigate('/chat')
-  return view.shown
+  if (!view.shown || framed || isChatPath(view.from)) return view.shown
+  return navigate('/chat') !== false
 }

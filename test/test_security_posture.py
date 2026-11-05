@@ -24,12 +24,17 @@ import pytest
 import kiro_crew.validation as validation
 from kiro_crew import security, security_posture
 from kiro_crew import sel as _sel_mod
+from kiro_crew.apps import seams as app_seams
 from kiro_crew.security_posture import (
     _CONTROLS,
     PostureItem,
     build_posture_snapshot,
     build_posture_snapshot_async,
 )
+
+
+def _all_output_sinks():
+    return (*security_posture._REDACTION_SINKS, *app_seams.output_sinks())
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -287,7 +292,6 @@ _BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
     "dashboard/session_control_parts/target_authorization.py": 1,
     "dashboard/session_transfer_install.py": 1,
     "dashboard/state_parts/slot_turns.py": 1,
-    "knowledge/agent_fetch.py": 1,
     "mcp_cron_vet.py": 1,
     # The pooled-backend daemon never composes a companion context. Its
     # declared-temp warnings therefore use the baseline pass deliberately.
@@ -416,6 +420,25 @@ class TestSnapshotShape:
             # The UI turns `source` into a GitHub deep link; a typo would render a
             # 404 for every reader of that row.
             assert (repo_root / control["source"]).is_file(), control["source"]
+
+    def test_every_label_and_unit_has_matching_dashboard_wording(self, snapshot):
+        import json
+        from pathlib import Path
+
+        # The dashboard words each control's name and "<count> <unit>" from its
+        # catalog by `key`, so it can translate and pluralize them; the server's
+        # English `label` and `unit` are only the fallback for a key the dashboard
+        # does not know. A rename here without the catalog would leave every
+        # language showing the old words.
+        locales = Path(__file__).resolve().parent.parent / "website/src/i18n/locales"
+        catalog: dict[str, str] = {}
+        for name in ("en.json", "en.manual.json"):
+            settings = json.loads((locales / name).read_text(encoding="utf-8"))["pages"]["settings"]
+            catalog.update(settings.get("postureDisclosure", {}))
+        for control in snapshot["controls"]:
+            key = control["key"]
+            assert catalog.get(f"label_{key}") == control["label"], key
+            assert catalog.get(f"count_{key}_other") == f"{{{{count}}}} {control['unit']}", key
 
     @pytest.mark.asyncio
     async def test_async_builder_matches_the_sync_one(self, snapshot):
@@ -759,7 +782,7 @@ class TestOmissionDetection:
         pkg = Path(security_posture.__file__).resolve().parent
         call = _REDACTOR_CALL_RE
 
-        registered = {module for _label, module, _detail in security_posture._REDACTION_SINKS}
+        registered = {module for _label, module, _detail in _all_output_sinks()}
         allowlisted = security_posture.NON_EGRESS_REDACTION_MODULES
         # The ``security`` package DEFINES the redactors; the posture registry and
         # its inventory owner only name them. The whole package is skipped because the
@@ -810,7 +833,7 @@ class TestOmissionDetection:
         assert not stale, f"allowlisted but no longer calls a redactor: {stale}"
 
     def test_a_module_cannot_be_in_both_buckets(self):
-        registered = {module for _label, module, _detail in security_posture._REDACTION_SINKS}
+        registered = {module for _label, module, _detail in _all_output_sinks()}
         overlap = registered & security_posture.NON_EGRESS_REDACTION_MODULES
         assert not overlap, f"classified as both egress and non-egress: {overlap}"
 
@@ -1056,14 +1079,14 @@ class TestRedactionSinkRegistry:
         from pathlib import Path
 
         pkg = Path(security_posture.__file__).resolve().parent
-        for _label, module, _detail in security_posture._REDACTION_SINKS:
+        for _label, module, _detail in _all_output_sinks():
             assert (pkg / module).is_file(), module
 
     def test_every_named_sink_module_actually_redacts(self):
         from pathlib import Path
 
         pkg = Path(security_posture.__file__).resolve().parent
-        for label, module, _detail in security_posture._REDACTION_SINKS:
+        for label, module, _detail in _all_output_sinks():
             # The claim "this is an output path where redaction is applied" must be
             # true of the module named, or the count is fiction. A CALL is required:
             # an import, a docstring or a comment that mentions a redactor is not one.
@@ -1183,8 +1206,14 @@ class TestRedactionSinkRegistry:
             # THEN redact_credentials, cached by content hash, so a sink calling it is
             # fully covered; test_the_display_redactor_runs_both_scanners pins that.
             "_redact_for_display(",
+            # _redact_project_path (dashboard/file_api/project_dirs.py) is `redact()`,
+            # both scanners, over the whole path; on Darwin only the OS-generated temp
+            # id is withheld from the scan (TestMacosPrefixBoundary pins that).
+            "_redact_project_path(",
+            # Arc board delegates to the member projection, pinned below.
+            "_redacted(",
         )
-        for label, module, detail in security_posture._REDACTION_SINKS:
+        for label, module, detail in _all_output_sinks():
             text = (pkg / module).read_text(encoding="utf-8")
             full = any(w in text for w in dual_pass) or (
                 "redact_credentials" in text and "redact_exfiltration_urls" in text
@@ -1196,6 +1225,15 @@ class TestRedactionSinkRegistry:
                 "does not disclose that — either say which scanner it runs, or fix "
                 "the sink to run both"
             )
+
+    def test_arc_board_projection_runs_both_scanners(self):
+        from kiro_crew.dashboard.handlers import arc_board, arcs
+
+        assert arc_board._redacted is arcs._public
+        url = "https://collect.attacker.example/?token=" + "aB3" * 70 + "&host=corp-laptop"
+        out = arc_board._redacted({"text": f"key AKIAIOSFODNN7EXAMPLE then {url}"})["text"]
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        assert "corp-laptop" not in out and "attacker.example/?token" not in out
 
     def test_the_display_redactor_runs_both_scanners(self):
         """Why ``_redact_for_display(`` is a dual pass above: one input carrying a
@@ -1229,7 +1267,7 @@ class TestRedactionSinkRegistry:
             "display_safe": "display_safe",
             "exfiltration-url scanning only": "redact_exfiltration_urls",
         }
-        for label, module, detail in security_posture._REDACTION_SINKS:
+        for label, module, detail in _all_output_sinks():
             text = (pkg / module).read_text(encoding="utf-8")
             low = detail.lower()
             for claim, symbol in claims.items():
@@ -1246,7 +1284,7 @@ class TestRedactionSinkRegistry:
                 )
 
     def test_sink_labels_are_unique(self):
-        labels = [label for label, _m, _d in security_posture._REDACTION_SINKS]
+        labels = [label for label, _m, _d in _all_output_sinks()]
         assert len(labels) == len(set(labels))
 
 

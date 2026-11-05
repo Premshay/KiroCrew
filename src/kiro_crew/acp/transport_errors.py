@@ -8,6 +8,13 @@ import sys as _sys
 from kiro_crew import _facade_mirror
 from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facade compatibility surface
     _5XX_SEP,
+    MODEL_REGISTRY_UNAVAILABLE_TEXT,
+    _is_request_size_exceeded,
+    format_many_image_dimension_message,
+    is_many_image_dimension,
+    is_model_registry_unavailable,
+    provider_data_text,
+    structured_data_prose,
     _COMPACTION_DETAIL_KEYS,
     _COMPACTION_DETAIL_MAX_CHARS,
     _COMPACTION_DETAIL_PLACEHOLDERS,

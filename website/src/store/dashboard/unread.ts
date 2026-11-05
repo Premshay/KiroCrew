@@ -1,6 +1,7 @@
 import { safeSetItem, safeSetSessionItem } from '../../utils/safeStorage'
 import { newerTs } from '../../lib/slotReadRelay'
 import { slotListHoldTest } from '../../utils/slotListHold'
+import { crewRootOf } from '../../lib/crewMode'
 import type { DashboardState } from '../dashboardSlice'
 
 /** The unread record behind the session badges: its Web Storage persistence,
@@ -177,6 +178,25 @@ export const clearSharedUnreadIfCovered = (slot: string, readTs: string | undefi
   persistSharedUnread({}, [slot])
   return undefined
 }
+/** The message watermark the shared record holds for one slot right now,
+ *  queued arrivals included; undefined when there is none ('' guards
+ *  nothing, and an unparseable value cannot be judged against a row). */
+export const sharedUnreadWatermark = (slot: string): string | undefined => {
+  flushSharedUnread()
+  let record: Record<string, string>
+  try { record = JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}') as Record<string, string> } catch { return undefined }
+  if (!Object.prototype.hasOwnProperty.call(record, slot)) return undefined
+  const w = record[slot]
+  return typeof w === 'string' && Number.isFinite(Date.parse(w)) ? w : undefined
+}
+/** Remove one slot's shared record only if it still holds `watermark`.
+ *  Any write since it was read (a sibling's newer arrival, a queued one
+ *  here) changes the value, and the record is then left alone. */
+export const retireSharedUnreadIfUnchanged = (slot: string, watermark: string): boolean => {
+  if (sharedUnreadWatermark(slot) !== watermark) return false
+  persistSharedUnread({}, [slot])
+  return true
+}
 /** This window's manual reminders, per-tab (sessionStorage): a deliberate
  *  mark-as-unread answers only to the window that made it, so a shared key
  *  would clobber siblings' reminder sets. */
@@ -289,10 +309,21 @@ const statusHeldOrphanTest = (state: DashboardState): ((key: string) => boolean)
   state.slotsListPartial === true,
 )
 
+/** The keys of the Crew Mode crew members among *slots* that the person's lists
+ *  leave out (`crewModeView`): those whose root is a row too, since that root's
+ *  Crew panel lists them. Counts shown to the person skip them; their unread
+ *  entries stay for that panel. A crew member whose root is closed is a row
+ *  again, so it counts. */
+export const crewMemberKeys = (slots: readonly { key: string; crew_root?: string }[]): ReadonlySet<string> => {
+  const keys = new Set(slots.map(s => s.key))
+  return new Set(slots.filter(s => { const root = crewRootOf(s); return !!root && keys.has(root) }).map(s => s.key))
+}
+
 /** The unread keys an embedded instance reports to the Instances hub. */
 export const relayedUnreadKeys = (state: DashboardState): string[] => {
   const isHeldOrphan = statusHeldOrphanTest(state)
-  return (state.unreadSlots ?? []).filter(key => !isHeldOrphan(key))
+  const crewMembers = crewMemberKeys(state.slots ?? [])
+  return (state.unreadSlots ?? []).filter(key => !isHeldOrphan(key) && !crewMembers.has(key))
 }
 
 /** True while slot-list state can hide absent unread sessions from the hub count. */

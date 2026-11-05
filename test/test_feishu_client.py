@@ -571,7 +571,6 @@ class TestSendReply:
         from kiro_crew.feishu.client import LarkClient
 
         client = LarkClient(app_id="a", app_secret="s")
-        # Make the reply fail
         client._lark.im.v1.message.succeed = False
         result = await client.send_reply("msg-1", "Hi")
         assert result is False
@@ -738,8 +737,12 @@ class TestSyncReply:
         from kiro_crew.feishu.client import LarkClient
 
         client = LarkClient(app_id="a", app_secret="s")
-        # Should not raise
-        client._sync_reply("msg-1", "text")
+        client._sync_reply("msg-1", "回复 text")
+        # The request the client built: addressed to the message, with the text
+        # serialized unescaped as a `text` body.
+        (req,) = client._lark.im.v1.message.calls
+        assert req._message_id == "msg-1"
+        assert req._body._content == '{"text": "回复 text"}'
 
 
 # ---------------------------------------------------------------------------
@@ -1043,7 +1046,6 @@ class TestStart:
         assert client._thread.daemon is True
         assert client._thread.is_alive()
 
-        # Clean up: stop and join
         client._ws_client.stop()
         client._thread.join(timeout=1.0)
         assert not client._thread.is_alive()

@@ -16,7 +16,7 @@ import { IS_MAC } from '../../hooks/useKeyboardShortcuts'
 import type { ChatInputProps } from './props'
 import type { MemorySource } from '../../lib/agentMemorySource'
 import { withMemorySource } from '../../utils/agentLabel'
-import type { useAutoCompactThreshold } from './autoCompact'
+import { harnessManagedNoteBackend, type useAutoCompactThreshold } from './autoCompact'
 import { uiLocation } from '../../uiLocations/uiLocation'
 import { useGuidePredicate } from '../../guide/guidePredicates'
 
@@ -27,8 +27,14 @@ import { useGuidePredicate } from '../../guide/guidePredicates'
 export function useShelfMeasure() {
   // Shelf responsiveness: measure the shelf row width and collapse chips to
   // icon-only (agent/project) + drop the model effort label when space is tight.
-  // Truncation handles the in-between cases.
-  const [shelfWidth, setShelfWidth] = useState(9999)
+  // Truncation handles the in-between cases. Only the width's band is state,
+  // not the width: the shelf resizes on every frame a side panel slides, and
+  // a new number each frame re-rendered the whole composer each frame. The
+  // last values are also kept in a ref and a setter runs only on a change: an
+  // equal setState still schedules a composer render when React cannot bail
+  // out early, which it often cannot mid-slide.
+  const [shelfBand, setShelfBand] = useState<'wide' | 'compact' | 'tiny'>('wide')
+  const lastShelf = useRef<{ band: string; h: number }>({ band: 'wide', h: 32 })
   // Border-box height of the shelf, handed to `.glass-shelf::before` as
   // `--glass-shelf-h`: the fade under the shelf is positioned against the
   // dock's input-area wrapper (so it spans exactly the dock root, which already
@@ -43,24 +49,25 @@ export function useShelfMeasure() {
     if (!el || typeof ResizeObserver === 'undefined') return
     const ro = new ResizeObserver(entries => {
       const w = entries[0]?.contentRect.width
-      if (typeof w === 'number') setShelfWidth(w)
+      // Below ~420px the labels no longer fit comfortably alongside the context
+      // bar + model chip, so the chips (agent/project) collapse to icon-only.
+      // A two-column split can leave under 200px per composer. The effort level
+      // on the model chip is the only at-a-glance readout of what a turn runs
+      // at, so it survives the compact collapse and drops only when even a
+      // short word has no room (the picker the chip opens always shows the
+      // level in force).
+      if (typeof w === 'number') {
+        const band = w < 220 ? 'tiny' : w < 420 ? 'compact' : 'wide'
+        if (band !== lastShelf.current.band) { lastShelf.current.band = band; setShelfBand(band) }
+      }
       const h = entries[0]?.borderBoxSize?.[0]?.blockSize ?? entries[0]?.target.getBoundingClientRect().height
-      if (typeof h === 'number' && h > 0) setShelfHeight(h)
+      if (typeof h === 'number' && h > 0 && h !== lastShelf.current.h) { lastShelf.current.h = h; setShelfHeight(h) }
     })
     ro.observe(el)
     shelfRoRef.current = ro
   }, [])
-  // The labels no longer fit alongside the context bar, the model chip AND the
-  // working-tree badge, so collapse the chips (agent/project) to icon-only. The
-  // threshold is a phone width, not 340: a 390px phone leaves the shelf ~364px,
-  // which cleared 340 and overflowed -- the badge then painted over the context
-  // readout. 420 covers the phone range with the labels shed.
-  const shelfCompact = shelfWidth < 420
-  // A two-column split can leave under 200px per composer. The effort level on
-  // the model chip is the only at-a-glance readout of what a turn runs at, so
-  // it survives the compact collapse and drops only when even a short word has
-  // no room (the picker the chip opens always shows the level in force).
-  const shelfTiny = shelfWidth < 220
+  const shelfCompact = shelfBand !== 'wide'
+  const shelfTiny = shelfBand === 'tiny'
   return { shelfRef, shelfHeight, shelfCompact, shelfTiny }
 }
 
@@ -221,10 +228,11 @@ export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agen
 
 /** The context-window readout and its popover (usage, model, the per-session
  *  auto-compact threshold). */
-export function ContextUsageControl({ contextPct, contextUsedTokens, contextWindowTokens, showContextPct, showContextTokens, shelfCompact, modelName, ctxPopoverOpen, setCtxPopoverOpen, ctxPopoverRect, setCtxPopoverRect, ctxWrapRef, ctxPanelRef, autoCompactThreshold }: {
+export function ContextUsageControl({ contextPct, contextUsedTokens, contextWindowTokens, derivePctFromUsed, showContextPct, showContextTokens, shelfCompact, modelName, ctxPopoverOpen, setCtxPopoverOpen, ctxPopoverRect, setCtxPopoverRect, ctxWrapRef, ctxPanelRef, autoCompactThreshold }: {
   contextPct: number
   contextUsedTokens?: number
   contextWindowTokens?: number
+  derivePctFromUsed?: boolean
   showContextPct?: boolean
   showContextTokens?: boolean
   shelfCompact: boolean
@@ -238,15 +246,26 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
   autoCompactThreshold: ReturnType<typeof useAutoCompactThreshold>
 }) {
   const { autoCompactQuery, autoCompact, autoCompactError, setAutoCompactError, pushAutoCompact } = autoCompactThreshold
+  const harnessManagedNote = harnessManagedNoteBackend(autoCompact)
   // The agent default's labels name the crew in mono so it reads as a name, and
   // their tooltip says where that number is set (config only, no UI edits it).
   const agentName = <span className="font-mono">{autoCompact?.agent ?? ''}</span>
   const agentDefaultSource = autoCompact?.agent_pct != null
     ? i18nT('components.chatInput.agent_default_source', { agent: autoCompact.agent ?? '' })
     : undefined
-  const pct = Math.round(contextPct)
   const win = contextWindowTokens || 0
-  const used = contextUsedTokens != null ? contextUsedTokens : (win ? Math.round((pct / 100) * win) : 0)
+  const used = contextUsedTokens != null ? contextUsedTokens : (win ? Math.round((contextPct / 100) * win) : 0)
+  // Only on a model switch does the stored entry carry `used` with NO measured
+  // window (the reducer drops the stale pct and window, keeps `used`): the
+  // caller signals that shape with `derivePctFromUsed`, and the percentage is
+  // derived from `used` against the window this control resolved, so the old
+  // model's percentage never pairs with the new model's window. On every other
+  // frame the backend's reported `contextPct` is used exactly as before — a
+  // backend whose percentage is not simply `used / window` (overhead counted,
+  // or a percentage backfilled against tokens) keeps rendering its own number.
+  const effectivePct = derivePctFromUsed && contextUsedTokens != null && win > 0
+    ? (used / win) * 100
+    : contextPct
   const remaining = win ? Math.max(win - used, 0) : 0
   const approx = contextUsedTokens == null
   const hasKnownWindow = win > 0
@@ -254,15 +273,15 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
   // With no window there is no percentage to colour or plot; the readout
   // degrades to a bare token count rather than asserting a 0% that was never
   // measured.
-  const pctColor = hasKnownWindow ? contextColor(contextPct) : 'var(--text)'
+  const pctColor = hasKnownWindow ? contextColor(effectivePct) : 'var(--text)'
   const showPct = !!showContextPct && hasKnownWindow
   const showTokens = !!showContextTokens && (hasKnownWindow || hasMeasuredUsed)
   // Graceful degrade: on a narrow shelf, collapse to the percentage
   // alone (or tokens, if that's the only segment enabled) so the
   // readout never crowds out the agent/model controls.
   const readout = shelfCompact
-    ? composeContextReadout(contextPct, used, win, { approx, showPct, showTokens: showTokens && !showPct })
-    : composeContextReadout(contextPct, used, win, { approx, showPct, showTokens })
+    ? composeContextReadout(effectivePct, used, win, { approx, showPct, showTokens: showTokens && !showPct })
+    : composeContextReadout(effectivePct, used, win, { approx, showPct, showTokens })
   const bindPress = usePressActivation()
   return (
   <div ref={ctxWrapRef} className="relative flex items-center">
@@ -272,11 +291,11 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
         setCtxPopoverRect(el.getBoundingClientRect())
         setCtxPopoverOpen(o => !o)
       })}
-      title={hasKnownWindow ? contextTip(contextPct) : i18nT('components.chatInput.context_usage')}
+      title={hasKnownWindow ? contextTip(effectivePct) : i18nT('components.chatInput.context_usage')}
       aria-label={i18nT('components.chatInput.context_usage')}
       {...uiLocation('composer.context-usage')}
     >
-      <ContextBar pct={hasKnownWindow ? contextPct : 0} width={40} height={3} decorative={!hasKnownWindow} />
+      <ContextBar pct={hasKnownWindow ? effectivePct : 0} width={40} height={3} decorative={!hasKnownWindow} />
       {!!readout && <span className="text-[11px] ml-1.5 tabular-nums whitespace-nowrap" style={{ color: pctColor }}>{readout}</span>}
     </button>
     {ctxPopoverOpen && ctxPopoverRect && <OverlayPortal>
@@ -290,7 +309,7 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
       >
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-[11px] font-semibold text-text">{hasKnownWindow ? i18nT('components.chatInput.context_window') : i18nT('components.chatInput.context_usage')}</span>
-                  <span className="text-[12px] font-mono font-bold" style={{ color: pctColor }}>{hasKnownWindow ? fmtPercent(contextPctClamped(contextPct) / 100) : fmtTokens(used)}</span>
+                  <span className="text-[12px] font-mono font-bold" style={{ color: pctColor }}>{hasKnownWindow ? fmtPercent(contextPctClamped(effectivePct) / 100) : fmtTokens(used)}</span>
                 </div>
                 <div className="flex flex-col gap-1 text-[11px] font-mono">
                   <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.used')}</span><span className="text-text">{approx ? '~' : ''}{fmtTokens(used)}</span></div>
@@ -327,6 +346,7 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
                       variant="inline"
                       testId="auto-compact-write-error"
                       message={autoCompactError}
+                      announce={false}
                       onDismiss={() => setAutoCompactError('')}
                     />
                   </div>
@@ -361,6 +381,11 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
                         {autoCompact.agent_pct != null
                           ? <Trans i18nKey="components.chatInput.following_agent_default" values={{ pct: Math.round(autoCompact.agent_pct) }} components={{ agent: agentName }} />
                           : i18nT('components.chatInput.following_global', { pct: Math.round(autoCompact.global_pct) })}
+                      </div>
+                    )}
+                    {harnessManagedNote && (
+                      <div className="mt-1 text-[10px] text-muted" data-testid="autocompact-harness-managed-note">
+                        {i18nT('components.chatInput.harness_managed_note', { backend: harnessManagedNote.toUpperCase() })}
                       </div>
                     )}
                   </div>

@@ -183,14 +183,16 @@ def _pr(number, merged=True, state="APPROVED"):
     }
 
 
-def test_verified_outcomes_need_merge_and_approval(monkeypatch):
+def test_verified_outcomes_are_github_records_with_a_reviewed_head(monkeypatch):
     b = Board(monkeypatch, "a")
-    for n in (1, 2, 3):
-        b.add(n, "a", "DONE", link=f"https://github.com/o/r/pull/{n}")
-    prs = {1: _pr(1), 2: _pr(2, merged=False), 3: _pr(3, state="COMMENTED")}
-    monkeypatch.setattr(report, "pr_view", lambda n, repo: prs[n])
+    b.add(1, "a", "DONE", link="https://github.com/o/r/pull/9")  # a lane DONE: not a PR record
     entries, _ = _window(b)
-    assert [p["number"] for p in report.verified_prs(entries, "o/r")] == [1]
+    entries += [
+        {"id": "g1", "kind": "DONE", "author": "github", "pr": 11, "verified": True},
+        {"id": "g2", "kind": "DONE", "author": "github", "pr": 12, "verified": False},
+    ]
+    monkeypatch.setattr(report, "pr_view", lambda n, repo: _pr(n))
+    assert [p["number"] for p in report.verified_prs(entries, "o/r")] == [11]
 
 
 def test_baseline_rows_are_na_for_board_metrics(monkeypatch, capsys):
@@ -230,6 +232,11 @@ def test_end_to_end_json_and_markdown(monkeypatch, tmp_path, capsys):
     b = Board(monkeypatch, "a", "b")
     claim = b.add(0, "a", "CLAIM")
     b.add(10, "a", "DONE", reply_to=claim["id"], link="https://github.com/o/r/pull/5")
+    b.clock = T0 + timedelta(minutes=11)
+    arcs.record_merged_pr(
+        b.id,
+        {"number": 5, "title": "t", "url": "https://github.com/o/r/pull/5", "reviewers": ["assay"]},
+    )
     b.add(30, "a", "CLAIM", step="next")
     b.add(31, "a", "ASK", to="owner", text="please decide now")
     prs = {5: _pr(5)}

@@ -540,7 +540,7 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
     # persist — showed the new one. The run's artifacts then hang off a different
     # `workspace_key` than the UI displays. Run startup takes the same lock across its own
     # config-read → driver build, which is what makes the pair mutually exclusive; a lock
-    # held by one side alone serializes nothing. Raised by the GPT review.
+    # held by one side alone serializes nothing.
     def _clone_and_persist() -> tuple[dict, str, dict[str, Any] | None]:
         with commit_mod.clone_lock():
             # Re-check INSIDE the lock: the pre-lock guard above only proves no run was live
@@ -742,9 +742,8 @@ async def _handle_findings(_request: web.Request) -> web.StreamResponse:
         return collapsed
 
     # Redact: a ledger row's `note` is agent-authored prose (a gate reason, a discard
-    # explanation), so it is the same class of text the DETAIL endpoint already scans. Found
-    # by sweeping every reader of run evidence after review caught the MCP surface — the
-    # four earlier fixes each treated their own path as the last one.
+    # explanation), so it is the same class of text the DETAIL endpoint already scans. Every
+    # reader of run evidence is redacted, not only the one in front of you.
     rows = await asyncio.to_thread(_read)
     return web.json_response({"findings": _redact_tree(rows)})
 
@@ -841,8 +840,7 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
             # EVERY agent-authored text field is redacted, not just the diff. These are
             # the model's own prose about the defect ("the fix uses KEY=…"), rendered in
             # the operator's browser by FindingDetail — the same egress boundary the diff
-            # crosses, and the same class of text. Raised by review of this branch: the
-            # first pass redacted the diff and the PR body and missed these.
+            # crosses, and the same class of text.
             detail["candidate"] = {
                 "cand_id": proposal.get("cand_id") or "",
                 "signature": _redact_for_display(str(cand.get("signature") or "")),
@@ -911,8 +909,7 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
     # calls above are defense-in-depth, but the endpoint also returns blocks assembled
     # elsewhere — the `run` provenance meta, the gate tree — and a field added later would
     # leak the moment someone forgets one more `_redact_for_display`. The list endpoint
-    # already wraps its whole payload; this makes the two consistent. Raised by the GPT
-    # review of this branch.
+    # already wraps its whole payload; this makes the two consistent.
     return web.json_response({"finding": _redact_tree(detail)})
 
 
@@ -949,7 +946,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     # then pushes whatever HEAD the interleaving left — reintroducing the metadata/content
     # mismatch the materialize step exists to prevent. Every other clone-mutating handler
     # (`/run`, `/calibrate`, `/findings/{fp}/commit`) already refuses; this one was the gap,
-    # introduced by the materialize fix itself. Raised by the Opus 5 review of this branch.
+    # introduced by the materialize fix itself.
     if busy := await _refuse_while_running(
         "drafting now would race the loop's own checkout/apply/push on this branch."
     ):
@@ -990,8 +987,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         # drafting an OLDER finding published whatever a LATER cycle left at HEAD. Measured
         # against a real bare repo: finding A's diff adds `FINDING_A`, and the branch pushed
         # for A contained `FINDING_B`. The loop path is safe because `_stage_winner` applies
-        # the winner first; this manual path had no such step. Raised by the GPT review of
-        # this branch.
+        # the winner first; this manual path needs its own step.
         diff_text = diff_path.read_text(encoding="utf-8")
         staged = commit_mod.materialize_queued_diff(
             clone=Path(clone),
@@ -1010,14 +1006,14 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         # COMMIT what was staged. `git apply --index` does not move `HEAD`, and
         # `_push_fix_branch` pushes `HEAD:refs/heads/<branch>` — so staging alone published
         # the BASE and the queued fix was absent from the pull request. Measured on a real
-        # bare repo: worktree `return 2`, pushed branch `return 1`. Raised by the GPT review.
+        # bare repo: worktree `return 2`, pushed branch `return 1`.
         # Everything after the commit must ROLL BACK on failure. Committing left the change
         # on the configured branch, and `clone_setup.checkout_branch` prefers an existing
         # local branch — so a draft that fails (no `gh`, no network, a refused push) would
         # leave the next run starting from an unfiled commit and treating the queued change
         # as already-landed baseline. Measured on a real bare repo: local `work` sat 1 commit
         # ahead of a remote it had never been pushed to. `commit_finding` already resets at
-        # each of its own failure points; this path had none. Raised by the GPT review.
+        # each of its own failure points; this path had none.
         base = str(staged.get("base") or "")
 
         def _rollback() -> None:
@@ -1113,7 +1109,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     # not around each step. The race is BETWEEN the steps: another operator-triggered mutation
     # doing `checkout -B` between our apply and our commit is what merges two findings into a
     # single commit (measured on a real bare repo). The run-status gate above only stops this
-    # racing the loop, not a second click. Raised by the Opus 5 review of this branch.
+    # racing the loop, not a second click.
     # RE-CHECK the run status INSIDE the lock, not just via the pre-lock `_refuse_while_running`
     # above. The two are not atomic: a request that passed the arrival check can then block on
     # `clone_lock` for the length of a driver build, and a run that starts in that window is now
@@ -1121,7 +1117,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     # mutation-races-the-loop bug the pre-lock guard is meant to stop, reached by waiting. This
     # is the same D-95/D-96 fix `PUT /config` and `POST /setup-clone` already carry; `_run_is_active`
     # exists precisely for this in-lock check (the async guard cannot be awaited here). A 409
-    # `run_in_progress` sentinel, distinguished from a real draft failure. Raised by the GPT review.
+    # `run_in_progress` sentinel, distinguished from a real draft failure.
     _RUN_STARTED = object()
 
     def _draft_serialized() -> dict[str, Any] | object:
@@ -1154,7 +1150,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
             # `_draft()`'s failure dicts carry `error`; `detail` is kept as the
             # legacy fallback. Reading only `detail` serialized every failure —
             # including the sandbox-launcher diagnosis this route now surfaces —
-            # as an empty string. Raised by the GPT review of this branch.
+            # as an empty string.
             "error": _redact_for_display(str(result.get("error") or result.get("detail") or "")),
         },
         status=400,
@@ -1259,7 +1255,7 @@ async def _handle_watchers(request: web.Request) -> web.StreamResponse:
     # carries `target`/`title`/`lastNote`/`verdictReason`/`fixing`, all derived from model
     # output or from the pull request's own text, which the watcher ingests as untrusted input
     # by design. Measured: a `target` of `src/m.py::aws_secret_access_key=AKIA…` reached the
-    # browser verbatim. Raised by the GPT review.
+    # browser verbatim.
     return web.json_response(_redact_tree({"sessions": sessions, "reconcile": reconcile}))
 
 
@@ -1359,7 +1355,7 @@ async def _handle_profiles(_request: web.Request) -> web.StreamResponse:
     # function/module/file names captured from the TARGET repo's code, and a credential-shaped
     # identifier there (an `AKIA…`-shaped symbol, a token-shaped path segment) would otherwise
     # reach the dashboard unscanned. Same redactor the findings/session/progress routes use; the
-    # single-profile route below is wrapped for the same reason. Raised by the GPT review.
+    # single-profile route below is wrapped for the same reason.
     profiles = await asyncio.to_thread(profile_normalize.list_profiles)
     return web.json_response(_redact_tree({"profiles": profiles}))
 
@@ -1381,8 +1377,7 @@ async def _handle_profile(request: web.Request) -> web.StreamResponse:
         )
     # Scan the frame tree before it reaches the browser: its function/module/file names come
     # from the target repo's code, so a credential-shaped identifier would otherwise be served
-    # raw — the same egress boundary the findings/session responses close. Raised by the GPT
-    # review.
+    # raw — the same egress boundary the findings/session responses close.
     return web.json_response(_redact_tree({"profile": tree}))
 
 
@@ -1506,7 +1501,7 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
     # checkout/apply/commit sequences in one clone: the button can commit onto a tree the
     # loop is mid-edit on, or push a HEAD the loop just moved. Gate on the supervisor's
     # live status (RUNNING / CALIBRATING / STOPPING) so the operator's manual commit only
-    # runs when the loop is not touching the clone. Raised by the GPT review of this branch.
+    # runs when the loop is not touching the clone.
     if busy := await _refuse_while_running(
         "committing now would race the loop's own checkout/apply/push on this branch."
     ):
@@ -1518,7 +1513,6 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
     # would put the loop mid checkout/apply/push on this clone when `commit_finding` runs the
     # same sequence. `clone_lock` is a re-entrant RLock, so holding it here and letting
     # `commit_finding` re-enter it is safe and keeps the whole recheck-then-mutate atomic.
-    # Raised by the GPT review.
     _RUN_STARTED = object()
 
     def _commit() -> dict[str, Any] | object:
@@ -1564,7 +1558,7 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
     # hook printed — scrubbed at the source with `redact_via_context` so its bound can
     # never cut a credential mid-match. Latent while nothing rendered it; D-97 started
     # showing it at the finding row, which made it a live egress path to the browser, so
-    # this pass stays as the output-boundary backstop. Raised by the GPT review.
+    # this pass stays as the output-boundary backstop.
     return web.json_response(
         {
             "code": "request_failed",

@@ -3,12 +3,64 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import Executor
 from typing import Any
 
 from kiro_crew.notifications.settings import PROTECTED_CHANNELS
+
+# Byte cap on a native-notification tag, counted in serialized bytes (the UTF-8
+# length of its JSON-escaped form, as the Web Push payload encodes it). The push
+# payload holds its tag to the same budget, so a tag minted here always fits the
+# push path unchanged (a cut tag would differ from the one the open tab shows).
+NATIVE_TAG_MAX_BYTES = 128
+NATIVE_TAG_ID_KEYS = ("approval_id", "job_id", "task_id", "ts")
+
+
+def _serialized_bytes(text: str) -> int:
+    """Bytes *text* occupies inside a JSON payload, quotes excluded.
+
+    A lone surrogate (valid in a JSON ``\\ud800`` escape, not in UTF-8) is
+    counted as three bytes instead of raising, so measuring never aborts the
+    delivery that asked; the push encoder replaces it with one byte.
+    """
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8", "surrogatepass")) - 2
+
+
+def _utf8_encodable(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def native_notification_tag(note: dict[str, Any]) -> str:
+    """The one OS-notification tag for *note*, shared by every banner path.
+
+    A delivered note can raise two OS banners: the open-but-hidden dashboard tab
+    (``useNativeNotification``) and the service worker's ``push`` handler (or
+    Safari's declarative Web Push, which renders the payload with no worker at
+    all). The OS collapses banners only when their tags are equal, so both paths
+    read this value -- stamped on the note as ``tag`` -- instead of each deriving
+    its own. Derived from the note's event id (approval, job, task, then the
+    note's own timestamp), so distinct events never collapse onto one banner.
+    An id that is over budget, or not valid UTF-8 (a lone surrogate an API
+    caller escaped into its metadata), is hashed, so the tag always fits and
+    always encodes: optional metadata can never abort local delivery.
+    """
+    for key in NATIVE_TAG_ID_KEYS:
+        value = note.get(key)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value):
+            tag = f"{key}:{value}"
+            if _utf8_encodable(tag) and _serialized_bytes(tag) <= NATIVE_TAG_MAX_BYTES:
+                return tag
+            digest = hashlib.sha256(tag.encode("utf-8", "surrogatepass")).hexdigest()
+            return f"{key}#" + digest[:32]
+    return "kirocrew-notif"
 
 
 def session_is_muted(state: Any, session_key: str) -> bool:
@@ -38,6 +90,22 @@ def session_is_muted(state: Any, session_key: str) -> bool:
     return False
 
 
+def unread_count(notes: Iterable[dict[str, Any]]) -> int:
+    """How many of *notes* still need the user: not read, and not passive.
+
+    Counted from the notes themselves on every read, so acknowledging a note,
+    deleting one, an expiry sweep and a gateway restart all agree with it. The
+    rule is the bell badge's (``shell/topbar/shellHeader.tsx``): a passive note
+    and a silenced one (a muted channel or session, which delivery also forces
+    to passive) are history, not attention.
+    """
+    return sum(
+        1
+        for note in notes
+        if not note.get("acked") and note.get("priority") != "passive" and not note.get("silenced")
+    )
+
+
 class NotificationCoordinator:
     """Coordinate notification state while the DashboardState facade owns it."""
 
@@ -53,6 +121,7 @@ class NotificationCoordinator:
         rewrite_all: Callable[[list[dict[str, Any]]], None],
         executor_provider: Callable[[], Executor],
         max_persisted: int,
+        web_push_fanout: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._logger_provider = logger_provider
         self._payload_from_legacy = payload_from_legacy
@@ -63,6 +132,12 @@ class NotificationCoordinator:
         self._rewrite_all = rewrite_all
         self._executor_provider = executor_provider
         self._max_persisted = max_persisted
+        # Optional secondary sink: fan the delivered note out to browser Web
+        # Push subscriptions. Placed after local delivery so it inherits the
+        # redaction and channel-settings (mute/priority) already applied to the
+        # note. None keeps the coordinator usable without a push subsystem
+        # (e.g. bare test states), so delivery never depends on it.
+        self._web_push_fanout = web_push_fanout
 
     def notify(
         self,
@@ -110,6 +185,9 @@ class NotificationCoordinator:
             if key != "ts":
                 note[key] = self._redact_value(value)
         state.notification_channel_settings.apply(note)
+        # Stamped after redaction so every surface (the WebSocket note the tab
+        # toasts from, the stored row, the Web Push payload) carries one tag.
+        note["tag"] = native_notification_tag(note)
         # Applied last, so a channel priority override cannot undo the mute.
         if publisher and not urgent and session_is_muted(state, publisher):
             note["silenced"] = True
@@ -118,9 +196,21 @@ class NotificationCoordinator:
         state._notification_log.append(note)
         if len(state._notification_log) > self._max_persisted:
             del state._notification_log[: len(state._notification_log) - self._max_persisted]
-        if note.get("priority") != "passive":
-            state._unread_count += 1
         state._broadcast(note)
+
+        # Secondary sink: fan out to browser Web Push. A silenced (muted) note
+        # or one forced to passive priority is history-only — the same gate
+        # ``unread_count`` applies — so it must not raise an OS banner on a
+        # closed device either. Best-effort: the fan-out schedules its own
+        # async delivery and never blocks or fails local delivery.
+        if self._web_push_fanout is not None and not note.get("silenced"):
+            if note.get("priority") != "passive":
+                try:
+                    self._web_push_fanout(dict(note))
+                except Exception:
+                    self._logger_provider().warning(
+                        "Web push fan-out failed to schedule", exc_info=True
+                    )
 
         # One FIFO executor owns append and rewrite jobs.  Snapshot the row
         # because acknowledgement may mutate the in-memory object afterward.
@@ -204,6 +294,5 @@ class NotificationCoordinator:
     async def clear(state: Any) -> None:
         """Clear clients before awaiting disk so a concurrent delivery survives."""
         state._notification_log.clear()
-        state._unread_count = 0
         state.broadcast_ws("notifications_clear", {})
         await state._rewrite_notifications_async()

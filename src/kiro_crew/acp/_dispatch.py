@@ -22,12 +22,14 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew import _facade_mirror, mcp_apps_render, session_directive  # noqa: F401
 from kiro_crew.acp.elicitation import is_elicitation_request
+from kiro_crew.acp.engine_fallback import is_v2_model_fallback
 from kiro_crew.acp.harness_tool_names import (  # noqa: F401
     CLAUDE_READ_ONLY_BUILTINS,
     GOOSE_READ_ONLY_BUILTINS,
     MAX_HARNESS_TOOL_NAME_LEN,
     qualified_harness_tool_id,
 )
+from kiro_crew.acp.kas_permissions import CREW_ONLY_ENTRY_KEYS
 from kiro_crew.acp.types import (  # noqa: F401
     EVENT_NOTICE,
     EVENT_PERMISSION_REQUEST,
@@ -72,6 +74,7 @@ from kiro_crew.acp_backends import (  # noqa: F401
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
     ACP_BACKENDS_META_IDENTITY,
 )
 from kiro_crew.agent_files import kas_wire_agent_id
@@ -84,6 +87,7 @@ from kiro_crew.metrics.tool_calls import (  # noqa: F401
     record_tool_call_finished,
 )
 from kiro_crew.platform.guest_paths import GuestPathParams  # noqa: F401
+from kiro_crew.platform.tool_names import KIRO_CLI_NAME_BY_KAS_TOOL  # noqa: F401
 from kiro_crew.platform.tool_paths import WRITE_PLANE_KINDS  # noqa: F401
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.security.credential_sources import tool_output_fingerprints  # noqa: F401
@@ -157,6 +161,10 @@ def attach_kas_custom_agents(
     Each entry goes out under :func:`~kiro_crew.agent_files.kas_wire_agent_id`,
     so a crewmate whose id the engine keeps for itself still registers. The
     caller's list is not mutated: everything else reads it by the crewmate's id.
+
+    Keys in ``kas_permissions.CREW_ONLY_ENTRY_KEYS`` are dropped here: they are
+    Crew's record of what it answers itself at the permission request, not a
+    field the engine defines.
     """
     if not agents:
         return
@@ -166,7 +174,10 @@ def attach_kas_custom_agents(
         params["_meta"] = meta
     wire = [
         (
-            {**a, "id": kas_wire_agent_id(a["id"])}
+            {
+                **{k: v for k, v in a.items() if k not in CREW_ONLY_ENTRY_KEYS},
+                "id": kas_wire_agent_id(a["id"]),
+            }
             if isinstance(a, dict) and isinstance(a.get("id"), str)
             else a
         )
@@ -519,6 +530,7 @@ STEER_UPDATE_DISCRIMINANTS = (
     "steering_cleared",
     "AgentExecutionUserMessageQueued",
     "AgentExecutionSteeringInjected",
+    "AgentExecutionUserMessageCleared",
 )
 
 
@@ -583,6 +595,11 @@ def classify_notification(msg: JsonRpcMessage) -> str:
     if msg.is_method(METHOD_SUBAGENT_LIST_UPDATE):
         return "subagent_list"
     if msg.is_method(METHOD_KIRO_SESSION_UPDATE):
+        # The V2 engine's own fallback notice rides the extension method too
+        # (``acp/engine_fallback.py``); it describes the session's model, not a
+        # child's activity.
+        if is_v2_model_fallback(msg.params):
+            return "model_fallback"
         return "subagent_activity"
     # An MCP server's elicitation, on either wire (standard `elicitation/create`
     # or KAS's `_kiro/mcp/elicitation`). Only a REQUEST (with an id) is one:
@@ -629,20 +646,30 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _DENY_BEHAVIORS,
         _DENY_OPTION_IDS,
         _KAS_NON_COMMAND_TOOLS,
+        _KAS_REMOTE_WRAPPER_ID_PREFIX,
+        _KAS_REMOTE_WRAPPER_SERVER,
         _LEGACY_OPTION_KIND,
         _PI_MCP_NAME_UNSAFE,
         _SPEC_OPTION_KINDS,
         _WORKSPACE_PATH_ARGUMENTS,
+        CLAUDE_CREW_PLACED_MCP_SOURCE,
         GATE_ENVELOPE_MARKER,
+        STRANDS_BUILTIN_TOOL_KINDS,
+        STRANDS_SIDE_READ_ONLY_REFUSAL,
+        StrandsCallIdentity,
         _anchored_in_workspace,
+        _is_kas_remote_builtin,
         _workspace_call_arguments,
         build_permission_event,
+        claude_mcp_identity,
         gate_envelope,
         identified_mcp_call,
         is_mcp_tool_approval,
+        is_strands_side_read,
         kas_consent_tool,
         pi_mcp_title,
         reject_option_id,
+        strands_envelope_identity,
     )
     from kiro_crew.acp._dispatch_parts.provider_notices import (  # noqa: F401
         NOTICE_DESCRIPTION_MAX,
@@ -672,6 +699,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         derive_edit_diff,
         extract_tool_purpose,
         fits_tool_result,
+        is_rendered_edit_diff,
         is_tool_purpose_key,
         make_unified_diff,
         redact_backend_text,
@@ -741,6 +769,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     import difflib  # noqa: F401
     import hashlib  # noqa: F401
     import json  # noqa: F401
+    import os  # noqa: F401
     import posixpath  # noqa: F401
     import re  # noqa: F401
     import unicodedata  # noqa: F401

@@ -730,21 +730,10 @@ function DesignCritiquePageContent() {
     // to 'analyzing', so the first run would read that as "still waiting for me"
     // and replace the second run's in-progress view with its own report. Any run
     // the user is no longer watching announces itself with the ready chip instead.
-    const waiting = isWatching(slotKey);
-    if (waiting)
-      showReport(
-        rep,
-        screens,
-        next.find((e) => e.slotKey === slotKey) || next[0],
-      );
-    else
-      setJustFinished({
-        slotKey,
-        read: rep.overallRead || i18nT("apps.designCritique.designCritiquePage.critique_ready"),
-        screens,
-        report: rep,
-      });
-  };
+    const waiting = isWatching(slotKey)
+    if (waiting) showReport(rep, screens, next.find(e => e.slotKey === slotKey) || next[0])
+    else setJustFinished({ slotKey, read: rep.overallRead || i18nT('apps.designCritique.designCritiquePage.critique_ready_fallback'), screens, report: rep })
+  }
 
   const failWith = async (e: unknown, slotKey: string, runId?: string) => {
     const flag = e as Flagged;
@@ -1586,8 +1575,8 @@ function DesignCritiquePageContent() {
     } catch (e) {
       const flag = e as Flagged
       if (flag && flag.cancelled) return
-      const msg = flag && flag.timeout ? i18nT("designSync.ask_timeout")
-        : (e instanceof Error) ? e.message : i18nT("apps.designCritique.designCritiquePage.something_went_wrong")
+      const msg = flag && flag.timeout ? i18nT('apps.designCritique.designCritiquePage.ask_too_long')
+        : (e instanceof Error) ? e.message : i18nT('apps.designCritique.designCritiquePage.ask_went_wrong')
       setAsks(prev => prev.map(a => a.id === askId
         ? { ...a, turns: a.turns.map(t => (t.t === stamp ? { ...t, a: msg, pending: false, failed: true } : t)) }
         : a))

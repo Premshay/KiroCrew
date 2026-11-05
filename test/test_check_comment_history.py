@@ -15,6 +15,7 @@ import importlib.util
 import tokenize
 from pathlib import Path
 
+import gate_script_checks
 import pytest
 import yaml
 
@@ -31,12 +32,12 @@ SPEC.loader.exec_module(gate)
 
 def _gate_step() -> dict:
     workflow = yaml.safe_load(FAST_GATE.read_text(encoding="utf-8"))
-    job = workflow["jobs"].get("comment-history-lint")
-    assert job, "fast-gate.yml has no comment-history-lint job"
+    job = workflow["jobs"].get("source-gates")
+    assert job, "fast-gate.yml has no source-gates job"
     for step in job.get("steps") or []:
         if "scripts/check_comment_history.py" in str(step.get("run", "")):
             return step
-    raise AssertionError("comment-history-lint runs no check_comment_history.py step")
+    raise AssertionError("source-gates runs no check_comment_history.py step")
 
 
 class TestCiWiring:
@@ -97,7 +98,7 @@ class TestCiWiring:
         assert "comment-history-baseline.json" not in text, "the baseline is gone"
 
 
-class TestRuleFamilies:
+class TestRuleFamilies(gate_script_checks.SelfTestPasses):
     """One probe per rule family, through the real detector."""
 
     def _found(self, source: str) -> list[tuple[int, str]]:
@@ -186,9 +187,6 @@ class TestRuleFamilies:
         # pins both.
         with pytest.raises((SyntaxError, tokenize.TokenError)):
             self._found(broken)
-
-    def test_self_test_passes(self) -> None:
-        assert gate._self_test() == 0
 
     def test_prefilter_cannot_fall_behind_the_pattern_tuple(self) -> None:
         # The pre-filter skips tokenize/ast for a file it cannot match, so a

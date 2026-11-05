@@ -557,7 +557,19 @@ class TestHookGateKwargs:
     # asking, on whose behalf, in which mode) rather than the tool call. Every
     # other keyword parameter is derived from the event, and the completeness
     # test below demands the helper emit exactly those.
-    SURFACE_KWARGS = frozenset({"session_key", "agent", "app", "resolved_agent", "classifier_only"})
+    # ``deny_waivers`` is the surface's too: the deny-rule keys a person overrode on
+    # the dashboard card for this call or session, never read off the event.
+    SURFACE_KWARGS = frozenset(
+        {
+            "session_key",
+            "agent",
+            "app",
+            "resolved_agent",
+            "classifier_only",
+            "trust_reads",
+            "deny_waivers",
+        }
+    )
 
     # The gate's event-derived parameters and the event attribute each reads.
     # A new entry here means a new enforcement signal; the completeness test
@@ -573,6 +585,11 @@ class TestHookGateKwargs:
         "mcp_identity_trusted": "mcp_identity_trusted",
         "mcp_identity_unreadable": "mcp_identity_unreadable",
         "kas_builtin_ids": "kas_builtin_ids",
+        "spec_granted_builtins": "spec_granted_builtins",
+        "spec_granted_commands": "spec_granted_commands",
+        "spec_shell_allowlist": "spec_shell_allowlist",
+        "spec_write_allowlist": "spec_write_allowlist",
+        "spec_write_cwd": "spec_write_cwd",
         "harness_builtin_tool": "harness_builtin_tool",
         "deepseek_tool_name": "deepseek_tool_name",
         "spawn_target": "spawn_target",
@@ -598,6 +615,11 @@ class TestHookGateKwargs:
             mcp_identity_trusted=True,
             mcp_identity_unreadable=True,
             kas_builtin_ids=True,
+            spec_granted_builtins=frozenset({"execute_bash"}),
+            spec_granted_commands=("git status",),
+            spec_shell_allowlist=("git log",),
+            spec_write_allowlist=("/w/out",),
+            spec_write_cwd="/w",
             harness_builtin_tool="web_fetch",
             deepseek_tool_name="read",
             spawn_target="helper",
@@ -614,6 +636,11 @@ class TestHookGateKwargs:
             "mcp_identity_trusted": True,
             "mcp_identity_unreadable": True,
             "kas_builtin_ids": True,
+            "spec_granted_builtins": frozenset({"execute_bash"}),
+            "spec_granted_commands": ("git status",),
+            "spec_shell_allowlist": ("git log",),
+            "spec_write_allowlist": ("/w/out",),
+            "spec_write_cwd": "/w",
             "harness_builtin_tool": "web_fetch",
             "deepseek_tool_name": "read",
             "spawn_target": "helper",
@@ -643,6 +670,11 @@ class TestHookGateKwargs:
             "mcp_identity_trusted": False,
             "mcp_identity_unreadable": False,
             "kas_builtin_ids": False,
+            "spec_granted_builtins": frozenset(),
+            "spec_granted_commands": (),
+            "spec_shell_allowlist": None,
+            "spec_write_allowlist": None,
+            "spec_write_cwd": "",
             "harness_builtin_tool": "",
             "deepseek_tool_name": "",
             "spawn_target": "",
@@ -739,6 +771,11 @@ class TestHookGateKwargs:
         probe.mcp_identity_trusted = True
         probe.mcp_identity_unreadable = True
         probe.kas_builtin_ids = True
+        probe.spec_granted_builtins = frozenset({"<spec_granted_builtins>"})
+        probe.spec_granted_commands = ("<spec_granted_commands>",)
+        probe.spec_shell_allowlist = ("<spec_shell_allowlist>",)
+        probe.spec_write_allowlist = ("<spec_write_allowlist>",)
+        probe.spec_write_cwd = "<spec_write_cwd>"
         call = ToolCall.from_event(probe)
         blank = ToolCall(title="")
         unfilled = [
@@ -766,6 +803,14 @@ class TestHookGateKwargs:
                 "kas_builtin_ids",
             ):
                 assert got[kwarg] is True
+            elif kwarg == "spec_granted_builtins":
+                assert got[kwarg] == frozenset({f"<{attr}>"})
+            elif kwarg in (
+                "spec_granted_commands",
+                "spec_shell_allowlist",
+                "spec_write_allowlist",
+            ):
+                assert got[kwarg] == (f"<{attr}>",)
             else:
                 assert got[kwarg] == f"<{attr}>", kwarg
 
@@ -795,7 +840,14 @@ class TestHookGateKwargs:
             return ToolHookResult(action=TOOL_ALLOW)
 
         monkeypatch.setattr(HookManager, "judge", judge)
-        surface = {"session_key": "s", "agent": "a", "app": "p", "classifier_only": True}
+        surface = {
+            "session_key": "s",
+            "agent": "a",
+            "app": "p",
+            "classifier_only": True,
+            "trust_reads": True,
+            "deny_waivers": frozenset({"<key>"}),
+        }
         HookManager().on_tool_call(
             probe.title, resolved_agent="kirocrew", **surface, **hook_gate_kwargs(probe)
         )

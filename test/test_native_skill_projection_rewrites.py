@@ -12,7 +12,10 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -30,11 +33,19 @@ from native_skill_projection_helpers import (
 )
 
 from kiro_crew.acp import skill_projection as projection
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.testing.wait import wait_until
 
 # The shared fixtures, bound here by name so pytest registers them for this module.
 _no_eager_prune = native_skill_projection_helpers._no_eager_prune
 _prune_on_every_spawn = native_skill_projection_helpers._prune_on_every_spawn
 native_tree = native_skill_projection_helpers.native_tree
+# The exit-hook tests swap ``_COLLECTED_ENDS`` for a private queue. The real reaper
+# reads that global on every loop, so one still finishing an earlier test's end
+# would follow the swap and take the test's items: drain it after every test.
+_end_projections_before_tmp_path_goes = (
+    native_skill_projection_helpers._end_projections_before_tmp_path_goes
+)
 
 
 _REAL_EAGER_PRUNE = projection._eager_prune
@@ -929,6 +940,12 @@ def test_a_dropped_projection_prunes_too_and_spares_what_another_projection_hold
 
     del ended
     gc.collect()
+    # The drop's end is handed to the reaper thread (never run inline on the
+    # dropping thread, which may hold a non-reentrant lock -- see
+    # ``_end_projection``). Wait for the reaper to reach it before asserting.
+    _reached = threading.Event()
+    projection._COLLECTED_ENDS.put(_reached.set)
+    assert _reached.wait(10), "the reaper never reached the dropped projection's end"
 
     assert not ended_alias.exists(), "a dropped projection's view waited for the next spawn"
     assert live_alias.exists(), "a view a live projection holds was pruned"
@@ -987,6 +1004,298 @@ def test_a_projection_the_cyclic_collector_frees_ends_on_the_reaper_not_the_coll
     assert ran == [(False, True)], "the end ran on the collecting thread, under its lock"
     assert not list(lease_dir.iterdir()), "the lease was not released"
     assert not alias.exists(), "the collected projection's view was not pruned"
+
+
+def test_a_projection_dropped_off_the_loop_ends_on_the_reaper_not_the_dropping_thread(
+    native_tree, monkeypatch
+):
+    """A refcount-zero drop runs the finalizer on the dropping thread. In the
+    Windows hang that thread was inside a ``ThreadPoolExecutor.submit`` holding
+    ``_global_shutdown_lock`` (constructing the ``Future`` whose allocation
+    dropped this projection's last reference), and running the end there
+    re-enters that same executor through the path-resolution pool, waiting on a
+    lock its own thread holds until the test timeout kills the xdist worker. A
+    lock this test holds across the drop stands in for that one: the end must NOT
+    run on the dropping thread -- off the loop a finalizer is queued for the
+    reaper, which holds none of those locks. This is the refcount companion to
+    the cyclic-collector case above; one rule covers both."""
+    monkeypatch.setattr(projection, "_eager_prune", _REAL_EAGER_PRUNE)
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    lease_dir = projection._projection_lease_dir()
+    held_by_dropper = threading.Lock()
+    ran: list[tuple[bool, bool]] = []
+    done = threading.Event()
+    real_end = projection._end_projection_off_loop
+
+    def end(*args):
+        on_dropper = threading.get_ident() == dropper["id"]
+        # Bounded so a regression (the end running inline on the dropping thread,
+        # which holds the lock) fails here instead of hanging the worker.
+        got = held_by_dropper.acquire(timeout=5)
+        try:
+            ran.append((on_dropper, got))
+            real_end(*args)
+        finally:
+            if got:
+                held_by_dropper.release()
+            done.set()
+
+    monkeypatch.setattr(projection, "_end_projection_off_loop", end)
+    dropper: dict[str, int] = {}
+    alias_box: dict[str, Path] = {}
+
+    def drop_under_lock() -> None:
+        dropper["id"] = threading.get_ident()
+        prepared = projection.prepare_native_skill_projection(project)
+        assert prepared is not None
+        alias_box["path"] = _alias_file(agents, prepared)
+        was_enabled = gc.isenabled()
+        gc.disable()  # force a pure refcount drop, never a cyclic collection
+        try:
+            # Hold a lock the end would deadlock on if it ran inline here, then
+            # drop the last reference: the finalizer fires on THIS thread.
+            with held_by_dropper:
+                del prepared
+        finally:
+            if was_enabled:
+                gc.enable()
+
+    t = threading.Thread(target=drop_under_lock, name="dropper", daemon=True)
+    t.start()
+    t.join(10)
+    assert not t.is_alive(), "the dropping thread hung -- the end ran inline under its lock"
+
+    assert done.wait(10), "the dropped projection was never ended"
+    # (False, True): the end ran on the reaper (not the dropper) and took the
+    # lock freely, because the dropping thread had already released it.
+    assert ran == [(False, True)], "the end ran inline on the dropping thread, under its lock"
+    assert not list(lease_dir.iterdir()), "the lease was not released"
+    assert not alias_box["path"].exists(), "the dropped projection's view was not pruned"
+
+
+def test_an_off_loop_drop_releases_the_lease_inline_when_the_reaper_is_gone(
+    native_tree, monkeypatch
+):
+    """The ``atexit`` weakref sweep can fire a finalizer for a projection the
+    shared runtime never explicitly released, after the daemon reaper is already
+    gone. A queued end would never run then, leaving the lock file behind to
+    block the next process's view of this home. So off the loop with the reaper
+    not alive the finalizer path releases the lease INLINE instead of queueing it
+    -- the prune (which re-enters the path-resolution executor) is dropped, the
+    next boot drain covers it, but the lease must not be lost. Forcing
+    ``_reaper_alive`` False stands in for interpreter shutdown; the lease
+    directory must be empty after the drop without anything landing on the
+    reaper queue."""
+    monkeypatch.setattr(projection, "_eager_prune", _REAL_EAGER_PRUNE)
+    monkeypatch.setattr(projection, "_reaper_alive", lambda: False)
+    # A fresh queue no reaper drains: anything queued here stays queued, so an
+    # empty queue after the drop proves the end did NOT take the reaper path.
+    sink: "queue.SimpleQueue" = queue.SimpleQueue()
+    monkeypatch.setattr(projection, "_COLLECTED_ENDS", sink)
+    # No real reaper may start on the private queue: it would take this test's
+    # items, then stay blocked on a queue nothing else ever feeds.
+    monkeypatch.setattr(projection, "_ensure_projection_reaper", lambda: None)
+
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    prepared = projection.prepare_native_skill_projection(project)
+    assert prepared is not None
+    lease_dir = projection._projection_lease_dir()
+    assert len(list(lease_dir.glob("*.json"))) == 1
+
+    was_enabled = gc.isenabled()
+    gc.disable()  # a pure refcount drop off the loop, never a cyclic collection
+    try:
+        del prepared
+    finally:
+        if was_enabled:
+            gc.enable()
+
+    assert sink.empty(), "the end was queued for a reaper that is gone instead of run inline"
+    assert list(lease_dir.glob("*.json")) == [], "the lease was not released inline at exit"
+
+
+def test_an_off_loop_drop_once_exit_began_releases_the_lease_inline_with_the_reaper_alive(
+    native_tree, monkeypatch
+):
+    """While ``atexit`` handlers run the daemon reaper is still alive, yet
+    finalization can stop it before it reaches a queued end. Once the exit hook
+    has set ``_EXITING``, a dropped projection must release its lease inline even
+    though ``_reaper_alive`` still answers True, and queue nothing."""
+    monkeypatch.setattr(projection, "_eager_prune", _REAL_EAGER_PRUNE)
+    monkeypatch.setattr(projection, "_reaper_alive", lambda: True)
+    exiting = threading.Event()
+    exiting.set()
+    monkeypatch.setattr(projection, "_EXITING", exiting)
+    sink: "queue.SimpleQueue" = queue.SimpleQueue()
+    monkeypatch.setattr(projection, "_COLLECTED_ENDS", sink)
+    # No real reaper may start on the private queue: it would take this test's
+    # items, then stay blocked on a queue nothing else ever feeds.
+    monkeypatch.setattr(projection, "_ensure_projection_reaper", lambda: None)
+
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    prepared = projection.prepare_native_skill_projection(project)
+    assert prepared is not None
+    lease_dir = projection._projection_lease_dir()
+    assert len(list(lease_dir.glob("*.json"))) == 1
+
+    was_enabled = gc.isenabled()
+    gc.disable()  # a pure refcount drop off the loop, never a cyclic collection
+    try:
+        del prepared
+    finally:
+        if was_enabled:
+            gc.enable()
+
+    assert sink.empty(), "the end was queued for a reaper that exit may stop first"
+    assert list(lease_dir.glob("*.json")) == [], "the lease was not released inline at exit"
+
+
+def test_the_exit_hook_releases_the_lease_of_an_end_still_queued(native_tree, monkeypatch):
+    """An end queued before the exit began (the reaper alive but not yet at it)
+    must not lose its lease when the process exits: the ``atexit`` hook takes it
+    off the queue and releases its lease on the exiting thread, sets
+    ``_EXITING``, and leaves a queued item that is not a projection end uncalled."""
+    monkeypatch.setattr(projection, "_eager_prune", _REAL_EAGER_PRUNE)
+    monkeypatch.setattr(projection, "_reaper_alive", lambda: True)
+    exiting = threading.Event()
+    monkeypatch.setattr(projection, "_EXITING", exiting)
+    sink: "queue.SimpleQueue" = queue.SimpleQueue()
+    monkeypatch.setattr(projection, "_COLLECTED_ENDS", sink)
+    # No real reaper may start on the private queue: it would take this test's
+    # items, then stay blocked on a queue nothing else ever feeds.
+    monkeypatch.setattr(projection, "_ensure_projection_reaper", lambda: None)
+    foreign_calls: list[int] = []
+    sink.put(lambda: foreign_calls.append(1))
+
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    prepared = projection.prepare_native_skill_projection(project)
+    assert prepared is not None
+    lease_dir = projection._projection_lease_dir()
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del prepared
+    finally:
+        if was_enabled:
+            gc.enable()
+    assert not sink.empty(), "the drop did not queue its end for the reaper"
+    assert len(list(lease_dir.glob("*.json"))) == 1, "the queued end released its lease early"
+
+    # The reaper is gone by now in this stand-in, so the hook has nothing to wait for.
+    monkeypatch.setattr(projection, "_reaper_alive", lambda: False)
+    projection._release_queued_leases_at_exit()
+
+    assert exiting.is_set(), "the exit hook did not mark the exit as begun"
+    assert sink.empty(), "the exit hook left an end on the queue"
+    assert list(lease_dir.glob("*.json")) == [], "the queued end's lease was not released at exit"
+    assert foreign_calls == [], "the exit hook ran a queued item that is not a projection end"
+
+
+def test_the_exit_hook_waits_for_the_end_the_reaper_already_took(monkeypatch):
+    """With the reaper alive the hook hands it a marker and waits for it, so an
+    end the reaper took off the queue just before the exit gets to release its
+    lease. A stand-in reaper takes the marker but holds it until released; the
+    hook must still be waiting while it is held, and return once it runs."""
+    monkeypatch.setattr(projection, "_EXITING", threading.Event())
+    sink: "queue.SimpleQueue" = queue.SimpleQueue()
+    monkeypatch.setattr(projection, "_COLLECTED_ENDS", sink)
+    # No real reaper may start on the private queue: it would take this test's
+    # items, then stay blocked on a queue nothing else ever feeds.
+    monkeypatch.setattr(projection, "_ensure_projection_reaper", lambda: None)
+    monkeypatch.setattr(projection, "_reaper_alive", lambda: True)
+    monkeypatch.setattr(projection, "_EXIT_REAPER_WAIT_SECS", 60.0)
+    took_marker = threading.Event()
+    let_it_run = threading.Event()
+
+    def stand_in_reaper() -> None:
+        end = sink.get(timeout=30)
+        took_marker.set()
+        let_it_run.wait(30)
+        end()
+
+    reaper = threading.Thread(target=stand_in_reaper, name="stand-in-reaper", daemon=True)
+    reaper.start()
+    hook_returned = threading.Event()
+
+    def run_hook() -> None:
+        projection._release_queued_leases_at_exit()
+        hook_returned.set()
+
+    hook = threading.Thread(target=run_hook, name="exit-hook", daemon=True)
+    hook.start()
+    try:
+        assert took_marker.wait(10), "the exit hook queued no marker for the reaper"
+        assert not hook_returned.wait(
+            0.5
+        ), "the exit hook returned before the reaper reached its marker"
+    finally:
+        let_it_run.set()
+    assert hook_returned.wait(10), "the exit hook kept waiting after the reaper ran its marker"
+    hook.join(10)
+    reaper.join(10)
+
+
+_EXIT_WITH_A_BUSY_REAPER = """
+import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import kiro_crew.agent as agent_module
+from kiro_crew.acp import skill_projection as projection
+
+root = Path(sys.argv[1])
+home = root / "kiro"
+agents = home / "agents"
+projection.kiro_home = lambda: home
+projection.data_home = lambda: root / "crew"
+projection.kiro_agents_dir = lambda: agents
+projection.platform_compat.path_volume_is_remote = lambda path: False
+projection.platform_compat.first_linked_ancestor = lambda path: None
+agent_module.managed_mcp_spec_entry = lambda name: {"command": "test-core", "args": []}
+agent_module._KIRO_MCP_JSON = home / "settings" / "mcp.json"
+projection.list_agents = lambda **kw: [
+    SimpleNamespace(name="custom", filename="custom.json", scope="global")
+]
+
+# Held until the interpreter exits, so only the atexit weakref sweep ends it.
+HELD = projection.prepare_native_skill_projection(root / "project")
+assert HELD is not None
+assert projection._reaper_alive()
+# The reaper stays alive but busy for the rest of the process, so an end
+# queued at exit would never be reached.
+projection._COLLECTED_ENDS.put(threading.Event().wait)
+print(len(list(projection._projection_lease_dir().glob("*.json"))))
+"""
+
+
+def test_a_projection_held_until_exit_releases_its_lease_with_the_reaper_alive(
+    native_tree, tmp_path
+):
+    """End to end, in a real interpreter: a projection still referenced when the
+    process exits is ended by the ``atexit`` weakref sweep while the daemon
+    reaper is alive but busy. Its lease must be released before the process
+    ends; queued for the reaper, it never would be."""
+    _home, agents, _project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "KIROCREW_NATIVE_SKILL_PROJECTION"}
+    result = subprocess.run(
+        [sys.executable, "-c", _EXIT_WITH_A_BUSY_REAPER, str(tmp_path)],
+        capture_output=True,
+        cwd=str(tmp_path),
+        env=env,
+        timeout=120,
+        **UTF8_TEXT,
+    )
+    assert result.returncode == 0, f"child failed: {result.stderr[-2000:]}"
+    assert result.stdout.strip().splitlines()[-1] == "1", "the child held no lease to release"
+    lease_dir = projection._projection_lease_dir()
+    assert list(lease_dir.glob("*.json")) == [], "the lease outlived the exiting process"
 
 
 def test_two_gateways_still_cannot_both_own_a_view(native_tree, monkeypatch):
@@ -1306,7 +1615,13 @@ def test_the_legacy_lease_scan_takes_the_older_builds_publication_lock(native_tr
     (legacy_leases / f"{stem}.hold").write_text("")
     lock_path = projection._legacy_lock_path(agents)
     lock_path.write_bytes(b"")
+    # The budget is also how long the scan waits for that lock, so a short one
+    # keeps the held case quick. The scan's own deadline is wall-clock time,
+    # though, and a worker that stalls past it mid-scan makes the lock-free pass
+    # answer uncertain too. Freeze the clock the deadline reads; the lock wait
+    # keeps the real one, so the held case is still refused on the lock alone.
     monkeypatch.setattr(projection, "_PROJECTION_LEASE_SCAN_MAX_SECONDS", 0.2)
+    _hold_the_prune_clock(monkeypatch)
 
     with projection.platform_compat.open_lock_file(lock_path) as lock_fd:
         with projection.platform_compat.file_lock(lock_fd, exclusive=True, wait=False):
@@ -1501,8 +1816,9 @@ def test_two_concurrent_releases_each_prune_their_own_view(native_tree, monkeypa
     ``kirocrew-skill-view-prune`` daemon thread. If the second end skipped its
     prune on the in-process lock the first still holds, its view would linger
     until the next spawn or boot drain -- the gateway-stop case the issue names.
-    The end path queues for the lock, so both ends prune and neither view
-    survives, even when they overlap on separate threads."""
+    An end that arrives while the other's pass runs is covered by a follow-up
+    pass on a third prune thread, so the test waits for every owed pass
+    (``_settle_end_prunes``), not just the two release threads."""
     monkeypatch.setattr(projection, "_eager_prune", _REAL_EAGER_PRUNE)
     monkeypatch.setattr(projection, "_PER_SPAWN_PRUNE_MIN_INTERVAL_SECS", 5.0)
     monkeypatch.setattr(projection, "_LAST_PER_SPAWN_PRUNE", {})
@@ -1521,14 +1837,10 @@ def test_two_concurrent_releases_each_prune_their_own_view(native_tree, monkeypa
 
     # on_event_loop() is patched True, so each release spawns its own prune
     # thread; the threads race for the in-process lock.
-    threads_before = {t.name for t in threading.enumerate()}
+    threads_before = set(threading.enumerate())
     first.release()
     second.release()
-    # Join the prune threads directly instead of polling threading.enumerate():
-    # each release spawns a kirocrew-skill-view-prune daemon, so wait on those
-    # handles to finish rather than sleeping in a loop.
-    for prune_thread in [t for t in threading.enumerate() if t.name == "kirocrew-skill-view-prune"]:
-        prune_thread.join(timeout=30)
+    _settle_end_prunes(agents, _new_prune_threads(threads_before))
 
     assert not first_alias.exists(), "the first release's view lingered"
     assert not second_alias.exists(), (
@@ -1536,4 +1848,113 @@ def test_two_concurrent_releases_each_prune_their_own_view(native_tree, monkeypa
         "lock and its view lingered"
     )
     assert not list(projection._projection_lease_dir().iterdir()), "a lease outlived its release"
-    _ = threads_before
+
+
+def _new_prune_threads(before):
+    """The ``kirocrew-skill-view-prune`` threads started since *before* was taken."""
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "kirocrew-skill-view-prune" and thread not in before
+    ]
+
+
+def _settle_end_prunes(agents, release_threads, *, on_poll=lambda: None):
+    """Wait until every prune the ends on *release_threads* owe has run.
+
+    Joining the release threads is not enough. An end that arrives while another
+    end's pass runs only records a request (``_coalesced_end_prune``), and the
+    running end hands the follow-up pass to a NEW ``kirocrew-skill-view-prune``
+    thread before it exits, so that pass can still be walking when the release
+    threads are gone. The follow-up is owed for as long as this agents directory
+    is in ``_END_PRUNE_RUNNING`` (a pending request always has a running key), so
+    the wait ends when no end prune is running or requested for it. *on_poll* runs
+    on each read of that state.
+    """
+    for thread in release_threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "an end's release thread never finished"
+    target = agents.absolute().as_posix()
+
+    def owed():
+        with projection._END_PRUNE_GUARD:
+            return sorted(
+                key
+                for key in projection._END_PRUNE_RUNNING | projection._END_PRUNE_REQUESTED
+                if key[1] == target
+            )
+
+    def settled():
+        on_poll()
+        return not owed()
+
+    wait_until(settled, describe=lambda: f"end prunes still owed: {owed()}")
+
+
+@pytest.mark.parametrize("leader", ["first", "second"])
+def test_a_release_handed_to_the_follow_up_pass_is_waited_for(
+    native_tree, monkeypatch, tmp_path, leader
+):
+    """The order that leaves ``test_two_concurrent_releases_each_prune_their_own_view``
+    a follow-up pass to wait for, forced. One end's pass walks while the other
+    projection still holds its lease. The other end then arrives, records a
+    request and returns, and the follow-up pass that removes its view runs on a
+    third prune thread, held here until the settle wait is already polling.
+    Joining only the two release threads would assert while that view is still
+    on disk. ``leader`` picks which release takes the first pass, so either
+    view can be the one the follow-up pass owes."""
+    monkeypatch.setattr(projection, "_eager_prune", _REAL_EAGER_PRUNE)
+    monkeypatch.setattr(projection, "_PER_SPAWN_PRUNE_MIN_INTERVAL_SECS", 5.0)
+    monkeypatch.setattr(projection, "_LAST_PER_SPAWN_PRUNE", {})
+    monkeypatch.setattr(projection, "on_event_loop", lambda: True)
+    _home, agents, project = native_tree
+    source = agents / "custom.json"
+    source.write_text('{"name":"custom","prompt":"v1"}', encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project)
+    source.write_text('{"name":"custom","prompt":"v2"}', encoding="utf-8")
+    second = projection.prepare_native_skill_projection(tmp_path / "second-run")
+    first_alias = _alias_file(agents, first)
+    second_alias = _alias_file(agents, second)
+    assert first_alias != second_alias
+    lead, follow = (first, second) if leader == "first" else (second, first)
+    lead_alias, follow_alias = (
+        (first_alias, second_alias) if leader == "first" else (second_alias, first_alias)
+    )
+    pass_threads: list[threading.Thread] = []
+    lead_walked = threading.Event()
+    follower_asked = threading.Event()
+    settle_polled = threading.Event()
+
+    def recording_prune(directory, crew_home_id, *, force=False):
+        pass_threads.append(threading.current_thread())
+        if len(pass_threads) == 2:
+            settle_polled.wait(30)
+        _REAL_EAGER_PRUNE(directory, crew_home_id, force=force)
+        if len(pass_threads) == 1:
+            lead_walked.set()
+            follower_asked.wait(30)
+
+    monkeypatch.setattr(projection, "_eager_prune", recording_prune)
+    threads_before = set(threading.enumerate())
+    try:
+        lead.release()
+        assert lead_walked.wait(30), "the leading end never ran its prune pass"
+        assert not lead_alias.exists()
+        assert follow_alias.exists(), "the following view went before its projection ended"
+
+        follow.release()
+        release_threads = _new_prune_threads(threads_before)
+        for thread in release_threads:
+            if thread is not pass_threads[0]:
+                thread.join(timeout=30)  # it only records a request and returns
+        follower_asked.set()
+        _settle_end_prunes(agents, release_threads, on_poll=settle_polled.set)
+    finally:
+        follower_asked.set()
+        settle_polled.set()
+
+    assert len(pass_threads) == 2, "the two ends did not share one follow-up pass"
+    assert pass_threads[1] not in release_threads, "the follow-up ran on a release thread"
+    assert not follow_alias.exists(), "the view handed to the follow-up pass lingered"
+    assert not lead_alias.exists()
+    assert not list(projection._projection_lease_dir().iterdir()), "a lease outlived its release"

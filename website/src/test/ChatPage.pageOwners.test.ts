@@ -106,6 +106,7 @@ describe('pages/chat/page owners', () => {
       // Pending picks own state/refs only and must precede the roster whose
       // agent-scoped model catalog consumes pendingAgent.
       'useNewSessionPicks',
+      'useSlotSelectionCapabilitiesQuery',
       'useSessionRosters',
       'useModelPickerModels',
       'useSteerDelivery',
@@ -130,6 +131,7 @@ describe('pages/chat/page owners', () => {
       'useComposerSend',
       'useAutoSendIntake',
       'useSessionChoices',
+      'useCrewModeSwitch',
       'useComposerSessionControls',
       'useAppPanelReveal',
       'useFileMentionActions',
@@ -153,6 +155,7 @@ describe('pages/chat/page owners', () => {
       'useTranscriptJumps',
       'useTranscriptRendering',
       'useSessionsDrawer',
+      'useChatPanelTrackpadSwipe',
       'usePanelLayout',
       'useComposerAboveBand',
       'useSessionControlChips',

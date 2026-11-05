@@ -1,11 +1,12 @@
 import { useEffect, useState, useRef } from 'react'
-import { Download, Upload, FileArchive, AlertCircle, CheckCircle } from 'lucide-react'
+import { Download, Upload, FileArchive, AlertCircle, CheckCircle, Loader2 } from 'lucide-react'
 import { Card, CardTitle } from '../../components/ui'
 import SimpleSelect from '../../components/SimpleSelect'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useConfirm } from '../../components/ConfirmDialog'
 
 import { i18nT } from '../../i18n/t'
+import { fmtBytes } from '../../i18n/format'
 import { noteStaleOwnerResponse } from '../../api/staleOwnerSignal'
 import { uiLocation } from '../../uiLocations/uiLocation'
 import { adoptHostUiPrefsOnNextLoad, pauseUiPrefsSync, resumeUiPrefsSync } from '../../lib/uiPrefs'
@@ -305,6 +306,8 @@ export default function PortabilityTab() {
   const [importErrors, setImportErrors] = useState<string[]>(carried?.errors ?? [])
   const [preview, setPreview] = useState<Manifest | null>(null)
   const [previewError, setPreviewError] = useState('')
+  // True while the server checks the chosen archive; a large one takes minutes.
+  const [checking, setChecking] = useState(false)
   const [mode, setMode] = useState<'merge' | 'replace'>('merge')
   const [includeChats, setIncludeChats] = useState(false)
   const [includeTemplates, setIncludeTemplates] = useState(false)
@@ -392,6 +395,7 @@ export default function PortabilityTab() {
 
     const fd = new FormData()
     fd.append('file', file)
+    setChecking(true)
     try {
       const resp = await fetch('/api/portability/preview', { method: 'POST', body: fd })
       const data = await resp.json()
@@ -405,6 +409,8 @@ export default function PortabilityTab() {
       }
     } catch {
       setPreviewError(i18nT('pages.overview.portabilityTab.network_error_during_preview'))
+    } finally {
+      setChecking(false)
     }
   }
 
@@ -642,7 +648,7 @@ export default function PortabilityTab() {
             : i18nT('pages.overview.portabilityTab.import_memory_only_hint')}
         </p>
         <div className="flex items-center gap-3 flex-wrap">
-          <label {...uiLocation('backup.import-file')} htmlFor="portability-import-file" className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-[13px] font-semibold font-body cursor-pointer bg-bg-elevated border border-border hover:border-accent transition-colors">
+          <label {...uiLocation('backup.import-file')} htmlFor="portability-import-file" className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-[13px] font-semibold font-body bg-bg-elevated border border-border transition-colors ${checking ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:border-accent'}`}>
             <Upload size={14} />
             {i18nT('pages.overview.portabilityTab.choose_file')}
             <input
@@ -651,6 +657,8 @@ export default function PortabilityTab() {
               type="file"
               accept=".zip"
               aria-label={i18nT('pages.overview.portabilityTab.choose_import_file')}
+              // One check at a time, so an older answer cannot replace a newer file's.
+              disabled={checking}
               onChange={handleFileChange}
               className="hidden"
             />
@@ -675,6 +683,12 @@ export default function PortabilityTab() {
             {importStatus.type === 'loading' ? i18nT('pages.overview.portabilityTab.importing') : i18nT('pages.overview.portabilityTab.import')}
           </button>
         </div>
+        {checking && (
+          <div role="status" data-testid="portability-preview-checking" className="mt-3 text-[12px] text-muted inline-flex items-center gap-1">
+            <Loader2 size={12} className="animate-spin" aria-hidden="true" />
+            {i18nT('pages.overview.portabilityTab.checking_archive')}
+          </div>
+        )}
 
         {preview && (() => {
           // In a memory import, rows outside memory are named but marked skipped,
@@ -686,9 +700,9 @@ export default function PortabilityTab() {
           return (
           <div className="mt-3 p-3 rounded-lg bg-bg-elevated border border-border text-[12px] font-mono space-y-1">
             <div className="font-semibold text-text mb-1">{i18nT('pages.overview.portabilityTab.archive_contents')}</div>
-            {preview.contents['config.json'] != null && <div className={outside}>{i18nT('pages.overview.portabilityTab.config')} {(preview.contents['config.json'] / 1024).toFixed(1)} {i18nT('pages.overview.portabilityTab.kb')}{skipped}</div>}
-            {preview.contents['memory.db'] != null && <div>{i18nT('pages.overview.portabilityTab.memory_db')} {(preview.contents['memory.db'] / 1024).toFixed(1)} {i18nT('pages.overview.portabilityTab.kb')}</div>}
-            {preview.contents['crons.json'] != null && <div className={outside}>{i18nT('pages.overview.portabilityTab.crons')} {(preview.contents['crons.json'] / 1024).toFixed(1)} {i18nT('pages.overview.portabilityTab.kb')}{skipped}</div>}
+            {preview.contents['config.json'] != null && <div className={outside}>{i18nT('pages.overview.portabilityTab.config')} {fmtBytes(preview.contents['config.json'])}{skipped}</div>}
+            {preview.contents['memory.db'] != null && <div>{i18nT('pages.overview.portabilityTab.memory_db')} {fmtBytes(preview.contents['memory.db'])}</div>}
+            {preview.contents['crons.json'] != null && <div className={outside}>{i18nT('pages.overview.portabilityTab.crons')} {fmtBytes(preview.contents['crons.json'])}{skipped}</div>}
             {preview.contents.workspace_files != null && (
               <div>
                 {previewMemoryOnly

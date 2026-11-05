@@ -46,13 +46,18 @@ from typing import TYPE_CHECKING
 # (other names on it may still be read here). The facade keeps binding them, so
 # ``kiro_crew.cli.<name>`` stays the object callers import, type checkers see and patches
 # replace (the mirror at the end of this file sends such a patch to every owner holding it).
-from kiro_crew import _facade_mirror, cli_help, platform_compat, version_line
+from kiro_crew import _facade_mirror, cli_help, platform_compat, sandbox_launch_mark, version_line
 from kiro_crew.apps import builtins as _builtins_pkg
 from kiro_crew.apps.builtins import BUILTIN_NAMES as _BUILTIN_NAMES
 from kiro_crew.cli_log_files import (  # noqa: F401 -- re-exported for existing callers
+    BOOT_LOG_GENERATIONS,
+    BOOT_LOG_GENERATIONS_MAX_BYTES,
     _AppendOnlyLogFileHandler,
     _open_owner_only,
     _OwnerOnlyRotatingFileHandler,
+    boot_log_dir,
+    boot_log_dir_is_linked,
+    older_boot_logs,
 )
 from kiro_crew.config import KiroCrewConfig, config_dir, ensure_data_home
 from kiro_crew.config.loader import (  # noqa: F401
@@ -69,6 +74,7 @@ from kiro_crew.constants import (  # noqa: F401
     parse_node_version,
 )
 from kiro_crew.crash_guard import install as _install_crash_guard
+from kiro_crew.dashboard.loop_watchdog import disarm_inherited_alarm
 from kiro_crew.env import git_build_info
 from kiro_crew.gateway_lock import LIVE_HOLDER_EXIT_CODE, GatewayLock, GatewayLockError
 from kiro_crew.history import ConversationLog, HistoryConsolidator  # noqa: F401
@@ -82,6 +88,7 @@ from kiro_crew.platform import (  # noqa: F401
     boot_platform,
     current_context,
 )
+from kiro_crew.platform_compat_offloop_spawn import gateway_loop_factory
 from kiro_crew.preflight import run_preflight_checks
 from kiro_crew.project_dir import PROJECT_MARKERS, detect_project_dir
 from kiro_crew.seed import seed_cmd
@@ -97,6 +104,100 @@ logger = logging.getLogger("kiro_crew.cli")
 
 # The project-root signature lives in kiro_crew.project_dir; kept here by name.
 _PROJECT_MARKERS = PROJECT_MARKERS
+
+
+#: The ``kas`` verbs that only read or write the Kiro sign-in in Crew's vault, plus
+#: ``route``, the read-only config lookup a remote sign-in runs before ``login``.
+_SIGN_IN_ACTIONS = frozenset({"login", "whoami", "logout", "route"})
+
+
+def _is_sign_in_command(args: argparse.Namespace) -> bool:
+    """Is *args* an enterprise build's sign-in verb, which must run before policy loads?
+
+    An enterprise build's policy fetch authenticates as the vault's sign-in, so with no
+    sign-in the fetch fails; the verb that creates one must not need it. An oss build
+    keeps the fail-closed rule for every command.
+    """
+    from kiro_crew import edition
+
+    return (
+        edition.is_enterprise()
+        and args.command == "kas"
+        and getattr(args, "kas_action", None) in _SIGN_IN_ACTIONS
+    )
+
+
+def _serve_sign_in_first(args: argparse.Namespace, exc: BaseException) -> None:
+    """Gateway boot failed for *exc*: show the sign-in screen if nobody is signed in.
+
+    Returns, having done nothing, for any other failure and in an ``oss`` build.
+    Otherwise it exits: 0 once a sign-in landed (start again to load the rules),
+    as before on any failure (``kiro_crew.enterprise_signin_gateway``).
+    """
+    from kiro_crew import enterprise_signin_gateway as signin
+
+    # A test or scripted start (`--test-mode`, `--json-ready`) waits for a ready
+    # line, not a browser sign-in, so it gets the refusal exit as before.
+    if getattr(args, "test_mode", False) or getattr(args, "json_ready", False):
+        return
+    if not signin.applies(exc):
+        return
+    from kiro_crew.cli_gateway_boot import _resolve_gateway_args
+    from kiro_crew.config.loader_credentials import CRED_OWNER_ID
+    from kiro_crew.dashboard.urls import parse_dashboard_url
+
+    # The same checked flags the gateway itself starts with: a bad `--port`
+    # exits 2 with its usual message here too, before anything binds.
+    gw = _resolve_gateway_args(args)
+    cfg = KiroCrewConfig.load()
+    # Open a browser only when the normal gateway would: not with `--no-open` or
+    # `dashboard.auto_open_browser` off, and not on a headless SSH session, where
+    # a console browser would take over the terminal (service_boot.py).
+    is_ssh = bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT"))
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    no_open = (
+        bool(gw["no_open"])
+        or not cfg.dashboard.auto_open_browser
+        or (is_ssh and not has_display and sys.platform != "darwin")
+    )
+    _host, port = parse_dashboard_url(cfg.dashboard.url)
+    override = gw["port_override"]
+    if override is not None:
+        port = 0 if override == "auto" else int(override)
+    try:
+        owner_id = str(cfg.load_credentials(propagate=False).get(CRED_OWNER_ID, "") or "")
+    except Exception:
+        owner_id = ""
+    # One gateway per data home, the sign-in screen included: the same lock the
+    # gateway takes, held until this process exits.
+    try:
+        lock = GatewayLock(config_dir(), port=port or None, bind_address=signin.BIND_HOST).acquire()
+    except GatewayLockError as lock_err:
+        print(f"👻 {lock_err}", file=sys.stderr)
+        sys.exit(LIVE_HOLDER_EXIT_CODE if lock_err.live_holder else 1)
+    try:
+        _start_gateway_log_after_lock()
+        signin.sign_in_then_exit(
+            exc, port=port, owner_id=owner_id, no_open=no_open, start_args=_restart_args(args)
+        )
+    finally:
+        lock.release()
+
+
+def _restart_args(args: argparse.Namespace) -> tuple[str, ...]:
+    """The `gateway` flags of this start that the restart must repeat.
+
+    The launch options only: one-shot ones (`--seed`, `--seed-replace`) are left out.
+    """
+    flags: list[str] = []
+    for flag in ("slack_only", "no_crons", "no_tunnel", "no_open"):
+        if getattr(args, flag, False):
+            flags.append("--" + flag.replace("_", "-"))
+    for flag in ("port", "approval"):
+        value = getattr(args, flag, None)
+        if value is not None:
+            flags += ["--" + flag, str(value)]
+    return tuple(flags)
 
 
 def _project_dir_file() -> Path:
@@ -243,6 +344,10 @@ def main() -> None:
     # KIROCREW_SANDBOX_LEVEL gets the same treatment: a stale inherited value
     # would be read as the ACTIVE tier by a descendant's passthrough and
     # corrupt its downgrade audit.
+    #
+    # Noted first, because the governance tier asks later where this process takes its
+    # ceiling from (``sandbox_launch_mark``). That answer picks a source, not a looser one.
+    sandbox_launch_mark.note()
     os.environ.pop("KIROCREW_SANDBOX_ACTIVE", None)
     os.environ.pop("KIROCREW_SANDBOX_LEVEL", None)
 
@@ -456,7 +561,6 @@ def main() -> None:
     cli_parser_admin.register_secrets_parser(sub)
     cli_parser_admin.register_pod_parser(sub)
     cli_parser_gateway.register_update_parser(sub)
-    cli_parser_admin.register_file_delivery_parser(sub)
     cli_parser_gateway.register_stop_parser(sub)
     cli_parser_gateway.register_restart_parser(sub)
     cli_parser_gateway.register_gateway_pid_parser(sub)
@@ -466,6 +570,7 @@ def main() -> None:
     cli_parser_admin.register_cloud_parser(sub)
     cli_parser_gateway.register_logs_parser(sub)
     cli_parser_gateway.register_token_parser(sub)
+    cli_parser_gateway.register_open_parser(sub)
     cli_parser_gateway.register_logout_parser(sub)
     cli_parser_gateway.register_status_parser(sub)
 
@@ -507,6 +612,11 @@ def main() -> None:
     # mcp-mate (MCP server -- a crewmate changing its own record from its own
     # chat: ``update_self`` and the card-backed asks).
     sub.add_parser("mcp-mate")
+
+    # mcp-secrets (MCP server -- the opt-in mediated-secret request tool: an agent
+    # granted ``@kirocrew-secrets`` may send a write to an owner-authorized origin
+    # with a Custom secret whose value never reaches the model).
+    sub.add_parser("mcp-secrets")
 
     # Builtin app MCP servers (spawned by the agent backend, not user-facing).
     # Only builtins that actually ship an ``mcp_server`` module get a verb —
@@ -678,13 +788,34 @@ def main() -> None:
         # mcp-core/mcp-cron/etc. with no security overlay or credential
         # redaction. PluginAdmissionError subclasses PlatformCompositionError.
         if isinstance(exc, PlatformCompositionError):
-            if args.command == "doctor":
+            sign_in = _is_sign_in_command(args)
+            if args.command == "gateway":
+                # Enterprise build, nobody signed in: the sign-in screen runs and
+                # this exits (0 once signed in). Returns for any other failure.
+                _serve_sign_in_first(args, exc)
+            if args.command != "doctor" and not sign_in:
+                # Enterprise build: governance rules that did not load stop Crew
+                # here, before any server binds, with what failed and the fix.
+                from kiro_crew.enterprise_boot import refuse_policy_boot
+
+                refuse_policy_boot(exc)
+            if args.command == "doctor" or sign_in:
+                # The sign-in verbs are what an enterprise build's policy fetch needs
+                # first, so a missing sign-in must not lock them out. They touch only
+                # the Kiro sign-in in Crew's vault and run no agent.
                 logging.getLogger("kiro_crew").debug(
-                    "platform composition failed; doctor will report it", exc_info=True
+                    "platform composition failed; %s runs without it", args.command, exc_info=True
                 )
                 _platform_boot_error = exc
             else:
-                raise
+                # Still fail-closed: the command never runs. The error already
+                # names what failed and how (e.g. "unknown governed key
+                # 'sandbox.enabeld' (fail-closed)"), so print it on one line
+                # and exit 1 instead of a traceback; doctor shows the detail.
+                logging.getLogger("kiro_crew").debug("platform composition failed", exc_info=True)
+                print(f"❌ {exc}", file=sys.stderr)
+                print("   Run `kirocrew doctor` for details.", file=sys.stderr)
+                raise SystemExit(1) from None
         else:
             # Standalone boot never raises; only genuinely-unexpected errors
             # reach here, and the standalone edition must not break on a corrupt
@@ -758,8 +889,6 @@ def main() -> None:
         # never armed -- before boot spends the seconds the watchdog is not yet
         # running. Only while SIGALRM is at its default disposition, the same
         # ownership rule the watchdog applies when it arms.
-        from kiro_crew.dashboard.loop_watchdog import disarm_inherited_alarm
-
         disarm_inherited_alarm()
         # Install crash breadcrumbs (atexit + excepthook) before asyncio.run
         # so any fatal exception writes to crash.log.
@@ -801,7 +930,11 @@ def main() -> None:
             # attempt may find cleared, so it keeps the restartable exit 1.
             sys.exit(LIVE_HOLDER_EXIT_CODE if exc.live_holder else 1)
         try:
-            asyncio.run(_gateway(**gw_kwargs))
+            # Only now, holding the lock, move the previous run's log aside: a
+            # start refused above must never rotate a running gateway's log.
+            _start_gateway_log_after_lock()
+            # Windows: every spawn on this loop builds its child off-loop.
+            asyncio.run(_gateway(**gw_kwargs), loop_factory=gateway_loop_factory())
         finally:
             _gw_lock.release()
     elif args.command == "setup":
@@ -908,6 +1041,11 @@ def main() -> None:
     elif args.command == "mcp-mate":
         # Lazily imported for the same reason as the guide.
         importlib.import_module("kiro_crew.mcp_mate").run_mcp_server()
+    elif args.command == "mcp-secrets":
+        # Lazily imported like the other opt-in servers, so the gateway boot path
+        # never loads the sandboxed forwarder just to exist. It does NOT import
+        # the vault -- the vault read happens host-side in the dashboard handler.
+        importlib.import_module("kiro_crew.mcp_secrets").run_mcp_server()
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
         # Registration gates this verb on _builtin_mcp_server_available, and
         # _run_app_mcp_server is the ONE dispatch-time spelling of "import the
@@ -915,8 +1053,17 @@ def main() -> None:
         # the `kirocrew app mcp <name>` manifest path uses (clean stderr line +
         # exit 1 on ImportError or a missing run_mcp_server entrypoint), so an
         # unresolvable module cannot reach a raw traceback here.
+        from kiro_crew.apps.builtin_adoption import builtin_package_released
         from kiro_crew.cli_commands import _run_app_mcp_server
 
+        if builtin_package_released(args.command[4:]):
+            # The app now runs from its own repository; the wheel copy's server
+            # must not answer for it.
+            print(
+                "This app is installed from its repository; use `kirocrew app mcp <name>`.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         _run_app_mcp_server(args.command[4:])
     elif args.command == "computer":
         # Deferred import: ``computer_use.cli`` reaches the driver seam, and the
@@ -947,7 +1094,7 @@ def main() -> None:
 
         _policy(args)
     elif args.command == "knowledge":
-        _knowledge(args)
+        sys.exit(_knowledge(args))
     elif args.command == "secrets":
         # Dispatch through the module-level `importlib` rather than a
         # function-local `from kiro_crew.cli_commands import …`: the latter trips
@@ -969,18 +1116,22 @@ def main() -> None:
             from kiro_crew.cli_server import _update
 
             _update(force=args.force)
-    elif args.command == "file-delivery":
-        from kiro_crew.cli_server import _file_delivery_approve
-
-        _file_delivery_approve()
     elif args.command == "stop":
         from kiro_crew.cli_server import _stop
 
         _stop(args.port, expect_pid=args.expect_pid)
     elif args.command == "restart":
-        from kiro_crew.cli_server import _restart
+        if args.max_wait is not None and not args.when_idle:
+            print("❌ --max-wait applies only with --when-idle.", file=sys.stderr)
+            sys.exit(2)
+        if args.when_idle:
+            from kiro_crew.cli_restart_idle import _restart_when_idle
 
-        _restart(args.port)
+            _restart_when_idle(args.port, max_wait_secs=args.max_wait)
+        else:
+            from kiro_crew.cli_server import _restart
+
+            _restart(args.port)
     elif args.command == "gateway-pid":
         from kiro_crew.cli_server import _gateway_pid
 
@@ -1007,6 +1158,10 @@ def main() -> None:
         from kiro_crew.cli_server import _token
 
         _token(args)
+    elif args.command == "open":
+        from kiro_crew.cli_open import cmd_open
+
+        sys.exit(cmd_open(args))
     elif args.command == "logout":
         from kiro_crew.cli_server import _logout, resolve_client_port
 
@@ -1087,7 +1242,7 @@ from kiro_crew.cli_gateway_boot import (  # noqa: E402
 )
 from kiro_crew.cli_jail import _JAILED_COMMANDS, _jail_reexec_gate  # noqa: E402
 from kiro_crew.cli_knowledge import _consolidate_cmd, _knowledge  # noqa: E402
-from kiro_crew.cli_logging import _setup_cli_logging  # noqa: E402
+from kiro_crew.cli_logging import _setup_cli_logging, _start_gateway_log_after_lock  # noqa: E402
 from kiro_crew.cli_perf import perf_cmd, register_perf_parser  # noqa: E402
 from kiro_crew.cli_setup import (  # noqa: E402, F401
     _fix_shell_profiles,
@@ -1134,6 +1289,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _knowledge_stats,
     )
     from kiro_crew.cli_logging import (  # noqa: F401
+        _GATEWAY_LOG_DETACHED,
+        _GATEWAY_LOG_HANDLER,
+        _GATEWAY_LOG_MAX_BYTES,
         _LOG_ERROR_STREAK_LIMIT,
         _LOG_FATAL_ERRNOS,
         _LOG_QUEUE_LISTENER,
@@ -1143,8 +1301,11 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _fd_is_regular_file,
         _fd_targets_file,
         _FdTrackingRotatingFileHandler,
+        _prune_older_boot_logs,
         _redirect_fds_to,
         _route_logging_through_queue,
+        _rotate_boot_logs,
         _stop_log_queue_listener,
         drain_log_queue_before_hard_exit,
     )
+    from kiro_crew.messaging.tables import display_width  # noqa: F401

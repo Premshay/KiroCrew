@@ -15,6 +15,7 @@ vi.mock('../api/client', () => ({
     arcBoardDetail: vi.fn(),
     arcBoardAccept: vi.fn(),
     arcBoardAnswer: vi.fn(),
+    arcBoardSettings: vi.fn(),
     arcBoardAddMember: vi.fn(),
     arcBoardReport: vi.fn(),
     agentCatalog: vi.fn(),
@@ -207,5 +208,25 @@ describe('ArcBoardPage', () => {
     fireEvent.change(screen.getByLabelText(/your answer/i), { target: { value: 'A' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
     expect(await screen.findByText(/Sent to Tenon in the channel/)).toBeTruthy()
+  })
+
+  it('shows a GitHub record with its reviewers and saves the arc settings', async () => {
+    const detail = await (api.arcBoardDetail as unknown as () => Promise<Record<string, unknown>>)()
+    vi.mocked(api.arcBoardDetail).mockResolvedValue({
+      ...detail,
+      entries: [
+        ...(detail.entries as object[]),
+        { id: 'ae_9', ts: '2026-11-03T10:00:00+00:00', author: 'github', kind: 'DONE', text: '#11 merged: M2 slice 1',
+          link: 'https://github.com/o/r/pull/11', pr: 11, head: 'c4978e364f41', reviewers: ['assay', 'derrick'],
+          verified: true, lane: 'chat-1' },
+      ],
+    } as never)
+    vi.mocked(api.arcBoardSettings).mockResolvedValue({ arc } as never)
+    renderPage()
+    expect(await screen.findByText('#11 merged: M2 slice 1')).toBeTruthy()
+    expect(screen.getByText('Verified: assay, derrick')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('GitHub repository'), { target: { value: 'o/r' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
+    await waitFor(() => expect(api.arcBoardSettings).toHaveBeenCalledWith(ARC, { repo: 'o/r', coordinator: '' }))
   })
 })

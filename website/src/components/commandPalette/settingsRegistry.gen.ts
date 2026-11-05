@@ -26,35 +26,92 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "about.update-the-gateway-automatically",
     "label": "Update the gateway automatically",
     "labelKey": "pages.settings.aboutPanel.automatic_updates",
-    "description": "Installs a new release once no work is running and restarts the gateway, on installs that can update themselves.",
+    "description": "Restarts the gateway to install a new release once no work is running. When off, it stays on its current version.",
     "tab": "about",
     "type": "toggle",
     "occurrence": 1,
     "configKey": "auto_update"
   },
   {
-    "id": "browser.attach-token",
-    "labelKey": "pages.settings.browserPanel.token_label",
-    "tab": "browser",
-    "type": "input",
+    "id": "agent.kiro-sign-in",
+    "labelKey": "pages.developer.kiroSignInCard.search_label",
+    "tab": "agent",
+    "type": "buttonGroup",
     "occurrence": 1,
-    "label": "Extension token (optional)"
+    "settingId": "kiro-sign-in",
+    "label": "Sign out or switch Kiro account",
+    "description": "Log out of the Kiro sign-in your agents use, or sign in with another account."
   },
   {
-    "id": "browser.use-the-built-in-browser",
-    "label": "Use the built-in browser",
-    "labelKey": "pages.settings.browserPanel.use_builtin_label",
+    "id": "browser.max-frame-rate",
+    "label": "Max frame rate",
+    "labelKey": "pages.settings.browserPanel.max_fps_label",
+    "hint": "60 is the most this machine streams. Nothing is sent while the card is off screen.",
+    "tab": "browser",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "browser.live.max_fps"
+  },
+  {
+    "id": "browser.quality",
+    "label": "Quality",
+    "labelKey": "pages.settings.browserPanel.quality_label",
+    "hint": "Auto adapts to your link: a slow link lowers the frame rate first and keeps the picture sharp.",
+    "tab": "browser",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "browser.live.quality"
+  },
+  {
+    "id": "browser.run-with-no-window",
+    "label": "Run with no window",
+    "labelKey": "pages.settings.browserPanel.headless_label",
+    "hint": "Kiro’s Chromium runs with no window, for a machine with no display. Turning this off keeps Kiro’s Chromium, with a window.",
+    "tab": "browser",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "browser.show-the-live-view-in-chat",
+    "label": "Show the live view in chat",
+    "labelKey": "pages.settings.browserPanel.live_enabled_label",
+    "hint": "When Kiro uses the browser, the turn shows a live card. Click the picture to take over.",
     "tab": "browser",
     "type": "toggle",
     "occurrence": 1,
-    "configKey": "dashboard.use_builtin_browser"
+    "configKey": "browser.live.enabled"
+  },
+  {
+    "id": "browser.which-browser",
+    "label": "Which browser",
+    "labelKey": "pages.settings.browserPanel.choice_label",
+    "hint": "Automatic tries your Chrome, then Edge on Windows, then Kiro’s Chromium. A hand pick skips that order.",
+    "tab": "browser",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "browser.choice"
+  },
+  {
+    "id": "channels.agent-sessions-slack",
+    "label": "Agent sessions (Slack)",
+    "labelKey": "pages.settings.slackPanel.slackCode.agent_sessions",
+    "labelSuffix": "Slack",
+    "hint": "Slack threads show a live status and title, and a Stop button that stops the agent's current reply.",
+    "tab": "channels",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "slack"
+    },
+    "configKey": "slack.agent_sessions"
   },
   {
     "id": "channels.allowed-emails-webex",
     "label": "Allowed emails (Webex)",
     "labelKey": "pages.settings.webexPanel.allowed_emails",
     "labelSuffix": "Webex",
-    "description": "Webex account emails permitted to DM the bot. Empty = nobody (fail closed) — anyone in an org can message a Webex bot, so add only your own.",
+    "description": "Empty lets nobody message it.",
+    "hint": "Webex account emails permitted to DM the bot. Empty = nobody (fail closed) — anyone in an org can message a Webex bot, so add only your own.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -67,7 +124,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Allowed enterprise orgs (Slack)",
     "labelKey": "pages.settings.slackPanel.allowed_enterprise_orgs",
     "labelSuffix": "Slack",
-    "description": "Enterprise Grid org or workspace IDs to allow (starts with E or T). On Enterprise Grid, list the org's E… ID and each workspace's T… ID: messages are checked by workspace, so a list with only the E… ID denies every message. Leave empty to allow all orgs.",
+    "description": "On Enterprise Grid, list each workspace's T… ID too. Empty allows all orgs.",
+    "hint": "Enterprise Grid org or workspace IDs to allow (starts with E or T). On Enterprise Grid, list the org's E… ID and each workspace's T… ID: messages are checked by workspace, so a list with only the E… ID denies every message. Leave empty to allow all orgs.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -80,7 +138,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Allowed handles (iMessage)",
     "labelKey": "pages.settings.iMessagePanel.allowed_handles",
     "labelSuffix": "iMessage",
-    "description": "Phone numbers or Apple Account emails allowed to message the agent. Empty denies everyone — anyone who knows this Mac's handle can send to it, so there is no safe default. Formatting is ignored.",
+    "description": "Empty lets nobody message it.",
+    "hint": "Phone numbers or Apple Account emails allowed to message the agent. Empty denies everyone — anyone who knows this Mac's handle can send to it, so there is no safe default. Formatting is ignored.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -106,7 +165,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Allowed space IDs (Webex)",
     "labelKey": "pages.settings.webexPanel.allowed_room_ids",
     "labelSuffix": "Webex",
-    "description": "Empty means no space is answered, so turning the switch on alone grants nothing. The sender must also be on the allowed-emails list. A space ID is an opaque string — list yours with:\ncurl -H \"Authorization: Bearer $WEBEX_BOT_TOKEN\" https://webexapis.com/v1/rooms",
+    "description": "Empty means no space is answered.",
+    "hint": "Empty means no space is answered, so turning the switch on alone grants nothing. The sender must also be on the allowed-emails list. A space ID is an opaque string — list yours with:\ncurl -H \"Authorization: Bearer $WEBEX_BOT_TOKEN\" https://webexapis.com/v1/rooms",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -168,7 +228,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Allowed users (email or AAD object id) (Teams)",
     "labelKey": "pages.settings.teamsPanel.allowed_users_email_or_aad_object_id",
     "labelSuffix": "Teams",
-    "description": "Azure AD UPNs/emails OR object ids permitted to DM the bot. Teams activities reliably carry the object id (email is often absent), so object ids work out of the box. Empty = nobody (fail closed).",
+    "description": "Empty lets nobody message it.",
+    "hint": "Azure AD UPNs/emails OR object ids permitted to DM the bot. Teams activities reliably carry the object id (email is often absent), so object ids work out of the box. Empty = nobody (fail closed).",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -181,7 +242,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Answer in group spaces (Webex)",
     "labelKey": "pages.settings.webexPanel.allow_group_spaces",
     "labelSuffix": "Webex",
-    "description": "Off by default. A reply in a space is visible to everyone in it, including people not on the allowed-emails list.",
+    "description": "Everyone in a space sees the reply, even people not on the list.",
+    "hint": "Off by default. A reply in a space is visible to everyone in it, including people not on the allowed-emails list.",
     "tab": "channels",
     "type": "toggle",
     "occurrence": 1,
@@ -207,7 +269,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "App password (client secret) (Teams)",
     "labelKey": "pages.settings.teamsPanel.app_password_client_secret",
     "labelSuffix": "Teams",
-    "description": "Azure Bot client secret. Stored only in .env (never config.json).",
+    "hint": "Azure Bot client secret. Stored only in .env (never config.json).",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -216,11 +278,26 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "channels.code-channels-slack",
+    "label": "Code channels (Slack)",
+    "labelKey": "pages.settings.slackPanel.slackCode.code_channels",
+    "labelSuffix": "Slack",
+    "description": "On: lets the agent open a Slack channel for each coding task, with a context bar and a diff tab, invite you to it, and post and keep notes there under its own name. Your Slack app gets 5 permissions for this. Off: nothing changes, and you can remove the permissions in Slack later. Slack is rolling code channels out gradually, so your workspace may not have them yet.",
+    "tab": "channels",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "slack"
+    },
+    "configKey": "slack.code_channels"
+  },
+  {
     "id": "channels.connect-new-sessions-to-slack-automatically-slack",
     "label": "Connect new sessions to Slack automatically (Slack)",
     "labelKey": "pages.settings.slackPanel.auto_link_sessions",
     "labelSuffix": "Slack",
-    "description": "Every new dashboard session gets a Slack thread on its first message, in your private direct message with the bot. Sessions started by cron, apps or sub-agents, sessions that began in Slack or another messaging app, and incognito or temporary sessions are left alone. A session connected this way does not count as a Slack session for the folder setting below: it stays where it is in the sidebar, and only conversations that start in Slack are filed.",
+    "description": "Posts every new dashboard chat to your Slack DM with the bot.",
+    "hint": "Every new dashboard session gets a Slack thread on its first message, in your private direct message with the bot. Sessions started by cron, apps or sub-agents, sessions that began in Slack or another messaging app, and incognito or temporary sessions are left alone. A session connected this way does not count as a Slack session for the folder setting below: it stays where it is in the sidebar, and only conversations that start in Slack are filed.",
     "tab": "channels",
     "type": "toggle",
     "occurrence": 1,
@@ -234,7 +311,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Enable iMessage channel (iMessage)",
     "labelKey": "pages.settings.iMessagePanel.enable",
     "labelSuffix": "iMessage",
-    "description": "Start the channel at gateway boot on this Mac.",
+    "hint": "Start the channel at gateway boot on this Mac.",
     "tab": "channels",
     "type": "toggle",
     "occurrence": 1,
@@ -247,7 +324,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Enable Teams channel (Teams)",
     "labelKey": "pages.settings.teamsPanel.enable_teams_channel",
     "labelSuffix": "Teams",
-    "description": "Start the channel at gateway boot when the App ID + password are set.",
+    "hint": "Start the channel at gateway boot when the App ID + password are set.",
     "tab": "channels",
     "type": "toggle",
     "occurrence": 1,
@@ -284,7 +361,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Enable Webex channel (Webex)",
     "labelKey": "pages.settings.webexPanel.enable_webex_channel",
     "labelSuffix": "Webex",
-    "description": "Start the channel at gateway boot when a token is set.",
+    "hint": "Start the channel at gateway boot when a token is set.",
     "tab": "channels",
     "type": "toggle",
     "occurrence": 1,
@@ -405,7 +482,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Folder name (Discord)",
     "labelKey": "pages.settings.botChannelPanel.session_folder_name",
     "labelSuffix": "Discord",
-    "description": "Created for you when you save these settings, if it does not exist yet.",
+    "hint": "Created for you when you save these settings, if it does not exist yet.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -418,7 +495,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Folder name (iMessage)",
     "labelKey": "pages.settings.botChannelPanel.session_folder_name",
     "labelSuffix": "iMessage",
-    "description": "Created for you when you save these settings, if it does not exist yet.",
+    "hint": "Created for you when you save these settings, if it does not exist yet.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -431,7 +508,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Folder name (Slack)",
     "labelKey": "pages.settings.botChannelPanel.session_folder_name",
     "labelSuffix": "Slack",
-    "description": "Created for you when you save these settings, if it does not exist yet.",
+    "hint": "Created for you when you save these settings, if it does not exist yet.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -444,7 +521,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Folder name (Teams)",
     "labelKey": "pages.settings.botChannelPanel.session_folder_name",
     "labelSuffix": "Teams",
-    "description": "Created for you when you save these settings, if it does not exist yet.",
+    "hint": "Created for you when you save these settings, if it does not exist yet.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -457,7 +534,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Folder name (Telegram)",
     "labelKey": "pages.settings.botChannelPanel.session_folder_name",
     "labelSuffix": "Telegram",
-    "description": "Created for you when you save these settings, if it does not exist yet.",
+    "hint": "Created for you when you save these settings, if it does not exist yet.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -470,7 +547,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Folder name (Webex)",
     "labelKey": "pages.settings.botChannelPanel.session_folder_name",
     "labelSuffix": "Webex",
-    "description": "Created for you when you save these settings, if it does not exist yet.",
+    "hint": "Created for you when you save these settings, if it does not exist yet.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -483,7 +560,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Folder name (WeChat)",
     "labelKey": "pages.settings.botChannelPanel.session_folder_name",
     "labelSuffix": "WeChat",
-    "description": "Created for you when you turn this on, if it does not exist yet.",
+    "hint": "Created for you when you turn this on, if it does not exist yet.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -496,7 +573,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Folder name (WeCom)",
     "labelKey": "pages.settings.botChannelPanel.session_folder_name",
     "labelSuffix": "WeCom",
-    "description": "Created for you when you save these settings, if it does not exist yet.",
+    "hint": "Created for you when you save these settings, if it does not exist yet.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -509,7 +586,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Folder name (WhatsApp)",
     "labelKey": "pages.settings.botChannelPanel.session_folder_name",
     "labelSuffix": "WhatsApp",
-    "description": "Created for you when you turn this on, if it does not already exist.",
+    "hint": "Created for you when you turn this on, if it does not already exist.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -561,7 +638,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Messages database path (iMessage)",
     "labelKey": "pages.settings.iMessagePanel.db_path",
     "labelSuffix": "iMessage",
-    "description": "Override where the Messages database is read from. Leave empty to use the default location.",
+    "hint": "Override where the Messages database is read from. Leave empty to use the default location.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -574,7 +651,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Owner Slack member ID (Slack)",
     "labelKey": "pages.settings.slackPanel.owner_slack_member_id",
     "labelSuffix": "Slack",
-    "description": "The one member who can always interact with the bot (KIROCREW_OWNER_ID). Starts with U or W.",
+    "description": "Your Slack member ID (KIROCREW_OWNER_ID): in Slack, open your profile, select ⋮, then Copy member ID. Starts with U or W.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -587,7 +664,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Phase reactions (Slack)",
     "labelKey": "pages.settings.slackPanel.phase_reactions",
     "labelSuffix": "Slack",
-    "description": "Show phase-aware emoji reactions (queued → thinking → coding → done) on messages.",
+    "hint": "Add 👀 to a message while it is answered (only where Slack shows no thread status) and 😱 if the turn fails.",
     "tab": "channels",
     "type": "toggle",
     "occurrence": 1,
@@ -600,7 +677,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Reply in thread (Webex)",
     "labelKey": "pages.settings.webexPanel.reply_in_thread",
     "labelSuffix": "Webex",
-    "description": "Reply under the message's own thread when it has one, which keeps a busy space readable.",
+    "hint": "Reply under the message's own thread when it has one, which keeps a busy space readable.",
     "tab": "channels",
     "type": "toggle",
     "occurrence": 1,
@@ -625,7 +702,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Send replies over (iMessage)",
     "labelKey": "pages.settings.iMessagePanel.service",
     "labelSuffix": "iMessage",
-    "description": "Which service outbound replies use. Inbound is unaffected — messages are accepted whichever service they arrive over.",
+    "hint": "Which service outbound replies use. Inbound is unaffected — messages are accepted whichever service they arrive over.",
     "tab": "channels",
     "type": "select",
     "occurrence": 1,
@@ -638,7 +715,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Show thinking (Slack)",
     "labelKey": "pages.settings.slackPanel.show_thinking",
     "labelSuffix": "Slack",
-    "description": "Post the model's reasoning as a thread reply. Disable to keep responses concise.",
+    "hint": "Post the model's reasoning as a thread reply. Disable to keep responses concise.",
     "tab": "channels",
     "type": "toggle",
     "occurrence": 1,
@@ -814,7 +891,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.auto-compact-threshold",
     "label": "Auto-Compact Threshold",
     "labelKey": "pages.settings.chatPanel.auto_compact_threshold",
-    "hint": "Context usage % at which auto-compaction triggers. Lower = more frequent compaction, longer sessions",
+    "hint": "Context usage % at which auto-compaction triggers. Lower = more frequent compaction, longer sessions. Does not apply to KAS sessions, which compact on their own.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -975,7 +1052,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.default-memory-mode",
     "label": "Default Memory Mode",
     "labelKey": "settings.chat.defaultMemoryMode.label",
-    "description": "Persistent uses what it knows and saves new memory. Incognito uses what it knows but saves no new memory. Temporary starts blank and saves no new memory. Every chat still appears in History. You can change the mode for any chat.",
+    "description": "Persistent saves new memory, Incognito saves none, Temporary starts blank and saves none.",
+    "hint": "Persistent uses what it knows and saves new memory. Incognito uses what it knows but saves no new memory. Temporary starts blank and saves no new memory. Every chat still appears in History. You can change the mode for any chat.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -988,8 +1066,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.default-model",
     "label": "Default Model",
     "labelKey": "pages.settings.chatPanel.default_model",
-    "description": "Which model new sessions start with when their agent pins none. Set a model per agent under Customize → Mates, or pick one inside a session to override it there.",
-    "hint": "Agents with their own configured model ignore this setting. 'Default' uses the model from the agent configuration, or the system default when none is configured. Changing this does not affect sessions that are already open.",
+    "hint": "Which model new sessions start with when their agent pins none. Set a model per agent under Customize → Bots, or pick one inside a session to override it there. Agents with their own configured model ignore this setting. 'Default' uses the model from the agent configuration, or the system default when none is configured. Changing this does not affect sessions that are already open.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1013,8 +1090,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.default-sidebar-folder-for-new-chats",
     "label": "Default Sidebar Folder for New Chats",
     "labelKey": "pages.settings.chatPanel.default_session_folder",
-    "description": "The sidebar folder new chats are filed into when you start one without choosing a folder. It groups chats in the sidebar; it is not a folder on disk.",
-    "hint": "The chat uses the folder's linked project and agent, as New chat in folder does.",
+    "hint": "The sidebar folder new chats are filed into when you start one without choosing a folder. It groups chats in the sidebar; it is not a folder on disk. The chat uses the folder's linked project and agent, as New chat in folder does.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1039,7 +1115,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.dim-inactive-panes",
     "label": "Dim Inactive Panes",
     "labelKey": "pages.settings.chatPanel.dim_inactive_panes",
-    "description": "In split view, fade every pane that does not have keyboard focus. When off, all panes stay at full brightness and the accent border marks the focused one.",
+    "hint": "In split view, fade every pane that does not have keyboard focus. When off, all panes stay at full brightness and the accent border marks the focused one.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1057,6 +1133,17 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1,
     "params": {
       "sub": "transcript"
+    }
+  },
+  {
+    "id": "chat.exact-threshold",
+    "label": "Exact Threshold (%)",
+    "labelKey": "pages.settings.chatPanel.auto_compact_exact",
+    "tab": "chat",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "sub": "advanced"
     }
   },
   {
@@ -1133,6 +1220,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "chat.jump-to-the-bottom-when-you-send",
+    "label": "Jump to the bottom when you send",
+    "labelKey": "pages.settings.chatPanel.scroll_on_send",
+    "hint": "When off, sending a message leaves the transcript where it is.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
+  },
+  {
     "id": "chat.keep-side-panel-open",
     "label": "Keep Side Panel Open",
     "labelKey": "pages.settings.chatPanel.side_panel_always_open",
@@ -1149,7 +1248,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.link-previews",
     "label": "Link Previews",
     "labelKey": "pages.settings.chatPanel.link_previews",
-    "description": "Show a favicon and page title instead of the raw URL. This machine then fetches every link the model outputs, so each linked site sees a request from your IP address.",
+    "description": "Each linked site sees a request from your IP address.",
+    "hint": "Show a favicon and page title instead of the raw URL. This machine then fetches every link the model outputs, so each linked site sees a request from your IP address.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1161,7 +1261,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.mcp-apps-in-side-panel",
     "label": "MCP Apps in Side Panel",
     "labelKey": "pages.settings.chatPanel.mcp_apps_in_side_panel",
-    "description": "Render interactive MCP Apps (such as Excalidraw diagrams) in the right side panel instead of inline in the chat. The panel opens automatically.",
+    "hint": "Render interactive MCP Apps (such as Excalidraw diagrams) in the right side panel instead of inline in the chat. The panel opens automatically.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1260,7 +1360,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.plain-diffs",
     "label": "Plain diffs",
     "labelKey": "settings.chat.plainDiff.label",
-    "description": "Render diffs as plain unified-diff text instead of syntax-highlighted colour. Uses less memory on large diffs.",
+    "hint": "Render diffs as plain unified-diff text instead of syntax-highlighted colour. Uses less memory on large diffs.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1272,7 +1372,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.pr-and-issue-chips-on-session-cards",
     "label": "PR and Issue Chips on Session Cards",
     "labelKey": "pages.settings.chatPanel.session_card_source_links",
-    "description": "Show a chip on each session's sidebar card for every pull request, merge request and issue mentioned in that session. Turning it off also stops the periodic provider calls that keep those chips up to date.",
+    "hint": "Show a chip on each session's sidebar card for every pull request, merge request and issue mentioned in that session. Turning it off also stops the periodic provider calls that keep those chips up to date.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1284,7 +1384,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.prevent-sleep-while-running",
     "label": "Prevent sleep while running",
     "labelKey": "pages.settings.chatPanel.prevent_sleep_while_running",
-    "hint": "Keep your computer awake while a task is running",
+    "hint": "Keep your computer awake while a task is running. On some Windows laptops (Modern Standby), locking the screen can still let it sleep, so keep the screen on for long tasks.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1292,6 +1392,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "sub": "advanced"
     },
     "configKey": "dashboard.prevent_sleep"
+  },
+  {
+    "id": "chat.preview-lines-on-session-cards",
+    "label": "Preview Lines on Session Cards",
+    "labelKey": "pages.settings.chatPanel.session_preview_lines",
+    "hint": "How many lines the latest-message preview can use before it is cut off",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.quick-send",
@@ -1406,7 +1518,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.show-full-titles-while-scrolling",
     "label": "Show Full Titles While Scrolling",
     "labelKey": "pages.settings.chatPanel.full_titles_on_scroll",
-    "hint": "While you scroll the session list, titles the sidebar cuts off show in full",
+    "hint": "While you scroll the session list, cut-off titles show in full",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1418,6 +1530,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.show-pasted-text-in-full",
     "label": "Show Pasted Text in Full",
     "labelKey": "pages.settings.chatPanel.show_pasted_text_in_full",
+    "description": "A very large paste can make the input slow.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1465,7 +1578,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.soft-stop-budget-seconds",
     "label": "Soft-stop budget (seconds)",
     "labelKey": "pages.settings.chatPanel.soft_stop_budget_seconds",
-    "description": "How long to wait for the agent to honor a Stop press before forcefully killing the session. Longer budgets preserve session state more often but make stops feel laggy when agents are stuck in long tool calls.",
+    "description": "After this, Stop kills the session.",
+    "hint": "How long to wait for the agent to honor a Stop press before forcefully killing the session. Longer budgets preserve session state more often but make stops feel laggy when agents are stuck in long tool calls.",
     "tab": "chat",
     "type": "input",
     "occurrence": 1,
@@ -1593,6 +1707,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "chat.title-lines-on-session-cards",
+    "label": "Title Lines on Session Cards",
+    "labelKey": "pages.settings.chatPanel.session_title_lines",
+    "hint": "How many lines a session title can use before it is cut off",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
+  },
+  {
     "id": "chat.tool-calls-start-expanded",
     "label": "Tool calls start expanded",
     "labelKey": "pages.settings.chatPanel.tool_calls_start_expanded",
@@ -1670,7 +1796,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "computer-use.attach-screenshots",
     "label": "Attach screenshots",
     "labelKey": "pages.settings.computerUsePanel.attach_screenshots",
-    "description": "Also capture the target window and pass its file path. The accessibility tree stays the primary channel; windows containing a password field are never captured.",
+    "description": "Windows with a password field are never captured.",
+    "hint": "Also capture the target window and pass its file path. The accessibility tree stays the primary channel; windows containing a password field are never captured.",
     "tab": "computer-use",
     "type": "toggle",
     "occurrence": 1
@@ -1679,7 +1806,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "computer-use.enable-computer-use",
     "label": "Enable computer use",
     "labelKey": "pages.settings.computerUsePanel.enable_computer_use",
-    "description": "Let the agent read desktop app windows through accessibility and act on their controls. Off until you turn it on here — an agent cannot enable it.",
+    "hint": "Let the agent read desktop app windows through accessibility and act on their controls. Off until you turn it on here — an agent cannot enable it.",
     "tab": "computer-use",
     "type": "toggle",
     "occurrence": 1
@@ -1688,7 +1815,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "computer-use.max-tree-nodes",
     "label": "Max tree nodes",
     "labelKey": "pages.settings.computerUsePanel.max_tree_nodes",
-    "description": "How many controls one window reading returns. A window with more than this gets truncated, and the agent is told so. Raise it for dense apps (a spreadsheet, an IDE); lower it to spend fewer tokens per reading.",
+    "hint": "How many controls one window reading returns. A window with more than this gets truncated, and the agent is told so. Raise it for dense apps (a spreadsheet, an IDE); lower it to spend fewer tokens per reading.",
     "tab": "computer-use",
     "type": "input",
     "occurrence": 1
@@ -1697,7 +1824,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "computer-use.screenshot-width",
     "label": "Screenshot width",
     "labelKey": "pages.settings.computerUsePanel.screenshot_width",
-    "description": "Longest edge of the screenshot, in pixels. Smaller is cheaper and faster to read; larger keeps small text legible if the agent has to fall back to the image.",
+    "hint": "Longest edge of the screenshot, in pixels. Smaller is cheaper and faster to read; larger keeps small text legible if the agent has to fall back to the image.",
     "tab": "computer-use",
     "type": "input",
     "occurrence": 1
@@ -1758,9 +1885,104 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
   },
   {
+    "id": "connections.oauth-client-gmail",
+    "labelKey": "pages.settings.connectionsPanel.oauth_app",
+    "labelSuffix": "Gmail",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1,
+    "settingId": "connections-oauth-client-gmail",
+    "label": "OAuth app",
+    "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+  },
+  {
+    "id": "connections.oauth-client-google-drive",
+    "labelKey": "pages.settings.connectionsPanel.oauth_app",
+    "labelSuffix": "Google Drive",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1,
+    "settingId": "connections-oauth-client-google-drive",
+    "label": "OAuth app",
+    "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+  },
+  {
+    "id": "connections.oauth-client-google-calendar",
+    "labelKey": "pages.settings.connectionsPanel.oauth_app",
+    "labelSuffix": "Google Calendar",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1,
+    "settingId": "connections-oauth-client-google-calendar",
+    "label": "OAuth app",
+    "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+  },
+  {
+    "id": "connections.oauth-client-google-sheets",
+    "labelKey": "pages.settings.connectionsPanel.oauth_app",
+    "labelSuffix": "Google Sheets",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1,
+    "settingId": "connections-oauth-client-google-sheets",
+    "label": "OAuth app",
+    "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+  },
+  {
+    "id": "connections.oauth-client-google-docs",
+    "labelKey": "pages.settings.connectionsPanel.oauth_app",
+    "labelSuffix": "Google Docs",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1,
+    "settingId": "connections-oauth-client-google-docs",
+    "label": "OAuth app",
+    "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+  },
+  {
+    "id": "connections.oauth-client-google-slides",
+    "labelKey": "pages.settings.connectionsPanel.oauth_app",
+    "labelSuffix": "Google Slides",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1,
+    "settingId": "connections-oauth-client-google-slides",
+    "label": "OAuth app",
+    "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+  },
+  {
+    "id": "developer.agent-harness-per-bot",
+    "label": "Agent harness per Bot",
+    "labelKey": "pages.developer.featurePreviewsTab.crewmate_harness",
+    "description": "Lets one Bot run on another AI coding tool.",
+    "hint": "Adds an Agent harness setting to each Bot's profile, so one Bot can run on a different AI coding tool, such as Claude Code, with that tool's models, while the rest keep the default.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
+    "id": "developer.also-send-screenshots-of-the-agent-s-browser-tab",
+    "label": "Also send screenshots of the agent's browser tab",
+    "labelKey": "pages.developer.featurePreviewsTab.decisions_browser_images",
+    "description": "Turn this off to keep screenshots on this machine.",
+    "hint": "On by default once a decision model is on; turn it off to keep screenshots on this machine. Sends a screenshot before and after a step to check it, and a screenshot to find a target drawn on a canvas, which the outline cannot see. No screenshot is taken while a password field is on the page or while you have taken over the browser. A System One endpoint, hosted or on your own SageMaker endpoint, accepts screenshots; a local model gets the outline only. On a SageMaker endpoint this starts off: turn it on yourself to send screenshots there.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
     "id": "developer.also-send-snippets-of-recalled-memories-so-jev-can-drop-the-ones-that-do-not-help",
     "labelKey": "pages.developer.featurePreviewsTab.decisions_memory_text",
     "tab": "developer",
+    "params": {
+      "sub": "feature-previews"
+    },
     "type": "toggle",
     "occurrence": 1,
     "label": "Also send snippets of recalled memories so Jev can drop the ones that do not help",
@@ -1770,6 +1992,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.also-send-the-conversation-and-tool-call-inputs-so-jev-can-score-compaction",
     "labelKey": "pages.developer.featurePreviewsTab.decisions_compaction",
     "tab": "developer",
+    "params": {
+      "sub": "feature-previews"
+    },
     "type": "toggle",
     "occurrence": 1,
     "label": "Also send the conversation and tool-call inputs so Jev can score compaction",
@@ -1779,6 +2004,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.also-send-tool-call-arguments-so-jev-can-flag-risky-calls",
     "labelKey": "pages.developer.featurePreviewsTab.decisions_tool_args",
     "tab": "developer",
+    "params": {
+      "sub": "feature-previews"
+    },
     "type": "toggle",
     "occurrence": 1,
     "label": "Also send tool-call arguments so Jev can flag risky calls",
@@ -1788,10 +2016,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.artifact-deploy",
     "label": "Artifact Deploy",
     "labelKey": "pages.developer.featurePreviewsTab.artifact_deploy",
-    "description": "Publish an artifact to a public HTTPS URL in your own AWS account. Off by default: every deploy spends money in your account and serves the content on the open internet.",
+    "description": "Each deploy costs money in your AWS account and is public.",
+    "hint": "Publish an artifact to a public HTTPS URL in your own AWS account. Off by default: every deploy spends money in your account and serves the content on the open internet.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.automatic-cards-for-all-sessions",
@@ -1801,61 +2033,87 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    },
     "configKey": "dashboard.dynamic_dashboard_cards"
   },
   {
     "id": "developer.chat-on-a-crew",
     "label": "Chat on a crew",
     "labelKey": "pages.developer.featurePreviewsTab.chat_on_a_crew",
-    "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote crew — another machine you have connected under Settings > Remote Crew — and shows each connected crew’s sessions in their own group in the Sessions list. Unfinished.",
+    "description": "Starts chats on a connected remote crew.",
+    "hint": "Adds “New chat on crew” to the create menu, which starts a session on a remote crew — another machine you have connected under Settings > Remote Crew — and shows each connected crew’s sessions in their own group in the Sessions list. Unfinished.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.composable-layout",
     "label": "Composable layout",
     "labelKey": "pages.developer.featurePreviewsTab.layout_harness",
-    "description": "Turns on an in-development, developer-only harness for a new layout mechanism. Nothing you can see changes yet: the mechanism has no page of its own, so this exists only so it can be built and tested behind a switch.",
+    "description": "Developer-only test harness, with no visible change.",
+    "hint": "Turns on an in-development, developer-only harness for a new layout mechanism. Nothing you can see changes yet: the mechanism has no page of its own, so this exists only so it can be built and tested behind a switch.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.decisions-jev",
     "label": "Decisions (Jev)",
     "labelKey": "pages.developer.featurePreviewsTab.decisions",
-    "description": "A small, fast model makes quick calls for Kiro Crew, such as which of your skills fits your message. Pick the model below. If it is slow or does not answer, the built-in rule decides instead, so your reply is never held up.",
+    "hint": "A small, fast model makes quick calls for Kiro Crew, such as which of your skills fits your message. Pick the model below. If it is slow or does not answer, the built-in rule decides instead, so your reply is never held up.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
-  },
-  {
-    "id": "developer.developer-mode",
-    "label": "Developer Mode",
-    "labelKey": "pages.settings.developerPanel.developer_mode",
-    "hint": "Show Developer page in sidebar with Logs, System metrics, and Memory internals",
-    "tab": "developer",
-    "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.earlier-conversation-one-decision-may-carry-in-characters",
     "label": "Earlier conversation one decision may carry, in characters",
     "labelKey": "pages.developer.featurePreviewsTab.decisions_history_label",
-    "description": "Earlier messages of yours and of the agent go with the question, newest first, up to this many characters. Tool output is never sent. Zero sends the message on its own, which is what the main Jev switch was agreed for, so a larger number sends more off the machine.",
+    "description": "A larger number sends more of the conversation off this machine.",
+    "hint": "Earlier messages of yours and of the agent go with the question, newest first, up to this many characters. Tool output is never sent. Zero sends the message on its own, which is what the main Jev switch was agreed for, so a larger number sends more off the machine.",
     "tab": "developer",
     "type": "input",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
+    "id": "developer.explore",
+    "label": "Explore",
+    "labelKey": "pages.developer.featurePreviewsTab.explore",
+    "description": "Features to try, in the top bar.",
+    "hint": "Adds Explore to the top bar: features to try, your progress, and a Try today card on a new chat.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.folder-conductor",
     "label": "Folder conductor",
     "labelKey": "pages.developer.featurePreviewsTab.folder_conductor",
-    "description": "Lifts the chat that started a folder's other chats to the top of that folder: an accent bar down its left edge and a small conductor tag beside the agent name. This changes the order of the Sessions list, so the list stays as it is until you turn it on. The folder menu's chat item is always there.",
+    "description": "Moves the chat that started a folder's chats to the top.",
+    "hint": "Lifts the chat that started a folder's other chats to the top of that folder: an accent bar down its left edge and a small conductor tag beside the agent name. This changes the order of the Sessions list, so the list stays as it is until you turn it on. The folder menu's chat item is always there.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.jev-api-key",
@@ -1864,43 +2122,61 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Kept in this dashboard's secret store on the machine that runs Kiro Crew, never in config.json, and never shown again once you save it.",
     "tab": "developer",
     "type": "input",
-    "occurrence": 1
-  },
-  {
-    "id": "developer.mates",
-    "label": "Mates",
-    "labelKey": "pages.developer.featurePreviewsTab.crew_members",
-    "hint": "The Mates page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
-    "tab": "developer",
-    "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.model-for-the-small-model-judge",
     "label": "Model for the small-model judge",
     "labelKey": "pages.developer.featurePreviewsTab.decisions_judge_model",
-    "description": "Only used when the judge above is the small model. Leave it on the judge agent's own model unless you want a cheaper one.",
+    "hint": "Only used when the judge above is the small model. Leave it on the judge agent's own model unless you want a cheaper one.",
     "tab": "developer",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
-    "id": "developer.reply-threads-on-mate-chat-messages",
-    "label": "Reply threads on mate chat messages",
-    "labelKey": "pages.settings.crewmatesSection.reply_threads",
-    "hint": "Let any message in a mate's chat carry its own reply thread, opened in the side panel while the chat stays visible. Off, the Reply in thread control is not offered and existing threads are hidden, not deleted.",
+    "id": "developer.remote-dispatch",
+    "label": "Remote dispatch",
+    "labelKey": "pages.developer.featurePreviewsTab.remote_dispatch",
+    "description": "Runs Ultra Mode tasks on connected machines.",
+    "hint": "Lets Ultra Mode chats run tasks on machines you've connected under Remote Crew. Nothing is sent until a machine is connected.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    },
+    "configKey": "work_ledger.remote_dispatch"
+  },
+  {
+    "id": "developer.reply-threads-on-bot-chat-messages",
+    "label": "Reply threads on Bot chat messages",
+    "labelKey": "pages.settings.crewmatesSection.reply_threads",
+    "hint": "Let any message in a Bot's chat carry its own reply thread, opened in the side panel while the chat stays visible. Off, the Reply in thread control is not offered and existing threads are hidden, not deleted.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.run-a-local-gateway",
     "label": "Run a local gateway",
     "labelKey": "pages.settings.developerPanel.run_a_local_gateway",
-    "description": "Start a gateway on this machine. Leave it on unless this app's port already reaches a crew on another machine, or the app cannot connect the next time it opens, which is when this takes effect. That needs the crew saved for this port with “Set Remote Host…” in the Connection menu, plus a tunnel: tick “Keep an SSH tunnel to this crew open” there (macOS and Linux) or keep your own SSH tunnel running. Settings → Remote Crew connections stop when this is off, so they do not count.",
+    "description": "Leave it on unless “Set Remote Host…” and a tunnel already reach a crew. Otherwise the app cannot connect.",
+    "hint": "Start a gateway on this machine. Leave it on unless this app's port already reaches a crew on another machine, or the app cannot connect the next time it opens, which is when this takes effect. That needs the crew saved for this port with “Set Remote Host…” in the Connection menu, plus a tunnel: tick “Keep an SSH tunnel to this crew open” there (macOS and Linux) or keep your own SSH tunnel running. Settings → Remote Crew connections stop when this is off, so they do not count.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.run-kas-on-kiro-crew-s-own-engine",
@@ -1909,7 +2185,48 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Uses the KAS engine version this Kiro Crew release was tested with, instead of the Kiro CLI. Applies to every new session on this Kiro Crew, not just this device. Signs in with your Kiro account from Settings → Agent Harness. Takes effect when Kiro Crew restarts.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
+    "id": "developer.session-environments",
+    "label": "Session Environments",
+    "labelKey": "sessionEnvironments.title",
+    "description": "Runs a chat in its own remote workspace.",
+    "hint": "Shows the Session Environments settings. Existing chats stay on this machine; a chat moves only if you pick a profile for it before its first message.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
+    "id": "developer.shared-crew",
+    "label": "Shared Crew",
+    "labelKey": "sharedCrew.preview_title",
+    "description": "People tab, invites and shared sessions",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
+    "id": "developer.ultra-mode",
+    "label": "Ultra Mode",
+    "labelKey": "pages.developer.featurePreviewsTab.crew_mode",
+    "description": "Hands a chat's tasks to a crew.",
+    "hint": "Lets a chat hand tasks to a crew and track them on a Board.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.webhooks",
@@ -1918,7 +2235,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "hint": "Inbound webhook tokens, registered contexts, and run history. The API works; the page is not finished.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.which-judge-answers",
@@ -1926,7 +2246,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.developer.featurePreviewsTab.decisions_judge_provider",
     "tab": "developer",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "display.command-completion",
@@ -2016,6 +2339,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "display.explore",
+    "label": "Explore",
+    "labelKey": "pages.settings.displayPanel.milestones",
+    "hint": "Show Explore in the top bar and a Try today card on a new chat.",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "view"
+    },
+    "configKey": "dashboard.milestones_enabled"
+  },
+  {
     "id": "display.external-terminal-app",
     "label": "External terminal app",
     "labelKey": "pages.settings.displayPanel.terminal_external_app",
@@ -2100,6 +2436,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "display.keep-running-in-the-background-after-closing-the-window",
+    "label": "Keep running in the background after closing the window",
+    "labelKey": "pages.settings.displayPanel.keep_running_when_window_closed",
+    "hint": "Closing the window hides Kiro Crew and keeps your sessions and jobs running. Turn this off to make the close button quit the app. A gateway this app started stops with it, and a gateway it only connects to keeps running.",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "view"
+    },
+    "settingId": "display.keep-running-in-the-background-after-closing-the-window"
+  },
+  {
     "id": "display.language",
     "label": "Language",
     "labelKey": "settings.display.language.label",
@@ -2124,6 +2473,17 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "display.overlays",
+    "label": "Overlays",
+    "labelKey": "pages.settings.displayPanel.theme_experience_overlays",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "theme"
+    }
+  },
+  {
     "id": "display.palette",
     "label": "Palette",
     "labelKey": "pages.settings.displayPanel.palette",
@@ -2136,10 +2496,22 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "display.persona",
+    "label": "Persona",
+    "labelKey": "pages.settings.displayPanel.theme_experience_persona",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "theme"
+    }
+  },
+  {
     "id": "display.reuse-the-current-terminal",
     "label": "Reuse the current terminal",
     "labelKey": "pages.settings.displayPanel.terminal_reuse_current",
-    "description": "Copies the command instead of running it: Run in terminal focuses the terminal tab you have selected and copies the command, so you can paste it into that shell while keeping its working directory, environment, and any active login session. With no terminal open, it still copies the command for you to paste — it is never run for you.",
+    "description": "Copies the command for you to paste. It is never run for you.",
+    "hint": "Copies the command instead of running it: Run in terminal focuses the terminal tab you have selected and copies the command, so you can paste it into that shell while keeping its working directory, environment, and any active login session. With no terminal open, it still copies the command for you to paste — it is never run for you.",
     "tab": "display",
     "type": "toggle",
     "occurrence": 1,
@@ -2147,6 +2519,29 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "sub": "terminal"
     },
     "configKey": "dashboard.terminal.reuse_current"
+  },
+  {
+    "id": "display.show-unread-dot-on-session-cards",
+    "label": "Show unread dot on session cards",
+    "labelKey": "pages.settings.displayPanel.show_unread_dot",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sidebar"
+    },
+    "configKey": "dashboard.show_unread_dot"
+  },
+  {
+    "id": "display.sounds",
+    "label": "Sounds",
+    "labelKey": "pages.settings.displayPanel.theme_experience_sounds",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "theme"
+    }
   },
   {
     "id": "display.theme",
@@ -2278,6 +2673,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Mark sessions unread only when they need you",
     "labelKey": "pages.settings.notificationsPanel.unread_only_when_done_or_waiting",
     "hint": "A background session is marked unread when its agent finishes or waits on your answer, instead of on every new message.",
+    "tab": "notifications",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "alerts"
+    }
+  },
+  {
+    "id": "notifications.notify-me-even-when-kiro-crew-is-closed",
+    "label": "Notify me even when Kiro Crew is closed",
+    "labelKey": "pages.settings.notificationsPanel.push_toggle_label",
+    "description": "Sends alerts to this device even after you close Kiro Crew. System notifications stop once you close it.",
     "tab": "notifications",
     "type": "toggle",
     "occurrence": 1,
@@ -2533,6 +2940,62 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Add your own deny patterns (Python-compatible regex). These are enforced at {{productName}}'s PreToolUse gate alongside the built-in rules."
   },
   {
+    "id": "session-environments.coder-url",
+    "label": "Coder URL",
+    "labelKey": "sessionEnvironments.url",
+    "hint": "Use the deployment URL without credentials, query parameters, or fragments, for example https://coder.example.com.",
+    "tab": "session-environments",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session_environments.coder_url"
+  },
+  {
+    "id": "session-environments.default-for-new-chats",
+    "label": "Default for new chats",
+    "labelKey": "sessionEnvironments.defaultProfile",
+    "hint": "New chats you start in the dashboard run here unless you pick another profile in the “Run this chat on” menu before the first message. Existing chats, scheduled jobs and channel conversations keep running where they do now.",
+    "tab": "session-environments",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
+    "id": "session-environments.machine-size",
+    "label": "Machine size",
+    "labelKey": "sessionEnvironments.boxdSize",
+    "description": "Larger sizes bill more while the machine runs.",
+    "hint": "A snapshot keeps the size it was saved with, so this applies only to profiles without one. Larger sizes bill more while the machine runs.",
+    "tab": "session-environments",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
+    "id": "session-environments.secret-name-for-the-token-usually-sprites-token",
+    "label": "Secret name for the token (usually SPRITES_TOKEN)",
+    "labelKey": "sessionEnvironments.tokenSecret",
+    "hint": "The name the token is stored under in Settings → Secrets. Change it only to use a different saved token.",
+    "tab": "session-environments",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "session-environments.start-new-chats-on-a-profile",
+    "label": "Start new chats on a profile",
+    "labelKey": "sessionEnvironments.defaultEnabled",
+    "tab": "session-environments",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "session_environments.default_profile"
+  },
+  {
+    "id": "session-environments.stop-workspaces-when-kiro-crew-shuts-down",
+    "label": "Stop workspaces when Kiro Crew shuts down",
+    "labelKey": "sessionEnvironments.stopOnShutdown",
+    "tab": "session-environments",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "session_environments.stop_on_shutdown"
+  },
+  {
     "id": "shortcuts.enable-shortcuts",
     "label": "Enable shortcuts",
     "labelKey": "pages.settings.shortcutsPanel.enable_shortcuts",
@@ -2571,7 +3034,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "skills.extra-skill-paths",
     "label": "Extra skill paths",
     "labelKey": "pages.settings.skillsPanel.extra_skill_paths",
-    "description": "Folders to load extra skills from, one path per line. Spaces around a path and blank lines are ignored. Skills found there are read-only, and a skill in your own skills folder wins on a duplicate name. Changes apply without a restart.",
+    "description": "One folder path per line.",
+    "hint": "Folders to load extra skills from, one path per line. Spaces around a path and blank lines are ignored. Skills found there are read-only, and a skill in your own skills folder wins on a duplicate name. Changes apply without a restart.",
     "tab": "skills",
     "type": "input",
     "occurrence": 1,
@@ -2581,7 +3045,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "skills.require-approval-before-generated-skills-go-live",
     "label": "Require approval before generated skills go live",
     "labelKey": "pages.settings.skillsPanel.require_approval_before_generated_skills_go_live",
-    "description": "Keep every auto-generated candidate in the pending queue until you approve it. Turning this off lets prose-only skills publish automatically; skills that bundle scripts always require approval regardless.",
+    "description": "Off lets skills without scripts go live without your approval.",
+    "hint": "Keep every auto-generated candidate in the pending queue until you approve it. Turning this off lets prose-only skills publish automatically; skills that bundle scripts always require approval regardless.",
     "tab": "skills",
     "type": "toggle",
     "occurrence": 1,
@@ -2637,7 +3102,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.aws-region-transcribe",
     "label": "AWS Region (Transcribe)",
     "labelKey": "pages.settings.sttSettings.aws_region_transcribe",
-    "description": "AWS region for Transcribe",
     "tab": "voice",
     "type": "input",
     "occurrence": 1
@@ -2751,7 +3215,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.mixed-languages",
     "label": "Mixed languages",
     "labelKey": "pages.settings.sttSettings.transcribe_languages",
-    "hint": "Languages people switch between in one recording, such as Vietnamese and English. With two or more picked, Amazon Transcribe detects the language of each part and transcribes it in that language. Streaming dictation only, one dialect per language.",
+    "hint": "Languages people switch between in one recording, such as Vietnamese and English. With two or more picked, dictation detects the language of each part and transcribes it in that language. Streaming dictation only, one dialect per language.",
     "tab": "voice",
     "type": "select",
     "occurrence": 1,
@@ -2863,7 +3327,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.tap-vs-hold-cutoff",
     "label": "Tap vs. hold cutoff",
     "labelKey": "pages.settings.sttSettings.ptt_hold_threshold",
-    "description": "Only used by “Both”. Hold the key longer than this to talk; a quicker tap starts recording and leaves it on.",
+    "hint": "Only used by “Both”. Hold the key longer than this to talk; a quicker tap starts recording and leaves it on.",
     "tab": "voice",
     "type": "stepper",
     "occurrence": 1
@@ -2872,7 +3336,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.tidy-up-transcripts-with-ai",
     "label": "Tidy up transcripts with AI",
     "labelKey": "pages.settings.sttSettings.polish",
-    "description": "Sends the finished text, never the audio, to the AI model you already chat with, which fixes punctuation and capitalisation. Your words are never changed.",
+    "description": "Sends the text, never the audio, to the model you chat with.",
+    "hint": "Sends the finished text, never the audio, to the AI model you already chat with, which fixes punctuation and capitalisation. Your words are never changed.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1,

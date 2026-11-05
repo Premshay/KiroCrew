@@ -172,8 +172,8 @@ def test_setup_cfg_carries_non_ascii_so_its_read_must_pin_utf8() -> None:
     encoding load-bearing DO hold everywhere, and this asserts both -- so the
     guard cannot rot silently on the runners that never feel it.
 
-    Deliberately not a repo-wide "missing encoding=" rule. `cross-platform.yml`
-    documents why it ships none (a line regex breaks on nested and multi-line
+    Deliberately not a repo-wide "missing encoding=" rule. The `Cross-Platform
+    Portability` step of `pr-policy.yml` documents why it ships none (a line regex breaks on nested and multi-line
     calls), and an AST version means editing `.github/workflows/**`. This stays
     the size of the defect.
     """
@@ -390,6 +390,11 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
     ``test_harness.py`` left this set when the gateway harness became
     cross-platform (reader thread instead of ``selectors`` on a pipe, tree kill
     instead of ``terminate_pgid``); it now runs on the Windows shards.
+    ``test_stop_kill_cancel.py``, the three ``test_theme_install*.py`` parts and
+    ``test_file_office_preview.py`` left it once their blockers were gone: the
+    kill-path tests skip their POSIX-only cases themselves, theme packs are served
+    on Windows, and the file schema accepts a drive-letter path. They run on the
+    Windows shards too.
 
     ``test_pod_windows_boot.py`` is the one entry here for a reason other than a
     POSIX assumption: it boots a real pod under Task Scheduler, needs a built
@@ -421,13 +426,11 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
         "test_sandbox_md_notebook_carveout.py",
         "test_sandbox_nested_tier.py",
         "test_pid_lifecycle.py",
-        "test_pid_lifecycle_browser_daemon.py",
         "test_pid_lifecycle_orphan_cleanup.py",
         "test_pid_lifecycle_process_sweeps.py",
         "test_pid_lifecycle_provider_tree.py",
         "test_pid_lifecycle_teardown.py",
         "test_pid_lifecycle_tracking_integrity.py",
-        "test_pid_sweep_helpers.py",
         "test_process_tree_kill.py",
         "test_source_providers.py",
         "test_source_providers_app_contributors.py",
@@ -467,7 +470,6 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
         "test_acp_client_tool_events.py",
         "test_acp_client_tool_hooks.py",
         "test_acp_client_transient_errors.py",
-        "test_stop_kill_cancel.py",
         "test_app_backend_stale_reap.py",
         "test_env.py",
         "test_outbox_notify_broadcast.py",
@@ -478,13 +480,9 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
         "test_snapshot.py",
         "test_snapshot_notification_copy_branch.py",
         "test_snapshot_notification_merge_branch.py",
-        "test_theme_install.py",
-        "test_theme_install_declarations.py",
-        "test_theme_install_identity.py",
         "test_webapp_preview.py",
         "test_file_raw.py",
         "test_file_download.py",
-        "test_file_office_preview.py",
         "test_dashboard_file_io.py",
         "test_dev_fleet_app.py",
         "test_dev_fleet_app_make_live.py",

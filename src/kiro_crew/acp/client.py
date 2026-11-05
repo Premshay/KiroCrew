@@ -256,7 +256,6 @@ from kiro_crew.acp.client_turn_control import _GOOSE_SESSION_STEER  # noqa: F401
 from kiro_crew.acp.client_turn_control import _ConcurrentSteerTurn  # noqa: F401
 from kiro_crew.acp.client_turn_control import format_command_result  # noqa: F401
 from kiro_crew.acp.client_turn_control import parse_slash_command  # noqa: F401
-from kiro_crew.acp.client_turn_control import steering_advertised  # noqa: F401
 from kiro_crew.acp.harness import claude as claude_mod  # noqa: F401
 from kiro_crew.acp.harness import pi as pi_mod  # noqa: F401
 from kiro_crew.acp.harness import process_adapter_for  # noqa: F401
@@ -321,6 +320,7 @@ from kiro_crew.acp.transport_framing import (  # noqa: F401
     write_request_frame_bounded,
     write_response_frame_bounded,
 )
+from kiro_crew.acp.types import steering_advertised  # noqa: F401
 from kiro_crew.acp.types import (  # noqa: F401
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
@@ -443,7 +443,6 @@ from kiro_crew.agent_sdk.backends import (  # noqa: F401
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for  # noqa: F401
 from kiro_crew.atomic_write import atomic_write  # noqa: F401
-from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env  # noqa: F401
 from kiro_crew.config.paths import config_dir, kiro_sessions_dir  # noqa: F401
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS  # noqa: F401
 from kiro_crew.dashboard.side_readonly_spec import unavailable_mode_explanation  # noqa: F401
@@ -955,6 +954,7 @@ _CLIENT_OWNERS: tuple[str, ...] = (
     "kiro_crew.acp.client_spawn_env",
     "kiro_crew.acp.client_permissions",
     "kiro_crew.acp.client_elicitation",
+    "kiro_crew.acp.client_copilot",
     "kiro_crew.acp.client_claude_session",
     "kiro_crew.acp.client_claude_seed",
     "kiro_crew.acp.client_seed_ownership",
@@ -965,6 +965,7 @@ _CLIENT_OWNERS: tuple[str, ...] = (
     "kiro_crew.acp.client_transport",
     "kiro_crew.acp.client_lifecycle",
     "kiro_crew.acp.client_turn_control",
+    "kiro_crew.acp.client_native_children",
     "kiro_crew.acp.client_start",
     "kiro_crew.acp.client_turn",
     "kiro_crew.acp.client_class",

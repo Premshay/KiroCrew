@@ -162,7 +162,10 @@ def _note_delivered_live(slot: _ChatSlot, note: dict[str, object]) -> bool:
         return False
     for row in slot.messages:
         row_meta = row.get("meta")
-        if isinstance(row_meta, dict) and row_meta.get("noteId") == note_id:
+        if isinstance(row_meta, dict) and note_id in (
+            row_meta.get("noteId"),
+            row_meta.get("noteRowFor"),
+        ):
             return True
     return False
 
@@ -580,12 +583,9 @@ async def api_chat_slot_note(request: web.Request) -> web.Response:
         if not deferred:
             # Both immediate halves resolve their destination LATE, so each
             # records the session it was authorized against -- same reason the
-            # deferred arm below does, and checked at those later seams.
+            # deferred arm below does, and checked at those later seams. The
+            # entry is seated only after the visible row lands, below.
             context_entry["noteSession"] = effective_session_key(slot)
-            if not slot.append_pending_context(context_entry):
-                # The visible line is still written; contextSkipped carries the
-                # refused half, the same surface the per-source cap uses.
-                context_skipped = True
 
     # Caller-controlled content reaching the visible transcript (SSE plus the
     # on-disk JSONL). Redact at this sink so a secret or exfil URL cannot land
@@ -673,6 +673,13 @@ async def api_chat_slot_note(request: web.Request) -> web.Response:
                 **({"appLabel": display_source} if display_source else {}),
             },
         )
+        # Visible row first, the same order the held flush keeps: a raise from
+        # the append above fails the request with nothing seated, so the
+        # context half is never queued without the row that gives it meaning.
+        if context_entry is not None and not slot.append_pending_context(context_entry):
+            # The visible line is written; contextSkipped carries the refused
+            # half, the same surface the per-source cap uses.
+            context_skipped = True
 
     sel().log_api_access(
         caller=request_app or request.get("user", "dashboard"),

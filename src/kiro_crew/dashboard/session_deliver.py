@@ -127,11 +127,14 @@ async def deliver(
     *,
     admission: dict | None = None,
     queue_meta: dict | None = None,
+    relay_meta: dict | None = None,
     evict_oldest: bool = False,
 ) -> str:
     """Deliver *text* from *origin* into *slot*; return a ``DELIVERED_*`` outcome.
 
-    Idle slot: append :func:`origin_row` and start the turn. Running slot: an
+    Idle slot: a cron or app message is queued and the queue drain starts it
+    (:func:`_deliver_idle`); a slot that is closing or the gateway is shutting
+    down answers :data:`NOT_DELIVERED` and the caller falls back. Running slot: an
     automation wake is steered into the turn (its row is the same nudge row,
     written by ``steer_into_running_turn``), and a cron or app message is queued
     behind it with a ``queued`` card, so an injection never starts a second
@@ -149,31 +152,55 @@ async def deliver(
     its out-of-session fallback.
     """
     if origin.kind == ORIGIN_PEER:
-        return await _deliver_peer(state, slot, text, origin, admission, queue_meta)
+        return await _deliver_peer(state, slot, text, origin, admission, queue_meta, relay_meta)
     if slot.running:
         return await _deliver_running(state, slot, text, origin, admission, evict_oldest)
     if origin.kind == ORIGIN_AUTOMATION:
         return NOT_DELIVERED
-    from kiro_crew.dashboard.chat_runner import _run_chat
-    from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
+    return await _deliver_idle(state, slot, text, origin, admission, evict_oldest)
 
-    write_origin_row(slot, text, origin)
-    # Not the person's speech: no human exemption from the drain's linked drop.
-    # An app's text is a synthetic payload, which keeps it off a linked
-    # channel mirror where it would read as the human's own words.
-    slot.task = spawn_guarded_turn(
-        state,
-        slot,
-        _run_chat(
-            state,
-            slot,
-            text,
-            _directive_user_origin=False,
-            _synthetic_payload=origin.kind == ORIGIN_APP,
-            _turn_actor=origin.kind,
-        ),
+
+async def _deliver_idle(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    text: str,
+    origin: Origin,
+    admission: dict | None,
+    evict_oldest: bool,
+) -> str:
+    """The idle-slot half of :func:`deliver` for a cron or app message.
+
+    The message is queued as the running-slot half queues it, then the queue
+    drain starts it, so it takes the checks every queued message takes before
+    its turn: memory preparation still running, a Stop being resolved, a sign-in
+    hold and an entry already waiting ahead of it. When one of them refuses, the
+    card waits for the next drain. A slot that is closing, was replaced while
+    this waited for its lock, or receives the message during gateway shutdown
+    takes nothing: its queued card would not survive this process, so the caller
+    falls back as for a gone session.
+    """
+    from kiro_crew.dashboard.chat_runner import (
+        _gateway_shutdown_requested,
+        _start_next_queued_turn,
+        idle_slot_admits_drain,
     )
-    return DELIVERED_TURN
+
+    async with slot._lock:
+        if (
+            slot.is_closing
+            or state.get_slot(slot.key) is not slot
+            or _gateway_shutdown_requested(state)
+        ):
+            return NOT_DELIVERED
+        outcome = _queue_entry(state, slot, text, origin, admission, evict_oldest)
+        if outcome != DELIVERED_QUEUED or not idle_slot_admits_drain(state, slot):
+            return outcome
+        slot._turn_admission_reserved = True
+        try:
+            started = await _start_next_queued_turn(state, slot)
+        finally:
+            slot._turn_admission_reserved = False
+    return DELIVERED_TURN if started else DELIVERED_QUEUED
 
 
 async def _deliver_running(
@@ -205,6 +232,18 @@ async def _deliver_running(
         if outcome == STEER_REQUEUED:
             return DELIVERED_REQUEUED
         return NOT_DELIVERED
+    return _queue_entry(state, slot, text, origin, admission, evict_oldest)
+
+
+def _queue_entry(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    text: str,
+    origin: Origin,
+    admission: dict | None,
+    evict_oldest: bool,
+) -> str:
+    """Queue a cron or app message as a card and return the delivery outcome."""
     if origin.kind == ORIGIN_CRON:
         from kiro_crew.dashboard.cron_inject import queue_cron_notification
 
@@ -278,6 +317,7 @@ async def _deliver_peer(
     origin: Origin,
     admission: dict | None,
     queue_meta: dict | None,
+    relay_meta: dict | None = None,
 ) -> str:
     """A peer's text: the steer arm when asked, else queue or run it.
 
@@ -299,7 +339,7 @@ async def _deliver_peer(
         )
 
         outcome = await steer_into_running_turn(
-            state, slot, text, user_origin=False, admission=admission
+            state, slot, text, user_origin=False, admission=admission, relay_meta=relay_meta
         )
         if outcome == STEER_STEERED:
             return DELIVERED_STEERED
@@ -308,5 +348,7 @@ async def _deliver_peer(
         return NOT_DELIVERED
     from kiro_crew.dashboard.chat_runner import _run_chat
 
-    started = slot.enqueue_or_run_prompt(text, _run_chat, state, extra_meta=queue_meta)
+    started = slot.enqueue_or_run_prompt(
+        text, _run_chat, state, extra_meta=queue_meta, relay_meta=relay_meta
+    )
     return DELIVERED_TURN if started else DELIVERED_QUEUED

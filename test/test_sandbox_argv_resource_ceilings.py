@@ -36,8 +36,7 @@ systemd_run_resolvable = sandbox_argv_helpers.systemd_run_resolvable
 
 class TestResourceLimitPreexec:
     """resource_limit_preexec() is the cached companion to sandboxed_spawn_argv:
-    it hands every agent-influenced spawn the kernel resource ceiling
-    (security-review bdf0d7e5)."""
+    it hands every agent-influenced spawn the kernel resource ceiling."""
 
     def _reset_cache(self):
         import kiro_crew.sandbox as sb
@@ -74,7 +73,7 @@ class TestResourceLimitPreexec:
     def test_non_posix_returns_none(self):
         """On non-POSIX (os.name != 'posix'), returns None — create_subprocess_exec
         rejects any non-None preexec_fn on Windows with ValueError, so the
-        contract must be None there (review-bot)."""
+        contract must be None there."""
         import kiro_crew.sandbox as sb
 
         self._reset_cache()
@@ -153,7 +152,7 @@ class TestSessionHostPreexec:
 class TestCgroupScopeArgv:
     """cgroup_scope_argv() wraps agent spawns in a transient systemd --user
     --scope with pids.max + memory.max — the default-on fork-bomb / memory-DoS
-    ceiling the finding's headline threats require (security-review bdf0d7e5)."""
+    ceiling the finding's headline threats require."""
 
     def _reset_probe(self):
         import kiro_crew.sandbox as sb
@@ -644,15 +643,20 @@ class TestAgentsSliceLimits:
         assert mem == 4096
         assert tasks == 1000
 
-    def test_config_defaults_when_absent_or_junk(self):
+    def test_config_defaults_when_absent_or_junk(self, monkeypatch):
         """Zero/junk falls back to the default rather than leaving the
         aggregate unset — same rule as the per-scope ceiling."""
         import kiro_crew.sandbox as sb
+        from kiro_crew import host_task_sizing
+
+        facts = host_task_sizing.HostTaskFacts(8, 16 * 1024**3, None, None, None)
+        monkeypatch.setattr(host_task_sizing, "host_task_facts", lambda: facts)
+        monkeypatch.setattr(sb, "_default_max_total_memory_mb", lambda: 12800)
 
         with patch("kiro_crew.config.loader._raw_config", return_value={}):
             mem, tasks = sb._slice_limits_from_config()
         assert mem == sb._default_max_total_memory_mb()
-        assert tasks == sb._CGROUP_DEFAULT_MAX_TOTAL_TASKS
+        assert tasks == sb._default_max_total_tasks()
         with patch(
             "kiro_crew.config.loader._raw_config",
             return_value={
@@ -664,7 +668,7 @@ class TestAgentsSliceLimits:
         ):
             mem, tasks = sb._slice_limits_from_config()
         assert mem == sb._default_max_total_memory_mb()
-        assert tasks == sb._CGROUP_DEFAULT_MAX_TOTAL_TASKS
+        assert tasks == sb._default_max_total_tasks()
         # Fractional values pass a naive `> 0` check but truncate to 0, which
         # would emit MemoryMax=0M and kill every agent scope — must fall back.
         with patch(
@@ -678,7 +682,7 @@ class TestAgentsSliceLimits:
         ):
             mem, tasks = sb._slice_limits_from_config()
         assert mem == sb._default_max_total_memory_mb()
-        assert tasks == sb._CGROUP_DEFAULT_MAX_TOTAL_TASKS
+        assert tasks == sb._default_max_total_tasks()
 
     @_POSIX_ONLY
     def test_default_total_memory_fraction_and_fallback(self):
@@ -726,10 +730,10 @@ class TestAgentsSliceLimits:
         finally:
             self._reset()
 
-    def _fake_slice(self, tmp_path, *, oom_kill=0, local_max=0, current=100, mem_max="1000"):
+    def _fake_slice(self, tmp_path, *, oom_kill=0, oom=0, local_max=0, current=100, mem_max="1000"):
         d = tmp_path / "kirocrew-agents.slice"
         d.mkdir(exist_ok=True)
-        (d / "memory.events").write_text(f"low 0\nhigh 0\nmax 0\noom 0\noom_kill {oom_kill}\n")
+        (d / "memory.events").write_text(f"low 0\nhigh 0\nmax 0\noom {oom}\noom_kill {oom_kill}\n")
         (d / "memory.events.local").write_text(
             f"low 0\nhigh 0\nmax {local_max}\noom 0\noom_kill 0\n"
         )
@@ -766,7 +770,37 @@ class TestAgentsSliceLimits:
             self._reset()
 
     def test_slice_pressure_scope_local_breach_is_distinguished(self, tmp_path):
-        """A kill without a slice-level max event reads as a per-scope breach."""
+        """A kill with a cgroup ``oom`` event below the slice, and no
+        slice-level max event, reads as a per-scope breach and names the
+        per-scope ceiling."""
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            d = self._fake_slice(tmp_path)
+            with (
+                patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=d),
+                patch(
+                    "kiro_crew.sandbox._cgroup_limits_from_config",
+                    return_value=(8192, 20480, 50, 0),
+                ),
+            ):
+                assert sb.check_agents_slice_pressure() is None
+                self._fake_slice(tmp_path, oom_kill=1, oom=1, local_max=0)
+                msg = sb.check_agents_slice_pressure()
+                assert msg is not None
+                assert "at least one scope hit its own per-tree limit" in msg
+                assert "configured per-scope MemoryMax=20480M" in msg
+                assert "no cgroup limit inside this slice" not in msg
+        finally:
+            self._reset()
+
+    def test_slice_pressure_kill_without_an_oom_event_is_not_blamed_on_a_scope(self, tmp_path):
+        """The kernel counts ``oom_kill`` for ANY OOM killer, but raises the
+        ``oom`` event only on the cgroup whose limit was hit and its
+        ancestors. A kill with no ``oom`` event under the slice came from the
+        host-wide OOM killer or a limit above the slice, so the message must
+        not claim a per-tree limit fired."""
         import kiro_crew.sandbox as sb
 
         self._reset()
@@ -774,10 +808,29 @@ class TestAgentsSliceLimits:
             d = self._fake_slice(tmp_path)
             with patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=d):
                 assert sb.check_agents_slice_pressure() is None
-                self._fake_slice(tmp_path, oom_kill=1, local_max=0)
+                self._fake_slice(tmp_path, oom_kill=1, oom=0, local_max=0)
                 msg = sb.check_agents_slice_pressure()
                 assert msg is not None
-                assert "a scope hit its own per-tree limit" in msg
+                assert "per-tree limit" not in msg
+                assert "no cgroup limit inside this slice was reached" in msg
+        finally:
+            self._reset()
+
+    def test_slice_pressure_reaped_victim_points_at_the_kernel_log(self, tmp_path):
+        """A victim scope that is gone by the time the sampler looks cannot be
+        named from cgroupfs; the message says where the name still is."""
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            d = self._fake_slice(tmp_path)
+            with patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=d):
+                assert sb.check_agents_slice_pressure() is None
+                self._fake_slice(tmp_path, oom_kill=1, oom=1)
+                msg = sb.check_agents_slice_pressure()
+                assert msg is not None
+                assert "already reaped" in msg
+                assert "kernel log" in msg
         finally:
             self._reset()
 

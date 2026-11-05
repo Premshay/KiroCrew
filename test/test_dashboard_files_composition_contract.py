@@ -49,6 +49,9 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 # no literal can narrow which files it parses.
 pytestmark = pytest.mark.xdist_group(name="tree_scan_dashboard_files_composition_contract")
 
+SHARED_FACADE_CHECKS = ("the_globstar_matcher_reads_patterns_as_the_reviewers_do",)
+
+
 _FACADE = files.__name__
 _FACADE_PATH = Path(files.__file__).resolve()
 _OWNER_PACKAGE = file_api.__name__
@@ -77,7 +80,7 @@ _BASE_NAMES = frozenset("""
         _GREP_MIN_QUERY_CHARS _GREP_PPTX_SLIDE_RE _GREP_PREVIEW_CHARS
         _GREP_RG_MAX_RECORD_BYTES _GREP_RG_OVERSIZE _GREP_RG_POLL_SECS
         _GREP_RG_QUEUE_LINES _GREP_RG_TEARDOWN_SECS _GREP_ROW_DEADLINE_STRIDE
-        _GREP_TIME_BUDGET_SECS _HEAD_READ_LIMIT _HEIF_BRANDS _HIDDEN_TOOL_DIRS
+        _GREP_TIME_BUDGET_SECS _HEAD_READ_LIMIT _HEIC_HINT_EXT _HEIF_BRANDS _HIDDEN_TOOL_DIRS
         _INLINE_DISPOSITION_PREFIXES _MACOS_TEMP_PROJECT_PREFIX_RE _MAGIC_PREFIXES
         _MAX_UPLOAD_BYTES _MAX_UPLOAD_FILES _MAX_VIDEO_UPLOAD_BYTES _MEDIA_EXT_MIME
         _MEDIA_MAGIC _OFFICE_PREVIEWABLE_EXT _OFFICE_PREVIEW_CAP _OpenDenied
@@ -131,7 +134,7 @@ _BASE_NAMES = frozenset("""
         append_and_surface asdict atomic_write binary_content_is_flagged
         cgroup_scope_argv coerce_dict_section config_dir config_loader
         dashboard_slot_key data_home drained_to_thread executors extract_blocks
-        extract_pdf_segments extract_slides extract_text file_delivery_consent
+        extract_pdf_segments extract_slides extract_text
         is_direct_local_request is_sensitive_canonical_path is_sensitive_path is_sensitive_resolved_path
         is_tracked_channel is_unc_shape join_slides link_pattern_url_ok logger
         materialize_workspace_dir open_access_control_source part_stream
@@ -236,8 +239,7 @@ _BASE_OWNERS: dict[str, tuple[str, ...]] = {
         _validate_dashboard_path
         """.split()),
     "outbox": tuple("""
-        _audit_consented_download _audit_owner_grant_refusal _owner_grant_releases_flagged
-        _read_outbox_file api_outbox_download api_outbox_list api_outbox_notify
+        _caller_is_owner _read_outbox_file api_outbox_download api_outbox_list api_outbox_notify
         """.split()),
     "channel_upload": tuple("""
         _gate_upload_file api_channel_upload_file api_slack_upload_file is_tracked_channel
@@ -262,7 +264,8 @@ _OWNER_CONSTANTS = {"git_panel": ("_GIT_PANEL_STDOUT_CAP",)}
 #: ``editor`` owners, from the base file, where each of their names had the same shape.
 #: Recaptured when ``_run_path_probe`` gained its keyword-only ``stall_path``.
 #: Recaptured when ``api_file_download`` began answering a ``web.StreamResponse``.
-_BASE_SHAPE_DIGEST = "b462dcc17ed8ba47197333e00c15ef7b63c8817837a43d28d4f582a720c3b788"
+#: Recaptured when ``_browse_files_sync`` gained its ``show_hidden`` flag.
+_BASE_SHAPE_DIGEST = "2b4cc46ac8b95071222148ebc8330e87b9e6187f569c438a4c4bafe085e24feb"
 #: Definitions that stay in the facade file: the seams the owners share -- the SEL
 #: accessor, the file-send audit, the sub-agent session mapping and the request-body
 #: error code -- the search walk's clock, the file viewer's owner-view verdict, whose
@@ -377,7 +380,9 @@ def _package_reexports() -> list[str]:
 
 def test_the_routes_and_the_package_reach_the_facade_objects() -> None:
     """Every route the gateway registers for a file handler and every name the
-    handlers package re-exports is the facade's object."""
+    handlers package re-exports is the facade's object. A route over this
+    machine's files runs behind the remote-chat guard, which wraps the facade's
+    object itself (``__wrapped__``)."""
     from kiro_crew.dashboard import routes
 
     app = web.Application()
@@ -388,10 +393,22 @@ def test_the_routes_and_the_package_reach_the_facade_objects() -> None:
         if getattr(files, getattr(route.handler, "__name__", ""), None) is not None
         and route.handler.__module__ == _FACADE
     ]
-    assert len({id(h) for h in served}) == 34
-    assert [h.__name__ for h in served if getattr(files, h.__name__) is not h] == []
+    assert len({id(h) for h in served}) == 35
+    inner = [getattr(h, "__wrapped__", h) for h in served]
+    assert [h.__name__ for h in inner if getattr(files, h.__name__) is not h] == []
+    assert sorted({h.__name__ for h in served if hasattr(h, "__wrapped__")}) == [
+        "api_file_diff",
+        "api_file_raw",
+        "api_file_read",
+        "api_file_stream",
+        "api_file_watch",
+        "api_file_write",
+        "api_project_git",
+        "api_project_git_log",
+        "api_project_git_status",
+    ]
     reexports = _package_reexports()
-    assert len(reexports) == 36
+    assert len(reexports) == 37
     assert [n for n in reexports if getattr(handlers_pkg, n) is not getattr(files, n)] == []
 
 
@@ -421,6 +438,7 @@ def test_the_seams_other_modules_import_keep_their_identity() -> None:
 #: path (or close an import cycle), so each stays function-local.
 _IMPORTED_BY_NAME = {
     "_get_config_lock": "kiro_crew.dashboard.handlers.agents",
+    "browse_denied_async": "kiro_crew.browser_harness.governance",
     "denied_sides": "kiro_crew.decisions.capability",
     "is_owner_dashboard_request": "kiro_crew.dashboard.handlers.source_providers",
     "owner_view_for_request": "kiro_crew.dashboard.handlers.source_providers",
@@ -490,7 +508,7 @@ def test_every_moved_name_is_one_object_in_its_owner() -> None:
     ]
     assert strays == []
     names = [name for group in _BASE_OWNERS.values() for name in group]
-    assert len(names) == len(set(names)) == 131
+    assert len(names) == len(set(names)) == 129
 
 
 def test_the_moved_names_keep_their_base_shapes() -> None:
@@ -499,7 +517,7 @@ def test_the_moved_names_keep_their_base_shapes() -> None:
         for names in _BASE_OWNERS.values()
         for name in names
     )
-    assert len(lines) == 131
+    assert len(lines) == 129
     digest = hashlib.sha256("\n".join(lines).encode()).hexdigest()
     assert digest == _BASE_SHAPE_DIGEST, "\n".join(lines)
 
@@ -552,7 +570,7 @@ def test_every_base_definition_is_in_exactly_one_place() -> None:
     }
     assert defined == set(_FACADE_DEFS)
     moved = {name for names in _BASE_OWNERS.values() for name in names}
-    assert len(defined | moved) == len(defined) + len(moved) == 139
+    assert len(defined | moved) == len(defined) + len(moved) == 137
 
 
 def test_the_owners_log_as_the_facade() -> None:
@@ -1395,7 +1413,7 @@ def test_the_resolved_gate_dicts_name_the_owners() -> None:
     gate = guard._call_sites("is_sensitive_resolved_path")
     assert {k: v for k, v in gate.items() if "dashboard/file_api/" in k} == {
         "kiro_crew/dashboard/file_api/path_complete.py": 3,
-        "kiro_crew/dashboard/file_api/project_tree.py": 2,
+        "kiro_crew/dashboard/file_api/project_tree.py": 3,
     }
     assert "kiro_crew/dashboard/handlers/files.py" not in gate
     containment = guard._containment_claim_sites()
@@ -1443,7 +1461,8 @@ def test_the_bare_hop_guard_reads_the_file_family(
 def test_the_error_code_rows_match_each_owner(tmp_path: Path) -> None:
     """The baseline's per-file rows for the facade and its owners are each one's
     measured count and sum to the one-module file's 82 less the codes added since
-    (the upload 413's ``file_too_large``), and the scan counts a response planted
+    (the upload 413's ``file_too_large``) and the notify content refusal removed
+    with the content scan, and the scan counts a response planted
     in an owner against that owner."""
     import json
 
@@ -1457,7 +1476,7 @@ def test_the_error_code_rows_match_each_owner(tmp_path: Path) -> None:
     }
     live = guard.tally(guard.scan())
     assert rows == {path: live[path] for path in rows}
-    assert sum(counts.get("missing_code", 0) for counts in rows.values()) == 81
+    assert sum(counts.get("missing_code", 0) for counts in rows.values()) == 80
     assert {path for path in live if path.startswith("dashboard/file_api/")} <= set(rows)
     root = _mirror(tmp_path) / "src/kiro_crew"
     owner = root / "dashboard/file_api/search.py"
@@ -1522,13 +1541,6 @@ def _autosde_rules() -> list[dict]:
         for name in ("AUTOSDE.yaml", "website/AUTOSDE.yaml")
         for rule in yaml.safe_load((root / name).read_text(encoding="utf-8"))["custom-rules"]
     ]
-
-
-def test_the_globstar_matcher_reads_patterns_as_the_reviewers_do() -> None:
-    assert _globstar("src/a/**/*.py").match("src/a/b.py")
-    assert _globstar("src/a/**/*.py").match("src/a/x/y/b.py")
-    assert not _globstar("src/a/*.py").match("src/a/x/b.py")
-    assert _globstar("src/a/**").match("src/a/x/b.py")
 
 
 def test_every_review_rule_on_the_facade_also_covers_its_owners() -> None:

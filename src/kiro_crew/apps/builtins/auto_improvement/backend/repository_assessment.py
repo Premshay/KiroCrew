@@ -66,8 +66,6 @@ def read_assessment(area_path: str = "") -> dict:
 
 
 def _build_runner():
-    import kiro_crew.acp  # noqa: F401 — initialize before the provider factory
-
     from kiro_crew.config.loader import build_provider_factory
     from kiro_crew.execution_context import bind_session_execution, resolve_member_execution
 

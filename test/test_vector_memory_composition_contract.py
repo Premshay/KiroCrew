@@ -17,7 +17,7 @@ the store observe independently of where each rule lives:
   it through the owner module, so one patch of the owner reaches every caller;
 * the read-only source guards that scan ``vector_memory.py`` by name
   (``test_memory_lineage_drift``, ``test_memory_v2_schema``,
-  ``test_core_path_redact_before_bound``, ``test_cse_2026_08_05_fixes`` and the
+  ``test_core_path_redact_before_bound``, ``test_security_source_scan_invariants`` and the
   redaction-sink registry) are re-applied to the runtime modules with their own
   helpers, each with a planted violation proving the re-applied check can fail;
 * the optional FAISS accelerator's lifecycle and search tier, driven through a
@@ -43,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import composition_contract_checks
 import numpy as np
 import pytest
 import test_memory_lineage_drift as drift
@@ -76,7 +77,9 @@ RUNTIME_MODULES = frozenset(
         "recall",
         "retirement",
         "semantic",
+        "semantic_scoring_patch",
         "store_bookkeeping",
+        "term_index",
         "text_scoring",
         "write_outcomes",
     }
@@ -297,7 +300,7 @@ _STORE_SIGNATURES = {
     "_infer_semantic_key": "(text: 'str') -> 'str | None'",
     "_init_database": "(self) -> 'None'",
     "_invalidate_episodic_scoring": "(self) -> 'None'",
-    "_invalidate_semantic_scoring": "(self) -> 'None'",
+    "_invalidate_semantic_scoring": "(self, key: 'str | None' = None) -> 'None'",
     "_lesson_keywords": "(text: 'str') -> 'set[str]'",
     "_log_event": "(self, event_type: 'str', memory_type: 'str', key: 'str', old_value: 'str | None', new_value: 'str | None', source: 'str') -> 'int | None'",
     "_matches_allowlist": "(self, key: 'str') -> 'bool'",
@@ -337,7 +340,7 @@ _STORE_SIGNATURES = {
     "_write_semantic": "(self, key: 'str', value_json: 'str', confidence: 'float', source: 'str', *, metadata: 'dict | None' = None, expected_revision: 'int | None' = None, correction: 'record_meta.CorrectionEvidence | None' = None, _consolidation: 'bool' = False, defer_embedding: 'bool' = False, embedding: 'list[float] | None' = None, embedding_resolved: 'bool' = False, embedding_generation: 'int | None' = None, retirement_embedding: 'list[float] | None' = None, retirement_embedding_resolved: 'bool' = False, retirement_value_json: 'str | None' = None) -> 'str | None'",
     "algorithm_version": "(self) -> 'str'",
     "append_history": "(self, entry: 'str') -> 'None'",
-    "apply_consolidation": "(self, *, source_id: 'str', session_key: 'str', source_total: 'int', result: 'dict', snapshot: 'dict', messages: 'list[dict]', facets: 'memory_schema.MemoryFacets | None' = None) -> 'dict'",
+    "apply_consolidation": "(self, *, source_id: 'str', session_key: 'str', source_total: 'int', result: 'dict', snapshot: 'dict', messages: 'list[dict]', facets: 'memory_schema.MemoryFacets | None' = None, kind_routing: 'KindRouting | None' = None) -> 'dict'",
     "backfill_missing_embeddings": "(self, progress: \"'Callable[[int, int], None] | None'\" = None, *, pace: 'bool' = True, max_rows_per_kind: 'int | None' = None, should_stop: \"'Callable[[], bool] | None'\" = None) -> 'int'",
     "begin_space_change": "(self) -> 'None'",
     "build_faiss_index": "(self) -> 'int'",
@@ -347,7 +350,7 @@ _STORE_SIGNATURES = {
     "count_lessons": "(self) -> 'int'",
     "db": "(self) -> 'sqlite3.Connection'",
     "delete_episodic": "(self, mem_id: 'str', source: 'str' = 'user_explicit') -> 'bool'",
-    "delete_lesson": "(self, rule_substring: 'str', repo_scope: 'str | None' = None, *, exact: 'bool' = False) -> 'bool'",
+    "delete_lesson": "(self, rule_substring: 'str', repo_scope: 'str | None' = None, *, exact: 'bool' = False, keep_one: 'bool' = False) -> 'bool'",
     "delete_semantic": "(self, key: 'str', source: 'str', *, expect_value_json: 'str | None' = None, superseded_by: 'str | None' = None, supersede_reason: 'str | None' = None) -> 'bool'",
     "embed_episodic": "(self, text: 'str') -> 'list[float] | None'",
     "embed_lesson": "(self, rule: 'str') -> 'list[float] | None'",
@@ -355,7 +358,7 @@ _STORE_SIGNATURES = {
     "embed_semantic_retirement": "(self, key: 'str', value_json: 'str') -> 'list[float] | None'",
     "embedding_repair_state": "(self, generation: 'str') -> 'tuple[bool, int]'",
     "find_contradiction_candidates": "(self, rule: 'str', threshold_low: 'float' = 0.4, threshold_high: 'float' = 0.85, rule_emb: 'list[float] | None' = None, repo_scope: 'str | None' = None) -> 'list[dict]'",
-    "get_all_semantic": "(self, limit: 'int | None' = None, offset: 'int' = 0, *, q: 'str' = '') -> 'list[dict]'",
+    "get_all_semantic": "(self, limit: 'int | None' = None, offset: 'int' = 0, *, q: 'str' = '', after_key: 'str | None' = None, exclude_lessons: 'bool' = False) -> 'list[dict]'",
     "get_context_preview": "(self, query_text: 'str' = '') -> 'dict'",
     "get_episodic_context": "(self, query_embedding: 'list[float] | None' = None, query_text: 'str' = '', cap: 'int' = 3000) -> 'str'",
     "get_episodic_list": "(self, limit: 'int' = 50, offset: 'int' = 0, tag_filter: 'list[str] | None' = None, *, q: 'str' = '') -> 'list[dict]'",
@@ -411,7 +414,7 @@ _STORE_SIGNATURES = {
     "with_record_metadata": "(self, rows: 'list[dict]') -> 'list[dict]'",
     "write_episodic": "(self, text: 'str', embedding: 'list[float] | None' = None, conversation_id: 'str' = '', tags: 'list[str] | None' = None, importance: 'float' = 0.5, source: 'str' = 'consolidation', *, preserve_existing: 'bool' = False, defer_embedding: 'bool' = False, embedding_resolved: 'bool' = False, embedding_generation: 'int | None' = None, facets: \"'memory_schema.MemoryFacets | None'\" = None, metadata: 'dict | None' = None) -> 'bool'",
     "write_episodic_outcome": "(self, text: 'str', embedding: 'list[float] | None' = None, conversation_id: 'str' = '', tags: 'list[str] | None' = None, importance: 'float' = 0.5, source: 'str' = 'consolidation', *, preserve_existing: 'bool' = False, defer_embedding: 'bool' = False, embedding_resolved: 'bool' = False, embedding_generation: 'int | None' = None, facets: \"'memory_schema.MemoryFacets | None'\" = None, metadata: 'dict | None' = None) -> \"'EpisodicWriteOutcome'\"",
-    "write_lesson": "(self, rule: 'str', category: 'str' = 'knowledge', negative: 'str | None' = None, source: 'str' = 'user_explicit', rule_emb: 'list[float] | None' = None, rule_emb_generation: 'int | None' = None, repo_scope: 'str | None' = None, *, applies: 'str | None' = None, rule_emb_resolved: 'bool' = False, defer_backfills: 'bool' = False, facets: \"'memory_schema.MemoryFacets | None'\" = None) -> 'LessonWriteResult'",
+    "write_lesson": "(self, rule: 'str', category: 'str' = 'knowledge', negative: 'str | None' = None, source: 'str' = 'user_explicit', rule_emb: 'list[float] | None' = None, rule_emb_generation: 'int | None' = None, repo_scope: 'str | None' = None, *, applies: 'str | None' = None, rule_emb_resolved: 'bool' = False, defer_backfills: 'bool' = False, facets: \"'memory_schema.MemoryFacets | None'\" = None, written_by: 'Mapping[str, str] | None' = None) -> 'LessonWriteResult'",
 }
 
 #: Every name ``kiro_crew.vector_memory`` itself bound (definitions, not imports),
@@ -506,9 +509,10 @@ def _load_probe(tmp_path: Path, name: str, source: str):
     return module, path
 
 
-class TestSurface:
-    def test_the_runtime_package_holds_exactly_the_composed_modules(self) -> None:
-        assert set(_runtime_sources()) == RUNTIME_MODULES
+class TestSurface(
+    composition_contract_checks.TheRuntimePackageHoldsExactlyTheComposedModules,
+    composition_contract_checks.ThePackageShipsWithTheWheel,
+):
 
     def test_every_store_member_keeps_its_name_and_kind(self) -> None:
         current: dict[str, list[str]] = {}
@@ -556,19 +560,11 @@ class TestSurface:
         public += _IMPORTED_PUBLIC_NAMES
         assert [name for name in public if not hasattr(probe, name)] == []
 
-    def test_the_package_ships_with_the_wheel(self) -> None:
-        """``packages = find:`` (not ``find_namespace:``) only ships a directory that
-        carries an ``__init__.py``; an editable install would import it anyway."""
-        import configparser
 
-        config = configparser.ConfigParser()
-        config.read(FACADE_PATH.parents[2] / "setup.cfg", encoding="utf-8")
-        assert config.get("options", "packages").strip() == "find:"
-        assert config.get("options.packages.find", "where").strip() == "src"
-        assert (RUNTIME_DIR / "__init__.py").is_file()
-
-
-class TestPlacement:
+class TestPlacement(
+    composition_contract_checks.NoRuntimeModuleReadsASeamAsABareGlobal,
+    composition_contract_checks.NoRuntimeModuleDefinesAnAsyncFunction,
+):
     """The rules that keep a facade patch effective once the code has moved."""
 
     @staticmethod
@@ -734,14 +730,6 @@ class TestPlacement:
                     hits.append(f"{node.lineno}: {node.value.id}.{node.attr}")
         return sorted(hits, key=lambda hit: (int(hit.split(":")[0]), hit))
 
-    def test_no_runtime_module_reads_a_seam_as_a_bare_global(self) -> None:
-        offenders = {
-            stem: hits
-            for stem, source in _runtime_sources().items()
-            if (hits := self._bare_seam_loads(source))
-        }
-        assert offenders == {}
-
     def test_the_seam_scan_catches_a_planted_bare_read(self) -> None:
         planted = (
             "WIDTH = _ROW_STEM_CACHE_SIZE\n"
@@ -787,12 +775,6 @@ class TestPlacement:
             module = _runtime_module(stem)
             if "logger" in vars(module):
                 assert module.logger is logging.getLogger(STORE_LOGGER)
-
-    def test_no_runtime_module_defines_an_async_function(self) -> None:
-        for stem, source in _runtime_sources().items():
-            assert not [
-                n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.AsyncFunctionDef)
-            ], stem
 
     def test_the_seam_scan_catches_a_seam_read_through_a_sibling_module(self) -> None:
         planted = (

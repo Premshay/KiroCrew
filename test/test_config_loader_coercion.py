@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import json
+import logging
 import re
 import tempfile
 import unittest.mock
@@ -34,6 +35,7 @@ from kiro_crew.config.loader import (
     MemoryConfig,
     SessionConfig,
     SlackConfig,
+    coerce_config_field,
 )
 
 # Fields with enum constraints and their allowed values
@@ -179,6 +181,112 @@ class TestMalformedConfigValuesNeverCrashLoad:
     def test_non_list_skills_extra_paths_falls_back(self):
         assert _load_from_dict({"skills": {"extra_paths": 5}}).skills.extra_paths == []
         assert _load_from_dict({"skills": {"extra_paths": ["/a", 9]}}).skills.extra_paths == ["/a"]
+
+
+class TestSlackAllowedUsersLoad:
+    """slack.allowed_users load-time validation and coercion.
+
+    load() coerces a near-miss `user_id` key to the canonical `slack_id` shape
+    instead of discarding the entry. Dropping it makes `config get
+    slack.allowed_users` read back `[]` while the write succeeded, which looks
+    like a failed save; coercion keeps the value and warns. The `slack_id` value
+    must be a non-empty string: `slack/gateway_runtime/orchestrator_init.py`
+    builds a set of these ids, so a non-string id would crash gateway startup.
+    """
+
+    def test_canonical_slack_id_entry_passes_through(self) -> None:
+        loaded = _load_from_dict(
+            {"slack": {"allowed_users": [{"slack_id": "U0C7AP0SY12", "name": "Clint"}]}}
+        )
+        assert loaded.slack.allowed_users == [{"slack_id": "U0C7AP0SY12", "name": "Clint"}]
+
+    def test_user_id_key_is_coerced_to_slack_id_not_dropped(self) -> None:
+        # A `user_id` key with no `slack_id`: the value is kept under `slack_id`,
+        # not discarded, so config get reads it back.
+        loaded = _load_from_dict({"slack": {"allowed_users": [{"user_id": "U0C7AP0SY12"}]}})
+        assert loaded.slack.allowed_users == [{"slack_id": "U0C7AP0SY12"}]
+
+    def test_user_id_coercion_keeps_other_keys_and_orders_slack_id_first(self) -> None:
+        loaded = _load_from_dict(
+            {"slack": {"allowed_users": [{"user_id": "U0C7AP0SY12", "name": "Clint"}]}}
+        )
+        assert loaded.slack.allowed_users == [{"slack_id": "U0C7AP0SY12", "name": "Clint"}]
+        assert list(loaded.slack.allowed_users[0].keys())[0] == "slack_id"
+
+    def test_slack_id_wins_when_both_keys_present(self) -> None:
+        loaded = _load_from_dict(
+            {"slack": {"allowed_users": [{"slack_id": "UCANON", "user_id": "UIGNORED"}]}}
+        )
+        # slack_id is canonical, so the entry passes through unchanged (no rename).
+        assert loaded.slack.allowed_users == [{"slack_id": "UCANON", "user_id": "UIGNORED"}]
+
+    def test_empty_slack_id_falls_through_to_user_id(self) -> None:
+        # An empty `slack_id` is not usable, so the `user_id` value is adopted and
+        # the empty key never clobbers it.
+        loaded = _load_from_dict(
+            {"slack": {"allowed_users": [{"slack_id": "", "user_id": "U0C7AP0SY12"}]}}
+        )
+        assert loaded.slack.allowed_users == [{"slack_id": "U0C7AP0SY12"}]
+
+    def test_non_string_slack_id_is_dropped(self) -> None:
+        # A list/dict id would raise TypeError when
+        # slack/gateway_runtime/orchestrator_init.py builds a set of ids. Such an entry is dropped, not kept with an unhashable value.
+        loaded = _load_from_dict(
+            {
+                "slack": {
+                    "allowed_users": [
+                        {"slack_id": ["U0C7AP0SY12"]},
+                        {"slack_id": {"id": "U0C7AP0SY12"}},
+                        {"slack_id": "U0C7AP0SY12"},
+                    ]
+                }
+            }
+        )
+        assert loaded.slack.allowed_users == [{"slack_id": "U0C7AP0SY12"}]
+        # The surviving ids are hashable, so a set build cannot crash.
+        assert {u["slack_id"] for u in loaded.slack.allowed_users} == {"U0C7AP0SY12"}
+
+    def test_non_string_user_id_is_not_coerced(self) -> None:
+        loaded = _load_from_dict(
+            {"slack": {"allowed_users": [{"user_id": ["U0C7AP0SY12"]}, {"user_id": 42}]}}
+        )
+        assert loaded.slack.allowed_users == []
+
+    def test_junk_entries_are_ignored(self) -> None:
+        loaded = _load_from_dict(
+            {
+                "slack": {
+                    "allowed_users": [
+                        {"slack_id": "U0C7AP0SY12"},
+                        {"name": "no id at all"},
+                        "U0C7AP0SY12",  # a bare string is not a coerced shape
+                        42,
+                        None,
+                    ]
+                }
+            }
+        )
+        assert loaded.slack.allowed_users == [{"slack_id": "U0C7AP0SY12"}]
+
+    def test_coerced_entry_survives_to_dict_round_trip(self) -> None:
+        loaded = _load_from_dict({"slack": {"allowed_users": [{"user_id": "U0C7AP0SY12"}]}})
+        reloaded = _load_from_dict(loaded.to_dict())
+        assert reloaded.slack.allowed_users == [{"slack_id": "U0C7AP0SY12"}]
+
+    def test_coercion_says_so_in_the_log(self) -> None:
+        cfg, logs = _load_from_dict_with_logs(
+            {"slack": {"allowed_users": [{"user_id": "U0C7AP0SY12"}]}}
+        )
+        assert cfg.slack.allowed_users == [{"slack_id": "U0C7AP0SY12"}]
+        said = [m for m in logs if "slack.allowed_users" in m and "auto-coerced" in m]
+        assert said, logs
+
+    def test_valid_entry_draws_no_coercion_line(self) -> None:
+        cfg, logs = _load_from_dict_with_logs(
+            {"slack": {"allowed_users": [{"slack_id": "U0C7AP0SY12"}]}}
+        )
+        assert cfg.slack.allowed_users == [{"slack_id": "U0C7AP0SY12"}]
+        assert not [m for m in logs if "slack.allowed_users" in m and "auto-coerced" in m]
 
 
 # ---------------------------------------------------------------------------
@@ -1147,3 +1255,83 @@ class TestEmptyResponseMaxContinuesWiring:
     def test_above_range_clamps_to_max(self) -> None:
         cfg = _load_from_dict({"session": {"empty_response_max_continues": 999}})
         assert cfg.session.empty_response_max_continues == 10
+
+
+def _loader_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "kiro_crew.config.loader"]
+
+
+class TestCoerceConfigField:
+    """``coerce_config_field`` gives raw config readers the loader's posture for a
+    nested value: a wrong type degrades to the default and logs, an absent key
+    takes the default silently."""
+
+    def test_a_correctly_typed_value_is_returned(self) -> None:
+        assert coerce_config_field({"n": 7}, "n", int, 10) == 7
+        assert coerce_config_field({"s": "ok"}, "s", str, "def") == "ok"
+        assert coerce_config_field({"xs": [1, 2]}, "xs", list, []) == [1, 2]
+        assert coerce_config_field({"d": {"a": 1}}, "d", dict, {}) == {"a": 1}
+
+    def test_an_absent_key_takes_the_default_silently(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            assert coerce_config_field({}, "n", int, 10) == 10
+        # Absent is the unconfigured state, not a degradation.
+        assert _loader_warnings(caplog) == []
+
+    @pytest.mark.parametrize("bad", [[], {}, "x", 1.5, None])
+    def test_a_wrong_typed_int_field_degrades_to_the_default(self, bad: object) -> None:
+        assert coerce_config_field({"n": bad}, "n", int, 10) == 10
+
+    @pytest.mark.parametrize("bad", [1, [], {}, None, True])
+    def test_a_wrong_typed_str_field_degrades_to_the_default(self, bad: object) -> None:
+        assert coerce_config_field({"s": bad}, "s", str, "def") == "def"
+
+    @pytest.mark.parametrize("bad", [1, "x", {}, None])
+    def test_a_wrong_typed_list_field_degrades_to_the_default(self, bad: object) -> None:
+        assert coerce_config_field({"xs": bad}, "xs", list, []) == []
+
+    @pytest.mark.parametrize("bad", [1, "x", [], None])
+    def test_a_wrong_typed_dict_field_degrades_to_the_default(self, bad: object) -> None:
+        assert coerce_config_field({"d": bad}, "d", dict, {"fallback": True}) == {"fallback": True}
+
+    def test_a_degrade_logs_a_warning_naming_the_key_and_got_type(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            coerce_config_field({"fetch_top_n": []}, "fetch_top_n", int, 10)
+        assert any("fetch_top_n" in m and "list" in m for m in _loader_warnings(caplog))
+
+    def test_a_bool_is_not_accepted_for_an_int_field(self) -> None:
+        """JSON ``true``/``false`` is distinct from a number, so a mistyped
+        ``true`` cannot pose as ``1``."""
+        assert coerce_config_field({"n": True}, "n", int, 10) == 10
+        assert coerce_config_field({"n": False}, "n", int, 10) == 10
+
+    def test_a_bool_is_accepted_for_a_bool_field(self) -> None:
+        assert coerce_config_field({"b": True}, "b", bool, False) is True
+        assert coerce_config_field({"b": False}, "b", bool, True) is False
+
+    def test_a_tuple_of_types_accepts_any_member(self) -> None:
+        assert coerce_config_field({"v": 1}, "v", (int, float), 0) == 1
+        assert coerce_config_field({"v": 1.5}, "v", (int, float), 0) == 1.5
+        assert coerce_config_field({"v": "x"}, "v", (int, float), 0) == 0
+
+
+class TestKasDeleteDelaySecs:
+    """session.kas_delete_delay_secs: 0 by default, which deletes a finished session's
+    record at once, and a hand-edited delay is capped at one day."""
+
+    def test_the_default_deletes_at_once(self) -> None:
+        cfg = _load_from_dict({})
+        assert cfg.session.kas_delete_delay_secs == 0
+
+    @pytest.mark.parametrize(
+        "stored, loaded",
+        [(1800, 1800), (0, 0), (-5, 0), (86400, 86400), (10**9, 86400), ("abc", 0)],
+        ids=["thirty-minutes", "zero", "negative", "one-day", "beyond-a-day", "not-a-number"],
+    )
+    def test_the_loader_bounds_the_delay(self, stored: object, loaded: int) -> None:
+        cfg = _load_from_dict({"session": {"kas_delete_delay_secs": stored}})
+        assert cfg.session.kas_delete_delay_secs == loaded

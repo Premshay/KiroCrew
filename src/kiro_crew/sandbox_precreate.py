@@ -15,6 +15,7 @@ from kiro_crew.sandbox_leaves import (
     _MD_NOTEBOOK_RETIRED_STATE_LEAVES,
     _MD_NOTEBOOK_STAGING_LEAF,
     _MD_NOTEBOOK_STATE_LEAVES,
+    _SECRET_REQUEST_POLICY_LEAF,
     MD_NOTEBOOK_APP_NAME,
 )
 
@@ -32,7 +33,7 @@ from kiro_crew.sandbox_leaves import (
 #:    * ``memory_stores`` — an empty root declares or provisions no store. The
 #:      gateway can later create named stores inside the directory bind; no
 #:      database, member configuration or Global V1 path is created here;
-#:    * ``playwright-cli`` — an empty dir means the launcher is absent,
+#:    * ``browser-harness`` — an empty dir means the engine is not installed,
 #:      exactly as a missing dir does; its directory bind shows a later gateway
 #:      install while withholding every agent-side write;
 #:    * ``computer_use.json`` — ``computer_use.enable_state.load_state`` reads ``{}``
@@ -43,6 +44,8 @@ from kiro_crew.sandbox_leaves import (
 #:      both absent and empty, so every service stays unconfirmed;
 #:    * ``decisions_consent.json`` — ``decisions.consent.load_state`` reads ``{}``
 #:      as NOT CONSENTED, which is what an absent keystone means;
+#:    * ``shared_crew_preview.json`` — ``shared_crew.preview.read_stored`` reads
+#:      ``{}`` as OFF, which is what an absent keystone means;
 #:    * ``settings_seeds.json`` — ``acp.seed_provenance._load`` finds no ``seeds``
 #:      mapping in ``{}`` and returns having recorded nothing, so every settings
 #:      path reads as unowned. Identical to absent, and the leaf that most needs
@@ -101,8 +104,13 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     # read-only listing above exists to deny, so without this entry that listing
     # protects only hosts that happen to have the directory already.
     "panel-templates",
-    "playwright-cli",
-    # The KAS engine bundle root, for the ``playwright-cli`` reason: on an install
+    # The Browser Harness prefix: until the owner presses Install in Settings the
+    # directory is absent, the seal is skipped, and the name is one an agent could
+    # create and fill with an interpreter the gateway later executes. An empty
+    # directory reads as "not installed" to ``browser_harness.install.install_state``
+    # exactly as an absent one does.
+    "browser-harness",
+    # The KAS engine bundle root, for the ``browser-harness`` reason: on an install
     # that has never run ``kirocrew kas install`` the directory is absent, and an
     # absent target is a seal skipped and a name the agent may create.
     "engines",
@@ -123,6 +131,12 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     # its first download, which is the window a sandboxed shell would use to swap
     # the bytes the loaders verify.
     "models",
+    # The own-``kirocrew`` link directory, on the same argument: an empty directory
+    # is a PATH entry with nothing in it, exactly as an absent one, and the bind is
+    # live, so the link the gateway writes at start is seen. Without this entry the
+    # seal skips the directory until that first write, and a sandboxed shell could
+    # create it and plant the ``kirocrew`` every later PATH lookup finds first.
+    "kirocrew-bin",
     # The redaction allow-list, on the same argument: no file means no host
     # allowed, which is what an empty directory means too, and the bind is live.
     "redaction-allow",
@@ -130,10 +144,20 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     # the adapter so the directory is a read-only mountpoint before ANY sandbox starts,
     # including the first pi spawn on a fresh install.
     "pi-gate",
+    # KAS MCP launch snapshots: the launcher reads a snapshot by name and refuses a
+    # missing one, so an empty directory means what an absent one does, and the
+    # bind is live, so a snapshot the gateway writes later is seen.
+    "kas-mcp-launch",
     # Empty directories are absent-equivalent to the approval and resolution readers.
     # Pre-creation gives Linux concrete bind targets on a fresh install.
     "mcp-launch-approvals",
     "mcp/resolved",
+    # The per-template MCP additions record, on the same argument: an absent record
+    # reads as no additions, so an empty directory is the same answer, and the bind
+    # is live, so the gateway's first write is seen. Without this entry the seal
+    # skips the directory until that write, which is the window a sandboxed shell
+    # would use to plant a record the next rebuild merges.
+    "template-mcp-additions",
     # The skill projection's side files, on the ``profiles`` argument. (1) Every reader
     # resolves a record, a lease or the ledger by name under it and treats a missing
     # one as absent, so an empty directory is no record, no lease and no ledger,
@@ -149,6 +173,13 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     # Without this entry the seal skips the directory until the first seed, and the
     # name is one an agent could create to forge the record.
     "seed-provenance",
+    # The gateway's config publication record (``config.write_provenance``), on the
+    # ``profiles`` argument. (1) Its reader, the launcher's pin, reads a missing record
+    # as vouching for nothing, exactly as it reads an absent directory: the refusal the
+    # pin always made. (2) The bind is live, so every later config save's record is seen.
+    # Without this entry the name is one an agent could create to forge the record that
+    # lets a changed config.json pass the pin.
+    "config-provenance",
 )
 #: Read-only directory leaves whose NAME must remain the mounted name. A resolving
 #: symlink is unsafe here: the mount follows its target and leaves the lexical name
@@ -158,18 +189,22 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
 #: half of a control, so none may be satisfied by a link the governed party planted.
 _CREW_NOFOLLOW_READONLY_DIR_LEAVES: tuple[str, ...] = (
     "app-agent-launch",
-    "playwright-cli",
+    "browser-harness",
     "engines",
     "subagents",
     "member-memory-bindings",
     "decisions",
     "models",
+    "kirocrew-bin",
     "redaction-allow",
     "pi-gate",
+    "kas-mcp-launch",
     "mcp-launch-approvals",
     "mcp/resolved",
+    "template-mcp-additions",
     "skill-projection",
     "seed-provenance",
+    "config-provenance",
 )
 assert set(_CREW_NOFOLLOW_READONLY_DIR_LEAVES) <= set(_CREW_PRECREATE_READONLY_DIR_LEAVES)
 #: Read-only FILE leaves whose NAME must remain the sealed name, for the same reason
@@ -196,9 +231,10 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
         "the agent could choose the container image a Fargate launch runs, and the task's "
         "execution role delivers the model credential into it",
     ),
-    "playwright-cli": (
-        "sealed browser runtime",
-        "the agent could replace the browser executable the gateway runs",
+    "browser-harness": (
+        "sealed browser engine",
+        "the agent could replace the Browser Harness interpreter or the Chromium the "
+        "gateway runs against the user's own browser",
     ),
     "engines": (
         "sealed agent engine",
@@ -232,6 +268,10 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
         "the agent could swap the weights a digest-pinned loader verifies before it "
         "reopens them by name",
     ),
+    "kirocrew-bin": (
+        "sealed kirocrew link",
+        "the agent could choose the kirocrew every later PATH lookup runs",
+    ),
     "redaction-allow": (
         "sealed redaction allow-list",
         "the agent could allow the host it wants to send conversation data to",
@@ -240,6 +280,10 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
         "sealed pi gate runtime",
         "the agent could plant the launcher a later pi session execs out of",
     ),
+    "kas-mcp-launch": (
+        "sealed KAS MCP launch snapshots",
+        "the agent could choose the command and environment a later MCP server start runs",
+    ),
     "mcp-launch-approvals": (
         "sealed MCP launch approvals",
         "the agent could approve a command the gateway launches outside the sandbox",
@@ -247,6 +291,10 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
     "mcp/resolved": (
         "sealed resolved MCP launches",
         "the agent could replace the executable the gateway substitutes for an approved launch",
+    ),
+    "template-mcp-additions": (
+        "sealed template MCP additions",
+        "the agent could record a server of its choosing that the next rebuild mounts",
     ),
     "skill-projection": (
         "sealed skill-view records",
@@ -257,6 +305,11 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
         "sealed settings-seed record",
         "the agent could forge the record that lets Kiro Crew overwrite and delete a "
         "settings.local.json the user wrote",
+    ),
+    "config-provenance": (
+        "sealed config publication record",
+        "the agent could forge the record that lets a substituted config.json pass the "
+        "launcher's identity check",
     ),
     "app-agent-launch": (
         "sealed app-agent launch directory",
@@ -294,16 +347,14 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     "oauth_endpoints.json",
     "aws_service_consent.json",
     "decisions_consent.json",
-    # ``file_delivery_consent._read_all`` returns ``{}`` for both absent and
-    # unreadable, and ``is_granted`` then reports no consent -- so an EMPTY
-    # document means exactly what an ABSENT one means (criterion 1). A stale
-    # sealed read also fails toward refusal: the writer publishes through
-    # ``atomic_write`` (new inode), so a sandboxed reader keeps seeing ``{}`` and
-    # stays frozen at "no consent", which is narrower than the truth
-    # (criterion 2).
-    "file_delivery_consent.json",
-    # Consent to forward SSH_AUTH_SOCK satisfies both criteria the way
-    # ``file_delivery_consent.json`` does: ``ssh_auth_sock_consent.is_granted``
+    # The Shared Crew preview switch: ``preview.read_stored`` reads an absent,
+    # empty and unreadable store alike as OFF, so a pre-created ``{}`` means
+    # exactly what an absent file means (criterion 1); the writer rewrites an
+    # existing record in place (``preview.write_stored``), so the read-only mount
+    # stays on the same inode and a sandboxed reader sees the owner's choice,
+    # never a writable copy (criterion 2).
+    "shared_crew_preview.json",
+    # Consent to forward SSH_AUTH_SOCK: ``ssh_auth_sock_consent.is_granted``
     # reports no consent for an absent, empty, AND unreadable store alike, so a
     # pre-created ``{}`` means exactly "not forwarded" (criterion 1); the writer
     # publishes through ``atomic_write`` (new inode), so a sandboxed reader frozen
@@ -313,7 +364,7 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     # namespace sandbox.
     "ssh_auth_sock_consent.json",
     # The credential-redaction switch satisfies both criteria the way
-    # ``file_delivery_consent.json`` does: ``redaction_switch.read_state`` reads
+    # ``ssh_auth_sock_consent.json`` does: ``redaction_switch.read_state`` reads
     # absent, empty and unreadable alike as ENABLED, so a pre-created ``{}``
     # means exactly what an absent file means (criterion 1); the writer
     # publishes through ``atomic_write`` (new inode), so a sandboxed reader
@@ -322,7 +373,7 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     "credential_redaction.json",
     "settings_seeds.json",
     # The operator's grants of ``owner`` trust to a hand-configured app registry.
-    # Satisfies both criteria the way ``file_delivery_consent.json`` does:
+    # Satisfies both criteria the way ``ssh_auth_sock_consent.json`` does:
     # ``registry._granted_owner_repos`` reads an absent, empty, AND ``{}``-versioned
     # document alike as NO grants (a ``{}`` carries no matching ``version``), so a
     # pre-created ``{}`` means exactly "no registry is owner-trusted" (criterion 1);
@@ -366,7 +417,7 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     # reads as unconfigured -- narrower than the truth, never wider.
     "cloud.json",
     # The fork-lineage sidecar satisfies both criteria the way
-    # ``file_delivery_consent.json`` does: ``agent_state._read`` returns ``{}``
+    # ``ssh_auth_sock_consent.json`` does: ``agent_state._read`` returns ``{}``
     # for absent, unreadable, AND an empty document alike, so a pre-created
     # ``{}`` means exactly "no lineage recorded" (criterion 1); the writer
     # publishes through ``atomic_write`` (new inode), so a sandboxed reader
@@ -411,15 +462,14 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
 #: any clone, so materialising it early changes nothing it relies on.
 _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     "aws-control-staging",
-    # Same lazily-created shape as aws-control-staging: the file-delivery step-up
-    # nonce dir is created on demand only when the owner first ARMS a grant
-    # (``file_delivery_consent.arm_grant`` -> ``make_owner_only_dir(path.parent)``).
-    # On a fresh install with no prior arm the leaf is absent at spawn, the
-    # ``isdir``-guarded sensitive_dirs loop skips it, and a later dashboard arm
-    # materialises the nonce INSIDE a running sandbox's view -- where a same-UID
-    # agent reads it and drives the loopback /approve to self-grant. Precreated
-    # (empty, 0o700) before every spawn so the mask always has a name to bind over.
-    "file-delivery-consent-pending",
+    # Browser Harness's runtime directory and Kiro's Chromium profile. Both are
+    # created on the FIRST connect (``browser_harness.supervisor``), so a sandbox
+    # spawned before the owner's first browse finds them absent, the
+    # ``sensitive_dirs`` loop skips them, and the socket, the Windows IPC token and
+    # the profile's cookies then appear INSIDE that running sandbox. Materialised
+    # empty at 0700 so the bind has a target from the first spawn.
+    "browser-harness-ipc",
+    "browser-profile",
     "appearance-library",
     "quarantined-clones",
     # First created by the first member-born session's vouch, so a sandbox spawned
@@ -440,6 +490,10 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     # loop skips it, and the directory the gateway creates later shows up INSIDE that running
     # sandbox -- with the signing-key staging window in it.
     _AUTH_STORE_STAGING_LEAF,
+    # The mediated-secret request directory, by the same rule: the gateway mints its key
+    # (and the owner CLI publishes the policy) after a sandbox may already be running, so
+    # the directory must exist, and be masked, before any namespace starts.
+    _SECRET_REQUEST_POLICY_LEAF,
     # ``crew-panels`` is the same requirement seen from the mirror side of the
     # ceilings above: a read-only ceiling is materialised so the SEAL can apply,
     # a hidden leaf so the MASK can. The skip lands precisely on a fresh install,
@@ -455,6 +509,9 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     # operator's, hiding runs from the panel. Materialising it empty gives the
     # bind a target from first boot.
     "panel-dismissals",
+    # Released-session entries, for the same reason: created on the first release,
+    # and an entry has the gateway delete the record it names.
+    "released-sessions",
     # Append-only per-unit crew logs, and the hazard is the sharpest here: the
     # record is the AUTHORITY a reader trusts instead of re-deriving, and the
     # store creates this root on its first write. A sandbox spawned before that
@@ -528,6 +585,7 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     # list is either here or made at boot.
     "ledger",
     "work-ledger",
+    "browser-recordings",
     "cron-running",
     "workflow_library",
     "routing",
@@ -535,6 +593,16 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     "mcp-apps",
     "whatsapp",
     "backup",
+    # The Web Push stores, written lazily on the first subscribe or key fetch; see
+    # its entry in ``_CREW_HIDDEN_LEAVES``.
+    "web-push",
+    # The governance cache, masked in every tier and lifted READ-ONLY for an enterprise
+    # sandbox (``sandbox_tiers.enterprise_policy_cache_view``). Written on the first
+    # successful fetch, so a sandbox spawned before then would find no name to mask or
+    # seal and could create the directory and plant a ceiling there. An empty directory
+    # is no cache to every reader (``read_cache_meta`` finds no document), and
+    # ``make_owner_only_dir`` accepts the existing 0700 directory.
+    "policy_cache",
 )
 
 #: The masked md-notebook leaves materialised before a namespace spawn, and what each

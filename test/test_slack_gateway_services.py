@@ -216,7 +216,7 @@ class TestNotifyNudgeExpired:
         for key in ("slack:1700000000.123456", "discord:kirocrew:direct:42"):
             state = MagicMock()
             loop = self._loop(slot_key=key)
-            GatewayOrchestrator._notify_nudge_expired(self._orch(state), loop)
+            assert GatewayOrchestrator._notify_nudge_expired(self._orch(state), loop) is True, key
             state.notify.assert_called_once()
             assert state.notify.call_args.kwargs["meta"] is None, key
 
@@ -324,7 +324,6 @@ class TestHeartbeatCallback:
             mock_hs.return_value = mock_hs_inst
             await orch._init_heartbeat()
 
-        # Get the on_task callback
         callback = mock_hs.call_args[1]["on_task"]
 
         with patch(
@@ -445,7 +444,6 @@ class TestAutonudgeFire:
                 mock_ans.return_value = mock_inst
                 await orch._init_autonudge()
 
-        # Get the on_fire callback
         on_fire = mock_ans.call_args[1]["on_fire"]
         loop = MagicMock()
         loop.id = "loop1"

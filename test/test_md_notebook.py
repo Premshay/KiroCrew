@@ -218,6 +218,22 @@ async def test_attach_existing_checkout(fixtures) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_folder_beside_the_clone_root_reads_as_external(fixtures) -> None:
+    """`<clone_root>-old/notes` shares the clone root's spelling but not its folder."""
+    server_mod, remote, _seed = fixtures
+    sibling = Path(f"{server_mod._clone_root()}-old") / "notes"
+    sibling.parent.mkdir(parents=True)
+    _git("clone", "-q", str(remote), str(sibling), cwd=sibling.parent)
+    async with signed_client(server_mod) as client:
+        cloned = await _clone(client, remote)
+        status, body = await client.post("/api/vaults/attach", {"path": str(sibling)})
+        assert status == 200, body
+        _, listing = await client.get("/api/vaults")
+        external = {v["id"]: v["external"] for v in listing["vaults"]}
+        assert external == {cloned["id"]: False, body["vault"]["id"]: True}
+
+
+@pytest.mark.asyncio
 async def test_attach_accepts_a_repo_with_no_remote(fixtures, tmp_path: Path) -> None:
     """A `git init` folder with no origin is a valid local-only vault.
 
@@ -1088,7 +1104,7 @@ async def test_note_read_snapshots_mtime_before_content(fixtures, monkeypatch) -
         note = Path(vault["localPath"]) / "One.md"
         future = time.time() + 1000
 
-        real_read = server_mod.read_note_text
+        real_read = server_mod.read_note_snapshot
 
         async def racing_read(path: Path):
             # Simulate an external atomic save landing DURING the read by bumping
@@ -1096,7 +1112,7 @@ async def test_note_read_snapshots_mtime_before_content(fixtures, monkeypatch) -
             os.utime(note, (future, future))
             return await real_read(path)
 
-        monkeypatch.setattr(server_mod, "read_note_text", racing_read)
+        monkeypatch.setattr(server_mod, "read_note_snapshot", racing_read)
 
         status, body = await client.get("/api/note?path=One.md")
         assert status == 200
@@ -1413,3 +1429,65 @@ async def test_reads_a_note_with_non_finite_frontmatter(fixtures) -> None:
         assert status == 200, read
         fm = read["meta"]["frontmatter"]
         assert isinstance(fm["x"], str) and isinstance(fm["y"], str)
+
+
+class TestMdNotebookErrorRedaction:
+    """Error text that reaches the browser goes through ``_safe_error``, which
+    strips local paths and credentials but keeps the diagnosis."""
+
+    def test_absolute_paths_are_stripped(self):
+        """The dominant leak shape here. redact_credentials alone does NOT match
+        this, so a fix that only chains the credential/URL passes is cosmetic."""
+        from kiro_crew.apps.builtins.md_notebook import server as md_server
+
+        exc = FileNotFoundError(
+            "[Errno 2] No such file or directory: '/home/alice/.kiro/crew/vaults/v1'"
+        )
+        out = md_server._safe_error(exc)
+        assert "/home/alice" not in out
+        assert "alice" not in out
+        assert "No such file or directory" in out
+
+    def test_credentials_are_stripped(self):
+        from kiro_crew.apps.builtins.md_notebook import server as md_server
+
+        token = "sk-" + "abcdefghijklmnopqrstuvwxyz" + "012345"
+        exc = RuntimeError("Authorization: Bearer " + token)
+        assert token not in md_server._safe_error(exc)
+
+    def test_plain_message_survives(self):
+        from kiro_crew.apps.builtins.md_notebook import server as md_server
+
+        assert md_server._safe_error(ValueError("vault not found")) == "vault not found"
+
+    @pytest.mark.asyncio
+    async def test_both_middleware_branches_route_through_the_helper(self):
+        """The modeled and catch-all branches both reach the browser, so neither
+        may return raw exception text."""
+        from aiohttp import web
+
+        from kiro_crew.apps.builtins.md_notebook import server_http
+
+        leak = "/home/alice/.kiro/crew/vaults/v1"
+
+        class _Req:
+            path = "/api/notes"
+
+        async def _modeled(_request):
+            raise FileNotFoundError(f"[Errno 2] No such file or directory: '{leak}'")
+
+        async def _unmodeled(_request):
+            raise RuntimeError(f"boom while reading {leak}")
+
+        with pytest.raises(web.HTTPException) as modeled:
+            await server_http.error_middleware(_Req(), _modeled)
+        modeled_body = json.loads(modeled.value.text)
+        assert "alice" not in modeled_body["error"]
+        assert "No such file or directory" in modeled_body["error"]
+
+        resp = await server_http.error_middleware(_Req(), _unmodeled)
+        assert resp.status == 500
+        body = json.loads(resp.text)
+        assert body["code"] == "internal_error"
+        assert "alice" not in body["error"]
+        assert "boom while reading" in body["error"]

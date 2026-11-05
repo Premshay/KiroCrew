@@ -21,6 +21,13 @@ async def _owner_identity(request, handler):
     return await handler(request)
 
 
+def _windows_exec_close_ack(loader) -> dict:
+    """The ack a Windows load with the exec key absent records once (windows_exec_adoption)."""
+    if loader.unsandboxed_exec_platform_default():
+        return {"agent.sandbox_allow_unsandboxed_exec": False}
+    return {}
+
+
 def _make_app() -> web.Application:
     from kiro_crew.dashboard.handlers import api_kirocrew_config_patch
 
@@ -610,6 +617,20 @@ class TestPatchGeneral:
                 headers={"Content-Type": "application/json"},
             )
             assert resp.status == 400
+
+    @pytest.mark.parametrize("raw", ["1e999", "-1e999"])
+    @pytest.mark.asyncio
+    async def test_infinite_int_value_returns_400(self, tmp_config, raw) -> None:
+        """JSON reads ``1e999`` as an infinite float: the integer 400, never a 500."""
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await c.patch(
+                "/api/config/kirocrew",
+                data=f'{{"path": "session.timeout_secs", "value": {raw}}}',
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 400
+            assert (await resp.json())["error"] == "must be an integer"
+        assert json.loads(tmp_config.read_text())["session"]["timeout_secs"] == 3600
 
 
 # ── Enum validator ───────────────────────────────────────────────────────
@@ -1940,7 +1961,10 @@ class TestChatTurnTimeout:
         async with TestClient(TestServer(_make_app())) as c:
             resp = await _patch(c, "agent.chat_turn_timeout_secs", 7200)
             assert resp.status == 200, await resp.text()
-        assert SD.acked_superseded() == {"agent.chat_turn_timeout_secs": 7200}
+        assert SD.acked_superseded() == {
+            "agent.chat_turn_timeout_secs": 7200,
+            **_windows_exec_close_ack(L),
+        }
         assert L.KiroCrewConfig.load().agent.chat_turn_timeout_secs == 7200
         stored = json.loads(tmp_config.read_text(encoding="utf-8"))
         assert stored["agent"]["chat_turn_timeout_secs"] == 7200
@@ -1953,7 +1977,7 @@ class TestChatTurnTimeout:
         monkeypatch.setattr(L, "config_dir", lambda: tmp_config.parent)
         async with TestClient(TestServer(_make_app())) as c:
             assert (await _patch(c, "agent.chat_turn_timeout_secs", 10800)).status == 200
-        assert SD.acked_superseded() == {}
+        assert SD.acked_superseded() == _windows_exec_close_ack(L)
 
     @pytest.mark.asyncio
     async def test_a_refused_ack_aborts_the_write(self, tmp_config, monkeypatch) -> None:

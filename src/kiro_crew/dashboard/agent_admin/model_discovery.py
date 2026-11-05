@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         _model_discovery_tasks,
         acp_model_config_options,
         logger,
+        model_registry,
     )
 
 
@@ -139,3 +140,43 @@ async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
             {"error": "subscription returned no models", "code": "models_unavailable"}, status=503
         )
     return web.json_response(result)
+
+
+def _normalize_model_key(name: str) -> str:
+    """Canonical key for de-duping CC model ids across spelling variants.
+
+    Mirrors ``normalizeModelKey`` in ``website/src/lib/model.ts``: both route a
+    model id through the shared canonical registry (``model_registry.json``) so
+    "same model?" has ONE definition across the dashboard (dropdown dedup, slot
+    display, and the subagent downgrade flag).
+
+    Resolution order:
+    1. ``auto``/``default``/unset -> the ``auto`` sentinel (both mean "let the
+       backend pick"); an empty id stays ``""`` (no pin, distinct from Auto).
+    2. Registry canonical key: a canonical key, a registry alias, or a
+       claude_code provider id -- with or without a region/vendor routing prefix
+       (``us.anthropic.…``, ``global.anthropic.…``) -- folds to its canonical
+       key. This makes an alias and its provider-prefixed canonical id equal
+       (``us.anthropic.claude-opus-4-8[1m]`` == ``claude-opus-4.8`` ->
+       ``opus-4.8-1m``) while keeping DISTINCT registry entries distinct -- the
+       advertised dashed ``claude-opus-4-8`` (200K, ``opus-4.8``) does NOT fold
+       onto dotted ``claude-opus-4.8`` (1M, ``opus-4.8-1m``); a bare
+       ``.``->``-`` fold conflates those two different-window models.
+    3. Fallback for an id the registry does not list (GPT/DeepSeek/Qwen, future
+       models, operator-typed ids): a lossless fold -- lowercase,
+       ``.``->``-`` -- so behavior is identity-preserving off the registered set,
+       matching ``from_provider_id``'s pass-through contract.
+    """
+    string_fold = (name or "").strip().lower().replace(".", "-")
+    if not string_fold:
+        return ""
+    if string_fold in ("default", "auto"):
+        return "auto"
+    # Registry lookups are exact and its keys/aliases/provider-ids are all
+    # lowercase, so resolve on the lowercased id. canonical_key resolves
+    # acp-first then claude_code AND peels a known routing prefix, so it covers
+    # both spelling halves above; a miss returns None.
+    resolved = model_registry.canonical_key((name or "").strip().lower())
+    if resolved is not None:
+        return resolved
+    return string_fold

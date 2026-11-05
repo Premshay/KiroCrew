@@ -47,11 +47,13 @@ from kiro_crew.apps.registry_pipeline import _FACADE
 from kiro_crew.apps.registry_pipeline.catalog import (
     SOURCE_REGISTRY_PREFIX,
     _is_catalog_row,
+    _manifest_shell_platform_refusal,
     _resolve_install_entry,
     resolve_installed_trust_repository,
 )
 from kiro_crew.apps.registry_pipeline.checkout import (
     _COMMIT_SHA_RE,
+    _KILL_GRACE_PERIOD,
     _communicate_with_timeout,
     _kill_process_group,
     _resolved_clone_commit,
@@ -202,6 +204,44 @@ def _trust_grant_would_stay_local(name: str) -> bool:
     return resolved and not repository
 
 
+#: Why an app lifecycle hook is not run on native Windows. The one copy of the
+#: text: ``run_lifecycle_script`` reports it for the sibling hooks too.
+NATIVE_WINDOWS_HOOK_REFUSAL = (
+    "app lifecycle hooks are not supported on native Windows (they run through /bin/bash)"
+)
+
+
+def _install_script_platform_refusal() -> str | None:
+    """Why ``setup.onInstall`` cannot run on this host, or None when it can.
+
+    ``onInstall`` runs through ``/bin/bash -c``, and native Windows has no
+    ``/bin/bash``. The sibling hooks (``onEnable`` / ``onDisable`` /
+    ``onUninstall``) refuse there up front in ``run_lifecycle_script``; this is
+    the same policy for the one hook that runs in the install transaction, so
+    the user gets a reason naming the platform instead of a spawn error that
+    reads as the app's own script breaking.
+    """
+    if platform_compat.IS_POSIX:
+        return None
+    return f"install script not run: {NATIVE_WINDOWS_HOOK_REFUSAL}"
+
+
+def _adoption_pending(name: str) -> str | None:
+    """The refusal for a pinned *name* whose record is still builtin-owned, else None."""
+    from kiro_crew.apps.builtin_adoption_pins import adoption_pin
+
+    pin = adoption_pin(name)
+    if pin is None:
+        return None
+    from kiro_crew.apps.manager import builtin_owns_installed
+
+    if not builtin_owns_installed(name):
+        return None
+    from kiro_crew.apps.builtin_adoption import pending_install_refusal
+
+    return pending_install_refusal(pin)
+
+
 async def install_from_registry(
     name: str,
     log_lines: list[str] | None = None,
@@ -273,6 +313,14 @@ async def install_from_registry(
         if is_reserved_app_name(name):
             outcome_early["code"] = RESERVED_APP_NAME_CODE
         return outcome_early
+
+    # A pinned former built-in whose record is still the built-in's switches to its
+    # repository only through adoption. A registry install here would keep
+    # `origin=builtin`/`lifecycle=locked` on a registry tree, so refuse it before
+    # any clone, saying what this host does next.
+    adoption_refusal = await asyncio.to_thread(_adoption_pending, name)
+    if adoption_refusal is not None:
+        return {"ok": False, "name": name, "code": "adoption_pending", "error": adoption_refusal}
 
     entry: dict[str, Any] | None
     if resolved_entry is not None:
@@ -505,7 +553,22 @@ async def install_from_registry(
     # but BEFORE the repo is cloned and setup.onInstall runs, so a banned /
     # non-allowlisted / unsigned app is never cloned nor its install script run.
     admission_manifest = AppManifest.from_dict(manifest) if manifest else None
-    denied = app_admission_denied(name, manifest=admission_manifest, action="install_from_registry")
+    # A lifecycle timeout `int()` cannot read is recorded by the parse, not raised,
+    # and refused here so nothing is cloned and no `onInstall` runs for a manifest
+    # install validation always refuses.
+    setup_errors = admission_manifest.setup.validate() if admission_manifest else []
+    if setup_errors:
+        return {"ok": False, "name": name, "error": f"invalid app.json: {'; '.join(setup_errors)}"}
+    # The version is not asked here: this manifest can be a stale local checkout.
+    # The clone-time admission (``_clone_build_app_locked``) asks it on the
+    # fetched manifest, before the build or ``onInstall`` runs.
+    denied = await asyncio.to_thread(
+        app_admission_denied,
+        name,
+        manifest=admission_manifest,
+        action="install_from_registry",
+        check_version=False,
+    )
     if denied:
         sel().log_api_access(
             caller="app_install_from_registry",
@@ -525,10 +588,12 @@ async def install_from_registry(
     # Kiro Crew is running on an incompatible platform, return client install
     # instructions instead of attempting a server-side install.
     manifest_platform = (manifest or {}).get("platform", {})
-    required_os = manifest_platform.get("os", ["macos", "linux"])
-    install_mode = manifest_platform.get("installMode", "server")
-
     from kiro_crew.apps.manifest import PlatformConfig
+
+    # The parsed `os`, not the raw JSON: `null` means unset and any other
+    # non-list supports no platform, and neither can be iterated raw.
+    required_os = (admission_manifest.platform if admission_manifest else PlatformConfig()).os
+    install_mode = manifest_platform.get("installMode", "server")
 
     if install_mode == "client" and not PlatformConfig(os=required_os).supports_platform(
         sys.platform
@@ -588,7 +653,14 @@ async def install_from_registry(
 
     # Guard: check if already installed externally (e.g. user ran setup.sh manually)
     detect_cmd = entry.get("detectInstalled", "")
-    if detect_cmd:
+    detect_refusal = _manifest_shell_platform_refusal() if detect_cmd else None
+    if detect_refusal:
+        # No /bin/sh to run the probe through. Say so in the install log the user
+        # reads, instead of a spawn error swallowed as "not installed", and go on:
+        # the install proceeded on this host before, and still does.
+        log_lines.append(f"detectInstalled not run: {detect_refusal}")
+        logger.warning("detectInstalled not run for %s: %s", name, detect_refusal)
+    elif detect_cmd:
         try:
 
             base_cmd = ["/bin/sh", "-c", detect_cmd]
@@ -813,7 +885,8 @@ async def install_from_registry(
         # install_app/update_app will actually register, and a build step can
         # rewrite app.json; a manifest that does not satisfy the admission
         # policy (e.g. signature required but absent) must not install.
-        denied = app_admission_denied(
+        denied = await asyncio.to_thread(
+            app_admission_denied,
             name,
             manifest=AppManifest.from_dict(manifest_data),
             action="install_from_registry",
@@ -873,6 +946,15 @@ async def install_from_registry(
         layout_before = await asyncio.to_thread(_desktop_layout_present, app_source)
 
         # Step 2: Run install script
+        refusal = _install_script_platform_refusal() if install_script else None
+        if refusal:
+            # Nothing was spawned, so the checkout is as the build left it; the
+            # retained/restorable-stale handling is owned by the `finally` below,
+            # as on the script's own failure exits.
+            logger.warning("App %s onInstall not run: %s", name, refusal)
+            log_lines.append(refusal)
+            outcome = {"ok": False, "name": name, "error": refusal}
+            return outcome
         if install_script:
             log_lines.append(f"Running install script: {install_script}")
             # Sandboxed via wrap_argv(); consider migrating to AcpClient._spawn() for full OS-level isolation.
@@ -933,6 +1015,49 @@ async def install_from_registry(
                     "error": f"install script timed out after {_SCRIPT_TIMEOUT}s",
                 }
                 return outcome
+            except asyncio.CancelledError:
+                # A cancelled wait (gateway shutdown, task cancel) must not
+                # leave the script running: it sits in its own process group,
+                # and the `finally` below may restore a moved-aside checkout
+                # into the tree it is still writing. The cancel skips the
+                # straggler sweep after this block, so stop the WHOLE group
+                # here: SIGTERM, wait for the group (not just the shell) up to
+                # the grace, then SIGKILL whatever is left, and reap. Then let
+                # the cancel propagate.
+                #
+                # When the shell has ALREADY exited (`sleep 999 &` keeps its
+                # stdout open, so the wait is still pending), the graceful stop
+                # has no live leader to address and reaps only the shell. So
+                # SIGKILL the known group first -- its id is the shell's pid by
+                # construction (start_new_session), the same address the
+                # straggler sweep below uses -- and sweep it once more after the
+                # graceful stop for anything a live leader left behind.
+                async def _kill_script_group() -> None:
+                    # Never broadcast-signal: group 0/1 would reach this process.
+                    if type(proc.pid) is not int or proc.pid <= 1:
+                        return
+                    try:
+                        if platform_compat.IS_POSIX:
+                            await asyncio.to_thread(
+                                platform_compat.kill_process_group,
+                                proc.pid,
+                                platform_compat.SIGKILL,
+                            )
+                        else:
+                            await platform_compat.kill_process_tree_async(
+                                proc.pid, platform_compat.SIGKILL
+                            )
+                    except (OSError, ValueError):
+                        # Empty group (nothing left to stop), or the shim refused
+                        # an id that would reach this process's own group.
+                        pass
+
+                if proc.returncode is not None:
+                    await _kill_script_group()
+                await platform_compat.terminate_and_reap(proc, grace=_KILL_GRACE_PERIOD)
+                await _kill_script_group()
+                _audit_script("cancelled", proc.returncode)
+                raise
 
             lines = stdout.decode(errors="replace").strip().split("\n")
             if len(lines) > 50:
@@ -1016,7 +1141,8 @@ async def install_from_registry(
                 # Retained-stale reporting for this post-script refusal is owned
                 # by the `finally` below (it re-stamps outcome["log"]).
                 return outcome
-            denied = app_admission_denied(
+            denied = await asyncio.to_thread(
+                app_admission_denied,
                 name,
                 manifest=AppManifest.from_dict(manifest_data),
                 action="install_from_registry",
@@ -1203,6 +1329,30 @@ async def install_from_registry(
             outcome = startup_refusal
             return outcome
 
+        async def _roll_back_refused() -> None:
+            # A refusal from here on comes after the build and the script. An
+            # update that fast-forwarded a pre-existing checkout in place is not
+            # restored by the `finally` (it restores moved-aside checkouts only),
+            # so it takes the desktop gates' rollback. A fresh clone keeps its
+            # existing handling.
+            if not build_result.get("_checkout_preexisted"):
+                return
+            await _roll_back_post_script_refusal(
+                name,
+                app_source,
+                app_source_dir(name),
+                log_lines,
+                layout_before=layout_before,
+                checkout_preexisted=bool(build_result.get("_checkout_preexisted")),
+                pre_pull_commit=str(build_result.get("_pre_pull_commit", "") or ""),
+                manifest_relpath=(f"{subdirectory}/app.json" if subdirectory else "app.json"),
+                manifest_snapshot=build_result.get("_pre_update_manifest"),
+                restore_from=_restorable_or_none(
+                    build_result.get("_pending_stale_cleanup"),
+                    build_result.get("_restorable_stale"),
+                ),
+            )
+
         # Step 4: Register with Kiro Crew
         if is_self_managed:
             # Pre-register with manifest from the cloned repo so the app
@@ -1210,6 +1360,7 @@ async def install_from_registry(
             # The app will update its own registration on next launch.
             # ``manifest_data`` is the identity-checked read from above — reusing
             # it avoids a second read that could see different bytes.
+            from kiro_crew.apps.admission import app_version_refusal
             from kiro_crew.apps.manager import refresh_app_config_keys, register_external_app
 
             display = manifest_data.get("displayName", name)
@@ -1219,6 +1370,18 @@ async def install_from_registry(
             # checkout beside the new record. The route holds this app's
             # lifecycle lock, and a contended record lock refuses before the
             # record is read, so the refusal path below stays consistent.
+            # The app_versions check reads the governance profile store, so it is
+            # asked here, off the loop, and register_external_app skips it.
+            version_refusal = await asyncio.to_thread(
+                app_version_refusal, name, AppManifest.from_dict(manifest_data), str(version)
+            )
+            if version_refusal:
+                log_lines.append(
+                    _refusal_line(verb, f"blocked by admission policy: {version_refusal}")
+                )
+                await _roll_back_refused()
+                outcome = {"ok": False, "name": name, "message": "", "error": version_refusal}
+                return outcome
             reg_result = register_external_app(
                 name=name,
                 version=version,
@@ -1228,6 +1391,7 @@ async def install_from_registry(
                 origin="registry",
                 source_repository=persisted_git_url,
                 start_disabled=start_disabled,
+                version_checked=True,
             )
             if not reg_result.ok:
                 # A refused registration leaves the prior record as it was, so the
@@ -1235,6 +1399,7 @@ async def install_from_registry(
                 # the `finally` puts the previous checkout back beside that record,
                 # and the caller sees the error that names the fix.
                 log_lines.append(reg_result.error or "registration failed")
+                await _roll_back_refused()
                 outcome = {
                     "ok": False,
                     "name": name,
@@ -1308,6 +1473,8 @@ async def install_from_registry(
             else:
                 result = await asyncio.to_thread(install_app, str(app_source))
         log_lines.append(result.message or result.error or "done")
+        if not result.ok:
+            await _roll_back_refused()
 
         # Record the source marker plus structured provenance, so a later update
         # resolves the source this install actually came from rather than
@@ -1349,9 +1516,9 @@ async def install_from_registry(
                         install_receipt.KIND_UPDATE if was_installed else install_receipt.KIND_FRESH
                     ),
                 )
-        # Install/update failed AFTER a successful clone+build: durable_success
-        # stays False, so the `finally` restores the restorable stale and its
-        # reporter filters it out — no per-exit report is needed here.
+        # Install/update failed AFTER a successful clone+build: the checkout was
+        # rolled back above, durable_success stays False, and the `finally`'s
+        # reporter filters the restored stale out — no per-exit report is needed.
 
         outcome = {
             "ok": result.ok,
@@ -1407,9 +1574,9 @@ async def install_from_registry(
                         "the install did not complete",
                     )
             except Exception:  # noqa: BLE001 - never mask the outcome being returned
-                # WARNING, not debug: this catch is what hid the KeyError above for
-                # four review rounds. A restoration that could not run is a possible
-                # data loss, so it has to be visible in the log the user sees.
+                # WARNING, not debug: a quiet catch here hides errors like the KeyError
+                # above. A restoration that could not run is a possible data loss, so
+                # it has to be visible in the log the user sees.
                 logger.warning(
                     "could not restore the moved-aside checkout for %r", name, exc_info=True
                 )

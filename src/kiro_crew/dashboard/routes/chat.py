@@ -36,6 +36,7 @@ from kiro_crew.dashboard.handlers.source_providers import (
     api_pull_request_unresolve,
 )
 from kiro_crew.dashboard.handlers.worktree import api_worktree_create
+from kiro_crew.dashboard.remote_dispatch_headroom import api_chat_headroom
 from kiro_crew.dashboard.slot_ownership import slot_not_found
 
 
@@ -62,6 +63,20 @@ async def api_dashboard_card(request: web.Request) -> web.Response:
     return web.json_response(await lifecycle.read(slot))
 
 
+async def api_chat_slot_work_item_get(request: web.Request) -> web.Response:
+    """Remote dispatch's per-slot read, imported on first use, never at boot."""
+    from kiro_crew.dashboard.handlers import remote_work_item
+
+    return await remote_work_item.api_chat_slot_work_item_get(request)
+
+
+async def api_chat_slot_work_item_patch(request: web.Request) -> web.Response:
+    """Remote dispatch's per-slot decision write, imported on first use, never at boot."""
+    from kiro_crew.dashboard.handlers import remote_work_item
+
+    return await remote_work_item.api_chat_slot_work_item_patch(request)
+
+
 def register(app: web.Application) -> None:
     """Register the chat routes on *app*."""
     # Chat
@@ -79,6 +94,9 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/source/pull-request/submit-review", api_pull_request_submit_review)
     app.router.add_post("/api/source/issue", api_issue_source)
     app.router.add_post("/api/source/contributors", api_app_contributors)
+    # Remote-dispatch preview: this crew's headroom for a conductor elsewhere.
+    # Owner only; 404 while work_ledger.remote_dispatch is off.
+    app.router.add_get("/api/chat/headroom", api_chat_headroom)
     app.router.add_get("/api/chat/slots", chat.api_chat_slots)
     app.router.add_post("/api/chat/slots", chat.api_chat_slot_create)
     app.router.add_post("/api/chat/slots/cleanup", chat.api_chat_slots_cleanup)
@@ -91,6 +109,10 @@ def register(app: web.Application) -> None:
     app.router.add_post(
         "/api/chat/slots/follow-default", chat_follow_default.api_chat_slots_follow_default
     )
+    # Bulk Resume: the literal sits with cleanup/model, before every ``{slot}``
+    # POST below, so aiohttp's registration-order resolution cannot read
+    # "resume-all" as a slot name and answer it from a per-slot handler.
+    app.router.add_post("/api/chat/slots/resume-all", chat.api_chat_slots_resume_all)
     # Static segment BEFORE the ``/api/chat/slots/{slot}`` GET below, for the reason
     # the import route's own note gives: aiohttp resolves in registration order, so a
     # later wildcard would shadow this path and answer it as a slot detail read.
@@ -105,6 +127,10 @@ def register(app: web.Application) -> None:
     # the tunnel's send, so it is not a pure read of the disk.
     app.router.add_get("/api/chat/slots/{slot}/export", session_export.api_chat_slot_export)
     app.router.add_get("/api/chat/slots/{slot}/summary", chat.api_chat_slot_summary)
+    # Remote dispatch (Feature Preview): a hub reads and steers the work item this
+    # crew's slot was born bound to. 404 with the preview off.
+    app.router.add_get("/api/chat/slots/{slot}/work-item", api_chat_slot_work_item_get)
+    app.router.add_patch("/api/chat/slots/{slot}/work-item", api_chat_slot_work_item_patch)
     app.router.add_get("/api/chat/slots/{slot}/dashboard-card", api_dashboard_card)
     # Same path, POST: reading a summary must stay free of side effects, so
     # generating one is a separate verb rather than a query flag on the GET.
@@ -127,10 +153,14 @@ def register(app: web.Application) -> None:
     )
     app.router.add_patch("/api/chat/slots/{slot}/queue/{queue_id}", chat.api_chat_slot_queue_edit)
     app.router.add_put("/api/chat/slots/{slot}/queue/order", chat.api_chat_slot_queue_reorder)
+    app.router.add_post(
+        "/api/chat/slots/{slot}/steers/{mid}/retract", chat.api_chat_slot_steer_retract
+    )
     app.router.add_delete("/api/chat/slots/{slot}", chat.api_chat_slot_delete)
     app.router.add_post(
         "/api/chat/slots/{slot}/reset-conversation", chat.api_chat_slot_reset_conversation
     )
+    app.router.add_post("/api/chat/slots/{slot}/repair-images", chat.api_chat_slot_repair_images)
     app.router.add_post("/api/chat/slots/{slot}/agent", chat.api_chat_slot_agent)
     app.router.add_get("/api/chat/slots/{slot}/runtime", chat.api_chat_slot_runtime)
     app.router.add_post("/api/chat/slots/{slot}/runtime", chat.api_chat_slot_runtime)

@@ -30,6 +30,7 @@ from handlers_memory_coverage_helpers import (  # noqa: F401 -- the autouse fixt
 
 import kiro_crew.dashboard.handlers.memory as mem_mod
 from kiro_crew.embeddings import CustomModelSpec
+from kiro_crew.embeddings_shared import ReembedProgress
 from kiro_crew.testing.wait import await_until
 
 _MOD = "kiro_crew.dashboard.handlers.memory"
@@ -110,6 +111,47 @@ class TestEmbeddingModelEndpoint:
             resp = await mem_mod.api_memory_embedding_model(req)
         assert _body(resp) == {"ok": True, "size_bytes": 4}
         apply_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sent", "validates_only"),
+        [
+            ("false", False),
+            ("0", False),
+            ("Off", False),
+            ("no", False),
+            ("true", True),
+            (1, True),
+            (None, False),
+            ("yes please", True),
+        ],
+    )
+    async def test_a_spelled_validate_only_reads_as_it_spells(
+        self, tmp_path: Path, sent: object, validates_only: bool
+    ) -> None:
+        """``bool("false")`` is True; a spelled false must go on to apply."""
+        from aiohttp import web
+
+        from kiro_crew.dashboard.handlers import memory_embeddings
+
+        model = tmp_path / "m.gguf"
+        model.write_bytes(b"abcd")
+        state = _make_state()
+        req = _make_request(
+            state, method="POST", json_body={"path": str(model), "validate_only": sent}
+        )
+        # Past the validate-only exit the next step is the startup check; a
+        # marker refusal there shows the request went on toward applying.
+        marker = web.json_response({"marker": True}, status=409)
+        with (
+            patch(f"{_MOD}.validate_custom_model_path", return_value=(model, "", "")),
+            patch.object(memory_embeddings, "memory_startup_refusal", return_value=marker),
+        ):
+            resp = await mem_mod.api_memory_embedding_model(req)
+        if validates_only:
+            assert _body(resp) == {"ok": True, "size_bytes": 4}
+        else:
+            assert resp is marker
 
     @pytest.mark.asyncio
     async def test_path_checks_run_off_the_event_loop(self, tmp_path: Path) -> None:
@@ -293,6 +335,81 @@ class TestEmbeddingStatusCustomModel:
         assert body["setup_step"] == "error"
         # str(Path), not the POSIX literal -- see the note above.
         assert str(model_path) in body["setup_error"]
+
+
+# ---------------------------------------------------------------------------
+# embedding-status runtime-load fault: a failed llama.cpp runtime load must not
+# read as a healthy idle model.
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingStatusRuntimeLoad:
+    # The handler reads the runtime load result from two primitives:
+    # ``_load_llama_class`` (the import result) and ``_platform_libs_dirname``
+    # (whether vendored libs ship for the platform). The three cases below drive
+    # those directly.
+    _FAILED = ("failed", None, "linux_x86_64")  # import failed, libs ship -> fault
+    _IMPORTABLE = ("importable", object(), "linux_x86_64")  # import ok
+    _UNSUPPORTED = ("unsupported", None, None)  # no libs ship -> designed degradation
+
+    def _patches(self, runtime_case: Any, *, model_present: bool = True) -> Any:
+        _name, llama, libs_dir = runtime_case
+        # A healthy-IDLE embedder: the model file is present and the backend is
+        # not serving yet (is_ready() False) — the state a failed runtime load is
+        # indistinguishable from unless the status reads the load result.
+        embedder = MagicMock(model_id="bundled", dim=1024)
+        embedder.is_ready.return_value = False
+        mgr = MagicMock()
+        mgr.status = {"step": "idle", "error": "", "attempt": 0}
+        return (
+            patch(f"{_MOD}.get_shared_embedder", return_value=embedder),
+            patch(f"{_MOD}.model_download_manager", return_value=mgr),
+            patch(f"{_MOD}.model_file_present", return_value=model_present),
+            patch(f"{_MOD}.resolve_custom_model", return_value=None),
+            patch(f"{_MOD}.embedding_backend_serving", return_value=False),
+            patch(f"{_MOD}._load_llama_class", return_value=llama),
+            patch(f"{_MOD}._platform_libs_dirname", return_value=libs_dir),
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_runtime_load_reports_fault_not_idle(self) -> None:
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(self._FAILED):
+                stack.enter_context(p)
+            body = _body(await mem_mod.api_memory_embedding_status(_make_request(_make_state())))
+        # The fault is distinct from the healthy-idle payload.
+        assert body["server_healthy"] is False
+        assert body["setup_error_code"] == "model_error_runtime_load"
+        # setup_step is left as the download manager reports it (idle), NOT forced
+        # to the download-flow "error" state whose card copy says "check network".
+        assert body["setup_step"] == "idle"
+        assert body["setup_error"]  # names the keyword-search cost
+        assert "keyword search" in body["setup_error"]
+
+    @pytest.mark.asyncio
+    async def test_importable_runtime_keeps_neutral_idle_state(self) -> None:
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(self._IMPORTABLE):
+                stack.enter_context(p)
+            body = _body(await mem_mod.api_memory_embedding_status(_make_request(_make_state())))
+        # Healthy idle model: unchanged neutral state, no fault, no runtime code.
+        assert body["server_healthy"] is True
+        assert body["setup_error_code"] == ""
+        assert body["setup_step"] == "idle"
+        assert body["setup_error"] == ""
+
+    @pytest.mark.asyncio
+    async def test_unsupported_platform_is_not_a_fault(self) -> None:
+        # No vendored libs ship for the platform: keyword search is the designed
+        # degradation, not a fault, so the status must not flip to an error code
+        # or report unhealthy on that account alone.
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(self._UNSUPPORTED):
+                stack.enter_context(p)
+            body = _body(await mem_mod.api_memory_embedding_status(_make_request(_make_state())))
+        assert body["server_healthy"] is True
+        assert body["setup_error_code"] == ""
+        assert body["setup_step"] == "idle"
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +717,8 @@ class _ApplyHarness:
         reconcile_error: Exception | None = None,
         serving: bool = False,
     ) -> None:
-        self.prog = MagicMock()
+        # Wraps the real progress object: its snapshot is what the status endpoint serves.
+        self.prog = MagicMock(wraps=ReembedProgress())
         self.embedder = MagicMock(model_id="m", dim=1024)
         self.embedder.is_ready.return_value = ready
         if has_wait_ready:
@@ -657,12 +775,17 @@ async def _run_apply(store: Any, raw: str) -> None:
     await asyncio.to_thread(mem_mod._apply_embedding_model, store, raw, loop)
 
 
+def _progress(step: str, error: str = "", done: int = 0, total: int = 0) -> dict[str, object]:
+    return {"step": step, "done": done, "total": total, "error": error}
+
+
 class TestApplyEmbeddingModelWorker:
     @pytest.mark.asyncio
     async def test_revalidation_failure_installs_nothing(self) -> None:
         store = _apply_store()
         with _ApplyHarness(validate=(Path("/x"), "sensitive path", "denied")) as h:
             await _run_apply(store, "/x")
+        assert h.prog.snapshot() == _progress("failed", "sensitive path")
         h.prog.fail.assert_called_once_with("sensitive path")
         h.install.assert_not_called()
         store.begin_space_change.assert_not_called()
@@ -672,6 +795,7 @@ class TestApplyEmbeddingModelWorker:
         store = _apply_store()
         with _ApplyHarness() as h:
             await _run_apply(store, "/m/new.gguf")
+        assert h.prog.snapshot() == _progress("done", done=7, total=7)
         h.install.assert_called_once_with(h.candidate)
         store.begin_space_change.assert_called_once()
 
@@ -680,6 +804,7 @@ class TestApplyEmbeddingModelWorker:
         store = _apply_store()
         with _ApplyHarness() as h:
             await _run_apply(store, "")
+        assert h.prog.snapshot() == _progress("done", done=7, total=7)
         h.install.assert_called_once_with(h.bundled)
         h.activate.assert_called_once()
         h.prog.finish.assert_called_once_with(7)
@@ -698,6 +823,8 @@ class TestApplyEmbeddingModelWorker:
         h.rollback.assert_awaited_once()
         h.reset.assert_called_once()
         assert "could not be removed" in h.prog.fail.call_args[0][0]
+        assert h.prog.snapshot()["step"] == "failed"
+        assert "could not be removed" in str(h.prog.snapshot()["error"])
 
     @pytest.mark.asyncio
     async def test_load_failure_drops_the_candidate_and_fails(self) -> None:
@@ -706,6 +833,8 @@ class TestApplyEmbeddingModelWorker:
             await _run_apply(store, "")
         h.reset.assert_called_once()
         assert "did not load" in h.prog.fail.call_args[0][0]
+        assert h.prog.snapshot()["step"] == "failed"
+        assert "did not load" in str(h.prog.snapshot()["error"])
         h.activate.assert_not_called()
 
     @pytest.mark.asyncio
@@ -715,6 +844,7 @@ class TestApplyEmbeddingModelWorker:
             await _run_apply(store, "")
         h.embedder.is_ready.assert_called_once()
         h.activate.assert_called_once()
+        assert h.prog.snapshot() == _progress("done", done=7, total=7)
 
     @pytest.mark.asyncio
     async def test_unreconciled_space_rolls_back_and_restores_the_width(self) -> None:
@@ -726,6 +856,8 @@ class TestApplyEmbeddingModelWorker:
         # Width restored to the model being restored, not left on the new one.
         assert store.set_embedding_dim.call_args_list[-1][0][0] == 512
         assert "could not be removed" in h.prog.fail.call_args[0][0]
+        assert h.prog.snapshot()["step"] == "failed"
+        assert "could not be removed" in str(h.prog.snapshot()["error"])
         h.write.assert_awaited_once_with("", 1024)
         h.rollback.assert_awaited_once()
         h.activate.assert_not_called()
@@ -740,6 +872,7 @@ class TestApplyEmbeddingModelWorker:
         store.backfill_missing_embeddings.assert_not_called()
         h.rollback.assert_not_awaited()
         h.prog.fail.assert_called_once_with("config.json could not be parsed")
+        assert h.prog.snapshot() == _progress("failed", "config.json could not be parsed")
         h.activate.assert_not_called()
 
     @pytest.mark.asyncio
@@ -750,6 +883,7 @@ class TestApplyEmbeddingModelWorker:
         h.reset.assert_called_once()
         assert store.set_embedding_dim.call_args_list[-1][0][0] == 512
         h.prog.fail.assert_called_once_with("disk full")
+        assert h.prog.snapshot() == _progress("failed", "disk full")
 
     @pytest.mark.asyncio
     async def test_blank_exception_message_falls_back_to_the_class_name(self) -> None:
@@ -757,6 +891,7 @@ class TestApplyEmbeddingModelWorker:
         with _ApplyHarness(reconcile_error=RuntimeError()) as h:
             await _run_apply(store, "")
         h.prog.fail.assert_called_once_with("RuntimeError")
+        assert h.prog.snapshot() == _progress("failed", "RuntimeError")
 
     @pytest.mark.asyncio
     async def test_failure_after_activation_keeps_the_serving_model(self) -> None:
@@ -768,6 +903,8 @@ class TestApplyEmbeddingModelWorker:
         h.activate.assert_called_once()
         h.reset.assert_not_called()
         h.prog.fail.assert_called_once_with("backfill died")
+        # The run had started over all 7 rows before the backfill failed.
+        assert h.prog.snapshot() == _progress("failed", "backfill died", total=7)
 
     @pytest.mark.asyncio
     async def test_no_retarget_means_no_width_restore(self) -> None:
@@ -778,6 +915,7 @@ class TestApplyEmbeddingModelWorker:
         # set_embedding_dim was called once (the retarget attempt), never again.
         store.set_embedding_dim.assert_called_once_with(1024)
         assert h.prog.fail.call_args[0][0] == "boom"
+        assert h.prog.snapshot() == _progress("failed", "boom")
 
 
 class TestConfigWritesRunOffTheEventLoop:

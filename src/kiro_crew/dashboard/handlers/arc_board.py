@@ -472,6 +472,23 @@ async def api_arc_board_open_channel(request: web.Request) -> web.Response:
     return web.json_response({"arc": arc, "lanes": lanes})
 
 
+async def api_arc_board_settings(request: web.Request) -> web.Response:
+    """POST /api/arc-board/arcs/{arc_id}/settings — the arc's GitHub repo and coordinator."""
+    body, err = await _gate_body(request, "arc_board.settings")
+    if err is not None:
+        return err
+    assert body is not None
+    arc_id = request.match_info.get("arc_id", "")
+    return await _run(
+        "arc_board.settings",
+        lambda: {
+            "arc": arcs.update_settings(
+                arc_id, repo=body.get("repo"), coordinator=body.get("coordinator")
+            )
+        },
+    )
+
+
 async def api_arc_board_autonomy(request: web.Request) -> web.Response:
     """POST /api/arc-board/arcs/{arc_id}/autonomy — change the arc's autonomy level."""
     body, err = await _gate_body(request, "arc_board.autonomy")

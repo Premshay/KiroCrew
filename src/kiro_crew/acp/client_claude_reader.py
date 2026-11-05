@@ -1,14 +1,14 @@
 """Claude background frames, idle activity and autonomous turn delivery.
 Instance fields written: ``_claude_autonomous_handler``, ``_claude_autonomous_handler_owner``,
 ``_claude_autonomous_message_id``, ``_claude_autonomous_origin``,
-``_claude_autonomous_session_key``, ``_claude_autonomous_text``, ``_claude_autonomous_timestamp``,
-``_claude_folded_message_break``, ``_claude_idle_handler``, ``_claude_idle_text``,
-``_claude_inbox``, ``_claude_live_background_tasks``, ``_claude_reader_task``,
+``_claude_autonomous_session_key``, ``_claude_autonomous_text``,
+``_claude_autonomous_timestamp``, ``_claude_folded_message_break``, ``_claude_idle_handler``,
+``_claude_idle_message_id``, ``_claude_idle_text``, ``_claude_inbox``,
+``_claude_live_background_tasks``, ``_claude_reader_task``,
 ``_pending_claude_autonomous_turns``, ``_session_activity_at``.
 
 
 Instance fields read: ``_claude_dispatch_depth``, ``_session_id``, ``_session_key``.
-
 """
 
 from __future__ import annotations

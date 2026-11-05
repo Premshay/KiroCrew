@@ -63,7 +63,7 @@ def test_append_validates_kind_and_caps():
     with pytest.raises(arcs.ArcError):
         arcs.append_entry(arc_id, "a", {"kind": "NOTE", "text": "x"})
     with pytest.raises(arcs.ArcError):
-        arcs.append_entry(arc_id, "a", {"kind": "FACT", "text": "x" * 101})
+        arcs.append_entry(arc_id, "a", {"kind": "FACT", "text": "x" * 301})
     done = {"kind": "DONE", "text": "x" * 300, "link": "http://e/1"}
     stored = arcs.append_entry(arc_id, "a", done)
     assert re.fullmatch(r"ae_[0-9a-f]{32}", stored["id"])

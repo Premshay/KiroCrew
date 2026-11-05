@@ -44,6 +44,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import native_skill_projection_helpers
 import pytest
 from test_update_provider import _UNALLOCATABLE_PID
 
@@ -52,6 +53,10 @@ from kiro_crew.acp import skill_projection as projection
 from kiro_crew.acp.runtime import AcpRuntime
 from kiro_crew.acp.types import METHOD_SET_MODE
 from kiro_crew.testing.wait import async_wait_until, default_timeout, finished
+
+_end_projections_before_tmp_path_goes = (
+    native_skill_projection_helpers._end_projections_before_tmp_path_goes
+)
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="the fake watcher is driven by inotify"
@@ -277,6 +282,11 @@ def host_tree(tmp_path, monkeypatch):
         resources = [] if name == "plain" else [f"skill://catalog/{name}/*/SKILL.md"]
         spec = {"name": name, "tools": ["read"], "resources": ["file://R.md", *resources]}
         (agents / f"{name}.json").write_text(json.dumps(spec), encoding="utf-8")
+    # Freeze the projection clock so the drain budget never expires; the production
+    # budget is left at its real value and only the deadline comparison is held.
+    # The facade mirror propagates the setattr to every owner module including
+    # alias_reclaim, so one call covers both projection.time and alias_reclaim.time.
+    native_skill_projection_helpers._hold_the_prune_clock(monkeypatch)
     return agents, project
 
 

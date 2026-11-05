@@ -152,6 +152,7 @@ class DeepseekHarness(MembershipHarness):
         member_dispatch: bool = False,
         crew_panel: bool = False,
         session_key: str = "",
+        worker_stub_names: frozenset[str] | None = None,
     ) -> SessionExtras:
         """No extra fields beyond the runtime's mirrored MCP array."""
         return SessionExtras()

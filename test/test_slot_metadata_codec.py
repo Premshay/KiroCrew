@@ -29,7 +29,7 @@ from kiro_crew.dashboard.slot_buffers import (
     serialize_deferred_notes,
 )
 from kiro_crew.dashboard.slot_persistence import metadata_codec as codec
-from kiro_crew.dashboard.slot_persistence import metadata_line
+from kiro_crew.dashboard.slot_persistence import metadata_line, metadata_values
 from kiro_crew.dashboard.source_providers.contract import source_ref_identity_key
 from kiro_crew.dashboard.state import durable_queue_entries
 from kiro_crew.history import SLOT_OWNED_META_KEYS
@@ -60,6 +60,7 @@ _POPULATED: dict = {
     "workspace": "ws",
     "memory_store": "silo",
     "agent_kind": "member",
+    "crew_mode_agent": "kirocrew-conductor",
     "app_agent_owner": "pr-bulk-ops/agent-a",
     "project": "/srv/p",
     "executor": "remote",
@@ -111,6 +112,7 @@ _BASE_LINE_ORDER = (
     "last_consolidated",
     "closed",
     "closed_at",
+    "closed_id",
     "memory_mode",
     "title",
     "title_origin",
@@ -127,6 +129,7 @@ _BASE_LINE_ORDER = (
     "memory_store",
     "agent_kind",
     "runtime_agent",
+    "crew_mode_agent",
     "app_agent_owner",
     "project",
     "executor",
@@ -145,6 +148,7 @@ _BASE_LINE_ORDER = (
     "post_restart_continuation",
     "origin",
     "created_by",
+    "attribution",
     "artifact",
     "pinned",
     "mutes_opened",
@@ -190,6 +194,7 @@ _BASE_MERGE_ORDER = (
     "memory_store",
     "agent_kind",
     "runtime_agent",
+    "crew_mode_agent",
     "app_agent_owner",
     "project",
     "app",
@@ -201,6 +206,7 @@ _BASE_MERGE_ORDER = (
     "post_restart_continuation",
     "origin",
     "created_by",
+    "attribution",
     "linked_session_key",
     "channel_origin",
     "forked_from",
@@ -215,6 +221,7 @@ _BASE_MERGE_ORDER = (
     "channel_folder_filed",
     "closed",
     "closed_at",
+    "closed_id",
     "dismissed_source_links",
     "deferred_notes",
 )
@@ -378,6 +385,7 @@ def test_the_table_declares_every_asymmetry_the_readers_had():
         "last_user_at",
         "closed",
         "closed_at",
+        "closed_id",
         "rotation_generation",
     ]
 
@@ -398,6 +406,7 @@ def _full_folds(slot) -> codec.SaveFolds:
         created_at="2026-01-01T00:00:00",
         closed=True,
         closed_at=1767225600.0,
+        closed_id="close-1",
         dismissed_source_links=[K1],
         deferred_notes=[{"id": "n-1", "content": "held", "session": "dashboard:src"}],
         queued_prompts=list(_QUEUE),
@@ -801,9 +810,9 @@ def test_a_resume_mints_a_tag_revision_even_for_a_slot_without_the_bump(tmp_path
     assert revisions == {codec.RECENT: False, codec.RESTORE: False, codec.RESUME: True}
 
 
-def test_the_facade_still_binds_every_name_that_moved_into_the_codec():
+def test_the_facade_still_binds_every_name_that_moved_into_the_codec_or_its_value_checks():
+    assert cp.COLOR_HEX_RE is codec.COLOR_HEX_RE
     for name in (
-        "COLOR_HEX_RE",
         "_RETIRED_MODES",
         "_rebase_rehydrated_refresh_mark",
         "_rehydrate_slot_title",
@@ -815,4 +824,4 @@ def test_the_facade_still_binds_every_name_that_moved_into_the_codec():
         "_restored_mode",
         "_validate_autocompact_pct",
     ):
-        assert getattr(cp, name) is getattr(codec, name), name
+        assert getattr(cp, name) is getattr(metadata_values, name), name

@@ -70,13 +70,24 @@ SKILL_SEARCH_INDEX_FILENAME = "skill_search_index.sqlite3"
 
 #: Bumped when the table shape or the derived metadata changes (6: HTML marker;
 #: 7: SKILL.md bytes decode as utf-8-sig, so a byte-order-marked file's stored
-#: frontmatter-less row must not be served against its unchanged fingerprint);
+#: frontmatter-less row must not be served against its unchanged fingerprint;
+#: 8: body rows are keyed by path, not skill key, and a stored catalog keeps
+#: every extra root's copy of a key);
 #: a mismatch drops and rebuilds, because every row is derived data one read regenerates.
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 #: Another process may be indexing the same skill. Wait briefly, then give up and
 #: let the caller read files this once rather than block a chat turn on a lock.
 _BUSY_TIMEOUT_SECS = 2.0
+
+#: Cap on the ``-wal`` file a checkpoint leaves behind. In WAL mode SQLite reuses
+#: the log file after a checkpoint instead of shrinking it, so on one long-lived
+#: connection the file stays at the largest transaction it ever held (10 MB beside
+#: an 18 MB index was measured) until the process exits. With
+#: ``journal_size_limit`` set, the log is truncated to this size each time it is
+#: reset after a checkpoint. That is the same automatic checkpoint that already
+#: runs, so no write waits on a reader and readers stay non-blocking.
+_WAL_SIZE_LIMIT_BYTES = 4 * 1024 * 1024
 
 #: Above this size, decline the index for the current search so the caller uses
 #: the legacy full-body reader. Indexing only a prefix would silently hide terms
@@ -236,7 +247,7 @@ def body_fingerprint(path: str | Path) -> str | None:
 class SyncOutcome(NamedTuple):
     """What one :meth:`SkillSearchIndex.sync` call left for its caller.
 
-    ``deferred`` is every key this index declined to answer for, which the caller
+    ``deferred`` is every row id this index declined to answer for, which the caller
     reads directly. ``pending`` is the subset left unread only because the call's
     work budget ran out, so an answer built from it may be missing matches.
 
@@ -369,6 +380,8 @@ class SkillSearchIndex:
                 # because a lost commit only costs a re-index.
                 enable_wal(conn, timeout_secs=_BUSY_TIMEOUT_SECS)
                 conn.execute("PRAGMA synchronous=NORMAL")
+                # Per connection, not stored in the file, so every opener sets it.
+                conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}")
                 conn.executescript(_DDL)
                 signature = tokenizer_signature()
                 row = conn.execute("SELECT version, tokenizer FROM skill_index_schema").fetchone()
@@ -720,21 +733,23 @@ class SkillSearchIndex:
         budget_seconds: float | None = None,
         canonical_roots: dict[str, str] | None = None,
     ) -> SyncOutcome | None:
-        """Bring the index up to date for *rows* of ``(key, path, fingerprint)``.
+        """Bring the index up to date for *rows* of ``(row_id, path, fingerprint)``.
 
-        Only a key whose stored fingerprint differs is re-read, so a warm index
-        costs one small query. Returns ``None`` when the database is unusable --
+        A row id is opaque here; the body index uses the path. Only a row whose
+        stored fingerprint differs is re-read, so a warm index costs one small
+        query. Returns ``None`` when the database is unusable --
         the signal the caller needs to read every body itself -- and otherwise a
-        :class:`SyncOutcome` naming the keys this index declines to answer for,
-        which the caller reads directly, and which of those the budget left
+        :class:`SyncOutcome` naming the row ids this index declines to answer
+        for, which the caller reads directly, and which of those the budget left
         unread. Both sets are normally empty.
 
-        Declining PER KEY rather than for the whole call is deliberate: one
+        Declining PER ROW rather than for the whole call is deliberate: one
         pathological body would otherwise send an entire catalog back to reading
         files on every search, which is the cost this index exists to remove.
 
-        *live_keys*, when given, is the full set of keys currently visible to the
-        caller. It prunes rows for skills that are gone, which is space only:
+        *live_keys*, when given, is the full set of row ids currently visible to
+        the caller; skill keys here would prune every path-keyed body row. It
+        prunes rows for skills that are gone, which is space only:
         scoring maps hits onto keys the caller already holds, so a stale row is
         inert either way.
         """

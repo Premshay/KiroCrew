@@ -1,3 +1,4 @@
+import ZoomLightbox from "./ZoomLightbox";
 import type { KiroCrewAgent } from "../../components/AgentSelector";
 import type { AgentList } from "./api";
 import type { ProjectContext, Toast } from "./types";
@@ -11,11 +12,12 @@ import {
   Plus,
   Sparkle,
   Upload,
-  X,
 } from "lucide-react";
-import { type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
+import { useMenuKeyboard } from "../../hooks/useMenuKeyboard";
 
 import Clickable from "../../components/Clickable";
+import { Btn } from "../../components/ui";
 import ErrorNotice from "../../components/ErrorNotice";
 import AskLayer from "./AskLayer";
 import Composer from "./Composer";
@@ -178,7 +180,11 @@ interface CritiquePresentationProps {
 }
 
 /** Render the critique workspace; run lifecycle and persistence stay in the page. */
-export function renderCritiquePresentation({
+export function renderCritiquePresentation(props: CritiquePresentationProps) {
+  return <CritiquePresentation {...props} />;
+}
+
+function CritiquePresentation({
   report,
   isFlow,
   designRoundData,
@@ -296,6 +302,40 @@ export function renderCritiquePresentation({
   const designRounds = (designRoundData?.rounds || []).filter(
     (designRound) => !!slotRunId && designRound.review_run_id === slotRunId,
   );
+
+  const historyMenuRef = useRef<HTMLDivElement>(null);
+  const historyBtnRef = useRef<HTMLButtonElement>(null);
+  // The History menu runs on the shared menu contract (focus enters on open,
+  // arrows/Home/End move, Tab stays inside). Dismissal is this host's: Escape
+  // closes and returns focus to the button; a pointer-down outside closes and
+  // leaves focus where the click put it (the SlotPopover/MenuBtn posture).
+  useMenuKeyboard({ enabled: menuOpen, containerRef: historyMenuRef })
+  useEffect(() => {
+    if (!menuOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      setMenuOpen(false)
+      historyBtnRef.current?.focus()
+    }
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as Node
+      if (historyMenuRef.current?.contains(t) || historyBtnRef.current?.contains(t)) return
+      setMenuOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    document.addEventListener('pointerdown', onDown)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      document.removeEventListener('pointerdown', onDown)
+    }
+  }, [menuOpen, setMenuOpen])
+
+  // Picking a critique closes the menu under the focused item, so focus goes
+  // back to the button instead of falling to <body>.
+  const pickFromHistory = (e: HistoryEntry) => {
+    selectCritique(e)
+    historyBtnRef.current?.focus()
+  }
 
   const idxOf = new Map<Finding, number>();
   flowFindings.forEach((f, i) => idxOf.set(f, i));
@@ -487,6 +527,9 @@ export function renderCritiquePresentation({
         {phase !== "new" && critiques.length ? (
           <div style={{ position: "relative" }}>
             <button
+              ref={historyBtnRef}
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
               style={S.railBtn}
               onClick={() => setMenuOpen((o) => !o)}
               title={i18nT(
@@ -497,12 +540,13 @@ export function renderCritiquePresentation({
               <ChevronDown size={12} />
             </button>
             {menuOpen ? (
-              <div style={S.menu}>
+              <div ref={historyMenuRef} role="menu" style={S.menu}>
                 {critiques.map((e) => (
-                  <Clickable
+                  <Btn
                     key={e.id}
                     style={S.menuItem}
-                    onClick={() => selectCritique(e)}
+                    role="menuitem"
+                    onClick={() => pickFromHistory(e)}
                     title={
                       e.pending
                         ? i18nT(
@@ -533,7 +577,7 @@ export function renderCritiquePresentation({
                     {e.pending ? (
                       <Spinner size={12} reduceMotion={reduceMotion} />
                     ) : null}
-                  </Clickable>
+                  </Btn>
                 ))}
               </div>
             ) : null}
@@ -1100,40 +1144,11 @@ export function renderCritiquePresentation({
   }
   const canvas = <div style={S.canvas}>{canvasInner}</div>;
 
-  const lightbox =
-    zoom && thumbUrl ? (
-      <div
-        style={S.lbOverlay}
-        role="presentation"
-        onClick={(e) => {
-          if (e.target === e.currentTarget) setZoom(false);
-        }}
-      >
-        <div
-          style={S.lbInner}
-          role="dialog"
-          aria-modal="true"
-          aria-label={i18nT(
-            "apps.designCritique.designCritiquePage.full_size_view",
-          )}
-        >
-          <img
-            src={thumbUrl}
-            style={S.lbImg}
-            alt={i18nT("apps.designCritique.designCritiquePage.full_size")}
-          />
-          {buildMarkers(false)}
-        </div>
-        <button
-          style={S.lbClose}
-          onClick={() => setZoom(false)}
-          title={i18nT("apps.designCritique.designCritiquePage.close_esc")}
-          aria-label={i18nT("apps.designCritique.askLayer.close")}
-        >
-          <X size={18} />
-        </button>
-      </div>
-    ) : null;
+  const lightbox = zoom && thumbUrl ? (
+    <ZoomLightbox src={thumbUrl} onClose={() => setZoom(false)}>
+      {buildMarkers(false)}
+    </ZoomLightbox>
+  ) : null;
 
   return (
     <div
