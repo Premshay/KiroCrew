@@ -183,7 +183,9 @@ def repository_runner(tmp_path, monkeypatch):
     governance_profiles.reset_store()
 
 
-def authenticated_run(state, *arguments, cwd=None, timeout=5, principal=None, env=None):
+def authenticated_run(
+    state, *arguments, cwd=None, timeout=FALLBACK_TIMEOUT_SECS, principal=None, env=None
+):
     import asyncio
 
     from kiro_crew.platform.app_execution import authenticated_app_execution
@@ -192,7 +194,7 @@ def authenticated_run(state, *arguments, cwd=None, timeout=5, principal=None, en
     async def handler(request):
         return state.adapter.run(
             state.adapter.python_argv(*arguments), cwd=cwd or state.clone, timeout=timeout, env=env
-        )  # flake-ok: Exercises the requested workload deadline and cleanup contract, not a test barrier.
+        )  # flake-ok: Forwards the workload deadline; successful calls use the suite safety budget.
 
     return asyncio.run(
         handler(
@@ -330,24 +332,28 @@ def test_runner_tampering_during_workload_rejects_result(repository_runner):
         )
 
 
-def test_real_runner_exit_and_timeout(repository_runner, monkeypatch):
-    monkeypatch.setattr(
-        mod, "_RUNNER_CLEANUP_SECONDS", 0.1
-    )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
+def test_real_runner_exit_status_and_output(repository_runner):
     result = authenticated_run(
         repository_runner,
         "-c",
         "import sys; print('out'); print('failure', file=sys.stderr); sys.exit(7)",
     )
     assert (result.returncode, result.stdout, result.stderr) == (7, "out\n", "failure\n")
+
+
+def test_runner_preserves_executor_timeout_and_partial_output(repository_runner, monkeypatch):
+    expired = subprocess.TimeoutExpired(
+        "operator runner", FALLBACK_TIMEOUT_SECS, output=b"started\n"
+    )
+
+    def blocked_executor(*args, **kwargs):
+        raise expired
+
+    monkeypatch.setattr(repository_runner.adapter, "_sandbox_run", blocked_executor)
     with pytest.raises(subprocess.TimeoutExpired) as caught:
-        authenticated_run(
-            repository_runner,
-            "-c",
-            "import time; print('started', flush=True); time.sleep(60)",
-            timeout=0.5,
-        )  # flake-ok: Exercises the requested workload deadline and cleanup contract, not a test barrier.
-    assert b"started" in caught.value.output
+        authenticated_run(repository_runner, "-c", "pass")
+    assert caught.value is expired
+    assert caught.value.output == b"started\n"
 
 
 def test_runner_can_cleanup_between_work_deadline_and_hard_timeout(repository_runner):

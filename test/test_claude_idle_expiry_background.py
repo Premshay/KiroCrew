@@ -119,21 +119,21 @@ class TestClaudeActivityClock:
     @pytest.mark.asyncio
     async def test_a_between_turn_frame_stamps_the_session(self, tmp_path):
         client = _client(tmp_path)
-        client._process.stdout.readline = AsyncMock(
-            return_value=(json.dumps(_update("sess-1")) + "\n").encode()
-        )
         before = time.monotonic()
 
-        message = await client._read_message_from_stdout()
-        assert message is not None
-        await client._route_claude_frame(message)
+        await client._route_claude_frame(_text_frame("still working"))
 
         assert client.session_activity_at is not None
         assert client.session_activity_at >= before
 
-    def test_a_new_client_starts_its_activity_clock(self, tmp_path):
-        client = AcpClient(work_dir=tmp_path, acp_backend="deepseek")
-        assert client.session_activity_at is not None
+    def test_a_client_without_the_reader_reports_nothing(self, tmp_path):
+        assert AcpClient(work_dir=tmp_path, acp_backend="deepseek").session_activity_at is None
+
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, "deepseek", "copilot", "opencode"])
+    def test_liveness_touches_do_not_count_as_session_frames(self, tmp_path, backend):
+        client = AcpClient(work_dir=tmp_path, acp_backend=backend)
+        client.touch_activity()
+        assert client.session_activity_at is None
 
 
 def _runtime(tmp_path: Path) -> tuple[AcpRuntime, asyncio.StreamReader]:

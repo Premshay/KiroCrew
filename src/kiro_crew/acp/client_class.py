@@ -126,7 +126,7 @@ class AcpClient:
 
     @property
     def session_activity_at(self) -> float | None:
-        return self._last_activity
+        return self._session_activity_at
 
     @property
     def has_background_work(self) -> bool:

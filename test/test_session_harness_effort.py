@@ -287,8 +287,8 @@ async def test_the_crew_editor_takes_the_crews_own_codex_session_over_another():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("crew", ["writer", "other"], ids=["its-own-crews", "another-crews"])
-async def test_no_codex_sessions_model_answers_for_a_crews_pin(tmp_path, crew):
-    """Its build says the option exists; the model it runs can be a slot pick, not the pin."""
+async def test_live_codex_effort_does_not_decide_a_crews_model_pin(tmp_path, crew):
+    """The live option is advertised, but the crew editor still needs its own pin context."""
     live = AcpProvider(acp_backend=ACP_BACKEND_CODEX, work_dir=tmp_path)
     live._client._model = "deepseek-chat"
     live._client._acp_config_options = [
