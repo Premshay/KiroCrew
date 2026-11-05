@@ -179,16 +179,20 @@ def reporting_creator(state: Any, slot: Any) -> Any:
 def worker_reports_mode() -> str:
     """``agent.worker_reports`` as in force now; ``every_turn`` when it cannot be read.
 
-    The watcher's snapshot when the gateway runs one (an attribute read, safe on the
-    loop), else a config load. The fallback is the default because it is the mode
-    that loses no report: a config read that fails must not silence a crewmate's
+    Only the config watcher's snapshot, an attribute read: this runs on the event
+    loop (a worker's turn end, the ledger route), so it never reads the file
+    itself, and the watcher owns the disk reads. With no snapshot yet, or one that
+    cannot be read, the mode is the default because it is the one that loses no
+    report: a config the gateway has not adopted must not silence a crewmate's
     workers.
     """
     try:
         from kiro_crew.config import live
-        from kiro_crew.config.loader import KiroCrewConfig
 
-        mode = (live.snapshot() or KiroCrewConfig.load()).agent.worker_reports
+        snapshot = live.snapshot()
+        if snapshot is None:
+            return WORKER_REPORTS_EVERY_TURN
+        mode = snapshot.agent.worker_reports
     except Exception:
         logger.warning("worker_reports: config read failed - reporting every turn", exc_info=True)
         return WORKER_REPORTS_EVERY_TURN
@@ -621,7 +625,7 @@ async def note_cron_result(state: Any, job: Any, session_key: str, reply_text: s
         member = getattr(job, "member_id", "") or ""
         if not isinstance(member, str) or not member or not _is_jobs_own_cron_key(job, session_key):
             return False
-        if await asyncio.to_thread(worker_reports_mode) == WORKER_REPORTS_OFF:
+        if worker_reports_mode() == WORKER_REPORTS_OFF:
             return False
         from kiro_crew.execution_context import execution_from_record
         from kiro_crew.mate_worker import cron_worker_execution, is_own_worker_execution

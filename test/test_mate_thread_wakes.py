@@ -568,12 +568,31 @@ async def test_off_never_wakes_the_crewmate(dispatched, reports_mode):
 
 def test_an_unreadable_config_reads_as_every_turn(monkeypatch):
     from kiro_crew.config import live
-    from kiro_crew.config.loader import KiroCrewConfig
 
     def broken():
-        raise OSError("config.json unreadable")
+        raise OSError("config snapshot unreadable")
 
-    monkeypatch.setattr(live, "snapshot", lambda: None)
-    monkeypatch.setattr(KiroCrewConfig, "load", staticmethod(broken))
+    monkeypatch.setattr(live, "snapshot", broken)
 
     assert wakes.worker_reports_mode() == "every_turn"
+
+
+def test_the_mode_reads_the_watcher_snapshot_and_never_the_file(monkeypatch):
+    # The read runs on the event loop: with no snapshot it is the default, and
+    # it never falls back to loading config.json itself.
+    from types import SimpleNamespace
+
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    loads = []
+    monkeypatch.setattr(KiroCrewConfig, "load", staticmethod(lambda *a, **k: loads.append(a)))
+
+    monkeypatch.setattr(live, "snapshot", lambda: None)
+    assert wakes.worker_reports_mode() == "every_turn"
+
+    adopted = SimpleNamespace(agent=SimpleNamespace(worker_reports="milestones"))
+    monkeypatch.setattr(live, "snapshot", lambda: adopted)
+    assert wakes.worker_reports_mode() == "milestones"
+
+    assert loads == []

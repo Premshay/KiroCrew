@@ -1146,10 +1146,14 @@ class AgentConfig:
             "wakes the member only when the worker has recorded a blocked, "
             "unblocked, decision or phase entry in its session ledger, or names a "
             "missing capability, since its last report; the report carries that "
-            "ledger entry. A member's changed scheduled-job results report as "
+            "ledger entry. A worker that finishes without recording one, such as "
+            "a 'done' phase, does not wake the member by finishing: its last "
+            "reply waits for the member's next report. A member's changed "
+            "scheduled-job results report as "
             "before. 'off' sends no worker or scheduled-job reports at all, so the "
-            "member checks on its workers itself. Read at each worker turn end, so "
-            "a change applies to the next one.",
+            "member checks on its workers itself. Read at each worker turn end "
+            "from the setting the gateway has applied, so a change applies to the "
+            "next one.",
             enum=list(WORKER_REPORTS_MODES),
         ),
     )
