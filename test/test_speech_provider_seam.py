@@ -94,7 +94,7 @@ def _load_stt(tmp_path: Path, section: dict) -> str:
 #: The exact text a standalone install logged before the seam existed.
 _STANDALONE_STT_WARNING = (
     "Unknown STT provider 'whispr'; using 'off' instead, so no recogniser runs until "
-    "the value is fixed. Selectable providers: local, bridge, apple, transcribe, off. Run "
+    "the value is fixed. Selectable providers: local, apple, transcribe, off. Run "
     "'kirocrew config set stt.provider <provider>' to choose one, or "
     "'kirocrew config defaults --adopt stt.provider' to drop the stored value."
 )
@@ -113,7 +113,6 @@ class TestStandaloneIsUnchanged:
     def test_valid_sets_are_the_builtins(self, standalone) -> None:
         assert sections_stt.valid_stt_providers() == (
             "local",
-            "bridge",
             "apple",
             "transcribe",
             "off",
@@ -159,7 +158,6 @@ class TestRegisteredProvider:
     def test_valid_sets_include_it(self) -> None:
         assert sections_stt.valid_stt_providers() == (
             "local",
-            "bridge",
             "apple",
             "transcribe",
             "acme",
@@ -186,7 +184,7 @@ class TestRegisteredProvider:
     def test_unknown_name_lists_it(self, caplog) -> None:
         with caplog.at_level(logging.WARNING):
             assert sections_stt._validated_stt_provider("whispr") == "off"
-        assert "Selectable providers: local, bridge, apple, transcribe, acme, off." in caplog.text
+        assert "Selectable providers: local, apple, transcribe, acme, off." in caplog.text
 
     def test_config_set_accepts_it(self) -> None:
         from kiro_crew.cli_config import _declared_enum_value
@@ -324,7 +322,6 @@ class TestBootRefusesShadowing:
         [
             (_Registry(stt=("transcribe",)), "'transcribe'"),
             (_Registry(stt=("local",)), "'local'"),
-            (_Registry(stt=("bridge",)), "'bridge'"),
             (_Registry(stt=("off",)), "'off'"),
             (_Registry(stt=("whisper",)), "'whisper'"),
             (_Registry(tts=("polly",)), "'polly'"),

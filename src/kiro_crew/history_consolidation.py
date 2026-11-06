@@ -68,6 +68,7 @@ from kiro_crew.history_consolidation_span import (
     _CONSOLIDATION_STALE,
     AttemptedSpan,
     ConsolidationOutcome,
+    PrefsWindow,
     _LeaseLostMidRun,
     _no_pass_ran,
     _persistence_disabled,
@@ -313,6 +314,7 @@ class HistoryConsolidator:
         self._idle_clean: dict[str, tuple[CacheIdentity, int]] = {}
         # Separate offset for prefs-only consolidation (doesn't advance main offset)
         self._prefs_offset: dict[str, int] = {}
+        self._prefs_generation: dict[str, int] = {}
         # key -> (consecutive prefs passes with no usable answer, retry-at wall
         # time). In memory like _prefs_offset: the preference-only window has no
         # durable failure record, so this only spaces out re-sends of a prompt
@@ -776,10 +778,15 @@ class HistoryConsolidator:
     async def _threshold_pass(self, key: str, claim: _CountClaim) -> None:
         """Count *key*'s rows off the loop, then run a prefs pass at the threshold."""
         try:
-            counted = await self._count_off_loop(key, claim, floor=self._prefs_offset.get(key, 0))
+            counted = await self._count_off_loop(
+                key,
+                claim,
+                floor=self._prefs_offset.get(key, 0),
+                floor_generation=self._prefs_generation.get(key),
+            )
             if counted is None:
                 return
-            total = counted[0]
+            total, pending = counted
             # Re-checked after the await: an idle or session-end pass may have
             # claimed this transcript, or finished one, while the count ran.
             if self._busy(key):
@@ -788,10 +795,7 @@ class HistoryConsolidator:
             if self._busy(key):
                 return
             include_history = total - history_offset >= _HISTORY_LAG_THRESHOLD
-            if (
-                not include_history
-                and total - self._prefs_offset.get(key, 0) < _CONSOLIDATION_THRESHOLD
-            ):
+            if not include_history and pending < _CONSOLIDATION_THRESHOLD:
                 return
             # Cheap pre-check mirroring the other automatic entry points. During
             # a backoff window every message past the threshold would otherwise
@@ -807,7 +811,10 @@ class HistoryConsolidator:
         finally:
             self._release_count(claim)
         try:
-            result = await self._consolidate(key, include_history=include_history)
+            window = PrefsWindow(self._prefs_offset.get(key, 0), self._prefs_generation.get(key))
+            result = await self._consolidate(
+                key, include_history=include_history, prefs_window=window
+            )
         except Exception:
             # _consolidate has already logged it and released its claim; a
             # failed pass leaves the offset alone so the window is retried.
@@ -851,7 +858,13 @@ class HistoryConsolidator:
             return
         result = cast(ConsolidationOutcome, result)
         if result.completed:
-            self._prefs_offset[key] = total
+            self._prefs_offset[key] = (
+                result.new_offset
+                if include_history and not result.complete
+                else total if window.end is None else window.end
+            )
+            if window.snapshot_generation is not None:
+                self._prefs_generation[key] = window.snapshot_generation
             self._prefs_retry.pop(key, None)
             if include_history and result.complete:
                 self._history_consolidated[key] = _time.time()
@@ -888,7 +901,12 @@ class HistoryConsolidator:
         del self._counting[claim.name]
 
     async def _count_off_loop(
-        self, key: str, claim: _CountClaim, *, floor: int | None
+        self,
+        key: str,
+        claim: _CountClaim,
+        *,
+        floor: int | None,
+        floor_generation: int | None = None,
     ) -> tuple[int, int] | None:
         """``(total, total - floor)`` for *key*, counted in a worker thread.
 
@@ -897,9 +915,13 @@ class HistoryConsolidator:
         to finish, and *claim* covers it until then. *floor* None means the
         transcript's consolidated offset. None means nothing was counted: the
         key is inside its retry deadline, or the read failed (logged as a
-        warning), so the check is skipped.
+        warning), so the check is skipped. *floor_generation* is the
+        ``rotation_generation`` *floor* was counted under; under another one
+        the transcript's consolidated offset is the floor instead.
         """
-        claim.reader = asyncio.ensure_future(asyncio.to_thread(self._count_rows, key, floor))
+        claim.reader = asyncio.ensure_future(
+            asyncio.to_thread(self._count_rows, key, floor, floor_generation)
+        )
         try:
             return await asyncio.shield(claim.reader)
         except Exception:
@@ -908,7 +930,9 @@ class HistoryConsolidator:
             )
             return None
 
-    def _count_rows(self, key: str, floor: int | None) -> tuple[int, int] | None:
+    def _count_rows(
+        self, key: str, floor: int | None, floor_generation: int | None = None
+    ) -> tuple[int, int] | None:
         """Worker thread: count *key*'s rows one line at a time.
 
         A key inside its retry deadline is refused by ``retry_eligible`` after
@@ -922,6 +946,9 @@ class HistoryConsolidator:
         """
         if self._inside_retry_deadline(key):
             return None
+        if floor is not None and floor_generation is not None:
+            if self._log.rotation_generation(key) != floor_generation:
+                floor = None  # counted rows a rotation or rewrite replaced
         if floor is None:
             floor = self._log.consolidated_offset(key)
         total = self._log._count_messages(key, hold_writer_lock=False)

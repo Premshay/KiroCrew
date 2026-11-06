@@ -11,6 +11,7 @@ import asyncio
 
 import pytest
 
+from kiro_crew import crewmate_prompts
 from kiro_crew import members as members_mod
 from kiro_crew.dashboard import mate_thread_wakes as wakes
 
@@ -267,30 +268,106 @@ def test_every_top_level_turn_end_reaches_the_wake_path(tmp_path, monkeypatch):
 
     state = _make_state(tmp_path)
     slot = state.get_or_create_slot("chat-2")
-    seen: list[tuple[str, object]] = []
-    monkeypatch.setattr(cr, "_note_mate_wakes", lambda st, s, reply: seen.append((s.key, reply)))
+    seen: list[tuple[str, object, bool]] = []
+    monkeypatch.setattr(
+        cr,
+        "_note_mate_wakes",
+        lambda st, s, reply, *, quiet_end: seen.append((s.key, reply, quiet_end)),
+    )
     monkeypatch.setattr(cr, "_hand_off_queue", AsyncMock())
     monkeypatch.setattr(cr, "_consume_pending_reset", AsyncMock(return_value=False))
 
-    landed = cr._TurnExit()
-    landed.outcome = cr._TurnOutcome(
-        auth_required=False,
-        memory_admitted=True,
-        start_priority=None,
-        nudge_facts={"reply_text": "worker says hi"},
-    )
+    def _landed(reply: str, quiet_end: bool):
+        landed = cr._TurnExit()
+        landed.outcome = cr._TurnOutcome(
+            auth_required=False,
+            memory_admitted=True,
+            start_priority=None,
+            nudge_facts={"reply_text": reply},
+            quiet_end=quiet_end,
+        )
+        return landed
+
     early = cr._TurnExit()
     nested = cr._TurnExit()
     nested.depth = 1
 
     async def _drive():
-        await cr._end_turn_tail(state, slot, landed)
+        await cr._end_turn_tail(state, slot, _landed("worker says hi", False))
+        await cr._end_turn_tail(state, slot, _landed("", True))
         await cr._end_turn_tail(state, slot, early)
         await cr._end_turn_tail(state, slot, nested)
 
     asyncio.run(_drive())
 
-    assert seen == [("chat-2", "worker says hi"), ("chat-2", None)]
+    assert seen == [
+        ("chat-2", "worker says hi", False),
+        ("chat-2", "", True),
+        ("chat-2", None, False),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply", ["", " \n "])
+async def test_a_quiet_worker_end_reports_nothing(dispatched, reply):
+    """A loop cycle that ended on ``nothing_to_do`` with no text costs the crewmate no turn."""
+    mate, worker = _crewmate(), _worker()
+    state = _State(mate, worker)
+
+    wakes.note_turn_end(state, worker, reply, quiet_end=True)
+    await _settle(state)
+
+    assert dispatched == []
+    assert not getattr(state, "_mate_wakes", {})
+    assert not getattr(state, "_mate_wake_tasks", {})
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_worker_end_leaves_a_pending_report_as_it_was(dispatched):
+    mate, worker = _crewmate(), _worker()
+    mate._turn_admission_reserved = True  # busy, so the first report is held
+    state = _State(mate, worker)
+
+    wakes.note_turn_end(state, worker, "PR #12 merged")
+    await _settle(state)
+    held = dict(state._mate_wakes["member-atlas"]["chat-worker-1"])
+    wakes.note_turn_end(state, worker, "", quiet_end=True)
+    await _settle(state)
+
+    assert held["turns"] == 1
+    assert state._mate_wakes["member-atlas"]["chat-worker-1"] == held
+    # The crewmate thread's own quiet end still delivers what is pending.
+    mate._turn_admission_reserved = False
+    wakes.note_turn_end(state, mate, "", quiet_end=True)
+    await _settle(state)
+    [(key, prompt)] = dispatched
+    assert key == "member-atlas" and "PR #12 merged" in prompt
+    assert "ended 2 turns" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_an_empty_reply_without_a_quiet_end_still_reports(dispatched):
+    mate, worker = _crewmate(), _worker()
+    state = _State(mate, worker)
+
+    wakes.note_turn_end(state, worker, "")
+    await _settle(state)
+
+    [(key, prompt)] = dispatched
+    assert key == "member-atlas"
+    assert crewmate_prompts.text("worker_report.no_reply") in prompt
+
+
+@pytest.mark.asyncio
+async def test_a_reply_with_text_reports_even_on_a_quiet_end(dispatched):
+    mate, worker = _crewmate(), _worker()
+    state = _State(mate, worker)
+
+    wakes.note_turn_end(state, worker, "CI went red on #12.", quiet_end=True)
+    await _settle(state)
+
+    [(key, prompt)] = dispatched
+    assert key == "member-atlas" and "CI went red on #12." in prompt
 
 
 @pytest.mark.asyncio
@@ -513,6 +590,34 @@ async def test_milestones_wakes_after_a_ledger_milestone_and_carries_it(
     wakes.note_turn_end(state, worker, "watching CI")
     await _settle(state)
     assert len(dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_end_preserves_a_milestone_for_the_next_report(dispatched, reports_mode):
+    reports_mode("milestones")
+    mate, worker = _crewmate(), _worker()
+    state = _State(mate, worker)
+    assert wakes.note_ledger_milestone(
+        state,
+        "dashboard:chat-worker-1",
+        event_kind="blocked",
+        event="waiting for the operator",
+        phase=None,
+    )
+    milestone = list(state._mate_milestones[worker.key])
+
+    wakes.note_turn_end(state, worker, "", quiet_end=True)
+    await _settle(state)
+    assert dispatched == []
+    assert state._mate_milestones[worker.key] == milestone
+
+    wakes.note_turn_end(state, worker, "The checks need operator input.")
+    await _settle(state)
+    [(key, prompt)] = dispatched
+    assert key == mate.key
+    assert "waiting for the operator" in prompt
+    assert "The checks need operator input." in prompt
+    assert not state._mate_milestones.get(worker.key)
 
 
 @pytest.mark.asyncio

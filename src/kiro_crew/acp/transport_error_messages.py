@@ -360,7 +360,7 @@ def _format_acp_error_worded(
                 "sign-in issue, not a backend error."
                 f"{req_id_suffix}"
             )
-        elif is_model_registry_unavailable(data):
+        elif is_model_registry_unavailable(error.get("data")):
             formatted = MODEL_REGISTRY_UNAVAILABLE_TEXT + req_id_suffix
         elif _RE_CONNECTION.search(haystack) or _RE_CONNECTOR_FAILURE.search(haystack):
             formatted = (
@@ -597,16 +597,16 @@ def _raise_acp_error(
     raw_data = ""
     if isinstance(error, dict):
         raw_data = f"{error.get('data', '')} {error.get('message', '')}"
-    if _CONVERSATION_PAYLOAD_EXCEEDED_RE.search(raw_data):
-        raise AcpConversationPayloadExceeded(formatted, transient=False, user_worded=worded)
-    if _CONTEXT_WINDOW_EXCEEDED_RE.search(raw_data):
-        raise AcpContextWindowExceeded(formatted, transient=False, user_worded=worded)
-    if _PROMPT_BUSY_RE.search(raw_data):
-        raise AcpPromptBusy(formatted, user_worded=worded)
-    # A binding mismatch changes only the exception TYPE and its retry verdict;
-    # it is built here, not raised early, so the tags below still read the frame.
+    # Specialized exceptions pass through the native tagger so background and
+    # worker recovery see the same structural verdict as the dashboard.
     err: AcpError
-    if _is_thinking_binding_mismatch(error):
+    if _CONVERSATION_PAYLOAD_EXCEEDED_RE.search(raw_data):
+        err = AcpConversationPayloadExceeded(formatted, transient=False, user_worded=worded)
+    elif _CONTEXT_WINDOW_EXCEEDED_RE.search(raw_data):
+        err = AcpContextWindowExceeded(formatted, transient=False, user_worded=worded)
+    elif _PROMPT_BUSY_RE.search(raw_data):
+        raise AcpPromptBusy(formatted, user_worded=worded)
+    elif _is_thinking_binding_mismatch(error):
         err = AcpConversationBindingMismatch(formatted, transient=False, user_worded=worded)
     else:
         err = AcpError(
@@ -639,7 +639,8 @@ def _raise_acp_error(
     # either field (anchored, see _RE_REQUEST_SIZE_EXCEEDED); every other tag
     # below stays data-scoped.
     _context_overflow = bool(
-        _RE_CONTEXT_WINDOW_OVERFLOW.search(raw_data_field)
+        isinstance(err, AcpContextWindowExceeded)
+        or _RE_CONTEXT_WINDOW_OVERFLOW.search(raw_data_field)
         or _RE_ADAPTER_INPUT_TOO_LONG.search(raw_message_field)
         or _is_request_size_exceeded(raw_data_field, raw_message_field)
     )

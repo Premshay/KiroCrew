@@ -598,6 +598,7 @@ past the messages it read (the history marker, or the preference-only offset), s
 a later pass of the same kind does not re-prompt a refused fact; a pass refused or
 failed before it completes leaves that marker where it was, as any such pass does
 without the bound, and the pass that retries the span prompts the fact again.
+
 The one exception is the same without the bound: a history pass that fails on
 its span's last allowed attempt (`_CONSOLIDATION_MAX_ATTEMPTS`) writes the
 history marker anyway and abandons the span, so, unless that marker write itself
@@ -610,6 +611,15 @@ bound under it), it matches the episodic `text` maximum the same prompt states,
 and it refuses only the long tail of values. Only consolidation is bound: owner
 edits, imports, the dashboard and lessons keep the byte ceiling alone
 ([Semantic Memory](#semantic-memory)).
+
+Preference-only passes use upstream's `PrefsWindow`: each prompt covers one
+bounded prefix, and its in-memory offset advances only to that prefix's end.
+The offset records the transcript generation, so rotation starts a fresh window.
+The fork retains typed outcomes, pause and routing controls, and history catch-up;
+a partial history result advances the preference offset only to its committed
+history position. Preference extraction does not advance the durable history
+marker, and an oversized preference head leaves full extraction to history's
+existing sliced-message path.
 
 The prompt's `## Current Semantic Memory` block is bounded too, on BOTH passes
 (the preference-only pass builds the same block): the active table is read
@@ -625,9 +635,13 @@ order the chat path's `semantic_cap` reads with no query
 rendered in the same key order, followed by one `[Context budget: omitted N of
 M semantic rows ...]` line telling the model the table is partial and to
 update or delete only keys it can see. The cap bounds the prompt copy only:
-the whole table stays the `snapshot` the writers read for update-versus-create
-and the revision check, and the keys the bounded copy showed travel with the
-model's answer as `visible_keys`: a `delete` of a key the model never saw is
+every active key stays in the `snapshot` the writers read for a correction's
+check and the V1 retirement, reduced once the block is built to each row's
+`value_json`, `updated_at` and (on the private path) `record_revision` as read
+before the model call; the full rows, their stored vectors and the entry list
+the block was cut from are released before the turn starts. The keys the
+bounded copy showed travel with the model's answer as `visible_keys`: a
+`delete` of a key the model never saw is
 withheld (logged once per key) on both write paths, the V1 writer and the
 member store's `apply_consolidation`, since keys are guessable and the notice
 alone cannot stop a blind delete. An update is not withheld: the new value's

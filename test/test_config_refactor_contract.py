@@ -35,7 +35,6 @@ def test_fork_settings_survive_owner_module_load_and_save(tmp_path, monkeypatch)
             "subagent_max_per_parent_by_agent": {"crew-*": 2},
         },
         "decisions": {"spawn_route": {"codex": {"small": ["operator-model"]}}},
-        "stt": {"provider": "bridge"},
     }
     path.write_text(json.dumps(stored), encoding="utf-8")
     monkeypatch.setattr(loader, "config_path", lambda: path)
@@ -46,13 +45,11 @@ def test_fork_settings_survive_owner_module_load_and_save(tmp_path, monkeypatch)
     assert config.agent.subagent_max_per_parent == 1
     assert config.agent.subagent_max_per_parent_by_agent == {"crew-*": 2}
     assert config.decisions.spawn_route["codex"]["small"] == ["operator-model"]
-    assert config.stt.provider == "bridge"
     config.save()
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["agent"]["subagent_max_per_parent"] == 1
     assert saved["agent"]["subagent_max_per_parent_by_agent"] == {"crew-*": 2}
     assert saved["decisions"]["spawn_route"]["codex"]["small"] == ["operator-model"]
-    assert saved["stt"]["provider"] == "bridge"
 
 
 def test_companion_broker_kwargs_follow_stub_routes_independently_of_sharing():

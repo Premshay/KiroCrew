@@ -160,7 +160,9 @@ class TestConsolidationOffset:
         log.consolidated_offset.return_value = 0
         # A fresh span is eligible; maybe_consolidate's pre-check reads this.
         log.consolidation_retry_state.return_value = (0, 0.0)
-        return HistoryConsolidator(log=log, memory=MagicMock(), sessions=None)
+        return HistoryConsolidator(
+            log=log, memory=MagicMock(), sessions=None, auto_consolidation_enabled=True
+        )
 
     def test_offset_advances_on_success(self):
         """When _consolidate succeeds, _prefs_offset should advance."""
@@ -367,7 +369,9 @@ class TestConsolidateSession:
         conv_log.init()
         mem = MemoryStore(workspace=tmp_path / "memory")
         mem.init()
-        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        consolidator = HistoryConsolidator(
+            log=conv_log, memory=mem, auto_consolidation_enabled=True
+        )
         key = "dashboard:chat-cold-expiry"
         for i in range(5):
             conv_log.append(key, "user", f"m{i}")
@@ -412,7 +416,9 @@ class TestConsolidateSession:
         conv_log.init()
         mem = MemoryStore(workspace=tmp_path / "memory")
         mem.init()
-        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        consolidator = HistoryConsolidator(
+            log=conv_log, memory=mem, auto_consolidation_enabled=True
+        )
         key = "dashboard:chat-twice"
         conv_log.append(key, "user", "hello")
 
@@ -465,6 +471,7 @@ class TestConsolidateSession:
             auto_skills_enabled=True,
             approval_required=False,
             auto_min_tool_calls=2,
+            auto_consolidation_enabled=True,
         )
 
         # Seed a session with tool calls
@@ -507,7 +514,9 @@ class TestConsolidateSession:
         mem = MemoryStore(workspace=tmp_path / "memory")
         mem.init()
 
-        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        consolidator = HistoryConsolidator(
+            log=conv_log, memory=mem, auto_consolidation_enabled=True
+        )
 
         # No messages for this key
         consolidator.consolidate_session("dashboard:chat-empty")
@@ -524,7 +533,9 @@ class TestConsolidateSession:
         mem = MemoryStore(workspace=tmp_path / "memory")
         mem.init()
 
-        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        consolidator = HistoryConsolidator(
+            log=conv_log, memory=mem, auto_consolidation_enabled=True
+        )
         conv_log.append("dashboard:chat-dup", "user", "hello")
 
         # Simulate already running
@@ -543,7 +554,9 @@ class TestConsolidateSession:
         mem = MemoryStore(workspace=tmp_path / "memory")
         mem.init()
 
-        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        consolidator = HistoryConsolidator(
+            log=conv_log, memory=mem, auto_consolidation_enabled=True
+        )
         # Seed a session with a sensitive tool call
         conv_log.append(
             "dashboard:chat-sensitive",
@@ -571,7 +584,9 @@ class TestConsolidateSession:
         mem = MemoryStore(workspace=tmp_path / "memory")
         mem.init()
 
-        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        consolidator = HistoryConsolidator(
+            log=conv_log, memory=mem, auto_consolidation_enabled=True
+        )
         conv_log.append("dashboard:chat-fail", "user", "hello")
 
         with patch.object(
@@ -1444,7 +1459,9 @@ class TestConsolidationLessonApplies:
         conv_log.init()
         mem = MemoryStore(workspace=tmp_path / "memory")
         mem.init()
-        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        consolidator = HistoryConsolidator(
+            log=conv_log, memory=mem, auto_consolidation_enabled=True
+        )
         conv_log.append("dashboard:chat-tier", "user", "no, always run the gate first")
         conv_log.append("dashboard:chat-tier", "assistant", "Understood, running it.")
 
@@ -1759,6 +1776,10 @@ class TestConsolidationOffsetForkContracts:
             ) as consolidate:
                 c.maybe_consolidate("k")
                 await asyncio.gather(*c._tasks, return_exceptions=True)
-            consolidate.assert_awaited_once_with("k", include_history=True)
+            consolidate.assert_awaited_once()
+            assert consolidate.await_args.args == ("k",)
+            assert consolidate.await_args.kwargs["include_history"] is True
+            window = consolidate.await_args.kwargs["prefs_window"]
+            assert window.start == 0 and window.generation is None
 
         asyncio.run(run())

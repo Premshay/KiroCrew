@@ -1499,6 +1499,13 @@ newly committed text.
 
 A composed edition can add STT providers through the `speech` slot on `PlatformContext` (`SpeechProviderRegistry.stt_providers()`; see `platform-context.md`). The default registry adds none, so a standalone install has exactly the built-in set.
 
+The operator's batch `bridge` recognizer belongs to the companion's speech
+registry. Its stored provider name, executable environment setting, fixed batch
+arguments and transcript redaction stay intact through native dispatch. It has
+no streaming channel and changes no absent-key default. Deploy its companion
+registration with the core removal; a standalone core does not supply this
+operator-specific executable bridge.
+
 - **Collision rule.** A registered name may not be a built-in (`local`, `apple`, `transcribe`), a retired name or `off`, may not be blank and may not repeat. `speech_providers.validate_speech_registry` refuses any of these at boot with `PlatformCompositionError`, so an edition can add a provider but never replace one.
 - **Default precedence.** A stored `stt.provider` always wins. Only an absent key takes the edition's `default_stt()`, and only when that is `None` does it take core's `local`. An unusable stored value keeps its built-in fallback below, so a typo never reaches the edition default.
 - **Streaming.** A registered provider joins the streaming grant only when its `streaming` attribute is true. Positive membership stays the rule.

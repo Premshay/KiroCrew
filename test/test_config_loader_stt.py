@@ -150,8 +150,9 @@ class TestSttRetiredProviders:
     """
 
     @pytest.fixture(autouse=True)
-    def _reset_warn_once(self):
+    def _reset_warn_once(self, monkeypatch):
         """The degrade log is once-per-value-per-process, so tests must not inherit it."""
+        monkeypatch.setattr("kiro_crew.platform.discovery.plugin_entry_points", lambda: [])
         loader_module._WARNED_STT_PROVIDERS.clear()
         yield
         loader_module._WARNED_STT_PROVIDERS.clear()
@@ -236,9 +237,6 @@ class TestSttRetiredProviders:
         that cannot be honoured and fails closed like any other unknown one."""
         assert _loaded_stt(tmp_path, {"provider": None}).provider == STT_PROVIDER_LOCAL
         assert _loaded_stt(tmp_path, {"provider": 7}).provider == "off"
-
-    def test_bridge_is_selectable(self, tmp_path: Path) -> None:
-        assert _loaded_stt(tmp_path, {"provider": "bridge"}).provider == "bridge"
 
 
 class TestSttRemovedFieldsAreInert:

@@ -103,7 +103,7 @@ VOLATILE_ENV = {
     # The spawning gateway's data home, so a reclaim can refuse a sibling install's
     # runtime. That the child RECEIVES it is the fact pinned; the path is the host's.
     "KIROCREW_SPAWN_HOME": "<data-home>",
-    # The runtime's per-process scratch directory, under the capture's temp dir.
+    # The runtime's private-state directory, under the capture's temp dir.
     # That the codex child RECEIVES it -- its SQLite home is its own -- is the fact
     # being pinned; the directory is not.
     "CODEX_SQLITE_HOME": "<scratch>",
@@ -572,9 +572,9 @@ def _capture_runtime_served(
                 "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
                 return_value=NativeSkillProjection({"kirocrew": "kirocrew-skill-view-golden"}),
             ),
-            # A real scratch dir under ``tmp_path`` (see
+            # A real scratch dir under ``tmp_path`` per label (see
             # :func:`_allocate_capture_scratch`): the codex child's SQLite home is
-            # this window, and that it receives one is a launch answer. Its env
+            # one of these windows, and that it receives one is a launch answer. Its env
             # contribution is pinned to the same placeholders as the client arm's,
             # for the same reasons.
             patch.object(

@@ -340,7 +340,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
     if "acp_backend" in body:
         from kiro_crew.crewmate_harness import harness_pin_rejected
 
-        backend_reason = harness_pin_rejected(body["acp_backend"])
+        backend_reason = harness_pin_rejected(
+            body["acp_backend"], await asyncio.to_thread(KiroCrewConfig.load)
+        )
         if backend_reason:
             return web.json_response(
                 {"error": backend_reason, "code": "invalid_acp_backend"}, status=400
@@ -911,7 +913,10 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     denied=lambda _session_key: None,
                     busy=lambda session_key: _busy(slot, session_key),
                     notice=(
-                        "Session reloaded so this Bot runs on its new agent harness. "
+                        "This Bot's default agent harness changed. This chat keeps its "
+                        "explicit backend selection in the composer. The conversation is kept."
+                        if slot.runtime_agent
+                        else "Session reloaded so this Bot runs on its new agent harness. "
                         "The conversation is kept."
                     ),
                     after_reset_in_lock=_after_teardown,

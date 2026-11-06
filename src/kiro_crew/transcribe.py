@@ -58,11 +58,6 @@ from kiro_crew.stt import decoder
 # found it, and one filter with two import paths cannot drift.
 from kiro_crew.stt.hallucinations import filter_hallucinations  # noqa: F401
 from kiro_crew.transcribe_aws import _aws_availability, _transcribe_aws
-from kiro_crew.transcribe_bridge import (  # noqa: F401 - preserved facade surface
-    CODE_BRIDGE_UNAVAILABLE,
-    _bridge_availability,
-    _transcribe_bridge,
-)
 from kiro_crew.transcribe_ffmpeg import (
     _FFMPEG_CANDIDATE_DIRS,
     _bundled_ffmpeg,
@@ -290,8 +285,6 @@ def availability_detail(stt_config=None) -> stt.Availability:  # type: ignore[no
         return _aws_availability()
     if provider == "apple":
         return _apple_availability()
-    if provider == "bridge":
-        return _bridge_availability()
     registered = _registered_provider(provider)
     if registered is not None:
         # An edition-registered provider: its own check() answers. BLOCKING, like
@@ -439,8 +432,6 @@ async def transcribe_audio(audio_path: str, stt_config=None) -> str | None:  # t
         result = await _transcribe_aws(audio_path, stt_config)
     elif provider == "apple":
         result = await _transcribe_apple(audio_path, stt_config)
-    elif provider == "bridge":
-        result = await _transcribe_bridge(audio_path, stt_config)
     elif (registered := _registered_provider(provider)) is not None:
         # An edition-registered provider. Same contract as every branch here:
         # text, "" for silence, or None -- never an exception. Called on this
@@ -1130,7 +1121,6 @@ async def transcribe_oversized_in_segments(
 # every name they define: a patch through this module reaches every owner that binds the
 # name (see :mod:`kiro_crew._facade_mirror`).
 _OWNERS = (
-    "kiro_crew.transcribe_bridge",
     "kiro_crew.transcribe_ffmpeg",
     "kiro_crew.transcribe_aws",
     "kiro_crew.transcribe_local",
@@ -1169,11 +1159,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _read_audio_bytes,
         boto3,
         list_custom_vocabularies,
-    )
-    from kiro_crew.transcribe_bridge import (  # noqa: F401
-        _BRIDGE_ENV,
-        _bridge_command,
-        _read_bridge_transcript,
     )
     from kiro_crew.transcribe_ffmpeg import (  # noqa: F401
         _DECODER_DETAIL_MAX_CHARS,

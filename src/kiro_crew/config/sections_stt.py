@@ -50,21 +50,13 @@ STT_PROVIDER_OFF = "off"
 STT_LANGUAGE_AUTO = "auto"
 STT_LANGUAGE_FALLBACK = "en-US"
 
-STT_PROVIDER_BRIDGE = "bridge"
-
 #: The recognisers a user can select. ``local`` runs whisper.cpp in-process,
-#: ``bridge`` uses an operator-configured batch recogniser, ``apple`` uses
-#: macOS on-device recognition, and ``transcribe`` sends audio to AWS Transcribe
-#: (billed, and gated on the AWS consent prompt). ``off`` selects no recogniser.
-#: ``off`` and ``bridge`` are deliberately absent from
+#: ``apple`` uses macOS 26+ on-device recognition, and ``transcribe`` sends audio
+#: to AWS Transcribe (billed, and gated on the AWS consent prompt). All three
+#: produce partial results, so streaming is not a per-provider capability.
+#: ``off`` selects no recogniser; it is deliberately absent from
 #: ``stt_stream._STREAMING_PROVIDERS``, which grants by positive membership.
-_VALID_STT_PROVIDERS = (
-    STT_PROVIDER_LOCAL,
-    STT_PROVIDER_BRIDGE,
-    "apple",
-    "transcribe",
-    STT_PROVIDER_OFF,
-)
+_VALID_STT_PROVIDERS = (STT_PROVIDER_LOCAL, "apple", "transcribe", STT_PROVIDER_OFF)
 
 
 def valid_stt_providers() -> tuple[str, ...]:

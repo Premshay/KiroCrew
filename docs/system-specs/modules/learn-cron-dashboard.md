@@ -19,6 +19,9 @@ Turn phases read and write shared reset, conversation-discard and flushed-text
 flags directly on the turn object, so provider callbacks and finalization use
 the same state rather than a phase-local copy.
 
+Deferred session-reset retries belong to the dashboard state that armed them.
+Waking one state's slot never replaces or wakes another state's same-key retry.
+
 Agent model edits prefer a fresh catalog discovered for the edited agent. When
 that catalog is unavailable, entitlement is checked only against the backend
 namespace that will run the member; another harness's catalog cannot reject it.
@@ -1881,7 +1884,13 @@ The owners, lowest layer first:
   member slot transitions.
 - `state_parts/slots_push.py` — when dashboard state reaches websocket clients, and
   how: the slots broadcast and its pacing, the serving loop, slot / lineage / removal
-  patches, card and progress pushes, `_broadcast` and the websocket fan-out.
+  patches, card and progress pushes, `_broadcast` and the websocket fan-out. A
+  `suspend_slots_push` block's exit flush logs a failing slots broadcast instead
+  of raising it: the block's change is already made, so its caller's answer (a
+  slot create's 200, say) is the one it gets when the trailing timer carries the
+  failure. A committed resume or import publishes its final push through such a
+  block. A direct `push_slots_update()` on a leading edge still raises, which is
+  what source-link unlink's `broadcast_failed` audit and its retry read.
 - `state_parts/slots_diff.py` — the coalesced slot list as row deltas for
   `slot_diff.1` sockets: the per-view base (`DiffBase`), the delta and its full-frame
   fallbacks, the shared row texts every slots frame of a pass is built from, the

@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kiro_crew.acp.client import AcpError
+from kiro_crew.acp.client import AcpError, _raise_acp_error
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.llm_helpers import is_context_overflow_error, run_bg_oneliner, stream_and_collect
@@ -131,6 +131,30 @@ class TestOneLinersBoundTheSharedConversation:
         first.shutdown.assert_not_awaited()
         assert mgr._sessions[BACKGROUND_KEY].provider is first
         await mgr.close_all()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "data",
+        [
+            'API Error: 413 {"code":"context_window_exceeded"}',
+            "Request too large (max 32MB). Accumulated images and attachments exceed the limit.",
+        ],
+        ids=["local-context-window", "retained-attachments"],
+    )
+    async def test_specialized_refusals_use_the_native_background_recycle(self, data):
+        with pytest.raises(AcpError) as raised:
+            _raise_acp_error({"code": -32603, "message": "Internal error", "data": data})
+        mgr = await _manager("claude")
+        try:
+            first = mgr._sessions[BACKGROUND_KEY].provider
+            first.raise_on_stream = raised.value
+            with pytest.raises(AcpError):
+                await run_bg_oneliner(mgr, "title this")
+            first.shutdown.assert_awaited_once()
+            assert mgr._sessions[BACKGROUND_KEY].provider is not first
+            assert await run_bg_oneliner(mgr, "title this") == "ok"
+        finally:
+            await mgr.close_all()
 
 
 class TestSwallowedOverflowStillRecycles:
