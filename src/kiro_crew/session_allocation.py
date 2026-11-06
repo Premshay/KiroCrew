@@ -221,6 +221,12 @@ class SessionRegistryState:
     #: ``spawn_in_flight``; a token leaves at registration (published, or a
     #: won race) or with its reservation.
     spawning_reservations: set[object] = field(default_factory=set)
+    #: Per key, the event a speculative (eager) allocation sets when it returns,
+    #: registered or not, and that allocation's start priority. A real claim of
+    #: no higher priority that finds no live session but finds this waits for it
+    #: and claims what it registered, instead of cold-starting a second process
+    #: for the same key. Removed by the call that added it.
+    speculative_starts: dict[str, tuple[asyncio.Event, StartPriority]] = field(default_factory=dict)
     #: Per fenced key, a receipt for every start the fence caught past its spawn
     #: door and whose reservation was then removed WHILE the fence was still up:
     #: the start returned during the ending caller's passes, its registration
@@ -264,6 +270,7 @@ class _AllocationOwner(Protocol):
     _warm_pool: asyncio.Queue[tuple[LLMProvider, float]]
     _background_tasks: set[asyncio.Task[Any]]
     _bg_runtime: Any | None
+    on_session_released: Callable[[str], None] | None
 
     def _store_provider_mapping(self, key: str, provider: LLMProvider) -> bool: ...
 
@@ -276,6 +283,8 @@ class _AllocationOwner(Protocol):
     def absorb_orphaned_release(self, key: str) -> bool: ...
 
     def adopt_turn(self, key: str) -> None: ...
+
+    def retire_turn_permit(self, key: str, session: Any) -> None: ...
 
     def get_provider(self, key: str) -> LLMProvider | None: ...
 
@@ -901,6 +910,14 @@ class SessionAllocationService:
         except BaseException:
             self._remove_reservation_now(key, token)
             raise
+        # A run's planner, step and review sessions end as soon as their work is
+        # done. Where the host can keep the record, it waits this long before Crew
+        # deletes it, so a finished step can still be read. The later delete is a
+        # cleanup-loop hook, and this path is not the allocation that starts the
+        # loop, so a delay starts it here.
+        handle.delete_delay_secs = float(owner._cfg.session.kas_delete_delay_secs)
+        if handle.delete_delay_secs > 0:
+            owner._ensure_cleanup_task()
         try:
             provider = self._deps.session_provider_type()(handle, runtime)
             setattr(
@@ -932,7 +949,7 @@ class SessionAllocationService:
                     self.advance_ownership_generation(key)
                     won_race_session = session
                     try:
-                        await record_session_started(key)
+                        await record_session_started(key, provider)
                     except BaseException:
                         # This await is the only suspension point between registering
                         # the session and returning it. Cancelled here, the caller
@@ -1121,12 +1138,18 @@ class SessionAllocationService:
     def conversation_provider(self, key: str) -> str:
         return self._owner._session_map.get_provider(self._owner._fold_key(key))
 
-    def release(self, key: str, *, cleanup: bool = False) -> None:
+    def release(self, key: str, *, cleanup: bool = False, wake_queue: bool = False) -> None:
         """Release the current registry occupant's semaphore.
 
         This intentionally preserves the existing key-only lease identity: it
         does not repair the known stale-release window when a locked replacement
         occupies the same key.
+
+        ``wake_queue`` is for a holder that is not a channel's own turn, such as a
+        sub-agent completion injection. A channel drains its queue only at the tail
+        of its own turn, so a message queued while such a holder ran would wait for
+        the person's next message. With it set, the drains of the channels whose
+        entries are queued on the key are woken once the lease is free.
         """
         key = self._owner._fold_key(key)
         if self._owner.absorb_orphaned_release(key):
@@ -1148,9 +1171,14 @@ class SessionAllocationService:
                 try:
                     session_id = session.provider.session_id
                     if session_id:
-                        asyncio.ensure_future(
+                        # Held in the owner's set: the loop keeps only a weak
+                        # reference to a task, so an unreferenced one can be
+                        # garbage-collected before the cleanup finishes.
+                        task = asyncio.ensure_future(
                             self._owner._safe_cleanup(session.provider, session_id)
                         )
+                        self._owner._background_tasks.add(task)
+                        task.add_done_callback(self._owner._background_tasks.discard)
                 except Exception:
                     self._deps.logger.debug("Failed to get session_id for cleanup", exc_info=True)
             try:
@@ -1175,18 +1203,36 @@ class SessionAllocationService:
                 # acquired. A run that never returns still goes stale and is
                 # reaped; a run working between tasks is not mistaken for one.
                 session.last_used = time.monotonic()
+                # Every surface ends a turn here, so this is the one point that
+                # sees a channel turn finish without knowing its transport
+                # (``on_session_released``). The observer only schedules work; a
+                # raise is logged and dropped so it can never leave the lease
+                # looking held. getattr: an owner double may predate the field.
+                listener = getattr(self._owner, "on_session_released", None)
+                if callable(listener):
+                    try:
+                        listener(key)
+                    except Exception:
+                        self._deps.logger.warning(
+                            "release(%s): release observer raised", key, exc_info=True
+                        )
             if getattr(session, "adopted_parked", False):
                 # The claim that just ended adopted entries a forced stop parked
                 # (``adopt_parked_queue``). Their channels' drains are woken
                 # NOW, after the lease is free, or the entries sit on the queue
-                # until an unrelated message happens to start a turn. Off this
-                # synchronous call, as ``wake_other_drains`` requires.
+                # until an unrelated message happens to start a turn.
                 session.adopted_parked = False
+                wake_queue = True
+            if wake_queue:
+                # Off this synchronous call, as ``wake_other_drains`` requires.
                 channels = [entry_channel(e[2]) for e in session.queue]
                 if any(channels):
-                    task = asyncio.ensure_future(
-                        wake_other_drains(waker="", session_key=key, channels=channels)
-                    )
+                    from kiro_crew.shared_crew.turn_gate import independent_turn
+
+                    with independent_turn():
+                        task = asyncio.ensure_future(
+                            wake_other_drains(waker="", session_key=key, channels=channels)
+                        )
                     self._owner._background_tasks.add(task)
                     task.add_done_callback(self._owner._background_tasks.discard)
 
@@ -1402,8 +1448,13 @@ class SessionAllocationService:
             directory_mtime = 0.0
         now = time.monotonic()
         cache = self._deps.agent_model_cache()
+        from kiro_crew import agent_spec_pins
 
-        entry = cache.get(agent)
+        # Keyed with the pin folded in: a pin change picks another file, and the
+        # agents directory's mtime does not move for it.
+        pins = agent_spec_pins.spec_pins()
+        cache_key = agent_spec_pins.pinned_memo_key(agent, pins)
+        entry = cache.get(cache_key)
         if entry is not None:
             cached_model, cached_mtime, cached_at = entry
             if (
@@ -1414,20 +1465,24 @@ class SessionAllocationService:
 
         model = "auto"
         try:
-            for agent_file in iter_agent_spec_files(agents_dir, ordered=False):
-                data = self._deps.read_agent_spec(
+            # First match, with ``agent.spec_pins`` applied (``pick_spec_row``).
+            rows = (
+                (
+                    self._deps.read_agent_spec(
+                        agent_file,
+                        operation="resolve_agent_model",
+                        source="unknown",
+                    ),
                     agent_file,
-                    operation="resolve_agent_model",
-                    source="unknown",
                 )
-                if data is None:
-                    continue
-                if data.get("name") == agent or agent_file.stem == agent:
-                    model = self._deps.spec_model(data)
-                    break
+                for agent_file in iter_agent_spec_files(agents_dir, ordered=False)
+            )
+            picked = agent_spec_pins.pick_spec_row(rows, agent, pins)
+            if picked is not None:
+                model = self._deps.spec_model(picked)
         except Exception:
             pass
-        cache[agent] = (model, directory_mtime, now)
+        cache[cache_key] = (model, directory_mtime, now)
         return model
 
 

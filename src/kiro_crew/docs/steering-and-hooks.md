@@ -67,10 +67,14 @@ description: How this service names endpoints and shapes errors
 Endpoints are plural nouns. Errors carry a stable `code` field.
 ```
 
-**Kiro Crew reports and edits the declaration; it does not decide delivery from
-it.** What a mode causes is kiro-cli's behaviour, it differs from the Kiro IDE,
-and it has changed between releases — so this page does not restate a
-per-version measurement. The one row every measurement agrees on is `manual`:
+**On kiro-cli, Kiro Crew reports and edits the declaration; it does not decide
+delivery from it.** The two loads Kiro Crew runs itself, folder steering and the
+Claude Code backend's global-root load, apply one rule
+(`every_session_body` in `src/kiro_crew/folder_steering.py`): a document
+declaring `manual`, `auto` or `fileMatch` is withheld, and the front matter is
+stripped from every document they deliver. What a mode causes on kiro-cli is the
+harness's behaviour, it differs from the Kiro IDE, and it has changed between
+releases — so this page does not restate a per-version measurement. The one row every measurement agrees on is `manual`:
 there is no way to bring such a document into a turn over ACP. For the rest,
 read the harness's own steering documentation rather than trusting a mode name to
 mean what it sounds like.
@@ -83,7 +87,10 @@ declares nothing) and lives in a root that session loads.
 The Steering files tab reads, creates, edits and deletes these documents. The
 inclusion mode is a segmented control in the editor, and the rewrite happens
 server-side so your body text is preserved byte for byte. An entry that is a
-symlink is listed and readable but never editable, and a workspace write must
+symlink is listed and readable but never editable. A symlink that points
+outside the folders the dashboard may read (for global steering, outside your
+home folder) is listed as "linked, not shown": sessions can still load it, but
+the dashboard never opens it or shows where it points. A workspace write must
 echo the project it was listed under — a chat slot's project can move, and a
 delete issued from a stale listing would otherwise unlink the same-named file in
 a different project.
@@ -133,6 +140,10 @@ tool call before it runs, or block it outright.
 | `PreToolUse` | before a tool runs | allows the tool |
 | `PostToolUse` | after a tool ran | nothing |
 | `Stop` | the turn ends | usually nothing — but see the continuation contract below |
+
+A spawned sub-agent fires `AgentSpawn` (on a new session) and `UserPromptSubmit`
+(with the task its parent wrote) before its prompt is sent, and their exit-0
+stdout is added to that prompt the same way.
 
 `PreToolUse` is the only event whose exit code can decide anything — and only
 on the path where the gateway is the one approving the call:
@@ -281,6 +292,13 @@ them with a default: `session_key` is the firing session's own key (a dashboard
 chat, a channel thread); `subagent_id` and `parent_session_key` appear only on
 an event a spawned subagent fired. To tell a person's turn from a subagent's,
 check for `subagent_id`, not `parent_session_key`.
+
+An agent spec's own `hooks` that Kiro Crew runs for a KAS chat session also get
+the session's ACP id, as `KIRO_SESSION_ID` in the environment and as
+`session_id` on stdin, the same names kiro-cli uses. The older stdin key
+`acp_session_id` carries the same value. Before the session has an id, all of
+them are left out. A subagent's Stop hooks get it too. Hooks-page hooks and
+other subagent events do not.
 
 **A hook does not inherit the gateway's environment.** The gateway process holds
 provider keys and tokens, so a hook subprocess gets an allowlisted slice instead

@@ -30,6 +30,7 @@ from kiro_crew.mcp_discovery import (
     _probe_cache,
     probe_server,
 )
+from kiro_crew.testing.clock import ManualClock
 
 
 class TestProbeServerConsentGate:
@@ -111,14 +112,9 @@ class TestProbeServerConsentGate:
     async def test_refusal_does_not_clobber_cached_tools(self) -> None:
         """The refusal must not write to the shared probe cache.
 
-        Guards a specific future refactor rather than the missing guard: adding
-        a well-meaning ``_cache_probe(server)`` to the refusal path to "record
-        the disabled state". The cache is keyed by name and read by
-        ``GET /api/mcp`` through ``_get_cached``, so an empty "disabled" entry
-        would erase the tool list a real probe recorded before the user
-        disabled the server. Verified by adding that call and watching this
-        fail — it does NOT fail merely from removing the guard, because the
-        probe's early error returns skip ``_cache_probe`` anyway.
+        Guards against adding ``_cache_probe(server)`` to the refusal path: the cache is
+        keyed by name and read by ``GET /api/mcp``, so an empty entry would erase the
+        tool list a real probe recorded. Removing the guard alone does not fail this.
         """
         probed = McpServerInfo(name="was-ok", command="true", status="ok", tools=["alpha", "beta"])
         _cache_probe(probed)
@@ -207,11 +203,8 @@ class TestProbeTempContainment:
     ) -> None:
         """A declared temp inside ``<data home>/run`` is refused, not honored.
 
-        Both backends seal that parent read-only, so honoring the declaration
-        hands the child a TMPDIR it cannot write -- silently, since the probe
-        still reports a green handshake. The declaration therefore yields to the
-        managed temp (allocated, carved out, and pointed at by the child's env),
-        and the sealed path never reaches the child.
+        Both backends seal that parent read-only, so the child would get an unwritable
+        TMPDIR while the handshake still shows green. The managed temp is used instead.
         """
         import sys
         from pathlib import Path
@@ -308,13 +301,8 @@ class TestProbeTempContainment:
     ) -> None:
         """A case variant must not survive the refusal.
 
-        Spec env keys are treated case-INSENSITIVELY here on purpose -- Windows
-        env keys are case-insensitive and the sanitized spec preserves the
-        author's spelling -- so the detection above already sees ``tmpdir`` as a
-        declaration. The REWRITE compared exact spellings, so the spec's own
-        lowercase key stayed in the env beside the managed triple: on Windows
-        those two names are ONE variable, and the child could be handed back the
-        very sealed path this refusal exists to withhold.
+        Windows env keys are case-insensitive, so a lowercase ``tmpdir`` left beside the
+        managed triple is the same variable and would hand back the sealed path.
         """
         import sys
 
@@ -605,8 +593,11 @@ class TestProbeTempContainment:
         stale = bt.backend_tmp_root() / "probe-deadbeef-old"
         stale.mkdir(parents=True)
         (stale / bt.OWNER_FILENAME).write_text(str(2**22 + 5), encoding="utf-8")
-        # flake-ok: pre-existing wall-clock read aging the stale dir two hours back; moved verbatim
-        old = time.time() - 7200
+        # The sweep reads backend_tmp's clock as its reference. Seed one frozen clock
+        # from the real time once and age the stale dir from that same reading.
+        clock = ManualClock(start=time.time())
+        clock.install(monkeypatch, bt)
+        old = clock.time() - 7200
         os.utime(stale / bt.OWNER_FILENAME, (old, old))
         os.utime(stale, (old, old))
         os.utime(bt.backend_tmp_root(), (old, old))
@@ -709,13 +700,9 @@ class TestProbeTempContainment:
         """The probe TMPDIR is allocated BEFORE the sandbox wrap, which
         receives it as a write carve-out, and the spawn env points at it.
 
-        The managed probe root lives at ``<data home>/run/mcp-tmp``, inside the
-        runtime parent the sandbox seals read-only. A TMPDIR allocated after
-        the wrap is a directory the sandboxed child cannot write -- a
-        Bun-packaged server then fails the probe with "Cannot find the native
-        Koffi module" because it cannot extract its native module. Lock BOTH
-        halves of the fix: the ordering (alloc, then wrap) and the carve-out
-        kwarg naming the allocated dir.
+        ``<data home>/run/mcp-tmp`` sits inside the parent the sandbox seals read-only,
+        so a TMPDIR made after the wrap is unwritable (a Bun server then fails with
+        "Cannot find the native Koffi module"). Pins the order and the carve-out kwarg.
         """
         import sys
         from pathlib import Path
@@ -810,13 +797,9 @@ class TestProbeTempContainment:
     ) -> None:
         """SECURITY: the probe is the SIBLING site of the cron tool bridge.
 
-        Both apply a config-declared ``env`` to a child they spawn themselves, but
-        only ``cron_script`` had a ``KIROCREW_*`` deny (``_CRON_ENV_DENY``, via
-        ``KIROCREW_OWNER_ID``) -- the probe applied none. Putting the
-        reserved-namespace deny in the shared sanitizer rather than in the cron
-        deny-set is what covers this path too, so this test is the reason for that
-        placement. A gateway-authored value must still be INHERITED: the probe
-        builds its env from ``dict(os.environ)`` and only the OVERRIDE is refused.
+        Both apply a config-declared ``env`` to their own child, so the ``KIROCREW_*``
+        deny lives in the shared sanitizer, not the cron deny-set. A gateway-authored
+        value from ``dict(os.environ)`` is still inherited; only the override is refused.
         """
         import sys
 
@@ -875,11 +858,8 @@ class TestProbeTempContainment:
 class TestProbeSandboxUnavailable:
     """A probe that could not RUN must not be reported as a broken server.
 
-    kiro-cli launches MCP servers from the agent config without going through
-    this probe, so on a host with no sandbox backend (any Windows host, macOS
-    >= 26) the servers work while the probe cannot spawn them. Reporting that as
-    an ordinary server fault renders every row red with "0 tools" and sends the
-    user debugging a server that is fine.
+    kiro-cli launches servers without this probe, so on a host with no sandbox
+    backend (Windows, macOS >= 26) the servers work while the probe cannot spawn them.
     """
 
     @pytest.mark.asyncio
@@ -915,11 +895,9 @@ class TestProbeSandboxUnavailable:
     async def test_a_managed_server_is_still_spawned_when_the_sandbox_works(self) -> None:
         """The spawn is the only thing that proves the server can START.
 
-        `_fix_stale_managed_command` exists because the managed invocation does go
-        stale ("command not found: kirocrew; the built-in cron/core tools then never
-        load"), and the probe was the one surface that caught it. Short-circuiting
-        on the server name would report `ok` for a managed server that cannot run —
-        silently changing what `ok` means in the shared `_cache_probe` store.
+        The managed invocation can go stale ("command not found: kirocrew"), and only
+        the probe catches it; skipping by server name would cache `ok` for a server
+        that cannot run.
         """
         spawned: dict[str, bool] = {}
 
@@ -1209,6 +1187,7 @@ class TestProbeRefusesSecretReferences:
             raise AssertionError("probe spawned a server holding a secret:// reference")
 
         monkeypatch.setattr("kiro_crew.mcp_discovery._probe_on_private_loop", _no_spawn)
+        monkeypatch.setattr("kiro_crew.mcp_discovery_probe._served_by_gateway", lambda _n: False)
         server = McpServerInfo(
             name="srv", command="srv-mcp", env={"API_TOKEN": "secret://NAME", "MODE": "x"}
         )
@@ -1222,3 +1201,66 @@ class TestProbeRefusesSecretReferences:
         assert out.status == "outdated"
         assert "API_TOKEN" in out.error
         assert "NAME" not in out.error.replace("API_TOKEN", "")
+
+    @pytest.mark.asyncio
+    async def test_server_the_gateway_serves_reports_routed(self, monkeypatch) -> None:
+        """A ``secret://`` server the running gateway starts is not told
+        to route itself through the gateway. Its row says it is routed, with no
+        not-probed reason (the dashboard hangs the routing guide off that
+        reason) and no health verdict, and nothing is spawned or cached."""
+
+        def _no_spawn(*_a, **_kw):
+            raise AssertionError("probe spawned a server holding a secret:// reference")
+
+        def _no_cache(*_a, **_kw):
+            raise AssertionError("a routed row carries no probe result to cache")
+
+        monkeypatch.setattr("kiro_crew.mcp_discovery._probe_on_private_loop", _no_spawn)
+        monkeypatch.setattr("kiro_crew.mcp_discovery._cache_probe", _no_cache)
+        monkeypatch.setattr(
+            "kiro_crew.agent_materialization.mcp_sources._gateway_routed_names",
+            lambda: frozenset({"srv"}),
+        )
+        server = McpServerInfo(name="srv", command="srv-mcp", env={"API_TOKEN": "secret://NAME"})
+        out = await probe_server(server)
+        from kiro_crew.mcp_quarantine import FAILING_STATUSES
+
+        assert out.status == "routed"
+        assert out.error == ""
+        assert out.status not in FAILING_STATUSES and out.status != "ok"
+
+    @pytest.mark.asyncio
+    async def test_server_the_gateway_does_not_serve_keeps_the_refusal(self, monkeypatch) -> None:
+        """Another server being routed does not make this one routed."""
+        monkeypatch.setattr(
+            "kiro_crew.agent_materialization.mcp_sources._gateway_routed_names",
+            lambda: frozenset({"other"}),
+        )
+        server = McpServerInfo(name="srv", command="srv-mcp", env={"API_TOKEN": "secret://NAME"})
+        out = await probe_server(server)
+        assert out.status == "outdated"
+        assert "API_TOKEN" in out.error
+
+    def test_routing_matches_the_alias_like_the_rebuild(self, monkeypatch) -> None:
+        """The routing list may hold the raw name while the row uses the alias."""
+        from kiro_crew.mcp_discovery_probe import _served_by_gateway
+        from kiro_crew.mcp_gateway.secret_uri import mcp_server_alias
+
+        monkeypatch.setattr(
+            "kiro_crew.agent_materialization.mcp_sources._gateway_routed_names",
+            lambda: frozenset({"npm:@acme/mcp"}),
+        )
+        assert _served_by_gateway(mcp_server_alias("npm:@acme/mcp"))
+        assert not _served_by_gateway("unrelated")
+
+    def test_unreadable_routing_answers_not_routed(self, monkeypatch) -> None:
+        """Cannot tell means the refusal row and its routing guidance stay."""
+        from kiro_crew.mcp_discovery_probe import _served_by_gateway
+
+        def _boom() -> frozenset[str]:
+            raise RuntimeError("overlay unreadable")
+
+        monkeypatch.setattr(
+            "kiro_crew.agent_materialization.mcp_sources._gateway_routed_names", _boom
+        )
+        assert _served_by_gateway("srv") is False

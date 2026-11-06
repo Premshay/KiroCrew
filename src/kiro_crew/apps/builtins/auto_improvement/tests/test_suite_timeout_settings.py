@@ -17,7 +17,7 @@ def test_invalid_suite_timeout_refused(value):
         gp.normalize_measurement_config({"suiteTimeoutSeconds": value})
 
 
-def test_default_and_independent_regression_timeout(tmp_path):
+def test_default_and_independent_regression_timeout(tmp_path, monkeypatch):
     defaults = gp.normalize_measurement_config({})
     assert defaults["suiteTimeoutSeconds"] == 900
     profile = gp.GitHubRepoProfile(
@@ -25,12 +25,14 @@ def test_default_and_independent_regression_timeout(tmp_path):
         pr_queue_dir=tmp_path / "queue",
         suite_timeout_s=2400,
         full_regression_timeout_s=3600,
-    )
+    )  # flake-ok: Pins a workload-budget contract with a mocked executor, not a wait barrier.
     assert profile.full_regression_timeout_s == 3600
     assert profile.ruler.measurement_constants["suiteTimeoutSeconds"] == "2400.0"
     run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
-    profile.environment.run = run
-    assert profile.full_regression(timeout=3500)
+    monkeypatch.setattr(profile.environment, "run", run)
+    assert profile.full_regression(
+        timeout=3500
+    )  # flake-ok: Pins a workload-budget contract with a mocked executor, not a wait barrier.
     assert run.call_args.kwargs["timeout"] == 3500
 
 
@@ -72,7 +74,7 @@ def test_routine_deadline_reaches_executor(tmp_path, monkeypatch, operation):
         pr_queue_dir=tmp_path / "queue",
         suite_timeout_s=2400,
         benchmark_cmd="python -c pass" if operation == "benchmark" else "",
-    )
+    )  # flake-ok: Pins a workload-budget contract with a mocked executor, not a wait barrier.
     if operation == "build":
         assert profile.build_gate.build_and_test(worktree=tmp_path, src=tmp_path).passed
     elif operation == "suite":
@@ -93,7 +95,7 @@ def test_routine_deadline_reaches_executor(tmp_path, monkeypatch, operation):
 def test_check_reports_actual_step_and_total_durations(tmp_path, monkeypatch, fails):
     profile = gp.GitHubRepoProfile(
         clone_path=tmp_path, pr_queue_dir=tmp_path / "queue", suite_timeout_s=2400
-    )
+    )  # flake-ok: Pins a workload-budget contract with a mocked executor, not a wait barrier.
     clock = SimpleNamespace(value=0.0)
     monkeypatch.setattr(gp.time, "perf_counter", lambda: clock.value)
     calls = []
@@ -105,7 +107,7 @@ def test_check_reports_actual_step_and_total_durations(tmp_path, monkeypatch, fa
             raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
         return subprocess.CompletedProcess(argv, 0, "2 tests collected", "")
 
-    profile.environment.run = run
+    monkeypatch.setattr(profile.environment, "run", run)
     result = profile.check_environment()
     assert result["ok"] is not fails
     assert result["timings"] == {"interpreter": 2, "collection": 7}
@@ -120,7 +122,7 @@ def test_benchmark_check_reports_workload_duration(tmp_path, monkeypatch):
         pr_queue_dir=tmp_path / "queue",
         benchmark_cmd="python -c pass",
         suite_timeout_s=2400,
-    )
+    )  # flake-ok: Pins a workload-budget contract with a mocked executor, not a wait barrier.
     clock = SimpleNamespace(value=0.0)
     monkeypatch.setattr(gp.time, "perf_counter", lambda: clock.value)
 
@@ -128,7 +130,7 @@ def test_benchmark_check_reports_workload_duration(tmp_path, monkeypatch):
         clock.value += 4
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    profile.environment.run = run
+    monkeypatch.setattr(profile.environment, "run", run)
     result = profile.check_environment()
     assert result["ok"]
     assert result["timings"] == {"interpreter": 4, "benchmark": 4}

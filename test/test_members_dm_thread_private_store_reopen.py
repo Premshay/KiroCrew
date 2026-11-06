@@ -197,8 +197,7 @@ async def test_reopen_bound_private_thread_preserves_active_turn(
         finally:
             release.set()
             if task is not None:
-                # flake-ok: awaits the stand-in turn release.set() just released; moved verbatim
-                await task
+                await await_until(task, what="the running turn task")
             slot.task = None
 
 
@@ -536,6 +535,7 @@ async def test_private_thread_reopen_rechecks_running_after_assignment(
         session_key = f"dashboard:{slot.key}"
         pinned = asyncio.Event()
         release_pin = asyncio.Event()
+        release_turn = asyncio.Event()
         real_pin = members.pin_private_agent_store
 
         async def gated_pin(*args, **kwargs):
@@ -543,8 +543,7 @@ async def test_private_thread_reopen_rechecks_running_after_assignment(
             # assignment has been made and before the route acts on it.
             result = await real_pin(*args, **kwargs)
             pinned.set()
-            # flake-ok: parks until the test sets release_pin, in its body and in finally; moved verbatim
-            await release_pin.wait()
+            await await_until(release_pin, what="the test releasing the gated assignment")
             return result
 
         monkeypatch.setattr(members, "pin_private_agent_store", gated_pin)
@@ -557,8 +556,11 @@ async def test_private_thread_reopen_rechecks_running_after_assignment(
             reopen = asyncio.create_task(client.post(f"/api/members/{CREW}/thread"))
             await await_until(pinned, what="the opener reaching the gated assignment")
             assert not reopen.done(), "opener did not reach the gated assignment"
-            # The turn dispatch this route cannot lock out.
-            turn = asyncio.create_task(release_pin.wait())
+            # The turn dispatch this route cannot lock out. The turn stays in
+            # flight until the finally block releases it, so the route's check
+            # after the assignment reads a running turn however the loop
+            # orders the pin's wake-up and the turn's.
+            turn = asyncio.create_task(release_turn.wait())
             slot.task = turn
             assert slot.running
             if fault == "store_rebound":
@@ -583,6 +585,7 @@ async def test_private_thread_reopen_rechecks_running_after_assignment(
                 assert body == opened
         finally:
             release_pin.set()
+            release_turn.set()
             if reopen is not None:
                 await await_until(
                     asyncio.gather(reopen, return_exceptions=True), what="the reopen task"
@@ -647,7 +650,6 @@ async def test_fresh_private_thread_pin_failure_leaves_no_ghost_slot(tmp_path, m
     await asyncio.to_thread(configure)
     state = _make_state(tmp_path)
 
-    # Record the slot keys visible at each push_slots_update call.
     broadcast_snapshots: list[list[str]] = []
 
     _real_push = state.push_slots_update
@@ -670,7 +672,6 @@ async def test_fresh_private_thread_pin_failure_leaves_no_ghost_slot(tmp_path, m
         body = await resp.json()
 
     if fault == "pin_raises":
-        # The route returns 503 (store_unavailable).
         assert resp.status == 503, body
         assert body.get("code") == "store_unavailable"
     else:
@@ -682,7 +683,6 @@ async def test_fresh_private_thread_pin_failure_leaves_no_ghost_slot(tmp_path, m
     # pin runs before get_or_create_slot, so no slot is created on a refusal.
     lingering = [k for k in state._slots if k.startswith("member-")]
     assert not lingering, f"ghost slot(s) in _slots after refused open: {lingering}"
-    # No member slot reached any broadcast.
     ghost_broadcasts = [
         snap for snap in broadcast_snapshots if any(k.startswith("member-") for k in snap)
     ]

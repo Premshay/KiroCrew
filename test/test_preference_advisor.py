@@ -71,7 +71,7 @@ class TestPreferenceAdvisor:
         assert json.loads(preference_advice("preference_advice", args))["advisory"] is True
         post.assert_called_once_with(
             "/api/preference-consult", args, session_key="dashboard:s", timeout=5
-        )
+        )  # flake-ok: Checks a recorded timeout argument on a mock; no real wait occurs.
 
     @pytest.mark.asyncio
     async def test_slotless_preview_does_not_create_slot_or_feedback_token(self, setup):
@@ -371,7 +371,9 @@ class TestPreferenceAdvisor:
             return await original(function, *args)
 
         monkeypatch.setattr(handler.asyncio, "to_thread", blocked)
-        monkeypatch.setattr(handler, "_COMPUTE_SECONDS", 0.02)
+        monkeypatch.setattr(
+            handler, "_COMPUTE_SECONDS", 0.02
+        )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
         pending = asyncio.create_task(handler.api_preference_advice(request))
         try:
             await await_until(entered, what="preference scoring entering its worker")

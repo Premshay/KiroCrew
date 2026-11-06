@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from kiro_crew import asset_downloader
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.embeddings_model import (
     _sha256_file,
     default_model_path,
@@ -167,10 +168,10 @@ class ModelDownloadManager:
         ``KIROCREW_SKIP_MODEL_DOWNLOAD=1`` escape hatch is set — test runs
         must never trigger a 610MB model download.
         """
-        if self.model_ready():
+        if await asyncio.to_thread(self.model_ready):
             self.status = {"step": "ready", "error": "", "attempt": 0}
             return True
-        if embedding_model_is_custom():
+        if await asyncio.to_thread(embedding_model_is_custom):
             # Reached via the dashboard's Enable/Retry click. Downloading the
             # bundled model here would install a second model the embedder is
             # not using, and would imply the custom one had been replaced.
@@ -185,7 +186,7 @@ class ModelDownloadManager:
             self._lock = asyncio.Lock()
         async with self._lock:
             # Re-check under the lock: a concurrent caller may have finished it.
-            if self.model_ready():
+            if await asyncio.to_thread(self.model_ready):
                 self.status = {"step": "ready", "error": "", "attempt": 0}
                 return True
             last_error = "download failed"
@@ -261,7 +262,7 @@ class ModelDownloadManager:
             else:
                 # Cross-filesystem safe: shutil.move copies when rename fails.
                 shutil.move(str(src), str(staging))
-            os.replace(staging, self._target)
+            replace_with_retry(staging, self._target)
         finally:
             staging.unlink(missing_ok=True)
 

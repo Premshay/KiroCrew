@@ -57,8 +57,7 @@ class TestSessionSlotRecovery:
     """
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in this module calls monkeypatch.undo()
-    def _persisted_history_dir_tracks_patched_home(self, monkeypatch):
+    def _persisted_history_dir_tracks_patched_home(self, _floor_monkeypatch):
         """Point ``_shared.config_dir()`` at ``<patched home>/.kirocrew``.
 
         The data home moved from ``~/.kirocrew`` to ``~/.kiro/crew``
@@ -71,7 +70,7 @@ class TestSessionSlotRecovery:
         ``Path.home`` patch) to keep the seeded layout authoritative. Applied
         first so a test's own patches still win.
         """
-        monkeypatch.setattr(
+        _floor_monkeypatch.setattr(
             "kiro_crew.dashboard.handlers._shared.config_dir",
             lambda: Path.home() / ".kirocrew",
         )
@@ -940,11 +939,10 @@ class TestLessonsDeleteGate:
     """
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in this module calls monkeypatch.undo()
-    def _persisted_history_dir_tracks_patched_home(self, monkeypatch):
+    def _persisted_history_dir_tracks_patched_home(self, _floor_monkeypatch):
         """Same redirect as TestSessionSlotRecovery: keep the seeded
         ``<home>/.kirocrew/sessions`` layout authoritative for the probe."""
-        monkeypatch.setattr(
+        _floor_monkeypatch.setattr(
             "kiro_crew.dashboard.handlers._shared.config_dir",
             lambda: Path.home() / ".kirocrew",
         )
@@ -1018,7 +1016,7 @@ class TestLessonsDeleteGate:
                 headers={"X-Session-Key": "dashboard:ui"},
             )
             assert resp.status == 200
-        state.lessons.remove.assert_called_once_with("x", None, exact=False)
+        state.lessons.remove.assert_called_once_with("x", None, exact=False, keep_one=False)
 
     @pytest.mark.asyncio
     async def test_delete_allowed_for_live_persistent_slot(self, tmp_path, monkeypatch):
@@ -1265,9 +1263,8 @@ class TestMemoryRoutesSessionGate:
     """
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in this module calls monkeypatch.undo()
-    def _persisted_history_dir_tracks_patched_home(self, monkeypatch):
-        monkeypatch.setattr(
+    def _persisted_history_dir_tracks_patched_home(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr(
             "kiro_crew.dashboard.handlers._shared.config_dir",
             lambda: Path.home() / ".kirocrew",
         )

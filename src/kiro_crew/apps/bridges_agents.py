@@ -34,7 +34,7 @@ from kiro_crew.apps.manifest import (
     contained_in_screened_root,
     screen_app_path,
 )
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry
 from kiro_crew.config.loader import (
     publish_materialized_agents,
     schedule_materialized_agents_refresh,
@@ -68,7 +68,7 @@ def _agent_mcp_policy(app_name: str) -> dict[str, Any]:
     path = app_dir(app_name) / "data" / AGENT_MCP_POLICY_FILE
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, OSError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -394,6 +394,115 @@ def _apply_agent_mcp_policy(
     return agent_data
 
 
+def _enforce_declared_mcp_tools(
+    agent_data: dict[str, Any], manifest: AppManifest
+) -> dict[str, Any]:
+    """Make ``permissions.mcpTools`` actually scope an app agent's managed tools.
+
+    The manifest field was validated at install and shown on the details page, but
+    nothing narrowed what the app's own agent (and its cron sessions, which run on
+    this same materialized spec) could call: the gateway mounts its managed servers
+    into every agent regardless, so an app declaring a short ``mcpTools`` still had
+    the full ``kirocrew-core`` / ``kirocrew-cron`` / ``kirocrew-dashboard`` surface.
+
+    This turns the declaration into enforcement through the mechanism that already
+    gates managed tools per agent: every managed tool the app did NOT declare is
+    added to this agent's ``managedToolPolicy.exclude``, which the managed servers
+    read per session (``GET /api/session-tool-policy``) and use to hide and refuse
+    those tools. The exclusion is UNIONED with any exclude the app's own agent spec
+    authored, so an app that already hand-excludes a managed tool keeps it.
+
+    A no-op when the app declares no ``mcpTools`` (empty = unrestricted, matching
+    :func:`~kiro_crew.apps.permissions.check_tool_permission`), and it never touches
+    the app's own server tools or the agent's base built-ins -- only host-managed
+    tool names are candidates. ``exclude`` and ``excludeServers`` are the only keys
+    written; a present ``include`` or ``honourToolRefs`` in the agent's policy is
+    preserved. A malformed authored ``managedToolPolicy``, ``exclude`` or
+    ``excludeServers`` is returned untouched so the session gate keeps refusing it
+    as ``policy_unreadable``.
+
+    A managed server whose tool declaration could not be read is written to
+    ``excludeServers``, which withholds that server's tools WHOLE: its names are
+    unknown, so the name-based ``exclude`` cannot cover it, and leaving it out
+    would leave every tool on it reachable.
+    """
+    from kiro_crew.apps.permissions import managed_tool_exclusion
+
+    excluded, withheld_servers = managed_tool_exclusion(manifest)
+    if not excluded and not withheld_servers:
+        return agent_data
+
+    if "managedToolPolicy" in agent_data and not isinstance(agent_data["managedToolPolicy"], dict):
+        # A malformed authored policy (an explicit null included) is left exactly
+        # as written: the per-session gate refuses every managed tool with
+        # ``policy_unreadable`` for it, which is stricter than any exclusion derived
+        # here. Rewriting it into a valid policy would turn that fail-closed
+        # refusal into a narrower allow.
+        return agent_data
+    policy = dict(agent_data.get("managedToolPolicy", {}))
+    for key in ("exclude", "excludeServers"):
+        if key in policy and (
+            not isinstance(policy[key], list) or not all(isinstance(t, str) for t in policy[key])
+        ):
+            return agent_data
+    if excluded:
+        policy["exclude"] = sorted(set(policy.get("exclude", [])) | set(excluded))
+    if withheld_servers:
+        policy["excludeServers"] = sorted(
+            set(policy.get("excludeServers", [])) | set(withheld_servers)
+        )
+
+    merged = dict(agent_data)
+    merged["managedToolPolicy"] = policy
+    return merged
+
+
+#: Most tool names one ``app_mcp_tools_restricted`` event lists by name; the rest
+#: are counted, so the event stays bounded however large the managed surface grows.
+_AUDIT_TOOL_NAMES_MAX = 20
+
+
+def _audit_declared_mcp_tools(
+    app_name: str, agent_name: str, manifest: AppManifest, written: dict[str, Any]
+) -> None:
+    """Record, in SEL, the managed-tool restriction an app agent was materialized with.
+
+    Turning ``permissions.mcpTools`` into ``managedToolPolicy`` is a permission
+    decision, so it gets one bounded audit event per written agent: the app, the
+    agent, how many managed tools and which whole servers its spec withholds, and
+    the first :data:`_AUDIT_TOOL_NAMES_MAX` tool names. Silent for an app that
+    declares no ``mcpTools`` (nothing is derived) and for a policy the derivation
+    left untouched because it was malformed. Never fails the write it follows.
+    """
+    if not manifest.permissions.mcpTools:
+        return
+    policy = written.get("managedToolPolicy")
+    if not isinstance(policy, dict):
+        return
+    tools = policy.get("exclude", [])
+    servers = policy.get("excludeServers", [])
+    if not isinstance(tools, list) or not isinstance(servers, list):
+        return
+    if not tools and not servers:
+        return
+    shown = ", ".join(str(t) for t in tools[:_AUDIT_TOOL_NAMES_MAX])
+    more = len(tools) - _AUDIT_TOOL_NAMES_MAX
+    try:
+        sel().log_api_access(
+            caller="system",
+            operation="app_mcp_tools_restricted",
+            outcome="ok",
+            source="app_agent_materialization",
+            resources=(
+                f"app {app_name} agent {agent_name}: {len(tools)} managed tool(s) "
+                f"excluded [{shown}{f', +{more} more' if more > 0 else ''}]; "
+                f"server(s) withheld whole: [{', '.join(str(s) for s in servers)}]"
+            ),
+        )
+    except Exception:  # noqa: BLE001 — audit must not break materialization
+        logger.debug("SEL audit unavailable for mcpTools restriction", exc_info=True)
+
+
 def _own_mcp_servers(app_name: str) -> dict[str, Any]:
     """The app's OWN registered MCP servers, keyed as ``<app>:<server>``.
 
@@ -538,8 +647,8 @@ _FRAMEWORK_OWNED_AGENT_KEYS = frozenset(
 def _read_agent_config(path: Path) -> dict[str, Any] | None:
     """The agent JSON currently on disk, or None when there is nothing usable."""
     try:
-        data = loads_user_json(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = loads_user_json(read_bytes_with_retry(path).decode("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -609,8 +718,9 @@ def _preserve_user_agent_edits(
 #: can move, or a dependency resolved from the installed Python package — cannot
 #: express it in the packaged file at all.
 #:
-#: `pptx-maker` is that case: its MCP server lives under the provisioned engine root
-#: and is launched with `uv`, neither of which has a fixed location.
+#: Such a builtin ships an ``agent_placeholders`` submodule whose
+#: ``placeholder_values()`` computes them (an MCP server under a provisioned engine
+#: root, launched with a ``uv`` resolved per host, has no fixed location).
 
 
 _TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{[A-Z][A-Z0-9_]*\}")
@@ -625,40 +735,43 @@ _RENDERED_AGENTS_DIRNAME = "rendered-agents"
 def _placeholder_values(app_name: str) -> dict[str, str]:
     """Trusted substitutions for *app_name*'s agent templates, or ``{}``.
 
-    Every value is COMPUTED HERE, in the gateway, from the data home and the installed
+    Every value is COMPUTED in the gateway process, by the builtin's own shipped
+    ``agent_placeholders.placeholder_values()``, from the data home and the installed
     Python package — the same way the app's own provisioner computes them. Nothing is
     read back from disk, so there is nothing for an attacker with write access to the
-    engine directory to influence.
+    engine directory to influence. Only a package in ``BUILTIN_NAMES`` is consulted, so
+    the code that computes them is shipped package code, never an installed app's.
 
-    An unknown app gets ``{}``, which leaves its template unrendered and therefore
-    unregistered (see :func:`_render_shipped_agent`) — fail-closed, so adding a
-    placeholder to a new app's config is inert until its values are named here.
+    An app with no such module gets ``{}``, which leaves its template unrendered and
+    therefore unregistered (see :func:`_render_shipped_agent`) — fail-closed, so adding
+    a placeholder to a new app's config is inert until its package computes the value.
+    A result that is not a ``{"{NAME}": str}`` mapping is refused whole the same way.
     """
-    if app_name != "pptx-maker":
+    import importlib
+
+    from kiro_crew.apps import builtins
+
+    package = app_name.replace("-", "_")
+    if package not in builtins.BUILTIN_NAMES:
+        return {}
+    # Looked for on disk first: a builtin with no placeholders is never imported here.
+    if not (Path(builtins.__file__).parent / package / "agent_placeholders.py").is_file():
         return {}
     # Imported lazily and defensively: this is a builtin's own module, and a
     # registration path must not fail because one app's package is unimportable.
     try:
-        from kiro_crew.apps.builtins.pptx_maker.backend import paths as pptx_paths
-        from kiro_crew.apps.builtins.pptx_maker.backend import provision as pptx_provision
+        module = importlib.import_module(f"{builtins.__name__}.{package}.agent_placeholders")
+        values = module.placeholder_values()
     except Exception:  # pragma: no cover - defensive
         logger.warning("App %s: cannot resolve placeholder values", app_name)
         return {}
-    uv_bin = pptx_provision.resolve_uv()
-    if not uv_bin:
+    if not isinstance(values, dict) or not all(
+        isinstance(k, str) and _TEMPLATE_PLACEHOLDER_RE.fullmatch(k) and isinstance(v, str)
+        for k, v in values.items()
+    ):
+        logger.warning("App %s: placeholder values are malformed, none applied", app_name)
         return {}
-    return {
-        "{UV_BIN}": uv_bin,
-        "{ENGINE_ROOT}": str(pptx_paths.engine_root()),
-        "{ENGINE_MCP_DIR}": str(pptx_paths.engine_mcp_dir()),
-        "{APP_PROMPTS}": str(app_dir(app_name) / "prompts"),
-        # The engine invokes `pdftoppm`/`soffice` BY NAME from inside its MCP
-        # server, which kiro-cli spawns from this config — not from any gateway
-        # subprocess. So the app's managed tool dir has to be on the PATH declared
-        # here or the managed install is invisible at the one moment it matters.
-        # Appended, so a real system poppler still wins the engine's own lookup.
-        "{TOOLS_PATH}": pptx_provision.mcp_tools_path(),
-    }
+    return values
 
 
 def _render_shipped_agent(
@@ -676,17 +789,15 @@ def _render_shipped_agent(
     identically forever, so reporting them to a caller that retries would spin without
     ever converging. The ``OSError`` arm is the transient one.
 
-    **The gateway renders the template itself.** An earlier version of this took the
-    app's own provisioned copy from its install dir and verified it was "the template
-    with only placeholders substituted". A reviewer pointed out why that is unsound and
-    they were right: the check constrained WHERE a substitution could appear but not
-    WHAT it could contain, and `{UV_BIN}` is an executable path — so an agent with
-    write access to the engine dir could substitute its own binary and kiro-cli would
-    run it. Constraining the shape of an injection point is not the same as trusting
-    the value that lands in it.
+    **The gateway renders the template itself.** Verifying the app's own provisioned
+    copy as "the template with only placeholders substituted" is unsound: that check
+    constrains WHERE a substitution can appear but not WHAT it can contain, and
+    `{UV_BIN}` is an executable path — so an agent with write access to the engine
+    dir could substitute its own binary and kiro-cli would run it. Constraining the
+    shape of an injection point is not the same as trusting the value that lands in it.
     Since every value is computable here (:func:`_placeholder_values`), there is no
     reason to read any of them back from a directory the agent can write. Nothing on
-    the mutable side is trusted now — the bytes come from the immutable package, the
+    the mutable side is trusted — the bytes come from the immutable package, the
     values from the gateway.
 
     The output goes under the DATA HOME next to the agent symlinks, not into the app's
@@ -694,7 +805,8 @@ def _render_shipped_agent(
     """
     try:
         template = agent_path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Unrendered: the caller's own read of this path reports the failure.
         return agent_path
     if not _TEMPLATE_PLACEHOLDER_RE.search(template):
         return agent_path
@@ -811,7 +923,7 @@ def _register_agents(
             # Read agent JSON to get the agent name
             try:
                 agent_data = json.loads(agent_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError) as exc:
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
                 logger.warning("App %s: unreadable agent %s: %s", app_name, agent_path, exc)
                 if isinstance(exc, OSError) and io_failures is not None:
                     io_failures.append(str(agent_path))  # transient; a malformed spec is not
@@ -878,6 +990,12 @@ def _register_agents(
                 # merge the reference dangles and the tool silently never mounts.
                 _materialize_managed_refs(agent_data)
                 merged = _apply_agent_mcp_policy(agent_data, agent_name, policy)
+                # Enforce permissions.mcpTools: withhold every host-managed tool the
+                # app did not declare via managedToolPolicy.exclude. BEFORE
+                # _preserve_user_agent_edits, which treats managedToolPolicy as
+                # framework-owned and refreshes it from `merged` — so the enforced
+                # value is the one carried across the refresh.
+                merged = _enforce_declared_mcp_tools(merged, manifest)
                 merged = _apply_agent_prompt(merged, agent_name, policy, app_name, app_root)
                 merged = _preserve_user_agent_edits(link_name, prior_on_disk, merged)
                 # LAST governance pass, on the map that is about to be written. By this
@@ -930,6 +1048,7 @@ def _register_agents(
                     if _agent._declined_foreign_spec_write(link_path):
                         continue
                     atomic_write(link_path, json.dumps(merged, indent=2) + "\n")
+                _audit_declared_mcp_tools(app_name, agent_name, manifest, merged)
                 registered.append(_namespace(app_name, agent_name))
                 # The DECLARED name only — kiro-cli enumerates agents by their
                 # `name` field, so the namespaced filename stem is not a name it

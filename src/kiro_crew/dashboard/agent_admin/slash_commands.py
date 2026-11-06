@@ -12,6 +12,7 @@ if TYPE_CHECKING:
         _DASHBOARD_COMMANDS,
         _MAX_COMMAND_DESCRIPTION_CHARS,
         _SLASH_COMMANDS,
+        ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
         SLASH_COMMAND_DESCRIPTIONS,
         DashboardState,
         KiroCrewConfig,
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
         capabilities_for,
         capabilities_of,
         is_claude_code,
+        local_harness_menu,
     )
 
 
@@ -92,7 +94,10 @@ async def api_slash_commands(request: web.Request) -> web.Response:
     state: DashboardState | None = request.app.get("state")
 
     result = _advertised_commands(state, request.query.get("slot"), blocked_commands)
-    if not result and is_claude_code(cfg.agent.provider):
+    if not result and (
+        capabilities_for(cfg.agent.acp_backend).runs_own_slash_commands
+        or is_claude_code(cfg.agent.provider)
+    ):
         # Cold start: no session has handshaked yet, so nothing has been
         # advertised. These are the SDK-supported commands every Claude Code
         # session carries.
@@ -106,6 +111,7 @@ async def api_slash_commands(request: web.Request) -> web.Response:
                 "init",
                 "review",
                 "security-review",
+                "todos",
                 "usage",
             )
             if f"/{c}" not in blocked_commands
@@ -115,7 +121,7 @@ async def api_slash_commands(request: web.Request) -> web.Response:
         advertised = {c["name"] for c in result}
         result.extend(
             {"name": name, "description": SLASH_COMMAND_DESCRIPTIONS.get(name, "")}
-            for name in _DASHBOARD_COMMANDS
+            for name in (*_DASHBOARD_COMMANDS, "/agent")
             if name not in advertised
         )
         return web.json_response(result)
@@ -124,9 +130,9 @@ async def api_slash_commands(request: web.Request) -> web.Response:
     # explicit "not available in the dashboard" rejection in chat_runner), but
     # the suggestion payload must not advertise them: a menu entry that only
     # ever produces a warning is an inert affordance.
+    offered = _SLASH_COMMANDS - blocked_commands
+    if cfg.agent.acp_backend in ACP_BACKENDS_LOCAL_HARNESS_COMMANDS:
+        offered = offered & local_harness_menu(cfg.agent.acp_backend)
     return web.json_response(
-        [
-            {"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")}
-            for c in sorted(_SLASH_COMMANDS - blocked_commands)
-        ]
+        [{"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")} for c in sorted(offered)]
     )

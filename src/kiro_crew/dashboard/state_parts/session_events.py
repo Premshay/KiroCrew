@@ -37,6 +37,7 @@ from kiro_crew.messaging.renderer import display_safe
 from kiro_crew.session_compaction import (
     COMPACT_OUTCOME_CANCELLED,
     COMPACT_OUTCOME_COMPACTED,
+    COMPACT_OUTCOME_COMPACTED_IDLE,
     COMPACT_OUTCOME_RECYCLED,
     COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE,
     COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS,
@@ -119,6 +120,21 @@ def _record_crew_log_class(state: Any, slot: Any) -> None:
 
 
 _AUTO_COMPACT_NOTICE = "🔄 Auto-compacted at {pct:.0f}%."
+
+
+#: ``session.idle_compaction`` compacted a quiet chat. Says so, because the user who
+#: returns sees the context meter dropped with no turn of theirs to explain it.
+_AUTO_COMPACT_IDLE_NOTICE = (
+    "🔄 Compacted at {pct:.0f}% while this chat was idle, before its prompt cache expired."
+)
+
+
+#: A failed idle compaction, or one that reported no status. The session is kept
+#: and only the cooldown is armed, so the threshold failure notice's retry advice
+#: does not apply to it.
+_AUTO_COMPACT_IDLE_FAILED_NOTICE = (
+    "⚠ Compaction while this chat was idle didn't succeed; nothing was changed."
+)
 
 
 #: The notice for the arm that REPLACES the session instead of summarizing it. A
@@ -320,12 +336,16 @@ def wire_session_compact_callback(self: DashboardState) -> None:
             template = _AUTO_COMPACT_WAITING_NOTICE
         elif outcome == COMPACT_OUTCOME_CANCELLED:
             template = _AUTO_COMPACT_CANCELLED_NOTICE
+        elif not success and outcome == COMPACT_OUTCOME_COMPACTED_IDLE:
+            template = _AUTO_COMPACT_IDLE_FAILED_NOTICE
         elif not success:
             template = _AUTO_COMPACT_FAILED_NOTICE
         elif outcome == COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE:
             template = _AUTO_RESTART_UNCOMPACTABLE_NOTICE
         elif outcome == COMPACT_OUTCOME_RECYCLED:
             template = _AUTO_RECYCLE_NOTICE
+        elif outcome == COMPACT_OUTCOME_COMPACTED_IDLE:
+            template = _AUTO_COMPACT_IDLE_NOTICE
         else:
             template = _AUTO_COMPACT_NOTICE
         message = template.format(pct=pct)
@@ -440,6 +460,61 @@ def wire_session_bind_listener(self: DashboardState) -> None:
         self.note_crew_log_class(slot)
 
     self.sessions.set_bind_listener(_on_bind)
+
+
+def wire_session_release_listener(self: DashboardState) -> None:
+    """Land a waiting model pick when a turn lease on its session ends.
+
+    The picker defers a pick that arrives mid-turn, and ``session_set_model``
+    queues one for the target's next turn; both were landed only at a DASHBOARD
+    turn boundary. A turn a channel (Slack, Discord, Telegram, Teams) or a cron
+    run drives passes none, so the live session kept the old model while the
+    picker showed the new one. Every surface ends a turn with
+    ``SessionManager.release``, which is the one transport-neutral point this
+    observer hangs on: the channel-neutral messaging layer stays untouched.
+
+    The observer itself only filters and schedules. It runs synchronously inside
+    ``release``, possibly off the loop thread, so the landing hops to the loop
+    captured here at wire time, the same way the unbind notice does. Slots with
+    nothing waiting cost one attribute read each; most releases match none.
+    """
+    # circular import: session_control imports dashboard modules at module level.
+    from kiro_crew.dashboard.session_control import (
+        channel_pick_waits_on,
+        landing_holds_lease,
+        schedule_channel_pick_landing,
+    )
+
+    loop = asyncio.get_event_loop()
+
+    def _land(key: str) -> None:
+        for slot in list(self._slots.values()):
+            if slot.running:
+                # The slot's own dashboard turn, reserved or running, lands its pick
+                # at its own boundary.
+                continue
+            try:
+                waits = channel_pick_waits_on(self, slot, key)
+            except Exception:
+                logger.debug("Model pick probe failed for slot %s", slot.key, exc_info=True)
+                continue
+            if waits:
+                schedule_channel_pick_landing(self, slot)
+
+    def _on_release(key: str) -> None:
+        if landing_holds_lease(key):
+            # The landing's own lease ending: that is not a turn boundary.
+            return
+        if not any(
+            s._deferred_model_switch_key or s._pending_model_pick is not None
+            for s in list(self._slots.values())
+        ):
+            return
+        if loop.is_closed():
+            return
+        loop.call_soon_threadsafe(_land, key)
+
+    self.sessions.on_session_released = _on_release
 
 
 def wire_session_unbind_listener(self: DashboardState) -> None:

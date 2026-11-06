@@ -41,6 +41,7 @@ from kiro_crew.agent_files import (
     SECURITY_CONDUCTOR_AGENT_FILENAME,
     WORKER_AGENT_FILENAME,
 )
+from kiro_crew.agent_materialization.worker_agent import worker_prompt
 from kiro_crew.agent_sdk.drivers.acp import derived_agent_permissions
 
 _INHERITED_PERMISSIONS = {"rules": [{"capability": "web_fetch", "effect": "deny"}]}
@@ -744,7 +745,7 @@ def test_a_refresh_restores_the_worker_prompt_and_description(
         json.dumps(_stale_worker_spec()), encoding="utf-8"
     )
     healed = worker_from_installed_default()
-    assert healed["prompt"] == agent._WORKER_SYSTEM_PROMPT
+    assert healed["prompt"] == worker_prompt()
     assert "reports status against that item" in healed["description"]
     assert healed["name"] == "kirocrew-worker"
 
@@ -1129,13 +1130,18 @@ def test_the_unassignable_set_is_derived_from_the_registry(monkeypatch):
     ``kirocrew-debug`` is withheld on the same derivation. Its host-wide views are
     gated in the route to the owner's own dashboard tab, so a worker would reach
     only refusals; granting it would spend the worker's context on tools that
-    cannot answer it."""
+    cannot answer it.
+
+    ``kirocrew-secrets`` is withheld on the same derivation. Its one tool sends a
+    request carrying an owner's stored credential and runs only from a member
+    conversation the owner approves it in, so a worker has no call it could make."""
     assert agent._worker_unassignable_servers() == frozenset(
         {
             "kirocrew-dashboard",
             "kirocrew-crew-log",
             "kirocrew-debug",
             "kirocrew-panel",
+            "kirocrew-secrets",
         }
     )
     monkeypatch.setitem(
@@ -1673,3 +1679,16 @@ def test_a_withheld_pattern_says_which_verbs_it_reached(tmp_path, monkeypatch):
     assert hits, f"no record names the withheld pattern: {records}"
     assert "reaches" in str(hits[0]["resources"])
     assert "cron_add" in str(hits[0]["resources"])
+
+
+def test_both_workers_carry_the_same_coding_rules() -> None:
+    """kirocrew-worker and a crewmate's worker read one text, so they cannot drift."""
+    from kiro_crew import crewmate_prompts
+    from kiro_crew.mate_worker import MATE_WORKER_PROMPT
+
+    rules = crewmate_prompts.text("worker.coding_rules")
+    assert "smallest complete change" in rules
+    assert "`shortcut: <the limit>, <when to upgrade>`" in rules
+    assert worker_prompt().startswith(agent._WORKER_SYSTEM_PROMPT.rstrip())
+    assert worker_prompt().rstrip().endswith(rules)
+    assert MATE_WORKER_PROMPT.endswith(rules)

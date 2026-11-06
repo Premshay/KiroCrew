@@ -413,7 +413,8 @@ describe('MarkdownPanel — selection copy', () => {
     sel.removeAllRanges()
     sel.addRange(range)
     fireEvent.mouseUp(document)
-    fireEvent.click(await screen.findByRole('button', { name: 'Copy' }))
+    const copyBtn = await screen.findByRole('button', { name: 'Copy' })
+    await act(async () => { fireEvent.click(copyBtn) })
     expect(copyToClipboard).toHaveBeenCalledWith('alpha')
   })
 })
@@ -832,7 +833,9 @@ describe('MarkdownPanel — live file watch', () => {
       liveWatch: true,
     }
     render(<MarkdownPanel embedded {...props} />, { wrapper })
-    await new Promise((resolve) => setTimeout(resolve, 20))
+    // The window is the panel's mount-time reads (the ⋯ menu's artifact and knowledge
+    // queries): wait until they have all settled, then look for a stream.
+    await waitFor(() => expect(qc.isFetching()).toBe(0))
     expect(streams.length).toBe(0)
   })
 })

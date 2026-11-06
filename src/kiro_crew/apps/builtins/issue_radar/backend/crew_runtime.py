@@ -228,17 +228,25 @@ def _read_or_refresh_deps(key: provider.RepoKey, scope) -> dict[str, Any] | None
     """The sweep's deps source: cache read, refreshed in place when absent/expired.
 
     Runs in a worker thread (the caller wraps it in ``asyncio.to_thread``).
-    GitHub-only, like the /deps route: other providers have no dependency fetch
-    yet, and for them this stays a plain cache read (normally None). A refresh
-    failure of any kind keeps whatever the cache held — stale beats wrong, and
-    an unknown reading can never fire the unlock (see ``detect_unblocks``).
+    GitHub-only by design: the crew sweep acts on GitHub issues alone (the PR's
+    "crew signals GitHub-only" non-goal), so a non-GitHub provider returns None
+    here — an unknown reading that ``detect_unblocks`` can never turn into a
+    spurious unlock. The GitLab deps cache is written by the /deps route for the
+    Graph tab's DISPLAY only; the sweep must not read it, because that cache can
+    legitimately be edgeless (an idle blocked issue past the /links fetch cap, or
+    one whose single /links call failed) and an edgeless graph reads as zero open
+    blockers — which would fire a false 1→0 unlock on a still-blocked issue. A
+    refresh failure keeps whatever the cache held — stale beats wrong, equally
+    unable to fire the unlock (see ``detect_unblocks``).
     """
+    if key.provider != "github":
+        return None
     cached = store.read_deps_cache(key.owner, key.repo, scope)
     fresh_enough = (
         isinstance(cached, dict)
         and (time.time() - float(cached.get("fetched_at") or 0)) < store.DEPS_CACHE_TTL_SEC
     )
-    if fresh_enough or key.provider != "github":
+    if fresh_enough:
         return cached
 
     # An ABSENT issues cache is unknown scope, not an empty repo: building the
@@ -646,7 +654,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.apps.builtins.issue_radar.backend.crew_runtime_supervision import (  # noqa: F401
         _CREW_SLOT_PREFIX,
+        _STAND_DOWN_REASONS,
         DISMISSED_PAUSE_REASON,
+        STOOD_DOWN_PAUSE_REASON,
         _crew_for_slot_key,
         _disabling,
         _is_crew_slot_key,
@@ -654,13 +664,17 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _note_revocation,
         _on_slot_close_undone,
         _on_slot_closed,
+        _pause_stood_down_crew,
         _reconcile_trust,
+        _retire_stood_down_loop,
         _revoke_generation,
+        _stood_down,
         _trust_inputs,
         _wake_crew_body,
         install_app_disable_hook,
         install_slot_close_hook,
         on_app_disabled,
+        refresh_crew_loop_message,
         revoke_crew_execution,
         revoke_crew_grants,
         suspend_crews,
@@ -676,6 +690,10 @@ if TYPE_CHECKING:  # names it serves from outside the owner family, from their h
     from kiro_crew.apps.teardown import (  # noqa: F401
         register_slot_close_hook,
         register_slot_close_undo_hook,
+    )
+    from kiro_crew.autonudge_service.model import (  # noqa: F401
+        CONSECUTIVE_FAILURE_REASON,
+        SESSION_START_FAILURE_REASON,
     )
     from kiro_crew.dashboard.chat_persistence import (  # noqa: F401
         rehydrate_slot_from_history_async,

@@ -308,6 +308,83 @@ class TestConfigSave:
         assert data["her_section"] == {"x": 1}
         assert data["computer_use"]["text_limit"] == 42
 
+    def test_limits_write_waits_for_a_concurrent_locked_writer(
+        self, config_file: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A limits save takes the ``config.json.lock`` sidecar.
+
+        A second writer holds ``update_config_locked`` after its read. Without the
+        sidecar, ``_write_limits`` lands at once and the holder's rename of its
+        older snapshot then reverts the limit. With it, the limits write waits and
+        both changes survive.
+
+        Ordered by events, not by sleeps: the holder keeps the lock until the
+        limits thread has either asked for the sidecar lock or finished without
+        asking.
+        """
+        import threading
+
+        from kiro_crew import platform_compat
+        from kiro_crew.config.loader import update_config_locked
+
+        config_file.write_text(
+            json.dumps({"unrelated_setting": "keep", "computer_use": {"max_tree_depth": 3}}),
+            encoding="utf-8",
+        )
+        holder_read = threading.Event()
+        # Set when the limits thread either asks for the sidecar lock or finishes.
+        limits_moved = threading.Event()
+        limits_done = threading.Event()
+        limits_done_while_held: list[bool] = []
+        errors: list[BaseException] = []
+        real_file_lock = platform_compat.file_lock
+
+        def _file_lock(*args, **kwargs):
+            if threading.current_thread().name == "limits":
+                limits_moved.set()
+            return real_file_lock(*args, **kwargs)
+
+        monkeypatch.setattr(platform_compat, "file_lock", _file_lock)
+
+        def _hold(data: dict) -> dict:
+            data["probe_holder"] = 1
+            holder_read.set()
+            limits_moved.wait(30)
+            limits_done_while_held.append(limits_done.is_set())
+            return data
+
+        def _run(fn, done: threading.Event | None = None) -> None:
+            try:
+                fn()
+            except BaseException as exc:  # surfaced by the assertion below
+                errors.append(exc)
+            finally:
+                if done is not None:
+                    done.set()
+                    limits_moved.set()
+
+        holder = threading.Thread(
+            target=_run, args=(lambda: update_config_locked(config_file, mutate=_hold),)
+        )
+        holder.start()
+        assert holder_read.wait(30)
+        limits = threading.Thread(
+            target=_run,
+            args=(lambda: cu_api._write_limits({"max_tree_depth": 7}), limits_done),
+            name="limits",
+        )
+        limits.start()
+        holder.join(30)
+        limits.join(30)
+        assert not holder.is_alive() and not limits.is_alive()
+        assert not errors
+        # The limits write must not finish while another writer holds the lock.
+        assert limits_done_while_held == [False]
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+        assert data["probe_holder"] == 1
+        assert data["unrelated_setting"] == "keep"
+        assert data["computer_use"]["max_tree_depth"] == 7
+
     @pytest.mark.asyncio
     async def test_app_lists_are_lowercased_and_deduped(self, state_file: Path):
         async with _client() as client:
@@ -947,3 +1024,49 @@ class TestErrorCodes:
             assert status == 400, payload
             assert isinstance(body.get("code"), str) and body["code"], payload
             assert isinstance(body.get("error"), str) and body["error"], payload
+
+
+# ── The capabilities.computer_use governance row ──
+
+
+class TestPolicyLock:
+    """A policy pinning ``capabilities.computer_use`` off: GET reports it, PUT 409s."""
+
+    @pytest.fixture
+    def pinned_off(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from kiro_crew.platform import context as pc
+        from kiro_crew.platform import governance_profiles
+        from kiro_crew.platform.governance import parse_policy
+
+        doc = {"version": 1, "boot": {}, "capabilities": {"computer_use": {"enabled": False}}}
+        ctx = SimpleNamespace(governance=parse_policy(doc))
+        monkeypatch.setattr(pc, "current_context", lambda: ctx)
+        monkeypatch.setattr(pc, "installed_context", lambda: ctx)
+        monkeypatch.setattr(governance_profiles, "resolve_active_scope", lambda *a, **k: None)
+
+    @pytest.mark.asyncio
+    async def test_get_reports_the_lock(self, state_file: Path, pinned_off):
+        state_file.write_text(json.dumps({STATE_KEY_ENABLED: True}), encoding="utf-8")
+        async with _client() as client:
+            body = await (await client.get("/api/computer-use/config")).json()
+        assert body["locked_by_policy"] is True
+        assert body["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_enable_is_refused_and_writes_nothing(
+        self, state_file: Path, mock_sel, pinned_off
+    ):
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+            body = await resp.json()
+        assert resp.status == 409
+        assert body["code"] == "locked_by_policy"
+        assert not state_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_no_policy_reports_no_lock(self, home):
+        async with _client() as client:
+            body = await (await client.get("/api/computer-use/config")).json()
+        assert body["locked_by_policy"] is False

@@ -520,6 +520,7 @@ async def test_every_owner_route_is_gated() -> None:
             ),
             ("POST", f"/api/arc-board/arcs/{MEMBER}/autonomy", {"autonomy": 2}),
             ("POST", f"/api/arc-board/arcs/{MEMBER}/note", {"text": "t"}),
+            ("POST", f"/api/arc-board/arcs/{MEMBER}/settings", {"repo": "o/r"}),
         ):
             if method == "GET":
                 response = await client.get(path, headers=headers)
@@ -770,3 +771,15 @@ async def test_a_refused_nudge_is_reported_not_raised(client: TestClient, monkey
     assert response.status == 200
     (lane,) = (await response.json())["lanes"]
     assert lane["nudge"] == "failed" and "already armed" in lane["nudge_error"]
+
+
+@pytest.mark.asyncio
+async def test_settings_set_repo_and_coordinator(client: TestClient) -> None:
+    arc = await _make_arc(client, members=[{"session_key": MEMBER, "role": "Baton"}])
+    url = f"/api/arc-board/arcs/{arc['id']}/settings"
+    body = await (await client.post(url, json={"repo": "o/r", "coordinator": MEMBER})).json()
+    assert (body["arc"]["repo"], body["arc"]["coordinator"]) == ("o/r", MEMBER)
+    assert (await client.post(url, json={"coordinator": PEER})).status == 400
+    assert (await client.post(url, json={"repo": "no repo"})).status == 400
+    body = await (await client.post(url, json={"coordinator": ""})).json()
+    assert body["arc"]["coordinator"] == "" and body["arc"]["repo"] == "o/r"

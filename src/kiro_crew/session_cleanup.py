@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.metrics.events import SESSION_RUNTIME_RECONCILE
 from kiro_crew.process_identity import (
     audit_kill_decision,
     audit_kill_phase,
@@ -29,6 +30,16 @@ from kiro_crew.process_identity import (
 )
 from kiro_crew.runtime_ownership import authorize_runtime_kill
 from kiro_crew.runtime_reconcile import build_reconciler
+from kiro_crew.session_background_hold import background_hold_secs, hold_expired_reason
+from kiro_crew.session_cleanup_probes import (
+    ActivePidCollector,
+    PeriodicPidSweep,
+    PidWriteback,
+    _no_attached_subagents,
+    _no_background_launch,
+    _no_pending_injection,
+)
+from kiro_crew.session_idle_clock import last_activity as _last_activity
 from kiro_crew.watchdog import SessionWatchdog
 
 if TYPE_CHECKING:
@@ -37,16 +48,6 @@ if TYPE_CHECKING:
 
 #: Caller name on this module's kill-decision audit rows.
 _SWEEP = "session_cleanup sweep"
-
-#: How long after a session's harness launched work that outlives the prompt
-#: the RSS recycle and the idle sweep still treat that session as busy. Claude
-#: Code runs a backgrounded command or a Workflow in the session's own process
-#: tree after the prompt returns, and reports the launch on the launching tool
-#: call; it reports nothing a client can read while that work runs, nor when it
-#: ends. So the hold is bounded by time: long enough for an ordinary workflow,
-#: short enough that a launch cannot exempt a runaway tree from the memory
-#: ceiling for the rest of the session's life.
-HARNESS_BACKGROUND_WORK_HOLD_SECS = 3600.0
 
 #: Hard ceiling multiplier on ``rss_max_mb`` that the hold cannot override.
 #: The hold's clock restarts on every launch, so an agent that keeps launching
@@ -145,44 +146,6 @@ class CleanupOwner(Protocol):
     def _companion_runtime_pids(self) -> set[int]: ...
 
 
-ActivePidCollector = Callable[
-    [MutableMapping[str, SessionEntry]],
-    tuple[set[int], bool],
-]
-PeriodicPidSweep = Callable[[int, set[int]], tuple[set[str], list[int]]]
-PidWriteback = Callable[[int, list[int], set[str]], int]
-
-
-def _no_attached_subagents(key: str) -> bool:
-    """Default sub-agent probe: a manager with no dashboard has no children."""
-    return False
-
-
-def _no_pending_injection(key: str) -> bool:
-    """Default injection probe: a manager with no gateway injects nothing."""
-    return False
-
-
-def _last_activity(session: SessionEntry) -> float:
-    """The later of the last dispatched turn and the backend's own last frame.
-
-    ``last_used`` moves only when a turn is dispatched. A backend woken by its
-    own background work, or a child still reporting to it, can work for an hour
-    without one, and the sweep expired it mid-stretch. Only a real number
-    counts: anything else (a provider double, a transport that does not read
-    between turns) leaves the turn clock in charge, as before.
-    """
-    at = getattr(session.provider, "session_activity_at", None)
-    if isinstance(at, (int, float)) and not isinstance(at, bool):
-        return max(session.last_used, at)
-    return session.last_used
-
-
-def _no_background_launch(provider: LLMProvider) -> tuple[float, str] | None:
-    """Default background-launch probe: no provider reports a launch."""
-    return None
-
-
 @dataclass(slots=True)
 class CleanupState:
     """Mutable state exclusively owned by :class:`SessionCleanup`."""
@@ -264,7 +227,14 @@ class CleanupDeps:
     cleanup_orphaned_session_roots: Callable[[], int]
     cleanup_stale_sandbox_profiles: Callable[[], int]
     prune_session_pid_mappings: Callable[[], int]
+    # Removes ``session_token_*.sig`` identity mappings past their age limit;
+    # answers how many. See ``session_pid._prune_stale_session_token_files``.
+    prune_session_token_mappings: Callable[[], int]
     prune_member_pid_bindings: Callable[[], int]
+    # Removes staging temps a killed writer left in the sessions directory and
+    # unheld lock sentinels whose transcript is gone; answers how many. See
+    # ``session_staging_sweep``.
+    sweep_session_staging_temps: Callable[[], int]
     # Rotates the bundled shell-audit hook's ``audit.log`` once it reaches its
     # cap; answers whether this call moved it aside. See ``shell_audit_log``.
     rotate_shell_audit_log: Callable[[], bool]
@@ -643,9 +613,14 @@ class SessionCleanup:
                 self._note_reconcile_refusal(reading.reason or "unsupported")
                 return
             self._clear_reconcile_refusal()
+            # Each field as "nonzero", never the raw count: a series is kept per
+            # attribute set for the process's life, and a byte sum or pid count
+            # would open a new one on nearly every pass. The leaked counts stay
+            # on the reading the dashboard serves; five others are in the summary
+            # line below.
             self._deps.emit_counter(
-                "session.runtime_reconcile",
-                reading.as_counter_fields(),
+                SESSION_RUNTIME_RECONCILE,
+                {k: bool(v) for k, v in reading.as_counter_fields().items()},
             )
             if reading.unowned_alive or reading.owned_dead:
                 # ``would_kill`` belongs beside the other four: it is the number an
@@ -659,7 +634,8 @@ class SessionCleanup:
                 # all permanently withheld (long-lived tool work, app backends) or
                 # all "not mine to retract" reads the same every tick, and at
                 # WARNING it was a line per tick for the gateway's life. The
-                # counter above still carries every field on every pass.
+                # counter above still carries every field, as a nonzero flag, on
+                # every supported pass.
                 acted = reading.killed or reading.would_kill or reading.forgotten
                 self._deps.logger.log(
                     logging.WARNING if acted else logging.DEBUG,
@@ -898,9 +874,10 @@ class SessionCleanup:
                 # check off forever while its tree grows without limit.
                 # Synchronous, so the no-suspend window to ``reset`` holds.
                 launch = self._harness_background_launch(session)
+                hold = background_hold_secs(self._owner._cfg)
                 if (
                     launch is not None
-                    and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS
+                    and launch[0] <= hold
                     and rss <= self.state.rss_max_mb * HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR
                 ):
                     self._deps.logger.info(
@@ -944,7 +921,7 @@ class SessionCleanup:
                 # cleared while the process lives, so warning "may have been
                 # stopped" about a launch from hours ago would be permanent
                 # noise on every later recycle.
-                if launch is not None and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS:
+                if launch is not None and launch[0] <= hold:
                     reason += (
                         "; background work its agent started earlier may have been "
                         f"stopped: {launch[1]}"
@@ -1229,7 +1206,9 @@ class SessionCleanup:
             await self._sweep_session_roots()
             await self._sweep_sandbox_artifacts()
             await self._sweep_session_pid_mappings()
+            await self._sweep_session_token_mappings()
             await self._sweep_member_pid_bindings()
+            await self._sweep_session_staging_temps()
             await self._sweep_shell_audit_log()
             await self._maybe_prune_pycache()
             await self._sweep_periodic_pids()
@@ -1322,6 +1301,39 @@ class SessionCleanup:
                 type(exc).__name__,
             )
 
+    async def _sweep_session_token_mappings(self) -> None:
+        """Retract ``session_token_*.sig`` mappings unrefreshed past their age limit.
+
+        Every started session publishes one, and the pass that removes them,
+        ``session_pid._prune_stale_session_token_files``, is otherwise reached
+        only from ``cleanup_orphaned_sessions`` (startup and graceful shutdown).
+        A gateway that keeps running, or that is only ever stopped by a kill,
+        would hold one file per session it has started. The pass needs nothing
+        added, only a caller on a bounded cadence, which this tick is.
+
+        Age is the pass's only signal and it is safe at any cadence: a live
+        session republishes its mapping at the start of every turn, before
+        anything in that turn can call a tool, so the TTL never costs a
+        live session its identity. Blocking glob and unlinks over the same-uid
+        agent-writable data home, so it runs on the maintenance executor like
+        the session-pid mapping sweep.
+        """
+        try:
+            removed = await asyncio.get_running_loop().run_in_executor(
+                self._deps.get_maintenance_executor(),
+                self._deps.prune_session_token_mappings,
+            )
+            if removed:
+                self._deps.logger.info(
+                    "Periodic sweep: retracted %d stale session-token mappings",
+                    removed,
+                )
+        except Exception as exc:
+            self._deps.logger.debug(
+                "session token mapping sweep failed: %s",
+                type(exc).__name__,
+            )
+
     async def _sweep_member_pid_bindings(self) -> None:
         """Collect aged per-pid member-memory binding records.
 
@@ -1347,6 +1359,34 @@ class SessionCleanup:
         except Exception as exc:
             self._deps.logger.debug(
                 "member-memory pid binding sweep failed: %s",
+                type(exc).__name__,
+            )
+
+    async def _sweep_session_staging_temps(self) -> None:
+        """Reclaim staging temps a killed writer left in the sessions directory.
+
+        A writer that is killed between staging a transcript and renaming it into
+        place leaves the staging file behind, and no in-process handler can remove
+        it. The same pass prunes ``*.jsonl.lock`` sentinels whose transcript is
+        gone and which no process holds. The pass is
+        ``session_staging_sweep.sweep_session_staging_temps``, age-gated so a live
+        write is never touched. Blocking filesystem work over
+        an agent-writable directory, so it runs on the maintenance executor like
+        the other sweeps.
+        """
+        try:
+            removed = await asyncio.get_running_loop().run_in_executor(
+                self._deps.get_maintenance_executor(),
+                self._deps.sweep_session_staging_temps,
+            )
+            if removed:
+                self._deps.logger.info(
+                    "Periodic sweep: removed %d orphaned session staging/lock file(s)",
+                    removed,
+                )
+        except Exception as exc:
+            self._deps.logger.debug(
+                "session staging temp sweep failed: %s",
                 type(exc).__name__,
             )
 
@@ -1653,7 +1693,10 @@ class SessionCleanup:
                 total_checked += 1
                 if session.semaphore.locked():
                     continue
-                idle = key not in idle_exempt_keys and now - _last_activity(session) > timeout_secs
+                idle = (
+                    key not in idle_exempt_keys
+                    and now - _last_activity(session, timeout_secs) > timeout_secs
+                )
                 guard = self.state.idle_expiry_guard
                 if idle and guard is not None:
                     try:
@@ -1780,7 +1823,8 @@ class SessionCleanup:
             # what makes it look idle to ``last_used`` and abandoned to the
             # orphan axis. Synchronous, like every read from here to ``reset``.
             launch = self._harness_background_launch(scanned)
-            if launch is not None and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS:
+            hold = background_hold_secs(self._owner._cfg)
+            if launch is not None and launch[0] <= hold:
                 self._deps.logger.info(
                     "Idle sweep: %s looks %s but its harness launched background "
                     "work %.0fs ago (%s) - left running",
@@ -1794,9 +1838,12 @@ class SessionCleanup:
             # finished inside the await released the semaphore again but bumped
             # ``last_used`` on its way in, so the session is not idle now.
             # The orphan axis ignores the clock and re-asks the live set below.
-            if not is_orphan and self._deps.monotonic() - _last_activity(scanned) <= timeout_secs:
+            if (
+                not is_orphan
+                and self._deps.monotonic() - _last_activity(scanned, timeout_secs) <= timeout_secs
+            ):
                 self._deps.logger.info(
-                    "Idle sweep: %s took a turn mid-sweep - left running",
+                    "Idle sweep: %s became active mid-sweep - left running",
                     key,
                 )
                 continue
@@ -1824,6 +1871,13 @@ class SessionCleanup:
                 )
             else:
                 self._deps.logger.warning("Expiring idle session: %s", key)
+            # Past the hold (inside it the session was kept above), so the
+            # launched work may still be running and this expiry may stop it.
+            hold_reason = (
+                None if launch is None else hold_expired_reason(launch, hold, orphaned=is_orphan)
+            )
+            if hold_reason is not None:
+                self._deps.logger.warning("Idle sweep: %s %s", key, hold_reason)
 
             # Preserve the historical attempt counter: it increments before the
             # race-safe reset, while the hang-resilience counter below is gated
@@ -1937,3 +1991,7 @@ class SessionCleanup:
                     self._deps.get_session_idle_expired_event(),
                     {"turn_active": turn_active, "orphaned": bool(is_orphan)},
                 )
+                # Tell the chat, which otherwise resets with no explanation.
+                # After ``reset``, so nothing here reopens a pre-reset window.
+                if hold_reason is not None:
+                    await self._owner._fire_recycle_callback(key, reason=hold_reason)

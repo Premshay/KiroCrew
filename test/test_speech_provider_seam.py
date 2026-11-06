@@ -105,7 +105,8 @@ class TestStandaloneIsUnchanged:
     """The default registry, and no context at all, give today's answers byte for byte."""
 
     @pytest.fixture(params=["no_context", "default_registry"])
-    def standalone(self, request):
+    def standalone(self, request, monkeypatch):
+        monkeypatch.setattr("kiro_crew.platform.discovery.plugin_entry_points", lambda: [])
         if request.param == "default_registry":
             _install(DefaultSpeechProviderRegistry())
 

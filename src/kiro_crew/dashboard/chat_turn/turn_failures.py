@@ -83,7 +83,7 @@ async def _on_cancelled(turn: _ChatTurn) -> None:
     # Mark the cancel on _stop_reason too — every cancelled exit (the Stop
     # press AND the involuntary cases: tab close, idle sweep, shutdown, the
     # turn ceiling converted one frame above _run_chat) is a discarded turn whose history
-    # must stay owed, so the debt correctly stays armed (GPT 6.1 F1).
+    # must stay owed, so the debt correctly stays armed.
     _stop_reason = STOP_REASON_CANCELLED
     turn._stop_reason = _stop_reason
     await _persist_partial_reply(turn, _cancel_reason)
@@ -147,6 +147,7 @@ async def _on_auth_required(turn: _ChatTurn, exc) -> None:
     # store the row stays a plain error. The prose is unchanged.
     slot.append("error", _auth_msg, "msg msg-err", meta=_terminal_error_meta(exc))
     _mark_kiro_signed_out(state)
+    turn.died_notice = "The chat stopped because the agent is signed out. Open the chat to sign in."
     await _deliver_linked_slack_message(state, slot, sessions, session_key, _auth_msg)
 
 
@@ -171,6 +172,7 @@ async def _on_prompt_busy(turn: _ChatTurn) -> None:
         _is_synthetic=_is_synthetic,
         _queue_recovery=functools.partial(_queue_recovery, turn),
         _stop_pressed=functools.partial(_stop_pressed, turn),
+        turn=turn,
     )
 
 
@@ -192,6 +194,8 @@ _POISON_CANARY_TIMEOUT_SECS = 30.0
 
 async def _on_acp_error_card(turn: _ChatTurn, exc) -> None:
     """Any other ACP error: the error card and the turn's failure record."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _directive_loop_gen = turn._directive_loop_gen
     _directive_loop_id = turn._directive_loop_id
     _directive_self_wake = turn._directive_self_wake
@@ -252,6 +256,8 @@ async def _on_acp_error_card(turn: _ChatTurn, exc) -> None:
     if (
         _escalation.should_probe()
         and _prompt_depth == 0
+        # A turn the agent started has no prompt to retry after the probe.
+        and not turn._agent_started
         and not _should_suppress_requeue(slot)
         # Resolved Stop: the canary snapshot below is taken after the
         # Stop moved the counter (see _on_process_died in acp_recovery.py).
@@ -368,7 +374,10 @@ async def _on_acp_error_card(turn: _ChatTurn, exc) -> None:
             "messages are kept; the model rebuilds its working "
             "context from them)…",
             "msg msg-err",
-            meta={"kind": TRANSIENT_RETRY_KIND},
+            meta={
+                "kind": TRANSIENT_RETRY_KIND,
+                **gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CONVERSATION_REJECTED_RESTARTING),
+            },
         )
         # The verbatim requeue carries the retry identity forward via
         # _queue_recovery itself (one mechanism for every recovery
@@ -408,6 +417,11 @@ async def _on_acp_error_card(turn: _ChatTurn, exc) -> None:
             "msg msg-err",
             meta=_unentitled_meta,
         )
+        # The turn ended on a terminal provider/runtime error the user
+        # must act on (a 5xx/throttle timeout, an unentitled model, a
+        # malformed-request rejection). Ring the bell so an operator in
+        # another session is not left to find the inline card.
+        turn.died_notice = "The chat stopped with an error. Open the chat to see what happened."
         # Record a STRUCTURAL terminal outcome for this slot's last turn,
         # but ONLY for a self-driven nudge fire (``_directive_self_wake``).
         # A malformed-request rejection is deterministic in the payload's
@@ -565,7 +579,7 @@ async def _on_error(turn: _ChatTurn, exc) -> None:
         # The bare code names neither the setting nor the saved spec, and
         # changing agent.acp_backend does nothing for a member chat.
         _err_text = (
-            "capability_harness_unsupported: This crew member has saved "
+            "capability_harness_unsupported: This Bot has saved "
             "capabilities, and the backend its chats run on "
             "(agent.member_acp_backend, not agent.acp_backend) cannot load "
             "them. Set agent.member_acp_backend to "
@@ -577,11 +591,16 @@ async def _on_error(turn: _ChatTurn, exc) -> None:
         if is_crewmate_worker_session(session_key):
             # A crewmate's worker is refused for its kit, which only some
             # member backends carry, so the member card's remedy does not fit.
+            from kiro_crew.crewmate_harness import crewmate_for_session
             from kiro_crew.mate_worker import crewmate_worker_backend, worker_kit_backend_refusal
 
-            _worker_reason = worker_kit_backend_refusal(
-                crewmate_worker_backend(KiroCrewConfig.load().agent)
-            )
+            _cfg = KiroCrewConfig.load()
+            try:
+                _worker_reason = worker_kit_backend_refusal(
+                    crewmate_worker_backend(_cfg, crewmate_for_session(_cfg, session_key))
+                )
+            except Exception as _exc:  # noqa: BLE001 - the row must still be written
+                _worker_reason = str(_exc)
             if _worker_reason:
                 _err_text = "capability_harness_unsupported: " + _worker_reason
         _err_meta = _terminal_error_meta(exc)
@@ -589,7 +608,7 @@ async def _on_error(turn: _ChatTurn, exc) -> None:
         isinstance(exc, CapabilityStartupError) and str(exc) == "capability_tool_limits_unsupported"
     ):
         _err_text = (
-            "capability_tool_limits_unsupported: This crew member's saved "
+            "capability_tool_limits_unsupported: This Bot's saved "
             "capabilities turn off single tools on an MCP server. The backend "
             "its chats run on (agent.member_acp_backend) cannot turn off single "
             "tools, so they would be on. On the member's Capabilities page, turn "
@@ -606,6 +625,16 @@ async def _on_error(turn: _ChatTurn, exc) -> None:
         # this arm carries none of the tags and keeps its plain row.
         _err_meta = _terminal_error_meta(exc)
     slot.append("error", _err_text, "msg msg-err", meta=_err_meta)
+    # Ring the dead-turn bell for a GENUINE runtime death that lands here -- a
+    # shared-runtime prompt timeout / session-start timeout (AcpRequestTimeout /
+    # AcpSessionStartTimeout, which descend from AcpRuntimeError, not AcpError,
+    # so they skip the arms above) or a plain terminal Exception. NOT for a
+    # deterministic config refusal: a memory-unavailable end and a
+    # capability/session-start refusal (`_err_meta["code"]`) carry their own
+    # guided-fix card and a retry repeats them unchanged, so they are not the
+    # "work silently stopped" case the bell exists for.
+    if not (isinstance(_err_meta, dict) and _err_meta.get("code")):
+        turn.died_notice = "The chat stopped with an error. Open the chat to see what happened."
     # The SIBLING of the tagged-start report in the AcpError branch (_on_acp_error_card).
     # A session start on the SHARED runtime raises AcpRequestTimeout /
     # AcpSessionStartTimeout, which descend from AcpRuntimeError and not from

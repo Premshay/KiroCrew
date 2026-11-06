@@ -72,6 +72,7 @@ def payload(**overrides: Any) -> dict[str, Any]:
         "alias_credential_ids": [],
         "required_mask_targets": [],
         "mask_occupants": {},
+        "published_file_record": {},
         "crew_home_aliases": [],
         "expose_files": [],
         "env_prefixes": [],
@@ -745,6 +746,23 @@ def test_a_child_run_masks_seals_carves_and_execs(tmp_path: Path) -> None:
     assert (38, 1, 0, 0, 0) in libc.prctls  # NO_NEW_PRIVS
     assert libc.prctls[-1][0] == 22  # the seccomp filter, last
     assert run.execs == [["/bin/agent", "/bin/agent", "--flag"]]
+
+
+def test_a_spawn_with_no_launch_directory_stands_in_its_directory_through_the_masks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spawn that names no ``exec_cwd`` and is started inside a masked tree runs its
+    command in the mask, not in the directory the mask was placed over."""
+    home = _Home(tmp_path)
+    monkeypatch.chdir(home.aws)
+    isdir = os.path.isdir
+    monkeypatch.setattr(program.os.path, "isdir", lambda path: path != "/tmp" and isdir(path))
+    run = launch(tmp_path, home.plan(), environ={"HOME": str(home.root)})
+    assert run.exec_cwd == ""
+    program.run_child(run, ["/bin/agent"])
+    assert run.execs == [["/bin/agent", "/bin/agent"]]
+    assert os.stat(".").st_ino == os.stat(home.aws).st_ino
+    assert sorted(os.listdir(".")) == ["config"]
 
 
 def test_seals_land_before_hides_and_carve_outs_after_them(tmp_path: Path) -> None:

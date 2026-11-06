@@ -302,9 +302,45 @@ describe('useWebSocket auto-speak voice pipeline', () => {
     hook.unmount()
   })
 
-  it('reports a replay stream failure instead of leaving the speaker button silent', async () => {
+  it('replaces active streaming audio when a stored reply is replayed', async () => {
+    const { hook, ws } = await mount()
+    act(() => { ws.simulateMessage(voiceChunk('slot-1', 0)) })
+    await act(async () => {})
+    const previous = AUDIO_INSTANCES[0]
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('voice-play-url', { detail: '/api/voice/replay/test' }))
+    })
+    expect(previous.pause).toHaveBeenCalledOnce()
+    expect(previous.onended).toBeNull()
+    expect(previous.onerror).toBeNull()
+    expect(AUDIO_INSTANCES.at(-1)?.src).toBe('/api/voice/replay/test')
+    expect(store.getState().chat.voicePlaying).toBe(true)
+    hook.unmount()
+  })
+
+  it('ignores a replaced replay whose play promise rejects late', async () => {
+    let rejectFirst!: (error: Error) => void
+    const pending = new Promise<void>((_resolve, reject) => { rejectFirst = reject })
+    class ReplayAudio extends MockAudio {
+      play = vi.fn(() => AUDIO_INSTANCES.indexOf(this) === 0 ? pending : Promise.resolve())
+    }
+    vi.stubGlobal('Audio', ReplayAudio)
+    const { hook } = await mount(false)
     const notificationsBefore = store.getState().notifications.items.length
+    act(() => {
+      window.dispatchEvent(new CustomEvent('voice-play-url', { detail: '/api/voice/replay/first' }))
+      window.dispatchEvent(new CustomEvent('voice-play-url', { detail: '/api/voice/replay/second' }))
+    })
+    await act(async () => { rejectFirst(new Error('old playback stopped')) })
+    expect(store.getState().notifications.items).toHaveLength(notificationsBefore)
+    expect(store.getState().chat.voicePlaying).toBe(true)
+    hook.unmount()
+  })
+
+  it('reports a replay stream failure instead of leaving the speaker button silent', async () => {
     const { hook } = await mount()
+    const notificationsBefore = store.getState().notifications.items.length
 
     act(() => {
       window.dispatchEvent(new CustomEvent('voice-play-url', { detail: '/api/voice/replay/test' }))

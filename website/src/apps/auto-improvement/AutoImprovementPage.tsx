@@ -27,13 +27,12 @@ import {
 import Clickable from '../../components/Clickable'
 import { Badge, Card, CardTitle, StatCard } from '../../components/ui'
 import { i18nT } from '../../i18n/t'
+import { api } from '../../api/client'
 
 import FindingDetail from './FindingDetail'
 import SetupPanel from './SetupPanel'
 import { useAgentSession, truncate } from './lib/agentSession'
 import { findingPrompt, prPrompt, rulerPrompt } from './lib/prompts'
-
-const API = '/api/apps/auto-improvement'
 
 interface RulerState {
   status: string
@@ -70,7 +69,7 @@ interface PrStatus {
 }
 
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(path)
+  const res = await api.autoImprovementResponse(path)
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   return (await res.json()) as T
 }
@@ -171,7 +170,7 @@ function PrRow({ finding, repo }: { finding: Finding; repo: string }) {
     // URLSearchParams encodes for us, and building the whole query (leading `?`
     // included) inside the interpolation keeps every string literal here a plain
     // path — no `?url=`-shaped fragment for the i18n scanner to mistake for copy.
-    queryFn: () => getJson<PrStatus>(`${API}${prStatusQuery(url as string)}`),
+    queryFn: () => getJson<PrStatus>(prStatusQuery(url as string)),
     enabled: Boolean(url),
     refetchInterval: 60_000,
   })
@@ -254,16 +253,16 @@ export default function AutoImprovementPage() {
   const [expanded, setExpanded] = useState<string | null>(null)
   const { data: config } = useQuery({
     queryKey: ['auto-improvement-config'],
-    queryFn: () => getJson<Record<string, unknown>>(`${API}/config`),
+    queryFn: () => getJson<Record<string, unknown>>('/config'),
   })
   const { data: ruler } = useQuery({
     queryKey: ['auto-improvement-ruler'],
-    queryFn: () => getJson<RulerState>(`${API}/ruler`),
+    queryFn: () => getJson<RulerState>('/ruler'),
     refetchInterval: 30_000,
   })
   const { data: findingsResp } = useQuery({
     queryKey: ['auto-improvement-findings'],
-    queryFn: () => getJson<{ findings: Finding[] }>(`${API}/findings`),
+    queryFn: () => getJson<{ findings: Finding[] }>('/findings'),
     refetchInterval: 30_000,
   })
 
@@ -288,7 +287,7 @@ export default function AutoImprovementPage() {
   // routes it to `commitFinding.error`, which the row renders. Raised by the UX review.
   const commitFinding = useMutation({
     mutationFn: async (fp: string) => {
-      const res = await fetch(`${API}/findings/${encodeURIComponent(fp)}/commit`, {
+      const res = await api.autoImprovementResponse(`/findings/${encodeURIComponent(fp)}/commit`, {
         method: 'POST',
       })
       const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string }

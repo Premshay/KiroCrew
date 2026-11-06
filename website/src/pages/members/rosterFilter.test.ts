@@ -13,7 +13,7 @@ import {
 
 const EMPTY_QUERY: RosterQuery = { search: '', starredOnly: false, source: 'all', status: new Set(), sort: 'recent' }
 
-const IDLE: MemberSignals = { running: false, needsYou: false, unread: false, patrolling: false }
+const IDLE: MemberSignals = { running: false, needsYou: false, unread: false, patrolling: false, goal: false }
 const SIGNALS: Record<string, MemberSignals> = {
   conductor: { ...IDLE, running: true, patrolling: true },
   kirocrew: { ...IDLE, needsYou: true },
@@ -99,17 +99,19 @@ describe('narrowRoster', () => {
 })
 
 /** A roster as a real host serves it. `has_dm_message` is the DM thread holding
- *  a message, whoever sent it; `dashboard_created` is source kirocrew AND a
- *  member id, and no longer lists a row by itself. */
+ *  a message, whoever sent it; `dashboard_created` is a crewmate the person
+ *  created (source kirocrew AND a member id), listed even with an empty chat;
+ *  `has_user_dm_message` is the reserved `default` row's own, stricter signal. */
 const NO = { dashboard_created: false, has_dm_message: false }
 const MIXED = [
-  // The built-in default crewmate: a row like any other, no message -> hidden.
-  { name: 'default', ...NO, source: 'builtin' },
+  // The reserved default member, no message the person sent -> hidden.
+  { name: 'default', ...NO, has_user_dm_message: false, source: 'builtin' },
   // Dashboard-created, greeting never landed, but starred: listed.
   { name: 'radar', display_name: 'Issue Radar', ...NO, dashboard_created: true, source: 'kirocrew', starred: true },
   // Dashboard-created AND a message in the thread: listed.
   { name: 'oncall', dashboard_created: true, has_dm_message: true, source: 'kirocrew' },
-  // Dashboard-created, no message, not starred -> hidden (an empty thread).
+  // Created by the person (on the page, or by approving Mate's card), chat
+  // never opened, not starred -> listed: the person asked for it.
   { name: 'fresh', ...NO, dashboard_created: true, source: 'kirocrew' },
   // Legacy kirocrew row: no member id, no message -> hidden.
   { name: 'legacy-aim', ...NO, source: 'kirocrew' },

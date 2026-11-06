@@ -29,6 +29,7 @@ from token_auth_helpers import (  # noqa: F401 -- the autouse fixture registers 
     clear_nonces,
 )
 
+import kiro_crew.dashboard.token_auth as token_auth_mod
 from kiro_crew.dashboard.token_auth import (
     MAX_CONCURRENT_NONCES,
     MAX_SESSION_TTL_SECS,
@@ -692,27 +693,21 @@ async def test_update_revalidate_get_still_requires_auth() -> None:
     assert resp.status != 200, "GET on the revalidate path bypassed the token gate"
 
 
-# -- Property 8a-bis: every browser-view relay route form bypasses the gate --
+# -- Property 8a-bis: the retired browser-view relay path is gated like any other --
 #
-# The relay authenticates with the capability token in the PATH (its iframe is
-# an opaque-origin sandbox that carries no cookies), and answers a UNIFORM 404
-# for tokenless and wrong-token requests alike. Both registered route forms
-# must therefore reach the handler: the tokened form via the /browser-view/
-# prefix entry, and the bare form via its own _BYPASS_EXACT entry — without
-# the latter, the middleware 403s the bare path and hands an unauthenticated
-# prober a response that stands out from the uniform 404s.
+# The same-origin relay for the old CLI browser view is gone, and its auth
+# bypass went with it. Nothing under /browser-view may reach a handler without
+# a session: a leftover bypass entry would hand an unauthenticated prober a
+# path that answers differently from every other unknown route.
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/browser-view", "/browser-view/", "/browser-view/tok/x.html"])
-async def test_browser_view_relay_routes_bypass_auth(path: str) -> None:
+async def test_browser_view_relay_paths_no_longer_bypass_auth(path: str) -> None:
     mw = token_auth_middleware()
     req = _make_request(path=path)  # no token, no cookie
     resp = await mw(req, _ok_handler)
-    assert resp.status == 200, (
-        f"{path} was denied by the auth middleware; the relay handler must "
-        f"answer every route form itself (uniform 404 without a valid token)."
-    )
+    assert resp.status != 200, f"{path} bypassed the auth middleware"
 
 
 # -- Property 8b: /api/apps/* still requires auth (security boundary) --
@@ -1225,6 +1220,117 @@ async def test_strict_path_non_loopback_still_hard_denied() -> None:
     assert resp.status == 403
 
 
+# -- Property 9c: one api_access row per mixed-internal cookie poll --
+#
+# A browser cookie request on a mixed-internal path writes only the dashboard-layer
+# ``_log_auth`` audit row, not a redundant ``internal_auth``/``granted`` token-auth row.
+# Every distinct decision (denial, app-token grant) still logs its own row.
+
+
+def _capture_sel(monkeypatch):
+    calls: list[dict] = []
+
+    class _FakeSel:
+        def log_api_access(self, **kw):
+            calls.append(kw)
+
+    monkeypatch.setattr(token_auth_mod, "_sel_fn", lambda: _FakeSel())
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote", ["127.0.0.1", "10.0.0.1"])
+async def test_mixed_internal_cookie_poll_emits_one_api_access_row(monkeypatch, remote):
+    """A cookie poll of a mixed-internal path writes exactly ONE api_access row.
+
+    Both the loopback and the DCV/SSH-forwarded cookie-auth success branches
+    collapse to the single dashboard-layer ``_log_auth`` row.
+    """
+    calls = _capture_sel(monkeypatch)
+    token = generate_token("owner", ttl_seconds=300)
+    bind_token_ip(token, remote)
+    mark_consumed(token)
+
+    mw = token_auth_middleware(
+        internal_paths=frozenset({"/api/workflows"}),
+        internal_secret="s",
+        local_only=False,
+    )
+    req = _make_request("/api/workflows/runs", cookies={"mc_token_5476": token}, remote=remote)
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+
+    rows = [c for c in calls if c.get("resources") == "/api/workflows/runs"]
+    assert len(rows) == 1, f"one request must write one api_access row; got {rows}"
+    assert rows[0]["operation"] == "dashboard.token_auth"
+    assert rows[0].get("source") != "token_auth"
+    # The surviving row names the resolved caller (the token subject), so it is
+    # a superset of the suppressed row rather than the ``"internal"`` literal.
+    assert rows[0]["caller"] == "owner", rows[0]
+    assert not [
+        c
+        for c in calls
+        if c.get("source") == "token_auth" and c.get("operation") == "internal_auth"
+    ], "the redundant internal_auth/granted token_auth row must be gone"
+
+
+@pytest.mark.asyncio
+async def test_mixed_internal_cookie_denial_still_logs(monkeypatch):
+    """A failed cookie on a mixed-internal path still writes a denial api_access row."""
+    calls = _capture_sel(monkeypatch)
+    mw = token_auth_middleware(
+        internal_paths=frozenset({"/api/workflows"}),
+        internal_secret="s",
+        local_only=False,
+    )
+    req = _make_request("/api/workflows/runs", cookies={"mc_token_5476": "garbage"})
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 403
+    denials = [
+        c
+        for c in calls
+        if c.get("outcome") == "denied"
+        and c.get("source") == "token_auth"
+        and c.get("operation") == "internal_auth"
+    ]
+    assert len(denials) == 1, calls
+    assert denials[0]["resources"] == "/api/workflows/runs"
+    assert denials[0]["error"].startswith("cookie auth failed"), denials[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote", ["127.0.0.1", "10.0.0.1"])
+async def test_mixed_internal_app_token_keeps_layer_row(monkeypatch, remote):
+    """An app token's scoped grant on a mixed path keeps its token_auth row.
+
+    The dedup narrows to the dashboard user: an app token reaching a mixed
+    route is a distinct security decision, so its per-layer
+    ``source=token_auth`` row survives.
+    """
+    monkeypatch.setattr(token_auth_mod, "app_token_path_allowed", lambda app_name, path: True)
+    calls = _capture_sel(monkeypatch)
+    token = generate_token("someapp", ttl_seconds=300, app="someapp")
+    bind_token_ip(token, remote)
+    mark_consumed(token)
+
+    mw = token_auth_middleware(
+        internal_paths=frozenset({"/api/workflows"}),
+        internal_secret="s",
+        local_only=False,
+    )
+    req = _make_request("/api/workflows/runs", cookies={"mc_token_5476": token}, remote=remote)
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+    layer_rows = [
+        c
+        for c in calls
+        if c.get("source") == "token_auth" and c.get("operation") == "internal_auth"
+    ]
+    assert len(layer_rows) == 1, calls
+    assert layer_rows[0]["outcome"] == "granted"
+    assert layer_rows[0]["resources"] == "/api/workflows/runs"
+
+
 # -- Property 10: Nonce-based token invalidation --
 
 
@@ -1484,25 +1590,25 @@ def test_signing_secret_destination_never_exists_while_incomplete(tmp_path, monk
     """
     from kiro_crew.dashboard import token_secret as ts
 
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
-    key_file = tmp_path / ts._SECRET_KEY_FILE
-    assert not key_file.exists()
+    with monkeypatch.context() as mp:
+        mp.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+        key_file = tmp_path / ts._SECRET_KEY_FILE
+        assert not key_file.exists()
 
-    # Sizes the destination had at each point a key byte was being written.
-    # ``None`` means "did not exist", which is the only acceptable value.
-    sizes_during_write: list[int | None] = []
-    real_write = os.write
+        # Sizes the destination had at each point a key byte was being written.
+        # ``None`` means "did not exist", which is the only acceptable value.
+        sizes_during_write: list[int | None] = []
+        real_write = os.write
 
-    def _spy(fd, data):  # type: ignore[no-untyped-def]
-        try:
-            sizes_during_write.append(key_file.stat().st_size)
-        except OSError:
-            sizes_during_write.append(None)
-        return real_write(fd, data)
+        def _spy(fd, data):  # type: ignore[no-untyped-def]
+            try:
+                sizes_during_write.append(key_file.stat().st_size)
+            except OSError:
+                sizes_during_write.append(None)
+            return real_write(fd, data)
 
-    monkeypatch.setattr(os, "write", _spy)
-    secret = ts._load_or_create_secret()
-    monkeypatch.undo()
+        mp.setattr(os, "write", _spy)
+        secret = ts._load_or_create_secret()
 
     on_disk = key_file.read_bytes()
     assert secret == on_disk, "returned key must be the persisted one"

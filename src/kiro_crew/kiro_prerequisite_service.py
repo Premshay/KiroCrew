@@ -23,6 +23,7 @@ from kiro_crew import kiro_prerequisite_agent_specs as _agent_specs
 from kiro_crew import kiro_prerequisite_identity_tracking as _identity_tracking
 from kiro_crew import kiro_prerequisite_probe as _probing
 from kiro_crew import sandbox
+from kiro_crew._facade_bindings import own_methods
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.kiro_prerequisite_agent_specs import _default_spec_lister
@@ -98,23 +99,16 @@ def _resolve_config_set_hints() -> dict[str, Any] | None:
     return config_set_hints_for_launcher(launcher, sys.platform)
 
 
-_OWNER_PREFIX = "kiro_crew.kiro_prerequisite_"
-
-
-def _own_methods(cls: type) -> None:
-    """Make each member *cls* binds from a collaborator read as a method of *cls*.
-
-    A bound function annotates ``self`` so mypy checks its body as a method body;
-    this drops that annotation from the runtime object and names the function after
-    the class attribute (``KiroPrerequisiteService._probe``), so its
-    ``inspect.signature`` and ``__qualname__`` are what the one-module class had. Only
-    ``__module__`` moves: it names the collaborator that holds the body.
-    """
-    for name, member in vars(cls).items():
-        function = getattr(member, "__func__", member)
-        if getattr(function, "__module__", "").startswith(_OWNER_PREFIX):
-            function.__annotations__.pop("self", None)
-            function.__qualname__ = f"{cls.__qualname__}.{name}"
+#: The modules whose functions :class:`KiroPrerequisiteService` binds as its members,
+#: this one included.
+_MEMBER_OWNERS = frozenset(
+    {
+        "kiro_crew.kiro_prerequisite_agent_specs",
+        "kiro_crew.kiro_prerequisite_identity_tracking",
+        "kiro_crew.kiro_prerequisite_probe",
+        "kiro_crew.kiro_prerequisite_service",
+    }
+)
 
 
 class KiroPrerequisiteService:
@@ -327,13 +321,17 @@ class KiroPrerequisiteService:
 
     @staticmethod
     def _kas_bundle_route() -> bool:
-        """Whether ``agent.kas_bundle`` is on, read from the config at call time."""
-        from kiro_crew.config import KiroCrewConfig
+        """The shared bundle-route predicate, ``agent_sdk.kas_bundle.kas_bundle_route``.
 
-        try:
-            return bool(KiroCrewConfig.load().agent.kas_bundle)
-        except Exception:
-            return False
+        Its one caller already requires ``backend == kas``, and both callers of that
+        method pass the CONFIGURED backend, so the predicate's backend half is
+        settled here and the answer is the route: ``agent.kas_bundle`` on, or the
+        automatic switch when kiro-cli's relay cannot run (``acp/kas_route.py``).
+        Unreadable config answers False, as before.
+        """
+        from kiro_crew.agent_sdk import kas_bundle
+
+        return kas_bundle.kas_bundle_route()
 
     async def record_independent_backend_setup(self, backend: str) -> bool:
         """Persist first-run completion after the configured harness is usable.
@@ -353,9 +351,9 @@ class KiroPrerequisiteService:
 
         On the BUNDLE route (``agent.kas_bundle`` on) KAS runs Crew's own installed
         engine and never kiro-cli, so none of the kiro-cli checks apply: the
-        prerequisite is the installed engine (``installed_bundle()``), and a host
-        with no kiro-cli at all completes here once ``kirocrew kas install`` has
-        run. The install probe below answers from the same reader on that route.
+        prerequisite is the installed engine (``installed_bundle()``) or a host
+        able to run it, since the first spawn installs it, and a host with no
+        kiro-cli at all completes here. The install probe below answers from the same reader on that route.
         """
         from kiro_crew.acp_backends import selectable_backend_values
         from kiro_crew.agent_sdk.backend_install import INSTALLED, probe_backend
@@ -364,10 +362,15 @@ class KiroPrerequisiteService:
             ACP_BACKENDS_INDEPENDENT_SETUP,
         )
 
-        if backend == ACP_BACKEND_KAS and self._kas_bundle_route():
-            from kiro_crew.agent_sdk import kas_bundle
+        # Off the loop: the route reads the vault and kiro-cli's sign-in store.
+        if backend == ACP_BACKEND_KAS and await asyncio.to_thread(self._kas_bundle_route):
+            from kiro_crew.agent_sdk import backend_install, kas_bundle
 
-            if await asyncio.to_thread(kas_bundle.installed_bundle) is None:
+            # An engine not installed yet is laid down by the first spawn
+            # (``acp/kas_engine_install.py``); only a host that cannot run it blocks.
+            if await asyncio.to_thread(
+                kas_bundle.installed_bundle
+            ) is None and not await asyncio.to_thread(backend_install._engine_installable_here):
                 return False
         elif backend == ACP_BACKEND_KAS:
             # KAS runs ON kiro-cli, so it is deliberately absent from
@@ -775,6 +778,17 @@ class KiroPrerequisiteService:
             return False
         return bool(self._status.authenticated)
 
+    async def boot_login_status(self) -> PrerequisiteStatus:
+        """Probe ``--version`` and ``whoami`` only, and return the latched status.
+
+        For the enterprise boot check, which runs before the gateway binds: the
+        spec and ``acp`` checks of a full probe run after the bind instead (a
+        probe that reached ``whoami`` is left not done, so the next read runs the
+        full one). ``authenticated`` is the verdict; it fails closed.
+        """
+
+        return await self._probe(force=True, login_only=True)
+
     async def session_ready(self) -> bool:
         """Return the latched readiness. Never probes; never blocks a turn.
 
@@ -828,7 +842,7 @@ class KiroPrerequisiteService:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-_own_methods(KiroPrerequisiteService)
+own_methods(KiroPrerequisiteService, _MEMBER_OWNERS)
 
 
 # The gateway's service, for the ACP layer's failed-prompt check. Set by the

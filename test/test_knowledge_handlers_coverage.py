@@ -550,7 +550,7 @@ class TestExport:
         async with _client(_make_app(store)) as client:
             resp = await client.get("/api/knowledge/export")
             assert resp.status == 200
-            assert "filename=knowledge.knowledge" in resp.headers["Content-Disposition"]
+            assert "filename*=UTF-8''knowledge.knowledge" in resp.headers["Content-Disposition"]
 
     @pytest.mark.asyncio
     async def test_export_all_sanitizes_namespace_into_filename(self, store):
@@ -560,8 +560,61 @@ class TestExport:
             disp = resp.headers["Content-Disposition"]
         # Path separators and dots-with-slashes cannot survive into the
         # suggested filename, so the download cannot escape its directory.
-        assert "/" not in disp.split("filename=")[1]
+        name = disp.split("filename*=UTF-8''")[1]
+        assert "/" not in name and "%2F" not in name
         assert "work" in disp
+
+
+def _malformed_cases(old_test_name: str, bundles: list) -> list:
+    return [
+        pytest.param(bundle, id=f"{old_test_name}-bundle{i}") for i, bundle in enumerate(bundles)
+    ]
+
+
+# Each group reaches the import handler by a different path; all must answer
+# 400 malformed_knowledge_bundle rather than a 500.
+_MALFORMED_BUNDLE_CASES = [
+    # A well-formed top-level dict whose collection isn't a list-of-objects
+    # still reaches the redaction loop's item.get(...) on a non-dict entry.
+    *_malformed_cases(
+        "test_non_object_collection_items_is_400_not_500",
+        [
+            {"items": [1]},
+            {"items": "not-a-list"},
+            {"entities": [None]},
+            {"relations": [["nested"]]},
+        ],
+    ),
+    # sources/source_locations/mentions are never touched by the handler's
+    # redaction loops (only items/entities/relations are), so a non-dict
+    # entry there reaches store.import_bundle() directly -- e.g. src["id"]
+    # on an int raises TypeError, which is neither a KeyError nor a
+    # sqlite3.Error.
+    *_malformed_cases(
+        "test_non_object_source_collections_is_400_not_500",
+        [
+            {"sources": [1]},
+            {"source_locations": ["x"]},
+            {"mentions": [42]},
+        ],
+    ),
+    # Every field the redaction loops pass to _redact() has to be a
+    # string or null -- _redact() forwards non-empty values straight into
+    # a regex .finditer() call, which raises TypeError on anything else.
+    *_malformed_cases(
+        "test_non_string_redacted_field_is_400_not_500",
+        [
+            {"items": [{"id": "i1", "item_type": "note", "title": [1, 2]}]},
+            {"items": [{"id": "i1", "item_type": "note", "content": {"a": 1}}]},
+            {"entities": [{"id": "e1", "entity_type": "person", "name": 5}]},
+            {
+                "relations": [
+                    {"id": "r1", "source_id": "e1", "target_id": "e1", "relation_type": ["x"]}
+                ]
+            },
+        ],
+    ),
+]
 
 
 class TestImportBundle:
@@ -731,63 +784,8 @@ class TestImportBundle:
         assert body["code"] == "body_not_object"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "bundle",
-        [
-            {"items": [1]},
-            {"items": "not-a-list"},
-            {"entities": [None]},
-            {"relations": [["nested"]]},
-        ],
-    )
-    async def test_non_object_collection_items_is_400_not_500(self, store, bundle):
-        # A well-formed top-level dict whose collection isn't a list-of-objects
-        # still reaches the redaction loop's item.get(...) on a non-dict entry.
-        async with _client(_make_app(store)) as client:
-            resp = await client.post("/api/knowledge/import", json=bundle)
-            assert resp.status == 400
-            body = await resp.json()
-        assert body["code"] == "malformed_knowledge_bundle"
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "bundle",
-        [
-            {"sources": [1]},
-            {"source_locations": ["x"]},
-            {"mentions": [42]},
-        ],
-    )
-    async def test_non_object_source_collections_is_400_not_500(self, store, bundle):
-        # sources/source_locations/mentions are never touched by the handler's
-        # redaction loops (only items/entities/relations are), so a non-dict
-        # entry there reaches store.import_bundle() directly -- e.g. src["id"]
-        # on an int raises TypeError, which is neither a KeyError nor a
-        # sqlite3.Error.
-        async with _client(_make_app(store)) as client:
-            resp = await client.post("/api/knowledge/import", json=bundle)
-            assert resp.status == 400
-            body = await resp.json()
-        assert body["code"] == "malformed_knowledge_bundle"
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "bundle",
-        [
-            {"items": [{"id": "i1", "item_type": "note", "title": [1, 2]}]},
-            {"items": [{"id": "i1", "item_type": "note", "content": {"a": 1}}]},
-            {"entities": [{"id": "e1", "entity_type": "person", "name": 5}]},
-            {
-                "relations": [
-                    {"id": "r1", "source_id": "e1", "target_id": "e1", "relation_type": ["x"]}
-                ]
-            },
-        ],
-    )
-    async def test_non_string_redacted_field_is_400_not_500(self, store, bundle):
-        # Every field the redaction loops pass to _redact() has to be a
-        # string or null -- _redact() forwards non-empty values straight into
-        # a regex .finditer() call, which raises TypeError on anything else.
+    @pytest.mark.parametrize("bundle", _MALFORMED_BUNDLE_CASES)
+    async def test_malformed_bundle_is_400_not_500(self, store, bundle):
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/import", json=bundle)
             assert resp.status == 400
@@ -1330,7 +1328,10 @@ class TestBatchEmbedItems:
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/embedding/generate")
             assert resp.status == 400
-            assert (await resp.json())["error"] == "Embedding not enabled"
+            assert await resp.json() == {
+                "error": "Embedding not enabled",
+                "code": "knowledge_embedding_disabled",
+            }
 
     @pytest.mark.asyncio
     async def test_unavailable_model_is_503(self, store):
@@ -1338,7 +1339,10 @@ class TestBatchEmbedItems:
         async with _client(app) as client:
             resp = await client.post("/api/knowledge/embedding/generate")
             assert resp.status == 503
-            assert (await resp.json())["error"] == "Embedding model not available"
+            assert await resp.json() == {
+                "error": "Embedding model not available",
+                "code": "knowledge_embedding_unavailable",
+            }
 
     @pytest.mark.asyncio
     async def test_fills_null_embeddings_synchronously(self, store):

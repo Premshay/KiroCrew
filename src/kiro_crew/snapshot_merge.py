@@ -503,7 +503,15 @@ def _write_merged_crons(
     *dst_fd* itself, opened read-write, so the inode and its ACL are kept.
     """
     from kiro_crew.atomic_write import atomic_write, pinned_parent_replace_supported
+    from kiro_crew.cron_service.zone_default_migration import settle_documents_before_merge
 
+    # A backup from before "local" became the default keeps its unzoned jobs on UTC.
+    if not settle_documents_before_merge(src, dst):
+        print(
+            "  ⚠️  config.json could not be read, so cron jobs from before the local "
+            "time zone default cannot be settled — skipping cron merge"
+        )
+        return False
     existing = {j.get("name") for j in dst.get("jobs", [])}
     imported = 0
     for job in src.get("jobs", []):
@@ -1254,8 +1262,8 @@ def _install_notifications(src_path: Path, dst_path: Path) -> None:
     # archive -- and reading once removes the second resolution the flag was
     # protecting.
     #
-    # `O_NONBLOCK` closes the other way that by-name selection misleads this open,
-    # which review did not name: the caller chose this branch on `is_file()`, and a
+    # `O_NONBLOCK` closes the other way that by-name selection misleads this open:
+    # the caller chose this branch on `is_file()`, and a
     # name that became a FIFO afterwards would block the open forever and hang the
     # restore rather than failing it. The kind is then judged on the DESCRIPTOR with
     # `fstat`, NOT by re-checking the name -- a second by-name check would be the

@@ -8,6 +8,10 @@ Only an enterprise build installs any of this; :func:`install_enterprise_gate`
 and :func:`enterprise_gate_middleware_for` are no-ops in an ``oss`` build, so its
 middleware chain is unchanged.
 
+An enterprise gateway with no kiro login never gets this far: it exits before
+the bind (``kiro_crew.enterprise_boot``). The gate therefore starts open, and is
+closed only by a login lost or expired while the gateway runs.
+
 While the gate is closed:
 
 * A request matching :data:`ALLOWED_WHILE_CLOSED` (method AND path) passes on.
@@ -193,8 +197,29 @@ def login_screen_required(app: web.Application) -> bool:
     return isinstance(gate, EnterpriseGate) and not gate.is_open
 
 
-def install_enterprise_gate(app: web.Application, login_source: LoginSource) -> None:
-    """Build the closed gate and its login watch on *app*. No-op in ``oss``.
+async def enterprise_login_source() -> LoginSource | None:
+    """The enterprise gate's login source, built off the event loop; ``None`` in ``oss``.
+
+    The edition check lives here, in the enterprise wiring: the sign-in resolver itself
+    (``kiro_crew.enterprise_sign_in``) does not read the edition.
+    """
+    if not edition.is_enterprise():
+        return None
+    from kiro_crew.enterprise_sign_in import SignInLoginSource
+
+    return await asyncio.to_thread(SignInLoginSource)
+
+
+def install_enterprise_gate(app: web.Application, login_source: LoginSource | None = None) -> None:
+    """Build the open gate and its login watch on *app*. No-op in ``oss``.
+
+    *login_source* defaults to :class:`kiro_crew.enterprise_sign_in.SignInLoginSource`,
+    the one enterprise sign-in (RFC D4) that the boot check and the rules fetch read.
+    The boot check (``kiro_crew.enterprise_boot.require_kiro_login``) has already seen
+    that sign-in, or the gateway exited before getting here, so the gate starts OPEN;
+    it closes only when the sign-in is later lost. Raises when *login_source* holds no
+    sign-in, so a caller that skipped the boot check fails at boot rather than serving
+    a gateway that starts locked.
 
     Must run before the middleware chain is installed (the chain reads
     :data:`GATE_APP_KEY`) and before ``runner.setup()`` freezes the signal
@@ -202,7 +227,13 @@ def install_enterprise_gate(app: web.Application, login_source: LoginSource) -> 
     """
     if not edition.is_enterprise():
         return
-    gate = EnterpriseGate()
+    if login_source is None:
+        from kiro_crew.enterprise_sign_in import SignInLoginSource
+
+        login_source = SignInLoginSource()
+    if not login_source.authenticated:
+        raise RuntimeError("enterprise build: the boot login check has not seen a kiro login")
+    gate = EnterpriseGate(closed_for=())
     watch = LoginWatch(gate, login_source)
     admitted = _AdmittedRequests()
     gate.add_listener(admitted.on_gate_change)

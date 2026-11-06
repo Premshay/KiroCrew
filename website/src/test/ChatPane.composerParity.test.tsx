@@ -29,7 +29,7 @@ vi.mock('../hooks/useVoiceInput', () => ({
   useVoiceInput: (_onText: unknown, options: typeof voiceOptions) => { voiceOptions = options; return engine },
   voiceInputSupported: true,
 }))
-vi.mock('../hooks/usePushToTalk', () => ({ usePushToTalk: () => undefined }))
+vi.mock('../hooks/usePushToTalk', () => ({ usePushToTalk: () => ({ config: { enabled: false, mode: 'hybrid', binding: { code: 'AltRight' }, holdMs: 500 }, phase: 'idle', holding: false }) }))
 vi.mock('react-virtuoso', () => ({
   Virtuoso: ({ data, itemContent }: { data?: unknown[]; itemContent: (index: number, item: unknown) => ReactNode }) => (
     <div data-testid="virtuoso">{data?.map((d: unknown, i: number) => <div key={i}>{itemContent(i, d)}</div>)}</div>
@@ -120,7 +120,7 @@ async function renderPane(streaming = false) {
   return store
 }
 
-const mic = () => screen.getByRole('button', { name: 'Voice input' })
+const mic = () => screen.getByRole('button', { name: /^Voice input/ })
 
 beforeEach(() => {
   localStorage.clear()

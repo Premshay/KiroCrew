@@ -17,7 +17,7 @@ _RUNNER = "scripts/dev/run_suite.sh"
 
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
+        ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True, encoding="utf-8"
     ).stdout.strip()
 
 

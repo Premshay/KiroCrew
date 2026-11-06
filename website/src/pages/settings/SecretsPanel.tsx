@@ -14,12 +14,15 @@ const UNUSED_REASON_KEYS = {
   gerrit_multi_host: 'settings.secrets.gerrit_global_unused_multi_host',
   gerrit_host_precedence: 'settings.secrets.gerrit_global_unused_host_credential',
 } as const
+
+import { SECRETS_AUTHORIZE_COMMAND, SECRETS_SERVER_GRANT } from './secretsAuthorizeCommand'
 import { Btn, IconButton, Input, PanelSectionHeader } from '../../components/ui'
 import { api, isAuthExpiredError, type ManagedSecret, type SecretsListResponse } from '../../api/client'
 import { i18nT } from '../../i18n/t'
 import { Link } from 'react-router-dom'
 import { settingsPath } from '../../components/settingsPath'
 import { connectionsOAuthClientEntryId } from '../../components/commandPalette/settingsManual'
+import { useGatewayPlatform } from '../../hooks/useGatewayPlatform'
 
 /**
  * The three secrets requests go through `api/client.ts`, not a local `fetch`.
@@ -159,8 +162,11 @@ function ManagedSecretRow({
     setEditing(false)
   }
 
+  // Each action clears the other's last outcome, so a past failure never sits
+  // beside a newer result ("Saved" next to "Could not delete").
   const setMutation = useMutation({
     mutationFn: () => api.secretsSave(secret.name, value),
+    onMutate: (): void => deleteMutation.reset(),
     onSuccess: finish,
   })
   const deleteMutation = useMutation({
@@ -185,6 +191,7 @@ function ManagedSecretRow({
   }, [onPendingChange, secret.name])
   const handleValueChange = (next: string) => {
     setMutation.reset()
+    deleteMutation.reset()
     setDeleteConfirm(false)
     setValue(next)
   }
@@ -273,6 +280,11 @@ function ManagedSecretRow({
 
 export function SecretsPanel() {
   const queryClient = useQueryClient()
+  // On Windows the mediated call route refuses every call (it needs a
+  // Unix-domain socket with peer-credential attestation), so the authorize
+  // command only signs a grant the host can never use. Show a notice in place
+  // of the command there, mirroring the CLI's own refusal.
+  const gatewayPlatform = useGatewayPlatform()
   const [showAdd, setShowAdd] = useState(false)
   const [newName, setNewName] = useState('')
   const [newValue, setNewValue] = useState('')
@@ -483,6 +495,18 @@ export function SecretsPanel() {
               <p className="text-sm text-muted">
                 {i18nT('settings.secrets.custom_description')}
               </p>
+              {gatewayPlatform === 'windows' ? (
+                <p className="text-sm text-muted">
+                  {i18nT('settings.secrets.custom_authorize_windows')}
+                </p>
+              ) : (
+                <p className="text-sm text-muted">
+                  {i18nT('settings.secrets.custom_authorize', { server: SECRETS_SERVER_GRANT })}
+                  <code className="block mt-1.5 rounded-md border border-border bg-bg-elevated px-2.5 py-1.5 font-mono text-[12px] text-accent overflow-x-auto">
+                    {SECRETS_AUTHORIZE_COMMAND}
+                  </code>
+                </p>
+              )}
 
               {otherNames.length > 0 ? (
                 <div className="space-y-2">

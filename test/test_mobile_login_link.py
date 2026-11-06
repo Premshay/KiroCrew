@@ -7,15 +7,18 @@ import json
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
 from aiohttp import web
 
 from kiro_crew.dashboard.handlers import _shared, auth_mobile
+from kiro_crew.dashboard.handlers.tailnet_mobile import MOBILE_QR_BOX_SIZE
 from kiro_crew.dashboard.token_auth import (
     LINK_WINDOW_SECS,
     MAX_SESSION_TTL_SECS,
     _b64url_decode,
     generate_token,
 )
+from kiro_crew.qr import render_qr_data_uri
 
 
 def _request(
@@ -308,7 +311,16 @@ def test_mobile_link_refuses_a_caller_with_no_lifetime_left():
     }
 
 
-def test_mobile_link_writes_its_audit_off_the_event_loop():
+@pytest.mark.parametrize(
+    "request_kwargs,valid_origin,status",
+    [
+        ({"dashboard_url": "https://dashboard.example"}, True, 200),
+        ({}, False, 403),
+        ({"user": ""}, True, 401),
+        ({}, True, 409),
+    ],
+)
+def test_mobile_link_writes_its_audit_off_the_event_loop(request_kwargs, valid_origin, status):
     """SEL's first post-restart write initializes the log synchronously.
 
     On the event loop that stalls every other in-flight request, so the record
@@ -317,15 +329,41 @@ def test_mobile_link_writes_its_audit_off_the_event_loop():
     """
     with patch.object(auth_mobile.asyncio, "to_thread", wraps=auth_mobile.asyncio.to_thread) as spy:
         response = _call(
-            _request(dashboard_url="https://dashboard.example", cookie_token=_caller_token())
+            _request(**request_kwargs, cookie_token=_caller_token()), valid_origin=valid_origin
         )
 
-    assert response.status == 200
+    assert response.status == status
     assert spy.call_args_list, "the audit record was written on the event loop"
     # Two legitimate off-loop callees: the SEL audit and the mobile-connect
     # governance re-check (profile resolution can touch the filesystem). The
     # audit MUST be among them — that is the property this test pins.
     callees = [call.args[0] for call in spy.call_args_list]
     assert auth_mobile._audit in callees, "the audit record was written on the event loop"
-    allowed = {auth_mobile._audit, auth_mobile.mint_denied_reason}
+    # The QR encode is the third: it pulls Pillow and must not block the loop.
+    allowed = {auth_mobile._audit, auth_mobile.mint_denied_reason, auth_mobile.render_qr_data_uri}
     assert all(fn in allowed for fn in callees)
+
+
+def test_mobile_link_returns_the_link_as_a_scannable_qr():
+    """The image encodes exactly the minted URL, at the dialog's box size."""
+    response = _call(
+        _request(dashboard_url="https://dashboard.example", cookie_token=_caller_token())
+    )
+
+    payload = json.loads(response.text)
+    assert response.status == 200
+    assert payload["image"].startswith("data:image/png;base64,")
+    assert payload["image"] == render_qr_data_uri(payload["url"], box_size=MOBILE_QR_BOX_SIZE)
+
+
+def test_mobile_link_still_returns_the_link_when_the_qr_encode_fails():
+    """The link is the credential; a failed encode only drops the picture."""
+    with patch.object(auth_mobile, "render_qr_data_uri", side_effect=ValueError("too long")):
+        response = _call(
+            _request(dashboard_url="https://dashboard.example", cookie_token=_caller_token())
+        )
+
+    payload = json.loads(response.text)
+    assert response.status == 200
+    assert payload["url"].startswith("https://dashboard.example?token=")
+    assert "image" not in payload

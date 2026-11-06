@@ -94,10 +94,10 @@ def test_focused_iteration_and_unrestricted_final_regression(tmp_path, monkeypat
         pr_queue_dir=tmp_path / "queue",
         focused_test_paths=["tests/unit"],
         full_regression_timeout_s=1234,
-    )
+    )  # flake-ok: Pins a workload-budget contract with a mocked executor, not a wait barrier.
     assert profile.build_gate.suite_scope == ["tests/unit"]
     assert profile.bug_runner.suite_scope == ["tests/unit"]
-    assert profile.full_regression(timeout=1234) is True
+    assert profile.full_regression(timeout=1234) is True  # flake-ok: Mocked workload budget.
     argv, kwargs = calls[-1]
     assert "tests/unit" not in argv
     assert argv[-1] == "."
@@ -121,7 +121,7 @@ def make_driver(tmp_path, monkeypatch, passed=True):
         final_regression_required=True,
         full_regression_timeout_s=900,
         full_regression=Mock(return_value=passed),
-    )
+    )  # flake-ok: Pins a workload-budget contract with a mocked executor, not a wait barrier.
     monkeypatch.setattr(d, "_retire_if_unsafe", Mock(return_value=False))
     monkeypatch.setattr(d, "_progress", Mock())
     monkeypatch.setattr(d, "_regression_tree_id", Mock(return_value="tree"))
@@ -332,7 +332,7 @@ def test_full_regression_never_waives_a_nonzero_exit(tmp_path, monkeypatch, retu
     profile = gp.GitHubRepoProfile(
         clone_path=tmp_path, pr_queue_dir=tmp_path / "queue", focused_test_paths=["tests"]
     )
-    assert profile.full_regression(timeout=900) is False
+    assert profile.full_regression(timeout=900) is False  # flake-ok: Mocked workload budget.
 
 
 def test_unexpected_regression_error_rolls_back_before_propagating(tmp_path, monkeypatch):

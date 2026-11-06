@@ -1,17 +1,22 @@
-"""ACP error taxonomy and shared recognition of harness failures.
+"""The ACP error taxonomy and the classification of harness failures.
 
-The message owner reads these same classifiers for recovery advice. Both remain
-available and patchable through ``kiro_crew.acp.transport_errors``.
+Defines ``AcpError`` and its subclasses, and turns what a harness reports -- a JSON-RPC
+error frame, its stderr, a compaction-failure payload -- into the exception, the
+retry verdict and the user-facing message both ACP transports raise. The patterns
+are module-level and shared, so the message a user reads and the retry decision the
+transports make are always taken from one reading of the same text.
+
+``kiro_crew.acp.client`` re-exports every name defined here.
 """
 
 from __future__ import annotations
 
-import asyncio  # noqa: F401 - shared classification/message surface
-import functools  # noqa: F401 - shared classification/message surface
-import logging  # noqa: F401 - shared classification/message surface
-import re  # noqa: F401 - shared classification/message surface
-from dataclasses import dataclass  # noqa: F401 - shared classification/message surface
-from typing import Any, Sequence  # noqa: F401 - shared classification/message surface
+import asyncio
+import functools
+import logging
+import re
+from dataclasses import dataclass
+from typing import Any, Sequence
 
 from kiro_crew.acp.compaction_errors import (  # noqa: F401 - re-exported via this module's facade
     _COMPACTION_DETAIL_KEYS,
@@ -23,22 +28,37 @@ from kiro_crew.acp.compaction_errors import (  # noqa: F401 - re-exported via th
     compaction_failure_detail,
     compaction_failure_is_transient,
 )
-from kiro_crew.acp.runtime_models import (  # noqa: F401 - shared classification/message surface
+from kiro_crew.acp.image_dimension_wedge import (  # noqa: F401 - facade/message compatibility surface
+    format_many_image_dimension_message,
+    is_many_image_dimension,
+)
+from kiro_crew.acp.model_registry_errors import (  # noqa: F401 - facade/message compatibility surface
+    MODEL_REGISTRY_UNAVAILABLE_TEXT,
+    is_model_registry_unavailable,
+)
+from kiro_crew.acp.oversized_request_errors import (
+    _RE_ADAPTER_INPUT_TOO_LONG,
+    _RE_OVERSIZED_REQUEST,
+    _is_request_size_exceeded,
+)
+from kiro_crew.acp.runtime_models import (  # noqa: F401 - facade/message compatibility surface
     DEFAULT_MODEL,
     advertised_model_ids,
     model_is_unusable,
     resolve_pin_spelling_on,
 )
-from kiro_crew.acp.types import (  # noqa: F401 - shared classification/message surface
+from kiro_crew.acp.structured_error_data import (  # noqa: F401 - facade/message compatibility surface
+    provider_data_text,
+    structured_data_prose,
+)
+from kiro_crew.acp.types import (  # noqa: F401 - facade/message compatibility surface
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
 )
-from kiro_crew.agent_sdk import host_auth  # noqa: F401 - shared classification/message surface
-from kiro_crew.credential_errors import (  # noqa: F401 - shared classification/message surface
-    is_credential_propagation_delay,
-)
-from kiro_crew.sandbox import (  # noqa: F401 - shared classification/message surface
+from kiro_crew.agent_sdk import host_auth
+from kiro_crew.credential_errors import is_credential_propagation_delay
+from kiro_crew.sandbox import (
     LAUNCHER_EXIT_PREFIXES,
     SANDBOX_LAYER_CREW,
     SANDBOX_LAYER_HARNESS,
@@ -46,8 +66,10 @@ from kiro_crew.sandbox import (  # noqa: F401 - shared classification/message su
     launcher_refusal,
     sandbox_init_remediation,
 )
-from kiro_crew.security import redact_credentials  # noqa: F401
-from kiro_crew.security import redact_exfiltration_urls  # noqa: F401
+from kiro_crew.security import (  # noqa: F401 - facade/message compatibility surface
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 
 # Logged under the ACP client's name: these are the client's diagnostics, and operator
 # log filters and level settings key on that name.
@@ -138,11 +160,19 @@ class AcpError(Exception):
         # current attachment from an unsupported image retained in native
         # history. Set only from the raw provider data field.
         self.image_format_unsupported: bool = False
+        # Narrow structural subtype for the provider's many-image PIXEL cap: an
+        # image already in native history exceeds 2000px on its longest edge.
+        # Distinct from ``image_format_unsupported`` and ``context_overflow``
+        # because its fix is distinct -- the oversized images can be downscaled
+        # in the transcript in place (``session_image_repair``), losing no turns.
+        # The dashboard reads this flag to offer "Repair images and resume"
+        # instead of Resume. Set only from the raw provider data field.
+        self.image_dimension_wedge: bool = False
         # Whether a TRANSIENT failure is the network path to the provider
         # (dispatch failure, connection reset or refused, DNS, TLS, connect
         # timeout) rather than a provider answer such as a 5xx or a throttle.
-        # Decided from the raw frame by :func:`_raise_acp_error`, because the
-        # formatter rewrites a dispatch failure into the generic 5xx prose.
+        # Decided from the raw frame by :func:`_raise_acp_error`, so the retry
+        # layer never parses the user-facing card wording.
         # ``None`` means unclassified: readers fall back to the message text.
         self.connection_failure: bool | None = None
         # Whether a TRANSIENT failure is the provider throttling (429, "Too many
@@ -474,27 +504,6 @@ class AcpPromptBusy(AcpError):  # noqa: N818
     """
 
 
-# Named by the path callers import them from: an error chain renders each raised class
-# as ``module.qualname`` (``subagent._describe_exception``), and that text reaches the
-# Subagents panel and tracebacks, so this module's name must not leak into it.
-for _raised in (
-    AcpError,
-    AcpTimeoutError,
-    AcpPermissionNeeded,
-    AcpProcessDied,
-    AcpAuthRequired,
-    AcpSandboxInitFailed,
-    AcpDelegateLaunchFailed,
-    AcpRegistrationRateLimited,
-    AcpToolGateUnroutable,
-    PiGateExtensionTampered,
-    AcpModelUnavailable,
-    AcpPromptBusy,
-):
-    _raised.__module__ = "kiro_crew.acp.client"
-del _raised
-
-
 class AcpProviderStreamInterrupted(AcpError):  # noqa: N818
     """A provider ended a turn before it emitted a terminal result.
 
@@ -521,6 +530,30 @@ class AcpConversationPayloadExceeded(AcpContextWindowExceeded):  # noqa: N818
     from bounded dashboard history before retrying, just as for a token-window
     overflow.
     """
+
+
+# Named by the path callers import them from: an error chain renders each raised class
+# as ``module.qualname`` (``subagent._describe_exception``), and that text reaches the
+# Subagents panel and tracebacks, so this module's name must not leak into it.
+for _raised in (
+    AcpError,
+    AcpTimeoutError,
+    AcpPermissionNeeded,
+    AcpProcessDied,
+    AcpAuthRequired,
+    AcpSandboxInitFailed,
+    AcpDelegateLaunchFailed,
+    AcpRegistrationRateLimited,
+    AcpToolGateUnroutable,
+    PiGateExtensionTampered,
+    AcpModelUnavailable,
+    AcpPromptBusy,
+    AcpProviderStreamInterrupted,
+    AcpContextWindowExceeded,
+    AcpConversationPayloadExceeded,
+):
+    _raised.__module__ = "kiro_crew.acp.client"
+del _raised
 
 
 # Auth failure on stderr is detected during spawn/prompt so we can raise
@@ -571,9 +604,7 @@ _RE_INVALID_MODEL_ID = re.compile(r"[Ii]nvalid model ID:\s*([^\s,;'\"]+)")
 _RE_THROTTLE_NAMED = re.compile(
     r"\b(ThrottlingException|TooManyRequestsException|ServiceQuotaExceededException)\b"
 )
-_RE_THROTTLE_GENERIC = re.compile(
-    r"\b(rate.?limit|throttl(?:e|ed|ing)|too many requests)\b", re.IGNORECASE
-)
+_RE_THROTTLE_GENERIC = re.compile(r"\b(rate.?limit|throttl(?:e|ed|ing))\b", re.IGNORECASE)
 
 
 _RE_AUTH = re.compile(
@@ -584,11 +615,16 @@ _5XX_SEP = r"[ \t_-]?"
 _RE_5XX_NAMED = re.compile(
     rf"\b(internal{_5XX_SEP}server{_5XX_SEP}error|internal{_5XX_SEP}failure"
     rf"|service{_5XX_SEP}unavailable(?:{_5XX_SEP}exception)?"
-    rf"|dispatch{_5XX_SEP}failure|connection{_5XX_SEP}reset(?:{_5XX_SEP}error)?)\b",
+    rf"|dispatch{_5XX_SEP}failure|connection{_5XX_SEP}reset(?:{_5XX_SEP}error)?"
+    rf"|overloaded{_5XX_SEP}errors?)\b",
     re.IGNORECASE,
 )
+# "API Error:" is the claude-agent-acp seam's status prefix: Anthropic's overload
+# answer arrives as "API Error: 529 {...overloaded_error...}", and once Claude
+# Code's own retries are spent as "API Error: Repeated 529 Overloaded errors",
+# which the named "overloaded error" token above catches.
 _RE_5XX_STATUS = re.compile(
-    r"(?:HTTP|status|API\s+Error:?)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE
+    r"(?:HTTP|status|API\s+Error:)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE
 )
 _RE_CONNECTION = re.compile(
     r"\bE(?:CONNREFUSED|CONNRESET|CONNABORTED|TIMEDOUT|PIPE|HOSTUNREACH|AI_AGAIN)\b"
@@ -597,14 +633,9 @@ _RE_CONNECTION = re.compile(
     r"|\bconnection (?:refused|reset|closed|error|timed ?out)\b",
     re.IGNORECASE,
 )
-_RE_5XX_PHRASE = re.compile(
-    r"\binternal server error\b|\bservice unavailable\b|\bno available lane\b", re.IGNORECASE
-)
-
-# Connector-level failures that never produced a provider answer. Separate from
-# _RE_CONNECTION because a dispatch failure and a named connection reset sit in
-# the 5xx family for formatting, yet they say the network path dropped, not that
-# the provider answered with an error.
+# Connector-level failures that never produced a provider answer: the network
+# path dropped. They also match _RE_5XX_NAMED, so the formatter and classifier
+# both check this before the 5xx family (connection card, connection verdict).
 _RE_CONNECTOR_FAILURE = re.compile(
     rf"\b(?:dispatch{_5XX_SEP}failure|connection{_5XX_SEP}reset(?:{_5XX_SEP}error)?)\b",
     re.IGNORECASE,
@@ -1063,41 +1094,6 @@ _RE_IMAGE_FORMAT_UNSUPPORTED = re.compile(
     re.IGNORECASE,
 )
 
-# kiro-cli's OWN refusal of a request no compaction round can make fit: "This
-# message is too large to send, and it contains no text that can be shortened.
-# Remove or reduce the attached content and try again." It is raised when the
-# context overflowed and the pending message is IRREDUCIBLE (image blocks have no
-# truncated form), and kiro-cli deliberately does not compact on the way to
-# saying so, nor does it append the failed message to the native history -- so the
-# conversation is byte-identical before and after the failure, and re-sending the
-# same context reproduces the verdict on every attempt. That makes it a
-# STRUCTURAL rejection in the same sense as _RE_MALFORMED_REQUEST (a size verdict
-# rather than a shape verdict, but equally deterministic), and a self-driving
-# caller that re-inlines the same attachment each cycle must stop rather than
-# re-fire it. Matched against the provider `data` field only, like its two
-# siblings: the ACP server hands the agent-loop error to `internal_error(text)`,
-# so the sentence rides in `data` beside the -32603 boilerplate `message`, and a
-# phrase echo carried only by `message` must not stamp an unrelated error. The
-# wording ends in "try again", so the terminal verdict is stated explicitly in
-# _is_transient_raw_error rather than left to the unknown fall-through: a
-# co-occurring retry hint or 5xx wrapper must not rescue a size verdict.
-_RE_OVERSIZED_REQUEST = re.compile(r"[Tt]his message is too large to send")
-
-# The claude adapter's spelling of a request larger than the model accepts:
-# ``Internal error: API Error: 400 Input is too long.`` (or ``Prompt is too
-# long``). Unlike kiro-cli it puts the sentence in the JSON-RPC ``message``, not
-# in ``data`` (which carries only ``{"errorKind": "unknown"}``), so this one is
-# matched against ``message`` -- anchored at its start, so it reads the adapter's
-# own wording and never a phrase echoed further into some other error. The
-# overflow is in the conversation history the adapter re-sends on every turn
-# (accumulated images are the usual cause), so the identical payload is refused
-# on every retry and on every model: a CONTEXT OVERFLOW in the same sense as
-# _RE_CONTEXT_WINDOW_OVERFLOW, and tagged the same way at raise time.
-_RE_ADAPTER_INPUT_TOO_LONG = re.compile(
-    r"^\s*(?:Internal error:\s*)?(?:API Error:\s*\d{3}\s+)?(?:Input|Prompt) is too long\b",
-    re.IGNORECASE,
-)
-
 # A preserved-thinking signature rejection whose own provider text says the block
 # is bound to another conversation is recoverable by replacing the NATIVE
 # conversation. Both clauses must appear IN ONE FIELD: the shorter
@@ -1127,13 +1123,14 @@ def _is_thinking_binding_mismatch(error: object) -> bool:
     return False
 
 
-# kiro-cli's wording for a concurrent in-flight prompt on the session, read by
-# the user-facing formatter below and by `_raise_acp_error`'s AcpPromptBusy
-# classification. One pattern, but two haystacks: the formatter scopes to the
-# provider `data` field while the classifier also searches the JSON-RPC
+# A concurrent in-flight prompt on the session, in kiro-cli's words and in goose's
+# (-32602 "session already has active run `<id>`" for a prompt sent while its run is
+# live). Read by the user-facing formatter below and by `_raise_acp_error`'s
+# AcpPromptBusy classification. One pattern, but two haystacks: the formatter scopes
+# to the provider `data` field while the classifier also searches the JSON-RPC
 # `message`, so an echo carried only by `message` raises AcpPromptBusy under the
 # unrecognised-shape text.
-_PROMPT_BUSY_RE = re.compile(r"already in progress", re.IGNORECASE)
+_PROMPT_BUSY_RE = re.compile(r"already in progress|session already has active run", re.IGNORECASE)
 
 # kiro-cli's envelope for a failure that happened mid-stream. The text after the
 # colon is the provider's own message — the same words the CLI prints in a
@@ -1200,6 +1197,11 @@ def _model_is_unentitled(data: str, available_models: Sequence[str] | None) -> s
     return rejected
 
 
+_RE_5XX_PHRASE = re.compile(
+    r"\binternal server error\b|\bservice unavailable\b|\bno available lane\b", re.IGNORECASE
+)
+
+
 def _is_transient_raw_error(error: object, available_models: Sequence[str] | None = None) -> bool:
     """True iff a raw ACP JSON-RPC ``error`` is a retryable transient backend
     failure (Bedrock 5xx / throttle / model-unavailable rollout) rather than an
@@ -1212,7 +1214,7 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
     unentitled-model(terminal) → usage-limit(terminal) →
     malformed-request(terminal) → context-window-overflow(terminal) →
     unsupported-image(terminal) → oversized-request(terminal) →
-    adapter input-too-long(terminal) →
+    adapter input-too-long(terminal) → request-size-exceeded(terminal) →
     model-unavailable → throttle →
     credential-propagation(transient) → auth(terminal) →
     session-expiry(terminal) → connection failure(transient) → generic 5xx /
@@ -1234,7 +1236,7 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
     """
     if not isinstance(error, dict):
         return False
-    data = str(error.get("data", "") or "")
+    data = provider_data_text(error)  # a structured `data` reads its prose from `message`
     message = str(error.get("message", "") or "")
     haystack = f"{data} {message}"
     if _model_is_unentitled(data, available_models):
@@ -1254,6 +1256,14 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
         # intentional and self-documenting, not incidental to the False
         # fall-through, and so a future transient marker added below cannot
         # accidentally match malformed-request wording.
+        return False
+    if is_many_image_dimension(data):
+        # Terminal on this conversation: an image already in the native history
+        # exceeds the provider's 2000px many-image cap, so replaying the same
+        # history is refused identically every time. Recovery is to downscale the
+        # offending images in place (session_image_repair), not to retry. Scoped
+        # to `data` like its image siblings, and stated explicitly so a
+        # co-occurring 5xx wrapper or retry hint cannot rescue a dimension verdict.
         return False
     if _RE_CONTEXT_WINDOW_OVERFLOW.search(data):
         # Terminal on this native session: its startup/turn envelope already
@@ -1278,6 +1288,11 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
         # chain can make it fit. Stated explicitly so a 5xx token or retry hint
         # added to the same frame cannot rescue a size verdict.
         return False
+    if _is_request_size_exceeded(data, message):
+        # Terminal: the model service's byte cap refuses the same re-sent
+        # history on every attempt. Stated explicitly for the same reason as the
+        # adapter's overflow above.
+        return False
     if _RE_MODEL_UNAVAILABLE.search(data):
         return True
     if _RE_MODEL_TEMP_UNAVAILABLE.search(data):
@@ -1298,13 +1313,10 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
         # Auth is terminal — a retry can't fix an expired/denied credential.
         return False
     if _is_session_expired(haystack):
-        # An expired or rejected kiro-cli login is terminal too.  Keep this
-        # before connection/5xx handling because aborted requests often carry
-        # a transport wrapper beside the credential failure.
+        # Session expiry is terminal — retrying can't refresh an expired login.
         return False
     if _RE_CONNECTION.search(haystack):
-        # Recognized terminal signals above take precedence; an otherwise unknown
-        # cause with connection wording may consume only this bounded retry budget.
+        # A temporary endpoint failure is safe for the bounded retry ladder.
         return True
     return bool(
         _RE_5XX_NAMED.search(haystack)
@@ -1399,10 +1411,3 @@ def classify_provider_error(haystack: str, *, data: str | None = None) -> Provid
     if match:
         return ProviderErrorClass(PROVIDER_ERROR_HTTP_5XX, True, match.group(0))
     return ProviderErrorClass(PROVIDER_ERROR_UNKNOWN, False)
-
-
-# Preserve exception identities used by logs and serialized records.
-for _exception in tuple(globals().values()):
-    if isinstance(_exception, type) and _exception.__module__ == __name__:
-        _exception.__module__ = "kiro_crew.acp.transport_errors"
-del _exception

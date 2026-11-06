@@ -483,14 +483,16 @@ class TestRepeatedToggleIsIdempotent:
         from kiro_crew.apps import teardown as teardown_mod
 
         both_read = asyncio.Event()
+        loop = asyncio.get_running_loop()
         real_get_app = routes_mod.get_app
-        reads = 0
+        reads: list[str] = []
 
         def _get_app(name: str) -> Any:
-            nonlocal reads
-            reads += 1
-            if reads == 2:
-                both_read.set()
+            # The route reads the record on a worker thread: append is atomic, and
+            # the event is set from the loop's own thread.
+            reads.append(name)
+            if len(reads) >= 2:
+                loop.call_soon_threadsafe(both_read.set)
             return real_get_app(name)
 
         scripts: list[str] = []
@@ -621,3 +623,139 @@ class TestRecordWritersRunOffTheLoop:
             assert (await client.post(f"/api/apps/{APP}/enable")).status == 200
             assert (await client.post(f"/api/apps/{APP}/disable")).status == 200
         assert on_loop == [("enable", False), ("disable", False)]
+
+
+class TestRecordReadsRunOffTheLoop:
+    """The enable, disable and open routes read the app record from a worker thread.
+
+    ``get_app`` reads installed.json and parses app.json, and ``app_enabled_state``
+    stats and reads installed.json. Called on the event loop, either read stalls
+    every gateway task until the disk answers.
+    """
+
+    @pytest.mark.asyncio
+    async def test_enable_disable_and_open_read_the_record_off_the_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        reads: list[tuple[str, bool]] = []
+
+        def _running_on_loop() -> bool:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return False
+            return True
+
+        def _spy(attr: str) -> Any:
+            real = getattr(routes_mod, attr)
+
+            def _read(name: str) -> Any:
+                reads.append((attr, _running_on_loop()))
+                return real(name)
+
+            return _read
+
+        for attr in ("get_app", "app_enabled_state"):
+            monkeypatch.setattr(routes_mod, attr, _spy(attr))
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            assert (await client.post(f"/api/apps/{APP}/enable")).status == 200
+            enable_reads, reads[:] = list(reads), []
+            # No openCommand: the route answers 400 after its record read.
+            assert (await client.post(f"/api/apps/{APP}/open")).status == 400
+            open_reads, reads[:] = list(reads), []
+            assert (await client.post(f"/api/apps/{APP}/disable")).status == 200
+            disable_reads = list(reads)
+        assert enable_reads == [("get_app", False), ("app_enabled_state", False)]
+        assert open_reads == [("get_app", False)]
+        assert disable_reads == [("get_app", False), ("app_enabled_state", False)]
+
+
+# ---------------------------------------------------------------------------
+# Native-Windows exec backend refusal reaches the enable response
+# ---------------------------------------------------------------------------
+
+
+def _install_with_backend(tmp_path: Path, entry: str, body: str, **backend: Any) -> None:
+    src = _make_app_source(tmp_path, backend={"entryPoint": entry, "port": "auto", **backend})
+    (src / entry).write_text(body)
+    from kiro_crew.apps.manager import install_app
+
+    assert install_app(src).ok
+
+
+def _backend_sees_platform(monkeypatch: pytest.MonkeyPatch, *, is_posix: bool) -> None:
+    """Make only the backend module read ``platform_compat.IS_POSIX`` as *is_posix*.
+
+    The enable route's own record and config writes keep the real host's code paths;
+    the refusal under test reads ``platform_compat.IS_POSIX`` in ``backend.py``. Every
+    other attribute is read from the real module.
+    """
+    import kiro_crew.apps.backend as bmod
+
+    real = bmod.platform_compat
+
+    class _PlatformView:
+        IS_POSIX = is_posix
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+    monkeypatch.setattr(bmod, "platform_compat", _PlatformView())
+
+
+def _backend_sees_native_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    _backend_sees_platform(monkeypatch, is_posix=False)
+
+
+class TestEnableReportsWindowsExecBackendRefusal:
+    """``start_app_backend`` returns the None of "no backend declared" when it refuses
+    an exec (shell launcher) backend on native Windows. The enable response must name
+    the refusal in ``backend_refused`` instead of reading as a clean start."""
+
+    @pytest.mark.asyncio
+    async def test_exec_backend_refusal_is_in_the_enable_response(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install_with_backend(tmp_path, "run.sh", "#!/bin/sh\necho hi\n", type="exec")
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        _backend_sees_native_windows(monkeypatch)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable")
+            body = await resp.json()
+        # The app still enables: its other parts may work without the backend.
+        assert resp.status == 200
+        assert "backend" not in body
+        assert "not supported on native Windows" in body["backend_refused"]
+        assert APP in body["backend_refused"]
+
+    @pytest.mark.asyncio
+    async def test_python_backend_on_windows_carries_no_refusal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install_with_backend(tmp_path, "server.py", "print('hi')\n", type="python")
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        _backend_sees_native_windows(monkeypatch)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable")
+            body = await resp.json()
+        assert resp.status == 200
+        assert "backend_refused" not in body
+
+    @pytest.mark.asyncio
+    async def test_exec_backend_on_posix_carries_no_refusal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install_with_backend(tmp_path, "run.sh", "#!/bin/sh\necho hi\n", type="exec")
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        _backend_sees_platform(monkeypatch, is_posix=True)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable")
+            body = await resp.json()
+        assert resp.status == 200
+        assert "backend_refused" not in body

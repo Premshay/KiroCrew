@@ -79,6 +79,7 @@ CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS: tuple[str, ...] = (
     "task_run",
     "register_hook",
     "pod_up",
+    "pod_restart",
 )
 
 # One tool on the same boundary cannot be held by NAME.  ``ops_mission_control_api``
@@ -137,6 +138,7 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # Changing a session's model decides what the user's next turn there runs
     # on and spends; same containment reason as stop.
     "session_set_model",
+    "session_set_color",
     # Reload relaunches another session's agent process; same containment
     # reason as stop.
     "session_reload",
@@ -162,6 +164,7 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # blocked for, one step shallower.
     "session_status",
     "session_create",
+    "work_dispatch",
     "session_fork",
     "session_close",
     # The tree verbs, blocked on the containment reason the rest share: a channel

@@ -259,9 +259,11 @@ def _tool_schema_items() -> list[PostureItem]:
 
 
 def _redaction_sink_items() -> list[PostureItem]:
+    from kiro_crew.apps import seams
+
     return [
         PostureItem(label=label, detail=f"{module} — {detail}")
-        for label, module, detail in _REDACTION_SINKS
+        for label, module, detail in (*_REDACTION_SINKS, *seams.output_sinks())
     ]
 
 

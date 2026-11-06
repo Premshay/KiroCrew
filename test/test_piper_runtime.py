@@ -306,7 +306,9 @@ async def test_timeout_reaps(runtime_env, monkeypatch, phase):
     # before any worker existed. Trigger the real timeout at a known lifecycle
     # boundary so this tests ownership/cleanup rather than scheduler speed.
     deadline = asyncio.timeout(None)
-    monkeypatch.setattr(runtime.asyncio, "timeout", lambda _seconds: deadline)
+    monkeypatch.setattr(
+        runtime.asyncio, "timeout", lambda _seconds: deadline
+    )  # flake-ok: Replaces the timeout context manager with a controlled test context.
     reached = proc.sent
     if phase == "before_spawn":
         reached = asyncio.Event()

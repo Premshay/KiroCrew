@@ -11,7 +11,7 @@ of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_agent``, ``_agent_capabilities``, ``_agent_version``,
 ``_can_load_session``, ``_child_pids``, ``_derived_spec_snapshot``, ``_exit_watch_task``,
-``_initialized``, ``_kas_host_auth``, ``_last_activity``, ``_launch_copy_spec``,
+``_initialize_result``, ``_initialized``, ``_kas_host_auth``, ``_last_activity``, ``_launch_copy_spec``,
 ``_launch_cwd_roots``, ``_launch_process_cwd``, ``_max_age_secs``,
 ``_max_rss_depth``, ``_max_rss_mb``, ``_native_launch_resources``,
 ``_native_launch_sources``, ``_native_launch_view_alias``, ``_native_skill_projection``,
@@ -24,7 +24,7 @@ Instance fields written: ``_agent``, ``_agent_capabilities``, ``_agent_version``
 ``_mcp_secret_server``.
 
 Instance fields read: ``_acp_backend``, ``_extra_env``, ``_launch_agent``, ``_member_context``,
-``_model``, ``_sandbox_mode``, ``_scratch_dir``, ``_shared_scratch``, ``_tool_search``,
+``_model``, ``_native_skill_projection_enabled``, ``_refuse_over_ceiling_launch``, ``_sandbox_mode``, ``_scratch_dir``, ``_shared_scratch``, ``_tool_search``,
 ``_work_dir``.
 """
 
@@ -52,6 +52,7 @@ from kiro_crew.acp.client import (
     apply_pod_bundle_spawn,
     finish_suspended_spawn,
 )
+from kiro_crew.acp.handshake_identity import refuse_conflicting_handshake
 from kiro_crew.acp.harness import SpawnContext, SpawnPlan
 from kiro_crew.acp.launch import LaunchRequest, LaunchTools, launch
 from kiro_crew.acp.runtime_process_tree import ChildRecord, _kill_escaped_children
@@ -59,13 +60,14 @@ from kiro_crew.acp.runtime_tree_kill import _prune_dead_descendants
 from kiro_crew.acp.session_handle import AcpRequestTimeout, AcpRuntimeError, AcpRuntimeOverloaded
 from kiro_crew.acp.types import ACP_BACKEND_KIRO
 from kiro_crew.agent import ensure_agent_materialized
+from kiro_crew.agent_sdk.backends import spawn_delegates_to_internal_sandbox
 from kiro_crew.agent_sdk.drivers import acp as acp_driver
 from kiro_crew.agent_sdk.tool_search import (
     kas_client_meta_settings,
+    kas_never_defer_ids,
     spec_grants_tool_search,
     with_client_meta_settings,
 )
-from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.constants import (
     INITIALIZE_TIMEOUT_SECS,
@@ -226,8 +228,6 @@ def _launch_tools() -> LaunchTools:
         augmented_path=augmented_path,
         scrub_agent_subprocess_env=scrub_agent_subprocess_env,
         apply_pod_home_remap=_apply_pod_home_remap,
-        browser_session_env=browser_session_env,
-        browser_socket_env=browser_socket_env,
         inject_xdist_auto_cap=inject_xdist_auto_cap,
         bind_voice_safe_agent_workspace_async=bind_voice_safe_agent_workspace_async,
         create_subprocess_limited=create_subprocess_limited,
@@ -376,7 +376,7 @@ async def _initialize_handshake(
             self._pid,
         )
     try:
-        return await self._send_and_await(
+        result = await self._send_and_await(
             "initialize",
             {
                 # kiro-cli reads the driving client name from `clientInfo.name`
@@ -398,6 +398,8 @@ async def _initialize_handshake(
             },
             timeout=timeout,
         )
+        refuse_conflicting_handshake(self._acp_backend, result)
+        return result
     except AcpRequestTimeout as exc:
         alive = self._process is not None and self._process.returncode is None
         if not alive or not (throttled_at_spawn or agents_slice_throttling()):
@@ -408,6 +410,30 @@ async def _initialize_handshake(
             "Free agent memory (close idle sessions, run fewer concurrent subagents) "
             "and retry."
         ) from exc
+
+
+async def _refuse_over_ceiling_launch(self: AcpRuntime, launch_name: str | None) -> None:
+    """Refuse a kiro-cli spawn whose agent would carry grants the ceiling denies.
+
+    kiro-cli honours the grants of the spec it is handed before Crew's gate, and Crew
+    never rewrites a crew-bound spec it does not own. *launch_name* is the name the
+    spawn hands kiro-cli: a skill view, a Crew-owned copy the projection wrote with
+    the ceiling applied (``agent.govern_shared_template_view``), or, with no view, the
+    authored name, whose every claimant is checked. Judged after the projection,
+    because the plan is built before it and cannot know the name.
+    """
+    from kiro_crew import agent as agent_mod
+
+    try:
+        await asyncio.to_thread(
+            agent_mod.require_shared_template_within_ceiling,
+            self._agent,
+            ACP_BACKEND_KIRO,
+            launch_name=launch_name,
+            work_dir=getattr(self, "_work_dir", None),
+        )
+    except agent_mod.SharedTemplateOverCeiling as exc:
+        raise AcpRuntimeError(str(exc)) from exc
 
 
 async def _spawn_admitted(self: AcpRuntime) -> None:
@@ -452,12 +478,6 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
             )
         except AppAgentLaunchError as exc:
             raise AcpRuntimeError(exc.detail) from exc
-    # Delegated Kiro agents on macOS do not inherit Kiro Crew's Seatbelt
-    # deny rules. Keep their workspace disjoint from the named voice-decoder
-    # runtime so verified executable bytes cannot be replaced before spawn.
-    if self._harness.internal_sandbox:
-        await asyncio.to_thread(assert_voice_runtime_outside_agent_workspace, self._work_dir)
-
     try:
         plan = await self._resolve_spawn_plan()
         self._max_rss_depth = plan.rss_depth
@@ -467,7 +487,10 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
             # on the identity; kiro-cli is handed the launch copy instead.
             argv = list(argv)
             argv[argv.index("--agent") + 1] = self._launch_agent
-        if self.acp_backend == ACP_BACKEND_KIRO:
+        # ``getattr``: a runtime built without ``__init__`` (test doubles) projects.
+        if self.acp_backend == ACP_BACKEND_KIRO and getattr(
+            self, "_native_skill_projection_enabled", True
+        ):
             from kiro_crew.acp.skill_projection import prepare_native_skill_projection
 
             async with self._skill_projection_lock():
@@ -585,6 +608,21 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
                                     )
     except _KiroExecutableTrustError as exc:
         raise AcpRuntimeError(str(exc)) from exc
+    if self.acp_backend == ACP_BACKEND_KIRO:
+        await self._refuse_over_ceiling_launch(
+            argv[argv.index("--agent") + 1] if "--agent" in argv[:-1] else None
+        )
+    # Who confines this process, decided from the plan because the route is the
+    # plan's: KAS's relay runs kiro-cli and its internal sandbox, its bundle runs
+    # Node and does not. Every reader below takes this one answer.
+    internal_sandbox = spawn_delegates_to_internal_sandbox(
+        self._acp_backend, kiro_cli_internal_sandbox=plan.kiro_cli_internal_sandbox
+    )
+    # Delegated Kiro agents on macOS do not inherit Kiro Crew's Seatbelt
+    # deny rules. Keep their workspace disjoint from the named voice-decoder
+    # runtime so verified executable bytes cannot be replaced before spawn.
+    if internal_sandbox:
+        await asyncio.to_thread(assert_voice_runtime_outside_agent_workspace, self._work_dir)
     # The handshake declaration is the harness's constant. A host that takes
     # feature settings over the wire (``client_meta_settings``, a positive
     # membership answer) has its channel filled here -- BEFORE the process
@@ -603,12 +641,13 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
     # is_kiro_cli drives the reviewed Kiro internal-sandbox delegation: on macOS
     # wrap_argv skips its seatbelt because the two cannot nest; on Windows the
     # official Kiro backend delegates by default because Crew has no native OS
-    # sandbox there. The verdict is membership in ACP_BACKENDS_INTERNAL_SANDBOX
-    # (harness-parity H7) — never "not KAS": that test fails OPEN, so a harness
-    # inheriting a negative test would have Crew's seatbelt skipped in favour of
-    # an internal sandbox that never starts. KAS is a Node process with no
-    # internal sandbox, so it takes Crew's seatbelt directly, and so does every
-    # harness added later.
+    # sandbox there. The verdict is ``spawn_delegates_to_internal_sandbox``
+    # (harness-parity H7), two positive memberships -- never "not KAS": that test
+    # fails OPEN, so a harness inheriting a negative test would have Crew's
+    # seatbelt skipped in favour of an internal sandbox that never starts. KAS
+    # delegates on its kiro-cli relay route only; its bundle route is a Node
+    # process with no internal sandbox and takes Crew's seatbelt directly, and so
+    # does every harness added later.
     #
     # The incarnation this spawn is. Minted BEFORE the launch because two things
     # carry it: the scope's unit name, and the child's own environment. One token
@@ -718,7 +757,7 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
             # credential homes.
             extra_hidden_dirs=plan.extra_hidden_dirs,
             extra_expose_files=plan.extra_expose_files,
-            internal_sandbox=self._harness.internal_sandbox,
+            internal_sandbox=internal_sandbox,
             pod_home_remap=self._harness.pod_home_remap,
             guard_scratch_hops=True,
         ),
@@ -974,6 +1013,7 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
         # _INITIALIZE_TIMEOUT -- see _initialize_handshake. The capabilities
         # were resolved above, before the process existed.
         init_resp = await self._initialize_handshake(client_capabilities)
+        self._initialize_result = init_resp if isinstance(init_resp, dict) else {}
         _agent_caps = init_resp.get("agentCapabilities", {})
         self._agent_capabilities = _agent_caps if isinstance(_agent_caps, dict) else {}
         self._can_load_session = bool(self._agent_capabilities.get("loadSession", False))
@@ -1154,11 +1194,13 @@ async def _handshake_client_capabilities(self: AcpRuntime) -> dict[str, Any]:
     for a host that reads it (``client_meta_settings``) and only with values
     the operator threaded in. Today that is MCP Tool Search, and the value
     sent is gated on the spawn agent's spec granting the ``tool_search``
-    loader: KAS defers every MCP spec when told to and never checks that a
-    loader is mounted, so a spec without the grant would run with its MCP
-    tools deferred and no way to load one. ``enabled`` therefore goes out as
-    an explicit false for such a spec rather than being left to the host's
-    default. The spec judged is the one the KAS projection will PUT ON THE
+    loader. KAS's deferral path ignores ``enabled`` and defers every MCP tool
+    not on ``toolSearch.neverDefer``, so for a spec without the grant the
+    payload lists every MCP tool that spec can call there
+    (``kas_never_defer_ids``, expanding whole-server grants from
+    :func:`_known_server_tool_names`) and ``enabled`` goes out as an explicit
+    false. A spec that grants the loader is sent no ``neverDefer``.
+    The spec judged is the one the KAS projection will PUT ON THE
     WIRE at session/new -- the freshness gate's snapshot for a derived agent,
     else the spec ``resolve_projected_spec`` resolves nearest-first, the same
     call the projection makes: a spec judged here that differed from the one
@@ -1172,17 +1214,38 @@ async def _handshake_client_capabilities(self: AcpRuntime) -> dict[str, Any]:
         return base
     spec = await asyncio.to_thread(self._projected_spawn_spec)
     loader_granted = spec_grants_tool_search(spec)
-    settings = kas_client_meta_settings(self._tool_search, loader_granted=loader_granted)
+    never_defer: list[str] = []
+    if not loader_granted:
+        never_defer = await asyncio.to_thread(kas_never_defer_ids, spec, _known_server_tool_names)
+    settings = kas_client_meta_settings(
+        self._tool_search, loader_granted=loader_granted, never_defer=never_defer
+    )
     self._tool_search_wire = settings
     logger.info(
         "AcpRuntime handshake: MCP Tool Search %s for agent=%s "
-        "(configured=%s, spec grants tool_search=%s)",
+        "(configured=%s, spec grants tool_search=%s, never-defer ids=%d)",
         "enabled" if settings["toolSearch"]["enabled"] else "disabled",
         self._agent or "<none>",
         self._tool_search.enabled,
         loader_granted,
+        len(never_defer),
     )
     return with_client_meta_settings(base, settings)
+
+
+def _known_server_tool_names(server: str) -> list[str] | None:
+    """The tool names Crew already holds for *server*, read without spawning it.
+
+    The last probe's ``tools/list``, expired or not, because a stale list only
+    risks a tool staying deferred or an id that matches nothing. Nothing is
+    imported to answer: a Kiro Crew server's declaration module lives in a
+    package the agent's uid can write, so this read stays on the probe cache the
+    sandboxed probe fills. ``None`` when the cache has no list -- the caller
+    then leaves that server to KAS's own deferral.
+    """
+    from kiro_crew.acp.kas_permissions import cached_mcp_tool_names
+
+    return cached_mcp_tool_names(server)
 
 
 async def _with_mcp_sign_in_storage(runtime: AcpRuntime, base: dict[str, Any]) -> dict[str, Any]:

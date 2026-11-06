@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -20,7 +19,11 @@ from knowledge_helpers import store_fixture  # noqa: F401
 
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.knowledge.sync import SyncScheduler
-from kiro_crew.testing.wait import await_until, finished
+from kiro_crew.testing.wait import async_wait_until, await_until, finished
+
+# The stamp written into the test's own rows. A fixed naive value, so the rows do not
+# depend on the host's clock or its time zone.
+_ROW_STAMP = "2026-10-01T12:00:00"
 
 # ---------------------------------------------------------------------------
 # 7. KnowledgeStore -- additional coverage
@@ -32,7 +35,6 @@ class TestKnowledgeStoreExtended:
         item_id = store.add_item("Original", "old content about cats", "doc")
         assert len(store.search_items_fts("cats")) == 1
         store.update_item(item_id, title="Updated", content="new content about dogs")
-        # After update, new content should be searchable
         assert len(store.search_items_fts("dogs")) == 1
         item = store.get_item(item_id)
         assert item["title"] == "Updated"
@@ -40,7 +42,10 @@ class TestKnowledgeStoreExtended:
 
     def test_update_item_no_fields(self, store):
         item_id = store.add_item("Doc", "content", "doc")
-        store.update_item(item_id)  # no-op, should not crash
+        before = dict(store.get_item(item_id))
+        store.update_item(item_id)
+        # A call with nothing to write must not even bump updated_at.
+        assert dict(store.get_item(item_id)) == before
 
     def test_update_item_non_fts_field(self, store):
         item_id = store.add_item("Doc", "content", "doc")
@@ -160,9 +165,7 @@ class TestKnowledgeStoreExtended:
         agree = str(uuid4())
         listprops = str(uuid4())
         forged = str(uuid4())
-        # flake-ok: pre-existing naive local stamp written into the test's own rows, moved verbatim; tracked for a de-flake pass
-        # nosemgrep: kirocrew.test-naive-local-time -- pre-existing naive stamp for the test's own rows, moved verbatim; tracked for a de-flake pass
-        now = datetime.now().isoformat()
+        now = _ROW_STAMP
         for sid, column, props_json, uri in (
             (divergent, "pending", json.dumps({"sync_status": "pending_confirmation"}), "/tmp/div"),
             (live, "paused", json.dumps({"sync_status": "active"}), "/tmp/live"),
@@ -213,9 +216,7 @@ class TestKnowledgeStoreExtended:
 
         db_path = str(tmp_path / "test.db")
         sid = str(uuid4())
-        # flake-ok: pre-existing naive local stamp written into the test's own rows, moved verbatim; tracked for a de-flake pass
-        # nosemgrep: kirocrew.test-naive-local-time -- pre-existing naive stamp for the test's own rows, moved verbatim; tracked for a de-flake pass
-        now = datetime.now().isoformat()
+        now = _ROW_STAMP
         store.db.execute(
             "INSERT INTO sources (id, name, source_type, uri, properties, sync_status, "
             "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -300,9 +301,7 @@ class TestKnowledgeStoreExtended:
         healthy = str(uuid4())
         recovered = str(uuid4())
         listprops = str(uuid4())
-        # flake-ok: pre-existing naive local stamp written into the test's own rows, moved verbatim; tracked for a de-flake pass
-        # nosemgrep: kirocrew.test-naive-local-time -- pre-existing naive stamp for the test's own rows, moved verbatim; tracked for a de-flake pass
-        now = datetime.now().isoformat()
+        now = _ROW_STAMP
         for sid, column, props_json, uri in (
             (
                 divergent,
@@ -369,9 +368,7 @@ class TestKnowledgeStoreExtended:
         """
         before = str(uuid4())
         after = str(uuid4())
-        # flake-ok: pre-existing naive local stamp written into the test's own rows, moved verbatim; tracked for a de-flake pass
-        # nosemgrep: kirocrew.test-naive-local-time -- pre-existing naive stamp for the test's own rows, moved verbatim; tracked for a de-flake pass
-        now = datetime.now().isoformat()
+        now = _ROW_STAMP
         for sid, column, uri in (
             (before, "synced", "/tmp/before"),
             (after, "pending", "/tmp/after"),
@@ -499,7 +496,10 @@ class TestKnowledgeStoreExtended:
 
     def test_update_source_no_fields(self, store):
         sid = store.add_source("f", "local_file", "/tmp/f2.md")
-        store.update_source(sid)  # no-op
+        query = "SELECT * FROM sources WHERE id = ?"
+        before = dict(store.db.execute(query, (sid,)).fetchone())
+        store.update_source(sid)
+        assert dict(store.db.execute(query, (sid,)).fetchone()) == before
 
     def test_add_source_location(self, store):
         sid = store.add_source("f", "local_file", "/tmp/loc.md")
@@ -517,10 +517,8 @@ class TestKnowledgeStoreExtended:
         e3 = store.add_entity("C", "svc")
         store.add_entity_relation(e1, e2, "calls")
         store.add_entity_relation(e2, e3, "calls")
-        # depth=1 should get B only
         n1 = store.get_neighbors(e1, depth=1)
         assert {n["id"] for n in n1} == {e2}
-        # depth=2 should get B and C
         n2 = store.get_neighbors(e1, depth=2)
         assert {n["id"] for n in n2} == {e2, e3}
 
@@ -531,6 +529,36 @@ class TestKnowledgeStoreExtended:
         # e1 has no outgoing but has incoming from e2
         neighbors = store.get_neighbors(e1, depth=1)
         assert {n["id"] for n in neighbors} == {e2}
+
+    def test_get_neighbors_matches_the_graph_walk_and_never_loads_the_graph(self, store):
+        import random
+
+        rng = random.Random(7)
+        ids = [store.add_entity(f"n{i}", "concept") for i in range(60)]
+        for _ in range(140):
+            store.add_entity_relation(rng.choice(ids), rng.choice(ids), "relates")
+        store.add_entity_relation(ids[0], ids[0], "self")
+        store._graph_loaded = False
+        walked = {
+            (eid, depth): sorted(n["id"] for n in store.get_neighbors(eid, depth=depth))
+            for eid in ids[:12]
+            for depth in (1, 2, 3)
+        }
+        assert store._graph_loaded is False
+        graph = store.graph
+        for (eid, depth), got in walked.items():
+            visited, frontier = set(), {eid}
+            for _ in range(depth):
+                nxt = set()
+                for nid in frontier:
+                    for nb in (*graph.successors(nid), *graph.predecessors(nid)):
+                        if nb not in visited and nb != eid:
+                            nxt.add(nb)
+                visited |= frontier
+                frontier = nxt
+            assert got == sorted((visited | frontier) - {eid}), (eid, depth)
+        names = {n["id"]: n["name"] for n in store.get_neighbors(ids[1], depth=1)}
+        assert names and all(names[i] == f"n{ids.index(i)}" for i in names)
 
     def test_find_entity_by_alias(self, store):
         store.add_entity("DynamoDB", "technology", aliases=["ddb", "dynamo"])
@@ -731,7 +759,7 @@ class TestRetireAutoRegisteredFolders:
         """
         folder = tmp_path / "legacy"
         folder.mkdir()
-        (folder / "note.md").write_text("# legacy\n\nbody\n" * 40)
+        (folder / "note.md").write_text("# legacy\n\nbody\n" * 40, encoding="utf-8")
         sid = self._add(store, {"auto_added": True}, uri=str(folder))
         fw = self._watcher(store)._folder_watcher
         fw._do_scan = AsyncMock()  # type: ignore[method-assign]
@@ -1121,11 +1149,17 @@ class TestWatcherRunLoop:
         w = self._watcher(store, interval=3600)
         w._scan = AsyncMock()  # type: ignore[method-assign]
         task = asyncio.create_task(w.start())
-        # flake-ok: pre-existing one-tick yield before the stop, which the bounded wait below covers; moved verbatim, tracked for a de-flake pass
-        await asyncio.sleep(0)  # let the first sweep run and enter the wait
+        # The first sweep has run once the scan has been awaited; the stop then
+        # lands on the loop whether it is parked in the interval wait or not yet there.
+        await async_wait_until(
+            lambda: w._scan.await_count >= 1,
+            describe=lambda: "the first sweep to run",
+        )
         await w.stop()
         await await_until(task, what="the stopped watcher loop returning")
-        w._scan.assert_awaited()
+        assert task.result() is None
+        # One sweep before the stop, and no second one after it.
+        assert w._scan.await_count == 1
 
 
 class TestScheduledDedupCadence:
@@ -1159,6 +1193,8 @@ class TestScheduledDedupCadence:
             cfg.load.return_value = self._cfg(0)
             await w._maybe_dedup_sweep()
         sweep.assert_not_called()
+        # A skipped pass must not consume the first-pass preview either.
+        assert w._dedup_applied_once is False
 
     @pytest.mark.asyncio
     async def test_it_only_runs_on_the_cadence(self, store):
@@ -1166,11 +1202,17 @@ class TestScheduledDedupCadence:
         w._sweep_count = 5  # 5 % 4 != 0
         with (
             patch("kiro_crew.knowledge.watcher.KiroCrewConfig") as cfg,
-            patch("kiro_crew.knowledge.watcher.dedup_sweep") as sweep,
+            patch("kiro_crew.knowledge.watcher.dedup_sweep", return_value=[]) as sweep,
         ):
             cfg.load.return_value = self._cfg(4)
             await w._maybe_dedup_sweep()
-        sweep.assert_not_called()
+            assert sweep.call_count == 0
+            assert w._dedup_applied_once is False
+            # The next multiple of the cadence does run, so the gate is the cadence.
+            w._sweep_count = 8
+            await w._maybe_dedup_sweep()
+        assert sweep.call_count == 1
+        assert w._dedup_applied_once is True
 
     @pytest.mark.asyncio
     async def test_the_first_pass_previews_and_the_next_one_applies(self, store):
@@ -1232,6 +1274,7 @@ class TestScheduledDedupCadence:
             cfg.load.side_effect = RuntimeError("no config")
             await w._maybe_dedup_sweep()
         sweep.assert_not_called()
+        assert w._dedup_applied_once is False
 
 
 # ---------------------------------------------------------------------------
@@ -1292,9 +1335,7 @@ class TestSyncAllSkipsErroredSources:
         """
         err_id = str(uuid4())
         ok_id = str(uuid4())
-        # flake-ok: pre-existing naive local stamp written into the test's own rows, moved verbatim; tracked for a de-flake pass
-        # nosemgrep: kirocrew.test-naive-local-time -- pre-existing naive stamp for the test's own rows, moved verbatim; tracked for a de-flake pass
-        now = datetime.now().isoformat()
+        now = _ROW_STAMP
         for sid, uri, props_json in (
             (
                 err_id,

@@ -115,6 +115,7 @@ async def test_environment_check_carries_app_identity(monkeypatch):
         request_for(app=store.APP_NAME, dashboard=False)
     )
     assert response.status == 202
+    assert routes._check_thread is not None
     routes._check_thread.join(10)
     assert seen[0] is not None
     assert seen[0].app == store.APP_NAME

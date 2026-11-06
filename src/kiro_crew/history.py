@@ -23,6 +23,7 @@ import sys as _sys
 import threading
 import time as _time  # noqa: F401 - facade re-export
 import uuid  # noqa: F401 - facade re-export
+import weakref
 from collections.abc import (  # noqa: F401 - facade re-export
     Callable,
     Container,
@@ -69,8 +70,10 @@ from kiro_crew.history_append import (  # noqa: F401 - facade re-exports
 )
 from kiro_crew.history_cache import (
     _METADATA_CACHE_MAX,
+    _PARSED_BYTES_PER_FILE_BYTE,
     _TRANSCRIPT_CACHE_IDLE_TTL,
     _TRANSCRIPT_CACHE_MAX,
+    _TRANSCRIPT_CACHE_MAX_BYTES,
     HistoryCacheCoordinator,
     _FileChangeCacheEntry,
     _LRUCache,
@@ -117,6 +120,7 @@ from kiro_crew.history_consolidation import (  # noqa: F401 - facade re-exports
     _strip_skill_frontmatter,
 )
 from kiro_crew.history_derivation import (  # noqa: F401 - facade re-exports
+    INCOGNITO_EXCLUDED_HEADER,
     INCOGNITO_MEMORY_MODES,
     TRANSCRIPT_HEADER_MAX_BYTES,
     TranscriptBusy,
@@ -327,7 +331,20 @@ class ConversationLog:
     # Per-file reentrant locks shared across every instance in this process so
     # transcript mutations (append / rewrite / metadata edit) targeting the
     # same session file are serialized and never lose each other's writes.
-    _file_locks: dict[str, threading.RLock] = {}
+    #
+    # A ``WeakValueDictionary`` so a lock evicts once nothing references it,
+    # rather than one RLock per distinct session path accumulating for the
+    # gateway's life (every chat, cron, subagent and webhook session adds one,
+    # and ``delete_session`` never dropped it). This is only safe because every
+    # caller of ``_file_lock`` holds a STRONG reference to the returned lock for
+    # its whole critical section — all take it as ``with self._file_lock(key):``
+    # or bind it to a local across ``acquire``/``release`` — so while any writer
+    # holds a path's lock the entry cannot evict, and a concurrent writer to the
+    # same path gets back the SAME object. An entry only disappears while no one
+    # holds it, when there is no writer to hand a stale lock to. Do NOT drop the
+    # entry on release in ``history_locks._file_lock``: an explicit pop could
+    # hand two concurrent writers different locks for one file.
+    _file_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
     _file_locks_guard = threading.Lock()
 
     # Cross-process advisory-lock state. The per-file ``threading.RLock`` above
@@ -397,9 +414,11 @@ class ConversationLog:
     # never the reverse, and never across I/O — so no read path waits on a
     # writer's file operations. Grows one small int per (dir, spelling) ever
     # invalidated in this process — a session can occupy up to two buckets
-    # (a legacy bare Slack stem plus its canonical spelling) — the same
-    # growth class as ``_file_locks``, and entries are never evicted because
-    # a missing entry must always mean "generation 0", not "forgotten bump".
+    # (a legacy bare Slack stem plus its canonical spelling) — and entries are
+    # never evicted because a missing entry must always mean "generation 0",
+    # not "forgotten bump". Unbounded by design (unlike ``_file_locks`` above,
+    # which a weak map evicts): a dropped counter would reset to 0 and let a
+    # stale pre-eviction cache snapshot read as current.
     _cache_gens: dict[tuple[str, str], int] = {}
     _cache_gens_guard = threading.Lock()
     #: Per transcript directory, the total of every bump above: one int per
@@ -418,8 +437,14 @@ class ConversationLog:
         # parsed-transcript working set without limit. Eviction is
         # least-recently-used and deterministic; writes invalidate per-key via
         # _invalidate_cache so a stale entry can never outlive a file change.
+        # Also bounded by bytes: entry [0] is the file's CacheIdentity, whose
+        # [2] is its size, so the weight is the file size times the measured
+        # parse ratio (see _TRANSCRIPT_CACHE_MAX_BYTES).
         self._msg_cache: _LRUCache[tuple[CacheIdentity, int, list[dict]]] = _LRUCache(
-            cache_max, idle_ttl=_TRANSCRIPT_CACHE_IDLE_TTL
+            cache_max,
+            idle_ttl=_TRANSCRIPT_CACHE_IDLE_TTL,
+            max_weight=_TRANSCRIPT_CACHE_MAX_BYTES,
+            weigh=lambda entry: entry[0][2] * _PARSED_BYTES_PER_FILE_BYTE,
         )
         #: ``(identity, gen, meta)`` — like the search memos, entries record the
         #: invalidation generation and a warm hit requires both fields to
@@ -463,7 +488,13 @@ class ConversationLog:
         #: every session, so routing it through ``_msg_cache`` retains the full
         #: parsed transcript corpus. The file stamp includes inode and size in
         #: addition to nanosecond mtime so rotations and atomic rewrites miss.
-        self._file_change_cache: _LRUCache[_FileChangeCacheEntry] = _LRUCache(cache_max)
+        #:
+        #: Sized by ``_METADATA_CACHE_MAX``, NOT ``cache_max``: the scan walks
+        #: every session in one order, so an LRU smaller than the store evicts
+        #: each entry before it is read again and every call re-reads every
+        #: file. Entries hold changed paths only (a few hundred bytes for a
+        #: session with documents), so covering the whole store is cheap.
+        self._file_change_cache: _LRUCache[_FileChangeCacheEntry] = _LRUCache(_METADATA_CACHE_MAX)
         #: Sparse row-to-byte indexes for paginated transcript reads. Entries
         #: contain offsets and counts only, never message content, so a bounded
         #: page does not retain the complete parsed transcript in memory.
@@ -693,8 +724,7 @@ class ConversationLog:
     def get_unconsolidated(self, key: str) -> tuple[list[dict], int]:
         """Return (messages_after_last_consolidated, total_message_count)."""
         messages = self._read_messages(key)
-        offset = self._read_metadata(key).get("last_consolidated", 0)
-        return messages[offset:], len(messages)
+        return messages[self.consolidated_offset(key) :], len(messages)
 
     def chained_keys(self, key: str) -> list[str]:
         """Every transcript key :meth:`read_messages_chained` concatenates for *key*."""
@@ -788,6 +818,10 @@ class ConversationLog:
     def read_rotated_messages_chained(self, key: str) -> list[dict]:
         return self._read_projection.read_rotated_messages_chained(key)
 
+    def read_rotated_messages(self, key: str) -> list[dict]:
+        """Rows size-rotation archived out of *key*'s own transcript, oldest first."""
+        return self._read_projection.read_rotated_messages(key)
+
     def chain_mid_rotation(self, key: str) -> bool:
         """See ``HistoryReadProjection.chain_mid_rotation``."""
         return self._read_projection.chain_mid_rotation(key)
@@ -823,6 +857,7 @@ class ConversationLog:
     def delete_session(self, key: str, *, skip_pinned: Literal[True]) -> bool | None: ...
 
     def delete_session(self, key: str, *, skip_pinned: bool = False) -> bool | None:
+        transcript = self._path(key)
         with self.delete_in_flight_window(key):
             if skip_pinned:
                 deleted = self._metadata_projection.delete_session(key, skip_pinned=True)
@@ -834,6 +869,8 @@ class ConversationLog:
             from kiro_crew._durable_vouch import forget_durable_vouch
 
             forget_durable_vouch(key)
+            # And its persisted page index, so the sidecars track live transcripts.
+            self._read_projection.forget_page_index(transcript)
         return deleted
 
     def delete_memory_consolidation_session(self, key: str, expected_store: str) -> bool:
@@ -897,8 +934,16 @@ class ConversationLog:
     def mtime_of(self, key: str) -> float | None:
         return self._metadata_projection.mtime_of(key)
 
-    def clear_closed(self, key: str, *, only_if_closed_before: float | None = None) -> None:
-        self._metadata_projection.clear_closed(key, only_if_closed_before=only_if_closed_before)
+    def clear_closed(
+        self,
+        key: str,
+        *,
+        only_if_closed_before: float | None = None,
+        only_if_closed_id: str | None = None,
+    ) -> None:
+        self._metadata_projection.clear_closed(
+            key, only_if_closed_before=only_if_closed_before, only_if_closed_id=only_if_closed_id
+        )
 
     def _read_messages(self, key: str) -> list[dict]:
         return self._read_projection._read_messages(key)
@@ -1088,6 +1133,7 @@ class ConversationLog:
     _persist_inline_attachments = _history_append._persist_inline_attachments
     append = _history_append.append
     append_if_absent = _history_append.append_if_absent
+    _holds_identical_row = _history_append._holds_identical_row
 
     # -- Consolidation marker and retry ledger (``history_marker``).
     rotation_generation = _history_marker.rotation_generation

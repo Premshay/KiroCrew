@@ -269,6 +269,7 @@ ALWAYS_ON_BIN_MCP_SERVERS = (
     "kirocrew-mate",
 )
 OPT_IN_BIN_MCP_SERVERS = (
+    "kirocrew-secrets",
     "kirocrew-dashboard",
     "kirocrew-work",
     "kirocrew-crew-log",
@@ -431,7 +432,7 @@ def clean_stale_managed_mcp() -> list[str]:
         return []
     try:
         data = loads_user_json(_kiro_mcp_json().read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         return []
     if not isinstance(data, dict):
         return []

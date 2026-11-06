@@ -46,6 +46,7 @@ if __name__ == "__main__":
 # imported while it is still pre-isolation, so no post-isolation code touches the
 # filesystem for stdlib.
 import ctypes  # noqa: E402
+import fnmatch  # noqa: E402
 import os  # noqa: E402
 import platform as _plat  # noqa: E402
 import stat  # noqa: E402
@@ -154,6 +155,13 @@ class Launch:
         self.alias_credential_ids = plan["alias_credential_ids"]
         #: The directory to enter after the seals and before exec, or "" for none.
         self.exec_cwd = plan.get("exec_cwd", "")
+        #: The name of the directory this launcher was started in, read before any
+        #: mount, or "" when it has none. Entered again after the seals when the plan
+        #: names no ``exec_cwd``.
+        try:
+            self.inherited_cwd = os.getcwd()
+        except OSError:
+            self.inherited_cwd = ""
         self.required_mask_targets = frozenset(plan["required_mask_targets"])
         #: The masked directories that must be SEALED read-only when they carry no
         #: writable window: the caller-supplied masks (``extra_hidden_dirs`` -- an app
@@ -165,6 +173,11 @@ class Launch:
         #: which is exactly main's behaviour before this control.
         self.seal_windowless_masks = frozenset(plan.get("seal_windowless_masks", ()))
         self.mask_occupants = plan["mask_occupants"]
+        #: ``{"record", "nonce", "names"}``: where the gateway records the config files
+        #: it published itself, the nonce of the gateway process that built this plan,
+        #: and the names whose changed occupant the pin may look up there. Empty in an
+        #: older payload, which vouches for nothing -- the pin's behaviour before this.
+        self.published_file_record = plan.get("published_file_record") or {}
         self.crew_home_aliases = plan["crew_home_aliases"]
         self.expose_files = plan["expose_files"]
         self.env_prefixes = plan["env_prefixes"]
@@ -481,6 +494,10 @@ if __name__ == "__main__":
 # ``kiro_crew.sandbox_launcher_parts``. The renderer drops these lines.
 from kiro_crew._facade_compose import compose as _facade_compose  # noqa: E402
 from kiro_crew.sandbox_launcher_parts.exec_lockdown import (  # noqa: E402
+    _git_ssh_config_file,
+    _git_ssh_identity_opts,
+    _ssh_config_loadable,
+    _ssh_config_words,
     drop_privileges,
     enter_exec_cwd,
     exec_agent,
@@ -520,6 +537,8 @@ from kiro_crew.sandbox_launcher_parts.pinned_mounts import (  # noqa: E402
     _mount_or_die,
     _mount_or_warn,
     _pin_mount_path,
+    _published_by_gateway,
+    _read_published_record,
     _register_stand_in,
     _retire_stage_or_die,
     _stand_in_identity,

@@ -149,7 +149,10 @@ export function usePlusMenu({ pickers, value, onChange, composerControl, fileInp
   return { plusOpen, setPlusOpen, sketchOpen, setSketchOpen, plusWrapRef, plusBtnRef, plusMenuRef, plusRect, togglePlus, openTrigger }
 }
 
-export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, uploadCount, directFilePicker, fileInputId, openPicker, isMac, touchInput, onScreenshot, collapseMenuRow, typedCommandMenus, onFileSelect, optimizeRow = null }: {
+export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, uploadCount, directFilePicker, fileInputId, openPicker, isMac, touchInput, onScreenshot, collapseMenuRow, typedCommandMenus, onFileSelect, optimizeRow = null, appActionRows = null }: {
+  /** App composer actions (`composerActions.tsx`), a group of their own after
+   *  the host's shortcuts so an app's row never sits among the host's. */
+  appActionRows?: ReactNode
   /** "Optimize prompt" while a turn runs (#23572), a menu row because the
    *  busy send cluster is at its button cap. Null when idle: the cluster's
    *  own Optimize button is back then. */
@@ -291,7 +294,6 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, upl
                 <button
                   type="button"
                   onClick={() => { setPlusOpen(false); setSketchOpen(true) }}
-                  title={i18nT('components.chatInput.sketch')}
                   {...uiLocation('composer.add-menu.sketch')}
                   className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                 >
@@ -335,38 +337,34 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, upl
                   <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">/</span>
                   <div className="min-w-0">
                     <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.command')}</div>
-                    <div className="text-[11px] text-muted leading-snug">{i18nT('components.chatInput.quick_actions_like_clearing_the_chat_or_checking')}</div>
                   </div>
                 </button>}
                 {onFileSelect && (
                   <button
                     type="button"
                     onClick={() => openTrigger('@')}
-                    title={i18nT('components.chatInput.reference_a_file')}
                     {...uiLocation('composer.add-menu.reference-file')}
                     className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                   >
                     <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">@</span>
                     <div className="min-w-0">
-                      <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.file')}</div>
-                      <div className="text-[11px] text-muted leading-snug">{i18nT('components.chatInput.let_the_agent_read_one_of_your_files')}</div>
+                      <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.reference_a_file')}</div>
                     </div>
                   </button>
                 )}
                 {typedCommandMenus && <button
                   type="button"
                   onClick={() => openTrigger('$')}
-                  title={i18nT('components.chatInput.use_a_skill')}
                   {...uiLocation('composer.add-menu.skill')}
                   className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                 >
                   <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">$</span>
                   <div className="min-w-0">
-                    <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.skill')}</div>
-                    <div className="text-[11px] text-muted leading-snug">{i18nT('components.chatInput.apply_a_ready_made_set_of_instructions')}</div>
+                    <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.use_a_skill')}</div>
                   </div>
                 </button>}
               </div>
+              {appActionRows}
             </div>
           </OverlayPortal>}
           </GuideRevealScope>

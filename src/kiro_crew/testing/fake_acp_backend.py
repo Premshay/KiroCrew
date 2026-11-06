@@ -26,12 +26,20 @@ sends none of this, exactly like kiro-cli v2.
 Prompt-driven behaviour on ``session/prompt`` (the reply is always sent last):
 
 * Default text -> stream one ``agent_message_chunk`` (the canned reply).
+* A session-naming prompt (opens with ``NAMING_PROMPT_OPENING``) -> stream
+  ``SKIP``, so the host titles the session from its first-message fallback.
 * ``[[TOOL]]`` in the prompt -> also emit a ``tool_call`` + ``tool_call_update``
   (no permission). Exercises the tool-card UI and is deterministic headless:
   kiro-cli likewise emits tool calls that never raise ``session/request_permission``
   for pre-approved tools. The emitted ``rawInput`` carries the reserved purpose
   argument under its camelCase spelling (see ``_TOOL_PURPOSE``), so the pill's
   concise-label path is covered by the harness.
+* ``[[BROWSER]]`` in the prompt -> emit a ``browser`` MCP tool call
+  (``_meta.kiro`` names ``kirocrew-core`` / ``browser``, the identity the live
+  browser card keys its turn on) plus its completed update. The fake drives no
+  browser itself: a smoke test posts the real ops to ``/api/browser/op`` for the
+  same slot while a ``[[SLOW_HOLD:...]]`` keeps the turn open, and the card in
+  the transcript shows the stream exactly as a real turn would.
 * ``[[PERMISSION]]`` in the prompt -> the ``[[TOOL]]`` sequence PLUS a
   server->client ``session/request_permission`` (to surface the approval
   modal). This is **fire-and-forget**: the fake does not gate its own
@@ -113,6 +121,17 @@ PROTOCOL_VERSION = "2025-08-22"
 # Stable, searchable marker the send->assert test asserts on. Kept distinctive
 # so a real backend's output could never masquerade as this fake's reply.
 REPLY_TEXT = "pong from the fake ACP backend"
+# The opening sentence of every session-naming prompt (the dashboard title, its
+# refresh, the Slack/Telegram conversation name). A copy of
+# ``kiro_crew.label_guard.NAMING_PROMPT_OPENING``, not an import: this module is
+# exec'd by its shebang and stays stdlib-only at import time. A unit test pins
+# the two equal.
+NAMING_PROMPT_OPENING = "You are a session naming agent."
+# The whole reply to a naming prompt. ``SKIP`` is the control word every naming
+# prompt teaches for "not nameable yet", so the host keeps its own fallback --
+# the truncated first user message -- instead of storing ``REPLY_TEXT`` as the
+# session title.
+NAMING_REPLY_TEXT = "SKIP"
 FAKE_VERSION = "kiro-cli fake-e2e"
 FAKE_IDENTITY = "fake-e2e-user"
 
@@ -141,6 +160,8 @@ FAKE_MODEL_CATALOG: dict[str, Any] = {
 
 # Prompt sentinels. Absent by default so a plain prompt stays text-only.
 TOOL_TRIGGER = "[[TOOL]]"
+# Emits a ``browser`` MCP tool call (see the module docstring).
+BROWSER_TRIGGER = "[[BROWSER]]"
 PERMISSION_TRIGGER = "[[PERMISSION]]"
 # Permission that actually GATES: the fake waits for the host's answer and
 # reflects it in the tool_call_update status. Distinct from PERMISSION_TRIGGER,
@@ -293,6 +314,7 @@ _MCP_CLIENT_ORIGIN = {
     "kiro": {"resource": {"resourceType": "mcpServer", "source": {"origin": "client"}}}
 }
 _TOOL_CALL_ID = "fake-tool-1"
+_BROWSER_TOOL_CALL_ID = "fake-browser-1"
 # The agent-authored purpose line, carried as a reserved tool argument. kiro-cli
 # echoes it back in ``rawInput`` under EITHER spelling; the fake emits the
 # camelCase one so the harness exercises the shape the dashboard's concise tool
@@ -575,6 +597,30 @@ def _emit_tool_call(session_id: str, *, with_permission: bool, gated: bool = Fal
     )
 
 
+def _emit_browser_tool_call(session_id: str, url: str = "https://jspaint.app") -> None:
+    """Emit one completed ``browser`` MCP tool call, as kiro-cli spells its identity."""
+    _update(
+        session_id,
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": _BROWSER_TOOL_CALL_ID,
+            "title": "browser",
+            "kind": "fetch",
+            "status": "pending",
+            "rawInput": {"op": "navigate", "args": {"url": url}, "__toolUsePurpose": "Open a page"},
+            "_meta": {"kiro": {"mcpServerName": "kirocrew-core", "toolName": "browser"}},
+        },
+    )
+    _update(
+        session_id,
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": _BROWSER_TOOL_CALL_ID,
+            "status": "completed",
+        },
+    )
+
+
 def _emit_elicitation(session_id: str, mode: str) -> str:
     """Raise an MCP elicitation mid tool call and echo the host's answer.
 
@@ -787,6 +833,18 @@ def _handle(msg: dict[str, Any]) -> None:
                 )
                 _result(req_id, {"stopReason": "end_turn"})
                 return
+        if text.lstrip().startswith(NAMING_PROMPT_OPENING):
+            # A naming turn, not a chat turn: answer with the naming control
+            # word, never the chat reply, or the session is titled with it.
+            _update(
+                session_id,
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": NAMING_REPLY_TEXT},
+                },
+            )
+            _result(req_id, {"stopReason": "end_turn"})
+            return
         if ERROR_TRIGGER in text:
             # A JSON-RPC error instead of a result: the turn fails, not stops.
             _error(req_id)
@@ -810,6 +868,8 @@ def _handle(msg: dict[str, Any]) -> None:
             _emit_tool_call(session_id, with_permission=True)
         elif TOOL_TRIGGER in text:
             _emit_tool_call(session_id, with_permission=False)
+        if BROWSER_TRIGGER in text:
+            _emit_browser_tool_call(session_id)
 
         holds = _SLOW_HOLD_RE.findall(text)
         if holds:

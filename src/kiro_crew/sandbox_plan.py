@@ -54,10 +54,12 @@ class RendererCapabilities:
     """
 
     #: Tier directories the cc tier leaves VISIBLE, because the renderer cannot mask a
-    #: directory while re-exposing one file inside it. The Linux launcher restores a
-    #: read-only copy of ``~/.aws/config`` into the empty mask; Seatbelt rules are path
-    #: rules with no such copy, and ``credential_process`` and the SSO caches live
-    #: under ``~/.aws``, so Seatbelt keeps the whole directory readable.
+    #: directory while re-exposing one file inside it. Neither renderer needs it today:
+    #: the Linux launcher restores a read-only copy of ``~/.aws/config`` into the empty
+    #: mask, and Seatbelt denies the ``~/.aws`` subpath with a ``require-not literal``
+    #: exception for ``~/.aws/config`` (the same shape as ``~/.ssh/known_hosts``). So
+    #: on both backends cc hides the credentials file and the SSO caches and keeps
+    #: only ``config`` readable.
     cc_unmaskable_dirs: frozenset[str]
 
 
@@ -67,7 +69,7 @@ CAPABILITIES: Mapping[str, RendererCapabilities] = {
         cc_unmaskable_dirs=frozenset(),
     ),
     BACKEND_SEATBELT: RendererCapabilities(
-        cc_unmaskable_dirs=frozenset({".aws"}),
+        cc_unmaskable_dirs=frozenset(),
     ),
 }
 
@@ -108,6 +110,10 @@ class SandboxRequest:
     #: optionally followed by the kind the name reached and the referent's dev and ino.
     mask_occupants: tuple[tuple[str, tuple[int, ...]], ...] = ()
     crew_home_aliases: tuple[tuple[str, str, int, int], ...] = ()
+    #: ``(record path, nonce, names)``: where the gateway records the config files it
+    #: published (``config.write_provenance``), so the launcher can tell the gateway's own
+    #: save of one of *names* from a substituted object. Empty: no name is vouched for.
+    published_file_record: tuple[str, str, tuple[str, ...]] | tuple[()] = ()
     #: A directory the launcher enters after every seal and before it execs, so the
     #: agent starts in it through the sealed mount; it must then be read-only and
     #: empty, or the launch fails closed. Empty: the agent starts in the launcher's
@@ -299,6 +305,7 @@ class NamespaceIdentities:
     required_mask_targets: tuple[str, ...] = ()
     mask_occupants: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     crew_home_aliases: tuple[tuple[str, str, int, int], ...] = ()
+    published_file_record: tuple[str, str, tuple[str, ...]] | tuple[()] = ()
 
 
 @dataclass(frozen=True)
@@ -909,6 +916,15 @@ def _namespace_plan(
         required_mask_targets=tuple(required),
         mask_occupants=occupants,
         crew_home_aliases=tuple(request.crew_home_aliases),
+        published_file_record=(
+            (
+                request.published_file_record[0],
+                request.published_file_record[1],
+                tuple(dict.fromkeys(fold(n) for n in request.published_file_record[2])),
+            )
+            if request.published_file_record
+            else ()
+        ),
     )
     return ConfinementPlan(
         backend=request.backend,
@@ -1133,6 +1149,15 @@ def namespace_payload(plan: ConfinementPlan) -> dict[str, Any]:
             for name, ident in ids.mask_occupants.items()
         },
         "crew_home_aliases": [list(entry) for entry in ids.crew_home_aliases],
+        "published_file_record": (
+            {
+                "record": ids.published_file_record[0],
+                "nonce": ids.published_file_record[1],
+                "names": list(ids.published_file_record[2]),
+            }
+            if ids.published_file_record
+            else {}
+        ),
         "expose_files": [list(pair) for pair in plan.expose],
         "env_prefixes": list(plan.env_scrub_prefixes),
         "ssh_dir": plan.ssh_dir,

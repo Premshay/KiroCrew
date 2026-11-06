@@ -38,13 +38,8 @@ def _close_subagent_managers(close_subagent_managers) -> None:
 async def _wait_until_done(info) -> None:
     """Wait for a spawned subagent to finish, deterministically.
 
-    ``manager.spawn`` runs the subagent as a background asyncio task that flips
-    ``info.done`` once ``_run`` completes. Sleeping a fixed amount races that
-    task under load — the source of the intermittent
-    ``test_shared_session_cleanup_destroys_handle`` failure (``info.done`` still
-    ``False`` when the assertion ran). Polling ``info.done`` against a deadline
-    is race-free: it returns as soon as the task settles and only fails if the
-    task genuinely never completes.
+    ``info.done`` flips in a background task, so a fixed sleep races it under load;
+    polling against a deadline does not.
     """
     await async_wait_until(
         lambda: info.done, describe=lambda: f"subagent {info.id} has not completed"
@@ -54,16 +49,8 @@ async def _wait_until_done(info) -> None:
 async def _wait_until_awaited(mock_attr, label: str) -> None:
     """Wait for an async mock to have been awaited, deterministically.
 
-    Companion to :func:`_wait_until_done`, for assertions about TEARDOWN rather
-    than completion. ``info.done`` flips inside ``_run_inner``, but the
-    shared-session teardown that reaches ``handle.destroy()`` runs strictly
-    afterwards — the ``asyncio.wait_for`` future in ``_run`` has to resolve, then
-    its cleanup awaits ``provider.shutdown()``. So ``_wait_until_done``
-    returning does NOT imply teardown has happened, and asserting on it
-    immediately races the completion task in exactly the way the fixed sleep did
-    before #574 — that fix made the ``info.done`` half deterministic and left
-    this half racing. Polling the await against a deadline closes it: it returns
-    as soon as teardown lands, and still fails if teardown never happens.
+    For TEARDOWN assertions: ``handle.destroy()`` runs after ``info.done`` flips, so
+    :func:`_wait_until_done` returning does NOT mean teardown has happened.
     """
     await async_wait_until(
         lambda: mock_attr.await_count, describe=lambda: f"{label} has not been awaited"
@@ -968,8 +955,10 @@ class TestSessionSharingParentReset:
                 return True
 
         monkeypatch.setattr("kiro_crew.acp.runtime.AcpRuntime", _LiveRuntime)
-        await sm.get_subagent_runtime("dashboard:slot1")
+        fresh = await sm.get_subagent_runtime("dashboard:slot1")
 
+        assert isinstance(fresh, _LiveRuntime)
+        assert sm._subagent_runtimes["dashboard:slot1"] is fresh
         dead.kill.assert_awaited_once()
         assert dead.kill.await_args.kwargs.get("reason")
 
@@ -986,8 +975,10 @@ class TestSessionSharingParentReset:
         sm._subagent_runtimes["dashboard:slot1"] = runtime
         sm._subagent_runtime_locks["dashboard:slot1"] = asyncio.Lock()
 
-        await sm.release_subagent_runtime("dashboard:slot1")
+        released = await sm.release_subagent_runtime("dashboard:slot1")
 
+        assert released is True
+        assert "dashboard:slot1" not in sm._subagent_runtimes
         runtime.kill.assert_awaited_once()
         assert runtime.kill.await_args.kwargs.get("reason")
 

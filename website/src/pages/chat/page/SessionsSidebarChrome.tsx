@@ -31,6 +31,9 @@ interface SessionsSidebarChromeProps {
   creatingSlot: boolean
   dispatch: AppDispatch
   filteredSlots: ChatSlot[]
+  /** `filteredSlots` without a Crew Mode root's crew members: what the collapsed-sidebar
+   *  flyout lists (the sidebar filters its own prop; the main pane keeps every row). */
+  personSlots: ChatSlot[]
   isMobile: boolean
   keyboardInset: number
   mobileNavRail: MobileNavRailRenderer | null
@@ -107,7 +110,7 @@ interface SessionsSidebarChromeProps {
  * The sessions chrome around the chat pane: the phone drawer and its scrim, the desktop sidebar toggle and its recents flyout, the sidebar or drawer itself (or the embedded sessions list), the phone top bar, and the tag popover.
  */
 export default function SessionsSidebarChrome({
-  embedMode, mode, activeSlot, connected, creatingSlot, dispatch, filteredSlots, isMobile, keyboardInset, mobileNavRail, surfaceUnreadSlots, titleInTopbar, topbarSlot, topbarTrailSlot, vv,
+  embedMode, mode, activeSlot, connected, creatingSlot, dispatch, filteredSlots, personSlots, isMobile, keyboardInset, mobileNavRail, surfaceUnreadSlots, titleInTopbar, topbarSlot, topbarTrailSlot, vv,
   activityOpen, selectFromSidebar, history, historyHasMore, navigateToEmbeddedSlot, openEmbeddedCrewWindow, splitMode, defaultAgent, installedAgents, sidebarAgents, sidebarChoices, setActionError, showActionError,
   canStageSessionRef, chatPaneEl, stageSessionRef, openSlotInNewTab, ownsSessionTabs, activePoppedOut, focusActivePopout, openActivePopout, splitFeatureEnabled, currentSlot, effectiveMode, title,
   activeIsSplitAnchor, editingTitle, enterSplit, setEditingTitleSlot, setSidebarDragging, setSidebarWidth, sidebarAutoHidden, sidebarDragging, splitAnchorForActive, effectiveSidebarWidth, toggleAct,
@@ -179,7 +182,7 @@ export default function SessionsSidebarChrome({
           <SessionFlyout
             key="session-flyout"
             ref={flyoutSurfaceRef}
-            slots={filteredSlots}
+            slots={personSlots}
             activeSlot={activeSlot}
             unreadSlots={surfaceUnreadSlots}
             // The flyout is a session list, which gains nothing past
@@ -228,6 +231,9 @@ export default function SessionsSidebarChrome({
       // drawer's contents are unmounted.
       <GuideRevealScope id={isMobile ? 'chat.sessions-drawer' : 'chat.sessions-sidebar'} open={sidebarOpen}>
       <OverlayDrawer open={isMobile ? drawerMounted : sidebarOpen} width={isMobile ? Math.max(0, winW - DRAWER_UNCOVERED_PX) : effectiveSidebarWidth} dragging={sidebarDragging} slideX={isMobile ? drawerX : undefined} slideRef={drawerPanelRef}
+        // Covers the chat pane only while open: on a phone `sidebarOpen` is
+        // the drawer's open phase, false while it slides out (#23564).
+        coversPane={isMobile && sidebarOpen}
         // Mobile only: the same visible-band inset the scrim above carries, so the
         // two surfaces move together. Margins rather than restated edges is what
         // matters here: top-safe-offset-[42px] and bottom-safe compose env() insets
@@ -250,7 +256,7 @@ export default function SessionsSidebarChrome({
         // covers the whole safe-area height like the App nav drawer it
         // replaces on this route -- the rail's brand mark then sits where
         // that drawer's did. Close: scrim tap, swipe, Back -- all unchanged.
-        morph={!isMobile} morphTarget={TOGGLE_RECT} expandFrom={expandFrom} contentH={Math.max(0, containerH - 8)} className={isMobile ? `mobile-sessions-overlay fixed ${titleInTopbar ? 'top-safe' : 'top-safe-offset-[42px]'} bottom-safe left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0` : ''}>
+        morph={!isMobile} morphTarget={TOGGLE_RECT} expandFrom={expandFrom} contentH={Math.max(0, containerH - 8)} className={isMobile ? `mobile-sessions-overlay fixed ${titleInTopbar ? 'top-safe' : 'top-safe-offset-[42px]'} bottom-safe left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0` : 'kc-vt-sessions'}>
         {/* Phone chat page: ONE drawer holds the shell's navigation rail (72px,
             from MobileNavRailContext) beside the sessions pane, Discord-style, so
             the bar above needs no second drawer trigger. The pane keeps its
@@ -284,6 +290,7 @@ export default function SessionsSidebarChrome({
           // the chip — see canStageSessionRef for why this is a named predicate.
           chatDropTarget={canStageSessionRef ? chatPaneEl : null}
           onDropSessionRef={stageSessionRef}
+          canStageSessionRef={canStageSessionRef}
         />
         )
         return isMobile && mobileNavRail ? (

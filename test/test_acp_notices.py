@@ -20,6 +20,7 @@ from kiro_crew.acp.types import (
     acp_client_capabilities,
 )
 from kiro_crew.providers.acp import AcpProvider
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
 
 
 def notice(sid="session-a", **fields):
@@ -235,7 +236,9 @@ async def test_shared_pre_turn_drain_preserves_notice():
     runtime.send_request = request
     handle = AcpSessionHandle("sA", queue, runtime)
     handle._queue.put_nowait(notice("sA", title="Between turns"))
-    events = [event async for event in handle.stream_command("/help", timeout=1)]
+    events = [
+        event async for event in handle.stream_command("/help", timeout=FALLBACK_TIMEOUT_SECS)
+    ]
     assert events[0].kind == EVENT_NOTICE and events[0].title == "Between turns"
     assert events[-1].kind == EVENT_COMPLETE
 

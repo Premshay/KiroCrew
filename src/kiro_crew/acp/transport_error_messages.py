@@ -4,6 +4,16 @@ from __future__ import annotations
 
 from typing import Sequence
 
+from kiro_crew.acp.image_dimension_wedge import (
+    format_many_image_dimension_message,
+    is_many_image_dimension,
+)
+from kiro_crew.acp.model_registry_errors import (
+    MODEL_REGISTRY_UNAVAILABLE_TEXT,
+    is_model_registry_unavailable,
+)
+from kiro_crew.acp.oversized_request_errors import _is_request_size_exceeded
+from kiro_crew.acp.structured_error_data import provider_data_text, structured_data_prose
 from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facade compatibility surface
     _PROMPT_BUSY_RE,
     _RE_5XX_HINT,
@@ -13,6 +23,7 @@ from kiro_crew.acp.transport_error_classification import (  # noqa: F401 - facad
     _RE_ADAPTER_INPUT_TOO_LONG,
     _RE_AUTH,
     _RE_CONNECTION,
+    _RE_CONNECTOR_FAILURE,
     _RE_CONTEXT_WINDOW_OVERFLOW,
     _RE_GENERATE_FAILED,
     _RE_IMAGE_FORMAT_UNSUPPORTED,
@@ -115,7 +126,8 @@ def _format_acp_error_worded(
     """
     worded = True
     if isinstance(error, dict):
-        data = str(error.get("data", "") or "")
+        data = provider_data_text(error)  # a structured `data` reads its prose from `message`
+        prose = structured_data_prose(error)
         message = str(error.get("message", "") or "")
         haystack = f"{data} {message}"
 
@@ -124,11 +136,11 @@ def _format_acp_error_worded(
         )
         req_id_suffix = f" (request_id: {req_id_match.group(1)})" if req_id_match else ""
 
+        # Entitlement failure: this account was never offered the model, so the
+        # capacity/rollout advice below would be actively misleading (there is
+        # nothing to wait for). Checked FIRST because upstream uses the same
+        # string for both cases.
         unentitled = _model_is_unentitled(data, available_models)
-
-        # The fleet router admits requests before forwarding.  Its machine code
-        # tells interactive callers to rebuild from bounded Kiro Crew history;
-        # do not leak the router's JSON error envelope to the user.
         if _CONVERSATION_PAYLOAD_EXCEEDED_RE.search(haystack):
             formatted = (
                 "The provider conversation retained too much attachment data. "
@@ -207,7 +219,7 @@ def _format_acp_error_worded(
             # than paraphrasing it: it is the authoritative statement of WHICH
             # limit was hit, and the CLI shows exactly this, so the dashboard
             # matching it means the two surfaces cannot tell different stories.
-            _limit_detail = _provider_detail(data)
+            _limit_detail = _provider_detail(prose or data)
             # The provider sentence has no trailing period, so add one before
             # appending guidance or the two run together as one sentence.
             if _limit_detail and _limit_detail[-1] not in ".!?":
@@ -242,6 +254,11 @@ def _format_acp_error_worded(
                 "Retrying or switching models will not help. Start a fresh session."
                 f"{req_id_suffix}"
             )
+        elif is_many_image_dimension(data):
+            # The provider's many-image PIXEL cap (>2000px on an image already in
+            # history). Surface-blind like its image siblings; the harness-specific
+            # remedy is built in image_dimension_wedge.
+            formatted = format_many_image_dimension_message(backend, req_id_suffix)
         elif _RE_IMAGE_FORMAT_UNSUPPORTED.search(data):
             # Deterministic image rejection. A new attachment can be repaired by
             # the sender; an image retained in native history needs a fresh
@@ -307,6 +324,8 @@ def _format_acp_error_worded(
                 "rotated, or mistyped) — refresh your AWS credentials."
                 f"{req_id_suffix}"
             )
+        elif _RE_AUTH.search(haystack) and host_auth.bedrock_auth_remedy(backend):
+            formatted = host_auth.bedrock_auth_remedy(backend) + req_id_suffix
         elif _RE_AUTH.search(haystack):
             # Bedrock auth failure — almost always missing/expired AWS
             # credentials.
@@ -341,7 +360,9 @@ def _format_acp_error_worded(
                 "sign-in issue, not a backend error."
                 f"{req_id_suffix}"
             )
-        elif _RE_CONNECTION.search(haystack):
+        elif is_model_registry_unavailable(data):
+            formatted = MODEL_REGISTRY_UNAVAILABLE_TEXT + req_id_suffix
+        elif _RE_CONNECTION.search(haystack) or _RE_CONNECTOR_FAILURE.search(haystack):
             formatted = (
                 "Could not reach the model backend (connection refused, reset, "
                 "or timed out). Retry in a moment. If it keeps happening, check "
@@ -364,7 +385,7 @@ def _format_acp_error_worded(
             # Match the combined `data + message` haystack so a 5xx token in
             # either field is caught. Scanning `message` is safe
             # here precisely because we require a real transient *token* (named
-            # exception, HTTP/status-50[0234]/529, or an explicit retry hint):
+            # exception, a 50[0234]/529 status after HTTP/status/API Error:, or a retry hint):
             # -32603's canonical message is literally "Internal error", which
             # carries no such token, so a bare uncaught -32603 (malformed-
             # request, context-length, deterministic backend bug) still falls
@@ -391,12 +412,6 @@ def _format_acp_error_worded(
                 "backend call died before streaming started, usually a momentary "
                 "capacity blip). Retry in a moment; if it keeps happening, switch "
                 "to a different model in the picker."
-                f"{req_id_suffix}"
-            )
-        elif _CONTEXT_WINDOW_EXCEEDED_RE.search(haystack):
-            formatted = (
-                "The local model context window is full. The conversation must "
-                "be rebuilt from a shorter history before this request can run."
                 f"{req_id_suffix}"
             )
         elif _RE_PROCESS_FAILED.search(data):
@@ -469,7 +484,7 @@ def _format_acp_error_worded(
             # Falls back to the raw dict only when there is no usable detail
             # (empty/odd data), so a genuinely opaque shape still loses nothing.
             # Redaction below scrubs any embedded secrets either way.
-            _detail = _provider_detail(data)
+            _detail = _provider_detail(prose or data)
             if _detail:
                 # Keep the JSON-RPC `message` too when it carries signal. For
                 # -32603 it is the fixed boilerplate "Internal error" (pure
@@ -507,13 +522,6 @@ def _format_acp_error_worded(
 
 
 # ---------------------------------------------------------------------------
-_CONTEXT_WINDOW_EXCEEDED_RE = re.compile(r"\bcontext_window_exceeded\b", re.IGNORECASE)
-_CONVERSATION_PAYLOAD_EXCEEDED_RE = re.compile(
-    r"request too large\s*\(max\s*\d+\s*mb\).*accumulated images and attachments",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
 def _rejected_model_from_error(error: object) -> str | None:
     """Return the model id a prompt-time error reports as invalid/unavailable.
 
@@ -552,6 +560,15 @@ def _error_kind_from_frame(error: object) -> str:
     return ""
 
 
+_CONTEXT_WINDOW_EXCEEDED_RE = re.compile(r"\bcontext_window_exceeded\b", re.IGNORECASE)
+
+
+_CONVERSATION_PAYLOAD_EXCEEDED_RE = re.compile(
+    r"request too large\s*\(max\s*\d+\s*mb\).*accumulated images and attachments",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 def _raise_acp_error(
     error: object,
     available_models: Sequence[str] | None = None,
@@ -560,9 +577,9 @@ def _raise_acp_error(
 ) -> None:
     """Format and raise the appropriate :class:`AcpError` for *error*.
 
-    Delegates formatting to ``_format_acp_error`` and raises a typed error for
-    known recovery paths, including ``AcpPromptBusy`` and a context-window
-    admission rejection. Other failures receive structural, model, auth, or usage tags from their raw frame.
+    Delegates formatting to ``_format_acp_error``. Prompt-busy uses
+    ``AcpPromptBusy``; other failures use ``AcpError`` and receive any
+    structural, model, auth, or usage tags from their raw frame.
 
     *available_models* is passed to BOTH the formatter and the transient
     classifier so a model-rejection's wording and its retry verdict are decided
@@ -608,23 +625,31 @@ def _raise_acp_error(
     )
     # Tag deterministic STRUCTURAL rejections so self-driving callers can
     # stop resending identical context. Keep the classifier data-scoped: a phrase
-    # echoed only in JSON-RPC ``message`` cannot stamp an unrelated error. Four
-    # answers carry the tag: context-window overflow, malformed request, image
-    # validation failure, and kiro-cli's own refusal of a request it could not
-    # shrink to fit -- each reproduced exactly by re-sending the same context.
-    raw_data_field = str(error.get("data", "") or "") if isinstance(error, dict) else ""
+    # echoed only in JSON-RPC ``message`` cannot stamp an unrelated error, except
+    # for the two anchored overflow sentences named below. The tag covers
+    # context overflow (kiro-cli's window, the claude adapter's input-too-long,
+    # the model service's request size cap), malformed request, image validation
+    # failure, the many-image pixel-dimension cap, and kiro-cli's own refusal of a
+    # request it could not shrink to fit -- each reproduced exactly by re-sending
+    # the same context.
+    raw_data_field = provider_data_text(error)  # the same field the verdict above read
     raw_message_field = str(error.get("message", "") or "") if isinstance(error, dict) else ""
     # The claude adapter's overflow rides in ``message`` (anchored match, see
-    # _RE_ADAPTER_INPUT_TOO_LONG); every other tag below stays data-scoped.
+    # _RE_ADAPTER_INPUT_TOO_LONG), and the model service's size cap may ride in
+    # either field (anchored, see _RE_REQUEST_SIZE_EXCEEDED); every other tag
+    # below stays data-scoped.
     _context_overflow = bool(
         _RE_CONTEXT_WINDOW_OVERFLOW.search(raw_data_field)
         or _RE_ADAPTER_INPUT_TOO_LONG.search(raw_message_field)
+        or _is_request_size_exceeded(raw_data_field, raw_message_field)
     )
     _image_format_unsupported = bool(_RE_IMAGE_FORMAT_UNSUPPORTED.search(raw_data_field))
+    _image_dimension_wedge = is_many_image_dimension(raw_data_field)
     if (
         _context_overflow
         or _RE_MALFORMED_REQUEST.search(raw_data_field)
         or _image_format_unsupported
+        or _image_dimension_wedge
         or _RE_OVERSIZED_REQUEST.search(raw_data_field)
     ):
         err.structural_terminal = True
@@ -635,6 +660,20 @@ def _raise_acp_error(
         err.context_overflow = True
     if _image_format_unsupported:
         err.image_format_unsupported = True
+    if _image_dimension_wedge:
+        # Terminal for every harness (re-sending the same oversized history is
+        # refused identically), so transient stays False. But the REPAIR this
+        # tag offers is Kiro-only -- it rewrites kiro-cli's own transcript -- so
+        # the dashboard-repair tag is set only for the kiro-cli backend
+        # (``""`` IS the kiro id, per the session-expiry branch above). Under
+        # another harness the error stays terminal and structural but carries no
+        # repair affordance, which is honest: a remedy written for Kiro is not
+        # offered by default to a harness it cannot help (AGENTS.md "Harness
+        # parity", the H-class negative-identity shape). The self-wake loop reads
+        # structural_terminal (set above) and stops re-firing regardless.
+        err.transient = False
+        if backend in ("", ACP_BACKEND_KIRO):
+            err.image_dimension_wedge = True
     # Tag a model-rejection so the SUBSTITUTE (background) retry layer can pick a
     # served model; harmless on every other error (attributes just stay unset).
     rejected = _rejected_model_from_error(error)

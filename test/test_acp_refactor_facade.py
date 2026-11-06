@@ -1,21 +1,12 @@
-"""``kiro_crew.acp.client`` and ``kiro_crew.acp.runtime`` stay the ACP patch seams after the split.
+"""``kiro_crew.acp.client`` and ``kiro_crew.acp.runtime`` stay the ACP patch seams.
 
-The module-level code moved out of the two transports lives in its owner modules:
-``transport_framing``, ``transport_errors``, ``runtime_models``, ``runtime_process_tree``,
-``runtime_start``, the launch tail ``launch``, and the per-process host adapters under
-``harness`` (``claude``, ``opencode``, ``goose``, ``pi``, ``deepseek``). Each facade keeps
-every moved name readable under its old path. A
-name the facade's own code reads, and that nothing patches through it, is an ordinary
-import; every other moved name is FORWARDED, so a patch through the facade lands on
-the owner, where the owner's own callers read it. The modules the moved helpers probe
-with stay bound on the facade their code came from, and each helper imports them from
-that facade when it runs, so a test that rebinds one there still reaches the helper.
+Names owned by ``transport_*``, ``runtime_*``, ``launch`` and ``harness.*`` stay readable
+on each facade. A name nothing patches through the facade is a plain import; the rest
+are FORWARDED so a facade patch lands on the owner. Probe modules stay bound on the
+facade and are imported from it at call time.
 
-The seam rows patch ONE name on a facade with a stub that raises ``_Reached`` and then
-drive an owner function that must read that name. ``_Reached`` derives from
-``BaseException`` on purpose: several of these helpers are best-effort and swallow
-``Exception``, and a stub such a handler could swallow would let a patch that MISSED
-read as one that landed.
+The seam rows patch one name with a stub raising ``_Reached``, a ``BaseException`` so a
+best-effort ``except Exception`` cannot hide a missed patch.
 """
 
 from __future__ import annotations
@@ -818,6 +809,8 @@ def test_a_module_rebound_on_the_facade_reaches_the_moved_helper(
             monkeypatch.setattr(runtime_process_tree, callee, inert)
     # A cached process table would answer before the helper probes anything.
     monkeypatch.setattr(runtime_process_tree, "_ps_table_cache", None)
+    # The children-file branch follows the steered ``sys``, not the host kernel.
+    monkeypatch.setattr(runtime_process_tree, "_CHILDREN_INTERFACE", True)
     for other, value in steer.items():
         monkeypatch.setattr(module, other, value)
     label = f"{facade}.{name}"
@@ -1817,18 +1810,10 @@ def test_the_launch_capture_patches_no_moved_name() -> None:
     assert names and names.isdisjoint(moved)
 
 
-#: Names a test patches through a facade that the facade AND an owner both bind, each
-#: importing its own: such a patch reaches only the facade's own code, which a mirrored
-#: facade's write also reaches in the owner modules that code moved to. Every entry is
-#: patched for code of the facade's own family -- the client's stderr drain and session
-#: init (``logger``), ``AcpClient.send_command`` (``redact_exfiltration_urls``), the
-#: runtime's response bound and descendant snapshot -- or for the launch the driver
-#: starts: each driver hands the launch tail its OWN sandbox wrap, scrub and scratch
-#: module (``_launch_tools``), so those patches reach the launch they drive, while a
-#: host's routing read-back wraps and scrubs with its adapter module's binding, which
-#: that host's tests patch there. ``launch`` on the runtime is the runtime's own call of
-#: the tail, which a test wraps to observe the runtime's steps. A new entry is a
-#: decision that the patch needs no forwarding.
+#: Names both a facade and an owner bind, patched only for the facade's own code: the
+#: client's ``logger``, ``redact_exfiltration_urls``, the runtime's response bound and
+#: snapshot, or the launch each driver starts (``_launch_tools``). A host's read-back uses
+#: its adapter's binding. A new entry is a decision that the patch needs no forwarding.
 _SHARED_BINDINGS_PATCHED: frozenset[tuple[str, str]] = frozenset(
     {
         ("kiro_crew.acp.client", "logger"),

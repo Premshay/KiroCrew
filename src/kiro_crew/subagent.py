@@ -67,6 +67,7 @@ if TYPE_CHECKING:
         QueuedRunListing,
     )
 
+from kiro_crew import sandbox_plan  # noqa: F401 - read by agent_policy.validate_cwd
 from kiro_crew import platform_compat
 from kiro_crew.agent_discovery import (
     AgentsDirMemo,
@@ -201,6 +202,10 @@ from kiro_crew.subagent_cost import (
     read_cap_costs,
     read_learned_costs_checked,
 )
+from kiro_crew.subagent_ending import (  # noqa: F401
+    SubagentEnding,
+    classify_ending,
+)
 from kiro_crew.subagent_manager import (
     CancellationCoordinator,
     ClaimPoint,
@@ -254,6 +259,7 @@ from kiro_crew.subagent_parts.agent_policy import (  # noqa: F401
     AgentCheck,
     ParentRecordUnreadable,
     ParentSpawnPolicy,
+    _accepted_project_dirs,
     _available_agents_hint,
     _inherited_member_agent,
     _internal_agent_refusal,
@@ -315,8 +321,8 @@ from kiro_crew.subagent_parts.host_memory import (  # noqa: F401
     _macos_vm_reclaimable_pages,
     _memory_check_cause,
     _proc_subtree_sample,
-    _read_inactive_file_bytes,
     _read_int_file,
+    _read_reclaimable_file_bytes,
     _subtree_cpu_jiffies,
     _working_set,
     check_memory_available,
@@ -353,9 +359,11 @@ from kiro_crew.subagent_parts.run_limits import (  # noqa: F401
     _HOST_READ_OFF_LOOP_SECS,
     _LOW_FIDELITY_DENY_REASON,
     _MAX_CONCURRENT,
+    _MAX_SPAWN_DEPTH,
     _ON_DONE_TIMEOUT,
     _PRESSURE_EPISODE_MAX_GAP_SECS,
     _PRESSURE_HOLD_PRUNE_FACTOR,
+    _QUEUED_SPAWN_ATTEMPT_LIMIT,
     _REAPER_INTERVAL,
     _RECOVERY_SLOT_WAIT_SECS,
     _RELEASE_REPUMP_SECS,
@@ -434,6 +442,7 @@ from kiro_crew.subagent_parts.start_pricing import (  # noqa: F401
     _spawn_memory_floor_and_cost,
     _startup_memory_reserve_gb,
 )
+from kiro_crew.subagent_parts.terminal_surface import write_refusal_tombstone  # noqa: F401
 from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone resolved by run_lifecycle.py via bind_component_globals
     DISMISSAL_FAILED,
     _agent_dir,

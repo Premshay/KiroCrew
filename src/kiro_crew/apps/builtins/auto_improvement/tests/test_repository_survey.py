@@ -12,6 +12,7 @@ from kiro_crew.apps.builtins.auto_improvement.backend.repository_survey import (
     resolve_survey_ref,
     survey_repository,
 )
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
 
 
 def _git(root: Path, *args: str) -> str:
@@ -21,7 +22,7 @@ def _git(root: Path, *args: str) -> str:
         text=True,
         encoding="utf-8",
         check=True,
-        timeout=30,
+        timeout=FALLBACK_TIMEOUT_SECS,
     ).stdout.strip()
 
 

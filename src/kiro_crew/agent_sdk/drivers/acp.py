@@ -67,6 +67,7 @@ __all__ = [
     "is_auth_failure_output",
     "kas_engine_gap",
     "kas_engine_unsupported_reason",
+    "kas_engine_verdict",
     "kiro_cli_resolves",
     "narrowed_agent_permissions",
     "provider_error_client",
@@ -75,6 +76,7 @@ __all__ = [
     "resolve_pin_spelling_on",
     "resolve_usable_model",
     "run_kiro_native_commands",
+    "settings_default_model",
     "drain_skill_view_aliases",
     "skill_view_alias_census",
     "skill_view_sidecar_dirs",
@@ -143,6 +145,18 @@ def finish_suspended_spawn(process: object, pid: int, *, label: str) -> bool:
     except AcpError:
         return False
     return True
+
+
+def provider_data_text(error: object) -> str:
+    """The provider-field text of a raw ACP error frame, for the dependency adapter.
+
+    Thin delegation to :func:`kiro_crew.acp.structured_error_data.provider_data_text`:
+    a frame whose ``data`` is a structured object reads its provider sentence from
+    ``message``, so the adapter's ``data``-scoped verdict matches the client's.
+    """
+    from kiro_crew.acp.structured_error_data import provider_data_text as _impl
+
+    return _impl(error)
 
 
 def provider_error_client() -> object | None:
@@ -218,6 +232,7 @@ def build_acp_provider(
     acp_backend: str = "",
     effort_per_model: dict[str, str] | None = None,
     unbound_effort: str = "",
+    inherited_effort: str = "",
     effort_defaults: object = None,
     tool_search: bool | None = None,
     tool_search_min_pct: object = None,
@@ -276,6 +291,7 @@ def build_acp_provider(
         acp_backend=acp_backend,
         effort_per_model=effort_per_model,
         unbound_effort=unbound_effort,
+        inherited_effort=inherited_effort,
         effort_defaults=effort_defaults,
         tool_search=tool_search,
         tool_search_min_pct=tool_search_min_pct,
@@ -307,6 +323,24 @@ def provider_label(provider: object) -> str:
     :func:`resolve_pin_spelling`.
     """
     from kiro_crew.providers.acp import provider_label as _impl
+
+    return _impl(provider)
+
+
+def _provider_backend(provider: object) -> object:
+    """The backend id *provider* talks to, or ``None`` for a shape that carries none.
+
+    Private, and kept out of ``__all__``: ``llm_helpers.provider_backend`` is the
+    public reader (``""`` on a miss); this one exists only for the ``harness``
+    metric attribute, which must tell a miss from kiro-cli's ``""``.
+
+    Thin delegation to :func:`kiro_crew.providers.acp._provider_backend`, the
+    shape check :func:`provider_label` resolves through, so the ``harness``
+    metric attribute (``metrics/harness.py``) reads the same answer the session
+    map persists without importing the providers layer. Function-local import
+    for the same reason as :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.providers.acp import _provider_backend as _impl
 
     return _impl(provider)
 
@@ -489,6 +523,20 @@ def narrowed_agent_permissions(
     return {"rules": carried}
 
 
+def backend_delivers_spec_servers(backend: str) -> bool:
+    """Whether *backend* runs the servers an agent spec declares.
+
+    kiro-cli and KAS read the spec itself (``ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE``); a
+    backend with a mirror (``providers.mirrors.has_mirror``) is handed them in its
+    ``session/new`` array. A broker-only backend runs only the pooled stubs. Asked here
+    so a caller above the boundary need not import the mirror registry.
+    """
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE
+    from kiro_crew.providers.mirrors import has_mirror
+
+    return backend in ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE or has_mirror(backend)
+
+
 def agent_spec_mcp_refs(agent: str) -> tuple[bool, list[tuple[str, list[str], bool]]]:
     """Per selectable backend: which of *agent*'s ``@server`` refs resolve to nothing.
 
@@ -591,18 +639,33 @@ def kas_engine_unsupported_reason() -> str | None:
 
     Blocking: one bounded spawn. Never raises.
     """
+    return kas_engine_verdict()[1]
+
+
+def kas_engine_verdict() -> tuple[bool | None, str | None]:
+    """``(offers_kas, reason)`` from the pinned kiro-cli's ``acp --help``.
+
+    ``offers_kas`` is ``True`` only for help text that RAN and names the engine,
+    ``False`` with the gap as *reason* for help text that ran without it, and
+    ``None`` for every unknown (no pinned binary, a failed spawn). The one probe
+    behind :func:`kas_engine_unsupported_reason`, read by the gateway's KAS floor,
+    which acts on a Kiro CLI pick only on ``True``.
+
+    Blocking: one bounded spawn. Never raises.
+    """
     from kiro_crew import kiro_cli
 
     try:
         binary, _unpinned = kiro_cli.pin_kiro_cli()
     except Exception:  # noqa: BLE001 - an unanswerable probe is unknown, not an error
-        return None
+        return None, None
     if binary is None:
-        return None
+        return None, None
     help_text = kiro_cli.kas_relay_help(binary)
     if help_text is None:
-        return None
-    return kas_engine_gap(help_text)
+        return None, None
+    gap = kas_engine_gap(help_text)
+    return gap is None, gap
 
 
 def claude_components_resolve() -> tuple[bool, bool]:
@@ -622,6 +685,41 @@ def claude_components_resolve() -> tuple[bool, bool]:
 
     adapter_argv, _searched_path = _resolve_claude_acp_bin()
     return bool(adapter_argv), bool(_resolve_claude_code_executable())
+
+
+def claude_adapter_disk_version() -> str:
+    """The installed claude-agent-acp's ``version`` from its package.json, or ``""``.
+
+    Read from the npm manifest the spawn path reads, never by running the adapter:
+    old releases do not know ``--version`` and start serving stdin instead, so a
+    ``--version`` probe hangs. ``""`` when the adapter does not resolve or its
+    manifest cannot be read (a wrapper script, an override naming another file).
+    Blocking (small file reads).
+    """
+    from kiro_crew.acp.client import (
+        _claude_adapter_installed_version,
+        _resolve_claude_acp_bin,
+    )
+
+    adapter_argv, _searched_path = _resolve_claude_acp_bin()
+    if not adapter_argv:
+        return ""
+    return _claude_adapter_installed_version(adapter_argv)
+
+
+def claude_adapter_version_is_below_floor(version: str) -> bool:
+    """Whether a READABLE *version* is below the floor the installers pin to.
+
+    An empty or unparseable version answers ``False``: not knowing the version is
+    no evidence that it is old.
+    """
+    from kiro_crew.acp import client as _client
+
+    if not _client._adapter_version_at_least(version, (0, 0, 0)):
+        return False
+    return not _client._adapter_version_at_least(
+        version, _client.CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION
+    )
 
 
 def claude_adapter_cached_negative() -> bool:
@@ -793,6 +891,64 @@ def self_served_install_command(backend: str) -> str:
     from kiro_crew.agent_sdk.backends import launch_for
 
     return launch_for(backend).install_command
+
+
+def self_served_wrong_version(backend: str) -> str:
+    """The release *backend*'s binary would run, when it is not the one Crew verified.
+
+    ``""`` when the binary does not resolve, when its release cannot be read, when it
+    is the verified one, and for every harness with no single verified release. Only
+    Copilot CLI has one (``COPILOT_VERIFIED_VERSION``): a session on any other release
+    is refused at the handshake, so an install row that only looked for the binary
+    would call a harness ready that refuses every chat. Read from the install's own
+    manifest, never by running it.
+    """
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_COPILOT, COPILOT_VERIFIED_VERSION
+
+    if backend == ACP_BACKEND_COPILOT:
+        from kiro_crew.acp.client import _resolve_self_served_bin
+        from kiro_crew.acp.harness.copilot import copilot_installed_version
+
+        binary, _searched_path = _resolve_self_served_bin(backend)
+        version = copilot_installed_version(binary) if binary else ""
+        if version and version != COPILOT_VERIFIED_VERSION:
+            return version
+    return ""
+
+
+def strands_wrong_version() -> str:
+    """The Strands CLI release installed when it is not the verified one, else ``""``.
+
+    Read from the install's own manifest, never by running it. Blocking.
+    """
+    from kiro_crew.acp.client import _resolve_self_served_bin
+    from kiro_crew.acp.harness.strands import strands_installed_version
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_STRANDS, STRANDS_VERIFIED_VERSION
+
+    binary, _searched_path = _resolve_self_served_bin(ACP_BACKEND_STRANDS)
+    version = strands_installed_version(binary) if binary else ""
+    return version if version and version != STRANDS_VERIFIED_VERSION else ""
+
+
+def strands_python_env_missing() -> tuple[str, str]:
+    """``(component, command)`` when the Strands project's Python environment is absent.
+
+    ``("", "")`` when it is ready. File reads only. The project directory is created
+    on the way, owner-only, which is also what the first spawn would do. Blocking.
+    """
+    from kiro_crew.acp.harness.strands import (
+        strands_project_dir,
+        strands_python_env_issue,
+        strands_python_setup_command,
+    )
+
+    try:
+        project_dir = strands_project_dir()
+    except Exception as exc:  # noqa: BLE001 -- the probe reports, it never raises
+        return f"Strands project directory ({exc})", ""
+    if not strands_python_env_issue(project_dir):
+        return "", ""
+    return "Strands Python environment", strands_python_setup_command(project_dir)
 
 
 def pi_components_resolve() -> tuple[bool, bool]:
@@ -1123,3 +1279,26 @@ def skill_view_sidecar_dirs() -> tuple[str, str]:
     )
 
     return (str(_projection_metadata_dir()), str(_projection_lease_dir()))
+
+
+def settings_default_model(agent_config: Any, backend: str) -> str:
+    """The model a launch-model harness's own settings name, or ``""`` for ``auto``.
+
+    Such a harness advertises no model list, so this is what its picker offers beside
+    ``auto``: for Strands, ``agent.strands_provider`` + ``agent.strands_model`` as the
+    ``provider/model`` id its launch would pass. A setting the launch would refuse
+    offers nothing here; the session start names it. Never a kiro-cli id.
+    """
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_STRANDS
+
+    if backend == ACP_BACKEND_STRANDS:
+        from kiro_crew.acp.harness.strands import strands_configured_model
+
+        try:
+            return strands_configured_model(
+                str(getattr(agent_config, "strands_provider", "") or ""),
+                str(getattr(agent_config, "strands_model", "") or ""),
+            )
+        except ValueError:
+            return ""
+    return ""

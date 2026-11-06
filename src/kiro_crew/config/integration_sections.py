@@ -126,7 +126,7 @@ MANAGED_STUB_LEADER = "kirocrew-core"
 #: already declares, so an opt-in server still reaches only the agents granted it.
 #:
 #: This is ``mcp_discovery._MANAGED_SERVERS_CALLER_AWARE`` minus the leader,
-#: ``kirocrew-computer`` and ``kirocrew-cron``. It is spelled out rather than
+#: ``kirocrew-computer``, ``kirocrew-cron`` and ``kirocrew-secrets``. It is spelled out rather than
 #: derived because this module may import only ``config.fields`` (the config
 #: boundary contract) and ``mcp_discovery`` pulls in aiohttp and the probe
 #: executor. A ratchet test pins the equality, so a new caller-aware server fails
@@ -136,7 +136,8 @@ MANAGED_STUB_LEADER = "kirocrew-core"
 #: per-connection tenant nonce (``mcp_caller.POOLING_REQUIRES_TENANT_NONCE``), so
 #: it stays an explicit choice. ``kirocrew-cron`` is not excluded for a known
 #: hazard: it is simply outside what this layer was measured on, and stays one
-#: operator toggle away like any other server.
+#: operator toggle away like any other server. ``kirocrew-secrets`` is the same:
+#: an opt-in, credential-bearing egress server this layer was not measured on.
 MANAGED_STUB_FOLLOWERS: tuple[str, ...] = (
     "kirocrew-guide",
     "kirocrew-mate",
@@ -568,10 +569,10 @@ class McpGatewayConfig:
             "initialize once the session sends it. A backend that stays silent is "
             "failed and reaped so its slot frees; the broker holds the spawn "
             "permit for this same window. Raise it for servers whose startup is "
-            "legitimately slow (large runtimes, remote resolution). On "
-            "Windows the effective deadline is floored at 30 seconds (a "
-            "cold-start floor): a configured value below it is lifted, a "
-            "value above it is used as is.",
+            "legitimately slow (large runtimes, remote resolution). The "
+            "effective deadline is floored at 30 seconds (a cold-start "
+            "floor): a configured value below it is lifted, a value above "
+            "it is used as is.",
             restart=True,
         ),
     )
@@ -847,6 +848,16 @@ class InstancesConfig:
             restart=True,
         ),
     )
+    crew_reads_enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Agent Crew Reads",
+            "Let the agent read another crew's sessions with the crew= scope of "
+            "search_chat_history, list_sessions and get_chat_session. Default off: a "
+            "peer's transcripts enter the agent's context as untrusted text, so this "
+            "is a separate opt-in on top of Enabled. Read per call; no restart.",
+        ),
+    )
     warm_set_cap: int = field(
         default=_DEFAULT_WARM_SET_CAP,
         metadata=_meta(
@@ -861,6 +872,18 @@ class InstancesConfig:
             "of crews in use makes tab switching look like a connection flap. Past that "
             "ceiling eviction resumes; an explicit value is honoured exactly, including "
             "one below the number of configured crews.",
+        ),
+    )
+    default_destination: str = field(
+        default="",
+        metadata=_meta(
+            "Default Destination Crew",
+            "Instance id of the crew that Send a copy to lists first, marked as the "
+            "default. Empty (the default) keeps every crew in registry order with no "
+            "default. A folder's own default destination crew overrides this for "
+            "sessions in that folder. Nothing is sent without a click: this only "
+            "orders and marks the menu, and an id that names no registered crew is "
+            "ignored.",
         ),
     )
     tunnel_base_port: int = field(
@@ -923,7 +946,7 @@ class InstancesConfig:
             "drop such as a screen lock or proxy warmup); a forward that re-binds "
             "but whose far end stays dead additionally spends one probe window per "
             "attempt (probe_failure_threshold x probe_interval), so handoff to "
-            "diagnosis takes roughly attempts x (90s + backoff) ~= 16 min at the "
+            "diagnosis takes roughly attempts x (30s + backoff) ~= 6 min at the "
             "default 8. Size this against the longer window.",
         ),
     )

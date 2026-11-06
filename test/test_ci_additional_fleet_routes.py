@@ -16,6 +16,15 @@ _EXPRESSIONS = {
     "push-pr": parity._CANONICAL_ROUTING_EXPR,
     "push": parity._CANONICAL_PUSH_EXPR,
     "push-dispatch": parity._CANONICAL_DISPATCH_EXPR,
+    # Named for its workflow rather than its events, unlike the three above:
+    # exactly one workflow uses it. Its non-fleet path takes the larger-runner
+    # group, and the condition that makes that safe -- plus the rollback
+    # trigger -- is in
+    # test_the_ratchet_audit_route_reaches_the_group_on_its_non_fleet_path
+    # below. The truth table alone does NOT pin that, since it reads its
+    # expectation out of the expression under test, so that separate assertion
+    # is what does.
+    "ratchet-audit": parity._CANONICAL_DISPATCH_MERGE_GROUP_EXPR,
 }
 
 
@@ -123,10 +132,10 @@ def test_expression_interpreter_rejects_unknown_syntax_and_context(expression):
 @pytest.mark.parametrize(
     "event,repo,head,actor,actors,eligible_policies",
     [
-        ("push", _REPO, "", "101", _ACTORS, {"push-pr", "push", "push-dispatch"}),
-        ("push", _REPO, "", "202", _ACTORS, {"push-pr", "push", "push-dispatch"}),
+        ("push", _REPO, "", "101", _ACTORS, {"push-pr", "push", "push-dispatch", "ratchet-audit"}),
+        ("push", _REPO, "", "202", _ACTORS, {"push-pr", "push", "push-dispatch", "ratchet-audit"}),
         ("pull_request", _REPO, _REPO, "101", _ACTORS, {"push-pr"}),
-        ("workflow_dispatch", _REPO, "", "101", _ACTORS, {"push-dispatch"}),
+        ("workflow_dispatch", _REPO, "", "101", _ACTORS, {"push-dispatch", "ratchet-audit"}),
         ("push", _FORK, "", "101", _ACTORS, set()),
         ("pull_request", _REPO, _FORK, "101", _ACTORS, set()),
         ("pull_request", _REPO, "", "101", _ACTORS, set()),
@@ -147,7 +156,7 @@ def test_expression_interpreter_rejects_unknown_syntax_and_context(expression):
         ("pull_request_target", _REPO, _REPO, "101", _ACTORS, set()),
         ("workflow_run", _REPO, _REPO, "101", _ACTORS, set()),
         ("workflow_call", _REPO, "", "101", _ACTORS, set()),
-        ("merge_group", _REPO, "", "101", _ACTORS, set()),
+        ("merge_group", _REPO, "", "101", _ACTORS, {"ratchet-audit"}),
     ],
 )
 def test_actor_and_event_truth_table(
@@ -166,7 +175,19 @@ def test_actor_and_event_truth_table(
     eligible = policy in eligible_policies and (
         event != "pull_request" or action in {"opened", "synchronize"}
     )
-    expected = "codebuild-kirocrew-gha-linux-456-3" if eligible else "ubuntu-latest"
+    # The non-fleet destination is read off the policy's own expression rather
+    # than hardcoded per policy, so a policy that moves to the group later is
+    # covered here without touching this line, and one that has not moved still
+    # asserts the hosted image. Dropping the fork branch from a moved policy
+    # fails this assertion, which is the point: a group label is unreachable
+    # from a fork, and a job asking for one there waits until GitHub cancels it.
+    moved = parity._GROUP_THEN_HOSTED_TAIL in _EXPRESSIONS[policy]
+    if eligible:
+        expected = "codebuild-kirocrew-gha-linux-456-3"
+    elif moved and repo == _REPO:
+        expected = "kirocrew-linux-4-core"
+    else:
+        expected = "ubuntu-latest"
     assert _evaluate(_EXPRESSIONS[policy], context) == expected
 
 
@@ -176,10 +197,12 @@ def test_actor_and_event_truth_table(
         # A same-repository PR head from a listed actor uses the fleet.
         ("pull_request_target", _REPO, _REPO, "", "101", _ACTORS, True),
         ("pull_request_target", _REPO, _REPO, "", "202", _ACTORS, True),
-        # A fork head stays hosted; the workflow_run field never stands in.
+        # A fork head misses the fleet and takes the group; the workflow_run
+        # field never stands in.
         ("pull_request_target", _REPO, _FORK, "", "101", _ACTORS, False),
         ("pull_request_target", _REPO, "", _REPO, "101", _ACTORS, False),
-        # The merge-guard hold path stays hosted, same-repo head or not.
+        # The merge-guard hold path misses the fleet and takes the group,
+        # same-repo head or not.
         ("workflow_run", _REPO, "", _REPO, "202", _ACTORS, False),
         ("workflow_run", _REPO, _REPO, _REPO, "101", _ACTORS, False),
         ("workflow_run", _REPO, "", _FORK, "101", _ACTORS, False),
@@ -206,7 +229,20 @@ def test_readiness_route_truth_table(event, repo, pr_head, run_head, actor, acto
         "github.run_id": "456",
         "github.run_attempt": "3",
     }
-    expected = "codebuild-kirocrew-gha-linux-456-3" if eligible else "ubuntu-latest"
+    # Pinned here as literals, deliberately NOT read off the expression under
+    # test the way the policy table above does it. This lane publishes the
+    # repository's one required status and its workflow_run leg carries the
+    # merge-guard hold, so moving any of these destinations has to be done on
+    # purpose in two places; deriving the expectation from the constant would
+    # let a future edit to both carry its own expectation along. Only a run
+    # executing OUTSIDE this repository reaches the hosted image, because a
+    # fork's own copy cannot reach an organization runner group.
+    if eligible:
+        expected = "codebuild-kirocrew-gha-linux-456-3"
+    elif repo == _REPO:
+        expected = "kirocrew-linux-4-core"
+    else:
+        expected = "ubuntu-latest"
     assert _evaluate(parity._CANONICAL_READINESS_EXPR, context) == expected
 
 
@@ -223,6 +259,54 @@ def test_readiness_never_checks_out_pr_code():
             "${{ github.event.repository.default_branch || github.ref_name }}"
         )
         assert step["with"]["persist-credentials"] is False
+
+
+@pytest.mark.parametrize(
+    "event,repo,pr_head,actor,actors,admitted",
+    [
+        # A same-repository head from a listed actor uses the fleet, and the
+        # review event is admitted too: this policy names no event.
+        ("pull_request", _REPO, _REPO, "101", _ACTORS, True),
+        ("pull_request_review", _REPO, _REPO, "202", _ACTORS, True),
+        # Executing here but not admitted. On a review event the actor is the
+        # REVIEWER, who is commonly outside the list, so this is the ordinary
+        # path rather than an edge case.
+        ("pull_request", _REPO, _REPO, "999", _ACTORS, False),
+        ("pull_request_review", _REPO, _REPO, "999", _ACTORS, False),
+        ("pull_request", _REPO, _REPO, "101", "", False),
+        ("pull_request", _REPO, _REPO, "101", "[]", False),
+        # A fork pull request against this repository executes HERE, so the
+        # group is reachable even though the head is a fork's.
+        ("pull_request", _REPO, _FORK, "101", _ACTORS, False),
+        # A fork running this workflow in its OWN repository cannot reach an
+        # organization group. Dropping the middle branch's repository guard
+        # fails these two rows, which is the point: a job asking there for a
+        # label no runner carries waits out GitHub's pending limit.
+        ("pull_request", _FORK, _FORK, "101", _ACTORS, False),
+        ("pull_request_review", _FORK, _FORK, "101", _ACTORS, False),
+    ],
+)
+def test_sensitive_change_review_route_truth_table(event, repo, pr_head, actor, actors, admitted):
+    context = {
+        "github.repository": repo,
+        "github.event_name": event,
+        "github.event.pull_request.head.repo.full_name": pr_head,
+        "github.actor_id": actor,
+        "vars.CODEBUILD_ACTOR_IDS": actors,
+        "github.run_id": "456",
+        "github.run_attempt": "3",
+    }
+    # Read off the policy's own expression, the same way the shared truth table
+    # above does, so rolling this policy back to the hosted tail needs no edit
+    # here -- and so a dropped fork branch still fails the fork rows.
+    moved = parity._GROUP_THEN_HOSTED_TAIL in parity._CANONICAL_BASE_ONLY_PR_EXPR
+    if admitted:
+        expected = "codebuild-kirocrew-gha-linux-456-3"
+    elif moved and repo == _REPO:
+        expected = "kirocrew-linux-4-core"
+    else:
+        expected = "ubuntu-latest"
+    assert _evaluate(parity._CANONICAL_BASE_ONLY_PR_EXPR, context) == expected
 
 
 @pytest.mark.parametrize("shape", ["no-actor", "wrong-fork", "literal-array", "folded"])
@@ -269,8 +353,50 @@ def test_additional_routes_have_no_container_or_cloud_credential_steps(filename,
         assert "claude-code-action" not in step.get("uses", "")
 
 
+def test_the_ratchet_audit_route_reaches_the_group_on_its_non_fleet_path():
+    """`main-ratchet-audit.yml` takes the group label when the fleet declines it.
+
+    This assertion replaces the one that pinned the hosted tail here. That pin
+    existed so moving this policy would be a deliberate act rather than a side
+    effect, and the move was made deliberately: the merge-group leg is the thing
+    it asked to have settled, so settle it here.
+
+    `merge-queue-readiness.yml` lists this workflow in its polled set. It polls
+    every merge group, counts a queued run as pending, and fails the group
+    closed when its budget runs out, so a queued run on a capped group does hold
+    merges. Three things decide that this is acceptable rather than reckless:
+
+    - The leg is dormant. A `merge_group` event needs a merge queue on the
+      branch, and no active ruleset configures one; all 1,099 `merge_group` runs
+      in this repository's history were created in one window, between
+      2026-10-02T18:17Z and 2026-10-03T00:03Z.
+    - It is not unique to this workflow. The queue polls `ci.yml`,
+      `fast-gate.yml` and `build.yml` as well, and their merge-group leg reaches
+      the group whenever the queuing actor is not on the allowlist. Several
+      `ci.yml` jobs reach it unconditionally, with no fleet branch at all. So
+      every merge group already waits on this cap.
+    - Only a merge group queued by an actor OUTSIDE `CODEBUILD_ACTOR_IDS` lands
+      here. An allowlisted queuer still takes the fleet.
+
+    Turning the merge queue back on is therefore the event that makes this live,
+    and it is the rollback trigger: restore the literal hosted tail on this
+    constant before enabling the queue if the group is anywhere near its cap.
+
+    Pinned DIRECTLY, like its predecessor, and not left to the truth table
+    above, because that table reads its expected value out of the expression
+    under test and so would carry along any later edit of the constant and the
+    workflow together.
+    """
+    assert parity._GROUP_THEN_HOSTED_TAIL in parity._CANONICAL_DISPATCH_MERGE_GROUP_EXPR, (
+        "main-ratchet-audit.yml's non-fleet path is expected to take the "
+        "kirocrew-runners group label, with the hosted image reachable only from a "
+        "fork. Restoring the bare hosted tail is a rollback: do it deliberately, and "
+        "before the merge queue is enabled rather than after."
+    )
+
+
 @pytest.mark.parametrize("filename", ["build-wheel.yml", "dependency-vulnerability.yml"])
-def test_reusable_routes_keep_schedule_callers_hosted(filename):
+def test_reusable_routes_keep_schedule_callers_off_the_fleet(filename):
     workflow = yaml.safe_load((parity._WORKFLOWS_DIR / filename).read_text(encoding="utf-8"))
     assert "workflow_call" in workflow.get("on", workflow.get(True))
     for caller in ("nightly.yml", "release.yml"):

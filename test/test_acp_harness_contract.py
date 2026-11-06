@@ -1,18 +1,11 @@
 """The harness layer's own contract.
 
-Every seam a host can differ on is asserted here per host, so a backend added
-later cannot half-implement the layer and still start. These are the assertions
-that make the layer worth having: without them a new harness could inherit
-kiro-cli's answer on a seam it actually differs on, and the first sign of it
-would be a live session behaving wrongly.
+Every seam a host can differ on is asserted per host, so a new backend cannot
+half-implement the layer and silently inherit kiro-cli's answer. The wire bytes are
+pinned in ``test_acp_harness_wire_parity.py``.
 
-The wire consequences of these answers -- the actual bytes -- are pinned
-separately in ``test_acp_harness_wire_parity.py``.
-
-Every stub below patches the module that DEFINES the helper, never a local
-binding inside a harness: the harnesses call through their defining modules
-precisely so a stub aimed at the definition reaches them, and a test that
-patched a local name would leave the real filesystem work running.
+Stubs patch the module that defines a helper, never a local binding in a harness,
+or the real filesystem work would keep running.
 """
 
 from __future__ import annotations
@@ -161,14 +154,8 @@ def test_the_registry_serves_every_backend_it_claims_to():
 def test_harness_for_refuses_an_unserved_backend():
     """Refusing beats defaulting.
 
-    A backend with no harness that silently got kiro-cli's would start fine and
-    then send the wrong protocol version, the wrong teardown verb and an argv for
-    a different binary.
-
-    Spelled with an id no harness serves rather than a real one. It named ``codex``
-    while codex had no harness; a registered host is the wrong probe for this,
-    because the day it registers the test would pass only by refusing something it
-    should serve.
+    A defaulted backend would send kiro-cli's protocol version, teardown verb and
+    argv. The id is one no harness serves, so registering a host cannot break this.
     """
     with pytest.raises(ValueError, match="no ACP harness"):
         harness_for("byo-harness")
@@ -288,6 +275,24 @@ async def test_kiro_spawn_refuses_when_fork_governance_is_unresolved(
     monkeypatch.setattr(agent_mod, "require_fork_governance", _boom)
     with pytest.raises(AcpRuntimeError, match="governance pending"):
         await harness_for(ACP_BACKEND_KIRO).resolve_spawn(_ctx(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_kiro_spawn_plan_leaves_the_over_ceiling_check_to_the_launch(
+    found_binary, kiro_gates_pass, monkeypatch, tmp_path
+):
+    """The over-ceiling check judges the name kiro-cli is finally handed, a skill view
+    or the authored name, which the runtime decides after the plan
+    (``runtime_spawn_launch._refuse_over_ceiling_launch``), so the plan never asks."""
+    calls: list[str | None] = []
+
+    def _over(agent, backend, **_kw):
+        calls.append(agent)
+        raise agent_mod.SharedTemplateOverCeiling("over the ceiling")
+
+    monkeypatch.setattr(agent_mod, "require_shared_template_within_ceiling", _over)
+    await harness_for(ACP_BACKEND_KIRO).resolve_spawn(_ctx(tmp_path))
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -476,13 +481,9 @@ def test_client_capabilities_are_the_shared_constants():
 def test_kas_capabilities_open_only_settings_and_external_urls():
     """KAS's extra capabilities are the settings channel and ``openExternalUrl``.
 
-    ``openExternalUrl`` is answered by the runtime for an MCP sign-in it started.
-    Every other ``_meta.kiro`` capability is a callback Crew does not implement,
-    so declaring one would invite a request with no handler; ``secretStorage`` in
-    particular would make Crew the store of MCP tokens. The settings channel is
-    declared EMPTY here: the runtime fills it at spawn from the operator's
-    settings (``client_meta_settings``), so the constant stays the pristine shape
-    every host's handshake is compared against.
+    Any other ``_meta.kiro`` capability would invite a request with no handler
+    (``secretStorage`` would make Crew the MCP token store). The settings channel is
+    empty here; the runtime fills it at spawn.
     """
     kas = harness_for(ACP_BACKEND_KAS).client_capabilities
     assert kas["_meta"] == {"kiro": {"settings": {}, "openExternalUrl": True}}
@@ -499,12 +500,8 @@ def test_kas_capabilities_open_only_settings_and_external_urls():
 def test_only_the_host_with_a_settings_channel_has_it_filled():
     """H6: whether ``initialize`` carries settings is a membership answer.
 
-    KAS opened ``_meta.kiro.settings`` and reads Tool Search from it; kiro-cli has
-    no such channel and takes the same setting from the cli.json overlay. A host
-    answering yes here without the channel would have its handshake rejected;
-    one answering no while it HAS the channel runs with every setting at the
-    engine's default -- which for Tool Search on KAS is the silent "loader never
-    mounted" the runtime's gate exists to prevent.
+    KAS reads Tool Search from ``_meta.kiro.settings``; kiro-cli reads cli.json. A
+    wrong yes rejects the handshake; a wrong no silently runs on engine defaults.
     """
     assert harness_for(ACP_BACKEND_KAS).client_meta_settings is True
     assert harness_for(ACP_BACKEND_KIRO).client_meta_settings is False
@@ -525,7 +522,7 @@ async def test_kas_projects_the_agent_spec(kas_projection_stubbed, monkeypatch, 
     monkeypatch.setattr(
         kas_agents_mod,
         "build_kas_custom_agents",
-        lambda d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key="": projected,
+        lambda d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key="", **_kw: projected,
     )
     extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
     assert extras.custom_agents == projected
@@ -564,7 +561,9 @@ async def test_kas_projection_refuses_an_untranslatable_spec(
     from kiro_crew.acp.kas_agents import KasAgentTranslationError
     from kiro_crew.acp.session_handle import AcpRuntimeError
 
-    def _boom(d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key=""):
+    def _boom(
+        d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key="", **_kw
+    ):
         raise KasAgentTranslationError("unreadable spec")
 
     monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _boom)
@@ -586,7 +585,9 @@ async def test_kas_projection_survives_an_unreadable_overlay(
     def _boom(overlay, agent):
         raise OSError("overlay unreadable")
 
-    def _build(d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key=""):
+    def _build(
+        d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key="", **_kw
+    ):
         seen.append(frozenset(stub_server_names))
         return [{"name": a}]
 
@@ -610,7 +611,9 @@ async def test_kas_member_dispatch_subtracts_the_dashboard_server(
 
     seen: list[frozenset] = []
 
-    def _build(d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key=""):
+    def _build(
+        d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key="", **_kw
+    ):
         seen.append(frozenset(stub_server_names))
         return []
 
@@ -619,6 +622,39 @@ async def test_kas_member_dispatch_subtracts_the_dashboard_server(
         "a", work_dir=str(tmp_path), member_dispatch=True
     )
     assert seen == [frozenset({MEMBER_DISPATCH_SERVER})]
+
+
+@pytest.mark.asyncio
+async def test_kas_extras_carry_the_managed_invocations_resolved_off_the_loop(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """the launcher lookup runs in the projection thread, not in the hoist."""
+    import threading
+
+    loop_thread = threading.get_ident()
+    looked_up: list[tuple[str, bool]] = []
+
+    def _build(
+        d, a, spec, *, stub_server_names, member_dispatch, crew_panel=False, session_key="", **_kw
+    ):
+        return [{"id": a, "mcpServers": {"kirocrew-core": {"command": "kc"}, "tp": {}}}]
+
+    def _managed(name, *, include_opt_in=False):
+        looked_up.append((name, threading.get_ident() != loop_thread))
+        return {"command": "/opt/kc", "args": ["mcp-core"]}
+
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _build)
+    monkeypatch.setattr(agent_mod, "managed_mcp_spec_entry", _managed)
+
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    assert extras.managed_entries == {"kirocrew-core": {"command": "/opt/kc", "args": ["mcp-core"]}}
+    assert looked_up == [("kirocrew-core", True)], "resolved once, off the loop thread"
+
+
+@pytest.mark.asyncio
+async def test_kiro_extras_carry_no_managed_invocations(tmp_path):
+    extras = await harness_for(ACP_BACKEND_KIRO).session_extras("a", work_dir=str(tmp_path))
+    assert extras.managed_entries is None
 
 
 # ── Seam 4: host-answered requests ──
@@ -652,11 +688,8 @@ async def test_kas_answers_the_token_callback_from_the_vault(monkeypatch):
 def test_the_reader_loop_answers_through_the_harness_that_claimed_the_method():
     """The answer comes from the host that named the method, not a fixed answerer.
 
-    The guard upstream accepts ANY method a host claims in
-    ``host_answered_methods``. With a hardcoded answerer, a host that claimed a
-    different method would pass that guard and be handed the credential another
-    host's harness built -- the mistaken-identity failure this layer exists to
-    prevent, and one no test of either host alone would catch.
+    With a fixed answerer, a host claiming another method in ``host_answered_methods``
+    would get a credential another host's harness built.
     """
     import inspect as _inspect
 
@@ -780,14 +813,8 @@ def test_teardown_verbs_are_per_host():
 def test_the_contract_mirrors_no_membership_table():
     """No harness member restates a table both drivers already read.
 
-    How a live session's model changes, and how privileged tools are made to ask,
-    are answered by ``ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION`` and
-    ``ACP_BACKEND_ROUTING``, and both drivers read those directly. A harness member
-    mirroring one would be a second declaration free to disagree with the one that
-    decides -- the exact drift this layer promises to remove, arriving as a feature.
-
-    A member belongs here when a CALLER asks the harness for it. Both of these are
-    looked up, so the honest surface is smaller.
+    Drivers read ``ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION`` and ``ACP_BACKEND_ROUTING``
+    directly; a harness mirror would be a second declaration free to disagree.
     """
     assert not hasattr(HarnessAdapter, "model_switch")
     assert not hasattr(HarnessAdapter, "effort_switch")
@@ -843,19 +870,9 @@ _RECLAIM_PROBES = (
 def test_reclaim_thresholds_pass_the_operator_configuration_through(backend):
     """Every harness passes the operator's thresholds through, in their own unit.
 
-    Universal, and asserted for every harness alike. Age passes through unchanged:
-    nothing about age depends on what a harness measures. RSS passes through
-    unchanged too -- UNLESS the harness measures a different SET of processes, in
-    which case the incoming number is in a unit it does not measure and the harness
-    states its own. The two shapes are told apart by what the harness declares on
-    itself, never by its identity: a bounded scope (``CORE_RSS_DEPTH``) and the
-    ceiling for that scope (``CORE_RSS_CEILING_MB``) travel together, and a harness
-    declaring neither is held to pass-through. The second probe is what makes a
-    stated ceiling distinguishable from a reinterpreted one: the answer must be the
-    SAME for two different inputs, and must be the declared constant, so a harness
-    scaling or clamping the operator's number fails on one probe or the other.
-    Quietly reinterpreting an operator's configured ceiling for one host is the
-    failure this ratchet catches, whichever host it is.
+    Age always passes through. RSS passes through unless the harness declares both
+    ``CORE_RSS_DEPTH`` and ``CORE_RSS_CEILING_MB``; then it must return that constant.
+    Two probes with different inputs catch a harness that scales or clamps the number.
     """
     harness = harness_for(backend)
     depth = getattr(type(harness), "CORE_RSS_DEPTH", None)
@@ -887,15 +904,8 @@ def test_reclaim_thresholds_pass_the_operator_configuration_through(backend):
 def test_the_kiro_lookup_is_total():
     """Kiro's harness lookup CANNOT fail, so the default path gains no failure mode.
 
-    The shared-process spawn asks a table which host it is starting. If that
-    lookup could raise for Kiro, every ordinary session would have gained a way
-    to fail before its process exists -- a new failure mode on the default path
-    in service of adapter support, which is precisely what H13 forbids.
-
-    Total by construction on three counts, each asserted rather than assumed: the
-    id is a key of the table, the table is a literal in the same module as the
-    class it names, and the class takes no constructor argument that could be
-    missing or malformed.
+    Asserted on three counts: the id is a key of the table, the table is a literal in
+    the class's module, and the class takes no constructor argument.
     """
     import inspect
 
@@ -1049,12 +1059,8 @@ def test_the_kiro_family_ignores_the_advertised_capabilities(backend):
 def test_codex_narrows_the_array_against_what_the_handshake_advertised():
     """The counterexample the two family assertions above must not swallow.
 
-    codex reads no agent spec, so this array IS the session's tool surface -- and an
-    element whose transport the adapter never advertised is ACCEPTED rather than
-    refused: ``session/new`` answers with a ``sessionId`` and that server is never
-    wired. The narrowing here is the only guard that the array Crew sends is the
-    array the adapter honours, because a session carrying an unwired server reports
-    nothing.
+    codex accepts a server whose transport it never advertised and silently never
+    wires it, so this narrowing is the only guard.
     """
     harness = harness_for(ACP_BACKEND_CODEX)
     requested = [{"name": "keep", "url": "http://keep"}, {"name": "drop", "type": "sse"}]
@@ -1268,8 +1274,7 @@ async def test_the_kiro_family_ignores_the_sandbox_tier(
     """Neither shipped host reads the tier, so its argv cannot move with it.
 
     Both ask by construction and carry no mask, so there is nothing for a tier to
-    invalidate -- and a spawn that changed shape with the tier would be a wire
-    difference this PR does not have.
+    invalidate.
     """
     from kiro_crew.acp.harness import kas as kas_module
 

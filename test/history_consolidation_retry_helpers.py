@@ -59,6 +59,7 @@ def _make_consolidator(log: ConversationLog, **kw: Any) -> HistoryConsolidator:
     memory.read_projects.return_value = ""
     kw.setdefault("history_idle_secs", 0)
     kw.setdefault("sessions", None)
+    kw.setdefault("auto_consolidation_enabled", True)
     return HistoryConsolidator(log=log, memory=memory, migrated=True, **kw)
 
 

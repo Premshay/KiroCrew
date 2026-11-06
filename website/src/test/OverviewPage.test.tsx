@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { screen, fireEvent } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
 import OverviewPage from '../pages/OverviewPage'
-import { KIRO_SIGN_IN_BACKEND, KIRO_SIGN_IN_PATH } from '../pages/developer/kiroSignInLink'
+import { KIRO_SIGN_IN_BACKEND } from '../pages/developer/kiroSignInLink'
 import type { RootState } from '../store'
 
 // Mock the two drill-in surfaces to isolate the mission-control shell.
@@ -34,6 +34,9 @@ vi.mock('../api/client', () => ({
   },
 }))
 
+// The Today line's counts, which one test sets to the singular.
+const usageToday = vi.hoisted(() => ({ sessions: 3, messages: 42, toolCalls: 5 }))
+
 // Usage summary card goes through the provider seam.
 vi.mock('../providers', () => ({
   useProvider: () => ({
@@ -43,7 +46,7 @@ vi.mock('../providers', () => ({
     fetchUsage: vi.fn().mockResolvedValue({
       sessions: {
         total: 10,
-        today: { sessions: 3, messages: 42, toolCalls: 5 },
+        today: { ...usageToday },
         thisWeek: { sessions: 8, messages: 100, toolCalls: 12 },
         thisMonth: { sessions: 10, messages: 120, toolCalls: 15 },
         avgMsgsPerSession: 12,
@@ -99,6 +102,23 @@ describe('OverviewPage — mission control', () => {
     expect(screen.getByText('Memory')).toBeInTheDocument()
     expect(await screen.findByText(/Summarizes chats into memory after 3h idle/)).toBeInTheDocument()
     expect(await screen.findByText(/Today:/)).toBeInTheDocument()
+  })
+
+  it('reads the Today line as one phrase with plural counts and a formatted cost', async () => {
+    renderWithProviders(<OverviewPage />, { store: statusStore() })
+    expect(await screen.findByText('Today: 3 sessions · 42 messages · 63.3K tokens · $4.12')).toBeInTheDocument()
+  })
+
+  it('uses the singular for a count of one on the Today line', async () => {
+    usageToday.sessions = 1
+    usageToday.messages = 1
+    try {
+      renderWithProviders(<OverviewPage />, { store: statusStore() })
+      expect(await screen.findByText('Today: 1 session · 1 message · 63.3K tokens · $4.12')).toBeInTheDocument()
+    } finally {
+      usageToday.sessions = 3
+      usageToday.messages = 42
+    }
   })
 
   it('drills into Memory and back', async () => {
@@ -185,10 +205,10 @@ describe('OverviewPage — mission control', () => {
     expect(api.kasLoginStatus).not.toHaveBeenCalled()
   })
 
-  it('signposts the sign-in card only while KAS is the selected backend', async () => {
+  it('carries no "sign-in moved" signpost either, whichever backend is selected', async () => {
     const { api } = await import('../api/client')
-    // Kiro CLI (the default, spelled as the empty string): no pointer, and no
-    // wrapper left behind where the card used to sit.
+    // The time-boxed pointer to Settings > Agent Harness is retired: the page
+    // neither renders it nor reads the backend to decide whether to.
     const first = renderWithProviders(<OverviewPage />, { store: statusStore() })
     expect(await screen.findByText('Memory')).toBeInTheDocument()
     expect(screen.queryByTestId('kiro-sign-in-moved')).not.toBeInTheDocument()
@@ -196,10 +216,9 @@ describe('OverviewPage — mission control', () => {
 
     vi.mocked(api.kirocrewConfig).mockResolvedValueOnce({ agent: { acp_backend: KIRO_SIGN_IN_BACKEND } })
     renderWithProviders(<OverviewPage />, { store: statusStore() })
-    const pointer = await screen.findByTestId('kiro-sign-in-moved')
-    expect(pointer).toHaveTextContent('Kiro sign-in moved to Settings > Agent Harness')
-    // Same destination as the chat error row, so the two doors cannot drift.
-    expect(pointer).toHaveAttribute('href', KIRO_SIGN_IN_PATH)
+    expect(await screen.findByText('Memory')).toBeInTheDocument()
+    expect(screen.queryByTestId('kiro-sign-in-moved')).not.toBeInTheDocument()
+    expect(screen.queryByText(/sign-in moved/i)).not.toBeInTheDocument()
     expect(api.kasLoginStatus).not.toHaveBeenCalled()
   })
 })

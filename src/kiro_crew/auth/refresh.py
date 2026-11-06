@@ -154,7 +154,9 @@ async def ensure_fresh(
             # whole lock-file setup stays off the event loop.
             lock_path = store.lock_path(token.identity)
             lock_path.parent.mkdir(parents=True, exist_ok=True)
-            return os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            from kiro_crew.platform_compat import open_create_or_existing
+
+            return open_create_or_existing(str(lock_path), os.O_RDWR, 0o600)
 
         fd = await asyncio.to_thread(_open_refresh_lock)
         try:
@@ -178,7 +180,9 @@ async def ensure_fresh(
                     # sign-in that replaces that token (save clears it in the
                     # same lock). Recorded, then re-raised unchanged: callers see
                     # the same failure they always did.
-                    await asyncio.to_thread(store.mark_refresh_rejected, token.identity)
+                    await asyncio.to_thread(
+                        store.mark_refresh_rejected, token.identity, current.refresh_token
+                    )
                     raise
                 # store.save does blocking file IO (owner-only lockdown included) — off-loop.
                 # This coroutine already holds the identity's refresh lock on `fd`;
@@ -228,6 +232,7 @@ async def _refresh_social(token: KasToken, *, session: aiohttp.ClientSession) ->
         refresh_token=data.get("refreshToken") or token.refresh_token,
         profile_arn=profile_arn,
         region=token.region,
+        extra=dict(token.extra),
     )
 
 
@@ -255,6 +260,7 @@ async def _refresh_sso_oidc(token: KasToken, *, session: aiohttp.ClientSession) 
         region=region,
         client_id=token.client_id,
         client_secret=token.client_secret,
+        extra=dict(token.extra),
     )
 
 
@@ -285,6 +291,7 @@ async def _refresh_external_idp(token: KasToken, *, session: aiohttp.ClientSessi
         auth_method="external_idp",
         client_id=token.client_id,
         token_endpoint=token.token_endpoint,
+        extra=dict(token.extra),
     )
 
 

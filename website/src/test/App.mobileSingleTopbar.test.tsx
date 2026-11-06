@@ -201,7 +201,7 @@ describe('phone chat page: one top bar', () => {
     expect(apps).not.toContainElement(customize)
   })
 
-  it('carries Developer and Terminal on the rail, and leaves out Discover, Library and Connect-your-phone', async () => {
+  it('carries Terminal on the rail and leaves Developer in Settings', async () => {
     localStorage.setItem('mc-onboarded', '1')
     localStorage.setItem('mc-dev-mode', '1')
     try {
@@ -212,7 +212,7 @@ describe('phone chat page: one top bar', () => {
       // still reach both.
       expect(within(rail).queryByRole('button', { name: 'Library' })).toBeNull()
       expect(within(rail).queryByRole('button', { name: 'Discover' })).toBeNull()
-      expect(within(rail).getByRole('button', { name: 'Developer' })).toBeInTheDocument()
+      expect(within(rail).queryByRole('button', { name: 'Developer' })).toBeNull()
       // Terminal toggles the docked panel from the chat page itself, without a
       // detour through another page's nav drawer. Pinned below the scrolling
       // Apps frame while the rail has room.
@@ -398,7 +398,7 @@ describe('phone chat page: one top bar', () => {
     // It hangs over the top of <main>: a readout must not swallow the taps
     // and scroll starts that land there.
     expect(strip).toHaveClass('pointer-events-none')
-    act(() => { store.dispatch(sseConnected()) })
+    await act(async () => { store.dispatch(sseConnected()) })
     expect(screen.queryByTestId('mobile-offline-strip')).toBeNull()
   })
 
@@ -475,27 +475,22 @@ describe('phone chat page: one top bar', () => {
 
   it('sizes the brand-mark glyphs on the Mates drawer rail like every other 20px tile', async () => {
     localStorage.setItem('mc-onboarded', '1')
-    localStorage.setItem('mc-preview-crew', '1')
-    try {
-      renderWithProviders(<App />, { route: '/members?member=alpha' })
-      const rail = await screen.findByTestId('mobile-nav-rail', undefined, LAZY_ROUTE)
-      // The two-ghost Crewmates mark and Customize's ghost are BrandGlyph spans
-      // with an inline 16px width/height. Only an `!important` rule on the
-      // glyph slot beats that, so the tile must size every child of the slot
-      // that way -- a `>svg` rule reaches the Lucide glyphs only, which left
-      // these two at 16px beside 20px neighbours.
-      const marks = [
-        within(rail).getByTestId('crew-member-mark'),
-        within(rail).getByTestId('kiro-ghost-mark'),
-      ]
-      for (const mark of marks) {
-        expect(mark.style.width).toBe('16px')
-        expect(mark.parentElement).toHaveClass('app-icon-nav')
-        const tile = mark.closest('.nav-item') as HTMLElement
-        expect(tile).toHaveClass('[&_.app-icon-nav>*]:!w-5', '[&_.app-icon-nav>*]:!h-5')
-      }
-    } finally {
-      localStorage.removeItem('mc-preview-crew')
+    renderWithProviders(<App />, { route: '/members?member=alpha' })
+    const rail = await screen.findByTestId('mobile-nav-rail', undefined, LAZY_ROUTE)
+    // The two-ghost Crewmates mark and Customize's ghost are BrandGlyph spans
+    // with an inline 16px width/height. Only an `!important` rule on the
+    // glyph slot beats that, so the tile must size every child of the slot
+    // that way -- a `>svg` rule reaches the Lucide glyphs only, which left
+    // these two at 16px beside 20px neighbours.
+    const marks = [
+      within(rail).getByTestId('crew-member-mark'),
+      within(rail).getByTestId('kiro-ghost-mark'),
+    ]
+    for (const mark of marks) {
+      expect(mark.style.width).toBe('16px')
+      expect(mark.parentElement).toHaveClass('app-icon-nav')
+      const tile = mark.closest('.nav-item') as HTMLElement
+      expect(tile).toHaveClass('[&_.app-icon-nav>*]:!w-5', '[&_.app-icon-nav>*]:!h-5')
     }
   })
 })

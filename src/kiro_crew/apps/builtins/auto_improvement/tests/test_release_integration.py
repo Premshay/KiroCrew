@@ -9,6 +9,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
+
 from .. import profiles
 from ..backend import clone_setup, commit, progress, routes, runner, store
 from ..spine.contracts import BugGateResult, Candidate, Proposal, Verdict
@@ -126,7 +128,7 @@ def test_manual_regression_rejects_incomplete_or_changed_tree(monkeypatch, tmp_p
         require_environment=Mock(),
         ruler=SimpleNamespace(),
         full_regression=regression,
-    )
+    )  # flake-ok: Pins a workload-budget contract with a mocked executor, not a wait barrier.
     monkeypatch.setattr(profiles, "build_profile", lambda _: profile)
     with pytest.raises((RuntimeError, subprocess.TimeoutExpired)):
         commit.run_publication_regression({"clone": str(tmp_path)}, lambda: state["stop"])
@@ -147,7 +149,7 @@ def test_manual_regression_guard_checks_again_at_publication(monkeypatch, tmp_pa
         require_environment=Mock(),
         ruler=SimpleNamespace(),
         full_regression=Mock(return_value=True),
-    )
+    )  # flake-ok: Pins a workload-budget contract with a mocked executor, not a wait barrier.
     monkeypatch.setattr(profiles, "build_profile", lambda _: profile)
     guard = commit.run_publication_regression({"clone": str(tmp_path)}, lambda: False)
     assert guard()
@@ -463,14 +465,16 @@ async def test_authenticated_http_publication_admits_runner(
         observed.append((current_app_execution(), threading.current_thread().name))
         return (
             state.adapter.run(
-                state.adapter.python_argv("-c", "pass"), cwd=state.clone, timeout=5
+                state.adapter.python_argv("-c", "pass"),
+                cwd=state.clone,
+                timeout=FALLBACK_TIMEOUT_SECS,
             ).returncode
             == 0
         )
 
     profile = SimpleNamespace(
         full_regression_timeout_s=5, ruler=SimpleNamespace(), full_regression=regression
-    )
+    )  # flake-ok: Pins a workload-budget contract with a mocked executor, not a wait barrier.
     monkeypatch.setattr(profiles, "build_profile", lambda _: profile)
 
     def commit_finding(fp, *, regression):

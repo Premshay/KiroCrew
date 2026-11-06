@@ -138,7 +138,7 @@ the learned cost. So the sampler special-cases them:
 - **Dedicated** (per-process) spawns keep the per-PID subtree sampling above.
   A spawn takes that path when it sets `model`, `reasoning_effort`,
   `allowed_tools`, `bare`, `backend`, or `keep: true`; when `agent.role_models["subagent"]`
-  or `agent.role_efforts["subagent"]` is pinned; when it runs as a crew member;
+  or `agent.role_efforts["subagent"]` is pinned; when it runs as a Bot;
   when `agent.session_sharing` is off; when there is no parent session; or when
   the parent is not ACP/kiro-backed (e.g. a Claude-Code parent).
 
@@ -385,9 +385,9 @@ start that later fails to commit (an accepted gap, tracked as
   leave the host-memory fallback intact. Ancestors hidden above the cgroup
   mount cannot be measured.
 - Usage there means the working set: `memory.current` (v1:
-  `memory.usage_in_bytes`) minus the group's inactive page cache
-  (`inactive_file`, v1 `total_inactive_file`), so reclaimable cache does not
-  read as used. The agents slice (`kirocrew-agents.slice`) is a second clamp:
+  `memory.usage_in_bytes`) minus the group's clean page cache
+  (`active_file + inactive_file - file_dirty - file_writeback`, v1 the
+  `total_` keys), so reclaimable cache does not read as used. The agents slice (`kirocrew-agents.slice`) is a second clamp:
   its headroom is the smaller of `memory.high` and `memory.max`, minus the
   slice's own working set.
 - Design rationale and worked examples:

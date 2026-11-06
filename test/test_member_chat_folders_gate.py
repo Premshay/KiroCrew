@@ -5,9 +5,10 @@ The bug: a dashboard chat session whose agent is a crew member with a private V2
 memory store got ``member_scope_denied`` (403) from EVERY ``/api/chat/folders*``
 and ``/api/chat/tags*`` route, because ``private_chat_route_refusal`` refused any
 scoped caller except ``POST .../followup``. Meanwhile ``/api/session-control/*``
-admits the same member callers -- so a conductor could create workers but could
-not put them in a folder, which its operating procedure (``session_create`` with
-``folder=``, ``chat_folder_file_self``) requires.
+admits the same member callers -- so a member could create workers but could not
+file them with ``session_create`` ``folder=``. Dispatcher guidance passes no
+folder; the member admission stays until the member folder routes go
+(rfc-crewmate-workers-under-the-crewmate.md, step 8).
 
 These tests pin:
 
@@ -111,9 +112,7 @@ class TestAdmittedChatRouteMethods:
         )
 
     def test_wrong_method_on_an_admitted_path_is_not_matched(self):
-        # DELETE on the folders collection route is not admitted.
         assert "DELETE" not in _shared._admitted_chat_route_methods("/api/chat/folders")
-        # Folder {id} admits PATCH only -- never DELETE.
         assert _shared._admitted_chat_route_methods("/api/chat/folders/abc123") == frozenset(
             {"PATCH"}
         )
@@ -121,7 +120,6 @@ class TestAdmittedChatRouteMethods:
         assert _shared._admitted_chat_route_methods("/api/chat/tags") == frozenset({"GET"})
         # So is the board's column list.
         assert _shared._admitted_chat_route_methods("/api/chat/tag-columns") == frozenset({"GET"})
-        # POST on the session list is not admitted (GET only).
         assert "POST" not in _shared._admitted_chat_route_methods("/api/chat/slots")
         # reorder admits POST only.
         assert "GET" not in _shared._admitted_chat_route_methods("/api/chat/folders/reorder")

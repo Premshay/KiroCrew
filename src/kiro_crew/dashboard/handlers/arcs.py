@@ -168,6 +168,7 @@ async def api_arc_entries_write(request: web.Request) -> web.Response:
     response = await _run(request, "arc_entries_write", work)
     if response.status != 200:
         return response
+    assert response.text is not None
     payload = json.loads(response.text)
     stored = payload["entry"]
     try:

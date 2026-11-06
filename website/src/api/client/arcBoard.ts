@@ -60,6 +60,16 @@ export interface ArcBoardEntry {
   milestone?: number
   /** A DONE that says it finishes the current milestone: a sign-off request. */
   completes_milestone?: boolean
+  /** A coordinator FACT that signed the milestone off for the owner. */
+  signoff?: boolean
+  /** Set on a merged PR the board recorded from GitHub (author "github"). */
+  pr?: number
+  head?: string
+  merge_sha?: string
+  reviewers?: string[]
+  verified?: boolean
+  /** The member whose branch it was, or "". */
+  lane?: string
 }
 
 /** An open ask: its age and who has seen it, for the "needs you" rail. */
@@ -85,6 +95,10 @@ export interface ArcBoardArc {
   channel_owned?: boolean
   /** Where new lane sessions start; empty keeps each session's default. */
   project?: string
+  /** GitHub owner/name whose merged "Arc: <id>" PRs are recorded; "" for none. */
+  repo?: string
+  /** The member who may sign milestones off for the owner; "" for none. */
+  coordinator?: string
   members: Record<string, ArcBoardMember>
   milestone_index: number
   created_at: string
@@ -206,6 +220,9 @@ export function createArcBoardEndpoints({ get, post, j }: ClientTransport) {
           ...(opts?.nudge ? { nudge: true } : {}),
           ...(opts?.kickoff === false ? { kickoff: false } : {}),
         }).then(j) as Promise<{ arc: ArcBoardArc; lane: ArcBoardLaneJoin }>,
+      /** The arc's GitHub repo and the coordinator who signs off for the owner. */
+      arcBoardSettings: (arcId: string, settings: { repo?: string; coordinator?: string }) =>
+        post('/api/arc-board/arcs/' + id(arcId) + '/settings', settings).then(j) as Promise<{ arc: ArcBoardArc }>,
       /** Gives an arc with no open channel its own and joins every lane to it. */
       arcBoardOpenChannel: (arcId: string) =>
         post('/api/arc-board/arcs/' + id(arcId) + '/channel', {}).then(j) as Promise<{

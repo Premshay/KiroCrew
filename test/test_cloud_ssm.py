@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,19 @@ from kiro_crew.testing.wait import wait_until
 #: Well under the 30 s the stand-in descendants sleep, so a test that waited on
 #: a descendant's natural exit instead of the kill fails.
 _DESCENDANT_KILL_SECS = 5.0
+
+#: The ownership fix ``_plugin_ownership_remedy`` offers for AWS's own tree.
+_PKG_TREE_REMEDY = "sudo chown -R root:wheel /usr/local/sessionmanagerplugin"
+
+
+def _pkg_tree_refusal() -> ssm.PluginRefusal:
+    """A plugin refused inside AWS's install tree, with its known ownership fix."""
+    return ssm.PluginRefusal(
+        path="/usr/local/sessionmanagerplugin/bin/session-manager-plugin",
+        reason="executable is owned by another user (uid 1501)",
+        remedy_command=_PKG_TREE_REMEDY,
+        code="other_owner",
+    )
 
 
 class TestArgvBuilders:
@@ -195,6 +209,15 @@ class TestOpenPortForward:
             fake_aws.write_text("#!/bin/sh\n")
             fake_aws.chmod(0o755)
         install_dir = tmp_path / "install"
+        install_dir.mkdir()
+        # The PATH wiring is under test here, not the directory check, which has
+        # its own tests in test_deploy_web_engine.py and refuses the Windows CI
+        # runner's temp directory.
+        from kiro_crew import github_runner
+
+        monkeypatch.setattr(
+            github_runner, "validate_provider_directory", lambda candidate: candidate
+        )
         monkeypatch.setenv("PATH", str(inherited))
         monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(install_dir),))
         monkeypatch.setattr(ssm, "require_session_manager_plugin", lambda: None)
@@ -347,6 +370,110 @@ class TestSessionManagerPluginProbe:
         assert refusal.reason == "executable parent is owned by another user (uid 1501)"
         # Outside AWS's package prefix no ownership command is known to fix it.
         assert refusal.remedy_command == ""
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership semantics")
+    def test_a_refused_plugin_is_not_reported_as_not_installed_at_tunnel_start(
+        self, monkeypatch, tmp_path
+    ):
+        """The tunnel gate and the installer name the refusal, not "not
+        installed" -- reinstalling puts the same refused file back."""
+        from kiro_crew import github_runner
+        from kiro_crew.deploy import engine
+
+        install = tmp_path / "pkgbin"
+        install.mkdir()
+        plugin = install / "session-manager-plugin"
+        plugin.write_text("#!/bin/sh\n")
+        plugin.chmod(0o755)
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(install),))
+        monkeypatch.setattr(engine, "_REFUSED_AWS_BIN_DIRS", set())
+        reason = "executable is owned by another user (uid 1501)"
+
+        def _refuse(candidate):
+            raise ValueError(reason)
+
+        monkeypatch.setattr(github_runner, "validate_provider_executable", _refuse)
+
+        with pytest.raises(aws.AWSError) as excinfo:
+            ssm.require_session_manager_plugin()
+        assert "not installed" not in str(excinfo.value)
+        assert str(plugin) in str(excinfo.value)
+        assert reason in str(excinfo.value)
+
+    def test_a_plugin_refused_in_aws_install_tree_is_not_reinstalled(self, monkeypatch):
+        """AWS's installer rewrites the same file and keeps its ownership."""
+        refusal = _pkg_tree_refusal()
+        monkeypatch.setattr(ssm, "session_manager_plugin_installed", lambda: False)
+        monkeypatch.setattr(ssm, "session_manager_plugin_refusal", lambda: refusal)
+
+        def _no_install(*_a, **_k):
+            raise AssertionError("a plugin refused in AWS's tree must not be reinstalled")
+
+        monkeypatch.setattr(ssm, "_session_manager_plugin_install_plan", _no_install)
+
+        assert ssm.reinstall_cannot_clear_refusal() is True
+        result = ssm.install_session_manager_plugin()
+        assert result.ok is False
+        assert refusal.path in result.message
+        assert refusal.remedy_command in result.message
+
+    def test_a_refusal_with_no_known_fix_still_installs(self, monkeypatch):
+        """A refused copy outside AWS's tree (a second account's Homebrew) can be
+        shadowed by a fresh AWS install, so the installer still runs."""
+        refusal = ssm.PluginRefusal(
+            path="/opt/homebrew/bin/session-manager-plugin",
+            reason="executable is owned by another user (uid 1501)",
+            remedy_command="",
+        )
+        monkeypatch.setattr(ssm, "session_manager_plugin_installed", lambda: False)
+        monkeypatch.setattr(ssm, "session_manager_plugin_refusal", lambda: refusal)
+        planned: list = []
+
+        def _plan(tmpdir):
+            planned.append(tmpdir)
+            return None
+
+        monkeypatch.setattr(ssm, "_session_manager_plugin_install_plan", _plan)
+
+        assert ssm.reinstall_cannot_clear_refusal() is False
+        ssm.install_session_manager_plugin()
+        assert planned
+
+    def test_unavailable_message_carries_a_known_remedy(self, monkeypatch):
+        refusal = _pkg_tree_refusal()
+        monkeypatch.setattr(ssm, "session_manager_plugin_refusal", lambda: refusal)
+
+        message = ssm.session_manager_plugin_unavailable_message()
+        assert "not installed" not in message
+        assert refusal.path in message
+        assert refusal.remedy_command in message
+        assert "reinstall it from AWS first" in message
+
+    def test_unavailable_message_without_a_remedy_takes_the_per_code_next_step(self, monkeypatch):
+        """A file another account owns, outside AWS's tree, gets the table's step
+        (install AWS's copy), never the generic "fix the ownership" sentence."""
+        refusal = ssm.PluginRefusal(
+            path="/opt/homebrew/bin/session-manager-plugin",
+            reason="executable is owned by another user (uid 1501)",
+            remedy_command="",
+            code="other_owner",
+        )
+        monkeypatch.setattr(ssm, "session_manager_plugin_refusal", lambda: refusal)
+
+        message = ssm.session_manager_plugin_unavailable_message()
+        assert message.endswith(ssm.REFUSAL_NEXT_STEP["other_owner"])
+        assert ssm.REFUSAL_NEXT_STEP[""] not in message
+
+    def test_unavailable_message_is_the_install_hint_when_absent(self, monkeypatch):
+        monkeypatch.setattr(ssm, "session_manager_plugin_refusal", lambda: None)
+
+        assert (
+            ssm.session_manager_plugin_unavailable_message()
+            == ssm.session_manager_plugin_install_hint()
+        )
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership semantics")
     def test_an_accepted_plugin_has_no_refusal(self, monkeypatch, tmp_path):
@@ -819,6 +946,170 @@ class TestKillPortForward:
                 return 0
 
         ssm.kill_port_forward(Dead())
+
+
+#: A stand-in ``session-manager-plugin``: ignores SIGTERM (as a plugin closing a
+#: session to a terminated target does), writes its pid once that is in place,
+#: then lives until the pytest process named in argv[2] is gone, 60 s at most,
+#: so a failed test cannot strand it.
+_STUBBORN_PLUGIN = (
+    "import os,signal,sys,time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+    "owner = int(sys.argv[2]); end = time.monotonic() + 60\n"
+    "while time.monotonic() < end:\n"
+    "    try:\n"
+    "        os.kill(owner, 0)\n"
+    "    except OSError:\n"
+    "        break\n"
+    "    time.sleep(0.2)\n"
+)
+
+
+def _stopped(pid: int) -> bool:
+    """Whether *pid* has stopped running: gone, or a zombie waiting to be reaped.
+
+    The killed plugin is an orphan once its wrapper is reaped, so it is
+    collected by whatever adopts it; a host whose init does not reap leaves it
+    a zombie, which ``pid_exists`` still reports.
+    """
+    return not platform_compat.pid_exists(pid) or platform_compat.pid_is_zombie(pid) is True
+
+
+@pytest.mark.skipif(not platform_compat.IS_POSIX, reason="POSIX process groups")
+class TestKillPortForwardPluginOutlivesWrapper:
+    """The plugin left in the forward's group after the ``aws`` wrapper exits."""
+
+    @pytest.fixture
+    def spawn_forward(self, tmp_path: Path, request):
+        """Spawn a wrapper leading its own group with a stubborn plugin child in it.
+
+        Shaped like :func:`ssm.open_port_forward`'s child: ``start_new_session``
+        and ``ssm_pgid`` recorded through the same helper. The wrapper either
+        exits once the plugin is up, or sleeps and dies on SIGTERM. Cleanup is
+        registered right after the spawn, before any wait that can fail, and
+        SIGKILLs the whole group (which the plugin stays in after the wrapper
+        is reaped) before reaping the wrapper.
+        """
+        import subprocess
+        import sys
+
+        def _spawn(name: str, *, wrapper_exits: bool):
+            plugin = tmp_path / f"{name}-plugin.py"
+            plugin.write_text(_STUBBORN_PLUGIN, encoding="utf-8")
+            pidfile = tmp_path / f"{name}.pid"
+            tail = "" if wrapper_exits else "time.sleep(60)\n"
+            wrapper = (
+                "import os,subprocess,sys,time\n"
+                f"subprocess.Popen([sys.executable, {str(plugin)!r}, {str(pidfile)!r},"
+                f" {str(os.getpid())!r}])\n"
+                "end = time.monotonic() + 30\n"
+                f"while not os.path.exists({str(pidfile)!r}) and time.monotonic() < end:\n"
+                "    time.sleep(0.05)\n" + tail
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", wrapper], cwd=tmp_path, start_new_session=True
+            )
+
+            def _cleanup() -> None:
+                with contextlib.suppress(OSError, ValueError):
+                    platform_compat.kill_process_group(proc.pid, platform_compat.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=_DESCENDANT_KILL_SECS)
+
+            request.addfinalizer(_cleanup)
+            proc.ssm_pgid = ssm._spawned_group(proc)
+            wait_until(
+                lambda: pidfile.exists() and pidfile.read_text(encoding="utf-8").strip(),
+                describe=lambda: f"{pidfile} was never written",
+            )
+            return proc, int(pidfile.read_text(encoding="utf-8").strip())
+
+        return _spawn
+
+    def test_spawned_group_is_the_wrapper_pid(self, spawn_forward):
+        proc, _ = spawn_forward("rec", wrapper_exits=False)
+        assert proc.ssm_pgid == proc.pid
+
+    def test_plugin_of_an_already_exited_wrapper_is_killed(self, spawn_forward):
+        proc, plugin_pid = spawn_forward("exited", wrapper_exits=True)
+        other, other_plugin = spawn_forward("other", wrapper_exits=False)
+        proc.wait(timeout=30)  # the wrapper is gone and reaped; the plugin is not
+        assert platform_compat.pid_exists(plugin_pid)
+
+        ssm.kill_port_forward(proc)
+
+        wait_until(
+            lambda: _stopped(plugin_pid),
+            timeout=_DESCENDANT_KILL_SECS,
+            describe=lambda: "plugin that outlived its wrapper must be killed",
+        )
+        # Another forward's group is never signalled.
+        assert other.poll() is None
+        assert platform_compat.pid_exists(other_plugin)
+
+    def test_plugin_that_survives_the_wrappers_sigterm_is_killed(self, spawn_forward):
+        proc, plugin_pid = spawn_forward("term", wrapper_exits=False)
+
+        ssm.kill_port_forward(proc)
+
+        assert proc.poll() is not None
+        wait_until(
+            lambda: _stopped(plugin_pid),
+            timeout=_DESCENDANT_KILL_SECS,
+            describe=lambda: "plugin that ignored SIGTERM must be killed",
+        )
+
+    def test_sigkilled_wrapper_is_reaped_before_the_survivor_check(self, tmp_path, request, caplog):
+        """A wrapper that ignores SIGTERM is SIGKILLed, then reaped, so the group
+        reads as empty: no second wait and no false 'survived SIGKILL' warning."""
+        import logging
+        import subprocess
+        import sys
+
+        script = tmp_path / "stubborn-wrapper.py"
+        script.write_text(_STUBBORN_PLUGIN, encoding="utf-8")
+        pidfile = tmp_path / "wrapper.pid"
+        proc = subprocess.Popen(
+            [sys.executable, str(script), str(pidfile), str(os.getpid())],
+            cwd=tmp_path,
+            start_new_session=True,
+        )
+
+        def _cleanup() -> None:
+            with contextlib.suppress(OSError, ValueError):
+                platform_compat.kill_process_group(proc.pid, platform_compat.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=_DESCENDANT_KILL_SECS)
+
+        request.addfinalizer(_cleanup)
+        proc.ssm_pgid = ssm._spawned_group(proc)
+        wait_until(
+            lambda: pidfile.exists() and pidfile.read_text(encoding="utf-8").strip(),
+            describe=lambda: f"{pidfile} was never written",
+        )
+
+        with caplog.at_level(logging.WARNING, logger=ssm.logger.name):
+            ssm.kill_port_forward(proc)
+
+        assert proc.returncode is not None
+        assert not [r for r in caplog.records if "survived SIGKILL" in r.getMessage()]
+
+    def test_exited_wrapper_with_an_empty_group_signals_nothing(self, monkeypatch):
+        class Exited:
+            pid = 4321
+            ssm_pgid = 4321
+
+            def poll(self):
+                return 0
+
+        monkeypatch.setattr(ssm.platform_compat, "pgroup_exists", lambda pgid: False)
+        monkeypatch.setattr(
+            ssm.platform_compat,
+            "kill_process_group",
+            lambda pgid, sig: pytest.fail("an empty group must not be signalled"),
+        )
+        ssm.kill_port_forward(Exited())
 
 
 class TestPortChecks:

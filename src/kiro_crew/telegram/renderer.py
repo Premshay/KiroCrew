@@ -93,6 +93,8 @@ from kiro_crew.messaging.renderer import (
 )
 from kiro_crew.messaging.split import (
     bounded_for_delivery,
+    fence_line_safe_offset,
+    rebalance_fenced_cuts,
     repaired_for_delivery,
     split_markdown_safe,
 )
@@ -165,7 +167,7 @@ def md_to_telegram_html_safe(text: str) -> str:
     whole function to ``asyncio.to_thread`` -- one hop covering both steps, since
     the redaction is the part that scans.
 
-    ``_html_len`` and the split budget keep using the raw translator: they MEASURE
+    ``_rendered_len`` and the split budget keep using the raw translator: they MEASURE
     the render, and redacting there would size a segment against text that is not
     the text being sent.
     """
@@ -343,11 +345,23 @@ def _md_to_telegram_html(text: str) -> str:
     text = TELEGRAM_FALLBACK_HEADING.sub(
         lambda m: f"<b>{telegram_fallback_heading_text(m)}</b>", text
     )
+
+    # Links before emphasis, with each tag stashed: a URL's own ``_x_`` or
+    # ``*x*`` is then out of the emphasis passes' reach, and only the link
+    # text between the stashed tags is formatted.
+    def _unstash(fragment: str) -> str:
+        return re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], fragment)
+
+    # A url's own placeholders (a code span inside it) resolve before its tag is
+    # stashed, so the single un-stash pass below leaves none inside the href.
+    text = TELEGRAM_FALLBACK_LINK.sub(
+        lambda m: _keep('<a href="' + _unstash(m.group(2)) + '">') + m.group(1) + _keep("</a>"),
+        text,
+    )
     text = TELEGRAM_FALLBACK_BOLD_STAR.sub(lambda m: f"<b>{m.group(1)}</b>", text)
     text = TELEGRAM_FALLBACK_BOLD_USCORE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
     text = _ITALIC_STAR_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
     text = _ITALIC_USCORE_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
-    text = TELEGRAM_FALLBACK_LINK.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', text)
     text = _BULLET_RE.sub(lambda m: f"{m.group(1)}\u2022 ", text)
     # Group consecutive "> " lines (escaped to "&gt; ") into a native Telegram
     # <blockquote> — the ▎ quote bar. Runs after inline formatting so bold/italic
@@ -778,25 +792,37 @@ class TelegramRenderer(Renderer):
             # rejected answer is the same answer every rotation and nothing ever goes
             # out. Off the loop for the cost reason the redaction above carries -- each
             # sampled offset is two full-buffer redaction passes.
-            budget, head, offset = limit, "", 0
+            #
+            # A source slice cut inside an open fence is sealed with the fence's
+            # closer and the remainder reopened, so the budget is measured on the
+            # head as it will actually be sealed.
+            budget, offset = limit, 0
+            cut: list[str] = []
             while True:
                 offset = await asyncio.to_thread(
                     safe_split_offset, raw, budget, _default_redactor, _delivered_form
                 )
-                head = raw[:offset]
-                worst = await asyncio.to_thread(_rendered_len, head)
+                offset = fence_line_safe_offset(raw, offset)
+                cut = rebalance_fenced_cuts([raw[:offset], raw[offset:]])
+                worst = await asyncio.to_thread(_rendered_len, cut[0])
                 if not offset or worst <= rendered_cap:
                     break
                 if budget <= _MIN_SPLIT_LIMIT:
                     offset = 0
                     break
                 budget = _shrunk_limit(budget, rendered_cap, worst)
+            # The fence repair adds delimiter lines the search did not grade, so
+            # what is sealed is graded again before anything goes out.
+            if offset and await asyncio.to_thread(
+                severs_a_credential, cut, _default_redactor, _delivered_form
+            ):
+                offset = 0
             if not offset:
                 # Deliver NOTHING: the withheld text rides the next rotation, and the
                 # final seal re-splits and seals an over-cap segment chunk by chunk.
                 self._buf = [raw + protocol_suffix]
                 return
-            chunks = [head, raw[offset:]]
+            chunks = cut
         for ch in chunks[:-1]:
             self._buf = [ch]
             # A length rotation never extracts: only a SEMANTIC seal (steer
@@ -835,6 +861,7 @@ class TelegramRenderer(Renderer):
                 offset = await asyncio.to_thread(
                     safe_split_offset, rest, budget, _default_redactor, _delivered_form
                 )
+                offset = fence_line_safe_offset(rest, offset)
                 if not offset:
                     return None
                 head = rest[:offset]
@@ -846,7 +873,12 @@ class TelegramRenderer(Renderer):
                 budget = _shrunk_limit(budget, rendered_cap, worst)
             graded.append(head)
             rest = rest[offset:]
-        chunks = [*graded, rest]
+        # Every piece is sealed, so one cut inside an open fence is closed on its
+        # piece and reopened on the next; a repaired piece is held to the cap too.
+        chunks = rebalance_fenced_cuts([*graded, rest])
+        for chunk in chunks:
+            if await asyncio.to_thread(_rendered_len, chunk) > rendered_cap:
+                return None
         if await asyncio.to_thread(severs_a_credential, chunks, _default_redactor, _delivered_form):
             return None
         return chunks

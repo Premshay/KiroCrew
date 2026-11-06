@@ -38,6 +38,7 @@ from conductor_wake_helpers import (
     _service,
     _Svc,
 )
+from crew_log_drain import assert_drained
 
 from kiro_crew import conductor_wake, work_ledger
 from kiro_crew.testing.wait import async_wait_until, default_timeout
@@ -503,7 +504,7 @@ def _write(unit: str, **fields) -> None:
     from kiro_crew.crew_log import emit as crew_log_emit
 
     assert crew_log_emit.on_work_recorded(unit, dict(fields), timeout=5.0) is True
-    crew_log_emit.flush(timeout=5.0)
+    assert_drained()
     assert crew_log_eager.drain(timeout=10.0)
 
 
@@ -523,9 +524,13 @@ def _board(unit: str, board: str, worker: str) -> None:
     _write(unit, **base, action="bind", item_id="it_p", worker_session_key=worker)
 
 
+#: Each board's own unit, where the report route writes the board's copy of a report.
+_BOARD_UNITS = {CONDUCTOR: "acp-c", OTHER: "acp-o"}
+
+
 def _report(unit: str, board: str, worker: str, stamp: str, *, status: str = "done") -> None:
-    _write(
-        unit,
+    """A worker's report as the route records it: the worker's copy, then the board's."""
+    fields = dict(
         slot=board,
         actor="worker",
         by=worker,
@@ -535,6 +540,9 @@ def _report(unit: str, board: str, worker: str, stamp: str, *, status: str = "do
         summary="s",
         last_report_at=stamp,
     )
+    _write(unit, **fields)
+    if _BOARD_UNITS[board] != unit:
+        _write(_BOARD_UNITS[board], **fields)
 
 
 async def _until(predicate, timeout: float | None = None) -> bool:
@@ -547,6 +555,15 @@ async def _sync_and_join(svc) -> None:
     """Sync the subscriptions, then wait for every join it started to land."""
     conductor_wake.sync_subscriptions(svc)
     await asyncio.gather(*list(conductor_wake._subscriptions.joining.values()))
+    # A board with no warm cell gets no baseline on the join: one background prime folds
+    # it and its first push is the board's first sight. Wait for that prime, then for the
+    # observations it scheduled on this loop, so every case starts from the board's
+    # first sight already recorded.
+    from kiro_crew.crew_log import slot_prime
+
+    assert await asyncio.to_thread(slot_prime.drain, 30.0), "a background prime never finished"
+    live = set(conductor_wake._subscriptions.live)
+    await _until(lambda: live <= set(conductor_wake._registry.boards))
 
 
 def _on_this_loop(monkeypatch, svc) -> None:
@@ -1053,11 +1070,14 @@ def _record_close(monkeypatch, *, save_fails: bool) -> list[str]:
     events: list[str] = []
     monkeypatch.setattr(autonudge, "_INSTANCE", None)
 
-    async def _save(_state, _slot, *_a, **kw) -> None:
+    async def _save(_state, _slot, *_a, **kw) -> bool:
         if kw.get("closed"):
             events.append("save")
             if save_fails:
                 raise OSError("disk full")
+        # True: this double models the durable write itself; a bare None reads
+        # as the save's own refusal, which the close answers rather than ignores.
+        return True
 
     async def _wake(_svc, board: str, item_id: str = "") -> str:
         events.append(f"wake:{board}:{item_id}")

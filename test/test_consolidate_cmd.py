@@ -11,16 +11,16 @@ import pytest
 from kiro_crew.history import ConsolidationOutcome
 
 
-def _draining(mock_log):
+def _draining(mock_log, outcome=None):
     """A ``consolidate_now`` that leaves the tail empty, as the real one does.
 
     The real call repeats bounded passes until nothing is left, so the count the
     command re-reads afterwards is what says whether it got there.
     """
 
-    async def _consolidate_now(_key: str) -> bool:
+    async def _consolidate_now(_key: str) -> ConsolidationOutcome:
         mock_log.unconsolidated_count.return_value = 0
-        return True
+        return outcome or ConsolidationOutcome("consolidated")
 
     return _consolidate_now
 
@@ -43,9 +43,16 @@ class TestConsolidateCmd:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_list_sessions(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         sessions_dir = self._make_session_file(tmp_path)
         mock_cfg_cls.load.return_value = MagicMock()
@@ -70,9 +77,16 @@ class TestConsolidateCmd:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_list_sessions_none_found(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
@@ -97,9 +111,16 @@ class TestConsolidateCmd:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_consolidate_all(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         sessions_dir = self._make_session_file(tmp_path, "sess1")
         self._make_session_file(tmp_path, "sess2")
@@ -110,7 +131,7 @@ class TestConsolidateCmd:
 
         mock_consolidator = mock_consolidator_cls.return_value
         mock_consolidator.consolidate_now = AsyncMock(
-            return_value=ConsolidationOutcome("consolidated", old_offset=0, new_offset=3)
+            side_effect=_draining(mock_log, ConsolidationOutcome("consolidated", old_offset=0, new_offset=3))
         )
 
         from kiro_crew.cli import _consolidate_cmd
@@ -135,9 +156,16 @@ class TestConsolidateCmd:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_consolidate_all_none_found(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
@@ -162,9 +190,16 @@ class TestConsolidateCmd:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_consolidate_single_session(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         sessions_dir = self._make_session_file(tmp_path)
         mock_cfg_cls.load.return_value = MagicMock()
@@ -174,7 +209,7 @@ class TestConsolidateCmd:
 
         mock_consolidator = mock_consolidator_cls.return_value
         mock_consolidator.consolidate_now = AsyncMock(
-            return_value=ConsolidationOutcome("consolidated", old_offset=12, new_offset=19)
+            side_effect=_draining(mock_log, ConsolidationOutcome("consolidated", old_offset=12, new_offset=19))
         )
 
         from kiro_crew.cli import _consolidate_cmd
@@ -186,8 +221,11 @@ class TestConsolidateCmd:
         assert "Consolidating session: test_session" in captured.out
         assert "consolidated 12 \u2192 19" in captured.out
         mock_sel.return_value.log_api_access.assert_called_with(
-            caller="cli", operation="consolidate", outcome="allowed",
-            source="cli", resources="test_session",
+            caller="cli",
+            operation="consolidate",
+            outcome="allowed",
+            source="cli",
+            resources="test_session",
         )
 
     @patch("kiro_crew.cli.sel")
@@ -198,9 +236,16 @@ class TestConsolidateCmd:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_consolidate_reports_a_remainder_instead_of_done(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         """A drain that stops short must not be reported as a completed pass.
 
@@ -222,11 +267,14 @@ class TestConsolidateCmd:
         from kiro_crew.cli import _consolidate_cmd
 
         args = argparse.Namespace(session_key="test_session", consolidate_all=False)
-        _consolidate_cmd(args)
+        with pytest.raises(SystemExit) as exit_info:
+            _consolidate_cmd(args)
 
+        assert exit_info.value.code == 1
         captured = capsys.readouterr()
-        assert "40 message(s) remain" in captured.out
+        assert "test_session: partially consolidated, 40 message(s) remain" in captured.err
         assert "done" not in captured.out
+        assert "Done." not in captured.out
 
     @patch("kiro_crew.cli.sel")
     @patch("kiro_crew.cli.SkillsLoader")
@@ -236,9 +284,16 @@ class TestConsolidateCmd:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_consolidate_single_no_messages(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         sessions_dir = self._make_session_file(tmp_path)
         mock_cfg_cls.load.return_value = MagicMock()
@@ -280,7 +335,7 @@ class TestConsolidateCmd:
         mock_log._dir = sessions_dir
         mock_log.unconsolidated_count.return_value = 1
         mock_consolidator_cls.return_value.consolidate_now = AsyncMock(
-            return_value=ConsolidationOutcome("consolidated", old_offset=0, new_offset=1)
+            side_effect=_draining(mock_log, ConsolidationOutcome("consolidated", old_offset=0, new_offset=1))
         )
 
         from kiro_crew.cli import _consolidate_cmd
@@ -392,9 +447,16 @@ class TestConsolidateCmdExceptionPath:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_consolidate_single_exception_logged(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         """Report consolidate_now failures and exit nonzero, distinct from a quiet session."""
         sessions_dir = self._make_session_file(tmp_path)
@@ -409,24 +471,151 @@ class TestConsolidateCmdExceptionPath:
         from kiro_crew.cli import _consolidate_cmd
 
         args = argparse.Namespace(session_key="test_session", consolidate_all=False)
-        with pytest.raises(SystemExit) as exc:
+        with pytest.raises(SystemExit) as exit_info:
             _consolidate_cmd(args)
-        assert exc.value.code == 1
 
+        assert exit_info.value.code == 1
         captured = capsys.readouterr()
         assert "Consolidating session: test_session" in captured.out
-        assert "failed: LLM down" in captured.out
+        assert "done" not in captured.out
+        assert "Done." not in captured.out
+        # One line naming the key and the exception type; the message itself
+        # can carry transcript text, so it stays out of the terminal.
+        failure_lines = [line for line in captured.err.splitlines() if "test_session" in line]
+        assert failure_lines == ["  test_session: failed (RuntimeError)"]
+        assert "LLM down" not in captured.err
+
+    @patch("kiro_crew.cli.sel")
+    @patch("kiro_crew.cli.SkillsLoader")
+    @patch("kiro_crew.cli.SessionManager")
+    @patch("kiro_crew.cli.MemoryStore")
+    @patch("kiro_crew.cli.HistoryConsolidator")
+    @patch("kiro_crew.cli.ConversationLog")
+    @patch("kiro_crew.cli.KiroCrewConfig")
+    def test_consolidate_all_reports_each_failed_key_and_exits_1(
+        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
+        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
+        tmp_path, capsys,
+    ):
+        """One failed key in an --all run is named on stderr and fails the run.
+
+        The keys that finish keep their ``done`` line on stdout, and the loop
+        still reaches every key after the failure.
+        """
+        sessions_dir = self._make_session_file(tmp_path, "good")
+        self._make_session_file(tmp_path, "bad")
+        self._make_session_file(tmp_path, "later")
+        mock_cfg_cls.load.return_value = MagicMock()
+        mock_log = mock_log_cls.return_value
+        mock_log._dir = sessions_dir
+        remaining = {"good": 3, "bad": 3, "later": 3}
+        mock_log.unconsolidated_count.side_effect = lambda key: remaining[key]
+
+        async def _consolidate_now(key: str) -> ConsolidationOutcome:
+            if key == "bad":
+                raise RuntimeError("secret transcript text")
+            remaining[key] = 0
+            return ConsolidationOutcome("consolidated")
+
+        mock_consolidator = mock_consolidator_cls.return_value
+        mock_consolidator.consolidate_now = AsyncMock(side_effect=_consolidate_now)
+
+        from kiro_crew.cli import _consolidate_cmd
+
+        args = argparse.Namespace(session_key=None, consolidate_all=True)
+        with pytest.raises(SystemExit) as exit_info:
+            _consolidate_cmd(args)
+
+        assert exit_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "  good: done ✓" in captured.out
+        assert "  later: done ✓" in captured.out
+        assert "  bad: failed (RuntimeError)" in captured.err
+        assert "1 session(s) did not finish consolidating." in captured.err
+        assert "secret transcript text" not in captured.err + captured.out
+
+    @patch("kiro_crew.cli.sel")
+    @patch("kiro_crew.cli.SkillsLoader")
+    @patch("kiro_crew.cli.SessionManager")
+    @patch("kiro_crew.cli.MemoryStore")
+    @patch("kiro_crew.cli.HistoryConsolidator")
+    @patch("kiro_crew.cli.ConversationLog")
+    @patch("kiro_crew.cli.KiroCrewConfig")
+    def test_consolidate_finished_and_skipped_keys_exit_0(
+        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
+        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
+        tmp_path, capsys,
+    ):
+        """A key that finishes and a key with nothing to do keep today's output."""
+        sessions_dir = self._make_session_file(tmp_path, "good")
+        mock_cfg_cls.load.return_value = MagicMock()
+        mock_log = mock_log_cls.return_value
+        mock_log._dir = sessions_dir
+        mock_log.unconsolidated_count.return_value = 3
+        mock_consolidator = mock_consolidator_cls.return_value
+        mock_consolidator.consolidate_now = AsyncMock(side_effect=_draining(mock_log))
+
+        from kiro_crew.cli import _consolidate_cmd
+
+        _consolidate_cmd(argparse.Namespace(session_key="good", consolidate_all=False))
+        _consolidate_cmd(argparse.Namespace(session_key="empty", consolidate_all=False))
+
+        captured = capsys.readouterr()
+        assert "  good: done ✓" in captured.out
+        assert "  empty: no unconsolidated messages, skipping" in captured.out
+        assert captured.out.count("Done. Check ~/.kiro/crew/skills/auto/ for new skills.") == 2
+        assert captured.err == ""
+
+    @patch("kiro_crew.cli.sel")
+    @patch("kiro_crew.cli.SkillsLoader")
+    @patch("kiro_crew.cli.SessionManager")
+    @patch("kiro_crew.cli.MemoryStore")
+    @patch("kiro_crew.cli.HistoryConsolidator")
+    @patch("kiro_crew.cli.ConversationLog")
+    @patch("kiro_crew.cli.KiroCrewConfig")
+    def test_consolidate_sensitive_session_skip_exits_0(
+        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
+        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
+        tmp_path, capsys,
+    ):
+        """consolidate_now's deliberate sensitive-session skip is a skip, not a failure.
+
+        It returns True and leaves the tail, so the remainder alone cannot tell
+        it from a stalled drain; a rerun never changes it, so exit 1 here would
+        fail every later run.
+        """
+        sessions_dir = self._make_session_file(tmp_path, "secretive")
+        mock_cfg_cls.load.return_value = MagicMock()
+        mock_log = mock_log_cls.return_value
+        mock_log._dir = sessions_dir
+        mock_log.unconsolidated_count.return_value = 4
+        mock_log._read_messages.return_value = [
+            {"role": "tool", "content": "fs_read ~/.ssh/config"},
+        ]
+        mock_consolidator = mock_consolidator_cls.return_value
+        mock_consolidator.consolidate_now = AsyncMock(
+            return_value=ConsolidationOutcome("skipped", detail="sensitive session", complete=False)
+        )
+
+        from kiro_crew.cli import _consolidate_cmd
+
+        _consolidate_cmd(argparse.Namespace(session_key="secretive", consolidate_all=False))
+
+        captured = capsys.readouterr()
+        assert "  secretive: sensitive session, skipping (4 message(s) left)" in captured.out
+        assert "Done." in captured.out
+        assert captured.err == ""
 
 
 class TestExpireIdleSelFailure:
     """Cover the SEL failure path in session.py _expire_idle."""
 
     @patch("kiro_crew.session.sel")
-    @patch("kiro_crew.session.SessionManager.reset", new_callable=AsyncMock)
     @patch("kiro_crew.session.Stats")
-    def test_expire_idle_sel_failure_still_resets(self, mock_stats, mock_reset, mock_sel):
+    def test_expire_idle_sel_failure_still_resets(self, mock_stats, mock_sel):
         """When sel().log_api_access raises, the session is still reset."""
         import time as _time
+        from types import SimpleNamespace
 
         from kiro_crew.session import SessionManager, _Session
 
@@ -440,17 +629,22 @@ class TestExpireIdleSelFailure:
         callback = MagicMock()
         sm.on_session_expire = callback
 
-        sess = _Session(provider=MagicMock())
-        sess.last_used = _time.monotonic() - 9999
+        provider = SimpleNamespace(
+            shutdown=AsyncMock(),
+            context_usage_pct=lambda: 0.0,
+            tool_search_settings=None,
+            work_scratch_dir=None,
+        )
+        sess = _Session(provider=provider, last_used=_time.monotonic() - 9999)
         sm._sessions["expired-sel"] = sess
 
         import asyncio
+
         asyncio.run(sm._expire_idle(60))
 
+        # The real reset ran: the entry left the map.
+        assert "expired-sel" not in sm._sessions
         callback.assert_not_called()
-        mock_reset.assert_called_once_with(
-            "expired-sel", expect_session=sess, skip_if_busy=True, skip_if_injecting=True
-        )
 
     @patch("kiro_crew.session.sel")
     @patch("kiro_crew.session.SessionManager.reset", new_callable=AsyncMock)
@@ -498,13 +692,12 @@ def test_refused_consolidation_cli_does_not_claim_zero_spend(capsys):
         patch("kiro_crew.cli.HistoryConsolidator") as consolidator,
     ):
         log.return_value.unconsolidated_count.return_value = 3
-        consolidator.return_value.consolidate_now = AsyncMock(
-            return_value=ConsolidationOutcome(
-                "skipped", detail="no completed pass recorded", complete=False
-            )
-        )
-        _consolidate_cmd(argparse.Namespace(session_key="test_session", consolidate_all=False))
-    output = capsys.readouterr().out
-    assert "no completed pass recorded" in output
+        consolidator.return_value.consolidate_now = AsyncMock(return_value=ConsolidationOutcome("failed", detail="no completed pass recorded", complete=False))
+        with pytest.raises(SystemExit) as exit_info:
+            _consolidate_cmd(argparse.Namespace(session_key="test_session", consolidate_all=False))
+    assert exit_info.value.code == 1
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "test_session: failed: no completed pass recorded" in captured.err
     assert "nothing ran" not in output
     assert "done" not in output

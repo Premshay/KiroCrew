@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
+import { api } from "../../api/client";
 import ErrorNotice from "../../components/ErrorNotice";
 import SimpleSelect from "../../components/SimpleSelect";
 import { Btn, PanelSectionHeader } from "../../components/ui";
@@ -51,9 +52,7 @@ export default function WorkloadRecommendations({
   const survey = useQuery({
     queryKey: ["auto-improvement-repository-survey", repository, branch],
     queryFn: async () => {
-      const response = await fetch(
-        "/api/apps/auto-improvement/repository/survey",
-      );
+      const response = await api.autoImprovementResponse("/repository/survey");
       const data = await response.json();
       if (!response.ok)
         throw new Error(

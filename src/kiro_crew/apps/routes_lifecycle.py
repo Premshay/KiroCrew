@@ -73,7 +73,29 @@ def _unregister_notification_channels(request: web.Request, name: str) -> None:
         logger.info("Unregistered %d notification channel(s) for app %s", removed, name)
 
 
-async def _start_backend_after_install(name: str) -> None:
+async def _backend_platform_refusal(name: str, backend: Any) -> str | None:
+    """The reason *name*'s backend was refused on this host, for a route's response.
+
+    ``start_app_backend`` returns None both for "no backend declared" and for a native
+    Windows exec (shell launcher) refusal, which it only logs. After a None this reads
+    the refusal so the enable, install and update responses can carry it as
+    ``backend_refused``. The app still enables: its other parts may work without the
+    backend. Off the loop because it reads the manifest and the entry file.
+    """
+    if backend is not None:
+        return None
+    from kiro_crew.apps.backend import exec_backend_platform_refusal
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), exec_backend_platform_refusal, name
+        )
+    except Exception:
+        logger.warning("Backend refusal lookup failed for app %s", name, exc_info=True)
+        return None
+
+
+async def _start_backend_after_install(name: str) -> str | None:
     """Spawn an app's backend after a fresh install/register, if it has one.
 
     ``start_app_backend`` is a no-op for apps that declare no backend and is
@@ -81,13 +103,18 @@ async def _start_backend_after_install(name: str) -> None:
     It blocks on a health-check poll, so run it off the event loop. Failures are
     logged but never abort the install — the backend also gets a retry on the
     next gateway boot via ``start_enabled_app_backends``.
+
+    Returns the platform refusal (see :func:`_backend_platform_refusal`) for the
+    caller's ``backend_refused`` response field, or None.
     """
     try:
-        await asyncio.get_running_loop().run_in_executor(
+        backend = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(), start_app_backend, name
         )
     except Exception:
         logger.warning("Backend auto-start after install failed for app %s", name, exc_info=True)
+        return None
+    return await _backend_platform_refusal(name, backend)
 
 
 async def _register_app_off_loop(name: str) -> RegistrationResult:
@@ -101,9 +128,26 @@ async def _register_app_off_loop(name: str) -> RegistrationResult:
     stall watchdog kills the gateway.  Same offload pattern as ``install_app``
     and ``start_app_backend`` on these handlers.
     """
-    return await asyncio.get_running_loop().run_in_executor(
-        subprocess_executor(), register_app, name
-    )
+    from kiro_crew.mcp_gateway.overlay_refresh import refresh_after_agent_change
+
+    loop = asyncio.get_running_loop()
+    box: list = []
+
+    async def _register() -> bool:
+        # Under the broker's refresh lock: no spec write between check and publish.
+        try:
+            box.append(await loop.run_in_executor(subprocess_executor(), register_app, name))
+        except BaseException as exc:
+            box.append(exc)
+            raise
+        return bool(getattr(box[0], "agents", None))
+
+    await refresh_after_agent_change(_register)
+    if not box:  # no broker serves, or the refresh failed before registering
+        box.append(await loop.run_in_executor(subprocess_executor(), register_app, name))
+    if isinstance(box[0], BaseException):
+        raise box[0]
+    return box[0]
 
 
 async def _deregister_app_off_loop(name: str) -> RegistrationResult:
@@ -114,40 +158,24 @@ async def _deregister_app_off_loop(name: str) -> RegistrationResult:
 
 
 async def _stop_backend_and_observe(name: str) -> tuple[int | None, bool]:
-    """Stop *name*'s backend and report what the probe could establish.
+    """Stop *name*'s backend on uninstall and report what the probe established.
 
-    Returns the port it is STILL listening on, if any, and whether the probe had
-    gateway-owned evidence of which port to look at. Both halves are needed,
-    because ``None`` from the probe means "nothing observed", NOT "definitely
-    stopped": with no recorded port the probe falls back to the declared one in
-    ``app.json``, which sits inside the app directory and is writable by any app
-    trusted to run code. By the time the stop runs, ``onUninstall`` has already
-    executed app-controlled code in that directory, so a fixed-port backend this
-    gateway never tracked could have relabelled its port -- or dropped its
-    ``entryPoint`` -- and the fallback would then probe the wrong port and answer
-    ``None``. Reporting that as a clean stop is the same mistake as believing the
-    stop's boolean, one level further out.
-
-    ``stop_app_backend``'s own return value cannot answer the first half. It is
-    ``False`` both for "there was nothing to stop" (never started, already dead)
-    and for "something is running that I did not stop" (a fixed-port backend never
-    adopted at boot, an adoption with no usable PIDs), and ``True`` only says the
-    process it was TRACKING is gone -- which is silent about a detached worker the
-    app spawned for itself. Those need opposite handling, so the port is OBSERVED
-    rather than the flag believed. Same contract ``teardown_app_runtime`` applies
-    on disable and on trust withdrawal.
-
-    The hint is captured BEFORE the stop because the stop drops both the live
-    tracking entry and the pidfile record, and those are the only gateway-owned
-    evidence of which port this backend actually used.
+    Runs :func:`kiro_crew.apps.teardown.stop_backend_and_observe`, the one
+    spelling of the hint / stop / probe sequence that disable and trust withdrawal
+    share, with this module's bindings of the three backend functions so a patch
+    through ``kiro_crew.apps.routes`` reaches them. On uninstall ``onUninstall``
+    has already run app code in the app directory, so the declared port the probe
+    falls back to may be stale; the second half of the result says whether a
+    gateway-owned hint existed.
     """
-    loop = asyncio.get_running_loop()
-    port_hint = await loop.run_in_executor(subprocess_executor(), recorded_backend_port, name)
-    await loop.run_in_executor(subprocess_executor(), stop_app_backend, name)
-    live_port = await loop.run_in_executor(
-        subprocess_executor(), lambda: unstopped_backend_port(name, port_hint=port_hint)
+    from kiro_crew.apps.teardown import stop_backend_and_observe
+
+    return await stop_backend_and_observe(
+        name,
+        recorded=recorded_backend_port,
+        stop=stop_app_backend,
+        probe=unstopped_backend_port,
     )
-    return live_port, port_hint is not None
 
 
 async def _app_may_run_after_install(name: str, *, fresh_install: bool = False) -> bool:
@@ -162,7 +190,7 @@ async def _app_may_run_after_install(name: str, *, fresh_install: bool = False) 
     return await asyncio.get_running_loop().run_in_executor(subprocess_executor(), _read_live_state)
 
 
-async def _restore_app_after_failed_update(name: str) -> None:
+async def _restore_app_after_failed_update(name: str) -> str | None:
     """Put an app back the way a failed update found it.
 
     The update stopped the backend and scrubbed the resources before it touched
@@ -177,14 +205,17 @@ async def _restore_app_after_failed_update(name: str) -> None:
     Recovery failures are logged and never escape: the caller still owes the
     failed-update audit line and the 400 body, and the cause of the failed
     update (disk full, no free port) is often what breaks the restore too.
+
+    Returns the restarted backend's platform refusal for the 400 body's
+    ``backend_refused`` field, or None.
     """
     if not await _app_may_run_after_install(name):
-        return
+        return None
     try:
         await _register_app_off_loop(name)
     except Exception:
         logger.warning("Re-register after failed update failed for app %s", name, exc_info=True)
-    await _start_backend_after_install(name)
+    return await _start_backend_after_install(name)
 
 
 async def _suspend_app_for_session_approval_reconsent(

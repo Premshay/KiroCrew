@@ -82,7 +82,7 @@ from kiro_crew.computer_use.types import (
     PolicyStateError,
 )
 from kiro_crew.config.loader import computer_use_state_path, read_config_text
-from kiro_crew.edition_locks import LOCKED_BY_POLICY, local_enable_locked
+from kiro_crew.edition_locks import LOCKED_BY_POLICY
 from kiro_crew.executors import subprocess_executor
 
 logger = logging.getLogger(__name__)
@@ -393,7 +393,7 @@ def _snapshot() -> dict[str, Any]:
 
     return {
         "enabled": enable_state.is_enabled(state),
-        "locked_by_policy": local_enable_locked("computer_use"),
+        "locked_by_policy": enable_state.locked_by_policy(),
         "supported": supported,
         "platform": platform_id,
         "reason": reason,
@@ -415,10 +415,9 @@ def _snapshot() -> dict[str, Any]:
         # operator set no restriction — and the panel must be able to tell the two
         # apart rather than presenting a confidently empty allow-list.
         "policy_error": policy_error,
-        # There is deliberately NO ``read_only`` / governance-lock field here, and no
-        # ``409`` on the PUT. Computer use is one operator opt-in on the keystone:
-        # ``SCOPE_CATALOG`` carries no ``computer_use*`` row, so there is no ceiling
-        # to report and nothing for the panel to grey out.
+        # ``locked_by_policy`` above is the only governance field: the one on/off
+        # ``capabilities.computer_use`` row (``enable_state.locked_by_policy``).
+        # Nothing finer is governed, so there is nothing else to grey out.
         # The write boundary that DOES hold is the app-token gate on the PUT (an app
         # token can never write the keystone); see ``api_computer_use_config_save``.
         # Ceilings, so the panel's number inputs bound themselves from the server
@@ -467,7 +466,7 @@ def _read_config_strict() -> dict:
         return {}
     try:
         data = json.loads(read_config_text(path))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise StateCorruptError(f"config.json is not readable as a JSON object: {exc}") from exc
     if not isinstance(data, dict):
         raise StateCorruptError("config.json top level is not a JSON object")
@@ -507,20 +506,26 @@ def _write_limits(patch: dict[str, Any]) -> None:
 
     Read-modify-write on the raw JSON (not ``KiroCrewConfig.to_dict()``) so an
     unrelated hand-edited or edition-contributed section is never rewritten by a
-    limits change. The caller holds the shared config lock.
+    limits change. The caller holds the in-process config lock; the write itself
+    goes through ``update_config_locked``, which holds the ``config.json.lock``
+    sidecar across the whole read-modify-write, so another process's locked
+    config write can neither land inside this one nor be reverted by it.
+    An unreadable file still raises :class:`StateCorruptError`.
     """
-    from kiro_crew.agent import _atomic_json_write
-    from kiro_crew.config.loader import config_path
+    from kiro_crew.config.loader import ConfigReadError, config_path, update_config_locked
 
-    path: Path = config_path()
-    data = _read_config_strict()
-    section = data.get("computer_use")
-    if not isinstance(section, dict):
-        section = {}
-    section.update(patch)
-    data["computer_use"] = section
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_json_write(path, data)
+    def _merge(data: dict) -> dict:
+        section = data.get("computer_use")
+        if not isinstance(section, dict):
+            section = {}
+        section.update(patch)
+        data["computer_use"] = section
+        return data
+
+    try:
+        update_config_locked(config_path(), mutate=_merge)
+    except ConfigReadError as exc:
+        raise StateCorruptError(f"config.json is not readable as a JSON object: {exc}") from exc
 
 
 async def _full_payload() -> dict[str, Any]:
@@ -562,11 +567,10 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
     desktop automation. Same guard as ``handlers/kiro_prerequisite.py`` and
     ``messaging_api/agent_push.py``'s notification push.
 
-    **There is no governance ceiling on this route, and therefore no 409.** Computer
-    use is one operator opt-in: ``SCOPE_CATALOG`` carries no ``computer_use*`` row, so
-    there is nothing that can forbid a widening request (there is no ``status=409`` in
-    this module) — see ``docs/system-specs/modules/governance.md`` for why computer
-    use is deliberately ungoverned. Other outcomes: ``400`` for a malformed body or an
+    **The one governance refusal is ``409 locked_by_policy``** for ``enabled: true``
+    while the ``capabilities.computer_use`` row keeps the feature off
+    (``enable_state.locked_by_policy``); nothing finer is governed — see
+    ``docs/system-specs/modules/governance.md``. Other outcomes: ``400`` for a malformed body or an
     out-of-range value, ``403`` for an app token (above), and ``500`` for a corrupt
     keystone or ``config.json``, which is left byte-identical rather than clobbered
     (``StateCorruptError``, the ``ConfigCorruptError`` precedent).
@@ -623,7 +627,9 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
                 {"error": "enabled must be a boolean", "code": "invalid_field_type"},
                 status=400,
             )
-        if body["enabled"] and local_enable_locked("computer_use"):
+        if body["enabled"] and await _off_loop(
+            lambda: enable_state.locked_by_policy(audit_tool="computer_use_enable")
+        ):
             _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources="enabled=locked")
             return web.json_response(
                 {"error": LOCKED_BY_POLICY, "code": "locked_by_policy"}, status=409
@@ -688,9 +694,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # No governance step here, deliberately: the computer-use governance model
-    # (and the 409 it would have returned) does not exist. The write boundary
-    # that DOES hold is the app-token gate at the top of this handler.
+    # The only governance step is the ``locked_by_policy`` 409 in the validation
+    # above. The write boundary that also holds is the app-token gate at the top.
 
     # ── Write ──
     # Read the CURRENT enable before mutating, so the session reset below fires only

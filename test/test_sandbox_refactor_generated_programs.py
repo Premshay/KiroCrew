@@ -392,6 +392,7 @@ _LAUNCHER_PLAN_GOLDEN: dict[str, Any] = {
     "required_mask_targets": ["<ROOT>/outside"],
     "mask_occupants": {"<ROOT>/crew/apps": [21, 22, 0], "<ROOT>/op/.aws": [23, 24, 1, 1, 25, 26]},
     "crew_home_aliases": [["<ROOT>/op/.kiro/crew", "<ROOT>/crew", 31, 32]],
+    "published_file_record": {},
     "expose_files": [["<ROOT>/op/.aws/sso/cache/token.json", "token.json"]],
     "env_prefixes": [
         "AWS_SECRET",
@@ -521,6 +522,8 @@ _PROFILE_GOLDEN = """\
 (deny file-link (subpath "<ROOT>/op/.kirocrew/crew-panels"))
 (deny file-read* (literal "<ROOT>/op/.kirocrew/crew-panels"))
 (deny file-link (literal "<ROOT>/op/.kirocrew/crew-panels"))
+(deny file-read* (require-all (subpath "<ROOT>/op/.aws") (require-not (literal "<ROOT>/op/.aws/config"))))
+(deny file-link (subpath "<ROOT>/op/.aws"))
 (deny file-read* (subpath "<ROOT>/op/.kube"))
 (deny file-link (subpath "<ROOT>/op/.kube"))
 (deny file-read* (subpath "<ROOT>/crew/policy_cache"))

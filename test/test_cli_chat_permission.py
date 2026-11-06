@@ -23,6 +23,8 @@ from cli_helpers import (  # noqa: F401 -- the autouse fixture registers by impo
     _TestChatPermissionRequestHarness,
 )
 
+from kiro_crew.testing.wait import async_wait_until, default_timeout
+
 
 class TestChatPermissionRequest(_TestChatPermissionRequestHarness):
     """`kirocrew chat` must ANSWER a permission request, and answering one is an
@@ -130,7 +132,13 @@ class TestChatPermissionRequest(_TestChatPermissionRequestHarness):
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "answer,call,outcome",
-        [("a", ("approve", 7, False), "allowed"), ("d", ("reject", 7, False), "denied")],
+        [
+            ("y", ("approve", 7, False), "allowed"),
+            ("n", ("reject", 7, False), "denied"),
+            # The pre-Kiro-CLI keys still answer the same way for one release.
+            ("a", ("approve", 7, False), "allowed"),
+            ("d", ("reject", 7, False), "denied"),
+        ],
     )
     async def test_the_turn_completes_whatever_the_human_answers(
         self, monkeypatch, capsys, answer, call, outcome
@@ -148,8 +156,25 @@ class TestChatPermissionRequest(_TestChatPermissionRequestHarness):
         # A prefix match reads `abort` as an allow -- the opposite of intent.
         # The other rejects are what a person types when a single-key prompt did
         # not register, plus the do-nothing answers.
-        [(a, True) for a in ("a", "A", " a ", "a\n")]
-        + [(a, False) for a in ("abort", "allow", "always", "wait", "ad", "x", "", EOFError)],
+        [(a, True) for a in ("y", "Y", " y ", "y\n", "a", "A", " a ", "a\n")]
+        + [
+            (a, False)
+            for a in (
+                "yes",
+                "yank",
+                "yn",
+                "n",
+                "no",
+                "abort",
+                "allow",
+                "always",
+                "wait",
+                "ad",
+                "x",
+                "",
+                EOFError,
+            )
+        ],
     )
     async def test_only_the_exact_allow_token_approves(self, monkeypatch, answer, allows):
         provider, sels, _ = await self._drive(monkeypatch, answer=answer)
@@ -157,11 +182,43 @@ class TestChatPermissionRequest(_TestChatPermissionRequestHarness):
         assert [s["outcome"] for s in sels] == ["allowed" if allows else "denied"]
 
     @pytest.mark.asyncio
+    async def test_the_prompt_advertises_kiro_clis_keys_not_the_legacy_ones(self, monkeypatch):
+        """`kiro-cli chat` asks [y/n/t]; this prompt shows the same y / n so a
+        habitual `y` is not read as a refusal. The legacy a / d still work but
+        are not advertised."""
+        _, _, reads = await self._drive(monkeypatch, answer="n")
+        prompt = reads["prompts"][0]
+        assert "[y] allow once" in prompt
+        assert "[n] deny (default)" in prompt
+        assert "[a]" not in prompt and "[d]" not in prompt
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("answer", ["t", "T", " t ", "t\n"])
+    async def test_kiro_clis_trust_key_denies_and_says_why(self, monkeypatch, capsys, answer):
+        """Kiro CLI's `t` trusts the tool for the session. There is no session
+        grant here, so it denies -- approving once would leave the person
+        believing later calls are trusted -- and the notice names the key that
+        does allow."""
+        provider, sels, reads = await self._drive(monkeypatch, answer=answer)
+        assert provider.calls == [("reject", 7, False)]
+        assert [s["outcome"] for s in sels] == ["denied"]
+        assert reads["n"] == 1
+        out = capsys.readouterr().out
+        assert "trusting a tool for the session is not available" in out
+        assert "Answer y to allow each call once" in out
+
+    @pytest.mark.asyncio
+    async def test_only_the_trust_key_prints_the_trust_notice(self, monkeypatch, capsys):
+        for answer in ("trust", "n", "y"):
+            await self._drive(monkeypatch, answer=answer)
+            assert "not available in kirocrew chat" not in capsys.readouterr().out
+
+    @pytest.mark.asyncio
     async def test_no_answer_grants_a_persistent_approval(self, monkeypatch):
         """There is no "always allow": a backend that records one stops sending
         permission requests for matching calls, and a request never sent is a
         call this ladder never runs and never audits."""
-        for answer in ("a", "w", "always"):
+        for answer in ("y", "a", "t", "w", "always"):
             provider, _, reads = await self._drive(monkeypatch, answer=answer)
             assert all(not always for kind, _, always in provider.calls if kind == "approve")
         # The prompt must not advertise an option the responder cannot honour.
@@ -318,17 +375,21 @@ class TestChatPermissionRequest(_TestChatPermissionRequestHarness):
         import kiro_crew.cli_chat as cli_chat
 
         entered = threading.Event()
+        # What the two stubs below park on. The test's cleanup sets both, so the
+        # reader thread cannot return "a" while the teardown is still being judged,
+        # and a reject that was wrongly awaited does not outlive the test.
+        read_released = threading.Event()
+        reject_released = asyncio.Event()
 
         class _HungReject(self._GatedProvider):
             async def reject_tool(self, request_id):
                 self.trace.append(("reject", request_id, False))
-                # flake-ok: pre-existing never-set event in the hung-reject stub, moved verbatim; teardown never calls it and the wait_for on the cancelled task bounds a regression
-                await asyncio.Event().wait()  # never returns
+                # A transport that never answers: only the cleanup below ends this wait.
+                await reject_released.wait()
 
         def blocking_read(prompt=""):
             entered.set()
-            # flake-ok: pre-existing bounded park of the prompt thread, moved verbatim; the test cancels the turn while it is parked
-            threading.Event().wait(timeout=self._TIMEOUT)
+            read_released.wait(timeout=default_timeout())
             return "a"
 
         trace: list = []
@@ -338,15 +399,21 @@ class TestChatPermissionRequest(_TestChatPermissionRequestHarness):
         task = asyncio.create_task(
             cli_chat._send_and_print(provider, "run it", interactive=True, gate=self._gate())
         )
-        # flake-ok: pre-existing 5 s bounded wait for the prompt thread to start, moved verbatim
-        await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5.0)
+        try:
+            await async_wait_until(
+                entered.is_set,
+                describe=lambda: f"the prompt thread never entered the read; turn: {task!r}",
+            )
 
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=self._TIMEOUT)
-        assert cli_chat._stdin_poisoned is True
-        assert provider.calls == []  # nothing was awaited on the way out
-        assert [s[1]["error"] for s in trace if s[0] == "sel"] == ["session_aborted"]
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=self._TIMEOUT)
+            assert cli_chat._stdin_poisoned is True
+            assert provider.calls == []  # nothing was awaited on the way out
+            assert [s[1]["error"] for s in trace if s[0] == "sel"] == ["session_aborted"]
+        finally:
+            read_released.set()
+            reject_released.set()
 
     @pytest.mark.asyncio
     async def test_the_teardown_audit_also_runs_off_the_event_loop(self, monkeypatch):
@@ -363,13 +430,15 @@ class TestChatPermissionRequest(_TestChatPermissionRequestHarness):
         import kiro_crew.cli_chat as cli_chat
 
         entered = threading.Event()
+        # The reader thread parks on this until the test's cleanup sets it, so it
+        # cannot return "a" while the teardown is still being judged.
+        read_released = threading.Event()
         threads: list = []
         trace: list = []
 
         def blocking_read(prompt=""):
             entered.set()
-            # flake-ok: pre-existing bounded park of the prompt thread, moved verbatim; the test cancels the turn while it is parked
-            threading.Event().wait(timeout=self._TIMEOUT)
+            read_released.wait(timeout=default_timeout())
             return "a"
 
         monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
@@ -388,18 +457,23 @@ class TestChatPermissionRequest(_TestChatPermissionRequestHarness):
         task = asyncio.create_task(
             cli_chat._send_and_print(provider, "run it", interactive=True, gate=self._gate())
         )
-        # flake-ok: pre-existing 5 s bounded wait for the prompt thread to start, moved verbatim
-        await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5.0)
+        try:
+            await async_wait_until(
+                entered.is_set,
+                describe=lambda: f"the prompt thread never entered the read; turn: {task!r}",
+            )
 
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=self._TIMEOUT)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=self._TIMEOUT)
 
-        assert [s[1]["error"] for s in trace if s[0] == "sel"] == ["session_aborted"]
-        assert threads[0] is not threading.main_thread(), (
-            "the teardown SEL write ran on the event loop thread; a slow audit "
-            "store would stall ACP draining while the turn is being torn down"
-        )
+            assert [s[1]["error"] for s in trace if s[0] == "sel"] == ["session_aborted"]
+            assert threads[0] is not threading.main_thread(), (
+                "the teardown SEL write ran on the event loop thread; a slow audit "
+                "store would stall ACP draining while the turn is being torn down"
+            )
+        finally:
+            read_released.set()
 
     @pytest.mark.asyncio
     async def test_an_approval_that_cannot_be_audited_is_refused(self, monkeypatch):
@@ -712,7 +786,6 @@ print("survived")
         out_path = tmp_path / "child.out"
         err_path = tmp_path / "child.err"
         with open(out_path, "wb") as out, open(err_path, "wb") as err:
-            # flake-ok: pre-existing real child interpreter run without a timeout, moved verbatim; tracked for a de-flake pass
             rc = subprocess.call(
                 [sys.executable, "-c", self._CHILD % {"title": self._TITLE}],
                 stdout=out,
@@ -723,6 +796,9 @@ print("survived")
                 # artifact it or a library writes then lands in the test's own tree
                 # instead of surviving in the repo.
                 cwd=tmp_path,
+                # A lost-run bound, half the test's timeout: a child that hangs is
+                # killed and fails this test as TimeoutExpired, not the worker.
+                timeout=default_timeout(),
             )
         stdout = out_path.read_text(encoding="utf-8", errors="replace")
 
@@ -863,3 +939,35 @@ class TestChatProviderShutdown:
             await cli_chat._chat("hello", None)
         assert provider.shutdowns == 1
         assert collected["n"] == 1
+
+
+class TestChatPermissionRequestSpecRestrictions(_TestChatPermissionRequestHarness):
+    """A KAS spec's deny-all-but restrictions reach the CLI gate, so answering the
+    prompt cannot run what the spec refuses."""
+
+    @pytest.mark.asyncio
+    async def test_a_write_the_spec_does_not_cover_is_refused_before_the_prompt(self, monkeypatch):
+        event = self._event(
+            title="Write", tool_kind="edit", raw_params={"path": "/w/elsewhere.txt"}
+        )
+        event.spec_write_allowlist = ("/w/out",)
+        event.spec_write_cwd = "/w"
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("reject", 7, False)]
+        assert reads["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_command_the_spec_does_not_list_is_refused_before_the_prompt(self, monkeypatch):
+        event = self._event(title="Run Command", command="mkfifo /tmp/x")
+        event.spec_shell_allowlist = ("git status",)
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("reject", 7, False)]
+        assert reads["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_covered_write_still_reaches_the_prompt(self, monkeypatch):
+        event = self._event(title="Write", tool_kind="edit", raw_params={"path": "/w/out/a.txt"})
+        event.spec_write_allowlist = ("/w/out",)
+        event.spec_write_cwd = "/w"
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert reads["n"] == 1

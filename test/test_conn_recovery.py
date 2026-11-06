@@ -139,6 +139,7 @@ async def test_queue_dispatch_preserves_recovery_provenance(
         "_directive_channel_origin": False,
         "_post_restart_continuation": False,
         "_drained_queue_ids": (queue_id,),
+        "_directive_owner_origin": False,
     }
     if expected_recovery:
         # A recovery-kind entry also tells the runner it IS a recovery
@@ -263,6 +264,7 @@ async def test_dispatch_classifies_the_payload_not_the_recovery(
         _directive_channel_origin=False,
         _post_restart_continuation=False,
         _drained_queue_ids=(queue_id,),
+        _directive_owner_origin=False,
     )
     # Provenance is unchanged by the split: either payload still renders as an
     # inject row, which is what stops the duplicate user bubble.

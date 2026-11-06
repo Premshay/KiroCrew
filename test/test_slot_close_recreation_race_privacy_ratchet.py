@@ -48,6 +48,7 @@ from kiro_crew.dashboard import chat_runner, chat_summary
 from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
 from kiro_crew.history import is_incognito_transcript
 from kiro_crew.memory_stores import UnknownMemoryStore
+from kiro_crew.testing.wait import finished
 
 
 def _summary_cfg():
@@ -150,8 +151,7 @@ async def test_delete_handover_of_a_restricted_tail_tightens_a_persistent_line(
         _summary_cfg(), replacement, 4, force=True
     ), "the persistent replacement was not summarizable before the drain"
     release.set()
-    # flake-ok: the close task ends once the test sets release; moved verbatim, a bounded await is tracked for a de-flake pass
-    resp = await close
+    resp = await finished(close, "the close finishing once the test released the cancelled turn")
 
     assert resp.status == 200, "the restricted tail was refused instead of landing"
     assert state._slots.get(NAME) is replacement
@@ -337,8 +337,7 @@ async def test_delete_handover_of_a_restricted_tail_lands_under_the_ratcheted_li
     await _publish_metadata(state, replacement, title="REPLACEMENT TITLE", folder="f-r")
     assert state.conversation_log.get_metadata(HKEY).get("memory_mode") == mode
     release.set()
-    # flake-ok: the close task ends once the test sets release; moved verbatim, a bounded await is tracked for a de-flake pass
-    resp = await close
+    resp = await finished(close, "the close finishing once the test released the cancelled turn")
 
     assert resp.status == 200
     meta = state.conversation_log.get_metadata(HKEY)
@@ -678,8 +677,9 @@ async def test_delete_handover_saves_tail_after_second_carrier_cas_failure(
     monkeypatch.setattr(chat_utils_mod, "tighten_live_session_execution", _always_fail)
     try:
         release.set()
-        # flake-ok: the close task ends once the test sets release; moved verbatim, a bounded await is tracked for a de-flake pass
-        resp = await close
+        resp = await finished(
+            close, "the close finishing once the test released the cancelled turn"
+        )
 
         assert resp.status == 200
         assert json.loads(resp.body) == {"ok": True}
@@ -852,6 +852,53 @@ async def test_a_save_over_a_corrupt_line_rewrites_it_strictest_and_lands_the_ro
     assert meta.get("created_at") == identity, "the full save restores the slot's identity"
     assert _disk_contents(state) == ["ROW-1", "ROW-2"], "the rows did not land"
     assert slot.memory_mode == STRICTEST_MEMORY_MODE, "the live slot must follow the line"
+
+    assert await handlers.save_slot_off_loop(state, slot, closed=True, best_effort=False) is True
+    assert log.get_metadata(HKEY).get("closed") is True
+
+
+@pytest.mark.asyncio
+async def test_a_save_over_a_first_line_that_is_not_utf8_rewrites_it_and_keeps_older_rows(
+    tmp_path,
+) -> None:
+    """The full save rewrites an undecodable first line, like one that is not JSON.
+
+    Bytes that are not UTF-8 read as CORRUPT, so the save takes its rewrite
+    branch; its strict text reads of the whole file then raised
+    ``UnicodeDecodeError``, so every save of the slot failed, its rows never
+    landed and ``closed`` never could. The rows OLDER than the in-memory window
+    are carried by the frozen prefix, which must still take them by position.
+    """
+    from kiro_crew.execution_context import STRICTEST_MEMORY_MODE
+    from kiro_crew.history import METADATA_LINE_CORRUPT, METADATA_LINE_READABLE
+
+    state = _make_state(tmp_path)
+    log = state.conversation_log
+    slot = state.get_or_create_slot(NAME)
+    slot.append("user", "ROW-1")
+    slot.append("assistant", "ROW-2")
+    slot.drain()
+    assert await handlers.save_slot_off_loop(state, slot, best_effort=False) is True
+    # A restored window that holds only the newest row: ROW-1 is on disk only,
+    # so only the frozen prefix can carry it through the next save.
+    slot.messages = slot.messages[1:]
+    slot._disk_older_count = 1
+
+    path = log._path(HKEY)
+    rows = path.read_bytes().split(b"\n", 1)[1]
+    path.write_bytes(b"\xff\xfe\x00{not a record\n" + rows)
+    log._invalidate_cache(HKEY)
+    assert log.metadata_line_state(HKEY) == METADATA_LINE_CORRUPT
+
+    slot.append("user", "ROW-3")
+    slot.drain()
+    assert await handlers.save_slot_off_loop(state, slot, best_effort=False) is True
+    assert log.metadata_line_state(HKEY) == METADATA_LINE_READABLE
+    meta = log.get_metadata(HKEY)
+    assert meta.get("_type") == "metadata", "the undecodable line was not rewritten"
+    assert meta.get("memory_mode") == STRICTEST_MEMORY_MODE
+    assert "memory_store" not in meta
+    assert _disk_contents(state) == ["ROW-1", "ROW-2", "ROW-3"], "a row was lost"
 
     assert await handlers.save_slot_off_loop(state, slot, closed=True, best_effort=False) is True
     assert log.get_metadata(HKEY).get("closed") is True
@@ -1117,8 +1164,7 @@ async def test_delete_handover_of_a_persistent_tail_keeps_a_restricted_line(tmp_
     await _publish_metadata(state, replacement, title="REPLACEMENT TITLE", folder="f-r")
     assert state.conversation_log.get_metadata(HKEY).get("memory_mode") == "incognito"
     release.set()
-    # flake-ok: the close task ends once the test sets release; moved verbatim, a bounded await is tracked for a de-flake pass
-    resp = await close
+    resp = await finished(close, "the close finishing once the test released the cancelled turn")
 
     assert resp.status == 200
     meta = state.conversation_log.get_metadata(HKEY)

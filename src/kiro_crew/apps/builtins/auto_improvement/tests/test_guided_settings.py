@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from aiohttp import web
 
 from ..backend import routes, store
 from ..backend.commit import manual_regression_required
@@ -92,6 +93,8 @@ async def test_timeout_is_saved_and_invalidates_calibration(monkeypatch):
     request._read_bytes = json.dumps({"suiteTimeoutSeconds": 2400}).encode()
     response = await routes._handle_put_config(request)
     assert response.status == 200
+    assert isinstance(response, web.Response)
+    assert response.text is not None
     assert json.loads(response.text)["rejected"] == []
     assert store.read_json(store.config_path())["suiteTimeoutSeconds"] == 2400
     assert store.read_json(ruler) == {"status": "uncalibrated"}

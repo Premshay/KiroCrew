@@ -133,6 +133,23 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
         "the transformed body is re-scanned before Discord receives it.",
     ),
     (
+        "Discord steer chip",
+        "discord/renderer_text.py",
+        "The quoted chip of a user's own mid-turn steer words. Backslash escapes "
+        "inserted for Discord markup would split a credential before the send-time "
+        "scan, while Discord renders the backslash away, so the chip text is "
+        "redacted in its display form before any escape goes in.",
+    ),
+    (
+        "Discord [OPTIONS] press echo",
+        "discord/transport_dispatch_interactions.py",
+        "The quoted line posted when a user presses an `[OPTIONS:]` button. It "
+        "carries the full choice, which can be longer than the label that was "
+        "shown. This module calls only `_redact_transformed`, the renderer's "
+        "display-form pass for the answer body, which itself runs both the "
+        "credential and the exfiltration-URL scan.",
+    ),
+    (
         "Teams rendered message text",
         "teams/renderer.py",
         "Every LLM-authored string this channel sends, re-scanned in the form Teams "
@@ -500,9 +517,9 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
         "File watch frames",
         "dashboard/file_api/transfer.py",
         "The file-watch SSE frames (api_file_watch) are redacted before they are "
-        "pushed. The file download and the Range stream serve the file's own "
-        "bytes and use redact() as a GATE: a file whose text the redactor would "
-        "change is refused, not served masked.",
+        "pushed. The owner-only file download serves the file's own bytes "
+        "without a content scan. The Range stream uses redact() as a GATE: a "
+        "file whose text the redactor would change is refused, not served masked.",
     ),
     (
         "Office document preview",
@@ -536,6 +553,17 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
         "The root the Files tab's tree listing (api_project_tree) returns goes "
         "through _redact_project_path, and every listed path is redacted segment "
         "by segment through redact_path_segments.",
+    ),
+    (
+        "Files tab edited-file list",
+        "dashboard/session_files.py",
+        "The absolute paths the Files tab's Edited view (api_project_session_files) "
+        "returns are checked through _redact_project_path: a path the redactor would "
+        "change is withheld from the list rather than sent masked, and the response "
+        "says the list is incomplete. One edit's texts (api_project_session_file_diff) "
+        "are served only for a path the list would name: the snapshot texts the turn "
+        "runner redacted before they were stored, run through _redact_for_display "
+        "again as they are served, since a transcript line stays writable after it.",
     ),
     (
         "Slide-deck render screen and conversion diagnostic",
@@ -859,7 +887,7 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
     (
         "Mate-written dashboard field values",
         "dashboard_agentic.py",
-        "Every string a mate writes into its own dashboard's agentic fields, on "
+        "Every string a Bot writes into its own dashboard's agentic fields, on "
         "its way to the rendered page. The scrub runs on the way IN, so what the "
         "registry stores is already redacted and no later reader has to remember to "
         "scrub it. Both shared redactors run, exfiltration URLs first, and the walk "
@@ -872,7 +900,21 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
         "cap after it.",
     ),
     (
-        "Field values pushed to a mate's dashboard page",
+        "Script-cron records appended for a Bot's dashboard page",
+        "dashboard/handlers/agent_panel_record.py",
+        "Every string a member-bound script cron sends through the record door "
+        "(`POST /api/agent-panel/dashboard/record`) on its way into the Bot's own crew "
+        "log, where the custom fold keeps it and the Bot's page draws it. The scrub runs "
+        "on the way IN, like the agentic value's, with the same two redactors in the "
+        "same order and the same recursive walk over arrays and objects, keys included; "
+        "and each string value is judged a second time beside its key, because a bearer "
+        "token is caught only next to its authorization header and a script that records "
+        "an upstream response's headers writes exactly that pair. The size is judged on "
+        "the scrubbed form, which is what lands. The client (`ScriptContext."
+        "crew_log_append`) scrubs too, but it is one caller of the route and not its gate.",
+    ),
+    (
+        "Field values pushed to a Bot's dashboard page",
         "dashboard/handlers/member_dashboard_fields.py",
         "Every subscribed field's value on its way to the owner's socket and into the "
         "page's data island. This is the ONE place such a value is produced -- the "
@@ -881,4 +923,8 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
         "redactor is handed in by the route rather than chosen here, so the module "
         "applies the gateway's own redactor and cannot substitute a weaker one.",
     ),
+    ("Slack code-channel classifier", "slack/code_channels/classifier.py", "Its model prompt."),
+    ("Slack code-channel diagnostics", "slack/code_channels/client.py", "Logs; credentials only."),
+    ("Slack code-channel bar", "slack/code_channels/workspace/context_bar.py", "Its labels."),
+    ("Slack code-channel diff", "slack/code_channels/workspace/service.py", "Its diff view."),
 )

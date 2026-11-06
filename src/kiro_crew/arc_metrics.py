@@ -70,7 +70,7 @@ def idle_gaps(entries: list[dict[str, Any]], until: datetime) -> dict[str, Any]:
     closed: list[float] = []
     per_member: dict[str, list[float]] = {}
     open_gaps: dict[str, float] = {}
-    members = sorted({e["author"] for e in entries if e["author"] != arcs.OWNER})
+    members = sorted({e["author"] for e in entries if e["author"] not in (arcs.OWNER, arcs.GITHUB)})
     for member in members:
         mine = [e for e in entries if e["author"] == member]
         for i, entry in enumerate(mine):
@@ -133,6 +133,12 @@ def board_report(arc_id: str, until: datetime) -> dict[str, Any]:
         "by_kind": dict(Counter(e["kind"] for e in entries)),
         "by_lane": {lane: dict(kinds) for lane, kinds in by_lane.items()},
         "done_links": [e["link"] for e in entries if e["kind"] == "DONE" and e.get("link")],
+        # Merged arc PRs recorded from GitHub, and those a reviewer lane cleared
+        # on their exact final head.
+        "merged_prs": [e["pr"] for e in entries if e["author"] == arcs.GITHUB],
+        "verified_prs": [
+            e["pr"] for e in entries if e["author"] == arcs.GITHUB and e.get("verified")
+        ],
         "idle_gaps": idle_gaps(entries, until),
         "ask_age": ask_ages(arc_id, entries, until),
         "collisions": collision_count(entries),

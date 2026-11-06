@@ -14,7 +14,7 @@
  * of them is fixed by picking a folder.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor, fireEvent, within } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, within, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 const mockApi = vi.hoisted(() => ({
@@ -170,6 +170,49 @@ describe('SteeringTab', () => {
       'title',
       'Linked from ~/dotfiles/conventions.md — read-only. Edit the target file instead.',
     )
+  })
+
+  it('lists a link the dashboard may not read as linked, not shown, and never fetches it', async () => {
+    // kiro-cli loads a link wherever it points, so the tab lists it; the
+    // server sends no target or metadata and refuses to read it, so the tab
+    // must say so instead of asking for a body that will 404.
+    const NOT_SHOWN = 'Linked, not shown. This link points outside the folders the dashboard may read, so its contents are not opened here. Sessions can still load it.'
+    const outside = {
+      ...FILES.files[0],
+      key: 'user/context/probe.md', name: 'probe.md', rel: 'context/probe.md',
+      path: '~/.kiro/steering/context/probe.md', size: 0, description: '',
+      linked: true, editable: false, readable: false, target: '',
+    }
+    mockApi.steeringFiles.mockResolvedValue({ ...FILES, files: [outside, FILES.files[1]] })
+    renderTab()
+    await waitFor(() => expect(screen.getByText('context/probe.md', { selector: '[role="listbox"] span' })).toBeInTheDocument())
+    expect(screen.getByText('Steering (2)')).toBeInTheDocument()
+    expect(screen.getByTestId('steering-linked-chip')).toHaveAttribute('title', NOT_SHOWN)
+    await waitFor(() => expect(screen.getByText(NOT_SHOWN)).toBeInTheDocument())
+    expect(screen.getByText('Edit')).toBeDisabled()
+    expect(screen.getByText('Delete')).toBeDisabled()
+    expect(screen.getByText('Edit')).toHaveAttribute('title', NOT_SHOWN)
+    // No body, no loading spinner and no guessed mode for a file never read.
+    expect(screen.queryByText('Loading…')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('md')).not.toBeInTheDocument()
+    expect(screen.queryByText('always')).not.toBeInTheDocument()
+    expect(mockApi.steeringFile).not.toHaveBeenCalled()
+
+    // A readable entry beside it still fetches and renders.
+    fireEvent.click(screen.getByRole('button', { name: 'Select api.md' }))
+    await waitFor(() => expect(screen.getByTestId('md')).toBeInTheDocument())
+    expect(mockApi.steeringFile).toHaveBeenCalledTimes(1)
+    expect(mockApi.steeringFile.mock.calls[0][0]).toBe('workspace/api.md')
+  })
+
+  it('shows a refused read instead of loading forever', async () => {
+    mockApi.steeringFile.mockRejectedValue(new FakeApiError(413, 'file too large (300000 bytes)'))
+    renderTab()
+    await waitFor(() => expect(screen.getByText('file too large (300000 bytes)')).toBeInTheDocument())
+    expect(screen.queryByText('Loading…')).not.toBeInTheDocument()
+    // View mode holds no draft, so the refused read hands off to the agent.
+    const notice = screen.getByText('file too large (300000 bytes)').closest('[role="alert"]') as HTMLElement
+    expect(within(notice).getByRole('button', { name: /Ask the agent/ })).toBeInTheDocument()
   })
 
   it('keeps Edit and Delete live on a regular entry beside a linked one', async () => {
@@ -549,6 +592,27 @@ describe('SteeringTab', () => {
     await waitFor(() => expect(screen.getByTestId('md')).toHaveTextContent('# Personal body'))
   })
 
+  it('names the disabled refresh for the read in flight, then restores it', async () => {
+    // A disabled "Refresh steering files" reads as unavailable; while the refetch
+    // runs its name says it is busy instead.
+    renderTab()
+    const idle = await screen.findByRole('button', { name: 'Refresh steering files' })
+    await waitFor(() => expect(idle).toBeEnabled())
+
+    let release: (v: typeof FILES) => void = () => {}
+    mockApi.steeringFiles.mockReturnValue(new Promise(resolve => { release = resolve }))
+    fireEvent.click(idle)
+
+    const busy = await screen.findByRole('button', { name: 'Refreshing steering files…' })
+    expect(busy).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Refresh steering files' })).toBeNull()
+
+    await act(async () => { release(FILES) })
+
+    const back = await screen.findByRole('button', { name: 'Refresh steering files' })
+    await waitFor(() => expect(back).toBeEnabled())
+  })
+
   it('shows an empty state naming both search roots when nothing is found', async () => {
     mockApi.steeringFiles.mockResolvedValue({ files: [], roots: FILES.roots, project: '~/proj' })
     renderTab()
@@ -578,6 +642,29 @@ describe('SteeringTab', () => {
     confirmSpy.mockReturnValue(true)
     fireEvent.click(screen.getByText('Delete'))
     await waitFor(() => expect(mockApi.deleteSteering).toHaveBeenCalledWith('user/personal.md', undefined, 'pk-listed'))
+    confirmSpy.mockRestore()
+  })
+
+  it('a file opened and edited while a delete is in flight keeps its editor when the delete lands', async () => {
+    mockApi.steeringFile.mockImplementation(async (key: string) => key === 'workspace/api.md'
+      ? { key, content: '# API\nbody', path: '~/proj/.kiro/steering/api.md', source: 'workspace' }
+      : { key, content: '# Personal\nbody', path: '~/.kiro/steering/personal.md', source: 'user' })
+    let land!: (v: { ok: boolean }) => void
+    mockApi.deleteSteering.mockImplementation(() => new Promise(resolve => { land = resolve }))
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    renderTab()
+    await waitFor(() => expect(screen.getByText('Delete')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('Delete'))
+    await waitFor(() => expect(mockApi.deleteSteering).toHaveBeenCalledWith('user/personal.md', undefined, 'pk-listed'))
+
+    fireEvent.click(screen.getByText('api.md'))
+    await waitFor(() => expect(screen.getByText('Edit')).toBeEnabled())
+    fireEvent.click(screen.getByText('Edit'))
+    const editor = await screen.findByLabelText('Edit api.md') as HTMLTextAreaElement
+    fireEvent.change(editor, { target: { value: '# API\nchanged' } })
+
+    await act(async () => { land({ ok: true }) })
+    expect((screen.getByLabelText('Edit api.md') as HTMLTextAreaElement).value).toBe('# API\nchanged')
     confirmSpy.mockRestore()
   })
 
@@ -1118,5 +1205,40 @@ describe('steeringBody', () => {
 
   it('handles CRLF', () => {
     expect(steeringBody('---\r\ninclusion: manual\r\n---\r\n# T\r\n')).toBe('# T\r\n')
+  })
+})
+
+describe('SteeringTab filter selection (#20262)', () => {
+  // A file listed first whose description mentions the query, then the file
+  // the user actually typed.
+  const MENTIONS = {
+    ...FILES,
+    files: [
+      { ...FILES.files[0], key: 'user/notes.md', name: 'notes.md', rel: 'notes.md', description: 'Notes on the api' },
+      FILES.files[1],
+    ],
+  }
+  const lastOpened = () => mockApi.steeringFile.mock.calls.at(-1)?.[0]
+
+  it('opens the file whose name matches the filter, not the first row', async () => {
+    mockApi.steeringFiles.mockResolvedValue(MENTIONS)
+    renderTab()
+    await waitFor(() => expect(lastOpened()).toBe('user/notes.md'))
+
+    fireEvent.change(screen.getByPlaceholderText(/filter steering/i), { target: { value: 'api' } })
+    // Both rows stay listed; the open file is the one that was typed.
+    await waitFor(() => expect(lastOpened()).toBe('workspace/api.md'))
+    expect(screen.getAllByText('notes.md').length).toBeGreaterThan(0)
+  })
+
+  it('keeps a file the user clicked while the filter still shows it', async () => {
+    mockApi.steeringFiles.mockResolvedValue(MENTIONS)
+    renderTab()
+    await waitFor(() => expect(lastOpened()).toBe('user/notes.md'))
+    fireEvent.click(screen.getAllByText('notes.md')[0])
+
+    fireEvent.change(screen.getByPlaceholderText(/filter steering/i), { target: { value: 'api' } })
+    await waitFor(() => expect(screen.getByText('api.md')).toBeInTheDocument())
+    expect(lastOpened()).toBe('user/notes.md')
   })
 })

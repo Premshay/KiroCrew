@@ -27,7 +27,7 @@ import { ensureChatFolder } from '../../../utils/ensureChatFolder'
 import { settleSeedReceipt } from '../../../utils/seedReceipt'
 import { isMissingSlotError } from '../../../utils/thunkError'
 import { useAppDispatch } from '../../../store'
-import { createSlot, deleteSlot, switchSlot } from '../../../store/chatSlice'
+import { createSlot, deleteSlot, requestSlotFolderOpen, switchSlot } from '../../../store/chatSlice'
 
 /** One folder per target repository groups every session from its runs. */
 const FOLDER_PREFIX = 'Auto-Improve - '
@@ -119,17 +119,15 @@ export function sessionKey(kind: SubjectKind, id: string | number, repo: string)
   return `${kind}-${keySegment(repo, 'norepo')}-${keySegment(String(id), 'unknown')}`
 }
 
-const API = '/api/apps/auto-improvement'
-
 async function loadRecord(key: string): Promise<SessionRecord | null> {
-  const res = await fetch(`${API}/sessions/${encodeURIComponent(key)}`)
+  const res = await api.autoImprovementResponse(`/sessions/${encodeURIComponent(key)}`)
   if (!res.ok) return null
   const body = (await res.json()) as { session?: SessionRecord | null }
   return body.session ?? null
 }
 
 async function saveRecord(key: string, patch: Partial<SessionRecord>): Promise<SessionRecord | null> {
-  const res = await fetch(`${API}/sessions/${encodeURIComponent(key)}`, {
+  const res = await api.autoImprovementResponse(`/sessions/${encodeURIComponent(key)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
@@ -275,6 +273,12 @@ export function useAgentSession(): UseAgentSession {
           url,
         })
         await dispatch(switchSlot(slot.key)).unwrap().catch(() => {})
+        // The app's folder can be collapsed: open its path so the row of the
+        // session /chat opens on shows. Skipped when the switch did not hold.
+        // The create's answer is the slot's own row, so its folder is where the
+        // session sits: an empty one is the top level, with no folder to open,
+        // even though the create asked for the app folder.
+        if (slot.folder_id) dispatch(requestSlotFolderOpen({ key: slot.key, folder_id: slot.folder_id, onlyIfActive: true }))
         navigate('/chat')
         return record
       } catch (e) {

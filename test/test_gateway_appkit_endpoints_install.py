@@ -33,17 +33,16 @@ class TestUninstallAppSourcesCleanup:
     """Verify that uninstalling a registry-installed app cleans up app-sources."""
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- pre-existing autouse fixture moved verbatim; no test of the class calls monkeypatch.undo()
-    def _uninstall_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def _uninstall_env(self, tmp_path: Path, _floor_monkeypatch: pytest.MonkeyPatch):
         home = tmp_path / "kirocrew-home"
         home.mkdir()
-        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        _floor_monkeypatch.setenv("KIROCREW_HOME", str(home))
         # Stub bridges
         import kiro_crew.apps.bridges as bridges_mod
 
         kiro_agents = tmp_path / "kiro-agents"
         kiro_agents.mkdir()
-        monkeypatch.setattr(bridges_mod, "KIRO_AGENTS_DIR", kiro_agents)
+        _floor_monkeypatch.setattr(bridges_mod, "KIRO_AGENTS_DIR", kiro_agents)
         import kiro_crew.apps.backend as bmod
 
         bmod._processes.clear()
@@ -354,13 +353,11 @@ class TestRegistryInstallStream:
             assert resp.headers["Content-Type"] == "text/event-stream"
             body = await resp.text()
 
-            # Verify log events were streamed
             assert "event: log" in body
             assert "step 1: cloning" in body
             assert "step 2: building" in body
             assert "step 3: done" in body
 
-            # Verify done event
             assert "event: done" in body
             assert '"ok": true' in body or '"ok":true' in body
 
@@ -469,15 +466,14 @@ class TestInstallFromRegistryLogLines:
     """Verify install_from_registry accepts custom log_lines."""
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- pre-existing autouse fixture moved verbatim; no test of the class calls monkeypatch.undo()
-    def _catalog_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _catalog_absent(self, _floor_monkeypatch: pytest.MonkeyPatch) -> None:
         """Pin "catalog reachable, app absent" for the unknown-app path.
 
         These tests exercise the same live-fetching resolution path as
         ``test_unknown_app_streams_error``; without the pin their
         verdict depends on the runner's network.
         """
-        monkeypatch.setattr(
+        _floor_monkeypatch.setattr(
             "kiro_crew.apps.official_catalog.inventory_for_install",
             lambda name: None,
         )

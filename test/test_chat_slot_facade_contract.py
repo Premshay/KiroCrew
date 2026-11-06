@@ -20,6 +20,7 @@ _TO_DICT_KEYS = (
     "title",
     "agent",
     "agent_kind",
+    "crew_mode_agent",
     "effective_agent",
     "model",
     "runtime_agent",
@@ -45,6 +46,7 @@ _TO_DICT_KEYS = (
     "artifact",
     "messages",
     "running",
+    "admission_queued",
     "wake_starting",
     # Turn identity beside `running`: the slot's monotonic turn counter and the
     # gateway process generation it is comparable within. The dashboard uses the
@@ -98,10 +100,14 @@ _TO_DICT_KEYS = (
     "memory_mode",
     "forked_from",
     "linked_session_key",
+    # The transcript's session key, derived by ``slot_history_key``; the
+    # reopen-closed-session shortcut resumes by it.
+    "history_key",
     "app",
     "origin",
     "created_by",
     "lineage_minted",
+    "attribution",
     "peer_channel_inbox_count",
     "peer_channel_attention",
     "declared_goal",

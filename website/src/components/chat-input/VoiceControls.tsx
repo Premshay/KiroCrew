@@ -213,7 +213,7 @@ export function HoldToTalkBar({ manualHeight, setHoldTarget, touchPtt, disabled,
 
 /** The mic: a record toggle, or on touch the switch between the keyboard and
  *  hold-to-talk (see `micIsModeSwitch` in `chat-input/voice.ts`). */
-export function MicButton({ voiceHoldMode, voiceRecording, micIsModeSwitch, transcribeInFlight, micHeldElsewhere, micBlocked, toggleVoiceMode, onVoiceToggle, onVoicePrewarm, disabled, optimizing, micLabel: recordLabel, handsFreePhase }: {
+export function MicButton({ voiceHoldMode, voiceRecording, micIsModeSwitch, transcribeInFlight, micHeldElsewhere, micBlocked, toggleVoiceMode, onVoiceToggle, onVoicePrewarm, disabled, optimizing, micLabel: recordLabel, handsFreePhase, micKeyShortcuts }: {
   voiceHoldMode: boolean
   voiceRecording: boolean
   micIsModeSwitch: boolean
@@ -227,6 +227,8 @@ export function MicButton({ voiceHoldMode, voiceRecording, micIsModeSwitch, tran
   optimizing: boolean
   micLabel: string
   handsFreePhase?: HandsFreePhase
+  /** The push-to-talk key as an `aria-keyshortcuts` value; absent when no key applies. */
+  micKeyShortcuts?: string
 }) {
   // While the hands-free loop runs, the mic is its stop (and barge-in) control.
   const micLabel = handsFreePhase
@@ -279,6 +281,7 @@ export function MicButton({ voiceHoldMode, voiceRecording, micIsModeSwitch, tran
          stays tappable while the loop is transcribing. */
       disabled={disabled || optimizing || (!handsFreePhase && (micIsModeSwitch ? false : micBlocked))}
       aria-label={micLabel}
+      aria-keyshortcuts={micKeyShortcuts}
       title={micLabel}
       {...uiLocation('composer.voice')}
     >

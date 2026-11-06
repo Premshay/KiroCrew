@@ -8,6 +8,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import KiroCrewAgentConfig
@@ -68,6 +69,9 @@ class Model(LLMProvider):
     def is_process_alive(self):
         return self.alive
 
+    def set_delete_delay(self, seconds):
+        return None
+
     def context_usage_pct(self):
         return 0.0
 
@@ -75,8 +79,8 @@ class Model(LLMProvider):
         return False
 
 
-@pytest.fixture
-def world(monkeypatch, event_loop, tmp_path, close_skills_loaders):
+@pytest_asyncio.fixture
+async def world(monkeypatch, tmp_path, close_skills_loaders):
     # ``close_skills_loaders`` (conftest) closes the builder's ``SkillsLoader``
     # and joins its ``skill-catalog-refresh`` worker at teardown; the first
     # ``WorkflowService.start`` here starts that worker, and without the join
@@ -129,7 +133,7 @@ def world(monkeypatch, event_loop, tmp_path, close_skills_loaders):
         key = f"dashboard:{member}"
         bind_private_session_store(key, stores[member])
         log.update_metadata(key, {"memory_store": stores[member]})
-        vectors = event_loop.run_until_complete(builder.ensure_store(stores[member]))
+        vectors = await builder.ensure_store(stores[member])
         vectors.write_lesson(f"{member.upper()}_LEARNED_MARKER", "tool", None, "test")
         from kiro_crew.members import member_slug, write_member_rules
 
@@ -167,7 +171,7 @@ def world(monkeypatch, event_loop, tmp_path, close_skills_loaders):
             builder=builder, log=log, stores=stores, sessions=sessions, models=models
         )
     finally:
-        event_loop.run_until_complete(sessions.close_all())
+        await sessions.close_all()
         for store in stores.values():
             release_cached_memory_store(store)
 

@@ -17,6 +17,11 @@ stopped request. Polly auto-speak starts as soon as the first sentence finishes
 streaming; Pocket starts a manual replay from the first progressively encoded
 Ogg Opus bytes. Sending a new message interrupts playback immediately.
 
+Replaying a stored reply uses the same cancellation boundary: active audio,
+queued chunks and synthesis requests stop before the replay starts. A replaced
+clip's delayed play result cannot report a failure or first-audio timing for the
+new clip. `useWebSocket.autoSpeak.test.ts` pins both transitions.
+
 The fork retains the local providers because the Nexus Pocket compatibility
 runtime is not replaced by upstream's system/Polly choices. Upstream's Piper
 removal (RFC `rfc-remove-piper-tts.md`, issue #23154) is a product-policy change,
@@ -292,8 +297,18 @@ during synthesis, and malformed requests.
 Read aloud request. This replaces a prior synthesis even during model loading,
 before any audio has started. `useVoiceInput` also dispatches it when an actual
 batch or streaming recording starts, before microphone acquisition, so the
-recognizer does not capture ongoing synthesized speech. Hover prewarming does
-not interrupt playback. Clicking Read aloud while audio plays stops it.
+recognizer does not capture ongoing synthesized speech. That covers every
+surface built on the hook: the chat composer and the document comment boxes'
+`CommentVoiceButton` (selection comment, image-box comment and thread reply;
+`stt-streaming.md` § "Comment-box dictation"), so pressing a comment box's mic
+stops a reply being read aloud. Hover prewarming does
+not interrupt playback. Clicking Read aloud while audio plays stops it, on
+whichever reply it is clicked, so while `voicePlaying` is set the More menu
+item reads "Stop reading" with a stop glyph (`SpeakMenuItem`). While audio
+is still being prepared a click starts that reply instead, so the item keeps
+reading "Read aloud" until playback begins. The item reads the store only
+under a react-redux Provider, because the app SDK's `ChatEmbed` renders
+`AssistantMessage` with no store.
 The playback owner (`website/src/hooks/websocket/voicePlayback.ts`) maps the
 event to `stopVoice()`, which stops scheduled PCM sources,
 pauses an active media element, revokes queued blob URLs, invalidates pending
@@ -374,6 +389,10 @@ the patch applied to the live `_vc`, so a failed write never leaves the gateway
 running a value the file does not hold. A failed write answers non-2xx with a
 `code`: 500 `config_corrupt` (config.json unreadable), 400
 `config_write_refused`, or 500 `config_write_failed`; success is `{"ok": true}`.
+A `provider` or `engine` the server does not know (or a non-string one) is left
+unsaved while the rest of the patch applies, and the 200 then also carries
+`warnings`: one `{field, code, message}` per such field, with code
+`voice_provider_unknown` or `voice_engine_unknown`.
 
 | Setting | Meaning |
 |---|---|
@@ -413,7 +432,12 @@ AWS CLI is unavailable. It checks that Polly is the active provider and that
 `aws_consent.refuse_and_log()` grants consent before it invokes
 `aws polly describe-voices`. Those gates keep a direct API request from
 silently using ambient AWS credentials for a provider the operator did not
-select or authorize.
+select or authorize. Both gates run before the cache too, so a cached catalogue
+is served only while Polly is the confirmed provider, and the cache is keyed by
+the `(aws_profile, region)` it was read with: after either changes, the next
+request reads the catalogue again. The handler reads that pair once, so the
+consent check, the cache key and the `describe-voices` command always name the
+same account and region even when a config PUT lands mid-request.
 
 ## Provider safety
 
@@ -441,8 +465,32 @@ Text-to-speech settings link. A refusal while the consent stands (the account co
 not be re-checked, or the consent changed during the check) returns no audio for
 that sentence, and the next sentence is checked again.
 
+
+On the same `raise_refusal=True` path, the one Polly failure #17511 reports —
+the chosen voice or engine is not offered in the request's region, which AWS
+rejects identically for every sentence — is matched from the CLI stderr
+(`_classify_polly_failure`) and raises
+`VoiceSynthesisError("voice_polly_rejected")`, whose notice names the
+voice/engine/region fix. It is the only AWS failure turned into a raise, because
+it is the only one whose fix is the one action the notice names and the only one
+that repeats for every sentence. Every other nonzero exit — a sentence-scoped
+SSML or parameter error, a credential or access error, a transport blip — keeps
+the old `None`/skip-per-sentence behaviour, so the dashboard shows its generic
+notice, which is the honest answer when the remedy is not "change the voice,
+engine or region". A general AWS-error taxonomy is a separate change, not this
+fix. The raise stops at the first sentence rather than being retried once per
+sentence; the AWS message can echo the SSML, so the code's text is fixed and the
+message stays in the log. The unattended callers keep the `None`/text-fallback
+contract on every failure. `voiceFailureMessage()` maps the code to its own
+localized notice. The client's own speech engine does not depend on the AWS
+region, so `voice_polly_rejected` is a client-fallback code alongside
+`voice_unavailable` (`_CLIENT_FALLBACK_CODES` in `chat_voice.py`): its error
+payloads carry `speakable`, and a manual Read aloud that allowed the fallback
+speaks the reply on the client instead of showing the notice.
+
 Local Piper/Pocket binary discovery and model-file checks run off the event loop.
 `_synthesize_polly()` and Pocket's replay stream run their commands through
+
 `wrap_argv_async(..., _prepare=wrap_argv)`. `_synthesize_system()` instead delegates
 to `_run_tts_subprocess()`, which uses `sandboxed_spawn_argv_async()` and the
 credential-scrubbed child environment. Those chokepoints catch

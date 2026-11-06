@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
 
 from ..backend import repository_routes, routes, store
 from .request_helpers import owner_request
@@ -36,6 +37,8 @@ async def test_survey_reads_saved_branch_without_changing_config(survey_route, m
         owner_request("GET", "/repository/survey")
     )
     assert response.status == 200
+    assert isinstance(response, web.Response)
+    assert response.text is not None
     assert json.loads(response.text)["revision"] == "abc"
     assert store.read_json(store.config_path()) == survey_route
 
@@ -50,6 +53,8 @@ async def test_invalid_declaration_is_visible_and_preserves_config(survey_route,
         owner_request("GET", "/repository/survey")
     )
     assert response.status == 400
+    assert isinstance(response, web.Response)
+    assert response.text is not None
     assert "declaration" in json.loads(response.text)["error"]
     assert store.read_json(store.config_path()) == survey_route
 
@@ -70,6 +75,8 @@ async def test_survey_checks_repository_isolation(survey_route, monkeypatch):
         owner_request("GET", "/repository/survey")
     )
     assert response.status == 400
+    assert isinstance(response, web.Response)
+    assert response.text is not None
     assert "isolation" in json.loads(response.text)["error"]
 
 
@@ -106,7 +113,7 @@ async def test_assessment_mutations_require_owner(handler, monkeypatch):
     from kiro_crew.dashboard.handlers import _shared
 
     async def denied(*args):
-        return web.json_response({"error": "owner required"}, status=403)
+        return web.json_response({"code": "forbidden", "error": "owner required"}, status=403)
 
     monkeypatch.setattr(_shared, "require_owner_dashboard_request", denied)
     response = await getattr(repository_routes, handler)(
@@ -123,7 +130,7 @@ async def test_assessment_start_refuses_active_run(monkeypatch):
         pass
 
     async def busy(*args):
-        return web.json_response({"error": "run busy"}, status=409)
+        return web.json_response({"code": "run_in_progress", "error": "run busy"}, status=409)
 
     monkeypatch.setattr(routes, "_audit_owner_route_allowed", audit)
     monkeypatch.setattr(routes, "_refuse_while_running", busy)

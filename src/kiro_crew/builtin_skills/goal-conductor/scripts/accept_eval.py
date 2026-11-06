@@ -18,10 +18,35 @@ stdin (JSON):
     {"items": [
         {"id": "item-1", "accept": {"kind": "pr_checks", "pr": 123,
                                      "repo": "owner/name"}},
-        {"id": "item-2", "accept": {"kind": "file", "path": "/abs/path",
+        {"id": "item-2", "accept": {"kind": "pr_merged", "pr": 123,
+                                     "repo": "owner/name"}},
+        {"id": "item-3", "accept": {"kind": "file", "path": "/abs/path",
                                      "exists": true}},
-        {"id": "item-3", "accept": {"kind": "human_approval"}}
+        {"id": "item-4", "accept": {"kind": "human_approval"}},
+        {"id": "item-5", "accept": {"kind": "edition_check",
+                                     "check": "name", "ref": "ID-1"}}
     ]}
+
+Kinds:
+    pr_checks       every check on a GitHub pull request is green
+                    (``gh pr checks``).
+    pr_merged       a GitHub pull request is merged (``gh pr view``; an open
+                    one is pending, a closed-unmerged one fails). ``repo`` is
+                    required here.
+    file            a path exists (or, with ``"exists": false``, does not).
+    human_approval  never machine-evaluated; always ``pending``.
+    edition_check   an installed edition answers a named check (below).
+
+``edition_check`` asks an installed edition. It runs
+``kirocrew acceptance-check --json <check> <ref>``, a command the public build
+does not ship, so here it answers ``error`` ("no edition provides the
+acceptance check"). An edition that provides the check prints one JSON object
+naming the same ``check``, ``ref`` and ``verdict`` as its exit code: 0 pass,
+8 pending, 1 fail, 3 needs a person (read as ``refused``), 4 could not answer
+(read as ``error``). Exit 2 means only that no edition provides that check.
+The check names are the edition's; the core knows none of them. The edition
+contract, and how an edition provides the command, is specified in
+``docs/system-specs/modules/platform-context.md`` ("Acceptance check command").
 
 stdout (JSON):
     {"results": [{"id": "...", "verdict": "pass|fail|pending|refused|error",

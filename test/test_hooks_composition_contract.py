@@ -200,16 +200,20 @@ _NEW_OWNER_DEFS: dict[str, tuple[str, ...]] = {
 #: captured from the one-module file before the split: each keeps the kind and the
 #: signature it had there. ``safe_read_file_bytes_nolink``'s keyword-only
 #: ``admit_hardlinked`` and ``ScriptHookStore``'s callers all read these shapes.
-#: Re-pinned once since: ``_governance_denial`` gained ``alias_groups`` and
+#: Re-pinned twice since: ``_governance_denial`` gained ``alias_groups`` and
 #: ``deny_aliases`` (the KAS tool-id spellings ``gate_decision`` reads as one
-#: identity), both keyword defaults, so every pre-split caller still fits.
-_BASE_SHAPE_DIGEST = "869ba96660ec8f4ea710d6c3dcbbbec3cfcd25827358d3bac7a597102d6860bb"
+#: identity), then ``own_scopes`` (the scopes a proven non-shell call is judged
+#: in), all keyword defaults, so every pre-split caller still fits.
+#: ``run_script_hook`` and ``_hook_subprocess_env`` take a trailing
+#: ``acp_session_id=None`` keyword, so their callers fit too.
+_BASE_SHAPE_DIGEST = "7e872cdc83e52010926255562ce45a06080de990bd7ddae5ead63d497ad9c6e2"
 
 #: Definitions that stay in the facade file, each because a guard, a contract or the
 #: ``compose`` ordering reads it there. The reason per entry is in
 #: ``docs/system-specs/modules/memory-skills-hooks.md``'s "Hook runtime owners".
 _FACADE_DEFS = (
     "uncounted_gate",
+    "unattended_turn",
     "_fail_closed_on_gate_crash",
     "GateRule",
     "GateTier",
@@ -482,7 +486,7 @@ def test_every_base_definition_is_in_exactly_one_place() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
     assert defined == set(_FACADE_DEFS)
-    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 93
+    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 94
 
 
 def test_the_owners_log_as_the_facade() -> None:

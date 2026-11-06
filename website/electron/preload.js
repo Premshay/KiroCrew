@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 // Live `watchCursorAway` subscriptions in this renderer; see that method.
 let cursorAwaySubscribers = 0;
+// Whether this document has sent `navigate-ready`; see `onNavigate`.
+let navigateReadySent = false;
 
 contextBridge.exposeInMainWorld("kirocrew", {
   platform: process.platform,
@@ -50,6 +52,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Resolves to whether a purge ran; the caller reloads regardless.
   clearPaneHttpCache: (origin) =>
     ipcRenderer.invoke("pane:clear-http-cache", String(origin || "")),
+  // Copy the image drawn at a main-frame point (CSS pixels) to the OS clipboard.
+  copyImageAt: (x, y) => ipcRenderer.invoke("image:copy-at", Number(x), Number(y)),
   onStatus: (cb) => {
     const handler = (_e, msg) => cb(msg);
     ipcRenderer.on("status", handler);
@@ -112,7 +116,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
       if (cursorAwaySubscribers === 0) ipcRenderer.send("focus-mode-watch-cursor", false);
     };
   },
-  // Dev mode IPC: renderer signals main process to show/hide DevTools menu item.
+  // Renderer signals main process to show/hide the DevTools menu item.
   setDevMode: (enabled) => ipcRenderer.send("dev-mode-changed", !!enabled),
   // Windows custom titlebar: menu surfaces render in the dashboard so hover
   // can switch between them; command execution stays in the main process.
@@ -124,6 +128,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
   onNavigate: (cb) => {
     const handler = (_e, path) => cb(path);
     ipcRenderer.on("navigate", handler);
+    // Tell the main process this document now has a `navigate` listener, so a
+    // kirocrew:// link it is holding goes to a listener instead of to nobody.
+    // Once per document: the SPA re-subscribes whenever its router callbacks
+    // change identity, and only the first subscription is news.
+    if (!navigateReadySent) {
+      navigateReadySent = true;
+      ipcRenderer.send("navigate-ready");
+    }
     return () => ipcRenderer.removeListener("navigate", handler);
   },
   // View > Toggle Focus Mode: main.js asks the dashboard to flip focus mode,
@@ -139,6 +151,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
     const handler = (_e, delta) => cb(delta);
     ipcRenderer.on("history:step", handler);
     return () => ipcRenderer.removeListener("history:step", handler);
+  },
+  // The trackpad's real finger-down ("begin") and finger-up ("end"), which
+  // main.js reads off Chromium's gesture-scroll events (see scroll-touch.js).
+  // macOS only; the page's swipe reader uses it to release a drag on the real
+  // lift-off. Anything but the two words is dropped here.
+  onScrollTouch: (cb) => {
+    const handler = (_e, phase) => {
+      if (phase === "begin" || phase === "end") cb(phase);
+    };
+    ipcRenderer.on("scroll-touch", handler);
+    return () => ipcRenderer.removeListener("scroll-touch", handler);
   },
   // Second argument: whether the macOS menu bar can slide over the window.
   // Only an explicit `menuBarOverlap: false` from main turns it off, so a
@@ -212,6 +235,16 @@ contextBridge.exposeInMainWorld("localGatewayAPI", {
   set: (enabled) => ipcRenderer.invoke("local-gateway:set", !!enabled),
 });
 
+// First-run setup's "connect to a crew on another machine" exit. `available`
+// resolves true only where `start` can work; `start` opens the remote-crew form
+// and resolves "switching", "cancelled" or "unavailable". Neither takes an
+// argument: the main process decides everything from the sender. Absent in
+// plain browsers, where setup has no local gateway to replace.
+contextBridge.exposeInMainWorld("remoteCrewSetupAPI", {
+  available: () => ipcRenderer.invoke("first-run:can-use-remote-crew"),
+  start: () => ipcRenderer.invoke("first-run:use-remote-crew"),
+});
+
 // Crash-artifact notice for the dashboard banner (CrashReportNotice).
 //
 // The app already captures a minidump and, on macOS, the OS writes an .ips
@@ -238,6 +271,14 @@ contextBridge.exposeInMainWorld("crashReportsAPI", {
 // shell" and renders nothing.
 contextBridge.exposeInMainWorld("wslAPI", {
   detect: () => ipcRenderer.invoke("wsl:detect"),
+});
+
+// What the main window's close button does: "background" or "quit". The main
+// process returns the stored value only to the main window's own dashboard.
+// Absent in plain browsers and in the PWA.
+contextBridge.exposeInMainWorld("closeActionAPI", {
+  get: () => ipcRenderer.invoke("close-action:get"),
+  set: (action) => ipcRenderer.invoke("close-action:set", String(action || "")),
 });
 
 // File-open bridge for the chat path chip's "Open in editor" affordance. Hands
@@ -318,39 +359,12 @@ contextBridge.exposeInMainWorld("browserAPI", {
     ipcRenderer.invoke("browser:set-inactive", panelId, !!value),
   close: (panelId) => ipcRenderer.invoke("browser:close", panelId),
   getState: (panelId) => ipcRenderer.invoke("browser:get-state", panelId),
-  // Agent control. `setAgentAct` mirrors the dashboard's general "let the agent
-  // act" authorization into the main process, which evaluates the control gate
-  // itself on every owner transition. `control` takes a CLOSED verb set, never a
-  // raw CDP method — the surface cannot be widened from here.
-  setAgentAct: (panelId, enabled) =>
-    ipcRenderer.invoke("browser:set-agent-act", panelId, !!enabled),
-  setControlOwner: (panelId, owner) =>
-    ipcRenderer.invoke("browser:set-control-owner", panelId, owner),
-  getControl: (panelId) => ipcRenderer.invoke("browser:get-control", panelId),
-  control: (panelId, op, args) => ipcRenderer.invoke("browser:control", panelId, op, args),
   // Human-initiated element annotation on the page in the native view:
   // start/stop pick mode, poll the notes the user typed in the in-page
   // overlay, remove/edit/clear, capture a screenshot with the markers. Read
-  // through executeJavaScript + capturePage, not the agent control plane.
+  // through executeJavaScript + capturePage.
   annotate: (panelId, op, args) => ipcRenderer.invoke("browser:annotate", panelId, op, args),
-  // Declares that a chat session may host a browser panel, so the agent command
-  // channel polls for it even before the Browser tab is ever opened. Grants no
-  // authorization — authorization to drive the built-in browser is Browser Mode
-  // (the Settings toggle), and the gate is just the view precondition. This is
-  // the ONLY session-declaration channel: reachability is simply the active slots
-  // the renderer declares here.
-  trackSession: (panelId, tracked) =>
-    ipcRenderer.invoke("browser:track-session", panelId, !!tracked),
   // Events carry their own panelId so a listener can ignore other panels'.
-  // `onAgentOpened` fires when the AGENT bootstrapped a native view for a
-  // session whose Browser panel may not be mounted yet — the dashboard must
-  // surface that panel so it can report bounds, or the page would render to
-  // nowhere.
-  onAgentOpened: (cb) => {
-    const handler = (_e, payload) => cb(payload);
-    ipcRenderer.on("browser:agent-opened", handler);
-    return () => ipcRenderer.removeListener("browser:agent-opened", handler);
-  },
   onDidNavigate: (cb) => {
     const handler = (_e, payload) => cb(payload);
     ipcRenderer.on("browser:did-navigate", handler);
@@ -382,4 +396,8 @@ contextBridge.exposeInMainWorld("updateAPI", {
   // Auto-download opt-out (Settings > About). ON by default: a discovered
   // update downloads in the background and installs on the next quit.
   setAutoDownload: (enabled) => ipcRenderer.invoke("update:set-auto-download", enabled),
+  // Notify the main process that a security policy provider now governs (or no
+  // longer governs) this install's updates. Called from useUpdateSubscription
+  // whenever update_bundled_by_app and update_managed_by align. Fire-and-forget.
+  notifyPolicyGoverned: (governed) => ipcRenderer.send("update:notify-policy-governed", governed),
 });

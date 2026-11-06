@@ -26,6 +26,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import runtime_death
+from kiro_crew.agent_sdk.drivers.acp_vocab import follow_engine_promotion
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import mint_row_mid
@@ -56,13 +57,16 @@ from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
 from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import DM_SCOPE_UNIFIED, channel_namespace_of
 from kiro_crew.messaging.renderer import SilentRenderer
+from kiro_crew.messaging.script_hooks import ScriptHookTurn
 from kiro_crew.messaging.session_resume import persisted_session_agent
 from kiro_crew.messaging.session_trust import is_session_trusted
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
+from kiro_crew.parent_turns import note_turn_landed
 from kiro_crew.safety_override import safety_override
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.start_priority import person_priority
 from kiro_crew.telegram.attachments import process_telegram_attachments
+from kiro_crew.telegram.client import frame_reply_context_for_message
 from kiro_crew.telegram.renderer import TelegramApprovalDecider as _APPROVAL_REGISTRY
 from kiro_crew.telegram.transport import TELEGRAM_CAPABILITIES
 
@@ -88,7 +92,7 @@ async def _run_turn(
     reply_thread: int | None,
     interpret_commands: bool,
     drain: bool,
-) -> None:
+) -> bool:
     """Run one model turn for a message ``handle_message`` admitted, then drain.
 
     By here the message has passed governance, admission and activation, is
@@ -182,6 +186,10 @@ async def _run_turn(
         if not muted:
             await renderer.on_turn_start()
         _memory_store = await session_store_for_turn(self.ctx_builder, session_key)
+        # The pick this turn starts on, read once: get_or_create applies it and
+        # the post-turn promotion follow compares against it, so a pick made
+        # while the turn prepares is left for the next turn.
+        _pick_before = self._model_pref.get(route)
         provider, is_new, resumed = await self.sessions.get_or_create(
             session_key,
             start_priority=person_priority(msg.person_origin),
@@ -198,9 +206,11 @@ async def _run_turn(
             # that conversation under a model its owner never picked, silently
             # and for every later turn. A resumed session therefore passes None
             # and lets its own persisted model resolve.
-            model=(None if resumed_key is not None else self._model_pref.get(route) or None),
+            model=(None if resumed_key is not None else _pick_before or None),
         )
         _acquired = True
+        # Taken on acquisition: a Stop from here on cancels the turn before it streams.
+        hook_turn = ScriptHookTurn.stoppable(self.sessions, session_key, text)
         # Hold the provider this turn obtained, for the failure handler's
         # attribution question. Captured HERE rather than looked up when a
         # failure is handled: the recovery paths replace a dead session, so a
@@ -278,8 +288,16 @@ async def _run_turn(
             attachment_result = await process_telegram_attachments(self.client, msg.attachments)
             attachment_temp_paths = list(attachment_result.temp_paths)
             text = append_attachment_context(text, attachment_result)
+        # Fold the replied-to message's quoted content onto the agent-facing
+        # text HERE — after activation and command parsing, once per turn (an
+        # album arrives already merged, carrying only its head member's
+        # reply_context; a queue replay has already framed each entry and
+        # carries no reply_context). Screened, audited and fenced inside
+        # frame_reply_context; kept out of msg.text so a quoted @handle never
+        # reached the mention gate.
+        text = frame_reply_context_for_message(msg, text, session_key=session_key)
         if not text:
-            return
+            return False
         # Publish this turn's session identity so managed MCP tools resolve
         # X-Session-Key; one shared writer lives in messaging.identity.
         await facade.publish_turn_identity(self.sessions, session_key)
@@ -336,6 +354,9 @@ async def _run_turn(
                 return "auto_approve"
             return ""
 
+        # The hooks match the sender's text as the turn will send it, attachments
+        # and quoted reply included.
+        hook_turn.prompt = text
         driver = facade.TurnDriver(
             provider,
             out_renderer,
@@ -370,8 +391,13 @@ async def _run_turn(
                 session_key, lambda: self.sessions.begin_turn(session_key)
             ),
             undelivered_watch_key=session_key,
+            script_hooks=hook_turn,
         )
         accumulated = await driver.run(full_message)
+        if resumed_key is None:
+            # The route's pick is what `/model` shows and what a cold start
+            # re-applies; follow a model the engine promoted this turn.
+            follow_engine_promotion(self._model_pref, route, provider, before=_pick_before)
 
         # ── Post-turn bookkeeping (each guarded so a failure here can't
         # fall through to the except and re-record the successful turn). ──
@@ -413,6 +439,8 @@ async def _run_turn(
         # the turn completed, so the finally must NOT restore the flag --
         # unless the user cancelled it, which discards that prompt.
         _turn_landed = driver_turn_landed(driver)
+        if _turn_landed:
+            note_turn_landed(self.sessions, session_key)
         if _unfinished:
             facade.Stats().inc_message_failed()
         else:
@@ -704,6 +732,7 @@ async def _run_turn(
     # necessarily the person who queued during it.
     if drain:
         await self._drain_queue(session_key)
+    return True
 
 
 def _persist_turn(

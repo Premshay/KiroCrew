@@ -140,6 +140,7 @@ class ClaudeHarness(MembershipHarness):
         member_dispatch: bool = False,
         crew_panel: bool = False,
         session_key: str = "",
+        worker_stub_names: frozenset[str] | None = None,
     ) -> SessionExtras:
         """Empty. The adapter has no custom-agent channel to register anything on."""
         return SessionExtras()

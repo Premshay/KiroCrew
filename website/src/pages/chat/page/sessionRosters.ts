@@ -17,6 +17,8 @@ interface SessionRostersOptions {
   slots: ChatSlot[]
   pendingAgent: string
   dispatch: AppDispatch
+  /** The active session's `models_backend`: its harness lists other models than the configured one. */
+  modelsBackend?: string
 }
 
 /**
@@ -24,7 +26,7 @@ interface SessionRostersOptions {
  * session: this machine's catalog. Also the agent picker's filter state and its
  * "set as default" write.
  */
-export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, slots, pendingAgent, dispatch }: SessionRostersOptions) {
+export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, slots, pendingAgent, dispatch, modelsBackend }: SessionRostersOptions) {
   const { agents: installedAgents, displayAgents, choices: catalogChoices, displayChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
   const sidebarChoices = displayChoices
   // What the chat sidebar tints its rows from: the last LOADED roster, so a
@@ -55,12 +57,15 @@ export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigge
   const modelPickerSlot = slots.find(slot => slot.key === activeSlot)
   const modelPickerAgentName = modelPickerSlot?.runtime_agent || modelPickerSlot?.agent || pendingAgent || defaultAgent
   const modelPickerAgent = installedAgents.find(agent => agent.name === modelPickerAgentName)
-  const localModelCatalog = useAvailableModelsQuery({ agent: modelPickerAgent })
-  const effectiveModels = localModelCatalog.data
+  const ownModelsQuery = useAvailableModelsQuery({ backend: modelsBackend, agent: modelPickerAgent })
+  const ownModelsFailed = modelsBackend !== undefined
+    && (ownModelsQuery.isError || ownModelsQuery.isDegraded)
+  const effectiveModels = ownModelsQuery.data
+  const localModelCatalog = ownModelsQuery
   return {
     installedAgents, sidebarAgents, sidebarChoices, defaultAgent, effectiveAgents,
     defaultAgentFailed, toggleDefaultAgent,
     agentDropdown, setAgentDropdown, agentFilter, setAgentFilter, agentDropdownRef, agentInputRef, filteredAgents,
-    effectiveModels, localModelCatalog,
+    effectiveModels, localModelCatalog, ownModelsQuery, ownModelsFailed,
   }
 }

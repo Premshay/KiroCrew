@@ -12,13 +12,15 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import threading
 from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import platform_compat
-from kiro_crew.config.paths import data_home, peek_data_home
+from kiro_crew import env_node_windows, env_own_kirocrew, platform_compat
+from kiro_crew.config.paths import data_home
+from kiro_crew.env_mise import _mise_bin
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # ``uv`` is a declared dependency shipped as a wheel (``setup.cfg``), so this
@@ -96,7 +98,10 @@ _EXTRA_PATH_DIRS = (
 # contribution out, :func:`mcp_runtime_path` wraps the former rather than
 # altering it, and nothing is persisted.
 #
-# That exception is also where the setting stops being live. A resolution caller
+# A second exception, the agent child (kiro-cli), which starts an unwrapped
+# bare-name server itself: see :func:`append_mcp_path_dirs`.
+#
+# The gatewayd exception is also where the setting stops being live. A resolution caller
 # reads the current snapshot on every call, so an edit reaches it immediately;
 # the daemon's PATH is a process environment fixed when ``manager._spawn_once``
 # spawns it, and an ADOPTED survivor never has a new one applied (``manager``'s
@@ -155,12 +160,23 @@ def _warn_rejected_bin_dir(raw: object, source: str) -> None:
 def _validated_bin_dirs(values: object, source: str) -> list[str]:
     """Validate an operator-supplied LIST of bin directories, dropping bad ones.
 
-    ``~`` is expanded first (a config file is where a human writes
-    ``~/.pixi/bin``), then each entry passes the same
-    :func:`_validated_bin_dir` gate as this module's own well-known dirs — one
-    absolute directory, no path separator, no NUL. A rejected entry is dropped
-    rather than failing the whole list: one typo must not cost an operator every
-    other directory they declared, nor abort PATH construction for every spawn.
+    ``~`` is expanded first (:func:`os.path.expanduser`, so ``~/.pixi/bin`` and a
+    ``~otheruser/bin`` both resolve the way an operator expects), then each entry
+    passes the same :func:`_validated_bin_dir` gate as this module's own
+    well-known dirs — one absolute directory, no path separator, no NUL. A
+    rejected entry is dropped rather than failing the whole list: one typo must
+    not cost an operator every other directory they declared, nor abort PATH
+    construction for every spawn.
+
+    A ``~otheruser`` prefix makes :func:`os.path.expanduser` call
+    ``pwd.getpwnam`` (POSIX) / the SAM database (Windows) SYNCHRONOUSLY, which on
+    an LDAP/SSSD/AD-backed host can block for as long as the directory service
+    takes to answer. That is tolerable on the paths that reach this at startup or
+    off the event loop, but NOT on the gateway's live ``.env`` PATH hot-reload,
+    which runs on the loop -- so that one caller expands and validates its
+    additions OFF the loop first (see :func:`extend_process_path` and
+    ``config.live.ConfigWatch._cycle``), and nothing on the loop reaches this
+    with an unexpanded ``~otheruser`` entry.
 
     *values* is typed ``object`` because both sources are hand-editable and can
     legally parse as something other than a list of strings.
@@ -241,27 +257,57 @@ def _extra_mcp_path_dirs() -> list[str]:
     ]
 
 
-def extend_process_path(value: str) -> None:
+def prepare_env_path_additions(value: str) -> tuple[str, ...]:
+    """Expand and validate a ``.env`` ``PATH`` line into absolute dirs to ADD.
+
+    The part of :func:`extend_process_path` that does NOT touch ``os.environ``,
+    split out so a caller on the event loop can run it OFF the loop. Each entry
+    goes through the absolute-directory gate the other operator lists use
+    (:func:`_validated_bin_dirs`, so ``~``/``~otheruser`` expands via
+    :func:`os.path.expanduser` and a relative or unexpanded entry such as
+    ``$HOME/bin`` is dropped with a warning), then is deduped in declared order.
+
+    This is where the only call that can BLOCK lives: a ``~otheruser`` entry
+    makes ``os.path.expanduser`` call ``pwd.getpwnam`` / the SAM database
+    synchronously, which an LDAP/SSSD/AD lookup can stall. The gateway's live
+    ``.env`` hot-reload (``config.live.ConfigWatch._cycle``) therefore calls THIS
+    off the loop and hands the result to :func:`extend_process_path`, so the only
+    work left on the loop is the ``os.environ`` mutation. Pure: no ``os.environ``
+    write, so it is safe to run in a worker thread.
+    """
+    wanted = [entry for entry in value.split(os.pathsep) if entry.strip()]
+    return tuple(_dedup_dirs(_validated_bin_dirs(wanted, ".env PATH")))
+
+
+def extend_process_path(value: str, *, prepared: tuple[str, ...] | None = None) -> None:
     """Append the directories of a data-home ``.env`` ``PATH`` line to this process's ``PATH``.
 
     The ``.env`` loader seeds the environment with ``setdefault``, and a process
     always has a ``PATH``, so this key cannot be applied the way every other one
-    is. The line is read as directories to ADD, never as a replacement: each entry
-    goes through the absolute-directory gate the other operator lists use
-    (:func:`_validated_bin_dirs`, so ``~`` expands and a relative or unexpanded
-    entry such as ``$HOME/bin`` is dropped with a warning), and lands behind the
-    ``PATH`` the process already has, so it can add a launcher but never shadow a
-    system tool. The existing string is kept byte for byte and an entry it
-    already holds is skipped, so the repeated loads of the file do not grow it.
+    is. The line is read as directories to ADD, never as a replacement: each
+    entry goes through :func:`prepare_env_path_additions` (``~``/``~otheruser``
+    expands, a relative or unexpanded entry such as ``$HOME/bin`` is dropped with
+    a warning), and lands behind the ``PATH`` the process already has, so it can
+    add a launcher but never shadow a system tool. The existing string is kept
+    byte for byte and an entry it already holds is skipped, so the repeated loads
+    of the file do not grow it.
+
+    *prepared* lets a caller that already ran :func:`prepare_env_path_additions`
+    OFF the event loop pass its result in, so the expand/validate step -- the one
+    that can block on a ``~otheruser`` directory-service lookup -- is not repeated
+    on the loop; only the ``os.environ`` mutation here runs on it. When omitted,
+    the expansion runs inline, which is what the boot and off-loop dashboard
+    callers want. A *prepared* value must be the result of
+    :func:`prepare_env_path_additions` over this same *value*.
 
     Nothing else about the environment widens. An agent child still receives its
     environment through the launch tail's scrub, and the terminal completion
     probe still filters this ``PATH`` through its ownership check.
     """
+    additions = prepare_env_path_additions(value) if prepared is None else prepared
     current = os.environ.get("PATH") or os.defpath
     held = _dedup_dirs(current.split(os.pathsep))
-    wanted = [entry for entry in value.split(os.pathsep) if entry.strip()]
-    merged = _dedup_dirs([*held, *_validated_bin_dirs(wanted, ".env PATH")])
+    merged = _dedup_dirs([*held, *additions])
     if len(merged) > len(held):
         os.environ["PATH"] = os.pathsep.join([current, *merged[len(held) :]])
 
@@ -324,6 +370,7 @@ _NODE_MANAGER_DIRS = (
     # process and does not inherit N_PREFIX from the user's shell rc.
     "{home}/.n/bin",
 )
+# The same managers' Windows default roots live in :mod:`kiro_crew.env_node_windows`.
 # Standalone Node TREES -- an unpacked distribution rather than a manager's
 # per-version store, so there is no version to glob and no shim to consult.
 # These are where an operator unpacking a nodejs.org tarball by hand puts one.
@@ -517,8 +564,8 @@ def node_bin_dirs() -> tuple[str, ...]:
        because it names the version that script decided on.
     3. The highest version found under each per-version manager root
        (mise / asdf / nvm / fnm; nvm under both ``~/.nvm`` and the XDG config
-       dir).
-    4. Shim dirs (mise shims, volta, n).
+       dir; on Windows also fnm and nvm-windows under ``%APPDATA%``).
+    4. Shim dirs (mise shims, volta, n; on Windows also Volta's two roots).
     5. Standalone Node trees -- the glibc-2.17 build ``ensure-node.sh`` unpacks
        into the data home (:data:`_NODE_TREE_DATA_HOME_DIRS`), then a
        hand-unpacked nodejs.org tarball under ``~/.local``
@@ -556,11 +603,15 @@ def node_bin_dirs() -> tuple[str, ...]:
     if marker:
         ordered.append(marker)
 
+    globs = (*_NODE_MANAGER_GLOBS, *env_node_windows.manager_globs(home))
     ordered.extend(
-        _manager_version_bin_dirs(home, mise_data, _xdg_config_dir(home), all_versions=False)
+        _manager_version_bin_dirs(
+            home, mise_data, _xdg_config_dir(home), all_versions=False, patterns=globs
+        )
     )
 
     ordered.extend(d.format(home=home, mise_data=mise_data) for d in _NODE_MANAGER_DIRS)
+    ordered.extend(env_node_windows.manager_dirs(home))
     # Under a KIROCREW_HOME override data_home() mkdirs, so it can raise on an
     # unwritable path. Only the data-home candidates depend on it; swallowing here
     # keeps a failure from taking out the manager and $HOME tiers with them.
@@ -619,11 +670,13 @@ def _homebrew_keg_node_bin_dirs() -> list[str]:
 
 
 @functools.lru_cache(maxsize=1)
-def _node_all_bin_dirs(home: str, mise_data: str, xdg_config: str) -> tuple[str, ...]:
+def _node_all_bin_dirs(
+    home: str, mise_data: str, xdg_config: str, windows_globs: tuple[str, ...] = ()
+) -> tuple[str, ...]:
     """Cached body of :func:`node_all_bin_dirs`, keyed on its inputs.
 
     Keyed on every root the globs format (``home``, ``mise_data``,
-    ``xdg_config``) — matching the retired helper's ``home`` keying — so a
+    ``xdg_config``, the Windows globs from ``env_node_windows``) — matching the retired helper's ``home`` keying — so a
     caller under a different HOME or config dir (tests patching ``expanduser``
     or ``XDG_CONFIG_HOME``) gets a fresh scan instead of the previous key's
     dirs, while the steady-state gateway still globs exactly once.
@@ -631,7 +684,13 @@ def _node_all_bin_dirs(home: str, mise_data: str, xdg_config: str) -> tuple[str,
     out: list[str] = []
     seen: set[str] = set()
     for d in (
-        *_manager_version_bin_dirs(home, mise_data, xdg_config, all_versions=True),
+        *_manager_version_bin_dirs(
+            home,
+            mise_data,
+            xdg_config,
+            all_versions=True,
+            patterns=(*_NODE_MANAGER_GLOBS, *windows_globs),
+        ),
         *_homebrew_keg_node_bin_dirs(),
     ):
         d = os.path.normpath(d)
@@ -673,7 +732,8 @@ def node_all_bin_dirs() -> tuple[str, ...]:
     ever needs re-discovery without one.
     """
     home = os.path.expanduser("~")
-    return _node_all_bin_dirs(home, mise_data_dir(home), _xdg_config_dir(home))
+    windows_globs = env_node_windows.manager_globs(home)
+    return _node_all_bin_dirs(home, mise_data_dir(home), _xdg_config_dir(home), windows_globs)
 
 
 def node_augmented_path(base_path: str = "") -> str:
@@ -854,25 +914,56 @@ def git_build_info() -> tuple[str, str]:
     )
 
 
-def _managed_browser_cli_dirs() -> list[str]:
-    """Managed browser CLI directories exposed to agent shell commands.
+def _own_kirocrew_dirs() -> list[str]:
+    """This install's ``kirocrew`` directory (:func:`env_own_kirocrew.own_kirocrew_dirs`)."""
+    return env_own_kirocrew.own_kirocrew_dirs(_validated_bin_dir)
 
-    The resolver in ``browser_cli.install`` never consumes this search path. It
-    resolves the same crew-home leaf by absolute path. These entries exist only
-    so an approved agent shell command can spell ``playwright-cli`` normally;
-    the OS sandbox seals the whole prefix read-only before that shell starts.
+
+def _windows_toolbox_bin_dir(resolved_home: str, pinned_home: str | None) -> str | None:
+    """Builder Toolbox's Windows bin dir, ``%LOCALAPPDATA%\\Toolbox\\bin``.
+
+    On Windows Toolbox does not use ``~/.toolbox/bin``: its install guide puts
+    every tool (``claude``, ``kiro-cli``, ...) under ``%LOCALAPPDATA%\\Toolbox\\bin``
+    and has the user add that to their own PATH, which a gateway started before
+    that edit (or by a launcher that does not read it) never sees. So the Agent
+    Harness probe reported a Toolbox-installed Claude Code as not installed.
+
+    ``LOCALAPPDATA`` names the account running this process, so a caller that
+    pinned another account's *pinned_home* gets that home's ``AppData\\Local``.
     """
-    try:
-        root = peek_data_home() / "playwright-cli"
-    except Exception:
-        logger.debug("could not resolve managed browser CLI path", exc_info=True)
-        return []
-    entries: tuple[Path, ...]
-    if platform_compat.IS_WINDOWS:
-        entries = (root / "managed-bin", root / "bin", root)
-    else:
-        entries = (root / "managed-bin", root / "bin")
-    return [value for entry in entries if (value := _validated_bin_dir(str(entry)))]
+    local = os.environ.get("LOCALAPPDATA", "") if pinned_home is None else ""
+    base = local or os.path.join(resolved_home, "AppData", "Local")
+    return _validated_bin_dir(os.path.join(base, "Toolbox", "bin"))
+
+
+def user_tool_bin_dirs(home: str) -> list[str]:
+    """:data:`_EXTRA_PATH_DIRS` formatted for *home*, invalid entries dropped.
+
+    The fixed tool-manager bin dirs, and nothing else: no managed browser CLI,
+    no per-version Node bins, no inherited ``PATH`` and no interpreter dir. That
+    is the part of :func:`augmented_path`'s search a process can pin once for a
+    whole account, which is what the pod gateway's default ``PATH`` needs (see
+    ``pod.config.default_gateway_path``). Every entry passes the same
+    absolute-only :func:`_validated_bin_dir` gate, so a relative
+    ``MISE_DATA_DIR`` cannot introduce a cwd-relative entry. Each entry is
+    ``os.path.normpath``-ed first: the templates join with ``/``, so on Windows
+    the raw entry mixes separators with *home*'s ``\\`` and would not match the
+    native spelling of the same directory.
+    """
+    mise_data = mise_data_dir(home)
+    return [
+        e
+        for d in _EXTRA_PATH_DIRS
+        if (e := _validated_bin_dir(os.path.normpath(d.format(home=home, mise_data=mise_data))))
+    ]
+
+
+# Where a POSIX PATH's system section starts. An inherited well-known dir only
+# anchors :func:`augmented_path`'s prepend when it sits ahead of these. POSIX
+# only: augmented_path does no anchoring on Windows.
+_SYSTEM_BIN_DIRS = frozenset(
+    os.path.normcase(os.path.normpath(d)) for d in ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+)
 
 
 def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
@@ -888,17 +979,23 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     sync.
 
     On Windows a launched (non-shell) gateway inherits a ``PATH`` that does
-    not include the venv's ``Scripts\\`` directory, so ``shutil.which`` fails
-    to resolve the ``kirocrew`` / ``kirocrew-core`` console-script wrappers
-    pip generated for MCP-server spawn. Append ``sys.executable``'s parent
-    directory as the LAST entry so the running interpreter's own
-    console-scripts (``Scripts\\`` on Windows, ``bin/`` on POSIX) are always
-    discoverable. Last, not first: the interpreter dir also contains
-    ``python``/``pip``, and placing it ahead of ``base_path`` would silently
+    not include the interpreter's console-scripts directory, so
+    ``shutil.which`` fails to resolve the ``kirocrew`` / ``kirocrew-core``
+    wrappers pip generated for MCP-server spawn, or the bundled ``uv`` /
+    ``uvx``. Append ``sys.executable``'s parent and then the interpreter's
+    ``sysconfig`` scripts directory as the LAST entries, so its own console
+    scripts are always discoverable. In a venv (``Scripts\\`` on Windows,
+    ``bin/`` on POSIX) and in a POSIX python-build-standalone tree they are
+    one directory. The Windows desktop backend is a python-build-standalone
+    tree with ``python.exe`` at its root and its console scripts in
+    ``Scripts\\``, so there they differ. Last, not first: the interpreter dir
+    also contains ``python``/``pip``, and placing it ahead of ``base_path`` would silently
     rebind a user MCP spec's bare ``"command": "python"`` (and the spawned
     agent's own ``python``/``pip`` shell calls) to the gateway's venv
     interpreter. As a pure fallback it resolves only names found nowhere
-    else — exactly the console-script-wrapper case.
+    else — exactly the console-script-wrapper case. The one name that must
+    NOT fall through to an earlier directory is ``kirocrew`` itself, so a
+    directory holding only that link (:func:`_own_kirocrew_dirs`) goes ahead of ``~/.local/bin``.
 
     Deliberately NOT extended by ``mcp.extra_path_dirs`` /
     :func:`register_mcp_path_dirs`: callers here include the resolvers for the
@@ -906,6 +1003,31 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     ``acp.client``'s claude-backend resolvers), which must not consume a
     contributed directory. That contribution lives on :func:`mcp_search_path` —
     see the section comment near ``_registered_path_dirs``.
+
+    A well-known directory the inherited ``base_path`` ALREADY lists ahead of
+    its system dirs (``/usr/bin``, ``/bin``, ``/usr/sbin``, ``/sbin``) is an
+    ANCHOR: it is not prepended again, so it keeps the position the user gave
+    it. The prepend exists for a gateway whose inherited ``PATH`` lacks these
+    dirs (systemd / launchd / another non-login shell); re-prepending a dir the
+    user already placed behind their own (a Nix devshell's tool dirs) would
+    shadow the user's choice instead. Matching uses ``normcase(normpath(...))``
+    exactly as :func:`_dedup_dirs` does.
+
+    Every other extra keeps its rank relative to the anchors: extras ranked
+    before the first anchor are prepended as before, and each later extra is
+    inserted right after the right-most of the higher-ranked anchors. So un-inherited
+    per-version node bins still follow inherited mise shims or an inherited
+    ``/opt/homebrew/bin``, and still precede ``/usr/bin``. An inherited dir
+    that sits behind a system dir is not an anchor and is prepended as on
+    main, so a :func:`~kiro_crew.service.common.service_path` ``PATH``
+    (``~/.local/bin:/usr/local/bin:/usr/bin:/bin:<installer PATH>``, with
+    mise's shims after ``~/.local/bin`` on Linux) resolves in the same order
+    as before. With no anchor at all the output equals main.
+    Anchoring is POSIX-only: on Windows the system section (``System32``) comes
+    FIRST and user dirs such as ``~/.local/bin`` come last, so there is no
+    "ahead of the system dirs" to anchor in, and every extra is prepended
+    exactly as on main. The ``sys.executable`` fallback is still appended last regardless, since its
+    whole purpose is to resolve names found nowhere else.
     """
     resolved_home = home or os.path.expanduser("~")
     mise_data = mise_data_dir(resolved_home)
@@ -914,16 +1036,81 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     # would otherwise put a relative "{mise_data}/shims" entry on every spawned
     # subprocess's PATH, re-resolved against the CHILD's cwd — letting a
     # work-dir-relative executable shadow the configured command.
-    extra = _managed_browser_cli_dirs() if home is None else []
+    extra = _own_kirocrew_dirs() if home is None else []
     extra += [
         e
         for d in _EXTRA_PATH_DIRS
         if (e := _validated_bin_dir(d.format(home=resolved_home, mise_data=mise_data)))
     ]
-    extra += _node_all_bin_dirs(resolved_home, mise_data, _xdg_config_dir(resolved_home))
-    parts = extra + ([base_path] if base_path else [])
-    parts.append(str(Path(sys.executable).parent))
+    if platform_compat.IS_WINDOWS and (
+        toolbox_bin := _windows_toolbox_bin_dir(resolved_home, home)
+    ):
+        extra.append(toolbox_bin)
+    extra += env_node_windows.manager_dirs(resolved_home, home)
+    windows_globs = env_node_windows.manager_globs(resolved_home, home)
+    extra += _node_all_bin_dirs(
+        resolved_home, mise_data, _xdg_config_dir(resolved_home), windows_globs
+    )
+    # Anchor each well-known dir the inherited PATH already lists ahead of its
+    # system dirs, so a prepend never moves it in front of the user's own dirs.
+    # Un-anchored extras keep their rank: before the first anchor they are
+    # prepended; after it they go right behind the right-most higher-ranked anchor.
+    # Windows has no anchors: its PATH lists System32 first and user dirs last,
+    # and _SYSTEM_BIN_DIRS never matches there, so anchoring would push every
+    # extra behind System32. Every extra is prepended there exactly as on main.
+    entries = base_path.split(os.pathsep) if base_path else []
+    anchors: dict[str, int] = {}
+    for i, p in enumerate(entries if not platform_compat.IS_WINDOWS else ()):
+        n = os.path.normcase(os.path.normpath(p)) if p else ""
+        if n in _SYSTEM_BIN_DIRS:
+            break
+        if n:
+            anchors.setdefault(n, i)
+    before: list[str] = []
+    after: dict[int, list[str]] = {}
+    anchor: int | None = None
+    for e in extra:
+        n = os.path.normcase(os.path.normpath(e))
+        if n in anchors:
+            # Never move back left: a lower-ranked extra must stay behind every
+            # higher-ranked anchor, even when the user listed those anchors in
+            # the opposite order (e.g. /usr/local/bin before the mise shims).
+            anchor = anchors[n] if anchor is None else max(anchor, anchors[n])
+        elif anchor is None:
+            before.append(e)
+        else:
+            after.setdefault(anchor, []).append(e)
+    parts = list(before)
+    for i, p in enumerate(entries):
+        parts.append(p)
+        parts.extend(after.get(i, ()))
+    parts.extend(_interpreter_script_dirs())
     return os.pathsep.join(parts)
+
+
+def _interpreter_script_dirs() -> list[str]:
+    """The running interpreter's own directory, then its console-scripts directory.
+
+    One entry when they are the same directory (a venv, POSIX
+    python-build-standalone); two on the Windows desktop backend, where
+    ``python.exe`` sits at the tree root and pip installs ``uv.exe`` and the
+    ``kirocrew`` wrappers into ``Scripts\\``.
+    """
+    dirs = [str(Path(sys.executable).parent)]
+    scripts = _INTERPRETER_SCRIPTS_DIR
+    same = os.path.normcase(os.path.normpath(scripts)) == os.path.normcase(
+        os.path.normpath(dirs[0])
+    )
+    if scripts and os.path.isabs(scripts) and not same:
+        dirs.append(scripts)
+    return dirs
+
+
+#: The interpreter's console-scripts directory, read once at import. It
+#: depends only on ``sys.prefix``, which does not change at runtime, and
+#: ``sysconfig.get_path`` runs ``os.path.expanduser`` over its result, so a
+#: per-call read would follow whatever home the caller is pinning.
+_INTERPRETER_SCRIPTS_DIR = sysconfig.get_path("scripts") or ""
 
 
 #: How many directories :func:`describe_search_path` names before truncating.
@@ -1172,6 +1359,27 @@ def resolved_command_casing(path: str | None) -> str:
     return path[: -len(name)] + matches[0]
 
 
+def saved_command_casing(path: str) -> str:
+    """Heal a saved absolute command whose only flaw is a PATHEXT extension.
+
+    Builds before :func:`resolved_command_casing` existed persisted
+    ``shutil.which`` results such as ``...\\demo-mcp.EXE`` as absolute
+    commands, and every resolver accepts an existing absolute command verbatim,
+    so the spelling never healed. This repairs only that signature: the stem
+    matches the on-disk entry exactly and the extension differs in case alone.
+    Any other spelling, a stem written in different case included, is the
+    operator's own and is returned unchanged.
+    """
+    repaired = resolved_command_casing(path)
+    if repaired == path:
+        return path
+    stem, ext = os.path.splitext(os.path.basename(path))
+    new_stem, new_ext = os.path.splitext(os.path.basename(repaired))
+    if stem == new_stem and ext != new_ext:
+        return repaired
+    return path
+
+
 def mcp_runtime_path(base_path: str = "") -> str:
     """Contributed MCP directories, then :func:`augmented_path` unchanged.
 
@@ -1202,6 +1410,25 @@ def mcp_runtime_path(base_path: str = "") -> str:
     if not extra:
         return path
     return os.pathsep.join(_dedup_dirs([*extra, *path.split(os.pathsep)]))
+
+
+def append_mcp_path_dirs(path: str) -> str:
+    """*path* with the contributed MCP dirs appended AFTER every entry, for an agent child.
+
+    kiro-cli resolves a bare-name server command against the PATH it inherits, and
+    its spec carries no contributed dir (:func:`spec_env_path`), so a gateway whose
+    PATH lacks one (a service installed from a non-login shell) starts no such
+    server. The dirs TRAIL, unlike :func:`mcp_runtime_path`, because the agent's
+    shell resolves against this PATH too: they only supply names found nowhere
+    else. Every existing entry, an empty (cwd) one too, is kept verbatim. Computed
+    per spawn, stored nowhere. A ``~user`` entry may block on lookup: run off-loop.
+    """
+    present = {os.path.normcase(os.path.normpath(p)) for p in path.split(os.pathsep) if p}
+    norm = os.path.normcase
+    added = [
+        d for d in _dedup_dirs(_extra_mcp_path_dirs()) if norm(os.path.normpath(d)) not in present
+    ]
+    return os.pathsep.join([p for p in (path, *added) if p]) if added else path
 
 
 # Env keys a spec's declared ``env`` must never set on a process WE spawn.
@@ -1551,38 +1778,6 @@ def expand_spec_args(args: Any, *, server: str | None = None) -> Any:
     ]
 
 
-@functools.lru_cache(maxsize=1)
-def _mise_bin() -> str | None:
-    """Locate the ``mise`` binary in a non-login (daemon) context.
-
-    A systemd / launchd gateway does not source the user's shell rc, so
-    ``~/.local/bin`` (mise's default install dir) is often absent from the
-    inherited ``$PATH``. Try ``$PATH`` first, then the default install dir,
-    then macOS Homebrew locations. Discovery must work before mise activation
-    adds the user's toolchain directories to the gateway environment.
-
-    A candidate whose probe raises ``OSError`` is skipped like a missing one:
-    ``Path.is_file`` swallows only not-found errors, so a ``stat`` refused with
-    EACCES (a restricted ``/usr/local/bin`` or a sandboxed gateway) would
-    otherwise abort gateway boot from a lookup that is meant to be optional.
-    """
-    found = shutil.which("mise")
-    if found:
-        return found
-    candidates = [Path.home() / ".local" / "bin" / "mise"]
-    if sys.platform == "darwin":
-        candidates.extend([Path("/opt/homebrew/bin/mise"), Path("/usr/local/bin/mise")])
-    for candidate in candidates:
-        try:
-            usable = candidate.is_file() and os.access(candidate, os.X_OK)
-        except OSError as exc:
-            logger.debug("mise candidate %s skipped: %s", candidate, type(exc).__name__)
-            continue
-        if usable:
-            return str(candidate)
-    return None
-
-
 def activate_mise(env: MutableMapping[str, str] | None = None) -> list[str]:
     """Merge mise's resolved environment into *env* (defaults to ``os.environ``).
 
@@ -1619,7 +1814,7 @@ def activate_mise(env: MutableMapping[str, str] | None = None) -> list[str]:
         proc = subprocess.run(
             [mise, "env", "--json"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=10,
             env=dict(target),
             cwd=str(Path.home()),

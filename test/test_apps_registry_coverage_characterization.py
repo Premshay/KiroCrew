@@ -51,9 +51,8 @@ class TestCacheFilenamesAreFrozen:
     _ROOT = Path("/registry-cache")
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- the class's own cache-root pin, moved verbatim; no test in the class calls monkeypatch.undo()
-    def _root(self, monkeypatch):
-        monkeypatch.setattr(registry, "_manifest_cache_dir", lambda: self._ROOT)
+    def _root(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr(registry, "_manifest_cache_dir", lambda: self._ROOT)
 
     def test_a_manifest_file_is_keyed_by_the_full_normalized_coordinates(self):
         entry = {
@@ -290,7 +289,14 @@ class TestTimeoutsAreReadWhereTheyAreUsed:
             "fetch cut off by the clone timeout",
             timeout=5,  # flake-ok: the 5 s bound IS the assertion; an inert _CLONE_TIMEOUT patch waits the real 60 s
         )
-        assert result == {"ok": False, "name": "demo-app", "error": "git fetch failed (exit 124)"}
+        assert result == {
+            "ok": False,
+            "name": "demo-app",
+            "error": (
+                "git fetch failed (exit 124): timed out; "
+                "check your network and proxy settings (HTTPS_PROXY, NO_PROXY)"
+            ),
+        }
         assert len(killed) == 1 and isinstance(killed[0], _NeverExits)
         assert "timed out" in log
         assert not dest.exists(), "a destination this call created is discarded on failure"

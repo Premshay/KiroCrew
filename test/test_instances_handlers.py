@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from instances_helpers import _body, _ConnectedMgr, _enable, _fake_reconfigure, _FakeReq, _State
+
+# 2100-01-01T00:00:00Z: a fixed stamp later than any write the test makes, so it reads as a
+# tunnel connected after the edit without reading the host clock.
+_CONNECTED_AFTER_ANY_WRITE = 4102444800.0
 
 
 class TestHandlers:
@@ -736,6 +741,19 @@ class TestHandlers:
         )
         assert rejected.status == 400 and _body(rejected)["code"] == "instance_invalid"
 
+    @pytest.mark.parametrize("field", ["remote_port", "via_remote_port"])
+    @pytest.mark.parametrize("raw", ["1e999", "-1e999"])
+    def test_add_infinite_port_is_an_invalid_field(self, tmp_path, monkeypatch, field, raw):
+        """JSON reads ``1e999`` as an infinite float: the invalid_field 400, never a 500."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        state = _State(reg)
+        body = json.loads(f'{{"name": "Bad", "ssh_host": "h", "{field}": {raw}}}')
+        resp = asyncio.run(handlers.api_instances_add(_FakeReq(state, body=body)))
+        assert resp.status == 400 and _body(resp)["code"] == "invalid_field"
+
     def test_update_paths(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard import handlers_instances as handlers
 
@@ -995,8 +1013,6 @@ class TestHandlers:
         """One teardown, inside the reconfiguration. An extra one after the write
         would hit whatever connected next — i.e. a Connect the user just made on
         the new coordinates."""
-        import time as _time
-
         from kiro_crew.dashboard import handlers_instances as handlers
         from kiro_crew.instances.ssh_tunnel_manager import TunnelState, TunnelStatus
 
@@ -1013,13 +1029,12 @@ class TestHandlers:
                 return True
 
             def status(self, instance_id):
-                # Connected just now — i.e. after the write this handler is about
-                # to make, which is the case the dated sweep must spare.
-                # flake-ok: pre-existing live-clock stamp set 60 s ahead so it reads newer than the edit's write, moved verbatim
+                # Connected after the write this handler is about to make, which is
+                # the case the dated sweep must spare.
                 return TunnelStatus(
                     instance_id=instance_id,
                     state=TunnelState.CONNECTED,
-                    connected_at=_time.time() + 60,
+                    connected_at=_CONNECTED_AFTER_ANY_WRITE,
                 )
 
             def last_error(self, instance_id):
@@ -1404,7 +1419,7 @@ class TestHandlers:
             def __init__(self, ok):
                 self._ok = ok
 
-            async def restart_remote(self, iid):
+            async def restart_remote(self, iid, *, force=False):
                 return {"ok": self._ok, "message": "" if self._ok else "fail"}
 
         # success -> 200

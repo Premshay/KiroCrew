@@ -6,7 +6,7 @@ import { setUpdateProgress } from './store/dashboardSlice'
 // module below that reads it (`shell/nav/navItems.ts` computes `NAV_ITEMS`).
 import './surfaces/builtins'
 import { surfaceLabel } from './surfaces/registry'
-import { setAgentSwitchNotice } from './store/chatSlice'
+import AgentSwitchNoticeBanner from './components/AgentSwitchNoticeBanner'
 import { GuideProvider } from './guide/GuideContext'
 import { metricColor } from './utils/metricColor'
 import { railWidthFor } from './hooks/useRailWidth'
@@ -15,15 +15,16 @@ import { OVERLAY_Z_MAX, THEME_DECOR_BEHIND_SLOT_ID, THEME_DECOR_SLOT_ID, registe
 import { ZoomProvider } from './hooks/ZoomProvider'
 import { api } from './api/client'
 import { MetricsCard } from './shell/topbar/metricsReadout'
-import { Rocket, Code, RefreshCw, Package, Download, Hammer, XCircle, Check, AlertTriangle, X, Coins, SquareTerminal, Search as SearchIcon } from 'lucide-react'
+import { Rocket, RefreshCw, Package, Download, Hammer, XCircle, Check, AlertTriangle, Coins, SquareTerminal, Search as SearchIcon } from 'lucide-react'
 import { FirstRunChapters } from './shell/boot/firstRun'
 import ErrorNotice from './components/ErrorNotice'
-import { MobileConnectDialog } from './shell/nav/mobileConnect'
+import { MobileConnectDialog } from './components/mobileConnect'
 import { isMacElectron, isWinElectron, isLinuxFramelessElectron } from './lib/electron'
 import ChatPage from './pages/ChatPage'
 import PopoutFrame from './pages/PopoutFrame'
 import ArtifactPopoutFrame from './pages/ArtifactPopoutFrame'
 import TerminalPopoutFrame from './pages/TerminalPopoutFrame'
+import AppPopoutFrame, { AppPopoutHardExit } from './pages/AppPopoutFrame'
 
 import ErrorBoundary from './components/ErrorBoundary'
 import AskAgentButton from './components/AskAgentButton'
@@ -36,6 +37,16 @@ import LogsPage from './pages/LogsPage'
 const MembersPage = lazy(() => import('./pages/members/MembersPage'))
 // The guide pill renders only once a guide is offered; keep it off the entry chunk.
 const GuideLayer = lazy(() => import('./guide/GuideLayer'))
+// App-contributed link previews (`contributes.linkPreviews`): hover detection only;
+// an app's module loads on the first hover of one of its links.
+const LinkPreviewLayer = lazy(() => import('./linkPreview/LinkPreviewLayer'))
+// App-contributed message actions (`contributes.messageActions`): a More-menu row per
+// approved action; an app's module loads only when its row is clicked.
+const MessageActionLayer = lazy(() => import('./messageActions/MessageActionLayer'))
+// App-contributed link opening (`contributes.linkOpen`): click detection only; an
+// app's module loads when the user chooses to open a link in it.
+const LinkOpenLayer = lazy(() => import('./linkOpen/LinkOpenLayer'))
+const SelectionActionLayer = lazy(() => import('./selectionActions/SelectionActionLayer'))
 // Lazy for the same reason: the crew work-item board is opened from a conductor
 // session or the Crew page, never at startup.
 const CrewBoardPage = lazy(() => import('./pages/CrewBoardPage'))
@@ -44,40 +55,42 @@ const CrewBoardPage = lazy(() => import('./pages/CrewBoardPage'))
 const ArcBoardPage = lazy(() => import('./pages/ArcBoardPage'))
 const SessionDashboardsPage = lazy(() => import('./pages/chat/command-center/SessionDashboardsPage'))
 import ArtifactDetailPage from './pages/ArtifactDetailPage'
-import { ChangelogModal } from './shell/updates/updateFlow'
+import { ChangelogModal, UpdateErrorDialogFrame } from './shell/updates/updateFlow'
 import KiroCrewNavBridge from './components/KiroCrewNavBridge'
 import InstancesViewport from './components/InstancesViewport'
 import { LocalOverlayRoot } from './components/overlayRoot'
 import EmbeddedHostBridge from './components/EmbeddedHostBridge'
+import AppConfirmHost from './components/AppConfirmHost'
 import EmbeddedDragRegionReporter from './components/EmbeddedDragRegionReporter'
 import EmbedTabStrip from './components/EmbedTabStrip'
 // Dev-only layout-editor harness (RFC §7 PR 2). Lazy so it never weighs the main
 // bundle — it is a developer route, not a shipped surface.
 const LayoutEditorHarnessPage = lazy(() => import('./pages/LayoutEditorHarnessPage'))
+
 import UpdateModal from './components/UpdateModal'
 
 import ComputerUseLiveView from './components/ComputerUseLiveView'
 import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTerminalPanel'
-import { toggleBottomTerminal } from './hooks/useBottomTerminal'
+import { toggleBottomTerminal, useTerminalFullscreen } from './hooks/useBottomTerminal'
 import { RunInTerminalShellNotice, useRunInTerminalShellBridge } from './shell/runInTerminalShellBridge'
 import { TerminalHostContext } from './hooks/useTerminalCommand'
 // Side effect: closes a terminal tab when its shell exits (main window and popout).
 import './utils/terminalExitClose'
 import { focusPopout as focusTerminalPopout } from './utils/terminalPopout'
+import { mainStackingClass } from './utils/terminalFullscreen'
 import MigrationCheck from './components/MigrationCheck'
 import CrashReportNotice from './components/CrashReportNotice'
 import RemoteUpdateOffer from './components/RemoteUpdateOffer'
 import KiroSignInNoticeFallback from './components/KiroSignInNoticeFallback'
 import { ImportSessionOutcomeNotice } from './components/ImportSessionItem'
+import { FileMenuResultToastFrame } from './components/notifications/FileMenuResultToast'
 import BuiltinAppRoute from './apps/BuiltinAppRoute'
 import { MobileNavRailContext, MobileRosterBarContext, type MobileNavRailOptions } from './components/MobileNavRailContext'
 import ShortcutsModal from './components/ShortcutsModal'
 import QuickSearchSurface from './components/QuickSearchSurface'
 import ReportProblemModal from './components/ReportProblemModal'
 import KiroAccountModal from './components/KiroAccountModal'
-import UnscannedDownloadConfirmHost from './components/UnscannedDownloadConfirmHost'
 
-import { StartupVideo } from './shell/boot/startupVideo'
 import { i18nT } from './i18n/t'
 import { isAppNavId } from './appNotificationBadges'
 import { lazyPage, TasksRedirect, ChatRedirect, OrchestratedRedirect } from './shell/routes'
@@ -89,6 +102,7 @@ import { useAppShell } from './shell/appShell'
 import { ShellHeader } from './shell/topbar/shellHeader'
 import { ShellNavRail } from './shell/nav/navRail'
 import { NavItem, NavBadge } from './shell/nav/navRow'
+import { DockMatesTiles, useDockMates } from './shell/nav/matesDock'
 
 // Lazy on purpose: the update-found popup (its policy module, Trans runtime
 // wiring, and mutation plumbing) is dead weight for every session without an
@@ -100,6 +114,7 @@ const UpdateFoundModal = lazy(() => import('./components/UpdateFoundModal'))
 // lapsed stored sign-in), so it is always mounted and its chunk is fetched once
 // at boot; it renders nothing in the common case.
 const KiroSignInNotice = lazy(() => import('./components/KiroSignInNotice'))
+const KasEngineNotice = lazy(() => import('./components/KasEngineNotice'))
 
 // Route-level code splitting for the App Store split (PR1): Discover and
 // Library are independent surfaces, and neither belongs in the app-core
@@ -231,7 +246,7 @@ export function UpdateOverlay({ onCancel }: { onCancel: () => void }) {
   }, [dispatch, onCancel])
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/80 backdrop-blur-xs animate-rise">
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/80 backdrop-blur-xs animate-rise p-safe">
       <div className="bg-card border border-border rounded-xl p-8 max-w-md w-full mx-4 shadow-xl text-center">
         {/* A terminal step is not in progress, so it does not pulse. */}
         <div className={`text-4xl mb-4 ${isFailed ? 'text-danger' : 'animate-pulse'}`} data-testid="update-overlay-step-icon">{info?.icon || <RefreshCw className="lucide-inline" />}</div>
@@ -303,7 +318,7 @@ export { NavItem, NavBadge }
 export default function App() {
   const shell = useAppShell()
   const {
-    isEmbed, isPopout, initialPopoutPath, dispatch, updateAvailable, terminalEnabled, terminalPoppedOut,
+    isEmbed, isPopout, initialPopoutPath, appPopoutRoute, updateAvailable, terminalEnabled, terminalPoppedOut,
     bottomTerminalOpen, mobileConnect, activeSlotProject, terminalPosition, navigate, mayLeaveForNavigation,
     colorTheme, onboarded, privacyAcked, markOnboarded, markImportOnboarded, markPrivacyAcked, firstRun,
     lookPreviewFrame, branding, avatar, isMobile, bottomDock, activeInstanceId, macFullscreen, macInset,
@@ -312,13 +327,19 @@ export default function App() {
     localHeaderDragGaps, shellEntered, setShellEntered, shellRef, setMembersBar, advertisedNavItems,
     sortedAppGroup, slotOwners, appBadges, railAppBadges, railAppRunStates, shortcutsOpen,
     setShortcutsOpen, toggleShortcutsModal, commandPalette, agentSwitchNotice, kiroUsageOpen, setKiroUsageOpen,
-    kiroUsageState, kiroAccountEntry, metrics, devMode, subscribeLogs, subscribeSubagents, forceReconnect,
+    kiroUsageState, kiroAccountEntry, metrics, subscribeLogs, subscribeSubagents, forceReconnect,
     updateFlow, updating, setUpdating, showUpdateModal, setShowUpdateModal, showChangelog, updateError,
-    setUpdateError, startupVideo, reportProblemOpen, setReportProblemOpen, effectiveCollapsed, activePath,
+    setUpdateError, reportProblemOpen, setReportProblemOpen, effectiveCollapsed, activePath,
     isChat, needsFixedHeight, navRowActive, membersRoute, mobileSingle,
   } = shell
   // "Run in terminal" from a code block outside every chat, on any route.
   const runInTerminal = useRunInTerminalShellBridge(activeSlotProject, !isPopout && !isEmbed)
+  // The dock terminal fills the content area only while maximized, so <main>
+  // becomes its own stacking context ONLY then — confining the fullscreen panel
+  // above the in-content chat layers it covers. Docked or closed, <main> creates
+  // no stacking context, so a page-level inline modal (fixed inset-0 z-[100])
+  // still paints over the dock as it does elsewhere.
+  const terminalFullscreen = useTerminalFullscreen()
 
   /**
    * Phone chat page: the main navigation as a 72px icon rail.
@@ -355,13 +376,15 @@ export default function App() {
    * renders no rail. The Crewmates page hosts it the same way, beside its
    * roster in the drawer over the open chat.
    */
+  // A docked mate's tile is the lit one while its chat is open (see navRail).
+  const { openIsDocked } = useDockMates()
   const railHost = mobileSingle || (isMobile && membersRoute)
   const mobileNavRail = railHost
     ? ({ onActivate }: MobileNavRailOptions) => {
       const railRow = (
         n: { path: string; id: string; label: string; labelKey?: string; icon: React.ReactNode; appName?: string },
       ) => {
-        const active = navRowActive(n.path)
+        const active = navRowActive(n.path) && !(n.id === 'members' && openIsDocked)
         return (
           <NavItem
             key={n.id}
@@ -417,24 +440,11 @@ export default function App() {
             </button>
             {advertisedNavItems.filter(n => n.group === 'Main').map(railRow)}
           </>}
-          apps={sortedAppGroup.map(railRow)}
+          apps={<>{sortedAppGroup.map(railRow)}<DockMatesTiles onActivate={onActivate} /></>}
           // Pinned above Settings while the rail has room; folded into the Apps
           // scroller (behind a divider) on screens where pinning them would leave
           // the app tiles less than four rows (shell/nav/adaptiveMobileRail.tsx).
           secondary={<>
-            {devMode && (
-              <NavItem
-                navId="developer"
-                path="/developer"
-                label={i18nT('app.developer')}
-                icon={<Code size={16} />}
-                active={activePath === '/developer'}
-                collapsed
-                touch
-                replace
-                onClickOverride={activePath === '/developer' ? onActivate : undefined}
-              />
-            )}
             {terminalEnabled && (
               <NavItem
                 navId="terminal"
@@ -508,7 +518,38 @@ export default function App() {
         the dashboard inside the local pane (below), where it hides with the
         local Crew. */}
     {(isPopout || isEmbed) && <ImportSessionOutcomeNotice />}
-    {isPopout ? (
+    {/* Same rule for a file-menu action's result: the dashboard shows it in the
+        notification sheet's banner region, which these frames do not render. */}
+    {(isPopout || isEmbed) && <FileMenuResultToastFrame />}
+    {/* The keyboard cycle, the session pickers and the auto-compact write all
+        dispatch this notice in a popout and an embed window too, and for several
+        of them it is the only surface: the picker closes on failure, and the
+        auto-compact flush fires from an unmount. */}
+    {(isPopout || isEmbed) && agentSwitchNotice && <AgentSwitchNoticeBanner notice={agentSwitchNotice} />}
+    {appPopoutRoute ? (
+      /* An app pop-out window. Its router is mounted at `/popout/app`
+         (main.tsx, via appPopoutRouterBasename), so the paths here are the
+         app's OWN — `/dev-fleet/…`, `/apps/<name>` — exactly as the dashboard
+         branch below spells them, and an app's absolute sub-path navigation
+         resolves unchanged. The two arms are the dashboard's two app arms; the
+         frame renders the pinned app for its own route and hands any other
+         destination (an app's "go to chat" exit, a link to Settings) to the
+         main window instead of mounting it here. The hard-exit sink is
+         installed above the route boundary, so a hard "Ask the agent" from a
+         crashed app (or a crashed frame) hands off to main instead of loading
+         the dashboard here. */
+      <>
+        <AppPopoutHardExit />
+        <Routes>
+          <Route path="/apps/:name" element={<ErrorBoundary><AppPopoutFrame route={appPopoutRoute} /></ErrorBoundary>} />
+          <Route path="/:builtinApp/*" element={<ErrorBoundary><AppPopoutFrame route={appPopoutRoute} /></ErrorBoundary>} />
+          <Route path="*" element={<ErrorBoundary><AppPopoutFrame route={appPopoutRoute} /></ErrorBoundary>} />
+        </Routes>
+      </>
+    ) : isPopout ? (
+      <>
+      {/* A popped-out chat offers app items on selected text too. */}
+      <Suspense fallback={null}><SelectionActionLayer /></Suspense>
       <Routes>
         <Route path="/popout/chat/:slug?" element={<ErrorBoundary><PopoutFrame /></ErrorBoundary>} />
         <Route path="/popout/artifact/:slug" element={<ErrorBoundary><ArtifactPopoutFrame /></ErrorBoundary>} />
@@ -519,9 +560,11 @@ export default function App() {
             stray path to '/', which no longer matches anything here). */}
         <Route path="*" element={<Navigate to={initialPopoutPath} replace />} />
       </Routes>
+      </>
     ) : isEmbed ? (
       <div className="h-screen supports-[height:100dvh]:h-dvh w-screen overflow-hidden bg-bg flex flex-col">
         <KiroCrewNavBridge />
+        <Suspense fallback={null}><SelectionActionLayer /></Suspense>
         <EmbedTabStrip />
         <div className="flex-1 min-h-0">
           <Routes>
@@ -681,19 +724,14 @@ export default function App() {
 
       <ShellHeader shell={shell} />
 
-      {agentSwitchNotice && (
-        <div role="status" className="fixed z-[70] top-safe-offset-14 left-safe-offset-4 right-safe-offset-4 sm:left-auto sm:w-[440px] bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 shadow-xl animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
-          <span className="text-sm text-text flex-1">{agentSwitchNotice.message}</span>
-          <button onClick={() => dispatch(setAgentSwitchNotice(null))} aria-label={i18nT('app.dismiss')} className="text-muted hover:text-text leading-none p-0.5"><X className="lucide-inline w-4 h-4" /></button>
-        </div>
-      )}
+      {agentSwitchNotice && <AgentSwitchNoticeBanner notice={agentSwitchNotice} />}
 
       {/* Report a Problem — mounted by the nav rail's "Report issue" link. */}
       <ReportProblemModal open={reportProblemOpen} onClose={() => setReportProblemOpen(false)} />
 
       {/* Update error modal */}
       {updateError && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/80 backdrop-blur-xs animate-rise" role="dialog" aria-modal="true" aria-label={i18nT('app.update_error')}>
+        <UpdateErrorDialogFrame setError={setUpdateError}>
           <div className="bg-card border border-border rounded-xl p-8 max-w-md w-full mx-4 shadow-xl text-center">
             <div className="text-4xl mb-4"><AlertTriangle className="lucide-inline" /></div>
             <div className="text-lg font-bold text-text-strong mb-2">{i18nT('app.update_failed')}</div>
@@ -707,7 +745,7 @@ export default function App() {
               </button>
             </div>
           </div>
-        </div>
+        </UpdateErrorDialogFrame>
       )}
 
       {/* Every surface that opens ITSELF at launch, mounted from one place so
@@ -724,15 +762,15 @@ export default function App() {
 
           {/* Updating overlay */}
           {(updating || showUpdateModal) && <UpdateOverlay onCancel={() => { setUpdating(false); setShowUpdateModal(false) }} />}
-          {/* Both held while What's new is open, so two update dialogs never stack;
-              each takes its turn once What's new closes, with its state intact. */}
-          <UpdateModal held={showChangelog} />
+          {/* Both held while What's new or the shortcuts dialog is open, so two
+              trapped dialogs never stack and fight over Tab; each takes its turn
+              once the other closes, with its state intact. */}
+          <UpdateModal held={showChangelog || shortcutsOpen} />
           {updateAvailable && (
             <Suspense fallback={null}>
-              <UpdateFoundModal held={showChangelog} />
+              <UpdateFoundModal held={showChangelog || shortcutsOpen} />
             </Suspense>
           )}
-          <StartupVideo startupVideo={startupVideo} />
           <MobileConnectDialog mobileConnect={mobileConnect} />
           <RemoteUpdateOffer />
 
@@ -763,12 +801,12 @@ export default function App() {
           }
           : { gridArea: 'content' }}
       >
-        <div className={`flex min-h-0 min-w-0 flex-1 ${terminalPosition === 'right' ? 'flex-row' : 'flex-col'}`}>
+        <div className={`relative flex min-h-0 min-w-0 flex-1 ${terminalPosition === 'right' ? 'flex-row' : 'flex-col'}`}>
         {/* `outline-hidden`: main is a programmatic focus target (the skip
             link, and focus mode's hand-off when the chrome hides), not a
             control, so it opts out of the global :focus-visible ring the way
             the tabIndex={-1} page headings do. */}
-        <main id="main-content" tabIndex={-1} className={`outline-hidden flex flex-col min-h-0 min-w-0 flex-1 overflow-x-hidden ${needsFixedHeight ? 'overflow-hidden p-0' : 'overflow-y-auto'}`}>
+        <main id="main-content" tabIndex={-1} className={`outline-hidden ${mainStackingClass({ isTerminalFullscreen: terminalFullscreen, terminalEnabled, terminalPoppedOut })} flex flex-col min-h-0 min-w-0 flex-1 overflow-x-hidden ${needsFixedHeight ? 'overflow-hidden p-0' : 'overflow-y-auto'}`}>
           <MigrationCheck />
           {/* Route-independent, unlike MigrationCheck: "you crashed" is true of
               the app, not of the page, and the launch after a crash rarely lands
@@ -786,6 +824,17 @@ export default function App() {
               <KiroSignInNotice />
             </Suspense>
           </ErrorBoundary>
+          {/* Route-independent too: the first KAS chat on a host without a
+              working kiro-cli waits on the gateway downloading Kiro Crew's own
+              engine, whatever page is open. */}
+          <ErrorBoundary
+            scope="kas-engine-notice"
+            fallback={error => <KiroSignInNoticeFallback error={error} />}
+          >
+            <Suspense fallback={null}>
+              <KasEngineNotice />
+            </Suspense>
+          </ErrorBoundary>
           {/* The rail renderer reaches the chat page through context rather than
               a prop: the route element is shared with the popout/embed frames. */}
           <MobileNavRailContext.Provider value={mobileNavRail}>
@@ -795,6 +844,11 @@ export default function App() {
               read their draft and request-header seams from this provider. */}
           <GuideProvider>
           <Suspense fallback={null}><GuideLayer /></Suspense>
+          <Suspense fallback={null}><LinkPreviewLayer /></Suspense>
+          <Suspense fallback={null}><MessageActionLayer /></Suspense>
+          <Suspense fallback={null}><LinkOpenLayer /></Suspense>
+          {/* The shell's own nav read owns the shared app list here. */}
+          <Suspense fallback={null}><SelectionActionLayer readApps={false} /></Suspense>
           <Routes>
             <Route path="/chat/:slug?" element={<ErrorBoundary><ChatPage /></ErrorBoundary>} />
             <Route path="/orchestrated/:slug?" element={<OrchestratedRedirect />} />
@@ -882,7 +936,7 @@ export default function App() {
       <MetricsCard metrics={metrics} />
       <KiroAccountModal open={kiroUsageOpen} onClose={() => setKiroUsageOpen(false)} usage={kiroUsageState} />
       <Lightbox />
-      <ImportSessionOutcomeNotice />
+      <ImportSessionOutcomeNotice navigateToChat />
       <RunInTerminalShellNotice error={runInTerminal.error} onDismiss={runInTerminal.dismiss} />
       </LocalOverlayRoot>
       </div>{/* /Local pane */}
@@ -904,8 +958,10 @@ export default function App() {
     )}
     </WsContext.Provider>
     {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
-    {/* Answers the "Too large to scan" question a file download asks. */}
-    <UnscannedDownloadConfirmHost />
+    {/* The dialog every `askAppConfirm()` caller raises (session close, ⌘W,
+        the sidebar's destructive actions), mounted outside the layout branches
+        so pop-out and embedded windows have it too. */}
+    <AppConfirmHost />
     <QuickSearchSurface
       owners={slotOwners}
       open={commandPalette.open}

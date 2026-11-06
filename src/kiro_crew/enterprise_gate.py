@@ -2,8 +2,10 @@
 
 Design: ``docs/request-for-change/rfc-crew-enterprise-edition.md``, section
 "Enterprise gate". In an enterprise build (``edition.is_enterprise()``) the
-gateway starts with the gate CLOSED and opens it only once a probe has seen a
-valid kiro login. While it is closed, the gateway middleware in
+gateway does not start at all without a kiro login (``kiro_crew.enterprise_boot``
+exits before the bind), so the gate starts OPEN. It closes when that login is
+lost or expires while the gateway runs, and reopens once a check sees a valid
+login again. While it is closed, the gateway middleware in
 ``dashboard/enterprise_gate_middleware.py`` denies every route except the few a
 login screen needs. An ``oss`` build never builds a gate.
 
@@ -15,9 +17,9 @@ Each concern owns one reason and only ever clears its own:
   ``gate.close("<its reason>")`` and ``gate.clear("<its reason>")`` with its own
   reason string. Nothing here needs to change for it.
 
-:class:`LoginWatch` reuses the existing login check
-(``KiroPrerequisiteService.login_verified``, the setup gate's ``whoami`` probe);
-there is no second login check.
+:class:`LoginWatch` reads the one enterprise sign-in (RFC D4) through
+``kiro_crew.enterprise_sign_in.SignInLoginSource``: the same resolver the start check,
+the rules fetch and the account lock read, so there is no second login check.
 """
 
 from __future__ import annotations
@@ -41,12 +43,11 @@ GATE_CLOSED_CODE = "enterprise_gate_closed"
 
 _REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
-# How often the login watch checks, and how old the last probe may be before a
-# check re-probes. While closed it checks often, so a fresh login reopens the
-# gate within seconds; the check is a local identity-store read unless the
-# probe is due. While open it checks less often; the full ``whoami`` probe that
-# catches an expired token runs at most once per ``_OPEN_MAX_AGE_SECS``. An ACP
-# auth failure closes the gate sooner, through the latch (see ``LoginWatch.sync``).
+# How often the login watch checks, and how old the last read may be before a
+# check reads again. While closed it checks often, so a fresh sign-in reopens the
+# gate within seconds; while open it checks less often. The enterprise source
+# (``enterprise_sign_in.SignInLoginSource``) is a plain store read: it reads on
+# every check while signed out, and at least once a minute while signed in.
 _CLOSED_INTERVAL_SECS = 5.0
 _CLOSED_MAX_AGE_SECS = 60.0
 _OPEN_INTERVAL_SECS = 60.0
@@ -72,9 +73,10 @@ GateListener = Callable[[GateStatus], None]
 class EnterpriseGate:
     """Open or closed, plus why. Safe to call from any thread.
 
-    Starts closed for every reason in *closed_for*. ``close`` and ``clear`` return
-    whether the open/closed state changed, and call each listener with the new
-    status when it did. Listeners run on the caller's thread, outside the lock;
+    Starts closed for every reason in *closed_for*, open when it is empty (the
+    gateway passes it empty: its boot login check already passed). ``close`` and
+    ``clear`` return whether the open/closed state changed, and call each
+    listener with the new status when it did. Listeners run on the caller's thread, outside the lock;
     one that raises is logged and does not stop the others.
     """
 
@@ -141,7 +143,7 @@ def _checked(reason: str) -> str:
 
 
 class LoginSource(Protocol):
-    """What :class:`LoginWatch` reads; ``KiroPrerequisiteService`` provides it."""
+    """What :class:`LoginWatch` reads; ``enterprise_sign_in.SignInLoginSource`` provides it."""
 
     @property
     def authenticated(self) -> bool: ...
@@ -150,13 +152,11 @@ class LoginSource(Protocol):
 
 
 class LoginWatch:
-    """Keeps :data:`REASON_LOGIN_REQUIRED` in step with the kiro login.
+    """Keeps :data:`REASON_LOGIN_REQUIRED` in step with the kiro sign-in.
 
-    ``check`` is the only path that OPENS for login: it asks the service, which
-    re-probes when due. ``sync`` is the per-request read of the latch and only
-    ever CLOSES, so a latch narrowed by an ACP auth failure closes the gate on
-    the next request, while a probe that failed (and so left the latch as it
-    was) cannot be undone by it.
+    ``check`` is the only path that OPENS for login: it asks the source, which
+    reads again when due. ``sync`` is the per-request read of the latched verdict
+    and only ever CLOSES, so a check that failed cannot be undone by it.
     """
 
     def __init__(

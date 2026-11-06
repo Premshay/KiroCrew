@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -197,6 +198,81 @@ def test_issue_body_has_no_absolute_zip_path(tmp_path, monkeypatch):
     assert str(home) not in body, "home prefix leaked into the issue body"
     assert r.filename in body, "the login-free filename should still identify the bundle"
     assert "secret(s) auto-redacted" in body
+
+
+def test_bundle_includes_every_kept_boot_log(tmp_path, monkeypatch):
+    """The older boots behind gateway.log.prev ride in the bundle, redacted like it."""
+    home = tmp_path / "home"
+    _isolate(monkeypatch, home)
+    boots = home / "logs" / "gateway-boots"
+    boots.mkdir(parents=True)
+    (home / "gateway.log").write_text("live run\n")
+    (home / "gateway.log.prev").write_text("boot 1 back\n")
+    (boots / "gateway.log.4").write_text("boot 2 back\n" + _GATEWAY)
+    (boots / "gateway.log.2").write_text("boot 4 back\n")
+
+    r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+    with zipfile.ZipFile(r.zip_path) as z:
+        names = set(z.namelist())
+        assert {
+            "gateway.log.prev",
+            "gateway-boots/gateway.log.4",
+            "gateway-boots/gateway.log.2",
+        } <= names
+        older = z.read("gateway-boots/gateway.log.4").decode()
+        assert z.read("gateway-boots/gateway.log.2").decode() == "boot 4 back\n"
+    for secret in _SECRETS:
+        assert secret not in older, f"secret leaked into bundle: {secret!r}"
+    assert older.startswith("boot 2 back\n")
+    # A boot that was never kept is neither a member nor reported as skipped.
+    assert not [m for m in r.skipped if m.startswith("gateway-boots/")]
+
+
+def test_bundle_with_no_older_boot_logs_skips_only_prev(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _isolate(monkeypatch, home)
+    (home / "gateway.log").write_text("live run\n")
+
+    r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+    boot_skips = [m for m in r.skipped if "gateway.log.prev" in m or "gateway-boots" in m]
+    assert boot_skips == ["gateway.log.prev"]
+
+
+@requires_symlinks
+def test_bundle_refuses_a_symlinked_older_boot_log(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _isolate(monkeypatch, home)
+    boots = home / "logs" / "gateway-boots"
+    boots.mkdir(parents=True)
+    (home / "gateway.log").write_text("live run\n")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not a log\n")
+    (boots / "gateway.log.2").symlink_to(outside)
+
+    r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+    with zipfile.ZipFile(r.zip_path) as z:
+        assert "gateway-boots/gateway.log.2" not in z.namelist()
+    assert "gateway-boots/gateway.log.2" in r.skipped
+
+
+@requires_symlinks
+def test_bundle_never_lists_a_linked_boot_dir(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _isolate(monkeypatch, home)
+    (home / "logs").mkdir()
+    (home / "gateway.log").write_text("live run\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "gateway.log.1").write_text("someone else's log\n")
+    (home / "logs" / "gateway-boots").symlink_to(outside, target_is_directory=True)
+
+    r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+    with zipfile.ZipFile(r.zip_path) as z:
+        assert not [n for n in z.namelist() if n.startswith("gateway-boots/")]
 
 
 def test_collapse_skips_root_and_single_segment_and_respects_boundary(monkeypatch):
@@ -1500,6 +1576,45 @@ def test_download_allows_and_audits_valid_zip(tmp_path, monkeypatch):
     resp = asyncio.run(dh.api_diagnostics_download(_DownloadReq("b.zip")))
     assert resp.status == 200
     assert sel.log_tool_invocation.call_args.kwargs["outcome"] == "allowed"
+
+
+@pytest.mark.parametrize("filename", ["b.zip", "../../etc/passwd"])
+def test_download_path_checks_run_off_the_event_loop_thread(tmp_path, monkeypatch, filename):
+    # ``resolve()`` and ``is_file()`` stat the data home, and a stat on a mount
+    # that stopped answering blocks for as long as the kernel does: on the loop
+    # that stalls every session, so the checks must run on a worker thread for
+    # both a served and a refused name.
+    diag = tmp_path / "diagnostics"
+    diag.mkdir()
+    (diag / "b.zip").write_bytes(b"PK\x03\x04zip")
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path)
+    sel = _stub_sel(monkeypatch)
+    loop_thread = threading.get_ident()
+    check_threads: set[int] = set()
+    real_resolve = Path.resolve
+    real_is_file = Path.is_file
+
+    def tracked_resolve(self, *a, **kw):
+        if diag in (self, *self.parents):
+            check_threads.add(threading.get_ident())
+        return real_resolve(self, *a, **kw)
+
+    def tracked_is_file(self, *a, **kw):
+        if diag in self.parents:
+            check_threads.add(threading.get_ident())
+        return real_is_file(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "resolve", tracked_resolve)
+    monkeypatch.setattr(Path, "is_file", tracked_is_file)
+    resp = asyncio.run(dh.api_diagnostics_download(_DownloadReq(filename)))
+
+    served = filename == "b.zip"
+    assert resp.status == (200 if served else 403)
+    assert sel.log_tool_invocation.call_args.kwargs["outcome"] == (
+        "allowed" if served else "denied"
+    )
+    assert check_threads, "the download never checked the bundle path"
+    assert loop_thread not in check_threads
 
 
 def test_collect_handler_returns_download_url(tmp_path, monkeypatch):

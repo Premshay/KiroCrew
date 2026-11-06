@@ -35,11 +35,9 @@ if TYPE_CHECKING:
         SubagentEventCoalescer,
         SubagentInfo,
         SubagentManager,
-        _ChatSlot,
         _compose_subagent_completion,
         _injection_notice_outcome,
         _queued_depth_off_loop,
-        bounded_chat_turn,
         dashboard_slot_key,
         deliver_spawn_approval,
         drain_idle_parent_queue_for_stall,
@@ -202,83 +200,6 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
         except Exception:
             logger.info("Failed to broadcast subagent %s status", info.id, exc_info=True)
 
-    def _retrigger_recovery(slot: "_ChatSlot", parent_key: str) -> None:
-        """Drain queued failures into a new recovery _run_chat turn.
-
-        Called from _on_done callbacks after resetting the guard, so
-        failures that arrived while the previous recovery was running
-        get processed without waiting for user input.
-        """
-        if slot._recovery_chat_triggered or not slot._pending_subagent_failures:
-            return
-        if not self.dashboard_state:
-            return
-        _max_retrigger = 3
-        if slot.recovery_retrigger_count >= _max_retrigger:
-            logger.warning(
-                "Recovery retrigger cap (%d) reached for %s, dropping %d queued failures",
-                _max_retrigger,
-                parent_key,
-                len(slot._pending_subagent_failures),
-            )
-            slot._pending_subagent_failures.clear()
-            return
-        slot.recovery_retrigger_count += 1
-        slot._recovery_chat_triggered = True
-        # Bound here rather than at module scope: this reads ``_run_chat`` from
-        # ``dashboard.chat``, a different module than the top-level
-        # ``chat_runner`` import, and resolving it per call is what lets a test
-        # patch ``dashboard.chat._run_chat`` and have this path observe it.
-        from kiro_crew.dashboard.chat import _run_chat
-
-        failures = slot._pending_subagent_failures[:]
-        slot._pending_subagent_failures.clear()
-        msg = "\n\n".join(failures)
-        msg, _ = redact_exfiltration_urls(msg)
-        msg, _ = redact_credentials(msg)
-        slot.append("user", msg, "msg msg-u auto-go")
-        logger.info(
-            "Re-triggering recovery _run_chat for %s (%d queued failures)",
-            parent_key,
-            len(failures),
-        )
-
-        def _done(t: asyncio.Task) -> None:  # type: ignore[type-arg]
-            if t.cancelled():
-                logger.warning("Re-triggered recovery cancelled for %s", parent_key)
-                slot._recovery_chat_triggered = False
-                return
-            elif t.exception():
-                logger.error(
-                    "Re-triggered recovery failed for %s",
-                    parent_key,
-                    exc_info=t.exception(),
-                )
-            slot._recovery_chat_triggered = False
-            if slot._pending_subagent_failures:
-                _retrigger_recovery(slot, parent_key)
-
-        _task = asyncio.create_task(
-            bounded_chat_turn(
-                _run_chat(
-                    self.dashboard_state,
-                    slot,
-                    msg,
-                    _directive_user_origin=False,
-                    # The text is the re-injected sub-agent completion or
-                    # failure this recovery drains, so the sub-agent is what
-                    # caused the turn.
-                    _turn_actor="subagent",
-                ),
-                state=self.dashboard_state,
-                slot=slot,
-            ),
-        )
-        slot.task = _task
-        self._background_tasks.add(_task)
-        _task.add_done_callback(self._background_tasks.discard)
-        _task.add_done_callback(_done)
-
     async def _subagent_done(info: SubagentInfo) -> None:
         # A synthetic flush-only record is NOT a wave member (see
         # SubagentManager.force_digest_flush): it exists only to force the
@@ -288,28 +209,23 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
         # bump would invent an agent that never ran.
         _flush_only = getattr(info, "_digest_flush_only", False) is True
         parent_key = info.parent_session_key
-        _parent_slot_name = dashboard_slot_key(parent_key)
-
-        _injection_slot = None
-        if self.dashboard_state and _parent_slot_name:
-            from kiro_crew.dashboard.handlers.messaging import _slot_for_parent
-
-            _injection_slot = _slot_for_parent(self.dashboard_state, parent_key)
-            if _injection_slot is None:
-                _injection_slot = self.dashboard_state.get_slot(_parent_slot_name)
-            if getattr(_injection_slot, "window_pending", False) is True:
-                # A parent tab restored as a sidebar row loads its window
-                # before the completion is delivered into it, off the loop.
-                await load_window_off_loop(_injection_slot)
-                _injection_slot = _slot_for_parent(
-                    self.dashboard_state, parent_key
-                ) or self.dashboard_state.get_slot(_parent_slot_name)
-        _completion_key = getattr(_injection_slot, "key", "")
-        _injection_slot_name = (
-            _completion_key
-            if isinstance(_completion_key, str) and _completion_key
-            else _event_slot(parent_key)
-        )
+        try:
+            _parent_slot_name, _injection_slot, _injection_slot_name = await self._parent_tab(
+                parent_key
+            )
+        except Exception:
+            # A restored tab whose window cannot be read is treated as closed:
+            # the parent's own route delivers the completion now, rather than
+            # leaving it to the next start's re-announce.
+            logger.warning(
+                "Subagent %s: the tab showing %s could not be read; "
+                "delivering its completion through the parent's own route",
+                info.id,
+                parent_key,
+                exc_info=True,
+            )
+            _parent_slot_name, _injection_slot = "", None
+            _injection_slot_name = subagent_event_slot(parent_key)
 
         if not _flush_only:
             await _broadcast_subagent_status(info, "done", _injection_slot_name)
@@ -369,40 +285,18 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
             return
 
         # ── Route completion back to the originating session ──
-        # Tab open        → that tab (a channel-born tab mirrors on to its channel)
-        # Channel, no tab → channel thread + dashboard notification
-        # Cron/no parent  → dashboard notification only
-
-        if _parent_slot_name and self.dashboard_state:
-            await self._route_subagent_to_tab(
-                info,
-                announce=wave.announce,
-                body=report.body,
-                title=report.title,
-                sub_meta=wave.sub_meta,
-                _flush_only=_flush_only,
-                _injection_slot=_injection_slot,
-                _injection_slot_name=_injection_slot_name,
-                parent_key=parent_key,
-            )
-            return
-
-        if parent_key and not parent_key.startswith(("cron:", "subagent:")):
-            await self._inject_subagent_into_channel_parent(
-                info,
-                announce=wave.announce,
-                body=report.body,
-                title=report.title,
-                parent_key=parent_key,
-            )
-            return
-
-        await self._finish_subagent_cron_or_notify(
+        await self._route_completion(
             info,
             announce=wave.announce,
             body=report.body,
             title=report.title,
+            sub_meta=wave.sub_meta,
+            carried=wave.carried,
+            flush_only=_flush_only,
             parent_key=parent_key,
+            slot_name=_parent_slot_name,
+            slot=_injection_slot,
+            event_slot=_injection_slot_name,
         )
 
     assert self.sessions is not None
@@ -471,7 +365,7 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
         nonlocal _slots_push_pending
         _slots_push_pending = False
         if self.dashboard_state:
-            self.dashboard_state.push_slots_update()
+            self.dashboard_state.push_subagent_patch()
 
     def _schedule_slots_push() -> None:
         nonlocal _slots_push_pending
@@ -523,8 +417,20 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
             if slot is not None and getattr(slot, "window_pending", False) is True:
                 # A parent tab restored as a sidebar row loads its window
                 # before the card is appended, with the read off the loop.
-                await load_window_off_loop(slot)
-                slot = self.dashboard_state.get_slot(slot_name)
+                # A window that cannot be read is treated as no tab: the
+                # frame below still reaches the UI.
+                try:
+                    await load_window_off_loop(slot)
+                    slot = self.dashboard_state.get_slot(slot_name)
+                except Exception:
+                    logger.warning(
+                        "Subagent %s: the tab %s could not be read; "
+                        "its failure card is sent as a frame only",
+                        info.id,
+                        slot_name,
+                        exc_info=True,
+                    )
+                    slot = None
             if slot:
                 task_preview = redact_and_truncate(info.task or "", 100)
                 error_text, _ = redact_exfiltration_urls(extra.get("error", "timed out"))
@@ -568,7 +474,16 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
                         try:
                             slot.note_pending_subagent_delivery(
                                 failure_msg,
-                                [SubagentDelivery(info.id, info.elapsed, info.credits)],
+                                [
+                                    SubagentDelivery(
+                                        info.id,
+                                        info.elapsed,
+                                        info.credits,
+                                        leaked_process=(
+                                            getattr(info, "_leaked_process", False) is True
+                                        ),
+                                    )
+                                ],
                             )
                         except Exception:
                             logger.debug(
@@ -647,8 +562,18 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
         slot = self.dashboard_state.get_slot(slot_name)
         if slot is not None and getattr(slot, "window_pending", False) is True:
             # A parent tab restored as a sidebar row loads its window before
-            # the notice is appended, with the read off the loop.
-            await load_window_off_loop(slot)
+            # the notice is appended, with the read off the loop. A window
+            # that cannot be read is treated as no tab, so the manager falls
+            # through to the owner DM.
+            try:
+                await load_window_off_loop(slot)
+            except Exception:
+                logger.warning(
+                    "The tab %s could not be read; its orphan notice goes to the owner",
+                    slot_name,
+                    exc_info=True,
+                )
+                return False
             slot = self.dashboard_state.get_slot(slot_name)
         if not slot:
             return False
@@ -718,6 +643,11 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
         # that yield is ``run()``'s memory barrier. Hold the pump until
         # ``_start_subagent_dispatch_after_memory_ready`` opens it.
         defer_queue_dispatch=True,
+        # The boot orphan sweep starts with the reaper below, before the dashboard
+        # has restored the tabs its notices belong in. ``run()`` releases them
+        # once the dashboard has rebuilt its tabs, channel ones included, and at
+        # once for the API-only server or a start that failed.
+        hold_orphan_notices=True,
     )
     # A parent that ends takes its children with it, on every backend. The
     # session lifecycle owns the boundary and drives both halves at each of its

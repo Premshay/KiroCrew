@@ -3,6 +3,7 @@ import {
   Crown,
   Ear,
   Hourglass,
+  Loader2,
   MessageSquare,
   Radio,
   RotateCcw,
@@ -442,14 +443,17 @@ export function AgentControlRow({
   onListenChange,
   onClearContext,
   onSetCoordinator,
+  justCleared = false,
 }: {
   agent: ChannelAgent
   onDismiss: () => void
   onListenChange: (m: ChannelAgent['listenMode']) => void
-  onClearContext: () => void
+  onClearContext: (begin: () => void) => void | Promise<void>
+  justCleared?: boolean
   onSetCoordinator: () => void
 }) {
   const [menu, setMenu] = useState(false)
+  const [clearing, setClearing] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
   // The trigger, so an explicit dismissal can hand focus back to it: the menu
   // keyboard contract moves focus INTO the menu on open, and the row holding
@@ -580,15 +584,27 @@ export function AgentControlRow({
               <Crown className="lucide-inline" />
             </Btn>
           )}
-          {alive && (
-            <Btn
-              onClick={onClearContext}
-              aria-label={i18nT('pages.channelPage.clear_context')}
-              title={i18nT('pages.channelPage.clear_context')}
-            >
-              <RotateCcw className="lucide-inline" />
-            </Btn>
-          )}
+      {alive && (
+        <Btn
+          onClick={async () => {
+            if (clearing || justCleared) return
+            // Busy only once the request starts: a spinner behind the open confirm reads as running.
+            try { await onClearContext(() => setClearing(true)) } finally { setClearing(false) }
+          }}
+          aria-disabled={clearing || justCleared}
+          aria-busy={clearing}
+          className={`aria-disabled:cursor-not-allowed aria-disabled:hover:border-border aria-disabled:hover:bg-transparent ${justCleared ? '' : 'aria-disabled:opacity-30'}`}
+          aria-label={justCleared ? i18nT('pages.channelPage.clear_context_done') : i18nT('pages.channelPage.clear_context')}
+          title={justCleared ? undefined : i18nT('pages.channelPage.clear_context')}
+          data-testid={justCleared ? 'agent-clear-done' : undefined}
+        >
+          {justCleared
+            ? <Check className="lucide-inline text-ok" aria-hidden="true" />
+            : clearing
+              ? <Loader2 className="lucide-inline animate-spin" aria-hidden="true" />
+              : <RotateCcw className="lucide-inline" />}
+        </Btn>
+      )}
           <Btn
             onClick={onDismiss}
             aria-label={i18nT('pages.channelPage.dismiss')}

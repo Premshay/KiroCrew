@@ -325,7 +325,7 @@ class TestConsolidationDoesNotBlockLoop:
             "via asyncio.to_thread()."
         )
 
-    def test_save_lessons_caps_oversized_list(self):
+    def test_save_lessons_caps_oversized_list(self, caplog):
         """The LLM lessons array is capped like semantic/episodic: each
         write_lesson can perform up to 6 blocking embeds, so an uncapped list
         would occupy a worker thread for minutes."""
@@ -345,9 +345,12 @@ class TestConsolidationDoesNotBlockLoop:
             {"rule": f"lesson number {i}", "category": "tool"}
             for i in range(_MAX_LESSONS_PER_CONSOLIDATION * 3)
         ]
-        c._save_lessons(oversized)
+        with caplog.at_level(logging.INFO, logger="kiro_crew.history"):
+            c._save_lessons(oversized)
 
-        assert vector_store.write_lesson.call_count == _MAX_LESSONS_PER_CONSOLIDATION
+        cap = _MAX_LESSONS_PER_CONSOLIDATION
+        assert f"Extracted {cap} lesson(s) from chat (vector store)" in caplog.text
+        assert vector_store.write_lesson.call_count == cap
 
 
 class TestConsolidateSession:
@@ -589,7 +592,7 @@ class TestConsolidateSession:
         assert "dashboard:chat-fail" not in consolidator._running
 
     @pytest.mark.asyncio
-    async def test_consolidate_now_skips_sensitive(self, tmp_path):
+    async def test_consolidate_now_skips_sensitive(self, tmp_path, caplog):
         """consolidate_now skips sessions that touched sensitive paths."""
         from kiro_crew.memory import MemoryStore
 
@@ -603,9 +606,14 @@ class TestConsolidateSession:
             "dashboard:chat-sens2", "assistant", "read .ssh/id_rsa", tools=["cat .ssh/id_rsa"]
         )
 
-        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock_consolidate:
-            await consolidator.consolidate_now("dashboard:chat-sens2")
-            mock_consolidate.assert_not_called()
+        with (
+            patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock_consolidate,
+            caplog.at_level(logging.INFO, logger="kiro_crew.history"),
+        ):
+            outcome = await consolidator.consolidate_now("dashboard:chat-sens2")
+        assert outcome.status == "skipped" and outcome.detail == "sensitive session"
+        assert conv_log.unconsolidated_count("dashboard:chat-sens2") == 1
+        mock_consolidate.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_consolidate_now_happy_path(self, tmp_path):
@@ -621,7 +629,11 @@ class TestConsolidateSession:
         conv_log.append("dashboard:chat-ok", "user", "hello world")
 
         with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock_consolidate:
-            await consolidator.consolidate_now("dashboard:chat-ok")
+            from kiro_crew.history_consolidation_span import ConsolidationOutcome
+
+            mock_consolidate.return_value = ConsolidationOutcome("consolidated")
+            outcome = await consolidator.consolidate_now("dashboard:chat-ok")
+            assert outcome.status == "consolidated" and outcome.complete
             mock_consolidate.assert_called_once_with("dashboard:chat-ok", include_history=True)
 
     @pytest.mark.asyncio
@@ -637,7 +649,7 @@ class TestConsolidateSession:
         consolidator = HistoryConsolidator(log=conv_log, memory=mem)
 
         with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock_consolidate:
-            await consolidator.consolidate_now("dashboard:chat-nonexist")
+            assert (await consolidator.consolidate_now("dashboard:chat-nonexist")).status == "empty"
             mock_consolidate.assert_not_called()
 
 
@@ -1520,8 +1532,12 @@ class TestConsolidationToolPolicyForkContracts:
         # These constants are read as module globals of history_consolidation;
         # kiro_crew.history only re-exports them, so patching the facade binds a
         # name nothing reads and the turn would run to the real 180s timeout.
-        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01)
-        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(
+            consolidation_mod, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01
+        )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
+        monkeypatch.setattr(
+            consolidation_mod, "_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S", 0.01
+        )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
         with patch("kiro_crew.history.stream_and_collect_json", side_effect=_stalled_stream):
             result = await consolidator._call_llm("some prompt")
 
@@ -1529,7 +1545,7 @@ class TestConsolidationToolPolicyForkContracts:
         await await_until(cancelled, what="the timed-out consolidation stream was cancelled")
         sessions.cancel_current.assert_awaited_once_with(
             _CONSOLIDATE_SESSION_KEY, wait_ack_timeout=0.01
-        )
+        )  # flake-ok: Checks a recorded timeout argument on a mock; no real wait occurs.
         sessions.remove.assert_awaited_once_with(_CONSOLIDATE_SESSION_KEY)
         sessions.release.assert_called_once_with(_CONSOLIDATE_SESSION_KEY)
         assert consolidator._last_llm_error == "consolidation turn timed out after 0s"
@@ -1698,7 +1714,9 @@ class TestConsolidationToolPolicyForkContracts:
             assert release.wait(timeout=30)
             return {"content": []}
 
-        monkeypatch.setattr(history_consolidation, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(
+            history_consolidation, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01
+        )  # flake-ok: Exercises timeout refusal of a blocked dependency, not successful completion speed.
         with patch.object(history_consolidation, "_post_consolidation_request", blocked_request):
             try:
                 assert await consolidator._call_direct_endpoint("first") is None

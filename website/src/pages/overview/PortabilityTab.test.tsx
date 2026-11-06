@@ -431,6 +431,45 @@ describe('PortabilityTab chat history', () => {
     await screen.findByText('Archive contents:')
   }
 
+  it('labels archive file sizes with the shared byte formatter', async () => {
+    await preview({ 'config.json': 2_000, 'memory.db': 1_500_000, 'crons.json': 512 })
+    expect(screen.getByText(/Config: 2kB/)).toBeTruthy()
+    expect(screen.getByText('Memory DB: 1.5MB')).toBeTruthy()
+    expect(screen.getByText(/Crons: 512B/)).toBeTruthy()
+  })
+
+  it('shows a busy line while the chosen archive is checked, and clears it after', async () => {
+    let answer: (resp: Response) => void = () => {}
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(resolve => { answer = resolve })))
+    render(<PortabilityTab />)
+    const input = screen.getByLabelText(/choose import file/i) as HTMLInputElement
+    fireEvent.change(input, { target: { files: [new File(['PK'], 'e.zip')] } })
+    const busy = await screen.findByTestId('portability-preview-checking')
+    expect(busy.getAttribute('role')).toBe('status')
+    expect(busy.textContent).toBe('Checking the archive... A large file can take a few minutes.')
+    expect(input.disabled).toBe(true)
+    expect((screen.getByRole('button', { name: /^import$/i }) as HTMLButtonElement).disabled).toBe(true)
+    answer(new Response(JSON.stringify(
+      { ok: true, manifest: { version: 1, created_at: 't', hostname: 'h', user: 'u', contents: { skill_count: 1 } } },
+    ), { status: 200 }))
+    await screen.findByText('Archive contents:')
+    expect(screen.queryByTestId('portability-preview-checking')).toBeNull()
+    expect(input.disabled).toBe(false)
+    expect((screen.getByRole('button', { name: /^import$/i }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('clears the busy line when the check is refused', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(
+      { ok: false, error: 'manifest.json is missing', code: 'import_archive_invalid' },
+    ), { status: 400 })))
+    render(<PortabilityTab />)
+    const input = screen.getByLabelText(/choose import file/i) as HTMLInputElement
+    fireEvent.change(input, { target: { files: [new File(['PK'], 'e.zip')] } })
+    await screen.findByText('manifest.json is missing')
+    expect(screen.queryByTestId('portability-preview-checking')).toBeNull()
+    expect(input.disabled).toBe(false)
+  })
+
   it('says when the chosen archive has no chats', async () => {
     await preview({ skill_count: 1 })
     expect(screen.getByTestId('portability-preview-no-chats').textContent)
